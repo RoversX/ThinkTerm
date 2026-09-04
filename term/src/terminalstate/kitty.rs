@@ -242,6 +242,16 @@ fn is_bare_continuation(img: &KittyImage) -> bool {
     }
 }
 
+/// The physical rows a placement still covers. Rows that have scrolled out
+/// of the buffer are skipped rather than substituted: `Screen::stable_range`
+/// answers an unknown range with the top or bottom of the buffer, which for
+/// a placement means touching rows that never carried it.
+fn placement_phys_rows(screen: &crate::Screen, info: &PlacementInfo) -> Vec<crate::PhysRowIndex> {
+    (info.first_row..info.first_row + info.rows as StableRowIndex)
+        .filter_map(|row| screen.stable_row_to_phys(row))
+        .collect()
+}
+
 impl TerminalState {
     #[cfg(test)]
     pub(crate) fn kitty_used_memory(&self) -> usize {
@@ -722,19 +732,23 @@ impl TerminalState {
     /// it doubles as the glyph cache's key, and changing it per frame would
     /// rebuild the decoded image on every paint and reset the animation clock.
     fn kitty_touch_placements_for_image(&mut self, image_id: u32) {
-        let placements: Vec<(StableRowIndex, usize)> = self
+        let placements: Vec<PlacementInfo> = self
             .kitty_img
             .placements
             .iter()
             .filter(|((id, _), _)| *id == image_id)
-            .map(|(_, info)| (info.first_row, info.rows))
+            .map(|(_, info)| *info)
             .collect();
 
         let seqno = self.seqno;
-        let screen = self.screen_mut();
-        for (first_row, rows) in placements {
-            let range = screen.stable_range(&(first_row..first_row + rows as StableRowIndex));
-            for idx in range {
+        for info in placements {
+            // The recorded screen, not the active one: frames keep arriving
+            // for a picture on the primary screen while a full-screen app
+            // has the alternate one up. Dirtying the active screen instead
+            // left the real rows clean (a mux server never resent them) and
+            // marked unrelated rows of the other screen changed.
+            let screen = self.screen.screen_for_alt_mut(info.alt_screen);
+            for idx in placement_phys_rows(screen, &info) {
                 screen.line_mut(idx).update_last_change_seqno(seqno);
             }
         }
@@ -751,9 +765,7 @@ impl TerminalState {
         // the other screen is up (a stream in one pane, btop in this one),
         // and StableRowIndex only means anything on the screen it came from.
         let screen = self.screen.screen_for_alt_mut(info.alt_screen);
-        let range =
-            screen.stable_range(&(info.first_row..info.first_row + info.rows as StableRowIndex));
-        for idx in range {
+        for idx in placement_phys_rows(screen, &info) {
             let line = screen.line_mut(idx);
             for c in line.cells_mut() {
                 c.attrs_mut()

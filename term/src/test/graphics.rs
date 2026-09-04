@@ -228,9 +228,7 @@ const HALF_2X2: &str = "AAAAAAAAAAA=";
 #[test]
 fn a_chunked_transfer_reassembles() {
     let (mut term, _tap) = term_with_tap(640, 384);
-    term.advance_bytes(format!(
-        "\x1b_Ga=t,i=9,f=32,s=2,v=2,m=1;{HALF_2X2}\x1b\\"
-    ));
+    term.advance_bytes(format!("\x1b_Ga=t,i=9,f=32,s=2,v=2,m=1;{HALF_2X2}\x1b\\"));
     term.advance_bytes(format!("\x1b_Gm=0;{HALF_2X2}\x1b\\"));
     term.advance_bytes("\x1b_Ga=p,i=9\x1b\\");
 
@@ -280,9 +278,7 @@ fn a_transfer_after_an_abandoned_one_still_works() {
     // Ending the abandoned transfer should clear the latch.
     term.advance_bytes("\x1b_Gm=0;AAAAAAAAAAA=\x1b\\");
 
-    term.advance_bytes(format!(
-        "\x1b_Ga=t,i=11,f=32,s=2,v=2,m=1;{HALF_2X2}\x1b\\"
-    ));
+    term.advance_bytes(format!("\x1b_Ga=t,i=11,f=32,s=2,v=2,m=1;{HALF_2X2}\x1b\\"));
     term.advance_bytes(format!("\x1b_Gm=0;{HALF_2X2}\x1b\\"));
     term.advance_bytes("\x1b_Ga=p,i=11\x1b\\");
 
@@ -307,7 +303,10 @@ fn fill_accumulator_to_the_brim(term: &mut Terminal, opening: &str) {
 #[test]
 fn the_closing_fragment_is_charged_against_the_cap() {
     let (mut term, tap) = term_with_tap(640, 384);
-    fill_accumulator_to_the_brim(&mut term, "\x1b_Ga=t,i=13,f=32,s=2,v=2,m=1;AAAAAAAAAAA=\x1b\\");
+    fill_accumulator_to_the_brim(
+        &mut term,
+        "\x1b_Ga=t,i=13,f=32,s=2,v=2,m=1;AAAAAAAAAAA=\x1b\\",
+    );
 
     // Nothing has been refused yet, so this closing fragment is the first one
     // over the limit. Letting m=0 through unmeasured would park the whole
@@ -348,7 +347,10 @@ fn a_rejected_transfer_respects_the_opening_fragments_verbosity() {
 #[test]
 fn a_rejected_unchunked_transfer_does_not_swallow_the_next_one() {
     let (mut term, _tap) = term_with_tap(640, 384);
-    fill_accumulator_to_the_brim(&mut term, "\x1b_Ga=t,i=19,f=32,s=2,v=2,m=1;AAAAAAAAAAA=\x1b\\");
+    fill_accumulator_to_the_brim(
+        &mut term,
+        "\x1b_Ga=t,i=19,f=32,s=2,v=2,m=1;AAAAAAAAAAA=\x1b\\",
+    );
     // Refused as a closing fragment, which ends the transfer; latching on the
     // way out would eat the start of the next one.
     term.advance_bytes("\x1b_Gm=0;AAAAAAAAAAA=\x1b\\");
@@ -575,9 +577,7 @@ fn an_interleaved_delete_aborts_the_transfer_and_still_executes() {
     term.advance_bytes(XMIT_2X2);
     term.advance_bytes("\x1b_Ga=p,i=1\x1b\\");
 
-    term.advance_bytes(format!(
-        "\x1b_Ga=t,i=31,f=32,s=2,v=2,m=1;{HALF_2X2}\x1b\\"
-    ));
+    term.advance_bytes(format!("\x1b_Ga=t,i=31,f=32,s=2,v=2,m=1;{HALF_2X2}\x1b\\"));
     term.advance_bytes("\x1b_Ga=d,d=i,i=1\x1b\\");
 
     let reply = drain(&mut term, &tap);
@@ -618,9 +618,7 @@ fn an_interleaved_delete_aborts_the_transfer_and_still_executes() {
 fn an_interleaved_placement_aborts_the_transfer_and_still_places() {
     let (mut term, tap) = term_with_tap(640, 384);
     term.advance_bytes(XMIT_2X2);
-    term.advance_bytes(format!(
-        "\x1b_Ga=t,i=41,f=32,s=2,v=2,m=1;{HALF_2X2}\x1b\\"
-    ));
+    term.advance_bytes(format!("\x1b_Ga=t,i=41,f=32,s=2,v=2,m=1;{HALF_2X2}\x1b\\"));
     term.advance_bytes("\x1b_Ga=p,i=1\x1b\\");
 
     let reply = drain(&mut term, &tap);
@@ -642,7 +640,10 @@ fn an_interleaved_placement_aborts_the_transfer_and_still_places() {
 #[test]
 fn a_fresh_keyed_transfer_clears_the_overflow_latch() {
     let (mut term, tap) = term_with_tap(640, 384);
-    fill_accumulator_to_the_brim(&mut term, "\x1b_Ga=t,i=51,f=32,s=2,v=2,m=1;AAAAAAAAAAA=\x1b\\");
+    fill_accumulator_to_the_brim(
+        &mut term,
+        "\x1b_Ga=t,i=51,f=32,s=2,v=2,m=1;AAAAAAAAAAA=\x1b\\",
+    );
     // The fragment over the cap still promises more data, so the latch arms.
     term.advance_bytes("\x1b_Gm=1;AAAAAAAAAAA=\x1b\\");
 
@@ -949,8 +950,7 @@ fn appended_animation_frames_stay_within_the_image_budget() {
 
 /// Standard base64 for test payloads; the crate has no encoder of its own.
 fn base64_of(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in bytes.chunks(3) {
         let mut word = 0u32;
@@ -1006,5 +1006,104 @@ fn a_frame_stream_with_fresh_ids_is_capped_by_the_image_budget() {
             .iter()
             .any(|img| img.image_id() == Some(20)),
         "the newest frame must survive eviction"
+    );
+}
+
+/// Physical rows of `screen` that changed after `since`.
+fn dirty_phys_rows(screen: &crate::Screen, since: wezterm_surface::SequenceNo) -> Vec<usize> {
+    let mut rows = vec![];
+    screen.for_each_phys_line(|idx, line| {
+        if line.changed_since(since) {
+            rows.push(idx);
+        }
+    });
+    rows
+}
+
+/// One appended 2x2 animation frame for image 1.
+const FRAME_2X2: &str = "\x1b_Ga=f,i=1,f=32,s=2,v=2,z=70;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\";
+
+#[test]
+fn a_screen_switch_marks_the_rows_now_on_view_changed() {
+    // A mux client caches lines by stable index and refetches only what
+    // moved past the seqno it last saw. Switching screens replaces what
+    // every visible row shows without writing a line, so the switch has
+    // to stamp them itself, on the screen that is now active. The old code
+    // stamped the primary screen's physical rows 0..n, which once there is
+    // scrollback are its oldest history lines: the alternate screen came
+    // up with stale seqnos and the client kept painting the primary one.
+    let mut term = term(640, 384, true);
+    for i in 0..40 {
+        term.advance_bytes(format!("line {i}\r\n"));
+    }
+    let rows = term.screen().physical_rows as i64;
+
+    let before_alt = term.current_seqno();
+    term.advance_bytes("\x1b[?1049h");
+    let alt = term.screen();
+    std::assert_eq!(
+        dirty_phys_rows(alt, before_alt),
+        alt.phys_range(&(0..rows)).collect::<Vec<_>>(),
+        "every alternate-screen row must be marked changed by the switch"
+    );
+    assert!(
+        dirty_phys_rows(term.screen_for_alt(false), before_alt).is_empty(),
+        "entering the alternate screen must not touch the primary screen, \
+         least of all its scrollback: {:?}",
+        dirty_phys_rows(term.screen_for_alt(false), before_alt)
+    );
+
+    let before_primary = term.current_seqno();
+    term.advance_bytes("\x1b[?1049l");
+    let primary = term.screen();
+    std::assert_eq!(
+        dirty_phys_rows(primary, before_primary),
+        primary.phys_range(&(0..rows)).collect::<Vec<_>>(),
+        "the rows on view, and only those, must be marked changed when \
+         the primary screen returns"
+    );
+}
+
+#[test]
+fn a_frame_dirties_the_rows_holding_its_placement() {
+    let mut term = term(640, 384, true);
+    term.advance_bytes("\x1b[H");
+    term.advance_bytes(XMIT_2X2);
+    term.advance_bytes("\x1b_Ga=p,i=1\x1b\\");
+
+    let before = term.current_seqno();
+    term.advance_bytes(FRAME_2X2);
+    std::assert_eq!(
+        dirty_phys_rows(term.screen(), before),
+        vec![0],
+        "the row carrying the placement must be marked changed by the frame"
+    );
+}
+
+#[test]
+fn a_frame_for_a_placement_on_the_other_screen_dirties_that_screen() {
+    // Frames keep arriving for a picture on the primary screen while a
+    // full-screen app has the alternate one up. Dirtying the active screen
+    // left the placement's rows clean, so a mux server never resent them
+    // and the remote pane stayed on the first frame -- while unrelated rows
+    // of the alternate screen were resent for nothing.
+    let mut term = term(640, 384, true);
+    term.advance_bytes("\x1b[H");
+    term.advance_bytes(XMIT_2X2);
+    term.advance_bytes("\x1b_Ga=p,i=1\x1b\\");
+    term.advance_bytes("\x1b[?1049h");
+
+    let before = term.current_seqno();
+    term.advance_bytes(FRAME_2X2);
+    assert!(
+        dirty_phys_rows(term.screen(), before).is_empty(),
+        "the frame must not mark alternate-screen rows changed; they do \
+         not carry the picture: {:?}",
+        dirty_phys_rows(term.screen(), before)
+    );
+    std::assert_eq!(
+        dirty_phys_rows(term.screen_for_alt(false), before),
+        vec![0],
+        "the primary-screen row holding the placement must be marked changed"
     );
 }

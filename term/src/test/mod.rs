@@ -1406,11 +1406,14 @@ fn test_alt_screen_region_scroll() {
     term.assert_dirty_lines(seqno, &[0, 1, 2, 3, 4], None);
     assert_eq!(term.screen().visible_row_to_stable_row(4), 4);
 
-    // Leave alternate-mode and ensure screen is restored, with all lines marked dirty
+    // Leave alternate-mode and ensure screen is restored, with every
+    // visible line marked dirty: physical rows 1..6, since "M" has
+    // scrolled into history. (Rows 0..5 used to be stamped, which dirtied
+    // the history line and left the bottom row on view clean.)
     let seqno = term.current_seqno();
     term.set_mode("?1049", false);
     assert_all_contents(&term, file!(), line!(), &["M", "o", "n", "k", "e", "y"]);
-    term.assert_dirty_lines(seqno, &[0, 1, 2, 3, 4], None);
+    term.assert_dirty_lines(seqno, &[1, 2, 3, 4, 5], None);
     assert_eq!(term.screen().visible_row_to_stable_row(0), 1);
 }
 

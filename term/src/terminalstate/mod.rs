@@ -205,24 +205,27 @@ impl ScreenOrAlt {
 
     pub fn activate_alt_screen(&mut self, seqno: SequenceNo) {
         self.alt_screen_is_active = true;
-        self.dirty_top_phys_rows(seqno);
+        self.dirty_visible_rows(seqno);
     }
 
     pub fn activate_primary_screen(&mut self, seqno: SequenceNo) {
         self.alt_screen_is_active = false;
-        self.dirty_top_phys_rows(seqno);
+        self.dirty_visible_rows(seqno);
     }
 
-    // When switching between alt and primary screen, we implicitly change
-    // the content associated with StableRowIndex 0..num_rows.  The muxer
-    // use case needs to know to invalidate its cache, so we mark those rows
-    // as dirty.
-    fn dirty_top_phys_rows(&mut self, seqno: SequenceNo) {
-        let num_rows = self.screen.physical_rows;
-        for line_idx in 0..num_rows {
-            self.screen
-                .line_mut(line_idx)
-                .update_last_change_seqno(seqno);
+    /// A screen switch changes what is on view without writing a single
+    /// line, so nothing would carry a new sequence number. A mux client
+    /// caches lines by stable index and refetches only what moved past the
+    /// seqno it last saw; without this it keeps painting the other screen's
+    /// rows, images attached, over the one now active. So the rows now on
+    /// view are marked changed -- on the screen that is now active, which
+    /// is the one a client asks about next. Marking the primary screen's
+    /// rows 0..n was the old behaviour, and with scrollback present those
+    /// are its oldest history lines, not anything visible.
+    fn dirty_visible_rows(&mut self, seqno: SequenceNo) {
+        let rows = self.physical_rows;
+        for row in 0..rows {
+            self.dirty_line(row as VisibleRowIndex, seqno);
         }
     }
 
@@ -788,6 +791,15 @@ impl TerminalState {
     /// the alternate screen).
     pub fn screen(&self) -> &Screen {
         &self.screen
+    }
+
+    /// The named screen whether or not it is the active one.
+    pub fn screen_for_alt(&self, alt_screen: bool) -> &Screen {
+        if alt_screen {
+            &self.screen.alt_screen
+        } else {
+            &self.screen.screen
+        }
     }
 
     /// Returns a mutable reference to the active screen (either the primary or
