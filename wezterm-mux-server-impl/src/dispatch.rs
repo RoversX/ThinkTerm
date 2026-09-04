@@ -163,9 +163,33 @@ where
     let mut handler = SessionHandler::new(pdu_sender);
 
     {
+        // Notifications take one hop through the main thread's queue before
+        // they reach this connection. A mutation runs on the main thread,
+        // notifies in the middle of its work and sends its response at the
+        // end; with this loop on its own thread, a notification handed
+        // over directly would be on the wire before the response to the
+        // request that caused it, where the single-threaded server always
+        // sent the response first. Clients rely on that: a state push that
+        // overtakes its response leaves the response looking stale, and a
+        // frontend waits for state that has, as far as it is concerned,
+        // never arrived. The hop lands the notification after the response
+        // has been queued, restoring the order.
         let mux = Mux::get();
         let tx = item_tx.clone();
-        mux.subscribe(move |n| tx.try_send(Item::Notif(n)).is_ok());
+        mux.subscribe(move |n| {
+            if tx.is_closed() {
+                return false;
+            }
+            log::trace!("notification queued for the connection: {n:?}");
+            let tx = tx.clone();
+            promise::spawn::spawn_into_main_thread(async move {
+                if let Err(err) = tx.try_send(Item::Notif(n)) {
+                    log::trace!("notification not delivered: {err}");
+                }
+            })
+            .detach();
+            true
+        });
     }
 
     // Notification PDUs go through the same WritePdu queue as RPC
@@ -222,6 +246,7 @@ where
                 }
             },
             Ok(Item::WritePdu(decoded)) => {
+                log::trace!("write {} serial {}", decoded.pdu.pdu_name(), decoded.serial);
                 match decoded.pdu.encode_async(&mut stream, decoded.serial).await {
                     Ok(()) => {}
                     Err(err) => {
@@ -246,6 +271,7 @@ where
                 }
             }
             Ok(Item::Notif(MuxNotification::PaneOutput(pane_id))) => {
+                log::trace!("notification: pane output {pane_id}");
                 handler.schedule_pane_push(pane_id);
             }
             Ok(Item::Notif(MuxNotification::PaneAdded(_pane_id))) => {}
