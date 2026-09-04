@@ -69,6 +69,21 @@ impl ChannelWrap {
         }
     }
 
+    /// Whether stream `idx` has bytes waiting inside the library, beyond
+    /// what a read just took. Unknown for ssh2, which reports false.
+    pub fn has_pending(&self, idx: usize) -> bool {
+        match self {
+            #[cfg(feature = "ssh2")]
+            Self::Ssh2(_) => false,
+
+            #[cfg(feature = "libssh-rs")]
+            Self::LibSsh(chan) => matches!(
+                chan.poll_timeout(idx == 1, Some(std::time::Duration::ZERO)),
+                Ok(libssh_rs::PollStatus::AvailableBytes(n)) if n > 0
+            ),
+        }
+    }
+
     pub fn writer(&mut self) -> Box<dyn std::io::Write + '_> {
         match self {
             #[cfg(feature = "ssh2")]

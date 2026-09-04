@@ -687,31 +687,46 @@ impl SessionInner {
                 if out.fd.is_none() {
                     continue;
                 }
-                let current_len = out.buf.len();
-                let room = out.buf.capacity() - current_len;
-                if room == 0 {
-                    continue;
-                }
-                match read_into_buf(&mut chan.channel.reader(idx), &mut out.buf) {
-                    Ok(progress) => made_progress |= progress,
-                    Err(err) => {
-                        if out.buf.is_empty() {
-                            log::trace!(
-                                "Failed to read data from channel {} stream {}: {:#}, closing pipe",
-                                id,
-                                idx,
-                                err
-                            );
-                            out.fd.take();
+                // Drain what the channel holds while there is room. libssh
+                // takes in a whole packet at a time, so after one read the
+                // socket can show nothing more while the channel still holds
+                // plenty; one read per wakeup left the rest to the next one,
+                // which came only when the socket had more or poll timed out
+                // -- and that timeout doubles, so a busy stream waited longer
+                // at every turn.
+                loop {
+                    if out.buf.len() == out.buf.capacity() {
+                        break;
+                    }
+                    let read = read_into_buf(&mut chan.channel.reader(idx), &mut out.buf);
+                    match read {
+                        Ok(true) => {
                             made_progress = true;
-                        } else {
-                            log::trace!(
-                                "Failed to read data from channel {} stream {}: {:#}, but \
-                                         still have some buffer to drain",
-                                id,
-                                idx,
-                                err
-                            );
+                            if !chan.channel.has_pending(idx) {
+                                break;
+                            }
+                        }
+                        Ok(false) => break,
+                        Err(err) => {
+                            if out.buf.is_empty() {
+                                log::trace!(
+                                    "Failed to read data from channel {} stream {}: {:#}, closing pipe",
+                                    id,
+                                    idx,
+                                    err
+                                );
+                                out.fd.take();
+                                made_progress = true;
+                            } else {
+                                log::trace!(
+                                    "Failed to read data from channel {} stream {}: {:#}, but \
+                                             still have some buffer to drain",
+                                    id,
+                                    idx,
+                                    err
+                                );
+                            }
+                            break;
                         }
                     }
                 }
