@@ -342,11 +342,17 @@ impl<'a> DrawContext<'a> {
         color: LinearRgba,
         radius: f32,
     ) -> anyhow::Result<()> {
-        if width <= 0.0 || height <= 0.0 {
+        let Some(rect) = pixel_snap_rounded_rect(x, y, width, height, radius) else {
             return Ok(());
-        }
+        };
+        let PixelSnappedRoundedRect {
+            x,
+            y,
+            width,
+            height,
+            radius,
+        } = rect;
 
-        let radius = radius.min(width / 2.0).min(height / 2.0).round().max(0.0);
         if radius <= 0.0 {
             return self.draw_rect(layers, layer_num, x, y, width, height, color);
         }
@@ -725,6 +731,57 @@ fn color_with_alpha(color: LinearRgba, alpha: f32) -> LinearRgba {
     LinearRgba(color.0, color.1, color.2, alpha.clamp(0.0, 1.0))
 }
 
+/// Rounded corners are rasterized as separate integer-sized sprites. Keep the
+/// rectangle that joins those sprites on the same physical-pixel grid or a
+/// fractional DPI scale can leave a one-pixel gap between the two halves of a
+/// pill (most visibly through the knob of a switch).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PixelSnappedRoundedRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub radius: f32,
+}
+
+pub(crate) fn pixel_snap_rounded_rect(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    radius: f32,
+) -> Option<PixelSnappedRoundedRect> {
+    if !x.is_finite()
+        || !y.is_finite()
+        || !width.is_finite()
+        || !height.is_finite()
+        || !radius.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+    {
+        return None;
+    }
+
+    let right = (x + width).round();
+    let bottom = (y + height).round();
+    let x = x.round();
+    let y = y.round();
+    let width = right - x;
+    let height = bottom - y;
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+
+    let max_radius = (width / 2.0).floor().min((height / 2.0).floor());
+    Some(PixelSnappedRoundedRect {
+        x,
+        y,
+        width,
+        height,
+        radius: radius.round().clamp(0.0, max_radius),
+    })
+}
+
 /// The primitives [`draw_rounded_frame`] is built from. Two painters supply
 /// them and cannot share a draw path -- [`DrawContext`] for the in-window
 /// pages, the settings window for its own -- so they share the frame's
@@ -792,16 +849,22 @@ pub(crate) fn draw_rounded_frame(
     border: LinearRgba,
     radius: f32,
 ) -> anyhow::Result<()> {
-    if width <= 0.0 || height <= 0.0 {
+    let Some(rect) = pixel_snap_rounded_rect(x, y, width, height, radius) else {
         return Ok(());
-    }
+    };
+    let PixelSnappedRoundedRect {
+        x,
+        y,
+        width,
+        height,
+        radius,
+    } = rect;
     if fill.3 > 0.0 {
         painter.frame_rounded_rect(layers, layer_num, x, y, width, height, fill, radius)?;
     }
     if border.3 <= 0.0 || border == fill {
         return Ok(());
     }
-    let radius = radius.min(width / 2.0).min(height / 2.0).round().max(0.0);
     const STROKE: f32 = 1.0;
     if radius > 0.0 {
         let size = euclid::size2(radius, radius);
@@ -882,5 +945,42 @@ impl RoundedFramePainter for DrawContext<'_> {
         color: LinearRgba,
     ) -> anyhow::Result<()> {
         self.draw_corner(layers, layer_num, x, y, polys, size, color)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pixel_snap_rounded_rect;
+
+    #[test]
+    fn fractional_dpi_pill_keeps_a_filled_center_strip() {
+        // A 36 design-pixel switch knob is 40.5 physical pixels at 225%.
+        // The old path rounded each 20.25px corner to 20px but kept the
+        // fractional outer width, leaving one uncovered column in the middle.
+        let rect = pixel_snap_rounded_rect(1939.0, 1036.0, 40.5, 40.5, 20.25).unwrap();
+        assert_eq!(rect.x, 1939.0);
+        assert_eq!(rect.y, 1036.0);
+        assert_eq!(rect.width, 41.0);
+        assert_eq!(rect.height, 41.0);
+        assert_eq!(rect.radius, 20.0);
+        assert_eq!(rect.width - rect.radius * 2.0, 1.0);
+    }
+
+    #[test]
+    fn common_windows_scales_produce_integral_geometry() {
+        for dpi in [96.0_f32, 120.0, 144.0, 168.0, 192.0, 216.0, 240.0, 288.0] {
+            let scale = dpi / 192.0;
+            let rect =
+                pixel_snap_rounded_rect(117.25, 209.75, 76.0 * scale, 44.0 * scale, 22.0 * scale)
+                    .unwrap();
+
+            assert_eq!(rect.x.fract(), 0.0);
+            assert_eq!(rect.y.fract(), 0.0);
+            assert_eq!(rect.width.fract(), 0.0);
+            assert_eq!(rect.height.fract(), 0.0);
+            assert_eq!(rect.radius.fract(), 0.0);
+            assert!(rect.width - rect.radius * 2.0 >= 0.0);
+            assert!(rect.height - rect.radius * 2.0 >= 0.0);
+        }
     }
 }

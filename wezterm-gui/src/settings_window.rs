@@ -9999,11 +9999,18 @@ impl SettingsWindow {
         color: LinearRgba,
         radius: f32,
     ) -> anyhow::Result<()> {
-        if width <= 0.0 || height <= 0.0 {
+        let Some(rect) = crate::ui::draw::pixel_snap_rounded_rect(x, y, width, height, radius)
+        else {
             return Ok(());
-        }
+        };
+        let crate::ui::draw::PixelSnappedRoundedRect {
+            x,
+            y,
+            width,
+            height,
+            radius,
+        } = rect;
 
-        let radius = radius.min(width / 2.0).min(height / 2.0).round().max(0.0);
         if radius <= 0.0 {
             return self.draw_rect(layers, layer_num, x, y, width, height, color);
         }
