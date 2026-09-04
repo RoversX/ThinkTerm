@@ -4,6 +4,7 @@ use anyhow::anyhow;
 use codec::*;
 use config::{configuration, ConfigHandle};
 use lru::LruCache;
+use mux::domain::DomainId;
 use mux::pane::PaneId;
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::Mux;
@@ -323,6 +324,11 @@ pub struct RenderableInner {
     poll_interval: Duration,
 
     cursor_position: StableCursorPosition,
+    /// Whether the remote pane showed its alternate screen at the last
+    /// push. The two screens share one stable-row space on the wire, so a
+    /// switch changes what every cached row means without any row being
+    /// resent: the cache is cleared on the switch.
+    alt_screen: bool,
     pub dimensions: RenderableDimensions,
     /// The dimensions most recently confirmed by the remote pane.  A GUI
     /// takeover may resize its local surface optimistically; keeping the
@@ -383,6 +389,7 @@ impl RenderableInner {
             poll_interval: BASE_POLL_INTERVAL,
             cursor_position: StableCursorPosition::default(),
             dimensions,
+            alt_screen: false,
             server_dimensions: dimensions,
             frontend_preview: None,
             lines: LruCache::new(
@@ -609,6 +616,15 @@ impl RenderableInner {
         let now = Instant::now();
         self.poll_interval = BASE_POLL_INTERVAL;
         self.last_recv_time = now;
+
+        if delta.alt_screen != self.alt_screen {
+            self.alt_screen = delta.alt_screen;
+            // Rows cached from the other screen are stamped with seqnos
+            // the server will never move past, so nothing else would ever
+            // refetch them; the alternate screen's rows in particular sit
+            // at the stable indices of the primary's oldest scrollback.
+            self.invalidate_line_cache(true);
+        }
 
         let live_preview_accepts_snapshot = self.frontend_preview.is_none_or(|preview| {
             preview.policy != FrontendPreviewPolicy::LiveResize
@@ -1174,7 +1190,26 @@ impl RenderableInner {
 }
 
 lazy_static::lazy_static! {
-    static ref IMAGE_LRU: Mutex<LruCache<[u8;32], Arc<ImageData>>> = Mutex::new(LruCache::new(NonZeroUsize::new(128).unwrap()));
+    /// Images fetched from remote panes, by the domain they came from and
+    /// their hash. The domain is part of the key because the generation an
+    /// image carries is a counter private to one server-side object: the
+    /// same picture from two servers, or from one server before and after a
+    /// restart, must not share a copy or compare generations.
+    static ref IMAGE_LRU: Mutex<LruCache<(DomainId, [u8;32]), Arc<ImageData>>> = Mutex::new(LruCache::new(NonZeroUsize::new(128).unwrap()));
+}
+
+/// Drop every image held for `domain_id`: on (re)attach the server may be
+/// a different process, whose generations start over.
+pub(crate) fn forget_images_for_domain(domain_id: DomainId) {
+    let mut lru = IMAGE_LRU.lock().unwrap();
+    let stale: Vec<(DomainId, [u8; 32])> = lru
+        .iter()
+        .filter(|((domain, _), _)| *domain == domain_id)
+        .map(|(key, _)| *key)
+        .collect();
+    for key in stale {
+        lru.pop(&key);
+    }
 }
 
 pub(crate) async fn hydrate_lines(
@@ -1190,8 +1225,13 @@ pub(crate) async fn hydrate_lines(
 
     let mut requests = HashMap::new();
     let mut data_by_hash = HashMap::new();
+    let domain_id = client.local_domain_id;
     for im in &image_cells {
-        let held = IMAGE_LRU.lock().unwrap().get(&im.data_hash).cloned();
+        let held = IMAGE_LRU
+            .lock()
+            .unwrap()
+            .get(&(domain_id, im.data_hash))
+            .cloned();
         match held {
             // A copy at or past the generation the cell was sent with is
             // current. An animation grows behind an unchanging hash, so
@@ -1235,7 +1275,7 @@ pub(crate) async fn hydrate_lines(
         IMAGE_LRU
             .lock()
             .unwrap()
-            .put(data.hash(), Arc::clone(&data));
+            .put((domain_id, data.hash()), Arc::clone(&data));
         data_by_hash.insert(data.hash(), data);
     }
 
@@ -1272,9 +1312,11 @@ pub(crate) async fn hydrate_lines(
 /// Fetch the image `request` names and bring `held`, the copy already
 /// filed under that hash, up to date in place; the Arc to file is returned.
 /// A delta the copy cannot take (its leading frames no longer match) is
-/// followed by one fetch of the whole image; a whole image the copy cannot
-/// take is adopted as a fresh Arc, and lines hydrated from now on point at
-/// that one.
+/// followed by one fetch of the whole image. A copy is never replaced by
+/// a fresh Arc: the glyph cache is keyed by hash and holds the copy, so a
+/// second Arc under the same hash would leave the painter on the old one
+/// for good. A whole image the copy still will not take (it would shrink
+/// under a painter) leaves the copy as it is.
 async fn fetch_image(
     client: &Arc<ClientInner>,
     held: Option<Arc<ImageData>>,
@@ -1284,9 +1326,9 @@ async fn fetch_image(
         have_frames: 0,
         ..request
     };
-    let asked_for_delta = request.have_frames > 0;
     let mut response = client.client.get_image_cell(request).await;
-    for _ in 0..2 {
+    let mut asked_for_whole = false;
+    loop {
         match response {
             Ok(GetImageCellResponse {
                 data: Some(fresh),
@@ -1294,20 +1336,31 @@ async fn fetch_image(
                 frames_from,
                 ..
             }) => {
-                let Some(held) = &held else {
-                    fresh.set_generation(data_generation);
-                    return Some(fresh);
-                };
-                if super::images::merge_into(held, &fresh, frames_from, data_generation) {
-                    return Some(Arc::clone(held));
+                match &held {
+                    None if frames_from == 0 => {
+                        fresh.set_generation(data_generation);
+                        return Some(fresh);
+                    }
+                    Some(held)
+                        if super::images::merge_into(
+                            held,
+                            &fresh,
+                            frames_from,
+                            data_generation,
+                        ) =>
+                    {
+                        return Some(Arc::clone(held));
+                    }
+                    _ => {}
                 }
-                if frames_from > 0 && asked_for_delta {
+                if !asked_for_whole {
+                    asked_for_whole = true;
                     log::debug!("image delta did not fit the copy held; fetching the whole image");
                     response = client.client.get_image_cell(GetImageCell { ..whole }).await;
                     continue;
                 }
-                fresh.set_generation(data_generation);
-                return Some(fresh);
+                log::debug!("the whole image did not fit the copy held either; keeping the copy");
+                return held;
             }
             Ok(GetImageCellResponse { data: None, .. }) => {
                 // Not an error: the image has been let go of on the server
@@ -1324,7 +1377,6 @@ async fn fetch_image(
             }
         }
     }
-    None
 }
 
 impl RenderableState {

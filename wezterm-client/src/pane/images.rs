@@ -78,6 +78,9 @@ pub(crate) fn merge_into(
         if !matches {
             return false;
         }
+        // `theirs` is taken apart first; `mine` is emptied last and for
+        // the shortest possible stretch, since every cached line and the
+        // glyph cache point at it.
         let taken = std::mem::replace(&mut *theirs, ImageDataType::EncodedFile(Vec::new()));
         let ImageDataType::AnimRgba8 {
             width,
@@ -93,7 +96,10 @@ pub(crate) fn merge_into(
         {
             ImageDataType::AnimRgba8 { frames, .. } => frames,
             ImageDataType::Rgba8 { data, .. } => vec![data],
-            _ => unreachable!("checked above"),
+            other => {
+                *mine = other;
+                return false;
+            }
         };
         frames.extend(tail);
         ImageDataType::AnimRgba8 {

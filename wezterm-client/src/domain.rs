@@ -1882,6 +1882,16 @@ pub(crate) fn deliver_thinkterm_session(
 }
 
 impl ClientDomain {
+    /// The unix socket this domain connects to, if it is a unix domain.
+    /// A mux server uses it to tell a client domain that leads back to its
+    /// own socket from one that leads elsewhere.
+    pub fn unix_socket_path(&self) -> Option<std::path::PathBuf> {
+        match &self.config {
+            ClientDomainConfig::Unix(unix) => Some(unix.socket_path()),
+            _ => None,
+        }
+    }
+
     pub fn new(config: ClientDomainConfig) -> Self {
         let local_domain_id = alloc_domain_id();
         let label = config.label();
@@ -1969,7 +1979,9 @@ impl ClientDomain {
     /// included; `is_attaching` is per-attempt and reads false while the
     /// engine waits between attempts.
     pub fn is_attach_retrying(&self) -> bool {
-        self.attach_retries.load(std::sync::atomic::Ordering::SeqCst) > 0
+        self.attach_retries
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
     }
 
     pub fn perform_detach(&self) {
@@ -2404,8 +2416,7 @@ impl ClientDomain {
                             continue;
                         }
                         if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
-                            if !client_pane
-                                .belongs_to_remote_server(connected_server_id.as_deref())
+                            if !client_pane.belongs_to_remote_server(connected_server_id.as_deref())
                             {
                                 client_pane.ignore_next_kill();
                             }
@@ -3526,6 +3537,10 @@ impl ClientDomain {
         let threshold = domain.config.local_echo_threshold_ms();
         let overlay_lag_indicator = domain.config.overlay_lag_indicator();
 
+        // The server behind this attach may be a new process: its image
+        // generations start over, and a copy kept from the old one would
+        // pass for current.
+        crate::pane::forget_images_for_domain(domain_id);
         let inner = Arc::new(ClientInner::new(
             domain_id,
             client,
@@ -5054,8 +5069,7 @@ impl ClientDomain {
                     // hop, at this client's version. Anything else, and a
                     // declined offer, keeps the original error.
                     let mismatch = err.downcast_ref::<crate::client::IncompatibleVersionError>();
-                    let (ClientDomainConfig::Ssh(ssh), Some(mismatch)) = (&config, mismatch)
-                    else {
+                    let (ClientDomainConfig::Ssh(ssh), Some(mismatch)) = (&config, mismatch) else {
                         return Err(err);
                     };
                     let outcome = {

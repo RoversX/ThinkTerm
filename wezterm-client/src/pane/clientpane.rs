@@ -978,6 +978,11 @@ impl Pane for ClientPane {
     }
 
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
+        // Kitty-protocol and win32-input-mode keys arrive here rather than
+        // through key_down, so this is where they count as input: for the
+        // client list's idle time, and for the laggy-link indicator.
+        Mux::get().record_input_for_current_identity();
+        self.renderable.lock().inner.borrow_mut().update_last_send();
         MutexGuard::map(self.writer.lock(), |writer| {
             let w: &mut dyn std::io::Write = writer;
             w
@@ -1405,10 +1410,22 @@ struct WriteQueue {
     draining: bool,
 }
 
+/// What may wait for a stalled link before further writes are dropped
+/// with a warning: a paste, not a runaway.
+const WRITE_QUEUE_LIMIT: usize = 4 * 1024 * 1024;
+
 impl WriteQueue {
     /// Queue `data`; true when the caller has to start the drain.
     fn push(&mut self, data: &[u8]) -> bool {
-        self.pending.extend_from_slice(data);
+        if self.pending.len() + data.len() > WRITE_QUEUE_LIMIT {
+            log::warn!(
+                "dropping {} bytes for a remote pane: {} bytes are already waiting for the link",
+                data.len(),
+                self.pending.len()
+            );
+        } else {
+            self.pending.extend_from_slice(data);
+        }
         !std::mem::replace(&mut self.draining, true)
     }
 
@@ -1423,32 +1440,51 @@ impl WriteQueue {
     }
 }
 
+/// Marks the drain over when the task ends, however it ends. A drain task
+/// dropped without finishing (a panic caught by the executor, a scheduler
+/// torn down with it queued) would otherwise leave `draining` set, and
+/// every later write to the pane would wait for a drain that never comes.
+struct Draining(Arc<Mutex<WriteQueue>>);
+
+impl Drop for Draining {
+    fn drop(&mut self) {
+        self.0.lock().draining = false;
+    }
+}
+
 async fn drain_pane_writes(
     client: Arc<ClientInner>,
     remote_pane_id: TabId,
     remote_tab_id: Arc<AtomicUsize>,
     queue: Arc<Mutex<WriteQueue>>,
 ) {
+    let _draining = Draining(Arc::clone(&queue));
     loop {
         let Some(data) = queue.lock().take() else {
             return;
         };
         let remote_tab_id = remote_tab_id.load(Ordering::Relaxed);
+        let len = data.len();
         let sent = async {
-            if client.prepare_remote_tab_input(remote_tab_id).await? {
-                client
-                    .client
-                    .write_to_pane(WriteToPane {
-                        pane_id: remote_pane_id,
-                        data,
-                    })
-                    .await?;
+            if !client.prepare_remote_tab_input(remote_tab_id).await? {
+                log::warn!(
+                    "dropping {len} bytes for remote pane {remote_pane_id}: this client may \
+                     not drive the tab right now"
+                );
+                return Ok(());
             }
+            client
+                .client
+                .write_to_pane(WriteToPane {
+                    pane_id: remote_pane_id,
+                    data,
+                })
+                .await?;
             Ok::<(), anyhow::Error>(())
         }
         .await;
         if let Err(err) = sent {
-            log::error!("writing to remote pane {remote_pane_id}: {err:#}");
+            log::error!("writing {len} bytes to remote pane {remote_pane_id}: {err:#}");
         }
     }
 }
@@ -1833,5 +1869,21 @@ mod palette_delivery_tests {
         );
         assert!(queue.take().is_none(), "empty: the drain ends");
         assert!(queue.push(b"c"), "and the next write starts a new one");
+    }
+
+    #[test]
+    fn a_drain_that_ends_early_gives_the_queue_back() {
+        let queue = std::sync::Arc::new(parking_lot::Mutex::new(super::WriteQueue::default()));
+        assert!(queue.lock().push(b"a"));
+        {
+            let _draining = super::Draining(std::sync::Arc::clone(&queue));
+            // ...the task is dropped here without draining.
+        }
+        assert!(!queue.lock().draining, "the slot is free again");
+        assert_eq!(
+            queue.lock().take().as_deref(),
+            Some(&b"a"[..]),
+            "and the bytes are still waiting for the next drain"
+        );
     }
 }

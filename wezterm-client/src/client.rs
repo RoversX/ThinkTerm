@@ -946,7 +946,13 @@ async fn client_thread_async(
                 match Pdu::decode_async(&mut stream, Some(next_serial)).await {
                     Ok(decoded) => {
                         crate::domain::wake_thinkterm_frontend();
-                        keepalive_deadline = std::time::Instant::now() + KEEPALIVE_INTERVAL;
+                        // Traffic postpones the next ping, but not the
+                        // verdict on one already sent: a server that keeps
+                        // pushing output while never answering is still
+                        // one that never answers.
+                        if pending_ping.is_none() {
+                            keepalive_deadline = std::time::Instant::now() + KEEPALIVE_INTERVAL;
+                        }
                         log::debug!(
                             "decoded serial {} {}",
                             decoded.serial,
@@ -966,6 +972,7 @@ async fn client_thread_async(
                         }
                         if pending_ping.map_or(false, |(serial, _)| serial == decoded.serial) {
                             pending_ping = None;
+                            keepalive_deadline = std::time::Instant::now() + KEEPALIVE_INTERVAL;
                         } else if decoded.serial == 0 {
                             if registration.is_complete() {
                                 process_unilateral(local_domain_id, connection_generation, decoded)
