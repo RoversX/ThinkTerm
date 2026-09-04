@@ -31,6 +31,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use termwiz::hyperlink::Hyperlink;
 use termwiz::image::{ImageData, TextureCoordinate};
+use termwiz::input::KeyboardEncoding;
+use wezterm_input_types::KittyKeyboardFlags;
 use termwiz::surface::{Line, SequenceNo};
 use thiserror::Error;
 use wezterm_term::color::ColorPalette;
@@ -1360,6 +1362,10 @@ pub struct GetPaneRenderChangesResponse {
     /// to know that a wheel notch has no scrollback to travel through and
     /// belongs to the full-screen program instead.
     pub alt_screen: bool,
+    /// How the program in the pane wants keys encoded. Without it a client
+    /// treats every remote pane as plain xterm and never speaks the kitty
+    /// keyboard protocol, or win32-input-mode, to a program that asked.
+    pub keyboard_encoding: WireKeyboardEncoding,
     pub cursor_position: StableCursorPosition,
     pub dimensions: RenderableDimensions,
     pub dirty_lines: Vec<Range<StableRowIndex>>,
@@ -1371,6 +1377,44 @@ pub struct GetPaneRenderChangesResponse {
 
     pub input_serial: Option<InputSerial>,
     pub seqno: SequenceNo,
+}
+
+/// `termwiz::input::KeyboardEncoding` for the wire: the termwiz type has no
+/// serde, and the kitty flags travel as their bits.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone, Copy, Default)]
+pub enum WireKeyboardEncoding {
+    #[default]
+    Xterm,
+    CsiU,
+    Win32,
+    Kitty(u16),
+}
+
+impl From<KeyboardEncoding> for WireKeyboardEncoding {
+    fn from(encoding: KeyboardEncoding) -> Self {
+        match encoding {
+            KeyboardEncoding::Xterm => Self::Xterm,
+            KeyboardEncoding::CsiU => Self::CsiU,
+            KeyboardEncoding::Win32 => Self::Win32,
+            KeyboardEncoding::Kitty(flags) => Self::Kitty(flags.bits()),
+        }
+    }
+}
+
+impl From<WireKeyboardEncoding> for KeyboardEncoding {
+    fn from(encoding: WireKeyboardEncoding) -> Self {
+        match encoding {
+            WireKeyboardEncoding::Xterm => Self::Xterm,
+            WireKeyboardEncoding::CsiU => Self::CsiU,
+            WireKeyboardEncoding::Win32 => Self::Win32,
+            // Bits this build does not know are dropped rather than refused:
+            // a newer program's extra flag must not turn the whole protocol
+            // off.
+            WireKeyboardEncoding::Kitty(bits) => {
+                Self::Kitty(KittyKeyboardFlags::from_bits_truncate(bits))
+            }
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -1739,6 +1783,7 @@ mod golden {
             pane_id: 1,
             mouse_grabbed: false,
             alt_screen: true,
+            keyboard_encoding: WireKeyboardEncoding::Kitty(3),
             cursor_position: StableCursorPosition::default(),
             dimensions: RenderableDimensions {
                 cols: 80,
@@ -1780,9 +1825,11 @@ mod golden {
         1, 4, 104, 111, 115, 116, 4, 117, 115, 101, 114, 100, 2, 3, 0, 128, 226, 207, 170, 6, 1, 7,
         100, 101, 102, 97, 117, 108, 116, 128, 226, 207, 170, 6, 1, 4,
     ];
+    // Re-captured for codec 64, when `keyboard_encoding` (the `3, 3`
+    // after `alt_screen`: variant Kitty, flag bits 3) joined the response.
     const RENDER_CHANGES: &[u8] = &[
-        1, 0, 1, 0, 0, 0, 1, 80, 24, 100, 121, 180, 127, 96, 128, 5, 128, 3, 0, 2, 0, 2, 5, 6, 5,
-        116, 105, 116, 108, 101, 0, 0, 0, 0, 0, 42,
+        1, 0, 1, 3, 3, 0, 0, 0, 1, 80, 24, 100, 121, 180, 127, 96, 128, 5, 128, 3, 0, 2, 0, 2, 5,
+        6, 5, 116, 105, 116, 108, 101, 0, 0, 0, 0, 0, 42,
     ];
     const LAYOUT_JSON: &str = r#"["Empty",{"Split":{"left":{"Leaf":{"window_id":1,"tab_id":2,"pane_id":3,"title":"left","size":{"rows":24,"cols":80,"pixel_width":640,"pixel_height":384,"dpi":96},"working_dir":"file:///tmp/x","is_active_pane":true,"is_zoomed_pane":false,"alt_screen":true,"workspace":"default","cursor_pos":{"x":0,"y":0,"shape":"Default","visibility":"Visible"},"physical_top":-3,"top_row":0,"left_col":0,"tty_name":"/dev/ttys001"}},"right":{"Stack":{"active":0,"panes":[{"window_id":1,"tab_id":2,"pane_id":4,"title":"stacked","size":{"rows":24,"cols":80,"pixel_width":640,"pixel_height":384,"dpi":96},"working_dir":"file:///tmp/x","is_active_pane":true,"is_zoomed_pane":false,"alt_screen":true,"workspace":"default","cursor_pos":{"x":0,"y":0,"shape":"Default","visibility":"Visible"},"physical_top":-3,"top_row":0,"left_col":0,"tty_name":"/dev/ttys001"}],"pane_stack_id":7}},"node":{"direction":"Horizontal","first":{"rows":24,"cols":40,"pixel_width":320,"pixel_height":384,"dpi":96},"second":{"rows":24,"cols":39,"pixel_width":312,"pixel_height":384,"dpi":96}}}}]"#;
 
@@ -2468,6 +2515,37 @@ mod test {
                 pdu: Pdu::Invalid { ident: 0xdeadbeef }
             },
             Pdu::decode(encoded.as_slice()).unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod keyboard_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn the_keyboard_encoding_survives_the_wire_both_ways() {
+        for encoding in [
+            KeyboardEncoding::Xterm,
+            KeyboardEncoding::CsiU,
+            KeyboardEncoding::Win32,
+            KeyboardEncoding::Kitty(
+                KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KittyKeyboardFlags::REPORT_EVENT_TYPES,
+            ),
+        ] {
+            let wire: WireKeyboardEncoding = encoding.into();
+            let back: KeyboardEncoding = wire.into();
+            assert_eq!(back, encoding);
+        }
+    }
+
+    #[test]
+    fn unknown_kitty_bits_are_dropped_not_fatal() {
+        let back: KeyboardEncoding = WireKeyboardEncoding::Kitty(0x8000 | 1).into();
+        assert_eq!(
+            back,
+            KeyboardEncoding::Kitty(KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
     }
 }

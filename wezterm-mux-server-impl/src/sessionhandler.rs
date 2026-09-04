@@ -71,6 +71,7 @@ pub(crate) struct PerPane {
     dimensions: RenderableDimensions,
     mouse_grabbed: bool,
     alt_screen: bool,
+    keyboard_encoding: WireKeyboardEncoding,
     /// Outer None means that this connection has never received application
     /// palette state for the pane. Inner None is an explicit reset to the
     /// client's own configured palette.
@@ -104,6 +105,11 @@ impl PerPane {
 
         let alt_screen = pane.is_alt_screen_active();
         if alt_screen != self.alt_screen {
+            changed = true;
+        }
+
+        let keyboard_encoding: WireKeyboardEncoding = pane.get_keyboard_encoding().into();
+        if keyboard_encoding != self.keyboard_encoding {
             changed = true;
         }
 
@@ -174,6 +180,7 @@ impl PerPane {
         self.dimensions = dims;
         self.mouse_grabbed = mouse_grabbed;
         self.alt_screen = alt_screen;
+        self.keyboard_encoding = keyboard_encoding;
 
         self.sent_images.remember(&bonus_lines);
         let bonus_lines = bonus_lines.into();
@@ -181,6 +188,7 @@ impl PerPane {
             pane_id: pane.pane_id(),
             mouse_grabbed,
             alt_screen,
+            keyboard_encoding,
             dirty_lines: all_dirty_lines.iter().cloned().collect(),
             dimensions: dims,
             cursor_position,

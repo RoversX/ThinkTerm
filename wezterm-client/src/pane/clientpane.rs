@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use termwiz::input::KeyEvent;
+use termwiz::input::{KeyEvent, KeyboardEncoding};
 use termwiz::surface::SequenceNo;
 use url::Url;
 use wezterm_dynamic::Value;
@@ -241,6 +241,10 @@ pub struct ClientPane {
     clipboard: Mutex<Option<Arc<dyn Clipboard>>>,
     mouse_grabbed: Mutex<bool>,
     alt_screen: Mutex<bool>,
+    /// As last reported by the server. The GUI's key encoders consult it
+    /// before every key: a pane left at Xterm never gets kitty-protocol or
+    /// win32-input-mode bytes, whatever the remote program asked for.
+    keyboard_encoding: Mutex<KeyboardEncoding>,
     requested_size: Mutex<Option<TerminalSize>>,
     ignore_next_kill: Mutex<bool>,
     user_vars: Mutex<HashMap<String, String>>,
@@ -364,6 +368,7 @@ impl ClientPane {
             client: Arc::clone(client),
             remote_pane_id,
             remote_tab_id: Arc::clone(&remote_tab_id),
+            queue: Default::default(),
         };
 
         let mouse = Arc::new(Mutex::new(MouseState::new(
@@ -431,6 +436,7 @@ impl ClientPane {
             clipboard: Mutex::new(None),
             mouse_grabbed: Mutex::new(false),
             alt_screen: Mutex::new(alt_screen),
+            keyboard_encoding: Mutex::new(KeyboardEncoding::Xterm),
             requested_size: Mutex::new(Some(size)),
             ignore_next_kill: Mutex::new(false),
             unseen_output: Mutex::new(false),
@@ -450,6 +456,7 @@ impl ClientPane {
             Pdu::GetPaneRenderChangesResponse(mut delta) => {
                 *self.mouse_grabbed.lock() = delta.mouse_grabbed;
                 *self.alt_screen.lock() = delta.alt_screen;
+                *self.keyboard_encoding.lock() = delta.keyboard_encoding.into();
 
                 let bonus_lines = std::mem::take(&mut delta.bonus_lines);
                 let client = { Arc::clone(&self.renderable.lock().inner.borrow().client) };
@@ -1154,7 +1161,11 @@ impl Pane for ClientPane {
     }
 
     fn key_up(&self, _key: KeyCode, _mods: KeyModifiers) -> anyhow::Result<()> {
-        // TODO: decide how to handle key_up for mux client
+        // Nothing to send, and that matches a local pane: the xterm-style
+        // encoders emit no bytes for a release. The protocols that do
+        // report releases (kitty, win32-input-mode) are encoded by the GUI
+        // and written through `writer()`, once `get_keyboard_encoding`
+        // tells it the remote program asked for them.
         Ok(())
     }
 
@@ -1243,6 +1254,10 @@ impl Pane for ClientPane {
 
     fn is_alt_screen_active(&self) -> bool {
         *self.alt_screen.lock()
+    }
+
+    fn get_keyboard_encoding(&self) -> KeyboardEncoding {
+        *self.keyboard_encoding.lock()
     }
 
     fn get_current_working_dir(&self, _policy: CachePolicy) -> Option<Url> {
@@ -1374,6 +1389,68 @@ struct PaneWriter {
     client: Arc<ClientInner>,
     remote_pane_id: TabId,
     remote_tab_id: Arc<AtomicUsize>,
+    queue: Arc<Mutex<WriteQueue>>,
+}
+
+/// Bytes written to a remote pane and not yet on the wire.
+///
+/// `Write::write` used to block its caller, the GUI thread, for a round
+/// trip per call; with the kitty keyboard protocol that is every
+/// keystroke. Writes queue here instead, and one task at a time drains
+/// the queue in order, sending whatever has piled up as a single
+/// WriteToPane.
+#[derive(Default)]
+struct WriteQueue {
+    pending: Vec<u8>,
+    draining: bool,
+}
+
+impl WriteQueue {
+    /// Queue `data`; true when the caller has to start the drain.
+    fn push(&mut self, data: &[u8]) -> bool {
+        self.pending.extend_from_slice(data);
+        !std::mem::replace(&mut self.draining, true)
+    }
+
+    /// Everything queued so far, or None once the drain is over.
+    fn take(&mut self) -> Option<Vec<u8>> {
+        if self.pending.is_empty() {
+            self.draining = false;
+            None
+        } else {
+            Some(std::mem::take(&mut self.pending))
+        }
+    }
+}
+
+async fn drain_pane_writes(
+    client: Arc<ClientInner>,
+    remote_pane_id: TabId,
+    remote_tab_id: Arc<AtomicUsize>,
+    queue: Arc<Mutex<WriteQueue>>,
+) {
+    loop {
+        let Some(data) = queue.lock().take() else {
+            return;
+        };
+        let remote_tab_id = remote_tab_id.load(Ordering::Relaxed);
+        let sent = async {
+            if client.prepare_remote_tab_input(remote_tab_id).await? {
+                client
+                    .client
+                    .write_to_pane(WriteToPane {
+                        pane_id: remote_pane_id,
+                        data,
+                    })
+                    .await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(err) = sent {
+            log::error!("writing to remote pane {remote_pane_id}: {err:#}");
+        }
+    }
 }
 
 impl std::io::Write for PaneWriter {
@@ -1381,21 +1458,15 @@ impl std::io::Write for PaneWriter {
         if self.client.remote_tab_input_is_blocked() {
             return Ok(data.len());
         }
-        let remote_tab_id = self.remote_tab_id.load(Ordering::Relaxed);
-        let payload = data.to_vec();
-        promise::spawn::block_on(async {
-            if self.client.prepare_remote_tab_input(remote_tab_id).await? {
-                self.client
-                    .client
-                    .write_to_pane(WriteToPane {
-                        pane_id: self.remote_pane_id,
-                        data: payload,
-                    })
-                    .await?;
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e)))?;
+        if self.queue.lock().push(data) {
+            promise::spawn::spawn_into_main_thread(drain_pane_writes(
+                Arc::clone(&self.client),
+                self.remote_pane_id,
+                Arc::clone(&self.remote_tab_id),
+                Arc::clone(&self.queue),
+            ))
+            .detach();
+        }
         Ok(data.len())
     }
 
@@ -1745,5 +1816,22 @@ mod palette_delivery_tests {
         assert!(transition.application_palette);
         assert!(!transition.palette_changed);
         assert!(transition.provenance_changed);
+    }
+
+    #[test]
+    fn the_first_write_starts_the_drain_and_later_ones_ride_along() {
+        let mut queue = super::WriteQueue::default();
+        assert!(queue.push(b"a"), "nothing draining: start one");
+        assert!(
+            !queue.push(b"b"),
+            "a drain is running: it will pick this up"
+        );
+        assert_eq!(
+            queue.take().as_deref(),
+            Some(&b"ab"[..]),
+            "coalesced, in order"
+        );
+        assert!(queue.take().is_none(), "empty: the drain ends");
+        assert!(queue.push(b"c"), "and the next write starts a new one");
     }
 }
