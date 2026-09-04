@@ -630,10 +630,9 @@ pub enum WindowEvent {
     /// Called when the window gains/loses focus
     FocusChanged(bool),
 
-    /// Called when the window stops being visible to the user (false:
-    /// fully covered, minimized, on another macOS Space, or the app is
-    /// hidden) and when it becomes visible again (true). Only the macOS
-    /// backend emits this today.
+    /// Called when the window stops being visible to the user (false) and when
+    /// it becomes visible again (true). macOS reports full occlusion, minimize,
+    /// Space changes and app hiding; Windows reports minimize and hiding.
     OcclusionChanged(bool),
 
     AdviseDeadKeyStatus(DeadKeyStatus),

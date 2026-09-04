@@ -139,6 +139,9 @@ pub(crate) struct WindowInner {
     config: ConfigHandle,
     paint_throttled: bool,
     invalidated: bool,
+    /// Last effective visibility sent to the platform-neutral window layer.
+    /// WM_WINDOWPOSCHANGED is noisy, so only edges should restart its timers.
+    occlusion_visible: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -873,6 +876,7 @@ impl Window {
             config: config.clone(),
             paint_throttled: false,
             invalidated: true,
+            occlusion_visible: None,
         }));
 
         // Careful: `raw` owns a ref to inner, but there is no Drop impl
@@ -2158,8 +2162,34 @@ unsafe fn wm_windowposchanged(
     _lparam: LPARAM,
 ) -> Option<LRESULT> {
     // let pos = &*(lparam as *const WINDOWPOS);
+    dispatch_occlusion_changed_if_needed(hwnd);
     wm_size(hwnd, 0, 0, 0)?;
     Some(0)
+}
+
+fn window_is_effectively_visible(is_visible: bool, is_iconic: bool) -> bool {
+    is_visible && !is_iconic
+}
+
+/// Windows has no AppKit-style full-occlusion notification, but the two
+/// expensive and reliable inactive states are queryable on every window-pos
+/// edge: a hidden HWND is not visible and a minimized HWND is iconic.
+unsafe fn dispatch_occlusion_changed_if_needed(hwnd: HWND) {
+    let visible = window_is_effectively_visible(
+        IsWindowVisible(hwnd) != winapi::shared::minwindef::FALSE,
+        IsIconic(hwnd) != winapi::shared::minwindef::FALSE,
+    );
+    let Some(inner) = rc_from_hwnd(hwnd) else {
+        return;
+    };
+    let mut inner = inner.borrow_mut();
+    if inner.occlusion_visible == Some(visible) {
+        return;
+    }
+    inner.occlusion_visible = Some(visible);
+    inner
+        .events
+        .dispatch(WindowEvent::OcclusionChanged(visible));
 }
 
 unsafe fn wm_size(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> Option<LRESULT> {
@@ -3615,5 +3645,18 @@ unsafe extern "system" fn wnd_proc(
             log::error!("caught {:?}", e);
             std::process::exit(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod occlusion_tests {
+    use super::window_is_effectively_visible;
+
+    #[test]
+    fn only_a_visible_non_iconic_window_is_effectively_visible() {
+        assert!(window_is_effectively_visible(true, false));
+        assert!(!window_is_effectively_visible(false, false));
+        assert!(!window_is_effectively_visible(true, true));
+        assert!(!window_is_effectively_visible(false, true));
     }
 }
