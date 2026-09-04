@@ -759,7 +759,23 @@ fn domain_for_entry(
     specs
         .get(&entry.pane_id)
         .and_then(|spec| spec.domain.as_deref())
-        .filter(|domain| mux.get_domain_by_name(domain).is_some())
+        // A saved domain name is meaningful here only for a domain this
+        // server runs itself. The name a client recorded is the client's
+        // name for *its* connection to this server, and a config shared
+        // between server and client gives the server a client domain of
+        // that same name, pointing back at itself. Spawning through it
+        // mirrored the server into itself without end.
+        .filter(|domain| {
+            mux.get_domain_by_name(domain).is_some_and(|found| {
+                let client_domain = found.is::<wezterm_client::domain::ClientDomain>();
+                if client_domain {
+                    log::debug!(
+                        "restoring a layout: domain {domain} is a client domain; using the default"
+                    );
+                }
+                !client_domain
+            })
+        })
         .map(|domain| SpawnTabDomain::DomainName(domain.to_string()))
         .unwrap_or(if root {
             SpawnTabDomain::DefaultDomain
