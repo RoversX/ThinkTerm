@@ -17,7 +17,7 @@ tag="${1:?usage: release-notes.sh <tag> [dist-dir]}"
 dist="${2:-dist}"
 version="${tag#v}"
 
-base="https://github.com/RoversX/ThinkTerm/releases/download/$tag"
+base="https://github.com/RoversX/thinkterm/releases/download/$tag"
 
 # Every Linux package we build is one of these two. Anything unrecognized is
 # labelled 64-bit rather than dropped, so a new architecture shows up wrong
@@ -65,20 +65,30 @@ link_to() {
   return 1
 }
 
-# The rpms that make up a full install, labelled by package name. Which of them
-# you want is not a question of architecture, and the split exists so that a
-# headless machine can take the multiplexer alone -- so that one is listed
-# separately and excluded here.
-rpm_full_links() {
-  local out='' f name
-  for f in "$dist"/*.rpm; do
-    [ -f "$f" ] || continue
-    f=$(basename "$f")
-    case "$f" in thinkterm-mux-server-*) continue ;; esac
-    name=${f%%-[0-9]*}
-    case "$f" in *arm64* | *aarch64*) name="$name (ARM64)" ;; esac
-    [ -z "$out" ] || out="$out · "
-    out="$out[$name]($base/$f)"
+# The rpms named, labelled by package name and listed in the order given. Which
+# of them you want is not a question of architecture, so one row carries every
+# arch that was built, 64-bit first as elsewhere.
+#
+# The package list is spelled out by the caller rather than globbed: the
+# metapackage requires all three subpackages, so a row that links only some of
+# them tells the reader to run a dnf command that cannot resolve.
+rpm_links() {
+  local out='' f name pkg want
+  for want in x86 arm; do
+    for pkg in "$@"; do
+      for f in "$dist"/"$pkg"-[0-9]*.rpm; do
+        [ -f "$f" ] || continue
+        f=$(basename "$f")
+        case "$f" in
+          *arm64* | *aarch64*) [ "$want" = arm ] || continue ;;
+          *) [ "$want" = x86 ] || continue ;;
+        esac
+        name=$pkg
+        case "$want" in arm) name="$name (ARM64)" ;; esac
+        [ -z "$out" ] || out="$out · "
+        out="$out[$name]($base/$f)"
+      done
+    done
   done
   [ -n "$out" ] || return 1
   printf '%s\n' "$out"
@@ -90,7 +100,7 @@ echo "## Downloads"
 echo
 echo "### macOS"
 echo
-echo "[Apple silicon]($base/ThinkTerm-macos-arm64-$version.zip) · [Intel]($base/ThinkTerm-macos-x86_64-$version.zip)"
+echo "[Apple silicon]($base/ThinkTerm-macos-arm64-$version.zip) · [Intel]($base/ThinkTerm-macos-x86_64-$version.zip) — or \`curl -fsSL https://raw.githubusercontent.com/RoversX/thinkterm/main/install.sh | sh\`, which picks the right one, verifies it and puts the command-line tools on PATH"
 echo
 
 win_setup=$(link_to "Installer" 'ThinkTerm-*-setup.exe') || win_setup=''
@@ -107,6 +117,22 @@ if [ -n "$win_setup$win_zip" ]; then
 fi
 
 linux=''
+# The tarballs are what install.sh fetches; the links are here for anyone who
+# would rather unpack by hand. The desktop glob pins the digit after the
+# name so it cannot also match thinkterm-server-*.
+desktop=$(links_by_arch 'thinkterm-[0-9]*-linux-*.tar.gz') || desktop=''
+server=$(links_by_arch 'thinkterm-server-*.tar.gz') || server=''
+if [ -n "$desktop$server" ]; then
+  linux="$linux
+**Install script** — \`curl -fsSL https://raw.githubusercontent.com/RoversX/thinkterm/main/install.sh | sh\` puts ThinkTerm under \`~/.local\` without root and asks which variant you want; \`--desktop\` or \`--server\` (headless remote host, no GUI) skips the question
+"
+  [ -z "$desktop" ] || linux="$linux
+Desktop tarball: $desktop
+"
+  [ -z "$server" ] || linux="$linux
+Server tarball: $server
+"
+fi
 if appimage=$(links_by_arch '*.AppImage'); then
   linux="$linux
 **AppImage** — \`chmod +x\` and run it; nothing is installed
@@ -121,18 +147,18 @@ if deb=$(links_by_arch '*.deb'); then
 $deb
 "
 fi
-if rpm_full=$(rpm_full_links); then
+if rpm_full=$(rpm_links thinkterm thinkterm-common thinkterm-gui thinkterm-mux-server); then
   linux="$linux
 **RPM (Fedora / RHEL)** — put these in one directory, then \`sudo dnf install ./thinkterm-*.rpm\`
 
 $rpm_full
 "
 fi
-if rpm_mux=$(links_by_arch 'thinkterm-mux-server-*.rpm'); then
+if rpm_server=$(rpm_links thinkterm-common thinkterm-mux-server); then
   linux="$linux
-**Multiplexer server only** (headless remote host) — \`sudo dnf install ./<file>.rpm\`, and it pulls in no GUI libraries
+**RPM, server only** (headless remote host) — \`sudo dnf install ./thinkterm-common-*.rpm ./thinkterm-mux-server-*.rpm\`, which pulls in no GUI libraries and still gives the host \`thinkterm tui\`
 
-$rpm_mux
+$rpm_server
 "
 fi
 
