@@ -695,7 +695,10 @@ fn process_unilateral(
                 let domain = domain
                     .downcast_ref::<ClientDomain>()
                     .ok_or_else(|| anyhow!("domain {} is not a ClientDomain", local_domain_id))?;
-                if domain.connection_generation() != Some(connection_generation) {
+                // Not the strict generation check of the other arms: this
+                // state is pushed right after the handshake, before the
+                // attach has built the inner that would carry a generation.
+                if !domain.accepts_connection_generation(connection_generation) {
                     return Ok(());
                 }
                 domain.process_remote_viewport_state(state);
@@ -716,7 +719,10 @@ fn process_unilateral(
                 let domain = domain
                     .downcast_ref::<ClientDomain>()
                     .ok_or_else(|| anyhow!("domain {} is not a ClientDomain", local_domain_id))?;
-                if domain.connection_generation() != Some(connection_generation) {
+                // Not the strict generation check of the other arms: this
+                // state is pushed right after the handshake, before the
+                // attach has built the inner that would carry a generation.
+                if !domain.accepts_connection_generation(connection_generation) {
                     return Ok(());
                 }
                 domain.process_remote_access_state(state);

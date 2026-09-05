@@ -1894,13 +1894,30 @@ pub(crate) fn deliver_thinkterm_session(
 }
 
 impl ClientDomain {
-    /// The unix socket this domain connects to, if it is a unix domain.
-    /// A mux server uses it to tell a client domain that leads back to its
-    /// own socket from one that leads elsewhere.
+    /// The unix socket this domain connects to, if it is a unix domain
+    /// that connects to a socket at all. A mux server uses it to tell a
+    /// client domain that leads back to its own socket from one that leads
+    /// elsewhere. A domain that goes through a proxy command leads
+    /// wherever the proxy does; its configured socket path is not used and
+    /// defaults to the very path a server listens on.
     pub fn unix_socket_path(&self) -> Option<std::path::PathBuf> {
         match &self.config {
-            ClientDomainConfig::Unix(unix) => Some(unix.socket_path()),
+            ClientDomainConfig::Unix(unix) if unix.proxy_command.is_none() => {
+                Some(unix.socket_path())
+            }
             _ => None,
+        }
+    }
+
+    /// Whether a PDU from connection `generation` is for this domain as it
+    /// stands. While no inner exists (the first attach is in flight) there
+    /// is no generation to hold it against, and what the server pushes
+    /// during the handshake -- where the frontend lease stands -- is the
+    /// state the attach is waiting to keep.
+    pub fn accepts_connection_generation(&self, generation: u64) -> bool {
+        match self.connection_generation() {
+            Some(current) => current == generation,
+            None => true,
         }
     }
 
