@@ -2,7 +2,7 @@
 use anyhow::Context;
 use libc::pid_t;
 use std::io::Write;
-use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 
 enum Fork {
     #[allow(dead_code)]
@@ -64,13 +64,35 @@ fn lock_pid_file(config: &config::ConfigHandle) -> anyhow::Result<std::fs::File>
     Ok(file)
 }
 
-/// `lock_pid_file` is false for a server that is taking over from a
-/// running one: that one holds the lock, and hands the locked file over
-/// with everything else.
+/// What the daemon inherits from the process that launched it.
+pub struct Daemonized {
+    /// The locked pid file, to keep open for the life of the daemon.
+    pub pid_file_fd: Option<RawFd>,
+    /// The write end of the report pipe: the daemon writes one line to
+    /// say how the takeover went, and the launching process relays it.
+    pub report_fd: Option<RawFd>,
+}
+
+/// `lock_pid` is false for a server that is taking over from a running
+/// one: that one holds the lock, and hands the locked file over with
+/// everything else. With `report`, the process that ran the command does
+/// not exit until the daemon has said how the takeover went, and exits
+/// the way it went: forking twice would otherwise report success before
+/// anything had happened.
 pub fn daemonize(
     config: &config::ConfigHandle,
     lock_pid: bool,
-) -> anyhow::Result<Option<RawFd>> {
+    report: bool,
+) -> anyhow::Result<Daemonized> {
+    let report_pipe = if report {
+        let mut fds = [0 as RawFd; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("pipe for the takeover report");
+        }
+        Some((fds[0], fds[1]))
+    } else {
+        None
+    };
     let pid_file = if lock_pid && !config::running_under_wsl() {
         // pid file locking is only partly functional when running under
         // WSL 1; it is possible for the pid file to exist after a reboot
@@ -90,6 +112,10 @@ pub fn daemonize(
         Fork::Parent(pid) => {
             let mut status = 0;
             unsafe { libc::waitpid(pid, &mut status, 0) };
+            if let Some((read_fd, write_fd)) = report_pipe {
+                unsafe { libc::close(write_fd) };
+                std::process::exit(relay_takeover_report(read_fd));
+            }
             std::process::exit(0);
         }
         Fork::Child(_) => {}
@@ -121,7 +147,36 @@ pub fn daemonize(
     unsafe { libc::dup2(stdout.as_raw_fd(), libc::STDOUT_FILENO) };
     unsafe { libc::dup2(stderr.as_raw_fd(), libc::STDERR_FILENO) };
 
-    Ok(pid_file_fd)
+    let report_fd = report_pipe.map(|(read_fd, write_fd)| {
+        unsafe { libc::close(read_fd) };
+        set_cloexec(write_fd, false);
+        write_fd
+    });
+
+    Ok(Daemonized {
+        pid_file_fd,
+        report_fd,
+    })
+}
+
+/// Wait for the daemon's one-line report and turn it into an exit status:
+/// `ok` is 0 and silent, `error: <why>` prints why and is 1, nothing at
+/// all (the daemon died first) is 1 too.
+fn relay_takeover_report(read_fd: RawFd) -> i32 {
+    use std::io::Read;
+    let mut report = String::new();
+    let mut pipe = unsafe { std::fs::File::from_raw_fd(read_fd) };
+    pipe.read_to_string(&mut report).ok();
+    let line = report.lines().next().unwrap_or("").trim();
+    if line == "ok" {
+        return 0;
+    }
+    if let Some(why) = line.strip_prefix("error: ") {
+        eprintln!("takeover failed: {why}");
+    } else {
+        eprintln!("the takeover did not report an outcome; see the server log");
+    }
+    1
 }
 
 pub fn set_cloexec(fd: RawFd, enable: bool) {

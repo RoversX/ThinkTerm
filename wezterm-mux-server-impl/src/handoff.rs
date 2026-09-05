@@ -230,10 +230,32 @@ fn decode_snapshot(bytes: &[u8]) -> anyhow::Result<TerminalSnapshot> {
 // ------------------------------------------------------- the old server
 
 static PID_FILE_FD: AtomicI32 = AtomicI32::new(-1);
+static REPORT_FD: AtomicI32 = AtomicI32::new(-1);
 
 /// The pid file this daemon holds locked, to pass on with everything else.
 pub fn remember_pid_file_fd(fd: RawFd) {
     PID_FILE_FD.store(fd, Ordering::SeqCst);
+}
+
+/// The pipe back to the shell that ran `--daemonize --takeover`.
+pub fn remember_report_fd(fd: RawFd) {
+    REPORT_FD.store(fd, Ordering::SeqCst);
+}
+
+/// Tell the shell that ran `--daemonize --takeover` how it went, once;
+/// nothing happens when it was not asked. The line is `ok` or
+/// `error: <why>`, and the pipe closes with it.
+pub fn report_takeover(outcome: Result<(), &str>) {
+    let fd = REPORT_FD.swap(-1, Ordering::SeqCst);
+    if fd < 0 {
+        return;
+    }
+    let mut pipe = unsafe { std::fs::File::from_raw_fd(fd) };
+    let line = match outcome {
+        Ok(()) => "ok\n".to_string(),
+        Err(why) => format!("error: {}\n", why.replace('\n', " ")),
+    };
+    pipe.write_all(line.as_bytes()).ok();
 }
 
 /// Listen for a successor at `<socket_path>.handoff`. One takeover at a

@@ -64,6 +64,12 @@ struct Opt {
     #[arg(long, hide = true)]
     pid_file_fd: Option<i32>,
 
+    /// The pipe a daemonized takeover reports its outcome on; see
+    /// daemonize::Daemonized.
+    #[cfg(unix)]
+    #[arg(long, hide = true)]
+    takeover_report_fd: Option<i32>,
+
     /// Instead of executing your shell, run PROG.
     /// For example: `thinkterm start -- bash -l` will spawn bash
     /// as if it were a login shell.
@@ -75,6 +81,8 @@ fn main() {
     if let Err(err) = run() {
         wezterm_blob_leases::clear_storage();
         log::error!("{:#}", err);
+        #[cfg(unix)]
+        wezterm_mux_server_impl::handoff::report_takeover(Err(&format!("{err:#}")));
         std::process::exit(1);
     }
     wezterm_blob_leases::clear_storage();
@@ -96,6 +104,10 @@ fn run() -> anyhow::Result<()> {
         if let Some(fd) = opts.pid_file_fd {
             daemonize::set_cloexec(fd, true);
         }
+        if let Some(fd) = opts.takeover_report_fd {
+            daemonize::set_cloexec(fd, true);
+            wezterm_mux_server_impl::handoff::remember_report_fd(fd);
+        }
     }
 
     config::common_init(
@@ -113,11 +125,15 @@ fn run() -> anyhow::Result<()> {
 
     #[cfg(unix)]
     let mut pid_file = None;
+    #[cfg(unix)]
+    let mut report_fd = None;
 
     #[cfg(unix)]
     {
         if opts.daemonize {
-            pid_file = daemonize::daemonize(&config, !opts.takeover)?;
+            let daemonized = daemonize::daemonize(&config, !opts.takeover, opts.takeover)?;
+            pid_file = daemonized.pid_file_fd;
+            report_fd = daemonized.report_fd;
             // When we reach this line, we are in a forked child process,
             // and the fork will have broken the async-io/reactor state
             // of the smol runtime.
@@ -140,6 +156,10 @@ fn run() -> anyhow::Result<()> {
             // being propagated to its children when they spawn
             if let Some(fd) = pid_file {
                 cmd.arg("--pid-file-fd");
+                cmd.arg(&fd.to_string());
+            }
+            if let Some(fd) = report_fd {
+                cmd.arg("--takeover-report-fd");
                 cmd.arg(&fd.to_string());
             }
         }
@@ -373,9 +393,11 @@ async fn async_run(
                 // Nothing of ours is registered and the layout files are
                 // the running server's: leave without the exit flush.
                 log::error!("taking over from the running server failed: {err:#}");
+                wezterm_mux_server_impl::handoff::report_takeover(Err(&format!("{err:#}")));
                 std::process::exit(2);
             }
         };
+        wezterm_mux_server_impl::handoff::report_takeover(Ok(()));
         if let Some(fd) = pid_file_fd {
             adopt_pid_file(fd);
         }
