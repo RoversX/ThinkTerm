@@ -2,6 +2,31 @@ use anyhow::{anyhow, Context as _};
 use config::{create_user_owned_dirs, UnixDomain};
 use wezterm_uds::UnixListener;
 
+#[cfg(unix)]
+lazy_static::lazy_static! {
+    /// The listening socket of each unix domain, by path, so a handoff can
+    /// pass it on to the successor.
+    static ref LISTENER_FDS: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::os::unix::io::RawFd>> =
+        std::sync::Mutex::new(std::collections::HashMap::new());
+}
+
+/// The descriptor of the listener bound at `socket_path`, if this server
+/// bound one.
+#[cfg(unix)]
+pub fn listener_fd_for(socket_path: &std::path::Path) -> Option<std::os::unix::io::RawFd> {
+    LISTENER_FDS.lock().unwrap().get(socket_path).copied()
+}
+
+/// Remember the listener at `socket_path`, for a later handoff.
+#[cfg(unix)]
+pub fn remember_listener(socket_path: std::path::PathBuf, listener: &UnixListener) {
+    use std::os::unix::io::AsRawFd;
+    LISTENER_FDS
+        .lock()
+        .unwrap()
+        .insert(socket_path, listener.as_raw_fd());
+}
+
 pub struct LocalListener {
     listener: UnixListener,
 }
@@ -13,6 +38,8 @@ impl LocalListener {
 
     pub fn with_domain(unix_dom: &UnixDomain) -> anyhow::Result<Self> {
         let listener = safely_create_sock_path(unix_dom)?;
+        #[cfg(unix)]
+        remember_listener(unix_dom.socket_path(), &listener);
         Ok(Self::new(listener))
     }
 

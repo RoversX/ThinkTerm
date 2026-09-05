@@ -64,8 +64,14 @@ fn lock_pid_file(config: &config::ConfigHandle) -> anyhow::Result<std::fs::File>
     Ok(file)
 }
 
-pub fn daemonize(config: &config::ConfigHandle) -> anyhow::Result<Option<RawFd>> {
-    let pid_file = if !config::running_under_wsl() {
+/// `lock_pid_file` is false for a server that is taking over from a
+/// running one: that one holds the lock, and hands the locked file over
+/// with everything else.
+pub fn daemonize(
+    config: &config::ConfigHandle,
+    lock_pid: bool,
+) -> anyhow::Result<Option<RawFd>> {
+    let pid_file = if lock_pid && !config::running_under_wsl() {
         // pid file locking is only partly functional when running under
         // WSL 1; it is possible for the pid file to exist after a reboot
         // and for attempts to open and lock it to fail when there are no

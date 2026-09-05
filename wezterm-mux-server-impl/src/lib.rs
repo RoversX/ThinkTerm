@@ -7,6 +7,8 @@ use wezterm_client::domain::{ClientDomain, ClientDomainConfig};
 
 pub mod connections;
 pub mod dispatch;
+#[cfg(unix)]
+pub mod handoff;
 pub mod local;
 pub mod pki;
 mod sent_images;

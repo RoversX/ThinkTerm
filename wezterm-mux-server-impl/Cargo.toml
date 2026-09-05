@@ -36,6 +36,12 @@ uuid = { workspace = true, features = ["v4"] }
 wezterm-client.workspace = true
 wezterm-term = { workspace=true, features=["use_serde"] }
 wezterm-uds.workspace = true
+varbincode.workspace = true
+zstd.workspace = true
+thinkterm-proto.workspace = true
+
+[target."cfg(unix)".dependencies]
+passfd.workspace = true
 
 [target."cfg(windows)".dependencies]
 winapi = { workspace=true, features = [ "winuser" ]}

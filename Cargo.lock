@@ -8190,6 +8190,7 @@ dependencies = [
  "lru",
  "metrics",
  "mux",
+ "passfd",
  "portable-pty",
  "promise",
  "rangeset",
@@ -8199,12 +8200,15 @@ dependencies = [
  "smol",
  "tempfile",
  "termwiz 0.24.0",
+ "thinkterm-proto",
  "url",
  "uuid",
+ "varbincode",
  "wezterm-client",
  "wezterm-term",
  "wezterm-uds",
  "winapi",
+ "zstd",
 ]
 
 [[package]]

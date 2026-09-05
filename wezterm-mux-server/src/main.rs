@@ -48,6 +48,13 @@ struct Opt {
     #[arg(long = "daemonize")]
     daemonize: bool,
 
+    /// Take over from the mux server already running on this socket:
+    /// its panes, windows and clients continue under this binary, and
+    /// the running server exits. The running server must support it.
+    #[cfg(unix)]
+    #[arg(long = "takeover")]
+    takeover: bool,
+
     /// Specify the current working directory for the initially
     /// spawned program
     #[arg(long = "cwd", value_parser, value_hint=ValueHint::DirPath)]
@@ -110,7 +117,7 @@ fn run() -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         if opts.daemonize {
-            pid_file = daemonize::daemonize(&config)?;
+            pid_file = daemonize::daemonize(&config, !opts.takeover)?;
             // When we reach this line, we are in a forked child process,
             // and the fork will have broken the async-io/reactor state
             // of the smol runtime.
@@ -138,6 +145,10 @@ fn run() -> anyhow::Result<()> {
         }
         if opts.skip_config {
             cmd.arg("-n");
+        }
+        #[cfg(unix)]
+        if opts.takeover {
+            cmd.arg("--takeover");
         }
         if let Some(f) = &opts.config_file {
             cmd.arg("--config-file");
@@ -232,6 +243,39 @@ fn run() -> anyhow::Result<()> {
     };
 
     let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new("local")?);
+
+    // A takeover learns who the running server is before the mux exists:
+    // the runtime server id and the id counters are inherited.
+    #[cfg(unix)]
+    let takeover = if opts.takeover {
+        let socket_path = takeover_socket_path(&config)?;
+        let takeover = wezterm_mux_server_impl::handoff::begin(&socket_path)?;
+        let hello = &takeover.hello;
+        log::info!(
+            "taking over from mux server {} ({} panes left behind)",
+            hello.runtime_server_id,
+            hello.left_behind.len()
+        );
+        mux::pane::reserve_pane_ids_below(hello.next_pane_id);
+        mux::tab::reserve_tab_ids_below(hello.next_tab_id);
+        mux::tab::reserve_pane_stack_ids_below(hello.next_stack_id);
+        mux::window::reserve_window_ids_below(hello.next_window_id);
+        Some(takeover)
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let takeover: Option<()> = None;
+
+    #[cfg(unix)]
+    let mux = match &takeover {
+        Some(takeover) => Arc::new(mux::Mux::new_with_runtime_server_id(
+            Some(domain.clone()),
+            takeover.hello.runtime_server_id.clone(),
+        )),
+        None => Arc::new(mux::Mux::new(Some(domain.clone()))),
+    };
+    #[cfg(not(unix))]
     let mux = Arc::new(mux::Mux::new(Some(domain.clone())));
     Mux::set_mux(&mux);
 
@@ -241,15 +285,28 @@ fn run() -> anyhow::Result<()> {
 
     let executor = promise::spawn::SimpleExecutor::new();
 
-    spawn_listener().map_err(|e| {
-        log::error!("problem spawning listeners: {:?}", e);
-        e
-    })?;
+    if takeover.is_none() {
+        spawn_listener().map_err(|e| {
+            log::error!("problem spawning listeners: {:?}", e);
+            e
+        })?;
+    } else {
+        // The listener arrives with the handoff; the environment is set
+        // now for the same reason spawn_listener sets it early.
+        if let Some(unix_dom) = config.unix_domains.last() {
+            std::env::set_var("WEZTERM_UNIX_SOCKET", unix_dom.socket_path());
+        }
+    }
+
+    #[cfg(unix)]
+    if let Some(fd) = opts.pid_file_fd {
+        wezterm_mux_server_impl::handoff::remember_pid_file_fd(fd);
+    }
 
     let activity = Activity::new();
 
     promise::spawn::spawn(async move {
-        if let Err(err) = async_run(cmd).await {
+        if let Err(err) = async_run(cmd, takeover).await {
             terminate_with_error(err);
         }
         drop(activity);
@@ -269,7 +326,25 @@ async fn trigger_mux_startup(lua: Option<Rc<mlua::Lua>>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
+#[cfg(unix)]
+type TakeoverHandle = wezterm_mux_server_impl::handoff::Takeover;
+#[cfg(not(unix))]
+type TakeoverHandle = ();
+
+/// The socket a takeover connects to: the one WEZTERM_UNIX_SOCKET names.
+#[cfg(unix)]
+fn takeover_socket_path(config: &config::ConfigHandle) -> anyhow::Result<std::path::PathBuf> {
+    config
+        .unix_domains
+        .last()
+        .map(|unix_dom| unix_dom.socket_path())
+        .ok_or_else(|| anyhow::anyhow!("no unix domain is configured, nothing to take over"))
+}
+
+async fn async_run(
+    cmd: Option<CommandBuilder>,
+    takeover: Option<TakeoverHandle>,
+) -> anyhow::Result<()> {
     let mux = Mux::get();
     let config = config::configuration();
 
@@ -277,6 +352,47 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
     // are available before agent detection starts its safety tick.
     mux::agent_status::initialize_mux(&mux);
     update_mux_domains_for_server(&config)?;
+
+    #[cfg(unix)]
+    if let Some(mut takeover) = takeover {
+        // The pid file outlives the takeover handle: it stays open, locked,
+        // for the life of this process.
+        let pid_file_fd = takeover.pid_file_fd.take().map(|fd| {
+            use std::os::unix::io::IntoRawFd;
+            fd.into_raw_fd()
+        });
+        let local_domain = mux.default_domain().domain_id();
+        let socket_path = takeover_socket_path(&config)?;
+        let stream = match wezterm_mux_server_impl::handoff::complete(
+            takeover,
+            local_domain,
+            &socket_path,
+        ) {
+            Ok(stream) => stream,
+            Err(err) => {
+                // Nothing of ours is registered and the layout files are
+                // the running server's: leave without the exit flush.
+                log::error!("taking over from the running server failed: {err:#}");
+                std::process::exit(2);
+            }
+        };
+        if let Some(fd) = pid_file_fd {
+            adopt_pid_file(fd);
+        }
+        wezterm_mux_server_impl::handoff::spawn_handoff_listener(socket_path)?;
+        // The TCP listeners wait for the old server to release its ports.
+        let tls_servers = config.tls_servers.clone();
+        thread::spawn(move || {
+            wezterm_mux_server_impl::handoff::wait_for_predecessor_exit(stream);
+            for tls_server in &tls_servers {
+                if let Err(err) = ossl::spawn_tls_listener(tls_server) {
+                    log::error!("problem spawning TLS listener after the takeover: {err:#}");
+                }
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = takeover;
     let _config_subscription = config::subscribe_to_config_reload(move || {
         promise::spawn::spawn_into_main_thread(async move {
             if let Err(err) = update_mux_domains_for_server(&config::configuration()) {
@@ -312,6 +428,27 @@ async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
             .await?;
     }
     Ok(())
+}
+
+/// The pid file the predecessor handed over: same lock, our pid in it.
+#[cfg(unix)]
+fn adopt_pid_file(fd: std::os::unix::io::RawFd) {
+    use std::io::{Seek, SeekFrom, Write};
+    daemonize::set_cloexec(fd, true);
+    wezterm_mux_server_impl::handoff::remember_pid_file_fd(fd);
+    let mut file = std::mem::ManuallyDrop::new(unsafe {
+        use std::os::unix::io::FromRawFd;
+        std::fs::File::from_raw_fd(fd)
+    });
+    // The offset is shared with the predecessor's writes: back to the
+    // start, or the pid lands after a hole of NULs.
+    if let Err(err) = file
+        .set_len(0)
+        .and_then(|_| file.seek(SeekFrom::Start(0)))
+        .and_then(|_| writeln!(file, "{}", std::process::id()))
+    {
+        log::warn!("rewriting the pid file after the takeover: {err:#}");
+    }
 }
 
 fn terminate_with_error(err: anyhow::Error) -> ! {
@@ -362,6 +499,8 @@ pub fn spawn_listener() -> anyhow::Result<()> {
         thread::spawn(move || {
             listener.run();
         });
+        #[cfg(unix)]
+        wezterm_mux_server_impl::handoff::spawn_handoff_listener(unix_dom.socket_path())?;
     }
 
     for tls_server in &config.tls_servers {
