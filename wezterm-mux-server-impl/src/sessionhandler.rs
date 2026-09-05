@@ -104,9 +104,17 @@ pub(crate) struct PerPane {
     /// Terminal input from this connection for this pane, in the order it
     /// was sent, waiting for the pane to be free. See `drain_pane_inputs`.
     inputs: VecDeque<QueuedInput>,
+    /// What `inputs` weighs, against `INPUT_QUEUE_LIMIT`.
+    queued_input_bytes: usize,
     /// A drain task exists for `inputs`.
     input_draining: bool,
 }
+
+/// What may wait for one pane from one connection before further input is
+/// refused: a paste, not a program pouring text into a pane that is not
+/// reading it. The client's own write queue stops at four megabytes;
+/// pastes and `cli send-text` do not pass through it.
+const INPUT_QUEUE_LIMIT: usize = 8 * 1024 * 1024;
 
 /// One piece of terminal input a client sent for a pane.
 enum PaneInput {
@@ -125,6 +133,16 @@ impl PaneInput {
     /// that is free. Bytes for the pty do not.
     fn needs_the_terminal(&self) -> bool {
         !matches!(self, PaneInput::Write(_))
+    }
+
+    /// What this costs to keep, against `INPUT_QUEUE_LIMIT`: its bytes,
+    /// with a floor for the pieces that are all bookkeeping.
+    fn weight(&self) -> usize {
+        match self {
+            PaneInput::Paste(text) => text.len().max(64),
+            PaneInput::Write(data) => data.len().max(64),
+            PaneInput::Key { .. } | PaneInput::Mouse(_) | PaneInput::EraseScrollback(_) => 64,
+        }
     }
 }
 
@@ -169,10 +187,23 @@ impl PerPane {
         self.push_scheduled = false;
     }
 
-    /// Queue `item`; true when the caller has to start the drain.
-    fn queue_input(&mut self, item: QueuedInput) -> bool {
+    /// Queue `item`; Ok(true) when the caller has to start the drain.
+    /// Refused, and handed back, when the queue is at its limit.
+    fn queue_input(&mut self, item: QueuedInput) -> Result<bool, QueuedInput> {
+        let weight = item.input.weight();
+        if self.queued_input_bytes + weight > INPUT_QUEUE_LIMIT {
+            return Err(item);
+        }
+        self.queued_input_bytes += weight;
         self.inputs.push_back(item);
-        !std::mem::replace(&mut self.input_draining, true)
+        Ok(!std::mem::replace(&mut self.input_draining, true))
+    }
+
+    /// The next queued piece, its weight given back.
+    fn pop_input(&mut self) -> Option<QueuedInput> {
+        let item = self.inputs.pop_front()?;
+        self.queued_input_bytes = self.queued_input_bytes.saturating_sub(item.input.weight());
+        Some(item)
     }
 
     fn needs_application_palette(&self, palette: &Option<ColorPalette>) -> bool {
@@ -576,7 +607,7 @@ impl InputDrain {
     /// the drain is over, decided under the same lock as the look.
     fn next(&mut self) -> Option<QueuedInput> {
         let mut per_pane = self.per_pane.lock().unwrap();
-        match per_pane.inputs.pop_front() {
+        match per_pane.pop_input() {
             Some(item) => Some(item),
             None => {
                 per_pane.input_draining = false;
@@ -597,6 +628,7 @@ impl Drop for InputDrain {
                 return;
             };
             per_pane.input_draining = false;
+            per_pane.queued_input_bytes = 0;
             std::mem::take(&mut per_pane.inputs)
         };
         for item in left {
@@ -1047,10 +1079,24 @@ impl SessionHandler {
         respond: impl FnOnce(anyhow::Result<Pdu>) + Send + 'static,
     ) {
         let per_pane = self.per_pane(pane_id);
-        let start = per_pane.lock().unwrap().queue_input(QueuedInput {
+        let queued = per_pane.lock().unwrap().queue_input(QueuedInput {
             input,
             respond: Box::new(respond),
         });
+        let start = match queued {
+            Ok(start) => start,
+            Err(refused) => {
+                log::warn!(
+                    "refusing {:?} for pane {pane_id}: {} bytes of input already wait for it",
+                    refused,
+                    INPUT_QUEUE_LIMIT
+                );
+                (refused.respond)(Err(anyhow!(
+                    "too much input is already waiting for pane {pane_id}"
+                )));
+                return;
+            }
+        };
         if start {
             let source = InputSource {
                 client_id: self.client_id.clone(),
@@ -2743,6 +2789,29 @@ mod tests {
         assert!(state.needs_application_palette(&None));
     }
 
+    /// Input for a pane nobody is reading is not kept without limit.
+    #[test]
+    fn a_pane_with_too_much_input_waiting_refuses_more() {
+        use super::{PaneInput, QueuedInput, INPUT_QUEUE_LIMIT};
+        let mut per_pane = PerPane::default();
+        let item = |bytes: usize| QueuedInput {
+            input: PaneInput::Write(vec![b'x'; bytes]),
+            respond: Box::new(|_| {}),
+        };
+        assert!(per_pane.queue_input(item(INPUT_QUEUE_LIMIT - 100)).is_ok());
+        assert!(per_pane.queue_input(item(64)).is_ok(), "just fits");
+        let refused = per_pane
+            .queue_input(item(64))
+            .expect_err("over the limit, handed back");
+        assert!(matches!(refused.input, PaneInput::Write(_)));
+        assert_eq!(per_pane.inputs.len(), 2);
+        per_pane.pop_input();
+        assert!(
+            per_pane.queue_input(item(64)).is_ok(),
+            "room again once the big one was applied"
+        );
+    }
+
     #[test]
     fn only_bytes_for_the_pty_skip_the_wait_for_a_free_pane() {
         assert!(!PaneInput::Write(vec![]).needs_the_terminal());
@@ -2770,17 +2839,17 @@ mod tests {
             }
         };
         assert!(
-            per_pane.lock().unwrap().queue_input(item("a")),
+            per_pane.lock().unwrap().queue_input(item("a")).unwrap(),
             "the first input starts the drain"
         );
         assert!(
-            !per_pane.lock().unwrap().queue_input(item("b")),
+            !per_pane.lock().unwrap().queue_input(item("b")).unwrap(),
             "the second rides along"
         );
 
         // The drain takes the first piece and is then dropped, the way a
         // task is when the pane stays busy or the scheduler goes away.
-        let first = per_pane.lock().unwrap().inputs.pop_front().unwrap();
+        let first = per_pane.lock().unwrap().pop_input().unwrap();
         assert!(matches!(&first.input, PaneInput::Write(data) if data == b"a"));
         drop(InputDrain {
             per_pane: Arc::clone(&per_pane),
@@ -2794,7 +2863,7 @@ mod tests {
         );
         assert!(per_pane.lock().unwrap().inputs.is_empty());
         assert!(
-            per_pane.lock().unwrap().queue_input(item("c")),
+            per_pane.lock().unwrap().queue_input(item("c")).unwrap(),
             "and the next input starts a new drain"
         );
 
@@ -2809,7 +2878,7 @@ mod tests {
         assert!(drain.next().is_some(), "c");
         assert!(drain.next().is_none(), "empty: the drain is over");
         assert!(
-            per_pane.lock().unwrap().queue_input(item("d")),
+            per_pane.lock().unwrap().queue_input(item("d")).unwrap(),
             "so the next input starts a new one"
         );
         drop(drain);
