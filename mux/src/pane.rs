@@ -308,6 +308,13 @@ pub trait Pane: Downcast + Send + Sync {
         false
     }
 
+    /// Take whatever `render_state_is_contended` reports on and hold it
+    /// for `hold`, sleeping. Only the wedge hook in `send_actions_to_mux`
+    /// uses it; a pane with nothing to hold does nothing.
+    fn hold_render_state_for_the_test(&self, hold: std::time::Duration) {
+        let _ = hold;
+    }
+
     /// What a listing shows of this pane, without waiting for its parser:
     /// the facts as they are if they can be read now, otherwise as they
     /// were last read. A pane with nothing to wait for reads them now.

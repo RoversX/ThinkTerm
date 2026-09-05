@@ -376,6 +376,11 @@ impl Pane for LocalPane {
         self.terminal.try_lock().is_none()
     }
 
+    fn hold_render_state_for_the_test(&self, hold: Duration) {
+        let _held = self.terminal.lock();
+        std::thread::sleep(hold);
+    }
+
     fn summary_without_waiting(&self) -> PaneSummary {
         let mut summary = match self.terminal.try_lock() {
             Some(mut term) => self.store_summary(&mut term),

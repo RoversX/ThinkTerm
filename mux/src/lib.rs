@@ -563,6 +563,36 @@ pub(crate) fn has_external_kitty_image_data_source(actions: &[Action]) -> bool {
 
 /// This function applies parsed actions to the pane and notifies any
 /// mux subscribers about the output event
+/// A pane whose parser holds the terminal for a long time, on request:
+/// `THINKTERM_WEDGE_PANE=<pane id>` in the server's environment makes that
+/// pane's parser take its terminal lock and keep it for
+/// `THINKTERM_WEDGE_SECS` (default 60) once, on the pane's first batch of
+/// output. What a runaway program does by accident, made to order, so the
+/// promise that one such pane leaves every other pane, the pane list and
+/// every client answering can be checked rather than assumed. Costs one
+/// atomic load per batch when unset.
+fn wedge_for_the_test(pane: &Arc<dyn Pane>) {
+    use std::sync::OnceLock;
+    static WEDGE: OnceLock<Option<(PaneId, Duration)>> = OnceLock::new();
+    static DONE: AtomicBool = AtomicBool::new(false);
+    let Some((wedged, hold)) = *WEDGE.get_or_init(|| {
+        let pane_id = std::env::var("THINKTERM_WEDGE_PANE").ok()?.parse().ok()?;
+        let secs = std::env::var("THINKTERM_WEDGE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+        Some((pane_id, Duration::from_secs(secs)))
+    }) else {
+        return;
+    };
+    if pane.pane_id() != wedged || DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    log::warn!("THINKTERM_WEDGE_PANE: holding pane {wedged}'s terminal for {hold:?}");
+    pane.hold_render_state_for_the_test(hold);
+    log::warn!("THINKTERM_WEDGE_PANE: pane {wedged} released");
+}
+
 fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut actions: Vec<Action>) {
     let start = Instant::now();
     // External kitty payloads (a path or shm name) are read here, on the
@@ -574,6 +604,7 @@ fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut action
     }
     match pane.upgrade() {
         Some(pane) => {
+            wedge_for_the_test(&pane);
             pane.perform_actions(actions);
             histogram!("send_actions_to_mux.perform_actions.latency").record(start.elapsed());
             Mux::notify_from_any_thread(MuxNotification::PaneOutput(pane.pane_id()));
