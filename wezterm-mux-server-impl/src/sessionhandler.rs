@@ -1,7 +1,7 @@
 use crate::PKI;
 use anyhow::{anyhow, Context};
 use codec::*;
-use config::keyassignment::SpawnTabDomain;
+use config::keyassignment::{ScrollbackEraseMode, SpawnTabDomain};
 use config::TermConfig;
 use mux::client::ClientId;
 use mux::command_spec::CommandSpecExt;
@@ -15,7 +15,7 @@ use mux::{
     FrontendViewportState, Mux, PaletteSessionId,
 };
 use promise::spawn::spawn_into_main_thread;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use termwiz::surface::SequenceNo;
@@ -101,6 +101,51 @@ pub(crate) struct PerPane {
     sent_images: crate::sent_images::SentImages,
     /// A push task exists for this pane and has not yet read the pane.
     push_scheduled: bool,
+    /// Terminal input from this connection for this pane, in the order it
+    /// was sent, waiting for the pane to be free. See `drain_pane_inputs`.
+    inputs: VecDeque<QueuedInput>,
+    /// A drain task exists for `inputs`.
+    input_draining: bool,
+}
+
+/// One piece of terminal input a client sent for a pane.
+enum PaneInput {
+    Key {
+        event: termwiz::input::KeyEvent,
+        input_serial: InputSerial,
+    },
+    Paste(String),
+    Mouse(wezterm_term::input::MouseEvent),
+    Write(Vec<u8>),
+    EraseScrollback(ScrollbackEraseMode),
+}
+
+/// Input waiting in `PerPane::inputs`, with the reply its request is owed.
+struct QueuedInput {
+    input: PaneInput,
+    respond: Box<dyn FnOnce(anyhow::Result<Pdu>) + Send>,
+}
+
+impl std::fmt::Debug for QueuedInput {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match &self.input {
+            PaneInput::Key { .. } => "key",
+            PaneInput::Paste(_) => "paste",
+            PaneInput::Mouse(_) => "mouse",
+            PaneInput::Write(data) => return write!(fmt, "write({} bytes)", data.len()),
+            PaneInput::EraseScrollback(_) => "erase scrollback",
+        };
+        fmt.write_str(kind)
+    }
+}
+
+/// Who the input came from: what the arms used to read off the handler
+/// when they applied it inline.
+#[derive(Clone)]
+struct InputSource {
+    client_id: Option<Arc<ClientId>>,
+    registration: Option<ClientRegistrationId>,
+    palette_session_id: Option<PaletteSessionId>,
 }
 
 impl PerPane {
@@ -114,6 +159,12 @@ impl PerPane {
     /// that lands during the read schedules the next push.
     fn release_push(&mut self) {
         self.push_scheduled = false;
+    }
+
+    /// Queue `item`; true when the caller has to start the drain.
+    fn queue_input(&mut self, item: QueuedInput) -> bool {
+        self.inputs.push_back(item);
+        !std::mem::replace(&mut self.input_draining, true)
     }
 
     fn needs_application_palette(&self, palette: &Option<ColorPalette>) -> bool {
@@ -383,7 +434,7 @@ async fn push_pane_changes_when_free(
     // schedules the next push rather than being carried by nobody.
     slot.release();
     let pushed_at = Instant::now();
-    let pushed = maybe_push_pane_changes(&pane, sender, per_pane);
+    let pushed = maybe_push_pane_changes(&pane, sender, per_pane, None);
     metrics::histogram!("mux_server.push.latency").record(pushed_at.elapsed());
     pushed
 }
@@ -425,6 +476,160 @@ async fn pane_when_free(
     }
 }
 
+/// Apply the input queued for `pane_id` by one connection, in order, each
+/// piece once the pane can take it without waiting.
+///
+/// Every arm used to apply its input inline on the main thread, which
+/// meant taking the pane's terminal lock there: a keystroke for a pane
+/// whose parser was digesting a huge frame stalled every other pane's
+/// push and every request that hops to main, for as long as the frame
+/// took. The input waits in the pane's own queue instead, and only the
+/// pane it is for waits with it. One queue per connection and pane keeps
+/// a client's input in the order it sent it, which is what the shared
+/// main-thread queue used to guarantee.
+///
+/// A pane busy past `PUSH_DEFERRAL_LIMIT` fails the piece in hand and
+/// everything queued behind it -- the client is told, rather than left
+/// with input that lands minutes later -- and the drain ends; the next
+/// input starts a fresh one.
+async fn drain_pane_inputs(
+    pane_id: PaneId,
+    sender: PduSender,
+    per_pane: Arc<Mutex<PerPane>>,
+    source: InputSource,
+) {
+    let mut drain = InputDrain {
+        per_pane: Arc::clone(&per_pane),
+        why: "the drain of this pane's input ended before it was applied",
+    };
+    loop {
+        let Some(item) = per_pane.lock().unwrap().inputs.pop_front() else {
+            drain.finish();
+            return;
+        };
+        let pane = match pane_when_free(pane_id, &sender, "its input").await {
+            Ok(Some(pane)) => pane,
+            Ok(None) => {
+                drain.why = "the pane stayed busy";
+                (item.respond)(Err(anyhow!("pane {pane_id} is busy")));
+                return;
+            }
+            Err(err) => {
+                drain.why = "the pane or the connection went away";
+                (item.respond)(Err(err));
+                return;
+            }
+        };
+        let result = apply_pane_input(&pane, &sender, &per_pane, &source, item.input);
+        (item.respond)(result);
+    }
+}
+
+/// Ends the drain however the task ends: clears the flag so the next
+/// input starts a new one, and answers whatever is still queued, since a
+/// task dropped mid-way would otherwise leave those requests unanswered
+/// and the flag set for good.
+struct InputDrain {
+    per_pane: Arc<Mutex<PerPane>>,
+    why: &'static str,
+}
+
+impl InputDrain {
+    fn finish(&mut self) {
+        let mut per_pane = self.per_pane.lock().unwrap();
+        per_pane.input_draining = false;
+    }
+}
+
+impl Drop for InputDrain {
+    fn drop(&mut self) {
+        let left = {
+            let Ok(mut per_pane) = self.per_pane.lock() else {
+                return;
+            };
+            per_pane.input_draining = false;
+            std::mem::take(&mut per_pane.inputs)
+        };
+        for item in left {
+            (item.respond)(Err(anyhow!("{}", self.why)));
+        }
+    }
+}
+
+/// One piece of input, applied the way its arm applied it inline: under
+/// the client's identity, after the viewport claim and the palette check
+/// the arms made, followed by the push the arms sent. The main thread,
+/// with the pane known to be free a moment ago.
+fn apply_pane_input(
+    pane: &Arc<dyn Pane>,
+    sender: &PduSender,
+    per_pane: &Arc<Mutex<PerPane>>,
+    source: &InputSource,
+    input: PaneInput,
+) -> anyhow::Result<Pdu> {
+    let mux = Mux::get();
+    let _identity = mux.with_identity(source.client_id.clone());
+    if let PaneInput::EraseScrollback(erase_mode) = input {
+        pane.erase_scrollback(erase_mode);
+        return Ok(Pdu::UnitResponse(UnitResponse {}));
+    }
+    claim_viewport_for_pane(
+        &mux,
+        source.client_id.as_ref(),
+        source.registration,
+        pane.pane_id(),
+    )?;
+    activate_client_palette(&mux, pane, source.palette_session_id)?;
+    let input_serial = match input {
+        PaneInput::Key {
+            event,
+            input_serial,
+        } => {
+            pane.key_down(event.key, event.modifiers)?;
+            // Sent back with the push so the predictive echo can tell
+            // which key the cursor position answers.
+            Some(input_serial)
+        }
+        PaneInput::Paste(text) => {
+            pane.send_paste(&text)?;
+            None
+        }
+        PaneInput::Mouse(event) => {
+            // The client coalesces rapid wheel motion into a single
+            // event with an accumulated amount, but the terminal
+            // emits one report per event regardless of the amount;
+            // replay it per notch so mouse-mode apps scroll the
+            // full distance.
+            use wezterm_term::MouseButton as MB;
+            let notches = match event.button {
+                MB::WheelUp(n) if n > 1 => Some((MB::WheelUp(1), n)),
+                MB::WheelDown(n) if n > 1 => Some((MB::WheelDown(1), n)),
+                MB::WheelLeft(n) if n > 1 => Some((MB::WheelLeft(1), n)),
+                MB::WheelRight(n) if n > 1 => Some((MB::WheelRight(1), n)),
+                _ => None,
+            };
+            match notches {
+                Some((notch, n)) => {
+                    let mut single = event;
+                    single.button = notch;
+                    for _ in 0..n {
+                        pane.mouse_event(single.clone())?;
+                    }
+                }
+                None => pane.mouse_event(event)?,
+            }
+            None
+        }
+        PaneInput::Write(data) => {
+            pane.writer().write_all(&data)?;
+            None
+        }
+        PaneInput::EraseScrollback(_) => unreachable!("answered above"),
+    };
+    maybe_push_pane_changes(pane, sender.clone(), Arc::clone(per_pane), input_serial)?;
+    Ok(Pdu::UnitResponse(UnitResponse {}))
+}
+
 /// Read `pane` and push what changed. Nothing of the pane is read while
 /// `per_pane` is locked (see `LastSent`); this runs on the main thread,
 /// where every writer of a `PerPane`'s state runs, so what is read out of
@@ -433,6 +638,7 @@ fn maybe_push_pane_changes(
     pane: &Arc<dyn Pane>,
     sender: PduSender,
     per_pane: Arc<Mutex<PerPane>>,
+    force_with_input_serial: Option<InputSerial>,
 ) -> anyhow::Result<()> {
     // Application palette provenance must arrive even when the state is
     // `None`: that explicit reset prevents a server's configured/advisory
@@ -460,7 +666,7 @@ fn maybe_push_pane_changes(
             .record_application_palette(application_palette);
     }
 
-    let reading = read_pane_changes(pane, &last, None);
+    let reading = read_pane_changes(pane, &last, force_with_input_serial);
     let mut per_pane = per_pane.lock().unwrap();
     if let Some(reading) = reading {
         let resp = per_pane.commit_changes(pane.pane_id(), reading);
@@ -768,6 +974,34 @@ impl SessionHandler {
                 .entry(pane_id)
                 .or_insert_with(|| Arc::new(Mutex::new(PerPane::default()))),
         )
+    }
+
+    /// Queue terminal input for `pane_id` and see that a drain is running.
+    fn queue_pane_input(
+        &mut self,
+        pane_id: PaneId,
+        input: PaneInput,
+        respond: impl FnOnce(anyhow::Result<Pdu>) + Send + 'static,
+    ) {
+        let per_pane = self.per_pane(pane_id);
+        let start = per_pane.lock().unwrap().queue_input(QueuedInput {
+            input,
+            respond: Box::new(respond),
+        });
+        if start {
+            let source = InputSource {
+                client_id: self.client_id.clone(),
+                registration: self.client_registration,
+                palette_session_id: self.palette_session_id,
+            };
+            spawn_into_main_thread(drain_pane_inputs(
+                pane_id,
+                self.to_write_tx.clone(),
+                per_pane,
+                source,
+            ))
+            .detach();
+        }
     }
 
     pub fn schedule_pane_push(&mut self, pane_id: PaneId) {
@@ -1087,52 +1321,17 @@ impl SessionHandler {
             }
 
             Pdu::WriteToPane(WriteToPane { pane_id, data }) => {
-                let sender = self.to_write_tx.clone();
-                let per_pane = self.per_pane(pane_id);
-                let client_id = self.client_id.clone();
-                let registration = self.client_registration;
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = Mux::get();
-                            let _identity = mux.with_identity(client_id.clone());
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            claim_viewport_for_pane(
-                                &mux,
-                                client_id.as_ref(),
-                                registration,
-                                pane_id,
-                            )?;
-                            activate_client_palette(&mux, &pane, palette_session_id)?;
-                            pane.writer().write_all(&data)?;
-                            maybe_push_pane_changes(&pane, sender, per_pane)?;
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                self.queue_pane_input(pane_id, PaneInput::Write(data), send_response);
             }
             Pdu::EraseScrollbackRequest(EraseScrollbackRequest {
                 pane_id,
                 erase_mode,
             }) => {
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = Mux::get();
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            pane.erase_scrollback(erase_mode);
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
-                        },
-                        send_response,
-                    );
-                })
-                .detach();
+                self.queue_pane_input(
+                    pane_id,
+                    PaneInput::EraseScrollback(erase_mode),
+                    send_response,
+                );
             }
             Pdu::KillPane(KillPane { pane_id }) => {
                 let sender = self.to_write_tx.clone();
@@ -1146,7 +1345,15 @@ impl SessionHandler {
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
                             pane.kill();
                             mux.remove_pane(pane_id);
-                            maybe_push_pane_changes(&pane, sender, per_pane)?;
+                            // Like every push: read once the pane is free,
+                            // not here. It is gone by then, and the push
+                            // finds nothing to do.
+                            if per_pane.lock().unwrap().claim_push() {
+                                spawn_into_main_thread(push_pane_changes_when_free(
+                                    pane_id, sender, per_pane,
+                                ))
+                                .detach();
+                            }
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
                         send_response,
@@ -1155,33 +1362,7 @@ impl SessionHandler {
                 .detach();
             }
             Pdu::SendPaste(SendPaste { pane_id, data }) => {
-                let sender = self.to_write_tx.clone();
-                let per_pane = self.per_pane(pane_id);
-                let client_id = self.client_id.clone();
-                let registration = self.client_registration;
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = Mux::get();
-                            let _identity = mux.with_identity(client_id.clone());
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            claim_viewport_for_pane(
-                                &mux,
-                                client_id.as_ref(),
-                                registration,
-                                pane_id,
-                            )?;
-                            activate_client_palette(&mux, &pane, palette_session_id)?;
-                            pane.send_paste(&data)?;
-                            maybe_push_pane_changes(&pane, sender, per_pane)?;
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
-                        },
-                        send_response,
-                    )
-                })
-                .detach();
+                self.queue_pane_input(pane_id, PaneInput::Paste(data), send_response);
             }
 
             Pdu::SearchScrollbackRequest(SearchScrollbackRequest {
@@ -1197,20 +1378,25 @@ impl SessionHandler {
                     pattern: Pattern,
                     range: std::ops::Range<StableRowIndex>,
                     limit: Option<u32>,
+                    sender: PduSender,
                 ) -> anyhow::Result<Pdu> {
-                    let mux = Mux::get();
-                    let pane = mux
-                        .get_pane(pane_id)
-                        .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                    // The search holds the terminal for its whole run, on
+                    // the main thread: only once the pane is free.
+                    let Some(pane) =
+                        pane_when_free(pane_id, &sender, "a scrollback search").await?
+                    else {
+                        anyhow::bail!("pane {pane_id} is busy");
+                    };
 
                     pane.search(pattern, range, limit).await.map(|results| {
                         Pdu::SearchScrollbackResponse(SearchScrollbackResponse { results })
                     })
                 }
 
+                let sender = self.to_write_tx.clone();
                 spawn_into_main_thread(async move {
                     promise::spawn::spawn(async move {
-                        let result = do_search(pane_id, pattern, range, limit).await;
+                        let result = do_search(pane_id, pattern, range, limit, sender).await;
                         send_response(result);
                     })
                     .detach();
@@ -1393,98 +1579,17 @@ impl SessionHandler {
                 event,
                 input_serial,
             }) => {
-                let sender = self.to_write_tx.clone();
-                let per_pane = self.per_pane(pane_id);
-                let client_id = self.client_id.clone();
-                let registration = self.client_registration;
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = Mux::get();
-                            let _identity = mux.with_identity(client_id.clone());
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            claim_viewport_for_pane(
-                                &mux,
-                                client_id.as_ref(),
-                                registration,
-                                pane_id,
-                            )?;
-                            activate_client_palette(&mux, &pane, palette_session_id)?;
-                            pane.key_down(event.key, event.modifiers)?;
-
-                            // For a key press, we want to always send back the
-                            // cursor position so that the predictive echo doesn't
-                            // leave the cursor in the wrong place
-                            let last = per_pane.lock().unwrap().last_sent();
-                            if let Some(reading) =
-                                read_pane_changes(&pane, &last, Some(input_serial))
-                            {
-                                let resp =
-                                    per_pane.lock().unwrap().commit_changes(pane_id, reading);
-                                sender.send(DecodedPdu {
-                                    pdu: Pdu::GetPaneRenderChangesResponse(resp),
-                                    serial: 0,
-                                })?;
-                            }
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
-                        },
-                        send_response,
-                    )
-                })
-                .detach();
+                self.queue_pane_input(
+                    pane_id,
+                    PaneInput::Key {
+                        event,
+                        input_serial,
+                    },
+                    send_response,
+                );
             }
             Pdu::SendMouseEvent(SendMouseEvent { pane_id, event }) => {
-                let sender = self.to_write_tx.clone();
-                let per_pane = self.per_pane(pane_id);
-                let client_id = self.client_id.clone();
-                let registration = self.client_registration;
-                spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = Mux::get();
-                            let _identity = mux.with_identity(client_id.clone());
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            claim_viewport_for_pane(
-                                &mux,
-                                client_id.as_ref(),
-                                registration,
-                                pane_id,
-                            )?;
-                            activate_client_palette(&mux, &pane, palette_session_id)?;
-                            // The client coalesces rapid wheel motion into a single
-                            // event with an accumulated amount, but the terminal
-                            // emits one report per event regardless of the amount;
-                            // replay it per notch so mouse-mode apps scroll the
-                            // full distance.
-                            use wezterm_term::MouseButton as MB;
-                            let notches = match event.button {
-                                MB::WheelUp(n) if n > 1 => Some((MB::WheelUp(1), n)),
-                                MB::WheelDown(n) if n > 1 => Some((MB::WheelDown(1), n)),
-                                MB::WheelLeft(n) if n > 1 => Some((MB::WheelLeft(1), n)),
-                                MB::WheelRight(n) if n > 1 => Some((MB::WheelRight(1), n)),
-                                _ => None,
-                            };
-                            match notches {
-                                Some((notch, n)) => {
-                                    let mut single = event;
-                                    single.button = notch;
-                                    for _ in 0..n {
-                                        pane.mouse_event(single.clone())?;
-                                    }
-                                }
-                                None => pane.mouse_event(event)?,
-                            }
-                            maybe_push_pane_changes(&pane, sender, per_pane)?;
-                            Ok(Pdu::UnitResponse(UnitResponse {}))
-                        },
-                        send_response,
-                    )
-                })
-                .detach();
+                self.queue_pane_input(pane_id, PaneInput::Mouse(event), send_response);
             }
 
             Pdu::SpawnV2(spawn) => {
@@ -2424,7 +2529,7 @@ async fn move_pane(
 mod tests {
     use super::{
         claim_viewport_for_pane, requires_existing_frontend_access, workspace_for_moved_pane,
-        PerPane,
+        InputDrain, PaneInput, PerPane, QueuedInput,
     };
     use codec::{EnsureThinkTermThread, Pdu};
     use mux::client::ClientId;
@@ -2563,5 +2668,50 @@ mod tests {
         assert!(!state.needs_application_palette(&palette));
 
         assert!(state.needs_application_palette(&None));
+    }
+
+    /// Input for a pane waits in its queue in the order it was sent; a
+    /// drain that ends early answers what it leaves behind and lets the
+    /// next input start a new one.
+    #[test]
+    fn queued_input_keeps_its_order_and_an_ended_drain_answers_what_is_left() {
+        let per_pane = Arc::new(std::sync::Mutex::new(PerPane::default()));
+        let answered: Arc<std::sync::Mutex<Vec<(&'static str, bool)>>> = Default::default();
+        let item = |tag: &'static str| {
+            let answered = Arc::clone(&answered);
+            QueuedInput {
+                input: PaneInput::Write(tag.as_bytes().to_vec()),
+                respond: Box::new(move |result| {
+                    answered.lock().unwrap().push((tag, result.is_ok()));
+                }),
+            }
+        };
+        assert!(
+            per_pane.lock().unwrap().queue_input(item("a")),
+            "the first input starts the drain"
+        );
+        assert!(
+            !per_pane.lock().unwrap().queue_input(item("b")),
+            "the second rides along"
+        );
+
+        // The drain takes the first piece and is then dropped, the way a
+        // task is when the pane stays busy or the scheduler goes away.
+        let first = per_pane.lock().unwrap().inputs.pop_front().unwrap();
+        assert!(matches!(&first.input, PaneInput::Write(data) if data == b"a"));
+        drop(InputDrain {
+            per_pane: Arc::clone(&per_pane),
+            why: "ended in the test",
+        });
+        assert_eq!(
+            answered.lock().unwrap().as_slice(),
+            &[("b", false)],
+            "what was left is answered with an error, in order"
+        );
+        assert!(per_pane.lock().unwrap().inputs.is_empty());
+        assert!(
+            per_pane.lock().unwrap().queue_input(item("c")),
+            "and the next input starts a new drain"
+        );
     }
 }
