@@ -320,6 +320,12 @@ pub struct LocalPane {
     /// found the parser holding the terminal, and the parser applies it
     /// around its next batch. Only ever the newest one.
     pending_resize: Mutex<Option<TerminalSize>>,
+    /// The terminal's configuration, as `set_config` last set it, so that
+    /// `get_config` -- read for every split and spawn that inherits it --
+    /// never waits for the parser.
+    config: Mutex<Arc<dyn TerminalConfiguration>>,
+    /// A configuration the terminal has yet to take, as `pending_resize`.
+    pending_config: Mutex<Option<Arc<dyn TerminalConfiguration>>>,
 }
 
 #[async_trait(?Send)]
@@ -622,11 +628,26 @@ impl Pane for LocalPane {
     }
 
     fn set_config(&self, config: Arc<dyn TerminalConfiguration>) {
-        self.terminal.lock().set_config(config);
+        *self.config.lock() = Arc::clone(&config);
+        // As a resize: now if the parser is not mid-batch, otherwise from
+        // the parser around its next batch, which is what it would first
+        // apply to anyway.
+        match self.terminal.try_lock() {
+            Some(mut term) => {
+                *self.pending_config.lock() = None;
+                term.set_config(config);
+            }
+            None => {
+                *self.pending_config.lock() = Some(config);
+                if let Some(mut term) = self.terminal.try_lock() {
+                    self.apply_pending_config(&mut term);
+                }
+            }
+        }
     }
 
     fn get_config(&self) -> Option<Arc<dyn TerminalConfiguration>> {
-        Some(self.terminal.lock().get_config())
+        Some(Arc::clone(&self.config.lock()))
     }
 
     fn perform_actions(&self, mut actions: Vec<termwiz::escape::Action>) {
@@ -638,8 +659,10 @@ impl Pane for LocalPane {
             }
         }
         let mut term = self.terminal.lock();
+        self.apply_pending_config(&mut term);
         self.apply_pending_resize(&mut term);
         term.perform_actions(actions);
+        self.apply_pending_config(&mut term);
         self.apply_pending_resize(&mut term);
         self.store_summary(&mut term);
         drop(term);
@@ -650,8 +673,9 @@ impl Pane for LocalPane {
         // terminal free, for as long as notes keep arriving: one left
         // after the last look is applied by the resize's own second
         // probe, which finds the terminal free.
-        while self.pending_resize.lock().is_some() {
+        while self.pending_resize.lock().is_some() || self.pending_config.lock().is_some() {
             let mut term = self.terminal.lock();
+            self.apply_pending_config(&mut term);
             self.apply_pending_resize(&mut term);
             self.store_summary(&mut term);
         }
@@ -1311,6 +1335,7 @@ impl LocalPane {
         }));
         terminal.set_notification_handler(Box::new(LocalPaneNotifHandler { pane_id }));
         let last_summary = Mutex::new(PaneSummary::from_terminal(&mut terminal, false));
+        let config = Mutex::new(terminal.get_config());
 
         Self {
             pane_id,
@@ -1331,6 +1356,17 @@ impl LocalPane {
             command_description,
             last_summary,
             pending_resize: Mutex::new(None),
+            config,
+            pending_config: Mutex::new(None),
+        }
+    }
+
+    /// Give the terminal a configuration `set_config` could not, with the
+    /// terminal lock held. See `apply_pending_resize`.
+    fn apply_pending_config(&self, term: &mut Terminal) {
+        let pending = self.pending_config.lock().take();
+        if let Some(config) = pending {
+            term.set_config(config);
         }
     }
 
@@ -1701,6 +1737,34 @@ mod summary_tests {
         pane.perform_actions(vec![]);
         assert_eq!(pane.get_dimensions().cols, 70);
         assert!(pane.pending_resize.lock().is_none());
+    }
+
+    /// A split or spawn inherits the source pane's configuration; the
+    /// read must not wait, and a change made while the parser holds the
+    /// terminal reaches it from the parser.
+    #[test]
+    fn the_configuration_is_read_without_waiting_and_set_through_the_parser() {
+        let (pane, _sizes, _exit) = pane();
+        let guard = pane.terminal.lock();
+        let started = Instant::now();
+        let config = pane.get_config().expect("a local pane has a config");
+        assert!(started.elapsed() < Duration::from_millis(50));
+        let replacement: Arc<dyn TerminalConfiguration> = Arc::new(config::TermConfig::new());
+        pane.set_config(Arc::clone(&replacement));
+        assert!(
+            Arc::ptr_eq(&pane.get_config().unwrap(), &replacement),
+            "the pane answers with the new one at once"
+        );
+        assert!(
+            !Arc::ptr_eq(&guard.get_config(), &replacement),
+            "the terminal, held by the parser, has not"
+        );
+        drop(guard);
+        pane.perform_actions(vec![]);
+        assert!(
+            Arc::ptr_eq(&pane.terminal.lock().get_config(), &replacement),
+            "and the terminal took it with the next batch"
+        );
     }
 
     #[test]

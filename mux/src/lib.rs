@@ -2885,9 +2885,14 @@ impl Mux {
     ) -> Option<String> {
         command_dir.or_else(|| {
             match pane {
-                Some(pane) if pane.domain_id() == target_domain => pane
-                    .get_current_working_dir(policy)
-                    .and_then(|url| {
+                // Without waiting for the pane's parser: this is the
+                // spawn path, on the main thread. The listing summary
+                // carries the divined directory the blocking read would.
+                Some(pane) if pane.domain_id() == target_domain => {
+                    let _ = policy;
+                    pane.listing_summary().working_dir
+                }
+                .and_then(|url| {
                         percent_decode_str(url.path())
                             .decode_utf8()
                             .ok()
