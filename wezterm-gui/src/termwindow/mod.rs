@@ -2644,6 +2644,13 @@ impl TermWindow {
                 "{label}: recent_images=[{}]",
                 stats.recent_image_allocs.join("; ")
             ));
+            let (remote_images, remote_image_bytes) =
+                wezterm_client::pane::remote_image_footprint();
+            lines.push(format!(
+                "{label}: remote_images={} {:.1}MiB",
+                remote_images,
+                remote_image_bytes as f64 / (1024.0 * 1024.0),
+            ));
             let dedicated = stats.dedicated_images;
             lines.push(format!(
                 "{label}: dedicated_images live={} pooled={} {:.1}MiB budget={}MiB",

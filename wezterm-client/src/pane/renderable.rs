@@ -1196,21 +1196,87 @@ lazy_static::lazy_static! {
     /// image carries is a counter private to one server-side object: the
     /// same picture from two servers, or from one server before and after a
     /// restart, must not share a copy or compare generations.
-    static ref IMAGE_LRU: Mutex<LruCache<(DomainId, [u8;32]), Arc<ImageData>>> = Mutex::new(LruCache::new(NonZeroUsize::new(128).unwrap()));
+    static ref IMAGE_LRU: Mutex<ImageStore> = Mutex::new(ImageStore::new(MAX_IMAGES, MAX_IMAGE_BYTES));
+}
+
+/// How much the images fetched from remote panes may hold: a count, and
+/// above all bytes. A program streaming full-window pictures gives every
+/// frame a new hash, and with the count alone the store held the last
+/// hundred-odd frames of it -- half a gigabyte of pixels nothing would
+/// show again. A picture larger than the whole budget is kept on its
+/// own.
+const MAX_IMAGES: usize = 128;
+const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The images fetched from remote panes, by domain and hash, with the
+/// size each was last measured at.
+pub(crate) struct ImageStore {
+    images: LruCache<(DomainId, [u8; 32]), (Arc<ImageData>, usize)>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl ImageStore {
+    fn new(max_images: usize, max_bytes: usize) -> Self {
+        Self {
+            images: LruCache::new(NonZeroUsize::new(max_images.max(1)).unwrap()),
+            bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn get(&mut self, key: &(DomainId, [u8; 32])) -> Option<Arc<ImageData>> {
+        self.images.get(key).map(|(data, _)| Arc::clone(data))
+    }
+
+    /// File `data` under `key`, measured now: the same Arc filed again
+    /// after it grew is measured again. The least recently used go while
+    /// the total is over budget, though never the one just filed.
+    fn put(&mut self, key: (DomainId, [u8; 32]), data: Arc<ImageData>) {
+        if let Some((_, old)) = self.images.pop(&key) {
+            self.bytes = self.bytes.saturating_sub(old);
+        }
+        let size = data.len();
+        if let Some((_, (_, evicted))) = self.images.push(key, (data, size)) {
+            self.bytes = self.bytes.saturating_sub(evicted);
+        }
+        self.bytes += size;
+        while self.images.len() > 1 && self.bytes > self.max_bytes {
+            if let Some((_, (_, size))) = self.images.pop_lru() {
+                self.bytes = self.bytes.saturating_sub(size);
+            }
+        }
+    }
+
+    fn forget_domain(&mut self, domain_id: DomainId) {
+        let stale: Vec<(DomainId, [u8; 32])> = self
+            .images
+            .iter()
+            .filter(|((domain, _), _)| *domain == domain_id)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in stale {
+            if let Some((_, size)) = self.images.pop(&key) {
+                self.bytes = self.bytes.saturating_sub(size);
+            }
+        }
+    }
+
+    /// Images held and the bytes they were last measured at.
+    pub(crate) fn footprint(&self) -> (usize, usize) {
+        (self.images.len(), self.bytes)
+    }
+}
+
+/// What the store of remote images holds right now: a count and bytes.
+pub fn remote_image_footprint() -> (usize, usize) {
+    IMAGE_LRU.lock().unwrap().footprint()
 }
 
 /// Drop every image held for `domain_id`: on (re)attach the server may be
 /// a different process, whose generations start over.
 pub(crate) fn forget_images_for_domain(domain_id: DomainId) {
-    let mut lru = IMAGE_LRU.lock().unwrap();
-    let stale: Vec<(DomainId, [u8; 32])> = lru
-        .iter()
-        .filter(|((domain, _), _)| *domain == domain_id)
-        .map(|(key, _)| *key)
-        .collect();
-    for key in stale {
-        lru.pop(&key);
-    }
+    IMAGE_LRU.lock().unwrap().forget_domain(domain_id);
 }
 
 /// Attach the images the serialized lines name. With `fetch_images` off,
@@ -1237,11 +1303,7 @@ pub(crate) async fn hydrate_lines(
     let mut data_by_hash = HashMap::new();
     let domain_id = client.local_domain_id;
     for im in &image_cells {
-        let held = IMAGE_LRU
-            .lock()
-            .unwrap()
-            .get(&(domain_id, im.data_hash))
-            .cloned();
+        let held = IMAGE_LRU.lock().unwrap().get(&(domain_id, im.data_hash));
         match held {
             // A copy at or past the generation the cell was sent with is
             // current. An animation grows behind an unchanging hash, so
@@ -1346,8 +1408,8 @@ pub(crate) async fn hydrate_lines(
 /// cell lands under a hash that may well be filed already.
 fn file_image(domain_id: DomainId, data: Arc<ImageData>) -> Arc<ImageData> {
     let key = (domain_id, data.hash());
-    let existing = IMAGE_LRU.lock().unwrap().get(&key).cloned();
-    match existing {
+    let existing = IMAGE_LRU.lock().unwrap().get(&key);
+    let filed = match existing {
         Some(existing) if !Arc::ptr_eq(&existing, &data) => {
             if !super::images::merge_into(&existing, &data, 0, data.generation()) {
                 // The copy holds more than the fetch brought, and is
@@ -1356,11 +1418,12 @@ fn file_image(domain_id: DomainId, data: Arc<ImageData>) -> Arc<ImageData> {
             }
             existing
         }
-        _ => {
-            IMAGE_LRU.lock().unwrap().put(key, Arc::clone(&data));
-            data
-        }
-    }
+        _ => data,
+    };
+    // Filed again whichever way: a copy that just grew, in place or by
+    // merge, is measured again here.
+    IMAGE_LRU.lock().unwrap().put(key, Arc::clone(&filed));
+    filed
 }
 
 /// Fetch the image `request` names and bring `held`, the copy already
@@ -1707,6 +1770,48 @@ impl RenderableState {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// A stream of full-window frames must not pin its last hundred
+    /// frames: the store is bounded in bytes, and the newest stays.
+    #[test]
+    fn the_image_store_lets_old_frames_go_when_over_its_byte_budget() {
+        let mut store = super::ImageStore::new(128, 100);
+        let frame = |n: u8| {
+            Arc::new(ImageData::with_data(
+                termwiz::image::ImageDataType::AnimRgba8 {
+                    width: 1,
+                    height: 1,
+                    durations: vec![std::time::Duration::from_millis(40)],
+                    frames: vec![vec![n; 40]],
+                    hashes: vec![[n; 32]],
+                },
+            ))
+        };
+        let frames: Vec<Arc<ImageData>> = (1..=5).map(frame).collect();
+        for f in &frames {
+            store.put((3, f.hash()), Arc::clone(f));
+        }
+        assert_eq!(store.footprint(), (2, 80), "two of forty fit in a hundred");
+        assert!(
+            store.get(&(3, frames[4].hash())).is_some(),
+            "the newest stays"
+        );
+        assert!(
+            store.get(&(3, frames[0].hash())).is_none(),
+            "the oldest went"
+        );
+
+        let big = Arc::new(ImageData::with_raw_data(vec![7; 500]));
+        store.put((3, big.hash()), Arc::clone(&big));
+        assert_eq!(
+            store.footprint(),
+            (1, 500),
+            "a picture over the budget is kept alone"
+        );
+
+        store.forget_domain(3);
+        assert_eq!(store.footprint(), (0, 0));
+    }
 
     /// The glyph cache keys on the hash and keeps the first Arc it met:
     /// a hash that is already filed keeps its Arc, brought up to date

@@ -6,3 +6,4 @@ mod images;
 mod mousestate;
 mod renderable;
 pub(crate) use renderable::forget_images_for_domain;
+pub use renderable::remote_image_footprint;
