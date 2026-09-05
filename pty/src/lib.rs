@@ -298,17 +298,28 @@ impl Child for std::process::Child {
 /// the process -- init, or a subreaper -- has to reap it.)
 #[cfg(unix)]
 pub fn adopted_child(pid: u32) -> Box<dyn Child + Send + Sync> {
-    Box::new(AdoptedChild { pid })
+    Box::new(AdoptedChild::new(pid))
 }
 
 #[cfg(unix)]
 #[derive(Debug)]
 struct AdoptedChild {
     pid: u32,
+    /// On Linux, a descriptor that names this process and not its pid:
+    /// readable once it exits, immune to pid reuse. None elsewhere, or on
+    /// a kernel without pidfd_open, where the pid is polled instead.
+    pidfd: Option<std::os::fd::OwnedFd>,
 }
 
 #[cfg(unix)]
 impl AdoptedChild {
+    fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            pidfd: pidfd_open(pid),
+        }
+    }
+
     fn alive(&self) -> bool {
         if unsafe { libc::kill(self.pid as libc::pid_t, 0) } == 0 {
             return true;
@@ -316,21 +327,66 @@ impl AdoptedChild {
         // EPERM: it exists and is not ours to signal. ESRCH: gone.
         std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
+
+    /// Whether the process has exited, waiting up to `timeout_ms` (-1:
+    /// forever) when a pidfd can say so; otherwise a look at the pid.
+    fn exited(&self, timeout_ms: i32) -> bool {
+        use std::os::fd::AsRawFd;
+        let Some(pidfd) = &self.pidfd else {
+            return !self.alive();
+        };
+        let mut pfd = libc::pollfd {
+            fd: pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            let ready = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if ready > 0 {
+                return true;
+            }
+            if ready == 0 {
+                return false;
+            }
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return !self.alive();
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_open(pid: u32) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0 as libc::c_uint) };
+    if fd < 0 {
+        return None;
+    }
+    Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn pidfd_open(_pid: u32) -> Option<std::os::fd::OwnedFd> {
+    None
 }
 
 #[cfg(unix)]
 impl Child for AdoptedChild {
     fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
-        Ok(if self.alive() {
-            None
-        } else {
+        Ok(if self.exited(0) {
             Some(ExitStatus::with_exit_code(0))
+        } else {
+            None
         })
     }
 
     fn wait(&mut self) -> IoResult<ExitStatus> {
-        while self.alive() {
-            std::thread::sleep(std::time::Duration::from_millis(250));
+        if self.pidfd.is_some() {
+            while !self.exited(-1) {}
+        } else {
+            while !self.exited(0) {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
         }
         Ok(ExitStatus::with_exit_code(0))
     }

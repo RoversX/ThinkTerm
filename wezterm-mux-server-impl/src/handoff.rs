@@ -54,6 +54,15 @@ pub const HANDOFF_VERSION: u32 = 1;
 
 /// How long either side waits for the other's next message.
 const STEP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the old server waits for `Owned` after `Commit`: that one step
+/// is the successor restoring every terminal and registering everything,
+/// which grows with the panes and their scrollback. Past it the old server
+/// carries on -- with both reading the same ptys if the successor was
+/// merely slow, which is why it is generous.
+const OWNED_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the successor waits for `Hello`: the old server is pausing
+/// and snapshotting every pane first, up to `PAUSE_TIMEOUT` each.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long the old server waits for one pane's reader to park and its
 /// parser to catch up.
 const PAUSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -310,7 +319,7 @@ fn serve(mut stream: UnixStream, socket_path: &Path) {
 /// Dropping it before the successor owns the panes resumes them.
 struct Capture {
     hello: Hello,
-    panes: Vec<(HandoffPane, RawFd)>,
+    panes: Vec<(HandoffPane, OwnedFd)>,
     topology: Vec<HandoffWindow>,
     paused: Vec<PausedReader>,
 }
@@ -321,6 +330,13 @@ fn serve_inner(stream: &mut UnixStream, socket_path: &Path) -> anyhow::Result<()
     };
     if version != HANDOFF_VERSION {
         bail!("the successor speaks handoff version {version}, this server speaks {HANDOFF_VERSION}");
+    }
+    let unix_domains = config::configuration().unix_domains.len();
+    if unix_domains > 1 {
+        bail!(
+            "this server listens for {unix_domains} unix domains and a takeover carries one; \
+             stop and restart it instead"
+        );
     }
     let listener_fd = crate::local::listener_fd_for(socket_path)
         .ok_or_else(|| anyhow!("no listening socket registered for {}", socket_path.display()))?;
@@ -344,7 +360,8 @@ fn serve_inner(stream: &mut UnixStream, socket_path: &Path) -> anyhow::Result<()
         let pane_id = pane.pane_id;
         write_message(stream, &HandoffMessage::Pane(clone_pane(pane)))
             .with_context(|| format!("sending pane {pane_id}"))?;
-        send_fd(stream, *fd).with_context(|| format!("sending pane {pane_id}'s pty"))?;
+        send_fd(stream, fd.as_raw_fd())
+            .with_context(|| format!("sending pane {pane_id}'s pty"))?;
         expect(stream, "Ack").with_context(|| format!("pane {pane_id}"))?;
     }
 
@@ -356,6 +373,7 @@ fn serve_inner(stream: &mut UnixStream, socket_path: &Path) -> anyhow::Result<()
     expect(stream, "Ack").context("listener")?;
 
     write_message(stream, &HandoffMessage::Commit)?;
+    stream.set_read_timeout(Some(OWNED_TIMEOUT)).ok();
     expect(stream, "Owned")?;
 
     for paused in capture.paused {
@@ -569,7 +587,7 @@ pub fn begin(socket_path: &Path) -> anyhow::Result<Takeover> {
             path.display()
         )
     })?;
-    stream.set_read_timeout(Some(STEP_TIMEOUT))?;
+    stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
     stream.set_write_timeout(Some(STEP_TIMEOUT))?;
     write_message(
         &mut stream,
@@ -593,6 +611,7 @@ pub fn begin(socket_path: &Path) -> anyhow::Result<Takeover> {
     } else {
         None
     };
+    stream.set_read_timeout(Some(STEP_TIMEOUT))?;
     write_message(&mut stream, &HandoffMessage::Ack)?;
     Ok(Takeover {
         stream,
@@ -730,8 +749,12 @@ fn install(
     for window in windows {
         built.push(build_window(window, &by_id)?);
     }
-    register(staged.commit(), built)?;
+    // The guard stays armed through registration: a failure there must
+    // not drop what was adopted either.
+    register(&staged.panes, built)?;
+    staged.commit();
 
+    unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
     let listener = unsafe { wezterm_uds::UnixListener::from_raw_fd(listener.into_raw_fd()) };
     crate::local::remember_listener(socket_path.to_path_buf(), &listener);
     let mut listener = crate::local::LocalListener::new(listener);
@@ -746,8 +769,9 @@ fn adopt_pane(item: Received, domain_id: DomainId) -> anyhow::Result<Arc<dyn Pan
     let Received { pane, fd, snapshot } = item;
     let master = portable_pty::unix::master_from_raw_fd(fd, pane.tty_name.map(PathBuf::from))?;
     let writer = master.take_writer()?;
+    let snapshot_size = snapshot.size;
     let mut terminal = wezterm_term::Terminal::new(
-        snapshot.size,
+        snapshot_size,
         Arc::new(config::TermConfig::new()),
         "ThinkTerm",
         config::wezterm_version(),
@@ -756,6 +780,23 @@ fn adopt_pane(item: Received, domain_id: DomainId) -> anyhow::Result<Arc<dyn Pan
     terminal
         .restore(snapshot)
         .context("restoring the terminal from its snapshot")?;
+    // The old server kept serving between the snapshot and Commit; a
+    // resize in that window reached the pty but not the snapshot.
+    if let Ok(size) = master.get_size() {
+        let current = TerminalSize {
+            rows: size.rows as usize,
+            cols: size.cols as usize,
+            pixel_width: size.pixel_width as usize,
+            pixel_height: size.pixel_height as usize,
+            dpi: snapshot_size.dpi,
+        };
+        if current.rows > 0
+            && current.cols > 0
+            && (current.rows != snapshot_size.rows || current.cols != snapshot_size.cols)
+        {
+            terminal.resize(current);
+        }
+    }
     let pane_writer = terminal.writer_handle();
     let local = LocalPane::new(
         pane.pane_id,
@@ -810,11 +851,11 @@ fn pane_ids_in(node: &PaneNode, out: &mut Vec<PaneId>) {
 /// Make the staged panes, tabs and windows the mux's. This is the moment
 /// the pane readers start, so it happens once, after everything arrived.
 fn register(
-    staged: Vec<Arc<dyn Pane>>,
+    staged: &[Arc<dyn Pane>],
     windows: Vec<(Window, Vec<Arc<Tab>>, usize)>,
 ) -> anyhow::Result<()> {
     let mux = Mux::get();
-    for pane in &staged {
+    for pane in staged {
         mux.add_pane(pane)
             .with_context(|| format!("registering pane {}", pane.pane_id()))?;
     }
@@ -838,8 +879,10 @@ pub fn wait_for_predecessor_exit(mut stream: UnixStream) {
     let mut buf = [0u8; 64];
     loop {
         match stream.read(&mut buf) {
-            Ok(0) | Err(_) => return,
+            Ok(0) => return,
             Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
         }
     }
 }

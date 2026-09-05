@@ -425,6 +425,10 @@ pub struct ThinkTermFrontendRecoveryTarget {
     pub tab_id: TabId,
 }
 
+/// How long a recovery barrier may wait for the frontend before it is
+/// released unacknowledged.
+const FRONTEND_RECOVERY_DEADLINE: Duration = Duration::from_secs(20);
+
 #[derive(Debug)]
 struct FrontendRecoveryBarrier {
     generation: u64,
@@ -1551,6 +1555,7 @@ impl ClientInner {
     }
 
     fn structure_mutation_in_flight(&self) -> bool {
+        self.release_stale_frontend_recovery_barrier();
         self.mutations_in_flight
             .load(std::sync::atomic::Ordering::SeqCst)
             > 0
@@ -1568,8 +1573,44 @@ impl ClientInner {
         structure: Option<StructureMutationGuard>,
     ) {
         let pending = targets.into_iter().collect::<HashMap<_, _>>();
+        if generation != self.client.connection_generation() {
+            // A newer attempt already owns the slot; a barrier for this
+            // one would never be acknowledged and would hold resyncs back
+            // for good.
+            log::info!(
+                "not arming the frontend recovery barrier for mux generation {generation}: \
+                 the connection is at generation {}",
+                self.client.connection_generation()
+            );
+            return;
+        }
         *self.frontend_recovery_barrier.lock().unwrap() =
             Some(FrontendRecoveryBarrier::new(generation, pending, structure));
+    }
+
+    /// Drop a recovery barrier the frontend is never going to acknowledge:
+    /// one from a superseded generation, or one older than
+    /// `FRONTEND_RECOVERY_DEADLINE` (a tab the user switched away from never
+    /// publishes its geometry). Its hold on push-driven resyncs goes with it.
+    fn release_stale_frontend_recovery_barrier(&self) {
+        let stale = {
+            let mut barrier = self.frontend_recovery_barrier.lock().unwrap();
+            let Some(armed) = barrier.as_ref() else {
+                return;
+            };
+            let superseded = armed.generation != self.client.connection_generation();
+            let overdue = armed.started_at.elapsed() > FRONTEND_RECOVERY_DEADLINE;
+            if !superseded && !overdue {
+                return;
+            }
+            barrier.take().map(|b| (b.generation, superseded, b.started_at.elapsed()))
+        };
+        if let Some((generation, superseded, waited)) = stale {
+            log::warn!(
+                "releasing the frontend recovery barrier for mux generation {generation} after {waited:?}: {}",
+                if superseded { "superseded" } else { "never acknowledged" }
+            );
+        }
     }
 
     fn ready_server_id(&self) -> Option<String> {
@@ -2467,7 +2508,16 @@ impl ClientDomain {
             // the frontend's selected Thread and current size.
             replacement = Some(inner.prepare_server_replacement());
         }
-        Self::process_pane_list(Arc::clone(&inner), panes, None, true, replacement.as_mut())?;
+        if let Err(err) =
+            Self::process_pane_list(Arc::clone(&inner), panes, None, true, replacement.as_mut())
+        {
+            // Windows this attempt made before failing would otherwise
+            // outlive it, as the ones a push-driven resync made used to.
+            if let Some(replacement) = replacement.as_ref() {
+                discard_replacement_windows(&inner, &replacement.created_windows);
+            }
+            return Err(err);
+        }
 
         let created_windows = replacement
             .as_ref()

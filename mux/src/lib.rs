@@ -736,6 +736,11 @@ fn parse_buffered_data(
                     }
                     unapplied = 0;
                 }
+                if let Some(control) = &control {
+                    control
+                        .holding
+                        .store(hold && !actions.is_empty(), Ordering::SeqCst);
+                }
             }
         }
     }
@@ -796,6 +801,11 @@ pub struct ReaderControl {
     changed: std::sync::Condvar,
     /// Bytes read from the pty and not yet applied to the terminal.
     pending_bytes: AtomicUsize,
+    /// The parser holds a synchronized-output frame that is not finished:
+    /// what it holds cannot be applied until the program ends the frame,
+    /// which a parked reader would never deliver. A pause accepts that
+    /// state as quiescent; the held frame is lost, the next one redraws.
+    holding: AtomicBool,
 }
 
 impl ReaderControl {
@@ -806,6 +816,7 @@ impl ReaderControl {
             parked: std::sync::Mutex::new(false),
             changed: std::sync::Condvar::new(),
             pending_bytes: AtomicUsize::new(0),
+            holding: AtomicBool::new(false),
         }
     }
 
@@ -834,7 +845,7 @@ impl ReaderControl {
         }
         loop {
             let pending = self.pending_bytes.load(Ordering::SeqCst);
-            if pending == 0 {
+            if pending == 0 || self.holding.load(Ordering::SeqCst) {
                 return Ok(());
             }
             if Instant::now() >= deadline {

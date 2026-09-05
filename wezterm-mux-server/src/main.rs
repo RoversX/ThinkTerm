@@ -325,8 +325,9 @@ fn run() -> anyhow::Result<()> {
 
     let activity = Activity::new();
 
+    let daemonized = opts.daemonize;
     promise::spawn::spawn(async move {
-        if let Err(err) = async_run(cmd, takeover).await {
+        if let Err(err) = async_run(cmd, takeover, daemonized).await {
             terminate_with_error(err);
         }
         drop(activity);
@@ -364,9 +365,11 @@ fn takeover_socket_path(config: &config::ConfigHandle) -> anyhow::Result<std::pa
 async fn async_run(
     cmd: Option<CommandBuilder>,
     takeover: Option<TakeoverHandle>,
+    daemonized: bool,
 ) -> anyhow::Result<()> {
     let mux = Mux::get();
     let config = config::configuration();
+    let took_over = takeover.is_some();
 
     // async_run is entered through SimpleExecutor, so promise's schedulers
     // are available before agent detection starts its safety tick.
@@ -398,10 +401,26 @@ async fn async_run(
             }
         };
         wezterm_mux_server_impl::handoff::report_takeover(Ok(()));
-        if let Some(fd) = pid_file_fd {
-            adopt_pid_file(fd);
+        match pid_file_fd {
+            Some(fd) => adopt_pid_file(fd),
+            // The predecessor ran in the foreground and had no pid file to
+            // hand over; a daemon takes one of its own, or the next
+            // `--daemonize` would bind the socket out from under it.
+            None if daemonized => match daemonize::lock_pid_file(&config) {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    writeln!(file, "{}", std::process::id()).ok();
+                    std::mem::forget(file);
+                }
+                Err(err) => log::warn!("no pid file after the takeover: {err:#}"),
+            },
+            None => {}
         }
-        wezterm_mux_server_impl::handoff::spawn_handoff_listener(socket_path)?;
+        // Everything is ours already; not listening for the next successor
+        // is worth a log line, not an exit.
+        if let Err(err) = wezterm_mux_server_impl::handoff::spawn_handoff_listener(socket_path) {
+            log::error!("not listening for a successor: {err:#}");
+        }
         // The TCP listeners wait for the old server to release its ports.
         let tls_servers = config.tls_servers.clone();
         thread::spawn(move || {
@@ -414,7 +433,7 @@ async fn async_run(
         });
     }
     #[cfg(not(unix))]
-    let _ = takeover;
+    let _ = (takeover, daemonized);
     let _config_subscription = config::subscribe_to_config_reload(move || {
         promise::spawn::spawn_into_main_thread(async move {
             if let Err(err) = update_mux_domains_for_server(&config::configuration()) {
@@ -427,7 +446,9 @@ async fn async_run(
 
     let domain = mux.default_domain();
 
-    {
+    // A takeover continues a mux that started long ago; its startup event
+    // already ran there.
+    if !took_over {
         if let Err(err) = config::with_lua_config_on_main_thread(trigger_mux_startup).await {
             log::error!("while processing mux-startup event: {:#}", err);
         }
@@ -521,8 +542,13 @@ pub fn spawn_listener() -> anyhow::Result<()> {
         thread::spawn(move || {
             listener.run();
         });
+        // Not fatal: a server that cannot be taken over is still a server.
         #[cfg(unix)]
-        wezterm_mux_server_impl::handoff::spawn_handoff_listener(unix_dom.socket_path())?;
+        if let Err(err) =
+            wezterm_mux_server_impl::handoff::spawn_handoff_listener(unix_dom.socket_path())
+        {
+            log::error!("not listening for a successor: {err:#}");
+        }
     }
 
     for tls_server in &config.tls_servers {

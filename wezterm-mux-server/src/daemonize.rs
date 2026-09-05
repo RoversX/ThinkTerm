@@ -36,7 +36,7 @@ fn setsid() -> anyhow::Result<()> {
     }
 }
 
-fn lock_pid_file(config: &config::ConfigHandle) -> anyhow::Result<std::fs::File> {
+pub fn lock_pid_file(config: &config::ConfigHandle) -> anyhow::Result<std::fs::File> {
     let pid_file = config.daemon_options.pid_file();
     let pid_file_dir = pid_file
         .parent()

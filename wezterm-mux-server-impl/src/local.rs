@@ -4,27 +4,45 @@ use wezterm_uds::UnixListener;
 
 #[cfg(unix)]
 lazy_static::lazy_static! {
-    /// The listening socket of each unix domain, by path, so a handoff can
-    /// pass it on to the successor.
-    static ref LISTENER_FDS: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::os::unix::io::RawFd>> =
+    /// A duplicate of the listening socket of each unix domain, by path,
+    /// so a handoff can pass it on to the successor. A duplicate, not the
+    /// number: should the accept loop end and close its own, the number
+    /// would come to name whatever was opened next.
+    static ref LISTENER_FDS: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::os::fd::OwnedFd>> =
         std::sync::Mutex::new(std::collections::HashMap::new());
 }
 
 /// The descriptor of the listener bound at `socket_path`, if this server
-/// bound one.
+/// bound one; valid for as long as the registry holds it.
 #[cfg(unix)]
 pub fn listener_fd_for(socket_path: &std::path::Path) -> Option<std::os::unix::io::RawFd> {
-    LISTENER_FDS.lock().unwrap().get(socket_path).copied()
+    use std::os::fd::AsRawFd;
+    LISTENER_FDS
+        .lock()
+        .unwrap()
+        .get(socket_path)
+        .map(|fd| fd.as_raw_fd())
 }
 
 /// Remember the listener at `socket_path`, for a later handoff.
 #[cfg(unix)]
 pub fn remember_listener(socket_path: std::path::PathBuf, listener: &UnixListener) {
+    use std::os::fd::{FromRawFd, OwnedFd};
     use std::os::unix::io::AsRawFd;
+    let dup = unsafe { libc::dup(listener.as_raw_fd()) };
+    if dup < 0 {
+        log::error!(
+            "cannot duplicate the listener at {} for a later handoff: {}",
+            socket_path.display(),
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    unsafe { libc::fcntl(dup, libc::F_SETFD, libc::FD_CLOEXEC) };
     LISTENER_FDS
         .lock()
         .unwrap()
-        .insert(socket_path, listener.as_raw_fd());
+        .insert(socket_path, unsafe { OwnedFd::from_raw_fd(dup) });
 }
 
 pub struct LocalListener {

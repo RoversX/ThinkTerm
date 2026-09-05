@@ -1293,22 +1293,11 @@ impl Pane for ClientPane {
         if self.client.remote_tab_input_is_blocked() {
             return;
         }
-        let client = Arc::clone(&self.client);
-        let remote_pane_id = self.remote_pane_id;
-        let remote_tab_id = self.remote_tab_id();
-        promise::spawn::spawn(async move {
-            if client.prepare_remote_tab_input(remote_tab_id).await? {
-                client
-                    .client
-                    .erase_scrollback(EraseScrollbackRequest {
-                        pane_id: remote_pane_id,
-                        erase_mode,
-                    })
-                    .await?;
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .detach();
+        // In the queue with the keys: the server applies it in arrival
+        // order, so the client sends it in the order it was asked.
+        if let Err(err) = self.queue_input(PaneInput::EraseScrollback(erase_mode)) {
+            log::warn!("erase scrollback of remote pane {}: {err:#}", self.remote_pane_id);
+        }
     }
 
     fn advise_focus(&self) {
@@ -1516,6 +1505,7 @@ enum PaneInput {
     },
     Paste(String),
     Mouse(MouseEvent),
+    EraseScrollback(ScrollbackEraseMode),
 }
 
 /// What an input weighs against `INPUT_QUEUE_LIMIT` when it is all
@@ -1527,7 +1517,9 @@ impl PaneInput {
         match self {
             PaneInput::Bytes(data) => data.len().max(INPUT_ITEM_FLOOR),
             PaneInput::Paste(text) => text.len().max(INPUT_ITEM_FLOOR),
-            PaneInput::Key { .. } | PaneInput::Mouse(_) => INPUT_ITEM_FLOOR,
+            PaneInput::Key { .. } | PaneInput::Mouse(_) | PaneInput::EraseScrollback(_) => {
+                INPUT_ITEM_FLOOR
+            }
         }
     }
 
@@ -1537,6 +1529,7 @@ impl PaneInput {
             PaneInput::Key { .. } => "a key".to_string(),
             PaneInput::Paste(text) => format!("a paste of {} bytes", text.len()),
             PaneInput::Mouse(_) => "a mouse report".to_string(),
+            PaneInput::EraseScrollback(_) => "a scrollback erase".to_string(),
         }
     }
 
@@ -1571,6 +1564,12 @@ impl PaneInput {
             }),
             PaneInput::Paste(data) => Pdu::SendPaste(SendPaste { pane_id, data }),
             PaneInput::Mouse(event) => Pdu::SendMouseEvent(SendMouseEvent { pane_id, event }),
+            PaneInput::EraseScrollback(erase_mode) => {
+                Pdu::EraseScrollbackRequest(EraseScrollbackRequest {
+                    pane_id,
+                    erase_mode,
+                })
+            }
         }
     }
 }
@@ -2281,6 +2280,7 @@ mod input_queue_tests {
             PaneInput::Bytes(data) => format!("bytes:{}", String::from_utf8_lossy(data)),
             PaneInput::Key { .. } => "key".to_string(),
             PaneInput::Paste(text) => format!("paste:{text}"),
+            PaneInput::EraseScrollback(_) => "erase".to_string(),
             PaneInput::Mouse(event) => match (&event.kind, &event.button) {
                 (MouseEventKind::Move, _) => format!("mouse:move@{}", event.x),
                 (_, MouseButton::WheelDown(n)) => format!("mouse:wheeldown{n}"),

@@ -1360,8 +1360,10 @@ fn split_child(
 pub struct PaneHandoffParts {
     pub pid: u32,
     pub tty_name: Option<std::path::PathBuf>,
-    /// The master pty, still owned here; the successor gets a duplicate.
-    pub pty_fd: std::os::unix::io::RawFd,
+    /// A duplicate of the master pty, taken under the pty lock: the pane
+    /// may close its own between now and the send, and a bare number
+    /// would then name whatever the kernel handed out next.
+    pub pty_fd: std::os::fd::OwnedFd,
     pub description: String,
 }
 
@@ -1379,7 +1381,15 @@ impl LocalPane {
             _ => return None,
         };
         let pty = self.pty.lock();
-        let pty_fd = pty.as_raw_fd()?;
+        let raw = pty.as_raw_fd()?;
+        let dup = unsafe { libc::dup(raw) };
+        if dup < 0 {
+            return None;
+        }
+        let pty_fd = unsafe {
+            use std::os::fd::FromRawFd;
+            std::os::fd::OwnedFd::from_raw_fd(dup)
+        };
         Some(PaneHandoffParts {
             pid,
             tty_name: pty.tty_name(),
@@ -1399,7 +1409,12 @@ impl LocalPane {
     /// Everything the terminal remembers. Take it with the reader paused
     /// (`crate::pause_pane_reader`), or it is a moment behind the pty.
     pub fn snapshot_terminal(&self) -> wezterm_term::TerminalSnapshot {
-        self.terminal.lock().snapshot()
+        let mut term = self.terminal.lock();
+        // A resize, configuration or focus noted while the parser held
+        // the terminal is the parser's to apply; with the reader parked it
+        // never will, so apply it here or the snapshot lags the pty.
+        self.apply_pending_and_store(&mut term);
+        term.snapshot()
     }
 
     pub fn new(
