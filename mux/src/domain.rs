@@ -758,6 +758,7 @@ impl Domain for LocalDomain {
         if self.is_conpty() {
             terminal.enable_conpty_quirks();
         }
+        let pane_writer = terminal.writer_handle();
 
         let pane: Arc<dyn Pane> = match child_result {
             Ok(child) => Arc::new(LocalPane::new(
@@ -765,7 +766,7 @@ impl Domain for LocalDomain {
                 terminal,
                 child,
                 pair.master,
-                Box::new(writer),
+                pane_writer,
                 self.id,
                 command_description,
             )),
@@ -781,7 +782,7 @@ impl Domain for LocalDomain {
                     Box::new(FailedSpawnPty {
                         inner: Mutex::new(pair.master),
                     }),
-                    Box::new(writer),
+                    pane_writer,
                     self.id,
                     command_description,
                 ))

@@ -1516,3 +1516,53 @@ fn test_hyperlinks() {
         Compare::TEXT | Compare::ATTRS,
     );
 }
+
+/// What the embedder writes through the terminal's writer handle goes out
+/// behind what the terminal itself wrote, never ahead: one pty, one order.
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn the_writer_handle_keeps_the_terminals_order() {
+    use std::io::Write;
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let sink = Sink::default();
+    let mut term = Terminal::new(
+        TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 640,
+            pixel_height: 384,
+            dpi: 0,
+        },
+        Arc::new(TestTermConfig { scrollback: 0 }),
+        "ThinkTerm",
+        "O_o",
+        Box::new(sink.clone()),
+    );
+    let mut handle = term.writer_handle();
+    let mut expected = Vec::new();
+    for _ in 0..50 {
+        // A paste the terminal applies, then bytes the embedder encoded.
+        term.send_paste("p").unwrap();
+        handle.write_all(b"h").unwrap();
+        expected.extend_from_slice(b"ph");
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while sink.0.lock().unwrap().len() < expected.len() && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(sink.0.lock().unwrap().clone(), expected);
+}

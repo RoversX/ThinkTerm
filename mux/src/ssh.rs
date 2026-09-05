@@ -1,5 +1,5 @@
 use crate::connui::ConnectionUI;
-use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, WriterWrapper};
+use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState};
 use crate::localpane::LocalPane;
 use crate::pane::{alloc_pane_id, Pane, PaneId};
 use crate::Mux;
@@ -911,22 +911,21 @@ impl Domain for RemoteSshDomain {
         // eg: tmux integration to be tunnelled via the remote
         // session without duplicating a lot of logic over here.
 
-        let writer = WriterWrapper::new(writer);
-
         let terminal = wezterm_term::Terminal::new(
             size,
             std::sync::Arc::new(config::TermConfig::new()),
             "ThinkTerm",
             config::wezterm_version(),
-            Box::new(writer.clone()),
+            writer,
         );
+        let pane_writer = terminal.writer_handle();
 
         let pane: Arc<dyn Pane> = Arc::new(LocalPane::new(
             pane_id,
             terminal,
             child,
             pty,
-            Box::new(writer),
+            pane_writer,
             self.id,
             "RemoteSshDomain".to_string(),
         ));

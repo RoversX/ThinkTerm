@@ -528,6 +528,15 @@ impl ThreadedWriter {
 
         Self { sender }
     }
+
+    /// Another way into the same writer thread: what is written through
+    /// the handle goes out behind what the terminal flushed before it.
+    #[cfg(not(target_family = "wasm"))]
+    fn handle(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+        }
+    }
 }
 
 #[cfg(target_family = "wasm")]
@@ -935,6 +944,19 @@ impl TerminalState {
     /// in the bracketing, otherwise it is fed to the writer as-is.
     /// De-fang the text by removing any embedded bracketed paste
     /// sequence that may be present.
+    /// A writer to the same pty as the terminal's own, usable without the
+    /// terminal. Bytes the embedder encodes itself -- kitty-protocol keys,
+    /// text from an input method, a Ctrl-C for a program the parser is
+    /// busy with -- go out through the terminal's writer thread, behind
+    /// whatever the terminal flushed before them (a key, a paste, a reply
+    /// to a query) and never ahead: one pty, one order. A writer that went
+    /// to the pty directly raced that thread, and a paste applied a moment
+    /// before a direct write landed after it.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn writer_handle(&self) -> Box<dyn std::io::Write + Send> {
+        Box::new(self.writer.get_ref().handle())
+    }
+
     pub fn send_paste(&mut self, text: &str) -> Result<(), Error> {
         let mut buf = String::new();
         if self.bracketed_paste {

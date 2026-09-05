@@ -1,4 +1,4 @@
-use crate::domain::{DomainId, WriterWrapper};
+use crate::domain::DomainId;
 use crate::localpane::LocalPane;
 use crate::pane::{alloc_pane_id, PaneId};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
@@ -197,7 +197,7 @@ impl TmuxDomainState {
             master_pane: ref_pane,
         };
 
-        let writer = WriterWrapper::new(pane_pty.take_writer()?);
+        let writer = pane_pty.take_writer()?;
 
         let size = TerminalSize {
             rows: pane.pane_height as usize,
@@ -216,15 +216,16 @@ impl TmuxDomainState {
             std::sync::Arc::new(config::TermConfig::new()),
             "ThinkTerm",
             config::wezterm_version(),
-            Box::new(writer.clone()),
+            writer,
         );
+        let pane_writer = terminal.writer_handle();
 
         Ok(Arc::new(LocalPane::new(
             local_pane_id,
             terminal,
             Box::new(child),
             Box::new(pane_pty),
-            Box::new(writer),
+            pane_writer,
             self.domain_id,
             "tmux pane".to_string(),
         )))
