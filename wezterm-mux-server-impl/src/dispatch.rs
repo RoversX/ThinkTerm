@@ -6,6 +6,9 @@ use futures::FutureExt;
 use mux::{Mux, MuxNotification};
 use smol::prelude::*;
 use smol::Async;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 use wezterm_uds::UnixStream;
 
@@ -237,11 +240,62 @@ where
             Ok(Item::LivenessTick)
         };
 
-        match smol::future::or(smol::future::or(rx_msg, wait_for_read), tick).await {
+        let item = match smol::future::or(smol::future::or(rx_msg, wait_for_read), tick).await {
+            Ok(Item::LivenessTick) => match liveness.check(Instant::now()) {
+                Verdict::Fine => continue,
+                // Through the write queue like every other push, so a
+                // peer that is gone fails the write and ends this the
+                // quick way.
+                Verdict::Probe => {
+                    send_notif_pdu(Pdu::Ping(codec::Ping {}));
+                    continue;
+                }
+                Verdict::Dead(silence) => {
+                    // The clock is believed only once the socket has been
+                    // looked at. The race above is decided in order, and
+                    // a wait for readability just built cannot finish on
+                    // its first poll, while a timer already due does: an
+                    // answer that arrived during a long write, and has
+                    // been sitting in the socket since, would lose to the
+                    // tick and the client be dropped as dead with its
+                    // answer unread.
+                    if !socket_has_data(&stream).await {
+                        log::warn!(
+                            "client silent for {silence:?} and did not answer a probe; \
+                             dropping the connection"
+                        );
+                        return Ok(());
+                    }
+                    Ok(Item::Readable)
+                }
+            },
+            other => other,
+        };
+
+        match item {
             Ok(Item::Readable) => {
-                let decoded = match Pdu::decode_async(&mut stream, None).await {
-                    Ok(data) => data,
-                    Err(err) => {
+                // A client that dies with a PDU part-way through leaves
+                // the read waiting for the rest with no clock running;
+                // the clock here runs once the first byte is in, and only
+                // while nothing more arrives.
+                let moved = AtomicU64::new(0);
+                let decoded = smol::future::or(
+                    async {
+                        let mut counted = Counted {
+                            stream: &mut stream,
+                            bytes: &moved,
+                        };
+                        Some(Pdu::decode_async(&mut counted, None).await)
+                    },
+                    async {
+                        stalled(&moved, READ_STALL_LIMIT, true).await;
+                        None
+                    },
+                )
+                .await;
+                let decoded = match decoded {
+                    Some(Ok(data)) => data,
+                    Some(Err(err)) => {
                         if let Some(err) = err.root_cause().downcast_ref::<std::io::Error>() {
                             if err.kind() == std::io::ErrorKind::UnexpectedEof {
                                 // Client disconnected: no need to make a noise
@@ -250,42 +304,42 @@ where
                         }
                         return Err(err).context("reading Pdu from client");
                     }
+                    None => {
+                        log::warn!(
+                            "the client stopped part-way through a PDU and sent nothing more \
+                             for {READ_STALL_LIMIT:?}; dropping the connection"
+                        );
+                        return Ok(());
+                    }
                 };
                 liveness.heard(Instant::now());
                 handler.process_one(decoded);
             }
-            Ok(Item::LivenessTick) => match liveness.check(Instant::now()) {
-                Verdict::Fine => {}
-                // Through the write queue like every other push, so a
-                // peer that is gone fails the write and ends this the
-                // quick way.
-                Verdict::Probe => send_notif_pdu(Pdu::Ping(codec::Ping {})),
-                Verdict::Dead(silence) => {
-                    log::warn!(
-                        "client silent for {silence:?} and did not answer a probe; \
-                         dropping the connection"
-                    );
-                    return Ok(());
-                }
-            },
+            Ok(Item::LivenessTick) => unreachable!("handled above"),
             Ok(Item::WritePdu(decoded)) => {
                 log::trace!("write {} serial {}", decoded.pdu.pdu_name(), decoded.serial);
                 let is_probe = decoded.serial == 0 && matches!(decoded.pdu, Pdu::Ping(_));
-                // A write that makes no progress at all is the one sure
-                // sign of a peer that died with data in flight: the
-                // liveness clock cannot run while this arm waits, so the
-                // wait itself is bounded.
+                // A write that makes no progress is the one sure sign of a
+                // peer that died with data in flight: the liveness clock
+                // cannot run while this arm waits, so the wait itself is
+                // bounded. Progress, not completion: a large picture over
+                // a slow link takes as long as it takes.
+                let moved = AtomicU64::new(0);
                 let written = smol::future::or(
                     async {
+                        let mut counted = Counted {
+                            stream: &mut stream,
+                            bytes: &moved,
+                        };
                         decoded
                             .pdu
-                            .encode_async(&mut stream, decoded.serial)
+                            .encode_async(&mut counted, decoded.serial)
                             .await
                             .map_err(WriteFailure::Encode)?;
-                        stream.flush().await.map_err(WriteFailure::Flush)
+                        counted.flush().await.map_err(WriteFailure::Flush)
                     },
                     async {
-                        smol::Timer::after(WRITE_STALL_LIMIT).await;
+                        stalled(&moved, WRITE_STALL_LIMIT, false).await;
                         Err(WriteFailure::Stalled)
                     },
                 )
@@ -348,10 +402,107 @@ where
     }
 }
 
-/// How long one PDU may take to reach the kernel before the peer is taken
-/// for dead. Generous: a large image over a slow link is minutes of
-/// transfer at worst, and a live peer keeps draining its end.
+/// How long a write to the client may go without a single byte leaving
+/// for the kernel before the peer is taken for dead, and how long a PDU
+/// the client has started sending may go without another byte arriving.
+/// Measured as progress, not completion: a large picture over a slow link
+/// takes as long as it takes, and the socket's buffers say when the peer
+/// has stopped taking anything at all.
 const WRITE_STALL_LIMIT: Duration = Duration::from_secs(60);
+const READ_STALL_LIMIT: Duration = Duration::from_secs(60);
+
+/// How often the stall clocks look at their counters.
+const STALL_CHECK: Duration = Duration::from_secs(1);
+
+/// How long the socket is given to show an answer before a peer the
+/// liveness clock calls dead is dropped.
+const DEAD_GRACE: Duration = Duration::from_millis(250);
+
+/// Whether the socket has something to read, given a moment to say so.
+async fn socket_has_data<T>(stream: &Async<T>) -> bool {
+    smol::future::or(async { stream.readable().await.is_ok() }, async {
+        smol::Timer::after(DEAD_GRACE).await;
+        false
+    })
+    .await
+}
+
+/// Resolves once `bytes` has stood still for `limit`. With `from_first_byte`
+/// the clock does not run until something has moved at all: a read is
+/// entered on readability, and nothing arriving after that is an idle
+/// client, not a stalled one.
+async fn stalled(bytes: &AtomicU64, limit: Duration, from_first_byte: bool) {
+    let mut seen = bytes.load(Ordering::Relaxed);
+    let mut still_since = if from_first_byte {
+        None
+    } else {
+        Some(Instant::now())
+    };
+    loop {
+        smol::Timer::after(STALL_CHECK).await;
+        let now = bytes.load(Ordering::Relaxed);
+        if now != seen {
+            seen = now;
+            still_since = Some(Instant::now());
+            continue;
+        }
+        if still_since.is_some_and(|since| since.elapsed() >= limit) {
+            return;
+        }
+    }
+}
+
+/// The stream with a count of the bytes that cross it, so a transfer that
+/// is merely long can be told from one that has stopped.
+#[derive(Debug)]
+struct Counted<'a, T> {
+    stream: &'a mut Async<T>,
+    bytes: &'a AtomicU64,
+}
+
+impl<T> AsyncRead for Counted<'_, T>
+where
+    Async<T>: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = &mut *self;
+        let polled = Pin::new(&mut *this.stream).poll_read(cx, buf);
+        if let Poll::Ready(Ok(n)) = &polled {
+            this.bytes.fetch_add(*n as u64, Ordering::Relaxed);
+        }
+        polled
+    }
+}
+
+impl<T> AsyncWrite for Counted<'_, T>
+where
+    Async<T>: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = &mut *self;
+        let polled = Pin::new(&mut *this.stream).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &polled {
+            this.bytes.fetch_add(*n as u64, Ordering::Relaxed);
+        }
+        polled
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.stream).poll_flush(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.stream).poll_close(cx)
+    }
+}
 
 enum WriteFailure {
     Encode(anyhow::Error),
@@ -601,6 +752,49 @@ mod tests {
         ));
         outcome.expect("the connection stays up");
         peer.join().expect("the peer's expectations hold");
+    }
+
+    /// An answer that is already in the socket when the clock runs out
+    /// is read, not lost: the peer here answers before it is even asked,
+    /// with a clock that calls it dead the moment the probe is out. The
+    /// old loop dropped it on the first tick after the probe; now the
+    /// answer is read, the clock starts over, and only the second probe
+    /// goes unanswered. Two probes on the peer's side say so.
+    #[cfg(unix)]
+    #[test]
+    fn an_answer_already_in_the_socket_is_read_before_the_peer_is_dropped() {
+        use std::os::fd::{FromRawFd, IntoRawFd};
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+
+        let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let ours = unsafe { UnixStream::from_raw_fd(ours.into_raw_fd()) };
+        let stream = Async::new(ours).unwrap();
+        Pdu::Pong(codec::Pong {})
+            .encode(&mut theirs, 0)
+            .expect("the early answer is written");
+        let liveness = Liveness::with_timing(Instant::now(), Duration::ZERO, Duration::ZERO);
+
+        let outcome = smol::block_on(smol::future::or(
+            process_async_with(stream, liveness),
+            async {
+                smol::Timer::after(Duration::from_secs(5)).await;
+                anyhow::bail!("the peer was never dropped")
+            },
+        ));
+        outcome.expect("the loop ends on its own once the peer really is silent");
+
+        theirs.set_nonblocking(true).unwrap();
+        let mut probes = 0;
+        while let Ok(decoded) = Pdu::decode(&mut theirs) {
+            assert!(matches!(decoded.pdu, Pdu::Ping(_)), "got {:?}", decoded.pdu);
+            probes += 1;
+        }
+        assert_eq!(
+            probes, 2,
+            "the first probe found its answer in the socket; the second went unanswered"
+        );
     }
 
     /// The whole loop against a socket whose peer never writes: it must
