@@ -2250,6 +2250,34 @@ impl Client {
             .await
     }
 
+    /// Put `pdu` on the wire now, behind everything sent before it, and
+    /// hand back its answer to await later. `send_pdu` waits for the answer
+    /// in place; a caller that has to keep several requests in order cannot
+    /// wait for each answer before sending the next, so this splits the two:
+    /// the send is done when this returns.
+    pub fn send_pdu_pipelined(
+        &self,
+        pdu: Pdu,
+    ) -> impl std::future::Future<Output = anyhow::Result<Pdu>> + Send + 'static {
+        log::trace!("send_pdu_pipelined {}", pdu.pdu_name());
+        let (promise, rx) = bounded(1);
+        // The channel is unbounded: try_send fails only once the reader is
+        // gone, which is the same failure `send_pdu` reports.
+        let sent = self
+            .sender
+            .try_send(ReaderMessage::SendPdu {
+                pdu,
+                promise,
+                registration_required: true,
+            })
+            .map_err(|_| ChannelSendError)
+            .context("send_pdu send");
+        async move {
+            sent?;
+            rx.recv().await.context("send_pdu recv")?
+        }
+    }
+
     async fn send_pdu_with_registration_requirement(
         &self,
         pdu: Pdu,

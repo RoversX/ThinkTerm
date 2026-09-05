@@ -1,5 +1,5 @@
 use crate::domain::ClientInner;
-use crate::pane::mousestate::MouseState;
+use crate::pane::mousestate;
 use crate::pane::renderable::{
     hydrate_lines, FrontendPreviewPolicy, RenderableInner, RenderableState,
 };
@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use codec::*;
 use config::configuration;
 use config::keyassignment::ScrollbackEraseMode;
+use futures::future::{BoxFuture, FutureExt};
 use futures::lock::Mutex as AsyncMutex;
+use futures::stream::{FuturesUnordered, StreamExt};
 use mux::domain::DomainId;
 use mux::pane::{
     alloc_pane_id, CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId,
@@ -21,7 +23,7 @@ use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use rangeset::RangeSet;
 use ratelim::RateLimiter;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -237,7 +239,9 @@ pub struct ClientPane {
     palette: Mutex<ColorPalette>,
     application_palette: Mutex<bool>,
     writer: Mutex<PaneWriter>,
-    mouse: Arc<Mutex<MouseState>>,
+    /// Everything this pane was given and the server has not answered,
+    /// in the order it was given; see [`PaneInput`].
+    inputs: Arc<Mutex<InputQueue>>,
     clipboard: Mutex<Option<Arc<dyn Clipboard>>>,
     mouse_grabbed: Mutex<bool>,
     alt_screen: Mutex<bool>,
@@ -366,18 +370,13 @@ impl ClientPane {
     ) -> Self {
         let local_pane_id = alloc_pane_id();
         let remote_tab_id = Arc::new(AtomicUsize::new(remote_tab_id));
+        let inputs: Arc<Mutex<InputQueue>> = Default::default();
         let writer = PaneWriter {
             client: Arc::clone(client),
             remote_pane_id,
             remote_tab_id: Arc::clone(&remote_tab_id),
-            queue: Default::default(),
+            inputs: Arc::clone(&inputs),
         };
-
-        let mouse = Arc::new(Mutex::new(MouseState::new(
-            remote_pane_id,
-            Arc::clone(client),
-            Arc::clone(&remote_tab_id),
-        )));
 
         let fetch_limiter =
             RateLimiter::new(|config| config.ratelimit_mux_line_prefetches_per_second);
@@ -424,7 +423,7 @@ impl ClientPane {
         Self {
             client: Arc::clone(client),
             remote_server_id: client.client.remote_server_id(),
-            mouse,
+            inputs,
             remote_pane_id,
             local_pane_id,
             remote_tab_id,
@@ -894,6 +893,21 @@ fn finish_preview_request(
     }
 }
 
+impl ClientPane {
+    /// Queue `input` behind everything this pane was given before it.
+    fn queue_input(&self, input: PaneInput) -> anyhow::Result<()> {
+        queue_pane_input(
+            &self.client,
+            self.remote_pane_id,
+            &self.remote_tab_id,
+            &self.inputs,
+            input,
+        )?;
+        self.renderable.lock().inner.borrow_mut().update_last_send();
+        Ok(())
+    }
+}
+
 #[async_trait(?Send)]
 impl Pane for ClientPane {
     fn pane_id(&self) -> PaneId {
@@ -980,30 +994,12 @@ impl Pane for ClientPane {
             return Ok(());
         }
         Mux::get().record_input_for_current_identity();
-        let client = Arc::clone(&self.client);
-        let remote_pane_id = self.remote_pane_id;
-        let remote_tab_id = self.remote_tab_id();
+        self.queue_input(PaneInput::Paste(text.to_owned()))?;
         self.renderable
             .lock()
             .inner
             .borrow_mut()
             .predict_from_paste(text);
-
-        let data = text.to_owned();
-        promise::spawn::spawn(async move {
-            if client.prepare_remote_tab_input(remote_tab_id).await? {
-                client
-                    .client
-                    .send_paste(SendPaste {
-                        pane_id: remote_pane_id,
-                        data,
-                    })
-                    .await?;
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .detach();
-        self.renderable.lock().inner.borrow_mut().update_last_send();
         Ok(())
     }
 
@@ -1167,35 +1163,18 @@ impl Pane for ClientPane {
             return Ok(());
         }
         Mux::get().record_input_for_current_identity();
-        let input_serial;
-        {
-            let renderable = self.renderable.lock();
-            let mut inner = renderable.inner.borrow_mut();
-            inner.input_serial = InputSerial::now();
-            input_serial = inner.input_serial;
-            inner.predict_from_key_event(key, mods);
-        }
-        let client = Arc::clone(&self.client);
-        let remote_pane_id = self.remote_pane_id;
-        let remote_tab_id = self.remote_tab_id();
-        promise::spawn::spawn(async move {
-            if client.prepare_remote_tab_input(remote_tab_id).await? {
-                client
-                    .client
-                    .key_down(SendKeyDown {
-                        pane_id: remote_pane_id,
-                        event: KeyEvent {
-                            key,
-                            modifiers: mods,
-                        },
-                        input_serial,
-                    })
-                    .await?;
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .detach();
-        self.renderable.lock().inner.borrow_mut().update_last_send();
+        let input_serial = InputSerial::now();
+        self.queue_input(PaneInput::Key {
+            event: KeyEvent {
+                key,
+                modifiers: mods,
+            },
+            input_serial,
+        })?;
+        let renderable = self.renderable.lock();
+        let mut inner = renderable.inner.borrow_mut();
+        inner.input_serial = input_serial;
+        inner.predict_from_key_event(key, mods);
         Ok(())
     }
 
@@ -1260,11 +1239,7 @@ impl Pane for ClientPane {
             return Ok(());
         }
         Mux::get().record_input_for_current_identity();
-        self.mouse.lock().append(event);
-        if MouseState::next(Arc::clone(&self.mouse)) {
-            self.renderable.lock().inner.borrow_mut().update_last_send();
-        }
-        Ok(())
+        self.queue_input(PaneInput::Mouse(mousestate::normalize_wheel(event)))
     }
 
     fn is_dead(&self) -> bool {
@@ -1518,120 +1493,314 @@ async fn drain_render_deltas(local_pane_id: PaneId) {
 
 struct PaneWriter {
     client: Arc<ClientInner>,
-    remote_pane_id: TabId,
+    remote_pane_id: PaneId,
     remote_tab_id: Arc<AtomicUsize>,
-    queue: Arc<Mutex<WriteQueue>>,
+    inputs: Arc<Mutex<InputQueue>>,
 }
 
-/// Bytes written to a remote pane and not yet on the wire.
+/// One thing the user gave a remote pane.
 ///
-/// `Write::write` used to block its caller, the GUI thread, for a round
-/// trip per call; with the kitty keyboard protocol that is every
-/// keystroke. Writes queue here instead, and one task at a time drains
-/// the queue in order, sending whatever has piled up as a single
-/// WriteToPane.
+/// Keys, pastes and mouse reports travel as their own requests; the pty
+/// bytes the GUI encodes itself (kitty-protocol and win32-input-mode keys,
+/// text from the input method, SendString) go as WriteToPane. The four
+/// used to leave by separate paths, and the byte path waited for each
+/// answer before sending more, so a key pressed while a write was still
+/// unanswered overtook the text queued behind that write: Enter before
+/// the sentence it was meant to end. Everything now goes through one
+/// queue per pane, in the order it was given.
+enum PaneInput {
+    Bytes(Vec<u8>),
+    Key {
+        event: KeyEvent,
+        input_serial: InputSerial,
+    },
+    Paste(String),
+    Mouse(MouseEvent),
+}
+
+/// What an input weighs against `INPUT_QUEUE_LIMIT` when it is all
+/// bookkeeping.
+const INPUT_ITEM_FLOOR: usize = 64;
+
+impl PaneInput {
+    fn weight(&self) -> usize {
+        match self {
+            PaneInput::Bytes(data) => data.len().max(INPUT_ITEM_FLOOR),
+            PaneInput::Paste(text) => text.len().max(INPUT_ITEM_FLOOR),
+            PaneInput::Key { .. } | PaneInput::Mouse(_) => INPUT_ITEM_FLOOR,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            PaneInput::Bytes(data) => format!("{} bytes", data.len()),
+            PaneInput::Key { .. } => "a key".to_string(),
+            PaneInput::Paste(text) => format!("a paste of {} bytes", text.len()),
+            PaneInput::Mouse(_) => "a mouse report".to_string(),
+        }
+    }
+
+    /// Fold `next` into this one when the two can travel as a single
+    /// request: bytes after bytes, a mouse report over the one before it.
+    /// Nothing folds across a key or a paste, so the order the user gave
+    /// is the order the pty sees. Hands `next` back when it has to stay
+    /// its own request.
+    fn absorb(&mut self, next: PaneInput) -> Option<PaneInput> {
+        match (self, next) {
+            (PaneInput::Bytes(data), PaneInput::Bytes(more)) => {
+                data.extend_from_slice(&more);
+                None
+            }
+            (PaneInput::Mouse(last), PaneInput::Mouse(event)) => {
+                mousestate::coalesce(last, event).map(PaneInput::Mouse)
+            }
+            (_, next) => Some(next),
+        }
+    }
+
+    fn into_pdu(self, pane_id: PaneId) -> Pdu {
+        match self {
+            PaneInput::Bytes(data) => Pdu::WriteToPane(WriteToPane { pane_id, data }),
+            PaneInput::Key {
+                event,
+                input_serial,
+            } => Pdu::SendKeyDown(SendKeyDown {
+                pane_id,
+                event,
+                input_serial,
+            }),
+            PaneInput::Paste(data) => Pdu::SendPaste(SendPaste { pane_id, data }),
+            PaneInput::Mouse(event) => Pdu::SendMouseEvent(SendMouseEvent { pane_id, event }),
+        }
+    }
+}
+
+/// Input for a remote pane the server has not answered: what waits to be
+/// sent, and how much is on the wire.
 #[derive(Default)]
-struct WriteQueue {
-    pending: Vec<u8>,
+struct InputQueue {
+    pending: VecDeque<PaneInput>,
+    /// The weight of `pending`.
+    queued: usize,
+    /// The weight sent and not yet answered.
+    in_flight: usize,
     draining: bool,
 }
 
-/// What may wait for a stalled link before further writes are refused:
-/// a paste, not a runaway.
-const WRITE_QUEUE_LIMIT: usize = 4 * 1024 * 1024;
+/// How much input may wait for the link, queued or sent and unanswered,
+/// before more is refused: a paste, not a runaway.
+const INPUT_QUEUE_LIMIT: usize = 4 * 1024 * 1024;
 
-/// The write queue is full: the link has taken nothing for a while and
-/// `WRITE_QUEUE_LIMIT` bytes already wait for it.
+/// The queue is full: the link has answered nothing for a while and
+/// `INPUT_QUEUE_LIMIT` bytes of input already wait for it.
 #[derive(Debug)]
-struct WriteQueueFull {
+struct InputQueueFull {
     waiting: usize,
 }
 
-impl std::fmt::Display for WriteQueueFull {
+impl std::fmt::Display for InputQueueFull {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             fmt,
-            "{} bytes are already waiting for the link to the remote pane",
+            "{} bytes of input are already waiting for the link to the remote pane",
             self.waiting
         )
     }
 }
 
-impl std::error::Error for WriteQueueFull {}
+impl std::error::Error for InputQueueFull {}
 
-impl WriteQueue {
-    /// Queue `data`; true when the caller has to start the drain. A full
-    /// queue refuses the bytes rather than dropping them and saying they
-    /// went: the caller is told, and what reaches the remote pane is
-    /// either all of a write or none of it.
-    fn push(&mut self, data: &[u8]) -> Result<bool, WriteQueueFull> {
-        if self.pending.len() + data.len() > WRITE_QUEUE_LIMIT {
-            return Err(WriteQueueFull {
-                waiting: self.pending.len(),
-            });
+impl InputQueue {
+    /// Queue `input` behind what already waits; true when the caller has
+    /// to start the drain. Over the limit the input is refused rather than
+    /// dropped and reported as sent: the caller is told, and what reaches
+    /// the remote pane is either all of an input or none of it.
+    fn push(&mut self, input: PaneInput) -> Result<bool, InputQueueFull> {
+        let waiting = self.queued + self.in_flight;
+        if waiting + input.weight() > INPUT_QUEUE_LIMIT {
+            return Err(InputQueueFull { waiting });
         }
-        self.pending.extend_from_slice(data);
+        let input = match self.pending.back_mut() {
+            Some(last) => {
+                let before = last.weight();
+                let left = last.absorb(input);
+                self.queued = self.queued - before + last.weight();
+                left
+            }
+            None => Some(input),
+        };
+        if let Some(input) = input {
+            self.queued += input.weight();
+            self.pending.push_back(input);
+        }
         Ok(!std::mem::replace(&mut self.draining, true))
     }
 
-    /// Everything queued so far, or None once the drain is over.
-    fn take(&mut self) -> Option<Vec<u8>> {
-        if self.pending.is_empty() {
-            self.draining = false;
-            None
-        } else {
-            Some(std::mem::take(&mut self.pending))
+    /// The next input to send, counted as in flight from here on, or None
+    /// once nothing waits: the drain is over and the next push starts a
+    /// new one. The check and the hand-back happen under the one lock, so
+    /// no push can slip between them and find the queue neither drained
+    /// nor draining.
+    fn take(&mut self) -> Option<PaneInput> {
+        match self.pending.pop_front() {
+            Some(input) => {
+                let weight = input.weight();
+                self.queued -= weight;
+                self.in_flight += weight;
+                Some(input)
+            }
+            None => {
+                self.draining = false;
+                None
+            }
+        }
+    }
+
+    /// `weight` of input was answered, or never went: it no longer waits.
+    fn settle(&mut self, weight: usize) {
+        self.in_flight = self.in_flight.saturating_sub(weight);
+    }
+}
+
+/// Marks the drain over if its task ends before it reaches the end of the
+/// queue (a panic caught by the executor, a scheduler torn down with it
+/// queued); every later input would otherwise wait for a drain that never
+/// comes. A drain that did reach the end handed the queue back itself and
+/// disarms this, so it cannot undo a drain the next push already started.
+struct InputDraining {
+    queue: Arc<Mutex<InputQueue>>,
+    done: bool,
+}
+
+impl Drop for InputDraining {
+    fn drop(&mut self) {
+        if !self.done {
+            self.queue.lock().draining = false;
         }
     }
 }
 
-/// Marks the drain over when the task ends, however it ends. A drain task
-/// dropped without finishing (a panic caught by the executor, a scheduler
-/// torn down with it queued) would otherwise leave `draining` set, and
-/// every later write to the pane would wait for a drain that never comes.
-struct Draining(Arc<Mutex<WriteQueue>>);
+/// Settles an input's weight when its answer arrives, or when the answer
+/// is given up on: dropped with the future, it settles all the same.
+struct Settling {
+    queue: Arc<Mutex<InputQueue>>,
+    weight: usize,
+}
 
-impl Drop for Draining {
+impl Drop for Settling {
     fn drop(&mut self) {
-        self.0.lock().draining = false;
+        self.queue.lock().settle(self.weight);
     }
 }
 
-async fn drain_pane_writes(
-    client: Arc<ClientInner>,
-    remote_pane_id: TabId,
+/// Where a drain sends: the connection, or a recorder under test.
+trait InputLink: Send + Sync + 'static {
+    /// Whether this client may drive the tab right now; a claim may have
+    /// to reach the server first.
+    fn prepare(&self, remote_tab_id: TabId) -> BoxFuture<'_, anyhow::Result<bool>>;
+
+    /// Put the request on the wire now, behind everything sent before it;
+    /// the future is its answer.
+    fn send(&self, pdu: Pdu) -> BoxFuture<'static, anyhow::Result<Pdu>>;
+}
+
+impl InputLink for ClientInner {
+    fn prepare(&self, remote_tab_id: TabId) -> BoxFuture<'_, anyhow::Result<bool>> {
+        self.prepare_remote_tab_input(remote_tab_id).boxed()
+    }
+
+    fn send(&self, pdu: Pdu) -> BoxFuture<'static, anyhow::Result<Pdu>> {
+        self.client.send_pdu_pipelined(pdu).boxed()
+    }
+}
+
+/// Sends the pane's queued input in order, each request the moment the
+/// one before it is on the wire, then waits for the answers. No request
+/// waits for an answer before the next is sent: the wire keeps the order,
+/// and the server applies one connection's input to a pane in the order
+/// it arrives. The answers only settle what counts against
+/// `INPUT_QUEUE_LIMIT`, so a stalled link ends in refused input, not in
+/// input sent out of order.
+async fn drain_pane_inputs<L: InputLink>(
+    link: Arc<L>,
+    remote_pane_id: PaneId,
     remote_tab_id: Arc<AtomicUsize>,
-    queue: Arc<Mutex<WriteQueue>>,
+    queue: Arc<Mutex<InputQueue>>,
 ) {
-    let _draining = Draining(Arc::clone(&queue));
+    let mut answers = FuturesUnordered::new();
+    let mut draining = InputDraining {
+        queue: Arc::clone(&queue),
+        done: false,
+    };
     loop {
-        let Some(data) = queue.lock().take() else {
-            return;
+        let Some(input) = queue.lock().take() else {
+            draining.done = true;
+            break;
+        };
+        let what = input.describe();
+        let settling = Settling {
+            queue: Arc::clone(&queue),
+            weight: input.weight(),
         };
         let remote_tab_id = remote_tab_id.load(Ordering::Relaxed);
-        let len = data.len();
-        let sent = async {
-            if !client.prepare_remote_tab_input(remote_tab_id).await? {
+        match link.prepare(remote_tab_id).await {
+            Ok(true) => {}
+            Ok(false) => {
                 log::warn!(
-                    "dropping {len} bytes for remote pane {remote_pane_id}: this client may \
+                    "dropping {what} for remote pane {remote_pane_id}: this client may \
                      not drive the tab right now"
                 );
-                return Ok(());
+                continue;
             }
-            client
-                .client
-                .write_to_pane(WriteToPane {
-                    pane_id: remote_pane_id,
-                    data,
-                })
-                .await?;
-            Ok::<(), anyhow::Error>(())
+            Err(err) => {
+                log::error!("dropping {what} for remote pane {remote_pane_id}: {err:#}");
+                continue;
+            }
         }
-        .await;
-        if let Err(err) = sent {
-            log::error!("writing {len} bytes to remote pane {remote_pane_id}: {err:#}");
-        }
+        let answer = link.send(input.into_pdu(remote_pane_id));
+        answers.push(async move {
+            let _settling = settling;
+            if let Err(err) = answered(answer.await) {
+                log::error!("sending {what} to remote pane {remote_pane_id}: {err:#}");
+            }
+        });
     }
+    drop(draining);
+    while answers.next().await.is_some() {}
+}
+
+fn answered(answer: anyhow::Result<Pdu>) -> anyhow::Result<()> {
+    match answer? {
+        Pdu::UnitResponse(_) => Ok(()),
+        Pdu::ErrorResponse(err) => bail!(err.reason),
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
+/// Queue `input` for the remote pane behind everything given before it,
+/// and start the drain when none runs.
+fn queue_pane_input(
+    client: &Arc<ClientInner>,
+    remote_pane_id: PaneId,
+    remote_tab_id: &Arc<AtomicUsize>,
+    inputs: &Arc<Mutex<InputQueue>>,
+    input: PaneInput,
+) -> Result<(), InputQueueFull> {
+    let what = input.describe();
+    let start_drain = inputs.lock().push(input).map_err(|full| {
+        log::warn!("refusing {what} for remote pane {remote_pane_id}: {full}");
+        full
+    })?;
+    if start_drain {
+        promise::spawn::spawn_into_main_thread(drain_pane_inputs(
+            Arc::clone(client),
+            remote_pane_id,
+            Arc::clone(remote_tab_id),
+            Arc::clone(inputs),
+        ))
+        .detach();
+    }
+    Ok(())
 }
 
 impl std::io::Write for PaneWriter {
@@ -1639,19 +1808,14 @@ impl std::io::Write for PaneWriter {
         if self.client.remote_tab_input_is_blocked() {
             return Ok(data.len());
         }
-        let start_drain = self.queue.lock().push(data).map_err(|full| {
-            log::warn!("refusing {} bytes for a remote pane: {full}", data.len());
-            std::io::Error::new(std::io::ErrorKind::WouldBlock, full)
-        })?;
-        if start_drain {
-            promise::spawn::spawn_into_main_thread(drain_pane_writes(
-                Arc::clone(&self.client),
-                self.remote_pane_id,
-                Arc::clone(&self.remote_tab_id),
-                Arc::clone(&self.queue),
-            ))
-            .detach();
-        }
+        queue_pane_input(
+            &self.client,
+            self.remote_pane_id,
+            &self.remote_tab_id,
+            &self.inputs,
+            PaneInput::Bytes(data.to_vec()),
+        )
+        .map_err(|full| std::io::Error::new(std::io::ErrorKind::WouldBlock, full))?;
         Ok(data.len())
     }
 
@@ -2004,26 +2168,6 @@ mod palette_delivery_tests {
     }
 
     #[test]
-    fn the_first_write_starts_the_drain_and_later_ones_ride_along() {
-        let mut queue = super::WriteQueue::default();
-        assert!(queue.push(b"a").unwrap(), "nothing draining: start one");
-        assert!(
-            !queue.push(b"b").unwrap(),
-            "a drain is running: it will pick this up"
-        );
-        assert_eq!(
-            queue.take().as_deref(),
-            Some(&b"ab"[..]),
-            "coalesced, in order"
-        );
-        assert!(queue.take().is_none(), "empty: the drain ends");
-        assert!(
-            queue.push(b"c").unwrap(),
-            "and the next write starts a new one"
-        );
-    }
-
-    #[test]
     fn render_pushes_are_taken_in_order_and_know_when_another_waits() {
         let mut queue = super::RenderDeltaQueue::default();
         let delta = |seqno| codec::GetPaneRenderChangesResponse {
@@ -2098,33 +2242,264 @@ mod palette_delivery_tests {
         assert!(!carried.contains(12), "ranges are half-open");
     }
 
+}
+
+#[cfg(test)]
+mod input_queue_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use wezterm_term::{MouseButton, MouseEventKind};
+
+    fn bytes(text: &str) -> PaneInput {
+        PaneInput::Bytes(text.as_bytes().to_vec())
+    }
+
+    fn enter() -> PaneInput {
+        PaneInput::Key {
+            event: KeyEvent {
+                key: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+            },
+            input_serial: InputSerial::empty(),
+        }
+    }
+
+    fn mouse(kind: MouseEventKind, button: MouseButton, x: usize) -> PaneInput {
+        PaneInput::Mouse(MouseEvent {
+            kind,
+            x,
+            y: 0,
+            x_pixel_offset: 0,
+            y_pixel_offset: 0,
+            button,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    fn tag(input: &PaneInput) -> String {
+        match input {
+            PaneInput::Bytes(data) => format!("bytes:{}", String::from_utf8_lossy(data)),
+            PaneInput::Key { .. } => "key".to_string(),
+            PaneInput::Paste(text) => format!("paste:{text}"),
+            PaneInput::Mouse(event) => match (&event.kind, &event.button) {
+                (MouseEventKind::Move, _) => format!("mouse:move@{}", event.x),
+                (_, MouseButton::WheelDown(n)) => format!("mouse:wheeldown{n}"),
+                _ => "mouse".to_string(),
+            },
+        }
+    }
+
+    fn pdu_tag(pdu: &Pdu) -> String {
+        match pdu {
+            Pdu::WriteToPane(write) => {
+                format!("bytes:{}", String::from_utf8_lossy(&write.data))
+            }
+            Pdu::SendKeyDown(_) => "key".to_string(),
+            Pdu::SendPaste(paste) => format!("paste:{}", paste.data),
+            Pdu::SendMouseEvent(_) => "mouse".to_string(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// A link that records what went on the wire and answers only when
+    /// the test says so.
+    #[derive(Default)]
+    struct RecordingLink {
+        wire: Mutex<Vec<String>>,
+        answers: Mutex<Vec<smol::channel::Sender<anyhow::Result<Pdu>>>>,
+        refuse: AtomicBool,
+    }
+
+    impl RecordingLink {
+        fn answer_everything(&self) {
+            for answer in self.answers.lock().drain(..) {
+                answer
+                    .try_send(Ok(Pdu::UnitResponse(UnitResponse {})))
+                    .unwrap();
+            }
+        }
+    }
+
+    impl InputLink for RecordingLink {
+        fn prepare(&self, _remote_tab_id: TabId) -> BoxFuture<'_, anyhow::Result<bool>> {
+            let allowed = !self.refuse.load(Ordering::SeqCst);
+            async move { Ok(allowed) }.boxed()
+        }
+
+        fn send(&self, pdu: Pdu) -> BoxFuture<'static, anyhow::Result<Pdu>> {
+            self.wire.lock().push(pdu_tag(&pdu));
+            let (tx, rx) = smol::channel::bounded(1);
+            self.answers.lock().push(tx);
+            async move {
+                rx.recv()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("the answer was dropped"))?
+            }
+            .boxed()
+        }
+    }
+
+    /// The scenario that was wrong: text from the input method is on the
+    /// wire and unanswered, more text arrives, then Enter. Enter must leave
+    /// after that text, and nothing may wait for the first answer.
     #[test]
-    fn a_full_write_queue_refuses_the_write_instead_of_dropping_it() {
-        let mut queue = super::WriteQueue::default();
-        let big = vec![b'x'; super::WRITE_QUEUE_LIMIT];
-        assert!(queue.push(&big).is_ok(), "the limit itself fits");
-        let refused = queue.push(b"y").expect_err("one more byte does not");
-        assert_eq!(refused.waiting, super::WRITE_QUEUE_LIMIT);
+    fn enter_leaves_behind_the_text_queued_before_it_without_waiting_for_an_answer() {
+        let link = Arc::new(RecordingLink::default());
+        let queue: Arc<Mutex<InputQueue>> = Default::default();
+        let tab = Arc::new(AtomicUsize::new(0));
+        let ex = smol::LocalExecutor::new();
+        let drain = || {
+            ex.spawn(drain_pane_inputs(
+                Arc::clone(&link),
+                7,
+                Arc::clone(&tab),
+                Arc::clone(&queue),
+            ))
+        };
+
+        assert!(queue.lock().push(bytes("ni")).unwrap());
+        let first = drain();
+        while ex.try_tick() {}
+        assert_eq!(*link.wire.lock(), ["bytes:ni"], "sent at once");
+        assert_eq!(queue.lock().in_flight, INPUT_ITEM_FLOOR, "and unanswered");
+        assert!(
+            !queue.lock().draining,
+            "an unanswered request does not hold the drain"
+        );
+
+        assert!(queue.lock().push(bytes("hao")).unwrap(), "a new drain starts");
+        assert!(!queue.lock().push(enter()).unwrap(), "and Enter rides along");
+        let second = drain();
+        while ex.try_tick() {}
         assert_eq!(
-            queue.take().map(|data| data.len()),
-            Some(super::WRITE_QUEUE_LIMIT),
-            "what was queued is intact; the refused byte is not in it"
+            *link.wire.lock(),
+            ["bytes:ni", "bytes:hao", "key"],
+            "Enter left after the text, while ni is still unanswered"
+        );
+        assert_eq!(queue.lock().in_flight, 3 * INPUT_ITEM_FLOOR);
+
+        link.answer_everything();
+        smol::block_on(ex.run(async {
+            first.await;
+            second.await;
+        }));
+        assert_eq!(queue.lock().in_flight, 0, "every answer settled its input");
+    }
+
+    #[test]
+    fn input_this_client_may_not_send_is_dropped_and_settled() {
+        let link = Arc::new(RecordingLink::default());
+        link.refuse.store(true, Ordering::SeqCst);
+        let queue: Arc<Mutex<InputQueue>> = Default::default();
+        assert!(queue.lock().push(enter()).unwrap());
+        let ex = smol::LocalExecutor::new();
+        smol::block_on(ex.run(drain_pane_inputs(
+            Arc::clone(&link),
+            7,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&queue),
+        )));
+        assert!(link.wire.lock().is_empty(), "nothing went");
+        let queue = queue.lock();
+        assert_eq!(queue.in_flight, 0, "and nothing is counted as waiting");
+        assert!(!queue.draining, "the drain is over");
+    }
+
+    #[test]
+    fn only_neighbours_of_the_same_kind_travel_together() {
+        let mut queue = InputQueue::default();
+        queue.push(bytes("a")).unwrap();
+        queue.push(bytes("b")).unwrap();
+        queue.push(enter()).unwrap();
+        queue.push(bytes("c")).unwrap();
+        queue
+            .push(mouse(MouseEventKind::Move, MouseButton::None, 1))
+            .unwrap();
+        queue
+            .push(mouse(MouseEventKind::Move, MouseButton::None, 2))
+            .unwrap();
+        queue.push(PaneInput::Paste("p".to_string())).unwrap();
+        queue
+            .push(mouse(MouseEventKind::Press, MouseButton::WheelDown(3), 0))
+            .unwrap();
+        queue
+            .push(mouse(MouseEventKind::Press, MouseButton::WheelDown(1), 0))
+            .unwrap();
+        assert_eq!(
+            queue.queued,
+            queue.pending.iter().map(PaneInput::weight).sum::<usize>(),
+            "folding keeps the account right"
+        );
+        let sent: Vec<String> = std::iter::from_fn(|| queue.take())
+            .map(|input| tag(&input))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                "bytes:ab",
+                "key",
+                "bytes:c",
+                "mouse:move@2",
+                "paste:p",
+                "mouse:wheeldown4"
+            ]
         );
     }
 
     #[test]
+    fn input_on_the_wire_counts_until_it_is_answered() {
+        let mut queue = InputQueue::default();
+        assert!(
+            queue
+                .push(PaneInput::Bytes(vec![b'x'; INPUT_QUEUE_LIMIT]))
+                .is_ok(),
+            "the limit itself fits"
+        );
+        let refused = queue.push(enter()).expect_err("a key on top of it does not");
+        assert_eq!(refused.waiting, INPUT_QUEUE_LIMIT);
+        assert_eq!(
+            queue.take().map(|input| input.weight()),
+            Some(INPUT_QUEUE_LIMIT),
+            "what was queued is intact; the refused key is not in it"
+        );
+        assert!(
+            queue.push(enter()).is_err(),
+            "on the wire and unanswered, it still counts"
+        );
+        queue.settle(INPUT_QUEUE_LIMIT);
+        assert!(queue.push(enter()).is_ok(), "answered, it makes room");
+    }
+
+    #[test]
     fn a_drain_that_ends_early_gives_the_queue_back() {
-        let queue = std::sync::Arc::new(parking_lot::Mutex::new(super::WriteQueue::default()));
-        assert!(queue.lock().push(b"a").unwrap());
-        {
-            let _draining = super::Draining(std::sync::Arc::clone(&queue));
-            // ...the task is dropped here without draining.
-        }
+        let queue: Arc<Mutex<InputQueue>> = Default::default();
+        assert!(queue.lock().push(bytes("a")).unwrap());
+        drop(InputDraining {
+            queue: Arc::clone(&queue),
+            done: false,
+        });
         assert!(!queue.lock().draining, "the slot is free again");
         assert_eq!(
-            queue.lock().take().as_deref(),
-            Some(&b"a"[..]),
-            "and the bytes are still waiting for the next drain"
+            tag(&queue.lock().take().unwrap()),
+            "bytes:a",
+            "and the bytes still wait for the next drain"
         );
+    }
+
+    #[test]
+    fn a_drain_that_reached_the_end_does_not_undo_the_next_one() {
+        let queue: Arc<Mutex<InputQueue>> = Default::default();
+        assert!(queue.lock().push(bytes("a")).unwrap());
+        assert!(queue.lock().take().is_some());
+        assert!(queue.lock().take().is_none(), "handed back under the lock");
+        assert!(
+            queue.lock().push(bytes("b")).unwrap(),
+            "the next push starts a new drain"
+        );
+        drop(InputDraining {
+            queue: Arc::clone(&queue),
+            done: true,
+        });
+        assert!(queue.lock().draining, "the finished drain's guard is disarmed");
     }
 }
