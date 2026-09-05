@@ -561,8 +561,6 @@ pub(crate) fn has_external_kitty_image_data_source(actions: &[Action]) -> bool {
     })
 }
 
-/// This function applies parsed actions to the pane and notifies any
-/// mux subscribers about the output event
 /// A pane whose parser holds the terminal for a long time, on request:
 /// `THINKTERM_WEDGE_PANE=<pane id>` in the server's environment makes that
 /// pane's parser take its terminal lock and keep it for
@@ -593,6 +591,8 @@ fn wedge_for_the_test(pane: &Arc<dyn Pane>) {
     log::warn!("THINKTERM_WEDGE_PANE: pane {wedged} released");
 }
 
+/// This function applies parsed actions to the pane and notifies any
+/// mux subscribers about the output event
 fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut actions: Vec<Action>) {
     let start = Instant::now();
     // External kitty payloads (a path or shm name) are read here, on the

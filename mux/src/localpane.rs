@@ -351,11 +351,8 @@ impl Pane for LocalPane {
     }
 
     fn get_cursor_position(&self) -> StableCursorPosition {
-        let mut cursor = terminal_get_cursor_position(&mut self.terminal.lock());
-        if self.tmux_domain.lock().is_some() {
-            cursor.visibility = termwiz::surface::CursorVisibility::Hidden;
-        }
-        cursor
+        let tmux = self.tmux_domain.lock().is_some();
+        PaneSummary::cursor_position_of(&mut self.terminal.lock(), tmux)
     }
 
     fn get_keyboard_encoding(&self) -> KeyboardEncoding {
@@ -382,21 +379,34 @@ impl Pane for LocalPane {
     }
 
     fn summary_without_waiting(&self) -> PaneSummary {
+        // The note before the snapshot: read the other way round, a
+        // parser applying the note in between would leave a snapshot
+        // from before the resize with no note to say so.
+        let resize_pending = *self.pending_resize.lock();
         let mut summary = match self.terminal.try_lock() {
             Some(mut term) => self.store_summary(&mut term),
             None => self.last_summary.lock().clone(),
         };
-        // A size the terminal has yet to take is the size the pane has:
-        // the pty has it, and whoever asked for it reads this next.
-        if let Some(size) = *self.pending_resize.lock() {
-            summary.dimensions.cols = size.cols;
-            summary.dimensions.viewport_rows = size.rows;
-            summary.dimensions.pixel_width = size.pixel_width;
-            summary.dimensions.pixel_height = size.pixel_height;
-            summary.dimensions.dpi = size.dpi;
-        }
+        // Noted alongside a coherent snapshot, never patched into it:
+        // that gave a screen no terminal ever showed, with a scrollback
+        // offset from before the reflow.
+        summary.resize_pending = resize_pending;
+        summary
+    }
+
+    fn listing_summary(&self) -> PaneSummary {
+        let mut summary = self.summary_without_waiting();
         self.spice_summary(&mut summary);
         summary
+    }
+
+    fn title_without_waiting(&self) -> String {
+        let mut title = match self.terminal.try_lock() {
+            Some(term) => term.get_title().to_string(),
+            None => self.last_summary.lock().title.clone(),
+        };
+        self.spice_title(&mut title);
+        title
     }
 
     fn get_changed_since(
@@ -636,9 +646,11 @@ impl Pane for LocalPane {
         // A resize that arrived after that last look, while the terminal
         // was still held here, found both of its own probes failing and
         // left its note; nothing else would read it until the next batch,
-        // which a quiet program may never write. Looked at once more with
-        // the terminal free, so one side or the other always applies it.
-        if self.pending_resize.lock().is_some() {
+        // which a quiet program may never write. Looked at again with the
+        // terminal free, for as long as notes keep arriving: one left
+        // after the last look is applied by the resize's own second
+        // probe, which finds the terminal free.
+        while self.pending_resize.lock().is_some() {
             let mut term = self.terminal.lock();
             self.apply_pending_resize(&mut term);
             self.store_summary(&mut term);
@@ -684,6 +696,7 @@ impl Pane for LocalPane {
             Some(mut term) => {
                 *self.pending_resize.lock() = None;
                 term.resize(size);
+                self.store_summary(&mut term);
             }
             None => {
                 *self.pending_resize.lock() = Some(size);
@@ -692,6 +705,7 @@ impl Pane for LocalPane {
                 // applies one left after it.
                 if let Some(mut term) = self.terminal.try_lock() {
                     self.apply_pending_resize(&mut term);
+                    self.store_summary(&mut term);
                 }
             }
         }
@@ -720,18 +734,8 @@ impl Pane for LocalPane {
     }
 
     fn get_title(&self) -> String {
-        let title = self.terminal.lock().get_title().to_string();
-        // If the title is the default pane title, then try to spice
-        // things up a bit by returning the process basename instead
-        if title == "thinkterm" {
-            if let Some(proc_name) = self.get_foreground_process_name(CachePolicy::AllowStale) {
-                let proc_name = std::path::Path::new(&proc_name);
-                if let Some(name) = proc_name.file_name() {
-                    return name.to_string_lossy().to_string();
-                }
-            }
-        }
-
+        let mut title = self.terminal.lock().get_title().to_string();
+        self.spice_title(&mut title);
         title
     }
 
@@ -760,14 +764,12 @@ impl Pane for LocalPane {
     }
 
     fn erase_scrollback(&self, erase_mode: ScrollbackEraseMode) {
+        let mut term = self.terminal.lock();
         match erase_mode {
-            ScrollbackEraseMode::ScrollbackOnly => {
-                self.terminal.lock().erase_scrollback();
-            }
-            ScrollbackEraseMode::ScrollbackAndViewport => {
-                self.terminal.lock().erase_scrollback_and_viewport();
-            }
+            ScrollbackEraseMode::ScrollbackOnly => term.erase_scrollback(),
+            ScrollbackEraseMode::ScrollbackAndViewport => term.erase_scrollback_and_viewport(),
         }
+        self.store_summary(&mut term);
     }
 
     fn focus_changed(&self, focused: bool) {
@@ -787,19 +789,13 @@ impl Pane for LocalPane {
     }
 
     fn is_alt_screen_active(&self) -> bool {
-        if self.tmux_domain.lock().is_some() {
-            false
-        } else {
-            self.terminal.lock().is_alt_screen_active()
-        }
+        let tmux = self.tmux_domain.lock().is_some();
+        PaneSummary::alt_screen_of(&self.terminal.lock(), tmux)
     }
 
     fn get_current_working_dir(&self, policy: CachePolicy) -> Option<Url> {
-        self.terminal
-            .lock()
-            .get_current_dir()
-            .cloned()
-            .or_else(|| self.divine_current_working_dir(policy))
+        let reported = self.terminal.lock().get_current_dir().cloned();
+        self.working_dir_or_divined(reported, policy)
     }
 
     fn tty_name(&self) -> Option<String> {
@@ -1314,7 +1310,7 @@ impl LocalPane {
             tmux_domain: None,
         }));
         terminal.set_notification_handler(Box::new(LocalPaneNotifHandler { pane_id }));
-        let last_summary = Mutex::new(raw_summary(&mut terminal, false));
+        let last_summary = Mutex::new(PaneSummary::from_terminal(&mut terminal, false));
 
         Self {
             pane_id,
@@ -1342,27 +1338,36 @@ impl LocalPane {
     /// nothing that needs a process lookup. `spice_summary` adds that at
     /// read time, so the parser thread never does it.
     fn store_summary(&self, term: &mut Terminal) -> PaneSummary {
-        let summary = raw_summary(term, self.tmux_domain.lock().is_some());
+        let summary = PaneSummary::from_terminal(term, self.tmux_domain.lock().is_some());
         *self.last_summary.lock() = summary.clone();
         summary
     }
 
     /// What `get_title` and `get_current_working_dir` add beyond the
-    /// terminal's own answer: the foreground process name for a pane that
-    /// never set a title, and a working directory divined from that
-    /// process when the shell reported none. Both come from the cached
-    /// process list, never from the terminal.
+    /// terminal's own answer, from the cached process list and never from
+    /// the terminal. `listing_summary` is the summary with these on.
     fn spice_summary(&self, summary: &mut PaneSummary) {
-        if summary.title == "thinkterm" {
-            if let Some(proc_name) = self.get_foreground_process_name(CachePolicy::AllowStale) {
-                if let Some(name) = std::path::Path::new(&proc_name).file_name() {
-                    summary.title = name.to_string_lossy().to_string();
-                }
+        self.spice_title(&mut summary.title);
+        summary.working_dir =
+            self.working_dir_or_divined(summary.working_dir.take(), CachePolicy::AllowStale);
+    }
+
+    /// A pane that never set a title is named after its foreground process.
+    fn spice_title(&self, title: &mut String) {
+        if title != "thinkterm" {
+            return;
+        }
+        if let Some(proc_name) = self.get_foreground_process_name(CachePolicy::AllowStale) {
+            if let Some(name) = std::path::Path::new(&proc_name).file_name() {
+                *title = name.to_string_lossy().to_string();
             }
         }
-        if summary.working_dir.is_none() {
-            summary.working_dir = self.divine_current_working_dir(CachePolicy::AllowStale);
-        }
+    }
+
+    /// The directory the shell reported, or the one divined from the
+    /// foreground process when it reported none.
+    fn working_dir_or_divined(&self, reported: Option<Url>, policy: CachePolicy) -> Option<Url> {
+        reported.or_else(|| self.divine_current_working_dir(policy))
     }
 
     /// Give the terminal a size the pty already has. Called with the
@@ -1503,23 +1508,6 @@ impl Drop for LocalPane {
     }
 }
 
-/// The summary straight from the terminal, under the guard the caller
-/// holds. `tmux` hides the cursor and the alternate screen the way the
-/// individual readers do for a pane that fronts a tmux control mode.
-fn raw_summary(term: &mut Terminal, tmux: bool) -> PaneSummary {
-    let mut cursor_position = terminal_get_cursor_position(term);
-    if tmux {
-        cursor_position.visibility = termwiz::surface::CursorVisibility::Hidden;
-    }
-    PaneSummary {
-        title: term.get_title().to_string(),
-        dimensions: terminal_get_dimensions(term),
-        cursor_position,
-        working_dir: term.get_current_dir().cloned(),
-        alt_screen: !tmux && term.is_alt_screen_active(),
-    }
-}
-
 #[cfg(test)]
 mod summary_tests {
     use super::*;
@@ -1615,6 +1603,13 @@ mod summary_tests {
         Arc<StdMutex<Vec<PtySize>>>,
         std::sync::mpsc::Sender<()>,
     ) {
+        // The waiter thread `LocalPane::new` starts hops to the main
+        // thread when the child exits; with no scheduler that is a panic
+        // that poisons promise's scheduler lock for every test after.
+        static SCHEDULER: std::sync::Once = std::sync::Once::new();
+        SCHEDULER.call_once(|| {
+            promise::spawn::SimpleExecutor::new();
+        });
         let (exit_tx, exit_rx) = std::sync::mpsc::channel();
         let sizes = Arc::new(StdMutex::new(vec![]));
         let terminal = Terminal::new(
@@ -1669,11 +1664,17 @@ mod summary_tests {
             vec![100, 120],
             "the pty took both at once"
         );
+        let summary = pane.summary_without_waiting();
         assert_eq!(
-            pane.summary_without_waiting().dimensions.cols,
-            120,
-            "the summary already says the size the pane has"
+            summary.resize_pending.map(|s| s.cols),
+            Some(120),
+            "the summary notes the size the pane has"
         );
+        assert_eq!(
+            summary.dimensions.cols, 80,
+            "next to a coherent snapshot of what the screen still shows"
+        );
+        assert_eq!(summary.terminal_size().cols, 120);
         assert_eq!(guard.get_size().cols, 80, "the terminal has neither yet");
         drop(guard);
         // The parser's next batch, empty as it may be.
@@ -1703,10 +1704,36 @@ mod summary_tests {
     }
 
     #[test]
-    fn a_resize_with_the_terminal_free_lands_at_once() {
+    fn a_resize_with_the_terminal_free_lands_at_once_and_refreshes_the_summary() {
         let (pane, _sizes, _exit) = pane();
         pane.resize(size(90, 20)).unwrap();
         assert_eq!(pane.get_dimensions().cols, 90);
         assert!(pane.pending_resize.lock().is_none());
+        let guard = pane.terminal.lock();
+        let summary = pane.summary_without_waiting();
+        assert_eq!(summary.dimensions.cols, 90, "the stored copy moved with it");
+        assert!(summary.resize_pending.is_none());
+        drop(guard);
+    }
+
+    #[test]
+    fn erasing_the_scrollback_refreshes_the_summary() {
+        let (pane, _sizes, _exit) = pane();
+        for _ in 0..40 {
+            pane.perform_actions(vec![
+                termwiz::escape::Action::Print('x'),
+                termwiz::escape::Action::Control(termwiz::escape::ControlCode::LineFeed),
+            ]);
+        }
+        let before = pane.get_dimensions().scrollback_rows;
+        pane.erase_scrollback(ScrollbackEraseMode::ScrollbackAndViewport);
+        let guard = pane.terminal.lock();
+        let summary = pane.summary_without_waiting();
+        assert!(summary.dimensions.scrollback_rows < before);
+        assert_eq!(
+            summary.dimensions.scrollback_rows,
+            guard.screen().physical_rows
+        );
+        drop(guard);
     }
 }

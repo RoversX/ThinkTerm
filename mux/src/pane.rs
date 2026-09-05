@@ -188,7 +188,8 @@ impl LogicalLine {
 /// The facts about a pane that a listing shows: what `Tab` reads for its
 /// pane tree and a mux server answers `ListPanes` with. Gathered under one
 /// guard where the pane has one, and kept where it can be handed out even
-/// while the pane's parser holds that guard.
+/// while the pane's parser holds that guard. Always one coherent snapshot
+/// of the terminal; a size the terminal has yet to take rides alongside.
 #[derive(Debug, Clone)]
 pub struct PaneSummary {
     pub title: String,
@@ -196,6 +197,53 @@ pub struct PaneSummary {
     pub cursor_position: StableCursorPosition,
     pub working_dir: Option<Url>,
     pub alt_screen: bool,
+    /// A size the pane's pty already has but its terminal does not yet,
+    /// because the parser held the terminal when the resize came. The
+    /// size the pane *has*; `dimensions` is what its screen still shows.
+    pub resize_pending: Option<TerminalSize>,
+}
+
+impl PaneSummary {
+    /// The snapshot straight from a terminal, under the guard the caller
+    /// holds. `tmux` hides the cursor and the alternate screen, as the
+    /// individual readers do for a pane fronting a tmux control mode.
+    pub fn from_terminal(term: &mut wezterm_term::Terminal, tmux: bool) -> Self {
+        Self {
+            title: term.get_title().to_string(),
+            dimensions: terminal_get_dimensions(term),
+            cursor_position: Self::cursor_position_of(term, tmux),
+            working_dir: term.get_current_dir().cloned(),
+            alt_screen: Self::alt_screen_of(term, tmux),
+            resize_pending: None,
+        }
+    }
+
+    pub fn cursor_position_of(
+        term: &mut wezterm_term::Terminal,
+        tmux: bool,
+    ) -> StableCursorPosition {
+        let mut cursor = terminal_get_cursor_position(term);
+        if tmux {
+            cursor.visibility = termwiz::surface::CursorVisibility::Hidden;
+        }
+        cursor
+    }
+
+    pub fn alt_screen_of(term: &wezterm_term::Terminal, tmux: bool) -> bool {
+        !tmux && term.is_alt_screen_active()
+    }
+
+    /// The size the pane has: the pending one when a resize is waiting
+    /// on the parser, otherwise the one its screen shows.
+    pub fn terminal_size(&self) -> TerminalSize {
+        self.resize_pending.unwrap_or(TerminalSize {
+            cols: self.dimensions.cols,
+            rows: self.dimensions.viewport_rows,
+            pixel_width: self.dimensions.pixel_width,
+            pixel_height: self.dimensions.pixel_height,
+            dpi: self.dimensions.dpi,
+        })
+    }
 }
 
 /// A Pane represents a view on a terminal
@@ -315,9 +363,10 @@ pub trait Pane: Downcast + Send + Sync {
         let _ = hold;
     }
 
-    /// What a listing shows of this pane, without waiting for its parser:
-    /// the facts as they are if they can be read now, otherwise as they
-    /// were last read. A pane with nothing to wait for reads them now.
+    /// The terminal's own facts about this pane, without waiting for its
+    /// parser: as they are if they can be read now, otherwise as they were
+    /// last read. Nothing here consults the process behind the pane. A
+    /// pane with nothing to wait for reads them now.
     fn summary_without_waiting(&self) -> PaneSummary {
         PaneSummary {
             title: self.get_title(),
@@ -325,7 +374,22 @@ pub trait Pane: Downcast + Send + Sync {
             cursor_position: self.get_cursor_position(),
             working_dir: self.get_current_working_dir(CachePolicy::AllowStale),
             alt_screen: self.is_alt_screen_active(),
+            resize_pending: None,
         }
+    }
+
+    /// `summary_without_waiting` with what a listing wants on top: the
+    /// title and working directory the way `get_title` and
+    /// `get_current_working_dir` would give them, process lookups
+    /// included. Costlier than the summary; not for a per-frame path.
+    fn listing_summary(&self) -> PaneSummary {
+        self.summary_without_waiting()
+    }
+
+    /// `get_title`, without waiting for the parser. For paths that paint
+    /// every frame and want nothing else.
+    fn title_without_waiting(&self) -> String {
+        self.summary_without_waiting().title
     }
 
     fn copy_user_vars(&self) -> HashMap<String, String> {

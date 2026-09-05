@@ -169,7 +169,7 @@ impl PaneStack {
             .enumerate()
             .map(|(idx, pane)| PaneStackTab {
                 pane_id: pane.pane_id(),
-                title: pane.summary_without_waiting().title,
+                title: pane.title_without_waiting(),
                 is_active: idx == active,
             })
             .collect()
@@ -343,7 +343,7 @@ fn pane_tree(
         // One read that does not wait for the pane's parser, in place of
         // five that each did: a listing must answer while one pane is
         // busy, and it is answered on the thread that serves every pane.
-        let summary = pane.summary_without_waiting();
+        let summary = pane.listing_summary();
         let dims = summary.dimensions;
 
         PaneEntry {
@@ -776,7 +776,9 @@ fn compute_tree_size_from_panes(node: &mut Tree, tab_cell: &TerminalSize) -> Opt
         Tree::Empty => None,
         Tree::Leaf(stack) => {
             let pane = stack.active_pane()?;
-            let dims = pane.summary_without_waiting().dimensions;
+            // The size the pane has, a pending one included: its pty
+            // already has that, and this derives what the tab asked for.
+            let dims = pane.summary_without_waiting().terminal_size();
             let cell_width = tab_cell.pixel_width;
             let cell_height = tab_cell.pixel_height;
             // Fall back to the pane's own counts when it cannot describe
@@ -790,7 +792,7 @@ fn compute_tree_size_from_panes(node: &mut Tree, tab_cell: &TerminalSize) -> Opt
             let rows = if cell_height > 0 && dims.pixel_height > 0 {
                 (dims.pixel_height / cell_height).max(1)
             } else {
-                dims.viewport_rows
+                dims.rows
             };
             let size = TerminalSize {
                 cols,
@@ -3155,14 +3157,7 @@ impl TabInner {
                 let stack = cursor.leaf_mut().unwrap();
                 if stack.contains_pane(base_pane_id) {
                     if let Some(base) = stack.active_pane() {
-                        let dims = base.summary_without_waiting().dimensions;
-                        pane.resize(TerminalSize {
-                            rows: dims.viewport_rows,
-                            cols: dims.cols,
-                            pixel_height: dims.pixel_height,
-                            pixel_width: dims.pixel_width,
-                            dpi: dims.dpi,
-                        })?;
+                        pane.resize(base.summary_without_waiting().terminal_size())?;
                     }
                     stack.push_and_activate(Arc::clone(&pane));
                     found = true;
@@ -3233,14 +3228,7 @@ impl TabInner {
                     if has_target {
                         target_found = true;
                         if let Some(active) = stack.active_pane() {
-                            let dims = active.summary_without_waiting().dimensions;
-                            target_dims = Some(TerminalSize {
-                                rows: dims.viewport_rows,
-                                cols: dims.cols,
-                                pixel_height: dims.pixel_height,
-                                pixel_width: dims.pixel_width,
-                                dpi: dims.dpi,
-                            });
+                            target_dims = Some(active.summary_without_waiting().terminal_size());
                         }
                     }
                     if has_src && has_target {
@@ -3292,14 +3280,9 @@ impl TabInner {
                         if let Some(base) =
                             stack.active_pane().filter(|_| !removed.is_remote_mirror())
                         {
-                            let dims = base.summary_without_waiting().dimensions;
-                            if let Err(err) = removed.resize(TerminalSize {
-                                rows: dims.viewport_rows,
-                                cols: dims.cols,
-                                pixel_height: dims.pixel_height,
-                                pixel_width: dims.pixel_width,
-                                dpi: dims.dpi,
-                            }) {
+                            if let Err(err) =
+                                removed.resize(base.summary_without_waiting().terminal_size())
+                            {
                                 log::error!(
                                     "move_pane_to_stack: resize after rebalance failed: {err:#}"
                                 );
@@ -3877,6 +3860,7 @@ mod test {
                 cursor_position: StableCursorPosition::default(),
                 working_dir: None,
                 alt_screen: false,
+                resize_pending: None,
             }
         }
     }

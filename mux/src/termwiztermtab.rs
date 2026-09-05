@@ -93,6 +93,9 @@ pub struct TermWizTerminalPane {
     dead: Mutex<bool>,
     writer: Mutex<Vec<u8>>,
     render_rx: FileDescriptor,
+    /// As `LocalPane::last_summary`: the render thread holds the terminal
+    /// for the whole of a batch, and the tab must not wait on it.
+    last_summary: Mutex<crate::pane::PaneSummary>,
 }
 
 impl TermWizTerminalPane {
@@ -105,22 +108,27 @@ impl TermWizTerminalPane {
     ) -> Self {
         let pane_id = alloc_pane_id();
 
-        let terminal = Mutex::new(wezterm_term::Terminal::new(
+        let mut terminal = wezterm_term::Terminal::new(
             size,
             term_config.unwrap_or_else(|| Arc::new(config::TermConfig::new())),
             "ThinkTerm",
             config::wezterm_version(),
             Box::new(Vec::new()), // FIXME: connect to something?
+        );
+        let last_summary = Mutex::new(crate::pane::PaneSummary::from_terminal(
+            &mut terminal,
+            false,
         ));
 
         Self {
             pane_id,
             domain_id,
-            terminal,
+            terminal: Mutex::new(terminal),
             writer: Mutex::new(Vec::new()),
             render_rx,
             input_tx,
             dead: Mutex::new(false),
+            last_summary,
         }
     }
 }
@@ -128,6 +136,17 @@ impl TermWizTerminalPane {
 impl Pane for TermWizTerminalPane {
     fn render_state_is_contended(&self) -> bool {
         self.terminal.try_lock().is_none()
+    }
+
+    fn summary_without_waiting(&self) -> crate::pane::PaneSummary {
+        match self.terminal.try_lock() {
+            Some(mut term) => {
+                let summary = crate::pane::PaneSummary::from_terminal(&mut term, false);
+                *self.last_summary.lock() = summary.clone();
+                summary
+            }
+            None => self.last_summary.lock().clone(),
+        }
     }
 
     fn pane_id(&self) -> PaneId {
@@ -274,7 +293,9 @@ impl Pane for TermWizTerminalPane {
                 crate::materialize_kitty_image_data_sources(&mut actions);
             }
         }
-        self.terminal.lock().perform_actions(actions)
+        let mut term = self.terminal.lock();
+        term.perform_actions(actions);
+        *self.last_summary.lock() = crate::pane::PaneSummary::from_terminal(&mut term, false);
     }
 
     fn kill(&self) {

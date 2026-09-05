@@ -120,6 +120,14 @@ enum PaneInput {
     EraseScrollback(ScrollbackEraseMode),
 }
 
+impl PaneInput {
+    /// Whether applying this needs the pane's terminal, and so a pane
+    /// that is free. Bytes for the pty do not.
+    fn needs_the_terminal(&self) -> bool {
+        !matches!(self, PaneInput::Write(_))
+    }
+}
+
 /// Input waiting in `PerPane::inputs`, with the reply its request is owed.
 struct QueuedInput {
     input: PaneInput,
@@ -426,7 +434,9 @@ async fn push_pane_changes_when_free(
         per_pane: Arc::clone(&per_pane),
         released: false,
     };
-    let Some(pane) = pane_when_free(pane_id, &sender, "this push").await? else {
+    let Some(pane) =
+        pane_when_free(pane_id, &sender, "this push", Some(PUSH_DEFERRAL_LIMIT)).await?
+    else {
         // Its next output will try again.
         return Ok(());
     };
@@ -440,19 +450,22 @@ async fn push_pane_changes_when_free(
 }
 
 /// The pane, once its render state can be read without waiting on its
-/// parser; None after `PUSH_DEFERRAL_LIMIT` of nothing but contention,
-/// with a warning naming `what` gave up. Every read of a pane on the main
-/// thread goes through here, so a pane wedged in its parser costs its own
-/// readers a wait and nobody else anything. The probe is a moment's
-/// glance, not a reservation; a pane that takes the lock back right after
-/// it still has to be waited for, once.
+/// parser. With a `limit`, None after that long of nothing but
+/// contention, with a warning naming `what` gave up; without one the wait
+/// is for as long as it takes, and the warning says so once. Every read
+/// of a pane on the main thread goes through here, so a pane wedged in
+/// its parser costs its own readers a wait and nobody else anything. The
+/// probe is a moment's glance, not a reservation; a pane that takes the
+/// lock back right after it still has to be waited for, once.
 async fn pane_when_free(
     pane_id: PaneId,
     sender: &PduSender,
     what: &str,
+    limit: Option<Duration>,
 ) -> anyhow::Result<Option<Arc<dyn Pane>>> {
     let mut delay = PUSH_RETRY_MIN;
     let started = Instant::now();
+    let mut warned = false;
     loop {
         if sender.is_closed() {
             anyhow::bail!("connection closed while pane {pane_id} was busy");
@@ -463,12 +476,21 @@ async fn pane_when_free(
         if !pane.render_state_is_contended() {
             return Ok(Some(pane));
         }
-        if started.elapsed() > PUSH_DEFERRAL_LIMIT {
-            log::warn!(
-                "pane {pane_id} has been busy for {:?}; giving up on {what}",
-                started.elapsed()
-            );
-            return Ok(None);
+        if started.elapsed() > limit.unwrap_or(PUSH_DEFERRAL_LIMIT) {
+            if limit.is_some() {
+                log::warn!(
+                    "pane {pane_id} has been busy for {:?}; giving up on {what}",
+                    started.elapsed()
+                );
+                return Ok(None);
+            }
+            if !warned {
+                warned = true;
+                log::warn!(
+                    "pane {pane_id} has been busy for {:?}; {what} waits for it",
+                    started.elapsed()
+                );
+            }
         }
         metrics::counter!("mux_server.push.deferred").increment(1);
         smol::Timer::after(delay).await;
@@ -488,10 +510,12 @@ async fn pane_when_free(
 /// a client's input in the order it sent it, which is what the shared
 /// main-thread queue used to guarantee.
 ///
-/// A pane busy past `PUSH_DEFERRAL_LIMIT` fails the piece in hand and
-/// everything queued behind it -- the client is told, rather than left
-/// with input that lands minutes later -- and the drain ends; the next
-/// input starts a fresh one.
+/// Input is never given up on: a keystroke that lands late is what the
+/// user typed, one that is thrown away is not, and only this pane waits.
+/// Bytes for the pty need no terminal at all -- kitty and win32 keys,
+/// composed text, `SendString`, `cli send-text` all arrive that way --
+/// and go to the pty as soon as they reach the head of the queue, so a
+/// Ctrl-C still reaches a program whose output is what wedged the pane.
 async fn drain_pane_inputs(
     pane_id: PaneId,
     sender: PduSender,
@@ -510,13 +534,17 @@ async fn drain_pane_inputs(
         let Some(item) = drain.next() else {
             return;
         };
-        let pane = match pane_when_free(pane_id, &sender, "its input").await {
-            Ok(Some(pane)) => pane,
-            Ok(None) => {
-                drain.why = "the pane stayed busy";
-                (item.respond)(Err(anyhow!("pane {pane_id} is busy")));
-                return;
-            }
+        let pane = if item.input.needs_the_terminal() {
+            pane_when_free(pane_id, &sender, "its input", None)
+                .await
+                .and_then(|pane| pane.ok_or_else(|| anyhow!("pane {pane_id} is busy")))
+        } else {
+            Mux::get()
+                .get_pane(pane_id)
+                .ok_or_else(|| anyhow!("no such pane {pane_id}"))
+        };
+        let pane = match pane {
+            Ok(pane) => pane,
             Err(err) => {
                 drain.why = "the pane or the connection went away";
                 (item.respond)(Err(err));
@@ -525,6 +553,9 @@ async fn drain_pane_inputs(
         };
         let result = apply_pane_input(&pane, &sender, &per_pane, &source, item.input);
         (item.respond)(result);
+        // A burst typed while the pane was busy is applied a piece per
+        // turn of the main thread, not all in one.
+        smol::future::yield_now().await;
     }
 }
 
@@ -588,6 +619,10 @@ fn apply_pane_input(
     let mux = Mux::get();
     let _identity = mux.with_identity(source.client_id.clone());
     if let PaneInput::EraseScrollback(erase_mode) = input {
+        // Checked when the request arrived; checked again now that the
+        // wait for the pane may have been long enough for the terminal
+        // to change hands.
+        require_registered_frontend_access(&mux, source.client_id.as_ref(), source.registration)?;
         pane.erase_scrollback(erase_mode);
         return Ok(Pdu::UnitResponse(UnitResponse {}));
     }
@@ -640,7 +675,17 @@ fn apply_pane_input(
         }
         PaneInput::Write(data) => {
             pane.writer().write_all(&data)?;
-            None
+            // The pane may be busy (see `PaneInput::needs_the_terminal`);
+            // its push is read once it is free, like any other.
+            if per_pane.lock().unwrap().claim_push() {
+                spawn_into_main_thread(push_pane_changes_when_free(
+                    pane.pane_id(),
+                    sender.clone(),
+                    Arc::clone(per_pane),
+                ))
+                .detach();
+            }
+            return Ok(Pdu::UnitResponse(UnitResponse {}));
         }
         PaneInput::EraseScrollback(_) => unreachable!("answered above"),
     };
@@ -1352,8 +1397,6 @@ impl SessionHandler {
                 );
             }
             Pdu::KillPane(KillPane { pane_id }) => {
-                let sender = self.to_write_tx.clone();
-                let per_pane = self.per_pane(pane_id);
                 spawn_into_main_thread(async move {
                     catch(
                         move || {
@@ -1362,16 +1405,9 @@ impl SessionHandler {
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
                             pane.kill();
+                            // No push for a pane that is gone: PaneRemoved
+                            // tells the client everything it needs.
                             mux.remove_pane(pane_id);
-                            // Like every push: read once the pane is free,
-                            // not here. It is gone by then, and the push
-                            // finds nothing to do.
-                            if per_pane.lock().unwrap().claim_push() {
-                                spawn_into_main_thread(push_pane_changes_when_free(
-                                    pane_id, sender, per_pane,
-                                ))
-                                .detach();
-                            }
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
                         send_response,
@@ -1400,8 +1436,13 @@ impl SessionHandler {
                 ) -> anyhow::Result<Pdu> {
                     // The search holds the terminal for its whole run, on
                     // the main thread: only once the pane is free.
-                    let Some(pane) =
-                        pane_when_free(pane_id, &sender, "a scrollback search").await?
+                    let Some(pane) = pane_when_free(
+                        pane_id,
+                        &sender,
+                        "a scrollback search",
+                        Some(PUSH_DEFERRAL_LIMIT),
+                    )
+                    .await?
                     else {
                         anyhow::bail!("pane {pane_id} is busy");
                     };
@@ -1917,7 +1958,14 @@ impl SessionHandler {
                     // Read once the pane can be read without waiting, like
                     // a push: the client asks again for rows it does not
                     // get, and the main thread has everyone else's work.
-                    let pane = match pane_when_free(pane_id, &sender, "a row fetch").await {
+                    let pane = match pane_when_free(
+                        pane_id,
+                        &sender,
+                        "a row fetch",
+                        Some(PUSH_DEFERRAL_LIMIT),
+                    )
+                    .await
+                    {
                         Ok(Some(pane)) => pane,
                         Ok(None) => {
                             send_response(Err(anyhow!("pane {pane_id} is busy")));
@@ -1973,7 +2021,14 @@ impl SessionHandler {
                     // be read without waiting.
                     let mut data = per_pane.lock().unwrap().sent_images.get(&data_hash);
                     let pane = if data.is_none() {
-                        match pane_when_free(pane_id, &sender, "an image fetch").await {
+                        match pane_when_free(
+                            pane_id,
+                            &sender,
+                            "an image fetch",
+                            Some(PUSH_DEFERRAL_LIMIT),
+                        )
+                        .await
+                        {
                             Ok(Some(pane)) => Some(pane),
                             Ok(None) => {
                                 send_response(Err(anyhow!("pane {pane_id} is busy")));
@@ -2686,6 +2741,16 @@ mod tests {
         assert!(!state.needs_application_palette(&palette));
 
         assert!(state.needs_application_palette(&None));
+    }
+
+    #[test]
+    fn only_bytes_for_the_pty_skip_the_wait_for_a_free_pane() {
+        assert!(!PaneInput::Write(vec![]).needs_the_terminal());
+        assert!(PaneInput::Paste(String::new()).needs_the_terminal());
+        assert!(PaneInput::EraseScrollback(
+            config::keyassignment::ScrollbackEraseMode::ScrollbackOnly
+        )
+        .needs_the_terminal());
     }
 
     /// Input for a pane waits in its queue in the order it was sent; a
