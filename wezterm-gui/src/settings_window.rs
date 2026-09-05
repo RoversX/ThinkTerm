@@ -722,6 +722,8 @@ enum SettingsAction {
     ToggleMainWindowFrameRestore,
     ToggleNotificationSounds,
     ToggleRemoteUpdateKeepsSessions,
+    /// The ⓘ after a label; hovering it shows the text under this i18n key.
+    Hint(&'static str),
     /// Turn one right-sidebar panel on or off.
     ToggleRightSidebarPanel(crate::termwindow::RightSidebarMode),
     ToggleAgentDetails(&'static str),
@@ -1225,6 +1227,9 @@ struct SettingsUiState {
     interaction: InteractionState<SettingsAction>,
     drag: Option<SettingsDrag>,
     open_dropdown: Option<SettingsDropdown>,
+    /// The ⓘ under the pointer this frame: its i18n key and where the icon
+    /// was painted, for the bubble the overlay pass draws.
+    hint: Option<(&'static str, f32, f32, f32)>,
     memory_monitoring: bool,
     memory_monitor_generation: u64,
     memory_snapshot: Option<MemorySnapshot>,
@@ -1281,6 +1286,7 @@ impl SettingsUiState {
             interaction: InteractionState::default(),
             drag: None,
             open_dropdown: None,
+            hint: None,
             memory_monitoring: false,
             memory_monitor_generation: 0,
             memory_snapshot: None,
@@ -2193,7 +2199,9 @@ impl SettingsWindow {
                             | WidgetKind::SidebarRow
                             | WidgetKind::PreviewControl,
                         ) => MouseCursor::Hand,
-                        Some(WidgetKind::ScrollArea) | None => MouseCursor::Arrow,
+                        Some(WidgetKind::ScrollArea | WidgetKind::Hint) | None => {
+                            MouseCursor::Arrow
+                        }
                     }));
                     window.invalidate();
                 }
@@ -3565,6 +3573,7 @@ impl SettingsWindow {
                     }
                 }
             }
+            SettingsAction::Hint(_) => {}
             SettingsAction::ToggleRemoteUpdateKeepsSessions => {
                 self.ui.open_dropdown = None;
                 let enabled = !self.native_settings.workspaces.remote_update_keeps_sessions;
@@ -5101,7 +5110,64 @@ impl SettingsWindow {
             self.content_scrollbar_visible(),
         )?;
         self.paint_open_dropdown_overlay(layers, x, max_width)?;
+        self.paint_hint_overlay(layers, x, max_width)?;
 
+        Ok(())
+    }
+
+    /// The bubble for the ⓘ under the pointer, painted after everything
+    /// else so it sits on top; nothing when no ⓘ is hovered.
+    fn paint_hint_overlay(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        content_x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        let Some((key, icon_x, icon_y, icon_size)) = self.ui.hint.take() else {
+            return Ok(());
+        };
+        let palette = self.palette();
+        let body_font = Rc::clone(&self.body_font);
+        let text = crate::i18n::tr(key);
+        let pad = self.ui_px(12.0);
+        let bubble_width = self.ui_px(380.0).min(max_width);
+        let lines = self.wrap_settings_text(&body_font, &text, bubble_width - pad * 2.0);
+        let line_step = self.metrics.cell_size.height as f32 + self.ui_px(4.0);
+        let height = pad * 2.0 + line_step * lines.len().max(1) as f32;
+        // Left-aligned with the icon and above it; below when the top of
+        // the content is too close.
+        let bubble_x = (icon_x - pad)
+            .min(content_x + max_width - bubble_width)
+            .max(content_x);
+        let gap = self.ui_px(8.0);
+        let bubble_y = if icon_y - gap - height >= self.ui_px(8.0) {
+            icon_y - gap - height
+        } else {
+            icon_y + icon_size + gap
+        };
+        self.draw_rounded_frame(
+            layers,
+            2,
+            bubble_x,
+            bubble_y,
+            bubble_width,
+            height,
+            palette.control_bg,
+            palette.control_border,
+            self.ui_px(10.0),
+        )?;
+        for (index, line) in lines.iter().enumerate() {
+            self.draw_text_on_layer(
+                layers,
+                2,
+                &body_font,
+                bubble_x + pad,
+                bubble_y + pad + line_step * index as f32,
+                line,
+                palette.text,
+                bubble_width - pad * 2.0,
+            )?;
+        }
         Ok(())
     }
 
@@ -7810,18 +7876,18 @@ impl SettingsWindow {
 
         // One choice: what updating a remote server does to its sessions.
         let toggle_card_y = card_y + card_height + gap;
-        let toggle_card_height = self.settings_card_height(1);
+        let toggle_card_height = self.compact_card_height(1);
         self.paint_group_card(layers, x, toggle_card_y, max_width, toggle_card_height)?;
-        self.paint_toggle_setting_row(
+        self.paint_toggle_setting_row_with_hint(
             layers,
             row_x,
-            toggle_card_y + self.settings_card_top_padding(),
+            toggle_card_y + self.ui_px(12.0),
             row_width,
+            self.compact_row_step(),
             &crate::i18n::tr("settings-remote-update-keep-sessions"),
-            &crate::i18n::tr("settings-remote-update-keep-sessions-description"),
+            "settings-remote-update-keep-sessions-description",
             self.native_settings.workspaces.remote_update_keeps_sessions,
             SettingsAction::ToggleRemoteUpdateKeepsSessions,
-            true,
         )?;
 
         // Under the facts: what an install would do here, or why this page
@@ -8220,6 +8286,87 @@ impl SettingsWindow {
         Ok(())
     }
 
+    /// A toggle row whose explanation lives behind an ⓘ after the label:
+    /// hovering the icon shows it in a bubble (`paint_hint_overlay`), so a
+    /// long one is neither cut short nor given a line of its own.
+    fn paint_toggle_setting_row_with_hint(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        band_height: f32,
+        label: &str,
+        hint_key: &'static str,
+        enabled: bool,
+        action: SettingsAction,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let control_width = Self::settings_control_width(width);
+        let control_x = x + width - control_width;
+        let control_height = self.ui_px(CONTROL_HEIGHT);
+        // `y` is the top of a single-line band; the switch and the label
+        // sit in its middle.
+        let control_y = y + ((band_height - control_height) / 2.0).max(0.0);
+        let cell_height = self.metrics.cell_size.height as f32;
+        let icon_size = self.ui_px(20.0);
+        let icon_gap = self.ui_px(8.0);
+        let text_width = (control_x - x - icon_size - icon_gap - 24.0).max(width * 0.45);
+        let control_rect = rect(control_x, control_y, control_width, control_height);
+        self.ui_context
+            .push(control_rect, WidgetKind::Button, action);
+        let hovered = self.ui.interaction.hovered == Some(action);
+        let pressed = self.ui.interaction.pressed == Some(action);
+
+        // One line, centred on the switch.
+        let label_y = control_y + (control_height - cell_height) / 2.0;
+        self.draw_text(layers, &ui_font, x, label_y, label, palette.text, text_width)?;
+        let shown = self.text_with_ellipsis(&ui_font, label, text_width);
+        let label_width = self.measure_text_width(&ui_font, &shown);
+
+        let icon_x = x + label_width + icon_gap;
+        let icon_y = label_y + (cell_height - icon_size) / 2.0;
+        let hint = SettingsAction::Hint(hint_key);
+        let reach = self.ui_px(6.0);
+        self.ui_context.push(
+            rect(
+                icon_x - reach,
+                icon_y - reach,
+                icon_size + reach * 2.0,
+                icon_size + reach * 2.0,
+            ),
+            WidgetKind::Hint,
+            hint,
+        );
+        let icon_hovered = self.ui.interaction.hovered == Some(hint);
+        self.draw_svg_icon(
+            layers,
+            SvgIcon::Info,
+            icon_x,
+            icon_y,
+            icon_size,
+            if icon_hovered {
+                palette.text
+            } else {
+                palette.muted_text
+            },
+        )?;
+        if icon_hovered {
+            self.ui.hint = Some((hint_key, icon_x, icon_y, icon_size));
+        }
+
+        self.paint_switch(
+            layers,
+            control_x + control_width - self.ui_px(SWITCH_WIDTH),
+            control_y + (control_height - self.ui_px(SWITCH_HEIGHT)) / 2.0,
+            enabled,
+            hovered,
+            pressed,
+        )?;
+        Ok(())
+    }
+
     fn paint_action_setting_row(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -8465,7 +8612,7 @@ impl SettingsWindow {
             height,
             palette.card_bg,
             palette.separator,
-            self.ui_px(28.0),
+            self.ui_px(34.0),
         )
     }
 

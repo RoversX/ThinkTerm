@@ -997,7 +997,19 @@ fn read_from_pane_pty(
             match poll(&mut pfd, None) {
                 Ok(_) => {}
                 Err(err) => {
-                    error!("read_pty poll failed: pane {} {:?}", pane_id, err);
+                    // EBADF: the pane closed its pty while this thread
+                    // waited on it, which is how a pane torn down during
+                    // startup ends; the read loop would have seen EOF.
+                    let pty_closed = matches!(
+                        &err,
+                        filedescriptor::Error::Poll(io) | filedescriptor::Error::Io(io)
+                            if io.raw_os_error() == Some(libc::EBADF)
+                    );
+                    if pty_closed {
+                        log::trace!("read_pty poll: pane {pane_id} pty closed");
+                    } else {
+                        error!("read_pty poll failed: pane {} {:?}", pane_id, err);
+                    }
                     break;
                 }
             }

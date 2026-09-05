@@ -16,6 +16,8 @@ pub(crate) enum WidgetKind {
     ResizeHandle,
     ScrollArea,
     PreviewControl,
+    /// An ⓘ that shows its text while hovered; not a click target.
+    Hint,
 }
 
 #[derive(Debug, Clone, Copy)]
