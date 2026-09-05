@@ -169,7 +169,7 @@ impl PaneStack {
             .enumerate()
             .map(|(idx, pane)| PaneStackTab {
                 pane_id: pane.pane_id(),
-                title: pane.get_title(),
+                title: pane.summary_without_waiting().title,
                 is_active: idx == active,
             })
             .collect()
@@ -340,18 +340,20 @@ fn pane_tree(
         left_col: usize,
         top_row: usize,
     ) -> PaneEntry {
-        let dims = pane.get_dimensions();
-        let working_dir = pane.get_current_working_dir(CachePolicy::AllowStale);
-        let cursor_pos = pane.get_cursor_position();
+        // One read that does not wait for the pane's parser, in place of
+        // five that each did: a listing must answer while one pane is
+        // busy, and it is answered on the thread that serves every pane.
+        let summary = pane.summary_without_waiting();
+        let dims = summary.dimensions;
 
         PaneEntry {
             window_id,
             tab_id,
             pane_id: pane.pane_id(),
-            title: pane.get_title(),
+            title: summary.title,
             is_active_pane: is_pane(pane, &active),
             is_zoomed_pane: is_pane(pane, &zoomed),
-            alt_screen: pane.is_alt_screen_active(),
+            alt_screen: summary.alt_screen,
             size: TerminalSize {
                 cols: dims.cols,
                 rows: dims.viewport_rows,
@@ -359,9 +361,9 @@ fn pane_tree(
                 pixel_width: dims.pixel_width,
                 dpi: dims.dpi,
             },
-            working_dir: working_dir.map(Into::into),
+            working_dir: summary.working_dir.map(Into::into),
             workspace: workspace.to_string(),
-            cursor_pos,
+            cursor_pos: summary.cursor_position,
             physical_top: dims.physical_top,
             left_col,
             top_row,
@@ -774,7 +776,7 @@ fn compute_tree_size_from_panes(node: &mut Tree, tab_cell: &TerminalSize) -> Opt
         Tree::Empty => None,
         Tree::Leaf(stack) => {
             let pane = stack.active_pane()?;
-            let dims = pane.get_dimensions();
+            let dims = pane.summary_without_waiting().dimensions;
             let cell_width = tab_cell.pixel_width;
             let cell_height = tab_cell.pixel_height;
             // Fall back to the pane's own counts when it cannot describe
@@ -3153,7 +3155,7 @@ impl TabInner {
                 let stack = cursor.leaf_mut().unwrap();
                 if stack.contains_pane(base_pane_id) {
                     if let Some(base) = stack.active_pane() {
-                        let dims = base.get_dimensions();
+                        let dims = base.summary_without_waiting().dimensions;
                         pane.resize(TerminalSize {
                             rows: dims.viewport_rows,
                             cols: dims.cols,
@@ -3231,7 +3233,7 @@ impl TabInner {
                     if has_target {
                         target_found = true;
                         if let Some(active) = stack.active_pane() {
-                            let dims = active.get_dimensions();
+                            let dims = active.summary_without_waiting().dimensions;
                             target_dims = Some(TerminalSize {
                                 rows: dims.viewport_rows,
                                 cols: dims.cols,
@@ -3290,7 +3292,7 @@ impl TabInner {
                         if let Some(base) =
                             stack.active_pane().filter(|_| !removed.is_remote_mirror())
                         {
-                            let dims = base.get_dimensions();
+                            let dims = base.summary_without_waiting().dimensions;
                             if let Err(err) = removed.resize(TerminalSize {
                                 rows: dims.viewport_rows,
                                 cols: dims.cols,
@@ -3713,6 +3715,9 @@ mod test {
         /// The most recent Pane::set_zoomed argument, so tests can assert
         /// which pane a zoom transition actually addressed.
         last_set_zoomed: Mutex<Option<bool>>,
+        /// How often the tab asked for the summary rather than the
+        /// individual readers.
+        summaries: std::sync::atomic::AtomicUsize,
     }
 
     impl FakePane {
@@ -3722,6 +3727,7 @@ mod test {
                 size: Mutex::new(size),
                 remote_mirror: false,
                 last_set_zoomed: Mutex::new(None),
+                summaries: Default::default(),
             })
         }
 
@@ -3731,8 +3737,16 @@ mod test {
                 size: Mutex::new(size),
                 remote_mirror: true,
                 last_set_zoomed: Mutex::new(None),
+                summaries: Default::default(),
             })
         }
+    }
+
+    fn summaries_read(pane: &Arc<dyn Pane>) -> usize {
+        pane.downcast_ref::<FakePane>()
+            .expect("test panes are FakePane")
+            .summaries
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn last_set_zoomed(pane: &Arc<dyn Pane>) -> Option<bool> {
@@ -3854,6 +3868,64 @@ mod test {
         fn get_current_working_dir(&self, _policy: CachePolicy) -> Option<Url> {
             None
         }
+        fn summary_without_waiting(&self) -> crate::pane::PaneSummary {
+            self.summaries
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::pane::PaneSummary {
+                title: format!("summary of {}", self.id),
+                dimensions: self.get_dimensions(),
+                cursor_position: StableCursorPosition::default(),
+                working_dir: None,
+                alt_screen: false,
+            }
+        }
+    }
+
+    /// The listing a `ListPanes` answers with is read through the one call
+    /// that does not wait for a pane's parser, once per pane.
+    #[test]
+    fn the_pane_tree_reads_each_pane_once_without_waiting() {
+        let size = test_size();
+        let tab = Tab::new(&size);
+        let first = FakePane::new(1, size);
+        tab.assign_pane(&first);
+        let second = FakePane::new(2, size);
+        tab.split_and_insert(0, SplitRequest::default(), Arc::clone(&second))
+            .unwrap();
+
+        // `codec_pane_tree` needs a window in the process-wide Mux to
+        // name; the tree builder under it is what reads the panes.
+        let inner = tab.inner.lock();
+        let tree = pane_tree(
+            inner.pane.as_ref().expect("the tab has a tree"),
+            inner.id,
+            0,
+            None,
+            None,
+            "workspace",
+            0,
+            0,
+        );
+        drop(inner);
+        assert_eq!(summaries_read(&first), 1);
+        assert_eq!(summaries_read(&second), 1);
+        fn titles(node: &PaneNode, out: &mut Vec<String>) {
+            match node {
+                PaneNode::Leaf(entry) => out.push(entry.title.clone()),
+                PaneNode::Stack(stack) => {
+                    out.extend(stack.panes.iter().map(|entry| entry.title.clone()))
+                }
+                PaneNode::Split { left, right, .. } => {
+                    titles(left, out);
+                    titles(right, out);
+                }
+                PaneNode::Empty => {}
+            }
+        }
+        let mut seen = vec![];
+        titles(&tree, &mut seen);
+        seen.sort();
+        assert_eq!(seen, vec!["summary of 1", "summary of 2"]);
     }
 
     #[test]

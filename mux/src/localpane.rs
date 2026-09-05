@@ -1,7 +1,7 @@
 use crate::domain::DomainId;
 use crate::pane::{
-    CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, Pattern,
-    SearchResult, WithPaneLines,
+    CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, PaneSummary,
+    Pattern, SearchResult, WithPaneLines,
 };
 use crate::renderable::*;
 use crate::tmux::{TmuxDomain, TmuxDomainState};
@@ -311,6 +311,15 @@ pub struct LocalPane {
     #[cfg(unix)]
     leader: Arc<Mutex<Option<CachedLeaderInfo>>>,
     command_description: String,
+    /// The summary as of the last time the terminal could be read: what
+    /// `summary_without_waiting` hands out while the parser holds the
+    /// terminal. Refreshed by the parser after every batch, and by every
+    /// read that gets the lock.
+    last_summary: Mutex<PaneSummary>,
+    /// A size the pty already has but the terminal does not yet: `resize`
+    /// found the parser holding the terminal, and the parser applies it
+    /// around its next batch. Only ever the newest one.
+    pending_resize: Mutex<Option<TerminalSize>>,
 }
 
 #[async_trait(?Send)]
@@ -365,6 +374,24 @@ impl Pane for LocalPane {
         // The parser thread holds this for the whole of a batch of output;
         // a probe that fails is the batch still being applied.
         self.terminal.try_lock().is_none()
+    }
+
+    fn summary_without_waiting(&self) -> PaneSummary {
+        let mut summary = match self.terminal.try_lock() {
+            Some(mut term) => self.store_summary(&mut term),
+            None => self.last_summary.lock().clone(),
+        };
+        // A size the terminal has yet to take is the size the pane has:
+        // the pty has it, and whoever asked for it reads this next.
+        if let Some(size) = *self.pending_resize.lock() {
+            summary.dimensions.cols = size.cols;
+            summary.dimensions.viewport_rows = size.rows;
+            summary.dimensions.pixel_width = size.pixel_width;
+            summary.dimensions.pixel_height = size.pixel_height;
+            summary.dimensions.dpi = size.dpi;
+        }
+        self.spice_summary(&mut summary);
+        summary
     }
 
     fn get_changed_since(
@@ -595,7 +622,11 @@ impl Pane for LocalPane {
                 crate::materialize_kitty_image_data_sources(&mut actions);
             }
         }
-        self.terminal.lock().perform_actions(actions)
+        let mut term = self.terminal.lock();
+        self.apply_pending_resize(&mut term);
+        term.perform_actions(actions);
+        self.apply_pending_resize(&mut term);
+        self.store_summary(&mut term);
     }
 
     fn mouse_event(&self, event: MouseEvent) -> Result<(), Error> {
@@ -628,7 +659,26 @@ impl Pane for LocalPane {
             pixel_width: size.pixel_width.try_into()?,
             pixel_height: size.pixel_height.try_into()?,
         })?;
-        self.terminal.lock().resize(size);
+        // The pty has the size, so the program has its SIGWINCH. The
+        // terminal gets it now if its parser is not in the middle of a
+        // batch, and from the parser otherwise: a tab resize used to wait
+        // here for every pane's parser in turn, on the thread that serves
+        // every other pane and client.
+        match self.terminal.try_lock() {
+            Some(mut term) => {
+                *self.pending_resize.lock() = None;
+                term.resize(size);
+            }
+            None => {
+                *self.pending_resize.lock() = Some(size);
+                // The parser may have let go between the probe and the
+                // note; it applies a note left during its batch, and this
+                // applies one left after it.
+                if let Some(mut term) = self.terminal.try_lock() {
+                    self.apply_pending_resize(&mut term);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1248,6 +1298,7 @@ impl LocalPane {
             tmux_domain: None,
         }));
         terminal.set_notification_handler(Box::new(LocalPaneNotifHandler { pane_id }));
+        let last_summary = Mutex::new(raw_summary(&mut terminal, false));
 
         Self {
             pane_id,
@@ -1266,6 +1317,45 @@ impl LocalPane {
             #[cfg(unix)]
             leader: Arc::new(Mutex::new(None)),
             command_description,
+            last_summary,
+            pending_resize: Mutex::new(None),
+        }
+    }
+
+    /// The summary the way it is stored: straight from the terminal, with
+    /// nothing that needs a process lookup. `spice_summary` adds that at
+    /// read time, so the parser thread never does it.
+    fn store_summary(&self, term: &mut Terminal) -> PaneSummary {
+        let summary = raw_summary(term, self.tmux_domain.lock().is_some());
+        *self.last_summary.lock() = summary.clone();
+        summary
+    }
+
+    /// What `get_title` and `get_current_working_dir` add beyond the
+    /// terminal's own answer: the foreground process name for a pane that
+    /// never set a title, and a working directory divined from that
+    /// process when the shell reported none. Both come from the cached
+    /// process list, never from the terminal.
+    fn spice_summary(&self, summary: &mut PaneSummary) {
+        if summary.title == "thinkterm" {
+            if let Some(proc_name) = self.get_foreground_process_name(CachePolicy::AllowStale) {
+                if let Some(name) = std::path::Path::new(&proc_name).file_name() {
+                    summary.title = name.to_string_lossy().to_string();
+                }
+            }
+        }
+        if summary.working_dir.is_none() {
+            summary.working_dir = self.divine_current_working_dir(CachePolicy::AllowStale);
+        }
+    }
+
+    /// Give the terminal a size the pty already has. Called with the
+    /// terminal lock held, before and after a batch of output: before, so
+    /// output written in answer to the resize is parsed at the new size;
+    /// after, for a resize that arrived during the batch.
+    fn apply_pending_resize(&self, term: &mut Terminal) {
+        if let Some(size) = self.pending_resize.lock().take() {
+            term.resize(size);
         }
     }
 
@@ -1390,5 +1480,197 @@ impl Drop for LocalPane {
         if let ProcessState::Running { signaller, .. } = &mut *self.process.lock() {
             let _ = signaller.kill();
         }
+    }
+}
+
+/// The summary straight from the terminal, under the guard the caller
+/// holds. `tmux` hides the cursor and the alternate screen the way the
+/// individual readers do for a pane that fronts a tmux control mode.
+fn raw_summary(term: &mut Terminal, tmux: bool) -> PaneSummary {
+    let mut cursor_position = terminal_get_cursor_position(term);
+    if tmux {
+        cursor_position.visibility = termwiz::surface::CursorVisibility::Hidden;
+    }
+    PaneSummary {
+        title: term.get_title().to_string(),
+        dimensions: terminal_get_dimensions(term),
+        cursor_position,
+        working_dir: term.get_current_dir().cloned(),
+        alt_screen: !tmux && term.is_alt_screen_active(),
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use portable_pty::PtySize;
+    use std::sync::Mutex as StdMutex;
+
+    /// A child that never exits, so the waiter thread `LocalPane::new`
+    /// spawns sits on it for the life of the test.
+    #[derive(Debug)]
+    struct SleepingChild(std::sync::mpsc::Receiver<()>);
+
+    impl ChildKiller for SleepingChild {
+        fn kill(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(NoKiller)
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoKiller;
+
+    impl ChildKiller for NoKiller {
+        fn kill(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(NoKiller)
+        }
+    }
+
+    impl Child for SleepingChild {
+        fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+            Ok(None)
+        }
+        fn wait(&mut self) -> IoResult<ExitStatus> {
+            let _ = self.0.recv();
+            Ok(ExitStatus::with_exit_code(0))
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    /// A pty that only remembers the sizes it was given.
+    struct RecordingPty(Arc<StdMutex<Vec<PtySize>>>);
+
+    impl MasterPty for RecordingPty {
+        fn resize(&self, size: PtySize) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(size);
+            Ok(())
+        }
+        fn get_size(&self) -> anyhow::Result<PtySize> {
+            Ok(self.0.lock().unwrap().last().copied().unwrap_or_default())
+        }
+        fn try_clone_reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
+            anyhow::bail!("no reader")
+        }
+        fn take_writer(&self) -> anyhow::Result<Box<dyn Write + Send>> {
+            anyhow::bail!("no writer")
+        }
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            None
+        }
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+            None
+        }
+        #[cfg(unix)]
+        fn tty_name(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
+    fn size(cols: usize, rows: usize) -> TerminalSize {
+        TerminalSize {
+            cols,
+            rows,
+            pixel_width: cols * 8,
+            pixel_height: rows * 16,
+            dpi: 96,
+        }
+    }
+
+    fn pane() -> (
+        LocalPane,
+        Arc<StdMutex<Vec<PtySize>>>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let sizes = Arc::new(StdMutex::new(vec![]));
+        let terminal = Terminal::new(
+            size(80, 24),
+            Arc::new(config::TermConfig::new()),
+            "ThinkTerm",
+            "test",
+            Box::new(Vec::new()),
+        );
+        let pane = LocalPane::new(
+            1,
+            terminal,
+            Box::new(SleepingChild(exit_rx)),
+            Box::new(RecordingPty(Arc::clone(&sizes))),
+            Box::new(Vec::new()),
+            0,
+            "test".into(),
+        );
+        (pane, sizes, exit_tx)
+    }
+
+    #[test]
+    fn the_summary_is_answered_from_the_last_read_while_the_terminal_is_held() {
+        let (pane, _sizes, _exit) = pane();
+        let title_before = pane.summary_without_waiting().title;
+        // The parser thread, mid-batch.
+        let guard = pane.terminal.lock();
+        let started = Instant::now();
+        let summary = pane.summary_without_waiting();
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "answered without waiting for the lock"
+        );
+        assert_eq!(summary.title, title_before);
+        assert_eq!(summary.dimensions.cols, 80);
+        drop(guard);
+    }
+
+    #[test]
+    fn a_resize_while_the_terminal_is_held_reaches_the_pty_now_and_the_terminal_later() {
+        let (pane, sizes, _exit) = pane();
+        let guard = pane.terminal.lock();
+        pane.resize(size(100, 30)).unwrap();
+        pane.resize(size(120, 40)).unwrap();
+        assert_eq!(
+            sizes
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|s| s.cols)
+                .collect::<Vec<_>>(),
+            vec![100, 120],
+            "the pty took both at once"
+        );
+        assert_eq!(
+            pane.summary_without_waiting().dimensions.cols,
+            120,
+            "the summary already says the size the pane has"
+        );
+        assert_eq!(guard.get_size().cols, 80, "the terminal has neither yet");
+        drop(guard);
+        // The parser's next batch, empty as it may be.
+        pane.perform_actions(vec![]);
+        assert_eq!(
+            pane.get_dimensions().cols,
+            120,
+            "and only the newest one lands"
+        );
+        assert!(pane.pending_resize.lock().is_none());
+    }
+
+    #[test]
+    fn a_resize_with_the_terminal_free_lands_at_once() {
+        let (pane, _sizes, _exit) = pane();
+        pane.resize(size(90, 20)).unwrap();
+        assert_eq!(pane.get_dimensions().cols, 90);
+        assert!(pane.pending_resize.lock().is_none());
     }
 }

@@ -185,6 +185,19 @@ impl LogicalLine {
     }
 }
 
+/// The facts about a pane that a listing shows: what `Tab` reads for its
+/// pane tree and a mux server answers `ListPanes` with. Gathered under one
+/// guard where the pane has one, and kept where it can be handed out even
+/// while the pane's parser holds that guard.
+#[derive(Debug, Clone)]
+pub struct PaneSummary {
+    pub title: String,
+    pub dimensions: RenderableDimensions,
+    pub cursor_position: StableCursorPosition,
+    pub working_dir: Option<Url>,
+    pub alt_screen: bool,
+}
+
 /// A Pane represents a view on a terminal
 #[async_trait(?Send)]
 pub trait Pane: Downcast + Send + Sync {
@@ -293,6 +306,19 @@ pub trait Pane: Downcast + Send + Sync {
     /// no.
     fn render_state_is_contended(&self) -> bool {
         false
+    }
+
+    /// What a listing shows of this pane, without waiting for its parser:
+    /// the facts as they are if they can be read now, otherwise as they
+    /// were last read. A pane with nothing to wait for reads them now.
+    fn summary_without_waiting(&self) -> PaneSummary {
+        PaneSummary {
+            title: self.get_title(),
+            dimensions: self.get_dimensions(),
+            cursor_position: self.get_cursor_position(),
+            working_dir: self.get_current_working_dir(CachePolicy::AllowStale),
+            alt_screen: self.is_alt_screen_active(),
+        }
     }
 
     fn copy_user_vars(&self) -> HashMap<String, String> {

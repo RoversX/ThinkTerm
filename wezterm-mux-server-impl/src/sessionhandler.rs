@@ -1743,13 +1743,14 @@ impl SessionHandler {
                             let pane = mux
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-                            let cursor_position = pane.get_cursor_position();
-                            let dimensions = pane.get_dimensions();
+                            // Without waiting for the pane's parser: this
+                            // runs on the thread that serves every pane.
+                            let summary = pane.summary_without_waiting();
                             Ok(Pdu::GetPaneRenderableDimensionsResponse(
                                 GetPaneRenderableDimensionsResponse {
                                     pane_id,
-                                    cursor_position,
-                                    dimensions,
+                                    cursor_position: summary.cursor_position,
+                                    dimensions: summary.dimensions,
                                 },
                             ))
                         },
