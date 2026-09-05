@@ -987,7 +987,7 @@ impl RenderableInner {
 
             let result = match result {
                 Ok(result) => {
-                    let lines =
+                    let (lines, _) =
                         hydrate_lines(Arc::clone(&client), remote_pane_id, result.lines, true)
                             .await;
                     Ok(lines)
@@ -1217,17 +1217,20 @@ pub(crate) fn forget_images_for_domain(domain_id: DomainId) {
 /// nothing is asked of the server: images already held are attached, and
 /// rows whose pictures would have to be fetched are left out, so the row
 /// the cache already shows stays -- the previous frame rather than a
-/// blank. Used for a push that a newer push has already overtaken.
+/// blank. Used for a push that a newer push has already overtaken. The
+/// rows left out are returned with the lines: the caller has to see that
+/// something brings them, or they would stay as they were for good, since
+/// the push carried them as bonus rows and nothing marks those dirty.
 pub(crate) async fn hydrate_lines(
     client: Arc<ClientInner>,
     pane_id: PaneId,
     serialized_lines: SerializedLines,
     fetch_images: bool,
-) -> Vec<(StableRowIndex, Line)> {
+) -> (Vec<(StableRowIndex, Line)>, Vec<StableRowIndex>) {
     let (mut lines, image_cells) = serialized_lines.extract_data();
 
     if image_cells.is_empty() {
-        return lines;
+        return (lines, vec![]);
     }
 
     let mut requests = HashMap::new();
@@ -1268,6 +1271,7 @@ pub(crate) async fn hydrate_lines(
         }
     }
 
+    let mut left_out = vec![];
     if !fetch_images && !requests.is_empty() {
         let unfetched: std::collections::HashSet<StableRowIndex> = image_cells
             .iter()
@@ -1275,6 +1279,7 @@ pub(crate) async fn hydrate_lines(
             .map(|im| im.line_idx)
             .collect();
         lines.retain(|(idx, _)| !unfetched.contains(idx));
+        left_out = unfetched.into_iter().collect();
         requests.clear();
     }
 
@@ -1294,10 +1299,7 @@ pub(crate) async fn hydrate_lines(
 
     for ((asked_for, _, _), data) in asked.into_iter().zip(fetched) {
         let Some(data) = data else { continue };
-        IMAGE_LRU
-            .lock()
-            .unwrap()
-            .put((domain_id, data.hash()), Arc::clone(&data));
+        let data = file_image(domain_id, data);
         // Filed under the hash the cell named as well: the server may have
         // answered with the picture now in the cell, whose hash differs.
         data_by_hash.insert(asked_for, Arc::clone(&data));
@@ -1331,7 +1333,34 @@ pub(crate) async fn hydrate_lines(
         }
     }
 
-    line_by_idx.into_iter().collect()
+    (line_by_idx.into_iter().collect(), left_out)
+}
+
+/// File `data` under its hash and return the Arc to attach to cells. When
+/// a copy is already filed there, that copy is brought up to date from
+/// `data` and is the one returned: the glyph cache is keyed by hash and
+/// keeps the first Arc it met, so a second Arc under the same hash would
+/// leave the painter on the old one, blind to every frame that grows in
+/// the new. Two fetches can miss the same hash at once (a row fetch and a
+/// push both naming it), and a fetch answered with the picture now in the
+/// cell lands under a hash that may well be filed already.
+fn file_image(domain_id: DomainId, data: Arc<ImageData>) -> Arc<ImageData> {
+    let key = (domain_id, data.hash());
+    let existing = IMAGE_LRU.lock().unwrap().get(&key).cloned();
+    match existing {
+        Some(existing) if !Arc::ptr_eq(&existing, &data) => {
+            if !super::images::merge_into(&existing, &data, 0, data.generation()) {
+                // The copy holds more than the fetch brought, and is
+                // therefore at least as current as it.
+                existing.set_generation(existing.generation().max(data.generation()));
+            }
+            existing
+        }
+        _ => {
+            IMAGE_LRU.lock().unwrap().put(key, Arc::clone(&data));
+            data
+        }
+    }
 }
 
 /// Fetch the image `request` names and bring `held`, the copy already
@@ -1378,7 +1407,17 @@ async fn fetch_image(
                 if fresh.hash() != whole.data_hash {
                     // Not the picture asked for but the one now in the cell:
                     // a newer frame. Its own copy, never merged into the
-                    // one held for the old hash.
+                    // one held for the old hash. It is always sent whole;
+                    // a tail of it would be frames counted from a copy of
+                    // some other picture, and adopting it as the whole
+                    // would leave a truncated animation under its hash.
+                    if frames_from != 0 {
+                        log::warn!(
+                            "the server answered a fetch for one image with part of another; \
+                             ignoring it"
+                        );
+                        return None;
+                    }
                     fresh.set_generation(data_generation);
                     return Some(fresh);
                 }
@@ -1405,7 +1444,13 @@ async fn fetch_image(
                     response = client.client.get_image_cell(GetImageCell { ..whole }).await;
                     continue;
                 }
+                // The copy stays, and is marked as current as the server's:
+                // left at its old generation, every later push would find
+                // it behind and fetch the whole image again, for good.
                 log::debug!("the whole image did not fit the copy held either; keeping the copy");
+                if let Some(held) = &held {
+                    held.set_generation(data_generation);
+                }
                 return held;
             }
             Ok(GetImageCellResponse { data: None, .. }) => {
@@ -1662,6 +1707,49 @@ impl RenderableState {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// The glyph cache keys on the hash and keeps the first Arc it met:
+    /// a hash that is already filed keeps its Arc, brought up to date
+    /// from what was fetched, whatever the fetch brought.
+    #[test]
+    fn a_hash_already_filed_keeps_its_arc_and_grows_it() {
+        let hash = [77u8; 32];
+        let anim = |pixels: &[u8]| termwiz::image::ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: vec![std::time::Duration::from_millis(40); pixels.len()],
+            frames: pixels.iter().map(|p| vec![*p; 4]).collect(),
+            hashes: pixels.iter().map(|p| [*p; 32]).collect(),
+        };
+        let frames = |image: &ImageData| super::super::images::frame_count(&image.data());
+        let domain = usize::MAX - 7;
+
+        let first = Arc::new(ImageData::with_data_and_hash(anim(&[1, 2]), hash));
+        let filed = super::file_image(domain, Arc::clone(&first));
+        assert!(
+            Arc::ptr_eq(&filed, &first),
+            "nothing filed yet: this Arc is the one"
+        );
+
+        let longer = Arc::new(ImageData::with_data_and_hash(anim(&[1, 2, 3]), hash));
+        longer.set_generation(3);
+        let filed = super::file_image(domain, longer);
+        assert!(Arc::ptr_eq(&filed, &first), "the Arc already filed is kept");
+        assert_eq!(frames(&first), 3, "and holds what the fetch brought");
+        assert_eq!(first.generation(), 3);
+
+        let shorter = Arc::new(ImageData::with_data_and_hash(anim(&[1]), hash));
+        shorter.set_generation(7);
+        let filed = super::file_image(domain, shorter);
+        assert!(Arc::ptr_eq(&filed, &first));
+        assert_eq!(frames(&first), 3, "a copy never shrinks under the painter");
+        assert_eq!(
+            first.generation(),
+            7,
+            "but counts as current, or every push would fetch it again"
+        );
+        super::forget_images_for_domain(domain);
+    }
 
     fn line(width: usize) -> Line {
         Line::with_width(width, SEQ_ZERO)

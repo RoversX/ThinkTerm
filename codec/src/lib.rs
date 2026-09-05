@@ -1498,6 +1498,11 @@ pub struct SerializedLines {
 }
 
 impl SerializedLines {
+    /// The stable rows these lines are for.
+    pub fn rows(&self) -> impl Iterator<Item = StableRowIndex> + '_ {
+        self.lines.iter().map(|(row, _)| *row)
+    }
+
     /// Reconsitute hyperlinks or other attributes that were decomposed for
     /// serialization, and return the line data.
     pub fn extract_data(self) -> (Vec<(StableRowIndex, Line)>, Vec<SerializedImageCell>) {

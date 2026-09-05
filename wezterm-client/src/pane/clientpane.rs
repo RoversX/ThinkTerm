@@ -454,10 +454,15 @@ impl ClientPane {
         }
     }
 
+    /// Apply one push. With `carried` given, newer pushes wait behind this
+    /// one and it is applied without fetching pictures; a row it then has
+    /// to leave out is marked dirty unless one of those pushes brings it,
+    /// since the server sent it as a bonus row and nothing else would ever
+    /// fetch it again.
     async fn apply_render_delta(
         &self,
         mut delta: GetPaneRenderChangesResponse,
-        fetch_images: bool,
+        carried: Option<RowsCarried>,
     ) {
         *self.mouse_grabbed.lock() = delta.mouse_grabbed;
         *self.alt_screen.lock() = delta.alt_screen;
@@ -465,7 +470,15 @@ impl ClientPane {
 
         let bonus_lines = std::mem::take(&mut delta.bonus_lines);
         let client = { Arc::clone(&self.renderable.lock().inner.borrow().client) };
-        let bonus_lines = hydrate_lines(client, delta.pane_id, bonus_lines, fetch_images).await;
+        let (bonus_lines, left_out) =
+            hydrate_lines(client, delta.pane_id, bonus_lines, carried.is_none()).await;
+        if let Some(carried) = carried {
+            for row in left_out {
+                if !carried.contains(row) {
+                    delta.dirty_lines.push(row..row + 1);
+                }
+            }
+        }
 
         self.renderable
             .lock()
@@ -1417,6 +1430,20 @@ struct RenderDeltaQueue {
     draining: bool,
 }
 
+/// The rows named by the pushes still waiting in the queue: as bonus rows,
+/// or as dirty ranges the client will fetch on its own.
+#[derive(Default)]
+struct RowsCarried {
+    rows: std::collections::HashSet<StableRowIndex>,
+    ranges: Vec<Range<StableRowIndex>>,
+}
+
+impl RowsCarried {
+    fn contains(&self, row: StableRowIndex) -> bool {
+        self.rows.contains(&row) || self.ranges.iter().any(|range| range.contains(&row))
+    }
+}
+
 impl RenderDeltaQueue {
     /// Queue `delta`; true when the caller has to start the drain.
     fn push(&mut self, delta: GetPaneRenderChangesResponse) -> bool {
@@ -1424,16 +1451,25 @@ impl RenderDeltaQueue {
         !std::mem::replace(&mut self.draining, true)
     }
 
-    /// The next push to apply and whether another already waits behind it,
-    /// or None once the drain is over.
-    fn take(&mut self) -> Option<(GetPaneRenderChangesResponse, bool)> {
-        match self.pending.pop_front() {
-            Some(delta) => Some((delta, !self.pending.is_empty())),
+    /// The next push to apply, with the rows the pushes behind it carry
+    /// when there are any, or None once the drain is over.
+    fn take(&mut self) -> Option<(GetPaneRenderChangesResponse, Option<RowsCarried>)> {
+        let delta = match self.pending.pop_front() {
+            Some(delta) => delta,
             None => {
                 self.draining = false;
-                None
+                return None;
             }
+        };
+        if self.pending.is_empty() {
+            return Some((delta, None));
         }
+        let mut carried = RowsCarried::default();
+        for newer in &self.pending {
+            carried.rows.extend(newer.bonus_lines.rows());
+            carried.ranges.extend(newer.dirty_lines.iter().cloned());
+        }
+        Some((delta, Some(carried)))
     }
 }
 
@@ -1443,7 +1479,10 @@ struct DrainingDeltas(PaneId);
 
 impl Drop for DrainingDeltas {
     fn drop(&mut self) {
-        if let Some(pane) = Mux::get().get_pane(self.0) {
+        let Some(mux) = Mux::try_get() else {
+            return;
+        };
+        if let Some(pane) = mux.get_pane(self.0) {
             if let Some(pane) = pane.downcast_ref::<ClientPane>() {
                 pane.render_deltas.lock().draining = false;
             }
@@ -1460,18 +1499,19 @@ async fn drain_render_deltas(local_pane_id: PaneId) {
         let Some(pane) = pane.downcast_ref::<ClientPane>() else {
             return;
         };
-        let Some((delta, newer_waiting)) = pane.render_deltas.lock().take() else {
+        let Some((delta, carried)) = pane.render_deltas.lock().take() else {
             return;
         };
         // A push with a newer one already behind it is applied without
         // asking for pictures: the newer push names the current ones, and
         // rows whose pictures are missing keep showing the previous frame.
         let started = std::time::Instant::now();
-        pane.apply_render_delta(delta, !newer_waiting).await;
+        let fetched_pictures = carried.is_none();
+        pane.apply_render_delta(delta, carried).await;
         log::debug!(
             "render push for pane {local_pane_id} applied in {:?} (fetched pictures: {})",
             started.elapsed(),
-            !newer_waiting
+            fetched_pictures
         );
     }
 }
@@ -1976,16 +2016,60 @@ mod palette_delivery_tests {
         };
         assert!(queue.push(delta(1)), "the first push starts the drain");
         assert!(!queue.push(delta(2)), "the second rides along");
-        let (first, newer_waiting) = queue.take().unwrap();
+        let (first, carried) = queue.take().unwrap();
         assert_eq!(first.seqno, 1);
         assert!(
-            newer_waiting,
+            carried.is_some(),
             "so the first is applied without fetching pictures"
         );
-        let (second, newer_waiting) = queue.take().unwrap();
+        let (second, carried) = queue.take().unwrap();
         assert_eq!(second.seqno, 2);
-        assert!(!newer_waiting, "the latest one fetches");
+        assert!(carried.is_none(), "the latest one fetches");
         assert!(queue.take().is_none(), "and the drain ends");
+    }
+
+    /// A push applied without pictures leaves rows out; the rows the
+    /// pushes behind it name are the ones something else will bring.
+    #[test]
+    fn a_push_applied_without_pictures_knows_which_rows_the_newer_ones_carry() {
+        use termwiz::surface::Line;
+        let mut queue = super::RenderDeltaQueue::default();
+        let delta =
+            |seqno,
+             bonus: Vec<wezterm_term::StableRowIndex>,
+             dirty: Vec<std::ops::Range<wezterm_term::StableRowIndex>>| {
+                codec::GetPaneRenderChangesResponse {
+                    pane_id: 1,
+                    mouse_grabbed: false,
+                    alt_screen: false,
+                    keyboard_encoding: Default::default(),
+                    cursor_position: Default::default(),
+                    dimensions: Default::default(),
+                    dirty_lines: dirty,
+                    title: String::new(),
+                    working_dir: None,
+                    bonus_lines: bonus
+                        .into_iter()
+                        .map(|row| (row, Line::with_width(1, 0)))
+                        .collect::<Vec<_>>()
+                        .into(),
+                    input_serial: None,
+                    seqno,
+                }
+            };
+        queue.push(delta(1, vec![3, 4], vec![]));
+        queue.push(delta(2, vec![4], vec![10..12]));
+        queue.push(delta(3, vec![7], vec![]));
+        let (_, carried) = queue.take().unwrap();
+        let carried = carried.expect("two pushes wait behind the first");
+        assert!(carried.contains(4), "a bonus row of a later push");
+        assert!(carried.contains(7));
+        assert!(carried.contains(11), "a dirty row of a later push");
+        assert!(
+            !carried.contains(3),
+            "row 3 is only in the push being applied: left out, it must be marked dirty"
+        );
+        assert!(!carried.contains(12), "ranges are half-open");
     }
 
     #[test]
