@@ -96,9 +96,32 @@ impl SentImages {
         }
     }
 
-    /// The image behind `hash`, if it was sent recently.
+    /// The image behind `hash`, if it was sent recently. Its size is
+    /// measured again here: an animation grows behind its hash, and a
+    /// fetch is what every growth leads to (the generation moved, the
+    /// client asks for the frames it lacks), so this is where the total
+    /// catches up with it -- one lock per fetch, not one per cell per
+    /// push. Others go if the total is now over budget; never this one.
     pub fn get(&mut self, hash: &[u8; 32]) -> Option<Arc<ImageData>> {
-        self.cache.get(hash).map(|(image, _)| Arc::clone(image))
+        let (image, size) = self.cache.get_mut(hash)?;
+        let image = Arc::clone(image);
+        let now = image.len();
+        if now != *size {
+            self.bytes = self.bytes.saturating_sub(*size) + now;
+            *size = now;
+            while self.cache.len() > MIN_KEPT && self.bytes > self.max_bytes {
+                let Some((oldest, _)) = self.cache.peek_lru() else {
+                    break;
+                };
+                if oldest == hash {
+                    break;
+                }
+                if let Some((_, (_, size))) = self.cache.pop_lru() {
+                    self.bytes = self.bytes.saturating_sub(size);
+                }
+            }
+        }
+        Some(image)
     }
 }
 
@@ -287,6 +310,50 @@ mod tests {
         let (_, payload, from) = reply_for(&image, 1);
         assert!(Arc::ptr_eq(&payload, &image));
         assert_eq!(from, 0);
+    }
+
+    /// An animation grows behind its hash after it was measured; the
+    /// fetch that every growth leads to is where the total catches up.
+    #[test]
+    fn an_image_that_grew_is_measured_again_when_fetched() {
+        let mut sent = SentImages::with_limits(10, 30);
+        let grows = animation(&[1]);
+        let others: Vec<Arc<ImageData>> = (10..10 + MIN_KEPT as u8 + 1)
+            .map(|n| image(&[n; 4]))
+            .collect();
+        sent.insert(Arc::clone(&grows));
+        for other in &others {
+            sent.insert(Arc::clone(other));
+        }
+        assert_eq!(sent.bytes, 4 + 4 * others.len());
+        // Ten frames appended behind the mutex, as the terminal does.
+        if let ImageDataType::AnimRgba8 {
+            frames,
+            hashes,
+            durations,
+            ..
+        } = &mut *grows.data()
+        {
+            for n in 2..12u8 {
+                frames.push(vec![n; 4]);
+                hashes.push([n; 32]);
+                durations.push(std::time::Duration::from_millis(40));
+            }
+        }
+        assert!(sent.get(&grows.hash()).is_some());
+        assert_eq!(
+            sent.bytes,
+            44 + 4 * (MIN_KEPT - 1),
+            "measured again, and the oldest let go"
+        );
+        assert!(
+            sent.get(&others[0].hash()).is_none(),
+            "the least recently sent still went first"
+        );
+        assert!(
+            sent.get(&grows.hash()).is_some(),
+            "never the one being fetched"
+        );
     }
 
     #[test]

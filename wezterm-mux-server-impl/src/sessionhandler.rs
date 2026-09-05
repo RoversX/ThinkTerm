@@ -375,6 +375,31 @@ async fn push_pane_changes_when_free(
         per_pane: Arc::clone(&per_pane),
         released: false,
     };
+    let Some(pane) = pane_when_free(pane_id, &sender, "this push").await? else {
+        // Its next output will try again.
+        return Ok(());
+    };
+    // Released before the read, so output that lands during it
+    // schedules the next push rather than being carried by nobody.
+    slot.release();
+    let pushed_at = Instant::now();
+    let pushed = maybe_push_pane_changes(&pane, sender, per_pane);
+    metrics::histogram!("mux_server.push.latency").record(pushed_at.elapsed());
+    pushed
+}
+
+/// The pane, once its render state can be read without waiting on its
+/// parser; None after `PUSH_DEFERRAL_LIMIT` of nothing but contention,
+/// with a warning naming `what` gave up. Every read of a pane on the main
+/// thread goes through here, so a pane wedged in its parser costs its own
+/// readers a wait and nobody else anything. The probe is a moment's
+/// glance, not a reservation; a pane that takes the lock back right after
+/// it still has to be waited for, once.
+async fn pane_when_free(
+    pane_id: PaneId,
+    sender: &PduSender,
+    what: &str,
+) -> anyhow::Result<Option<Arc<dyn Pane>>> {
     let mut delay = PUSH_RETRY_MIN;
     let started = Instant::now();
     loop {
@@ -384,26 +409,19 @@ async fn push_pane_changes_when_free(
         let Some(pane) = Mux::get().get_pane(pane_id) else {
             anyhow::bail!("no such pane {pane_id}");
         };
-        if pane.render_state_is_contended() {
-            if started.elapsed() > PUSH_DEFERRAL_LIMIT {
-                log::warn!(
-                    "pane {pane_id} has been busy for {:?}; giving up on this push,                      its next output will try again",
-                    started.elapsed()
-                );
-                return Ok(());
-            }
-            metrics::counter!("mux_server.push.deferred").increment(1);
-            smol::Timer::after(delay).await;
-            delay = (delay * 2).min(PUSH_RETRY_MAX);
-            continue;
+        if !pane.render_state_is_contended() {
+            return Ok(Some(pane));
         }
-        // Released before the read, so output that lands during it
-        // schedules the next push rather than being carried by nobody.
-        slot.release();
-        let pushed_at = Instant::now();
-        let pushed = maybe_push_pane_changes(&pane, sender, per_pane);
-        metrics::histogram!("mux_server.push.latency").record(pushed_at.elapsed());
-        return pushed;
+        if started.elapsed() > PUSH_DEFERRAL_LIMIT {
+            log::warn!(
+                "pane {pane_id} has been busy for {:?}; giving up on {what}",
+                started.elapsed()
+            );
+            return Ok(None);
+        }
+        metrics::counter!("mux_server.push.deferred").increment(1);
+        smol::Timer::after(delay).await;
+        delay = (delay * 2).min(PUSH_RETRY_MAX);
     }
 }
 
@@ -1770,13 +1788,24 @@ impl SessionHandler {
 
             Pdu::GetLines(GetLines { pane_id, lines }) => {
                 let per_pane = self.per_pane(pane_id);
+                let sender = self.to_write_tx.clone();
                 spawn_into_main_thread(async move {
+                    // Read once the pane can be read without waiting, like
+                    // a push: the client asks again for rows it does not
+                    // get, and the main thread has everyone else's work.
+                    let pane = match pane_when_free(pane_id, &sender, "a row fetch").await {
+                        Ok(Some(pane)) => pane,
+                        Ok(None) => {
+                            send_response(Err(anyhow!("pane {pane_id} is busy")));
+                            return;
+                        }
+                        Err(err) => {
+                            send_response(Err(err));
+                            return;
+                        }
+                    };
                     catch(
                         move || {
-                            let mux = Mux::get();
-                            let pane = mux
-                                .get_pane(pane_id)
-                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
                             let mut lines_and_indices = vec![];
 
                             for range in lines {
@@ -1812,19 +1841,31 @@ impl SessionHandler {
                 have_frames,
             }) => {
                 let per_pane = self.per_pane(pane_id);
+                let sender = self.to_write_tx.clone();
                 spawn_into_main_thread(async move {
+                    // What was sent is answered from memory: the cell
+                    // named here may have moved on since. Only a miss
+                    // reads the pane, and then like a push: once it can
+                    // be read without waiting.
+                    let mut data = per_pane.lock().unwrap().sent_images.get(&data_hash);
+                    let pane = if data.is_none() {
+                        match pane_when_free(pane_id, &sender, "an image fetch").await {
+                            Ok(Some(pane)) => Some(pane),
+                            Ok(None) => {
+                                send_response(Err(anyhow!("pane {pane_id} is busy")));
+                                return;
+                            }
+                            Err(err) => {
+                                send_response(Err(err));
+                                return;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     catch(
                         move || {
-                            let mux = Mux::get();
-                            // What was sent is answered from memory: the
-                            // cell named here may have moved on since.
-                            let mut data = per_pane.lock().unwrap().sent_images.get(&data_hash);
-
-                            if data.is_none() {
-                                let pane = mux
-                                    .get_pane(pane_id)
-                                    .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
-
+                            if let Some(pane) = pane {
                                 // The row asked about, if it is still in the
                                 // buffer: a stable index that has scrolled
                                 // away comes back as some other row (the
