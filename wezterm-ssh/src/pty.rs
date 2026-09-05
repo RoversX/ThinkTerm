@@ -1,5 +1,5 @@
 use crate::session::{DeadSession, SessionRequest, SessionSender, SignalChannel};
-use crate::sessioninner::{ChannelId, ChannelInfo, DescriptorState};
+use crate::sessioninner::{ChannelId, ChannelInfo, DescriptorState, CHANNEL_BUFFER};
 use crate::sessionwrap::SessionWrap;
 use filedescriptor::{socketpair, FileDescriptor};
 use portable_pty::{ExitStatus, PtySize};
@@ -366,15 +366,15 @@ impl crate::sessioninner::SessionInner {
             descriptors: [
                 DescriptorState {
                     fd: Some(read_from_stdin),
-                    buf: VecDeque::with_capacity(8192),
+                    buf: VecDeque::with_capacity(CHANNEL_BUFFER),
                 },
                 DescriptorState {
                     fd: Some(write_to_stdout),
-                    buf: VecDeque::with_capacity(8192),
+                    buf: VecDeque::with_capacity(CHANNEL_BUFFER),
                 },
                 DescriptorState {
                     fd: Some(write_to_stderr),
-                    buf: VecDeque::with_capacity(8192),
+                    buf: VecDeque::with_capacity(CHANNEL_BUFFER),
                 },
             ],
         };

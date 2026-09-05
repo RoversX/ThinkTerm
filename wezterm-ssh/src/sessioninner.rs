@@ -31,7 +31,7 @@ pub(crate) struct DescriptorState {
 /// What one channel stream can hold on its way to or from the pipe. Each
 /// loop iteration moves at most this much per stream, so it bounds the
 /// throughput of a busy channel; 8 KiB made a mux client's output crawl.
-const CHANNEL_BUFFER: usize = 64 * 1024;
+pub(crate) const CHANNEL_BUFFER: usize = 64 * 1024;
 
 pub(crate) struct ChannelInfo {
     pub channel_id: ChannelId,
@@ -504,24 +504,32 @@ impl SessionInner {
                 return Ok(());
             }
 
-            // Reading from the session only pays off when every open stream
-            // has room for what may come: the packet waiting on the socket
-            // belongs to some stream, and libssh does not say which before
-            // it is read. With a full stream (the reader on the other side
-            // of its pipe is busy), a readable session socket woke poll at
-            // once, nothing could be done, and the loop was taken for a busy
-            // loop and sent to sleep for 50 milliseconds: one buffer per
-            // nap, a few hundred kilobytes a second, for as long as the
-            // reader lagged. Waiting on the pipe instead lets the next
-            // iteration run the moment it drains.
-            let every_stream_has_room = self.channels.values().all(|info| {
-                info.descriptors
-                    .iter()
-                    .skip(1)
-                    .filter(|state| state.fd.is_some())
-                    .all(|state| state.buf.len() < state.buf.capacity())
-            });
-            let session_events = if every_stream_has_room {
+            // Reading from the session only pays off while some open stream
+            // has room for what may come. With every stream full (the
+            // readers on the other side of their pipes are busy), a readable
+            // session socket woke poll at once, nothing could be done, and
+            // the loop was taken for a busy loop and sent to sleep for 50
+            // milliseconds: one buffer per nap, a few hundred kilobytes a
+            // second, for as long as the reader lagged. Waiting on the pipes
+            // instead lets the next iteration run the moment one drains.
+            //
+            // One full stream among several is no reason to stop reading:
+            // the session socket carries every channel, and a read made on
+            // behalf of a channel with room moves the other channels'
+            // packets into libssh's own buffers, where they wait until
+            // their stream drains; once its window is spent the far end
+            // stops sending on that channel alone. Not reading would have
+            // held every pane of an ssh domain behind its busiest one. With
+            // no channel at all the socket is read as it always was.
+            let some_stream_has_room = self.channels.is_empty()
+                || self.channels.values().any(|info| {
+                    info.descriptors
+                        .iter()
+                        .skip(1)
+                        .filter(|state| state.fd.is_some())
+                        .any(|state| state.buf.len() < state.buf.capacity())
+                });
+            let session_events = if some_stream_has_room {
                 sess.get_poll_flags()
             } else {
                 sess.get_poll_flags() & !POLLIN
@@ -638,12 +646,12 @@ impl SessionInner {
             } else if idle_wakes < 3 {
                 idle_wakes += 1;
             } else {
-                // Repeated immediate wakeups with no IO progress. The
-                // throttle below already caps this at ~20 iterations/sec,
-                // which is enough to keep CPU usage negligible; don't kill
-                // the session over it (protocol-only traffic such as
-                // keepalives can legitimately look like this), just make
-                // the condition visible in the logs.
+                // Repeated immediate wakeups with no IO progress. The nap
+                // below caps this at a couple of hundred iterations a
+                // second, which keeps CPU usage negligible; don't kill the
+                // session over it (protocol-only traffic such as keepalives
+                // can legitimately look like this), just make the condition
+                // visible in the logs.
                 let started = *busy_loop_started.get_or_insert_with(Instant::now);
                 let should_warn = match busy_loop_last_warn {
                     None => started.elapsed() >= busy_loop_warn_every,
