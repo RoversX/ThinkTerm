@@ -317,11 +317,12 @@ fi
 # ---- download and verify ---------------------------------------------------
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/thinkterm-install.XXXXXX")
-# Staged files all live next to their destination as .<name>.tmp, so the trap
-# can find them without a list that a prefix containing spaces would break.
+# Linux binaries are staged on the destination filesystem, in a directory
+# owned by this invocation. Never glob temporary files in the shared bin/.
+bin_stage=""
 cleanup() {
   rm -rf "$tmp"
-  rm -f "$bindir"/.*.tmp 2>/dev/null || true
+  [ -z "$bin_stage" ] || rm -rf "$bin_stage" 2>/dev/null || true
   [ -z "$app_dir" ] || rm -rf "$app_dir/.ThinkTerm.app.tmp" 2>/dev/null || true
   [ -z "$app_dir" ] || rm -rf "$app_dir/.ThinkTerm.app.old" 2>/dev/null || true
 }
@@ -491,10 +492,11 @@ else
   # existing install untouched, the rename is atomic so no reader ever sees
   # a half-written binary, and a running thinkterm-mux-server keeps its old
   # inode. Paths are not word-split into a list: a prefix may contain spaces.
+  bin_stage=$(mktemp -d "$bindir/.thinkterm-install.XXXXXX")
   for f in "$src_bin"/*; do
     name=$(basename "$f")
-    cp "$f" "$bindir/.$name.tmp"
-    chmod 755 "$bindir/.$name.tmp"
+    cp "$f" "$bin_stage/$name"
+    chmod 755 "$bin_stage/$name"
   done
 
   # The variants are mutually exclusive: same CLI, same mux server, and only
@@ -514,7 +516,7 @@ else
 
   for f in "$src_bin"/*; do
     name=$(basename "$f")
-    mv -f "$bindir/.$name.tmp" "$bindir/$name"
+    mv -f "$bin_stage/$name" "$bindir/$name"
     say "  $bindir/$name"
   done
 

@@ -296,10 +296,16 @@ pub fn is_newer_release(latest: &str, current: &str) -> bool {
 /// `~/.local/bin` goes on PATH first because a non-interactive ssh shell does
 /// not source the files that would add it, and the script's PATH reminder is
 /// aimed at a person reading a terminal.
+/// Download to a private temporary file first: a failed or partial download
+/// must never execute or look like a successful install to the restart UI.
 pub fn install_command(variant: &str, version: &str) -> String {
     format!(
-        "export PATH=\"$HOME/.local/bin:$PATH\"; \
-         curl -fsSL {INSTALL_SCRIPT_URL} | sh -s -- --{variant} --version {version}"
+        "(export PATH=\"$HOME/.local/bin:$PATH\"; \
+         installer=$(mktemp \"${{TMPDIR:-/tmp}}/thinkterm-update.XXXXXX\") || exit 1; \
+         trap 'rm -f \"$installer\"' EXIT; \
+         trap 'exit 130' INT; trap 'exit 143' TERM; \
+         curl -fsSL -o \"$installer\" {INSTALL_SCRIPT_URL} && \
+         sh \"$installer\" --{variant} --version {version})"
     )
 }
 
@@ -464,5 +470,37 @@ mod tests {
         let cmd = install_command("server", "0.2.0");
         assert!(cmd.contains("--server --version 0.2.0"), "{cmd}");
         assert!(cmd.contains(INSTALL_SCRIPT_URL), "{cmd}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_installer_requires_a_complete_download_and_preserves_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("executed");
+        for (download, expected_status, executed) in [
+            ("return 22;", 22, false),
+            (
+                r#"printf '%s\n' 'printf executed > "$THINKTERM_UPDATE_TEST_MARKER"; exit 7' > "$3"; return 22;"#,
+                22,
+                false,
+            ),
+            (
+                r#"printf '%s\n' 'printf executed > "$THINKTERM_UPDATE_TEST_MARKER"; exit 7' > "$3"; return 0;"#,
+                7,
+                true,
+            ),
+        ] {
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "curl() {{ {download} }}\n{}",
+                    install_command("server", "0.2.0")
+                ))
+                .env("THINKTERM_UPDATE_TEST_MARKER", &marker)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(expected_status));
+            assert_eq!(marker.exists(), executed);
+        }
     }
 }

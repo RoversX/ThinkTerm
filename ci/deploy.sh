@@ -490,9 +490,15 @@ EOF
             install -Dm644 assets/wezterm-nautilus.py $root/usr/share/nautilus-python/extensions/wezterm-nautilus.py
           fi
 
-          # dpkg-shlibdeps wants to run from the directory holding debian/.
+          # dpkg-shlibdeps reads source control information at debian/control,
+          # separately from the binary package's DEBIAN/control.
+          {
+            printf 'Source: thinkterm\nMaintainer: RoversX\n\n'
+            cat "$root/DEBIAN/control"
+          } > "$root/control"
           local deps
           deps=$(cd "pkg/$variant" && dpkg-shlibdeps -O -e debian/usr/bin/*)
+          rm "$root/control"
           echo $deps | sed -e 's/shlibs:Depends=/Depends: /' >> $root/DEBIAN/control
           cat $root/DEBIAN/control
 
