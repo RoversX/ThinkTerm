@@ -425,21 +425,32 @@ pub struct ThinkTermFrontendRecoveryTarget {
     pub tab_id: TabId,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct FrontendRecoveryBarrier {
     generation: u64,
     pending: HashMap<FrontendRecoverySlot, TabId>,
     /// When the barrier was armed, so the recovery log can say how long
     /// the frontend took to publish its geometry.
     started_at: Instant,
+    /// The reattach's hold on push-driven resyncs, kept until the frontend
+    /// has published the recovered geometry: a resync in between resized
+    /// the very tabs whose geometry the frontend was confirming, and the
+    /// confirmation was lost to the newer epoch. Its drop runs whatever
+    /// resync was deferred meanwhile.
+    _structure: Option<StructureMutationGuard>,
 }
 
 impl FrontendRecoveryBarrier {
-    fn new(generation: u64, pending: HashMap<FrontendRecoverySlot, TabId>) -> Self {
+    fn new(
+        generation: u64,
+        pending: HashMap<FrontendRecoverySlot, TabId>,
+        structure: Option<StructureMutationGuard>,
+    ) -> Self {
         Self {
             generation,
             pending,
             started_at: Instant::now(),
+            _structure: structure,
         }
     }
 }
@@ -899,21 +910,23 @@ pub struct ClientInner {
 
 /// RAII scope for a structure-mutating RPC; defers resyncs for its lifetime
 /// and schedules the catch-up resync when the last in-flight mutation ends.
+#[derive(Debug)]
 pub(crate) struct StructureMutationGuard {
-    inner: Arc<ClientInner>,
+    /// Weak, since a guard can live inside the inner it counts for (the
+    /// frontend recovery barrier holds one).
+    inner: std::sync::Weak<ClientInner>,
 }
 
 impl Drop for StructureMutationGuard {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
-        if self
-            .inner
-            .mutations_in_flight
-            .fetch_sub(1, Ordering::SeqCst)
-            == 1
-            && self.inner.resync_deferred.swap(false, Ordering::SeqCst)
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        if inner.mutations_in_flight.fetch_sub(1, Ordering::SeqCst) == 1
+            && inner.resync_deferred.swap(false, Ordering::SeqCst)
         {
-            let domain_id = self.inner.local_domain_id;
+            let domain_id = inner.local_domain_id;
             promise::spawn::spawn_into_main_thread(async move {
                 let Some(mux) = Mux::try_get() else {
                     return;
@@ -1533,7 +1546,7 @@ impl ClientInner {
         self.mutations_in_flight
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         StructureMutationGuard {
-            inner: Arc::clone(self),
+            inner: Arc::downgrade(self),
         }
     }
 
@@ -1552,10 +1565,11 @@ impl ClientInner {
         &self,
         generation: u64,
         targets: impl IntoIterator<Item = (FrontendRecoverySlot, TabId)>,
+        structure: Option<StructureMutationGuard>,
     ) {
         let pending = targets.into_iter().collect::<HashMap<_, _>>();
         *self.frontend_recovery_barrier.lock().unwrap() =
-            Some(FrontendRecoveryBarrier::new(generation, pending));
+            Some(FrontendRecoveryBarrier::new(generation, pending, structure));
     }
 
     fn ready_server_id(&self) -> Option<String> {
@@ -2302,8 +2316,10 @@ impl ClientDomain {
         // each used to run a resync that made a local window for every
         // remote window *before* this function rebound them into the
         // windows it had retained, and then this made its own set on top:
-        // duplicates nobody removed. Deferred, and run once at the end.
-        let _structure = inner.begin_structure_mutation();
+        // duplicates nobody removed. Deferred, and run once at the end --
+        // or, for a replaced server, once the frontend has confirmed the
+        // recovered geometry (the barrier takes the guard over).
+        let mut structure = Some(inner.begin_structure_mutation());
         let prior_server_id = inner.ready_server_id();
         let recovery_targets = inner.recovery_targets();
         inner.begin_remote_generation();
@@ -2569,7 +2585,11 @@ impl ClientDomain {
             let recovery_targets = frontend_targets
                 .iter()
                 .map(|target| (target.slot, target.tab_id));
-            inner.begin_frontend_recovery(connection_generation, recovery_targets);
+            inner.begin_frontend_recovery(
+                connection_generation,
+                recovery_targets,
+                structure.take(),
+            );
             if inner.client.connection_generation() != connection_generation {
                 discard_replacement_windows(&inner, &created_windows);
                 bail!("generation {connection_generation} was superseded during topology sync");
@@ -4410,6 +4430,7 @@ mod tests {
                 (FrontendRecoverySlot::Window(1), 41),
                 (FrontendRecoverySlot::Window(2), 42),
             ]),
+            None,
         ));
         assert_eq!(
             acknowledge_recovery_target(&mut barrier, FrontendRecoverySlot::Window(1), 41, 9, 9,),
@@ -4428,6 +4449,7 @@ mod tests {
         let mut barrier = Some(FrontendRecoveryBarrier::new(
             9,
             HashMap::from([(FrontendRecoverySlot::Primary, 41)]),
+            None,
         ));
         assert_eq!(
             acknowledge_recovery_target(&mut barrier, FrontendRecoverySlot::Primary, 42, 9, 9,),
