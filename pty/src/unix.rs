@@ -306,6 +306,24 @@ struct UnixMasterPty {
     tty_name: Option<PathBuf>,
 }
 
+/// A master pty this process did not open: the descriptor came from
+/// another process, a mux server handing its panes over. Ownership passes
+/// here and the descriptor closes with the pty. The tty name is the
+/// sender's to tell: `ttyname` on a master gives nothing useful, and
+/// `ptsname` is not thread-safe everywhere.
+pub fn master_from_raw_fd(
+    fd: std::os::fd::OwnedFd,
+    tty_name: Option<PathBuf>,
+) -> Result<Box<dyn MasterPty>, Error> {
+    let fd = FileDescriptor::new(fd);
+    cloexec(fd.as_raw_fd())?;
+    Ok(Box::new(UnixMasterPty {
+        fd: PtyFd(fd),
+        took_writer: RefCell::new(false),
+        tty_name,
+    }))
+}
+
 /// Represents the slave end of a pty.
 /// The file descriptor will be closed when the Pty is dropped.
 struct UnixSlavePty {

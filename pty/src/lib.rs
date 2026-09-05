@@ -290,6 +290,72 @@ impl Child for std::process::Child {
     }
 }
 
+/// A process this process did not spawn: the child of a mux server that
+/// handed its pane over. Only a parent can wait on a process, so its exit
+/// is noticed by asking the kernel whether the pid still exists, four
+/// times a second; the exit status is not knowable that way and reads as
+/// success. (A pid answers as long as it is a zombie, so whoever inherits
+/// the process -- init, or a subreaper -- has to reap it.)
+#[cfg(unix)]
+pub fn adopted_child(pid: u32) -> Box<dyn Child + Send + Sync> {
+    Box::new(AdoptedChild { pid })
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct AdoptedChild {
+    pid: u32,
+}
+
+#[cfg(unix)]
+impl AdoptedChild {
+    fn alive(&self) -> bool {
+        if unsafe { libc::kill(self.pid as libc::pid_t, 0) } == 0 {
+            return true;
+        }
+        // EPERM: it exists and is not ours to signal. ESRCH: gone.
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
+#[cfg(unix)]
+impl Child for AdoptedChild {
+    fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
+        Ok(if self.alive() {
+            None
+        } else {
+            Some(ExitStatus::with_exit_code(0))
+        })
+    }
+
+    fn wait(&mut self) -> IoResult<ExitStatus> {
+        while self.alive() {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        Ok(ExitStatus::with_exit_code(0))
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        Some(self.pid)
+    }
+}
+
+#[cfg(unix)]
+impl ChildKiller for AdoptedChild {
+    fn kill(&mut self) -> IoResult<()> {
+        ProcessSignaller {
+            pid: Some(self.pid),
+        }
+        .kill()
+    }
+
+    fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+        Box::new(ProcessSignaller {
+            pid: Some(self.pid),
+        })
+    }
+}
+
 #[derive(Debug)]
 struct ProcessSignaller {
     pid: Option<u32>,
@@ -405,3 +471,32 @@ pub fn native_pty_system() -> Box<dyn PtySystem + Send> {
 pub type NativePtySystem = unix::UnixPtySystem;
 #[cfg(windows)]
 pub type NativePtySystem = win::conpty::ConPtySystem;
+
+#[cfg(all(test, unix))]
+mod adopted_child_tests {
+    use super::*;
+
+    /// An adopted child is seen to exit once whoever is its parent reaps
+    /// it; until then it is alive, and a kill reaches it.
+    #[test]
+    fn an_adopted_child_is_waited_for_by_polling() {
+        let mut real = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("spawn sh");
+        let pid = real.id();
+        let mut adopted = adopted_child(pid);
+        assert_eq!(adopted.process_id(), Some(pid));
+        assert!(adopted.try_wait().unwrap().is_none(), "alive");
+
+        // The test process is the real parent; it reaps on a thread, as
+        // init would for a process whose parent went away.
+        let reaper = std::thread::spawn(move || real.wait());
+        adopted.kill().expect("SIGHUP");
+        let status = adopted.wait().expect("wait");
+        assert!(status.success(), "the status of an adopted process reads as success");
+        assert!(reaper.join().unwrap().is_ok());
+        assert!(adopted.try_wait().unwrap().is_some(), "gone");
+    }
+}

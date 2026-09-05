@@ -118,6 +118,13 @@ impl std::ops::DerefMut for UnixStream {
 
 pub struct UnixListener(ListenerImpl);
 
+#[cfg(unix)]
+impl FromRawFd for UnixListener {
+    unsafe fn from_raw_fd(fd: RawFd) -> UnixListener {
+        UnixListener(ListenerImpl::from_raw_fd(fd))
+    }
+}
+
 impl UnixListener {
     pub fn bind<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         Ok(Self(ListenerImpl::bind(path)?))
