@@ -407,6 +407,15 @@ fn drain_and_evaluate() {
             PENDING.lock().insert(pane_id);
             continue;
         }
+        // A pane whose parser holds its terminal is not read now: the
+        // evaluation reads the screen and the user variables through that
+        // lock, on the main thread, and one pane digesting a huge frame
+        // used to stall everything else on it for as long as the frame
+        // took. Left pending, the safety tick brings it back.
+        if pane.render_state_is_contended() {
+            PENDING.lock().insert(pane_id);
+            continue;
+        }
         LAST_EVAL.lock().insert(pane_id, now);
         if evaluate_pane(pane.as_ref()) {
             publish_change(pane_id);
@@ -807,6 +816,10 @@ mod tests {
 
     /// One dirty-pane step exactly as `drain_and_evaluate` performs it.
     fn drain_step(pane: &dyn Pane) {
+        if pane.render_state_is_contended() {
+            PENDING.lock().insert(pane.pane_id());
+            return;
+        }
         if evaluate_pane(pane) {
             publish_change(pane.pane_id());
         }
@@ -846,6 +859,8 @@ mod tests {
         /// then applies this content and bumps the seqno -- emulating
         /// output that lands while an evaluation is still running.
         swap_after_read: parking_lot::Mutex<Option<String>>,
+        /// The parser holds the terminal: reading the pane would wait.
+        contended: AtomicBool,
     }
 
     impl FakeAgentPane {
@@ -864,6 +879,7 @@ mod tests {
                 remote_mirror: false,
                 dead: AtomicBool::new(false),
                 swap_after_read: parking_lot::Mutex::new(None),
+                contended: AtomicBool::new(false),
             })
         }
 
@@ -1019,6 +1035,9 @@ mod tests {
         fn is_dead(&self) -> bool {
             self.dead.load(Ordering::SeqCst)
         }
+        fn render_state_is_contended(&self) -> bool {
+            self.contended.load(Ordering::SeqCst)
+        }
         fn palette(&self) -> ColorPalette {
             unimplemented!();
         }
@@ -1044,6 +1063,34 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
+    }
+
+    /// A pane whose parser holds its terminal is not read on the main
+    /// thread; it stays dirty and is read once the parser lets go.
+    #[test]
+    fn a_pane_whose_parser_holds_the_terminal_waits_for_the_next_round() {
+        let pane = FakeAgentPane::new(None);
+        pane.set_contract(&format!(
+            "v1;agent=soul;state=working;session=s-1;ts={}",
+            now_unix()
+        ));
+        pane.contended.store(true, Ordering::SeqCst);
+        drain_step(pane.as_ref() as &dyn Pane);
+        assert!(
+            status_for_pane(pane.pane_id()).is_none(),
+            "nothing was read through the held lock"
+        );
+        assert!(
+            PENDING.lock().remove(&pane.pane_id()),
+            "and the pane stays dirty for the next round"
+        );
+        pane.contended.store(false, Ordering::SeqCst);
+        drain_step(pane.as_ref() as &dyn Pane);
+        assert_eq!(
+            status_for_pane(pane.pane_id()).expect("read once free").agent_id,
+            "soul"
+        );
+        evict_pane(pane.pane_id());
     }
 
     #[test]
