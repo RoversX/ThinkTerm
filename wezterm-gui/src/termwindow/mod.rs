@@ -2068,6 +2068,10 @@ pub struct TermWindow {
     /// stack member) keeps the watchdog latched forever and must not turn
     /// the heal into a warn-spamming resubscribe loop.
     watchdog_forced_repaints: u8,
+    /// Per pane, the presented generation at the last tick that found the
+    /// pane behind: painting that still moves between ticks is a busy pane,
+    /// not a lost frame.
+    watchdog_presented_seen: HashMap<PaneId, u64>,
     /// When the counter above last advanced. The watchdog can run in
     /// sub-second bursts (status updates queue up), so increments are
     /// paced to at most one per ~700ms to approximate "consecutive
@@ -3430,6 +3434,7 @@ impl TermWindow {
             mux_window_id_for_subscriptions: Arc::new(Mutex::new(mux_window_id)),
             pane_subscription_dead: RefCell::new(None),
             watchdog_forced_repaints: 0,
+            watchdog_presented_seen: HashMap::new(),
             watchdog_last_forced: None,
             fonts: Rc::clone(&fontconfig),
             render_metrics,
@@ -5064,8 +5069,8 @@ impl TermWindow {
                     return;
                 }
                 tw.unfocused_invalidate_due = None;
-                tw.unfocused_next_allowed = Instant::now()
-                    + Duration::from_millis(1000 / tw.config.unfocused_fps.max(1));
+                tw.unfocused_next_allowed =
+                    Instant::now() + Duration::from_millis(1000 / tw.config.unfocused_fps.max(1));
                 win.invalidate();
             })));
         })
@@ -7085,7 +7090,18 @@ impl TermWindow {
                 .get(&pane_id)
                 .map(|state| state.presented_output_generation)
                 .unwrap_or(0);
-            if pane_output_needs_repaint(current, presented) {
+            if !pane_output_needs_repaint(current, presented) {
+                self.watchdog_presented_seen.remove(&pane_id);
+            } else {
+                // A pane whose output arrives faster than it is presented
+                // is behind at every tick while painting perfectly well:
+                // a remote pane streaming pictures, say. Behind is a lost
+                // frame only when what was presented has not moved since
+                // the last tick that found the pane behind.
+                let seen = self.watchdog_presented_seen.insert(pane_id, presented);
+                if seen != Some(presented) {
+                    continue;
+                }
                 log::debug!(
                     "terminal render watchdog: window={} pane={pane_id} output generation \
                      {current} has not been presented (last={presented}); repainting",
@@ -7109,8 +7125,7 @@ impl TermWindow {
                     .is_none_or(|at| at.elapsed() >= Duration::from_millis(700));
                 if paced {
                     self.watchdog_last_forced = Some(Instant::now());
-                    self.watchdog_forced_repaints =
-                        self.watchdog_forced_repaints.saturating_add(1);
+                    self.watchdog_forced_repaints = self.watchdog_forced_repaints.saturating_add(1);
                     if self.watchdog_forced_repaints == 3 && self.occluded.is_none() {
                         log::warn!(
                             "terminal render watchdog: window={} forced 3 consecutive repaints; \
@@ -9071,11 +9086,7 @@ impl TermWindow {
                 thread_id,
             } => {
                 if let Some(window) = self.window.as_ref().cloned() {
-                    self.switch_space_to_thread(
-                        space_id.clone(),
-                        Some(thread_id.clone()),
-                        &window,
-                    );
+                    self.switch_space_to_thread(space_id.clone(), Some(thread_id.clone()), &window);
                 }
             }
             PromptInputLine(args) => self.show_prompt_input_line(args),
