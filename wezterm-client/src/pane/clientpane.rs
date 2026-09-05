@@ -1536,23 +1536,42 @@ struct WriteQueue {
     draining: bool,
 }
 
-/// What may wait for a stalled link before further writes are dropped
-/// with a warning: a paste, not a runaway.
+/// What may wait for a stalled link before further writes are refused:
+/// a paste, not a runaway.
 const WRITE_QUEUE_LIMIT: usize = 4 * 1024 * 1024;
 
+/// The write queue is full: the link has taken nothing for a while and
+/// `WRITE_QUEUE_LIMIT` bytes already wait for it.
+#[derive(Debug)]
+struct WriteQueueFull {
+    waiting: usize,
+}
+
+impl std::fmt::Display for WriteQueueFull {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            fmt,
+            "{} bytes are already waiting for the link to the remote pane",
+            self.waiting
+        )
+    }
+}
+
+impl std::error::Error for WriteQueueFull {}
+
 impl WriteQueue {
-    /// Queue `data`; true when the caller has to start the drain.
-    fn push(&mut self, data: &[u8]) -> bool {
+    /// Queue `data`; true when the caller has to start the drain. A full
+    /// queue refuses the bytes rather than dropping them and saying they
+    /// went: the caller is told, and what reaches the remote pane is
+    /// either all of a write or none of it.
+    fn push(&mut self, data: &[u8]) -> Result<bool, WriteQueueFull> {
         if self.pending.len() + data.len() > WRITE_QUEUE_LIMIT {
-            log::warn!(
-                "dropping {} bytes for a remote pane: {} bytes are already waiting for the link",
-                data.len(),
-                self.pending.len()
-            );
-        } else {
-            self.pending.extend_from_slice(data);
+            return Err(WriteQueueFull {
+                waiting: self.pending.len(),
+            });
         }
-        !std::mem::replace(&mut self.draining, true)
+        self.pending.extend_from_slice(data);
+        Ok(!std::mem::replace(&mut self.draining, true))
     }
 
     /// Everything queued so far, or None once the drain is over.
@@ -1620,7 +1639,11 @@ impl std::io::Write for PaneWriter {
         if self.client.remote_tab_input_is_blocked() {
             return Ok(data.len());
         }
-        if self.queue.lock().push(data) {
+        let start_drain = self.queue.lock().push(data).map_err(|full| {
+            log::warn!("refusing {} bytes for a remote pane: {full}", data.len());
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, full)
+        })?;
+        if start_drain {
             promise::spawn::spawn_into_main_thread(drain_pane_writes(
                 Arc::clone(&self.client),
                 self.remote_pane_id,
@@ -1983,9 +2006,9 @@ mod palette_delivery_tests {
     #[test]
     fn the_first_write_starts_the_drain_and_later_ones_ride_along() {
         let mut queue = super::WriteQueue::default();
-        assert!(queue.push(b"a"), "nothing draining: start one");
+        assert!(queue.push(b"a").unwrap(), "nothing draining: start one");
         assert!(
-            !queue.push(b"b"),
+            !queue.push(b"b").unwrap(),
             "a drain is running: it will pick this up"
         );
         assert_eq!(
@@ -1994,7 +2017,10 @@ mod palette_delivery_tests {
             "coalesced, in order"
         );
         assert!(queue.take().is_none(), "empty: the drain ends");
-        assert!(queue.push(b"c"), "and the next write starts a new one");
+        assert!(
+            queue.push(b"c").unwrap(),
+            "and the next write starts a new one"
+        );
     }
 
     #[test]
@@ -2073,9 +2099,23 @@ mod palette_delivery_tests {
     }
 
     #[test]
+    fn a_full_write_queue_refuses_the_write_instead_of_dropping_it() {
+        let mut queue = super::WriteQueue::default();
+        let big = vec![b'x'; super::WRITE_QUEUE_LIMIT];
+        assert!(queue.push(&big).is_ok(), "the limit itself fits");
+        let refused = queue.push(b"y").expect_err("one more byte does not");
+        assert_eq!(refused.waiting, super::WRITE_QUEUE_LIMIT);
+        assert_eq!(
+            queue.take().map(|data| data.len()),
+            Some(super::WRITE_QUEUE_LIMIT),
+            "what was queued is intact; the refused byte is not in it"
+        );
+    }
+
+    #[test]
     fn a_drain_that_ends_early_gives_the_queue_back() {
         let queue = std::sync::Arc::new(parking_lot::Mutex::new(super::WriteQueue::default()));
-        assert!(queue.lock().push(b"a"));
+        assert!(queue.lock().push(b"a").unwrap());
         {
             let _draining = super::Draining(std::sync::Arc::clone(&queue));
             // ...the task is dropped here without draining.
