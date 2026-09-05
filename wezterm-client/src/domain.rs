@@ -480,6 +480,38 @@ fn acknowledge_recovery_target(
 struct ServerReplacementMirrors {
     windows_by_workspace: HashMap<String, WindowId>,
     old_tabs: Vec<TabId>,
+    /// Local windows this attempt made for remote windows that had no
+    /// retained window to rebind into. An attempt that fails after this
+    /// point takes them back; the next attempt makes its own.
+    created_windows: Vec<WindowId>,
+}
+
+/// Take back the local windows one replacement attempt made, when the
+/// attempt fails after making them. Nobody else would: they hold tabs, so
+/// `prune_dead_windows` keeps them, and a reconnect that took three
+/// attempts ended with three copies of every window the retained ones did
+/// not cover. The panes in them mirror live panes on the current server,
+/// so the local windows go and the remote panes stay.
+fn discard_replacement_windows(inner: &ClientInner, windows: &[WindowId]) {
+    let mux = Mux::get();
+    for window_id in windows {
+        let tabs = match mux.get_window(*window_id) {
+            Some(window) => window.iter().cloned().collect::<Vec<_>>(),
+            None => continue,
+        };
+        for tab in tabs {
+            for pane in tab.iter_all_panes() {
+                if pane.domain_id() != inner.local_domain_id {
+                    continue;
+                }
+                if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                    client_pane.ignore_next_kill();
+                }
+            }
+        }
+        log::info!("discarding local window {window_id} made by a failed reattach attempt");
+        mux.kill_window(*window_id);
+    }
 }
 
 fn pane_node_workspace(node: &mux::tab::PaneNode) -> Option<&str> {
@@ -1252,6 +1284,7 @@ impl ClientInner {
         let mut mirrors = ServerReplacementMirrors {
             windows_by_workspace: self.pending_recovery_windows.lock().unwrap().clone(),
             old_tabs: Vec::new(),
+            created_windows: Vec::new(),
         };
         for window_id in local_windows {
             let Some(window) = mux.get_window(window_id) else {
@@ -2263,6 +2296,14 @@ impl ClientDomain {
         if inner.client.connection_generation() != connection_generation {
             bail!("generation {connection_generation} was superseded before reattach began");
         }
+        // Held for the whole reattach. The reader releases the pushes it
+        // buffered during registration the moment SetClientId is answered,
+        // and a replacement server sends plenty (its restore adds tabs);
+        // each used to run a resync that made a local window for every
+        // remote window *before* this function rebound them into the
+        // windows it had retained, and then this made its own set on top:
+        // duplicates nobody removed. Deferred, and run once at the end.
+        let _structure = inner.begin_structure_mutation();
         let prior_server_id = inner.ready_server_id();
         let recovery_targets = inner.recovery_targets();
         inner.begin_remote_generation();
@@ -2410,16 +2451,12 @@ impl ClientDomain {
             // the frontend's selected Thread and current size.
             replacement = Some(inner.prepare_server_replacement());
         }
-        Self::process_pane_list(
-            Arc::clone(&inner),
-            panes,
-            None,
-            true,
-            replacement
-                .as_mut()
-                .map(|state| &mut state.windows_by_workspace),
-        )?;
+        Self::process_pane_list(Arc::clone(&inner), panes, None, true, replacement.as_mut())?;
 
+        let created_windows = replacement
+            .as_ref()
+            .map(|state| state.created_windows.clone())
+            .unwrap_or_default();
         if let Some(replacement) = replacement {
             {
                 let _activity = mux::activity::Activity::new();
@@ -2521,6 +2558,7 @@ impl ClientDomain {
                 });
             }
             if frontend_targets.is_empty() {
+                discard_replacement_windows(&inner, &created_windows);
                 bail!(
                     "replacement mux restored no active frontend tab for generation {connection_generation}"
                 );
@@ -2533,6 +2571,7 @@ impl ClientDomain {
                 .map(|target| (target.slot, target.tab_id));
             inner.begin_frontend_recovery(connection_generation, recovery_targets);
             if inner.client.connection_generation() != connection_generation {
+                discard_replacement_windows(&inner, &created_windows);
                 bail!("generation {connection_generation} was superseded during topology sync");
             }
             // TabAddedToWindow is emitted while process_pane_list is still
@@ -3177,7 +3216,7 @@ impl ClientDomain {
         panes: ListPanesResponse,
         mut primary_window_id: Option<WindowId>,
         resend_palette: bool,
-        mut replacement_windows: Option<&mut HashMap<String, WindowId>>,
+        mut replacement: Option<&mut ServerReplacementMirrors>,
     ) -> anyhow::Result<()> {
         let mux = Mux::get();
         // A native/mux window can disappear while an attach or structural RPC
@@ -3372,9 +3411,11 @@ impl ClientDomain {
                 }
 
                 if let (Some(workspace_name), Some(replacements)) =
-                    (workspace.as_ref(), replacement_windows.as_deref_mut())
+                    (workspace.as_ref(), replacement.as_deref_mut())
                 {
-                    if let Some(local_window_id) = replacements.remove(workspace_name) {
+                    if let Some(local_window_id) =
+                        replacements.windows_by_workspace.remove(workspace_name)
+                    {
                         if mux.get_window(local_window_id).is_some() {
                             log::info!(
                                 "rebinding fresh remote window {} into local window {} for {}",
@@ -3434,6 +3475,9 @@ impl ClientDomain {
                     position,
                     Some(inner.local_domain_id),
                 );
+                if let Some(replacement) = replacement.as_deref_mut() {
+                    replacement.created_windows.push(*local_window_id);
+                }
                 inner.record_remote_to_local_window_mapping(remote_window_id, *local_window_id);
                 mux.add_tab_to_window(&tab, *local_window_id)?;
             }
