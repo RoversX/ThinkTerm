@@ -326,6 +326,13 @@ pub struct LocalPane {
     config: Mutex<Arc<dyn TerminalConfiguration>>,
     /// A configuration the terminal has yet to take, as `pending_resize`.
     pending_config: Mutex<Option<Arc<dyn TerminalConfiguration>>>,
+    /// A focus change the terminal has yet to hear of, as `pending_resize`:
+    /// focusing a pane is what a person does right before typing into it,
+    /// and the main thread must not wait on that pane's parser for it.
+    pending_focus: Mutex<Option<bool>>,
+    /// The progress the terminal last reported, for `get_progress` while
+    /// the parser holds the terminal.
+    last_progress: Mutex<Progress>,
 }
 
 #[async_trait(?Send)]
@@ -661,10 +668,9 @@ impl Pane for LocalPane {
         let mut term = self.terminal.lock();
         self.apply_pending_config(&mut term);
         self.apply_pending_resize(&mut term);
+        self.apply_pending_focus(&mut term);
         term.perform_actions(actions);
-        self.apply_pending_config(&mut term);
-        self.apply_pending_resize(&mut term);
-        self.store_summary(&mut term);
+        self.apply_pending_and_store(&mut term);
         drop(term);
         // A resize that arrived after that last look, while the terminal
         // was still held here, found both of its own probes failing and
@@ -673,11 +679,9 @@ impl Pane for LocalPane {
         // terminal free, for as long as notes keep arriving: one left
         // after the last look is applied by the resize's own second
         // probe, which finds the terminal free.
-        while self.pending_resize.lock().is_some() || self.pending_config.lock().is_some() {
+        while self.anything_pending() {
             let mut term = self.terminal.lock();
-            self.apply_pending_config(&mut term);
-            self.apply_pending_resize(&mut term);
-            self.store_summary(&mut term);
+            self.apply_pending_and_store(&mut term);
         }
     }
 
@@ -764,7 +768,15 @@ impl Pane for LocalPane {
     }
 
     fn get_progress(&self) -> Progress {
-        self.terminal.lock().get_progress()
+        // Read for every session snapshot, on the main thread.
+        match self.terminal.try_lock() {
+            Some(term) => {
+                let progress = term.get_progress();
+                *self.last_progress.lock() = progress.clone();
+                progress
+            }
+            None => self.last_progress.lock().clone(),
+        }
     }
 
     fn agent_osc_evidence(&self) -> wezterm_term::AgentOscEvidence {
@@ -797,7 +809,18 @@ impl Pane for LocalPane {
     }
 
     fn focus_changed(&self, focused: bool) {
-        self.terminal.lock().focus_changed(focused);
+        match self.terminal.try_lock() {
+            Some(mut term) => {
+                *self.pending_focus.lock() = None;
+                term.focus_changed(focused);
+            }
+            None => {
+                *self.pending_focus.lock() = Some(focused);
+                if let Some(mut term) = self.terminal.try_lock() {
+                    self.apply_pending_focus(&mut term);
+                }
+            }
+        }
     }
 
     fn has_unseen_output(&self) -> bool {
@@ -1358,7 +1381,34 @@ impl LocalPane {
             pending_resize: Mutex::new(None),
             config,
             pending_config: Mutex::new(None),
+            pending_focus: Mutex::new(None),
+            last_progress: Mutex::new(Progress::default()),
         }
+    }
+
+    /// Tell the terminal of a focus change `focus_changed` could not, with
+    /// the terminal lock held. See `apply_pending_resize`.
+    fn apply_pending_focus(&self, term: &mut Terminal) {
+        let pending = self.pending_focus.lock().take();
+        if let Some(focused) = pending {
+            term.focus_changed(focused);
+        }
+    }
+
+    /// Everything the terminal has yet to take, applied under the guard
+    /// the caller holds, and the stored copies refreshed from it.
+    fn apply_pending_and_store(&self, term: &mut Terminal) {
+        self.apply_pending_config(term);
+        self.apply_pending_resize(term);
+        self.apply_pending_focus(term);
+        self.store_summary(term);
+        *self.last_progress.lock() = term.get_progress();
+    }
+
+    fn anything_pending(&self) -> bool {
+        self.pending_resize.lock().is_some()
+            || self.pending_config.lock().is_some()
+            || self.pending_focus.lock().is_some()
     }
 
     /// Give the terminal a configuration `set_config` could not, with the
@@ -1764,6 +1814,26 @@ mod summary_tests {
         assert!(
             Arc::ptr_eq(&pane.terminal.lock().get_config(), &replacement),
             "and the terminal took it with the next batch"
+        );
+    }
+
+    /// Focusing a pane is what a person does right before typing into
+    /// it; with the parser holding the terminal the focus change waits
+    /// for the parser, not the other way round.
+    #[test]
+    fn a_focus_change_never_waits_for_the_parser() {
+        let (pane, _sizes, _exit) = pane();
+        let guard = pane.terminal.lock();
+        let started = Instant::now();
+        pane.focus_changed(true);
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert_eq!(*pane.pending_focus.lock(), Some(true));
+        let _ = pane.get_progress();
+        drop(guard);
+        pane.perform_actions(vec![]);
+        assert!(
+            pane.pending_focus.lock().is_none(),
+            "the parser passed it on"
         );
     }
 
