@@ -354,8 +354,8 @@ impl ImageDataType {
     /// minted by different processes (this GUI, every mux server) from
     /// colliding in the client- and GPU-side caches that mix all sources.
     fn nonce_key() -> [u8; 32] {
-        use std::sync::OnceLock;
         use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::OnceLock;
         static SALT: OnceLock<[u8; 16]> = OnceLock::new();
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let salt = SALT.get_or_init(|| {
@@ -739,7 +739,9 @@ impl ImageData {
             ImageDataType::EncodedFile(d) => d.len(),
             ImageDataType::EncodedLease(_) => 0,
             ImageDataType::Rgba8 { data, .. } => data.len(),
-            ImageDataType::AnimRgba8 { frames, .. } => frames.len() * frames[0].len(),
+            // An animation may have no frames at all: the tail sent to a
+            // client that already holds every frame is one such.
+            ImageDataType::AnimRgba8 { frames, .. } => frames.iter().map(Vec::len).sum(),
         }
     }
 
@@ -755,6 +757,26 @@ impl ImageData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_animation_with_no_frames_has_a_length_of_zero() {
+        let empty = ImageData::with_data(ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: vec![],
+            frames: vec![],
+            hashes: vec![],
+        });
+        assert_eq!(empty.len(), 0);
+        let two = ImageData::with_data(ImageDataType::AnimRgba8 {
+            width: 1,
+            height: 1,
+            durations: vec![Duration::from_millis(1); 2],
+            frames: vec![vec![0; 4], vec![1; 4]],
+            hashes: vec![[0; 32], [1; 32]],
+        });
+        assert_eq!(two.len(), 8);
+    }
 
     #[test]
     fn small_payloads_get_stable_content_hashes() {

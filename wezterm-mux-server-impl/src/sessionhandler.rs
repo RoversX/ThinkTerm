@@ -124,113 +124,199 @@ impl PerPane {
         self.last_sent_application_palette = Some(palette);
     }
 
-    fn compute_changes(
+    /// The pane as this connection last described it.
+    fn last_sent(&self) -> LastSent {
+        LastSent {
+            cursor_position: self.cursor_position,
+            title: self.title.clone(),
+            working_dir: self.working_dir.clone(),
+            dimensions: self.dimensions,
+            mouse_grabbed: self.mouse_grabbed,
+            alt_screen: self.alt_screen,
+            keyboard_encoding: self.keyboard_encoding,
+            seqno: self.seqno,
+        }
+    }
+
+    /// Record what `read_pane_changes` found, and build the push for it.
+    fn commit_changes(
         &mut self,
-        pane: &Arc<dyn Pane>,
-        force_with_input_serial: Option<InputSerial>,
-    ) -> Option<GetPaneRenderChangesResponse> {
-        let mut changed = false;
-        let mouse_grabbed = pane.is_mouse_grabbed();
-        if mouse_grabbed != self.mouse_grabbed {
-            changed = true;
-        }
-
-        let alt_screen = pane.is_alt_screen_active();
-        if alt_screen != self.alt_screen {
-            changed = true;
-        }
-
-        let keyboard_encoding: WireKeyboardEncoding = pane.get_keyboard_encoding().into();
-        if keyboard_encoding != self.keyboard_encoding {
-            changed = true;
-        }
-
-        let dims = pane.get_dimensions();
-        if dims != self.dimensions {
-            changed = true;
-        }
-
-        let cursor_position = pane.get_cursor_position();
-        if cursor_position != self.cursor_position {
-            changed = true;
-        }
-
-        let title = pane.get_title();
-        if title != self.title {
-            changed = true;
-        }
-
-        let working_dir = pane.get_current_working_dir(CachePolicy::AllowStale);
-        if working_dir != self.working_dir {
-            changed = true;
-        }
-
-        let old_seqno = self.seqno;
-        self.seqno = pane.get_current_seqno();
-        let mut all_dirty_lines = pane.get_changed_since(
-            0..dims.physical_top + dims.viewport_rows as StableRowIndex,
-            old_seqno,
-        );
-        if !all_dirty_lines.is_empty() {
-            changed = true;
-        }
-
-        if !changed && !force_with_input_serial.is_some() {
-            return None;
-        }
-
-        // Figure out what we're going to send as dirty lines vs bonus lines
-        let viewport_range =
-            dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex;
-
-        let (first_line, lines) = pane.get_lines(viewport_range);
-        let mut bonus_lines = lines
-            .into_iter()
-            .enumerate()
-            .filter_map(|(idx, mut line)| {
-                let stable_row = first_line + idx as StableRowIndex;
-                if all_dirty_lines.contains(stable_row) {
-                    all_dirty_lines.remove(stable_row);
-                    line.compress_for_scrollback();
-                    Some((stable_row, line))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
-        // Always send the cursor's row, as that tends to the busiest and we don't
-        // have a sequencing concept for our idea of the remote state.
-        let (cursor_line_idx, mut lines) = pane.get_lines(cursor_position.y..cursor_position.y + 1);
-        let mut cursor_line = lines.remove(0);
-        cursor_line.compress_for_scrollback();
-        bonus_lines.push((cursor_line_idx, cursor_line));
-
-        self.cursor_position = cursor_position;
-        self.title = title.clone();
-        self.working_dir = working_dir.clone();
-        self.dimensions = dims;
-        self.mouse_grabbed = mouse_grabbed;
-        self.alt_screen = alt_screen;
-        self.keyboard_encoding = keyboard_encoding;
-
-        self.sent_images.remember(&bonus_lines);
-        let bonus_lines = bonus_lines.into();
-        Some(GetPaneRenderChangesResponse {
-            pane_id: pane.pane_id(),
+        pane_id: PaneId,
+        reading: PaneReading,
+    ) -> GetPaneRenderChangesResponse {
+        let PaneReading {
             mouse_grabbed,
             alt_screen,
             keyboard_encoding,
-            dirty_lines: all_dirty_lines.iter().cloned().collect(),
-            dimensions: dims,
+            dimensions,
+            cursor_position,
+            title,
+            working_dir,
+            seqno,
+            dirty_lines,
+            bonus_lines,
+            input_serial,
+        } = reading;
+        self.cursor_position = cursor_position;
+        self.title = title.clone();
+        self.working_dir = working_dir.clone();
+        self.dimensions = dimensions;
+        self.mouse_grabbed = mouse_grabbed;
+        self.alt_screen = alt_screen;
+        self.keyboard_encoding = keyboard_encoding;
+        self.seqno = seqno;
+
+        self.sent_images.remember(&bonus_lines);
+        let bonus_lines = bonus_lines.into();
+        GetPaneRenderChangesResponse {
+            pane_id,
+            mouse_grabbed,
+            alt_screen,
+            keyboard_encoding,
+            dirty_lines: dirty_lines.iter().cloned().collect(),
+            dimensions,
             cursor_position,
             title,
             bonus_lines,
             working_dir: working_dir.map(Into::into),
-            input_serial: force_with_input_serial,
-            seqno: self.seqno,
-        })
+            input_serial,
+            seqno,
+        }
     }
+}
+
+/// The pane as a connection last described it: what a reading of the pane
+/// is held against. Copied out of `PerPane` so that the reading is made
+/// with no `PerPane` lock held. Reading the pane waits on its terminal
+/// lock, which its parser holds for a whole batch of output, and the
+/// connection's thread locks `PerPane` to schedule the pane's next push:
+/// with the lock held across the reading, that thread -- and every client
+/// it serves -- waited behind this one pane's parser, which is the wait
+/// the connection threads exist to avoid.
+#[derive(Clone)]
+struct LastSent {
+    cursor_position: StableCursorPosition,
+    title: String,
+    working_dir: Option<Url>,
+    dimensions: RenderableDimensions,
+    mouse_grabbed: bool,
+    alt_screen: bool,
+    keyboard_encoding: WireKeyboardEncoding,
+    seqno: SequenceNo,
+}
+
+/// What a reading of the pane found, for `PerPane::commit_changes`.
+struct PaneReading {
+    mouse_grabbed: bool,
+    alt_screen: bool,
+    keyboard_encoding: WireKeyboardEncoding,
+    dimensions: RenderableDimensions,
+    cursor_position: StableCursorPosition,
+    title: String,
+    working_dir: Option<Url>,
+    seqno: SequenceNo,
+    dirty_lines: rangeset::RangeSet<StableRowIndex>,
+    bonus_lines: Vec<(StableRowIndex, wezterm_term::Line)>,
+    input_serial: Option<InputSerial>,
+}
+
+/// Read `pane` against what was `last` sent: None when nothing changed and
+/// nothing forces a push. Takes the pane's terminal lock, several times;
+/// no `PerPane` lock may be held by the caller.
+fn read_pane_changes(
+    pane: &Arc<dyn Pane>,
+    last: &LastSent,
+    force_with_input_serial: Option<InputSerial>,
+) -> Option<PaneReading> {
+    let mut changed = false;
+    let mouse_grabbed = pane.is_mouse_grabbed();
+    if mouse_grabbed != last.mouse_grabbed {
+        changed = true;
+    }
+
+    let alt_screen = pane.is_alt_screen_active();
+    if alt_screen != last.alt_screen {
+        changed = true;
+    }
+
+    let keyboard_encoding: WireKeyboardEncoding = pane.get_keyboard_encoding().into();
+    if keyboard_encoding != last.keyboard_encoding {
+        changed = true;
+    }
+
+    let dims = pane.get_dimensions();
+    if dims != last.dimensions {
+        changed = true;
+    }
+
+    let cursor_position = pane.get_cursor_position();
+    if cursor_position != last.cursor_position {
+        changed = true;
+    }
+
+    let title = pane.get_title();
+    if title != last.title {
+        changed = true;
+    }
+
+    let working_dir = pane.get_current_working_dir(CachePolicy::AllowStale);
+    if working_dir != last.working_dir {
+        changed = true;
+    }
+
+    let seqno = pane.get_current_seqno();
+    let mut all_dirty_lines = pane.get_changed_since(
+        0..dims.physical_top + dims.viewport_rows as StableRowIndex,
+        last.seqno,
+    );
+    if !all_dirty_lines.is_empty() {
+        changed = true;
+    }
+
+    if !changed && !force_with_input_serial.is_some() {
+        return None;
+    }
+
+    // Figure out what we're going to send as dirty lines vs bonus lines
+    let viewport_range =
+        dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex;
+
+    let (first_line, lines) = pane.get_lines(viewport_range);
+    let mut bonus_lines = lines
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, mut line)| {
+            let stable_row = first_line + idx as StableRowIndex;
+            if all_dirty_lines.contains(stable_row) {
+                all_dirty_lines.remove(stable_row);
+                line.compress_for_scrollback();
+                Some((stable_row, line))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // Always send the cursor's row, as that tends to the busiest and we don't
+    // have a sequencing concept for our idea of the remote state.
+    let (cursor_line_idx, mut lines) = pane.get_lines(cursor_position.y..cursor_position.y + 1);
+    let mut cursor_line = lines.remove(0);
+    cursor_line.compress_for_scrollback();
+    bonus_lines.push((cursor_line_idx, cursor_line));
+
+    Some(PaneReading {
+        mouse_grabbed,
+        alt_screen,
+        keyboard_encoding,
+        dimensions: dims,
+        cursor_position,
+        title,
+        working_dir,
+        seqno,
+        dirty_lines: all_dirty_lines,
+        bonus_lines,
+        input_serial: force_with_input_serial,
+    })
 }
 
 /// How long a push waits for a busy pane before looking again: short at
@@ -321,19 +407,28 @@ async fn push_pane_changes_when_free(
     }
 }
 
+/// Read `pane` and push what changed. Nothing of the pane is read while
+/// `per_pane` is locked (see `LastSent`); this runs on the main thread,
+/// where every writer of a `PerPane`'s state runs, so what is read out of
+/// it and what is written back stay consistent.
 fn maybe_push_pane_changes(
     pane: &Arc<dyn Pane>,
     sender: PduSender,
     per_pane: Arc<Mutex<PerPane>>,
 ) -> anyhow::Result<()> {
-    let mut per_pane = per_pane.lock().unwrap();
-
     // Application palette provenance must arrive even when the state is
     // `None`: that explicit reset prevents a server's configured/advisory
     // palette from taking over client rendering. Send it before line changes
     // so a real application override is installed before those lines paint.
     let application_palette = pane.palette_override();
-    if per_pane.needs_application_palette(&application_palette) {
+    let (needs_palette, last) = {
+        let per_pane = per_pane.lock().unwrap();
+        (
+            per_pane.needs_application_palette(&application_palette),
+            per_pane.last_sent(),
+        )
+    };
+    if needs_palette {
         sender.send(DecodedPdu {
             pdu: Pdu::SetApplicationPalette(SetApplicationPalette {
                 pane_id: pane.pane_id(),
@@ -341,10 +436,16 @@ fn maybe_push_pane_changes(
             }),
             serial: 0,
         })?;
-        per_pane.record_application_palette(application_palette);
+        per_pane
+            .lock()
+            .unwrap()
+            .record_application_palette(application_palette);
     }
 
-    if let Some(resp) = per_pane.compute_changes(pane, None) {
+    let reading = read_pane_changes(pane, &last, None);
+    let mut per_pane = per_pane.lock().unwrap();
+    if let Some(reading) = reading {
+        let resp = per_pane.commit_changes(pane.pane_id(), reading);
         sender.send(DecodedPdu {
             pdu: Pdu::GetPaneRenderChangesResponse(resp),
             serial: 0,
@@ -1298,9 +1399,12 @@ impl SessionHandler {
                             // For a key press, we want to always send back the
                             // cursor position so that the predictive echo doesn't
                             // leave the cursor in the wrong place
-                            let mut per_pane = per_pane.lock().unwrap();
-                            if let Some(resp) = per_pane.compute_changes(&pane, Some(input_serial))
+                            let last = per_pane.lock().unwrap().last_sent();
+                            if let Some(reading) =
+                                read_pane_changes(&pane, &last, Some(input_serial))
                             {
+                                let resp =
+                                    per_pane.lock().unwrap().commit_changes(pane_id, reading);
                                 sender.send(DecodedPdu {
                                     pdu: Pdu::GetPaneRenderChangesResponse(resp),
                                     serial: 0,
@@ -1641,23 +1745,25 @@ impl SessionHandler {
                 let sender = self.to_write_tx.clone();
                 let per_pane = self.per_pane(pane_id);
                 spawn_into_main_thread(async move {
-                    catch(
-                        move || {
-                            let mux = Mux::get();
-                            let is_alive = match mux.get_pane(pane_id) {
-                                Some(pane) => {
-                                    maybe_push_pane_changes(&pane, sender, per_pane)?;
-                                    true
-                                }
-                                None => false,
-                            };
-                            Ok(Pdu::LivenessResponse(LivenessResponse {
-                                pane_id,
-                                is_alive,
-                            }))
-                        },
-                        send_response,
-                    )
+                    let is_alive = Mux::get().get_pane(pane_id).is_some();
+                    // The client's fallback poll for a pane it has heard
+                    // nothing from -- which is just the pane whose parser
+                    // may be holding its terminal lock. The pane is read
+                    // the way a push reads it, once it can be read without
+                    // waiting, rather than on this thread now; the answer
+                    // does not wait for that, since the push carries the
+                    // changes and the poll only asks whether the pane
+                    // still exists.
+                    if is_alive && per_pane.lock().unwrap().claim_push() {
+                        spawn_into_main_thread(push_pane_changes_when_free(
+                            pane_id, sender, per_pane,
+                        ))
+                        .detach();
+                    }
+                    send_response(Ok(Pdu::LivenessResponse(LivenessResponse {
+                        pane_id,
+                        is_alive,
+                    })));
                 })
                 .detach();
             }
@@ -1719,7 +1825,13 @@ impl SessionHandler {
                                     .get_pane(pane_id)
                                     .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
 
-                                let (_, lines) = pane.get_lines(line_idx..line_idx + 1);
+                                // The row asked about, if it is still in the
+                                // buffer: a stable index that has scrolled
+                                // away comes back as some other row (the
+                                // oldest kept), whose picture would be filed
+                                // under this hash and painted into this cell.
+                                let (first, lines) = pane.get_lines(line_idx..line_idx + 1);
+                                let lines = if first == line_idx { lines } else { vec![] };
                                 // The picture now in the cell, should the one
                                 // asked for be gone: a program streaming frames
                                 // replaces it faster than a fetch can land, and
@@ -1755,6 +1867,16 @@ impl SessionHandler {
                             }
                             let (data_generation, data, frames_from) = match &data {
                                 Some(image) => {
+                                    // The frames the client holds belong to
+                                    // the image it asked for; a different
+                                    // picture is sent whole, or its frames
+                                    // would be cut at a count that means
+                                    // nothing for it.
+                                    let have_frames = if image.hash() == data_hash {
+                                        have_frames
+                                    } else {
+                                        0
+                                    };
                                     let (generation, payload, from) =
                                         crate::sent_images::reply_for(image, have_frames);
                                     (generation, Some(payload), from)
