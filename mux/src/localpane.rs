@@ -632,6 +632,17 @@ impl Pane for LocalPane {
         term.perform_actions(actions);
         self.apply_pending_resize(&mut term);
         self.store_summary(&mut term);
+        drop(term);
+        // A resize that arrived after that last look, while the terminal
+        // was still held here, found both of its own probes failing and
+        // left its note; nothing else would read it until the next batch,
+        // which a quiet program may never write. Looked at once more with
+        // the terminal free, so one side or the other always applies it.
+        if self.pending_resize.lock().is_some() {
+            let mut term = self.terminal.lock();
+            self.apply_pending_resize(&mut term);
+            self.store_summary(&mut term);
+        }
     }
 
     fn mouse_event(&self, event: MouseEvent) -> Result<(), Error> {
@@ -1359,7 +1370,11 @@ impl LocalPane {
     /// output written in answer to the resize is parsed at the new size;
     /// after, for a resize that arrived during the batch.
     fn apply_pending_resize(&self, term: &mut Terminal) {
-        if let Some(size) = self.pending_resize.lock().take() {
+        // The note is taken and its lock let go before the resize: a
+        // resize reflows the scrollback, and `summary_without_waiting`
+        // reads the note on the thread that must not wait.
+        let pending = self.pending_resize.lock().take();
+        if let Some(size) = pending {
             term.resize(size);
         }
     }
@@ -1668,6 +1683,22 @@ mod summary_tests {
             120,
             "and only the newest one lands"
         );
+        assert!(pane.pending_resize.lock().is_none());
+    }
+
+    /// A resize that lands while the parser is between its last look at
+    /// the note and letting go of the terminal is still applied by the
+    /// parser, without another batch of output.
+    #[test]
+    fn a_resize_noted_during_the_parsers_last_moments_is_applied_by_the_parser() {
+        let (pane, _sizes, _exit) = pane();
+        let guard = pane.terminal.lock();
+        // What `resize` does when both of its probes fail: the note alone.
+        *pane.pending_resize.lock() = Some(size(70, 20));
+        drop(guard);
+        // The parser's batch ended; its trailing look finds the note.
+        pane.perform_actions(vec![]);
+        assert_eq!(pane.get_dimensions().cols, 70);
         assert!(pane.pending_resize.lock().is_none());
     }
 

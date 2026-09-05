@@ -501,10 +501,13 @@ async fn drain_pane_inputs(
     let mut drain = InputDrain {
         per_pane: Arc::clone(&per_pane),
         why: "the drain of this pane's input ended before it was applied",
+        done: false,
     };
     loop {
-        let Some(item) = per_pane.lock().unwrap().inputs.pop_front() else {
-            drain.finish();
+        // Empty check and hand-back under the one lock: input queued
+        // between the two would start its own drain, whose queue this
+        // task's guard would then take for its own and fail.
+        let Some(item) = drain.next() else {
             return;
         };
         let pane = match pane_when_free(pane_id, &sender, "its input").await {
@@ -532,17 +535,32 @@ async fn drain_pane_inputs(
 struct InputDrain {
     per_pane: Arc<Mutex<PerPane>>,
     why: &'static str,
+    /// The queue was found empty and given back; the guard has nothing
+    /// left to do, and must not touch a drain that started since.
+    done: bool,
 }
 
 impl InputDrain {
-    fn finish(&mut self) {
+    /// The next piece, or None once the queue is empty -- in which case
+    /// the drain is over, decided under the same lock as the look.
+    fn next(&mut self) -> Option<QueuedInput> {
         let mut per_pane = self.per_pane.lock().unwrap();
-        per_pane.input_draining = false;
+        match per_pane.inputs.pop_front() {
+            Some(item) => Some(item),
+            None => {
+                per_pane.input_draining = false;
+                self.done = true;
+                None
+            }
+        }
     }
 }
 
 impl Drop for InputDrain {
     fn drop(&mut self) {
+        if self.done {
+            return;
+        }
         let left = {
             let Ok(mut per_pane) = self.per_pane.lock() else {
                 return;
@@ -2702,6 +2720,7 @@ mod tests {
         drop(InputDrain {
             per_pane: Arc::clone(&per_pane),
             why: "ended in the test",
+            done: false,
         });
         assert_eq!(
             answered.lock().unwrap().as_slice(),
@@ -2713,5 +2732,27 @@ mod tests {
             per_pane.lock().unwrap().queue_input(item("c")),
             "and the next input starts a new drain"
         );
+
+        // A drain that found its queue empty is over: input queued after
+        // that belongs to the drain it starts, and the old guard must not
+        // take it.
+        let mut drain = InputDrain {
+            per_pane: Arc::clone(&per_pane),
+            why: "ended in the test",
+            done: false,
+        };
+        assert!(drain.next().is_some(), "c");
+        assert!(drain.next().is_none(), "empty: the drain is over");
+        assert!(
+            per_pane.lock().unwrap().queue_input(item("d")),
+            "so the next input starts a new one"
+        );
+        drop(drain);
+        assert_eq!(
+            per_pane.lock().unwrap().inputs.len(),
+            1,
+            "d is still queued for the new drain"
+        );
+        assert!(!answered.lock().unwrap().iter().any(|(tag, _)| *tag == "d"));
     }
 }
