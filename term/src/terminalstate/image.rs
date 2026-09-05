@@ -9,6 +9,10 @@ use wezterm_cell::Cell;
 use wezterm_surface::change::ImageData;
 use wezterm_surface::TextureCoordinate;
 
+#[cfg_attr(
+    feature = "use_serde",
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlacementInfo {
     pub first_row: StableRowIndex,

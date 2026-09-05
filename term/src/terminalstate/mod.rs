@@ -33,8 +33,12 @@ pub(crate) mod kitty;
 mod mouse;
 pub(crate) mod performer;
 mod sixel;
+#[cfg(feature = "use_serde")]
+mod snapshot;
 use crate::terminalstate::image::*;
 use crate::terminalstate::kitty::*;
+#[cfg(feature = "use_serde")]
+pub use crate::terminalstate::snapshot::*;
 
 lazy_static::lazy_static! {
     static ref DB: Database = {
@@ -43,20 +47,33 @@ lazy_static::lazy_static! {
     };
 }
 
-pub(crate) struct TabStop {
+#[cfg_attr(
+    feature = "use_serde",
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabStop {
     tabs: Vec<bool>,
     tab_width: usize,
 }
 
+#[cfg_attr(
+    feature = "use_serde",
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CharSet {
+pub enum CharSet {
     Ascii,
     Uk,
     DecLineDrawing,
 }
 
+#[cfg_attr(
+    feature = "use_serde",
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MouseEncoding {
+pub enum MouseEncoding {
     X10,
     Utf8,
     SGR,
@@ -131,8 +148,12 @@ impl TabStop {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct SavedCursor {
+#[cfg_attr(
+    feature = "use_serde",
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedCursor {
     position: CursorPosition,
     wrap_next: bool,
     pen: CellAttributes,

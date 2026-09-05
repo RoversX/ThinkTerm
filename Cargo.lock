@@ -8303,6 +8303,7 @@ dependencies = [
  "termwiz 0.24.0",
  "unicode-normalization",
  "url",
+ "varbincode",
  "wezterm-bidi 0.2.3",
  "wezterm-cell",
  "wezterm-dynamic 0.2.1",

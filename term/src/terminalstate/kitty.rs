@@ -66,7 +66,72 @@ pub struct KittyImageState {
     used_memory: usize,
 }
 
+impl TerminalState {
+    /// The picture stored under a kitty image id, for tests.
+    #[cfg(test)]
+    pub(crate) fn kitty_image_data_for_id(&self, image_id: u32) -> Option<Arc<ImageData>> {
+        self.kitty_img.image_data_for_id(image_id)
+    }
+}
+
 impl KittyImageState {
+    /// The bookkeeping, with each picture replaced by its hash in `images`.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn snapshot(
+        &self,
+        images: &mut crate::terminalstate::snapshot::ImageTable,
+    ) -> crate::terminalstate::snapshot::KittySnapshot {
+        crate::terminalstate::snapshot::KittySnapshot {
+            max_image_id: self.max_image_id,
+            number_to_id: self.number_to_id.iter().map(|(k, v)| (*k, *v)).collect(),
+            id_to_hash: self
+                .id_to_data
+                .iter()
+                .map(|(id, data)| (*id, images.remember(data)))
+                .collect(),
+            id_seq: self.id_seq.iter().map(|(k, v)| (*k, *v)).collect(),
+            next_seq: self.next_seq,
+            placements: self.placements.iter().map(|(k, v)| (*k, *v)).collect(),
+            transmission_in_progress: !self.accumulator.is_empty(),
+        }
+    }
+
+    /// The bookkeeping from a snapshot, pictures looked up in `images` by
+    /// hash. A transfer that was in flight is not resumed: the accumulator
+    /// starts empty, and the program hears an error for its next fragment.
+    #[cfg(feature = "use_serde")]
+    pub(crate) fn restore(
+        &mut self,
+        snapshot: crate::terminalstate::snapshot::KittySnapshot,
+        images: &std::collections::HashMap<[u8; 32], Arc<ImageData>>,
+    ) -> anyhow::Result<()> {
+        let mut id_to_data = HashMap::new();
+        for (id, hash) in snapshot.id_to_hash {
+            let data = images.get(&hash).ok_or_else(|| {
+                anyhow::anyhow!("kitty image {id} refers to a picture the snapshot does not carry")
+            })?;
+            id_to_data.insert(id, Arc::clone(data));
+        }
+        self.accumulator.clear();
+        self.accumulated_bytes = 0;
+        self.accumulator_overflowed = false;
+        self.max_image_id = snapshot.max_image_id;
+        self.number_to_id = snapshot.number_to_id.into_iter().collect();
+        self.id_to_data = id_to_data;
+        self.id_seq = snapshot.id_seq.into_iter().collect();
+        self.next_seq = snapshot.next_seq;
+        self.placements = snapshot.placements.into_iter().collect();
+        self.recompute_used_memory();
+        Ok(())
+    }
+
+    /// The picture stored under a kitty image id, for tests that check a
+    /// restore shares one `Arc` between the cells and this map.
+    #[cfg(test)]
+    pub(crate) fn image_data_for_id(&self, image_id: u32) -> Option<Arc<ImageData>> {
+        self.id_to_data.get(&image_id).cloned()
+    }
+
     /// Bytes actually held: small pictures with identical pixels share one
     /// `ImageData` through the content-hash cache, so summing per id would
     /// count a logo re-emitted under fresh ids once per prompt, and the

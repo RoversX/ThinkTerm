@@ -104,6 +104,32 @@ impl Screen {
         scrollback_size(&self.config, self.allow_scrollback)
     }
 
+    /// Every line held, scrollback first, visible rows last.
+    pub(crate) fn lines(&self) -> &VecDeque<Line> {
+        &self.lines
+    }
+
+    pub(crate) fn stable_row_index_offset(&self) -> usize {
+        self.stable_row_index_offset
+    }
+
+    /// How many lines this screen may hold before the oldest scroll off:
+    /// the visible rows plus the scrollback the configuration allows.
+    pub(crate) fn line_capacity(&self) -> usize {
+        self.physical_rows + self.scrollback_size()
+    }
+
+    /// Replace the contents wholesale, as a restore from a snapshot does.
+    /// `lines` must hold at least the visible rows and at most
+    /// `line_capacity`; `stable_row_index_offset` says how many lines had
+    /// scrolled off before the first one kept.
+    pub(crate) fn replace_lines(&mut self, lines: VecDeque<Line>, stable_row_index_offset: usize) {
+        debug_assert!(lines.len() >= self.physical_rows);
+        debug_assert!(lines.len() <= self.line_capacity());
+        self.lines = lines;
+        self.stable_row_index_offset = stable_row_index_offset;
+    }
+
     fn rewrap_lines(
         &mut self,
         physical_cols: usize,
