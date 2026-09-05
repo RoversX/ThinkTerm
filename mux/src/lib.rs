@@ -625,8 +625,12 @@ fn parse_buffered_data(
     dead: &Arc<AtomicBool>,
     mut rx: FileDescriptor,
     heartbeat: Arc<parse_watchdog::ParseHeartbeat>,
+    control: Option<Arc<ReaderControl>>,
 ) {
     let mut buf = vec![0; configuration().mux_output_parser_buffer_size];
+    // Bytes read and not yet turned into applied actions; settled against
+    // the reader's count whenever nothing is left waiting to be sent.
+    let mut unapplied = 0usize;
     let mut parser = termwiz::escape::parser::Parser::new();
     let mut actions = vec![];
     let mut hold = false;
@@ -645,6 +649,7 @@ fn parse_buffered_data(
                 break;
             }
             Ok(size) => {
+                unapplied += size;
                 let work_started = Instant::now();
                 parser.parse(&buf[0..size], |action| {
                     let mut flush = false;
@@ -724,6 +729,13 @@ fn parse_buffered_data(
                 let config = configuration();
                 buf.resize(config.mux_output_parser_buffer_size, 0);
                 delay = Duration::from_millis(config.mux_output_parser_coalesce_delay_ms);
+
+                if actions.is_empty() {
+                    if let Some(control) = &control {
+                        control.pending_bytes.fetch_sub(unapplied, Ordering::SeqCst);
+                    }
+                    unapplied = 0;
+                }
             }
         }
     }
@@ -734,6 +746,9 @@ fn parse_buffered_data(
     // display what they displayed.
     if !actions.is_empty() {
         send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
+    }
+    if let Some(control) = &control {
+        control.pending_bytes.fetch_sub(unapplied, Ordering::SeqCst);
     }
     parse_watchdog::unregister(pane_id);
 }
@@ -768,19 +783,152 @@ fn allocate_socketpair() -> anyhow::Result<(FileDescriptor, FileDescriptor)> {
     Ok((tx, rx))
 }
 
+/// A pane's reader thread, from the outside. A takeover hands the pty to
+/// another process, and while it does nothing here may read it; the
+/// control lets the reader be parked and says when everything it read
+/// has been applied to the terminal.
+pub struct ReaderControl {
+    /// A byte written here breaks the reader out of its poll.
+    wake: parking_lot::Mutex<FileDescriptor>,
+    paused: AtomicBool,
+    /// Whether the reader is parked; `changed` is signalled by both sides.
+    parked: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
+    /// Bytes read from the pty and not yet applied to the terminal.
+    pending_bytes: AtomicUsize,
+}
+
+impl ReaderControl {
+    fn new(wake: FileDescriptor) -> Self {
+        Self {
+            wake: parking_lot::Mutex::new(wake),
+            paused: AtomicBool::new(false),
+            parked: std::sync::Mutex::new(false),
+            changed: std::sync::Condvar::new(),
+            pending_bytes: AtomicUsize::new(0),
+        }
+    }
+
+    /// Park the reader and wait until what it read has been applied.
+    /// Times out on a reader that never parks, or on a parser that never
+    /// finishes: an output batch held for synchronized output, or a pane
+    /// wedged for the test. Either way the reader runs again on return.
+    fn pause(&self, timeout: Duration) -> anyhow::Result<()> {
+        let deadline = Instant::now() + timeout;
+        self.paused.store(true, Ordering::SeqCst);
+        if let Err(err) = self.wake.lock().write_all(&[1]) {
+            self.resume();
+            return Err(err).context("waking the pane reader");
+        }
+        {
+            let mut parked = self.parked.lock().unwrap();
+            while !*parked {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    drop(parked);
+                    self.resume();
+                    anyhow::bail!("the pane reader did not park within {timeout:?}");
+                }
+                parked = self.changed.wait_timeout(parked, left).unwrap().0;
+            }
+        }
+        loop {
+            let pending = self.pending_bytes.load(Ordering::SeqCst);
+            if pending == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                self.resume();
+                anyhow::bail!(
+                    "{pending} bytes read from the pty were still being applied after {timeout:?}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        let _parked = self.parked.lock().unwrap();
+        self.changed.notify_all();
+    }
+
+    /// The reader's side: announce the park, wait for the resume.
+    fn park(&self) {
+        let mut parked = self.parked.lock().unwrap();
+        *parked = true;
+        self.changed.notify_all();
+        while self.paused.load(Ordering::SeqCst) {
+            parked = self.changed.wait(parked).unwrap();
+        }
+        *parked = false;
+        self.changed.notify_all();
+    }
+
+    pub fn pending_bytes(&self) -> usize {
+        self.pending_bytes.load(Ordering::SeqCst)
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref PANE_READERS: parking_lot::Mutex<HashMap<PaneId, Arc<ReaderControl>>> =
+        parking_lot::Mutex::new(HashMap::new());
+}
+
+/// A pane reader that is parked. Dropping it lets the reader run again;
+/// `keep` does not, for the pty that now belongs to another process.
+pub struct PausedReader {
+    control: Arc<ReaderControl>,
+    kept: bool,
+}
+
+impl PausedReader {
+    /// The pty has been handed to another process: this reader must never
+    /// run again. It ends with this process.
+    pub fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for PausedReader {
+    fn drop(&mut self) {
+        if !self.kept {
+            self.control.resume();
+        }
+    }
+}
+
+/// Park the reader of `pane_id` and wait until everything it read has been
+/// applied to the terminal, so that the terminal is exactly what the pty
+/// produced up to the park. Output the program writes meanwhile waits in
+/// the kernel's pty buffer for whoever reads next. Panes without a pty
+/// (or on a platform without poll) cannot be paused.
+pub fn pause_pane_reader(pane_id: PaneId, timeout: Duration) -> anyhow::Result<PausedReader> {
+    let control = PANE_READERS
+        .lock()
+        .get(&pane_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("pane {pane_id} has no reader that can be paused"))?;
+    control.pause(timeout)?;
+    Ok(PausedReader {
+        control,
+        kept: false,
+    })
+}
+
 /// This function is run in a separate thread; its purpose is to perform
 /// blocking reads from the pty (non-blocking reads are not portable to
-/// all platforms and pty/tty types), parse the escape sequences and
-/// relay the actions to the mux thread to apply them to the pane.
+/// all platforms) and to feed the bytes to the parser thread over a
+/// socketpair. With a pty file descriptor to poll, the reader can also be
+/// parked; see [`pause_pane_reader`].
 fn read_from_pane_pty(
     pane: Weak<dyn Pane>,
     banner: Option<String>,
     mut reader: Box<dyn std::io::Read>,
+    pty_fd: Option<i32>,
 ) {
     let mut buf = vec![0; PTY_READ_BUFSIZE];
 
-    // This is used to signal that an error occurred either in this thread,
-    // or in the main mux thread.  If `true`, this thread will terminate.
     let dead = Arc::new(AtomicBool::new(false));
 
     let (pane_id, exit_behavior) = match pane.upgrade() {
@@ -803,10 +951,29 @@ fn read_from_pane_pty(
         }
     };
 
+    // The wake pipe and the control exist only when the pty can be polled;
+    // without them the loop below is the plain blocking read.
+    let pausable = pty_fd.and_then(|fd| match filedescriptor::Pipe::new() {
+        Ok(pipe) => Some((fd, pipe)),
+        Err(err) => {
+            log::warn!("pane {pane_id}: no wake pipe for the reader, it cannot be paused: {err:#}");
+            None
+        }
+    });
+    let (control, mut wake_read, poll_fd) = match pausable {
+        Some((fd, pipe)) => {
+            let control = Arc::new(ReaderControl::new(pipe.write));
+            PANE_READERS.lock().insert(pane_id, Arc::clone(&control));
+            (Some(control), Some(pipe.read), Some(fd))
+        }
+        None => (None, None, None),
+    };
+
     let heartbeat = parse_watchdog::register(pane_id);
     std::thread::spawn({
         let dead = Arc::clone(&dead);
-        move || parse_buffered_data(pane, pane_id, &dead, rx, heartbeat)
+        let control = control.clone();
+        move || parse_buffered_data(pane, pane_id, &dead, rx, heartbeat, control)
     });
 
     if let Some(banner) = banner {
@@ -814,6 +981,38 @@ fn read_from_pane_pty(
     }
 
     while !dead.load(Ordering::Relaxed) {
+        if let (Some(control), Some(wake_read), Some(fd)) = (&control, &mut wake_read, poll_fd) {
+            let mut pfd = [
+                pollfd {
+                    fd: fd as _,
+                    events: POLLIN,
+                    revents: 0,
+                },
+                pollfd {
+                    fd: wake_read.as_socket_descriptor(),
+                    events: POLLIN,
+                    revents: 0,
+                },
+            ];
+            match poll(&mut pfd, None) {
+                Ok(_) => {}
+                Err(err) => {
+                    error!("read_pty poll failed: pane {} {:?}", pane_id, err);
+                    break;
+                }
+            }
+            if pfd[1].revents != 0 {
+                let mut drained = [0u8; 16];
+                wake_read.read(&mut drained).ok();
+            }
+            if control.paused.load(Ordering::SeqCst) {
+                control.park();
+                continue;
+            }
+            if pfd[0].revents == 0 {
+                continue;
+            }
+        }
         match reader.read(&mut buf) {
             Ok(size) if size == 0 => {
                 log::trace!("read_pty EOF: pane_id {}", pane_id);
@@ -826,7 +1025,15 @@ fn read_from_pane_pty(
             Ok(size) => {
                 histogram!("read_from_pane_pty.bytes.rate").record(size as f64);
                 log::trace!("read_pty pane {pane_id} read {size} bytes");
+                // Counted before the parser can see the bytes, so the
+                // count never dips below what is really pending.
+                if let Some(control) = &control {
+                    control.pending_bytes.fetch_add(size, Ordering::SeqCst);
+                }
                 if let Err(err) = tx.write_all(&buf[..size]) {
+                    if let Some(control) = &control {
+                        control.pending_bytes.fetch_sub(size, Ordering::SeqCst);
+                    }
                     error!(
                         "read_pty failed to write to parser: pane {} {:?}",
                         pane_id, err
@@ -837,10 +1044,12 @@ fn read_from_pane_pty(
         }
     }
 
+    if control.is_some() {
+        PANE_READERS.lock().remove(&pane_id);
+    }
+
     match exit_behavior.unwrap_or_else(|| configuration().exit_behavior) {
         ExitBehavior::Hold | ExitBehavior::CloseOnCleanExit => {
-            // We don't know if we can unilaterally close
-            // this pane right now, so don't!
             promise::spawn::spawn_into_main_thread(async move {
                 let mux = Mux::get();
                 log::trace!("checking for dead windows after EOF on pane {}", pane_id);
@@ -919,6 +1128,17 @@ impl std::ops::Deref for MuxWindowBuilder {
 
 impl Mux {
     pub fn new(default_domain: Option<Arc<dyn Domain>>) -> Self {
+        Self::new_with_runtime_server_id(default_domain, new_runtime_server_id())
+    }
+
+    /// A mux that answers to a runtime server id chosen by the caller: the
+    /// one a server inherits from the predecessor it took over from, so
+    /// that clients reconnecting to it find the same server rather than a
+    /// replacement.
+    pub fn new_with_runtime_server_id(
+        default_domain: Option<Arc<dyn Domain>>,
+        runtime_server_id: String,
+    ) -> Self {
         let mut domains = HashMap::new();
         let mut domains_by_name = HashMap::new();
         if let Some(default_domain) = default_domain.as_ref() {
@@ -937,7 +1157,7 @@ impl Mux {
         };
 
         Self {
-            runtime_server_id: new_runtime_server_id(),
+            runtime_server_id,
             tabs: RwLock::new(HashMap::new()),
             panes: RwLock::new(HashMap::new()),
             windows: RwLock::new(HashMap::new()),
@@ -2384,8 +2604,12 @@ impl Mux {
         let pane_id = pane.pane_id();
         if let Some(reader) = pane.reader()? {
             let banner = self.banner.read().clone();
+            #[cfg(unix)]
+            let pty_fd = pane.pty_raw_fd();
+            #[cfg(not(unix))]
+            let pty_fd = None;
             let pane = Arc::downgrade(pane);
-            thread::spawn(move || read_from_pane_pty(pane, banner, reader));
+            thread::spawn(move || read_from_pane_pty(pane, banner, reader, pty_fd));
         }
         self.recompute_pane_count();
         self.notify(MuxNotification::PaneAdded(pane_id));
@@ -2643,6 +2867,18 @@ impl Mux {
         origin_domain: Option<DomainId>,
     ) -> MuxWindowBuilder {
         let window = Window::new(workspace, position, origin_domain);
+        let window_id = window.window_id();
+        self.windows.write().insert(window_id, window);
+        MuxWindowBuilder {
+            window_id,
+            activity: Some(Activity::new()),
+            notified: false,
+        }
+    }
+
+    /// Register a window built elsewhere, under its own id (one adopted
+    /// from a predecessor server). The builder announces it like a new one.
+    pub fn insert_window(&self, window: Window) -> MuxWindowBuilder {
         let window_id = window.window_id();
         self.windows.write().insert(window_id, window);
         MuxWindowBuilder {

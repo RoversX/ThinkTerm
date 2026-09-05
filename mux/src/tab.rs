@@ -24,6 +24,24 @@ static PANE_STACK_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::At
 pub fn alloc_pane_stack_id() -> PaneStackId {
     PANE_STACK_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
 }
+
+/// Keep the allocators away from every id below `next`; see
+/// `crate::pane::reserve_pane_ids_below`.
+pub fn reserve_tab_ids_below(next: TabId) {
+    TAB_ID.fetch_max(next, ::std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn reserve_pane_stack_ids_below(next: PaneStackId) {
+    PANE_STACK_ID.fetch_max(next, ::std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn next_tab_id() -> TabId {
+    TAB_ID.load(::std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn next_pane_stack_id() -> PaneStackId {
+    PANE_STACK_ID.load(::std::sync::atomic::Ordering::Relaxed)
+}
 pub use thinkterm_proto::TabId;
 
 #[derive(Default)]
@@ -926,6 +944,18 @@ impl Tab {
     pub fn new(size: &TerminalSize) -> Self {
         let inner = TabInner::new(size);
         let tab_id = inner.id;
+        Self {
+            inner: Mutex::new(inner),
+            tab_id,
+        }
+    }
+
+    /// A tab under an id the caller chose: one adopted from a predecessor
+    /// server. The id is reserved so no later tab is given it.
+    pub fn new_with_id(size: &TerminalSize, tab_id: TabId) -> Self {
+        reserve_tab_ids_below(tab_id + 1);
+        let mut inner = TabInner::new(size);
+        inner.id = tab_id;
         Self {
             inner: Mutex::new(inner),
             tab_id,

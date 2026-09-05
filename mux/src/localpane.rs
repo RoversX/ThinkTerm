@@ -752,6 +752,11 @@ impl Pane for LocalPane {
         Ok(Some(self.pty.lock().try_clone_reader()?))
     }
 
+    #[cfg(unix)]
+    fn pty_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        self.pty.lock().as_raw_fd()
+    }
+
     fn send_paste(&self, text: &str) -> Result<(), Error> {
         Mux::get().record_input_for_current_identity();
         if self.tmux_domain.lock().is_some() {
@@ -1349,7 +1354,54 @@ fn split_child(
     (rx, signaller, pid)
 }
 
+/// What a pane hands to a successor server besides its terminal: see
+/// `LocalPane::handoff_parts`.
+#[cfg(unix)]
+pub struct PaneHandoffParts {
+    pub pid: u32,
+    pub tty_name: Option<std::path::PathBuf>,
+    /// The master pty, still owned here; the successor gets a duplicate.
+    pub pty_fd: std::os::unix::io::RawFd,
+    pub description: String,
+}
+
 impl LocalPane {
+    /// The pieces a successor server needs to adopt this pane, or None
+    /// for a pane that cannot travel: one over a channel rather than a
+    /// pty (ssh, tmux), or one whose process has already exited.
+    #[cfg(unix)]
+    pub fn handoff_parts(&self) -> Option<PaneHandoffParts> {
+        if self.tmux_domain.lock().is_some() {
+            return None;
+        }
+        let pid = match &*self.process.lock() {
+            ProcessState::Running { pid: Some(pid), .. } => *pid,
+            _ => return None,
+        };
+        let pty = self.pty.lock();
+        let pty_fd = pty.as_raw_fd()?;
+        Some(PaneHandoffParts {
+            pid,
+            tty_name: pty.tty_name(),
+            pty_fd,
+            description: self.command_description.clone(),
+        })
+    }
+
+    /// Forget the process without touching it: this pane was staged for
+    /// a takeover that did not happen, and the process still belongs to
+    /// the server that is keeping it. Dropping the pane afterwards sends
+    /// nothing.
+    pub fn release_process(&self) {
+        *self.process.lock() = ProcessState::Dead;
+    }
+
+    /// Everything the terminal remembers. Take it with the reader paused
+    /// (`crate::pause_pane_reader`), or it is a moment behind the pty.
+    pub fn snapshot_terminal(&self) -> wezterm_term::TerminalSnapshot {
+        self.terminal.lock().snapshot()
+    }
+
     pub fn new(
         pane_id: PaneId,
         mut terminal: Terminal,
@@ -1703,18 +1755,22 @@ mod summary_tests {
         }
     }
 
+    /// The waiter thread `LocalPane::new` starts hops to the main thread
+    /// when the child exits; with no scheduler that is a panic that
+    /// poisons promise's scheduler lock for every test after.
+    fn ensure_scheduler() {
+        static SCHEDULER: std::sync::Once = std::sync::Once::new();
+        SCHEDULER.call_once(|| {
+            promise::spawn::SimpleExecutor::new();
+        });
+    }
+
     fn pane() -> (
         LocalPane,
         Arc<StdMutex<Vec<PtySize>>>,
         std::sync::mpsc::Sender<()>,
     ) {
-        // The waiter thread `LocalPane::new` starts hops to the main
-        // thread when the child exits; with no scheduler that is a panic
-        // that poisons promise's scheduler lock for every test after.
-        static SCHEDULER: std::sync::Once = std::sync::Once::new();
-        SCHEDULER.call_once(|| {
-            promise::spawn::SimpleExecutor::new();
-        });
+        ensure_scheduler();
         let (exit_tx, exit_rx) = std::sync::mpsc::channel();
         let sizes = Arc::new(StdMutex::new(vec![]));
         let terminal = Terminal::new(
@@ -1911,5 +1967,94 @@ mod summary_tests {
             guard.screen().physical_rows
         );
         drop(guard);
+    }
+
+    /// A pty whose output is a pipe the test writes into.
+    #[cfg(unix)]
+    struct PipePty {
+        read: filedescriptor::FileDescriptor,
+    }
+
+    #[cfg(unix)]
+    impl MasterPty for PipePty {
+        fn resize(&self, _size: PtySize) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_size(&self) -> anyhow::Result<PtySize> {
+            Ok(PtySize::default())
+        }
+        fn try_clone_reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
+            Ok(Box::new(self.read.try_clone()?))
+        }
+        fn take_writer(&self) -> anyhow::Result<Box<dyn Write + Send>> {
+            anyhow::bail!("no writer")
+        }
+        fn process_group_leader(&self) -> Option<libc::pid_t> {
+            None
+        }
+        fn as_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+            use std::os::unix::io::AsRawFd;
+            Some(self.read.as_raw_fd())
+        }
+        fn tty_name(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
+    /// While a reader is paused, what the program writes stays in the pty;
+    /// resuming applies it, and a kept pause never does.
+    #[cfg(unix)]
+    #[test]
+    fn a_paused_reader_leaves_the_pty_output_where_it_is() {
+        use std::os::unix::io::AsRawFd;
+        ensure_scheduler();
+        let pipe = filedescriptor::Pipe::new().unwrap();
+        let mut program = pipe.write;
+        let raw = pipe.read.as_raw_fd();
+        let (_exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let terminal = Terminal::new(
+            size(80, 24),
+            Arc::new(config::TermConfig::new()),
+            "ThinkTerm",
+            "test",
+            Box::new(Vec::new()),
+        );
+        let pane: Arc<dyn Pane> = Arc::new(LocalPane::new(
+            4242,
+            terminal,
+            Box::new(SleepingChild(exit_rx)),
+            Box::new(PipePty { read: pipe.read }),
+            Box::new(Vec::new()),
+            0,
+            "test".into(),
+        ));
+        let reader = pane.reader().unwrap().unwrap();
+        let weak = Arc::downgrade(&pane);
+        std::thread::spawn(move || crate::read_from_pane_pty(weak, None, reader, Some(raw)));
+
+        let title = |pane: &Arc<dyn Pane>| pane.summary_without_waiting().title;
+        let wait_for = |pane: &Arc<dyn Pane>, want: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while title(pane) != want && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(title(pane), want);
+        };
+
+        program.write_all(b"\x1b]0;first\x07").unwrap();
+        wait_for(&pane, "first");
+
+        let paused = crate::pause_pane_reader(4242, Duration::from_secs(2)).expect("pause");
+        program.write_all(b"\x1b]0;second\x07").unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(title(&pane), "first", "nothing is read while paused");
+        drop(paused);
+        wait_for(&pane, "second");
+
+        let paused = crate::pause_pane_reader(4242, Duration::from_secs(2)).expect("pause again");
+        program.write_all(b"\x1b]0;third\x07").unwrap();
+        paused.keep();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(title(&pane), "second", "a kept pause never resumes");
     }
 }

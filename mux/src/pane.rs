@@ -28,6 +28,18 @@ pub fn alloc_pane_id() -> PaneId {
     PANE_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Keep `alloc_pane_id` away from every id below `next`: a server that
+/// adopts panes from its predecessor keeps their ids and must not hand
+/// them out again.
+pub fn reserve_pane_ids_below(next: PaneId) {
+    PANE_ID.fetch_max(next, ::std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The id the next pane would get; what a successor has to reserve.
+pub fn next_pane_id() -> PaneId {
+    PANE_ID.load(::std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The cell geometry a frontend sizes this pane's PTY with.
 ///
 /// The split tree thinks in root-font cells and knows nothing of per-pane
@@ -321,6 +333,13 @@ pub trait Pane: Downcast + Send + Sync {
     }
     fn send_paste(&self, text: &str) -> anyhow::Result<()>;
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>>;
+    /// The pty behind `reader`, when there is one: the reader thread waits
+    /// for it with poll, which is what lets it be parked (see
+    /// `crate::pause_pane_reader`).
+    #[cfg(unix)]
+    fn pty_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        None
+    }
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write>;
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()>;
     /// Called as a hint that the pane is being resized as part of

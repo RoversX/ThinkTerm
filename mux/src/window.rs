@@ -9,6 +9,17 @@ static WIN_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsi
 pub use thinkterm_proto::WindowId;
 pub type WindowUiSurfaceId = String;
 
+/// The id the next window would get; what a successor has to reserve.
+pub fn next_window_id() -> WindowId {
+    WIN_ID.load(::std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Keep the allocator away from every id below `next`; see
+/// `crate::pane::reserve_pane_ids_below`.
+pub fn reserve_window_ids_below(next: WindowId) {
+    WIN_ID.fetch_max(next, ::std::sync::atomic::Ordering::Relaxed);
+}
+
 pub struct Window {
     id: WindowId,
     tabs: Vec<Arc<Tab>>,
@@ -40,6 +51,24 @@ impl Window {
             title: String::new(),
             workspace: workspace.unwrap_or_else(|| Mux::get().active_workspace()),
             initial_position,
+            origin_domain,
+        }
+    }
+
+    /// A window under an id the caller chose: one adopted from a
+    /// predecessor server. The id is reserved so no later window is
+    /// given it.
+    pub fn new_with_id(id: WindowId, workspace: String, origin_domain: Option<DomainId>) -> Self {
+        WIN_ID.fetch_max(id + 1, ::std::sync::atomic::Ordering::Relaxed);
+        Self {
+            id,
+            tabs: vec![],
+            ui_surfaces: BTreeSet::new(),
+            active: 0,
+            last_active: None,
+            title: String::new(),
+            workspace,
+            initial_position: None,
             origin_domain,
         }
     }
