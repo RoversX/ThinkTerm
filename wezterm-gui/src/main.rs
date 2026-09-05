@@ -1221,6 +1221,9 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     wezterm_client::domain::set_thinkterm_frontend_recovery_sink(
         crate::frontend::request_thinkterm_frontend_recovery,
     );
+    wezterm_client::remote_update::set_keep_sessions_on_update(
+        crate::native_settings::remote_update_keeps_sessions(),
+    );
 
     let config = config::configuration();
     let need_builder = !opts.prog.is_empty() || opts.cwd.is_some();

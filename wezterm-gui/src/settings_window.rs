@@ -721,6 +721,7 @@ enum SettingsAction {
     ToggleImportField(ImportFieldId),
     ToggleMainWindowFrameRestore,
     ToggleNotificationSounds,
+    ToggleRemoteUpdateKeepsSessions,
     /// Turn one right-sidebar panel on or off.
     ToggleRightSidebarPanel(crate::termwindow::RightSidebarMode),
     ToggleAgentDetails(&'static str),
@@ -3559,6 +3560,27 @@ impl SettingsWindow {
                     Err(err) => {
                         self.status = settings_tr(
                             "settings-status-notification-sounds-error",
+                            &[("error", format!("{err:#}"))],
+                        );
+                    }
+                }
+            }
+            SettingsAction::ToggleRemoteUpdateKeepsSessions => {
+                self.ui.open_dropdown = None;
+                let enabled = !self.native_settings.workspaces.remote_update_keeps_sessions;
+                self.native_settings.workspaces.remote_update_keeps_sessions = enabled;
+                wezterm_client::remote_update::set_keep_sessions_on_update(enabled);
+                match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => {
+                        self.status = crate::i18n::tr(if enabled {
+                            "settings-status-remote-update-keep-sessions-on"
+                        } else {
+                            "settings-status-remote-update-keep-sessions-off"
+                        });
+                    }
+                    Err(err) => {
+                        self.status = settings_tr(
+                            "settings-status-remote-update-keep-sessions-error",
                             &[("error", format!("{err:#}"))],
                         );
                     }
@@ -7786,9 +7808,25 @@ impl SettingsWindow {
             )?;
         }
 
+        // One choice: what updating a remote server does to its sessions.
+        let toggle_card_y = card_y + card_height + gap;
+        let toggle_card_height = self.settings_card_height(1);
+        self.paint_group_card(layers, x, toggle_card_y, max_width, toggle_card_height)?;
+        self.paint_toggle_setting_row(
+            layers,
+            row_x,
+            toggle_card_y + self.settings_card_top_padding(),
+            row_width,
+            &crate::i18n::tr("settings-remote-update-keep-sessions"),
+            &crate::i18n::tr("settings-remote-update-keep-sessions-description"),
+            self.native_settings.workspaces.remote_update_keeps_sessions,
+            SettingsAction::ToggleRemoteUpdateKeepsSessions,
+            true,
+        )?;
+
         // Under the facts: what an install would do here, or why this page
         // cannot do one, and the outcome of the install just run.
-        let note_y = card_y + card_height + gap;
+        let note_y = toggle_card_y + toggle_card_height + gap;
         let line_step = self.metrics.cell_size.height as f32 + self.ui_px(6.0);
         let mut notes: Vec<(String, LinearRgba)> = Vec::new();
         match &self.ui.update_install {

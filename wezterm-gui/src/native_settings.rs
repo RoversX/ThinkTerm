@@ -362,6 +362,9 @@ pub(crate) struct NativeWorkspaceSettings {
     /// Play a short sound when a thread you are not watching finishes, or when
     /// one starts waiting on you.
     pub(crate) notification_sounds_enabled: bool,
+    /// Updating a remote mux server hands its sessions to the new version
+    /// instead of stopping it; off, the update asks whether to stop it.
+    pub(crate) remote_update_keeps_sessions: bool,
 }
 
 impl Default for NativeWorkspaceSettings {
@@ -371,6 +374,7 @@ impl Default for NativeWorkspaceSettings {
             remote_download_directory: String::new(),
             remote_drop_destination: String::new(),
             notification_sounds_enabled: true,
+            remote_update_keeps_sessions: true,
         }
     }
 }
@@ -906,6 +910,10 @@ pub(crate) fn pane_header_font_size() -> f64 {
 
 pub(crate) fn notification_sounds_enabled() -> bool {
     load().workspaces.notification_sounds_enabled
+}
+
+pub(crate) fn remote_update_keeps_sessions() -> bool {
+    load().workspaces.remote_update_keeps_sessions
 }
 
 pub(crate) fn bottom_quote_interval_minutes(settings: &ThinkTermNativeSettings) -> u32 {

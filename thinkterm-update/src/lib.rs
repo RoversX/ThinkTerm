@@ -309,6 +309,17 @@ pub fn install_command(variant: &str, version: &str) -> String {
     )
 }
 
+/// The command that upgrades a running mux server on the host in place:
+/// the freshly installed binary takes the running server's panes over and
+/// the running server exits, so nothing in its sessions ends. Exits 0 once
+/// the new server owns everything, and 1 with the reason on stderr when
+/// the running server cannot hand over (a build from before the feature)
+/// or the takeover failed and the running server carried on.
+pub fn takeover_command() -> String {
+    "export PATH=\"$HOME/.local/bin:$PATH\"; thinkterm-mux-server --daemonize --takeover"
+        .to_string()
+}
+
 /// Run `install.sh` on this machine for the install the manifest describes,
 /// asking it for release `tag`. The script is fetched fresh and fed to `sh`
 /// on stdin, exactly as the documented `curl | sh` does, so there is one
@@ -463,6 +474,13 @@ mod tests {
             serde_json::from_str(r#"{"name":"a","size":1,"url":"u","browser_download_url":"b"}"#)
                 .unwrap();
         assert_eq!(without.sha256(), None);
+    }
+
+    #[test]
+    fn the_takeover_command_runs_the_installed_server_in_place() {
+        let cmd = takeover_command();
+        assert!(cmd.starts_with("export PATH=\"$HOME/.local/bin:$PATH\";"), "{cmd}");
+        assert!(cmd.ends_with("thinkterm-mux-server --daemonize --takeover"), "{cmd}");
     }
 
     #[test]

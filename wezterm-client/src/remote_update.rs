@@ -15,8 +15,10 @@
 //! - pick "the latest release". The server has to match *this* client, which
 //!   may not be the latest; a development build has no release to match at
 //!   all and is told so.
-//! - keep sessions alive across the restart. That needs the server to hand
-//!   its ptys to its successor, which it cannot do yet.
+//! - end sessions to get the new version running, when it can help it. A
+//!   server that can hand over (`thinkterm-mux-server --takeover`) is asked
+//!   to; only when it cannot, or the person turned that off, does the old
+//!   question come: stop the server, ending every session, or leave it.
 
 use crate::client::IncompatibleVersionError;
 use anyhow::Context;
@@ -24,7 +26,21 @@ use config::SshDomain;
 use mux::connui::ConnectionUI;
 use portable_pty::Child as _;
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wezterm_ssh::Session;
+
+static KEEP_SESSIONS: AtomicBool = AtomicBool::new(true);
+
+/// Whether a remote update hands the running server's sessions to the new
+/// version (the default) or asks to stop the server. The GUI sets it from
+/// its settings; a headless client keeps the default.
+pub fn set_keep_sessions_on_update(keep: bool) {
+    KEEP_SESSIONS.store(keep, Ordering::SeqCst);
+}
+
+pub fn keep_sessions_on_update() -> bool {
+    KEEP_SESSIONS.load(Ordering::SeqCst)
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RemoteUpdateOutcome {
@@ -128,6 +144,28 @@ pub fn offer_remote_update(
             thinkterm_update::build_from_source_instructions(&local)
         ));
         anyhow::bail!("the installer on {host} failed");
+    }
+
+    // The installed server can take the running one over, sessions and
+    // all; the running server has to be new enough to hand over, and the
+    // person may have turned this off.
+    if keep_sessions_on_update() {
+        ui.output_str(&format!(
+            "\nHanding the sessions of the running mux server on {host} to {local}...\n"
+        ));
+        match run_and_relay(&session, ui, &thinkterm_update::takeover_command()) {
+            Ok(true) => {
+                ui.output_str("Handed over; reconnecting.\n");
+                return Ok(RemoteUpdateOutcome::Updated { restarted: true });
+            }
+            Ok(false) => ui.output_str(&format!(
+                "\nThe running server on {host} could not hand over (its output is above; \
+                 a server from before the handoff feature cannot). The old way remains.\n"
+            )),
+            Err(err) => ui.output_str(&format!(
+                "\nCould not run the takeover on {host}: {err:#}. The old way remains.\n"
+            )),
+        }
     }
 
     // The install is done whatever happens to this question: a UI that has
