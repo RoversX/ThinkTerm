@@ -1822,6 +1822,12 @@ impl Mux {
             return;
         };
         self.client_had_input(&ident);
+        // The mode is read before the focused pane is resolved: that
+        // resolution walks every window and tab, and this runs for every
+        // keystroke to a remote pane.
+        if self.frontend_lease.lock().access_mode != FrontendAccessMode::TmuxLatest {
+            return;
+        }
         let Some((_domain, _window, tab_id, _pane)) = self.resolve_focused_pane(&ident) else {
             return;
         };
