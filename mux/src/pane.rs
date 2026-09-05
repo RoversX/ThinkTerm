@@ -392,6 +392,12 @@ pub trait Pane: Downcast + Send + Sync {
         self.summary_without_waiting().title
     }
 
+    /// `get_current_working_dir`, without waiting for the parser; the
+    /// policy still governs how fresh a divined directory has to be.
+    fn working_dir_without_waiting(&self, policy: CachePolicy) -> Option<Url> {
+        self.get_current_working_dir(policy)
+    }
+
     fn copy_user_vars(&self) -> HashMap<String, String> {
         HashMap::new()
     }

@@ -845,6 +845,15 @@ impl Pane for LocalPane {
         self.working_dir_or_divined(reported, policy)
     }
 
+    fn working_dir_without_waiting(&self, policy: CachePolicy) -> Option<Url> {
+        // The reported directory from the terminal if it can be read
+        // now, from the stored copy otherwise; the divination keeps the
+        // caller's policy, since a spawn right after a `cd` in a shell
+        // that reports nothing wants the process looked at now.
+        let reported = self.summary_without_waiting().working_dir;
+        self.working_dir_or_divined(reported, policy)
+    }
+
     fn tty_name(&self) -> Option<String> {
         #[cfg(unix)]
         {
@@ -1461,12 +1470,22 @@ impl LocalPane {
     /// output written in answer to the resize is parsed at the new size;
     /// after, for a resize that arrived during the batch.
     fn apply_pending_resize(&self, term: &mut Terminal) {
-        // The note is taken and its lock let go before the resize: a
-        // resize reflows the scrollback, and `summary_without_waiting`
-        // reads the note on the thread that must not wait.
-        let pending = self.pending_resize.lock().take();
+        // The note's lock is not held across the resize: a resize
+        // reflows the scrollback, and `summary_without_waiting` reads
+        // the note on the thread that must not wait. Nor is the note
+        // taken before the resize: until the stored snapshot shows the
+        // new size, a reader must still find the note, or it would take
+        // the old snapshot for the size the pane has. So the note stays
+        // until the snapshot is stored, and goes only if it is still the
+        // size just applied; a newer one waits for the next look.
+        let pending = *self.pending_resize.lock();
         if let Some(size) = pending {
             term.resize(size);
+            self.store_summary(term);
+            let mut note = self.pending_resize.lock();
+            if *note == Some(size) {
+                *note = None;
+            }
         }
     }
 
@@ -1771,6 +1790,29 @@ mod summary_tests {
             "and only the newest one lands"
         );
         assert!(pane.pending_resize.lock().is_none());
+    }
+
+    /// While the parser is applying a noted resize, a reader that cannot
+    /// take the terminal still finds the note: the old snapshot without
+    /// it would say the pane has its old size.
+    #[test]
+    fn the_note_outlives_the_reflow_until_the_snapshot_shows_the_size() {
+        let (pane, _sizes, _exit) = pane();
+        let guard = pane.terminal.lock();
+        pane.resize(size(100, 30)).unwrap();
+        drop(guard);
+        // What the parser does, step by step: the resize itself first.
+        let mut term = pane.terminal.lock();
+        let before = *pane.pending_resize.lock();
+        assert_eq!(before.map(|s| s.cols), Some(100));
+        pane.apply_pending_resize(&mut term);
+        assert!(
+            pane.pending_resize.lock().is_none(),
+            "gone once the snapshot shows it"
+        );
+        assert_eq!(pane.last_summary.lock().dimensions.cols, 100);
+        drop(term);
+        assert_eq!(pane.summary_without_waiting().terminal_size().cols, 100);
     }
 
     /// A resize that lands while the parser is between its last look at

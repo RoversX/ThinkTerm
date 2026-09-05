@@ -2886,13 +2886,12 @@ impl Mux {
         command_dir.or_else(|| {
             match pane {
                 // Without waiting for the pane's parser: this is the
-                // spawn path, on the main thread. The listing summary
-                // carries the divined directory the blocking read would.
-                Some(pane) if pane.domain_id() == target_domain => {
-                    let _ = policy;
-                    pane.listing_summary().working_dir
-                }
-                .and_then(|url| {
+                // spawn path, on the main thread. The policy still
+                // applies to the divined directory, so a spawn right
+                // after a `cd` finds the new one.
+                Some(pane) if pane.domain_id() == target_domain => pane
+                    .working_dir_without_waiting(policy)
+                    .and_then(|url| {
                         percent_decode_str(url.path())
                             .decode_utf8()
                             .ok()
