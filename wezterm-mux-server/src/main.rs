@@ -229,9 +229,20 @@ fn run() -> anyhow::Result<()> {
                 if let Some(mask) = umask::UmaskSaver::saved_umask() {
                     unsafe { libc::umask(mask) };
                 }
-                let args: Vec<OsString> = cmd.get_args().map(|arg| arg.to_os_string()).collect();
-                let err = daemonize::exec_as_own_tcc_identity(cmd.get_program(), &args);
-                log::warn!("re-exec with own privacy identity failed, using exec: {err:#}");
+                // A disclaiming exec of a binary macOS has not assessed (an
+                // unnotarized build) stalls in dyld for most of a minute, and
+                // the GUI gives up on the socket long before; developers opt
+                // out and keep the launcher's identity.
+                let opted_out = std::env::var_os("THINKTERM_NO_PRIVACY_DISCLAIM")
+                    .is_some_and(|value| !value.is_empty());
+                if opted_out {
+                    log::info!("THINKTERM_NO_PRIVACY_DISCLAIM is set; keeping the launcher's privacy identity");
+                } else {
+                    let args: Vec<OsString> =
+                        cmd.get_args().map(|arg| arg.to_os_string()).collect();
+                    let err = daemonize::exec_as_own_tcc_identity(cmd.get_program(), &args);
+                    log::warn!("re-exec with own privacy identity failed, using exec: {err:#}");
+                }
             }
 
             return Err(anyhow::anyhow!("failed to re-exec: {:?}", cmd.exec()));
