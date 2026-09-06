@@ -14,6 +14,20 @@ use mux::connui::ConnectionUI;
 use std::io::Read;
 use std::process::{Command, Stdio};
 
+/// Whether this process started (or took over) the local session server,
+/// as opposed to finding one already running. The GUI only ever stops a
+/// server it started itself.
+static STARTED_LOCAL_SESSION_HOST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn note_local_session_host_started() {
+    STARTED_LOCAL_SESSION_HOST.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub fn local_session_host_started_by_us() -> bool {
+    STARTED_LOCAL_SESSION_HOST.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Run the server this client ships with as a successor of the one
 /// listening on `unix`'s socket. `Ok(true)` when it now serves; `Ok(false)`
 /// when the running server refused or the takeover failed (its output was
@@ -80,6 +94,7 @@ pub fn take_over_local_server(unix: &UnixDomain, ui: &ConnectionUI) -> anyhow::R
         let _ = thread.join();
     }
     if status.success() {
+        note_local_session_host_started();
         ui.output_str("Handed over; reconnecting.\n");
         Ok(true)
     } else {

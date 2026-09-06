@@ -1193,7 +1193,13 @@ impl Pane for ClientPane {
             *ignore = false;
             return;
         }
-        if self.client.remote_tab_input_is_blocked() {
+        // The local session host's terminals are this machine's: a kill is
+        // not held back by the frontend lease, which is still being settled
+        // for the first moments of every launch. Dropping the kill there
+        // left the pane running in the server while its mirror was gone,
+        // and the next resync mirrored it back as a new window.
+        let host = self.client.client.is_local_session_host();
+        if !host && self.client.remote_tab_input_is_blocked() {
             return;
         }
         let client = Arc::clone(&self.client);
@@ -1219,16 +1225,30 @@ impl Pane for ClientPane {
         }
 
         if send_kill {
+            client.note_pending_kill(remote_pane_id);
             promise::spawn::spawn(async move {
-                if client.prepare_remote_tab_input(remote_tab_id).await? {
-                    client
-                        .client
-                        .kill_pane(KillPane {
-                            pane_id: remote_pane_id,
-                        })
-                        .await?;
+                let result = async {
+                    if host || client.prepare_remote_tab_input(remote_tab_id).await? {
+                        client
+                            .client
+                            .kill_pane(KillPane {
+                                pane_id: remote_pane_id,
+                            })
+                            .await?;
+                    }
+                    Ok::<(), anyhow::Error>(())
                 }
-                Ok::<(), anyhow::Error>(())
+                .await;
+                client.forget_pending_kill(remote_pane_id);
+                if let Err(err) = &result {
+                    if host {
+                        log::warn!(
+                            "the session server refused to close pane {remote_pane_id}: {err:#}; \
+                             it stays running and comes back at the next resync"
+                        );
+                    }
+                }
+                result
             })
             .detach();
         }
@@ -2228,6 +2248,7 @@ mod palette_delivery_tests {
             };
         queue.push(delta(1, vec![3, 4], vec![]));
         queue.push(delta(2, vec![4], vec![10..12]));
+
         queue.push(delta(3, vec![7], vec![]));
         let (_, carried) = queue.take().unwrap();
         let carried = carried.expect("two pushes wait behind the first");
@@ -2240,7 +2261,6 @@ mod palette_delivery_tests {
         );
         assert!(!carried.contains(12), "ranges are half-open");
     }
-
 }
 
 #[cfg(test)]

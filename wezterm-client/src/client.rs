@@ -1421,6 +1421,9 @@ impl Reconnectable {
                 let child = cmd
                     .spawn()
                     .with_context(|| format!("while spawning {:?}", cmd))?;
+                if unix_dom.local_session_host {
+                    crate::local_update::note_local_session_host_started();
+                }
                 std::thread::spawn(move || match child.wait_with_output() {
                     Ok(out) => {
                         if let Ok(stdout) = std::str::from_utf8(&out.stdout) {
@@ -1921,9 +1924,27 @@ impl Client {
                                         // attempt would only ask again.
                                         suspend = Some("authentication was declined".to_string());
                                     } else if outage_started.elapsed() >= GIVE_UP_AFTER {
-                                        suspend = Some(format!(
-                                            "unable to reconnect for {GIVE_UP_AFTER:?}"
-                                        ));
+                                        if reconnectable.is_local_session_host() {
+                                            // The local session host keeps
+                                            // trying at the capped interval:
+                                            // its Space is a local one with
+                                            // no Reconnect row, so a parked
+                                            // retry could never be resumed.
+                                            // And a server that kept dying
+                                            // at once gets started again
+                                            // after this long; nothing else
+                                            // would ever try.
+                                            log::warn!(
+                                                "the session server has been unreachable for \
+                                                 {GIVE_UP_AFTER:?}; starting it again if nothing answers"
+                                            );
+                                            short_sessions = 0;
+                                            outage_started = std::time::Instant::now();
+                                        } else {
+                                            suspend = Some(format!(
+                                                "unable to reconnect for {GIVE_UP_AFTER:?}"
+                                            ));
+                                        }
                                     }
                                 }
                             }

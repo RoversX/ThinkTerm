@@ -855,6 +855,10 @@ pub struct ClientInner {
     /// cold-start fetch ran before the panes existed and the push path
     /// had nothing to deliver to — each side assumed the other covered it.
     remote_agent_statuses: Mutex<HashMap<PaneId, thinkterm_proto::AgentStatus>>,
+    /// Remote panes whose KillPane is on its way. A resync that lands in
+    /// between must not mirror them back: the local mirror is gone already,
+    /// and a fresh one would get a window of its own.
+    pending_kills: Mutex<HashSet<PaneId>>,
     /// Authoritative per-remote-tab viewport ownership pushed by the server.
     remote_viewports: Mutex<HashMap<TabId, codec::ClientViewportState>>,
     /// Connection-wide A/B mode and exclusive handoff owner.
@@ -1448,6 +1452,13 @@ impl ClientInner {
         &self,
         remote_tab_id: TabId,
     ) -> anyhow::Result<bool> {
+        // The local session host's terminals are this machine's: the lease
+        // decides who paints, not whether a layout may be restored into it.
+        // Gating here refused the splits of a saved layout while the first
+        // viewport was still being settled, and the thread stayed unbuilt.
+        if self.client.is_local_session_host() {
+            return Ok(true);
+        }
         if self.remote_frontend_gate().obscures_terminal() {
             return Ok(false);
         }
@@ -1456,14 +1467,7 @@ impl ClientInner {
         };
         match access.mode {
             codec::FrontendAccessMode::Handoff => {
-                // No owner: the server decides (the first screen, or the
-                // one that was driving and came back, is let through and
-                // becomes the owner on its first viewport; anyone else is
-                // refused there). Refusing here would refuse the splits of
-                // a layout restored before anything was painted.
-                return Ok(
-                    access.owner.is_none() || self.remote_owner_is_self(access.owner.as_ref())
-                );
+                return Ok(self.remote_owner_is_self(access.owner.as_ref()));
             }
             codec::FrontendAccessMode::TmuxLatest => {}
         }
@@ -1588,6 +1592,7 @@ impl ClientInner {
             remote_to_local_tab: Mutex::new(HashMap::new()),
             remote_to_local_pane: Mutex::new(HashMap::new()),
             remote_agent_statuses: Mutex::new(HashMap::new()),
+            pending_kills: Mutex::new(HashSet::new()),
             remote_viewports: Mutex::new(HashMap::new()),
             remote_access: Mutex::new(None),
             reported_viewports: Mutex::new(HashMap::new()),
@@ -1603,6 +1608,41 @@ impl ClientInner {
             pending_recovery_targets: Mutex::new(HashMap::new()),
             pending_recovery_windows: Mutex::new(HashMap::new()),
             viewport_latency: Mutex::new(ViewportLatencyState::default()),
+        }
+    }
+}
+
+impl ClientInner {
+    pub(crate) fn note_pending_kill(&self, remote_pane_id: PaneId) {
+        self.pending_kills.lock().unwrap().insert(remote_pane_id);
+    }
+
+    pub(crate) fn forget_pending_kill(&self, remote_pane_id: PaneId) {
+        self.pending_kills.lock().unwrap().remove(&remote_pane_id);
+    }
+
+    /// Whether every pane of this tab is one we asked the server to kill.
+    fn tab_is_being_killed(&self, tabroot: &mux::tab::PaneNode) -> bool {
+        let mut pane_ids = Vec::new();
+        collect_pane_ids(tabroot, &mut pane_ids);
+        if pane_ids.is_empty() {
+            return false;
+        }
+        let pending = self.pending_kills.lock().unwrap();
+        pane_ids.iter().all(|pane_id| pending.contains(pane_id))
+    }
+}
+
+fn collect_pane_ids(node: &mux::tab::PaneNode, out: &mut Vec<PaneId>) {
+    match node {
+        mux::tab::PaneNode::Empty => {}
+        mux::tab::PaneNode::Split { left, right, .. } => {
+            collect_pane_ids(left, out);
+            collect_pane_ids(right, out);
+        }
+        mux::tab::PaneNode::Leaf(entry) => out.push(entry.pane_id),
+        mux::tab::PaneNode::Stack(stack) => {
+            out.extend(stack.panes.iter().map(|entry| entry.pane_id))
         }
     }
 }
@@ -2098,9 +2138,9 @@ impl ClientDomain {
             .unwrap_or_else(CommandBuilder::new_default_prog);
         match mux::default_prog::shell_application(&argv, cfg!(windows)) {
             Some(mux::default_prog::ShellApplication::ShellEnv(shell)) => {
-                if cmd.get_env("SHELL").is_none() {
-                    cmd.env("SHELL", shell);
-                }
+                // The builder's base environment already carries the login
+                // SHELL; the choice replaces it.
+                cmd.env("SHELL", shell);
             }
             Some(mux::default_prog::ShellApplication::Argv(argv)) => {
                 *cmd.get_argv_mut() = argv.into_iter().map(Into::into).collect();
@@ -3510,6 +3550,13 @@ impl ClientDomain {
             };
 
             if let Some((remote_window_id, remote_tab_id)) = tabroot.window_and_tab_ids() {
+                if inner.tab_is_being_killed(&tabroot) {
+                    log::debug!(
+                        "domain {}: remote tab {remote_tab_id} is being killed; not mirroring it",
+                        inner.local_domain_id
+                    );
+                    continue;
+                }
                 let tab;
                 // For a tab we already track, the locally-held size (driven
                 // by the GUI window geometry) is authoritative; the wire
