@@ -254,6 +254,12 @@ struct TabFrontendLease {
 /// must still stop the desktop from silently assuming tab A. Filtering by
 /// `live` registrations guards against a viewport left behind by a client
 /// whose transport died without an orderly unregister.
+/// The same screen, as far as a lease is concerned: one user on one host.
+/// The process behind it changes on every restart; the device does not.
+fn same_device(a: &ClientId, b: &ClientId) -> bool {
+    a.hostname == b.hostname && a.username == b.username
+}
+
 fn is_sole_live_renderer(
     tabs: &HashMap<TabId, TabFrontendLease>,
     live: &HashSet<ClientId>,
@@ -274,6 +280,13 @@ struct FrontendLeaseState {
     /// Distinguishes initial server startup (first renderer auto-owns) from an
     /// owner disconnect (everyone stays blocked until an explicit takeover).
     handoff_ever_owned: bool,
+    /// The owner that disconnected, until someone owns again. The lease
+    /// belongs to a *device*, not a process: when the same device comes
+    /// back (the GUI restarted, a laptop's ssh re-established), it is not a
+    /// second screen to hand off to but the one that was already driving,
+    /// and it takes its lease back on its first viewport without a click.
+    /// Another device still has to take over explicitly.
+    handoff_last_owner: Option<ClientId>,
     /// Clients that have ever advertised or claimed a viewport during their
     /// current registration. Handoff's gate exists to stop two *screens* from
     /// fighting over one terminal; a client that never renders -- `thinkterm
@@ -295,6 +308,7 @@ impl Default for FrontendLeaseState {
             access_mode: FrontendAccessMode::Handoff,
             handoff_owner: None,
             handoff_ever_owned: false,
+            handoff_last_owner: None,
             ever_rendered: HashSet::new(),
             access_initialized: false,
             access_generation: 0,
@@ -1462,10 +1476,15 @@ impl Mux {
             let mut access_changed = false;
             if lease.access_mode == FrontendAccessMode::Handoff
                 && lease.handoff_owner.is_none()
-                && !lease.handoff_ever_owned
+                && (!lease.handoff_ever_owned
+                    || lease
+                        .handoff_last_owner
+                        .as_ref()
+                        .is_some_and(|last| same_device(last, client_id)))
             {
                 lease.handoff_owner = Some(client_id.clone());
                 lease.handoff_ever_owned = true;
+                lease.handoff_last_owner = None;
                 access_changed = true;
             }
             let mode = lease.access_mode;
@@ -2397,9 +2416,11 @@ impl Mux {
             if access_changed {
                 // Do not select a surviving renderer automatically. Every
                 // remaining device stays opaque until one explicitly clicks,
-                // wheels or swipes the takeover surface.
+                // wheels or swipes the takeover surface -- except this very
+                // device coming back, which inherits (see handoff_last_owner).
                 lease.handoff_owner = None;
                 lease.handoff_ever_owned = true;
+                lease.handoff_last_owner = Some(client_id.clone());
             }
             (affected, access_changed)
         };
@@ -3740,8 +3761,10 @@ mod tests {
     }
 
     fn client_id(id: usize) -> ClientId {
+        // One host per id: two renderers in a test are two devices, which is
+        // what handoff arbitrates between (one device restarting inherits).
         ClientId {
-            hostname: "test-host".to_string(),
+            hostname: format!("test-host-{id}"),
             username: "test-user".to_string(),
             pid: id as u32,
             epoch: 1,
@@ -4416,6 +4439,51 @@ mod tests {
     /// unpublished reseed hands back a stale generation that the client
     /// rejects - it then never learns it owns the tab, keeps sending bare
     /// paneless viewports, and the server stays on the dead owner's geometry.
+    #[test]
+    fn the_same_device_returning_inherits_the_handoff_lease() {
+        let mux = Mux::new(None);
+        let tab = Arc::new(Tab::new(&TerminalSize::default()));
+        mux.add_tab_no_panes(&tab);
+        let tab_id = tab.tab_id();
+        let first = Arc::new(client_id(70));
+        let first_registration = mux.register_client(Arc::clone(&first));
+        let grid = FrontendViewport::CellGrid {
+            size: TerminalSize::default(),
+        };
+        mux.set_registered_client_viewport(&first, first_registration, tab_id, grid.clone())
+            .unwrap();
+        assert_eq!(
+            mux.frontend_access_state().owner.as_ref(),
+            Some(first.as_ref())
+        );
+        mux.unregister_client(&first, first_registration);
+        assert_eq!(mux.frontend_access_state().owner, None);
+
+        // The GUI on that host restarted: same host and user, new process.
+        let again = Arc::new(ClientId {
+            pid: 7000,
+            id: 71,
+            ..client_id(70)
+        });
+        let again_registration = mux.register_client(Arc::clone(&again));
+        mux.set_registered_client_viewport(&again, again_registration, tab_id, grid.clone())
+            .unwrap();
+        assert_eq!(
+            mux.frontend_access_state().owner.as_ref(),
+            Some(again.as_ref()),
+            "the returning device drives without a claim"
+        );
+        assert!(mux.registered_client_had_tab_input(&again, again_registration, tab_id));
+
+        // A different device after that owner leaves still has to take over.
+        mux.unregister_client(&again, again_registration);
+        let other = Arc::new(client_id(72));
+        let other_registration = mux.register_client(Arc::clone(&other));
+        mux.set_registered_client_viewport(&other, other_registration, tab_id, grid)
+            .unwrap();
+        assert_eq!(mux.frontend_access_state().owner, None);
+    }
+
     #[test]
     fn tmux_reseeding_a_vacated_tab_applies_and_publishes() {
         let mux = Mux::new(None);
