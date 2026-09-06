@@ -659,15 +659,18 @@ impl super::TermWindow {
             .get_active_pane()
             .is_none_or(|pane| pane.downcast_ref::<ClientPane>().is_none())
         {
+            self.reapply_collapsed_panes_for_tab(tab_id);
             self.force_sync_active_mux_tab_pane_sizes();
             return;
         }
-
         let mode = self.active_frontend_access_state().map(|state| state.mode);
         let ownership = self.tab_frontend_viewport_ownership(&tab);
         if mode == Some(mux::FrontendAccessMode::Handoff) && ownership != Some(true) {
             return;
         }
+        // Same reason as in sync_active_tab_geometry_now: past the ownership
+        // gate, adopt squeezed orphans before any return below skips it.
+        self.reapply_collapsed_panes_for_tab(tab_id);
         let epoch = if let Some(stream) = self.remote_divider_resize_streams.get(&tab_id) {
             stream.epoch
         } else {
@@ -1502,6 +1505,11 @@ impl super::TermWindow {
             self.invalidate_window();
             return;
         }
+        // Past the ownership gate (a passive mirror keeps the server's tree)
+        // but ahead of the epoch gates: a rearrangement (tab drop, divider
+        // drag) can leave a squeezed orphan that paints raw, and the returns
+        // below would keep it that way.
+        self.reapply_collapsed_panes_for_tab(tab_id);
         if self
             .frontend_geometry_phases
             .get(&tab_id)
