@@ -205,6 +205,11 @@ pub struct WorkspaceThreadLayoutSnapshot {
     pub tabs: Vec<serde_json::Value>,
     #[serde(default)]
     pub terminal_specs: Vec<TerminalSpecEntry>,
+    /// Written by builds whose Project-directory spawns are strict all the
+    /// way to the server (codec 66). A snapshot without it may hold a pane
+    /// that silently fell back to `$HOME`; only such snapshots are healed.
+    #[serde(default)]
+    pub strict_cwd_spawns: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -7618,6 +7623,7 @@ where
         active_tab,
         tabs,
         terminal_specs,
+        strict_cwd_spawns: true,
     })
 }
 
@@ -7818,9 +7824,19 @@ async fn materialize_layout(
         .collect::<HashMap<_, _>>();
     let mut window_id = None;
     let mut spawned_tabs = 0usize;
+    // Only a snapshot from before strict spawns reached the server can hold
+    // a silent `$HOME` fallback; a newer one saying `$HOME` means `cd ~`.
+    let heal_root = if layout.strict_cwd_spawns {
+        None
+    } else {
+        initial_cwd.as_deref()
+    };
     for node in &tabs {
         let first_entry = first_pane_entry(node);
-        let saved_cwd = first_entry.and_then(|entry| working_dir_for_entry(entry, &terminal_specs));
+        let saved_cwd = heal_fallback_cwd(
+            first_entry.and_then(|entry| working_dir_for_entry(entry, &terminal_specs)),
+            heal_root,
+        );
         // Only a tab starting in the Project directory is strict. A pane's
         // own saved cwd is inherited state and keeps the long-standing
         // fallback; the Project directory was asked for by name, and
@@ -7865,6 +7881,7 @@ async fn materialize_layout(
             pane.pane_id(),
             node,
             &terminal_specs,
+            heal_root,
             Arc::clone(&term_config),
         )
         .await?;
@@ -7888,13 +7905,22 @@ fn restore_node<'a>(
     base_pane_id: PaneId,
     node: &'a PaneNode,
     terminal_specs: &'a HashMap<PaneId, TerminalSpawnSpec>,
+    project_root: Option<&'a str>,
     term_config: Arc<dyn TerminalConfiguration>,
 ) -> LocalBoxFuture<'a, Result<()>> {
     Box::pin(async move {
         match node {
             PaneNode::Empty | PaneNode::Leaf(_) => {}
             PaneNode::Stack(stack) => {
-                restore_stack(mux, base_pane_id, stack, terminal_specs, term_config).await?;
+                restore_stack(
+                    mux,
+                    base_pane_id,
+                    stack,
+                    terminal_specs,
+                    project_root,
+                    term_config,
+                )
+                .await?;
             }
             PaneNode::Split { left, right, node } => {
                 let right_entry = first_pane_entry(right);
@@ -7914,8 +7940,12 @@ fn restore_node<'a>(
                         request,
                         SplitSource::Spawn {
                             command: None,
-                            command_dir: right_entry
-                                .and_then(|entry| working_dir_for_entry(entry, terminal_specs)),
+                            command_dir: heal_fallback_cwd(
+                                right_entry.and_then(|entry| {
+                                    working_dir_for_entry(entry, terminal_specs)
+                                }),
+                                project_root,
+                            ),
                         },
                         right_entry
                             .map(|entry| spawn_domain_for_entry(&mux, entry, terminal_specs, false))
@@ -7929,6 +7959,7 @@ fn restore_node<'a>(
                     base_pane_id,
                     left,
                     terminal_specs,
+                    project_root,
                     Arc::clone(&term_config),
                 )
                 .await?;
@@ -7937,6 +7968,7 @@ fn restore_node<'a>(
                     right_pane.pane_id(),
                     right,
                     terminal_specs,
+                    project_root,
                     term_config,
                 )
                 .await?;
@@ -7951,6 +7983,7 @@ async fn restore_stack(
     base_pane_id: PaneId,
     stack: &PaneStackEntry,
     terminal_specs: &HashMap<PaneId, TerminalSpawnSpec>,
+    project_root: Option<&str>,
     term_config: Arc<dyn TerminalConfiguration>,
 ) -> Result<()> {
     let mut pane_ids = vec![base_pane_id];
@@ -7960,7 +7993,7 @@ async fn restore_stack(
                 base_pane_id,
                 spawn_domain_for_entry(&mux, entry, terminal_specs, false),
                 None,
-                working_dir_for_entry(entry, terminal_specs),
+                heal_fallback_cwd(working_dir_for_entry(entry, terminal_specs), project_root),
                 entry.size,
             )
             .await
@@ -7986,6 +8019,29 @@ fn split_second_percent(
     };
     let total = first.saturating_add(second).max(1);
     ((second.saturating_mul(100) / total).clamp(5, 95)) as u8
+}
+
+/// In a snapshot from before the refusal travelled the wire, a pane saved
+/// exactly at `$HOME` in a Thread whose Project lives elsewhere is the mark
+/// of a silent fallback. Dropping it lets the Project-directory fallback take
+/// over. `project_root` is `None` for snapshots that cannot be poisoned, so
+/// a deliberate `cd ~` recorded by this build is kept.
+fn heal_fallback_cwd(saved: Option<String>, project_root: Option<&str>) -> Option<String> {
+    heal_fallback_cwd_with_home(saved, project_root, &config::HOME_DIR)
+}
+
+fn heal_fallback_cwd_with_home(
+    saved: Option<String>,
+    project_root: Option<&str>,
+    home: &Path,
+) -> Option<String> {
+    let same_dir = |a: &str, b: &Path| {
+        Path::new(a).components().eq(b.components())
+    };
+    match (&saved, project_root) {
+        (Some(saved), Some(root)) if same_dir(saved, home) && !same_dir(root, home) => None,
+        _ => saved,
+    }
 }
 
 fn working_dir_from_entry(entry: &PaneEntry) -> Option<String> {
@@ -8918,6 +8974,43 @@ fn now_ts() -> i64 {
 mod tests {
     use super::*;
 
+    /// Only the exact `$HOME` of a Thread rooted elsewhere is dropped: a
+    /// subdirectory of home, a Thread whose Project *is* home, and a pane
+    /// with no Project at all keep what was saved.
+    #[test]
+    fn a_pane_saved_at_home_is_healed_back_to_the_project() {
+        let home = Path::new("/Users/x");
+        let heal = |saved: &str, root: Option<&str>| {
+            heal_fallback_cwd_with_home(Some(saved.to_string()), root, home)
+        };
+        assert_eq!(heal("/Users/x", Some("/Users/x/proj")), None);
+        assert_eq!(heal("/Users/x/", Some("/Users/x/proj")), None);
+        assert_eq!(
+            heal("/Users/x/proj/sub", Some("/Users/x/proj")),
+            Some("/Users/x/proj/sub".to_string())
+        );
+        assert_eq!(heal("/Users/x", Some("/Users/x")), Some("/Users/x".to_string()));
+        assert_eq!(heal("/Users/x", None), Some("/Users/x".to_string()));
+        assert_eq!(heal_fallback_cwd_with_home(None, Some("/p"), home), None);
+    }
+
+    /// A snapshot written before the flag existed reads as unstrict, which
+    /// is what makes it eligible for healing; one this build writes is not.
+    #[test]
+    fn snapshots_without_the_strict_flag_are_the_ones_healed() {
+        let old: WorkspaceThreadLayoutSnapshot =
+            serde_json::from_str(r#"{"active_tab":0,"tabs":[]}"#).unwrap();
+        assert!(!old.strict_cwd_spawns);
+        let now = serde_json::to_value(WorkspaceThreadLayoutSnapshot {
+            active_tab: 0,
+            tabs: vec![],
+            terminal_specs: vec![],
+            strict_cwd_spawns: true,
+        })
+        .unwrap();
+        assert_eq!(now["strict_cwd_spawns"], serde_json::Value::Bool(true));
+    }
+
     #[test]
     fn denied_project_fallback_is_cleared_only_after_a_successful_repair() {
         let mut repairs = DeniedProjectFallbackRepairs::default();
@@ -9573,6 +9666,7 @@ mod tests {
     fn an_undecodable_layout_is_refused_rather_than_overwritten() {
         let workspace = "test-workspace-undecodable-layout";
         let layout = WorkspaceThreadLayoutSnapshot {
+            strict_cwd_spawns: false,
             active_tab: 0,
             tabs: vec![serde_json::json!({"Leaf": {"a field from the future": true}})],
             terminal_specs: vec![],
@@ -9846,6 +9940,7 @@ mod tests {
             WorkspaceThread::new("project-saved".to_string(), "main".to_string(), None);
         let thread_id = thread.id.clone();
         thread.layout = Some(WorkspaceThreadLayoutSnapshot {
+            strict_cwd_spawns: false,
             active_tab: 0,
             tabs: vec![serde_json::json!({"kind": "saved"})],
             terminal_specs: vec![],
@@ -10125,6 +10220,7 @@ mod tests {
             &space_id,
             &materialized_workspace,
             WorkspaceThreadLayoutSnapshot {
+                strict_cwd_spawns: false,
                 active_tab: 0,
                 tabs: vec![serde_json::json!({"kind": "must-not-be-saved"})],
                 terminal_specs: vec![],
@@ -10794,6 +10890,7 @@ mod tests {
         );
         let default_thread_id = default_thread.id.clone();
         default_thread.layout = Some(WorkspaceThreadLayoutSnapshot {
+            strict_cwd_spawns: false,
             active_tab: 0,
             tabs: vec![serde_json::json!({"kind": "default"})],
             terminal_specs: vec![],
@@ -10991,6 +11088,7 @@ mod tests {
             &space_id,
             "ws",
             WorkspaceThreadLayoutSnapshot {
+                strict_cwd_spawns: false,
                 active_tab: 0,
                 tabs: vec![serde_json::json!({"kind": "test"})],
                 terminal_specs: vec![],
@@ -11040,6 +11138,7 @@ mod tests {
         store.set_active_project_for_space(&second_space, "project-second".to_string());
 
         let snapshot = WorkspaceThreadLayoutSnapshot {
+            strict_cwd_spawns: false,
             active_tab: 0,
             tabs: vec![serde_json::json!({"kind": "wrong"})],
             terminal_specs: vec![],
@@ -11052,6 +11151,7 @@ mod tests {
         assert!(store.projects[1].threads[0].layout.is_none());
 
         let snapshot = WorkspaceThreadLayoutSnapshot {
+            strict_cwd_spawns: false,
             active_tab: 0,
             tabs: vec![serde_json::json!({"kind": "right"})],
             terminal_specs: vec![],
@@ -12854,6 +12954,7 @@ mod tests {
         t1.is_pinned = true;
         let mut t2 = WorkspaceThread::new(alpha.id.clone(), "side".to_string(), None);
         t2.layout = Some(WorkspaceThreadLayoutSnapshot {
+            strict_cwd_spawns: false,
             active_tab: 0,
             tabs: vec![],
             terminal_specs: vec![],
