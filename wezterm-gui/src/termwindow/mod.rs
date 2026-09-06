@@ -2742,6 +2742,13 @@ impl TermWindow {
             crate::workspace_threads::window_layout_structure_fingerprint(self.mux_window_id);
     }
 
+    fn persist_workspace_layout_if_structure_changed(&mut self) {
+        let now = crate::workspace_threads::window_layout_structure_fingerprint(self.mux_window_id);
+        if now.is_some() && now != self.workspace_layout_structure_fingerprint {
+            self.persist_workspace_layout_after_mutation("tab structure changed");
+        }
+    }
+
     pub(crate) fn persist_workspace_layout_after_mutation(&mut self, reason: &'static str) {
         if let Some(workspace) = self.current_mux_workspace() {
             if crate::workspace_threads::is_materializing_thread_layout(&workspace) {
@@ -2780,27 +2787,34 @@ impl TermWindow {
             return false;
         };
 
-        // The local session host is not a remote to preserve: closing one
-        // of its windows ends the terminals in it, as it does in process.
-        let is_remote_client_domain = |domain: &Arc<dyn mux::domain::Domain>| {
-            domain
-                .downcast_ref::<ClientDomain>()
-                .is_some_and(|client| !client.is_local_session_host())
+        // The local session host counts as a client domain here too: its
+        // terminals live in the session server, and closing a window is
+        // closing a view of them, as it is for a remote host. Closing a tab
+        // or a pane still ends what runs in it.
+        let is_client_domain = |domain: &Arc<dyn mux::domain::Domain>| {
+            domain.downcast_ref::<ClientDomain>().is_some()
         };
         let origin_client_domain = origin_domain
             .and_then(|domain_id| mux.get_domain(domain_id))
-            .filter(is_remote_client_domain)
+            .filter(is_client_domain)
             .map(|domain| domain.domain_id());
 
         let active_space_domain =
             crate::workspace_threads::client_domain_for_space(&self.active_space_id)
                 .and_then(|domain_name| mux.get_domain_by_name(&domain_name))
-                .filter(is_remote_client_domain)
+                .filter(is_client_domain)
                 .map(|domain| domain.domain_id());
+        // A window the layout restore made for the host carries no origin
+        // tag (`spawn_tab_or_window` tags nothing), so judge it by what it
+        // holds: every pane a mirror of the host's.
+        let host_pane_domain = client_pane_domains
+            .first()
+            .copied()
+            .filter(|domain_id| crate::local_sessions::is_host_domain_id(*domain_id));
 
         preserve_mux_window_on_gui_close(
             origin_client_domain,
-            active_space_domain,
+            active_space_domain.or(host_pane_domain),
             &pane_domains,
             &client_pane_domains,
         )
@@ -4618,6 +4632,13 @@ impl TermWindow {
                 MuxNotification::TabResized(_) => {
                     // Also handled by wezterm-client
                     self.update_title_post_status();
+                    // A split lands here: PaneAdded goes out before the new
+                    // pane is in the tab tree, and a mirror of a server-side
+                    // split never sends it at all, so the snapshot "pane added"
+                    // takes sees the old layout. Sizes are not part of the
+                    // fingerprint, so live resizes cost a tree walk and no
+                    // write.
+                    self.persist_workspace_layout_if_structure_changed();
                 }
                 MuxNotification::TabTitleChanged { .. } => {
                     self.update_title_post_status();
@@ -4911,7 +4932,8 @@ impl TermWindow {
     /// workspace has no mux window to adopt.
     pub(crate) fn adopt_workspace_in_this_window(&mut self, workspace: &str) -> bool {
         let mux = Mux::get();
-        let Some(target) = mux.iter_windows_in_workspace(workspace).first().copied() else {
+        let Some(target) = crate::workspace_threads::window_to_show_in_workspace(workspace)
+        else {
             return false;
         };
         mux.set_active_workspace(workspace);

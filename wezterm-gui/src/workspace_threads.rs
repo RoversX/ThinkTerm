@@ -8435,16 +8435,54 @@ pub fn client_domain_for_space(space_id: &str) -> Option<String> {
 
 /// Parse a thread workspace name (`thinkterm:<project-id>:<thread-id>`,
 /// optionally with a `:<remote-workspace>` suffix) back into its identity.
-/// Thread ids never contain `:`, project ids may (`::space::`).
+/// Thread ids never contain `:`, project ids may (`::space::`). Threads
+/// made before the id scheme settled carry a `session-` id; stores still
+/// hold them, so they are threads too.
 pub(crate) fn parse_thread_workspace_name(workspace: &str) -> Option<(String, String)> {
     let rest = workspace.strip_prefix("thinkterm:")?;
-    let idx = rest.find(":thread-")?;
+    let idx = rest.find(":thread-").or_else(|| rest.find(":session-"))?;
     let project_id = &rest[..idx];
     let thread_id = rest[idx + 1..].split(':').next()?;
     if project_id.is_empty() {
         return None;
     }
     Some((project_id.to_string(), thread_id.to_string()))
+}
+
+/// The mux window a GUI window should show for `workspace`. A workspace
+/// normally has one; when a server holds more than one for the same thread
+/// (duplicates left by an earlier mirror rebuild), the one with the most
+/// panes is the one the user was working in. Ties go to the lowest id on
+/// the server, which is stable across launches and takeovers, unlike the
+/// local mirror ids, which follow the order the server listed them in.
+pub(crate) fn window_to_show_in_workspace(workspace: &str) -> Option<mux::window::WindowId> {
+    let mux = mux::Mux::get();
+    let rank = |window_id: mux::window::WindowId| {
+        let Some(window) = mux.get_window(window_id) else {
+            return (0, std::cmp::Reverse((true, window_id)));
+        };
+        let pane_count: usize = window
+            .iter()
+            .map(|tab| tab.count_panes().unwrap_or(0))
+            .sum();
+        let remote_id = window
+            .iter()
+            .flat_map(|tab| tab.iter_all_panes())
+            .next()
+            .and_then(|pane| mux.get_domain(pane.domain_id()))
+            .and_then(|domain| {
+                domain
+                    .downcast_ref::<wezterm_client::domain::ClientDomain>()
+                    .and_then(|client| client.local_to_remote_window_id(window_id))
+            });
+        (
+            pane_count,
+            std::cmp::Reverse((remote_id.is_none(), remote_id.unwrap_or(window_id))),
+        )
+    };
+    mux.iter_windows_in_workspace(workspace)
+        .into_iter()
+        .max_by_key(|window_id| rank(*window_id))
 }
 
 /// Whether the workspace is managed by ThinkTerm's Space/thread store.
@@ -12671,6 +12709,24 @@ mod tests {
             parse_thread_workspace_name(&ws_a),
             Some((a, "thread-1".to_string()))
         );
+    }
+
+    /// Stores from before the id scheme settled hold `session-` thread ids;
+    /// their workspaces are thread workspaces like any other.
+    #[test]
+    fn legacy_session_ids_name_thread_workspaces() {
+        let ws =
+            workspace_name_for_thread("project-102e49b953fef4dc", "session-1779804751445-cafe1753");
+        assert_eq!(
+            parse_thread_workspace_name(&ws),
+            Some((
+                "project-102e49b953fef4dc".to_string(),
+                "session-1779804751445-cafe1753".to_string()
+            ))
+        );
+        assert!(is_thread_workspace_name(&ws));
+        assert!(!is_thread_workspace_name("thinkterm:project-1:other-1"));
+        assert!(!is_thread_workspace_name("default"));
     }
 
     /// The local store and `codec::apply_op` implement the same row-ordering

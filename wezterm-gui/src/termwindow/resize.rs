@@ -1480,10 +1480,9 @@ impl super::TermWindow {
         }
 
         let ownership = self.tab_frontend_viewport_ownership(&tab);
-        // The local session host has one screen, this one. A tab it does
-        // not own yet (a lease left by a previous run of this GUI, or a tab
-        // restored before anything was painted) is claimed the way a click
-        // on the terminal claims it, so the same full sync follows.
+        // The local session host's lease is settled by the server: the
+        // device that was driving inherits it on its first viewport, so a
+        // tab this GUI does not own yet is claimed there, not here.
         let previewing = matches!(
             self.frontend_geometry_phases.get(&tab_id),
             Some(super::FrontendGeometryPhase::Previewing { .. })

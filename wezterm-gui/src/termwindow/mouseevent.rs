@@ -6508,10 +6508,8 @@ impl super::TermWindow {
             crate::workspace_threads::activation_plan_for_thread(&thread_id, &live_workspaces)
         {
             if !plan.needs_materialize {
-                let target = mux
-                    .iter_windows_in_workspace(&plan.workspace_name)
-                    .into_iter()
-                    .next();
+                let target =
+                    crate::workspace_threads::window_to_show_in_workspace(&plan.workspace_name);
                 if let Some(target) = target {
                     if target != self.mux_window_id {
                         if let Some(other) =
@@ -6939,12 +6937,17 @@ impl super::TermWindow {
             {
                 self.show_project_root_problem(thread_id, space_id, display_name, failure);
             }
+            // The workspaces this activation was told to kill are dead
+            // already (mirrors of a replaced server); a failed rebuild must
+            // not keep them for the life of the process.
+            kill_workspace_windows(&workspaces_to_kill_after_adopt, None);
             release(self);
             return;
         }
 
         if !self.adopt_workspace_in_this_window(&workspace) {
             log::error!("materialized ThinkTerm workspace {workspace:?} has no window to adopt");
+            kill_workspace_windows(&workspaces_to_kill_after_adopt, None);
             release(self);
             return;
         }
@@ -8752,7 +8755,7 @@ mod local_thread_activation_tests {
 /// without disturbing any other GUI window already bound to the mux.
 pub(crate) fn adopt_workspace_into_window(window: &Option<::window::Window>, workspace: &str) {
     let mux = Mux::get();
-    let Some(target) = mux.iter_windows_in_workspace(workspace).first().copied() else {
+    let Some(target) = crate::workspace_threads::window_to_show_in_workspace(workspace) else {
         return;
     };
     mux.set_active_workspace(workspace);
