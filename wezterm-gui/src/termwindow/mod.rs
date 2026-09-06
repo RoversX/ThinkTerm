@@ -6992,6 +6992,11 @@ impl TermWindow {
                         title.push_str(" · B ACTIVE");
                     }
                     wezterm_client::domain::RemoteFrontendGate::Claimable { owner } => {
+                        log::debug!(
+                            "window {}: terminal gate is claimable (owner {:?})",
+                            self.mux_window_id,
+                            owner.as_ref().map(|owner| (owner.hostname.as_str(), owner.pid, owner.id))
+                        );
                         let owner = owner
                             .as_ref()
                             .map(|owner| owner.hostname.as_str())

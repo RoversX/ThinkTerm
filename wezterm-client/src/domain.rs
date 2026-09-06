@@ -1228,6 +1228,18 @@ impl ClientInner {
         map.get(&remote_tab_id).copied()
     }
 
+    /// Lease generations are a server process's own counter. A new
+    /// connection may be to a new process (a takeover keeps the runtime id
+    /// and every pane, a crash brings a replacement), whose counter starts
+    /// again below what this client remembers; kept, that memory would
+    /// reject every lease update from it, including the one that makes
+    /// this client the owner, and the terminal would stay claimable for
+    /// good. Forgotten at every (re)connection instead.
+    fn forget_lease_generations(&self) {
+        self.remote_access.lock().unwrap().take();
+        self.remote_viewports.lock().unwrap().clear();
+    }
+
     fn update_remote_viewport(&self, state: codec::ClientViewportState) -> bool {
         let mut states = self.remote_viewports.lock().unwrap();
         if !accepts_generation(
@@ -2373,6 +2385,15 @@ impl ClientDomain {
     }
 
     pub fn process_remote_access_state(&self, state: codec::FrontendAccessState) {
+        log::debug!(
+            "frontend access from {}: mode={:?} owner={:?} generation={} (this client: {:?})",
+            self.config.name(),
+            state.mode,
+            state.owner.as_ref().map(|owner| (owner.hostname.as_str(), owner.pid, owner.id)),
+            state.generation,
+            self.inner()
+                .map(|inner| (inner.client.client_id.pid, inner.client.client_id.id))
+        );
         let Some(inner) = self.inner() else {
             self.early_remote_state.lock().unwrap().access = Some(state);
             return;
@@ -2506,6 +2527,7 @@ impl ClientDomain {
         if inner.client.connection_generation() != connection_generation {
             bail!("generation {connection_generation} was superseded during registration");
         }
+        inner.forget_lease_generations();
 
         // A reconnect begins a new connection generation. The revision
         // baseline, any old connection-scoped presentation overlay, and the
@@ -2793,7 +2815,14 @@ impl ClientDomain {
         // server can return current access state for the new live session.
         // SetClientViewport is non-claiming: if another device took over while
         // we were offline, it remains the owner.
-        for (remote_tab_id, viewport) in inner.reported_viewports_for_live_tabs() {
+        let reported = inner.reported_viewports_for_live_tabs();
+        log::debug!(
+            "re-reporting {} viewports after reconnecting to {} (live tabs {})",
+            reported.len(),
+            client.config.name(),
+            inner.remote_to_local_tab.lock().unwrap().len()
+        );
+        for (remote_tab_id, viewport) in reported {
             let state = inner
                 .client
                 .set_client_viewport(codec::SetClientViewport {
@@ -5419,6 +5448,11 @@ impl ClientDomain {
                         match outcome {
                             Ok(true) => {
                                 ui.output_str("Reconnecting to the updated server\n");
+                                // The lease state stashed from the old server
+                                // carries its generations; the successor's
+                                // start over.
+                                *self.early_remote_state.lock().unwrap() =
+                                    EarlyRemoteState::default();
                                 client = connect(config.clone(), ui.clone()).await?;
                                 client.verify_version_compat(&ui).await?;
                             }
