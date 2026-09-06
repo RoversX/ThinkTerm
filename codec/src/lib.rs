@@ -449,15 +449,21 @@ macro_rules! pdu {
                       R: AsyncRead,
                       R: std::fmt::Debug
             {
+                #[cfg(not(target_family = "wasm"))]
                 let started = std::time::Instant::now();
                 let decoded = decode_raw_async(r, max_serial).await.context("decoding a PDU")?;
+                // Only a debug line above 64 KiB reads these; wasm has no
+                // Instant, and the line is not worth a clock abstraction.
+                #[cfg(not(target_family = "wasm"))]
                 let read_took = started.elapsed();
                 match decoded.ident {
                     $(
                         $vers => {
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
+                            #[cfg(not(target_family = "wasm"))]
                             let deserialize_started = std::time::Instant::now();
                             let pdu = Pdu::$name(deserialize(decoded.data.as_slice(), decoded.is_compressed)?);
+                            #[cfg(not(target_family = "wasm"))]
                             if decoded.data.len() > 64 * 1024 {
                                 log::debug!(
                                     "decode {} serial {}: {} bytes read in {:?}, deserialized in {:?}",
@@ -913,9 +919,24 @@ impl InputSerial {
         std::time::SystemTime::now().into()
     }
 
+    /// Milliseconds since the unix epoch, supplied by whatever clock the
+    /// host has: a session layer must not read `SystemTime` itself.
+    pub const fn from_millis(millis: u64) -> Self {
+        Self(millis)
+    }
+
+    pub const fn millis(self) -> u64 {
+        self.0
+    }
+
     pub fn elapsed_millis(&self) -> u64 {
         let now = InputSerial::now();
         now.0 - self.0
+    }
+
+    /// `elapsed_millis` with the caller's "now"; the same subtraction.
+    pub fn elapsed_millis_since(self, now_millis: u64) -> u64 {
+        now_millis - self.0
     }
 }
 
