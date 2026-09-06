@@ -309,7 +309,7 @@ impl super::TermWindow {
         Some(Mux::get().current_identity_owns_frontend_lease(tab.tab_id()))
     }
 
-    fn tab_owns_frontend_viewport(&self, tab: &Arc<mux::tab::Tab>) -> bool {
+    pub(crate) fn tab_owns_frontend_viewport(&self, tab: &Arc<mux::tab::Tab>) -> bool {
         self.tab_frontend_viewport_ownership(tab) == Some(true)
     }
 
@@ -1480,6 +1480,10 @@ impl super::TermWindow {
         }
 
         let ownership = self.tab_frontend_viewport_ownership(&tab);
+        // The local session host has one screen, this one. A tab it does
+        // not own yet (a lease left by a previous run of this GUI, or a tab
+        // restored before anything was painted) is claimed the way a click
+        // on the terminal claims it, so the same full sync follows.
         let previewing = matches!(
             self.frontend_geometry_phases.get(&tab_id),
             Some(super::FrontendGeometryPhase::Previewing { .. })

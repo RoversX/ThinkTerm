@@ -282,7 +282,7 @@ impl CommandDef {
                 let label = name;
 
                 if dom.state() == DomainState::Attached {
-                    if name == "local" {
+                    if name == "local" || !dom.detachable() {
                         continue;
                     }
                     result.push(ExpandedCommand {

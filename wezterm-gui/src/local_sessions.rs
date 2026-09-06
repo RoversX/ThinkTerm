@@ -1,0 +1,321 @@
+//! Local terminals kept in a background mux server.
+//!
+//! With the setting on, the GUI is a client of `thinkterm-mux-server` for
+//! this machine too: the default unix domain is marked as the *local
+//! session host* (`UnixDomain::local_session_host`), attached before the
+//! first window, and made the default domain, so every local terminal is
+//! spawned in the server and survives the GUI quitting, crashing or
+//! updating. The in-process `local` domain stays registered as the
+//! fallback and for `--domain local`.
+//!
+//! Everywhere the GUI decides "is this a remote host?" by finding a client
+//! domain, the host is excluded: its threads are the local Space's, closing
+//! its windows kills their panes, a second launch reuses this GUI. Those
+//! decisions live next to the code they gate; this module only knows which
+//! domain the host is.
+
+use config::{ConfigHandle, UnixDomain};
+use mux::domain::Domain;
+use mux::Mux;
+use std::sync::{Arc, Mutex, OnceLock};
+use wezterm_client::domain::{ClientDomain, ClientDomainConfig};
+use window::WindowOps as _;
+
+/// The name of the host domain for this launch, once `install` chose one.
+static HOST: OnceLock<Option<String>> = OnceLock::new();
+/// Set when the host could not be attached at launch: the GUI then runs
+/// its terminals in process as if the setting were off.
+static FELL_BACK: Mutex<bool> = Mutex::new(false);
+
+/// Whether this build and platform can run local sessions in a server:
+/// the handoff that keeps sessions across an update passes descriptors,
+/// which has no Windows implementation.
+pub(crate) fn supported() -> bool {
+    cfg!(unix)
+}
+
+/// The setting, as it applies to this launch.
+pub(crate) fn wanted() -> bool {
+    supported() && crate::native_settings::local_sessions_via_mux()
+}
+
+/// The unix domain that is, or would be, the host: the configured one
+/// named `unix` (the default domain every configuration has), else the
+/// first one that connects to a socket rather than through a proxy.
+pub(crate) fn candidate(config: &ConfigHandle) -> Option<UnixDomain> {
+    candidate_in(&config.unix_domains)
+}
+
+fn candidate_in(domains: &[UnixDomain]) -> Option<UnixDomain> {
+    domains
+        .iter()
+        .find(|dom| dom.name == "unix" && dom.proxy_command.is_none())
+        .or_else(|| domains.iter().find(|dom| dom.proxy_command.is_none()))
+        .cloned()
+}
+
+/// Register the host domain with the mux when the setting is on. Runs
+/// before the configured client domains are registered, which skip a name
+/// that already exists, so this marked copy is the one the mux keeps.
+/// Returns the host's name.
+pub(crate) fn install(mux: &Mux, config: &ConfigHandle) -> Option<String> {
+    let name = if wanted() && config.default_domain.is_some() {
+        // A configured default domain is re-applied on every config
+        // reload; it wins, and the setting is left as a documented no-op.
+        log::warn!(
+            "local sessions: the configuration sets default_domain = {:?}, so local terminals \
+             stay there and the session server is not used",
+            config.default_domain.as_deref().unwrap_or_default()
+        );
+        None
+    } else if wanted() {
+        candidate(config).map(|mut unix| {
+            unix.local_session_host = true;
+            unix.connect_automatically = true;
+            // Every pane of the host is one this GUI asked for: no default
+            // shell in a workspace nothing shows.
+            if let Ok(mut serve) = unix.serve_command() {
+                serve.push("--no-initial-pane".into());
+                unix.serve_command =
+                    Some(serve.iter().map(|arg| arg.to_string_lossy().into_owned()).collect());
+            }
+            if mux.get_domain_by_name(&unix.name).is_none() {
+                let domain: Arc<dyn Domain> =
+                    Arc::new(ClientDomain::new(ClientDomainConfig::Unix(unix.clone())));
+                mux.add_domain(&domain);
+            }
+            unix.name
+        })
+    } else {
+        None
+    };
+    HOST.get_or_init(|| name.clone());
+    name
+}
+
+/// The host's domain name for this launch, if local sessions run in it.
+pub(crate) fn host_domain_name() -> Option<String> {
+    if *FELL_BACK.lock().unwrap() {
+        return None;
+    }
+    HOST.get().cloned().flatten()
+}
+
+/// Whether `name` is the host domain of this launch.
+pub(crate) fn is_host_domain_name(name: &str) -> bool {
+    host_domain_name().as_deref() == Some(name)
+}
+
+/// Whether the domain with `id` is the host domain of this launch.
+pub(crate) fn is_host_domain_id(id: mux::domain::DomainId) -> bool {
+    let Some(host) = host_domain_name() else {
+        return false;
+    };
+    Mux::get()
+        .get_domain(id)
+        .is_some_and(|domain| domain.domain_name() == host)
+}
+
+/// The host could not be attached at launch: run this launch in process.
+/// The domain stays registered but detached; nothing retries it, since a
+/// host attached later would find windows already classified as local.
+pub(crate) fn fall_back_to_in_process(mux: &Mux, why: &anyhow::Error) {
+    let Some(host) = HOST.get().cloned().flatten() else {
+        return;
+    };
+    *FELL_BACK.lock().unwrap() = true;
+    match mux.get_domain_by_name("local") {
+        Some(local) => {
+            mux.set_default_domain(&local);
+            log::error!(
+                "local sessions: could not attach the session server {host} ({why:#}); \
+                 this launch runs its terminals in process"
+            );
+        }
+        None => log::error!(
+            "local sessions: could not attach the session server {host} ({why:#}) and \
+             there is no in-process domain to fall back to"
+        ),
+    }
+}
+
+/// The host came back as a different, empty server (it crashed and was
+/// started again): the terminals its mirrors show are gone. Each window
+/// that showed only such mirrors rebuilds its thread from the layout store
+/// into the new server -- the old mux window is moved aside first so the
+/// thread's workspace counts as dead, then killed once the new one is
+/// adopted. An activity guard keeps the GUI from quitting while the mux
+/// is briefly empty.
+pub(crate) fn on_host_replaced(domain_id: mux::domain::DomainId) {
+    promise::spawn::spawn_into_main_thread(async move {
+        let _activity = mux::activity::Activity::new();
+        let mux = Mux::get();
+        let dead_windows: Vec<mux::window::WindowId> = mux
+            .iter_windows()
+            .into_iter()
+            .filter(|window_id| {
+                mux.get_window(*window_id).is_some_and(|window| {
+                    let panes: Vec<_> = window
+                        .iter()
+                        .flat_map(|tab| tab.iter_all_panes())
+                        .collect();
+                    !panes.is_empty() && panes.iter().all(|pane| pane.domain_id() == domain_id)
+                })
+            })
+            .collect();
+        log::info!(
+            "local sessions: {} windows showed terminals of the replaced server; rebuilding them",
+            dead_windows.len()
+        );
+        let rebuilt_panes: std::collections::HashSet<_> = dead_windows
+            .iter()
+            .filter_map(|window_id| mux.get_window(*window_id))
+            .flat_map(|window| {
+                window
+                    .iter()
+                    .flat_map(|tab| tab.iter_all_panes())
+                    .map(|pane| pane.pane_id())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for window_id in dead_windows {
+            let Some(gui) = crate::frontend::front_end().gui_window_for_mux_window(window_id)
+            else {
+                // Nothing shows it: gone, along with its dead mirrors.
+                if let Some(window) = mux.get_window(window_id) {
+                    for pane in window.iter().flat_map(|tab| tab.iter_all_panes()) {
+                        if let Some(client_pane) =
+                            pane.downcast_ref::<wezterm_client::pane::ClientPane>()
+                        {
+                            client_pane.ignore_next_kill();
+                        }
+                    }
+                }
+                mux.kill_window(window_id);
+                continue;
+            };
+            // Moved aside quietly (a notified move would be synced into the
+            // thread store and the thread would then "live" there), the
+            // thread's own workspace counts as dead; the activation below
+            // materializes it again from the layout store, adopts the new
+            // window into this GUI window, and kills the old workspace.
+            let Some(old_workspace) = mux
+                .get_window(window_id)
+                .map(|window| window.get_workspace().to_string())
+            else {
+                continue;
+            };
+            let dead_workspace = if old_workspace.starts_with("dead-session:") {
+                old_workspace
+            } else {
+                let dead_workspace = format!("dead-session:{old_workspace}");
+                mux.rename_workspace_quietly(&old_workspace, &dead_workspace);
+                dead_workspace
+            };
+            if let Some(window) = mux.get_window(window_id) {
+                for pane in window.iter().flat_map(|tab| tab.iter_all_panes()) {
+                    if let Some(client_pane) =
+                        pane.downcast_ref::<wezterm_client::pane::ClientPane>()
+                    {
+                        client_pane.ignore_next_kill();
+                    }
+                }
+            }
+            gui.window.notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                move |term_window| {
+                    let thread_id = term_window.window.clone().and_then(|window| {
+                        crate::workspace_threads::ensure_active_thread_for_space(
+                            term_window.active_space_id(),
+                        )
+                        .map(|thread_id| (thread_id, window))
+                    });
+                    match thread_id {
+                        Some((thread_id, window)) => term_window
+                            .activate_workspace_thread_with_cleanup(
+                                thread_id,
+                                &window,
+                                vec![dead_workspace],
+                            ),
+                        None => {
+                            // Nothing to rebuild into: the parked window
+                            // must not outlive this.
+                            log::warn!("local sessions: no thread to rebuild for the window");
+                            Mux::get().kill_window(window_id);
+                        }
+                    }
+                },
+            )));
+        }
+        // Windows mixing host terminals with others keep the others; only
+        // the dead mirrors go (nothing is sent for them: their ids mean
+        // nothing on the replacement).
+        for pane in mux.iter_panes() {
+            if pane.domain_id() != domain_id || rebuilt_panes.contains(&pane.pane_id()) {
+                continue;
+            }
+            if let Some(client_pane) = pane.downcast_ref::<wezterm_client::pane::ClientPane>() {
+                client_pane.ignore_next_kill();
+            }
+            mux.remove_pane(pane.pane_id());
+        }
+        smol::Timer::after(std::time::Duration::from_secs(3)).await;
+    })
+    .detach();
+}
+
+/// Where a terminal that is asked for "locally" goes: the host while local
+/// sessions run in it, the in-process domain otherwise. For the places that
+/// name `local` explicitly rather than using the default domain.
+pub(crate) fn local_spawn_domain() -> config::keyassignment::SpawnTabDomain {
+    config::keyassignment::SpawnTabDomain::DomainName(
+        host_domain_name().unwrap_or_else(|| "local".to_string()),
+    )
+}
+
+/// A layout records the domain each terminal ran in, and a terminal of the
+/// host is recorded as `local` (it is one). While the setting is on, `local`
+/// restores into the host; off, it restores in process. A unix domain named
+/// in a layout is one the user chose and is left alone either way.
+pub(crate) fn alias_recorded_domain(recorded: &str) -> Option<String> {
+    alias_for(recorded, host_domain_name().as_deref())
+}
+
+fn alias_for(recorded: &str, host: Option<&str>) -> Option<String> {
+    let host = host?;
+    (recorded == "local").then(|| host.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{alias_for, candidate_in};
+    use config::UnixDomain;
+
+    fn unix(name: &str, proxy: bool) -> UnixDomain {
+        UnixDomain {
+            name: name.into(),
+            proxy_command: proxy.then(|| vec!["wsl".to_string()]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_candidate_prefers_the_default_unix_domain_over_proxies() {
+        let domains = vec![unix("wsl", true), unix("other", false), unix("unix", false)];
+        assert_eq!(candidate_in(&domains).map(|d| d.name), Some("unix".to_string()));
+        let domains = vec![unix("wsl", true), unix("other", false)];
+        assert_eq!(candidate_in(&domains).map(|d| d.name), Some("other".to_string()));
+        assert!(candidate_in(&[unix("wsl", true)]).is_none());
+    }
+
+    #[test]
+    fn recorded_local_terminals_follow_the_setting() {
+        // On: local terminals restore into the host; a unix domain named in
+        // a layout was the user's choice and remote domains are untouched.
+        assert_eq!(alias_for("local", Some("unix")), Some("unix".to_string()));
+        assert_eq!(alias_for("unix", Some("unix")), None);
+        assert_eq!(alias_for("vm", Some("unix")), None);
+        // Off: nothing is rewritten.
+        assert_eq!(alias_for("local", None), None);
+        assert_eq!(alias_for("unix", None), None);
+    }
+}

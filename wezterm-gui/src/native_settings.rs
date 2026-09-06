@@ -365,6 +365,10 @@ pub(crate) struct NativeWorkspaceSettings {
     /// Updating a remote mux server hands its sessions to the new version
     /// instead of stopping it; off, the update asks whether to stop it.
     pub(crate) remote_update_keeps_sessions: bool,
+    /// Local terminals run in a background mux server (the default unix
+    /// domain) instead of inside the GUI process, so they survive the GUI
+    /// quitting, crashing or updating. Read once at launch.
+    pub(crate) local_sessions_via_mux: bool,
 }
 
 impl Default for NativeWorkspaceSettings {
@@ -375,6 +379,7 @@ impl Default for NativeWorkspaceSettings {
             remote_drop_destination: String::new(),
             notification_sounds_enabled: true,
             remote_update_keeps_sessions: true,
+            local_sessions_via_mux: false,
         }
     }
 }
@@ -914,6 +919,10 @@ pub(crate) fn notification_sounds_enabled() -> bool {
 
 pub(crate) fn remote_update_keeps_sessions() -> bool {
     load().workspaces.remote_update_keeps_sessions
+}
+
+pub(crate) fn local_sessions_via_mux() -> bool {
+    load().workspaces.local_sessions_via_mux
 }
 
 pub(crate) fn bottom_quote_interval_minutes(settings: &ThinkTermNativeSettings) -> u32 {

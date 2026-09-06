@@ -2807,9 +2807,10 @@ pub fn snapshot_active_space_thread_layout_with_font_scales<F>(
     // the tag says; the tag is still honoured so tmux keeps its behaviour.
     let space_is_remote = client_domain_for_space(space_id).is_some();
     if space_is_remote
-        || Mux::get()
-            .get_window(window_id)
-            .map_or(false, |w| w.origin_domain().is_some())
+        || Mux::get().get_window(window_id).map_or(false, |w| {
+            w.origin_domain()
+                .is_some_and(|id| !crate::local_sessions::is_host_domain_id(id))
+        })
     {
         let mut scales: HashMap<PaneId, f64> = HashMap::new();
         let mut remote_panes = 0usize;
@@ -2895,8 +2896,11 @@ pub(crate) async fn materialize_thread(
     // resync below, the opaque terminal surface can perform the real claim.
     if let Some((_project_id, thread_id)) = parse_thread_workspace_name(&workspace_name) {
         if let Ok(domain) = mux.resolve_spawn_tab_domain(None, &default_domain) {
-            if let Some(client_domain) =
-                domain.downcast_ref::<wezterm_client::domain::ClientDomain>()
+            // Not the local session host: its threads are this machine's,
+            // spawned and laid out from the local store below.
+            if let Some(client_domain) = domain
+                .downcast_ref::<wezterm_client::domain::ClientDomain>()
+                .filter(|client| !client.is_local_session_host())
             {
                 let response = client_domain
                     .ensure_thinkterm_thread(Some(thread_id), size)
@@ -2952,6 +2956,9 @@ pub(crate) async fn materialize_thread(
                 domain
                     .downcast_ref::<mux::domain::LocalDomain>()
                     .is_some_and(mux::domain::LocalDomain::is_plain_local)
+                    || domain
+                        .downcast_ref::<wezterm_client::domain::ClientDomain>()
+                        .is_some_and(|client| client.is_local_session_host())
             }))
         })
         .await
@@ -8029,7 +8036,16 @@ fn collect_terminal_spec<F>(
         // would record its name and every later materialize of the Thread
         // would fail; leave it unset so restore falls back instead.
         .filter(|domain| domain.spawnable())
-        .map(|domain| domain.domain_name().to_string());
+        // A terminal in the local session host is a local terminal:
+        // recorded as `local`, it restores wherever local terminals run
+        // when the layout is next used (local_sessions::alias_recorded_domain).
+        .map(|domain| {
+            if crate::local_sessions::is_host_domain_id(domain.domain_id()) {
+                "local".to_string()
+            } else {
+                domain.domain_name().to_string()
+            }
+        });
     terminal_specs.push(TerminalSpecEntry {
         pane_id: entry.pane_id,
         spec: TerminalSpawnSpec {
@@ -8071,10 +8087,12 @@ fn spawn_domain_for_entry(
     terminal_specs: &HashMap<PaneId, TerminalSpawnSpec>,
     default_if_missing: bool,
 ) -> SpawnTabDomain {
+    let recorded = terminal_specs
+        .get(&entry.pane_id)
+        .and_then(|spec| spec.domain.as_deref());
+    let aliased = recorded.and_then(crate::local_sessions::alias_recorded_domain);
     spawn_domain_for_recorded_name(
-        terminal_specs
-            .get(&entry.pane_id)
-            .and_then(|spec| spec.domain.as_deref()),
+        aliased.as_deref().or(recorded),
         |name| {
             mux.get_domain_by_name(name)
                 .map(|domain| domain.spawnable())
@@ -8418,7 +8436,7 @@ pub fn client_domain_for_space(space_id: &str) -> Option<String> {
 /// Parse a thread workspace name (`thinkterm:<project-id>:<thread-id>`,
 /// optionally with a `:<remote-workspace>` suffix) back into its identity.
 /// Thread ids never contain `:`, project ids may (`::space::`).
-fn parse_thread_workspace_name(workspace: &str) -> Option<(String, String)> {
+pub(crate) fn parse_thread_workspace_name(workspace: &str) -> Option<(String, String)> {
     let rest = workspace.strip_prefix("thinkterm:")?;
     let idx = rest.find(":thread-")?;
     let project_id = &rest[..idx];

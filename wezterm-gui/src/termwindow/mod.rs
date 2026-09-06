@@ -2780,15 +2780,22 @@ impl TermWindow {
             return false;
         };
 
+        // The local session host is not a remote to preserve: closing one
+        // of its windows ends the terminals in it, as it does in process.
+        let is_remote_client_domain = |domain: &Arc<dyn mux::domain::Domain>| {
+            domain
+                .downcast_ref::<ClientDomain>()
+                .is_some_and(|client| !client.is_local_session_host())
+        };
         let origin_client_domain = origin_domain
             .and_then(|domain_id| mux.get_domain(domain_id))
-            .filter(|domain| domain.downcast_ref::<ClientDomain>().is_some())
+            .filter(is_remote_client_domain)
             .map(|domain| domain.domain_id());
 
         let active_space_domain =
             crate::workspace_threads::client_domain_for_space(&self.active_space_id)
                 .and_then(|domain_name| mux.get_domain_by_name(&domain_name))
-                .filter(|domain| domain.downcast_ref::<ClientDomain>().is_some())
+                .filter(is_remote_client_domain)
                 .map(|domain| domain.domain_id());
 
         preserve_mux_window_on_gui_close(
@@ -4785,6 +4792,11 @@ impl TermWindow {
             window.invalidate();
         }
     }
+
+    pub(crate) fn active_space_id(&self) -> &str {
+        &self.active_space_id
+    }
+
 
     /// The mux window this GUI window displayed is gone (its last pane
     /// exited, e.g. `exit` in a thread's only shell). Fall back to another
@@ -8933,7 +8945,11 @@ impl TermWindow {
             }
             DetachDomain(domain) => {
                 let domain = Mux::get().resolve_spawn_tab_domain(Some(pane.pane_id()), domain)?;
-                domain.detach()?;
+                if domain.detachable() {
+                    domain.detach()?;
+                } else {
+                    log::warn!("domain {} cannot be detached", domain.domain_name());
+                }
             }
             AttachDomain(domain) => {
                 let window = self.mux_window_id;

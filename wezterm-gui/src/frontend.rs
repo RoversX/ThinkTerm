@@ -437,7 +437,7 @@ impl GuiFrontEnd {
                     match mux
                         .spawn_tab_or_window(
                             window_id,
-                            SpawnTabDomain::DomainName("local".to_string()),
+                            crate::local_sessions::local_spawn_domain(),
                             cmd,
                             cwd,
                             TerminalSize::default(),
@@ -610,8 +610,12 @@ impl GuiFrontEnd {
                     let Some(mux_window) = mux.get_window(mux_window_id) else {
                         continue;
                     };
+                    // A window of the local session host is a local window:
+                    // shown like one, restored like one.
                     (
-                        mux_window.origin_domain().is_some(),
+                        mux_window
+                            .origin_domain()
+                            .is_some_and(|id| !crate::local_sessions::is_host_domain_id(id)),
                         mux_window.get_workspace().to_string(),
                     )
                 };
@@ -670,7 +674,7 @@ impl GuiFrontEnd {
         future
     }
 
-    fn spawn_space_window(&self) {
+    pub(crate) fn spawn_space_window(&self) {
         // Each Dock "New Window" gets its own Space and its own GUI window, and
         // must work regardless of whatever else is in flight. We claim a
         // distinct (unoccupied) Space synchronously so rapid repeated clicks
@@ -899,7 +903,20 @@ impl GuiFrontEnd {
     fn detach_attached_client_domains(&self) {
         let mux = Mux::get();
         for domain in mux.iter_domains() {
-            if domain.detachable() && domain.state() == mux::domain::DomainState::Attached {
+            if domain.state() != mux::domain::DomainState::Attached {
+                continue;
+            }
+            // The local session host is not detachable by the mux or by an
+            // action, but the last window closing is this connection's
+            // end: its mirrors must go so the mux empties and the process
+            // exits (its terminals live on in the server).
+            if let Some(client) = domain.downcast_ref::<ClientDomain>() {
+                if client.is_local_session_host() {
+                    client.perform_detach();
+                    continue;
+                }
+            }
+            if domain.detachable() {
                 if let Err(err) = domain.detach() {
                     log::error!(
                         "while detaching domain {} after the last window closed: {err:#}",

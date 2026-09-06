@@ -48,6 +48,7 @@ mod i18n;
 mod input_diagnostics;
 mod inputmap;
 mod markdown_editor;
+mod local_sessions;
 mod native_paths;
 mod native_settings;
 mod overlay;
@@ -360,6 +361,27 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
     let mux = Mux::get();
 
     let domain = domain.unwrap_or_else(|| mux.default_domain());
+
+    // The local session host was attached before this ran, but the local
+    // windows for its remote ones arrive with the topology sync, which can
+    // still be in flight; deciding before it lands spawns a startup tab
+    // into a server that already holds the threads. Sync first.
+    let mut workspace = workspace;
+    if let Some(client) = domain.downcast_ref::<ClientDomain>() {
+        if client.is_local_session_host() && domain.state() == mux::domain::DomainState::Attached {
+            if let Err(err) = client.resync().await {
+                log::warn!("local sessions: syncing the session server at startup: {err:#}");
+            }
+            // Its threads live in thread workspaces, which reconcile leaves
+            // hidden, so "the domain has panes" is not "a window will
+            // open". Judge the startup workspace alone: a startup tab there
+            // gets a window, whose restore then adopts the live thread and
+            // cleans the tab up -- as it does in process.
+            if workspace.is_none() {
+                workspace = Some(mux.active_workspace());
+            }
+        }
+    }
 
     if !is_connecting {
         if have_panes_in_domain_and_ws(&domain, &workspace) {
@@ -750,13 +772,29 @@ async fn connect_to_auto_connect_domains() -> anyhow::Result<()> {
             continue;
         }
         // One UI (its own window, since no GUI window exists yet) hosts the
-        // first attempt and any background retries for this domain.
-        let ui = mux::connui::ConnectionUI::with_params(Default::default());
+        // first attempt and any background retries for this domain. The
+        // local session host connects headless: a unix socket asks nothing,
+        // and the UI's own mux window would be taken for the startup window
+        // by the thread store, which then starts a fresh thread when it
+        // closes.
+        let ui = if client.is_local_session_host() {
+            mux::connui::ConnectionUI::new_headless()
+        } else {
+            mux::connui::ConnectionUI::with_params(Default::default())
+        };
         // The first attempt stays synchronous so that, on the happy path,
         // auto-connected domains are live before the first GUI window opens
         // (their windows adopt/fold correctly instead of racing startup).
         match client.attach_with_ui(None, ui.clone()).await {
             Ok(()) => {}
+            // The session server of this machine must be there before the
+            // first window spawns into it; without it this launch runs its
+            // terminals in process rather than in a domain that is not
+            // attached.
+            Err(err) if client.is_local_session_host() => {
+                crate::local_sessions::fall_back_to_in_process(&mux, &err);
+                ui.close();
+            }
             Err(err) if is_fatal_attach_error(&err) => {
                 log::error!("auto-connect {}: {err:#}", dom.domain_name());
             }
@@ -960,8 +998,12 @@ enum Publish {
 
 impl Publish {
     pub fn resolve(mux: &Arc<Mux>, config: &ConfigHandle, always_new_process: bool) -> Self {
-        if mux.default_domain().domain_name() != config.default_domain.as_deref().unwrap_or("local")
-        {
+        // The local session host is the default domain of an ordinary
+        // launch too: a second launch still hands its command to this GUI.
+        let default_name = mux.default_domain().domain_name().to_string();
+        let default_is_local = default_name == config.default_domain.as_deref().unwrap_or("local")
+            || crate::local_sessions::is_host_domain_name(&default_name);
+        if !default_is_local {
             return Self::NoConnectNoPublish;
         }
 
@@ -1166,6 +1208,9 @@ fn setup_mux(
     );
     mux.set_active_workspace(&default_workspace_name);
     crate::update::load_last_release_info();
+    // Before the configured client domains: the host is the configured
+    // unix domain with two flags set, registered under the same name.
+    let session_host = crate::local_sessions::install(&mux, config);
     update_mux_domains(config)?;
     // Register ThinkTerm's saved SSH hosts as runtime mux domains so that
     // reconnecting / restoring remote sessions can resolve them by name.
@@ -1175,8 +1220,12 @@ fn setup_mux(
     // Local removal only; the server keeps its copy.
     crate::ssh_hosts::forget_spaces_of_deleted_hosts();
 
-    let default_name =
-        default_domain_name.unwrap_or(config.default_domain.as_deref().unwrap_or("local"));
+    let default_name = default_domain_name.unwrap_or(
+        session_host
+            .as_deref()
+            .or(config.default_domain.as_deref())
+            .unwrap_or("local"),
+    );
 
     let domain = match mux.get_domain_by_name(default_name) {
         Some(domain) => domain,
@@ -1223,6 +1272,9 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     );
     wezterm_client::remote_update::set_keep_sessions_on_update(
         crate::native_settings::remote_update_keeps_sessions(),
+    );
+    wezterm_client::domain::set_local_session_host_replaced_sink(
+        crate::local_sessions::on_host_replaced,
     );
 
     let config = config::configuration();

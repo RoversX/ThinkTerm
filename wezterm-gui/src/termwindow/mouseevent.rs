@@ -7638,7 +7638,7 @@ impl super::TermWindow {
         if event.kind == WMEK::Press(MousePress::Left) {
             self.spawn_command(
                 &SpawnCommand {
-                    domain: SpawnTabDomain::DomainName("local".to_string()),
+                    domain: crate::local_sessions::local_spawn_domain(),
                     ..SpawnCommand::default()
                 },
                 crate::spawn::SpawnWhere::NewTab,

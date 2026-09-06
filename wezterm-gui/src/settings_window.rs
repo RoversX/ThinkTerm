@@ -722,6 +722,7 @@ enum SettingsAction {
     ToggleMainWindowFrameRestore,
     ToggleNotificationSounds,
     ToggleRemoteUpdateKeepsSessions,
+    ToggleLocalSessionsViaMux,
     /// The ⓘ after a label; hovering it shows the text under this i18n key.
     Hint(&'static str),
     /// Turn one right-sidebar panel on or off.
@@ -3595,6 +3596,26 @@ impl SettingsWindow {
                     }
                 }
             }
+            SettingsAction::ToggleLocalSessionsViaMux => {
+                self.ui.open_dropdown = None;
+                let enabled = !self.native_settings.workspaces.local_sessions_via_mux;
+                self.native_settings.workspaces.local_sessions_via_mux = enabled;
+                match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => {
+                        self.status = crate::i18n::tr(if enabled {
+                            "settings-status-local-sessions-via-mux-on"
+                        } else {
+                            "settings-status-local-sessions-via-mux-off"
+                        });
+                    }
+                    Err(err) => {
+                        self.status = settings_tr(
+                            "settings-status-local-sessions-via-mux-error",
+                            &[("error", format!("{err:#}"))],
+                        );
+                    }
+                }
+            }
             SettingsAction::ToggleMainRendererMenu => {
                 self.ui.open_dropdown =
                     if self.ui.open_dropdown == Some(SettingsDropdown::MainRenderer) {
@@ -5187,9 +5208,18 @@ impl SettingsWindow {
         let row_count = 8;
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let card_height = self.settings_card_height(row_count);
+        // One more card under the rows, where the platform can run local
+        // sessions in a server.
+        let sessions_card = crate::local_sessions::supported().then(|| {
+            let y = card_y + card_height + self.settings_section_card_gap();
+            (y, self.compact_card_height(1))
+        });
+        let content_bottom = sessions_card
+            .map(|(y, height)| y + height)
+            .unwrap_or(card_y + card_height);
         self.ui.content_scroll.set_extents(
             self.content_viewport_extent(),
-            self.settings_content_extent(card_y + scroll + card_height),
+            self.settings_content_extent(content_bottom + scroll),
         );
         let source = Self::config_source_summary();
         let native_path = Self::native_settings_path();
@@ -5274,6 +5304,20 @@ impl SettingsWindow {
             SettingsAction::QuitApplication,
             true,
         )?;
+        if let Some((sessions_card_y, sessions_card_height)) = sessions_card {
+            self.paint_group_card(layers, card_x, sessions_card_y, max_width, sessions_card_height)?;
+            self.paint_toggle_setting_row_with_hint(
+                layers,
+                row_x,
+                sessions_card_y + self.ui_px(12.0),
+                row_width,
+                self.compact_row_step(),
+                &crate::i18n::tr("settings-local-sessions-via-mux"),
+                "settings-local-sessions-via-mux-description",
+                self.native_settings.workspaces.local_sessions_via_mux,
+                SettingsAction::ToggleLocalSessionsViaMux,
+            )?;
+        }
         Ok(())
     }
 
