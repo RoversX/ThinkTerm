@@ -55,6 +55,12 @@ struct Opt {
     #[arg(long = "takeover")]
     takeover: bool,
 
+    /// Start with no pane at all instead of one running the default
+    /// program: for a server whose panes are all spawned by a client,
+    /// such as the GUI keeping its local terminals in it.
+    #[arg(long = "no-initial-pane")]
+    no_initial_pane: bool,
+
     /// Specify the current working directory for the initially
     /// spawned program
     #[arg(long = "cwd", value_parser, value_hint=ValueHint::DirPath)]
@@ -170,6 +176,9 @@ fn run() -> anyhow::Result<()> {
         if opts.takeover {
             cmd.arg("--takeover");
         }
+        if opts.no_initial_pane {
+            cmd.arg("--no-initial-pane");
+        }
         if let Some(f) = &opts.config_file {
             cmd.arg("--config-file");
             cmd.arg(f);
@@ -246,6 +255,7 @@ fn run() -> anyhow::Result<()> {
         wezterm_blob_leases::simple_tempdir::SimpleTempDir::new_in(&*config::CACHE_DIR)?,
     ))?;
 
+    let no_initial_pane = opts.no_initial_pane;
     let need_builder = !opts.prog.is_empty() || opts.cwd.is_some();
 
     let cmd = if need_builder {
@@ -327,7 +337,7 @@ fn run() -> anyhow::Result<()> {
 
     let daemonized = opts.daemonize;
     promise::spawn::spawn(async move {
-        if let Err(err) = async_run(cmd, takeover, daemonized).await {
+        if let Err(err) = async_run(cmd, takeover, daemonized, no_initial_pane).await {
             terminate_with_error(err);
         }
         drop(activity);
@@ -366,6 +376,7 @@ async fn async_run(
     cmd: Option<CommandBuilder>,
     takeover: Option<TakeoverHandle>,
     daemonized: bool,
+    no_initial_pane: bool,
 ) -> anyhow::Result<()> {
     let mux = Mux::get();
     let config = config::configuration();
@@ -416,15 +427,42 @@ async fn async_run(
             },
             None => {}
         }
-        // Everything is ours already; not listening for the next successor
-        // is worth a log line, not an exit.
-        if let Err(err) = wezterm_mux_server_impl::handoff::spawn_handoff_listener(socket_path) {
-            log::error!("not listening for a successor: {err:#}");
-        }
-        // The TCP listeners wait for the old server to release its ports.
+        // The handoff listener and the TCP listeners wait for the old
+        // server to exit: it still answers on the handoff path and holds
+        // the ports until then, and a path someone answers on is not bound
+        // over. Everything is ours already; not listening for the next
+        // successor is worth a log line, not an exit.
         let tls_servers = config.tls_servers.clone();
         thread::spawn(move || {
             wezterm_mux_server_impl::handoff::wait_for_predecessor_exit(stream);
+            // Its descriptors close one after another as it exits; the
+            // handoff socket may answer for a while after the stream did.
+            // A server that cannot be taken over is one whose sessions the
+            // next update ends, so this keeps trying for a long time
+            // rather than giving up at once.
+            let handoff_path = wezterm_mux_server_impl::handoff::handoff_socket_path(&socket_path);
+            let give_up = std::time::Instant::now() + std::time::Duration::from_secs(600);
+            let mut last_err = None;
+            loop {
+                if !wezterm_mux_server_impl::local::someone_listens(&handoff_path) {
+                    match wezterm_mux_server_impl::handoff::spawn_handoff_listener(
+                        socket_path.clone(),
+                    ) {
+                        Ok(()) => break,
+                        Err(err) => last_err = Some(err),
+                    }
+                }
+                if std::time::Instant::now() >= give_up {
+                    log::error!(
+                        "not listening for a successor: {}",
+                        last_err
+                            .map(|err| format!("{err:#}"))
+                            .unwrap_or_else(|| "the predecessor's handoff socket kept answering".into())
+                    );
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_millis(250));
+            }
             for tls_server in &tls_servers {
                 if let Err(err) = ossl::spawn_tls_listener(tls_server) {
                     log::error!("problem spawning TLS listener after the takeover: {err:#}");
@@ -459,7 +497,7 @@ async fn async_run(
         .iter()
         .any(|p| p.domain_id() == domain.domain_id());
 
-    if !have_panes_in_domain {
+    if !have_panes_in_domain && !no_initial_pane {
         let workspace = None;
         let position = None;
         let window_id = mux.new_empty_window(workspace, position);
@@ -537,7 +575,17 @@ pub fn spawn_listener() -> anyhow::Result<()> {
     if let Some(unix_dom) = config.unix_domains.last() {
         std::env::set_var("WEZTERM_UNIX_SOCKET", unix_dom.socket_path());
     }
+    // Two domains naming one socket path would have the second bind over
+    // the first (now refused): one listener per path.
+    let mut bound = std::collections::HashSet::new();
     for unix_dom in &config.unix_domains {
+        if !bound.insert(unix_dom.socket_path()) {
+            log::warn!(
+                "unix domain {} shares the socket path of an earlier domain; not binding it twice",
+                unix_dom.name
+            );
+            continue;
+        }
         let mut listener = wezterm_mux_server_impl::local::LocalListener::with_domain(unix_dom)?;
         thread::spawn(move || {
             listener.run();

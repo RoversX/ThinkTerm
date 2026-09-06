@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Context as _};
 use config::{create_user_owned_dirs, UnixDomain};
 use wezterm_uds::UnixListener;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
 
 #[cfg(unix)]
 lazy_static::lazy_static! {
@@ -80,6 +82,83 @@ impl LocalListener {
     }
 }
 
+/// Make `path` free to bind: remove the socket file a previous server
+/// left there, unless a server still answers on it. A server that is not
+/// the daemon -- one run in the foreground, say by mistaking
+/// `thinkterm-mux-server cli list` for the client -- takes no pid lock,
+/// and without this it would bind the path out from under the running one:
+/// that one keeps serving its connections on an inode nothing can reach,
+/// and every later `thinkterm cli` is refused.
+pub fn claim_socket_path(path: &std::path::Path) -> anyhow::Result<()> {
+    if someone_listens(path) {
+        anyhow::bail!(
+            "a mux server is already listening on {}; refusing to bind over it. \
+             `thinkterm cli list` talks to it; `thinkterm-mux-server --daemonize --takeover` \
+             replaces it",
+            path.display()
+        );
+    }
+    // On windows, we can't tell if the unix domain socket exists using the
+    // methods on Path, so we just unconditionally remove it and see what
+    // error occurs.
+    match std::fs::remove_file(path) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).context(format!("Unable to remove {}", path.display())),
+    }
+}
+
+/// Whether a connect to `path` reaches a listener. Only a missing file
+/// and a refused connection mean nobody does; everything else -- a
+/// connection, EAGAIN from a full backlog, or any other failure -- counts
+/// as someone, because binding over a live server is the one outcome
+/// this must never allow. Non-blocking, so a full backlog cannot hang
+/// the caller.
+#[cfg(unix)]
+pub fn someone_listens(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= addr.sun_path.len() {
+        // Cannot be probed (nor bound): let the bind report it.
+        return true;
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+        *dst = *src as libc::c_char;
+    }
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return true;
+    }
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    unsafe {
+        libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    let len = std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1;
+    let res = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            len as libc::socklen_t,
+        )
+    };
+    if res == 0 {
+        return true;
+    }
+    !matches!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ENOENT) | Some(libc::ECONNREFUSED)
+    )
+}
+
+#[cfg(not(unix))]
+pub fn someone_listens(_path: &std::path::Path) -> bool {
+    false
+}
+
 /// Take care when setting up the listener socket;
 /// we need to be sure that the directory that we create it in
 /// is owned by the user and has appropriate file permissions
@@ -115,17 +194,7 @@ fn safely_create_sock_path(unix_dom: &UnixDomain) -> anyhow::Result<UnixListener
         }
     }
 
-    // We want to remove the socket if it exists.
-    // However, on windows, we can't tell if the unix domain socket
-    // exists using the methods on Path, so instead we just unconditionally
-    // remove it and see what error occurs.
-    match std::fs::remove_file(sock_path) {
-        Ok(_) => {}
-        Err(err) => match err.kind() {
-            std::io::ErrorKind::NotFound => {}
-            _ => return Err(err).context(format!("Unable to remove {}", sock_path.display())),
-        },
-    }
+    claim_socket_path(sock_path)?;
 
     let listener = UnixListener::bind(sock_path)
         .with_context(|| format!("Failed to bind to {}", sock_path.display()))?;
@@ -133,4 +202,46 @@ fn safely_create_sock_path(unix_dom: &UnixDomain) -> anyhow::Result<UnixListener
     config::set_sticky_bit(&sock_path);
 
     Ok(listener)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::claim_socket_path;
+
+    fn short_dir() -> tempfile::TempDir {
+        // Socket paths are short; the default temp dir on macOS is not.
+        tempfile::Builder::new()
+            .prefix("tt-")
+            .tempdir_in("/tmp")
+            .unwrap()
+    }
+
+    #[test]
+    fn a_path_with_a_listener_is_refused() {
+        let dir = short_dir();
+        let path = dir.path().join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let err = claim_socket_path(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("already listening"),
+            "{err:#}"
+        );
+        assert!(path.exists(), "the live socket file must stay");
+    }
+
+    #[test]
+    fn a_stale_socket_file_is_removed() {
+        let dir = short_dir();
+        let path = dir.path().join("sock");
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(path.exists());
+        claim_socket_path(&path).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_missing_file_is_free() {
+        let dir = short_dir();
+        claim_socket_path(&dir.path().join("sock")).unwrap();
+    }
 }

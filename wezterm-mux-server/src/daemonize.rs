@@ -56,7 +56,16 @@ pub fn lock_pid_file(config: &config::ConfigHandle) -> anyhow::Result<std::fs::F
     let res = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if res != 0 {
         let err = std::io::Error::last_os_error();
-        anyhow::bail!("unable to lock pid file {}: {}", pid_file.display(), err);
+        let holder = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map(|pid| format!(" (a mux server with pid {pid} holds it)"))
+            .unwrap_or_default();
+        anyhow::bail!(
+            "unable to lock pid file {}{holder}: {}",
+            pid_file.display(),
+            err
+        );
     }
 
     unsafe { libc::ftruncate(file.as_raw_fd(), 0) };

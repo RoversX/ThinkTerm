@@ -271,11 +271,7 @@ pub fn report_takeover(outcome: Result<(), &str>) {
 /// time; a failed one leaves this server as it was.
 pub fn spawn_handoff_listener(socket_path: PathBuf) -> anyhow::Result<()> {
     let path = handoff_socket_path(&socket_path);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err).with_context(|| format!("removing {}", path.display())),
-    }
+    crate::local::claim_socket_path(&path)?;
     let listener =
         UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
     config::set_sticky_bit(&path);
