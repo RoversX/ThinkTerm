@@ -362,24 +362,17 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
 
     let domain = domain.unwrap_or_else(|| mux.default_domain());
 
-    // The local session host was attached before this ran, but the local
-    // windows for its remote ones arrive with the topology sync, which can
-    // still be in flight; deciding before it lands spawns a startup tab
-    // into a server that already holds the threads. Sync first.
+    // The local session host was attached before this ran and its windows
+    // are mirrored already (the attach installs the topology before it
+    // returns). Its threads live in thread workspaces, which reconcile
+    // leaves hidden, so "the domain has panes" is not "a window will open".
+    // Judge the startup workspace alone: a startup tab there gets a window,
+    // whose restore then adopts the live thread and cleans the tab up -- as
+    // it does in process.
     let mut workspace = workspace;
     if let Some(client) = domain.downcast_ref::<ClientDomain>() {
-        if client.is_local_session_host() && domain.state() == mux::domain::DomainState::Attached {
-            if let Err(err) = client.resync().await {
-                log::warn!("local sessions: syncing the session server at startup: {err:#}");
-            }
-            // Its threads live in thread workspaces, which reconcile leaves
-            // hidden, so "the domain has panes" is not "a window will
-            // open". Judge the startup workspace alone: a startup tab there
-            // gets a window, whose restore then adopts the live thread and
-            // cleans the tab up -- as it does in process.
-            if workspace.is_none() {
-                workspace = Some(mux.active_workspace());
-            }
+        if client.is_local_session_host() && workspace.is_none() {
+            workspace = Some(mux.active_workspace());
         }
     }
 

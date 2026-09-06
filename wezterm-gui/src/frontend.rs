@@ -20,8 +20,23 @@ use wezterm_client::domain::{ClientDomain, FrontendRecoverySlot, ThinkTermFronte
 use wezterm_term::{Alert, ClipboardSelection};
 use wezterm_toast_notification::*;
 
-fn should_spawn_reconciled_gui_window(is_domain_owned: bool, workspace: &str) -> bool {
-    !is_domain_owned || crate::workspace_threads::is_thread_workspace_name(workspace)
+/// Which mux windows in the active workspace get a GUI window of their
+/// own. Local windows always; a remote domain's only in its thread
+/// workspaces (its plain windows are background). A window of the local
+/// session host is the other way round: its thread windows are the
+/// threads of the local Spaces, opened by their Space window through the
+/// thread store (making one here would open every live thread of every
+/// Space), and only a startup window in a plain workspace opens on its own.
+fn should_spawn_reconciled_gui_window(
+    is_domain_owned: bool,
+    is_host: bool,
+    workspace: &str,
+) -> bool {
+    let thread_workspace = crate::workspace_threads::is_thread_workspace_name(workspace);
+    if is_host {
+        return !thread_workspace;
+    }
+    !is_domain_owned || thread_workspace
 }
 
 fn frontend_recovery_tab(
@@ -606,7 +621,7 @@ impl GuiFrontEnd {
                 }
 
                 let mux = Mux::get();
-                let (is_domain_owned, window_workspace) = {
+                let (is_domain_owned, is_host, window_workspace) = {
                     let Some(mux_window) = mux.get_window(mux_window_id) else {
                         continue;
                     };
@@ -616,6 +631,9 @@ impl GuiFrontEnd {
                         mux_window
                             .origin_domain()
                             .is_some_and(|id| !crate::local_sessions::is_host_domain_id(id)),
+                        mux_window
+                            .origin_domain()
+                            .is_some_and(crate::local_sessions::is_host_domain_id),
                         mux_window.get_workspace().to_string(),
                     )
                 };
@@ -632,7 +650,7 @@ impl GuiFrontEnd {
                 // giving them a GUI window creates the stray "local Space with
                 // a remote terminal" window and tangles its lifecycle with the
                 // real thread window.
-                if !should_spawn_reconciled_gui_window(is_domain_owned, &window_workspace) {
+                if !should_spawn_reconciled_gui_window(is_domain_owned, is_host, &window_workspace) {
                     log::debug!(
                         "reconcile: leaving background domain window {} in workspace {:?} hidden",
                         mux_window_id,
@@ -1099,8 +1117,9 @@ mod tests {
 
     #[test]
     fn reconcile_keeps_local_windows_visible() {
-        assert!(should_spawn_reconciled_gui_window(false, "default"));
+        assert!(should_spawn_reconciled_gui_window(false, false, "default"));
         assert!(should_spawn_reconciled_gui_window(
+            false,
             false,
             "user-created-workspace"
         ));
@@ -1108,13 +1127,15 @@ mod tests {
 
     #[test]
     fn reconcile_hides_background_domain_windows() {
-        assert!(!should_spawn_reconciled_gui_window(true, "default"));
+        assert!(!should_spawn_reconciled_gui_window(true, false, "default"));
         assert!(!should_spawn_reconciled_gui_window(
             true,
+            false,
             "unmanaged-remote-workspace"
         ));
         assert!(!should_spawn_reconciled_gui_window(
             true,
+            false,
             "thinkterm:not-a-thread-workspace"
         ));
     }
@@ -1123,11 +1144,25 @@ mod tests {
     fn reconcile_shows_thinkterm_domain_thread_windows() {
         assert!(should_spawn_reconciled_gui_window(
             true,
+            false,
             "thinkterm:muxdomain-host::space::space-1:thread-2"
         ));
         assert!(should_spawn_reconciled_gui_window(
             true,
+            false,
             "thinkterm:muxdomain-host::space::space-1:thread-2:remote-default"
+        ));
+    }
+
+    #[test]
+    fn reconcile_opens_only_the_hosts_startup_window() {
+        // The host's thread windows belong to the local Spaces and are
+        // opened through the thread store, never one per live thread.
+        assert!(should_spawn_reconciled_gui_window(false, true, "default"));
+        assert!(!should_spawn_reconciled_gui_window(
+            false,
+            true,
+            "thinkterm:project-1:thread-2"
         ));
     }
 
