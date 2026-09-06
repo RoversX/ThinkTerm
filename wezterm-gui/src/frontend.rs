@@ -12,7 +12,7 @@ use mux::tab::TabId;
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
 use promise::{Future, Promise};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -27,14 +27,20 @@ use wezterm_toast_notification::*;
 /// threads of the local Spaces, opened by their Space window through the
 /// thread store (making one here would open every live thread of every
 /// Space), and only a startup window in a plain workspace opens on its own.
+/// `no_gui_window_yet`: this process shows nothing so far. A host window
+/// outside a thread workspace is the startup tab, whose window restores
+/// the thread; once one window is up, further ones there are leftovers
+/// the server accumulated (a startup tab whose close never landed, a
+/// `cli spawn --new-window`) and stay in the background.
 fn should_spawn_reconciled_gui_window(
     is_domain_owned: bool,
     is_host: bool,
     workspace: &str,
+    no_gui_window_yet: bool,
 ) -> bool {
     let thread_workspace = crate::workspace_threads::is_thread_workspace_name(workspace);
     if is_host {
-        return !thread_workspace;
+        return !thread_workspace && no_gui_window_yet;
     }
     !is_domain_owned || thread_workspace
 }
@@ -179,6 +185,17 @@ pub struct GuiFrontEnd {
     switching_workspaces: RefCell<usize>,
     spawned_mux_window: RefCell<HashSet<MuxWindowId>>,
     known_windows: RefCell<BTreeMap<Window, MuxWindowId>>,
+    /// Whether this process has shown a GUI window yet. AppKit asks a
+    /// freshly launched app with no windows to "open an untitled file";
+    /// before the first window exists that request is the launch itself,
+    /// which startup already answers with a window of its own.
+    any_window_recorded: Cell<bool>,
+    /// Startup has run its course (the first window is up, or startup
+    /// produced none): a new-window request is honoured from here on.
+    startup_settled: Cell<bool>,
+    /// A new-window request arrived during startup and was held; it is
+    /// answered if startup ends with no window at all.
+    new_window_request_held: Cell<bool>,
     /// Stable native-window lookup used across replacement mux runtimes.
     /// Unlike `known_windows`, this is keyed by the frontend-owned slot and
     /// therefore remains valid while remote WindowIds are being replaced.
@@ -219,6 +236,9 @@ impl GuiFrontEnd {
             switching_workspaces: RefCell::new(0),
             spawned_mux_window: RefCell::new(HashSet::new()),
             known_windows: RefCell::new(BTreeMap::new()),
+            any_window_recorded: Cell::new(false),
+            startup_settled: Cell::new(false),
+            new_window_request_held: Cell::new(false),
             recovery_windows: RefCell::new(BTreeMap::new()),
             detach_when_windowless: std::cell::Cell::new(false),
             client_id: client_id.clone(),
@@ -507,7 +527,21 @@ impl GuiFrontEnd {
                         Connection::get().unwrap().terminate_message_loop();
                     }
                     KeyAssignment::SpawnWindow => {
-                        front_end().spawn_space_window();
+                        // macOS sends this at launch for an app that has no
+                        // window yet. In process the startup window is there
+                        // before the request arrives; with the local session
+                        // host it comes after a round trip, and honouring the
+                        // request opened a second Space window beside it.
+                        let front_end = front_end();
+                        if !front_end.any_window_recorded.get() && !front_end.startup_settled.get()
+                        {
+                            log::debug!(
+                                "holding the launch-time new-window request: startup opens the first window"
+                            );
+                            front_end.new_window_request_held.set(true);
+                            return;
+                        }
+                        front_end.spawn_space_window();
                     }
                     KeyAssignment::SpawnTab(spawn_where) => {
                         spawn_command(
@@ -650,7 +684,14 @@ impl GuiFrontEnd {
                 // giving them a GUI window creates the stray "local Space with
                 // a remote terminal" window and tangles its lifecycle with the
                 // real thread window.
-                if !should_spawn_reconciled_gui_window(is_domain_owned, is_host, &window_workspace) {
+                let no_gui_window_yet = front_end().known_windows.borrow().is_empty()
+                    && front_end().spawned_mux_window.borrow().is_empty();
+                if !should_spawn_reconciled_gui_window(
+                    is_domain_owned,
+                    is_host,
+                    &window_workspace,
+                    no_gui_window_yet,
+                ) {
                     log::debug!(
                         "reconcile: leaving background domain window {} in workspace {:?} hidden",
                         mux_window_id,
@@ -690,6 +731,25 @@ impl GuiFrontEnd {
         })
         .detach();
         future
+    }
+
+    /// Startup's spawn has returned; its window, if any, follows within
+    /// moments. Once those have passed, a new-window request held during
+    /// startup is answered if startup showed nothing, and later requests
+    /// are answered as they come.
+    pub(crate) fn startup_settled_soon(&self) {
+        promise::spawn::spawn(async move {
+            smol::Timer::after(std::time::Duration::from_secs(2)).await;
+            let front_end = front_end();
+            front_end.startup_settled.set(true);
+            if front_end.new_window_request_held.replace(false)
+                && !front_end.any_window_recorded.get()
+            {
+                log::info!("startup opened no window; answering the held new-window request");
+                front_end.spawn_space_window();
+            }
+        })
+        .detach();
     }
 
     pub(crate) fn spawn_space_window(&self) {
@@ -834,9 +894,7 @@ impl GuiFrontEnd {
             }
         }
 
-        mux.iter_windows_in_workspace(&plan.workspace_name)
-            .into_iter()
-            .next()
+        crate::workspace_threads::window_to_show_in_workspace(&plan.workspace_name)
             .map(|window_id| (window_id, created_mux_window))
             .ok_or_else(|| anyhow!("Space workspace {} has no mux window", plan.workspace_name))
     }
@@ -872,6 +930,7 @@ impl GuiFrontEnd {
     ) {
         // A GUI window exists again: any pending last-window cleanup is moot.
         self.detach_when_windowless.set(false);
+        self.any_window_recorded.set(true);
         // Mark this mux window as having a GUI window so the additive reconcile
         // never re-creates a window for it (e.g. after the user closes it while
         // its mux window keeps running in the background).
@@ -1117,53 +1176,32 @@ mod tests {
 
     #[test]
     fn reconcile_keeps_local_windows_visible() {
-        assert!(should_spawn_reconciled_gui_window(false, false, "default"));
-        assert!(should_spawn_reconciled_gui_window(
-            false,
-            false,
-            "user-created-workspace"
-        ));
+        assert!(should_spawn_reconciled_gui_window(false, false, "default", true));
+        assert!(should_spawn_reconciled_gui_window(false, false, "user-created-workspace", true));
     }
 
     #[test]
     fn reconcile_hides_background_domain_windows() {
-        assert!(!should_spawn_reconciled_gui_window(true, false, "default"));
-        assert!(!should_spawn_reconciled_gui_window(
-            true,
-            false,
-            "unmanaged-remote-workspace"
-        ));
-        assert!(!should_spawn_reconciled_gui_window(
-            true,
-            false,
-            "thinkterm:not-a-thread-workspace"
-        ));
+        assert!(!should_spawn_reconciled_gui_window(true, false, "default", true));
+        assert!(!should_spawn_reconciled_gui_window(true, false, "unmanaged-remote-workspace", true));
+        assert!(!should_spawn_reconciled_gui_window(true, false, "thinkterm:not-a-thread-workspace", true));
     }
 
     #[test]
     fn reconcile_shows_thinkterm_domain_thread_windows() {
-        assert!(should_spawn_reconciled_gui_window(
-            true,
-            false,
-            "thinkterm:muxdomain-host::space::space-1:thread-2"
-        ));
-        assert!(should_spawn_reconciled_gui_window(
-            true,
-            false,
-            "thinkterm:muxdomain-host::space::space-1:thread-2:remote-default"
-        ));
+        assert!(should_spawn_reconciled_gui_window(true, false, "thinkterm:muxdomain-host::space::space-1:thread-2", true));
+        assert!(should_spawn_reconciled_gui_window(true, false, "thinkterm:muxdomain-host::space::space-1:thread-2:remote-default", true));
     }
 
     #[test]
     fn reconcile_opens_only_the_hosts_startup_window() {
         // The host's thread windows belong to the local Spaces and are
         // opened through the thread store, never one per live thread.
-        assert!(should_spawn_reconciled_gui_window(false, true, "default"));
-        assert!(!should_spawn_reconciled_gui_window(
-            false,
-            true,
-            "thinkterm:project-1:thread-2"
-        ));
+        assert!(should_spawn_reconciled_gui_window(false, true, "default", true));
+        // A second host window in the startup workspace stays hidden once
+        // a window is up: it is a leftover, not a window to show.
+        assert!(!should_spawn_reconciled_gui_window(false, true, "default", false));
+        assert!(!should_spawn_reconciled_gui_window(false, true, "thinkterm:project-1:thread-2", true));
     }
 
     #[test]

@@ -370,10 +370,11 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
     // whose restore then adopts the live thread and cleans the tab up -- as
     // it does in process.
     let mut workspace = workspace;
-    if let Some(client) = domain.downcast_ref::<ClientDomain>() {
-        if client.is_local_session_host() && workspace.is_none() {
-            workspace = Some(mux.active_workspace());
-        }
+    let is_host = domain
+        .downcast_ref::<ClientDomain>()
+        .is_some_and(|client| client.is_local_session_host());
+    if is_host && workspace.is_none() {
+        workspace = Some(mux.active_workspace());
     }
 
     if !is_connecting {
@@ -382,21 +383,27 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
         }
     }
 
-    let window_id = {
-        // Force the builder to notify the frontend early,
-        // so that the attach await below doesn't block it.
-        // This has the consequence of creating the window
-        // at the initial size instead of populating it
-        // from the size specified in the remote mux.
-        // We use the TabAddedToWindow mux notification
-        // to detect and adjust the size later on.
-        let position = None;
-        let builder = mux.new_empty_window_for_domain(
-            workspace.clone(),
-            position,
-            client_domain_origin(&domain),
-        );
-        *builder
+    let position = None;
+    let builder = mux.new_empty_window_for_domain(
+        workspace.clone(),
+        position,
+        client_domain_origin(&domain),
+    );
+    let window_id = *builder;
+    // Dropping the builder tells the frontend about the window. For a domain
+    // that still has to attach, that happens now, so the attach await below
+    // does not hold the window back (it opens at the initial size and the
+    // TabAddedToWindow notification adjusts it later). The host is attached
+    // already, and its spawn is a round trip: shown empty, the window is
+    // adopted by the thread restore and cleaned up before the shell lands,
+    // and the shell then makes a window of its own -- a second one on
+    // screen. So the host's window is announced once the tab is in it, the
+    // order the in-process spawn has.
+    let held_window = if is_host {
+        Some(builder)
+    } else {
+        drop(builder);
+        None
     };
 
     let config = config::configuration();
@@ -423,14 +430,16 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
     });
 
     let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi());
-    let _tab = domain
+    let spawned = domain
         .spawn(
             config.initial_size(dpi as u32, Some(cell_pixel_dims(&config, dpi)?)),
             cmd,
             None,
             window_id,
         )
-        .await?;
+        .await;
+    drop(held_window);
+    spawned?;
     trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
     Ok(())
 }
@@ -779,6 +788,13 @@ async fn connect_to_auto_connect_domains() -> anyhow::Result<()> {
         // auto-connected domains are live before the first GUI window opens
         // (their windows adopt/fold correctly instead of racing startup).
         match client.attach_with_ui(None, ui.clone()).await {
+            // Only a server this process started (or took over) is the
+            // setting's to stop later; one the user runs is left alone.
+            Ok(()) if client.is_local_session_host()
+                && wezterm_client::local_update::local_session_host_started_by_us() =>
+            {
+                crate::local_sessions::note_host_attached();
+            }
             Ok(()) => {}
             // The session server of this machine must be there before the
             // first window spawns into it; without it this launch runs its
@@ -893,6 +909,10 @@ async fn async_run_terminal_gui(
         log::warn!("{:#}", err);
     }
 
+    // This process is the GUI now (a launch that handed its command to a
+    // running GUI returned before this), so a server the setting no longer
+    // wants can go.
+    crate::local_sessions::stop_background_server_when_off(&config::configuration());
     if !opts.no_auto_connect {
         connect_to_auto_connect_domains().await?;
     }
@@ -979,7 +999,10 @@ async fn async_run_terminal_gui(
             }
         }
     }
-    spawn_tab_in_domain_if_mux_is_empty(cmd, is_connecting, domain, opts.workspace).await
+    let started =
+        spawn_tab_in_domain_if_mux_is_empty(cmd, is_connecting, domain, opts.workspace).await;
+    crate::frontend::front_end().startup_settled_soon();
+    started
 }
 
 #[derive(Debug)]

@@ -93,6 +93,103 @@ pub(crate) fn install(mux: &Mux, config: &ConfigHandle) -> Option<String> {
     name
 }
 
+/// The file that says the server at the default socket is the one this
+/// setting runs: written when a launch attaches to it as the host, removed
+/// when the server is stopped for the setting. A server the user started
+/// by hand (`thinkterm-mux-server --daemonize`, `thinkterm connect unix`)
+/// never gets it.
+fn managed_marker() -> std::path::PathBuf {
+    config::RUNTIME_DIR.join(config::runtime_file_name("local-session-host"))
+}
+
+/// This launch attached to the session server as the host.
+pub(crate) fn note_host_attached() {
+    if let Err(err) = std::fs::write(managed_marker(), b"") {
+        log::warn!(
+            "local sessions: could not record the session server as managed at {}: {err:#}",
+            managed_marker().display()
+        );
+    }
+}
+
+/// With the setting off, the session server an earlier launch ran for it
+/// is stopped: "off" means no terminals in the background, and a server
+/// nothing shows would otherwise live on until the next reboot. Only the
+/// server this setting started is stopped (the marker says so), and only
+/// while it holds the pid file's lock, so a server the user runs for their
+/// own purposes, a stale file or someone else's process is left alone.
+/// Its terminals end with it, which is what turning the setting off asks
+/// for. Runs once this process is the GUI, never from a launch that hands
+/// its command to a GUI already running.
+#[cfg(unix)]
+pub(crate) fn stop_background_server_when_off(config: &ConfigHandle) {
+    if !supported() || wanted() {
+        return;
+    }
+    let marker = managed_marker();
+    if !marker.exists() {
+        return;
+    }
+    let Some(unix) = candidate(config) else {
+        return;
+    };
+    let socket = unix.socket_path();
+    // The pid file is one per profile, the socket path is per domain: a
+    // domain on a custom path may not be the server the pid file names.
+    if socket != config::RUNTIME_DIR.join(config::runtime_file_name("sock")) {
+        return;
+    }
+    if !wezterm_mux_server_impl::local::someone_listens(&socket) {
+        // Gone already; nothing is managed any more.
+        std::fs::remove_file(&marker).ok();
+        return;
+    }
+    let pid_file = config.daemon_options.pid_file();
+    let Some(pid) = pid_of_server_holding(&pid_file) else {
+        log::warn!(
+            "local sessions: the setting is off but a server answers at {}; nothing holds {}, \
+             so it is left running",
+            socket.display(),
+            pid_file.display()
+        );
+        return;
+    };
+    log::info!(
+        "local sessions: the setting is off; stopping the session server (pid {pid}) at {}",
+        socket.display()
+    );
+    if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
+        log::warn!(
+            "local sessions: could not stop the session server (pid {pid}): {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    std::fs::remove_file(&marker).ok();
+}
+
+#[cfg(not(unix))]
+pub(crate) fn stop_background_server_when_off(_config: &ConfigHandle) {}
+
+/// The pid written in `pid_file`, when a running server holds its lock.
+#[cfg(unix)]
+fn pid_of_server_holding(pid_file: &std::path::Path) -> Option<u32> {
+    use std::os::unix::io::AsRawFd as _;
+    let file = std::fs::File::open(pid_file).ok()?;
+    let locked_by_someone =
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0;
+    if !locked_by_someone {
+        // We hold it now: no server does. The lock goes with the file.
+        return None;
+    }
+    std::fs::read_to_string(pid_file)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 1)
+}
+
 /// The host's domain name for this launch, if local sessions run in it.
 pub(crate) fn host_domain_name() -> Option<String> {
     if *FELL_BACK.lock().unwrap() {
@@ -195,10 +292,12 @@ pub(crate) fn on_host_replaced(domain_id: mux::domain::DomainId) {
                 continue;
             };
             // Moved aside quietly (a notified move would be synced into the
-            // thread store and the thread would then "live" there), the
-            // thread's own workspace counts as dead; the activation below
-            // materializes it again from the layout store, adopts the new
-            // window into this GUI window, and kills the old workspace.
+            // thread store and the thread would then "live" there) into a
+            // workspace of its own -- only this window, not the others of
+            // its workspace, which may hold live panes of other domains --
+            // the thread's own workspace counts as dead; the activation
+            // below materializes it again from the layout store, adopts the
+            // new window into this GUI window, and kills the parked one.
             let Some(old_workspace) = mux
                 .get_window(window_id)
                 .map(|window| window.get_workspace().to_string())
@@ -208,8 +307,8 @@ pub(crate) fn on_host_replaced(domain_id: mux::domain::DomainId) {
             let dead_workspace = if old_workspace.starts_with("dead-session:") {
                 old_workspace
             } else {
-                let dead_workspace = format!("dead-session:{old_workspace}");
-                mux.rename_workspace_quietly(&old_workspace, &dead_workspace);
+                let dead_workspace = format!("dead-session:{window_id}:{old_workspace}");
+                mux.move_window_to_workspace_quietly(window_id, &dead_workspace);
                 dead_workspace
             };
             if let Some(window) = mux.get_window(window_id) {
@@ -289,6 +388,26 @@ fn alias_for(recorded: &str, host: Option<&str>) -> Option<String> {
 mod tests {
     use super::{alias_for, candidate_in};
     use config::UnixDomain;
+
+    /// A pid file is only believed while a process holds its lock.
+    #[cfg(unix)]
+    #[test]
+    fn a_pid_file_counts_only_while_locked() {
+        use std::io::Write as _;
+        use std::os::unix::io::AsRawFd as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid");
+        let mut holder = std::fs::File::create(&path).unwrap();
+        writeln!(holder, "4242").unwrap();
+        assert_eq!(super::pid_of_server_holding(&path), None, "nobody holds the lock");
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert_eq!(super::pid_of_server_holding(&path), Some(4242));
+        drop(holder);
+        assert_eq!(super::pid_of_server_holding(&path), None);
+    }
 
     fn unix(name: &str, proxy: bool) -> UnixDomain {
         UnixDomain {

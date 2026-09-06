@@ -329,7 +329,7 @@ pub fn build_mosh_fallback_spawn(spec: &SshHostSpec) -> SpawnCommand {
     SpawnCommand {
         label: Some(format!("mosh {}", spec.label)),
         args: Some(build_mosh_args(spec)),
-        domain: SpawnTabDomain::DomainName("local".to_string()),
+        domain: crate::local_sessions::local_spawn_domain(),
         ..Default::default()
     }
 }
@@ -366,7 +366,7 @@ fn build_mosh_client_spawn(
         label: Some(format!("mosh {}", spec.label)),
         args: Some(vec!["mosh-client".to_string(), host, port.to_string()]),
         set_environment_variables: env,
-        domain: SpawnTabDomain::DomainName("local".to_string()),
+        domain: crate::local_sessions::local_spawn_domain(),
         ..Default::default()
     }
 }
