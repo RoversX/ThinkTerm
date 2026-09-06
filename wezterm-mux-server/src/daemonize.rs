@@ -204,3 +204,89 @@ pub fn set_cloexec(fd: RawFd, enable: bool) {
         libc::fcntl(fd, libc::F_SETFD, flags);
     }
 }
+
+/// Replace this process with `program`, making the new image responsible
+/// for itself in macOS privacy (TCC) terms.
+///
+/// A daemon spawned by the GUI is otherwise attributed to that GUI: the
+/// first GUI's grant covers it, and once that GUI has exited the attribution
+/// dangles, so a Documents/Desktop Project is refused and the shell lands in
+/// `$HOME` "sometimes". Disclaiming gives the server one stable identity of
+/// its own, granted once. Only returns on failure, like `exec`.
+#[cfg(target_os = "macos")]
+pub fn exec_as_own_tcc_identity(
+    program: &std::ffi::OsStr,
+    args: &[std::ffi::OsString],
+) -> std::io::Error {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    type SetDisclaim = unsafe extern "C" fn(*mut libc::posix_spawnattr_t, libc::c_int) -> libc::c_int;
+    let symbol = unsafe {
+        libc::dlsym(
+            libc::RTLD_DEFAULT,
+            b"responsibility_spawnattrs_setdisclaim\0".as_ptr() as *const libc::c_char,
+        )
+    };
+    if symbol.is_null() {
+        return std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "responsibility_spawnattrs_setdisclaim is not available",
+        );
+    }
+    let set_disclaim: SetDisclaim = unsafe { std::mem::transmute(symbol) };
+
+    let c_program = match CString::new(program.as_bytes()) {
+        Ok(program) => program,
+        Err(err) => return std::io::Error::new(std::io::ErrorKind::InvalidInput, err),
+    };
+    let c_args: Vec<CString> = std::iter::once(program)
+        .chain(args.iter().map(|arg| arg.as_os_str()))
+        .filter_map(|arg| CString::new(arg.as_bytes()).ok())
+        .collect();
+    let c_env: Vec<CString> = std::env::vars_os()
+        .filter_map(|(key, value)| {
+            let mut entry = key.as_bytes().to_vec();
+            entry.push(b'=');
+            entry.extend_from_slice(value.as_bytes());
+            CString::new(entry).ok()
+        })
+        .collect();
+    let mut argv: Vec<*mut libc::c_char> =
+        c_args.iter().map(|arg| arg.as_ptr() as *mut _).collect();
+    argv.push(std::ptr::null_mut());
+    let mut envp: Vec<*mut libc::c_char> =
+        c_env.iter().map(|entry| entry.as_ptr() as *mut _).collect();
+    envp.push(std::ptr::null_mut());
+
+    unsafe {
+        let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
+        let rc = libc::posix_spawnattr_init(&mut attr);
+        if rc != 0 {
+            return std::io::Error::from_raw_os_error(rc);
+        }
+        // SETEXEC turns posix_spawn into exec-in-place; the disclaim applies
+        // to the replaced image.
+        let rc = libc::posix_spawnattr_setflags(&mut attr, libc::POSIX_SPAWN_SETEXEC as libc::c_short);
+        if rc != 0 {
+            libc::posix_spawnattr_destroy(&mut attr);
+            return std::io::Error::from_raw_os_error(rc);
+        }
+        let rc = set_disclaim(&mut attr, 1);
+        if rc != 0 {
+            libc::posix_spawnattr_destroy(&mut attr);
+            return std::io::Error::from_raw_os_error(rc);
+        }
+        let mut pid: libc::pid_t = 0;
+        let rc = libc::posix_spawn(
+            &mut pid,
+            c_program.as_ptr(),
+            std::ptr::null(),
+            &attr,
+            argv.as_ptr(),
+            envp.as_ptr(),
+        );
+        libc::posix_spawnattr_destroy(&mut attr);
+        std::io::Error::from_raw_os_error(rc)
+    }
+}

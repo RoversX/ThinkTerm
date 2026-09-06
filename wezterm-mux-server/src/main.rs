@@ -222,6 +222,18 @@ fn run() -> anyhow::Result<()> {
                 }
             }
 
+            #[cfg(target_os = "macos")]
+            {
+                // The umask pre_exec above only runs through `exec`; apply
+                // it in place, since a disclaiming exec keeps this process.
+                if let Some(mask) = umask::UmaskSaver::saved_umask() {
+                    unsafe { libc::umask(mask) };
+                }
+                let args: Vec<OsString> = cmd.get_args().map(|arg| arg.to_os_string()).collect();
+                let err = daemonize::exec_as_own_tcc_identity(cmd.get_program(), &args);
+                log::warn!("re-exec with own privacy identity failed, using exec: {err:#}");
+            }
+
             return Err(anyhow::anyhow!("failed to re-exec: {:?}", cmd.exec()));
         }
     }
