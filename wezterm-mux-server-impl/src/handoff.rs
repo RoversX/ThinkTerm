@@ -271,7 +271,10 @@ pub fn report_takeover(outcome: Result<(), &str>) {
 /// time; a failed one leaves this server as it was.
 pub fn spawn_handoff_listener(socket_path: PathBuf) -> anyhow::Result<()> {
     let path = handoff_socket_path(&socket_path);
-    crate::local::claim_socket_path(&path)?;
+    crate::local::claim_socket_path_for_server(
+        &path,
+        &config::configuration().daemon_options.pid_file(),
+    )?;
     let listener =
         UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
     config::set_sticky_bit(&path);

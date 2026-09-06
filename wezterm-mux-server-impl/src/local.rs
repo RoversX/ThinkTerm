@@ -108,6 +108,56 @@ pub fn claim_socket_path(path: &std::path::Path) -> anyhow::Result<()> {
     }
 }
 
+/// `claim_socket_path` for a server: besides the probe, the pid file is
+/// consulted. On macOS a listener whose accept backlog is full answers a
+/// non-blocking connect with ECONNREFUSED, the same as a stale file, so a
+/// server stalled long enough to fill its backlog would read as absent
+/// and be bound over -- the very thing the probe exists to prevent. A pid
+/// file held under lock by a live process other than this one says a
+/// server is there whatever the probe found.
+pub fn claim_socket_path_for_server(
+    path: &std::path::Path,
+    pid_file: &std::path::Path,
+) -> anyhow::Result<()> {
+    if let Some(pid) = other_server_holding_pid_file(pid_file) {
+        anyhow::bail!(
+            "a mux server (pid {pid}) holds {}; refusing to bind {} over it. \
+             `thinkterm cli list` talks to it; `thinkterm-mux-server --daemonize --takeover` \
+             replaces it",
+            pid_file.display(),
+            path.display()
+        );
+    }
+    claim_socket_path(path)
+}
+
+/// The pid in `pid_file` when a live process other than this one holds
+/// the file's lock.
+#[cfg(unix)]
+fn other_server_holding_pid_file(pid_file: &std::path::Path) -> Option<u32> {
+    use std::os::unix::io::AsRawFd as _;
+    let file = std::fs::File::open(pid_file).ok()?;
+    // Our own lock (the daemon locks before it binds) conflicts with this
+    // probe too, so the pid decides whether the holder is us.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return None;
+    }
+    let pid = std::fs::read_to_string(pid_file)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    if pid <= 1 || pid == std::process::id() {
+        return None;
+    }
+    (unsafe { libc::kill(pid as libc::pid_t, 0) } == 0).then_some(pid)
+}
+
+#[cfg(not(unix))]
+fn other_server_holding_pid_file(_pid_file: &std::path::Path) -> Option<u32> {
+    None
+}
+
 /// Whether a connect to `path` reaches a listener. Only a missing file
 /// and a refused connection mean nobody does; everything else -- a
 /// connection, EAGAIN from a full backlog, or any other failure -- counts
@@ -194,7 +244,15 @@ fn safely_create_sock_path(unix_dom: &UnixDomain) -> anyhow::Result<UnixListener
         }
     }
 
-    claim_socket_path(sock_path)?;
+    // The pid file belongs to the daemon serving the profile's socket; a
+    // GUI's own per-process listener (`gui-sock-<pid>`) must not be refused
+    // because a daemon is running.
+    let daemon_socket = sock_path.file_name() == Some(std::ffi::OsStr::new(&config::runtime_file_name("sock")));
+    if daemon_socket {
+        claim_socket_path_for_server(sock_path, &config::configuration().daemon_options.pid_file())?;
+    } else {
+        claim_socket_path(sock_path)?;
+    }
 
     let listener = UnixListener::bind(sock_path)
         .with_context(|| format!("Failed to bind to {}", sock_path.display()))?;
