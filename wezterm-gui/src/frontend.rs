@@ -207,6 +207,10 @@ pub struct GuiFrontEnd {
     /// arrival and finish the job instead of leaving an invisible process.
     /// Cleared as soon as any GUI window exists again.
     detach_when_windowless: std::cell::Cell<bool>,
+    /// Window openings in flight (Dock, SpawnWindow, the command script):
+    /// while one runs the latch above stays clear, and it is re-armed only
+    /// when the last of them fails with still no window on screen.
+    openings_in_flight: Cell<u32>,
     client_id: Arc<ClientId>,
     config_subscription: RefCell<Option<ConfigSubscription>>,
 }
@@ -241,6 +245,7 @@ impl GuiFrontEnd {
             new_window_request_held: Cell::new(false),
             recovery_windows: RefCell::new(BTreeMap::new()),
             detach_when_windowless: std::cell::Cell::new(false),
+            openings_in_flight: Cell::new(0),
             client_id: client_id.clone(),
             config_subscription: RefCell::new(None),
         });
@@ -468,6 +473,7 @@ impl GuiFrontEnd {
                     let cmd = None;
                     let cwd = None;
                     let workspace = mux.active_workspace();
+                    let latch_was_armed = front_end().opening_a_window();
 
                     match mux
                         .spawn_tab_or_window(
@@ -483,11 +489,13 @@ impl GuiFrontEnd {
                         .await
                     {
                         Ok((_tab, pane, _window_id)) => {
+                            front_end().opening_succeeded();
                             log::trace!("Spawned {file_name} as pane_id {}", pane.pane_id());
                             let mut writer = pane.writer();
                             write!(writer, "{quoted_file_name} ; exit\n").ok();
                         }
                         Err(err) => {
+                            front_end().opening_failed(latch_was_armed);
                             log::error!("Failed to spawn {file_name}: {err:#?}");
                         }
                     };
@@ -761,6 +769,7 @@ impl GuiFrontEnd {
         let space_owner_id = crate::workspace_threads::next_space_owner_id();
         let active_space_id = crate::workspace_threads::claim_space_for_new_window(space_owner_id);
         self.set_switching_workspaces(true);
+        let latch_was_armed = self.opening_a_window();
 
         promise::spawn::spawn(async move {
             let result = async {
@@ -786,9 +795,13 @@ impl GuiFrontEnd {
             }
             .await;
 
-            if let Err(err) = result {
-                crate::workspace_threads::release_window_space(space_owner_id);
-                log::error!("failed to create ThinkTerm Space window: {err:#}");
+            match result {
+                Ok(()) => front_end().opening_succeeded(),
+                Err(err) => {
+                    crate::workspace_threads::release_window_space(space_owner_id);
+                    log::error!("failed to create ThinkTerm Space window: {err:#}");
+                    front_end().opening_failed(latch_was_armed);
+                }
             }
             front_end().set_switching_workspaces(false);
         })
@@ -1001,6 +1014,37 @@ impl GuiFrontEnd {
                     );
                 }
             }
+        }
+    }
+
+    /// The user asked for a window: the last-window cleanup is over, and
+    /// what attaches from here on is wanted. Cleared here, not when the
+    /// window is recorded: the spawn attaches its domain first, and the
+    /// mirror windows that attach creates arrive while no GUI window
+    /// exists yet -- the reap below would detach the domain the spawn is
+    /// about to use, the spawn would fail, and every later click repeated
+    /// the loop.
+    /// Returns whether the latch was armed, for `opening_failed`.
+    pub(crate) fn opening_a_window(&self) -> bool {
+        self.openings_in_flight
+            .set(self.openings_in_flight.get() + 1);
+        self.detach_when_windowless.replace(false)
+    }
+
+    pub(crate) fn opening_succeeded(&self) {
+        self.openings_in_flight
+            .set(self.openings_in_flight.get().saturating_sub(1));
+    }
+
+    /// The opening that cleared the latch did not produce a window. With
+    /// nothing else opening and still no window, the cleanup it interrupted
+    /// is owed again: an attach that was pending when the last window
+    /// closed must not complete into an invisible process.
+    pub(crate) fn opening_failed(&self, latch_was_armed: bool) {
+        let left = self.openings_in_flight.get().saturating_sub(1);
+        self.openings_in_flight.set(left);
+        if latch_was_armed && left == 0 && self.known_windows.borrow().is_empty() {
+            self.detach_when_windowless.set(true);
         }
     }
 

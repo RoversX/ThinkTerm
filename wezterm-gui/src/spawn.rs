@@ -32,10 +32,15 @@ pub fn spawn_command_impl(
     success_action: Option<SpawnSuccessAction>,
 ) {
     let spawn = spawn.clone();
+    let opening = matches!(spawn_where, SpawnWhere::NewWindow)
+        .then(|| crate::frontend::front_end().opening_a_window());
 
     promise::spawn::spawn(async move {
         match spawn_command_internal(spawn, spawn_where, size, src_window_id, term_config).await {
             Ok(()) => {
+                if opening.is_some() {
+                    crate::frontend::front_end().opening_succeeded();
+                }
                 if let Some(window) = completion_window {
                     window.notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
                         move |tw| {
@@ -51,6 +56,9 @@ pub fn spawn_command_impl(
                 }
             }
             Err(err) => {
+                if let Some(latch_was_armed) = opening {
+                    crate::frontend::front_end().opening_failed(latch_was_armed);
+                }
                 log::error!("Failed to spawn: {:#}", err);
             }
         }
