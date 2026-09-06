@@ -60,7 +60,7 @@ use smol::channel::Sender;
 use smol::Timer;
 use std::cell::{Cell, RefCell, RefMut};
 use std::collections::{HashMap, HashSet, LinkedList, VecDeque};
-use std::ops::{Add, Range};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -7227,30 +7227,33 @@ impl TermWindow {
         }
     }
 
-    fn update_text_cursor(&mut self, pos: &PositionedPane) {
-        if let Some(win) = self.window.as_ref() {
-            let cursor = pos.pane.get_cursor_position();
-            let top = pos.pane.get_dimensions().physical_top;
-            let tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-                self.tab_bar_pixel_height().unwrap()
-            } else {
-                0.0
-            };
-            let (padding_left, padding_top) = self.padding_left_top();
-
-            let r = Rect::new(
-                Point::new(
-                    (((cursor.x + pos.left) as isize).max(0) * self.render_metrics.cell_size.width)
-                        .add(padding_left as isize),
-                    ((cursor.y + pos.top as isize - top).max(0)
-                        * self.render_metrics.cell_size.height)
-                        .add(tab_bar_height as isize)
-                        .add(padding_top as isize),
-                ),
-                self.render_metrics.cell_size,
-            );
-            win.set_text_cursor_position(r);
-        }
+    /// Where the IME puts its candidate window: the cursor cell in the exact
+    /// coordinates `paint_pane` drew it with. Deriving it from pane dimensions
+    /// alone drifted on mux panes (viewport ahead of physical_top, pane nav
+    /// bar, per-pane font scale), landing the popup rows above the text.
+    pub(crate) fn update_text_cursor(
+        &mut self,
+        cursor: &mux::renderable::StableCursorPosition,
+        stable_top: StableRowIndex,
+        dims: &RenderableDimensions,
+        left_pixel_x: f32,
+        top_pixel_y: f32,
+        cell_size: Size,
+    ) {
+        let Some(win) = self.window.as_ref() else {
+            return;
+        };
+        let last_row = dims.viewport_rows.saturating_sub(1) as isize;
+        let row = (cursor.y - stable_top).clamp(0, last_row);
+        let col = cursor.x.min(dims.cols.saturating_sub(1)) as isize;
+        let r = Rect::new(
+            Point::new(
+                left_pixel_x as isize + col * cell_size.width,
+                top_pixel_y as isize + row * cell_size.height,
+            ),
+            cell_size,
+        );
+        win.set_text_cursor_position(r);
     }
 
     fn activate_window(&mut self, window_idx: usize) -> anyhow::Result<()> {

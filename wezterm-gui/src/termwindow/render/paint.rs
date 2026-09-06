@@ -3745,7 +3745,6 @@ impl crate::TermWindow {
         if paint_terminal_world && !frontend_blocked {
             for pos in panes {
                 if pos.is_active {
-                    self.update_text_cursor(&pos);
                     if focused {
                         pos.pane.advise_focus();
                         mux::Mux::get().record_focus_for_current_identity(pos.pane.pane_id());

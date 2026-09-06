@@ -1615,6 +1615,17 @@ impl crate::TermWindow {
                 + (pos.top as f32 * global_render_metrics.cell_size.height as f32)
                 + pane_nav_height as f32;
 
+            if pos.is_active {
+                self.update_text_cursor(
+                    &cursor,
+                    stable_range.start,
+                    &render_dims,
+                    left_pixel_x,
+                    pane_top_pixel_y,
+                    pane_render_metrics.cell_size,
+                );
+            }
+
             let mut render = LineRender {
                 term_window: self,
                 selrange,
