@@ -109,6 +109,13 @@ impl Window {
         Mux::get().notify(MuxNotification::WindowWorkspaceChanged(self.id));
     }
 
+    /// `set_workspace` without the notification: for moving a window
+    /// aside that nothing should follow (a GUI syncs announced moves into
+    /// its thread store).
+    pub fn set_workspace_quietly(&mut self, workspace: &str) {
+        self.workspace = workspace.to_string();
+    }
+
     pub fn window_id(&self) -> WindowId {
         self.id
     }

@@ -1714,6 +1714,9 @@ impl Mux {
                 access_changed = lease.handoff_owner.as_ref() != Some(client_id);
                 lease.handoff_owner = Some(client_id.clone());
                 lease.handoff_ever_owned = true;
+                // An explicit claim supersedes whoever drove before: the
+                // returning-device rule must not hand the lease back to it.
+                lease.handoff_last_owner = None;
                 if access_changed {
                     for (affected_tab_id, state) in &mut lease.tabs {
                         if state.view.take().is_some() && *affected_tab_id != tab_id {
@@ -2075,7 +2078,10 @@ impl Mux {
             let mut affected = Vec::new();
             match mode {
                 FrontendAccessMode::Handoff => {
-                    lease.handoff_owner = None;
+                    // The screen whose geometry failed is the one that gets
+                    // to come back without a click, not whoever drove
+                    // before it.
+                    lease.handoff_last_owner = lease.handoff_owner.take();
                     lease.handoff_ever_owned = true;
                     for (affected_tab_id, state) in &mut lease.tabs {
                         state.owner = None;
@@ -2327,6 +2333,14 @@ impl Mux {
     /// so per-window state keeps syncing.
     pub fn rename_workspace_quietly(&self, old_workspace: &str, new_workspace: &str) {
         self.rename_workspace_impl(old_workspace, new_workspace, false);
+    }
+
+    /// Move one window to `workspace` without announcing it. The other
+    /// windows of its workspace stay where they are.
+    pub fn move_window_to_workspace_quietly(&self, window_id: WindowId, workspace: &str) {
+        if let Some(mut window) = self.get_window_mut(window_id) {
+            window.set_workspace_quietly(workspace);
+        }
     }
 
     fn rename_workspace_impl(&self, old_workspace: &str, new_workspace: &str, announce: bool) {
