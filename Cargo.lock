@@ -6471,6 +6471,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkterm-session"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "async-executor",
+ "codec",
+ "futures-lite",
+ "futures-util",
+ "log",
+ "lru",
+ "rangeset",
+ "termwiz 0.24.0",
+ "textwrap",
+ "thinkterm-proto",
+ "thiserror 1.0.69",
+ "url",
+ "wezterm-term",
+]
+
+[[package]]
 name = "thinkterm-syntax"
 version = "0.1.0"
 dependencies = [

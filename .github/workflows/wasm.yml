@@ -41,10 +41,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+      # Dev-dependencies are not checked here (cargo check builds none):
+      # thinkterm-session's tests run natively and lean on async-executor.
       - name: Check the portable core for wasm32
         run: |
-          cargo check -p thinkterm-proto -p codec -p wezterm-term -p termwiz \
-            --target wasm32-unknown-unknown
+          cargo check -p thinkterm-proto -p codec -p thinkterm-session \
+            -p wezterm-term -p termwiz --target wasm32-unknown-unknown
       - name: Run the terminal core in a wasm VM
         run: |
           cargo build -p wasm-probe --target wasm32-unknown-unknown --release

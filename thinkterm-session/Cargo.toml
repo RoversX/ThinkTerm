@@ -1,0 +1,37 @@
+[package]
+name = "thinkterm-session"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The mux client "session layer": per-pane wire state (deltas by seqno,
+# dirty lines, fetch and stall bookkeeping, the line cache, predictive
+# echo, input serials), the ordered input queue, the render-delta queue,
+# and the transport-neutral half of a connection. Shared by the desktop
+# client, the browser client and any later mobile client. This crate must
+# always build for wasm32-unknown-unknown; that constraint is what keeps a
+# pure client able to mirror a pane. Do not add dependencies that touch
+# processes, files, sockets or threads, and never call
+# std::time::Instant/SystemTime or std::thread from it: time goes through
+# the Clock trait, spawning through Spawner, the wire through PduLink and
+# notifications through SessionEvents. Banned by name: mux, config,
+# promise, ratelim, smol, async-io, openssl, portable-pty, filedescriptor.
+
+[dependencies]
+anyhow.workspace = true
+codec.workspace = true
+futures-util.workspace = true
+log.workspace = true
+lru.workspace = true
+rangeset.workspace = true
+termwiz = { workspace = true, features = ["use_serde"] }
+textwrap.workspace = true
+thinkterm-proto.workspace = true
+thiserror.workspace = true
+url.workspace = true
+wezterm-term = { workspace = true, features = ["use_serde"] }
+
+[dev-dependencies]
+async-channel.workspace = true
+async-executor.workspace = true
+futures-lite.workspace = true
