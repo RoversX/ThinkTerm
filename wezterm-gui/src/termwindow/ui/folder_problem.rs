@@ -128,12 +128,19 @@ impl ProjectRootUnavailable {
         if let Some(failure) = err.downcast_ref::<Self>() {
             return Some(failure.clone());
         }
-        err.downcast_ref::<mux::domain::RequiredCwdUnavailable>()
-            .map(|refused| Self {
-                path: refused.dir.clone(),
-                problem: FolderProblem::from_read_dir_kind(refused.kind),
-                detail: refused.detail.clone(),
-            })
+        let from_refusal = |refused: mux::domain::RequiredCwdUnavailable| Self {
+            path: refused.dir,
+            problem: FolderProblem::from_read_dir_kind(refused.kind),
+            detail: refused.detail,
+        };
+        if let Some(refused) = err.downcast_ref::<mux::domain::RequiredCwdUnavailable>() {
+            return Some(from_refusal(refused.clone()));
+        }
+        // A mux server (the local session host included) reports its refusal
+        // as one string; the type is recovered from the message.
+        err.chain()
+            .find_map(|layer| mux::domain::RequiredCwdUnavailable::from_message(&layer.to_string()))
+            .map(from_refusal)
     }
 }
 
@@ -180,6 +187,23 @@ mod test {
                 );
             }
         }
+    }
+
+    /// The local session host spawns in another process and answers with a
+    /// string, which has to open the same page as an in-process refusal.
+    #[test]
+    fn a_refusal_relayed_by_a_mux_server_is_recovered() {
+        let refused = mux::domain::RequiredCwdUnavailable {
+            dir: std::path::PathBuf::from("/Users/x/Documents/proj"),
+            kind: ErrorKind::PermissionDenied,
+            detail: "Operation not permitted (os error 1)".to_string(),
+        };
+        let relayed = anyhow::anyhow!("Error: {refused}").context("spawn thread tab");
+        let failure = ProjectRootUnavailable::from_error_chain(&relayed).expect("recovered");
+        assert_eq!(failure.path, refused.dir);
+        assert_eq!(failure.problem, FolderProblem::UnreadableRoot);
+        assert_eq!(failure.detail, refused.detail);
+        assert!(ProjectRootUnavailable::from_error_chain(&anyhow::anyhow!("other")).is_none());
     }
 
     /// The picker button is macOS-only and permission-only: a missing folder

@@ -837,8 +837,8 @@ mod tests {
     /// the new field in thinkterm_proto::CommandSpec (and bump
     /// CODEC_VERSION) or record here why it does not travel.
     ///
-    /// `require_cwd` deliberately does not travel: it is local-domain policy,
-    /// and a remote server re-derives its own against its own filesystem.
+    /// `require_cwd` travels since codec 66: the local session host spawns in
+    /// a separate process, and the refusal has to reach the GUI as an error.
     #[test]
     fn every_field_is_accounted_for_on_the_wire() {
         #[cfg(unix)]

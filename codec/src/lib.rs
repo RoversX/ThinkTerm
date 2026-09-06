@@ -520,7 +520,9 @@ macro_rules! pdu {
 ///     (GetPaneRenderChangesResponse.keyboard_encoding). Its own number,
 ///     because a server built between the two changes would otherwise
 ///     answer 64 and mis-decode every render push.
-pub const CODEC_VERSION: usize = 65;
+/// 66: CommandSpec carries require_cwd, so a spawn whose named directory
+///     cannot be opened fails on the server instead of landing in `$HOME`.
+pub const CODEC_VERSION: usize = 66;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -1883,15 +1885,17 @@ mod golden {
             cwd: Some(b"/tmp".to_vec()),
             umask: Some(0o022),
             controlling_tty: false,
+            require_cwd: false,
         }
     }
 
-    // The v60 baseline for CommandSpec, captured when the type was
-    // introduced. The other literals guard against changing an old format;
-    // this one guards against accidentally changing the new one.
+    // The CommandSpec baseline, captured at v60 when the type was
+    // introduced and re-captured for codec 66 (the trailing `0` is
+    // `require_cwd`). The other literals guard against changing an old
+    // format; this one guards against accidentally changing the new one.
     const COMMAND_SPEC: &[u8] = &[
         2, 4, 112, 114, 111, 103, 3, 102, 128, 111, 2, 4, 80, 65, 84, 72, 8, 47, 117, 115, 114, 47,
-        98, 105, 110, 1, 3, 70, 79, 79, 3, 98, 97, 114, 0, 1, 4, 47, 116, 109, 112, 1, 18, 0,
+        98, 105, 110, 1, 3, 70, 79, 79, 3, 98, 97, 114, 0, 1, 4, 47, 116, 109, 112, 1, 18, 0, 0,
     ];
 
     #[test]
@@ -2068,6 +2072,7 @@ mod test {
             cwd: Some(b"/tmp".to_vec()),
             umask: Some(0o022),
             controlling_tty: false,
+            require_cwd: false,
         };
 
         let pdus = [
@@ -2228,7 +2233,7 @@ mod test {
         // The exact assertion is the tripwire: whoever bumps the codec must
         // come here, confirm the round-trips still cover the new version,
         // and advance it deliberately.
-        assert_eq!(CODEC_VERSION, 65);
+        assert_eq!(CODEC_VERSION, 66);
         use thinkterm_proto::{AgentEvidence, AgentState, AgentStatus};
 
         fn round_trip(pdu: Pdu) {

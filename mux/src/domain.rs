@@ -873,11 +873,21 @@ pub struct RequiredCwdUnavailable {
     pub detail: String,
 }
 
+const REQUIRED_CWD_PHRASE: &str = " cannot be opened, and this command requires it: ";
+const REQUIRED_CWD_TAG: &str = " [required-cwd:";
+
+/// The message doubles as the wire form: a mux server reports errors as one
+/// string, so the GUI recovers this type with `from_message` on that side.
 impl std::fmt::Display for RequiredCwdUnavailable {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let kind = match self.kind {
+            std::io::ErrorKind::PermissionDenied => "permission-denied",
+            std::io::ErrorKind::NotFound => "not-found",
+            _ => "other",
+        };
         write!(
             fmt,
-            "Directory {} cannot be opened, and this command requires it: {}",
+            "Directory {}{REQUIRED_CWD_PHRASE}{}{REQUIRED_CWD_TAG}{kind}]",
             self.dir.display(),
             self.detail
         )
@@ -885,6 +895,28 @@ impl std::fmt::Display for RequiredCwdUnavailable {
 }
 
 impl std::error::Error for RequiredCwdUnavailable {}
+
+impl RequiredCwdUnavailable {
+    /// Recover the refusal from a message a server sent back, wherever the
+    /// server's own prefixes put it. `None` for any other message.
+    pub fn from_message(message: &str) -> Option<Self> {
+        let phrase_at = message.find(REQUIRED_CWD_PHRASE)?;
+        let dir_at = message[..phrase_at].rfind("Directory ")? + "Directory ".len();
+        let rest = &message[phrase_at + REQUIRED_CWD_PHRASE.len()..];
+        let tag_at = rest.rfind(REQUIRED_CWD_TAG)?;
+        let close = rest[tag_at + REQUIRED_CWD_TAG.len()..].find(']')?;
+        let kind = match &rest[tag_at + REQUIRED_CWD_TAG.len()..][..close] {
+            "permission-denied" => std::io::ErrorKind::PermissionDenied,
+            "not-found" => std::io::ErrorKind::NotFound,
+            _ => std::io::ErrorKind::Other,
+        };
+        Some(Self {
+            dir: PathBuf::from(&message[dir_at..phrase_at]),
+            kind,
+            detail: rest[..tag_at].to_string(),
+        })
+    }
+}
 
 /// Whether a cwd that could not be listed should fail the spawn outright.
 /// Pulled out so the `sudo -i` regression is pinned by a test: making every
@@ -897,7 +929,7 @@ fn required_cwd_error_is_fatal(require_cwd: bool) -> bool {
 
 #[cfg(test)]
 mod cwd_refusal_tests {
-    use super::required_cwd_error_is_fatal;
+    use super::{required_cwd_error_is_fatal, RequiredCwdUnavailable};
 
     /// The `sudo -i` case, and every other pane that merely inherited its cwd:
     /// a refusal still degrades to the home directory.
@@ -910,5 +942,32 @@ mod cwd_refusal_tests {
     #[test]
     fn every_requested_cwd_error_is_fatal() {
         assert!(required_cwd_error_is_fatal(true));
+    }
+
+    /// The server sends its error as one string with its own prefixes; the
+    /// GUI must still get the directory and the kind back out of it.
+    #[test]
+    fn the_refusal_survives_a_trip_through_a_server_message() {
+        let refused = RequiredCwdUnavailable {
+            dir: std::path::PathBuf::from("/Users/x/Documents/a b: c"),
+            kind: std::io::ErrorKind::PermissionDenied,
+            detail: "Operation not permitted (os error 1)".to_string(),
+        };
+        let message = format!("Error: spawn: {refused}");
+        let back = RequiredCwdUnavailable::from_message(&message).expect("recovered");
+        assert_eq!(back.dir, refused.dir);
+        assert_eq!(back.kind, refused.kind);
+        assert_eq!(back.detail, refused.detail);
+
+        let missing = RequiredCwdUnavailable {
+            kind: std::io::ErrorKind::NotFound,
+            ..refused
+        };
+        assert_eq!(
+            RequiredCwdUnavailable::from_message(&missing.to_string())
+                .map(|back| back.kind),
+            Some(std::io::ErrorKind::NotFound)
+        );
+        assert!(RequiredCwdUnavailable::from_message("Error: something else").is_none());
     }
 }

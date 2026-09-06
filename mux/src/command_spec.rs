@@ -27,6 +27,7 @@ impl CommandSpecExt for CommandSpec {
             cwd: cmd.get_cwd().map(|d| os_to_bytes(d)),
             umask: umask_of(cmd),
             controlling_tty: cmd.get_controlling_tty(),
+            require_cwd: cmd.get_require_cwd(),
         }
     }
 
@@ -56,6 +57,7 @@ impl CommandSpecExt for CommandSpec {
         }
         apply_umask(&mut cmd, self.umask);
         cmd.set_controlling_tty(self.controlling_tty);
+        cmd.set_require_cwd(self.require_cwd);
         cmd
     }
 }
@@ -168,6 +170,17 @@ mod tests {
         assert!(!back.get_controlling_tty());
         #[cfg(unix)]
         assert_eq!(back.get_umask(), Some(0o022));
+    }
+
+    /// The flag is what turns a refused cwd into an error on the server
+    /// instead of a silent `$HOME`; losing it re-opens that defect.
+    #[test]
+    fn require_cwd_survives() {
+        let mut cmd = CommandBuilder::new("prog");
+        cmd.cwd("/some/dir");
+        cmd.set_require_cwd(true);
+        assert!(round_trip(&cmd).get_require_cwd());
+        assert!(!round_trip(&CommandBuilder::new("prog")).get_require_cwd());
     }
 
     /// cwd survives byte-for-byte.

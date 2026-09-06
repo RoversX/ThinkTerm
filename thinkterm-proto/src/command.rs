@@ -43,6 +43,12 @@ pub struct CommandSpec {
     /// Whether the pty becomes the child's controlling terminal. False when
     /// spawning across a flatpak boundary.
     pub controlling_tty: bool,
+
+    /// Whether `cwd` is a requirement (the spawn fails if it cannot be
+    /// opened) or a preference (degrades to the home directory). Carried so
+    /// a server refuses out loud instead of silently substituting `$HOME`
+    /// for a directory the sender named on purpose.
+    pub require_cwd: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -76,6 +82,7 @@ impl std::fmt::Debug for CommandSpec {
             .field("cwd", &self.cwd.as_deref().map(String::from_utf8_lossy))
             .field("umask", &self.umask)
             .field("controlling_tty", &self.controlling_tty)
+            .field("require_cwd", &self.require_cwd)
             .finish()
     }
 }
