@@ -5305,10 +5305,19 @@ impl Domain for ClientDomain {
     }
 
     async fn attach(&self, window_id: Option<WindowId>) -> anyhow::Result<()> {
-        let ui = ConnectionUI::with_params(ConnectionUIParams {
-            window_id,
-            ..Default::default()
-        });
+        // The local session host answers over a unix socket with nothing to
+        // ask; a progress tab in the window being spawned into reads as an
+        // error, and closing it leaves that window with no tab. Attach it
+        // silently; remote domains keep the tab for prompts and failures.
+        let ui = if self.is_local_session_host() {
+            log::debug!("attaching the local session host without a progress tab");
+            ConnectionUI::new_headless()
+        } else {
+            ConnectionUI::with_params(ConnectionUIParams {
+                window_id,
+                ..Default::default()
+            })
+        };
         let outcome = self
             .attach_with_ui_retry(
                 window_id,

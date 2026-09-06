@@ -329,10 +329,20 @@ async fn attach_domain_in_window_with_retry(
     domain: Arc<dyn Domain>,
     window_id: mux::window::WindowId,
 ) -> anyhow::Result<AttachRetryOutcome> {
-    let ui = mux::connui::ConnectionUI::with_params(mux::connui::ConnectionUIParams {
-        window_id: Some(window_id),
-        ..Default::default()
-    });
+    // The local session host never shows connection progress in a window
+    // (see ClientDomain::attach); here it is usually attached already, and
+    // even then the tab would flash before the attach saw that.
+    let is_host = domain
+        .downcast_ref::<ClientDomain>()
+        .is_some_and(|client| client.is_local_session_host());
+    let ui = if is_host {
+        mux::connui::ConnectionUI::new_headless()
+    } else {
+        mux::connui::ConnectionUI::with_params(mux::connui::ConnectionUIParams {
+            window_id: Some(window_id),
+            ..Default::default()
+        })
+    };
     attach_domain_with_retry(
         domain,
         Some(window_id),
