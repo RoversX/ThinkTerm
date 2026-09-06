@@ -1285,6 +1285,43 @@ impl ClientInner {
         targets
     }
 
+    /// The runtime these bindings named is gone and nothing on the
+    /// replacement corresponds to them: forget them before anything is
+    /// asked of the new server by an old id. The local mirrors stay until
+    /// `reap_dead_runtime_mirrors`.
+    fn forget_dead_runtime_bindings(&self) {
+        self.pending_recovery_windows.lock().unwrap().clear();
+        self.remote_to_local_window.lock().unwrap().clear();
+        self.remote_to_local_tab.lock().unwrap().clear();
+        self.remote_to_local_pane.lock().unwrap().clear();
+        self.remote_to_local_stack.lock().unwrap().clear();
+        self.reported_viewports.lock().unwrap().clear();
+        self.remote_agent_statuses.lock().unwrap().clear();
+    }
+
+    /// Kill every local mirror of this domain: the terminals they showed
+    /// died with the old runtime. Nothing is sent to the server (the ids
+    /// mean nothing there), and the windows left empty are pruned, which
+    /// is what makes the GUI rebuild them from its layout store.
+    fn reap_dead_runtime_mirrors(&self) {
+        let mux = Mux::get();
+        let mut dead = Vec::new();
+        for pane in mux.iter_panes() {
+            if pane.domain_id() != self.local_domain_id {
+                continue;
+            }
+            if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
+                client_pane.ignore_next_kill();
+            }
+            dead.push(pane.pane_id());
+        }
+        log::info!(
+            "dropping {} mirrors of the replaced session server's terminals",
+            dead.len()
+        );
+        mux.domain_was_detached(self.local_domain_id);
+    }
+
     /// Prepare to bind a fresh mux runtime into the local windows that were
     /// already displaying it. The old tabs stay alive and opaque until the
     /// replacement topology has been installed; they are removed only after
@@ -1407,7 +1444,14 @@ impl ClientInner {
         };
         match access.mode {
             codec::FrontendAccessMode::Handoff => {
-                return Ok(self.remote_owner_is_self(access.owner.as_ref()));
+                // No owner: the server decides (the first screen, or the
+                // one that was driving and came back, is let through and
+                // becomes the owner on its first viewport; anyone else is
+                // refused there). Refusing here would refuse the splits of
+                // a layout restored before anything was painted.
+                return Ok(
+                    access.owner.is_none() || self.remote_owner_is_self(access.owner.as_ref())
+                );
             }
             codec::FrontendAccessMode::TmuxLatest => {}
         }
@@ -1468,6 +1512,12 @@ impl ClientDomainConfig {
             ClientDomainConfig::Tls(tls) => &tls.name,
             ClientDomainConfig::Ssh(ssh) => &ssh.name,
         }
+    }
+
+    /// The session server of the machine the GUI runs on; see
+    /// `UnixDomain::local_session_host`.
+    pub fn is_local_session_host(&self) -> bool {
+        matches!(self, ClientDomainConfig::Unix(unix) if unix.local_session_host)
     }
 
     pub fn local_echo_threshold_ms(&self) -> Option<u64> {
@@ -1956,11 +2006,31 @@ fn request_thinkterm_frontend_recovery(
     }
 }
 
-pub(crate) fn deliver_thinkterm_tree(domain_name: &str, tree: codec::ThinkTermTree) {
+pub(crate) fn deliver_thinkterm_tree(config: &ClientDomainConfig, tree: codec::ThinkTermTree) {
+    // The local session host keeps this machine's terminals, not a remote
+    // Space: its tree never reaches the sidebar.
+    if config.is_local_session_host() {
+        return;
+    }
     let sink = *THINKTERM_TREE_SINK.lock().unwrap();
     if let Some(sink) = sink {
-        sink(domain_name, tree);
+        sink(config.name(), tree);
     }
+}
+
+/// Told when the local session host came back as a different, empty
+/// server: every mirror of this domain shows a terminal that no longer
+/// exists. The GUI rebuilds each affected window's thread from its layout
+/// store; without a sink the mirrors are simply dropped.
+pub type LocalSessionHostReplacedSink = fn(DomainId);
+
+lazy_static::lazy_static! {
+    static ref LOCAL_SESSION_HOST_REPLACED_SINK: Mutex<Option<LocalSessionHostReplacedSink>> =
+        Mutex::new(None);
+}
+
+pub fn set_local_session_host_replaced_sink(sink: LocalSessionHostReplacedSink) {
+    LOCAL_SESSION_HOST_REPLACED_SINK.lock().unwrap().replace(sink);
 }
 
 pub(crate) fn deliver_thinkterm_connected(domain_name: &str, connection_generation: u64) {
@@ -1982,6 +2052,52 @@ pub(crate) fn deliver_thinkterm_session(
 }
 
 impl ClientDomain {
+    /// Whether this domain is the session server of the machine the GUI
+    /// runs on: its panes are local terminals kept out of process, not a
+    /// remote host, and the GUI treats them as local everywhere it would
+    /// otherwise treat a client domain as remote.
+    pub fn is_local_session_host(&self) -> bool {
+        self.config.is_local_session_host()
+    }
+
+    pub fn client_domain_config(&self) -> &ClientDomainConfig {
+        &self.config
+    }
+
+    /// The command to ask the server for. The session server of this
+    /// machine builds its commands in its own process, where the shell the
+    /// user chose in the GUI is not known: a spawn that asks for the
+    /// default program names that shell explicitly.
+    fn command_spec_for(&self, command: Option<&CommandBuilder>) -> Option<CommandSpec> {
+        let wants_default_prog = command.map_or(true, CommandBuilder::is_default_prog);
+        let chosen = if self.is_local_session_host() && wants_default_prog {
+            mux::default_prog::preferred_argv()
+        } else {
+            None
+        };
+        let Some(argv) = chosen else {
+            return command.map(CommandSpec::from_command_builder);
+        };
+        // Applied the way the in-process domain applies it: a bare shell
+        // travels as `SHELL`, so the server still runs it as the login
+        // shell; a shell with arguments is taken literally.
+        let mut cmd = command
+            .cloned()
+            .unwrap_or_else(CommandBuilder::new_default_prog);
+        match mux::default_prog::shell_application(&argv, cfg!(windows)) {
+            Some(mux::default_prog::ShellApplication::ShellEnv(shell)) => {
+                if cmd.get_env("SHELL").is_none() {
+                    cmd.env("SHELL", shell);
+                }
+            }
+            Some(mux::default_prog::ShellApplication::Argv(argv)) => {
+                *cmd.get_argv_mut() = argv.into_iter().map(Into::into).collect();
+            }
+            None => {}
+        }
+        Some(CommandSpec::from_command_builder(&cmd))
+    }
+
     /// The unix socket this domain connects to, if it is a unix domain
     /// that connects to a socket at all. A mux server uses it to tell a
     /// client domain that leads back to its own socket from one that leads
@@ -2419,10 +2535,26 @@ impl ClientDomain {
                 )
             })?
             .tree;
-        deliver_thinkterm_tree(client.config.name(), tree.clone());
+        deliver_thinkterm_tree(&client.config, tree.clone());
 
+        // The session server of this machine has no layout of its own to
+        // restore from: a replacement is empty, and the terminals the old
+        // one held are gone. Their mirrors are dropped once this attach is
+        // through, and the GUI rebuilds the visible Space from its layout
+        // store, as it does for any window whose mux window died.
+        let host_replaced = server_replaced && client.is_local_session_host();
+        if host_replaced {
+            log::warn!(
+                "session server {} was replaced ({:?} -> {}); its terminals are gone, \
+                 the visible Space is rebuilt from the local layout store",
+                client.config.name(),
+                prior_server_id,
+                server.server_id
+            );
+            inner.forget_dead_runtime_bindings();
+        }
         let mut restored_targets = Vec::new();
-        if server_replaced {
+        if server_replaced && !host_replaced {
             inner.remember_recovery_targets(&recovery_targets);
             log::info!(
                 "mux runtime changed from {:?} to {}; restoring {} visible workspaces",
@@ -2496,7 +2628,7 @@ impl ClientDomain {
             }
         }
         let mut replacement = None;
-        if server_replaced {
+        if server_replaced && !host_replaced {
             if restored_targets.is_empty() {
                 bail!(
                     "replacement mux has no visible frontend workspace to restore for generation {connection_generation}"
@@ -2575,7 +2707,7 @@ impl ClientDomain {
             log::warn!("failed to fetch agent statuses on reattach: {err:#}");
         }
 
-        if server_replaced {
+        if server_replaced && !host_replaced {
             let active_remote_tabs = replacement_session
                 .as_ref()
                 .map(active_remote_tabs_by_workspace)
@@ -2687,6 +2819,13 @@ impl ClientDomain {
             bail!("generation {connection_generation} was superseded during topology sync");
         }
         inner.mark_server_recovered();
+        if host_replaced {
+            let sink = *LOCAL_SESSION_HOST_REPLACED_SINK.lock().unwrap();
+            match sink {
+                Some(sink) => sink(domain_id),
+                None => inner.reap_dead_runtime_mirrors(),
+            }
+        }
         Ok(true)
     }
 
@@ -2907,7 +3046,7 @@ impl ClientDomain {
             .mutate_thinkterm_tree(codec::MutateThinkTermTree { ops })
             .await?;
         let tree = response.tree;
-        deliver_thinkterm_tree(self.config.name(), tree.clone());
+        deliver_thinkterm_tree(&self.config, tree.clone());
         Ok(tree)
     }
 
@@ -2980,7 +3119,7 @@ impl ClientDomain {
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
         let response = inner.client.get_thinkterm_tree().await?;
-        deliver_thinkterm_tree(self.config.name(), response.tree);
+        deliver_thinkterm_tree(&self.config, response.tree);
         Ok(())
     }
 
@@ -4659,7 +4798,7 @@ impl Domain for ClientDomain {
             .client
             .spawn_pane_in_stack(codec::SpawnPaneInStack {
                 pane_id: pane.remote_pane_id,
-                command: command.as_ref().map(CommandSpec::from_command_builder),
+                command: self.command_spec_for(command.as_ref()),
                 command_dir,
                 domain: SpawnTabDomain::CurrentPaneDomain,
             })
@@ -4854,9 +4993,9 @@ impl Domain for ClientDomain {
                 domain: SpawnTabDomain::DefaultDomain,
                 window_id: inner.local_to_remote_window(window),
                 size,
-                command: command.as_ref().map(CommandSpec::from_command_builder),
+                command: self.command_spec_for(command.as_ref()),
                 command_dir,
-                workspace,
+                workspace: workspace.clone(),
             })
             .await?;
 
@@ -4877,6 +5016,23 @@ impl Domain for ClientDomain {
 
         let mux = Mux::get();
         mux.add_tab_and_active_pane(&tab)?;
+        // The window was empty while the server answered, and an empty
+        // window is what a pane removal's prune sweeps away; the tab then
+        // needs a window of its own rather than a fatal error.
+        let window = if mux.get_window(window).is_some() {
+            window
+        } else {
+            let replacement = *mux.new_empty_window_for_domain(
+                Some(workspace.clone()),
+                None,
+                Some(self.local_domain_id),
+            );
+            log::warn!(
+                "local window {window} for the new tab was pruned while spawning; using {replacement}"
+            );
+            inner.record_remote_to_local_window_mapping(result.window_id, replacement);
+            replacement
+        };
         mux.add_tab_to_window(&tab, window)?;
 
         Ok(tab)
@@ -4983,7 +5139,7 @@ impl Domain for ClientDomain {
                 domain: SpawnTabDomain::CurrentPaneDomain,
                 pane_id: target_remote_pane_id,
                 split_request,
-                command: command.as_ref().map(CommandSpec::from_command_builder),
+                command: self.command_spec_for(command.as_ref()),
                 command_dir,
                 move_pane_id,
             })
@@ -5093,8 +5249,12 @@ impl Domain for ClientDomain {
         }
     }
 
+    /// The local session host is never detached: not when its last window
+    /// closes (the mux would drop it, and the next window spawns into it),
+    /// and not by a detach action. Closing the GUI is what ends this
+    /// connection.
     fn detachable(&self) -> bool {
-        true
+        !self.is_local_session_host()
     }
 
     fn detach(&self) -> anyhow::Result<()> {
@@ -5225,7 +5385,53 @@ impl ClientDomain {
                 let mut client = connect(config.clone(), ui.clone()).await?;
 
                 ui.output_str("Checking server version\n");
-                if let Err(err) = client.verify_version_compat(&ui).await {
+                let verified = client.verify_version_compat(&ui).await;
+                // The session server of this machine is brought to this
+                // client's build whenever the two differ, codec mismatch or
+                // not: the running one hands its panes over and exits. A
+                // failed takeover leaves a compatible server serving and
+                // an incompatible one refused as before.
+                if let (ClientDomainConfig::Unix(unix), true) =
+                    (&config, config.is_local_session_host())
+                {
+                    let needs_takeover = match &verified {
+                        Ok(info) => info.version_string != config::wezterm_version(),
+                        Err(err)
+                            if err
+                                .downcast_ref::<crate::client::IncompatibleVersionError>()
+                                .is_some() =>
+                        {
+                            true
+                        }
+                        // A stalled handshake or a refused registration is
+                        // not something a takeover repairs.
+                        Err(_) => return Err(verified.unwrap_err()),
+                    };
+                    if needs_takeover {
+                        let outcome = {
+                            let unix = unix.clone();
+                            let ui = ui.clone();
+                            spawn_into_new_thread(move || {
+                                crate::local_update::take_over_local_server(&unix, &ui)
+                            })
+                            .await
+                        };
+                        match outcome {
+                            Ok(true) => {
+                                ui.output_str("Reconnecting to the updated server\n");
+                                client = connect(config.clone(), ui.clone()).await?;
+                                client.verify_version_compat(&ui).await?;
+                            }
+                            Ok(false) => {
+                                verified?;
+                            }
+                            Err(takeover_err) => {
+                                ui.output_str(&format!("Local update failed: {takeover_err:#}\n"));
+                                verified?;
+                            }
+                        }
+                    }
+                } else if let Err(err) = verified {
                     // A codec mismatch over ssh is the one connect failure
                     // this side can repair: the installer runs over the same
                     // hop, at this client's version. Anything else, and a
@@ -5284,8 +5490,10 @@ impl ClientDomain {
 
         // The sidebar structure lives on the server. Fetching it is not worth
         // failing an otherwise-good attach over: without it the Space simply
-        // shows no rows until the next push or reconnect.
-        if let Err(err) = self.fetch_thinkterm_tree().await {
+        // shows no rows until the next push or reconnect. The local session
+        // host has no Space of its own; its tree stays where it is.
+        if self.is_local_session_host() {
+        } else if let Err(err) = self.fetch_thinkterm_tree().await {
             log::warn!(
                 "failed to fetch the ThinkTerm tree from {}: {err:#}",
                 self.config.name()

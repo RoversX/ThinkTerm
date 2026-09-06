@@ -62,6 +62,15 @@ pub struct UnixDomain {
     /// instead.
     #[dynamic(default)]
     pub overlay_lag_indicator: bool,
+
+    /// This domain is the session server of the machine the GUI runs on:
+    /// the GUI keeps its local terminals in it so they survive the GUI
+    /// quitting, crashing or updating. Set by the GUI from its own
+    /// settings, not meant for the configuration file. The client
+    /// reconnects to such a domain, starts its server again when it is
+    /// gone, and takes an older server over instead of refusing it.
+    #[dynamic(default)]
+    pub local_session_host: bool,
 }
 
 impl Default for UnixDomain {
@@ -78,6 +87,7 @@ impl Default for UnixDomain {
             local_echo_threshold_ms: None,
             proxy_command: None,
             overlay_lag_indicator: false,
+            local_session_host: false,
         }
     }
 }

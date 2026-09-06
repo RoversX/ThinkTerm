@@ -652,7 +652,7 @@ fn process_unilateral(
                 if domain.connection_generation() != Some(connection_generation) {
                     return Ok(());
                 }
-                crate::domain::deliver_thinkterm_tree(domain.domain_name(), state.tree);
+                crate::domain::deliver_thinkterm_tree(domain.client_domain_config(), state.tree);
                 anyhow::Result::<()>::Ok(())
             })
             .detach();
@@ -1232,12 +1232,18 @@ impl Reconnectable {
         matches!(&self.config, ClientDomainConfig::Unix(_))
     }
 
+    fn is_local_session_host(&self) -> bool {
+        self.config.is_local_session_host()
+    }
+
     fn reconnectable(&mut self) -> bool {
         match &self.config {
-            // It doesn't make sense to reconnect to a unix socket; we only
-            // get disconnected it it dies, so respawning it would not preserve
-            // the set of tabs and we'd have confusing and inconsistent state
-            ClientDomainConfig::Unix(_) => false,
+            // The session server of this machine: it exits when a newer
+            // build takes its panes over (same runtime id, the client
+            // rebinds) and it can crash (a replacement, restored from the
+            // saved layout). Any other unix domain only goes away when its
+            // server dies, and respawning one would not bring the tabs back.
+            ClientDomainConfig::Unix(unix) => unix.local_session_host,
             ClientDomainConfig::Tls(_) => true,
             // An ssh transport dies whenever the network path changes
             // (VPN egress rotation, sleep/wake, flaky wifi); the remote mux
@@ -1255,7 +1261,13 @@ impl Reconnectable {
     /// common case by far is a network-level drop, we still reconnect. The
     /// reconnect UI is cancellable for the rare deliberate-shutdown case.
     fn reconnect_on_eof(&self) -> bool {
-        matches!(&self.config, ClientDomainConfig::Ssh(_))
+        match &self.config {
+            ClientDomainConfig::Ssh(_) => true,
+            // EOF is how a handoff or a crash of the local session server
+            // shows up.
+            ClientDomainConfig::Unix(unix) => unix.local_session_host,
+            ClientDomainConfig::Tls(_) => false,
+        }
     }
 
     fn connect(
@@ -1374,7 +1386,11 @@ impl Reconnectable {
         let stream = match unix_connect_with_retry(&target, false, max_attempts) {
             Ok(stream) => stream,
             Err(e) => {
-                if no_auto_start || unix_dom.no_serve_automatically || !initial {
+                // The session server of this machine is started again on a
+                // reconnect too: nothing answering after the retries means
+                // it is gone, and the replacement restores the saved layout.
+                let may_start_on_reconnect = initial || unix_dom.local_session_host;
+                if no_auto_start || unix_dom.no_serve_automatically || !may_start_on_reconnect {
                     bail!("failed to connect to {:?}: {}", target, e);
                 }
                 log::warn!(
@@ -1874,7 +1890,15 @@ impl Client {
                             // revive the server after a couple of instant
                             // deaths — it still only spawns one if connecting
                             // to the existing socket fails.
-                            let no_auto_start = short_sessions < 2;
+                            // The local session host is started again
+                            // whenever nothing answers -- unless what was
+                            // started keeps dying at once, which no restart
+                            // fixes; then the backoff and the give-up apply.
+                            let no_auto_start = if reconnectable.is_local_session_host() {
+                                short_sessions >= 3
+                            } else {
+                                short_sessions < 2
+                            };
                             match reconnectable.connect(initial, &mut ui, no_auto_start) {
                                 Ok(_) => {
                                     log::info!("Transport reconnected; restoring mux session");
@@ -2009,6 +2033,11 @@ impl Client {
     /// session dies.
     pub fn set_fatal_connection_error(&self, reason: String) {
         self.fatal_connection_error.lock().unwrap().replace(reason);
+    }
+
+    /// See `ClientDomainConfig::is_local_session_host`.
+    pub fn is_local_session_host(&self) -> bool {
+        self.client_domain_config.is_local_session_host()
     }
 
     pub fn into_client_domain_config(self) -> ClientDomainConfig {
@@ -2422,6 +2451,30 @@ mod tests {
     use super::{
         describe_server_build_mismatch, is_auth_cancelled, Reconnectable, RegistrationBarrier,
     };
+    use crate::domain::ClientDomainConfig;
+
+    #[test]
+    fn only_the_local_session_host_reconnects_over_a_unix_socket() {
+        let plain = Reconnectable::new(
+            ClientDomainConfig::Unix(config::UnixDomain::default()),
+            None,
+        );
+        let mut plain = plain;
+        assert!(!plain.reconnectable());
+        assert!(!plain.reconnect_on_eof());
+        assert!(!plain.is_local_session_host());
+
+        let mut host = Reconnectable::new(
+            ClientDomainConfig::Unix(config::UnixDomain {
+                local_session_host: true,
+                ..Default::default()
+            }),
+            None,
+        );
+        assert!(host.reconnectable());
+        assert!(host.reconnect_on_eof());
+        assert!(host.is_local_session_host());
+    }
 
     #[test]
     fn an_identical_build_is_not_worth_warning_about() {
