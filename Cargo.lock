@@ -7583,7 +7583,11 @@ dependencies = [
 name = "wasm-probe"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "codec",
  "termwiz 0.24.0",
+ "thinkterm-proto",
+ "thinkterm-session",
  "wezterm-term",
 ]
 

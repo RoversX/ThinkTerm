@@ -42,6 +42,11 @@ WebAssembly.instantiate(buf, stubs).then(({ instance }) => {
     // "abcdef", cursor to col 3, ECH with u32::MAX: the clamp leaves "ab" (len 2).
     // Unfixed 32-bit release would wrap and erase nothing, leaving len 6.
     ['stage6_ech_overflow', 2],
+    // The session layer: a render push applied through the fake host, its
+    // dirty rows fetched, predictive echo, and the input-serial rule.
+    ['stage7_pane_session', 0],
+    // The ordered input drain: folding, wire order, settlement.
+    ['stage8_input_queue', 0],
   ];
   let failed = 0;
   for (const [name, expect] of stages) {

@@ -10,5 +10,9 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
+anyhow.workspace = true
+codec.workspace = true
 termwiz.workspace = true
+thinkterm-proto.workspace = true
+thinkterm-session.workspace = true
 wezterm-term.workspace = true
