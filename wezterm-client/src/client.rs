@@ -35,18 +35,21 @@ use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
+use thinkterm_session::connection::{
+    describe_handshake_failure, describe_server_build_mismatch, leads_back_to_this_process,
+    ChannelSendError, RegistrationBarrier,
+};
 use thiserror::Error;
 use wezterm_uds::UnixStream;
+
+pub use thinkterm_session::connection::ConnectionPhase as ClientConnectionPhase;
+pub use thinkterm_session::connection::VersionHandshakeStalled;
 
 static NEXT_CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Error, Debug)]
 #[error("Timeout")]
 struct Timeout;
-
-#[derive(Error, Debug)]
-#[error("ChannelSendError")]
-struct ChannelSendError;
 
 enum ReaderMessage {
     SendPdu {
@@ -70,38 +73,6 @@ enum ReaderMessage {
     /// The connection has been idle for a while: send a keepalive ping,
     /// or declare the transport dead if the previous ping went unanswered.
     KeepaliveTick,
-}
-
-struct RegistrationBarrier<T> {
-    complete: bool,
-    deferred: VecDeque<T>,
-}
-
-impl<T> RegistrationBarrier<T> {
-    fn new() -> Self {
-        Self {
-            complete: false,
-            deferred: VecDeque::new(),
-        }
-    }
-
-    fn submit(&mut self, item: T, registration_required: bool) -> Option<T> {
-        if registration_required && !self.complete {
-            self.deferred.push_back(item);
-            None
-        } else {
-            Some(item)
-        }
-    }
-
-    fn complete(&mut self) -> VecDeque<T> {
-        self.complete = true;
-        std::mem::take(&mut self.deferred)
-    }
-
-    fn drain(&mut self) -> VecDeque<T> {
-        std::mem::take(&mut self.deferred)
-    }
 }
 
 struct PduRegistrationBarrier {
@@ -128,7 +99,7 @@ impl PduRegistrationBarrier {
     }
 
     fn is_complete(&self) -> bool {
-        self.inner.complete
+        self.inner.is_complete()
     }
 
     fn fail_deferred(&mut self, reason: &str) {
@@ -141,32 +112,6 @@ impl PduRegistrationBarrier {
 impl Drop for PduRegistrationBarrier {
     fn drop(&mut self) {
         self.fail_deferred("reconnect generation ended before mux client registration completed");
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum ClientConnectionPhase {
-    Connecting = 0,
-    Registering = 1,
-    Syncing = 2,
-    Ready = 3,
-    Reconnecting = 4,
-    Suspended = 5,
-    Detached = 6,
-}
-
-impl ClientConnectionPhase {
-    fn from_u8(value: u8) -> Self {
-        match value {
-            0 => Self::Connecting,
-            1 => Self::Registering,
-            2 => Self::Syncing,
-            3 => Self::Ready,
-            4 => Self::Reconnecting,
-            5 => Self::Suspended,
-            _ => Self::Detached,
-        }
     }
 }
 
@@ -278,77 +223,6 @@ impl Client {
 pub struct IncompatibleVersionError {
     pub version: String,
     pub codec_vers: usize,
-}
-
-/// The server accepted the connection but never answered the version
-/// handshake. Unlike [`IncompatibleVersionError`] this is a transient
-/// condition — a wedged or overloaded server (e.g. one pane consuming all
-/// of its resources) or a stalled link — and retrying can succeed, so it
-/// must never be classified as fatal.
-#[derive(Error, Debug, Clone, PartialEq, Eq)]
-#[error(
-    "The server did not answer the version handshake within {timeout_secs} \
-     seconds. The server may be overloaded or wedged, or the link may have \
-     stalled. This is transient — it is NOT a version mismatch — and \
-     reconnecting can succeed."
-)]
-pub struct VersionHandshakeStalled {
-    pub timeout_secs: u64,
-}
-
-/// Human-readable description of a failed version handshake, for errors
-/// that are not a timeout. The wording deliberately does not claim a
-/// version mismatch: a real mismatch is detected from an actual response
-/// ([`IncompatibleVersionError`]); landing here means no usable answer
-/// arrived at all, which is most often a transport or server-health
-/// problem.
-fn describe_handshake_failure(err: &anyhow::Error) -> String {
-    if err.root_cause().is::<CorruptResponse>() {
-        "Received an implausible and likely corrupt response from \
-         the server. This can happen if the remote host outputs \
-         to stdout prior to running commands. \
-         Check your shell startup!"
-            .to_string()
-    } else if err.root_cause().is::<ChannelSendError>() {
-        "Internal channel was closed prior to sending request. \
-         This may indicate that the remote host output invalid data \
-         to stdout prior to running the requested command. \
-         Check your shell startup!"
-            .to_string()
-    } else {
-        format!(
-            "The version handshake with the server failed: '{err}'. \
-             Possible causes: the connection or the server stalled before \
-             answering; the remote host printed to stdout during shell \
-             startup (check your shell startup files); or the server build \
-             is too old to answer at all. An actual version mismatch is \
-             reported explicitly, so do not assume one from this message."
-        )
-    }
-}
-
-/// Describe a server whose build differs from ours, or `None` when they match.
-///
-/// [`CODEC_VERSION`] guards the wire format, not behaviour: two builds that
-/// differ only by a behaviour change still carry the same codec version and
-/// handshake without complaint. That is how a mux server left running from a
-/// days-old build goes on serving live shells while looking healthy to a
-/// freshly built client -- the failure this reports is invisible otherwise.
-///
-/// Reported through the log rather than the connection UI on purpose. A
-/// *remote* server legitimately runs its own build, and nagging on every
-/// connect would train the warning away before it ever caught the local case
-/// it exists for.
-pub(crate) fn describe_server_build_mismatch(local: &str, remote: &str) -> Option<String> {
-    if local == remote {
-        return None;
-    }
-    Some(format!(
-        "mux server is running {remote}, this client is {local}. \
-         Codec version {CODEC_VERSION} matches, so they interoperate, but the \
-         server may be serving behaviour from an older build; restart it if \
-         that is not deliberate."
-    ))
 }
 
 macro_rules! rpc {
@@ -769,11 +643,6 @@ fn process_unilateral(
         bail!("don't know how to handle {:?}", decoded);
     }
     Ok(())
-}
-
-/// Whether the server answering the handshake is the process asking.
-fn leads_back_to_this_process(own_server_id: Option<&str>, server_id: &str) -> bool {
-    own_server_id.is_some_and(|own| own == server_id)
 }
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -2469,9 +2338,7 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        describe_server_build_mismatch, is_auth_cancelled, Reconnectable, RegistrationBarrier,
-    };
+    use super::{is_auth_cancelled, Reconnectable};
     use crate::domain::ClientDomainConfig;
 
     #[test]
@@ -2495,43 +2362,6 @@ mod tests {
         assert!(host.reconnectable());
         assert!(host.reconnect_on_eof());
         assert!(host.is_local_session_host());
-    }
-
-    #[test]
-    fn an_identical_build_is_not_worth_warning_about() {
-        assert_eq!(
-            describe_server_build_mismatch("20260814-011230-aaef9bfb", "20260814-011230-aaef9bfb"),
-            None
-        );
-    }
-
-    #[test]
-    fn a_server_from_another_build_names_both_sides() {
-        let mismatch =
-            describe_server_build_mismatch("20260815-150100-eab2bf7c", "20260813-012155-816da4db")
-                .expect("differing builds are reported");
-        // Which side is which is the whole point of the message: the same two
-        // version strings in the wrong order sends the user to restart the
-        // wrong process.
-        assert!(mismatch.contains("server is running 20260813-012155-816da4db"));
-        assert!(mismatch.contains("client is 20260815-150100-eab2bf7c"));
-    }
-
-    #[test]
-    fn registration_barrier_sends_bootstrap_before_deferred_rpcs() {
-        let mut barrier = RegistrationBarrier::new();
-        assert_eq!(barrier.submit("palette", true), None);
-        assert_eq!(barrier.submit("viewport", true), None);
-        assert_eq!(
-            barrier.submit("GetCodecVersion", false),
-            Some("GetCodecVersion")
-        );
-        assert_eq!(barrier.submit("SetClientId", false), Some("SetClientId"));
-        assert_eq!(
-            barrier.complete().into_iter().collect::<Vec<_>>(),
-            vec!["palette", "viewport"]
-        );
-        assert_eq!(barrier.submit("focus", true), Some("focus"));
     }
 
     #[test]
@@ -2566,42 +2396,5 @@ mod tests {
         let cmd = Reconnectable::remote_mux_command(&None, "cli --prefer-mux proxy");
         assert!(cmd.contains("thinkterm cli --prefer-mux proxy"), "{}", cmd);
         assert!(cmd.contains("wezterm cli --prefer-mux proxy"), "{}", cmd);
-    }
-}
-
-#[cfg(test)]
-mod handshake_classification_tests {
-    use super::*;
-
-    #[test]
-    fn unknown_failure_does_not_claim_a_version_mismatch() {
-        let err = anyhow::anyhow!("Client was destroyed");
-        let msg = describe_handshake_failure(&err);
-        assert!(!msg.contains("install a compatible"), "{msg}");
-        assert!(msg.contains("Client was destroyed"), "{msg}");
-    }
-
-    #[test]
-    fn channel_send_error_keeps_its_specific_guidance() {
-        let err = anyhow::Error::new(ChannelSendError).context("send_pdu");
-        let msg = describe_handshake_failure(&err);
-        assert!(msg.contains("Internal channel was closed"), "{msg}");
-    }
-
-    #[test]
-    fn stalled_handshake_reads_as_transient() {
-        let msg = VersionHandshakeStalled { timeout_secs: 60 }.to_string();
-        assert!(msg.contains("transient"), "{msg}");
-        assert!(msg.contains("NOT a version mismatch"), "{msg}");
-    }
-
-    #[test]
-    fn a_server_with_our_own_id_is_never_attached() {
-        assert!(super::leads_back_to_this_process(Some("abc"), "abc"));
-        assert!(!super::leads_back_to_this_process(Some("abc"), "def"));
-        assert!(
-            !super::leads_back_to_this_process(None, "abc"),
-            "a process without a mux of its own cannot be the server"
-        );
     }
 }

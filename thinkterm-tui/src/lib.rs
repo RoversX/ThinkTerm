@@ -60,7 +60,7 @@ const RESIZE_SETTLE: Duration = Duration::from_millis(150);
 /// How often to ask the panes for new content when nothing has asked to draw.
 ///
 /// A remote pane only asks the server from inside `get_changed_since`, and
-/// `RenderableInner::poll` doubles its own interval every time it runs — up to
+/// the session's poll doubles its own interval every time it runs — up to
 /// half a minute — resetting only when a response lands. Until now the only
 /// caller was `paint_pane`, so a renderer that draws strictly on demand stopped
 /// asking, and the screen sat still until something was tapped.
