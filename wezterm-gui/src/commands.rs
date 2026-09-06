@@ -902,6 +902,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: Some("md_folder_open"),
         },
+        GrantProjectFolderAccess(_) => CommandDef {
+            brief: "Grant Folder Access".into(),
+            doc: "Asks macOS to grant ThinkTerm access to the Project folder, then opens the Project".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: Some("md_folder_open"),
+        },
         OpenFileWith { .. } => CommandDef {
             brief: "Open File With Application".into(),
             doc: "Opens a file with a selected application".into(),

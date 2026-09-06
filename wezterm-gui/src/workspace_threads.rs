@@ -3353,6 +3353,13 @@ pub fn project_reveal_path(project_id: &str) -> Option<PathBuf> {
     store.project_reveal_path(project_id)
 }
 
+/// A local Project's folder as recorded, whether or not it can be listed
+/// right now (a refused folder is exactly the one to grant access to).
+pub fn local_project_path(project_id: &str) -> Option<PathBuf> {
+    let store = THREAD_STORE.lock();
+    store.local_project_path(project_id)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RemoteFilesSource {
     SshHost(String),
@@ -5644,6 +5651,17 @@ impl WorkspaceThreadStore {
             .iter()
             .find(|project| project.id == project_id)?;
         if is_remote_project(project, &self.spaces) || !project.path.is_dir() {
+            return None;
+        }
+        Some(project.path.clone())
+    }
+
+    fn local_project_path(&self, project_id: &str) -> Option<PathBuf> {
+        let project = self
+            .projects
+            .iter()
+            .find(|project| project.id == project_id)?;
+        if is_remote_project(project, &self.spaces) {
             return None;
         }
         Some(project.path.clone())

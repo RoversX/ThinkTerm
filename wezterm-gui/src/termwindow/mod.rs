@@ -8458,6 +8458,9 @@ impl TermWindow {
             PromptRenamePaneTab(pane_id) => self.prompt_rename_pane_tab(*pane_id),
             PromptRenameProject(project_id) => self.prompt_rename_project(project_id.clone()),
             RevealProjectInFolder(project_id) => self.reveal_project_in_folder(project_id),
+            GrantProjectFolderAccess(project_id) => {
+                self.grant_project_folder_access(project_id.clone())
+            }
             OpenFileWith { path, app, label } => {
                 let selected_app = crate::native_settings::NativeOpenWithApp {
                     id: app.clone(),

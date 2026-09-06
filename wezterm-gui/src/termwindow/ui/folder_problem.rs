@@ -96,6 +96,9 @@ pub(crate) struct ProjectRootUnavailable {
     /// The raw OS refusal, kept for the detail line. It names the path and the
     /// errno, which is what makes a bug report actionable.
     pub(crate) detail: String,
+    /// The session server was refused, not this process. A picker grant
+    /// covers only the GUI; the server needs its own grant.
+    pub(crate) via_session_server: bool,
 }
 
 impl std::fmt::Display for ProjectRootUnavailable {
@@ -118,6 +121,7 @@ impl ProjectRootUnavailable {
             path: path.into(),
             problem: FolderProblem::from_read_dir_kind(err.kind()),
             detail: format!("{err}"),
+            via_session_server: false,
         }
     }
 
@@ -128,19 +132,20 @@ impl ProjectRootUnavailable {
         if let Some(failure) = err.downcast_ref::<Self>() {
             return Some(failure.clone());
         }
-        let from_refusal = |refused: mux::domain::RequiredCwdUnavailable| Self {
+        let from_refusal = |refused: mux::domain::RequiredCwdUnavailable, via_session_server| Self {
             path: refused.dir,
             problem: FolderProblem::from_read_dir_kind(refused.kind),
             detail: refused.detail,
+            via_session_server,
         };
         if let Some(refused) = err.downcast_ref::<mux::domain::RequiredCwdUnavailable>() {
-            return Some(from_refusal(refused.clone()));
+            return Some(from_refusal(refused.clone(), false));
         }
         // A mux server (the local session host included) reports its refusal
         // as one string; the type is recovered from the message.
         err.chain()
             .find_map(|layer| mux::domain::RequiredCwdUnavailable::from_message(&layer.to_string()))
-            .map(from_refusal)
+            .map(|refused| from_refusal(refused, true))
     }
 }
 

@@ -35,6 +35,9 @@ pub(crate) const PROJECT_ROOT_CONTENT_VIEW_KEY_PREFIX: &str = "project-root:";
 enum ProjectRootAction {
     Reauthorize,
     OpenThread,
+    /// The session server, not the GUI, was refused: a picker cannot grant
+    /// for it, so send the user to the switch macOS keeps for it.
+    OpenSystemSettings,
 }
 
 /// Deliberately only two states: everything beyond these existed to drive an
@@ -111,6 +114,10 @@ impl ProjectRootView {
                     body.push(' ');
                     body.push_str(&hint);
                 }
+                if failure.via_session_server {
+                    body.push(' ');
+                    body.push_str(&crate::i18n::tr("project-root-server-refused"));
+                }
                 Some(body)
             }
             ViewPhase::Granted => Some(crate::i18n::tr("project-root-recovered-note")),
@@ -133,12 +140,23 @@ impl ProjectRootView {
             return Vec::new();
         }
         match &self.phase {
-            ViewPhase::Blocked(failure) if failure.problem.can_reauthorize() => vec![(
-                crate::i18n::tr("project-root-reauthorize"),
-                SvgIcon::FolderOpen,
-                ProjectRootAction::Reauthorize,
-                true,
-            )],
+            ViewPhase::Blocked(failure) if failure.problem.can_reauthorize() => {
+                let mut buttons = vec![(
+                    crate::i18n::tr("project-root-reauthorize"),
+                    SvgIcon::FolderOpen,
+                    ProjectRootAction::Reauthorize,
+                    true,
+                )];
+                if failure.via_session_server {
+                    buttons.push((
+                        crate::i18n::tr("project-root-open-settings"),
+                        SvgIcon::Settings,
+                        ProjectRootAction::OpenSystemSettings,
+                        false,
+                    ));
+                }
+                buttons
+            }
             ViewPhase::Blocked(_) => Vec::new(),
             // Delegates to the exact activation a sidebar click triggers;
             // its predecessor's bugs all came from re-implementing that.
@@ -593,6 +611,10 @@ impl ProjectRootView {
                 reauthorize_response(self.root.clone())
             }
             ProjectRootAction::OpenThread => open_thread_response(self.thread_id.clone()),
+            ProjectRootAction::OpenSystemSettings => {
+                open_files_and_folders_settings();
+                ContentViewResponse::Redraw
+            }
         }
     }
 }
@@ -827,6 +849,7 @@ impl TermWindow {
                     path: root,
                     problem: FolderProblem::Other,
                     detail: "window is no longer available".to_string(),
+                    via_session_server: false,
                 }),
             );
             return;
@@ -849,6 +872,7 @@ impl TermWindow {
                             path: PathBuf::new(),
                             problem: FolderProblem::Other,
                             detail: format!("{err:#}"),
+                            via_session_server: false,
                         })
                     });
                     notify.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
@@ -872,6 +896,85 @@ impl TermWindow {
             self.invalidate_window();
         }
     }
+}
+
+impl TermWindow {
+    /// The Project menu's "Grant Folder Access…": the same picker the blocked
+    /// page offers, without needing that page first. A grant is followed by
+    /// opening the Project's first Thread, so the spawn (through the session
+    /// server when local sessions use it) proves the access end to end.
+    pub(crate) fn grant_project_folder_access(&mut self, project_id: String) {
+        let Some(root) = crate::workspace_threads::local_project_path(&project_id) else {
+            return;
+        };
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        let notify = window.clone();
+        window.pick_folder_async_with_options(
+            window::FolderPickerOptions {
+                title: crate::i18n::tr("project-root-reauthorize-title"),
+                prompt: crate::i18n::tr("project-root-reauthorize-prompt"),
+                directory: Some(root.clone()),
+            },
+            Box::new(move |chosen| {
+                promise::spawn::spawn(async move {
+                    let outcome = promise::spawn::spawn_into_new_thread(move || {
+                        Ok(reauthorize_outcome(root, chosen))
+                    })
+                    .await
+                    .unwrap_or_else(|err| {
+                        ProjectRootProbe::Blocked(ProjectRootUnavailable {
+                            path: PathBuf::new(),
+                            problem: FolderProblem::Other,
+                            detail: format!("{err:#}"),
+                            via_session_server: false,
+                        })
+                    });
+                    notify.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                        term_window.deliver_project_folder_grant(project_id, outcome);
+                    })));
+                })
+                .detach();
+            }),
+        );
+    }
+
+    fn deliver_project_folder_grant(&mut self, project_id: String, outcome: ProjectRootProbe) {
+        let thread_id = crate::workspace_threads::ordered_thread_ids(&project_id)
+            .into_iter()
+            .next()
+            .or_else(|| crate::workspace_threads::create_thread(&project_id, None).ok());
+        let Some(thread_id) = thread_id else {
+            self.invalidate_window();
+            return;
+        };
+        match outcome {
+            ProjectRootProbe::Available => {
+                if let Some(window) = self.window.as_ref().cloned() {
+                    self.activate_workspace_thread(thread_id, &window);
+                }
+            }
+            ProjectRootProbe::Blocked(failure) => {
+                let display_name =
+                    crate::workspace_threads::thread_display_name(&project_id, &thread_id);
+                let space_id = self.active_space_id.clone();
+                self.show_project_root_problem(thread_id, space_id, display_name, failure);
+            }
+            ProjectRootProbe::OtherFolderChosen => {
+                log::info!("grant folder access: a different folder was chosen; nothing granted");
+            }
+        }
+        self.invalidate_window();
+    }
+}
+
+/// The pane where macOS keeps per-app folder grants; the session server is
+/// listed there under its own name once it has asked.
+fn open_files_and_folders_settings() {
+    wezterm_open_url::open_url(
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders",
+    );
 }
 
 /// Decide what a finished picker means, on a worker thread.
@@ -938,6 +1041,7 @@ mod tests {
             path: PathBuf::from(path),
             problem: FolderProblem::UnreadableRoot,
             detail: "denied".to_string(),
+            via_session_server: false,
         }
     }
 
@@ -978,6 +1082,7 @@ mod tests {
             path: PathBuf::from("/project"),
             problem: FolderProblem::MissingRoot,
             detail: "gone".to_string(),
+            via_session_server: false,
         }));
         assert!(matches!(&view.phase, ViewPhase::Blocked(failure)
                 if failure.problem == FolderProblem::MissingRoot));

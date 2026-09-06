@@ -5337,8 +5337,17 @@ impl super::TermWindow {
         if crate::workspace_threads::project_reveal_path(&project_id).is_none() {
             reveal_item = reveal_item.disabled();
         }
+        // macOS only: the picker it runs is what grants access there.
+        let mut grant_item = ContextMenuItem::item_with_icon(
+            crate::i18n::tr("menu-grant-folder-access"),
+            ContextMenuIcon::Folder,
+            KeyAssignment::GrantProjectFolderAccess(project_id.clone()),
+        );
+        if crate::workspace_threads::local_project_path(&project_id).is_none() {
+            grant_item = grant_item.disabled();
+        }
 
-        vec![
+        let mut items = vec![
             ContextMenuItem::item_with_icon(
                 crate::i18n::tr("menu-rename-project"),
                 ContextMenuIcon::Edit,
@@ -5405,7 +5414,11 @@ impl super::TermWindow {
                 ContextMenuIcon::FolderRemove,
                 KeyAssignment::RemoveProject(project_id),
             ),
-        ]
+        ];
+        if cfg!(target_os = "macos") {
+            items.insert(2, grant_item);
+        }
+        items
     }
 
     /// The menu for a revealed archived row: restore it, or delete it for
