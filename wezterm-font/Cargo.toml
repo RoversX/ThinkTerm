@@ -33,6 +33,7 @@ metrics.workspace = true
 ordered-float.workspace = true
 rangeset.workspace = true
 termwiz.workspace = true
+thinkterm-font-core.workspace = true
 thiserror.workspace = true
 walkdir.workspace = true
 wezterm-bidi.workspace = true
@@ -56,4 +57,6 @@ objc.workspace = true
 
 [dev-dependencies]
 env_logger.workspace = true
+# The snapshot tests print GlyphInfo, text included, in release too.
+thinkterm-font-core = { workspace = true, features = ["glyph-text"] }
 k9.workspace = true

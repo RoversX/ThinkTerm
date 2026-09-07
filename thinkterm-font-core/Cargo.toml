@@ -1,0 +1,25 @@
+[package]
+name = "thinkterm-font-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The font types every renderer agrees on: pixel units, glyph metrics, the
+# shaped-glyph record, the rasterized bitmap, and the FontShaper /
+# FontRasterizer traits. wezterm-font implements them over FreeType and
+# HarfBuzz for the desktop; the browser implements them over pure Rust.
+# This crate must always build for wasm32-unknown-unknown: no processes,
+# files, sockets, threads, std::time, and never a dependency on config or
+# on a C font library.
+
+[features]
+# Keep `GlyphInfo.text` in release builds too; the font crates' snapshot
+# tests turn it on so `cargo test --release` sees the same Debug output.
+glyph-text = []
+
+[dependencies]
+anyhow.workspace = true
+euclid.workspace = true
+termwiz.workspace = true
+wezterm-bidi.workspace = true
+wezterm-input-types.workspace = true

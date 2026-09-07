@@ -517,7 +517,7 @@ mod test {
     use termwiz::cell::CellAttributes;
     use termwiz::surface::{Line, SEQ_ZERO};
     use wezterm_bidi::Direction;
-    use wezterm_font::shaper::{GlyphInfo, PresentationWidth};
+    use wezterm_font::shaper::{GlyphInfo, GlyphInfoParts, PresentationWidth};
     use wezterm_font::units::PixelLength;
     use wezterm_font::{FontConfiguration, LoadedFont};
 
@@ -596,34 +596,36 @@ mod test {
             scale: 1.0,
         });
         let infos = vec![
-            GlyphInfo {
-                #[cfg(debug_assertions)]
-                text: "a".to_string(),
-                only_char: Some('a'),
-                is_space: false,
-                num_cells: 1,
-                cluster: 0,
-                font_idx: 0,
-                glyph_pos: 11,
-                x_advance: PixelLength::new(1.0),
-                y_advance: PixelLength::new(0.0),
-                x_offset: PixelLength::new(0.0),
-                y_offset: PixelLength::new(0.0),
-            },
-            GlyphInfo {
-                #[cfg(debug_assertions)]
-                text: "你".to_string(),
-                only_char: Some('你'),
-                is_space: false,
-                num_cells: 2,
-                cluster: 3,
-                font_idx: 0,
-                glyph_pos: 12,
-                x_advance: PixelLength::new(2.0),
-                y_advance: PixelLength::new(0.0),
-                x_offset: PixelLength::new(0.0),
-                y_offset: PixelLength::new(0.0),
-            },
+            GlyphInfo::new(
+                "a",
+                GlyphInfoParts {
+                    only_char: Some('a'),
+                    is_space: false,
+                    num_cells: 1,
+                    cluster: 0,
+                    font_idx: 0,
+                    glyph_pos: 11,
+                    x_advance: PixelLength::new(1.0),
+                    y_advance: PixelLength::new(0.0),
+                    x_offset: PixelLength::new(0.0),
+                    y_offset: PixelLength::new(0.0),
+                },
+            ),
+            GlyphInfo::new(
+                "你",
+                GlyphInfoParts {
+                    only_char: Some('你'),
+                    is_space: false,
+                    num_cells: 2,
+                    cluster: 3,
+                    font_idx: 0,
+                    glyph_pos: 12,
+                    x_advance: PixelLength::new(2.0),
+                    y_advance: PixelLength::new(0.0),
+                    x_offset: PixelLength::new(0.0),
+                    y_offset: PixelLength::new(0.0),
+                },
+            ),
         ];
         let shaped = ShapedInfo::process(&infos, &[Rc::clone(&glyph), glyph]);
 

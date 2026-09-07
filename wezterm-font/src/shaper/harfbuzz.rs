@@ -1,5 +1,5 @@
 use crate::parser::ParsedFont;
-use crate::shaper::{FallbackIdx, FontMetrics, FontShaper, GlyphInfo, PresentationWidth};
+use crate::shaper::{FallbackIdx, FontMetrics, FontShaper, GlyphInfo, PresentationWidth, GlyphInfoParts};
 use crate::units::*;
 use crate::{ftwrap, hbwrap as harfbuzz};
 use anyhow::{anyhow, Context};
@@ -47,20 +47,21 @@ fn get_only_char(s: &str) -> Option<char> {
 fn make_glyphinfo(text: &str, num_cells: u8, font_idx: usize, info: &Info) -> GlyphInfo {
     let is_space = text == " ";
     let only_char = get_only_char(text);
-    GlyphInfo {
-        #[cfg(any(debug_assertions, test))]
-        text: text.into(),
-        only_char,
-        is_space,
-        num_cells,
-        font_idx,
-        glyph_pos: info.codepoint,
-        cluster: info.cluster as u32,
-        x_advance: PixelLength::new(f64::from(info.x_advance) / 64.0),
-        y_advance: PixelLength::new(f64::from(info.y_advance) / 64.0),
-        x_offset: PixelLength::new(f64::from(info.x_offset) / 64.0),
-        y_offset: PixelLength::new(f64::from(info.y_offset) / 64.0),
-    }
+    GlyphInfo::new(
+        text,
+        GlyphInfoParts {
+            only_char,
+            is_space,
+            num_cells,
+            font_idx,
+            glyph_pos: info.codepoint,
+            cluster: info.cluster as u32,
+            x_advance: PixelLength::new(f64::from(info.x_advance) / 64.0),
+            y_advance: PixelLength::new(f64::from(info.y_advance) / 64.0),
+            x_offset: PixelLength::new(f64::from(info.x_offset) / 64.0),
+            y_offset: PixelLength::new(f64::from(info.y_offset) / 64.0),
+        },
+    )
 }
 
 struct FontPair {

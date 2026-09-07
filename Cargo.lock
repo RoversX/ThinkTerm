@@ -6457,6 +6457,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkterm-font-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "euclid",
+ "termwiz 0.24.0",
+ "wezterm-bidi 0.2.3",
+ "wezterm-input-types 0.1.0",
+]
+
+[[package]]
 name = "thinkterm-proto"
 version = "0.1.0"
 dependencies = [
@@ -8040,6 +8051,7 @@ dependencies = [
  "ordered-float 4.6.0",
  "rangeset",
  "termwiz 0.24.0",
+ "thinkterm-font-core",
  "thiserror 1.0.69",
  "walkdir",
  "wezterm-bidi 0.2.3",

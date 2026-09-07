@@ -1,5 +1,4 @@
 use crate::parser::ParsedFont;
-use crate::units::*;
 use config::FontRasterizerSelection;
 use image::{ImageBuffer, Rgba};
 
@@ -11,31 +10,7 @@ pub mod colr;
 pub mod freetype;
 pub mod harfbuzz;
 
-/// A bitmap representation of a glyph.
-/// The data is stored as pre-multiplied RGBA 32bpp.
-#[derive(Debug)]
-pub struct RasterizedGlyph {
-    pub data: Vec<u8>,
-    pub height: usize,
-    pub width: usize,
-    pub bearing_x: PixelLength,
-    pub bearing_y: PixelLength,
-    pub has_color: bool,
-    /// if true, glyphcache shouldn't need to scale the
-    /// glyph to match metrics
-    pub is_scaled: bool,
-}
-
-/// Rasterizes the specified glyph index in the associated font
-/// and returns the generated bitmap
-pub trait FontRasterizer {
-    fn rasterize_glyph(
-        &self,
-        glyph_pos: u32,
-        size: f64,
-        dpi: u32,
-    ) -> anyhow::Result<RasterizedGlyph>;
-}
+pub use thinkterm_font_core::{FontRasterizer, RasterizedGlyph};
 
 pub fn new_rasterizer(
     rasterizer: FontRasterizerSelection,
