@@ -31,6 +31,7 @@ openssl.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}
 promise.workspace = true
 signal-hook.workspace = true
+smol.workspace = true
 umask.workspace = true
 wezterm-blob-leases = {workspace=true, features=["simple_tempdir"]}
 wezterm-mux-server-impl.workspace = true

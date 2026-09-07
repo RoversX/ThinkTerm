@@ -28,7 +28,14 @@ rangeset.workspace = true
 rcgen.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
 smol.workspace = true
+soketto.workspace = true
+base64.workspace = true
+getrandom.workspace = true
+hex = { workspace = true, features = ["alloc"] }
+httparse.workspace = true
 tempfile.workspace = true
 termwiz = { workspace=true, features=["use_serde"] }
 url.workspace = true

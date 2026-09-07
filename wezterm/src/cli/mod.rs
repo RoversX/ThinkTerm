@@ -22,6 +22,7 @@ mod set_window_title;
 mod spawn_command;
 mod split_pane;
 mod tls_creds;
+mod web_token;
 mod zoom_pane;
 
 #[derive(Debug, Parser, Clone, Copy)]
@@ -87,6 +88,11 @@ enum CliSubCommand {
 
     #[command(name = "tlscreds", about = "obtain tls credentials")]
     TlsCreds(tls_creds::TlsCredsCommand),
+
+    /// Mint, list and revoke the tokens a browser presents at the
+    /// server's web port
+    #[command(name = "web-token", rename_all = "kebab")]
+    WebToken(web_token::WebTokenCommand),
 
     #[command(
         name = "move-pane-to-new-tab",
@@ -204,6 +210,7 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::SpawnCommand(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
         CliSubCommand::Proxy(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
         CliSubCommand::TlsCreds(cmd) => cmd.run(client).await,
+        CliSubCommand::WebToken(cmd) => cmd.run(client).await,
         CliSubCommand::ActivatePaneDirection(cmd) => cmd.run(client).await,
         CliSubCommand::GetPaneDirection(cmd) => cmd.run(client).await,
         CliSubCommand::KillPane(cmd) => cmd.run(client).await,

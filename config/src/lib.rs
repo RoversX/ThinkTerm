@@ -41,6 +41,7 @@ mod tls;
 mod units;
 mod unix;
 mod version;
+mod web;
 pub mod window;
 mod wsl;
 
@@ -61,6 +62,7 @@ pub use tls::*;
 pub use units::*;
 pub use unix::*;
 pub use version::*;
+pub use web::*;
 pub use wsl::*;
 
 type ErrorCallback = fn(&str);

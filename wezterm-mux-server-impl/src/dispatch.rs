@@ -1,4 +1,4 @@
-use crate::sessionhandler::{PduSender, SessionHandler};
+use crate::sessionhandler::{ConnectionPeer, PduSender, SessionHandler};
 use anyhow::Context;
 use async_ossl::AsyncSslStream;
 use codec::{DecodedPdu, Pdu};
@@ -6,6 +6,7 @@ use futures::FutureExt;
 use mux::{Mux, MuxNotification};
 use smol::prelude::*;
 use smol::Async;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context as TaskContext, Poll};
@@ -26,6 +27,30 @@ enum Item {
     WritePdu(DecodedPdu),
     Readable,
     LivenessTick,
+    /// The accept layer withdrew this connection's admission (a web token
+    /// was revoked).
+    Shutdown,
+}
+
+/// A client's byte stream as the connection loop sees it: async reads and
+/// writes, plus a wait for readability the loop races against its queue
+/// and clocks. `Async<T>` is the unix-socket and TLS shape; the web
+/// listener supplies a WebSocket-backed one.
+pub trait ConnectionStream: AsyncRead + AsyncWrite + Unpin + Send + std::fmt::Debug + 'static {
+    /// Resolves once a read would return at least one byte, or end of
+    /// stream. It must not resolve while nothing is buffered: the loop
+    /// enters a decode on it, and would otherwise sit inside a read with
+    /// pushes waiting unsent in the write queue.
+    fn wait_for_readable(&self) -> impl Future<Output = std::io::Result<()>> + Send + '_;
+}
+
+impl<T> ConnectionStream for Async<T>
+where
+    T: std::io::Read + std::io::Write + Send + Sync + std::fmt::Debug + async_io::IoSafe + 'static,
+{
+    fn wait_for_readable(&self) -> impl Future<Output = std::io::Result<()>> + Send + '_ {
+        self.readable()
+    }
 }
 
 /// Noticing a client that died without closing its socket.
@@ -138,34 +163,42 @@ where
     T: AsRawDesc,
     T: std::fmt::Debug,
     T: async_io::IoSafe,
+    T: Send + Sync,
 {
     let stream = smol::Async::new(stream)?;
     process_async(stream).await
 }
 
-pub async fn process_async<T>(stream: Async<T>) -> anyhow::Result<()>
-where
-    T: 'static,
-    T: std::io::Read,
-    T: std::io::Write,
-    T: std::fmt::Debug,
-    T: async_io::IoSafe,
-{
+pub async fn process_async<S: ConnectionStream>(stream: S) -> anyhow::Result<()> {
     process_async_with(stream, Liveness::new(Instant::now())).await
 }
 
-pub(crate) async fn process_async_with<T>(
-    mut stream: Async<T>,
+/// A connection whose peer the accept layer has already identified: the
+/// web listener, after the token check at the HTTP upgrade.
+pub async fn process_stream<S: ConnectionStream>(
+    stream: S,
+    peer: ConnectionPeer,
+) -> anyhow::Result<()> {
+    process_async_with_peer(stream, Liveness::new(Instant::now()), peer).await
+}
+
+pub(crate) async fn process_async_with<S: ConnectionStream>(
+    stream: S,
+    liveness: Liveness,
+) -> anyhow::Result<()> {
+    process_async_with_peer(stream, liveness, ConnectionPeer::Local).await
+}
+
+async fn process_async_with_peer<S: ConnectionStream>(
+    mut stream: S,
     mut liveness: Liveness,
-) -> anyhow::Result<()>
-where
-    T: 'static,
-    T: std::io::Read,
-    T: std::io::Write,
-    T: std::fmt::Debug,
-    T: async_io::IoSafe,
-{
+    peer: ConnectionPeer,
+) -> anyhow::Result<()> {
     log::trace!("process_async called");
+    let revoked = match &peer {
+        ConnectionPeer::Web(web) => Some(web.revoked.clone()),
+        ConnectionPeer::Local => None,
+    };
 
     let (item_tx, item_rx) = smol::channel::unbounded::<Item>();
 
@@ -183,7 +216,7 @@ where
             move || item_tx.is_closed()
         },
     );
-    let mut handler = SessionHandler::new(pdu_sender);
+    let mut handler = SessionHandler::for_peer(pdu_sender, peer);
 
     {
         // Notifications take one hop through the main thread's queue before
@@ -233,14 +266,30 @@ where
     };
 
     loop {
+        // Checked first, unconditionally: the race below polls its arms in
+        // order and a busy pane keeps the queue arm ready on every turn, so
+        // a revocation that only lived in the race could wait forever.
+        if admission_is_withdrawn(&revoked) {
+            log::warn!("the client's web token was revoked; dropping the connection");
+            return Ok(());
+        }
         let rx_msg = item_rx.recv();
-        let wait_for_read = stream.readable().map(|_| Ok(Item::Readable));
+        let wait_for_read = stream.wait_for_readable().map(|_| Ok(Item::Readable));
         let tick = async {
             smol::Timer::at(liveness.next_check()).await;
             Ok(Item::LivenessTick)
         };
+        let shutdown = async {
+            admission_withdrawn(&revoked).await;
+            Ok(Item::Shutdown)
+        };
 
-        let item = match smol::future::or(smol::future::or(rx_msg, wait_for_read), tick).await {
+        let item = match smol::future::or(
+            smol::future::or(smol::future::or(rx_msg, wait_for_read), tick),
+            shutdown,
+        )
+        .await
+        {
             Ok(Item::LivenessTick) => match liveness.check(Instant::now()) {
                 Verdict::Fine => continue,
                 // Through the write queue like every other push, so a
@@ -278,24 +327,33 @@ where
                 // the read waiting for the rest with no clock running;
                 // the clock here runs once the first byte is in, and only
                 // while nothing more arrives.
+                // Revocation races the read as well: a peer dribbling one
+                // byte at a time keeps the decode alive indefinitely, and
+                // must still be gone the moment its token is.
                 let moved = AtomicU64::new(0);
                 let decoded = smol::future::or(
+                    smol::future::or(
+                        async {
+                            let mut counted = Counted {
+                                stream: &mut stream,
+                                bytes: &moved,
+                            };
+                            Read::Decoded(Pdu::decode_async(&mut counted, None).await)
+                        },
+                        async {
+                            stalled(&moved, READ_STALL_LIMIT, true).await;
+                            Read::Stalled
+                        },
+                    ),
                     async {
-                        let mut counted = Counted {
-                            stream: &mut stream,
-                            bytes: &moved,
-                        };
-                        Some(Pdu::decode_async(&mut counted, None).await)
-                    },
-                    async {
-                        stalled(&moved, READ_STALL_LIMIT, true).await;
-                        None
+                        admission_withdrawn(&revoked).await;
+                        Read::Revoked
                     },
                 )
                 .await;
                 let decoded = match decoded {
-                    Some(Ok(data)) => data,
-                    Some(Err(err)) => {
+                    Read::Decoded(Ok(data)) => data,
+                    Read::Decoded(Err(err)) => {
                         if let Some(err) = err.root_cause().downcast_ref::<std::io::Error>() {
                             if err.kind() == std::io::ErrorKind::UnexpectedEof {
                                 // Client disconnected: no need to make a noise
@@ -304,18 +362,32 @@ where
                         }
                         return Err(err).context("reading Pdu from client");
                     }
-                    None => {
+                    Read::Stalled => {
                         log::warn!(
                             "the client stopped part-way through a PDU and sent nothing more \
                              for {READ_STALL_LIMIT:?}; dropping the connection"
                         );
                         return Ok(());
                     }
+                    Read::Revoked => {
+                        log::warn!("the client's web token was revoked; dropping the connection");
+                        return Ok(());
+                    }
                 };
+                // Decoded, but not yet acted on: a revocation that landed
+                // during the read must not get this one last request in.
+                if admission_is_withdrawn(&revoked) {
+                    log::warn!("the client's web token was revoked; dropping the connection");
+                    return Ok(());
+                }
                 liveness.heard(Instant::now());
                 handler.process_one(decoded);
             }
             Ok(Item::LivenessTick) => unreachable!("handled above"),
+            Ok(Item::Shutdown) => {
+                log::warn!("the client's web token was revoked; dropping the connection");
+                return Ok(());
+            }
             Ok(Item::WritePdu(decoded)) => {
                 log::trace!("write {} serial {}", decoded.pdu.pdu_name(), decoded.serial);
                 let is_probe = decoded.serial == 0 && matches!(decoded.pdu, Pdu::Ping(_));
@@ -324,23 +396,31 @@ where
                 // cannot run while this arm waits, so the wait itself is
                 // bounded. Progress, not completion: a large picture over
                 // a slow link takes as long as it takes.
+                // A revocation also stops a transfer mid-way: pane contents
+                // must not go on streaming to a browser whose token is gone.
                 let moved = AtomicU64::new(0);
                 let written = smol::future::or(
+                    smol::future::or(
+                        async {
+                            let mut counted = Counted {
+                                stream: &mut stream,
+                                bytes: &moved,
+                            };
+                            decoded
+                                .pdu
+                                .encode_async(&mut counted, decoded.serial)
+                                .await
+                                .map_err(WriteFailure::Encode)?;
+                            counted.flush().await.map_err(WriteFailure::Flush)
+                        },
+                        async {
+                            stalled(&moved, WRITE_STALL_LIMIT, false).await;
+                            Err(WriteFailure::Stalled)
+                        },
+                    ),
                     async {
-                        let mut counted = Counted {
-                            stream: &mut stream,
-                            bytes: &moved,
-                        };
-                        decoded
-                            .pdu
-                            .encode_async(&mut counted, decoded.serial)
-                            .await
-                            .map_err(WriteFailure::Encode)?;
-                        counted.flush().await.map_err(WriteFailure::Flush)
-                    },
-                    async {
-                        stalled(&moved, WRITE_STALL_LIMIT, false).await;
-                        Err(WriteFailure::Stalled)
+                        admission_withdrawn(&revoked).await;
+                        Err(WriteFailure::Revoked)
                     },
                 )
                 .await;
@@ -355,6 +435,10 @@ where
                             "a write to the client made no progress for \
                              {WRITE_STALL_LIMIT:?}; dropping the connection"
                         );
+                        return Ok(());
+                    }
+                    Err(WriteFailure::Revoked) => {
+                        log::warn!("the client's web token was revoked; dropping the connection");
                         return Ok(());
                     }
                     Err(WriteFailure::Encode(err)) => {
@@ -419,8 +503,8 @@ const STALL_CHECK: Duration = Duration::from_secs(1);
 const DEAD_GRACE: Duration = Duration::from_millis(250);
 
 /// Whether the socket has something to read, given a moment to say so.
-async fn socket_has_data<T>(stream: &Async<T>) -> bool {
-    smol::future::or(async { stream.readable().await.is_ok() }, async {
+async fn socket_has_data<S: ConnectionStream>(stream: &S) -> bool {
+    smol::future::or(async { stream.wait_for_readable().await.is_ok() }, async {
         smol::Timer::after(DEAD_GRACE).await;
         false
     })
@@ -455,15 +539,12 @@ async fn stalled(bytes: &AtomicU64, limit: Duration, from_first_byte: bool) {
 /// The stream with a count of the bytes that cross it, so a transfer that
 /// is merely long can be told from one that has stopped.
 #[derive(Debug)]
-struct Counted<'a, T> {
-    stream: &'a mut Async<T>,
+struct Counted<'a, S> {
+    stream: &'a mut S,
     bytes: &'a AtomicU64,
 }
 
-impl<T> AsyncRead for Counted<'_, T>
-where
-    Async<T>: AsyncRead + Unpin,
-{
+impl<S: AsyncRead + Unpin> AsyncRead for Counted<'_, S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
@@ -478,10 +559,7 @@ where
     }
 }
 
-impl<T> AsyncWrite for Counted<'_, T>
-where
-    Async<T>: AsyncWrite + Unpin,
-{
+impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<'_, S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
@@ -508,6 +586,33 @@ enum WriteFailure {
     Encode(anyhow::Error),
     Flush(std::io::Error),
     Stalled,
+    Revoked,
+}
+
+enum Read {
+    Decoded(anyhow::Result<DecodedPdu>),
+    Stalled,
+    Revoked,
+}
+
+/// Whether the accept layer has withdrawn this connection's admission:
+/// either the revocation itself or the store letting go of its sender.
+/// A local connection has no admission to lose.
+fn admission_is_withdrawn(revoked: &Option<smol::channel::Receiver<()>>) -> bool {
+    match revoked {
+        Some(rx) => rx.try_recv().is_ok() || rx.is_closed(),
+        None => false,
+    }
+}
+
+/// Resolves when the admission is withdrawn; never, for a local peer.
+async fn admission_withdrawn(revoked: &Option<smol::channel::Receiver<()>>) {
+    match revoked {
+        Some(rx) => {
+            let _ = rx.recv().await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 /// What the connection loop needs for a mux notification, prepared on the
@@ -680,6 +785,119 @@ mod tests {
     /// its Pong. (The first cut replied to the Pong with an ErrorResponse,
     /// which the client could not handle: every client died ten seconds
     /// after connecting.)
+    /// Revocation reaches the loop even when nothing else is idle: the
+    /// check runs before the race, every turn.
+    #[cfg(unix)]
+    #[test]
+    fn a_revoked_web_peer_is_dropped_promptly() {
+        use crate::sessionhandler::{ConnectionPeer, WebPeer};
+        use std::os::fd::{FromRawFd, IntoRawFd};
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let ours = unsafe { UnixStream::from_raw_fd(ours.into_raw_fd()) };
+        let stream = Async::new(ours).unwrap();
+        let (kill, revoked) = smol::channel::bounded(1);
+        let peer = ConnectionPeer::Web(WebPeer {
+            token_id: "t".into(),
+            label: "test".into(),
+            username: "me".into(),
+            revoked,
+        });
+        // Keep the loop busy: a stream of pushes has the queue arm ready on
+        // every turn, which is exactly when a revocation must still win.
+        let busy = std::thread::spawn(move || {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_millis(600) {
+                Pdu::Ping(codec::Ping {}).encode(&theirs, 1).ok();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            theirs
+        });
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            kill.try_send(()).unwrap();
+        });
+        let outcome = smol::block_on(smol::future::or(
+            async {
+                process_async_with_peer(stream, Liveness::new(Instant::now()), peer).await?;
+                Ok(true)
+            },
+            async {
+                smol::Timer::after(Duration::from_millis(500)).await;
+                Ok::<bool, anyhow::Error>(false)
+            },
+        ));
+        assert_eq!(outcome.unwrap(), true, "the revoked connection did not end in time");
+        busy.join().unwrap();
+    }
+
+    /// A peer part-way through a PDU, still sending, is not out of reach
+    /// of a revocation: the read is raced against it.
+    #[cfg(unix)]
+    #[test]
+    fn a_revoked_web_peer_is_dropped_mid_pdu() {
+        use crate::sessionhandler::{ConnectionPeer, WebPeer};
+        use std::io::Write;
+        use std::os::fd::{FromRawFd, IntoRawFd};
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+
+        let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let ours = unsafe { UnixStream::from_raw_fd(ours.into_raw_fd()) };
+        let stream = Async::new(ours).unwrap();
+        let (kill, revoked) = smol::channel::bounded(1);
+        let peer = ConnectionPeer::Web(WebPeer {
+            token_id: "t".into(),
+            label: "test".into(),
+            username: "me".into(),
+            revoked,
+        });
+        // Incompressible, so the PDU really is thousands of bytes long.
+        let mut noise = vec![0u8; 4000];
+        getrandom::fill(&mut noise).unwrap();
+        let data = noise.iter().map(|b| (b'a' + b % 26) as char).collect::<String>();
+        let mut bytes = Vec::new();
+        Pdu::SendPaste(codec::SendPaste { pane_id: 1, data })
+            .encode(&mut bytes, 1)
+            .unwrap();
+        assert!(bytes.len() > 1000, "{} bytes", bytes.len());
+        // The header and a little of the body, then one byte at a time,
+        // forever as far as the loop can tell.
+        let dribble = std::thread::spawn(move || {
+            theirs.write_all(&bytes[..64]).ok();
+            let started = Instant::now();
+            for byte in &bytes[64..] {
+                if started.elapsed() > Duration::from_millis(900) {
+                    break;
+                }
+                if theirs.write_all(std::slice::from_ref(byte)).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            kill.try_send(()).unwrap();
+        });
+        let outcome = smol::block_on(smol::future::or(
+            async {
+                process_async_with_peer(stream, Liveness::new(Instant::now()), peer).await?;
+                Ok(true)
+            },
+            async {
+                smol::Timer::after(Duration::from_millis(600)).await;
+                Ok::<bool, anyhow::Error>(false)
+            },
+        ));
+        assert_eq!(outcome.unwrap(), true, "the revoked connection did not end mid-PDU");
+        dribble.join().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_peer_that_answers_the_probe_is_kept_and_not_answered_back() {

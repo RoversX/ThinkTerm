@@ -456,6 +456,7 @@ async fn async_run(
         // over. Everything is ours already; not listening for the next
         // successor is worth a log line, not an exit.
         let tls_servers = config.tls_servers.clone();
+        let web_servers = config.web_servers.clone();
         thread::spawn(move || {
             wezterm_mux_server_impl::handoff::wait_for_predecessor_exit(stream);
             // Its descriptors close one after another as it exits; the
@@ -489,6 +490,14 @@ async fn async_run(
             for tls_server in &tls_servers {
                 if let Err(err) = ossl::spawn_tls_listener(tls_server) {
                     log::error!("problem spawning TLS listener after the takeover: {err:#}");
+                }
+            }
+            if let Err(err) = web::configure_tokens(&web_servers) {
+                log::error!("problem loading web tokens after the takeover: {err:#}");
+            }
+            for web_server in &web_servers {
+                if let Err(err) = web::spawn_web_listener(web_server) {
+                    log::error!("problem spawning web listener after the takeover: {err:#}");
                 }
             }
         });
@@ -589,6 +598,7 @@ fn install_shutdown_signal_handler() -> anyhow::Result<()> {
 }
 
 mod ossl;
+mod web;
 
 pub fn spawn_listener() -> anyhow::Result<()> {
     let config = configuration();
@@ -624,6 +634,15 @@ pub fn spawn_listener() -> anyhow::Result<()> {
 
     for tls_server in &config.tls_servers {
         ossl::spawn_tls_listener(tls_server)?;
+    }
+
+    // Not fatal: a token store that cannot be read means no web tokens,
+    // not no server.
+    if let Err(err) = web::configure_tokens(&config.web_servers) {
+        log::error!("problem loading web tokens: {err:#}");
+    }
+    for web_server in &config.web_servers {
+        web::spawn_web_listener(web_server)?;
     }
 
     Ok(())

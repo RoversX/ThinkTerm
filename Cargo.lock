@@ -5934,6 +5934,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "soketto"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e859df029d160cb88608f5d7df7fb4753fd20fdfb4de5644f3d8b8440841721"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "futures",
+ "httparse",
+ "log",
+ "rand 0.8.5",
+ "sha1",
+]
+
+[[package]]
 name = "spa"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7450,8 +7465,6 @@ dependencies = [
 [[package]]
 name = "varbincode"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b712fa900b441e2d5226a094ca37ca70c0d26d26b79822a5cf34a853a9e26f9f"
 dependencies = [
  "byteorder",
  "leb128",
@@ -8222,6 +8235,7 @@ dependencies = [
  "portable-pty",
  "promise",
  "signal-hook",
+ "smol",
  "umask",
  "wezterm-blob-leases 0.1.1",
  "wezterm-gui-subcommands",
@@ -8237,11 +8251,15 @@ dependencies = [
  "anyhow",
  "async-io",
  "async_ossl",
+ "base64 0.22.1",
  "codec",
  "config",
  "dns-lookup",
  "futures",
+ "getrandom 0.3.4",
+ "hex",
  "hostname",
+ "httparse",
  "lazy_static",
  "libc",
  "log",
@@ -8255,7 +8273,10 @@ dependencies = [
  "rcgen",
  "serde",
  "serde_json",
+ "sha1",
+ "sha2",
  "smol",
+ "soketto",
  "tempfile",
  "termwiz 0.24.0",
  "thinkterm-proto",

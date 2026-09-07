@@ -2312,6 +2312,9 @@ impl Client {
     );
     rpc!(get_codec_version, GetCodecVersion, GetCodecVersionResponse);
     rpc!(get_tls_creds, GetTlsCreds = (), GetTlsCredsResponse);
+    rpc!(web_token_mint, WebTokenMint, WebTokenMintResponse);
+    rpc!(web_token_list, WebTokenList = (), WebTokenListResponse);
+    rpc!(web_token_revoke, WebTokenRevoke, WebTokenRevokeResponse);
     rpc!(
         search_scrollback,
         SearchScrollbackRequest,

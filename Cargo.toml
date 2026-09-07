@@ -131,6 +131,7 @@ governor = {version="0.5", default-features=false, features=["std"]}
 guillotiere = "0.6"
 harfbuzz = { path = "deps/harfbuzz" }
 heapless = "0.8"
+httparse = "1.10"
 hdrhistogram = "7.1"
 hex = {version="0.4", default-features=false}
 hostname = "0.4"
@@ -217,6 +218,7 @@ serde_with = {version="2.0", features = ["chrono_0_4"]}
 serde_yaml = "0.9"
 semver = "1.0"
 serial2 = "0.2"
+sha1 = "0.10"
 sha2 = "0.10"
 share-data = { path = "lua-api-crates/share-data" }
 shared_library = "0.1"
@@ -226,6 +228,7 @@ signal-hook = "0.3"
 siphasher = "1.0.1"
 smithay-client-toolkit = {version = "0.19", default-features=false}
 smol = "2.0"
+soketto = "0.8"
 socket2 = "0.5"
 spa = "0.3.1"
 spawn-funcs = { path = "lua-api-crates/spawn-funcs" }
@@ -310,3 +313,5 @@ zvariant = "4.0"
 # We use our own vendored cairo, which has minimal deps and should just
 # build via cargo.
 cairo-sys-rs = {path="deps/cairo", version="0.18.0"}
+# Vendored to bound allocations by the bytes present, not by declared lengths.
+varbincode = {path="deps/varbincode", version="0.1.0"}

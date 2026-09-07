@@ -282,3 +282,43 @@ remote terminal session
 ```console
 $ wezterm connect server.name
 ```
+
+## Browser access
+
+A multiplexer can also serve a browser client: one TCP port delivers the
+page, its JavaScript and wasm, and accepts a WebSocket that speaks the same
+protocol as every other client. The browser mirrors a pane the way the
+desktop does, and takes over input the moment you type into it.
+
+### Configuring the server
+
+```lua
+config.web_servers = {
+  {
+    -- loopback by default; see WebServer for TLS and other hosts
+    bind_address = '127.0.0.1:8088',
+  },
+}
+```
+
+[See Browser access](thinkterm/web-access.md) for every setting, TLS and
+remote use.
+
+### Minting a token and opening the page
+
+A browser is admitted by a *web token*, minted where the server already
+trusts you: over the unix socket, or through `thinkterm cli` over ssh.
+
+```console
+$ thinkterm cli web-token mint --label laptop --ttl 12h
+```
+
+prints a URL to open. The token is a login as your user on that machine;
+`thinkterm cli web-token list` shows what exists and who is connected, and
+`thinkterm cli web-token revoke <id>` cuts a token and its browsers off at
+once.
+
+For a server on another machine, forward the port over ssh rather than
+exposing it: `ssh -L 8088:127.0.0.1:8088 server.hostname`, then open the
+loopback URL locally. Browsers only render the client in a secure context,
+which `http://localhost` is and a plain `http://` to a remote host is not.

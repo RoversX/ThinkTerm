@@ -46,21 +46,29 @@ pub fn spawn<F>(future: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    spawn_task(future).detach();
+}
+
+/// Like `spawn`, but the caller keeps the handle: dropping it cancels
+/// the task, which is how a connection's helper tasks are tied to its
+/// lifetime.
+pub fn spawn_task<F>(future: F) -> smol::Task<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     // The executor catches a task's panic and hands it to whoever holds
     // the task; detached, that would be nobody, and the connection would
     // simply vanish. Say so, at least.
-    EXECUTOR
-        .spawn(async move {
-            if let Err(payload) = AssertUnwindSafe(future).catch_unwind().await {
-                let message = payload
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| payload.downcast_ref::<&str>().copied())
-                    .unwrap_or("(no message)");
-                log::error!("a client connection panicked and was dropped: {message}");
-            }
-        })
-        .detach();
+    EXECUTOR.spawn(async move {
+        if let Err(payload) = AssertUnwindSafe(future).catch_unwind().await {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("(no message)");
+            log::error!("a client connection panicked and was dropped: {message}");
+        }
+    })
 }
 
 #[cfg(test)]

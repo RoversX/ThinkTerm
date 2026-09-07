@@ -1,0 +1,21 @@
+# Vendored from crates.io varbincode 0.1.0 (Wez Furlong, MIT) with one
+# change: a declared byte/string length no longer allocates up front, so a
+# corrupt or hostile length costs only the bytes actually present in the
+# stream instead of aborting the process on allocation failure.
+[package]
+name = "varbincode"
+version = "0.1.0"
+authors = ["Wez Furlong <wez@wezfurlong.org>"]
+edition = "2018"
+description = "A binary encoder / decoder with variable length integer encoding implementation in Rust."
+license = "MIT"
+repository = "https://github.com/wez/varbincode"
+publish = false
+
+[dependencies]
+byteorder = "1.3"
+leb128 = "0.2"
+serde = "1.0"
+
+[dev-dependencies]
+serde_derive = "1.0"

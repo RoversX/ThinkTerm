@@ -78,8 +78,10 @@ impl OpenSSLNetListener {
                     match acceptor.accept(stream) {
                         Ok(stream) => {
                             if let Err(err) = Self::verify_peer_cert(&stream) {
+                                // One bad client is one refused connection,
+                                // not the end of the listener.
                                 log::error!("problem with peer cert: {}", err);
-                                break;
+                                continue;
                             }
                             wezterm_mux_server_impl::connections::spawn(async move {
                                 log::debug!("Making new AsyncSslStream");
@@ -98,8 +100,11 @@ impl OpenSSLNetListener {
                     }
                 }
                 Err(err) => {
+                    // As above: a failed accept (a peer that reset before
+                    // we got to it, a moment without descriptors) is not
+                    // the end of the listener.
                     log::error!("accept failed: {}", err);
-                    return;
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             }
         }

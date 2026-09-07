@@ -985,8 +985,86 @@ fn schedule_palette_session_cleanup(session_id: PaletteSessionId, reason: &'stat
     .detach();
 }
 
+/// Who is on the other end of a connection, as far as the accept layer
+/// could tell. The unix socket and the mTLS port are the server's own
+/// user by construction; a browser is whoever presented a web token.
+#[derive(Debug, Clone)]
+pub enum ConnectionPeer {
+    Local,
+    Web(WebPeer),
+}
+
+/// A browser connection admitted by `web_auth`. The identity it presents
+/// in `SetClientId` is overwritten with this, so `cli list-clients` shows
+/// the token that let it in rather than whatever the page claimed.
+#[derive(Debug, Clone)]
+pub struct WebPeer {
+    pub token_id: String,
+    pub label: String,
+    /// The server's own user: every web session runs as that user.
+    pub username: String,
+    /// Fires when the token is revoked; the connection loop drops the
+    /// socket the moment it does.
+    pub revoked: smol::channel::Receiver<()>,
+}
+
+/// What a browser admitted by a web token may ask for: the terminal, the
+/// mux and the ThinkTerm tree, exactly as a local client would. Not on
+/// the list, deliberately: `GetTlsCreds` (a client certificate neither
+/// expires nor revokes, so a leaked token must not become one) and the
+/// token administration PDUs (a browser minting further browsers is how
+/// one leaked token becomes many).
+fn web_peer_may_send(pdu: &Pdu) -> bool {
+    matches!(
+        pdu,
+        Pdu::Ping(_)
+            | Pdu::Pong(_)
+            | Pdu::GetCodecVersion(_)
+            | Pdu::GetServerOsRelease(_)
+            | Pdu::SetClientId(_)
+            | Pdu::GetClientList(_)
+            | Pdu::ListPanes(_)
+            | Pdu::WriteToPane(_)
+            | Pdu::SendKeyDown(_)
+            | Pdu::SendMouseEvent(_)
+            | Pdu::SendPaste(_)
+            | Pdu::Resize(_)
+            | Pdu::GetLines(_)
+            | Pdu::GetPaneRenderChanges(_)
+            | Pdu::GetPaneRenderableDimensions(_)
+            | Pdu::GetImageCell(_)
+            | Pdu::SearchScrollbackRequest(_)
+            | Pdu::EraseScrollbackRequest(_)
+            | Pdu::SetPalette(_)
+            | Pdu::SetPaneZoomed(_)
+            | Pdu::SplitPane(_)
+            | Pdu::KillPane(_)
+            | Pdu::SpawnV2(_)
+            | Pdu::SetWindowWorkspace(_)
+            | Pdu::RenameWorkspace(_)
+            | Pdu::SetFocusedPane(_)
+            | Pdu::MovePaneToNewTab(_)
+            | Pdu::ActivatePaneDirection(_)
+            | Pdu::GetPaneDirection(_)
+            | Pdu::AdjustPaneSize(_)
+            | Pdu::SpawnPaneInStack(_)
+            | Pdu::ActivatePaneInStack(_)
+            | Pdu::MovePaneToStack(_)
+            | Pdu::GetThinkTermTree(_)
+            | Pdu::MutateThinkTermTree(_)
+            | Pdu::GetThinkTermSessionState(_)
+            | Pdu::EnsureThinkTermThread(_)
+            | Pdu::SetClientViewport(_)
+            | Pdu::ClaimClientViewport(_)
+            | Pdu::SetClientView(_)
+            | Pdu::SetFrontendAccessMode(_)
+            | Pdu::GetAgentStatuses(_)
+    )
+}
+
 pub struct SessionHandler {
     to_write_tx: PduSender,
+    peer: ConnectionPeer,
     per_pane: HashMap<TabId, Arc<Mutex<PerPane>>>,
     client_id: Option<Arc<ClientId>>,
     client_registration: Option<ClientRegistrationId>,
@@ -1009,8 +1087,13 @@ impl Drop for SessionHandler {
 
 impl SessionHandler {
     pub fn new(to_write_tx: PduSender) -> Self {
+        Self::for_peer(to_write_tx, ConnectionPeer::Local)
+    }
+
+    pub fn for_peer(to_write_tx: PduSender, peer: ConnectionPeer) -> Self {
         Self {
             to_write_tx,
+            peer,
             per_pane: HashMap::new(),
             client_id: None,
             client_registration: None,
@@ -1150,6 +1233,19 @@ impl SessionHandler {
             sender.send(DecodedPdu { pdu, serial }).ok();
         };
 
+        // A web session is admitted by a revocable, expiring token; it
+        // may do everything the user could at a keyboard, and nothing that
+        // would turn the token into another credential. The list names
+        // what is allowed, so a request added later is refused here until
+        // someone decides it belongs.
+        if matches!(self.peer, ConnectionPeer::Web(_)) && !web_peer_may_send(&decoded.pdu) {
+            send_response(Err(anyhow!(
+                "{} is not available to a web session",
+                decoded.pdu.pdu_name()
+            )));
+            return;
+        }
+
         if requires_existing_frontend_access(&decoded.pdu) {
             if let Err(err) = require_registered_frontend_access(
                 &Mux::get(),
@@ -1217,6 +1313,11 @@ impl SessionHandler {
                         // with the logic in mux/src/ssh_agent
                         client_id.hostname =
                             format!("{} (via proxy pid {})", client_id.hostname, proxy_id.pid);
+                    }
+                    if let ConnectionPeer::Web(web) = &self.peer {
+                        client_id.username = web.username.clone();
+                        client_id.hostname = format!("web:{}", web.label);
+                        client_id.ssh_auth_sock = None;
                     }
 
                     let client_id = Arc::new(client_id);
@@ -2184,6 +2285,43 @@ impl SessionHandler {
                 },
             ))),
 
+            Pdu::WebTokenMint(WebTokenMint { label, ttl_secs }) => {
+                catch(
+                    move || {
+                        let minted = crate::web_auth::WEB_TOKENS.mint(
+                            label,
+                            ttl_secs.map(Duration::from_secs),
+                        )?;
+                        let urls = config::configuration()
+                            .web_servers
+                            .iter()
+                            .flat_map(|server| server.urls())
+                            // In the fragment: never sent to any server, never
+                            // in a Referer, never in an access log.
+                            .map(|url| format!("{url}#token={}", minted.token))
+                            .collect();
+                        Ok(Pdu::WebTokenMintResponse(WebTokenMintResponse {
+                            id: minted.id,
+                            label: minted.label,
+                            token: minted.token,
+                            expires_at: minted.expires_at,
+                            urls,
+                        }))
+                    },
+                    send_response,
+                );
+            }
+            Pdu::WebTokenList(_) => {
+                send_response(Ok(Pdu::WebTokenListResponse(WebTokenListResponse {
+                    tokens: crate::web_auth::WEB_TOKENS.list(),
+                })));
+            }
+            Pdu::WebTokenRevoke(WebTokenRevoke { id }) => {
+                let revoked = crate::web_auth::WEB_TOKENS.revoke(id.as_deref());
+                send_response(Ok(Pdu::WebTokenRevokeResponse(WebTokenRevokeResponse {
+                    revoked,
+                })));
+            }
             Pdu::GetTlsCreds(_) => {
                 catch(
                     move || {
@@ -2317,6 +2455,9 @@ impl SessionHandler {
             | Pdu::GetCodecVersionResponse { .. }
             | Pdu::WindowWorkspaceChanged { .. }
             | Pdu::GetTlsCredsResponse { .. }
+            | Pdu::WebTokenMintResponse { .. }
+            | Pdu::WebTokenListResponse { .. }
+            | Pdu::WebTokenRevokeResponse { .. }
             | Pdu::GetClientListResponse { .. }
             | Pdu::PaneRemoved { .. }
             | Pdu::PaneFocused { .. }

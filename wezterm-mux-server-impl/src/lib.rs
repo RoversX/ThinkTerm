@@ -17,6 +17,9 @@ pub mod thinkterm_access;
 pub mod thinkterm_layout;
 pub mod thinkterm_session;
 pub mod thinkterm_tree;
+pub mod web_auth;
+pub mod web_http;
+pub mod web_stream;
 
 fn client_domains(config: &config::ConfigHandle) -> Vec<ClientDomainConfig> {
     let mut domains = vec![];

@@ -4,6 +4,7 @@ use crate::color::{
     ColorSchemeFile, HsbTransform, Palette, SrgbaTuple, TabBarStyle, WindowFrameConfig,
 };
 use crate::daemon::DaemonOptions;
+use crate::web::WebServer;
 use crate::exec_domain::ExecDomain;
 use crate::font::{
     AllowSquareGlyphOverflow, DisplayPixelGeometry, FontLocatorSelection, FontRasterizerSelection,
@@ -406,6 +407,12 @@ pub struct Config {
     /// each of the endpoints that we'll listen for connections
     #[dynamic(default)]
     pub tls_servers: Vec<TlsDomainServer>,
+
+    /// When running in server mode, web entries: each serves the browser
+    /// client's bundle over HTTP and accepts its WebSocket, admitted by a
+    /// web token. Read at server start, like `tls_servers`.
+    #[dynamic(default)]
+    pub web_servers: Vec<WebServer>,
 
     /// The set of tls domains that we can connect to as a client
     #[dynamic(default)]

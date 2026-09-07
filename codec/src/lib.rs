@@ -25,6 +25,7 @@ use futures_lite::io::AsyncWriteExt;
 use futures_lite::prelude::*;
 use std::collections::HashMap;
 use std::convert::TryInto;
+use std::convert::TryFrom;
 use std::io::Cursor;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -175,6 +176,28 @@ struct Decoded {
     is_compressed: bool,
 }
 
+/// The largest payload a PDU may declare. Nothing legitimate comes near
+/// it (a pane's worth of lines with images is megabytes); anything past it
+/// is a corrupt or hostile header, refused before a byte is allocated for
+/// it rather than aborting the process when the allocation fails.
+pub const MAX_PDU_PAYLOAD: usize = 256 * 1024 * 1024;
+/// How much of a payload is allocated at a time while it is read.
+const PAYLOAD_READ_STEP: usize = 1024 * 1024;
+/// The most a compressed payload may inflate to. Bounded separately from
+/// the wire length: a small frame can otherwise expand without limit.
+const MAX_DECOMPRESSED: u64 = 1024 * 1024 * 1024;
+
+fn check_payload_length(data_len: usize, len: u64, serial: u64, ident: u64) -> anyhow::Result<()> {
+    if data_len > MAX_PDU_PAYLOAD {
+        return Err(CorruptResponse(format!(
+            "PDU payload of {data_len} bytes (len:{len} serial:{serial} ident:{ident}) \
+             exceeds the {MAX_PDU_PAYLOAD} byte limit"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// Decode a frame.
 /// See encode_raw() for the frame format.
 async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
@@ -205,7 +228,10 @@ async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
         .await
         .context("decode_raw_async failed to read PDU ident")?;
     let data_len =
-        match (len as usize).overflowing_sub(encoded_length(ident) + encoded_length(serial)) {
+        match usize::try_from(len)
+            .map_err(|_| CorruptResponse(format!("PDU length {len} does not fit in memory")))?
+            .overflowing_sub(encoded_length(ident) + encoded_length(serial))
+        {
             (_, true) => {
                 return Err(CorruptResponse(format!(
                     "decode_raw_async: sizes don't make sense: \
@@ -218,20 +244,28 @@ async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
             (data_len, false) => data_len,
         };
 
+    check_payload_length(data_len, len, serial, ident)?;
     if is_compressed {
         metrics::histogram!("pdu.decode.compressed.size").record(data_len as f64);
     } else {
         metrics::histogram!("pdu.decode.size").record(data_len as f64);
     }
 
-    let mut data = vec![0u8; data_len];
-    r.read_exact(&mut data).await.with_context(|| {
-        format!(
-            "decode_raw_async failed to read {} bytes of data \
-            for PDU of length {} with serial={} ident={}",
-            data_len, len, serial, ident
-        )
-    })?;
+    // Grown as the bytes arrive: the declared length is a peer's claim,
+    // and must not cost anything before the bytes do.
+    let mut data = Vec::with_capacity(data_len.min(PAYLOAD_READ_STEP));
+    while data.len() < data_len {
+        let start = data.len();
+        let chunk = (data_len - start).min(PAYLOAD_READ_STEP);
+        data.resize(start + chunk, 0);
+        r.read_exact(&mut data[start..]).await.with_context(|| {
+            format!(
+                "decode_raw_async failed to read {} bytes of data \
+                for PDU of length {} with serial={} ident={}",
+                data_len, len, serial, ident
+            )
+        })?;
+    }
     Ok(Decoded {
         ident,
         serial,
@@ -252,7 +286,10 @@ fn decode_raw<R: std::io::Read>(mut r: R) -> anyhow::Result<Decoded> {
     let serial = read_u64(r.by_ref()).context("reading PDU serial")?;
     let ident = read_u64(r.by_ref()).context("reading PDU ident")?;
     let data_len =
-        match (len as usize).overflowing_sub(encoded_length(ident) + encoded_length(serial)) {
+        match usize::try_from(len)
+            .map_err(|_| CorruptResponse(format!("PDU length {len} does not fit in memory")))?
+            .overflowing_sub(encoded_length(ident) + encoded_length(serial))
+        {
             (_, true) => {
                 anyhow::bail!(
                     "sizes don't make sense: len:{} serial:{} (enc={}) ident:{} (enc={})",
@@ -266,19 +303,25 @@ fn decode_raw<R: std::io::Read>(mut r: R) -> anyhow::Result<Decoded> {
             (data_len, false) => data_len,
         };
 
+    check_payload_length(data_len, len, serial, ident)?;
     if is_compressed {
         metrics::histogram!("pdu.decode.compressed.size").record(data_len as f64);
     } else {
         metrics::histogram!("pdu.decode.size").record(data_len as f64);
     }
 
-    let mut data = vec![0u8; data_len];
-    r.read_exact(&mut data).with_context(|| {
-        format!(
-            "reading {} bytes of data for PDU of length {} with serial={} ident={}",
-            data_len, len, serial, ident
-        )
-    })?;
+    let mut data = Vec::with_capacity(data_len.min(PAYLOAD_READ_STEP));
+    while data.len() < data_len {
+        let start = data.len();
+        let chunk = (data_len - start).min(PAYLOAD_READ_STEP);
+        data.resize(start + chunk, 0);
+        r.read_exact(&mut data[start..]).with_context(|| {
+            format!(
+                "reading {} bytes of data for PDU of length {} with serial={} ident={}",
+                data_len, len, serial, ident
+            )
+        })?;
+    }
     Ok(Decoded {
         ident,
         serial,
@@ -352,12 +395,14 @@ fn deserialize<T: serde::de::DeserializeOwned, R: std::io::Read>(
 ) -> Result<T, Error> {
     if is_compressed {
         #[cfg(not(target_family = "wasm"))]
-        let mut decompress = zstd::Decoder::new(r)?;
+        let decompress = zstd::Decoder::new(r)?;
         // The pure-Rust decoder stands in where the zstd C library cannot
         // build; it also implements std::io::Read, so the shape is identical.
         #[cfg(target_family = "wasm")]
-        let mut decompress = ruzstd::decoding::StreamingDecoder::new(r)
+        let decompress = ruzstd::decoding::StreamingDecoder::new(r)
             .map_err(|e| anyhow::anyhow!("ruzstd: {e}"))?;
+        use std::io::Read as _;
+        let mut decompress = decompress.take(MAX_DECOMPRESSED);
         let mut decode = varbincode::Deserializer::new(&mut decompress);
         serde::Deserialize::deserialize(&mut decode).map_err(Into::into)
     } else {
@@ -528,7 +573,10 @@ macro_rules! pdu {
 ///     answer 64 and mis-decode every render push.
 /// 66: CommandSpec carries require_cwd, so a spawn whose named directory
 ///     cannot be opened fails on the server instead of landing in `$HOME`.
-pub const CODEC_VERSION: usize = 66;
+/// 67: Web tokens: the credential a browser presents at the server's web
+///     port is minted, listed and revoked over the mux connection
+///     (WebTokenMint/List/Revoke), the way TLS credentials are obtained.
+pub const CODEC_VERSION: usize = 67;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -611,6 +659,12 @@ pdu! {
     GetAgentStatusesResponse: 82,
     GetServerOsRelease: 83,
     GetServerOsReleaseResponse: 84,
+    WebTokenMint: 85,
+    WebTokenMintResponse: 86,
+    WebTokenList: 87,
+    WebTokenListResponse: 88,
+    WebTokenRevoke: 89,
+    WebTokenRevokeResponse: 90,
 }
 
 impl Pdu {
@@ -793,6 +847,64 @@ pub struct GetTlsCredsResponse {
     /// A client authentication certificate and private
     /// key, PEM encoded
     pub client_cert_pem: String,
+}
+
+/// Mint a web token: the bearer credential a browser presents when it
+/// opens the server's web port. Like TLS credentials, it is full access as
+/// the server's user; unlike them it can expire and be revoked.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct WebTokenMint {
+    /// A name for `web-token list`; the connecting browser is shown under
+    /// it in `list-clients`.
+    pub label: Option<String>,
+    /// Lifetime in seconds. None means until revoked or the server forgets
+    /// it (a restart, when tokens are not persisted).
+    pub ttl_secs: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct WebTokenMintResponse {
+    pub id: String,
+    pub label: String,
+    /// The secret. Shown once; the server keeps only a digest.
+    pub token: String,
+    /// Unix seconds.
+    pub expires_at: Option<u64>,
+    /// Ready-to-open URLs, one per spelling of each web listener, with
+    /// the token in the URL fragment for the page to pick up (never sent
+    /// to the server, never in a Referer).
+    pub urls: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct WebTokenList {}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct WebTokenInfo {
+    pub id: String,
+    pub label: String,
+    /// Unix seconds.
+    pub created_at: u64,
+    pub expires_at: Option<u64>,
+    pub last_used_at: Option<u64>,
+    pub live_connections: u32,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct WebTokenListResponse {
+    pub tokens: Vec<WebTokenInfo>,
+}
+
+/// Revoke one token by id, or every token when `id` is None. Connections
+/// admitted by a revoked token are dropped at once.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct WebTokenRevoke {
+    pub id: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct WebTokenRevokeResponse {
+    pub revoked: u32,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -2029,6 +2141,23 @@ mod test {
     /// zstd C library, the wasm side decodes with pure-Rust ruzstd. Proven
     /// here on native, where both libraries are available.
     #[test]
+    fn a_pdu_declaring_an_absurd_length_is_refused_before_allocation() {
+        // A frame whose header claims a 2^40 byte payload, then nothing.
+        let mut bytes = Vec::new();
+        leb128::write::unsigned(&mut bytes, 1u64 << 40).unwrap();
+        leb128::write::unsigned(&mut bytes, 1).unwrap(); // serial
+        leb128::write::unsigned(&mut bytes, 1).unwrap(); // ident
+        let err = Pdu::decode(std::io::Cursor::new(bytes.clone())).expect_err("refused");
+        assert!(format!("{:#}", err).contains("exceeds"), "{:#}", err);
+        let err = futures_lite::future::block_on(Pdu::decode_async(
+            &mut futures_lite::io::Cursor::new(bytes),
+            None,
+        ))
+        .expect_err("refused");
+        assert!(format!("{:#}", err).contains("exceeds"), "{:#}", err);
+    }
+
+    #[test]
     fn ruzstd_decodes_zstd_output() {
         let payload: Vec<u8> = (0u32..500).flat_map(|v| v.to_le_bytes()).collect();
         let (bytes, is_compressed) = serialize(&payload).unwrap();
@@ -2254,7 +2383,7 @@ mod test {
         // The exact assertion is the tripwire: whoever bumps the codec must
         // come here, confirm the round-trips still cover the new version,
         // and advance it deliberately.
-        assert_eq!(CODEC_VERSION, 66);
+        assert_eq!(CODEC_VERSION, 67);
         use thinkterm_proto::{AgentEvidence, AgentState, AgentStatus};
 
         fn round_trip(pdu: Pdu) {
