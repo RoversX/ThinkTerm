@@ -1,0 +1,23 @@
+[package]
+name = "thinkterm-font-web"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The browser's font backend: thinkterm-font-core's FontShaper and
+# FontRasterizer over rustybuzz and swash, pure Rust, for a fixed list of
+# faces the page ships. No system locator, no C libraries. Must always
+# build for wasm32-unknown-unknown; tests run natively against the fonts in
+# assets/fonts.
+
+[dependencies]
+anyhow.workspace = true
+finl_unicode.workspace = true
+log.workspace = true
+rustybuzz.workspace = true
+swash.workspace = true
+termwiz.workspace = true
+thinkterm-font-core.workspace = true
+
+[dev-dependencies]
+thinkterm-font-core = { workspace = true, features = ["glyph-text"] }

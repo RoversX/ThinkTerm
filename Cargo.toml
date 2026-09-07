@@ -8,6 +8,7 @@ members = [
   "thinkterm-syntax",
   "thinkterm-core",
   "thinkterm-font-core",
+  "thinkterm-font-web",
   "thinkterm-proto",
   "thinkterm-render",
   "thinkterm-session",
@@ -80,6 +81,7 @@ colorgrad = "0.6"
 config = { path = "config" }
 thinkterm-core = { path = "thinkterm-core" }
 thinkterm-font-core = { path = "thinkterm-font-core" }
+thinkterm-font-web = { path = "thinkterm-font-web" }
 thinkterm-proto = { path = "thinkterm-proto" }
 thinkterm-render = { path = "thinkterm-render" }
 thinkterm-session = { path = "thinkterm-session" }
@@ -205,6 +207,7 @@ rayon = "1.10"
 rcgen = "0.12"
 regex = "1"
 reqwest = "0.12"
+rustybuzz = "0.20"
 resize = "0.5"
 resvg = { version = "0.45.1", default-features = false }
 rstest = "0.21"
@@ -219,6 +222,7 @@ serde_yaml = "0.9"
 semver = "1.0"
 serial2 = "0.2"
 sha1 = "0.10"
+swash = "0.2"
 sha2 = "0.10"
 share-data = { path = "lua-api-crates/share-data" }
 shared_library = "0.1"
