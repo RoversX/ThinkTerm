@@ -97,3 +97,7 @@ __pycache__/
 
 # well...
 /.claude
+
+# Built browser bundle (ci/build-web.sh)
+/thinkterm-web/www/pkg/
+/thinkterm-web/www/fonts/

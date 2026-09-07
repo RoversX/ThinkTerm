@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ThinkTerm</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #ccc; font: 12px system-ui, sans-serif; overflow: hidden; }
+  #term { position: absolute; inset: 0 0 22px 0; width: 100%; height: calc(100% - 22px); display: block; outline: none; }
+  #status { position: absolute; left: 0; right: 0; bottom: 0; height: 22px; line-height: 22px; padding: 0 8px; background: #111; color: #9a9a9a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #status.error { color: #f66; }
+  /* Focus lives here so the IME composes into a real text field; the
+     field itself stays out of sight. */
+  #kbd { position: absolute; left: 0; top: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; resize: none; overflow: hidden; }
+</style>
+</head>
+<body>
+<canvas id="term"></canvas>
+<textarea id="kbd" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
+<div id="status">loading…</div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

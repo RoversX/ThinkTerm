@@ -46,7 +46,9 @@ jobs:
       - name: Check the portable core for wasm32
         run: |
           cargo check -p thinkterm-proto -p codec -p thinkterm-session \
-            -p wezterm-term -p termwiz --target wasm32-unknown-unknown
+            -p thinkterm-render -p thinkterm-font-core -p thinkterm-font-web \
+            -p thinkterm-web -p wezterm-term -p termwiz \
+            --target wasm32-unknown-unknown
       - name: Run the terminal core in a wasm VM
         run: |
           cargo build -p wasm-probe --target wasm32-unknown-unknown --release

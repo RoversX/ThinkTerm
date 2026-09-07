@@ -1,0 +1,47 @@
+[package]
+name = "thinkterm-web"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The browser client: thinkterm-session's PaneSession over a WebSocket,
+# drawn through thinkterm-render's shader and quads on a WebGPU canvas,
+# with thinkterm-font-web for glyphs. Standards only -- WebGPU, WebSocket,
+# wasm -- so it runs in Safari, Chrome and Firefox alike. The page-facing
+# code is wasm32-only; the pure logic (key mapping, viewport arithmetic)
+# builds and tests natively.
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+codec.workspace = true
+euclid.workspace = true
+futures.workspace = true
+log.workspace = true
+termwiz = { workspace = true, features = ["use_serde"] }
+thinkterm-font-core.workspace = true
+thinkterm-font-web.workspace = true
+thinkterm-proto.workspace = true
+thinkterm-render = { workspace = true, features = ["wgpu"] }
+thinkterm-session.workspace = true
+wezterm-color-types.workspace = true
+wezterm-term = { workspace = true, features = ["use_serde"] }
+wgpu.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook.workspace = true
+js-sys.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+web-sys = { workspace = true, features = [
+  "BinaryType", "Clipboard", "ClipboardEvent", "CloseEvent", "CompositionEvent",
+  "console", "CssStyleDeclaration", "DataTransfer", "Document", "DomRect",
+  "DomRectReadOnly", "Element", "Event", "EventTarget", "FocusEvent", "History",
+  "HtmlCanvasElement", "HtmlElement", "HtmlTextAreaElement", "InputEvent",
+  "KeyboardEvent", "Location", "MessageEvent", "MouseEvent", "Navigator",
+  "Performance", "PointerEvent", "ResizeObserver", "ResizeObserverEntry", "Storage",
+  "WebSocket", "WheelEvent", "Window",
+] }

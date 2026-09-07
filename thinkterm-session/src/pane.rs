@@ -488,12 +488,22 @@ impl<H: SessionHost> PaneSession<H> {
     /// healthy but consistently slow request eventually gets a window long
     /// enough to complete instead of losing forever to a fixed watchdog.
     pub fn render_looks_stalled(self: &Arc<Self>, viewport_top: Option<StableRowIndex>) -> bool {
+        let st = self.state();
+        let top = viewport_top.unwrap_or(st.dimensions.physical_top);
+        let range = top..top.saturating_add(st.dimensions.viewport_rows as StableRowIndex);
+        drop(st);
+        self.render_looks_stalled_in(range)
+    }
+
+    /// The same check over exactly the rows a client shows. A client whose
+    /// view is shorter than the pane's screen must not ask about rows past
+    /// its bottom: those may not exist, and a row that does not exist
+    /// reads as "repaint" forever.
+    pub fn render_looks_stalled_in(self: &Arc<Self>, range: Range<StableRowIndex>) -> bool {
         let mut st = self.state();
         if !crate::decide::render_watchdog_should_run(st.dead) {
             return false;
         }
-        let top = viewport_top.unwrap_or(st.dimensions.physical_top);
-        let range = top..top.saturating_add(st.dimensions.viewport_rows as StableRowIndex);
         let decision = line_watchdog_decision(&mut st.lines, range, self.now());
         if decision.repaint {
             st.poll_interval = BASE_POLL_INTERVAL;

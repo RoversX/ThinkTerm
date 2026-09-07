@@ -12,6 +12,7 @@ members = [
   "thinkterm-proto",
   "thinkterm-render",
   "thinkterm-session",
+  "thinkterm-web",
   "thinkterm-tui",
   "thinkterm-update",
   "deps/cairo",
@@ -85,6 +86,7 @@ thinkterm-font-web = { path = "thinkterm-font-web" }
 thinkterm-proto = { path = "thinkterm-proto" }
 thinkterm-render = { path = "thinkterm-render" }
 thinkterm-session = { path = "thinkterm-session" }
+thinkterm-web = { path = "thinkterm-web" }
 thinkterm-update = { path = "thinkterm-update" }
 core-foundation = "=0.10.0"
 core-graphics = "=0.24.0"
@@ -298,6 +300,13 @@ wezterm-toast-notification = { path = "wezterm-toast-notification" }
 wezterm-uds = { path = "wezterm-uds" }
 wezterm-version = { path = "wezterm-version" }
 wgpu = "25.0.2"
+# The browser client. wasm-bindgen is pinned exactly: the CLI that emits
+# the JavaScript glue must match the crate the wasm was built with.
+wasm-bindgen = "=0.2.105"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = "0.3"
+console_error_panic_hook = "0.1"
 whoami = "1.5"
 winapi = "0.3.9"
 window = {path="window"}
