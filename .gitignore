@@ -101,3 +101,4 @@ __pycache__/
 # Built browser bundle (ci/build-web.sh)
 /thinkterm-web/www/pkg/
 /thinkterm-web/www/fonts/
+/thinkterm-web/www/*.gz

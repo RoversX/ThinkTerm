@@ -30,5 +30,15 @@ if command -v wasm-opt >/dev/null 2>&1 && [ "$PROFILE" = release ]; then
 fi
 mkdir -p "$OUT/fonts"
 cp assets/fonts/JetBrainsMono-Regular.ttf assets/fonts/SymbolsNerdFontMono-Regular.ttf "$OUT/fonts/"
+# Precompress what a browser will take compressed. The mux server sends a
+# .gz sibling as it is when the client accepts gzip, so this cost is paid
+# once here instead of per request, and -9 beats what a server would spend
+# in a request's time. -n leaves out the name and timestamp so the output
+# is the same for the same input.
+for f in "$OUT/index.html" "$OUT/app.js" "$OUT/pkg"/*.js "$OUT/pkg"/*.wasm "$OUT/fonts"/*.ttf; do
+  [ -f "$f" ] || continue
+  gzip -9 -n -c "$f" > "$f.gz"
+done
+
 ls -la "$OUT/pkg"
 echo "bundle at $OUT; serve it with web_servers.static_dir = \"$(pwd)/$OUT\" or THINKTERM_WEB_STATIC_DIR"

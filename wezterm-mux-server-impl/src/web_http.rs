@@ -342,6 +342,12 @@ pub fn accept_key(key: &str) -> String {
 /// segment must be a plain file name, so nothing outside `root` can be
 /// named however the path is spelled.
 pub fn safe_static_path(root: &Path, url_path: &str) -> Option<PathBuf> {
+    // The precompressed siblings are an implementation detail of how a
+    // file is sent, not a second name for it: asking for one directly
+    // would hand back gzip bytes with no Content-Encoding to say so.
+    if url_path.ends_with(".gz") {
+        return None;
+    }
     let path = url_path.split(['?', '#']).next().unwrap_or("");
     let path = if path == "/" || path.is_empty() {
         "/index.html"
@@ -443,10 +449,68 @@ async fn respond<S: AsyncWrite + Unpin>(
     }
 }
 
+/// The weight this request gives a coding, taking the wildcard into
+/// account: `gzip;q=0.8`, `*;q=0`, or plain `gzip` (which means 1). None
+/// means the coding was not mentioned and no wildcard covered it.
+fn encoding_weight(req: &Request, coding: &str) -> Option<f32> {
+    let mut wildcard = None;
+    for item in req.header_list("accept-encoding") {
+        let mut parts = item.split(';');
+        let name = parts.next().unwrap_or("").trim();
+        // A weight we cannot read is not a refusal: a truncated header or
+        // a proxy that rewrote it should not cost the client its bytes.
+        let mut q = 1.0f32;
+        for param in parts {
+            let param = param.trim();
+            if let Some(value) = param.strip_prefix("q=").or_else(|| param.strip_prefix("Q=")) {
+                q = value.trim().parse().unwrap_or(1.0);
+            }
+        }
+        if name.eq_ignore_ascii_case(coding) {
+            return Some(q);
+        }
+        if name == "*" && wildcard.is_none() {
+            wildcard = Some(q);
+        }
+    }
+    wildcard
+}
+
+fn accepts_gzip(req: &Request) -> bool {
+    encoding_weight(req, "gzip")
+        .map(|q| q > 0.0)
+        .unwrap_or(false)
+}
+
+/// The `<name>.gz` beside a bundle file, when it is no older than the file
+/// it stands for. `ci/build-web.sh` writes these, so serving one costs the
+/// same as serving any other file: a chunk at a time, nothing held.
+///
+/// A sibling older than its original is ignored. That happens when someone
+/// rebuilds the wasm without rerunning the script, and serving the previous
+/// build compressed is worse than serving this one plainly.
+async fn precompressed(path: &Path) -> Option<PathBuf> {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".gz");
+    let packed = PathBuf::from(name);
+    let meta = smol::fs::metadata(&packed).await.ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let plain = smol::fs::metadata(path).await.ok()?;
+    (meta.modified().ok()? >= plain.modified().ok()?).then_some(packed)
+}
+
 /// Send a file from the bundle without holding more than one piece of it:
 /// a slow reader of the wasm costs a seat, not megabytes.
-async fn send_file<S: AsyncWrite + Unpin>(stream: &mut S, path: &Path) {
-    let file = match smol::fs::File::open(path).await {
+///
+/// When the client takes gzip and a precompressed sibling is there, that
+/// file is sent instead, with the content type of the name that was asked
+/// for. Compression itself happens at build time; nothing here does it.
+async fn send_file<S: AsyncWrite + Unpin>(stream: &mut S, path: &Path, gzip_ok: bool) {
+    let packed = if gzip_ok { precompressed(path).await } else { None };
+    let sending = packed.as_deref().unwrap_or(path);
+    let file = match smol::fs::File::open(sending).await {
         Ok(file) => file,
         Err(_) => {
             return respond(
@@ -472,15 +536,16 @@ async fn send_file<S: AsyncWrite + Unpin>(stream: &mut S, path: &Path) {
             .await;
         }
     };
-    let head = response_head(
-        200,
-        "OK",
-        &[
-            ("Content-Type", content_type(path)),
-            ("Cache-Control", "no-cache"),
-        ],
-        len as usize,
-    );
+    let mut extra = vec![
+        // The type of what was asked for, not of the .gz that carries it.
+        ("Content-Type", content_type(path)),
+        ("Vary", "Accept-Encoding"),
+        ("Cache-Control", "no-cache"),
+    ];
+    if packed.is_some() {
+        extra.push(("Content-Encoding", "gzip"));
+    }
+    let head = response_head(200, "OK", &extra, len as usize);
     if write_within(stream, &head).await.is_err() {
         return;
     }
@@ -577,7 +642,7 @@ where
             )
             .await;
         }
-        Route::Static(path) => send_file(&mut stream, &path).await,
+        Route::Static(path) => send_file(&mut stream, &path, accepts_gzip(&request)).await,
         Route::Upgrade { key, token } => {
             let Some(admission) = WEB_TOKENS.verify(&token) else {
                 log::warn!(
@@ -664,6 +729,44 @@ mod tests {
             ("Origin", origin),
             ("Sec-WebSocket-Protocol", protocols),
         ]
+    }
+
+    fn accept_encoding(value: &str) -> Request {
+        Request {
+            method: "GET".into(),
+            path: "/app.js".into(),
+            headers: vec![("accept-encoding".into(), value.into())],
+        }
+    }
+
+    #[test]
+    fn accept_encoding_reads_weights_and_the_wildcard() {
+        assert!(accepts_gzip(&accept_encoding("gzip, deflate, br")));
+        assert!(accepts_gzip(&accept_encoding("gzip;q=1")));
+        assert!(accepts_gzip(&accept_encoding("GZIP;q=0.8")));
+        assert!(accepts_gzip(&accept_encoding("*")));
+        // A weight of zero is a refusal, and a named coding beats the
+        // wildcard whichever way round they are written.
+        assert!(!accepts_gzip(&accept_encoding("gzip;q=0")));
+        assert!(!accepts_gzip(&accept_encoding("deflate, *;q=0")));
+        assert!(accepts_gzip(&accept_encoding("*;q=0, gzip")));
+        assert!(!accepts_gzip(&accept_encoding("br")));
+        // No header at all, and an empty one, mean the bytes as they are.
+        assert!(!accepts_gzip(&Request {
+            method: "GET".into(),
+            path: "/app.js".into(),
+            headers: vec![],
+        }));
+        assert!(!accepts_gzip(&accept_encoding("")));
+        // A weight we cannot read must not be taken for a refusal: a
+        // truncated header should not cost the client its compression.
+        assert!(accepts_gzip(&accept_encoding("gzip;q=")));
+        assert!(accepts_gzip(&accept_encoding("gzip;q=high")));
+        // Duplicates: the first mention wins, either way round.
+        assert!(!accepts_gzip(&accept_encoding("gzip;q=0, gzip;q=1")));
+        assert!(accepts_gzip(&accept_encoding("gzip;q=1, gzip;q=0")));
+        // Two wildcards: the first also wins, so this is not a refusal.
+        assert!(accepts_gzip(&accept_encoding("*;q=1, *;q=0")));
     }
 
     #[test]
@@ -860,6 +963,176 @@ mod end_to_end {
             }
         }
         String::from_utf8_lossy(&out).to_string()
+    }
+
+    async fn read_bytes(client: &mut Async<UnixStream>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match client.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+            }
+        }
+        out
+    }
+
+    fn split_response(bytes: &[u8]) -> (String, Vec<u8>) {
+        let end = bytes
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response head");
+        (
+            String::from_utf8_lossy(&bytes[..end]).to_string(),
+            bytes[end + 4..].to_vec(),
+        )
+    }
+
+    fn bundle_with(name: &str, body: &[u8]) -> (tempfile::TempDir, Arc<WebSite>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(name), body).unwrap();
+        let site = Arc::new(WebSite::from_config(
+            &config::WebServer::default(),
+            Some(dir.path().to_path_buf()),
+            "me".into(),
+        ));
+        (dir, site)
+    }
+
+    /// gzip a file the way `ci/build-web.sh` does, beside the original.
+    fn write_sibling(dir: &Path, name: &str, body: &[u8]) {
+        std::fs::write(dir.join(name), body).unwrap();
+        let packed = std::process::Command::new("gzip")
+            .args(["-9", "-c"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child.stdin.take().unwrap().write_all(body)?;
+                child.wait_with_output()
+            })
+            .unwrap();
+        std::fs::write(dir.join(format!("{name}.gz")), packed.stdout).unwrap();
+    }
+
+    #[test]
+    fn a_client_that_accepts_gzip_is_sent_the_precompressed_sibling() {
+        let body = "console.log('the bundle');\n".repeat(500).into_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        write_sibling(dir.path(), "app.js", &body);
+        let site = Arc::new(WebSite::from_config(
+            &config::WebServer::default(),
+            Some(dir.path().to_path_buf()),
+            "me".into(),
+        ));
+        let (server, mut client) = pair();
+        crate::connections::spawn(serve(server, site));
+        smol::block_on(async {
+            let req = "GET /app.js HTTP/1.1\r\nHost: localhost:8088\r\n\
+                       Accept-Encoding: gzip, deflate\r\n\r\n";
+            client.write_all(req.as_bytes()).await.unwrap();
+            let (head, packed) = split_response(&read_bytes(&mut client).await);
+            assert!(head.starts_with("HTTP/1.1 200"), "{}", head);
+            assert!(head.contains("Content-Encoding: gzip"), "{}", head);
+            // Without this a shared cache could hand the compressed body to
+            // a client that never asked for one.
+            assert!(head.contains("Vary: Accept-Encoding"), "{}", head);
+            // The type of the name that was asked for, not of the .gz.
+            assert!(head.contains("Content-Type: text/javascript"), "{}", head);
+            assert!(
+                packed.len() < body.len() / 2,
+                "{} bytes is no better than {}",
+                packed.len(),
+                body.len()
+            );
+            assert!(
+                head.contains(&format!("Content-Length: {}", packed.len())),
+                "{}",
+                head
+            );
+            let mut unpacked = Vec::new();
+            std::io::Read::read_to_end(
+                &mut std::process::Command::new("gunzip")
+                    .arg("-c")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .map(|mut child| {
+                        use std::io::Write;
+                        child.stdin.take().unwrap().write_all(&packed).unwrap();
+                        child.wait_with_output().unwrap().stdout
+                    })
+                    .unwrap()
+                    .as_slice(),
+                &mut unpacked,
+            )
+            .unwrap();
+            assert_eq!(unpacked, body);
+        });
+    }
+
+    #[test]
+    fn a_client_that_says_nothing_gets_the_plain_file_even_when_a_sibling_exists() {
+        let body = b"<!doctype html><title>x</title>".to_vec();
+        let dir = tempfile::tempdir().unwrap();
+        write_sibling(dir.path(), "index.html", &body);
+        let site = Arc::new(WebSite::from_config(
+            &config::WebServer::default(),
+            Some(dir.path().to_path_buf()),
+            "me".into(),
+        ));
+        let (server, mut client) = pair();
+        crate::connections::spawn(serve(server, site));
+        smol::block_on(async {
+            let req = "GET /index.html HTTP/1.1\r\nHost: localhost:8088\r\n\r\n";
+            client.write_all(req.as_bytes()).await.unwrap();
+            let (head, sent) = split_response(&read_bytes(&mut client).await);
+            assert!(head.starts_with("HTTP/1.1 200"), "{}", head);
+            assert!(!head.contains("Content-Encoding"), "{}", head);
+            assert!(head.contains("Vary: Accept-Encoding"), "{}", head);
+            assert_eq!(sent, body);
+        });
+    }
+
+    #[test]
+    fn the_precompressed_sibling_is_not_a_url_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        write_sibling(dir.path(), "app.js", b"the build\n");
+        let site = Arc::new(WebSite::from_config(
+            &config::WebServer::default(),
+            Some(dir.path().to_path_buf()),
+            "me".into(),
+        ));
+        let (server, mut client) = pair();
+        crate::connections::spawn(serve(server, site));
+        smol::block_on(async {
+            let req = "GET /app.js.gz HTTP/1.1\r\nHost: localhost:8088\r\n\r\n";
+            client.write_all(req.as_bytes()).await.unwrap();
+            let (head, _) = split_response(&read_bytes(&mut client).await);
+            assert!(head.starts_with("HTTP/1.1 404"), "{}", head);
+        });
+    }
+
+    #[test]
+    fn a_sibling_older_than_its_file_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        write_sibling(dir.path(), "app.js", b"the first build\n");
+        // Rebuild the original without rerunning the script: the sibling now
+        // holds the previous build and must not be served for it.
+        std::fs::write(dir.path().join("app.js"), b"the second build\n").unwrap();
+        let path = dir.path().join("app.js");
+        smol::block_on(async {
+            assert!(
+                precompressed(&path).await.is_none(),
+                "a stale sibling was trusted"
+            );
+        });
+        // Regenerating it makes the sibling usable again.
+        write_sibling(dir.path(), "app.js", b"the second build\n");
+        smol::block_on(async {
+            assert!(precompressed(&path).await.is_some());
+        });
     }
 
     #[test]

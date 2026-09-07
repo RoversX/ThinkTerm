@@ -52,6 +52,10 @@ case $OSTYPE in
     if [[ -f thinkterm-web/www/pkg/thinkterm_web.js ]] ; then
       mkdir -p $zipdir/ThinkTerm.app/Contents/Resources/web
       cp thinkterm-web/www/index.html thinkterm-web/www/app.js $zipdir/ThinkTerm.app/Contents/Resources/web/
+      # The precompressed siblings, when ci/build-web.sh made them.
+      for gz in thinkterm-web/www/*.gz ; do
+        [[ -f "$gz" ]] && cp "$gz" $zipdir/ThinkTerm.app/Contents/Resources/web/
+      done
       cp -r thinkterm-web/www/pkg thinkterm-web/www/fonts $zipdir/ThinkTerm.app/Contents/Resources/web/
     fi
     tic -xe wezterm -o $zipdir/ThinkTerm.app/Contents/Resources/terminfo termwiz/data/wezterm.terminfo
@@ -569,6 +573,9 @@ EOF
           # server finds it at <exe>/../share/thinkterm/web.
           if [[ -f thinkterm-web/www/pkg/thinkterm_web.js ]] ; then
             install -Dm644 -t "$tardir/share/thinkterm/web" thinkterm-web/www/index.html thinkterm-web/www/app.js
+            for gz in thinkterm-web/www/*.gz ; do
+              [[ -f "$gz" ]] && install -Dm644 -t "$tardir/share/thinkterm/web" "$gz"
+            done
             install -Dm644 -t "$tardir/share/thinkterm/web/pkg" thinkterm-web/www/pkg/*
             install -Dm644 -t "$tardir/share/thinkterm/web/fonts" thinkterm-web/www/fonts/*
           fi
