@@ -51,12 +51,15 @@ case $OSTYPE in
     # inside the bundle finds it at <exe>/../Resources/web.
     if [[ -f thinkterm-web/www/pkg/thinkterm_web.js ]] ; then
       mkdir -p $zipdir/ThinkTerm.app/Contents/Resources/web
-      cp thinkterm-web/www/index.html thinkterm-web/www/app.js $zipdir/ThinkTerm.app/Contents/Resources/web/
+      # -p throughout: the server decides whether a .gz still stands for
+      # its file by comparing their modification times, and a copy that
+      # rewrites them can make a stale sibling look current.
+      cp -p thinkterm-web/www/index.html thinkterm-web/www/app.js $zipdir/ThinkTerm.app/Contents/Resources/web/
       # The precompressed siblings, when ci/build-web.sh made them.
       for gz in thinkterm-web/www/*.gz ; do
-        [[ -f "$gz" ]] && cp "$gz" $zipdir/ThinkTerm.app/Contents/Resources/web/
+        [[ -f "$gz" ]] && cp -p "$gz" $zipdir/ThinkTerm.app/Contents/Resources/web/
       done
-      cp -r thinkterm-web/www/pkg thinkterm-web/www/fonts $zipdir/ThinkTerm.app/Contents/Resources/web/
+      cp -Rp thinkterm-web/www/pkg thinkterm-web/www/fonts $zipdir/ThinkTerm.app/Contents/Resources/web/
     fi
     tic -xe wezterm -o $zipdir/ThinkTerm.app/Contents/Resources/terminfo termwiz/data/wezterm.terminfo
 
@@ -572,12 +575,13 @@ EOF
           # The browser client, when ci/build-web.sh ran before this: the
           # server finds it at <exe>/../share/thinkterm/web.
           if [[ -f thinkterm-web/www/pkg/thinkterm_web.js ]] ; then
-            install -Dm644 -t "$tardir/share/thinkterm/web" thinkterm-web/www/index.html thinkterm-web/www/app.js
+            # -p keeps the modification times the .gz freshness check reads.
+            install -Dpm644 -t "$tardir/share/thinkterm/web" thinkterm-web/www/index.html thinkterm-web/www/app.js
             for gz in thinkterm-web/www/*.gz ; do
-              [[ -f "$gz" ]] && install -Dm644 -t "$tardir/share/thinkterm/web" "$gz"
+              [[ -f "$gz" ]] && install -Dpm644 -t "$tardir/share/thinkterm/web" "$gz"
             done
-            install -Dm644 -t "$tardir/share/thinkterm/web/pkg" thinkterm-web/www/pkg/*
-            install -Dm644 -t "$tardir/share/thinkterm/web/fonts" thinkterm-web/www/fonts/*
+            install -Dpm644 -t "$tardir/share/thinkterm/web/pkg" thinkterm-web/www/pkg/*
+            install -Dpm644 -t "$tardir/share/thinkterm/web/fonts" thinkterm-web/www/fonts/*
           fi
           if [[ "$variant" == thinkterm ]] ; then
             install -Dm755 -t "$tardir/bin" assets/open-thinkterm-here assets/open-wezterm-here

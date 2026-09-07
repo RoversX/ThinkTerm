@@ -13,8 +13,9 @@ use crate::web_auth::WEB_TOKENS;
 use crate::web_stream::{Prefixed, WebStream};
 use base64::Engine;
 use config::{default_port, is_loopback_host, split_authority, Origin};
-use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use futures::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use sha1::{Digest, Sha1};
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -511,13 +512,32 @@ fn already_held(header: Option<&str>, tag: &str) -> bool {
         })
 }
 
+/// The uncompressed length gzip records in its last four bytes.
+///
+/// This is a length, not a digest: it is taken modulo 2^32 and says
+/// nothing about the content, so an edit that keeps the size passes it.
+/// It answers the question modification times cannot -- whether a copy
+/// that rewrote the timestamps left a sibling standing for other bytes --
+/// and the time comparison answers the one this cannot. Both are cheap,
+/// and each catches what the other misses.
+async fn gzip_uncompressed_len(path: &Path) -> Option<u64> {
+    let mut file = smol::fs::File::open(path).await.ok()?;
+    file.seek(SeekFrom::End(-4)).await.ok()?;
+    let mut trailer = [0u8; 4];
+    file.read_exact(&mut trailer).await.ok()?;
+    Some(u32::from_le_bytes(trailer) as u64)
+}
+
 /// The `<name>.gz` beside a bundle file, when it is no older than the file
 /// it stands for. `ci/build-web.sh` writes these, so serving one costs the
 /// same as serving any other file: a chunk at a time, nothing held.
 ///
-/// A sibling older than its original is ignored. That happens when someone
-/// rebuilds the wasm without rerunning the script, and serving the previous
-/// build compressed is worse than serving this one plainly.
+/// A sibling is used only when two things agree that it stands for the
+/// file beside it: it is no older, and the length in its trailer is the
+/// length of that file. Either alone can be fooled -- a copy that rewrites
+/// timestamps defeats the first, an edit that keeps the size defeats the
+/// second -- and serving the previous build compressed is worse than
+/// serving this one plainly, so a sibling that fails either is ignored.
 async fn precompressed(path: &Path) -> Option<PathBuf> {
     let mut name = path.as_os_str().to_os_string();
     name.push(".gz");
@@ -527,7 +547,13 @@ async fn precompressed(path: &Path) -> Option<PathBuf> {
         return None;
     }
     let plain = smol::fs::metadata(path).await.ok()?;
-    (meta.modified().ok()? >= plain.modified().ok()?).then_some(packed)
+    if meta.modified().ok()? < plain.modified().ok()? {
+        return None;
+    }
+    // The trailer counts modulo 2^32, so compare the file's length the
+    // same way rather than refusing everything past 4 GiB.
+    let wrapped = plain.len() % (1u64 << 32);
+    (gzip_uncompressed_len(&packed).await? == wrapped).then_some(packed)
 }
 
 /// Send a file from the bundle without holding more than one piece of it:
@@ -1286,6 +1312,93 @@ mod end_to_end {
             client.write_all(req.as_bytes()).await.unwrap();
             let (head, _) = split_response(&read_bytes(&mut client).await);
             assert!(head.starts_with("HTTP/1.1 404"), "{}", head);
+        });
+    }
+
+    /// Copy a file the way the packaging scripts do, timestamps and all.
+    fn copy_preserving_times(from: &Path, to: &Path) {
+        let status = std::process::Command::new("cp")
+            .arg("-p")
+            .arg(from)
+            .arg(to)
+            .status()
+            .unwrap();
+        assert!(status.success(), "cp -p failed");
+    }
+
+    #[test]
+    fn a_sibling_survives_the_copy_the_packaging_scripts_do() {
+        let build = tempfile::tempdir().unwrap();
+        write_sibling(build.path(), "app.js", b"the build\n");
+        // ci/deploy.sh copies the plain file first and the sibling after,
+        // which without -p would leave the sibling looking newer than it is
+        // -- and the other order would leave it looking stale.
+        let shipped = tempfile::tempdir().unwrap();
+        copy_preserving_times(&build.path().join("app.js"), &shipped.path().join("app.js"));
+        copy_preserving_times(
+            &build.path().join("app.js.gz"),
+            &shipped.path().join("app.js.gz"),
+        );
+        smol::block_on(async {
+            assert!(
+                precompressed(&shipped.path().join("app.js")).await.is_some(),
+                "a packaged sibling was refused"
+            );
+        });
+    }
+
+    #[test]
+    fn a_rebuild_that_kept_the_length_still_rejects_the_old_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        write_sibling(dir.path(), "app.js", b"version = \"1\"\n");
+        // The same number of bytes, so the trailer still matches: only the
+        // modification time can tell that the sibling is a build behind.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.path().join("app.js"), b"version = \"2\"\n").unwrap();
+        let path = dir.path().join("app.js");
+        smol::block_on(async {
+            // The trailer still matches, so this proves the time comparison
+            // is what rejects the sibling -- the length cannot.
+            assert_eq!(
+                gzip_uncompressed_len(&dir.path().join("app.js.gz"))
+                    .await
+                    .unwrap(),
+                std::fs::metadata(&path).unwrap().len(),
+                "this test only means something while the length agrees"
+            );
+            assert!(
+                precompressed(&path).await.is_none(),
+                "a same-length rebuild was served from the old sibling"
+            );
+        });
+    }
+
+    #[test]
+    fn a_sibling_that_stands_for_other_bytes_is_refused_however_new_it_looks() {
+        let dir = tempfile::tempdir().unwrap();
+        // The sibling holds a previous, shorter build; the packaging copy
+        // then gave it the newer timestamp, so only its trailer gives it
+        // away.
+        std::fs::write(dir.path().join("app.js"), b"the second build, longer\n").unwrap();
+        let packed = std::process::Command::new("gzip")
+            .args(["-9", "-n", "-c"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                child.stdin.take().unwrap().write_all(b"the first build\n")?;
+                child.wait_with_output()
+            })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.path().join("app.js.gz"), packed.stdout).unwrap();
+        let path = dir.path().join("app.js");
+        smol::block_on(async {
+            assert!(
+                precompressed(&path).await.is_none(),
+                "a sibling for other bytes was trusted because it looked newer"
+            );
         });
     }
 

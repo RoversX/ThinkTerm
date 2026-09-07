@@ -560,7 +560,9 @@ done
 # A tarball without one leaves an installed bundle alone.
 if [ -d "$root/share/thinkterm/web" ]; then
   rm -rf "$sharedir/thinkterm/web"
-  cp -R "$root/share/thinkterm/web" "$sharedir/thinkterm/web"
+  # -p: the server compares a .gz against its file by modification
+  # time, so an install that rewrites them can mislead it.
+  cp -Rp "$root/share/thinkterm/web" "$sharedir/thinkterm/web"
 fi
 
 # Written last, so it only ever describes a completed install.
