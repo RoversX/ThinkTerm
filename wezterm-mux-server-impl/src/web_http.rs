@@ -18,7 +18,7 @@ use sha1::{Digest, Sha1};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The one subprotocol the browser client speaks. A token rides beside it
 /// in the same header, the only request header a browser lets a page set.
@@ -387,7 +387,12 @@ pub fn content_type(path: &Path) -> &'static str {
     }
 }
 
-fn response_head(status: u16, reason: &str, extra: &[(&str, &str)], body_len: usize) -> Vec<u8> {
+fn response_head(
+    status: u16,
+    reason: &str,
+    extra: &[(&str, &str)],
+    body_len: Option<usize>,
+) -> Vec<u8> {
     let mut out = format!(
         "HTTP/1.1 {status} {reason}\r\nConnection: close\r\n\
          X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n"
@@ -398,7 +403,11 @@ fn response_head(status: u16, reason: &str, extra: &[(&str, &str)], body_len: us
         out.push_str(value);
         out.push_str("\r\n");
     }
-    out.push_str(&format!("Content-Length: {body_len}\r\n\r\n"));
+    match body_len {
+        Some(len) => out.push_str(&format!("Content-Length: {len}\r\n\r\n")),
+        // A 304 carries no body and no length for one.
+        None => out.push_str("\r\n"),
+    }
     out.into_bytes()
 }
 
@@ -442,7 +451,7 @@ async fn respond<S: AsyncWrite + Unpin>(
     extra: &[(&str, &str)],
     body: &[u8],
 ) {
-    let mut bytes = response_head(status, reason, extra, body.len());
+    let mut bytes = response_head(status, reason, extra, Some(body.len()));
     bytes.extend_from_slice(body);
     if write_within(stream, &bytes).await.is_ok() {
         finish(stream).await;
@@ -482,6 +491,26 @@ fn accepts_gzip(req: &Request) -> bool {
         .unwrap_or(false)
 }
 
+/// A validator for the exact bytes being sent: the length and modification
+/// time of the file that carries them, which the response already had to
+/// read. The compressed sibling is a different file with its own pair, so
+/// the two representations never share a tag.
+fn etag(len: u64, mtime: Option<SystemTime>) -> Option<String> {
+    let stamp = mtime?.duration_since(UNIX_EPOCH).ok()?.as_nanos();
+    Some(format!("\"{len:x}-{stamp:x}\""))
+}
+
+/// Whether `If-None-Match` says the client already holds these bytes.
+fn already_held(header: Option<&str>, tag: &str) -> bool {
+    header
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .any(|item| {
+            item == "*" || item == tag || item.strip_prefix("W/").map(str::trim) == Some(tag)
+        })
+}
+
 /// The `<name>.gz` beside a bundle file, when it is no older than the file
 /// it stands for. `ci/build-web.sh` writes these, so serving one costs the
 /// same as serving any other file: a chunk at a time, nothing held.
@@ -507,7 +536,12 @@ async fn precompressed(path: &Path) -> Option<PathBuf> {
 /// When the client takes gzip and a precompressed sibling is there, that
 /// file is sent instead, with the content type of the name that was asked
 /// for. Compression itself happens at build time; nothing here does it.
-async fn send_file<S: AsyncWrite + Unpin>(stream: &mut S, path: &Path, gzip_ok: bool) {
+async fn send_file<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    path: &Path,
+    gzip_ok: bool,
+    if_none_match: Option<&str>,
+) {
     let packed = if gzip_ok { precompressed(path).await } else { None };
     let sending = packed.as_deref().unwrap_or(path);
     let file = match smol::fs::File::open(sending).await {
@@ -523,8 +557,8 @@ async fn send_file<S: AsyncWrite + Unpin>(stream: &mut S, path: &Path, gzip_ok: 
             .await;
         }
     };
-    let len = match file.metadata().await {
-        Ok(meta) if meta.is_file() => meta.len(),
+    let (len, mtime) = match file.metadata().await {
+        Ok(meta) if meta.is_file() => (meta.len(), meta.modified().ok()),
         _ => {
             return respond(
                 stream,
@@ -536,6 +570,27 @@ async fn send_file<S: AsyncWrite + Unpin>(stream: &mut S, path: &Path, gzip_ok: 
             .await;
         }
     };
+    // A reload asks whether what it holds is still current; when it is,
+    // that is a few dozen bytes instead of the whole bundle again.
+    let tag = etag(len, mtime);
+    if let Some(tag) = &tag {
+        if already_held(if_none_match, tag) {
+            let head = response_head(
+                304,
+                "Not Modified",
+                &[
+                    ("ETag", tag),
+                    ("Vary", "Accept-Encoding"),
+                    ("Cache-Control", "no-cache"),
+                ],
+                None,
+            );
+            if write_within(stream, &head).await.is_ok() {
+                finish(stream).await;
+            }
+            return;
+        }
+    }
     let mut extra = vec![
         // The type of what was asked for, not of the .gz that carries it.
         ("Content-Type", content_type(path)),
@@ -545,7 +600,10 @@ async fn send_file<S: AsyncWrite + Unpin>(stream: &mut S, path: &Path, gzip_ok: 
     if packed.is_some() {
         extra.push(("Content-Encoding", "gzip"));
     }
-    let head = response_head(200, "OK", &extra, len as usize);
+    if let Some(tag) = &tag {
+        extra.push(("ETag", tag));
+    }
+    let head = response_head(200, "OK", &extra, Some(len as usize));
     if write_within(stream, &head).await.is_err() {
         return;
     }
@@ -642,7 +700,15 @@ where
             )
             .await;
         }
-        Route::Static(path) => send_file(&mut stream, &path, accepts_gzip(&request)).await,
+        Route::Static(path) => {
+            send_file(
+                &mut stream,
+                &path,
+                accepts_gzip(&request),
+                request.header("if-none-match"),
+            )
+            .await
+        }
         Route::Upgrade { key, token } => {
             let Some(admission) = WEB_TOKENS.verify(&token) else {
                 log::warn!(
@@ -737,6 +803,34 @@ mod tests {
             path: "/app.js".into(),
             headers: vec![("accept-encoding".into(), value.into())],
         }
+    }
+
+    #[test]
+    fn if_none_match_accepts_the_shapes_a_client_sends() {
+        let tag = "\"2a-17b\"";
+        assert!(already_held(Some(tag), tag));
+        assert!(already_held(Some("*"), tag));
+        // A list, and the weak form a proxy may have rewritten it into.
+        assert!(already_held(Some("\"other\", \"2a-17b\""), tag));
+        assert!(already_held(Some("W/\"2a-17b\""), tag));
+        assert!(!already_held(Some("\"other\""), tag));
+        assert!(!already_held(None, tag));
+        assert!(!already_held(Some(""), tag));
+    }
+
+    #[test]
+    fn an_etag_follows_the_bytes_it_stands_for() {
+        let now = SystemTime::now();
+        let a = etag(100, Some(now)).unwrap();
+        assert_eq!(etag(100, Some(now)).unwrap(), a, "same bytes, same tag");
+        assert_ne!(etag(101, Some(now)).unwrap(), a, "a different length");
+        assert_ne!(
+            etag(100, Some(now + Duration::from_secs(1))).unwrap(),
+            a,
+            "a different modification time"
+        );
+        assert!(a.starts_with('"') && a.ends_with('"'), "{}", a);
+        assert!(etag(100, None).is_none());
     }
 
     #[test]
@@ -1093,6 +1187,87 @@ mod end_to_end {
             assert!(head.contains("Vary: Accept-Encoding"), "{}", head);
             assert_eq!(sent, body);
         });
+    }
+
+    #[test]
+    fn a_reload_that_holds_the_current_bytes_is_answered_304() {
+        let body = "the bundle\n".repeat(200).into_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        write_sibling(dir.path(), "app.js", &body);
+        let site = Arc::new(WebSite::from_config(
+            &config::WebServer::default(),
+            Some(dir.path().to_path_buf()),
+            "me".into(),
+        ));
+        let get = |extra: String| {
+            let site = Arc::clone(&site);
+            let (server, mut client) = pair();
+            crate::connections::spawn(serve(server, site));
+            smol::block_on(async move {
+                let req = format!(
+                    "GET /app.js HTTP/1.1\r\nHost: localhost:8088\r\n\
+                     Accept-Encoding: gzip\r\n{extra}\r\n"
+                );
+                client.write_all(req.as_bytes()).await.unwrap();
+                split_response(&read_bytes(&mut client).await)
+            })
+        };
+
+        let (head, first) = get(String::new());
+        assert!(head.starts_with("HTTP/1.1 200"), "{}", head);
+        let tag = head
+            .lines()
+            .find_map(|l| l.strip_prefix("ETag: "))
+            .expect("an ETag")
+            .to_string();
+        assert!(!first.is_empty());
+
+        // The reload: same bytes, so no body and no length for one.
+        let (head, body_again) = get(format!("If-None-Match: {tag}\r\n"));
+        assert!(head.starts_with("HTTP/1.1 304"), "{}", head);
+        assert!(body_again.is_empty(), "304 carried {} bytes", body_again.len());
+        assert!(!head.contains("Content-Length"), "{}", head);
+        assert!(head.contains(&format!("ETag: {tag}")), "{}", head);
+
+        // A tag for something else still gets the file.
+        let (head, sent) = get("If-None-Match: \"stale\"\r\n".to_string());
+        assert!(head.starts_with("HTTP/1.1 200"), "{}", head);
+        assert_eq!(sent.len(), first.len());
+    }
+
+    #[test]
+    fn the_two_representations_do_not_share_an_etag() {
+        let dir = tempfile::tempdir().unwrap();
+        write_sibling(dir.path(), "app.js", b"the same bytes either way\n");
+        let site = Arc::new(WebSite::from_config(
+            &config::WebServer::default(),
+            Some(dir.path().to_path_buf()),
+            "me".into(),
+        ));
+        let tag_for = |accept: &str| {
+            let site = Arc::clone(&site);
+            let (server, mut client) = pair();
+            crate::connections::spawn(serve(server, site));
+            let accept = accept.to_string();
+            smol::block_on(async move {
+                let req = format!(
+                    "GET /app.js HTTP/1.1\r\nHost: localhost:8088\r\n{accept}\r\n"
+                );
+                client.write_all(req.as_bytes()).await.unwrap();
+                let (head, _) = split_response(&read_bytes(&mut client).await);
+                head.lines()
+                    .find_map(|l| l.strip_prefix("ETag: "))
+                    .map(str::to_string)
+                    .expect("an ETag")
+            })
+        };
+        // Handing a compressed body's tag back for the plain one -- or the
+        // other way round -- must not read as "you already have it".
+        assert_ne!(
+            tag_for("Accept-Encoding: gzip\r\n"),
+            tag_for(""),
+            "gzip and identity shared a tag"
+        );
     }
 
     #[test]
