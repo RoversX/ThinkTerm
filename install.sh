@@ -555,6 +555,13 @@ fi
 for doc in NOTICE LICENSE.md LICENSE-MIT; do
   [ -f "$src_doc/$doc" ] && cp "$src_doc/$doc" "$sharedir/thinkterm/$doc"
 done
+# The browser client, if the tarball carries one; the mux server serves it
+# from here when a web_servers entry is configured.
+# A tarball without one leaves an installed bundle alone.
+if [ -d "$root/share/thinkterm/web" ]; then
+  rm -rf "$sharedir/thinkterm/web"
+  cp -R "$root/share/thinkterm/web" "$sharedir/thinkterm/web"
+fi
 
 # Written last, so it only ever describes a completed install.
 {
@@ -570,7 +577,7 @@ done
 
 # ---- report ----------------------------------------------------------------
 
-say "  $sharedir/thinkterm/ (licenses, shell integration, install-manifest)"
+say "  $sharedir/thinkterm/ (licenses, shell integration, install-manifest, web client)"
 say "  $sharedir/{bash-completion,zsh,fish}/... (completions)"
 
 # The binaries were swapped under it, so a mux server that is still running

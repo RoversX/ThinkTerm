@@ -47,6 +47,13 @@ case $OSTYPE in
     # code) and the third-party attributions; all of them have to ship with the
     # binaries that embed the material they cover.
     cp LICENSE.md LICENSE-MIT NOTICE $zipdir/ThinkTerm.app/Contents/Resources/
+    # The browser client, when ci/build-web.sh ran before this: the server
+    # inside the bundle finds it at <exe>/../Resources/web.
+    if [[ -f thinkterm-web/www/pkg/thinkterm_web.js ]] ; then
+      mkdir -p $zipdir/ThinkTerm.app/Contents/Resources/web
+      cp thinkterm-web/www/index.html thinkterm-web/www/app.js $zipdir/ThinkTerm.app/Contents/Resources/web/
+      cp -r thinkterm-web/www/pkg thinkterm-web/www/fonts $zipdir/ThinkTerm.app/Contents/Resources/web/
+    fi
     tic -xe wezterm -o $zipdir/ThinkTerm.app/Contents/Resources/terminfo termwiz/data/wezterm.terminfo
 
     # Naming an architecture names its target directory too. Without that the
@@ -558,6 +565,13 @@ EOF
           install -Dm644 -t "$tardir/share/shell-completion" assets/shell-completion/*
           install -Dm644 -t "$tardir/share/shell-integration" assets/shell-integration/*
           install -Dm644 -t "$tardir" NOTICE LICENSE.md LICENSE-MIT
+          # The browser client, when ci/build-web.sh ran before this: the
+          # server finds it at <exe>/../share/thinkterm/web.
+          if [[ -f thinkterm-web/www/pkg/thinkterm_web.js ]] ; then
+            install -Dm644 -t "$tardir/share/thinkterm/web" thinkterm-web/www/index.html thinkterm-web/www/app.js
+            install -Dm644 -t "$tardir/share/thinkterm/web/pkg" thinkterm-web/www/pkg/*
+            install -Dm644 -t "$tardir/share/thinkterm/web/fonts" thinkterm-web/www/fonts/*
+          fi
           if [[ "$variant" == thinkterm ]] ; then
             install -Dm755 -t "$tardir/bin" assets/open-thinkterm-here assets/open-wezterm-here
             install -Dm644 assets/wezterm.desktop "$tardir/share/applications/com.roversx.thinkterm.desktop"
