@@ -110,6 +110,10 @@ pub struct GlyphCache {
     glyphs: HashMap<GlyphKey, Rc<CachedGlyph>>,
     lines: HashMap<LineKey, Sprite>,
     cursors: HashMap<(Option<CursorShape>, u8), Sprite>,
+    /// Braille is drawn rather than shaped, so it is keyed by the dot
+    /// pattern: every one of the 256 shapes to the same .notdef, and
+    /// `glyphs` would collide them onto a single entry.
+    braille: HashMap<u8, Rc<CachedGlyph>>,
     shapes: HashMap<ShapeKey, Rc<Vec<GlyphInfo>>>,
     #[allow(dead_code)]
     pub white_space: Sprite,
@@ -148,6 +152,7 @@ impl GlyphCache {
             glyphs: HashMap::new(),
             lines: HashMap::new(),
             cursors: HashMap::new(),
+            braille: HashMap::new(),
             shapes: HashMap::new(),
             white_space,
             filled_box,
@@ -203,6 +208,12 @@ impl GlyphCache {
         followed_by_space: bool,
         num_cells: u8,
     ) -> Result<Rc<CachedGlyph>> {
+        // Drawn, not looked up: no bundled face covers U+2800..=U+28FF, so
+        // every Braille character would otherwise be a missing-glyph box --
+        // and every graph btop or macmon draws is made of them.
+        if let Some(dots) = info.only_char.and_then(crate::braille::dots) {
+            return self.braille_glyph(dots);
+        }
         let key = GlyphKey {
             font_idx: info.font_idx,
             glyph_pos: info.glyph_pos,
@@ -449,6 +460,35 @@ impl GlyphCache {
     /// outlined block, bar and underline as flat pixels: the desktop draws
     /// these through its custom-glyph poly rasteriser, which is not shared
     /// yet.
+    /// The glyph for a Braille dot pattern, drawn into the atlas once.
+    ///
+    /// The sprite covers the whole cell, which is not where a shaped glyph
+    /// sits: `emit.rs` puts a glyph's top at `cell_height + descender -
+    /// bearing_y`, so a bearing of zero would drop the pattern to the
+    /// baseline and let it hang into the row below. This bearing is the one
+    /// that puts the sprite's top on the cell's top.
+    fn braille_glyph(&mut self, dots: u8) -> Result<Rc<CachedGlyph>> {
+        if let Some(glyph) = self.braille.get(&dots) {
+            return Ok(Rc::clone(glyph));
+        }
+        let cell = self.metrics.cell_size;
+        let buffer = crate::braille::image(dots, cell);
+        let sprite = self.atlas.allocate(&buffer).context("braille sprite")?;
+        let glyph = Rc::new(CachedGlyph {
+            brightness_adjust: 1.0,
+            has_color: false,
+            texture: Some(sprite),
+            x_offset: PixelLength::new(0.0),
+            y_offset: PixelLength::new(0.0),
+            x_advance: PixelLength::new(cell.width as f64),
+            bearing_x: PixelLength::new(0.0),
+            bearing_y: PixelLength::new(cell.height as f64 + self.metrics.descender.get()),
+            scale: 1.0,
+        });
+        self.braille.insert(dots, Rc::clone(&glyph));
+        Ok(glyph)
+    }
+
     pub fn cursor_sprite(&mut self, shape: Option<CursorShape>, width: u8) -> Result<Sprite> {
         if let Some(sprite) = self.cursors.get(&(shape, width)) {
             return Ok(sprite.clone());

@@ -1,8 +1,9 @@
 //! The ThinkTerm browser client. See Cargo.toml for the charter.
 //!
-//! `keymap` and `viewport` are pure and build everywhere; everything that
-//! touches the page is `wasm32` only.
+//! `braille`, `keymap`, `lease` and `viewport` are pure and build
+//! everywhere; everything that touches the page is `wasm32` only.
 
+pub mod braille;
 pub mod keymap;
 pub mod lease;
 pub mod viewport;
