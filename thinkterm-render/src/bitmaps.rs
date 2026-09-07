@@ -1,17 +1,17 @@
-use crate::color::{LinearRgba, SrgbaPixel};
-use crate::{Point, Rect, Size};
+//! CPU-side bitmaps and the texture trait the atlas uploads through.
+
+use wezterm_color_types::{LinearRgba, SrgbaPixel};
+use crate::geom::{Point, Rect, Size};
 use downcast_rs::{impl_downcast, Downcast};
-use glium::texture::SrgbTexture2d;
 use std::cell::RefCell;
 
-pub mod atlas;
 
 pub struct TextureUnit;
 pub type TextureCoord = euclid::Point2D<f32, TextureUnit>;
 pub type TextureRect = euclid::Rect<f32, TextureUnit>;
 pub type TextureSize = euclid::Size2D<f32, TextureUnit>;
 
-/// Represents a big endian bgra32 bitmap that may not be present
+/// Represents an rgba32 bitmap that may not be present
 /// in local RAM, but may be addressable in eg: video RAM
 pub trait Texture2d: Downcast {
     /// Copy the bits from the source bitmap to the texture at the location
@@ -43,43 +43,7 @@ pub trait Texture2d: Downcast {
 }
 impl_downcast!(Texture2d);
 
-impl Texture2d for SrgbTexture2d {
-    fn write(&self, rect: Rect, im: &dyn BitmapImage) {
-        let (im_width, im_height) = im.image_dimensions();
-
-        let source = glium::texture::RawImage2d {
-            data: std::borrow::Cow::Borrowed(im.pixels()),
-            width: im_width as u32,
-            height: im_height as u32,
-            format: glium::texture::ClientFormat::U8U8U8U8,
-        };
-
-        SrgbTexture2d::write(
-            self,
-            glium::Rect {
-                left: rect.min_x() as u32,
-                bottom: rect.min_y() as u32,
-                width: rect.size.width as u32,
-                height: rect.size.height as u32,
-            },
-            source,
-        )
-    }
-
-    fn read(&self, _rect: Rect, _im: &mut dyn BitmapImage) {
-        unimplemented!();
-    }
-
-    fn width(&self) -> usize {
-        SrgbTexture2d::width(self) as usize
-    }
-
-    fn height(&self) -> usize {
-        SrgbTexture2d::height(self) as usize
-    }
-}
-
-/// A bitmap in big endian rbga32 color format with abstract
+/// A bitmap in rgba32 color format (R, G, B, A byte order) with abstract
 /// storage filled in by the trait implementation.
 pub trait BitmapImage {
     /// Obtain a read only pointer to the pixel data

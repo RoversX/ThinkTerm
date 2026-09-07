@@ -17,8 +17,35 @@ use wezterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, Value};
 
 extern crate alloc;
 
+/// A hue/saturation/brightness multiplier applied to a colour on the GPU.
+/// 1.0 on every axis is the identity. Lives here, not in `config`, so the
+/// renderer core can name it without depending on the configuration crate.
+#[derive(Debug, Copy, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct HsbTransform {
+    #[dynamic(default = "default_one_point_oh")]
+    pub hue: f32,
+    #[dynamic(default = "default_one_point_oh")]
+    pub saturation: f32,
+    #[dynamic(default = "default_one_point_oh")]
+    pub brightness: f32,
+}
+
+fn default_one_point_oh() -> f32 {
+    1.0
+}
+
+impl Default for HsbTransform {
+    fn default() -> Self {
+        Self {
+            hue: 1.,
+            saturation: 1.,
+            brightness: 1.,
+        }
+    }
+}
+
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 #[cfg(feature = "std")]

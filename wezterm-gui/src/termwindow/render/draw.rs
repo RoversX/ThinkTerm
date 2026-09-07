@@ -120,7 +120,7 @@ fn composite_quad_verts(
     let v1 = (vis.max_y() - dest.min_y()) / dest.size.height;
     let (x0, x1) = (vis.min_x() - half_w, vis.max_x() - half_w);
     let (y0, y1) = (vis.min_y() - half_h, vis.max_y() - half_h);
-    const IS_BG_IMAGE: f32 = 2.0;
+    use crate::quad::IS_BG_IMAGE;
     let vert = |x: f32, y: f32, u: f32, v: f32| Vertex {
         position: [x, y],
         tex: [u, v],
@@ -599,17 +599,12 @@ impl crate::TermWindow {
     }
 
     fn call_draw_glium(&mut self, frame: &mut glium::Frame) -> anyhow::Result<()> {
-        use window::glium::texture::SrgbTexture2d;
-
         let gl_state = self.render_state.as_ref().unwrap();
         let tex = gl_state.glyph_cache.borrow().atlas.texture();
-        let tex = if let Some(tex) = tex.downcast_ref::<SrgbTexture2d>() {
-            tex
-        } else {
-            tex.downcast_ref::<LoggedSrgbTexture2d>()
-                .expect("OpenGL texture atlas")
-                .inner()
-        };
+        let tex = tex
+            .downcast_ref::<LoggedSrgbTexture2d>()
+            .expect("OpenGL texture atlas")
+            .inner();
 
         frame.clear_color(0., 0., 0., 0.);
 

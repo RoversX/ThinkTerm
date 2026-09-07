@@ -1,4 +1,4 @@
-use crate::quad::Vertex;
+use thinkterm_render::pipeline::Pipeline;
 use anyhow::anyhow;
 use config::{ConfigHandle, GpuInfo, WebGpuPowerPreference};
 use std::cell::{Cell, RefCell};
@@ -21,17 +21,7 @@ fn gpu_debug(message: impl AsRef<str>) {
     }
 }
 
-#[repr(C)]
-#[derive(Copy, Clone, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct ShaderUniform {
-    pub foreground_text_hsb: [f32; 3],
-    pub milliseconds: u32,
-    pub viewport_and_corner: [f32; 4],
-    pub window_border: [f32; 4],
-    pub projection: [[f32; 4]; 4],
-    // sampler2D atlas_nearest_sampler;
-    // sampler2D atlas_linear_sampler;
-}
+pub use thinkterm_render::pipeline::ShaderUniform;
 
 /// A persistent uniform buffer plus its bind group. The buffer is written
 /// at most once per frame, so a slot can be reused every frame without
@@ -86,21 +76,6 @@ pub struct WebGpuState {
 pub struct RawHandlePair {
     window: RawWindowHandle,
     display: RawDisplayHandle,
-}
-
-#[cfg(test)]
-mod shader_tests {
-    #[test]
-    fn main_wgsl_shader_parses_and_validates() {
-        let module = wgpu::naga::front::wgsl::parse_str(include_str!("../shader.wgsl"))
-            .expect("main WGSL shader should parse");
-        wgpu::naga::valid::Validator::new(
-            wgpu::naga::valid::ValidationFlags::all(),
-            wgpu::naga::valid::Capabilities::all(),
-        )
-        .validate(&module)
-        .expect("main WGSL shader should validate");
-    }
 }
 
 impl RawHandlePair {
@@ -663,114 +638,9 @@ impl WebGpuState {
         ));
         surface.configure(&device, &config);
 
-        let shader = device.create_shader_module(wgpu::include_wgsl!("../shader.wgsl"));
-
-        let shader_uniform_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-                label: Some("ShaderUniform bind group layout"),
-            });
-
-        let texture_nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-        let texture_linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-
-        let texture_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-                label: Some("texture bind group layout"),
-            });
-
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[
-                    &shader_uniform_bind_group_layout,
-                    &texture_bind_group_layout,
-                    &texture_bind_group_layout,
-                ],
-                push_constant_ranges: &[],
-            });
-
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Vertex::desc()],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-            cache: None,
-        });
+        // The shader, layouts, samplers and pipeline are the shared
+        // renderer's; the browser builds the very same ones.
+        let pipeline = Pipeline::new(&device, config.format);
 
         Ok(Self {
             adapter_info,
@@ -780,12 +650,12 @@ impl WebGpuState {
             queue,
             config: RefCell::new(config),
             dimensions: RefCell::new(dimensions),
-            render_pipeline,
+            render_pipeline: pipeline.render_pipeline,
             handle,
-            shader_uniform_bind_group_layout,
-            texture_bind_group_layout,
-            texture_nearest_sampler,
-            texture_linear_sampler,
+            shader_uniform_bind_group_layout: pipeline.uniform_layout,
+            texture_bind_group_layout: pipeline.texture_layout,
+            texture_nearest_sampler: pipeline.nearest_sampler,
+            texture_linear_sampler: pipeline.linear_sampler,
             frame_uniforms: RefCell::new(FrameUniforms::default()),
             atlas_bind_groups: RefCell::new(None),
             pending_frame_latency: Cell::new(None),

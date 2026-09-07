@@ -8,25 +8,7 @@ pub use termwiz::color::{AnsiColor, ColorAttribute, RgbColor, SrgbaTuple};
 use wezterm_dynamic::{FromDynamic, ToDynamic};
 use wezterm_term::color::ColorPalette;
 
-#[derive(Debug, Copy, Clone, FromDynamic, ToDynamic)]
-pub struct HsbTransform {
-    #[dynamic(default = "default_one_point_oh")]
-    pub hue: f32,
-    #[dynamic(default = "default_one_point_oh")]
-    pub saturation: f32,
-    #[dynamic(default = "default_one_point_oh")]
-    pub brightness: f32,
-}
-
-impl Default for HsbTransform {
-    fn default() -> Self {
-        Self {
-            hue: 1.,
-            saturation: 1.,
-            brightness: 1.,
-        }
-    }
-}
+pub use wezterm_color_types::HsbTransform;
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
 #[dynamic(try_from = "String", into = "String")]

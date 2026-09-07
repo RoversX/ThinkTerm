@@ -8,6 +8,7 @@ members = [
   "thinkterm-syntax",
   "thinkterm-core",
   "thinkterm-proto",
+  "thinkterm-render",
   "thinkterm-session",
   "thinkterm-tui",
   "thinkterm-update",
@@ -78,6 +79,7 @@ colorgrad = "0.6"
 config = { path = "config" }
 thinkterm-core = { path = "thinkterm-core" }
 thinkterm-proto = { path = "thinkterm-proto" }
+thinkterm-render = { path = "thinkterm-render" }
 thinkterm-session = { path = "thinkterm-session" }
 thinkterm-update = { path = "thinkterm-update" }
 core-foundation = "=0.10.0"

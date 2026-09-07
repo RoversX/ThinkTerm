@@ -991,6 +991,7 @@ dependencies = [
  "toml 0.8.23",
  "umask",
  "wezterm-bidi 0.2.3",
+ "wezterm-color-types 0.3.0",
  "wezterm-config-derive",
  "wezterm-dynamic 0.2.1",
  "wezterm-input-types 0.1.0",
@@ -6471,6 +6472,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkterm-render"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "downcast-rs",
+ "euclid",
+ "glium",
+ "guillotiere",
+ "line_drawing",
+ "log",
+ "metrics",
+ "naga",
+ "resize",
+ "thiserror 1.0.69",
+ "wezterm-color-types 0.3.0",
+ "wezterm-input-types 0.1.0",
+ "wgpu",
+]
+
+[[package]]
 name = "thinkterm-session"
 version = "0.1.0"
 dependencies = [
@@ -8102,6 +8124,7 @@ dependencies = [
  "textwrap",
  "thinkterm-core",
  "thinkterm-proto",
+ "thinkterm-render",
  "thinkterm-syntax",
  "thinkterm-update",
  "thiserror 1.0.69",
@@ -8593,7 +8616,6 @@ dependencies = [
  "core-foundation 0.10.0",
  "core-graphics 0.24.0",
  "dirs-next",
- "downcast-rs",
  "euclid",
  "filedescriptor 0.8.3",
  "foreign-types 0.5.0",
@@ -8601,12 +8623,10 @@ dependencies = [
  "futures-util",
  "gl_generator",
  "glium",
- "guillotiere",
  "k9",
  "lazy_static",
  "libc",
  "libloading",
- "line_drawing",
  "log",
  "metrics",
  "mio 0.8.11",
@@ -8616,11 +8636,11 @@ dependencies = [
  "plist",
  "promise",
  "raw-window-handle",
- "resize",
  "serde",
  "shared_library",
  "shlex 1.3.0",
  "smithay-client-toolkit",
+ "thinkterm-render",
  "thiserror 1.0.69",
  "tiny-skia",
  "url",

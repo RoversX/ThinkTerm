@@ -105,6 +105,7 @@ termwiz-funcs.workspace = true
 termwiz.workspace = true
 textwrap.workspace = true
 thinkterm-proto.workspace = true
+thinkterm-render = { workspace = true, features = ["glium", "wgpu"] }
 thinkterm-update.workspace = true
 thiserror.workspace = true
 tiny-skia.workspace = true

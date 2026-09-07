@@ -1,5 +1,7 @@
-use crate::bitmaps::{BitmapImage, Texture2d, TextureRect};
-use crate::{Point, Rect, Size};
+//! The glyph/sprite atlas: guillotiere packing over a `Texture2d`.
+
+use crate::bitmaps::{BitmapImage, Image, Texture2d, TextureRect};
+use crate::geom::{Point, Rect, Size};
 use anyhow::{ensure, Result as Fallible};
 use guillotiere::{SimpleAtlasAllocator, Size as AtlasSize};
 use std::convert::TryInto;
@@ -103,7 +105,7 @@ impl Atlas {
         let side = texture.width();
         let iside = side as isize;
 
-        let image = crate::Image::new(side, side);
+        let image = Image::new(side, side);
         let rect = Rect::new(Point::new(0, 0), Size::new(iside, iside));
         texture.write(rect, &image);
 
@@ -148,7 +150,7 @@ impl Atlas {
         let (width, height) = im.image_dimensions();
 
         if let Some(scale_down) = scale_down {
-            let mut copied = crate::Image::new(width, height);
+            let mut copied = Image::new(width, height);
             copied.draw_image(Point::new(0, 0), None, im);
 
             // A source smaller than the divisor must not become 0x0: the
@@ -175,6 +177,7 @@ impl Atlas {
         let reserve_width = reserve_width + padding.unwrap_or(0) as i32 + PADDING * 2;
         let reserve_height = reserve_height + padding.unwrap_or(0) as i32 + PADDING * 2;
 
+        #[cfg(not(target_family = "wasm"))]
         let start = std::time::Instant::now();
         let res = if let Some(allocation) = self
             .allocator
@@ -206,6 +209,7 @@ impl Atlas {
                 current_size: self.side,
             })
         };
+        #[cfg(not(target_family = "wasm"))]
         metrics::histogram!("window.atlas.allocate.latency").record(start.elapsed());
 
         res
@@ -223,7 +227,7 @@ impl Atlas {
     /// Zero out the texture, and forget all allocated regions
     pub fn clear(&mut self) {
         let iside = self.side as isize;
-        let image = crate::Image::new(self.side, self.side);
+        let image = Image::new(self.side, self.side);
         let rect = Rect::new(Point::new(0, 0), Size::new(iside, iside));
         self.texture.write(rect, &image);
         self.allocator.clear();
@@ -265,7 +269,7 @@ impl Sprite {
 #[cfg(test)]
 mod usage_tests {
     use super::{Atlas, AtlasTag, AtlasUsage, PADDING};
-    use crate::bitmaps::{ImageTexture, Texture2d};
+    use crate::bitmaps::{Image, ImageTexture, Texture2d};
     use std::rc::Rc;
 
     fn atlas(side: usize) -> Atlas {
@@ -280,8 +284,8 @@ mod usage_tests {
     #[test]
     fn accounts_padded_area_per_tag_and_tracks_the_largest_rect() {
         let mut atlas = atlas(64);
-        let glyph = crate::Image::new(10, 10);
-        let frame = crate::Image::new(20, 5);
+        let glyph = Image::new(10, 10);
+        let frame = Image::new(20, 5);
         atlas
             .allocate_tagged(&glyph, None, None, AtlasTag::Glyph)
             .unwrap();
@@ -310,10 +314,10 @@ mod usage_tests {
     fn max_rect_follows_the_longest_side_not_the_area() {
         let mut atlas = atlas(256);
         atlas
-            .allocate_tagged(&crate::Image::new(200, 1), None, None, AtlasTag::Image)
+            .allocate_tagged(&Image::new(200, 1), None, None, AtlasTag::Image)
             .unwrap();
         atlas
-            .allocate_tagged(&crate::Image::new(50, 50), None, None, AtlasTag::Glyph)
+            .allocate_tagged(&Image::new(50, 50), None, None, AtlasTag::Glyph)
             .unwrap();
         // 52x52 has the larger area, but 202x3 is what forces the atlas side.
         assert_eq!(atlas.usage().max_rect, padded(200, 1));
@@ -322,7 +326,7 @@ mod usage_tests {
     #[test]
     fn scaled_allocations_account_the_scaled_rect() {
         let mut atlas = atlas(64);
-        let big = crate::Image::new(40, 40);
+        let big = Image::new(40, 40);
         atlas
             .allocate_tagged(&big, None, Some(2), AtlasTag::Image)
             .unwrap();
@@ -337,8 +341,8 @@ mod usage_tests {
     #[test]
     fn failures_count_and_clear_resets_everything() {
         let mut atlas = atlas(32);
-        atlas.allocate(&crate::Image::new(8, 8)).unwrap();
-        assert!(atlas.allocate(&crate::Image::new(100, 100)).is_err());
+        atlas.allocate(&Image::new(8, 8)).unwrap();
+        assert!(atlas.allocate(&Image::new(100, 100)).is_err());
         assert_eq!(atlas.usage().failures, 1);
         assert_eq!(atlas.usage().allocations, 1);
 

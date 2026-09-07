@@ -48,19 +48,36 @@ impl LoggedSrgbTexture2d {
 
 impl Texture2d for LoggedSrgbTexture2d {
     fn write(&self, rect: Rect, im: &dyn BitmapImage) {
-        <SrgbTexture2d as Texture2d>::write(&self.inner, rect, im);
+        let (im_width, im_height) = im.image_dimensions();
+
+        let source = glium::texture::RawImage2d {
+            data: std::borrow::Cow::Borrowed(im.pixels()),
+            width: im_width as u32,
+            height: im_height as u32,
+            format: glium::texture::ClientFormat::U8U8U8U8,
+        };
+
+        self.inner.write(
+            glium::Rect {
+                left: rect.min_x() as u32,
+                bottom: rect.min_y() as u32,
+                width: rect.size.width as u32,
+                height: rect.size.height as u32,
+            },
+            source,
+        )
     }
 
-    fn read(&self, rect: Rect, im: &mut dyn BitmapImage) {
-        <SrgbTexture2d as Texture2d>::read(&self.inner, rect, im);
+    fn read(&self, _rect: Rect, _im: &mut dyn BitmapImage) {
+        unimplemented!();
     }
 
     fn width(&self) -> usize {
-        <SrgbTexture2d as Texture2d>::width(&self.inner)
+        self.inner.width() as usize
     }
 
     fn height(&self) -> usize {
-        <SrgbTexture2d as Texture2d>::height(&self.inner)
+        self.inner.height() as usize
     }
 }
 

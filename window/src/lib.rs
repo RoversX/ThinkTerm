@@ -128,12 +128,7 @@ impl ClipboardContents {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Dimensions {
-    pub pixel_width: usize,
-    pub pixel_height: usize,
-    pub dpi: usize,
-}
+pub use thinkterm_render::Dimensions;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContextMenuAction {
@@ -497,11 +492,7 @@ impl ContextMenuItem {
     }
 }
 
-pub type ULength = euclid::Length<usize, PixelUnit>;
-pub type Rect = euclid::Rect<isize, PixelUnit>;
-pub type RectF = euclid::Rect<f32, PixelUnit>;
-pub type Size = euclid::Size2D<isize, PixelUnit>;
-pub type SizeF = euclid::Size2D<f32, PixelUnit>;
+pub use thinkterm_render::geom::{Rect, RectF, Size, SizeF, ULength};
 pub type ScreenRect = euclid::Rect<isize, ScreenPixelUnit>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

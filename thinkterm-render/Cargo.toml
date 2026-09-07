@@ -1,0 +1,39 @@
+[package]
+name = "thinkterm-render"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The GPU-backend-neutral half of the terminal renderer: the WGSL shader,
+# the vertex layout and quad machinery, CPU bitmaps, the glyph atlas and
+# (behind the `wgpu` feature) the pipeline setup. Shared by the desktop
+# window and the browser client so the two cannot drift. This crate must
+# always build for wasm32-unknown-unknown: no processes, files, sockets,
+# threads or std::time, and never a dependency on config, window, mux or
+# wezterm-font. The `glium` feature exists only so the desktop's OpenGL
+# fallback can keep one Vertex definition; wasm never enables it.
+
+[features]
+default = []
+glium = ["dep:glium"]
+wgpu = ["dep:wgpu"]
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+downcast-rs.workspace = true
+euclid.workspace = true
+glium = { workspace = true, optional = true }
+guillotiere.workspace = true
+line_drawing.workspace = true
+log.workspace = true
+metrics.workspace = true
+resize.workspace = true
+thiserror.workspace = true
+wezterm-color-types.workspace = true
+wezterm-input-types.workspace = true
+wgpu = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The WGSL validation test runs whatever features are on.
+naga = { version = "25", features = ["wgsl-in"] }
