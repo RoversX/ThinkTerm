@@ -259,6 +259,20 @@ async fn start_attached(
     let _ = textarea.focus();
     app.resize();
     app.request_frame();
+    // A moment after the first frame, in its own task: the fallback
+    // canvas's first use is a one-off stall, and this is when nobody is
+    // waiting on it. Not at 0 ms, which could land before the first paint
+    // and the status line, and did show up in the attach time.
+    {
+        let app = Rc::clone(&app);
+        let warm = Closure::once_into_js(move || app.warm_glyph_canvas());
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                warm.as_ref().unchecked_ref(),
+                250,
+            );
+        }
+    }
     // The push and close handlers and every DOM listener hold the app.
     Ok(())
 }

@@ -358,6 +358,20 @@ impl GlyphCache {
         }
     }
 
+    /// Pay the canvas's first-use cost now rather than on the first frame
+    /// that needs a fallback glyph.
+    ///
+    /// Measured: the first draw through a fresh 2D context is a single
+    /// ~45 ms stall (the context and its readback path coming into being),
+    /// and it landed inside the first frame of CJK as a 70 ms task. Every
+    /// draw after it is milliseconds. One throwaway glyph here, off the
+    /// frame path, moves that stall to where nobody is waiting on it.
+    pub fn warm(&mut self) {
+        if let Some(scratch) = self.scratch() {
+            let _ = scratch.measure("x", 1);
+        }
+    }
+
     /// Keep what the canvas produced, including that it produced nothing.
     fn remember(
         &mut self,

@@ -24,9 +24,10 @@ The symbols face is larger than the wasm on the wire.
 |---|---|
 | DOMContentLoaded | 28-37 ms |
 | first status line | 15-35 ms |
-| attached to the pane | 121-142 ms |
+| attached to the pane | 121-197 ms |
 
-Loopback; the wasm fetch itself is ~22 ms.
+Loopback; the wasm fetch itself is ~22 ms. Attach varies by ±40 ms from run
+to run with nothing changed, so treat a difference below that as noise.
 
 ## Idle
 
@@ -38,24 +39,25 @@ content). The page does not repaint on its own.
 
 | | first screen | a second screen of *different* fresh CJK |
 |---|---|---|
-| frames | 2-3 | 2-3 |
-| worst gap between frames | 71-79 ms | 30-44 ms |
-| long tasks (>50 ms) | one, 70-73 ms | none |
-| CPU profile, top self time | `clearRect` 44 ms, glue 24 ms | `fillText` 4 ms, `getImageData` 1 ms |
+| frames | 3 | 2-3 |
+| worst gap between frames | 23-28 ms | 16 ms |
+| long tasks (>50 ms) | none | none |
+| CPU profile, top self time | `fillText` 21-25 ms in total | `fillText` ~4 ms |
 
-The long task is a one-time cost of the 2D canvas's first use (the first
-`clearRect` waits for the context and its readback pipeline to exist), not
-a per-glyph cost: the second cold screen has none. The 8 ms per-frame
-fallback budget holds once the canvas exists. A warm-up during font loading
-would move those ~45 ms off the first CJK frame.
+Before the page warmed the canvas (`GlyphCache::warm`, run 250 ms after the
+first frame) the first screen carried one 70-79 ms task, 44 ms of it in the
+first `clearRect`: the 2D context and its readback path coming into being.
+That was a one-time cost, not per glyph -- a second cold screen never had
+it -- and the warm-up moves it to a moment nobody is waiting on. From then
+on the 8 ms per-frame fallback budget holds.
 
-Repainting the same CJK from the cache: 3 frames, 19-31 ms apart, no long
-task.
+Repainting the same CJK from the cache: 2 frames, 11 ms apart.
 
 ## Sustained output (300 lines, one every 10 ms)
 
-251-253 frames in 5 s; gaps median 17 ms, p95 18 ms, max 23-38 ms. That is
-vsync pacing with nothing dropped.
+219-253 frames in 5 s; gaps median 17 ms, p95 18 ms. That is vsync pacing
+with nothing dropped. The largest gap (23-207 ms) is the python interpreter
+starting between the echoed command and its first line, not a paint.
 
 ## A burst (`seq 1 20000`)
 

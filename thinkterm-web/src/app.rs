@@ -851,6 +851,11 @@ impl App {
         self.request_frame();
     }
 
+    /// See `GlyphCache::warm`. Called once, after the first frame.
+    pub fn warm_glyph_canvas(&self) {
+        self.inner.borrow_mut().glyphs.warm();
+    }
+
     /// Fit the grid to the canvas's CSS box at the device pixel ratio, and
     /// tell the server if this browser owns the viewport.
     pub fn resize(&self) {

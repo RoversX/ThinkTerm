@@ -143,12 +143,16 @@ const INSTRUMENT = `
   const pct = (a, p) => { const b = [...a].sort((x, y) => x - y); return Math.round(b[Math.min(b.length - 1, Math.floor(b.length * p))]); };
 
   const line = (text) => `printf '%s\\n' '${text}' | ${sendPrefix}`;
-  const CJK = 'python3 -c "print((\\"中文测试汉字渲染性能基线 한국어 테스트 日本語のテスト ★☆♥ \\" * 2 + chr(10)) * 30, end=\\"\\")"';
-  const cjk = line(CJK);
-  const cjk2 = line("clear; " + CJK);
+  // The CJK screens come from files and `cat`, not from an interpreter: a
+  // python3 start-up inside the window read as a 100-300 ms gap between
+  // the echoed command and the output, which is not the page's doing.
+  const screen = (name, row) => { const f = `${os.tmpdir()}/tt-bench-${name}.txt`; fs.writeFileSync(f, (row.repeat(2) + "\n").repeat(30)); return f; };
+  const cjkFile = screen("cjk1", "中文测试汉字渲染性能基线 한국어 테스트 日本語のテスト ★☆♥ ");
+  const cjkFile2 = screen("cjk2", "東京都渋谷区神宮前 대한민국 서울특별시 강남구 北京市朝阳区 ♠♣♦ ");
+  const cjk = line(`cat ${cjkFile}`);
+  const cjk2 = line(`clear; cat ${cjkFile}`);
+  const cjk_other = line(`clear; cat ${cjkFile2}`);
   const seq = line("seq 1 20000");
-  const CJK2 = 'python3 -c "print((\\"東京都渋谷区神宮前 대한민국 서울특별시 강남구 北京市朝阳区 ♠♣♦ \\" * 2 + chr(10)) * 30, end=\\"\\")"';
-  const cjk_other = line("clear; " + CJK2);
   const trickle = line('python3 -c "import time\nfor i in range(300): print(i, flush=True); time.sleep(0.01)"');
   const results = {
     bundle: wasmRes, load: { dom_content_loaded_ms: Math.round(nav.domContentLoadedEventEnd), first_status_ms: tFirst, attached_ms: tAttached },
