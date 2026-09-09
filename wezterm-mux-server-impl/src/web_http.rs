@@ -184,6 +184,16 @@ impl WebSite {
         if self.allowed_origins.iter().any(|o| o.same_as(&origin)) {
             return true;
         }
+        // An address of this machine that came up after the listener did
+        // (a tailnet joined, a new network): an IP literal cannot be a
+        // DNS-rebinding name, and at our scheme and port it is this page.
+        if !self.configured_origins
+            && origin.scheme == self.scheme
+            && origin.port == self.port
+            && origin.host.parse::<std::net::IpAddr>().is_ok_and(|ip| !ip.is_loopback())
+        {
+            return true;
+        }
         if self.configured_origins || !self.loopback || !is_loopback_host(&origin.host) {
             return false;
         }

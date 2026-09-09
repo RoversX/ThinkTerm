@@ -3113,11 +3113,14 @@ fn web_urls(listening: &[String]) -> Vec<String> {
     listening
         .iter()
         .flat_map(|address| {
-            config
-                .web_servers
-                .iter()
-                .find(|server| &server.bind_address == address)
-                .cloned()
+            crate::web_control::effective(address)
+                .or_else(|| {
+                    config
+                        .web_servers
+                        .iter()
+                        .find(|server| &server.bind_address == address)
+                        .cloned()
+                })
                 .unwrap_or_else(|| config::WebServer {
                     bind_address: address.clone(),
                     ..Default::default()

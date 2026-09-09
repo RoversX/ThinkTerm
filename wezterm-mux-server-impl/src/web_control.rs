@@ -17,6 +17,10 @@ pub struct WebControl {
     pub stop: fn(&str) -> bool,
     /// The bind addresses currently accepting.
     pub listening: fn() -> Vec<String>,
+    /// The entry a listener is running with -- the configured one, or the
+    /// defaults, plus whatever the listener filled in itself (a generated
+    /// certificate) -- so URLs and origins are told the scheme in use.
+    pub effective: fn(&str) -> Option<config::WebServer>,
 }
 
 static CONTROL: OnceLock<WebControl> = OnceLock::new();
@@ -37,4 +41,9 @@ pub fn get() -> Option<&'static WebControl> {
 /// every caller.
 pub fn listening() -> Vec<String> {
     get().map(|c| (c.listening)()).unwrap_or_default()
+}
+
+/// The entry a live listener runs with, when it is up.
+pub fn effective(bind_address: &str) -> Option<config::WebServer> {
+    get().and_then(|c| (c.effective)(bind_address))
 }

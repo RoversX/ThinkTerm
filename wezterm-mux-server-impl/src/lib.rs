@@ -21,6 +21,7 @@ pub mod web_auth;
 pub mod web_control;
 pub mod web_http;
 pub mod web_stream;
+pub mod web_tls;
 
 fn client_domains(config: &config::ConfigHandle) -> Vec<ClientDomainConfig> {
     let mut domains = vec![];

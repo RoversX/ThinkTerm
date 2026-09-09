@@ -802,6 +802,10 @@ enum SettingsAction {
     SetWebLinkTtl(Option<u64>),
     /// Mint a link and put it straight on the clipboard.
     CopyWebLink,
+    /// Listen on every address (a phone can reach it) or loopback only.
+    ToggleWebReachable,
+    /// Mint a link and show it as a QR code, or hide the one shown.
+    ToggleWebQr,
     /// Index into the token rows cached at paint time.
     /// Carries `web_token_key(id)`, not the row's index: the press is
     /// remembered at mouse-down and compared by value with the action under
@@ -3468,10 +3472,30 @@ impl SettingsWindow {
     /// Shared by the sidebar click and by an external request to open a
     /// particular page, so a page reached from the app menu arrives in the
     /// same state as one clicked into.
+    /// Where the listener binds: every address when the page is to be
+    /// reachable from other devices, else the configured or default one.
+    fn web_bind_address(&self) -> String {
+        let state = crate::web_settings::state();
+        let configured = state
+            .status
+            .as_ref()
+            .and_then(|status| status.configured.first().cloned())
+            .unwrap_or_else(|| config::WebServer::default().bind_address);
+        if self.native_settings.web.reachable {
+            let port = configured.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).unwrap_or(8088);
+            format!("0.0.0.0:{port}")
+        } else {
+            configured
+        }
+    }
+
     fn enter_section(&mut self, section: SettingsSection) {
         self.selected = section;
         self.ui.content_scroll.reset();
         self.ui.open_dropdown = None;
+        // A code on screen carries a live token; it does not outlast the
+        // section it was asked for in.
+        crate::web_settings::hide_qr();
         if section == SettingsSection::Agents {
             // Probe PATH on entry so painting never touches the filesystem.
             crate::agent_status::refresh_path_probe();
@@ -3933,15 +3957,7 @@ impl SettingsWindow {
                     .status
                     .as_ref()
                     .is_some_and(|status| !status.listening.is_empty());
-                // Turning it on with nothing configured is the ordinary
-                // case, so fall back to the same loopback address a bare
-                // `web_servers = { {} }` would have produced.
-                let address = state
-                    .status
-                    .as_ref()
-                    .and_then(|status| status.configured.first().cloned())
-                    .or_else(|| Some(config::WebServer::default().bind_address));
-                crate::web_settings::set_enabled(window.clone(), !on, address);
+                crate::web_settings::set_enabled(window.clone(), !on, Some(self.web_bind_address()));
             }
             SettingsAction::ToggleWebLinkTtlMenu => {
                 self.ui.open_dropdown = if self.ui.open_dropdown == Some(SettingsDropdown::WebLinkTtl)
@@ -3960,6 +3976,24 @@ impl SettingsWindow {
                 self.ui.open_dropdown = None;
                 crate::web_settings::mint(window.clone(), self.native_settings.web.link_ttl_secs);
                 self.schedule_copied_state_clear(window);
+            }
+            SettingsAction::ToggleWebReachable => {
+                self.ui.open_dropdown = None;
+                self.native_settings.web.reachable = !self.native_settings.web.reachable;
+                self.save_web_settings();
+                let state = crate::web_settings::state();
+                let on = state.status.as_ref().is_some_and(|status| !status.listening.is_empty());
+                if on {
+                    crate::web_settings::restart(window.clone(), self.web_bind_address());
+                }
+            }
+            SettingsAction::ToggleWebQr => {
+                self.ui.open_dropdown = None;
+                if crate::web_settings::state().qr.is_some() {
+                    crate::web_settings::hide_qr();
+                } else {
+                    crate::web_settings::show_qr(window.clone(), self.native_settings.web.link_ttl_secs);
+                }
             }
             SettingsAction::RevokeWebToken(key) => {
                 self.ui.open_dropdown = None;
@@ -5668,18 +5702,31 @@ impl SettingsWindow {
             palette.muted_text,
             max_width,
         )?;
-        let (card_y, first_row_y) = self.settings_card_geometry(section_y, 3);
-        let card_height = self.settings_card_height(3);
+        // Five rows: the switch, reachable, the link's life, copy, the
+        // code -- plus the code itself below the last when one is shown.
+        let qr_modules = state.qr.as_ref().map(|q| q.len()).unwrap_or(0);
+        let qr_scale = self.ui_px(4.0);
+        let qr_side = qr_modules as f32 * qr_scale;
+        let qr_extra = if qr_modules > 0 { qr_side + self.ui_px(24.0) } else { 0.0 };
+        let (card_y, first_row_y) = self.settings_card_geometry(section_y, 5);
+        let card_height = self.settings_card_height(5) + qr_extra;
         self.paint_group_card(layers, x, card_y, max_width, card_height)?;
 
         // The error takes the description slot rather than a line of its
         // own: it is always about the thing the toggle just tried to do,
         // and a row that appears and disappears moves everything below it.
+        // Every address the listener answers on, as the server lists them
+        // (the ones another device can use first).
+        let urls = state
+            .status
+            .as_ref()
+            .map(|status| status.urls.iter().map(|u| u.trim_end_matches('/').to_string()).collect::<Vec<_>>())
+            .unwrap_or_default();
         let description = match (&state.error, &address) {
             (Some(error), _) => error.clone(),
             (None, Some(address)) => {
                 let mut args = FluentArgs::new();
-                args.set("address", address.clone());
+                args.set("address", if urls.is_empty() { address.clone() } else { urls.join("  ·  ") });
                 crate::i18n::tr_args("settings-web-on-at", &args)
             }
             (None, None) => crate::i18n::tr("settings-web-enable-description"),
@@ -5696,10 +5743,23 @@ impl SettingsWindow {
             false,
         )?;
 
-        let ttl_y = first_row_y + row_step;
+        let reachable_y = first_row_y + row_step;
+        self.paint_toggle_setting_row(
+            layers,
+            row_x,
+            reachable_y,
+            row_width,
+            &crate::i18n::tr("settings-web-reachable"),
+            &crate::i18n::tr("settings-web-reachable-description"),
+            self.native_settings.web.reachable,
+            SettingsAction::ToggleWebReachable,
+            true,
+        )?;
+
+        let ttl_y = first_row_y + row_step * 2.0;
         self.paint_web_link_ttl_row(layers, row_x, ttl_y, row_width, true)?;
 
-        let copy_y = first_row_y + row_step * 2.0;
+        let copy_y = first_row_y + row_step * 3.0;
         self.paint_separator(layers, row_x, copy_y - self.ui_px(28.0), row_width)?;
         let copy_label = if state.copied {
             crate::i18n::tr("settings-web-copied")
@@ -5735,6 +5795,60 @@ impl SettingsWindow {
             &copy_label,
             SettingsAction::CopyWebLink,
         )?;
+
+        // --- the code ---------------------------------------------------
+        let qr_y = first_row_y + row_step * 4.0;
+        self.paint_separator(layers, row_x, qr_y - self.ui_px(28.0), row_width)?;
+        let qr_label = if qr_modules > 0 {
+            crate::i18n::tr("settings-web-qr-hide")
+        } else {
+            crate::i18n::tr("settings-web-qr-show")
+        };
+        let qr_button_width = self.button_width_for_label(&qr_label, 190.0);
+        let qr_button_x = row_x + row_width - qr_button_width;
+        let qr_text_width = qr_button_x - row_x - self.ui_px(24.0);
+        self.draw_text(layers, &ui_font, row_x, qr_y, &crate::i18n::tr("settings-web-qr"), palette.text, qr_text_width)?;
+        self.draw_text(
+            layers,
+            &body_font,
+            row_x,
+            self.settings_row_description_y(qr_y),
+            &crate::i18n::tr("settings-web-qr-description"),
+            palette.secondary_text,
+            qr_text_width,
+        )?;
+        self.draw_button(layers, qr_button_x, qr_y + self.ui_px(4.0), qr_button_width, &qr_label, SettingsAction::ToggleWebQr)?;
+        if let Some(rows) = &state.qr {
+            // White behind, dark modules on it, a quiet zone of four modules:
+            // a scanner wants the contrast, whatever the theme.
+            let quiet = qr_scale * 4.0;
+            let top = self.settings_row_description_y(qr_y) + self.ui_px(30.0);
+            let white = LinearRgba::with_components(1.0, 1.0, 1.0, 1.0);
+            let black = LinearRgba::with_components(0.0, 0.0, 0.0, 1.0);
+            self.draw_rect(layers, 0, row_x - quiet, top - quiet, qr_side + quiet * 2.0, qr_side + quiet * 2.0, white)?;
+            for (yy, row) in rows.iter().enumerate() {
+                let mut x0: Option<usize> = None;
+                for xx in 0..=row.len() {
+                    let dark = xx < row.len() && row[xx];
+                    match (dark, x0) {
+                        (true, None) => x0 = Some(xx),
+                        (false, Some(start)) => {
+                            self.draw_rect(
+                                layers,
+                                0,
+                                row_x + start as f32 * qr_scale,
+                                top + yy as f32 * qr_scale,
+                                (xx - start) as f32 * qr_scale,
+                                qr_scale,
+                                black,
+                            )?;
+                            x0 = None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
 
         // --- the links --------------------------------------------------
         // One extra row for "every link" only when there is more than

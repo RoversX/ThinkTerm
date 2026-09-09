@@ -108,6 +108,42 @@ pub fn default_port(scheme: &str) -> Option<u16> {
     }
 }
 
+/// Whether an address is on a Tailscale network (CGNAT 100.64/10, or its
+/// IPv6 prefix): worth naming first, since it reaches the machine from
+/// anywhere the tailnet does.
+pub fn is_tailscale(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 100 && (64..128).contains(&o[1])
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0
+        }
+    }
+}
+
+/// The machine's addresses a browser elsewhere can reach: every interface
+/// address that is not loopback or link-local, Tailscale ones first, then
+/// IPv4 before IPv6. Empty when the interfaces cannot be listed.
+pub fn local_addresses() -> Vec<std::net::IpAddr> {
+    use std::net::IpAddr;
+    let mut addrs: Vec<IpAddr> = if_addrs::get_if_addrs()
+        .map(|list| list.into_iter().map(|i| i.ip()).collect())
+        .unwrap_or_default();
+    addrs.retain(|ip| match ip {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            !v6.is_loopback() && !v6.is_unspecified() && (s[0] & 0xffc0) != 0xfe80
+        }
+    });
+    addrs.sort_by_key(|ip| (!is_tailscale(ip), ip.is_ipv6(), *ip));
+    addrs.dedup();
+    addrs
+}
+
 /// A name that can only ever mean this machine.
 pub fn is_loopback_host(host: &str) -> bool {
     match host.parse::<std::net::IpAddr>() {
@@ -186,9 +222,16 @@ impl WebServer {
     }
 
     /// The `host[:port]` values a browser will send in `Host:` and use in
-    /// a URL. A loopback listener answers to both spellings of itself.
-    /// A scheme's default port is left out, as a browser leaves it out.
+    /// a URL. A loopback listener answers to both spellings of itself; a
+    /// listener bound everywhere to the loopback spellings and every
+    /// address the machine has. A scheme's default port is left out, as
+    /// a browser leaves it out.
     pub fn url_hosts(&self) -> Vec<String> {
+        self.url_hosts_with(&local_addresses())
+    }
+
+    /// `url_hosts` given the machine's addresses.
+    pub fn url_hosts_with(&self, addresses: &[std::net::IpAddr]) -> Vec<String> {
         let (host, port) = self.host_and_port();
         let shown = port.filter(|p| Some(*p) != default_port(self.scheme()));
         let with_port = |h: &str| match shown {
@@ -204,11 +247,23 @@ impl WebServer {
                 hosts.push(with_port("[::1]"));
             }
             Some(ip) if ip.is_unspecified() => {
-                // Bound everywhere: any name reaches it, and the listener
-                // cannot enumerate them. Loopback spellings at least.
+                // Bound everywhere: the loopback spellings, then every
+                // address the machine has (names it may also have are
+                // not ours to guess; `allowed_origins` lists those).
                 hosts.push(with_port("127.0.0.1"));
                 hosts.push(with_port("localhost"));
                 hosts.push(with_port("[::1]"));
+                for addr in addresses {
+                    if addr.is_ipv6() && ip.is_ipv4() {
+                        // An IPv4 bind does not answer on IPv6 addresses.
+                        continue;
+                    }
+                    let spelled = match addr {
+                        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+                        std::net::IpAddr::V4(v4) => v4.to_string(),
+                    };
+                    hosts.push(with_port(&spelled));
+                }
             }
             Some(std::net::IpAddr::V6(v6)) => hosts.push(with_port(&format!("[{v6}]"))),
             _ => hosts.push(with_port(&host)),
@@ -264,6 +319,20 @@ mod tests {
                 "http://[::1]:8088"
             ]
         );
+    }
+
+    #[test]
+    fn a_listener_bound_everywhere_names_the_machine_s_addresses() {
+        let server = WebServer { bind_address: "0.0.0.0:8443".into(), ..WebServer::default() };
+        let addrs = vec!["192.168.1.7".parse().unwrap(), "100.100.5.5".parse().unwrap(), "fd7a:115c:a1e0::1".parse().unwrap()];
+        assert_eq!(
+            server.url_hosts_with(&addrs),
+            vec!["127.0.0.1:8443", "localhost:8443", "[::1]:8443", "192.168.1.7:8443", "100.100.5.5:8443"]
+        );
+        let v6 = WebServer { bind_address: "[::]:8443".into(), ..WebServer::default() };
+        assert!(v6.url_hosts_with(&addrs).contains(&"[fd7a:115c:a1e0::1]:8443".to_string()));
+        assert!(is_tailscale(&"100.100.5.5".parse().unwrap()));
+        assert!(!is_tailscale(&"192.168.1.7".parse().unwrap()));
     }
 
     #[test]

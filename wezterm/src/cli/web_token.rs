@@ -119,7 +119,16 @@ impl MintCommand {
             })
             .await?;
         if self.url_only {
-            match minted.urls.first() {
+            // The one address another device can use, when there is one;
+            // a loopback URL is only good on this machine.
+            let reachable = minted.urls.iter().find(|url| {
+                url.split("://")
+                    .nth(1)
+                    .and_then(|rest| rest.split('/').next())
+                    .and_then(config::split_authority)
+                    .is_some_and(|(host, _)| !config::is_loopback_host(&host))
+            });
+            match reachable.or(minted.urls.first()) {
                 Some(url) => println!("{url}"),
                 None => {
                     // A script asked for a URL and there is none: do not

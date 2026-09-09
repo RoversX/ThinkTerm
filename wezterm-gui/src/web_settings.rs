@@ -32,6 +32,9 @@ pub struct WebState {
     /// A link was just put on the clipboard. The URL itself is not kept:
     /// it carries a live token, and nothing here needs to read it back.
     pub copied: bool,
+    /// A minted link as a QR code (rows of dark modules), shown until the
+    /// section is left. The code carries the token, as a copied link does.
+    pub qr: Option<Vec<Vec<bool>>>,
     /// Whether anything has been asked yet, so the first paint of the
     /// section can ask without a button.
     pub loaded: bool,
@@ -279,6 +282,97 @@ pub fn set_enabled(window: Window, enabled: bool, bind_address: Option<String>) 
         }
     })
     .detach();
+}
+
+/// Turn the listener off and on again at another address: the settings
+/// switch flipped where it listens while it was up.
+pub fn restart(window: Window, bind_address: String) {
+    if with_state(|s| std::mem::replace(&mut s.busy, true)) {
+        return;
+    }
+    let Some(client) = client() else {
+        finish(&window, Some(crate::i18n::tr("settings-web-no-server")), Gate::Action);
+        return;
+    };
+    promise::spawn::spawn_into_main_thread(async move {
+        let off = client
+            .set_web_server(codec::SetWebServer { enabled: false, bind_address: None })
+            .await;
+        let outcome = match off {
+            Ok(_) => client
+                .set_web_server(codec::SetWebServer { enabled: true, bind_address: Some(bind_address) })
+                .await,
+            Err(err) => Err(err),
+        };
+        match outcome {
+            Ok(status) => {
+                with_state(|s| {
+                    s.status = Some(status);
+                    s.qr = None;
+                });
+                finish(&window, None, Gate::Action);
+                refresh(window);
+            }
+            Err(err) => finish(&window, Some(format!("{err:#}")), Gate::Action),
+        }
+    })
+    .detach();
+}
+
+/// Mint a link and show it as a QR code, for a phone to scan. Prefers a
+/// URL another device can use; a loopback-only listener gets a remark.
+pub fn show_qr(window: Window, ttl_secs: Option<u64>) {
+    if with_state(|s| std::mem::replace(&mut s.busy, true)) {
+        return;
+    }
+    let Some(client) = client() else {
+        finish(&window, Some(crate::i18n::tr("settings-web-no-server")), Gate::Action);
+        return;
+    };
+    promise::spawn::spawn_into_main_thread(async move {
+        match client.web_token_mint(codec::WebTokenMint { label: None, ttl_secs }).await {
+            Ok(minted) => {
+                let reachable = minted.urls.iter().find(|url| {
+                    url.split("://")
+                        .nth(1)
+                        .and_then(|rest| rest.split('/').next())
+                        .and_then(config::split_authority)
+                        .is_some_and(|(host, _)| !config::is_loopback_host(&host))
+                });
+                match reachable.or(minted.urls.first()) {
+                    Some(url) => {
+                        let code = qrcode::QrCode::new(url.as_bytes());
+                        match code {
+                            Ok(code) => {
+                                let width = code.width();
+                                let colors = code.to_colors();
+                                let rows: Vec<Vec<bool>> = (0..width)
+                                    .map(|y| (0..width).map(|x| colors[y * width + x] == qrcode::Color::Dark).collect())
+                                    .collect();
+                                let remark = reachable.is_none().then(|| crate::i18n::tr("settings-web-qr-loopback"));
+                                with_state(|s| s.qr = Some(rows));
+                                finish(&window, remark, Gate::Action);
+                                refresh(window);
+                            }
+                            Err(err) => finish(&window, Some(format!("{err}")), Gate::Action),
+                        }
+                    }
+                    None => {
+                        let _ = client
+                            .web_token_revoke(codec::WebTokenRevoke { id: Some(minted.id.clone()) })
+                            .await;
+                        finish(&window, Some(crate::i18n::tr("settings-web-no-listener")), Gate::Action);
+                    }
+                }
+            }
+            Err(err) => finish(&window, Some(format!("{err:#}")), Gate::Action),
+        }
+    })
+    .detach();
+}
+
+pub fn hide_qr() {
+    with_state(|s| s.qr = None);
 }
 
 /// Mint a link and put it on the clipboard.

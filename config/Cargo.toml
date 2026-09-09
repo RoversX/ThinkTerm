@@ -15,6 +15,7 @@ tempfile.workspace = true
 distro-defaults = []
 
 [dependencies]
+if-addrs.workspace = true
 wezterm-color-types.workspace = true
 anyhow.workspace = true
 bitflags.workspace = true

@@ -432,11 +432,15 @@ pub(crate) const DEFAULT_WEB_LINK_TTL_SECS: u64 = 8 * 60 * 60;
 pub(crate) struct NativeWebSettings {
     /// Seconds, or `None` for "until revoked".
     pub(crate) link_ttl_secs: Option<u64>,
+    /// Listen on every address (with the server's own certificate) rather
+    /// than loopback only, so a phone can reach it.
+    pub(crate) reachable: bool,
 }
 
 impl Default for NativeWebSettings {
     fn default() -> Self {
         Self {
+            reachable: false,
             link_ttl_secs: Some(DEFAULT_WEB_LINK_TTL_SECS),
         }
     }

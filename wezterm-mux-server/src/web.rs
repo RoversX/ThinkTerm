@@ -30,6 +30,9 @@ const TOKEN_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 static LISTENERS: Mutex<BTreeMap<String, Listening>> = Mutex::new(BTreeMap::new());
 
 struct Listening {
+    /// What the listener runs with: the entry as given, plus the
+    /// certificate it made for itself when the entry named none.
+    effective: WebServer,
     stop: Arc<AtomicBool>,
     /// The address `accept()` actually returned, not the configured
     /// string: an unspecified bind has to be woken through a real address.
@@ -39,6 +42,15 @@ struct Listening {
 /// The bind addresses currently accepting, in configuration order.
 pub fn listening() -> Vec<String> {
     LISTENERS.lock().map_or_else(|e| e.into_inner(), |g| g).keys().cloned().collect()
+}
+
+/// The entry a live listener runs with.
+pub fn effective(bind_address: &str) -> Option<WebServer> {
+    LISTENERS
+        .lock()
+        .map_or_else(|e| e.into_inner(), |g| g)
+        .get(bind_address)
+        .map(|l| l.effective.clone())
 }
 
 pub fn is_listening(bind_address: &str) -> bool {
@@ -177,26 +189,26 @@ pub fn spawn_web_listener(server: &WebServer) -> anyhow::Result<()> {
             server.bind_address
         );
     }
-    let (host, _) = server.host_and_port();
-    let unspecified = host
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_unspecified());
-    if unspecified && server.allowed_origins.is_empty() {
-        bail!(
-            "web server {} listens on every address but names no allowed_origins; \
-             a browser reaching it by hostname would be refused. List the origins \
-             (e.g. \"https://host.example:port\") or bind one address",
-            server.bind_address
-        );
-    }
+    // Off loopback a browser needs https for WebGPU. Without a
+    // certificate of the user's, the listener makes its own: self-signed,
+    // for the machine's names and addresses, kept across restarts. The
+    // browser warns once; a name it cannot verify is still a secure
+    // context once accepted.
+    let mut effective = server.clone();
     if !server.is_loopback() && !server.uses_tls() && server.require_tls_off_loopback {
-        bail!(
-            "web server {} is not on loopback and has no TLS; browsers only expose WebGPU \
-             to secure contexts, so it could not render. Add pem_cert/pem_private_key, \
-             reach it through `ssh -L`, or set require_tls_off_loopback = false",
-            server.bind_address
+        let tls = wezterm_mux_server_impl::web_tls::ensure(&config::local_addresses())
+            .with_context(|| format!("web server {}: making its certificate", server.bind_address))?;
+        log::error!(
+            "web server {}: {} self-signed certificate {} (SHA-256 {}); browsers warn once, then continue",
+            server.bind_address,
+            if tls.generated { "made a" } else { "using the" },
+            tls.cert.display(),
+            tls.fingerprint
         );
+        effective.pem_cert = Some(tls.cert);
+        effective.pem_private_key = Some(tls.key);
     }
+    let server = &effective;
     let acceptor = if server.uses_tls() {
         Some(build_acceptor(server)?)
     } else {
@@ -232,6 +244,7 @@ pub fn spawn_web_listener(server: &WebServer) -> anyhow::Result<()> {
     LISTENERS.lock().map_or_else(|e| e.into_inner(), |g| g).insert(
         server.bind_address.clone(),
         Listening {
+            effective: effective.clone(),
             stop: Arc::clone(&stop),
             local,
         },

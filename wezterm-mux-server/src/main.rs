@@ -355,6 +355,7 @@ fn run() -> anyhow::Result<()> {
             configure_tokens: web::configure_tokens,
             stop: web::stop_web_listener,
             listening: web::listening,
+            effective: web::effective,
         },
     );
 
