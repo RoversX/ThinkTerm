@@ -1886,13 +1886,20 @@ impl Mux {
             return None;
         }
         let lease = self.frontend_lease.lock();
-        Some(match lease.access_mode {
-            FrontendAccessMode::Handoff => lease.handoff_owner.as_ref() == Some(client_id),
+        let owner = match lease.access_mode {
+            FrontendAccessMode::Handoff => lease.handoff_owner.as_ref(),
             FrontendAccessMode::TmuxLatest => match lease.tabs.get(&tab_id) {
-                None => true,
-                Some(state) => state.owner.as_ref() == Some(client_id),
+                None => return Some(true),
+                Some(state) => state.owner.as_ref(),
             },
-        })
+        };
+        let may = owner == Some(client_id);
+        if !may {
+            // Both ids in full: a client that believes it owns the viewport
+            // and is refused here is comparing them differently from us.
+            log::warn!("resize of tab {tab_id} refused: owner {owner:?}, asked by {client_id:?}");
+        }
+        Some(may)
     }
 
     fn publish_frontend_access_state(&self) {

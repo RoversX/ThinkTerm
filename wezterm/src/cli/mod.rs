@@ -185,11 +185,20 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
     let mut ui = mux::connui::ConnectionUI::new_headless();
     let initial = true;
 
+    // The browser port and its tokens belong to the mux server; a GUI's
+    // in-process mux has neither. Asking the GUI (the default, for every
+    // other command) answered "not accepting browser clients" while the
+    // server was.
+    let prefer_mux = cli.prefer_mux
+        || matches!(
+            cli.sub,
+            CliSubCommand::WebServer(_) | CliSubCommand::WebToken(_)
+        );
     let client = Client::new_default_unix_domain(
         initial,
         &mut ui,
         cli.no_auto_start,
-        cli.prefer_mux,
+        prefer_mux,
         cli.class
             .as_deref()
             .unwrap_or(wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS),

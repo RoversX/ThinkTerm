@@ -1,9 +1,10 @@
 //! `thinkterm cli web-server …`: turn the browser listener on and off, and
 //! see where it is accepting.
 //!
-//! The port is bound by the mux server, so this is the only way to change
-//! it without restarting one: `web_servers` in the configuration is read at
-//! startup and nothing re-reads it.
+//! The port is bound by the mux server, and `web_servers` in the
+//! configuration is read only when one starts; this and the Web section of
+//! the desktop's Settings are the two ways to change it while it runs.
+//! Both talk to the mux server, never to a GUI's in-process mux.
 
 use anyhow::bail;
 use clap::Parser;

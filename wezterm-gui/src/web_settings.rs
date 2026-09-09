@@ -72,24 +72,48 @@ pub fn reset() {
     *STATE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
-/// The mux client, if this GUI has one. A GUI with only local panes and no
-/// mux server has nothing to ask, and the section says so.
+/// The mux client the switch is about, if this GUI has one. A GUI with
+/// only local panes and no mux server has nothing to ask, and the section
+/// says so.
+///
+/// The server that owns this machine's sessions is the one the page means
+/// -- the local session host, when local sessions run in one, the same
+/// rule `local_sessions` applies to spawning. Only without a host does it
+/// fall back to a remote domain, and it says so when it had to pick among
+/// several, because "Web" then reads as that server's port.
 fn client() -> Option<Client> {
+    let mut clients = Vec::new();
     for domain in Mux::get().iter_domains() {
-        let is_client = domain.downcast_ref::<ClientDomain>().is_some();
-        log::debug!(
-            "web settings: domain {} ({}) client={is_client}",
-            domain.domain_id(),
-            domain.domain_name()
-        );
-        if is_client {
-            match ClientDomain::get_client_inner_for_domain(domain.domain_id()) {
-                Ok(inner) => return Some(inner.client.clone()),
-                Err(err) => log::debug!("web settings: domain has no live client: {err:#}"),
-            }
+        if domain.downcast_ref::<ClientDomain>().is_none() {
+            continue;
+        }
+        match ClientDomain::get_client_inner_for_domain(domain.domain_id()) {
+            Ok(inner) => clients.push((
+                domain.domain_id(),
+                domain.domain_name().to_string(),
+                inner.client.clone(),
+            )),
+            Err(err) => log::debug!("web settings: domain has no live client: {err:#}"),
         }
     }
-    None
+    if let Some((_, _, client)) = clients
+        .iter()
+        .find(|(id, _, _)| crate::local_sessions::is_host_domain_id(*id))
+    {
+        return Some(client.clone());
+    }
+    if clients.len() > 1 {
+        log::warn!(
+            "web settings: no local session host; the Web section is about {} (attached: {})",
+            clients[0].1,
+            clients
+                .iter()
+                .map(|(_, name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    clients.into_iter().next().map(|(_, _, client)| client)
 }
 
 /// Which gate an answer releases. They are separate on purpose: a poll

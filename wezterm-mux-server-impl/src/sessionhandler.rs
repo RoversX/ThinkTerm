@@ -1749,9 +1749,13 @@ impl SessionHandler {
                                     containing_tab_id,
                                 ) {
                                     None => anyhow::bail!("client connection was superseded"),
-                                    Some(false) => {
-                                        return Ok(Pdu::UnitResponse(UnitResponse {}));
-                                    }
+                                    // An error, not a silent success: the
+                                    // client reflowed itself before asking,
+                                    // and "ok" would leave it showing a grid
+                                    // the server does not have, for ever.
+                                    Some(false) => anyhow::bail!(
+                                        "resize refused: this client does not own the viewport of tab {containing_tab_id}"
+                                    ),
                                     Some(true) => {}
                                 }
                             }

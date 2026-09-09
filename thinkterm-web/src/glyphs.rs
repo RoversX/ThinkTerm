@@ -147,6 +147,11 @@ pub struct GlyphCache {
     /// and this table goes with it. So is presentation -- one font string,
     /// one drawing procedure, no difference in the pixels.
     fallback: HashMap<u8, HashMap<String, Option<Rc<CachedGlyph>>>>,
+    /// Gaps whose drawing threw, with when to try again and how long the
+    /// next wait is. Neither a fact about this machine (so not `fallback`)
+    /// nor something to redo every frame: a canvas that keeps throwing
+    /// would otherwise cost a draw and a warning per gap per frame.
+    failed: HashMap<(u8, String), (f64, f64)>,
     scratch: Renderer,
     /// The CSS font stack the fallback draws with.
     pub families: Rc<str>,
@@ -223,6 +228,7 @@ impl GlyphCache {
             blocks: HashMap::new(),
             shapes: HashMap::new(),
             fallback: HashMap::new(),
+            failed: HashMap::new(),
             scratch: Renderer::Untried,
             families,
             blank: Rc::new(blank_glyph()),
@@ -427,6 +433,12 @@ impl GlyphCache {
             self.declined += 1;
             return Ok(None);
         }
+        let now = crate::app::monotonic_ms();
+        if let Some((retry_at, _)) = self.failed.get(&(cells, gap.text.clone())) {
+            if now < *retry_at {
+                return Ok(None);
+            }
+        }
         // The canvas is checked before the budget. Spending budget on a
         // browser that will not give us a 2D context produced `deferred`,
         // `deferred` asked for another frame, and the next frame was
@@ -454,14 +466,27 @@ impl GlyphCache {
             // retrying every frame would redraw the same nothing for ever.
             Ok(None) => return Ok(self.remember(gap, cells, None)),
             Err(err) => {
-                // Not remembered. `Ok(None)` above is a fact about this
-                // machine -- no font has the glyph -- and is worth caching
-                // for ever. A thrown exception is not: `getImageData` can
-                // fail for reasons that pass, and writing "undrawable" here
-                // left the grapheme a box for the life of the cache. The
-                // budget already stops this from being redrawn more than a
-                // few times a frame.
-                log::warn!("the canvas could not draw {:?}: {err:#}", gap.text);
+                // Not a fact about this machine the way `Ok(None)` is:
+                // `getImageData` can fail for reasons that pass, and writing
+                // "undrawable" here left the grapheme a box for the life of
+                // the cache. Not forgotten either: retried every frame, a
+                // canvas that keeps throwing costs a draw and a warning per
+                // gap per frame. So: a box now, another try after a wait
+                // that doubles up to the atlas's own cap.
+                if self.failed.len() > MAX_FALLBACK_ENTRIES {
+                    self.failed.clear();
+                }
+                let backoff = self
+                    .failed
+                    .get(&(cells, gap.text.clone()))
+                    .map(|(_, backoff)| (backoff * 2.0).min(crate::fallback::MAX_RETRY_MS))
+                    .unwrap_or(crate::fallback::MIN_RETRY_MS);
+                self.failed
+                    .insert((cells, gap.text.clone()), (now + backoff, backoff));
+                log::warn!(
+                    "the canvas could not draw {:?}, retrying in {backoff:.0} ms: {err:#}",
+                    gap.text
+                );
                 return Ok(None);
             }
         };

@@ -12,7 +12,11 @@ moment you type into it.
 
 `config.web_servers` is a list of `WebServer` objects, read when
 `thinkterm-mux-server` starts, like `tls_servers`; reloading the configuration
-does not open or close web ports.
+does not open or close web ports. While the server runs, the port is opened
+and closed from the desktop's Settings → Web, or with
+`thinkterm cli web-server on|off|status`; an address that is in
+`web_servers` brings its TLS, origins and bundle directory with it, and one
+that is not gets the loopback, plain-HTTP defaults.
 
 ```lua
 config.web_servers = {

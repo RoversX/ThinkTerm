@@ -12,6 +12,7 @@ use codec::Pdu;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use thinkterm_session::host::SessionEvents as _;
 use termwiz::input::{KeyCode, Modifiers};
 use thinkterm_font_web::FontSet;
 use thinkterm_proto::{PaneId, TabId};
@@ -915,6 +916,8 @@ impl App {
             let (tab_id, pane_id) = (inner.tab_id, inner.pane_id);
             if owner {
                 inner.session.apply_local_resize(size);
+                let session = Arc::clone(&inner.session);
+                let host = Arc::clone(&inner.host);
                 wasm_bindgen_futures::spawn_local(async move {
                     let pdu = Pdu::Resize(codec::Resize {
                         containing_tab_id: tab_id,
@@ -927,7 +930,15 @@ impl App {
                     })
                     .await
                     {
+                        // The reflow above was optimistic. Refused, it would
+                        // show a grid the server does not have, for ever:
+                        // back to the canonical one, and repaint.
                         log::warn!("resize refused: {err:#}");
+                        if let Some(canonical) = link.lease().canonical_size {
+                            session.apply_local_resize(canonical);
+                            session.make_all_stale();
+                            host.events.pane_output(0);
+                        }
                     }
                 });
             } else {
