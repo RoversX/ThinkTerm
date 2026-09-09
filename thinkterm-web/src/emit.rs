@@ -15,7 +15,7 @@ use thinkterm_font_core::PresentationWidth;
 use thinkterm_font_web::GlyphRole;
 use thinkterm_proto::StableCursorPosition;
 use thinkterm_render::quad::{HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocatorTrait};
-use wezterm_color_types::LinearRgba;
+use wezterm_color_types::{HsbTransform, LinearRgba};
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{CellAttributes, StableRowIndex};
 
@@ -30,8 +30,20 @@ pub struct LineParams<'a> {
     pub selection: Range<usize>,
     pub focused: bool,
     pub reverse_video: bool,
-    /// The canvas, in device pixels.
+    /// The canvas, in device pixels: the projection's centre.
     pub surface: (f32, f32),
+    /// Where the pane's content box starts on the canvas, in device
+    /// pixels. `top_pixel_y` is measured from here.
+    pub origin: (f32, f32),
+    /// The content box's size in device pixels; nothing is drawn past its
+    /// right edge, so a pane on the right of a split does not run into
+    /// its neighbour.
+    pub clip: (f32, f32),
+    /// The desktop's inactive-pane dimming, on every quad of the row when
+    /// this pane is not the focused one.
+    pub hsv: Option<HsbTransform>,
+    /// Only the focused pane shows its cursor.
+    pub draw_cursor: bool,
 }
 
 /// The desktop's default `bold_brightens_ansi_colors`: bold lifts the
@@ -104,9 +116,9 @@ pub fn emit_line(
     let height_scale: f32 = if p.line.is_double_height_top() { 2.0 } else { 1.0 };
     let cell_width = metrics.cell_size.width as f32 * width_scale;
     let cell_height = metrics.cell_size.height as f32 * height_scale;
-    let gl_x = -p.surface.0 / 2.0;
-    let pos_y = -p.surface.1 / 2.0 + p.top_pixel_y;
-    let pixel_width = p.surface.0;
+    let gl_x = -p.surface.0 / 2.0 + p.origin.0;
+    let pos_y = -p.surface.1 / 2.0 + p.origin.1 + p.top_pixel_y;
+    let pixel_width = p.clip.0;
 
     let cursor_on_row = p.stable_row == p.cursor.y;
     let cursor_cell = if cursor_on_row {
@@ -126,7 +138,8 @@ pub fn emit_line(
     } else {
         p.selection.start as f32 * cell_width..p.selection.end as f32 * cell_width
     };
-    let cursor_visible = cursor_on_row && p.cursor.visibility == CursorVisibility::Visible;
+    let cursor_visible =
+        p.draw_cursor && cursor_on_row && p.cursor.visibility == CursorVisibility::Visible;
     let filled_cursor = cursor_visible && p.focused && is_block(p.cursor.shape);
 
     let selection_fg = p.palette.selection_fg.to_linear();
@@ -144,7 +157,7 @@ pub fn emit_line(
             quad.set_texture(filled_box);
             quad.set_is_background();
             quad.set_fg_color(color);
-            quad.set_hsv(None);
+            quad.set_hsv(p.hsv);
             Ok(())
         };
 
@@ -280,7 +293,7 @@ pub fn emit_line(
                 let x = gl_x + (item.first_cell + i) as f32 * cell_width;
                 let mut quad = layers.allocate(0).context("allocate")?;
                 quad.set_position(x, pos_y, x + cell_width, pos_y + cell_height);
-                quad.set_hsv(None);
+                quad.set_hsv(p.hsv);
                 quad.set_has_color(false);
                 quad.set_texture(*tex);
                 quad.set_fg_color(*color);
@@ -316,7 +329,7 @@ pub fn emit_line(
         let sprite = cache.cursor_sprite(Some(shape), width_cells)?;
         let x = gl_x + cursor_range_pixels.start;
         let mut quad = layers.allocate(layer).context("allocate")?;
-        quad.set_hsv(None);
+        quad.set_hsv(p.hsv);
         quad.set_has_color(false);
         quad.set_position(x, pos_y, x + width_cells as f32 * cell_width, pos_y + cell_height);
         quad.set_texture(sprite.texture_coords());
@@ -379,7 +392,7 @@ pub fn emit_line(
                     quad.set_fg_color(glyph_color);
                     quad.set_alt_color_and_mix_value(glyph_color, 0.0);
                     quad.set_texture(texture_rect);
-                    quad.set_hsv(None);
+                    quad.set_hsv(p.hsv);
                     quad.set_has_color(glyph.has_color);
                 }
             }

@@ -114,6 +114,10 @@ async fn run(names: Vec<String>, fonts: Vec<js_sys::Uint8Array>, size: f64) -> R
                     focused: false,
                     reverse_video: false,
                     surface: (w as f32, h as f32),
+                    origin: (0.0, 0.0),
+                    clip: (w as f32, h as f32),
+                    hsv: None,
+                    draw_cursor: true,
                 },
             )?;
         }

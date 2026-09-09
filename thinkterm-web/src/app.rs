@@ -1549,6 +1549,10 @@ impl App {
                 focused: inner.focused && inner.link.lease().owns_viewport(),
                 reverse_video: dims.reverse_video,
                 surface: (w as f32, h as f32),
+                origin: (0.0, 0.0),
+                clip: (w as f32, h as f32),
+                hsv: None,
+                draw_cursor: true,
             };
             crate::emit::emit_line(&mut inner.glyphs, &mut inner.quads, budget, &params)?;
         }
