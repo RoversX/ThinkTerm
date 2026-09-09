@@ -213,12 +213,15 @@ under "Other windows" so nothing is out of reach. The panel's width is
 dragged at its edge and kept per browser; the button at the start of the
 tab row hides it.
 
-One thing to know: a desktop's own sidebar is its own store. It mirrors a
-server's tree only for Spaces bound to a remote host, and its local session
-host is excluded, so a page attached to the desktop's own machine sees the
-server's tree, not the desktop's sidebar, until the desktop is taught to
-keep its local Space on that server too. Against a remote mux server the
-page and the desktop show the same tree.
+On the desktop's own machine the page shows the desktop's sidebar: with
+local sessions running in the mux server, the desktop keeps every local
+Space, project and thread in that server's tree (same ids, both ways), so
+the browser, the TUI and the desktop agree on this machine like they do
+against a remote server. Two desktop-only things stay out of that tree:
+projects on an ssh host and thread references, which the server could not
+open. The first attach merges: rows the server already had (a landing
+Space a browser created earlier, say) appear on the desktop as ordinary
+local rows, to keep or delete there.
 
 Images (kitty, sixel, iTerm2) are not drawn; the cursor does not blink. The
 input method's hidden field follows the terminal cursor, including

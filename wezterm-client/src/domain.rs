@@ -2059,11 +2059,8 @@ fn request_thinkterm_frontend_recovery(
 }
 
 pub(crate) fn deliver_thinkterm_tree(config: &ClientDomainConfig, tree: codec::ThinkTermTree) {
-    // The local session host keeps this machine's terminals, not a remote
-    // Space: its tree never reaches the sidebar.
-    if config.is_local_session_host() {
-        return;
-    }
+    // The local session host's tree mirrors the local Spaces; the sink
+    // merges it like any other server's.
     let sink = *THINKTERM_TREE_SINK.lock().unwrap();
     if let Some(sink) = sink {
         sink(config.name(), tree);
@@ -5580,10 +5577,9 @@ impl ClientDomain {
 
         // The sidebar structure lives on the server. Fetching it is not worth
         // failing an otherwise-good attach over: without it the Space simply
-        // shows no rows until the next push or reconnect. The local session
-        // host has no Space of its own; its tree stays where it is.
-        if self.is_local_session_host() {
-        } else if let Err(err) = self.fetch_thinkterm_tree().await {
+        // shows no rows until the next push or reconnect. For the local
+        // session host the fetch is what starts the mirror of the local Spaces.
+        if let Err(err) = self.fetch_thinkterm_tree().await {
             log::warn!(
                 "failed to fetch the ThinkTerm tree from {}: {err:#}",
                 self.config.name()

@@ -4088,6 +4088,72 @@ fn tree_domain_for_space(store: &WorkspaceThreadStore, space_id: &str) -> Option
         .and_then(|space| space.client_domain.clone())
 }
 
+/// Which of the store's rows one server mirrors: a remote mux domain owns
+/// the Spaces tagged with its name; the local session host mirrors every
+/// local Space and its local projects, so that the browser, the TUI and
+/// any other client of this machine's server see the desktop's sidebar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublishScope<'a> {
+    Domain(&'a str),
+    Host,
+}
+
+fn publish_scope(domain_name: &str) -> PublishScope<'_> {
+    if crate::local_sessions::is_host_domain_name(domain_name) {
+        PublishScope::Host
+    } else {
+        PublishScope::Domain(domain_name)
+    }
+}
+
+impl WorkspaceThreadStore {
+    fn space_in_scope(space: &Space, scope: PublishScope) -> bool {
+        match scope {
+            PublishScope::Domain(name) => space.client_domain.as_deref() == Some(name),
+            PublishScope::Host => space.client_domain.is_none(),
+        }
+    }
+
+    /// ssh-host projects live in local Spaces but run elsewhere; the host
+    /// could not materialise them, so they stay desktop-only.
+    fn project_in_scope(&self, project: &Project, scope: PublishScope) -> bool {
+        let in_space = self
+            .spaces
+            .iter()
+            .any(|space| space.id == project.space_id && Self::space_in_scope(space, scope));
+        in_space
+            && (scope != PublishScope::Host || !is_remote_project(project, &self.spaces))
+    }
+
+    fn space_ids_in_scope(&self, scope: PublishScope) -> std::collections::HashSet<SpaceId> {
+        self.spaces
+            .iter()
+            .filter(|space| Self::space_in_scope(space, scope))
+            .map(|space| space.id.clone())
+            .collect()
+    }
+
+    /// A Space's published projects in the order the sidebar shows them:
+    /// `folder_order` first, the rest in store order.
+    fn published_projects_in_space(&self, space: &Space, scope: PublishScope) -> Vec<&Project> {
+        let mut projects: Vec<&Project> = self
+            .projects
+            .iter()
+            .filter(|project| {
+                project.space_id == space.id && self.project_in_scope(project, scope)
+            })
+            .collect();
+        projects.sort_by_key(|project| {
+            space
+                .folder_order
+                .iter()
+                .position(|key| *key == project.id)
+                .map_or((1, 0), |position| (0, position))
+        });
+        projects
+    }
+}
+
 fn tree_domain_for_project(store: &WorkspaceThreadStore, project_id: &str) -> Option<String> {
     let space_id = store
         .projects
@@ -4236,12 +4302,18 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
     }
     let tree_for_store = patched;
 
+    let scope = publish_scope(domain_name);
+    let host = scope == PublishScope::Host;
     let mut store = THREAD_STORE.lock();
     // Which Spaces belonged to this server *before* it spoke. Only a window
     // parked on one of these can have been orphaned by this push, and the set
     // has to be taken now because the ingest below is what removes them.
-    let owned_before = store.space_ids_for_domain(domain_name);
-    let mut changed = store.ingest_remote_tree(domain_name, &tree_for_store);
+    let owned_before = store.space_ids_in_scope(scope);
+    let mut changed = if host {
+        store.ingest_host_tree(&tree_for_store, first_of_connection)
+    } else {
+        store.ingest_remote_tree(domain_name, &tree_for_store)
+    };
     // A server can legitimately have no Spaces left — its last one was deleted
     // from here or from another device. A device that is connecting to it
     // right now still needs somewhere on *that server* to land, so build one
@@ -4250,7 +4322,7 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
     // broadcast reaching several attached devices at once would otherwise have
     // every one of them invent a Space.
     let minted_space =
-        if first_of_connection && store.preferred_space_for_domain(domain_name).is_none() {
+        if !host && first_of_connection && store.preferred_space_for_domain(domain_name).is_none() {
             let plan = store.ensure_mux_domain_space(domain_name);
             log::info!(
                 "{domain_name} has no Spaces left; created {}",
@@ -4278,6 +4350,11 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
     if minted_space {
         // The replacement Space exists only here so far; the server is the one
         // place it has to reach for the other devices to see it too.
+        reconcile_remote_subtree(domain_name);
+    }
+    // The host's first tree was merged, not adopted: whatever the desktop
+    // holds that the server lacks is published now.
+    if host && first_of_connection {
         reconcile_remote_subtree(domain_name);
     }
 
@@ -4390,11 +4467,18 @@ fn rehome_orphaned_windows(rehome: Vec<(u64, SpaceId)>) {
 /// where restating the result is more reliable than enumerating the edits.
 /// See `WorkspaceThreadStore::reconcile_ops_for_domain`.
 pub fn reconcile_remote_subtree(domain_name: &str) {
-    let last_known = LAST_KNOWN_REMOTE_TREES
+    let mut last_known = LAST_KNOWN_REMOTE_TREES
         .lock()
         .get(domain_name)
         .cloned()
         .unwrap_or_default();
+    // Ops already on the wire count as said: diffing against the server's
+    // copy alone would restate them until the reply lands.
+    if let Some(in_flight) = IN_FLIGHT_TREE_OPS.lock().get(domain_name) {
+        for op in in_flight {
+            codec::apply_op(&mut last_known, op);
+        }
+    }
     let ops = {
         let store = THREAD_STORE.lock();
         store.reconcile_ops_for_domain(domain_name, &last_known)
@@ -6345,8 +6429,9 @@ impl WorkspaceThreadStore {
     ///
     /// Every mutation with a simple shape sends its own targeted op; this is
     /// for the compound ones (ending a thread, adopting an orphaned window,
-    /// first connect) where enumerating the individual edits would be more
-    /// error-prone than restating the result.
+    /// first connect, and every local write for the session host) where
+    /// enumerating the individual edits would be more error-prone than
+    /// restating the result.
     ///
     /// `last_known` is the tree the server last told us about, and every op
     /// here is a *difference* from it. That is what keeps a reconcile from
@@ -6356,29 +6441,35 @@ impl WorkspaceThreadStore {
     /// reverted to our stale copy. Only rows we actually changed — and rows
     /// the server has that we no longer do — produce ops.
     ///
-    /// Row *order* is not reconciled: reorders have their own ops, and the
-    /// paths that call this only ever append on both sides.
+    /// Row order is restated only for a container whose order differs from
+    /// the server's last word, as a full sequence of move-to-end ops.
     fn reconcile_ops_for_domain(
         &self,
         domain_name: &str,
         last_known: &codec::ThinkTermTree,
     ) -> Vec<codec::TreeOp> {
-        let space_ids: Vec<SpaceId> = self
+        self.reconcile_ops_for_scope(publish_scope(domain_name), last_known)
+    }
+
+    fn reconcile_ops_for_scope(
+        &self,
+        scope: PublishScope,
+        last_known: &codec::ThinkTermTree,
+    ) -> Vec<codec::TreeOp> {
+        let spaces: Vec<&Space> = self
             .spaces
             .iter()
-            .filter(|space| space.client_domain.as_deref() == Some(domain_name))
-            .map(|space| space.id.clone())
+            .filter(|space| Self::space_in_scope(space, scope))
             .collect();
+        let space_ids: Vec<SpaceId> = spaces.iter().map(|space| space.id.clone()).collect();
 
         let mut ops = vec![];
+        // Reorders go after every create so each row they name exists.
+        let mut order_ops = vec![];
         let mut live_projects: std::collections::HashSet<&str> = Default::default();
         let mut live_threads: std::collections::HashSet<&str> = Default::default();
 
-        for space in self
-            .spaces
-            .iter()
-            .filter(|space| space.client_domain.as_deref() == Some(domain_name))
-        {
+        for space in &spaces {
             match last_known.space(&space.id) {
                 None => ops.push(codec::TreeOp::CreateSpace {
                     space_id: space.id.clone(),
@@ -6392,120 +6483,158 @@ impl WorkspaceThreadStore {
             }
         }
 
-        for project in self
-            .projects
-            .iter()
-            .filter(|project| space_ids.contains(&project.space_id))
-        {
-            live_projects.insert(project.id.as_str());
-            let known_project = last_known.project(&project.id);
-            match known_project {
-                None => {
-                    ops.push(codec::TreeOp::CreateProject {
-                        project_id: project.id.clone(),
-                        space_id: project.space_id.clone(),
-                        name: project.name.clone(),
-                        path: project.path.to_string_lossy().to_string(),
-                    });
-                    if project.archived_at.is_some() {
-                        ops.push(codec::TreeOp::SetProjectArchived {
-                            project_id: project.id.clone(),
-                            archived_at: project.archived_at,
-                        });
-                    }
-                }
-                Some(known) => {
-                    if known.name != project.name {
-                        ops.push(codec::TreeOp::RenameProject {
-                            project_id: project.id.clone(),
-                            name: project.name.clone(),
-                        });
-                    }
-                    if known.archived_at != project.archived_at {
-                        ops.push(codec::TreeOp::SetProjectArchived {
-                            project_id: project.id.clone(),
-                            archived_at: project.archived_at,
-                        });
-                    }
+        for space in &spaces {
+            let projects = self.published_projects_in_space(space, scope);
+            if last_known.space(&space.id).is_some() {
+                let ours: Vec<&str> = projects.iter().map(|project| project.id.as_str()).collect();
+                let theirs: Vec<&str> = last_known
+                    .projects_in_space(&space.id)
+                    .map(|project| project.id.as_str())
+                    .filter(|id| ours.contains(id))
+                    .collect();
+                if ours != theirs {
+                    order_ops.extend(ours.iter().map(|id| codec::TreeOp::MoveProjectBefore {
+                        space_id: space.id.clone(),
+                        project_id: id.to_string(),
+                        before: None,
+                    }));
                 }
             }
-            for thread in &project.threads {
-                live_threads.insert(thread.id.as_str());
-                let Some(known) = last_known.thread(&thread.id) else {
-                    ops.push(codec::TreeOp::CreateThread {
-                        thread_id: thread.id.clone(),
-                        project_id: project.id.clone(),
-                        name: thread.name.clone(),
-                        workspace: thread.materialized_workspace_name.clone(),
-                        created_at: thread.last_active_at,
-                    });
-                    if thread.planned_workspace_name.is_some() {
+            for project in projects {
+                live_projects.insert(project.id.as_str());
+                let known_project = last_known.project(&project.id);
+                match known_project {
+                    None => {
+                        ops.push(codec::TreeOp::CreateProject {
+                            project_id: project.id.clone(),
+                            space_id: project.space_id.clone(),
+                            name: project.name.clone(),
+                            path: project.path.to_string_lossy().to_string(),
+                        });
+                        if project.archived_at.is_some() {
+                            ops.push(codec::TreeOp::SetProjectArchived {
+                                project_id: project.id.clone(),
+                                archived_at: project.archived_at,
+                            });
+                        }
+                    }
+                    Some(known) => {
+                        if known.name != project.name {
+                            ops.push(codec::TreeOp::RenameProject {
+                                project_id: project.id.clone(),
+                                name: project.name.clone(),
+                            });
+                        }
+                        if known.archived_at != project.archived_at {
+                            ops.push(codec::TreeOp::SetProjectArchived {
+                                project_id: project.id.clone(),
+                                archived_at: project.archived_at,
+                            });
+                        }
+                        // The server refuses to move pinned threads, so only
+                        // the unpinned sequence is compared and restated.
+                        let ours: Vec<&str> = project
+                            .threads
+                            .iter()
+                            .filter(|thread| !thread.is_pinned)
+                            .map(|thread| thread.id.as_str())
+                            .collect();
+                        let theirs: Vec<&str> = known
+                            .threads
+                            .iter()
+                            .map(|thread| thread.id.as_str())
+                            .filter(|id| ours.contains(id))
+                            .collect();
+                        if ours != theirs {
+                            order_ops.extend(ours.iter().map(|id| {
+                                codec::TreeOp::MoveThreadBefore {
+                                    project_id: project.id.clone(),
+                                    thread_id: id.to_string(),
+                                    before: None,
+                                }
+                            }));
+                        }
+                    }
+                }
+                for thread in &project.threads {
+                    live_threads.insert(thread.id.as_str());
+                    let Some(known) = last_known.thread(&thread.id) else {
+                        ops.push(codec::TreeOp::CreateThread {
+                            thread_id: thread.id.clone(),
+                            project_id: project.id.clone(),
+                            name: thread.name.clone(),
+                            workspace: thread.materialized_workspace_name.clone(),
+                            created_at: thread.last_active_at,
+                        });
+                        if thread.planned_workspace_name.is_some() {
+                            ops.push(codec::TreeOp::SetThreadWorkspaceName {
+                                thread_id: thread.id.clone(),
+                                planned: thread.planned_workspace_name.clone(),
+                                materialized: thread.materialized_workspace_name.clone(),
+                            });
+                        }
+                        if thread.is_pinned {
+                            ops.push(codec::TreeOp::SetThreadPinned {
+                                thread_id: thread.id.clone(),
+                                pinned: true,
+                                last_active_at: thread.last_active_at,
+                            });
+                        }
+                        if thread.is_unread {
+                            ops.push(codec::TreeOp::SetThreadUnread {
+                                thread_id: thread.id.clone(),
+                                unread: true,
+                            });
+                        }
+                        continue;
+                    };
+
+                    // `SetThreadPinned` and `RenameThread` carry the recency stamp
+                    // because toggling a pin and renaming both bump it locally.
+                    // Sending a bare `TouchThread` when neither fired avoids
+                    // restating a name we may no longer own.
+                    let mut stamp_sent = false;
+                    if known.is_pinned != thread.is_pinned {
+                        ops.push(codec::TreeOp::SetThreadPinned {
+                            thread_id: thread.id.clone(),
+                            pinned: thread.is_pinned,
+                            last_active_at: thread.last_active_at,
+                        });
+                        stamp_sent = true;
+                    }
+                    if known.name != thread.name {
+                        ops.push(codec::TreeOp::RenameThread {
+                            thread_id: thread.id.clone(),
+                            name: thread.name.clone(),
+                            last_active_at: thread.last_active_at,
+                        });
+                        stamp_sent = true;
+                    }
+                    if !stamp_sent && known.last_active_at != thread.last_active_at {
+                        ops.push(codec::TreeOp::TouchThread {
+                            thread_id: thread.id.clone(),
+                            at: thread.last_active_at,
+                        });
+                    }
+                    if known.planned_workspace_name != thread.planned_workspace_name
+                        || known.materialized_workspace_name != thread.materialized_workspace_name
+                    {
                         ops.push(codec::TreeOp::SetThreadWorkspaceName {
                             thread_id: thread.id.clone(),
                             planned: thread.planned_workspace_name.clone(),
                             materialized: thread.materialized_workspace_name.clone(),
                         });
                     }
-                    if thread.is_pinned {
-                        ops.push(codec::TreeOp::SetThreadPinned {
-                            thread_id: thread.id.clone(),
-                            pinned: true,
-                            last_active_at: thread.last_active_at,
-                        });
-                    }
-                    if thread.is_unread {
+                    if known.is_unread != thread.is_unread {
                         ops.push(codec::TreeOp::SetThreadUnread {
                             thread_id: thread.id.clone(),
-                            unread: true,
+                            unread: thread.is_unread,
                         });
                     }
-                    continue;
-                };
-
-                // `SetThreadPinned` and `RenameThread` carry the recency stamp
-                // because toggling a pin and renaming both bump it locally.
-                // Sending a bare `TouchThread` when neither fired avoids
-                // restating a name we may no longer own.
-                let mut stamp_sent = false;
-                if known.is_pinned != thread.is_pinned {
-                    ops.push(codec::TreeOp::SetThreadPinned {
-                        thread_id: thread.id.clone(),
-                        pinned: thread.is_pinned,
-                        last_active_at: thread.last_active_at,
-                    });
-                    stamp_sent = true;
-                }
-                if known.name != thread.name {
-                    ops.push(codec::TreeOp::RenameThread {
-                        thread_id: thread.id.clone(),
-                        name: thread.name.clone(),
-                        last_active_at: thread.last_active_at,
-                    });
-                    stamp_sent = true;
-                }
-                if !stamp_sent && known.last_active_at != thread.last_active_at {
-                    ops.push(codec::TreeOp::TouchThread {
-                        thread_id: thread.id.clone(),
-                        at: thread.last_active_at,
-                    });
-                }
-                if known.planned_workspace_name != thread.planned_workspace_name
-                    || known.materialized_workspace_name != thread.materialized_workspace_name
-                {
-                    ops.push(codec::TreeOp::SetThreadWorkspaceName {
-                        thread_id: thread.id.clone(),
-                        planned: thread.planned_workspace_name.clone(),
-                        materialized: thread.materialized_workspace_name.clone(),
-                    });
-                }
-                if known.is_unread != thread.is_unread {
-                    ops.push(codec::TreeOp::SetThreadUnread {
-                        thread_id: thread.id.clone(),
-                        unread: thread.is_unread,
-                    });
                 }
             }
         }
+        ops.extend(order_ops);
 
         // Threads and projects first: deleting their Space would take them
         // with it, and we want the narrower removal when only a row went away.
@@ -6700,6 +6829,163 @@ impl WorkspaceThreadStore {
         let projects = splice_in_place(&self.projects, new_projects, |project| {
             owned_space_ids.contains(&project.space_id)
         });
+
+        if spaces == self.spaces && projects == self.projects {
+            return false;
+        }
+        self.spaces = spaces;
+        self.projects = projects;
+        true
+    }
+
+    /// Adopt the local session host's tree onto the local Spaces.
+    ///
+    /// The same contract as `ingest_remote_tree` for what the server owns
+    /// and what this device keeps, except that local Spaces stay local:
+    /// their tag, default flag, refs, folder order and vault, and every
+    /// thread's stored layout, are carried across by id, and ssh-host
+    /// projects, which the host never sees, are left alone. Space order is
+    /// this device's (the tree has no reorder for Spaces); Spaces new to
+    /// it are appended. On a connection's first tree (`merge`) rows the
+    /// server lacks are kept for the reconcile that follows to publish;
+    /// afterwards a published row it lacks was deleted elsewhere.
+    fn ingest_host_tree(&mut self, tree: &codec::ThinkTermTree, merge: bool) -> bool {
+        let scope = PublishScope::Host;
+        let published: std::collections::HashSet<ProjectId> = self
+            .projects
+            .iter()
+            .filter(|project| self.project_in_scope(project, scope))
+            .map(|project| project.id.clone())
+            .collect();
+
+        let mut spaces: Vec<Space> = Vec::new();
+        for space in &self.spaces {
+            if space.client_domain.is_some() {
+                spaces.push(space.clone());
+                continue;
+            }
+            match tree.space(&space.id) {
+                Some(known) => {
+                    let mut space = space.clone();
+                    space.name = known.name.clone();
+                    spaces.push(space);
+                }
+                None if merge => spaces.push(space.clone()),
+                None => {}
+            }
+        }
+        for known in &tree.spaces {
+            if spaces.iter().any(|space| space.id == known.id) {
+                continue;
+            }
+            spaces.push(Space {
+                id: known.id.clone(),
+                name: known.name.clone(),
+                active_project_id: None,
+                note_vault: None,
+                is_default: false,
+                client_domain: None,
+                is_collection: false,
+                thread_refs: Vec::new(),
+                thread_ref_meta: HashMap::new(),
+                active_thread_ref: None,
+                folder_order: Vec::new(),
+            });
+        }
+        let local_space_ids: std::collections::HashSet<&str> = spaces
+            .iter()
+            .filter(|space| space.client_domain.is_none())
+            .map(|space| space.id.as_str())
+            .collect();
+
+        let from_tree = |known: &codec::TtThread, local: Option<&WorkspaceThread>| WorkspaceThread {
+            id: known.id.clone(),
+            name: known.name.clone(),
+            project_id: known.project_id.clone(),
+            layout: local.and_then(|thread| thread.layout.clone()),
+            remote_font_scales: local
+                .map(|thread| thread.remote_font_scales.clone())
+                .unwrap_or_default(),
+            planned_workspace_name: known.planned_workspace_name.clone(),
+            materialized_workspace_name: known.materialized_workspace_name.clone(),
+            last_active_at: known.last_active_at,
+            is_pinned: known.is_pinned,
+            is_unread: known.is_unread,
+            work_is_running: local.map_or(false, |thread| thread.work_is_running),
+            work_needs_attention: local.map_or(false, |thread| thread.work_needs_attention),
+            work_attention_acknowledged: local
+                .map_or(false, |thread| thread.work_attention_acknowledged),
+            work_waiting_panes: local
+                .map(|thread| thread.work_waiting_panes.clone())
+                .unwrap_or_default(),
+            work_finished_unseen: local.map_or(false, |thread| thread.work_finished_unseen),
+        };
+        // The server's landing project says `~`; a local project path has
+        // to be one the spawn can chdir into.
+        let local_path = |path: &str| normalize_project_path(path).unwrap_or_else(|_| PathBuf::from(path));
+
+        let mut projects: Vec<Project> = Vec::new();
+        for project in &self.projects {
+            if !published.contains(&project.id) {
+                projects.push(project.clone());
+                continue;
+            }
+            match tree.project(&project.id) {
+                Some(known) => {
+                    let mut threads: Vec<WorkspaceThread> = known
+                        .threads
+                        .iter()
+                        .map(|thread| {
+                            from_tree(thread, project.threads.iter().find(|t| t.id == thread.id))
+                        })
+                        .collect();
+                    if merge {
+                        threads.extend(
+                            project
+                                .threads
+                                .iter()
+                                .filter(|t| !known.threads.iter().any(|k| k.id == t.id))
+                                .cloned(),
+                        );
+                    }
+                    let active_thread_id = project
+                        .active_thread_id
+                        .clone()
+                        .filter(|id| threads.iter().any(|thread| &thread.id == id));
+                    projects.push(Project {
+                        id: project.id.clone(),
+                        space_id: known.space_id.clone(),
+                        name: known.name.clone(),
+                        path: local_path(&known.path),
+                        threads,
+                        active_thread_id,
+                        threads_collapsed: project.threads_collapsed,
+                        active_note_path: project.active_note_path.clone(),
+                        archived_at: known.archived_at,
+                    });
+                }
+                None if merge => projects.push(project.clone()),
+                None => {}
+            }
+        }
+        for known in &tree.projects {
+            if projects.iter().any(|project| project.id == known.id)
+                || !local_space_ids.contains(known.space_id.as_str())
+            {
+                continue;
+            }
+            projects.push(Project {
+                id: known.id.clone(),
+                space_id: known.space_id.clone(),
+                name: known.name.clone(),
+                path: local_path(&known.path),
+                threads: known.threads.iter().map(|thread| from_tree(thread, None)).collect(),
+                active_thread_id: None,
+                threads_collapsed: false,
+                active_note_path: None,
+                archived_at: known.archived_at,
+            });
+        }
 
         if spaces == self.spaces && projects == self.projects {
             return false;
@@ -7583,7 +7869,45 @@ fn persist_snapshot(store: &WorkspaceThreadStore, seq: u64) {
         });
     if wrote {
         publish_thinkterm_session_changed();
+        schedule_host_tree_reconcile();
     }
+}
+
+static HOST_TREE_RECONCILE_SCHEDULED: AtomicBool = AtomicBool::new(false);
+
+/// After a write of the store, restate the local Spaces to the session
+/// host: one coalesced reconcile, off the store lock, a moment later.
+/// Nothing is sent before the host's first tree of this connection has
+/// arrived (the merge on attach publishes then) or while it is detached
+/// (the next attach merges).
+fn schedule_host_tree_reconcile() {
+    if crate::local_sessions::host_domain_name().is_none() {
+        return;
+    }
+    if HOST_TREE_RECONCILE_SCHEDULED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(150));
+        HOST_TREE_RECONCILE_SCHEDULED.store(false, Ordering::Release);
+        promise::spawn::spawn_into_main_thread(async {
+            reconcile_host_tree();
+        })
+        .detach();
+    });
+}
+
+fn reconcile_host_tree() {
+    let Some(host) = crate::local_sessions::host_domain_name() else {
+        return;
+    };
+    if !LAST_KNOWN_REMOTE_TREES.lock().contains_key(&host) {
+        return;
+    }
+    if !remote_tree_domain_is_attached(&host) {
+        return;
+    }
+    reconcile_remote_subtree(&host);
 }
 
 fn schedule_workspace_thread_store_persist() {
@@ -12283,6 +12607,276 @@ mod tests {
         assert_eq!(project.threads.len(), 1);
         // Rather than leaving the sidebar pointing at a row that is gone.
         assert_eq!(project.active_thread_id, None);
+    }
+
+    /// A store as the desktop keeps it: the default local Space with a
+    /// local project of two threads and an ssh-host project, plus a Space
+    /// owned by a remote mux domain.
+    fn host_test_store() -> WorkspaceThreadStore {
+        let mut store = remote_test_store("syd");
+        let local_space = store.spaces[0].id.clone();
+        let t1 = WorkspaceThread::new("local-1".to_string(), "alpha".to_string(), None);
+        let t2 = WorkspaceThread::new("local-1".to_string(), "beta".to_string(), None);
+        store.projects[0].threads = vec![t1, t2];
+        store.projects.push(test_project_in_space(
+            &local_space,
+            "ssh-box",
+            "box",
+            PathBuf::from("ssh://box/home/x"),
+            vec![WorkspaceThread::new(
+                "ssh-box".to_string(),
+                "remote shell".to_string(),
+                None,
+            )],
+        ));
+        store
+    }
+
+    fn local_thread_ids(store: &WorkspaceThreadStore) -> Vec<String> {
+        store.projects[0]
+            .threads
+            .iter()
+            .map(|thread| thread.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_host_reconcile_publishes_local_spaces_but_not_ssh_projects() {
+        let store = host_test_store();
+        let ids = local_thread_ids(&store);
+        let ops = store.reconcile_ops_for_scope(PublishScope::Host, &codec::ThinkTermTree::default());
+
+        assert!(ops.contains(&codec::TreeOp::CreateSpace {
+            space_id: DEFAULT_SPACE_ID.to_string(),
+            name: "Default".to_string(),
+        }));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            codec::TreeOp::CreateProject { project_id, path, .. }
+                if project_id == "local-1" && path == "/tmp/local"
+        )));
+        for id in &ids {
+            assert!(ops.iter().any(|op| matches!(
+                op,
+                codec::TreeOp::CreateThread { thread_id, project_id, .. }
+                    if thread_id == id && project_id == "local-1"
+            )));
+        }
+        // The ssh-host project runs elsewhere and the remote domain's Space
+        // belongs to another server: neither is the host's business.
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            codec::TreeOp::CreateProject { project_id, .. } if project_id == "ssh-box"
+        )));
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            codec::TreeOp::CreateSpace { space_id, .. } if space_id == "space-remote"
+        )));
+        // The domain scope still sees only its own Space.
+        let ops = store.reconcile_ops_for_scope(
+            PublishScope::Domain("syd"),
+            &codec::ThinkTermTree::default(),
+        );
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            codec::TreeOp::CreateProject { project_id, .. } if project_id == "local-1"
+        )));
+    }
+
+    #[test]
+    fn a_reconcile_emits_moves_when_only_the_order_changed() {
+        let mut store = remote_test_store("syd");
+        let last_known = sample_tree();
+        assert!(store.ingest_remote_tree("syd", &last_known));
+        assert!(store
+            .reconcile_ops_for_domain("syd", &last_known)
+            .is_empty());
+
+        assert!(store.move_thread_before("rp1", "rt2", Some("rt1")));
+        let ops = store.reconcile_ops_for_domain("syd", &last_known);
+        assert_eq!(
+            ops,
+            vec![
+                codec::TreeOp::MoveThreadBefore {
+                    project_id: "rp1".to_string(),
+                    thread_id: "rt2".to_string(),
+                    before: None,
+                },
+                codec::TreeOp::MoveThreadBefore {
+                    project_id: "rp1".to_string(),
+                    thread_id: "rt1".to_string(),
+                    before: None,
+                },
+            ]
+        );
+        // Moving a row that is already last is a no-op on the server; the
+        // sequence as a whole still lands the order.
+        let mut server = last_known.clone();
+        for op in &ops {
+            codec::apply_op(&mut server, op);
+        }
+        assert_eq!(
+            server
+                .project("rp1")
+                .unwrap()
+                .threads
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>(),
+            ["rt2", "rt1"]
+        );
+
+        // A pinned thread cannot be moved on the server, so it is left out
+        // of the sequence rather than making every reconcile fail on it.
+        assert!(store.toggle_thread_pinned("rt2"));
+        let ops = store.reconcile_ops_for_domain("syd", &server);
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            codec::TreeOp::SetThreadPinned { thread_id, pinned: true, .. } if thread_id == "rt2"
+        )));
+        assert!(!ops
+            .iter()
+            .any(|op| matches!(op, codec::TreeOp::MoveThreadBefore { .. })));
+    }
+
+    /// The host's tree as it stands after the desktop published
+    /// `host_test_store`, with another client's additions.
+    fn host_tree(store: &WorkspaceThreadStore) -> codec::ThinkTermTree {
+        let ids = local_thread_ids(store);
+        let mut tree = codec::ThinkTermTree::default();
+        for op in store.reconcile_ops_for_scope(PublishScope::Host, &tree) {
+            assert!(codec::apply_op(&mut tree, &op));
+        }
+        // The browser renamed the Space and a thread, added a project in
+        // the default Space and a Space of its own.
+        for op in [
+            codec::TreeOp::RenameSpace {
+                space_id: DEFAULT_SPACE_ID.to_string(),
+                name: "Main".to_string(),
+            },
+            codec::TreeOp::RenameThread {
+                thread_id: ids[0].clone(),
+                name: "shell".to_string(),
+                last_active_at: 99,
+            },
+            codec::TreeOp::CreateProject {
+                project_id: "web-1".to_string(),
+                space_id: DEFAULT_SPACE_ID.to_string(),
+                name: "Home".to_string(),
+                path: "~".to_string(),
+            },
+            codec::TreeOp::CreateThread {
+                thread_id: "web-t1".to_string(),
+                project_id: "web-1".to_string(),
+                name: "main".to_string(),
+                workspace: None,
+                created_at: 5,
+            },
+            codec::TreeOp::CreateSpace {
+                space_id: "space-web".to_string(),
+                name: "Phone".to_string(),
+            },
+        ] {
+            assert!(codec::apply_op(&mut tree, &op));
+        }
+        tree.revision = 3;
+        tree
+    }
+
+    #[test]
+    fn ingesting_the_hosts_tree_keeps_local_state_and_ssh_projects() {
+        let mut store = host_test_store();
+        let ids = local_thread_ids(&store);
+        store.spaces[0].folder_order = vec!["ssh-box".to_string(), "local-1".to_string()];
+        store.spaces[0].thread_refs = vec!["elsewhere".to_string()];
+        store.projects[0].threads[1].remote_font_scales.insert(3, 1.25);
+        store.projects[0].threads_collapsed = true;
+        let tree = host_tree(&store);
+
+        assert!(store.ingest_host_tree(&tree, false));
+
+        let space = &store.spaces[0];
+        assert_eq!(space.name, "Main");
+        assert!(space.is_default);
+        assert_eq!(space.client_domain, None);
+        assert_eq!(space.folder_order, ["ssh-box", "local-1"]);
+        assert_eq!(space.thread_refs, ["elsewhere"]);
+        // The remote domain's Space and the ssh project are not the host's.
+        assert!(store.spaces.iter().any(|space| space.id == "space-remote"));
+        assert!(store.projects.iter().any(|project| project.id == "ssh-box"));
+        let local = store
+            .projects
+            .iter()
+            .find(|project| project.id == "local-1")
+            .unwrap();
+        assert_eq!(local.threads[0].id, ids[0]);
+        assert_eq!(local.threads[0].name, "shell");
+        assert_eq!(local.threads[1].remote_font_scales.get(&3), Some(&1.25));
+        assert!(local.threads_collapsed);
+        // Rows another client added arrive as ordinary local rows, with a
+        // path this machine can spawn into.
+        let web = store
+            .projects
+            .iter()
+            .find(|project| project.id == "web-1")
+            .unwrap();
+        assert_eq!(web.space_id, DEFAULT_SPACE_ID);
+        assert_eq!(web.path, *config::HOME_DIR);
+        assert_eq!(web.threads[0].id, "web-t1");
+        let phone = store.spaces.last().unwrap();
+        assert_eq!((phone.id.as_str(), phone.name.as_str()), ("space-web", "Phone"));
+        assert_eq!(phone.client_domain, None);
+        assert!(!phone.is_default);
+        // Same tree again: nothing to repaint or write.
+        assert!(!store.ingest_host_tree(&tree, false));
+        // And nothing left to publish.
+        assert!(store
+            .reconcile_ops_for_scope(PublishScope::Host, &tree)
+            .is_empty());
+    }
+
+    #[test]
+    fn the_hosts_first_tree_merges_and_later_ones_drop_deleted_rows() {
+        let mut store = host_test_store();
+        let ids = local_thread_ids(&store);
+        let mut tree = host_tree(&store);
+        // The server never heard of the second thread, nor of the project
+        // the desktop made while detached.
+        tree.projects[0].threads.pop();
+        store.projects.push(test_project_in_space(
+            DEFAULT_SPACE_ID,
+            "offline-1",
+            "offline",
+            PathBuf::from("/tmp/offline"),
+            vec![],
+        ));
+
+        // First tree of the connection: keep ours, take theirs, and the
+        // reconcile that follows publishes the difference.
+        assert!(store.ingest_host_tree(&tree, true));
+        assert_eq!(local_thread_ids(&store), ids);
+        assert!(store.projects.iter().any(|project| project.id == "offline-1"));
+        assert!(store.projects.iter().any(|project| project.id == "web-1"));
+        let ops = store.reconcile_ops_for_scope(PublishScope::Host, &tree);
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            codec::TreeOp::CreateThread { thread_id, .. } if *thread_id == ids[1]
+        )));
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            codec::TreeOp::CreateProject { project_id, .. } if project_id == "offline-1"
+        )));
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            codec::TreeOp::DeleteThread { .. }
+                | codec::TreeOp::RemoveProject { .. }
+                | codec::TreeOp::DeleteSpace { .. }
+        )));
+
+        // A later push without those rows means another client deleted them.
+        assert!(store.ingest_host_tree(&tree, false));
+        assert_eq!(local_thread_ids(&store), ids[..1]);
+        assert!(!store.projects.iter().any(|project| project.id == "offline-1"));
     }
 
     #[test]
