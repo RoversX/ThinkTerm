@@ -46,6 +46,29 @@ pub struct LineParams<'a> {
     pub draw_cursor: bool,
 }
 
+/// A flat rectangle at `at` of `size`, both in device pixels from the
+/// canvas's top-left: a pane's ground, a divider.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_rect(
+    cache: &GlyphCache,
+    layers: &mut HeapQuadAllocator,
+    layer: usize,
+    surface: (f32, f32),
+    at: (f32, f32),
+    size: (f32, f32),
+    color: LinearRgba,
+    hsv: Option<HsbTransform>,
+) -> Result<()> {
+    let (x, y) = (-surface.0 / 2.0 + at.0, -surface.1 / 2.0 + at.1);
+    let mut quad = layers.allocate(layer).context("allocate")?;
+    quad.set_position(x, y, x + size.0, y + size.1);
+    quad.set_texture(cache.filled_box.texture_coords());
+    quad.set_is_background();
+    quad.set_fg_color(color);
+    quad.set_hsv(hsv);
+    Ok(())
+}
+
 /// The desktop's default `bold_brightens_ansi_colors`: bold lifts the
 /// first eight palette colours to their bright twins.
 fn resolve_fg(attrs: &CellAttributes, fg: ColorAttribute, palette: &ColorPalette) -> LinearRgba {

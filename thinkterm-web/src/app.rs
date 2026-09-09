@@ -66,6 +66,13 @@ const RECONNECT_DOUBT_AFTER: u32 = 6;
 /// Shorter than the shortest useful outage and longer than the time a
 /// server that is restarting in a loop stays up.
 const RECONNECT_STABLE_MS: f64 = 5_000.0;
+/// The desktop's `inactive_pane_hsb` default: panes without the focus are
+/// a little darker and a little greyer.
+const INACTIVE_PANE_HSB: wezterm_color_types::HsbTransform = wezterm_color_types::HsbTransform {
+    hue: 1.0,
+    saturation: 0.9,
+    brightness: 0.8,
+};
 
 pub struct Setup {
     pub link: WsLink,
@@ -173,6 +180,8 @@ pub struct Inner {
     /// The server's tabs and panes as last listed, for the strip and for
     /// switching. Refreshed on the pushes that change it and on a timer.
     layout: Option<codec::ListPanesResponse>,
+    /// Where the panes of the tab on show go, from that listing.
+    tab_layout: Option<crate::layout::TabLayout>,
     /// Whether the page moves to whatever pane the desktop focuses. On by
     /// default: a page opened to "see my terminal" wants the one being
     /// used. Choosing a pane here turns it off.
@@ -319,6 +328,7 @@ impl App {
             quads: HeapQuadAllocator::default(),
             vertices: Vec::new(),
             layout: None,
+            tab_layout: None,
             following: true,
             strip: setup.strip,
             layout_refresh_pending: false,
@@ -644,20 +654,34 @@ impl App {
         self.request_frame();
     }
 
+    fn focused_placement(inner: &Inner) -> Option<crate::layout::PanePlacement> {
+        Self::placements(inner)
+            .into_iter()
+            .find(|p| p.pane_id == inner.focused_pane)
+    }
+
     fn refresh_status(&self) {
         let inner = self.inner.borrow();
         if inner.disconnected.is_some() {
             return;
         }
         let owner = inner.link.lease().owns_viewport();
-        let text = if owner {
-            format!("{}  ·  {}x{}  ·  this browser has the terminal", inner.title(), inner.cols, inner.rows)
+        let (cols, rows) = inner
+            .tab_layout
+            .as_ref()
+            .map(|l| (l.cols, l.rows))
+            .unwrap_or((inner.cols, inner.rows));
+        let mut text = if owner {
+            format!("{}  ·  {}x{}  ·  this browser has the terminal", inner.title(), cols, rows)
         } else {
             format!(
                 "{}  ·  {}x{}  ·  following another device (type or click to take over)",
-                inner.title(), inner.cols, inner.rows
+                inner.title(), cols, rows
             )
         };
+        if cols > inner.cols || rows > inner.rows {
+            text.push_str(&format!("  ·  this window fits {}x{}", inner.cols, inner.rows));
+        }
         Self::set_status(&inner, &text);
     }
 
@@ -878,12 +902,12 @@ impl App {
     }
 
     /// The selected cells of `row`, from the selection's shape and mode.
-    fn selection_on_row(inner: &Inner, sel: &Selection, row: StableRowIndex, line: &termwiz::surface::Line) -> std::ops::Range<usize> {
+    fn selection_on_row(width: usize, sel: &Selection, row: StableRowIndex, line: &termwiz::surface::Line) -> std::ops::Range<usize> {
         let ((r0, c0), (r1, c1)) = sel.ordered();
         if row < r0 || row > r1 {
             return 0..0;
         }
-        let cols = inner.cols.max(line.len());
+        let cols = width.max(line.len());
         match sel.mode {
             3 => 0..cols,
             2 => {
@@ -911,10 +935,11 @@ impl App {
         let sel = inner.focused().selection?;
         let ((r0, _), (r1, _)) = sel.ordered();
         let (first, lines) = inner.focused().session.get_lines(r0..r1 + 1);
+        let width = Self::focused_placement(inner).map(|p| Self::shown(&p).0).unwrap_or(inner.cols);
         let mut out = Vec::new();
         for (i, line) in lines.iter().enumerate() {
             let row = first + i as StableRowIndex;
-            let range = Self::selection_on_row(inner, &sel, row, line);
+            let range = Self::selection_on_row(width, &sel, row, line);
             let mut text = String::new();
             for cell in line.visible_cells() {
                 if range.contains(&cell.cell_index()) {
@@ -1009,9 +1034,9 @@ impl App {
         strip.render(&tabs, inner.following);
     }
 
-    /// List the server's panes again and redraw the strip. If the pane on
-    /// show is gone, move to the first tab's pane: a dead pane is not
-    /// something to look at.
+    /// List the server's panes again, redraw the strip, and bring the tab
+    /// on show up to date: new panes get sessions, gone ones lose them. If
+    /// the focused pane is gone, the first tab's pane is shown instead.
     pub fn refresh_layout(self: &Rc<Self>) {
         {
             let mut inner = self.inner.borrow_mut();
@@ -1022,41 +1047,193 @@ impl App {
         }
         let app = Rc::clone(self);
         wasm_bindgen_futures::spawn_local(async move {
-            let link = app.inner.borrow().link.clone();
-            let listed = thinkterm_session::host::request(
-                &link,
-                Pdu::ListPanes(codec::ListPanes {}),
-                |pdu| match pdu {
-                    Pdu::ListPanesResponse(p) => Ok(p),
-                    other => Err(other),
-                },
-            )
-            .await;
-            let replacement = {
-                let mut inner = app.inner.borrow_mut();
-                inner.layout_refresh_pending = false;
-                match listed {
-                    Ok(layout) => {
-                        let gone = crate::chrome::entry(&layout, inner.focused_pane).is_none();
-                        let replacement = if gone {
-                            crate::chrome::first_choice(&layout)
-                        } else {
-                            None
-                        };
-                        inner.layout = Some(layout);
-                        Self::render_strip(&inner);
-                        replacement
-                    }
-                    Err(err) => {
-                        log::warn!("listing panes: {err:#}");
-                        None
-                    }
-                }
+            let listed = app.list_panes().await;
+            app.inner.borrow_mut().layout_refresh_pending = false;
+            let Some(list) = listed else {
+                return;
             };
-            if let Some(entry) = replacement {
-                app.switch_to(entry).await;
-            }
+            let want = app.inner.borrow().focused_pane;
+            app.show(list, want).await;
         });
+    }
+
+    async fn list_panes(&self) -> Option<codec::ListPanesResponse> {
+        let link = self.inner.borrow().link.clone();
+        match thinkterm_session::host::request(
+            &link,
+            Pdu::ListPanes(codec::ListPanes {}),
+            |pdu| match pdu {
+                Pdu::ListPanesResponse(p) => Ok(p),
+                other => Err(other),
+            },
+        )
+        .await
+        {
+            Ok(list) => Some(list),
+            Err(err) => {
+                log::warn!("listing panes: {err:#}");
+                None
+            }
+        }
+    }
+
+    /// Put the tab holding `want` on the canvas with `want` focused, from
+    /// a fresh listing. The same tab is reconciled in place; another tab
+    /// is reported to the server first, since the lease is per tab.
+    async fn show(self: &Rc<Self>, list: codec::ListPanesResponse, want: PaneId) {
+        let node = crate::layout::tab_containing(&list, want)
+            .or_else(|| list.tabs.iter().find(|t| crate::layout::layout(t).is_some()));
+        let Some(layout) = node.and_then(crate::layout::layout) else {
+            let mut inner = self.inner.borrow_mut();
+            inner.layout = Some(list);
+            Self::render_strip(&inner);
+            Self::set_status(&inner, "the server has no panes to show");
+            return;
+        };
+        let (link, size, tab_changed) = {
+            let mut inner = self.inner.borrow_mut();
+            if inner.switching || inner.disconnected.is_some() {
+                return;
+            }
+            let tab_changed = layout.tab_id != inner.tab_id;
+            inner.switching = tab_changed;
+            let reported = inner.link.lease().reported;
+            (inner.link.clone(), reported, tab_changed)
+        };
+        if tab_changed {
+            // The lease is per tab: a follower's report, never a claim.
+            // Typing or clicking claims, as at attach.
+            let outcome: Result<()> = async {
+                if let Some(size) = size {
+                    let state = thinkterm_session::host::request(
+                        &link,
+                        Pdu::SetClientViewport(codec::SetClientViewport {
+                            tab_id: layout.tab_id,
+                            viewport: codec::ClientViewport::CellGrid { size },
+                        }),
+                        |pdu| match pdu {
+                            Pdu::ClientViewportState(s) => Ok(s),
+                            other => Err(other),
+                        },
+                    )
+                    .await?;
+                    let mut lease = link.lease_mut();
+                    lease.tab_id = Some(layout.tab_id);
+                    lease.apply_viewport(&state);
+                } else {
+                    link.lease_mut().tab_id = Some(layout.tab_id);
+                }
+                Ok(())
+            }
+            .await;
+            let mut inner = self.inner.borrow_mut();
+            inner.switching = false;
+            if let Err(err) = outcome {
+                log::warn!("switching to tab {}: {err:#}", layout.tab_id);
+                Self::set_status(&inner, &format!("could not switch tabs: {err:#}"));
+                return;
+            }
+        }
+        let fresh = {
+            let mut inner = self.inner.borrow_mut();
+            inner.layout = Some(list);
+            let fresh = Self::apply_layout(&mut inner, layout, want);
+            if tab_changed {
+                inner.selecting = false;
+                inner.ime_anchor = None;
+                // Forces `resize` to see a change: the tab is reflowed to
+                // this grid if the page owns it, or reported against it.
+                inner.cols = 0;
+            }
+            if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                doc.set_title(&format!("{} — ThinkTerm", inner.title()));
+            }
+            Self::render_strip(&inner);
+            fresh
+        };
+        // A pane's first push comes when something asks after it: one
+        // liveness poll each, and the answer is not waited for.
+        for pane_id in fresh {
+            let link = link.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = thinkterm_session::host::request(
+                    &link,
+                    Pdu::GetPaneRenderChanges(codec::GetPaneRenderChanges { pane_id }),
+                    |pdu| match pdu {
+                        Pdu::LivenessResponse(_) | Pdu::UnitResponse(_) => Ok(()),
+                        other => Err(other),
+                    },
+                )
+                .await;
+            });
+        }
+        if tab_changed {
+            self.resize();
+        }
+        self.refresh_status();
+        self.request_frame();
+    }
+
+    /// Make `inner.panes` match `layout`, focusing `want` if it is drawn
+    /// and the tab's active pane otherwise. Returns the panes that are
+    /// new to the page.
+    fn apply_layout(inner: &mut Inner, layout: crate::layout::TabLayout, want: PaneId) -> Vec<PaneId> {
+        if layout.tab_id != inner.tab_id {
+            // Another tab is another lease and another tab id for every
+            // session under it.
+            inner.remote_tab_id = Arc::new(std::sync::atomic::AtomicUsize::new(layout.tab_id));
+            inner.panes.clear();
+            inner.tab_id = layout.tab_id;
+        }
+        inner.window_id = layout.window_id;
+        inner.workspace = layout.workspace.clone();
+        let drawn: std::collections::BTreeSet<PaneId> =
+            layout.panes.iter().map(|p| p.pane_id).collect();
+        inner.panes.retain(|id, _| drawn.contains(id));
+        let mut fresh = Vec::new();
+        for place in &layout.panes {
+            if inner.panes.contains_key(&place.pane_id) {
+                continue;
+            }
+            let rows = place.size.rows;
+            let dims = thinkterm_proto::RenderableDimensions {
+                cols: place.size.cols,
+                viewport_rows: rows,
+                scrollback_rows: rows,
+                physical_top: place.physical_top,
+                scrollback_top: place.physical_top,
+                dpi: place.size.dpi,
+                pixel_width: place.size.pixel_width,
+                pixel_height: place.size.pixel_height,
+                reverse_video: false,
+            };
+            let session = build_session(
+                &inner.host,
+                &inner.images,
+                &inner.remote_tab_id,
+                place.pane_id,
+                dims,
+                &place.title,
+                place.alt_screen,
+            );
+            inner
+                .panes
+                .insert(place.pane_id, PaneCell::new(session, &place.title));
+            fresh.push(place.pane_id);
+        }
+        inner.focused_pane = if drawn.contains(&want) {
+            want
+        } else {
+            layout
+                .panes
+                .iter()
+                .find(|p| p.is_active)
+                .or(layout.panes.first())
+                .map(|p| p.pane_id)
+                .unwrap_or(want)
+        };
+        inner.tab_layout = Some(layout);
+        fresh
     }
 
     /// `refresh_layout`, a moment from now, so a burst of pushes is one
@@ -1108,160 +1285,49 @@ impl App {
         }
     }
 
-    /// Show `pane_id`. `chosen` is a person's click, which also stops the
-    /// page following the desktop; a focus push is not.
+    /// The pane at `pane_id`, and the page's focus with it. `chosen` is a
+    /// person's click, which also stops the page following the desktop;
+    /// a focus push is not.
     pub fn switch_to_pane(self: &Rc<Self>, pane_id: PaneId, chosen: bool) {
         if chosen {
             self.inner.borrow_mut().following = false;
         }
-        let known = self
-            .inner
-            .borrow()
-            .layout
-            .as_ref()
-            .and_then(|layout| crate::chrome::entry(layout, pane_id));
-        let app = Rc::clone(self);
-        wasm_bindgen_futures::spawn_local(async move {
-            // Listed again either way: the entry carries the pane's size
-            // and screen state, and the listing may be seconds old.
-            let link = app.inner.borrow().link.clone();
-            let fresh = thinkterm_session::host::request(
-                &link,
-                Pdu::ListPanes(codec::ListPanes {}),
-                |pdu| match pdu {
-                    Pdu::ListPanesResponse(p) => Ok(p),
-                    other => Err(other),
-                },
-            )
-            .await
-            .ok();
-            let entry = match fresh {
-                Some(layout) => {
-                    let entry = crate::chrome::entry(&layout, pane_id);
-                    let mut inner = app.inner.borrow_mut();
-                    inner.layout = Some(layout);
-                    Self::render_strip(&inner);
-                    entry
-                }
-                None => known,
-            };
-            match entry {
-                Some(entry) => app.switch_to(entry).await,
-                None => {
-                    log::warn!("pane {pane_id} is not on the server");
-                    Self::render_strip(&app.inner.borrow());
-                }
-            }
-        });
-    }
-
-    /// Put another pane on the canvas: report this page's grid against
-    /// its tab, subscribe to it, and start a session for it in place of
-    /// the old one. Everything that hangs off the session -- input, the
-    /// watchdog, the delta queue -- follows, because it all goes through
-    /// `inner.session`.
-    async fn switch_to(self: &Rc<Self>, entry: thinkterm_proto::layout::PaneEntry) {
-        let (link, size) = {
-            let mut inner = self.inner.borrow_mut();
-            if entry.pane_id == inner.focused_pane || inner.switching || inner.disconnected.is_some() {
-                return;
-            }
-            inner.switching = true;
-            let size = inner.link.lease().reported;
-            (inner.link.clone(), size)
-        };
-        let outcome: Result<()> = async {
-            // The lease is per tab: a follower's report, never a claim.
-            // Typing or clicking claims, as at attach.
-            if let Some(size) = size {
-                let state = thinkterm_session::host::request(
-                    &link,
-                    Pdu::SetClientViewport(codec::SetClientViewport {
-                        tab_id: entry.tab_id,
-                        viewport: codec::ClientViewport::CellGrid { size },
-                    }),
-                    |pdu| match pdu {
-                        Pdu::ClientViewportState(s) => Ok(s),
-                        other => Err(other),
-                    },
-                )
-                .await?;
-                let mut lease = link.lease_mut();
-                lease.tab_id = Some(entry.tab_id);
-                lease.apply_viewport(&state);
-            } else {
-                link.lease_mut().tab_id = Some(entry.tab_id);
-            }
-            thinkterm_session::host::request(
-                &link,
-                Pdu::GetPaneRenderChanges(codec::GetPaneRenderChanges {
-                    pane_id: entry.pane_id,
-                }),
-                |pdu| match pdu {
-                    Pdu::LivenessResponse(_) | Pdu::UnitResponse(_) => Ok(()),
-                    other => Err(other),
-                },
-            )
-            .await?;
-            Ok(())
-        }
-        .await;
+        // Already drawn: a focus change and nothing else.
         {
             let mut inner = self.inner.borrow_mut();
-            inner.switching = false;
-            if let Err(err) = outcome {
-                log::warn!("switching to pane {}: {err:#}", entry.pane_id);
-                Self::set_status(&inner, &format!("could not switch panes: {err:#}"));
+            if inner.panes.contains_key(&pane_id) {
+                if inner.focused_pane != pane_id {
+                    inner.focused_pane = pane_id;
+                    inner.selecting = false;
+                    inner.ime_anchor = None;
+                    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                        doc.set_title(&format!("{} — ThinkTerm", inner.title()));
+                    }
+                    Self::render_strip(&inner);
+                    let _ = inner.textarea.focus();
+                }
+                drop(inner);
+                self.refresh_status();
+                self.request_frame();
                 return;
             }
-            let rows = entry.size.rows;
-            let dims = thinkterm_proto::RenderableDimensions {
-                cols: entry.size.cols,
-                viewport_rows: rows,
-                scrollback_rows: rows,
-                physical_top: entry.physical_top,
-                scrollback_top: entry.physical_top,
-                dpi: entry.size.dpi,
-                pixel_width: entry.size.pixel_width,
-                pixel_height: entry.size.pixel_height,
-                reverse_video: false,
-            };
-            // Another tab is another lease and another tab id for every
-            // session under it.
-            if entry.tab_id != inner.tab_id {
-                inner.remote_tab_id = Arc::new(std::sync::atomic::AtomicUsize::new(entry.tab_id));
-            }
-            let session = build_session(
-                &inner.host,
-                &inner.images,
-                &inner.remote_tab_id,
-                entry.pane_id,
-                dims,
-                &entry.title,
-                entry.alt_screen,
-            );
-            // One pane on show, so the old cells go; a later step keeps
-            // the whole tab.
-            inner.panes.clear();
-            inner.panes.insert(entry.pane_id, PaneCell::new(session, &entry.title));
-            inner.focused_pane = entry.pane_id;
-            inner.tab_id = entry.tab_id;
-            inner.window_id = entry.window_id;
-            inner.workspace = entry.workspace.clone();
-            inner.selecting = false;
-            inner.ime_anchor = None;
-            // Forces `resize` to see a change: the new pane is reflowed to
-            // this grid if the page owns its tab, or reported against it.
-            inner.cols = 0;
-            if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-                doc.set_title(&format!("{} — ThinkTerm", inner.title()));
-            }
-            Self::render_strip(&inner);
-            let _ = inner.textarea.focus();
         }
-        self.resize();
-        self.refresh_status();
-        self.request_frame();
+        // Elsewhere: listed again either way, since the entry carries the
+        // pane's size and screen state and the listing may be seconds old.
+        let app = Rc::clone(self);
+        wasm_bindgen_futures::spawn_local(async move {
+            let Some(list) = app.list_panes().await else {
+                return;
+            };
+            if crate::layout::tab_containing(&list, pane_id).is_none() {
+                log::warn!("pane {pane_id} is not on the server");
+                let mut inner = app.inner.borrow_mut();
+                inner.layout = Some(list);
+                Self::render_strip(&inner);
+                return;
+            }
+            app.show(list, pane_id).await;
+        });
     }
 
     /// See `GlyphCache::warm`. Called once, after the first frame.
@@ -1487,9 +1553,12 @@ impl App {
         // meant a dropped `GetLines` was never retried, and those rows
         // stayed blank for the rest of the stream. Every pane, every frame.
         let mut stalled = false;
-        for cell in inner.panes.values() {
+        for place in Self::placements(&inner) {
+            let Some(cell) = inner.panes.get(&place.pane_id) else {
+                continue;
+            };
             let dims = cell.session.dimensions();
-            let visible = visible_rows(&dims, inner.rows, cell.scroll_from_bottom);
+            let visible = visible_rows(&dims, Self::shown(&place).1, cell.scroll_from_bottom);
             stalled |= cell.session.render_looks_stalled_in(visible);
         }
         let mut again = owed > 0 || stalled;
@@ -1587,64 +1656,151 @@ impl App {
         Ok(())
     }
 
+    /// The panes to draw and where. Before the first listing there is
+    /// one, at the canvas's origin and the page's own grid.
+    fn placements(inner: &Inner) -> Vec<crate::layout::PanePlacement> {
+        if let Some(layout) = &inner.tab_layout {
+            return layout.panes.clone();
+        }
+        let cell = inner.focused();
+        let size = cell.session.dimensions();
+        vec![crate::layout::PanePlacement {
+            pane_id: inner.focused_pane,
+            tab_id: inner.tab_id,
+            window_id: inner.window_id,
+            frame: crate::layout::Rect { left: 0, top: 0, cols: inner.cols, rows: inner.rows },
+            content: (inner.cols, inner.rows),
+            is_active: true,
+            is_zoomed: false,
+            title: cell.title.clone(),
+            alt_screen: false,
+            physical_top: size.physical_top,
+            size: TerminalSize::default(),
+            workspace: inner.workspace.clone(),
+        }]
+    }
+
+    /// The grid a placement shows: its frame, or less when the pane's own
+    /// grid is smaller (the desktop reserves rows of a frame for chrome).
+    fn shown(place: &crate::layout::PanePlacement) -> (usize, usize) {
+        (place.frame.cols.min(place.content.0), place.frame.rows.min(place.content.1))
+    }
+
     /// Returns what this frame owes: glyphs the budget put off, and sprites
     /// a full atlas declined.
     fn paint(inner: &mut Inner, budget: &mut FallbackBudget) -> Result<(u32, u32)> {
         inner.glyphs.begin_frame(inner.capacity.frozen());
-        let session = Arc::clone(&inner.focused().session);
-        let dims = session.dimensions();
-        let max = max_scroll(&dims);
-        if inner.focused().scroll_from_bottom > max {
-            inner.focused_mut().scroll_from_bottom = max;
-        }
-        let cursor = session.cursor_position();
-        let visible = visible_rows(&dims, inner.rows, inner.focused().scroll_from_bottom);
-        let (first, lines) = session.get_lines(visible);
-        let palette = inner.focused().palette.clone();
         let (w, h) = inner.gpu.size();
+        let surface = (w as f32, h as f32);
+        let cell_w = inner.glyphs.metrics.cell_size.width as f32;
         let cell_h = inner.glyphs.metrics.cell_size.height as f32;
-        let cursor_line = cursor.y.checked_sub(first)
-            .and_then(|row| usize::try_from(row).ok())
-            .and_then(|row| lines.get(row));
-        let width_scale = if cursor_line.is_some_and(|line| !line.is_single_width()) { 2.0 } else { 1.0 };
-        let height_scale = if cursor_line.is_some_and(|line| line.is_double_height_top()) { 2.0 } else { 1.0 };
-        let cell_w = inner.glyphs.metrics.cell_size.width as f64 * width_scale;
-        let anchor = crate::ime::anchor(
-            inner.canvas_rect,
-            (w, h),
-            (cursor.x as f64 * cell_w, cursor.y.saturating_sub(first) as f64 * cell_h as f64),
-            (cell_w, cell_h as f64 * height_scale),
-        );
-        crate::ime::update_field(&inner.textarea, &mut inner.ime_anchor, anchor)
-            .map_err(|e| anyhow::anyhow!("IME anchor: {e:?}"))?;
+        let owns = inner.link.lease().owns_viewport();
+        let placements = Self::placements(inner);
+        let focused_palette = inner.focused().palette.clone();
         inner.quads.recycle();
-        let selection = inner.focused().selection;
-        for (i, line) in lines.iter().enumerate() {
-            let row = first + i as StableRowIndex;
-            let sel_range = match &selection {
-                Some(sel) => Self::selection_on_row(inner, sel, row, line),
-                None => 0..0,
+        for place in &placements {
+            let Some(cell) = inner.panes.get_mut(&place.pane_id) else {
+                continue;
             };
-            let params = crate::emit::LineParams {
-                line,
-                stable_row: row,
-                top_pixel_y: i as f32 * cell_h,
-                cursor: &cursor,
-                palette: &palette,
-                selection: sel_range,
-                focused: inner.focused && inner.link.lease().owns_viewport(),
-                reverse_video: dims.reverse_video,
-                surface: (w as f32, h as f32),
-                origin: (0.0, 0.0),
-                clip: (w as f32, h as f32),
-                hsv: None,
-                draw_cursor: true,
-            };
-            crate::emit::emit_line(&mut inner.glyphs, &mut inner.quads, budget, &params)?;
+            let session = Arc::clone(&cell.session);
+            let dims = session.dimensions();
+            let max = max_scroll(&dims);
+            if cell.scroll_from_bottom > max {
+                cell.scroll_from_bottom = max;
+            }
+            let (cols_shown, rows_shown) = Self::shown(place);
+            let visible = visible_rows(&dims, rows_shown, cell.scroll_from_bottom);
+            let (first, lines) = session.get_lines(visible);
+            let cursor = session.cursor_position();
+            let palette = cell.palette.clone();
+            let selection = cell.selection;
+            let is_focused = place.pane_id == inner.focused_pane;
+            let hsv = if is_focused { None } else { Some(INACTIVE_PANE_HSB) };
+            let origin = (place.frame.left as f32 * cell_w, place.frame.top as f32 * cell_h);
+            let clip = (cols_shown as f32 * cell_w, rows_shown as f32 * cell_h);
+            // The pane's own ground, over its whole frame: it carries the
+            // pane's colours, and covers the chrome rows of a frame the
+            // desktop reserved.
+            crate::emit::fill_rect(
+                &inner.glyphs,
+                &mut inner.quads,
+                0,
+                surface,
+                origin,
+                (place.frame.cols as f32 * cell_w, place.frame.rows as f32 * cell_h),
+                palette.background.to_linear(),
+                hsv,
+            )?;
+            if is_focused {
+                let cursor_line = cursor
+                    .y
+                    .checked_sub(first)
+                    .and_then(|row| usize::try_from(row).ok())
+                    .and_then(|row| lines.get(row));
+                let width_scale = if cursor_line.is_some_and(|line| !line.is_single_width()) { 2.0 } else { 1.0 };
+                let height_scale = if cursor_line.is_some_and(|line| line.is_double_height_top()) { 2.0 } else { 1.0 };
+                let cw = cell_w as f64 * width_scale;
+                let anchor = crate::ime::anchor(
+                    inner.canvas_rect,
+                    (w, h),
+                    (
+                        origin.0 as f64 + cursor.x as f64 * cw,
+                        origin.1 as f64 + cursor.y.saturating_sub(first) as f64 * cell_h as f64,
+                    ),
+                    (cw, cell_h as f64 * height_scale),
+                );
+                crate::ime::update_field(&inner.textarea, &mut inner.ime_anchor, anchor)
+                    .map_err(|e| anyhow::anyhow!("IME anchor: {e:?}"))?;
+            }
+            for (i, line) in lines.iter().enumerate() {
+                let row = first + i as StableRowIndex;
+                let sel_range = match &selection {
+                    Some(sel) => Self::selection_on_row(cols_shown, sel, row, line),
+                    None => 0..0,
+                };
+                let params = crate::emit::LineParams {
+                    line,
+                    stable_row: row,
+                    top_pixel_y: i as f32 * cell_h,
+                    cursor: &cursor,
+                    palette: &palette,
+                    selection: sel_range,
+                    focused: inner.focused && owns,
+                    reverse_video: dims.reverse_video,
+                    surface,
+                    origin,
+                    clip,
+                    hsv,
+                    draw_cursor: is_focused,
+                };
+                crate::emit::emit_line(&mut inner.glyphs, &mut inner.quads, budget, &params)?;
+            }
+        }
+        // Dividers, centred in the gap cell like the desktop's.
+        if let Some(layout) = &inner.tab_layout {
+            let t = (inner.glyphs.metrics.underline_height.max(1)) as f32;
+            let colour = focused_palette.split.to_linear();
+            for divider in &layout.dividers {
+                let (x, y, dw, dh) = match *divider {
+                    crate::layout::Divider::Col { col, top, rows } => (
+                        col as f32 * cell_w + (cell_w - t) / 2.0,
+                        top as f32 * cell_h,
+                        t,
+                        rows as f32 * cell_h,
+                    ),
+                    crate::layout::Divider::Row { row, left, cols } => (
+                        left as f32 * cell_w,
+                        row as f32 * cell_h + (cell_h - t) / 2.0,
+                        cols as f32 * cell_w,
+                        t,
+                    ),
+                };
+                crate::emit::fill_rect(&inner.glyphs, &mut inner.quads, 0, surface, (x, y), (dw, dh), colour, None)?;
+            }
         }
         inner.vertices.clear();
         inner.quads.extract_vertices(&mut inner.vertices);
-        let bg = palette.background.to_linear().tuple();
+        let bg = focused_palette.background.to_linear().tuple();
         let millis = (js_sys::Date::now() % (u32::MAX as f64)) as u32;
         inner
             .gpu
