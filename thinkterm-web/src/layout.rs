@@ -32,6 +32,13 @@ impl Rect {
     }
 }
 
+/// A pane in a stack, for the stack's row of capsules.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StackMember {
+    pub pane_id: PaneId,
+    pub title: String,
+}
+
 /// One pane to draw.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PanePlacement {
@@ -50,6 +57,8 @@ pub struct PanePlacement {
     pub physical_top: StableRowIndex,
     pub size: TerminalSize,
     pub workspace: String,
+    /// Every pane sharing this frame, the drawn one included, in order.
+    pub stack: Vec<StackMember>,
 }
 
 /// The gap cell between two panes.
@@ -80,6 +89,40 @@ pub struct TabLayout {
     pub hidden: Vec<PaneId>,
 }
 
+impl TabLayout {
+    /// What the desktop would claim for this layout: every drawn pane in
+    /// the frame the split tree gives it, with `nav_rows` of the frame
+    /// kept for the bar above the pane, as the desktop keeps them for
+    /// its own (`ClientViewport::Native`). With the bar the desktop's
+    /// height this is the layout the desktop already has, and claiming
+    /// it resizes nothing; a `CellGrid` claim would grow each pane to
+    /// its frame.
+    pub fn viewport(&self, nav_rows: usize) -> Vec<codec::ClientPaneViewport> {
+        let cell_w = self.size.pixel_width.checked_div(self.cols).unwrap_or(0);
+        let cell_h = self.size.pixel_height.checked_div(self.rows).unwrap_or(0);
+        self.panes
+            .iter()
+            .map(|p| codec::ClientPaneViewport {
+                pane_id: p.pane_id,
+                size: TerminalSize {
+                    rows: p.frame.rows.saturating_sub(nav_rows).max(1),
+                    cols: p.frame.cols,
+                    pixel_width: p.frame.cols * cell_w,
+                    pixel_height: p.frame.rows.saturating_sub(nav_rows).max(1) * cell_h,
+                    dpi: self.size.dpi,
+                },
+                frame: TerminalSize {
+                    rows: p.frame.rows,
+                    cols: p.frame.cols,
+                    pixel_width: p.frame.cols * cell_w,
+                    pixel_height: p.frame.rows * cell_h,
+                    dpi: self.size.dpi,
+                },
+            })
+            .collect()
+    }
+}
+
 /// Every pane in a tab, left to right, top to bottom, stacks included.
 pub fn leaves(node: &PaneNode) -> Vec<&PaneEntry> {
     match node {
@@ -101,7 +144,7 @@ pub fn tab_containing(list: &ListPanesResponse, pane_id: PaneId) -> Option<&Pane
         .find(|tab| leaves(tab).iter().any(|e| e.pane_id == pane_id))
 }
 
-fn placement(entry: &PaneEntry, frame: Rect) -> PanePlacement {
+fn placement(entry: &PaneEntry, frame: Rect, stack: Vec<StackMember>) -> PanePlacement {
     PanePlacement {
         pane_id: entry.pane_id,
         tab_id: entry.tab_id,
@@ -115,7 +158,12 @@ fn placement(entry: &PaneEntry, frame: Rect) -> PanePlacement {
         physical_top: entry.physical_top,
         size: entry.size,
         workspace: entry.workspace.clone(),
+        stack,
     }
+}
+
+fn member(entry: &PaneEntry) -> StackMember {
+    StackMember { pane_id: entry.pane_id, title: entry.title.clone() }
 }
 
 fn walk(
@@ -127,12 +175,13 @@ fn walk(
 ) {
     match node {
         PaneNode::Empty => {}
-        PaneNode::Leaf(entry) => panes.push(placement(entry, frame)),
+        PaneNode::Leaf(entry) => panes.push(placement(entry, frame, vec![member(entry)])),
         PaneNode::Stack(stack) => {
             let active = stack.active.min(stack.panes.len().saturating_sub(1));
+            let members: Vec<StackMember> = stack.panes.iter().map(member).collect();
             for (i, entry) in stack.panes.iter().enumerate() {
                 if i == active {
-                    panes.push(placement(entry, frame));
+                    panes.push(placement(entry, frame, members.clone()));
                 } else {
                     hidden.push(entry.pane_id);
                 }
@@ -171,7 +220,29 @@ fn walk(
 
 /// Lay a tab out. `None` for an empty tab.
 pub fn layout(node: &PaneNode) -> Option<TabLayout> {
-    let size = node.root_size()?;
+    layout_in(node, None, 0)
+}
+
+/// Lay a tab out, knowing the tab's own size when the server has said
+/// it. A split's sizes are its frames and compose to the tab; a lone
+/// pane (or stack) only lists the pane's grid, which is the frame less
+/// the bar above it. Without the server's word the frame is taken to be
+/// that grid plus `nav_rows`, as whoever laid it out with a bar would
+/// have left it -- never the grid itself, since claiming a frame the
+/// size of the pane would shrink the pane by the bar's rows each time.
+pub fn layout_in(node: &PaneNode, tab_size: Option<TerminalSize>, nav_rows: usize) -> Option<TabLayout> {
+    let listed = node.root_size()?;
+    let size = match node {
+        PaneNode::Split { .. } => listed,
+        _ => tab_size.unwrap_or_else(|| {
+            let rows = listed.rows + nav_rows;
+            TerminalSize {
+                rows,
+                pixel_height: listed.pixel_height.checked_div(listed.rows).unwrap_or(0) * rows,
+                ..listed
+            }
+        }),
+    };
     let (window_id, tab_id) = node.window_and_tab_ids()?;
     let root = Rect {
         left: 0,
@@ -287,6 +358,52 @@ mod tests {
         assert_eq!(l.panes[0].frame, Rect { left: 0, top: 0, cols: 80, rows: 24 });
         assert!(l.dividers.is_empty());
         assert_positions_agree(&node, &l);
+    }
+
+    #[test]
+    fn the_viewport_claims_each_pane_at_its_own_grid_in_its_frame() {
+        // The desktop keeps 3 rows of each frame for its nav bar: the
+        // listed size is 21 rows in a 24-row frame.
+        let mut a = pane(1, 40, 24, 0, 0, false);
+        a.size = size(40, 21);
+        let mut b = pane(2, 39, 24, 41, 0, true);
+        b.size = size(39, 21);
+        let node = split(
+            SplitDirection::Horizontal,
+            size(40, 24),
+            size(39, 24),
+            PaneNode::Leaf(a),
+            PaneNode::Leaf(b),
+        );
+        let l = layout(&node).unwrap();
+        let v = l.viewport(3);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].size, size(40, 21), "the frame less the bar's rows: the grid the pane has");
+        assert_eq!(l.viewport(2)[0].size, size(40, 22), "a shorter bar would give the pane a row");
+        assert_eq!(v[0].frame, size(40, 24), "the frame the split gives it");
+        assert_eq!(v[1].frame, size(39, 24));
+        assert_eq!(v[0].frame.cols + v[1].frame.cols + 1, l.cols, "frames compose to the tab");
+        assert_eq!(v[0].frame.pixel_width, 40 * 8, "pixels from the tab's cell");
+    }
+
+    #[test]
+    fn a_lone_pane_s_frame_is_its_tab_not_its_grid() {
+        let node = PaneNode::Leaf(pane(1, 80, 21, 0, 0, true));
+        let told = layout_in(&node, Some(size(80, 24)), 3).unwrap();
+        assert_eq!((told.rows, told.panes[0].frame.rows, told.panes[0].content.1), (24, 24, 21));
+        let guessed = layout_in(&node, None, 3).unwrap();
+        assert_eq!(guessed.rows, 24, "the grid plus the bar's rows");
+        assert_eq!(guessed.size.pixel_height, 24 * 16);
+        assert_eq!(guessed.viewport(3)[0].size, size(80, 21), "so a claim leaves the pane as it is");
+        // A split's frames are its own word.
+        let split = split(
+            SplitDirection::Horizontal,
+            size(40, 24),
+            size(39, 24),
+            PaneNode::Leaf(pane(1, 40, 21, 0, 0, false)),
+            PaneNode::Leaf(pane(2, 39, 21, 41, 0, true)),
+        );
+        assert_eq!(layout_in(&split, Some(size(80, 30)), 3).unwrap().rows, 24);
     }
 
     #[test]

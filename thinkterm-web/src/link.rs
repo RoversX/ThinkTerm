@@ -461,55 +461,74 @@ impl WsLink {
     /// `take_over` is the explicit way.
     pub async fn ensure_owner(&self, tab_id: TabId) -> Result<bool> {
         {
-            let lease = self.0.lease.borrow();
+            let mut lease = self.0.lease.borrow_mut();
             if lease.owns_viewport() {
                 return Ok(true);
             }
             if !lease.may_type() {
                 return Ok(false);
             }
+            // An interaction here takes the terminal at this page's own
+            // shape, as the desktop's window takes it at its own.
+            lease.fit = true;
         }
         self.claim(tab_id).await
     }
 
-    /// Claim the tab, at the size `Lease::claim_size` says: the desktop's
-    /// own unless this page is fitting the tab to itself.
+    /// Claim the tab with the viewport `Lease::claim_viewport` says: the
+    /// desktop's own shape unless this page is fitting the tab to itself.
+    /// A pane-by-pane claim the server will not compose (a stale zoom
+    /// position, say) is retried as the bare grid: the hand-over matters
+    /// more than the geometry.
     pub async fn claim(&self, tab_id: TabId) -> Result<bool> {
-        let size = self
+        let viewport = self
             .0
             .lease
             .borrow()
-            .claim_size()
+            .claim_viewport()
             .ok_or_else(|| anyhow!("no viewport has been reported yet"))?;
-        let state = thinkterm_session::host::request(
+        let (viewport, state) = match self.claim_with(tab_id, viewport.clone()).await {
+            Ok(state) => (viewport, state),
+            Err(err) if matches!(viewport, codec::ClientViewport::Native { .. }) => {
+                log::warn!("pane-by-pane claim refused, claiming the grid: {err:#}");
+                let grid = codec::ClientViewport::CellGrid { size: viewport.size() };
+                let state = self.claim_with(tab_id, grid.clone()).await?;
+                (grid, state)
+            }
+            Err(err) => return Err(err),
+        };
+        let mut lease = self.0.lease.borrow_mut();
+        // A claim is also what the server remembers as this page's report.
+        lease.reported_viewport = Some(viewport);
+        lease.apply_viewport(&state);
+        Ok(lease.owns_viewport())
+    }
+
+    async fn claim_with(
+        &self,
+        tab_id: TabId,
+        viewport: codec::ClientViewport,
+    ) -> Result<codec::ClientViewportState> {
+        thinkterm_session::host::request(
             self,
-            Pdu::ClaimClientViewport(codec::ClaimClientViewport {
-                tab_id,
-                viewport: codec::ClientViewport::CellGrid { size },
-            }),
+            Pdu::ClaimClientViewport(codec::ClaimClientViewport { tab_id, viewport }),
             |pdu| match pdu {
                 Pdu::ClientViewportState(state) => Ok(state),
                 other => Err(other),
             },
         )
-        .await?;
-        let mut lease = self.0.lease.borrow_mut();
-        lease.apply_viewport(&state);
-        Ok(lease.owns_viewport())
+        .await
     }
 
-    /// Tell the server the tab's own size, so that a claim the server
+    /// Tell the server the tab's own shape, so that a claim the server
     /// makes for this page (it claims a client's last report when it
-    /// types) reshapes nothing. Sent whenever the canonical size the page
-    /// knows differs from what it last reported; inert for a follower.
-    pub async fn report_canonical(&self, tab_id: TabId) -> Result<()> {
-        let size = {
+    /// types) reshapes nothing. Sent whenever what the page would claim
+    /// differs from what it last reported; inert for a follower.
+    pub async fn report_viewport(&self, tab_id: TabId) -> Result<()> {
+        let viewport = {
             let lease = self.0.lease.borrow();
-            if lease.fit {
-                return Ok(());
-            }
-            match lease.canonical_size {
-                Some(size) if lease.reported_canonical != Some(size) => size,
+            match lease.claim_viewport() {
+                Some(v) if lease.reported_viewport.as_ref() != Some(&v) => v,
                 _ => return Ok(()),
             }
         };
@@ -517,7 +536,7 @@ impl WsLink {
             self,
             Pdu::SetClientViewport(codec::SetClientViewport {
                 tab_id,
-                viewport: codec::ClientViewport::CellGrid { size },
+                viewport: viewport.clone(),
             }),
             |pdu| match pdu {
                 Pdu::ClientViewportState(state) => Ok(state),
@@ -526,7 +545,7 @@ impl WsLink {
         )
         .await?;
         let mut lease = self.0.lease.borrow_mut();
-        lease.reported_canonical = Some(size);
+        lease.reported_viewport = Some(viewport);
         lease.apply_viewport(&state);
         Ok(())
     }

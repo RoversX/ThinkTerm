@@ -25,7 +25,7 @@ pub struct Attached {
 /// `size` is the grid this page can show, or `None` when it cannot show
 /// one yet; only a real size is reported, so a later claim never carries
 /// a made-up one.
-pub async fn attach(link: &WsLink, size: Option<TerminalSize>) -> Result<Attached> {
+pub async fn attach(link: &WsLink, size: Option<TerminalSize>, nav_rows: usize) -> Result<Attached> {
     let version = request(
         link,
         Pdu::GetCodecVersion(codec::GetCodecVersion {}),
@@ -80,34 +80,22 @@ pub async fn attach(link: &WsLink, size: Option<TerminalSize>) -> Result<Attache
     // The page's own grid is kept for a later "fit"; what the server hears
     // is the tab's own size, so that whatever it claims for this page
     // (it claims a client's last report when it types) reshapes nothing.
-    let tab_size = panes
-        .tabs
-        .iter()
-        .find(|tab| crate::layout::leaves(tab).iter().any(|e| e.pane_id == entry.pane_id))
-        .and_then(|tab| tab.root_size())
-        .unwrap_or(entry.size);
+    // The tab's size is not the lone pane's (see `layout_in`), and the
+    // report is pane by pane from the first: a bare grid would resize
+    // every pane to its frame if this page turns out to hold the tab.
+    let laid = crate::layout::tab_containing(&panes, entry.pane_id)
+        .and_then(|t| crate::layout::layout_in(t, None, nav_rows));
+    let tab_size = laid.as_ref().map(|l| l.size).unwrap_or(entry.size);
     {
         let mut lease = link.lease_mut();
         lease.tab_id = Some(entry.tab_id);
         lease.reported = size;
+        lease.canonical_size = Some(tab_size);
+        if let Some(laid) = &laid {
+            lease.set_native(laid, nav_rows);
+        }
     }
-    let state = request(
-        link,
-        Pdu::SetClientViewport(codec::SetClientViewport {
-            tab_id: entry.tab_id,
-            viewport: codec::ClientViewport::CellGrid { size: tab_size },
-        }),
-        |pdu| match pdu {
-            Pdu::ClientViewportState(s) => Ok(s),
-            other => Err(other),
-        },
-    )
-    .await?;
-    {
-        let mut lease = link.lease_mut();
-        lease.reported_canonical = Some(tab_size);
-        lease.apply_viewport(&state);
-    }
+    link.report_viewport(entry.tab_id).await?;
 
     request(
         link,
@@ -177,6 +165,7 @@ pub async fn reattach(
     tab_id: TabId,
     focused: PaneId,
     size: Option<TerminalSize>,
+    nav_rows: usize,
 ) -> Result<codec::ListPanesResponse> {
     let version = request(
         link,
@@ -226,17 +215,19 @@ pub async fn reattach(
         .or_else(|| panes.tabs.iter().find(|tab| tab.root_size().is_some()))
         .ok_or(NoPanes)?;
     let (_, tab_id) = tab.window_and_tab_ids().ok_or(NoPanes)?;
-    let tab_size = tab.root_size().ok_or(NoPanes)?;
+    let known = link.lease().tab_sizes.get(&tab_id).copied();
+    let laid = crate::layout::layout_in(tab, known, nav_rows).ok_or(NoPanes)?;
     {
         let mut lease = link.lease_mut();
         lease.tab_id = Some(tab_id);
         lease.tab_owner = None;
         lease.reported = size;
-        lease.canonical_size = Some(tab_size);
-        lease.reported_canonical = None;
+        lease.canonical_size = Some(laid.size);
+        lease.reported_viewport = None;
+        lease.set_native(&laid, nav_rows);
         lease.fit = false;
     }
-    link.report_canonical(tab_id).await?;
+    link.report_viewport(tab_id).await?;
     Ok(panes)
 }
 

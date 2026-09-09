@@ -8,8 +8,12 @@ pub mod chrome;
 pub mod fallback;
 pub mod ime;
 pub mod keymap;
+pub mod icons;
 pub mod layout;
 pub mod lease;
+pub mod navbar;
+pub mod sidebar;
+pub mod tree;
 pub mod viewport;
 
 #[cfg(target_arch = "wasm32")]
