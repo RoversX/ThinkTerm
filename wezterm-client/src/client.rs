@@ -2315,6 +2315,8 @@ impl Client {
     rpc!(web_token_mint, WebTokenMint, WebTokenMintResponse);
     rpc!(web_token_list, WebTokenList = (), WebTokenListResponse);
     rpc!(web_token_revoke, WebTokenRevoke, WebTokenRevokeResponse);
+    rpc!(get_web_server_status, GetWebServerStatus = (), WebServerStatus);
+    rpc!(set_web_server, SetWebServer, WebServerStatus);
     rpc!(
         search_scrollback,
         SearchScrollbackRequest,

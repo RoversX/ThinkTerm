@@ -22,6 +22,7 @@ mod set_window_title;
 mod spawn_command;
 mod split_pane;
 mod tls_creds;
+mod web_server;
 mod web_token;
 mod zoom_pane;
 
@@ -93,6 +94,10 @@ enum CliSubCommand {
     /// server's web port
     #[command(name = "web-token", rename_all = "kebab")]
     WebToken(web_token::WebTokenCommand),
+
+    /// Turn the browser listener on and off, and see where it is accepting
+    #[command(name = "web-server", rename_all = "kebab")]
+    WebServer(web_server::WebServerCommand),
 
     #[command(
         name = "move-pane-to-new-tab",
@@ -210,6 +215,7 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::SpawnCommand(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
         CliSubCommand::Proxy(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
         CliSubCommand::TlsCreds(cmd) => cmd.run(client).await,
+        CliSubCommand::WebServer(cmd) => cmd.run(client).await,
         CliSubCommand::WebToken(cmd) => cmd.run(client).await,
         CliSubCommand::ActivatePaneDirection(cmd) => cmd.run(client).await,
         CliSubCommand::GetPaneDirection(cmd) => cmd.run(client).await,

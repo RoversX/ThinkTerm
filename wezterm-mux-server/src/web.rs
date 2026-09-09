@@ -6,9 +6,11 @@ use async_ossl::AsyncSslStream;
 use config::WebServer;
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use smol::Async;
-use std::net::TcpListener;
+use std::collections::BTreeMap;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use wezterm_mux_server_impl::web_auth::WEB_TOKENS;
 use wezterm_mux_server_impl::web_http::{serve, serve_seated, PreAuthSeat, WebSite};
@@ -18,6 +20,66 @@ use wezterm_mux_server_impl::web_http::{serve, serve_seated, PreAuthSeat, WebSit
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often expired tokens are swept and their connections dropped.
 const TOKEN_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The listeners that are up, and the flag that ends each one.
+///
+/// Stopping is two moves, because the accept loop blocks inside
+/// `accept()` and owns its listener: raise the flag, then open one
+/// connection to the port so the loop wakes and sees it. Dropping the
+/// listener from another thread is not available to us.
+static LISTENERS: Mutex<BTreeMap<String, Listening>> = Mutex::new(BTreeMap::new());
+
+struct Listening {
+    stop: Arc<AtomicBool>,
+    /// The address `accept()` actually returned, not the configured
+    /// string: an unspecified bind has to be woken through a real address.
+    local: SocketAddr,
+}
+
+/// The bind addresses currently accepting, in configuration order.
+pub fn listening() -> Vec<String> {
+    LISTENERS.lock().map_or_else(|e| e.into_inner(), |g| g).keys().cloned().collect()
+}
+
+pub fn is_listening(bind_address: &str) -> bool {
+    LISTENERS
+        .lock()
+        .map_or_else(|e| e.into_inner(), |g| g)
+        .contains_key(bind_address)
+}
+
+/// The address to knock on to wake a blocking `accept`. A listener bound to
+/// every address is not reachable *at* that address, so knock on loopback.
+fn wake_address(local: SocketAddr) -> SocketAddr {
+    if !local.ip().is_unspecified() {
+        return local;
+    }
+    match local {
+        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::LOCALHOST, local.port())),
+        SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::LOCALHOST, local.port())),
+    }
+}
+
+/// Stop the listener on this address. `false` if nothing was listening.
+///
+/// The port is free once this returns: the loop is woken, sees the flag and
+/// drops the listener before the knock is answered.
+pub fn stop_web_listener(bind_address: &str) -> bool {
+    let Some(entry) = LISTENERS
+        .lock()
+        .map_or_else(|e| e.into_inner(), |g| g)
+        .remove(bind_address)
+    else {
+        return false;
+    };
+    entry.stop.store(true, Ordering::SeqCst);
+    // The knock is refused by the loop, which is the point: it is only
+    // there to return from `accept`. A failure here means nobody was
+    // blocked on it any more, which is equally fine.
+    let _ = TcpStream::connect_timeout(&wake_address(entry.local), Duration::from_secs(1));
+    log::error!("stopped listening for web clients on {bind_address}");
+    true
+}
 
 /// Point the token store at its file. One store serves every web listener,
 /// so the first entry's choice wins; the others are told.
@@ -39,12 +101,20 @@ pub fn configure_tokens(servers: &[WebServer]) -> anyhow::Result<()> {
     }
     // A token's lifetime ends when it says, whether or not anyone touches
     // the store again.
-    wezterm_mux_server_impl::connections::spawn(async {
-        loop {
-            smol::Timer::after(TOKEN_SWEEP_INTERVAL).await;
-            WEB_TOKENS.sweep();
-        }
-    });
+    //
+    // Once per process. This used to run at startup only; the settings
+    // switch calls it again on every "on", and each of those left another
+    //ever-running sweep behind -- more timers doing the same work, and one
+    // more every time the switch is flipped.
+    static SWEEPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SWEEPING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        wezterm_mux_server_impl::connections::spawn(async {
+            loop {
+                smol::Timer::after(TOKEN_SWEEP_INTERVAL).await;
+                WEB_TOKENS.sweep();
+            }
+        });
+    }
     Ok(())
 }
 
@@ -144,25 +214,68 @@ pub fn spawn_web_listener(server: &WebServer) -> anyhow::Result<()> {
 
     let listener = TcpListener::bind(&server.bind_address)
         .with_context(|| format!("binding web server to {}", server.bind_address))?;
+    let local = listener
+        .local_addr()
+        .with_context(|| format!("reading the address of the web server on {}", server.bind_address))?;
     log::error!(
         "listening for web clients on {}{}",
         server.bind_address,
         if acceptor.is_some() { " with TLS" } else { "" }
     );
 
-    std::thread::Builder::new()
+    let stop = Arc::new(AtomicBool::new(false));
+    // Registered before the thread starts, so a stop that arrives in the
+    // same breath as the start still finds it.
+    LISTENERS.lock().map_or_else(|e| e.into_inner(), |g| g).insert(
+        server.bind_address.clone(),
+        Listening {
+            stop: Arc::clone(&stop),
+            local,
+        },
+    );
+    let bind_address = server.bind_address.clone();
+    match std::thread::Builder::new()
         .name(format!("web-accept-{}", server.bind_address))
-        .spawn(move || accept_loop(listener, acceptor, site))
-        .context("spawning the web accept thread")?;
-    Ok(())
+        .spawn(move || accept_loop(listener, acceptor, site, stop))
+    {
+        Ok(_) => {
+            // The other half of `disconnect_all`, which stops admissions
+            // when a listener goes down. Done here, on every path that
+            // opens a port -- startup, the takeover thread, the settings
+            // switch -- because an "off" that lands before the takeover's
+            // listener is up would otherwise leave a port open on which
+            // every token is refused.
+            wezterm_mux_server_impl::web_auth::WEB_TOKENS.resume_admitting();
+            Ok(())
+        }
+        Err(err) => {
+            // Nothing is accepting, so nothing may claim to be.
+            LISTENERS
+                .lock()
+                .map_or_else(|e| e.into_inner(), |g| g)
+                .remove(&bind_address);
+            Err(err).context("spawning the web accept thread")
+        }
+    }
 }
 
 /// How long the accept loop pauses after a failed accept. A refused
 /// peer costs nothing; an exhausted descriptor table would otherwise spin.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
-fn accept_loop(listener: TcpListener, acceptor: Option<SslAcceptor>, site: Arc<WebSite>) {
+fn accept_loop(
+    listener: TcpListener,
+    acceptor: Option<SslAcceptor>,
+    site: Arc<WebSite>,
+    stop: Arc<AtomicBool>,
+) {
     for stream in listener.incoming() {
+        // Checked before the connection is looked at, so the knock that
+        // woke us is dropped rather than served.
+        if stop.load(Ordering::SeqCst) {
+            log::info!("web accept loop for {} is done", site.describe);
+            return;
+        }
         let stream = match stream {
             Ok(stream) => stream,
             Err(err) => {

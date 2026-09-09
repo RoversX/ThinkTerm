@@ -134,7 +134,10 @@ impl MintCommand {
             }
             return Ok(());
         }
-        println!("Token {} ({}) minted.", minted.id, minted.label);
+        match &minted.label {
+            Some(label) => println!("Token {} ({label}) minted.", minted.id),
+            None => println!("Token {} minted.", minted.id),
+        }
         match minted.expires_at {
             Some(at) => println!("Expires {}.", local_time(at)),
             None => println!("Does not expire; revoke it with `thinkterm cli web-token revoke {}`.", minted.id),
@@ -159,10 +162,12 @@ impl MintCommand {
 #[derive(serde::Serialize)]
 struct CliWebTokenItem {
     id: String,
-    label: String,
+    label: Option<String>,
     created_at: u64,
     expires_at: Option<u64>,
     last_used_at: Option<u64>,
+    /// What the browser said it was, last time this link was used.
+    last_device: Option<String>,
     live_connections: u32,
 }
 
@@ -181,6 +186,7 @@ impl ListCommand {
                         created_at: t.created_at,
                         expires_at: t.expires_at,
                         last_used_at: t.last_used_at,
+                        last_device: t.last_device,
                         live_connections: t.live_connections,
                     })
                     .collect();
@@ -191,6 +197,7 @@ impl ListCommand {
                 let columns = [
                     Column { name: "ID".into(), alignment: Alignment::Left },
                     Column { name: "LABEL".into(), alignment: Alignment::Left },
+                    Column { name: "LAST DEVICE".into(), alignment: Alignment::Left },
                     Column { name: "CREATED".into(), alignment: Alignment::Left },
                     Column { name: "EXPIRES".into(), alignment: Alignment::Left },
                     Column { name: "LAST USED".into(), alignment: Alignment::Left },
@@ -202,7 +209,8 @@ impl ListCommand {
                     .map(|t| {
                         vec![
                             t.id.clone(),
-                            t.label.clone(),
+                            t.label.clone().unwrap_or_else(|| "-".into()),
+                            t.last_device.clone().unwrap_or_else(|| "-".into()),
                             local_time(t.created_at),
                             t.expires_at.map(local_time).unwrap_or_else(|| "never".into()),
                             t.last_used_at.map(local_time).unwrap_or_else(|| "-".into()),

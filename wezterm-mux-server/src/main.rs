@@ -338,6 +338,26 @@ fn run() -> anyhow::Result<()> {
 
     let executor = promise::spawn::SimpleExecutor::new();
 
+    // The listener lives in this binary; the session handler that answers a
+    // settings window lives in the impl crate, which cannot call up into
+    // this one, so the controls are handed down here.
+    //
+    // Ahead of the branch below, and not inside `spawn_listener`, because
+    // only the non-takeover path calls that. A server started with
+    // `--takeover` -- which is what an in-place update does -- bound the
+    // port from its own thread and then had no controls at all: the
+    // settings switch read Off while browsers were connecting, pressing it
+    // said there was no listener to turn off, and "Copy link" minted a
+    // token, got no URL back and revoked the token it had just made.
+    wezterm_mux_server_impl::web_control::install(
+        wezterm_mux_server_impl::web_control::WebControl {
+            start: web::spawn_web_listener,
+            configure_tokens: web::configure_tokens,
+            stop: web::stop_web_listener,
+            listening: web::listening,
+        },
+    );
+
     if takeover.is_none() {
         spawn_listener().map_err(|e| {
             log::error!("problem spawning listeners: {:?}", e);

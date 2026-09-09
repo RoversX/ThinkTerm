@@ -18,6 +18,7 @@ pub mod thinkterm_layout;
 pub mod thinkterm_session;
 pub mod thinkterm_tree;
 pub mod web_auth;
+pub mod web_control;
 pub mod web_http;
 pub mod web_stream;
 

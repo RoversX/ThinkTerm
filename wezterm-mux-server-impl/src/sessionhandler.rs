@@ -2292,10 +2292,8 @@ impl SessionHandler {
                             label,
                             ttl_secs.map(Duration::from_secs),
                         )?;
-                        let urls = config::configuration()
-                            .web_servers
-                            .iter()
-                            .flat_map(|server| server.urls())
+                        let urls = web_urls(&crate::web_control::listening())
+                            .into_iter()
                             // In the fragment: never sent to any server, never
                             // in a Referer, never in an access log.
                             .map(|url| format!("{url}#token={}", minted.token))
@@ -2321,6 +2319,53 @@ impl SessionHandler {
                 send_response(Ok(Pdu::WebTokenRevokeResponse(WebTokenRevokeResponse {
                     revoked,
                 })));
+            }
+            Pdu::GetWebServerStatus(_) => {
+                send_response(Ok(Pdu::WebServerStatus(web_server_status())));
+            }
+            Pdu::SetWebServer(SetWebServer {
+                enabled,
+                bind_address,
+            }) => {
+                catch(
+                    move || {
+                        let Some(control) = crate::web_control::get() else {
+                            anyhow::bail!(
+                                "this server has no web listener to turn on or off"
+                            );
+                        };
+                        if enabled {
+                            let server = web_server_to_start(bind_address.as_deref())?;
+                            if !crate::web_control::listening().contains(&server.bind_address) {
+                                // The token store is set up by whoever starts
+                                // the first listener. A server configured with
+                                // no `web_servers` never did it at startup, and
+                                // an unconfigured store keeps tokens in memory
+                                // and never sweeps the expired ones. A second
+                                // call is a no-op; see `WebTokenStore::configure`.
+                                (control.configure_tokens)(std::slice::from_ref(&server))?;
+                                // The listener resumes admissions itself once
+                                // the port is up; see `spawn_web_listener`.
+                                (control.start)(&server)?;
+                            }
+                        } else {
+                            // Every listener, not just the named one: a client
+                            // that only knows "off" must not leave a second
+                            // port open behind it.
+                            for address in crate::web_control::listening() {
+                                (control.stop)(&address);
+                            }
+                            // Closing the port only stops the next browser.
+                            // Off has to mean the ones already inside, too.
+                            let cut = crate::web_auth::WEB_TOKENS.disconnect_all();
+                            if cut > 0 {
+                                log::info!("web listener stopped; cut {cut} live browsers");
+                            }
+                        }
+                        Ok(Pdu::WebServerStatus(web_server_status()))
+                    },
+                    send_response,
+                );
             }
             Pdu::GetTlsCreds(_) => {
                 catch(
@@ -2458,6 +2503,7 @@ impl SessionHandler {
             | Pdu::WebTokenMintResponse { .. }
             | Pdu::WebTokenListResponse { .. }
             | Pdu::WebTokenRevokeResponse { .. }
+            | Pdu::WebServerStatus { .. }
             | Pdu::GetClientListResponse { .. }
             | Pdu::PaneRemoved { .. }
             | Pdu::PaneFocused { .. }
@@ -3030,4 +3076,90 @@ mod tests {
         );
         assert!(!answered.lock().unwrap().iter().any(|(tag, _)| *tag == "d"));
     }
+}
+
+/// What a client is told about the browser listener.
+///
+/// `urls` names only the listeners that are actually up: a URL for a port
+/// nobody is accepting on is worse than no URL, because it looks like the
+/// feature is on.
+fn web_server_status() -> WebServerStatus {
+    let listening = crate::web_control::listening();
+    let configured = config::configuration()
+        .web_servers
+        .iter()
+        .map(|server| server.bind_address.clone())
+        .collect();
+    WebServerStatus {
+        urls: web_urls(&listening),
+        listening,
+        configured,
+    }
+}
+
+/// The pages a browser can open, one per live listener.
+///
+/// Built from what is accepting rather than from what is configured, and in
+/// both directions: a listener started at runtime is in no `web_servers`
+/// entry and would otherwise have no URL at all, and a URL for a configured
+/// port nobody is accepting on is worse than none -- it reads as though the
+/// feature were on.
+fn web_urls(listening: &[String]) -> Vec<String> {
+    let config = config::configuration();
+    listening
+        .iter()
+        .flat_map(|address| {
+            config
+                .web_servers
+                .iter()
+                .find(|server| &server.bind_address == address)
+                .cloned()
+                .unwrap_or_else(|| config::WebServer {
+                    bind_address: address.clone(),
+                    ..Default::default()
+                })
+                .urls()
+        })
+        .collect()
+}
+
+/// The listener a `SetWebServer { enabled: true }` should bring up.
+///
+/// A configured entry is used whole, so its TLS, origins and bundle
+/// directory come with it. An address that is not in the configuration gets
+/// the defaults, which is what lets a server with no `web_servers` at all
+/// be switched on from a settings window.
+///
+/// Two of those defaults are borrowed from the first configured entry when
+/// there is one, because they describe *this server's* resources rather
+/// than how one address is exposed: where the page lives, and where tokens
+/// are kept. Without the first, a switch flipped on an ad-hoc port serves
+/// no page at all when the bundle is somewhere non-standard.
+fn web_server_to_start(bind_address: Option<&str>) -> anyhow::Result<config::WebServer> {
+    let config = config::configuration();
+    if let Some(address) = bind_address {
+        if let Some(server) = config
+            .web_servers
+            .iter()
+            .find(|server| server.bind_address == address)
+        {
+            return Ok(server.clone());
+        }
+        let first = config.web_servers.first();
+        return Ok(config::WebServer {
+            bind_address: address.to_string(),
+            static_dir: first.and_then(|s| s.static_dir.clone()),
+            token_file: first.and_then(|s| s.token_file.clone()),
+            ..Default::default()
+        });
+    }
+    // A server with no `web_servers` at all is the ordinary case now that
+    // the switch lives in a settings window, so "on" means the same
+    // loopback address a bare `web_servers = { {} }` would have produced
+    // rather than an error about configuration the user never wrote.
+    Ok(config
+        .web_servers
+        .first()
+        .cloned()
+        .unwrap_or_default())
 }

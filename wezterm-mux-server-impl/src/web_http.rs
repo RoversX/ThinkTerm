@@ -736,7 +736,13 @@ where
             .await
         }
         Route::Upgrade { key, token } => {
-            let Some(admission) = WEB_TOKENS.verify(&token) else {
+            // Taken here and nowhere else: the header belongs to the
+            // connection being admitted, and there is no second chance to
+            // read it once the socket becomes a mux stream.
+            let device = request
+                .header("user-agent")
+                .and_then(crate::web_auth::describe_user_agent);
+            let Some(admission) = WEB_TOKENS.verify(&token, device) else {
                 log::warn!(
                     "web socket from origin {:?} refused: unknown or expired token",
                     request.header("origin")
@@ -766,15 +772,21 @@ where
                 return;
             }
             let _ = stream.flush().await;
+            // The token id when the link has no name of its own: a peer
+            // has to be called something in `list-clients`, and the id is
+            // the one handle that is always there and always unique.
+            let peer_label = admission
+                .label
+                .clone()
+                .unwrap_or_else(|| admission.token_id.clone());
             log::info!(
-                "web client admitted on {} with token {} ({})",
+                "web client admitted on {} with token {} ({peer_label})",
                 site.describe,
                 admission.token_id,
-                admission.label
             );
             let peer = ConnectionPeer::Web(WebPeer {
                 token_id: admission.token_id.clone(),
-                label: admission.label.clone(),
+                label: peer_label,
                 username: site.username.clone(),
                 revoked: admission.revoked.clone(),
             });

@@ -576,7 +576,7 @@ macro_rules! pdu {
 /// 67: Web tokens: the credential a browser presents at the server's web
 ///     port is minted, listed and revoked over the mux connection
 ///     (WebTokenMint/List/Revoke), the way TLS credentials are obtained.
-pub const CODEC_VERSION: usize = 67;
+pub const CODEC_VERSION: usize = 69;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -665,6 +665,9 @@ pdu! {
     WebTokenListResponse: 88,
     WebTokenRevoke: 89,
     WebTokenRevokeResponse: 90,
+    GetWebServerStatus: 91,
+    SetWebServer: 92,
+    WebServerStatus: 93,
 }
 
 impl Pdu {
@@ -865,7 +868,7 @@ pub struct WebTokenMint {
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct WebTokenMintResponse {
     pub id: String,
-    pub label: String,
+    pub label: Option<String>,
     /// The secret. Shown once; the server keeps only a digest.
     pub token: String,
     /// Unix seconds.
@@ -882,17 +885,51 @@ pub struct WebTokenList {}
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct WebTokenInfo {
     pub id: String,
-    pub label: String,
+    /// What a person called it, if anyone did.
+    pub label: Option<String>,
     /// Unix seconds.
     pub created_at: u64,
     pub expires_at: Option<u64>,
     pub last_used_at: Option<u64>,
+    /// What the browser said it was, last time this link was used, e.g.
+    /// "iPad · Safari". Self-reported by the client: a description to tell
+    /// your own devices apart, never a credential.
+    pub last_device: Option<String>,
     pub live_connections: u32,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct WebTokenListResponse {
     pub tokens: Vec<WebTokenInfo>,
+}
+
+/// Where the server is accepting browser clients, if anywhere.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct GetWebServerStatus {}
+
+/// Start or stop the browser listener while the server runs.
+///
+/// `bind_address` is consulted only when starting, and falls back to the
+/// first configured `web_servers` entry. Stopping stops every listener, so
+/// a client that does not know which address is up still turns it off.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SetWebServer {
+    pub enabled: bool,
+    pub bind_address: Option<String>,
+}
+
+/// The answer to both of the above, so a client that changes the state and
+/// a client that only asks read the same shape.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct WebServerStatus {
+    /// Accepting right now. Empty means no browser can reach this server.
+    pub listening: Vec<String>,
+    /// One page URL per live listener, without a token: minting is
+    /// separate, and a URL here is safe to show and to log.
+    pub urls: Vec<String>,
+    /// What `web_servers` names in the configuration, up or not. A client
+    /// offering to start one uses this rather than inventing an address.
+    pub configured: Vec<String>,
 }
 
 /// Revoke one token by id, or every token when `id` is None. Connections
@@ -2383,7 +2420,7 @@ mod test {
         // The exact assertion is the tripwire: whoever bumps the codec must
         // come here, confirm the round-trips still cover the new version,
         // and advance it deliberately.
-        assert_eq!(CODEC_VERSION, 67);
+        assert_eq!(CODEC_VERSION, 69);
         use thinkterm_proto::{AgentEvidence, AgentState, AgentStatus};
 
         fn round_trip(pdu: Pdu) {
