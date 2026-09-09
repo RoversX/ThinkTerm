@@ -35,7 +35,7 @@ pub enum Pointer {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Selection {
+pub struct Selection {
     anchor: (StableRowIndex, usize),
     head: (StableRowIndex, usize),
     /// 1 = cells, 2 = words, 3 = lines.
@@ -69,8 +69,11 @@ const RECONNECT_STABLE_MS: f64 = 5_000.0;
 
 pub struct Setup {
     pub link: WsLink,
-    pub session: Arc<PaneSession<WebHost>>,
     pub host: Arc<WebHost>,
+    pub images: Arc<thinkterm_session::Lock<thinkterm_session::images::ImageStore>>,
+    pub remote_tab_id: Arc<std::sync::atomic::AtomicUsize>,
+    /// The pane on show, already built with `build_session`.
+    pub pane: PaneCell,
     pub gpu: Gpu,
     pub glyphs: GlyphCache,
     pub fonts: Rc<FontSet>,
@@ -82,31 +85,63 @@ pub struct Setup {
     pub token: String,
     pub pane_id: PaneId,
     pub tab_id: TabId,
+    pub window_id: thinkterm_proto::WindowId,
+    pub workspace: String,
     pub dpr: f64,
     pub cols: usize,
     pub rows: usize,
-    pub title: String,
     pub strip: Option<crate::chrome::TabStrip>,
+}
+
+/// One pane on the page: its session and the state that is the page's
+/// own for it. Everything here is per pane; what is per page lives on
+/// `Inner`.
+pub struct PaneCell {
+    pub session: Arc<PaneSession<WebHost>>,
+    pub scroll_from_bottom: usize,
+    pub selection: Option<Selection>,
+    /// The pane's own colours (OSC 4/10/11), pushed as `SetApplicationPalette`.
+    pub palette: ColorPalette,
+    pub title: String,
+}
+
+impl PaneCell {
+    pub fn new(session: Arc<PaneSession<WebHost>>, title: &str) -> Self {
+        Self {
+            session,
+            scroll_from_bottom: 0,
+            selection: None,
+            palette: ColorPalette::default(),
+            title: title.to_string(),
+        }
+    }
 }
 
 pub struct Inner {
     link: WsLink,
-    session: Arc<PaneSession<WebHost>>,
+    /// The panes of the tab on show, by remote pane id. Never empty: the
+    /// focused pane's cell stays (dead, if need be) until a listing puts
+    /// something else in its place.
+    panes: std::collections::BTreeMap<PaneId, PaneCell>,
+    focused_pane: PaneId,
     host: Arc<WebHost>,
+    /// One per connection, shared by every session: a picture one pane
+    /// fetched is not fetched again by another.
+    images: Arc<thinkterm_session::Lock<thinkterm_session::images::ImageStore>>,
+    /// One per shown tab, shared by its sessions, so a move updates all.
+    remote_tab_id: Arc<std::sync::atomic::AtomicUsize>,
     gpu: Gpu,
     glyphs: GlyphCache,
     fonts: Rc<FontSet>,
     canvas: web_sys::HtmlCanvasElement,
     textarea: web_sys::HtmlTextAreaElement,
     status: Option<web_sys::Element>,
-    palette: ColorPalette,
-    pane_id: PaneId,
     tab_id: TabId,
+    window_id: thinkterm_proto::WindowId,
+    workspace: String,
     dpr: f64,
     cols: usize,
     rows: usize,
-    scroll_from_bottom: usize,
-    selection: Option<Selection>,
     /// Word/line selection extends by units; the pointer is down.
     selecting: bool,
     click_count: u8,
@@ -133,7 +168,6 @@ pub struct Inner {
     connected_since: Option<f64>,
     quads: HeapQuadAllocator,
     vertices: Vec<Vertex>,
-    title: String,
     /// What to do about an atlas that has run out of room for good.
     capacity: Capacity,
     /// The server's tabs and panes as last listed, for the strip and for
@@ -201,51 +235,72 @@ pub(crate) fn monotonic_ms() -> f64 {
 /// A session for one pane, configured the way this page runs them.
 pub fn build_session(
     host: &Arc<WebHost>,
+    images: &Arc<thinkterm_session::Lock<thinkterm_session::images::ImageStore>>,
+    remote_tab_id: &Arc<std::sync::atomic::AtomicUsize>,
     pane_id: PaneId,
-    tab_id: TabId,
     dims: thinkterm_proto::RenderableDimensions,
     title: &str,
     alt_screen: bool,
 ) -> Arc<PaneSession<WebHost>> {
     PaneSession::new(
         Arc::clone(host),
-        Arc::new(thinkterm_session::Lock::new(
-            thinkterm_session::images::ImageStore::default(),
-        )),
+        Arc::clone(images),
         thinkterm_session::SessionConfig {
             scrollback_lines: 3500,
             local_echo_threshold_ms: Some(100),
             overlay_lag_indicator: false,
         },
         pane_id,
-        Arc::new(std::sync::atomic::AtomicUsize::new(tab_id)),
-        0,
+        Arc::clone(remote_tab_id),
+        // The host's name for the pane is the server's: it is what the
+        // session's events carry, and the page keys its panes by it.
+        pane_id,
         dims,
         title,
         alt_screen,
     )
 }
 
+impl Inner {
+    fn focused(&self) -> &PaneCell {
+        self.panes
+            .get(&self.focused_pane)
+            .expect("the focused pane has a cell")
+    }
+
+    fn focused_mut(&mut self) -> &mut PaneCell {
+        let id = self.focused_pane;
+        self.panes.get_mut(&id).expect("the focused pane has a cell")
+    }
+
+    fn title(&self) -> &str {
+        &self.focused().title
+    }
+}
+
 impl App {
     pub fn new(setup: Setup) -> Rc<Self> {
+        let mut panes = std::collections::BTreeMap::new();
+        panes.insert(setup.pane_id, setup.pane);
         let inner = Inner {
             link: setup.link,
-            session: setup.session,
+            panes,
+            focused_pane: setup.pane_id,
             host: setup.host,
+            images: setup.images,
+            remote_tab_id: setup.remote_tab_id,
             gpu: setup.gpu,
             glyphs: setup.glyphs,
             fonts: setup.fonts,
             canvas: setup.canvas,
             textarea: setup.textarea,
             status: setup.status,
-            palette: ColorPalette::default(),
-            pane_id: setup.pane_id,
             tab_id: setup.tab_id,
+            window_id: setup.window_id,
+            workspace: setup.workspace,
             dpr: setup.dpr,
             cols: setup.cols,
             rows: setup.rows,
-            scroll_from_bottom: 0,
-            selection: None,
             selecting: false,
             click_count: 0,
             last_click_ms: 0.0,
@@ -263,7 +318,6 @@ impl App {
             capacity: Capacity::new(),
             quads: HeapQuadAllocator::default(),
             vertices: Vec::new(),
-            title: setup.title,
             layout: None,
             following: true,
             strip: setup.strip,
@@ -359,19 +413,27 @@ impl App {
     pub fn on_push(self: &Rc<Self>, pdu: Pdu) {
         let inner = self.inner.borrow();
         match pdu {
-            Pdu::GetPaneRenderChangesResponse(delta) if delta.pane_id == inner.pane_id => {
-                inner.session.queue_render_delta(delta);
+            // Every pane on the server pushes to every client; only the
+            // ones on this page are wanted, and the rest are simply not
+            // ours (never a reason to re-list: there are many).
+            Pdu::GetPaneRenderChangesResponse(delta) => {
+                if let Some(cell) = inner.panes.get(&delta.pane_id) {
+                    cell.session.queue_render_delta(delta);
+                }
             }
-            Pdu::PaneRemoved(removed) if removed.pane_id == inner.pane_id => {
-                inner.session.set_dead(true);
-                Self::set_status(&inner, "the pane was closed on the server");
+            Pdu::PaneRemoved(removed) if inner.panes.contains_key(&removed.pane_id) => {
+                let cell = &inner.panes[&removed.pane_id];
+                cell.session.set_dead(true);
+                if removed.pane_id == inner.focused_pane {
+                    Self::set_status(&inner, "the pane was closed on the server");
+                }
                 // Something else to show, if the server has anything.
                 drop(inner);
                 self.refresh_layout();
             }
             // The desktop moved. Followed only while following; a page
             // that chose a pane is not dragged off it.
-            Pdu::PaneFocused(focused) if inner.following && focused.pane_id != inner.pane_id => {
+            Pdu::PaneFocused(focused) if inner.following && focused.pane_id != inner.focused_pane => {
                 drop(inner);
                 self.switch_to_pane(focused.pane_id, false);
             }
@@ -391,14 +453,15 @@ impl App {
             // program's OSC 4/10/11 colours. Dropping it would leave the
             // page on the stock palette for good.
             Pdu::SetApplicationPalette(codec::SetApplicationPalette { pane_id, palette })
-                if pane_id == inner.pane_id =>
+                if inner.panes.contains_key(&pane_id) =>
             {
                 drop(inner);
                 let mut inner = self.inner.borrow_mut();
                 let palette = palette.unwrap_or_default();
-                if palette != inner.palette {
-                    inner.palette = palette;
-                    inner.session.make_all_stale();
+                let cell = inner.panes.get_mut(&pane_id).expect("checked above");
+                if palette != cell.palette {
+                    cell.palette = palette;
+                    cell.session.make_all_stale();
                     drop(inner);
                     self.request_frame();
                 }
@@ -436,7 +499,9 @@ impl App {
             // Nothing more will arrive on this socket: the watchdog must
             // stop asking, or the page keeps requesting lines that never
             // come. `reconnected` turns it back on.
-            inner.session.set_dead(true);
+            for cell in inner.panes.values() {
+                cell.session.set_dead(true);
+            }
             log::warn!("connection lost: {reason}");
         }
         self.show_reconnect_status();
@@ -512,7 +577,7 @@ impl App {
                 inner.link.clone(),
                 inner.url.clone(),
                 inner.token.clone(),
-                inner.pane_id,
+                inner.focused_pane,
                 inner.tab_id,
                 size,
             )
@@ -569,9 +634,11 @@ impl App {
             // takes to hand back a socket. `frame` clears it once the
             // connection has proved it can carry a frame.
             inner.connected_since = Some(monotonic_ms());
-            inner.session.set_dead(false);
-            inner.session.make_all_stale();
-            log::info!("reconnected to pane {}", inner.pane_id);
+            for cell in inner.panes.values() {
+                cell.session.set_dead(false);
+                cell.session.make_all_stale();
+            }
+            log::info!("reconnected to pane {}", inner.focused_pane);
         }
         self.refresh_status();
         self.request_frame();
@@ -584,24 +651,26 @@ impl App {
         }
         let owner = inner.link.lease().owns_viewport();
         let text = if owner {
-            format!("{}  ·  {}x{}  ·  this browser has the terminal", inner.title, inner.cols, inner.rows)
+            format!("{}  ·  {}x{}  ·  this browser has the terminal", inner.title(), inner.cols, inner.rows)
         } else {
             format!(
                 "{}  ·  {}x{}  ·  following another device (type or click to take over)",
-                inner.title, inner.cols, inner.rows
+                inner.title(), inner.cols, inner.rows
             )
         };
         Self::set_status(&inner, &text);
     }
 
-    fn spawn_drain(inner: &Inner, start: Result<bool, thinkterm_session::input::InputQueueFull>) {
+    fn spawn_drain(
+        session: &Arc<PaneSession<WebHost>>,
+        start: Result<bool, thinkterm_session::input::InputQueueFull>,
+    ) {
         match start {
             Ok(true) => {
-                let session = Arc::clone(&inner.session);
-                wasm_bindgen_futures::spawn_local(session.drain_inputs());
-                inner.session.update_last_send();
+                wasm_bindgen_futures::spawn_local(Arc::clone(session).drain_inputs());
+                session.update_last_send();
             }
-            Ok(false) => inner.session.update_last_send(),
+            Ok(false) => session.update_last_send(),
             Err(full) => log::warn!("input refused: {full}"),
         }
     }
@@ -632,15 +701,16 @@ impl App {
             _ if mods.contains(Modifiers::SUPER) => return false,
             _ => {}
         }
-        // Typing goes back to following the output.
-        inner.scroll_from_bottom = 0;
-        inner.selection = None;
         let serial = codec::InputSerial::from_millis(
             thinkterm_session::clock::Clock::wall_millis(&inner.host.clock),
         );
         let mods = KeyModifiers::from_bits_truncate(mods.bits());
-        let start = inner.session.key_down(serial, key, mods);
-        Self::spawn_drain(&inner, start);
+        // Typing goes back to following the output.
+        let cell = inner.focused_mut();
+        cell.scroll_from_bottom = 0;
+        cell.selection = None;
+        let start = cell.session.key_down(serial, key, mods);
+        Self::spawn_drain(&cell.session, start);
         drop(inner);
         self.request_frame();
         true
@@ -656,9 +726,10 @@ impl App {
         if inner.disconnected.is_some() {
             return;
         }
-        inner.scroll_from_bottom = 0;
-        let start = inner.session.write_bytes(text.as_bytes());
-        Self::spawn_drain(&inner, start);
+        let cell = inner.focused_mut();
+        cell.scroll_from_bottom = 0;
+        let start = cell.session.write_bytes(text.as_bytes());
+        Self::spawn_drain(&cell.session, start);
         drop(inner);
         self.request_frame();
     }
@@ -668,9 +739,10 @@ impl App {
         if inner.disconnected.is_some() {
             return;
         }
-        inner.scroll_from_bottom = 0;
-        let start = inner.session.paste(text);
-        Self::spawn_drain(&inner, start);
+        let cell = inner.focused_mut();
+        cell.scroll_from_bottom = 0;
+        let start = cell.session.paste(text);
+        Self::spawn_drain(&cell.session, start);
         drop(inner);
         self.request_frame();
     }
@@ -720,8 +792,8 @@ impl App {
             return;
         }
         let (col, row, x_off, y_off) = Self::cell_under(&inner, ev);
-        let dims = inner.session.dimensions();
-        let visible = visible_rows(&dims, inner.rows, inner.scroll_from_bottom);
+        let dims = inner.focused().session.dimensions();
+        let visible = visible_rows(&dims, inner.rows, inner.focused().scroll_from_bottom);
         let stable_row = visible.start + row as StableRowIndex;
         let button = match ev.button() {
             0 => MouseButton::Left,
@@ -732,7 +804,7 @@ impl App {
 
         // A program that asked for the mouse gets it, unless Shift holds
         // the event back for the page's own selection.
-        if inner.session.is_mouse_grabbed() && !ev.shift_key() {
+        if inner.focused().session.is_mouse_grabbed() && !ev.shift_key() {
             let kind = match what {
                 Pointer::Down => MouseEventKind::Press,
                 Pointer::Up => MouseEventKind::Release,
@@ -749,8 +821,9 @@ impl App {
                 button: if what == Pointer::Move && ev.buttons() == 0 { MouseButton::None } else { button },
                 modifiers: Self::mouse_modifiers(ev),
             };
-            let start = inner.session.mouse_event(event);
-            Self::spawn_drain(&inner, start);
+            let session = &inner.focused().session;
+            let start = session.mouse_event(event);
+            Self::spawn_drain(session, start);
             return;
         }
 
@@ -764,7 +837,7 @@ impl App {
                 };
                 inner.last_click_ms = t;
                 let mode = inner.click_count;
-                inner.selection = Some(Selection {
+                inner.focused_mut().selection = Some(Selection {
                     anchor: (stable_row, col),
                     head: (stable_row, col),
                     mode,
@@ -778,21 +851,22 @@ impl App {
                 });
             }
             Pointer::Move if inner.selecting => {
-                if let Some(sel) = &mut inner.selection {
+                if let Some(sel) = &mut inner.focused_mut().selection {
                     sel.head = (stable_row, col);
                 }
             }
             Pointer::Up if inner.selecting => {
                 inner.selecting = false;
-                if let Some(sel) = &mut inner.selection {
+                if let Some(sel) = &mut inner.focused_mut().selection {
                     sel.head = (stable_row, col);
                 }
                 let empty = inner
+                    .focused()
                     .selection
                     .map(|s| s.mode == 1 && s.anchor == s.head)
                     .unwrap_or(true);
                 if empty {
-                    inner.selection = None;
+                    inner.focused_mut().selection = None;
                 } else if let Some(text) = Self::selection_text(&inner) {
                     write_clipboard(&text);
                 }
@@ -834,9 +908,9 @@ impl App {
     }
 
     fn selection_text(inner: &Inner) -> Option<String> {
-        let sel = inner.selection?;
+        let sel = inner.focused().selection?;
         let ((r0, _), (r1, _)) = sel.ordered();
-        let (first, lines) = inner.session.get_lines(r0..r1 + 1);
+        let (first, lines) = inner.focused().session.get_lines(r0..r1 + 1);
         let mut out = Vec::new();
         for (i, line) in lines.iter().enumerate() {
             let row = first + i as StableRowIndex;
@@ -870,7 +944,7 @@ impl App {
         if notches == 0 {
             return false;
         }
-        if inner.session.is_alt_screen() || inner.session.is_mouse_grabbed() {
+        if inner.focused().session.is_alt_screen() || inner.focused().session.is_mouse_grabbed() {
             let button = if lines < 0.0 { MouseButton::WheelUp(notches) } else { MouseButton::WheelDown(notches) };
             let (col, row, x_off, y_off) = {
                 let rect = inner.canvas.get_bounding_client_rect();
@@ -883,8 +957,8 @@ impl App {
                 let (c, r) = cell_at(px, py, cw, ch);
                 (c, r, (px - c as f64 * cw) as isize, (py - r as f64 * ch) as isize)
             };
-            let dims = inner.session.dimensions();
-            let visible = visible_rows(&dims, inner.rows, inner.scroll_from_bottom);
+            let dims = inner.focused().session.dimensions();
+            let visible = visible_rows(&dims, inner.rows, inner.focused().scroll_from_bottom);
             let event = MouseEvent {
                 kind: MouseEventKind::Press,
                 x: col,
@@ -894,19 +968,20 @@ impl App {
                 button,
                 modifiers: Self::mouse_modifiers(ev),
             };
-            let start = inner.session.mouse_event(event);
-            Self::spawn_drain(&inner, start);
+            let session = &inner.focused().session;
+            let start = session.mouse_event(event);
+            Self::spawn_drain(session, start);
             return true;
         }
         if ev.ctrl_key() {
             return false;
         }
-        let dims = inner.session.dimensions();
-        let max = max_scroll(&dims);
-        inner.scroll_from_bottom = if lines < 0.0 {
-            (inner.scroll_from_bottom + notches).min(max)
+        let cell = inner.focused_mut();
+        let max = max_scroll(&cell.session.dimensions());
+        cell.scroll_from_bottom = if lines < 0.0 {
+            (cell.scroll_from_bottom + notches).min(max)
         } else {
-            inner.scroll_from_bottom.saturating_sub(notches)
+            cell.scroll_from_bottom.saturating_sub(notches)
         };
         drop(inner);
         self.request_frame();
@@ -930,7 +1005,7 @@ impl App {
         let (Some(strip), Some(layout)) = (&inner.strip, &inner.layout) else {
             return;
         };
-        let tabs = crate::chrome::model(layout, inner.pane_id, &inner.title);
+        let tabs = crate::chrome::model(layout, inner.focused_pane, inner.title());
         strip.render(&tabs, inner.following);
     }
 
@@ -962,7 +1037,7 @@ impl App {
                 inner.layout_refresh_pending = false;
                 match listed {
                     Ok(layout) => {
-                        let gone = crate::chrome::entry(&layout, inner.pane_id).is_none();
+                        let gone = crate::chrome::entry(&layout, inner.focused_pane).is_none();
                         let replacement = if gone {
                             crate::chrome::first_choice(&layout)
                         } else {
@@ -1088,7 +1163,7 @@ impl App {
     async fn switch_to(self: &Rc<Self>, entry: thinkterm_proto::layout::PaneEntry) {
         let (link, size) = {
             let mut inner = self.inner.borrow_mut();
-            if entry.pane_id == inner.pane_id || inner.switching || inner.disconnected.is_some() {
+            if entry.pane_id == inner.focused_pane || inner.switching || inner.disconnected.is_some() {
                 return;
             }
             inner.switching = true;
@@ -1151,29 +1226,35 @@ impl App {
                 pixel_height: entry.size.pixel_height,
                 reverse_video: false,
             };
-            inner.session = build_session(
+            // Another tab is another lease and another tab id for every
+            // session under it.
+            if entry.tab_id != inner.tab_id {
+                inner.remote_tab_id = Arc::new(std::sync::atomic::AtomicUsize::new(entry.tab_id));
+            }
+            let session = build_session(
                 &inner.host,
+                &inner.images,
+                &inner.remote_tab_id,
                 entry.pane_id,
-                entry.tab_id,
                 dims,
                 &entry.title,
                 entry.alt_screen,
             );
-            inner.pane_id = entry.pane_id;
+            // One pane on show, so the old cells go; a later step keeps
+            // the whole tab.
+            inner.panes.clear();
+            inner.panes.insert(entry.pane_id, PaneCell::new(session, &entry.title));
+            inner.focused_pane = entry.pane_id;
             inner.tab_id = entry.tab_id;
-            inner.title = entry.title.clone();
-            inner.scroll_from_bottom = 0;
-            inner.selection = None;
+            inner.window_id = entry.window_id;
+            inner.workspace = entry.workspace.clone();
             inner.selecting = false;
             inner.ime_anchor = None;
-            // The palette is a pane's; the new one says its own, if it has
-            // one, right after the subscription.
-            inner.palette = ColorPalette::default();
             // Forces `resize` to see a change: the new pane is reflowed to
             // this grid if the page owns its tab, or reported against it.
             inner.cols = 0;
             if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-                doc.set_title(&format!("{} — ThinkTerm", inner.title));
+                doc.set_title(&format!("{} — ThinkTerm", inner.title()));
             }
             Self::render_strip(&inner);
             let _ = inner.textarea.focus();
@@ -1250,10 +1331,10 @@ impl App {
             let owner = inner.link.lease().owns_viewport();
             inner.link.lease_mut().reported = Some(size);
             let link = inner.link.clone();
-            let (tab_id, pane_id) = (inner.tab_id, inner.pane_id);
+            let (tab_id, pane_id) = (inner.tab_id, inner.focused_pane);
             if owner {
-                inner.session.apply_local_resize(size);
-                let session = Arc::clone(&inner.session);
+                inner.focused().session.apply_local_resize(size);
+                let session = Arc::clone(&inner.focused().session);
                 let host = Arc::clone(&inner.host);
                 wasm_bindgen_futures::spawn_local(async move {
                     let pdu = Pdu::Resize(codec::Resize {
@@ -1315,12 +1396,12 @@ impl App {
             inner.reconnect_delay = RECONNECT_MIN_MS;
         }
         let _ = inner.host.events.take_dirty();
-        let title = inner.session.title();
-        if title != inner.title {
-            inner.title = title;
+        let title = inner.focused().session.title();
+        if title != inner.focused().title {
+            inner.focused_mut().title = title;
             Self::render_strip(&inner);
             if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-                doc.set_title(&format!("{} — ThinkTerm", inner.title));
+                doc.set_title(&format!("{} — ThinkTerm", inner.title()));
             }
             drop(inner);
             self.refresh_status();
@@ -1398,16 +1479,19 @@ impl App {
 
         // Lines still in flight, a stalled fetch, or glyphs the budget put
         // off: come back for them.
-        let dims = inner.session.dimensions();
         // Exactly the rows shown: asking about rows past a shorter page's
         // bottom, which may not exist, would repaint forever.
-        let visible = visible_rows(&dims, inner.rows, inner.scroll_from_bottom);
         // Called first, and never behind a `||`. This is not a predicate:
         // it re-issues line fetches that timed out and resets the poll
         // interval. Short-circuiting it on a frame that deferred a glyph
         // meant a dropped `GetLines` was never retried, and those rows
-        // stayed blank for the rest of the stream.
-        let stalled = inner.session.render_looks_stalled_in(visible);
+        // stayed blank for the rest of the stream. Every pane, every frame.
+        let mut stalled = false;
+        for cell in inner.panes.values() {
+            let dims = cell.session.dimensions();
+            let visible = visible_rows(&dims, inner.rows, cell.scroll_from_bottom);
+            stalled |= cell.session.render_looks_stalled_in(visible);
+        }
         let mut again = owed > 0 || stalled;
 
         let mut retry_in = None;
@@ -1507,14 +1591,16 @@ impl App {
     /// a full atlas declined.
     fn paint(inner: &mut Inner, budget: &mut FallbackBudget) -> Result<(u32, u32)> {
         inner.glyphs.begin_frame(inner.capacity.frozen());
-        let dims = inner.session.dimensions();
+        let session = Arc::clone(&inner.focused().session);
+        let dims = session.dimensions();
         let max = max_scroll(&dims);
-        if inner.scroll_from_bottom > max {
-            inner.scroll_from_bottom = max;
+        if inner.focused().scroll_from_bottom > max {
+            inner.focused_mut().scroll_from_bottom = max;
         }
-        let cursor = inner.session.cursor_position();
-        let visible = visible_rows(&dims, inner.rows, inner.scroll_from_bottom);
-        let (first, lines) = inner.session.get_lines(visible);
+        let cursor = session.cursor_position();
+        let visible = visible_rows(&dims, inner.rows, inner.focused().scroll_from_bottom);
+        let (first, lines) = session.get_lines(visible);
+        let palette = inner.focused().palette.clone();
         let (w, h) = inner.gpu.size();
         let cell_h = inner.glyphs.metrics.cell_size.height as f32;
         let cursor_line = cursor.y.checked_sub(first)
@@ -1532,7 +1618,7 @@ impl App {
         crate::ime::update_field(&inner.textarea, &mut inner.ime_anchor, anchor)
             .map_err(|e| anyhow::anyhow!("IME anchor: {e:?}"))?;
         inner.quads.recycle();
-        let selection = inner.selection;
+        let selection = inner.focused().selection;
         for (i, line) in lines.iter().enumerate() {
             let row = first + i as StableRowIndex;
             let sel_range = match &selection {
@@ -1544,7 +1630,7 @@ impl App {
                 stable_row: row,
                 top_pixel_y: i as f32 * cell_h,
                 cursor: &cursor,
-                palette: &inner.palette,
+                palette: &palette,
                 selection: sel_range,
                 focused: inner.focused && inner.link.lease().owns_viewport(),
                 reverse_video: dims.reverse_video,
@@ -1558,7 +1644,7 @@ impl App {
         }
         inner.vertices.clear();
         inner.quads.extract_vertices(&mut inner.vertices);
-        let bg = inner.palette.background.to_linear().tuple();
+        let bg = palette.background.to_linear().tuple();
         let millis = (js_sys::Date::now() % (u32::MAX as f64)) as u32;
         inner
             .gpu

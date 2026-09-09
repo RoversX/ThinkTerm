@@ -2,7 +2,7 @@
 //! sink and its settings.
 
 use crate::link::WsLink;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -48,7 +48,9 @@ impl Spawner for LocalSpawner {
 /// the few facts the page shows.
 #[derive(Default)]
 pub struct WebEvents {
-    dirty: Cell<bool>,
+    /// The panes with news since the last frame, by the id the page
+    /// keys them on (the server's pane id).
+    dirty: RefCell<std::collections::HashSet<HostPaneId>>,
     wake: RefCell<Option<Rc<dyn Fn()>>>,
 }
 
@@ -59,12 +61,12 @@ impl WebEvents {
         *self.wake.borrow_mut() = Some(wake);
     }
 
-    pub fn take_dirty(&self) -> bool {
-        self.dirty.replace(false)
+    pub fn take_dirty(&self) -> std::collections::HashSet<HostPaneId> {
+        std::mem::take(&mut *self.dirty.borrow_mut())
     }
 
-    fn mark(&self) {
-        self.dirty.set(true);
+    fn mark(&self, pane: HostPaneId) {
+        self.dirty.borrow_mut().insert(pane);
         if let Some(wake) = self.wake.borrow().clone() {
             wake();
         }
@@ -72,13 +74,13 @@ impl WebEvents {
 }
 
 impl SessionEvents for WebEvents {
-    fn pane_output(&self, _pane: HostPaneId) {
-        self.mark();
+    fn pane_output(&self, pane: HostPaneId) {
+        self.mark(pane);
     }
     fn alert(&self, _pane: HostPaneId, _alert: wezterm_term::Alert) {}
     fn agent_status_changed(&self, _pane: HostPaneId) {}
-    fn pane_removed(&self, _pane: HostPaneId) {
-        self.mark();
+    fn pane_removed(&self, pane: HostPaneId) {
+        self.mark(pane);
     }
     fn pane_focused(&self, _pane: HostPaneId) {}
     fn input_recorded(&self) {}

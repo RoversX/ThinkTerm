@@ -208,10 +208,15 @@ async fn start_attached(
         link: link.clone(),
         config: WebConfig::default(),
     });
+    let images = Arc::new(thinkterm_session::Lock::new(
+        thinkterm_session::images::ImageStore::default(),
+    ));
+    let remote_tab_id = Arc::new(std::sync::atomic::AtomicUsize::new(attached.tab_id));
     let session = crate::app::build_session(
         &host,
+        &images,
+        &remote_tab_id,
         attached.pane_id,
-        attached.tab_id,
         attached.dims,
         &attached.title,
         attached.alt_screen,
@@ -219,8 +224,10 @@ async fn start_attached(
 
     let app = App::new(Setup {
         link: link.clone(),
-        session,
         host: Arc::clone(&host),
+        images,
+        remote_tab_id,
+        pane: crate::app::PaneCell::new(session, &attached.title),
         gpu,
         glyphs,
         fonts,
@@ -231,10 +238,11 @@ async fn start_attached(
         token: token.to_string(),
         pane_id: attached.pane_id,
         tab_id: attached.tab_id,
+        window_id: attached.window_id,
+        workspace: attached.workspace.clone(),
         dpr,
         cols,
         rows,
-        title: attached.title.clone(),
         strip: crate::chrome::TabStrip::mount("tabs"),
     });
     host.events.set_wake(app.wake());

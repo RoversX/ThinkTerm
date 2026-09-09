@@ -14,6 +14,8 @@ use wezterm_term::TerminalSize;
 pub struct Attached {
     pub pane_id: PaneId,
     pub tab_id: TabId,
+    pub window_id: thinkterm_proto::WindowId,
+    pub workspace: String,
     pub title: String,
     pub dims: RenderableDimensions,
     pub alt_screen: bool,
@@ -110,6 +112,8 @@ pub async fn attach(link: &WsLink, size: Option<TerminalSize>) -> Result<Attache
     Ok(Attached {
         pane_id: entry.pane_id,
         tab_id: entry.tab_id,
+        window_id: entry.window_id,
+        workspace: entry.workspace.clone(),
         title: entry.title.clone(),
         dims: RenderableDimensions {
             cols: entry.size.cols,
