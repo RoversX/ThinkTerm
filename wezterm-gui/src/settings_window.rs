@@ -302,6 +302,7 @@ enum SettingsSection {
     Terminal,
     Workspaces,
     Agents,
+    Web,
     Archived,
     Keymap,
     CommandPalette,
@@ -320,6 +321,7 @@ const BASE_SECTIONS: &[SettingsSection] = &[
     SettingsSection::Terminal,
     SettingsSection::Workspaces,
     SettingsSection::Agents,
+    SettingsSection::Web,
     SettingsSection::Archived,
     SettingsSection::Keymap,
     SettingsSection::CommandPalette,
@@ -382,6 +384,7 @@ fn initial_section() -> SettingsSection {
         "terminal" => SettingsSection::Terminal,
         "workspaces" => SettingsSection::Workspaces,
         "agents" => SettingsSection::Agents,
+        "web" => SettingsSection::Web,
         "archived" => SettingsSection::Archived,
         "keymap" => SettingsSection::Keymap,
         "commandpalette" => SettingsSection::CommandPalette,
@@ -408,6 +411,7 @@ impl SettingsSection {
             Self::Terminal => crate::i18n::tr("settings-section-terminal"),
             Self::Workspaces => crate::i18n::tr("settings-section-workspaces"),
             Self::Agents => crate::i18n::tr("settings-section-agents"),
+            Self::Web => crate::i18n::tr("settings-section-web"),
             Self::Archived => crate::i18n::tr("settings-section-archived"),
             Self::Keymap => crate::i18n::tr("settings-section-keymap"),
             Self::CommandPalette => crate::i18n::tr("settings-section-command-palette"),
@@ -428,6 +432,7 @@ impl SettingsSection {
             Self::Terminal => SettingsIcon::Terminal,
             Self::Workspaces => SettingsIcon::Workspaces,
             Self::Agents => SettingsIcon::Agents,
+            Self::Web => SettingsIcon::Web,
             Self::Archived => SettingsIcon::Archived,
             Self::Keymap => SettingsIcon::Keymap,
             Self::CommandPalette => SettingsIcon::CommandPalette,
@@ -458,6 +463,18 @@ impl SettingsSection {
                 "Window Size",
                 "Window Position",
                 "Configuration",
+            ],
+            Self::Web => &[
+                "Web",
+                "Browser",
+                "Browser Access",
+                "Remote",
+                "Link",
+                "Token",
+                "Share",
+                "HTTP",
+                "Port",
+                "Listener",
             ],
             Self::Appearance => &[
                 "Theme Mode",
@@ -646,6 +663,45 @@ mod settings_search_tests {
     }
 }
 
+/// What the expiry dropdown offers, shortest first.
+///
+/// `None` last, because it is the one with no bound and reading the list in
+/// order should make that the deliberate end of a scale.
+const WEB_LINK_TTL_CHOICES: &[Option<u64>] = &[
+    Some(60 * 60),
+    Some(8 * 60 * 60),
+    Some(24 * 60 * 60),
+    Some(7 * 24 * 60 * 60),
+    None,
+];
+
+/// A lifetime as words: hours below a day, days above it, and "until
+/// revoked" for no expiry at all.
+fn web_link_ttl_label(ttl: Option<u64>) -> String {
+    let Some(secs) = ttl else {
+        return crate::i18n::tr("settings-web-ttl-never");
+    };
+    let mut args = FluentArgs::new();
+    if secs < 24 * 60 * 60 {
+        args.set("hours", (secs / 3600).max(1) as i64);
+        crate::i18n::tr_args("settings-web-ttl-hours", &args)
+    } else {
+        args.set("days", (secs / (24 * 60 * 60)).max(1) as i64);
+        crate::i18n::tr_args("settings-web-ttl-days", &args)
+    }
+}
+
+/// When a browser link stops working, in the viewer's own time zone.
+fn format_web_token_when(secs: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
+        .map(|when| {
+            when.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| secs.to_string())
+}
+
 fn localized_theme_mode_label(mode: NativeThemeMode) -> String {
     crate::i18n::tr(match mode {
         NativeThemeMode::System => "settings-theme-system",
@@ -706,6 +762,15 @@ fn settings_tr(id: &'static str, values: &[(&'static str, String)]) -> String {
     crate::i18n::tr_args(id, &args)
 }
 
+/// A token id as something a `Copy` action can carry. Ids are random, so a
+/// 64-bit hash of one is as good as the id for telling rows apart.
+fn web_token_key(id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut hasher);
+    hasher.finish()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsAction {
     WindowHide,
@@ -731,6 +796,18 @@ enum SettingsAction {
     /// Index into the archived rows cached at paint time.
     UnarchiveArchivedRow(usize),
     DeleteArchivedRow(usize),
+    ToggleWebServer,
+    ToggleWebLinkTtlMenu,
+    /// Seconds, or `None` for a link that lasts until it is revoked.
+    SetWebLinkTtl(Option<u64>),
+    /// Mint a link and put it straight on the clipboard.
+    CopyWebLink,
+    /// Index into the token rows cached at paint time.
+    /// Carries `web_token_key(id)`, not the row's index: the press is
+    /// remembered at mouse-down and compared by value with the action under
+    /// the pointer at release, and the list can be refreshed in between.
+    RevokeWebToken(u64),
+    RevokeAllWebTokens,
     ToggleDeveloperMode,
     ToggleFallbackContextMenu,
     ShowOnboardingNow,
@@ -822,6 +899,7 @@ enum SettingsDropdown {
     MainRenderer,
     DefaultShell,
     CommandPaletteHotkey,
+    WebLinkTtl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1239,6 +1317,10 @@ struct SettingsUiState {
     /// The archived rows as last painted; row-action indices resolve here
     /// so a click acts on exactly what the user saw.
     archived_rows: Vec<crate::workspace_threads::ArchivedProjectRow>,
+    /// The browser links as last painted, for the same reason: a revoke
+    /// must cut off the row that was under the pointer, not whichever row
+    /// holds that index after the list refreshed.
+    web_tokens: Vec<codec::WebTokenInfo>,
     /// The shells found on this machine. Refreshed when the Terminal
     /// section is entered, never while painting: discovery touches the
     /// filesystem, and the paint path must not.
@@ -1294,6 +1376,7 @@ impl SettingsUiState {
             main_window_resource_lines: Vec::new(),
             memory_snapshot_copied_until: None,
             archived_rows: Vec::new(),
+            web_tokens: Vec::new(),
             shell_catalog: Vec::new(),
             confirm_delete_archived: None,
             input_diagnostics_copied_until: None,
@@ -2240,6 +2323,8 @@ impl SettingsWindow {
                         | SettingsAction::SetDefaultShell(_)
                         | SettingsAction::ToggleCommandPaletteHotkeyMenu
                         | SettingsAction::SetCommandPaletteHotkey(_)
+                        | SettingsAction::ToggleWebLinkTtlMenu
+                        | SettingsAction::SetWebLinkTtl(_)
                         | SettingsAction::DropdownMenuBackdrop,
                     ) => {
                         self.set_focused_input(None);
@@ -2477,6 +2562,10 @@ impl SettingsWindow {
                     .is_some_and(|until| Instant::now() >= until)
                 {
                     settings.ui.update_checked_until = None;
+                    window.invalidate();
+                }
+                if crate::web_settings::state().copied {
+                    crate::web_settings::clear_copied();
                     window.invalidate();
                 }
                 if settings
@@ -3837,6 +3926,56 @@ impl SettingsWindow {
                     }
                 }
             }
+            SettingsAction::ToggleWebServer => {
+                self.ui.open_dropdown = None;
+                let state = crate::web_settings::state();
+                let on = state
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| !status.listening.is_empty());
+                // Turning it on with nothing configured is the ordinary
+                // case, so fall back to the same loopback address a bare
+                // `web_servers = { {} }` would have produced.
+                let address = state
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.configured.first().cloned())
+                    .or_else(|| Some(config::WebServer::default().bind_address));
+                crate::web_settings::set_enabled(window.clone(), !on, address);
+            }
+            SettingsAction::ToggleWebLinkTtlMenu => {
+                self.ui.open_dropdown = if self.ui.open_dropdown == Some(SettingsDropdown::WebLinkTtl)
+                {
+                    None
+                } else {
+                    Some(SettingsDropdown::WebLinkTtl)
+                };
+            }
+            SettingsAction::SetWebLinkTtl(ttl) => {
+                self.native_settings.web.link_ttl_secs = ttl;
+                self.ui.open_dropdown = None;
+                self.save_web_settings();
+            }
+            SettingsAction::CopyWebLink => {
+                self.ui.open_dropdown = None;
+                crate::web_settings::mint(window.clone(), self.native_settings.web.link_ttl_secs);
+                self.schedule_copied_state_clear(window);
+            }
+            SettingsAction::RevokeWebToken(key) => {
+                self.ui.open_dropdown = None;
+                if let Some(token) = self
+                    .ui
+                    .web_tokens
+                    .iter()
+                    .find(|token| web_token_key(&token.id) == key)
+                {
+                    crate::web_settings::revoke(window.clone(), Some(token.id.clone()));
+                }
+            }
+            SettingsAction::RevokeAllWebTokens => {
+                self.ui.open_dropdown = None;
+                crate::web_settings::revoke(window.clone(), None);
+            }
             SettingsAction::ToggleDeveloperMode => {
                 self.ui.open_dropdown = None;
                 self.native_settings.developer.developer_mode =
@@ -5106,6 +5245,7 @@ impl SettingsWindow {
             SettingsSection::Terminal => self.paint_terminal(layers, x, max_width)?,
             SettingsSection::Workspaces => self.paint_workspaces(layers, x, max_width)?,
             SettingsSection::Agents => self.paint_agents(layers, x, max_width)?,
+            SettingsSection::Web => self.paint_web(layers, x, max_width)?,
             SettingsSection::Archived => self.paint_archived(layers, x, max_width)?,
             SettingsSection::Keymap => self.paint_placeholder(
                 layers,
@@ -5461,6 +5601,315 @@ impl SettingsWindow {
             true,
         )?;
 
+        Ok(())
+    }
+
+    /// Browser access: whether the mux server is accepting browser clients,
+    /// and the links that let one in.
+    ///
+    /// Two cards, because they answer different questions: the first is a
+    /// switch and its state, the second is a list of credentials that
+    /// outlive any one session. Putting a revoke button in the same card as
+    /// the on/off switch read as though it were part of turning it off.
+    ///
+    /// Everything here is the *server's* state, not this window's, so it is
+    /// read over the mux client and cached in `web_settings`; painting only
+    /// ever reads that cache.
+    fn paint_web(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
+        let scroll = self.ui.content_scroll.offset;
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
+
+        let state = crate::web_settings::state();
+        // Asked here rather than in `enter_section`, which has no window to
+        // wake when the answer lands. One request: `refresh` refuses to
+        // start a second while one is out.
+        if let Some(window) = self.window.clone() {
+            // The first read, and then every couple of seconds for as long
+            // as this section is the one on screen: the live-connection
+            // count is the server's news, not this window's, so nothing
+            // else would ever bring it up to date.
+            if !state.loaded || crate::web_settings::poll_is_due() {
+                crate::web_settings::refresh(window.clone());
+            }
+            crate::web_settings::arm_poll(window);
+        }
+        let listening = state
+            .status
+            .as_ref()
+            .is_some_and(|status| !status.listening.is_empty());
+        let address = state
+            .status
+            .as_ref()
+            .and_then(|status| status.listening.first().cloned());
+
+        // Snapshotted for the row actions, exactly as the archived rows are.
+        self.ui.web_tokens = state.tokens.clone();
+
+        let padding = 36.0;
+        let row_x = x + padding;
+        let row_width = max_width - padding * 2.0;
+        let row_step = self.settings_row_step();
+
+        // --- the switch -------------------------------------------------
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            section_y,
+            &crate::i18n::tr("settings-web-heading"),
+            palette.muted_text,
+            max_width,
+        )?;
+        let (card_y, first_row_y) = self.settings_card_geometry(section_y, 3);
+        let card_height = self.settings_card_height(3);
+        self.paint_group_card(layers, x, card_y, max_width, card_height)?;
+
+        // The error takes the description slot rather than a line of its
+        // own: it is always about the thing the toggle just tried to do,
+        // and a row that appears and disappears moves everything below it.
+        let description = match (&state.error, &address) {
+            (Some(error), _) => error.clone(),
+            (None, Some(address)) => {
+                let mut args = FluentArgs::new();
+                args.set("address", address.clone());
+                crate::i18n::tr_args("settings-web-on-at", &args)
+            }
+            (None, None) => crate::i18n::tr("settings-web-enable-description"),
+        };
+        self.paint_toggle_setting_row(
+            layers,
+            row_x,
+            first_row_y,
+            row_width,
+            &crate::i18n::tr("settings-web-enable"),
+            &description,
+            listening,
+            SettingsAction::ToggleWebServer,
+            false,
+        )?;
+
+        let ttl_y = first_row_y + row_step;
+        self.paint_web_link_ttl_row(layers, row_x, ttl_y, row_width, true)?;
+
+        let copy_y = first_row_y + row_step * 2.0;
+        self.paint_separator(layers, row_x, copy_y - self.ui_px(28.0), row_width)?;
+        let copy_label = if state.copied {
+            crate::i18n::tr("settings-web-copied")
+        } else {
+            crate::i18n::tr("settings-web-copy")
+        };
+        let copy_width = self.button_width_for_label(&copy_label, 190.0);
+        let copy_x = row_x + row_width - copy_width;
+        let copy_text_width = copy_x - row_x - self.ui_px(24.0);
+        self.draw_text(
+            layers,
+            &ui_font,
+            row_x,
+            copy_y,
+            &crate::i18n::tr("settings-web-link"),
+            palette.text,
+            copy_text_width,
+        )?;
+        self.draw_text(
+            layers,
+            &body_font,
+            row_x,
+            self.settings_row_description_y(copy_y),
+            &crate::i18n::tr("settings-web-link-description"),
+            palette.secondary_text,
+            copy_text_width,
+        )?;
+        self.draw_button(
+            layers,
+            copy_x,
+            copy_y + self.ui_px(4.0),
+            copy_width,
+            &copy_label,
+            SettingsAction::CopyWebLink,
+        )?;
+
+        // --- the links --------------------------------------------------
+        // One extra row for "every link" only when there is more than
+        // nothing to revoke; an empty list gets the placeholder row alone.
+        let link_rows = state.tokens.len().max(1) + usize::from(!state.tokens.is_empty());
+        let links_title_y = card_y + card_height + self.settings_section_card_gap();
+        let links_card_y = links_title_y + self.settings_section_card_gap().min(54.0);
+        let links_first_row_y = links_card_y + self.settings_card_top_padding();
+        let links_card_height = self.settings_card_height(link_rows);
+        self.ui.content_scroll.set_extents(
+            self.content_viewport_extent(),
+            self.settings_content_extent(links_card_y + scroll + links_card_height),
+        );
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            links_title_y,
+            &crate::i18n::tr("settings-web-links-heading"),
+            palette.muted_text,
+            max_width,
+        )?;
+        self.paint_group_card(layers, x, links_card_y, max_width, links_card_height)?;
+
+        let icon_gap = self.ui_px(12.0);
+        let tile_for = |window: &Self, y: f32| {
+            window.settings_row_description_y(y) - y + window.metrics.cell_size.height as f32
+        };
+
+        if state.tokens.is_empty() {
+            let y = links_first_row_y;
+            let tile = tile_for(self, y);
+            self.draw_rounded_frame(
+                layers,
+                0,
+                row_x,
+                y,
+                tile,
+                tile,
+                palette.control_bg,
+                palette.rule,
+                self.ui_px(8.0),
+            )?;
+            let mark = tile * 0.62;
+            self.draw_svg_icon(
+                layers,
+                SvgIcon::Globe,
+                row_x + (tile - mark) / 2.0,
+                y + (tile - mark) / 2.0,
+                mark,
+                palette.muted_text,
+            )?;
+            self.draw_text(
+                layers,
+                &body_font,
+                row_x + tile + icon_gap,
+                y,
+                &crate::i18n::tr("settings-web-tokens-empty"),
+                palette.muted_text,
+                row_width - tile - icon_gap,
+            )?;
+            return Ok(());
+        }
+
+        let revoke_label = crate::i18n::tr("settings-web-revoke");
+        let revoke_width = self.button_width_for_label(&revoke_label, 0.0);
+        for (index, token) in state.tokens.iter().enumerate() {
+            let y = links_first_row_y + row_step * index as f32;
+            if index > 0 {
+                self.paint_separator(layers, row_x, y - self.ui_px(28.0), row_width)?;
+            }
+            let controls_x = row_x + row_width - revoke_width;
+            let tile = tile_for(self, y);
+            self.draw_rounded_frame(
+                layers,
+                0,
+                row_x,
+                y,
+                tile,
+                tile,
+                palette.control_bg,
+                palette.rule,
+                self.ui_px(8.0),
+            )?;
+            let mark = tile * 0.62;
+            self.draw_svg_icon(
+                layers,
+                SvgIcon::Globe,
+                row_x + (tile - mark) / 2.0,
+                y + (tile - mark) / 2.0,
+                mark,
+                palette.text,
+            )?;
+            let text_x = row_x + tile + icon_gap;
+            let text_width = (controls_x - text_x - self.ui_px(24.0)).max(row_width * 0.3);
+            // What this link is, in order of how much it actually tells
+            // you: the name a person gave it, then what the browser that
+            // used it said it was, then the honest admission that nobody
+            // has used it yet. The label used to be stamped "Settings" for
+            // every link minted here, so the list was a column of identical
+            // rows -- a name that names nothing is worse than no name.
+            let headline = token
+                .label
+                .clone()
+                .or_else(|| token.last_device.clone())
+                .unwrap_or_else(|| crate::i18n::tr("settings-web-token-unused"));
+            self.draw_text(
+                layers,
+                &ui_font,
+                text_x,
+                y,
+                &headline,
+                palette.text,
+                text_width,
+            )?;
+            let mut args = FluentArgs::new();
+            args.set(
+                "expires",
+                match token.expires_at {
+                    Some(at) => format_web_token_when(at),
+                    None => crate::i18n::tr("settings-web-token-never"),
+                },
+            );
+            args.set("connections", token.live_connections as i64);
+            self.draw_text(
+                layers,
+                &body_font,
+                text_x,
+                self.settings_row_description_y(y),
+                &crate::i18n::tr_args("settings-web-token-meta", &args),
+                palette.secondary_text,
+                text_width,
+            )?;
+            self.draw_button(
+                layers,
+                controls_x,
+                y + (tile - self.ui_px(CONTROL_HEIGHT)) / 2.0,
+                revoke_width,
+                &revoke_label,
+                SettingsAction::RevokeWebToken(web_token_key(&token.id)),
+            )?;
+        }
+
+        let all_y = links_first_row_y + row_step * state.tokens.len() as f32;
+        self.paint_separator(layers, row_x, all_y - self.ui_px(28.0), row_width)?;
+        let all_label = crate::i18n::tr("settings-web-revoke-all");
+        let all_width = self.button_width_for_label(&all_label, 190.0);
+        let all_x = row_x + row_width - all_width;
+        let all_text_width = all_x - row_x - self.ui_px(24.0);
+        self.draw_text(
+            layers,
+            &ui_font,
+            row_x,
+            all_y,
+            &crate::i18n::tr("settings-web-revoke-all-label"),
+            palette.text,
+            all_text_width,
+        )?;
+        self.draw_text(
+            layers,
+            &body_font,
+            row_x,
+            self.settings_row_description_y(all_y),
+            &crate::i18n::tr("settings-web-revoke-all-description"),
+            palette.secondary_text,
+            all_text_width,
+        )?;
+        self.draw_button(
+            layers,
+            all_x,
+            all_y + self.ui_px(4.0),
+            all_width,
+            &all_label,
+            SettingsAction::RevokeAllWebTokens,
+        )?;
         Ok(())
     }
 
@@ -5884,6 +6333,17 @@ impl SettingsWindow {
         let value = (self.current_command_palette_font_size() + delta).clamp(8.0, 32.0);
         self.native_settings.command_palette.font_size = Some(value);
         self.save_command_palette_settings();
+    }
+
+    /// The same merge-then-write dance as the palette's: another window
+    /// may have written a different group while Settings was open.
+    fn save_web_settings(&mut self) {
+        let mut merged = crate::native_settings::load();
+        merged.web = self.native_settings.web.clone();
+        self.native_settings = merged;
+        if let Err(err) = crate::native_settings::save(&self.native_settings) {
+            log::error!("failed to save the browser link expiry: {err:#}");
+        }
     }
 
     fn save_command_palette_settings(&mut self) {
@@ -8980,6 +9440,122 @@ impl SettingsWindow {
         Ok(())
     }
 
+    /// How long the next link lasts. A dropdown rather than a fixed value
+    /// because both ends are legitimate: an afternoon on a borrowed phone,
+    /// and a link in a password manager for a machine reached every day.
+    fn paint_web_link_ttl_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
+        if draw_top_rule {
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
+        }
+
+        let (control_x, control_y, control_width) = self.dropdown_control_geometry(x, y, width);
+        let text_width = (control_x - x - 24.0).max(width * 0.45);
+        let action = SettingsAction::ToggleWebLinkTtlMenu;
+        let control_rect = rect(
+            control_x,
+            control_y,
+            control_width,
+            self.ui_px(CONTROL_HEIGHT),
+        );
+        let open = self.ui.open_dropdown == Some(SettingsDropdown::WebLinkTtl);
+        let hovered = self.ui.interaction.hovered == Some(action);
+        let pressed = self.ui.interaction.pressed == Some(action);
+        let bg = if pressed || hovered {
+            palette.control_hover_bg
+        } else {
+            palette.control_bg
+        };
+        let border = if open {
+            palette.nav_selected_bg
+        } else if hovered || pressed {
+            palette.separator
+        } else {
+            palette.control_border
+        };
+
+        self.ui_context
+            .push(control_rect, WidgetKind::Button, action);
+        self.draw_text(
+            layers,
+            &ui_font,
+            x,
+            y,
+            &crate::i18n::tr("settings-web-ttl"),
+            palette.text,
+            text_width,
+        )?;
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            self.settings_row_description_y(y),
+            &crate::i18n::tr("settings-web-ttl-description"),
+            palette.secondary_text,
+            text_width,
+        )?;
+        self.draw_rounded_frame(
+            layers,
+            0,
+            control_rect.origin.x,
+            control_rect.origin.y,
+            control_rect.size.width,
+            control_rect.size.height,
+            bg,
+            border,
+            self.ui_px(CONTROL_RADIUS),
+        )?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            control_x + self.ui_px(16.0),
+            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
+            &web_link_ttl_label(self.native_settings.web.link_ttl_secs),
+            palette.text,
+            control_width - self.ui_px(60.0),
+        )?;
+        self.draw_svg_icon(
+            layers,
+            SvgIcon::ChevronDown,
+            control_x + control_width - self.ui_px(38.0),
+            control_y + (self.ui_px(CONTROL_HEIGHT) - 22.0) / 2.0,
+            self.ui_px(22.0),
+            palette.secondary_text,
+        )?;
+        Ok(())
+    }
+
+    fn paint_web_link_ttl_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+    ) -> anyhow::Result<()> {
+        let current = self.native_settings.web.link_ttl_secs;
+        let options: Vec<(String, SettingsAction, bool)> = WEB_LINK_TTL_CHOICES
+            .iter()
+            .copied()
+            .map(|ttl| {
+                (
+                    web_link_ttl_label(ttl),
+                    SettingsAction::SetWebLinkTtl(ttl),
+                    current == ttl,
+                )
+            })
+            .collect();
+        self.paint_dropdown_menu(layers, x, y, width, &options)
+    }
+
     fn paint_command_palette_hotkey_row(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -9733,6 +10309,7 @@ impl SettingsWindow {
             SettingsSection::Appearance => 4,
             SettingsSection::Terminal => 9,
             SettingsSection::CommandPalette => 4,
+            SettingsSection::Web => 3,
             _ => 4,
         };
         let (_, first_row_y) = self.settings_card_geometry(section_y, row_count);
@@ -9747,7 +10324,8 @@ impl SettingsWindow {
                     SettingsDropdown::AppIcon => first_row_y + self.settings_row_step(),
                     SettingsDropdown::MainRenderer
                     | SettingsDropdown::DefaultShell
-                    | SettingsDropdown::CommandPaletteHotkey => return Ok(()),
+                    | SettingsDropdown::CommandPaletteHotkey
+                    | SettingsDropdown::WebLinkTtl => return Ok(()),
                 };
                 (x + card_padding, row_y, max_width - card_padding * 2.0)
             }
@@ -9758,7 +10336,8 @@ impl SettingsWindow {
                     SettingsDropdown::MainRenderer => first_row_y + self.settings_row_step() * 4.0,
                     SettingsDropdown::AppIcon
                     | SettingsDropdown::DefaultShell
-                    | SettingsDropdown::CommandPaletteHotkey => return Ok(()),
+                    | SettingsDropdown::CommandPaletteHotkey
+                    | SettingsDropdown::WebLinkTtl => return Ok(()),
                 };
                 (x + card_padding, row_y, max_width - card_padding * 2.0)
             }
@@ -9771,7 +10350,8 @@ impl SettingsWindow {
                     | SettingsDropdown::ThemeMode
                     | SettingsDropdown::AppIcon
                     | SettingsDropdown::MainRenderer
-                    | SettingsDropdown::CommandPaletteHotkey => return Ok(()),
+                    | SettingsDropdown::CommandPaletteHotkey
+                    | SettingsDropdown::WebLinkTtl => return Ok(()),
                 };
                 (x + card_padding, row_y, max_width - card_padding * 2.0)
             }
@@ -9779,6 +10359,14 @@ impl SettingsWindow {
                 let row_y = match dropdown {
                     // First row of its card, like DefaultShell above.
                     SettingsDropdown::CommandPaletteHotkey => first_row_y,
+                    _ => return Ok(()),
+                };
+                (x + card_padding, row_y, max_width - card_padding * 2.0)
+            }
+            SettingsSection::Web => {
+                let row_y = match dropdown {
+                    // Second row of the first card; see `paint_web`.
+                    SettingsDropdown::WebLinkTtl => first_row_y + self.settings_row_step(),
                     _ => return Ok(()),
                 };
                 (x + card_padding, row_y, max_width - card_padding * 2.0)
@@ -9819,6 +10407,12 @@ impl SettingsWindow {
                 control_width,
             ),
             SettingsDropdown::CommandPaletteHotkey => self.paint_command_palette_hotkey_menu(
+                layers,
+                control_x,
+                control_y + self.ui_px(CONTROL_HEIGHT) + 8.0,
+                control_width,
+            ),
+            SettingsDropdown::WebLinkTtl => self.paint_web_link_ttl_menu(
                 layers,
                 control_x,
                 control_y + self.ui_px(CONTROL_HEIGHT) + 8.0,

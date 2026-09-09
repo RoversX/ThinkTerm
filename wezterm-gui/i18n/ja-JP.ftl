@@ -664,3 +664,33 @@ settings-update-method-system = システムのパッケージマネージャー
 settings-update-method-windows = Windows インストーラーでインストールされています。アップデートは新しいインストーラーをダウンロードして実行します。
 settings-update-method-source = ソースからのビルドです。リポジトリを更新して再ビルドしてください。
 settings-update-method-unknown = このコピーはインストールスクリプトによるものではないため、ThinkTerm は置き換えません。元の方法で更新してください。
+
+# --- Web: ブラウザからこのマシンの端末へ ---
+settings-section-web = Web
+settings-web-heading = ブラウザからこの端末を開く
+settings-web-enable = ブラウザからのアクセスを許可
+settings-web-enable-description = オフです。待ち受けておらず、リンクも開きません。
+settings-web-on-at = { $address } で待ち受け中。リンクを持つ人だけが入れます。
+settings-web-link = アクセスリンク
+settings-web-link-description = 開いた人はあなたのシェルを得ます。
+settings-web-ttl = リンクの有効期限
+settings-web-ttl-description = 次にコピーするリンクに適用されます。
+settings-web-ttl-never = 失効させるまで
+settings-web-ttl-hours = { $hours } 時間
+settings-web-ttl-days = { $days } 日
+settings-web-copy = リンクをコピー
+settings-web-copied = コピーしました
+settings-web-links-heading = 発行済みのリンク
+settings-web-tokens-empty = まだリンクを発行していません。
+settings-web-token-meta = { $expires }に失効 · { $connections ->
+    [0] 接続中のブラウザなし
+   *[other] { $connections } 個のブラウザが接続中
+}
+settings-web-token-unused = 未使用
+settings-web-token-never = 無期限
+settings-web-revoke = 失効
+settings-web-revoke-all = すべて失効
+settings-web-revoke-all-label = すべてのリンク
+settings-web-revoke-all-description = すべてのブラウザを一度に切断します。
+settings-web-no-server = 問い合わせ先の mux サーバーがありません。ブラウザアクセスには必要です。
+settings-web-no-listener = 待ち受けていないため、リンクの向き先がありません。先にブラウザアクセスを有効にしてください。

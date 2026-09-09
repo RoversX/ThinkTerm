@@ -664,3 +664,33 @@ settings-update-method-system = 由系统包管理器安装:从发布页下载�
 settings-update-method-windows = 由 Windows 安装器安装;安装更新会下载新安装器并运行。
 settings-update-method-source = 这是从源码构建的版本:拉取仓库后重新构建。
 settings-update-method-unknown = 这个副本不是由安装脚本安装的,ThinkTerm 不会替换它;请按原来的安装方式更新。
+
+# --- 网页端:用浏览器访问这台机器的终端 ---
+settings-section-web = 网页
+settings-web-heading = 用浏览器打开这里的终端
+settings-web-enable = 允许浏览器访问
+settings-web-enable-description = 未开启。没有在监听,链接也打不开。
+settings-web-on-at = 正在监听 { $address }。只有拿到链接的人进得来。
+settings-web-link = 访问链接
+settings-web-link-description = 打开它的人拿到的是你的 shell。
+settings-web-ttl = 链接有效期
+settings-web-ttl-description = 对下一次复制的链接生效。
+settings-web-ttl-never = 直到手动吊销
+settings-web-ttl-hours = { $hours } 小时
+settings-web-ttl-days = { $days } 天
+settings-web-copy = 复制链接
+settings-web-copied = 已复制
+settings-web-links-heading = 已发出的链接
+settings-web-tokens-empty = 还没有发出过链接。
+settings-web-token-meta = { $expires }失效 · { $connections ->
+    [0] 无浏览器连接
+   *[other] { $connections } 个浏览器已连接
+}
+settings-web-token-unused = 尚未使用
+settings-web-token-never = 永不
+settings-web-revoke = 吊销
+settings-web-revoke-all = 全部吊销
+settings-web-revoke-all-label = 所有链接
+settings-web-revoke-all-description = 一次性切断所有浏览器。
+settings-web-no-server = 没有可询问的 mux 服务端。网页访问需要它在运行。
+settings-web-no-listener = 没有在监听,链接无处指向。请先打开浏览器访问。

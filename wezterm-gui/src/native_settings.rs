@@ -418,6 +418,30 @@ impl NativeCommandPaletteHotkey {
     }
 }
 
+/// How long a link minted from the Web settings section lasts.
+///
+/// `None` is "until it is revoked". That is a real choice -- a link kept in
+/// a password manager for a machine you reach every day should not expire
+/// under you -- so it is offered rather than assumed away. The default is
+/// still bounded, because the common case is handing a link to a phone for
+/// an afternoon and never thinking about it again.
+pub(crate) const DEFAULT_WEB_LINK_TTL_SECS: u64 = 8 * 60 * 60;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct NativeWebSettings {
+    /// Seconds, or `None` for "until revoked".
+    pub(crate) link_ttl_secs: Option<u64>,
+}
+
+impl Default for NativeWebSettings {
+    fn default() -> Self {
+        Self {
+            link_ttl_secs: Some(DEFAULT_WEB_LINK_TTL_SECS),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct NativeCommandPaletteSettings {
@@ -457,6 +481,7 @@ pub(crate) struct ThinkTermNativeSettings {
     pub(crate) window: NativeWindowSettings,
     pub(crate) workspaces: NativeWorkspaceSettings,
     pub(crate) command_palette: NativeCommandPaletteSettings,
+    pub(crate) web: NativeWebSettings,
 }
 
 impl Default for ThinkTermNativeSettings {
@@ -473,6 +498,7 @@ impl Default for ThinkTermNativeSettings {
             window: NativeWindowSettings::default(),
             workspaces: NativeWorkspaceSettings::default(),
             command_palette: NativeCommandPaletteSettings::default(),
+            web: NativeWebSettings::default(),
         }
     }
 }

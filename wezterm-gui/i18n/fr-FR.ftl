@@ -676,3 +676,40 @@ settings-update-method-system = Installé par le gestionnaire de paquets du syst
 settings-update-method-windows = Installé par l'installateur Windows ; la mise à jour télécharge le nouvel installateur et l'exécute.
 settings-update-method-source = Ceci est une compilation depuis les sources : mettez à jour le dépôt et recompilez.
 settings-update-method-unknown = Cette copie n'a pas été installée par le script d'installation ; ThinkTerm ne la remplacera pas. Mettez-la à jour comme elle a été installée.
+
+# --- Web : accéder à ces terminaux depuis un navigateur ---
+settings-section-web = Web
+settings-web-heading = Ouvrir ces terminaux depuis un navigateur
+settings-web-enable = Autoriser l'accès par navigateur
+settings-web-enable-description = Désactivé. Rien n'écoute, et aucun lien ne s'ouvrira.
+settings-web-on-at = À l'écoute sur { $address }. Seul quelqu'un muni d'un lien peut entrer.
+settings-web-link = Lien d'accès
+settings-web-link-description = Qui l'ouvre obtient un shell à votre nom.
+settings-web-ttl = Expiration du lien
+settings-web-ttl-description = S'applique au prochain lien copié.
+settings-web-ttl-never = Jusqu'à révocation
+settings-web-ttl-hours = { $hours ->
+    [one] 1 heure
+   *[other] { $hours } heures
+}
+settings-web-ttl-days = { $days ->
+    [one] 1 jour
+   *[other] { $days } jours
+}
+settings-web-copy = Copier le lien
+settings-web-copied = Copié
+settings-web-links-heading = Liens distribués
+settings-web-tokens-empty = Aucun lien n'a été distribué.
+settings-web-token-meta = Expire { $expires } · { $connections ->
+    [0] aucun navigateur connecté
+    [one] 1 navigateur connecté
+   *[other] { $connections } navigateurs connectés
+}
+settings-web-token-unused = Jamais utilisé
+settings-web-token-never = jamais
+settings-web-revoke = Révoquer
+settings-web-revoke-all = Tout révoquer
+settings-web-revoke-all-label = Tous les liens
+settings-web-revoke-all-description = Coupe tous les navigateurs d'un coup.
+settings-web-no-server = Aucun serveur mux à interroger. L'accès par navigateur en requiert un.
+settings-web-no-listener = Rien n'écoute, un lien ne pointerait nulle part. Activez d'abord l'accès par navigateur.

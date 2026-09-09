@@ -61,6 +61,7 @@ mod scrollbar;
 mod secret;
 mod selection;
 mod settings_window;
+mod web_settings;
 mod shapecache;
 mod shell_catalog;
 mod snippets;

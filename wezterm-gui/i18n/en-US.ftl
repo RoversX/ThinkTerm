@@ -679,3 +679,40 @@ settings-update-method-system = Installed by the system package manager: install
 settings-update-method-windows = Installed by the Windows installer; installing an update downloads the new installer and runs it.
 settings-update-method-source = This is a build from source: pull the repository and build again.
 settings-update-method-unknown = This copy was not installed by the install script, so ThinkTerm will not replace it; update it the way it was installed.
+
+# --- Web: browser access to this machine's terminals ---
+settings-section-web = Web
+settings-web-heading = Reach these terminals from a browser
+settings-web-enable = Allow browser access
+settings-web-enable-description = Off. Nothing is listening, and no link will open.
+settings-web-on-at = Listening on { $address }. Only someone holding a link can get in.
+settings-web-link = Access link
+settings-web-link-description = Whoever opens it gets a shell as you.
+settings-web-ttl = Link expires
+settings-web-ttl-description = Applies to the next link you copy.
+settings-web-ttl-never = Until revoked
+settings-web-ttl-hours = { $hours ->
+    [one] 1 hour
+   *[other] { $hours } hours
+}
+settings-web-ttl-days = { $days ->
+    [one] 1 day
+   *[other] { $days } days
+}
+settings-web-copy = Copy link
+settings-web-copied = Copied
+settings-web-links-heading = Links you have handed out
+settings-web-tokens-empty = No links have been handed out.
+settings-web-token-meta = Expires { $expires } · { $connections ->
+    [0] no browser connected
+    [one] 1 browser connected
+   *[other] { $connections } browsers connected
+}
+settings-web-token-unused = Not used yet
+settings-web-token-never = never
+settings-web-revoke = Revoke
+settings-web-revoke-all = Revoke all
+settings-web-revoke-all-label = Every link
+settings-web-revoke-all-description = Cuts off every browser at once.
+settings-web-no-server = No mux server to ask. Browser access needs one running.
+settings-web-no-listener = Nothing is listening, so there is nowhere for a link to point. Turn browser access on first.
