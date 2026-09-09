@@ -32,19 +32,7 @@ pub struct PaneView {
     pub current: bool,
 }
 
-/// Every pane in a tab, left to right, top to bottom.
-pub fn leaves(node: &PaneNode) -> Vec<&PaneEntry> {
-    match node {
-        PaneNode::Empty => vec![],
-        PaneNode::Leaf(entry) => vec![entry],
-        PaneNode::Stack(stack) => stack.panes.iter().collect(),
-        PaneNode::Split { left, right, .. } => {
-            let mut all = leaves(left);
-            all.extend(leaves(right));
-            all
-        }
-    }
-}
+pub use crate::layout::leaves;
 
 /// The pane a tab is showing: its active one, or the first.
 pub fn active_pane(node: &PaneNode) -> Option<PaneEntry> {

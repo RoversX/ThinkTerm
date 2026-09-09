@@ -8,6 +8,7 @@ pub mod chrome;
 pub mod fallback;
 pub mod ime;
 pub mod keymap;
+pub mod layout;
 pub mod lease;
 pub mod viewport;
 
