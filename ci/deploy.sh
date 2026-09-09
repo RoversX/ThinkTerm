@@ -71,12 +71,12 @@ case $OSTYPE in
       # -p throughout: the server decides whether a .gz still stands for
       # its file by comparing their modification times, and a copy that
       # rewrites them can make a stale sibling look current.
-      cp -p thinkterm-web/www/index.html thinkterm-web/www/app.js $zipdir/ThinkTerm.app/Contents/Resources/web/
+      cp -p thinkterm-web/www/index.html $zipdir/ThinkTerm.app/Contents/Resources/web/
       # The precompressed siblings, when ci/build-web.sh made them.
       for gz in thinkterm-web/www/*.gz ; do
         [[ -f "$gz" ]] && cp -p "$gz" $zipdir/ThinkTerm.app/Contents/Resources/web/
       done
-      cp -Rp thinkterm-web/www/pkg thinkterm-web/www/fonts $zipdir/ThinkTerm.app/Contents/Resources/web/
+      cp -Rp thinkterm-web/www/assets thinkterm-web/www/pkg thinkterm-web/www/fonts $zipdir/ThinkTerm.app/Contents/Resources/web/
     fi
     tic -xe wezterm -o $zipdir/ThinkTerm.app/Contents/Resources/terminfo termwiz/data/wezterm.terminfo
 
@@ -240,11 +240,11 @@ case $OSTYPE in
     # times the .gz freshness check reads.
     if require_web_bundle ; then
       mkdir -p $zipdir/web
-      cp -p thinkterm-web/www/index.html thinkterm-web/www/app.js $zipdir/web/
+      cp -p thinkterm-web/www/index.html $zipdir/web/
       for gz in thinkterm-web/www/*.gz ; do
         [[ -f "$gz" ]] && cp -p "$gz" $zipdir/web/
       done
-      cp -Rp thinkterm-web/www/pkg thinkterm-web/www/fonts $zipdir/web/
+      cp -Rp thinkterm-web/www/assets thinkterm-web/www/pkg thinkterm-web/www/fonts $zipdir/web/
     fi
     7z a -tzip $zipname $zipdir
     iscc.exe -DMyAppVersion=${TAG_NAME#nightly} -F${instname} ci/windows-installer.iss
@@ -604,10 +604,11 @@ EOF
           # server finds it at <exe>/../share/thinkterm/web.
           if require_web_bundle ; then
             # -p keeps the modification times the .gz freshness check reads.
-            install -Dpm644 -t "$tardir/share/thinkterm/web" thinkterm-web/www/index.html thinkterm-web/www/app.js
+            install -Dpm644 -t "$tardir/share/thinkterm/web" thinkterm-web/www/index.html
             for gz in thinkterm-web/www/*.gz ; do
               [[ -f "$gz" ]] && install -Dpm644 -t "$tardir/share/thinkterm/web" "$gz"
             done
+            install -Dpm644 -t "$tardir/share/thinkterm/web/assets" thinkterm-web/www/assets/*
             install -Dpm644 -t "$tardir/share/thinkterm/web/pkg" thinkterm-web/www/pkg/*
             install -Dpm644 -t "$tardir/share/thinkterm/web/fonts" thinkterm-web/www/fonts/*
           fi

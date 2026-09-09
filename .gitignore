@@ -98,7 +98,11 @@ __pycache__/
 # well...
 /.claude
 
-# Built browser bundle (ci/build-web.sh)
+# Built browser bundle (ci/build-web.sh): wasm-bindgen's pkg/, the fonts,
+# and the page Vite builds from thinkterm-web/ui
 /thinkterm-web/www/pkg/
 /thinkterm-web/www/fonts/
+/thinkterm-web/www/assets/
+/thinkterm-web/www/index.html
 /thinkterm-web/www/*.gz
+/thinkterm-web/ui/node_modules/

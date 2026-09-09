@@ -214,8 +214,19 @@ jobs:
           wasm-bindgen --version
           wasm-opt --version
 
+      # The page around the terminal is built by Vite from thinkterm-web/ui.
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: thinkterm-web/ui/package-lock.json
+
       - name: Build
         run: bash ci/build-web.sh
+
+      - name: Type-check the page
+        run: npm run --prefix thinkterm-web/ui check
 
       - name: Upload
         uses: actions/upload-artifact@v7

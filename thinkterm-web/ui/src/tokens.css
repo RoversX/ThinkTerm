@@ -1,0 +1,307 @@
+/* The desktop's chrome (wezterm-gui/src/ui/tokens.rs, fancy_tab_bar.rs,
+   render/pane.rs): its palette, its 40 px tab row of 160 px capsules,
+   its bar above every pane. Dark is the desktop's default whatever the
+   OS says; ?theme=light picks the other set. */
+:root {
+  --bg: #19191A; --side-bg: #121214; --sep: rgba(84,84,88,.22);
+  --ctl: rgba(45,45,47,.98); --ctl-hover: rgba(55,55,57,.98); --ctl-pressed: rgba(66,66,69,.98); --ctl-border: rgba(118,118,128,.28);
+  --text: #F2F2F7; --text2: #C7C7CC; --muted: #8E8E93; --accent: #0A84FF; --danger: #FF453A;
+  --wash: rgba(242,242,247,.025); --ring: rgba(242,242,247,.12); --edge: rgba(242,242,247,.38); --shadow: 0 .5px 0 1px rgba(0,0,0,.12);
+  --ui: -apple-system, "SF Pro Text", "Helvetica Neue", Roboto, system-ui, sans-serif;
+  --tabs: 40px; --side-w: 220px; --side-px: 220px; --agents-w: 0px; --keybar: 0px;
+  --done: #7CE5A2; --open: #61B8FF; --warn: #DB7320;
+}
+body[data-side=off] { --side-w: 0px; }
+/* The right panel's width lives on the root, as the sidebar's does; without
+   the mark on the body -- which the panel itself puts there -- nothing
+   leaves room for it. */
+body:not([data-agents]) { --agents-w: 0px; }
+[data-theme=light] {
+  --bg: #EEEEF2; --side-bg: #E2E2E8; --sep: rgba(60,60,67,.18);
+  --ctl: rgba(255,255,255,.94); --ctl-hover: rgba(247,247,250,.98); --ctl-pressed: rgba(232,242,255,.98); --ctl-border: rgba(60,60,67,.20);
+  --text: #1C1C1E; --text2: #48484A; --muted: #8E8E93; --accent: #007AFF; --danger: #D7263D;
+  --wash: rgba(28,28,30,.025); --ring: rgba(28,28,30,.12); --edge: rgba(28,28,30,.38); --shadow: 0 .5px 0 1px rgba(0,0,0,.04);
+  --warn: #C05F14;
+}
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text2); font: 500 14px var(--ui); overflow: hidden; }
+/* The page is mounted into #app; it generates no box of its own, so the
+   chrome below is laid out against the viewport exactly as it was when it
+   sat directly in the body. */
+#app { display: contents; }
+svg { width: 16px; height: 16px; flex: none; }
+/* The window's tab row. Capsules never shrink; the row scrolls. */
+#tabs { position: absolute; left: var(--side-w); right: var(--agents-w); top: 0; height: var(--tabs); box-sizing: border-box; display: flex; align-items: center; gap: 9px; padding: 2px 8px 0 8px; background: var(--bg); overflow-x: auto; overflow-y: hidden; white-space: nowrap; user-select: none; scrollbar-width: none; }
+#tabs::-webkit-scrollbar { display: none; }
+#tabs .tab { display: inline-flex; align-items: center; flex: 0 0 auto; width: 160px; height: 30px; box-sizing: border-box; padding: 0 9px; border-radius: 999px; border: 1px solid transparent; color: var(--text2); cursor: default; }
+#tabs .tab:hover { background: var(--ctl-hover); }
+#tabs .tab.current { background: var(--ctl); border-color: var(--ctl-border); box-shadow: var(--shadow); color: var(--text); }
+.t { margin-left: 4px; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.x { display: none; margin-left: 4px; width: 22px; height: 22px; border-radius: 999px; align-items: center; justify-content: center; opacity: .82; flex: none; }
+.current .x, .tab:hover .x, .cap:hover .x { display: inline-flex; }
+.x:hover { background: var(--ring); opacity: 1; }
+.x.danger { width: auto; padding: 0 6px; font-size: 11px; color: var(--danger); opacity: 1; }
+.act { width: 30px; height: 30px; flex: none; border-radius: 999px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid transparent; box-sizing: border-box; color: var(--text2); }
+.act:hover { background: var(--ctl-hover); border-color: var(--edge); color: var(--text); }
+#tabs .act.on { color: var(--accent); }
+#tabs .trail { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; flex: none; }
+#tabs .hint { color: var(--muted); font-size: 12px; padding: 0 6px; }
+#tabs .follow { color: var(--muted); font-size: 12px; padding: 0 8px; height: 24px; line-height: 24px; border-radius: 999px; cursor: default; }
+#tabs .follow.on { color: var(--accent); }
+#tabs .follow:hover { background: var(--ctl-hover); }
+#term { position: absolute; inset: var(--tabs) var(--agents-w) 0 var(--side-w); width: calc(100% - var(--side-w) - var(--agents-w)); height: calc(100% - var(--tabs)); display: block; outline: none; }
+/* Its own layer: the sidebar's edge moves the canvas on every drag frame,
+   and a promoted layer moves instead of being laid out again. */
+canvas#term { will-change: transform; }
+/* One bar over each pane, laid out from the canvas's cells. */
+#panes { position: absolute; inset: var(--tabs) var(--agents-w) 0 var(--side-w); pointer-events: none; overflow: hidden; }
+/* The desktop's left sidebar: Spaces, Projects, Threads. */
+#side { position: absolute; left: 0; top: 0; bottom: 0; width: var(--side-w); box-sizing: border-box; background: var(--side-bg); border-right: 1px solid var(--sep); font: 500 15px var(--ui); color: var(--text2); user-select: none; overflow: hidden; }
+body[data-side=off] #side:not(.revealed) { display: none; }
+/* Hovering the window's left edge, or the toggle, while the panel is put
+   away: it comes back over the canvas rather than beside it, so nothing is
+   resized -- `--side-w` stays 0 and the width comes from `--side-px`. */
+#side.revealed { top: var(--tabs); width: var(--side-px); z-index: 15; box-shadow: 0 8px 28px rgba(0,0,0,.42); }
+#side .list { position: absolute; inset: 26px 5px 44px 5px; overflow-y: auto; scrollbar-width: thin; display: flex; flex-direction: column; gap: 5px; padding-bottom: 8px; }
+/* The footer, as the desktop's sidebar ends: Settings as a row on the left,
+   the thread search as a button on the right. */
+/* The footer as the desktop ends its sidebar: a row of icons, the gear
+   at the left inset and the thread search at the right, no rule above. */
+#side .foot { position: absolute; left: 12px; right: 12px; bottom: 0; height: 44px; display: flex; align-items: center; justify-content: space-between; }
+#side .foot .act { width: 28px; height: 28px; color: var(--text2); border-radius: 8px; }
+#side .foot .act svg { width: 15px; height: 15px; }
+#side .foot .act:hover { color: var(--text); background: rgba(42,42,44,.98); }
+#side .handle { position: absolute; right: -2px; top: 0; bottom: 0; width: 4px; cursor: col-resize; z-index: 1; }
+#side .row { display: flex; align-items: center; min-height: 33px; box-sizing: border-box; padding: 0 5px; border-radius: 10px; border: 1px solid transparent; flex: none; }
+#side .row.thread { padding-left: 25px; }
+#side .row .t { margin-left: 5px; color: var(--text); }
+#side .row.project .t, #side .row.space .t { color: var(--text2); }
+#side .row:hover { background: rgba(42,42,44,.98); }
+#side .row.selected { background: rgba(62,62,65,.98); border-color: rgba(118,118,128,.22); box-shadow: var(--shadow); }
+#side .row.archived { opacity: .55; }
+#side .chev { display: inline-flex; width: 16px; margin-right: 2px; color: var(--muted); }
+#side .hov { display: none; margin-left: auto; gap: 2px; }
+#side .row:hover .hov { display: inline-flex; }
+#side .act { width: 24px; height: 24px; }
+#side .act svg { width: 13px; height: 13px; }
+/* The desktop's round buttons: the bell, the new project, a project's plus. */
+#side .act.round { width: 28px; height: 28px; border-radius: 999px; border: 1px solid rgba(118,118,128,.22); background: rgba(36,36,38,.94); color: var(--text); flex: none; }
+#side .act.round:hover { background: rgba(48,48,50,.98); }
+#side .act.round svg { width: 14px; height: 14px; }
+#side .top { display: flex; align-items: center; gap: 8px; margin: 4px 10px 6px 10px; flex: none; }
+#side .top .pill { flex: 1 1 auto; margin: 0; }
+#side .row.project .act.round { margin-left: auto; }
+#side .row.project .hov { margin-left: auto; margin-right: 2px; }
+#side .row.project:hover .act.round { margin-left: 0; }
+#side .hdr { display: flex; align-items: center; gap: 5px; min-height: 33px; padding: 0 10px; color: var(--text2); font-size: 14px; margin-top: 6px; }
+#side .hdr .act { margin-left: auto; }
+#side .hdr.sub { cursor: default; }
+#side .pill { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 30px; margin: 4px 10px 6px 10px; border-radius: 999px; background: rgba(36,36,38,.94); border: 1px solid rgba(118,118,128,.22); color: var(--text); flex: none; }
+#side .pill:hover { background: rgba(48,48,50,.98); }
+#side .st { display: inline-flex; width: 13px; height: 13px; align-items: center; justify-content: center; margin-left: 6px; flex: none; }
+#side .st svg { width: 13px; height: 13px; }
+#side .st.alert svg { width: 10px; height: 10px; }
+#side .st.done { color: var(--done); }
+#side .st.dot::before { content: ""; width: 5px; height: 5px; border-radius: 999px; background: rgba(242,242,247,.16); }
+#side .st.dot.active::before { background: var(--done); }
+#side .st.dot.unread::before { background: #3A3A3C; }
+#side .st.dot.pinned::before { background: rgba(242,242,247,.68); }
+#side .st.dot.open::before { background: var(--open); }
+#side input.rename { font: 500 15px var(--ui); color: var(--text); background: #3A3A3C; border: 0; border-radius: 4px; padding: 2px 4px; margin-left: 5px; flex: 1 1 auto; min-width: 0; outline: none; }
+#side .path { display: flex; align-items: center; gap: 5px; padding: 0 10px; }
+#side .path input { flex: 1 1 auto; min-width: 0; font: 14px var(--ui); color: var(--text); background: var(--ctl); border: 1px solid var(--ctl-border); border-radius: 6px; padding: 4px 6px; outline: none; }
+/* The desktop's right-hand Agents panel: one row per pane an agent runs
+   in (wezterm-gui/src/termwindow/ui/agent_panel.rs). */
+#agents { position: absolute; right: 0; top: 0; bottom: 0; width: var(--agents-w); box-sizing: border-box; background: var(--side-bg); border-left: 1px solid var(--sep); font: 500 13px var(--ui); color: var(--text2); user-select: none; overflow: hidden; }
+#agents .handle { position: absolute; left: -2px; top: 0; bottom: 0; width: 4px; cursor: col-resize; z-index: 1; }
+#agents .hd { position: absolute; left: 0; right: 0; top: 0; box-sizing: border-box; padding: 9px 12px 7px 12px; display: flex; flex-direction: column; gap: 2px; }
+#agents .hd .ti { color: var(--text); font-size: 14px; }
+#agents .hd .sum { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#agents .list { position: absolute; inset: 56px 5px 0 5px; overflow-y: auto; scrollbar-width: thin; display: flex; flex-direction: column; gap: 2px; padding-bottom: 32px; }
+/* Two lines and a chip, the row height the desktop gives them. */
+#agents .ag { display: flex; align-items: center; gap: 9px; min-height: 46px; box-sizing: border-box; padding: 5px 7px; border-radius: 10px; flex: none; }
+#agents .ag:hover { background: rgba(42,42,44,.98); }
+#agents .ag.elsewhere { opacity: .62; }
+#agents .ic { display: inline-flex; width: 20px; height: 20px; flex: none; align-items: center; justify-content: center; color: var(--text2); }
+#agents .ic svg { width: 20px; height: 20px; }
+/* The brand marks carry no stroke and no fill of their own. */
+#agents .ic svg[role=img] { fill: currentColor; }
+#agents .tx { display: flex; flex-direction: column; gap: 2px; flex: 1 1 auto; min-width: 0; }
+#agents .n { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#agents .n .d { color: var(--muted); }
+#agents .p { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#agents .st { display: inline-flex; width: 16px; height: 16px; flex: none; align-items: center; justify-content: center; }
+#agents .st svg { width: 16px; height: 16px; }
+#agents .st.alert { color: var(--warn); }
+#agents .st.idle { color: var(--muted); }
+.nav { position: absolute; pointer-events: auto; box-sizing: border-box; display: flex; align-items: center; gap: 9px; padding: 0 5px; background: var(--bg); color: var(--text2); user-select: none; overflow: hidden; }
+.nav.focused { color: var(--text); }
+.nav .caps { display: flex; gap: 9px; flex: 1 1 auto; min-width: 0; overflow: hidden; }
+.nav .cap { display: inline-flex; align-items: center; flex: 0 0 auto; width: 160px; height: 30px; box-sizing: border-box; padding: 0 9px; border-radius: 999px; border: 1px solid transparent; background: var(--wash); color: var(--text2); cursor: default; }
+.nav .cap.current { background: var(--ctl); border-color: var(--ctl-border); box-shadow: var(--shadow); color: inherit; }
+.nav .cap:hover:not(.current) { background: var(--ctl-hover); }
+.nav .acts { display: flex; gap: 2px; margin-left: auto; flex: none; }
+.nav .act svg { width: 13px; height: 13px; }
+.spin { display: inline-flex; animation: spin .96s steps(12) infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+/* What the desktop shows over a terminal another device holds. */
+#card { position: absolute; left: 50%; top: 45%; transform: translate(-50%, -50%); text-align: center; padding: 26px 36px; border-radius: 18px; background: color-mix(in srgb, var(--bg) 86%, transparent); border: 1px solid var(--ctl-border); pointer-events: none; user-select: none; }
+#card .eyes { font: 17px var(--ui); color: var(--muted); letter-spacing: 2px; margin-bottom: 8px; }
+#card .title { font: 500 17px var(--ui); color: var(--text); }
+#card .hint { font: 15px var(--ui); color: var(--text2); margin-top: 10px; }
+/* Passing remarks: refusals, reconnects. */
+#status { position: absolute; right: 12px; bottom: 12px; max-width: 60%; padding: 7px 11px; border-radius: 8px; background: var(--ctl); border: 1px solid var(--ctl-border); color: var(--text); font: 13px var(--ui); box-shadow: 0 2px 12px rgba(0,0,0,.35); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+#status.error { color: var(--danger); }
+/* The context menus: one panel per open submenu, over everything the page
+   draws, the desktop's control colours at the page's smaller size. */
+.menu { position: fixed; z-index: 20; min-width: 168px; max-width: 340px; box-sizing: border-box; padding: 5px; border-radius: 10px; background: var(--ctl); border: 1px solid var(--ctl-border); box-shadow: 0 8px 28px rgba(0,0,0,.42); color: var(--text); font: 500 13px var(--ui); user-select: none; outline: none; }
+.menu .mi { display: flex; align-items: center; gap: 8px; height: 28px; box-sizing: border-box; padding: 0 8px; border-radius: 6px; white-space: nowrap; }
+.menu .mi:hover, .menu .mi.on { background: var(--ctl-hover); }
+.menu .mi.disabled { color: var(--muted); }
+.menu .mi.disabled:hover, .menu .mi.disabled.on { background: transparent; }
+/* A row without an icon keeps its width, so the labels line up. */
+.menu .ic { display: inline-flex; width: 16px; height: 16px; flex: none; align-items: center; justify-content: center; }
+.menu .ic svg { width: 14px; height: 14px; }
+.menu .lb { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+.menu .sub { display: inline-flex; margin-left: 6px; color: var(--muted); flex: none; }
+.menu .sub svg { width: 13px; height: 13px; }
+.menu .mi.checked .lb { color: var(--text); }
+.menu .mh { padding: 5px 8px; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.menu .ms { height: 0; margin: 4px 0; border: 0; border-top: 1px solid var(--sep); }
+/* The search palette: a field near the top of the window and what the
+   wasm ranked for it, in sections. Over everything the page draws, its
+   own backdrop behind it. */
+#palette-back, #settings-back { position: fixed; inset: 0; z-index: 30; background: rgba(0,0,0,.28); }
+#palette { position: fixed; z-index: 31; left: 50%; top: 12vh; transform: translateX(-50%); width: min(640px, 90vw); box-sizing: border-box; display: flex; flex-direction: column; border-radius: 12px; background: var(--ctl); border: 1px solid var(--ctl-border); box-shadow: 0 16px 48px rgba(0,0,0,.46); color: var(--text); font: 500 13px var(--ui); overflow: hidden; }
+#palette .q { flex: none; box-sizing: border-box; width: 100%; padding: 12px; font: 400 15px var(--ui); color: var(--text); background: transparent; border: 0; border-bottom: 1px solid var(--sep); outline: none; }
+#palette .q::placeholder { color: var(--muted); }
+#palette .pl { flex: 1 1 auto; max-height: 52vh; overflow-y: auto; scrollbar-width: thin; padding: 5px; }
+#palette .ph { padding: 7px 9px 3px 9px; color: var(--muted); font-size: 11px; }
+#palette .pe { display: flex; align-items: center; gap: 8px; height: 32px; box-sizing: border-box; padding: 0 9px; border-radius: 6px; white-space: nowrap; }
+#palette .pe.on { background: var(--ctl-hover); }
+#palette .ic { display: inline-flex; width: 16px; height: 16px; flex: none; align-items: center; justify-content: center; color: var(--muted); }
+#palette .t { color: var(--text); }
+#palette .st { flex: none; max-width: 34%; overflow: hidden; text-overflow: ellipsis; color: var(--muted); font-size: 12px; }
+#palette .acc { flex: none; margin-left: auto; padding-left: 10px; color: var(--muted); font-size: 12px; }
+#palette .pn { padding: 14px 9px; color: var(--muted); }
+/* The settings panel: the page's own preferences, one row each. */
+/* The settings window, as the desktop draws it: a nav column with the
+   sections, and the section's cards of rows on the right. */
+#settings { position: fixed; z-index: 31; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(920px, 94vw); height: min(602px, 90vh); box-sizing: border-box; display: flex; background: var(--bg); border: 1px solid var(--ctl-border); border-radius: 12px; box-shadow: 0 24px 80px rgba(0,0,0,.55); color: var(--text); font: 500 14px var(--ui); overflow: hidden; outline: none; }
+#settings .sc { position: absolute; right: 12px; top: 12px; z-index: 1; display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: 999px; background: transparent; border: 0; color: var(--muted); }
+#settings .sc:hover { color: var(--text); background: var(--ctl-hover); }
+#settings .sc svg { width: 15px; height: 15px; }
+#settings .snav { flex: 0 0 220px; box-sizing: border-box; padding: 18px 14px; background: var(--side-bg); border-right: 1px solid var(--sep); display: flex; flex-direction: column; gap: 10px; }
+#settings .app { font-size: 17px; font-weight: 700; color: var(--text); padding: 12px 2px 6px 2px; }
+#settings .find { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 12px; border-radius: 999px; background: var(--ctl); border: 1px solid var(--ctl-border); color: var(--muted); }
+#settings .find svg { width: 14px; height: 14px; flex: none; }
+#settings .find input { flex: 1 1 auto; min-width: 0; background: transparent; border: 0; outline: none; color: var(--text); font: 500 14px var(--ui); }
+#settings .secs { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; }
+#settings .sec { display: flex; align-items: center; gap: 10px; height: 36px; padding: 0 12px; border-radius: 10px; color: var(--text); cursor: default; }
+#settings .sec svg { width: 16px; height: 16px; flex: none; color: var(--text2); }
+#settings .sec:hover { background: rgba(42,42,44,.98); }
+#settings .sec.on { background: var(--ctl); border: 1px solid var(--ctl-border); box-shadow: var(--shadow); }
+#settings .body { flex: 1 1 auto; min-width: 0; overflow-y: auto; scrollbar-width: thin; padding: 30px 34px 24px 24px; }
+#settings .title { font-size: 20px; font-weight: 700; margin: 6px 0 18px 0; }
+#settings .card { background: var(--ctl); border: 1px solid var(--ctl-border); border-radius: 12px; padding: 0 18px; margin-bottom: 18px; }
+#settings .srow { display: flex; align-items: center; gap: 18px; padding: 14px 0; border-bottom: 1px solid var(--sep); }
+#settings .srow:last-child { border-bottom: 0; }
+#settings .tx { flex: 1 1 auto; min-width: 0; }
+#settings .lab { font-weight: 600; color: var(--text); }
+#settings .desc { margin-top: 3px; color: var(--muted); font-size: 13px; font-weight: 500; }
+#settings .ctl { display: flex; align-items: center; gap: 10px; flex: none; }
+#settings .pillsel, #settings .pillbtn { flex: none; font: 500 13px var(--ui); color: var(--text); background: var(--ctl-hover); border: 1px solid var(--ctl-border); border-radius: 8px; padding: 6px 12px; min-width: 120px; }
+#settings .pillsel { appearance: none; -webkit-appearance: none; padding-right: 28px; background-image: linear-gradient(45deg, transparent 50%, var(--text2) 50%), linear-gradient(135deg, var(--text2) 50%, transparent 50%); background-position: calc(100% - 16px) 55%, calc(100% - 11px) 55%; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; }
+#settings .pillbtn { min-width: 0; }
+#settings .pillbtn:hover { background: var(--ctl-pressed); }
+#settings .seg { display: inline-flex; border: 1px solid var(--ctl-border); border-radius: 8px; overflow: hidden; }
+#settings .sg { display: inline-flex; align-items: center; gap: 6px; padding: 5px 11px; color: var(--text2); font: 500 13px var(--ui); cursor: default; }
+#settings .sg input { position: absolute; opacity: 0; width: 0; height: 0; }
+#settings .sg.on { background: var(--ctl-pressed); color: var(--text); }
+#settings .stepper { display: inline-flex; align-items: center; height: 30px; border-radius: 8px; background: var(--ctl-hover); border: 1px solid var(--ctl-border); overflow: hidden; }
+#settings .stepper.off { opacity: .5; }
+#settings .stepper button { width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 0; color: var(--text); }
+#settings .stepper button svg { width: 13px; height: 13px; }
+#settings .stepper .num { width: 54px; height: 28px; text-align: center; background: transparent; border: 0; color: var(--text); font: 500 13px var(--ui); outline: none; -moz-appearance: textfield; }
+#settings .stepper .num::-webkit-inner-spin-button { display: none; }
+#settings .reset { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 999px; background: transparent; border: 0; color: var(--muted); }
+#settings .reset:hover:not(:disabled) { color: var(--text); background: var(--ctl-hover); }
+#settings .reset:disabled { opacity: .35; }
+#settings .reset svg { width: 15px; height: 15px; }
+#settings .switch { position: relative; display: inline-block; width: 40px; height: 24px; flex: none; }
+#settings .switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: default; }
+#settings .switch .knob { position: absolute; inset: 0; border-radius: 999px; background: rgba(118,118,128,.32); transition: background .15s; }
+#settings .switch .knob::after { content: ""; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; border-radius: 999px; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.4); transition: transform .15s; }
+#settings .switch input:checked + .knob { background: var(--accent); }
+#settings .switch input:checked + .knob::after { transform: translateX(16px); }
+#settings .err { padding: 0 2px 8px 2px; color: var(--danger); font-size: 12px; }
+/* Focus lives here so the IME composes into a real text field; the
+   field itself stays out of sight. */
+#kbd { position: fixed; left: 0; top: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; margin: 0; resize: none; overflow: hidden; pointer-events: none; }
+
+/* The phone shape. `body[data-mobile]` is put there by mobile.svelte.ts when
+   the pointer is coarse or the window is too narrow for the desktop's
+   chrome, and everything below is scoped to it: a desktop browser is served
+   exactly the page it was. Termux is the shape this follows -- the terminal
+   takes the width, the two panels become drawers over it, and a key bar
+   supplies the keys a soft keyboard has not got. */
+body[data-mobile] { --side-w: 0px; --agents-w: 0px; }
+/* The soft keyboard shrinks the *visual* viewport and nothing else, so the
+   canvas is sized from that rather than from the window: --vvh and --keybar
+   are KeyBar.svelte's, set on the root while the bar is mounted. */
+body[data-mobile] #term,
+body[data-mobile] #panes {
+  inset: var(--tabs) 0 auto 0;
+  width: 100%;
+  height: calc(var(--vvh, 100%) - var(--tabs) - var(--keybar));
+}
+/* The browser must not pan or zoom the page: every finger on the canvas is
+   the terminal's, and touch.ts decides what it meant. */
+body[data-mobile] canvas#term { touch-action: none; }
+body[data-mobile] #tabs { -webkit-overflow-scrolling: touch; }
+/* Only the zoom button fits beside the capsules on a phone; a split and a
+   new tab are the tab row's and the menus'. */
+body[data-mobile] .nav .act[data-action=new-tab],
+body[data-mobile] .nav .act[data-action=split-right],
+body[data-mobile] .nav .act[data-action=split-below] { display: none; }
+/* The two panels are drawers: over the canvas, resizing nothing, or not
+   there at all. */
+body[data-mobile] #side,
+body[data-mobile] #agents {
+  top: var(--tabs);
+  bottom: auto;
+  height: calc(var(--vvh, 100%) - var(--tabs) - var(--keybar));
+  width: min(300px, 85vw);
+  z-index: 15;
+  box-shadow: 0 8px 28px rgba(0,0,0,.42);
+}
+body[data-mobile] #side { display: none; }
+body[data-mobile] #side.open { display: block; }
+/* Their edges are dragged with a pointer, which a phone has not got. */
+body[data-mobile] #side .handle,
+body[data-mobile] #agents .handle { display: none; }
+/* Behind whichever drawer is out: a press here puts it away. */
+#scrim { position: fixed; inset: 0; z-index: 14; background: rgba(0,0,0,.34); }
+/* A menu row a finger can hit. */
+body[data-mobile] .menu .mi { height: 40px; }
+/* The key bar, along the foot of the visual viewport; `top` is the bar's
+   own, since the soft keyboard moves that foot up the window. It scrolls
+   sideways when the keys do not fit. */
+#keybar {
+  position: fixed; left: 0; right: 0; height: 44px; z-index: 16; box-sizing: border-box;
+  display: flex; align-items: center; gap: 4px; padding: 0 6px;
+  background: var(--ctl); border-top: 1px solid var(--ctl-border);
+  overflow-x: auto; overflow-y: hidden; white-space: nowrap;
+  scrollbar-width: none; user-select: none; touch-action: manipulation;
+}
+#keybar::-webkit-scrollbar { display: none; }
+#keybar .k {
+  flex: 0 0 auto; min-width: 44px; height: 34px; margin: 0; padding: 0 8px;
+  display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box;
+  border-radius: 8px; border: 1px solid var(--ctl-border); background: var(--ctl-hover);
+  color: var(--text); font: 500 13px var(--ui);
+  touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+}
+#keybar .k:active { background: var(--ctl-pressed); }
+/* An armed modifier: it is spent on the next key, from here or from the
+   soft keyboard. */
+#keybar .k.armed { background: var(--accent); border-color: transparent; color: #FFFFFF; }
