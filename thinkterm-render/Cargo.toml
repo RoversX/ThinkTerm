@@ -20,6 +20,7 @@ wgpu = ["dep:wgpu"]
 
 [dependencies]
 anyhow.workspace = true
+bitflags.workspace = true
 bytemuck.workspace = true
 downcast-rs.workspace = true
 euclid.workspace = true
@@ -30,6 +31,7 @@ log.workspace = true
 metrics.workspace = true
 resize.workspace = true
 thiserror.workspace = true
+tiny-skia.workspace = true
 wezterm-color-types.workspace = true
 wezterm-input-types.workspace = true
 wgpu = { workspace = true, optional = true }

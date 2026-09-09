@@ -4,6 +4,7 @@
 
 pub mod atlas;
 pub mod bitmaps;
+pub mod customglyph;
 pub mod geom;
 #[cfg(feature = "wgpu")]
 pub mod pipeline;

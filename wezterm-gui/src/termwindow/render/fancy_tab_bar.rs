@@ -1,4 +1,3 @@
-use crate::customglyph::BlockKey;
 use crate::quad::{
     HeapQuadAllocator, QuadClipRect, QuadTrait, TripleLayerQuadAllocator,
     TripleLayerQuadAllocatorTrait,
@@ -1447,7 +1446,7 @@ impl crate::TermWindow {
                     chars.to_vec(),
                 ))
             },
-            BlockKey::filter_out_synthetic,
+            crate::customglyph::filter_out_synthetic,
             None,
             Direction::LeftToRight,
             None,

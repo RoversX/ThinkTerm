@@ -1080,7 +1080,7 @@ impl crate::TermWindow {
                             chars.to_vec(),
                         ))
                     },
-                    BlockKey::filter_out_synthetic,
+                    crate::customglyph::filter_out_synthetic,
                     Some(cluster.presentation),
                     cluster.direction,
                     None, // FIXME: need more paragraph context
@@ -1212,7 +1212,7 @@ impl crate::TermWindow {
                                 chars.to_vec(),
                             ))
                         },
-                        BlockKey::filter_out_synthetic,
+                        crate::customglyph::filter_out_synthetic,
                         Some(cluster.presentation),
                         cluster.direction,
                         None,

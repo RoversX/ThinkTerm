@@ -612,7 +612,7 @@ impl super::TermWindow {
                             chars.to_vec(),
                         ))
                     },
-                    BlockKey::filter_out_synthetic,
+                    crate::customglyph::filter_out_synthetic,
                     element.presentation,
                     direction,
                     None,
