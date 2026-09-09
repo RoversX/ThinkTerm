@@ -1,7 +1,8 @@
 // The sidebar end to end, against a throwaway server: the landing tree
 // appears after "New Thread", a second thread is created, renamed, pinned
 // and deleted, a project is created from a path and its `main` thread
-// spawns there, and archiving the last project is refused with a remark.
+// spawns there, archiving the last project is refused with a remark, and a
+// second Space is made, renamed and still on show after a reload.
 //   node sidebar-test.js <url> <cli prefix> <out.png>
 const { spawn, execSync } = require("child_process");
 const http = require("http"); const fs = require("fs"); const os = require("os");
@@ -84,6 +85,48 @@ const sh = (cmd) => execSync(cmd, { encoding: "utf8" });
   await click(`[data-action=archive][data-project="${last.id}"]`);
   await until("refusal shown", () => ev("/last project/.test(document.getElementById('status').textContent) && !document.getElementById('status').hasAttribute('hidden')"), 10000);
   out.archive = "ok";
+
+  // --- Spaces: the row's menu makes one, renames it, and the page opens
+  // on the one it was showing.
+  const menu = () => ev("Array.from(document.querySelectorAll('.menu .mi')).map((e) => e.dataset.id)");
+  const space = async () => (await rows())[0];
+  const openSpaceMenu = async () => {
+    if (!(await click("#side [data-action=space-menu]"))) fail("no Space menu button");
+    await until("the Space menu", () => ev("!!document.getElementById('menu')"));
+    return menu();
+  };
+  let ids = await openSpaceMenu();
+  out.space_menu = ids;
+  if (!ids.includes("new-space")) fail("the Space menu is " + JSON.stringify(ids));
+  if (ids.some((i) => /^delete-space:/.test(i))) fail("the last Space can be deleted: " + JSON.stringify(ids));
+  const landed = await space();
+  if (landed.kind !== "space") fail("the first row is " + JSON.stringify(landed));
+  if (!(await click('[data-id="new-space"]'))) fail("no New Space row");
+  const made = await until("a second Space on show", async () => {
+    const row = await space();
+    return row.kind === "space" && row.id !== landed.id ? row : null;
+  }, 15000);
+  if (made.name !== "Space 2") fail("the new Space is named " + JSON.stringify(made.name));
+  ids = await openSpaceMenu();
+  if (!ids.some((i) => /^delete-space:/.test(i))) fail("a Space of two cannot be deleted: " + JSON.stringify(ids));
+  if (!(await click('[data-id^="rename-space:"]'))) fail("no Rename row");
+  await until("the Space's rename field", () => ev("!!document.querySelector('#side .row.space input.rename')"));
+  await typeInto("Work");
+  await until("renamed", async () => (await space()).name === "Work");
+
+  // A real reload, not a jump to the same address with the token back in
+  // the fragment, which the browser would not reload for at all. The token
+  // is in this tab's session storage by now, so the address is enough.
+  await ev("window.__landed = 1");
+  await send("Page.reload", { ignoreCache: true }, s);
+  await until("a fresh document", () => ev("window.__landed === undefined"), 20000);
+  await until("attach again", async () => /this browser has|mirroring|following/.test(await ev("document.getElementById('status').dataset.summary || ''")), 20000);
+  const reopened = await until("the same Space on show", async () => {
+    const row = await space();
+    return row && row.kind === "space" && row.id === made.id ? row : null;
+  }, 20000);
+  if (reopened.name !== "Work") fail("the Space came back as " + JSON.stringify(reopened.name));
+  out.space = "ok";
 
   const shot = await send("Page.captureScreenshot", { format: "png" }, s); fs.writeFileSync(outPng, Buffer.from(shot.data, "base64"));
   out.logs = logs.filter((l) => !/^\s*$/.test(l) && !/INFO/.test(l)).slice(-6);
