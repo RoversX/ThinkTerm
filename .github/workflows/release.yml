@@ -170,9 +170,63 @@ jobs:
   # One job per architecture, each producing its own zip. We deliberately do not
   # lipo them into a universal bundle: that doubles the download for an Intel
   # audience that is on its way out.
+  # The browser client is the same bytes on every platform, so it is built
+  # once here and dropped into each package's tree before ci/deploy.sh. It
+  # was not built anywhere in this workflow before: deploy.sh copies the
+  # bundle only when it exists, so every package shipped without a page and
+  # the server logged "no web bundle found".
+  web:
+    name: web bundle
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: web
+          cache-on-failure: true
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      # The wasm-bindgen CLI has to match the crate the workspace pins
+      # exactly (ci/build-web.sh refuses any other), so its version is read
+      # from Cargo.toml rather than written here twice. The prebuilt binary
+      # takes seconds where `cargo install` takes minutes. binaryen is
+      # wasm-opt, which takes a quarter off the wasm.
+      - name: Install wasm-bindgen and wasm-opt
+        run: |
+          set -euo pipefail
+          version=$(grep -E '^wasm-bindgen = "=' Cargo.toml | sed -E 's/.*"=([0-9.]+)".*/\1/')
+          dir="wasm-bindgen-${version}-x86_64-unknown-linux-musl"
+          curl -sSfL "https://github.com/rustwasm/wasm-bindgen/releases/download/${version}/${dir}.tar.gz" \
+            | tar -xz -C "$HOME/.cargo/bin" --strip-components=1 "${dir}/wasm-bindgen"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binaryen
+          wasm-bindgen --version
+          wasm-opt --version
+
+      - name: Build
+        run: bash ci/build-web.sh
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: web-bundle
+          path: thinkterm-web/www
+          if-no-files-found: error
+
   macos:
     name: macos ${{ matrix.arch }}
-    needs: prepare
+    needs: [prepare, web]
     if: needs.prepare.outputs.macos_matrix != '[]'
     strategy:
       fail-fast: false
@@ -234,6 +288,12 @@ jobs:
             -p wezterm-mux-server \
             -p strip-ansi-escapes
 
+      - name: Fetch the browser bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: web-bundle
+          path: thinkterm-web/www
+
       # Without signing credentials ci/deploy.sh falls back to an ad-hoc
       # signature: the bundle is well-formed but Gatekeeper will still warn on
       # another machine.
@@ -255,7 +315,7 @@ jobs:
 
   windows:
     name: windows x86_64
-    needs: prepare
+    needs: [prepare, web]
     if: needs.prepare.outputs.windows == 'true'
     runs-on: windows-2022
     timeout-minutes: 90
@@ -316,6 +376,12 @@ jobs:
           PATH C:\Strawberry\perl\bin;%PATH%
           cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
 
+      - name: Fetch the browser bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: web-bundle
+          path: thinkterm-web/www
+
       - name: Package
         shell: bash
         run: bash ci/deploy.sh
@@ -333,7 +399,7 @@ jobs:
   # against that distro's glibc, and the arch comes from the runner underneath.
   linux:
     name: ${{ matrix.name }} ${{ matrix.arch }}
-    needs: prepare
+    needs: [prepare, web]
     if: needs.prepare.outputs.linux_matrix != '[]'
     strategy:
       fail-fast: false
@@ -415,6 +481,12 @@ jobs:
             -p wezterm-gui \
             -p wezterm-mux-server \
             -p strip-ansi-escapes
+
+      - name: Fetch the browser bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: web-bundle
+          path: thinkterm-web/www
 
       - name: Package
         run: bash ci/deploy.sh

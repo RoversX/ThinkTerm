@@ -88,11 +88,14 @@ TLS PKI is regenerated every time it starts and is not suitable for that.
 
 `ci/build-web.sh` builds `thinkterm-web` for `wasm32-unknown-unknown`, runs
 `wasm-bindgen` (the CLI must match the version pinned in `Cargo.toml`) and
-copies the fonts into `thinkterm-web/www`. The release tarballs and the macOS
-app carry that directory as `share/thinkterm/web` (or `Contents/Resources/web`),
-which is where the server looks by default; `static_dir` in a `web_servers`
-entry or the `THINKTERM_WEB_STATIC_DIR` environment variable point it elsewhere,
-for instance at a development checkout.
+copies the fonts into `thinkterm-web/www`. The release workflow builds it once
+and every package carries that directory: `share/thinkterm/web` in the
+tarballs, deb and rpm, `Contents/Resources/web` in the macOS app, `web` beside
+the executables on Windows. Those are where the server looks by default;
+`static_dir` in a `web_servers` entry or the `THINKTERM_WEB_STATIC_DIR`
+environment variable point it elsewhere, for instance at a development
+checkout. `ci/deploy.sh` refuses to package without the bundle in CI and warns
+on a laptop; `ci/macos-package.sh --build` builds it.
 
 ## What the first version does not do
 

@@ -132,6 +132,9 @@ fn resolve_static_dir(server: &WebServer) -> Option<PathBuf> {
         if let Some(bin) = exe.parent() {
             candidates.push(bin.join("../share/thinkterm/web"));
             candidates.push(bin.join("../Resources/web"));
+            // The Windows zip and installer are flat: everything beside the
+            // executables, the bundle in web/.
+            candidates.push(bin.join("web"));
         }
     }
     for candidate in candidates {

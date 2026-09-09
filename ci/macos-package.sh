@@ -289,7 +289,21 @@ if [[ "$BUILD" == yes ]]; then
     -p wezterm-mux-server \
     -p strip-ansi-escapes
   echo
+  echo "==> Building the browser client"
+  # Into thinkterm-web/www, where deploy.sh picks it up. Needs the wasm32
+  # target and the wasm-bindgen CLI at the pinned version; the script says
+  # which if either is missing.
+  bash ci/build-web.sh
+  echo
   echo "==> Checking prerequisites (continued)"
+fi
+
+# A package without the browser client has a server that accepts browser
+# connections and serves no page. Say so here rather than ship it quietly.
+if [[ ! -f thinkterm-web/www/pkg/thinkterm_web.js ]]; then
+  echo "No browser client in thinkterm-web/www." >&2
+  echo "Build it first with 'ci/build-web.sh', or re-run with --build." >&2
+  exit 1
 fi
 
 # A plain `cargo build --release` writes to target/release with no target

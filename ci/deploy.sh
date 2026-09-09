@@ -1,5 +1,22 @@
 #!/bin/bash
 set -x
+
+# Whether the browser client was built (ci/build-web.sh). A package without
+# it has a server that accepts browser connections and serves no page. The
+# release workflow always builds it, so there its absence is a broken run
+# and this fails; on a laptop it is only a warning, since a local package
+# may deliberately leave it out.
+require_web_bundle() {
+  if [[ -f thinkterm-web/www/pkg/thinkterm_web.js ]] ; then
+    return 0
+  fi
+  if [[ -n "${CI:-}" ]] ; then
+    echo "error: no browser bundle in thinkterm-web/www; ci/build-web.sh did not run before deploy.sh" >&2
+    exit 1
+  fi
+  echo "warning: no browser bundle in thinkterm-web/www (run ci/build-web.sh); packaging without the web client" >&2
+  return 1
+}
 set -e
 
 TARGET_DIR=${1:-target}
@@ -49,7 +66,7 @@ case $OSTYPE in
     cp LICENSE.md LICENSE-MIT NOTICE $zipdir/ThinkTerm.app/Contents/Resources/
     # The browser client, when ci/build-web.sh ran before this: the server
     # inside the bundle finds it at <exe>/../Resources/web.
-    if [[ -f thinkterm-web/www/pkg/thinkterm_web.js ]] ; then
+    if require_web_bundle ; then
       mkdir -p $zipdir/ThinkTerm.app/Contents/Resources/web
       # -p throughout: the server decides whether a .gz still stands for
       # its file by comparing their modification times, and a copy that
@@ -218,6 +235,17 @@ case $OSTYPE in
     # stages a copy of it next to the exe, so take it from assets directly.
     mkdir $zipdir/mesa
     cp assets/windows/mesa/opengl32.dll $zipdir/mesa
+    # The browser client, beside the executables: the server looks for
+    # <exe>/web on a flat layout like this one. -p keeps the modification
+    # times the .gz freshness check reads.
+    if require_web_bundle ; then
+      mkdir -p $zipdir/web
+      cp -p thinkterm-web/www/index.html thinkterm-web/www/app.js $zipdir/web/
+      for gz in thinkterm-web/www/*.gz ; do
+        [[ -f "$gz" ]] && cp -p "$gz" $zipdir/web/
+      done
+      cp -Rp thinkterm-web/www/pkg thinkterm-web/www/fonts $zipdir/web/
+    fi
     7z a -tzip $zipname $zipdir
     iscc.exe -DMyAppVersion=${TAG_NAME#nightly} -F${instname} ci/windows-installer.iss
     ;;
@@ -574,7 +602,7 @@ EOF
           install -Dm644 -t "$tardir" NOTICE LICENSE.md LICENSE-MIT
           # The browser client, when ci/build-web.sh ran before this: the
           # server finds it at <exe>/../share/thinkterm/web.
-          if [[ -f thinkterm-web/www/pkg/thinkterm_web.js ]] ; then
+          if require_web_bundle ; then
             # -p keeps the modification times the .gz freshness check reads.
             install -Dpm644 -t "$tardir/share/thinkterm/web" thinkterm-web/www/index.html thinkterm-web/www/app.js
             for gz in thinkterm-web/www/*.gz ; do
