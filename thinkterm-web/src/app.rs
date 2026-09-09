@@ -621,16 +621,23 @@ impl App {
         };
         let outcome = async {
             link.reconnect(&url, &token).await?;
-            crate::attach::reattach(&link, pane_id, tab_id, size).await
+            crate::attach::reattach(&link, tab_id, pane_id, size).await
         }
         .await;
         match outcome {
-            Ok(()) => self.reconnected(),
+            Ok(list) => {
+                self.reconnected();
+                // The tab is laid out again from the fresh listing: panes
+                // that came or went while the socket was down are taken
+                // up or let go, and the ones that stayed keep their cells.
+                self.show(list, pane_id).await;
+            }
             Err(err) => {
-                // A pane that is gone will not come back, and neither will a
-                // server whose protocol this bundle cannot speak. Retrying
-                // either one for ever would only hide the reason.
-                let permanent = err.downcast_ref::<crate::attach::PaneGone>().is_some()
+                // A server with nothing to show will not grow something by
+                // being asked again, and neither will one whose protocol
+                // this bundle cannot speak. Retrying either one for ever
+                // would only hide the reason.
+                let permanent = err.downcast_ref::<crate::attach::NoPanes>().is_some()
                     || err.to_string().contains("update the server or the bundle");
                 if permanent {
                     // Nothing will read this socket again, and the server

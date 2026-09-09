@@ -144,37 +144,40 @@ pub async fn attach(link: &WsLink, size: Option<TerminalSize>) -> Result<Attache
     })
 }
 
-/// The pane this page was showing is not on the server any more.
+/// The server has nothing to show at all.
 ///
 /// Its own type so the reconnect loop can tell "come back later" from
-/// "there is nothing to come back to" and stop retrying.
+/// "there is nothing to come back to" and stop retrying. A pane that is
+/// gone is not that: the page moves to another.
 #[derive(Debug)]
-pub struct PaneGone(pub PaneId);
+pub struct NoPanes;
 
-impl std::fmt::Display for PaneGone {
+impl std::fmt::Display for NoPanes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "pane {} is no longer on the server", self.0)
+        write!(f, "the server has no panes to show")
     }
 }
 
-impl std::error::Error for PaneGone {}
+impl std::error::Error for NoPanes {}
 
 /// The handshake again, on a socket that has just been reopened.
 ///
 /// Not `attach`: that picks a pane, and picking again after a reconnect
-/// would silently move the page to whatever is active now. This one insists
-/// on the pane it was already showing and fails with [`PaneGone`] if the
-/// server no longer has it.
+/// would silently move the page to whatever is active now. This one
+/// prefers the tab it was already showing, then the tab holding the pane
+/// it was focused on, and only then the first tab; it fails with
+/// [`NoPanes`] when the server has none. The listing comes back for the
+/// page to lay the tab out again.
 ///
 /// The identity is the one from the first connection. The server tracks the
 /// frontend lease by `ClientId`, so coming back under a new one would hand
 /// this page a different seat than the one it left.
 pub async fn reattach(
     link: &WsLink,
-    pane_id: PaneId,
     tab_id: TabId,
+    focused: PaneId,
     size: Option<TerminalSize>,
-) -> Result<()> {
+) -> Result<codec::ListPanesResponse> {
     let version = request(
         link,
         Pdu::GetCodecVersion(codec::GetCodecVersion {}),
@@ -215,49 +218,26 @@ pub async fn reattach(
         other => Err(other),
     })
     .await?;
-    if !panes.tabs.iter().any(|tab| contains_pane(tab, pane_id)) {
-        return Err(PaneGone(pane_id).into());
-    }
-
-    let tab_size = panes
+    let tab = panes
         .tabs
         .iter()
-        .find(|tab| contains_pane(tab, pane_id))
-        .and_then(|tab| tab.root_size());
+        .find(|tab| tab.window_and_tab_ids().is_some_and(|(_, id)| id == tab_id))
+        .or_else(|| panes.tabs.iter().find(|tab| contains_pane(tab, focused)))
+        .or_else(|| panes.tabs.iter().find(|tab| tab.root_size().is_some()))
+        .ok_or(NoPanes)?;
+    let (_, tab_id) = tab.window_and_tab_ids().ok_or(NoPanes)?;
+    let tab_size = tab.root_size().ok_or(NoPanes)?;
     {
         let mut lease = link.lease_mut();
         lease.tab_id = Some(tab_id);
+        lease.tab_owner = None;
         lease.reported = size;
+        lease.canonical_size = Some(tab_size);
+        lease.reported_canonical = None;
+        lease.fit = false;
     }
-    if let Some(tab_size) = tab_size {
-        let state = request(
-            link,
-            Pdu::SetClientViewport(codec::SetClientViewport {
-                tab_id,
-                viewport: codec::ClientViewport::CellGrid { size: tab_size },
-            }),
-            |pdu| match pdu {
-                Pdu::ClientViewportState(s) => Ok(s),
-                other => Err(other),
-            },
-        )
-        .await?;
-        let mut lease = link.lease_mut();
-        lease.reported_canonical = Some(tab_size);
-        lease.apply_viewport(&state);
-    }
-
-    // Re-subscribes: the server forgot this page along with the socket.
-    request(
-        link,
-        Pdu::GetPaneRenderChanges(codec::GetPaneRenderChanges { pane_id }),
-        |pdu| match pdu {
-            Pdu::LivenessResponse(_) | Pdu::UnitResponse(_) => Ok(()),
-            other => Err(other),
-        },
-    )
-    .await?;
-    Ok(())
+    link.report_canonical(tab_id).await?;
+    Ok(panes)
 }
 
 /// Whether a tab's layout still holds this pane.
