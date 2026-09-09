@@ -1,0 +1,18 @@
+[package]
+name = "thinkterm-i18n"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The interface strings every ThinkTerm client shows, as Fluent catalogues,
+# and the little engine that picks a locale and formats them. One home for
+# the translations: the desktop, the browser page and the mobile shells
+# read the same files. Must always build for wasm32-unknown-unknown: no
+# processes, files, threads or system locale lookups here -- the caller
+# says which languages the platform prefers.
+
+[dependencies]
+fluent-bundle.workspace = true
+fluent-langneg.workspace = true
+log.workspace = true
+unic-langid.workspace = true

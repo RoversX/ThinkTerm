@@ -64,6 +64,7 @@ filedescriptor.workspace = true
 finl_unicode.workspace = true
 fluent-bundle.workspace = true
 fluent-langneg.workspace = true
+thinkterm-i18n.workspace = true
 frecency.workspace = true
 futures.workspace = true
 hdrhistogram.workspace = true
@@ -82,6 +83,7 @@ nucleo-matcher.workspace = true
 openssl.workspace = true
 ordered-float.workspace = true
 parking_lot.workspace = true
+qrcode.workspace = true
 phf.workspace = true
 portable-pty = { workspace=true, features = ["serde_support"]}
 pulldown-cmark.workspace = true

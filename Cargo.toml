@@ -9,6 +9,7 @@ members = [
   "thinkterm-core",
   "thinkterm-font-core",
   "thinkterm-font-web",
+  "thinkterm-i18n",
   "thinkterm-proto",
   "thinkterm-render",
   "thinkterm-session",
@@ -83,6 +84,7 @@ config = { path = "config" }
 thinkterm-core = { path = "thinkterm-core" }
 thinkterm-font-core = { path = "thinkterm-font-core" }
 thinkterm-font-web = { path = "thinkterm-font-web" }
+thinkterm-i18n = { path = "thinkterm-i18n" }
 thinkterm-proto = { path = "thinkterm-proto" }
 thinkterm-render = { path = "thinkterm-render" }
 thinkterm-session = { path = "thinkterm-session" }
@@ -138,6 +140,7 @@ heapless = "0.8"
 httparse = "1.10"
 hdrhistogram = "7.1"
 hex = {version="0.4", default-features=false}
+if-addrs = "0.13"
 hostname = "0.4"
 http_req = "0.11"
 human-sort = "0.2"
@@ -206,6 +209,7 @@ rangeset = { path = "rangeset" }
 ratelim= { path = "ratelim" }
 raw-window-handle = "0.6"
 rayon = "1.10"
+qrcode = { version = "0.14", default-features = false }
 rcgen = "0.12"
 regex = "1"
 reqwest = "0.12"
