@@ -1,6 +1,7 @@
 # Browser client: performance baseline
 
-Measured 2026-09-09 on `web-client` after 6473846, on an Apple-silicon Mac,
+Measured 2026-09-09 on `web-client` (one-pane numbers after 6473846, the
+four-pane run after the mirror landed), on an Apple-silicon Mac,
 headless Chrome (`--headless=new --enable-unsafe-webgpu`), release server,
 release bundle through `ci/build-web.sh` with `wasm-opt -Oz` (binaryen 132).
 Three runs of `thinkterm-web/smoke/bench.sh`; the spread between runs is
@@ -64,6 +65,13 @@ starting between the echoed command and its first line, not a paint.
 3 frames. The client fetches what is on screen when it asks, not every
 intermediate state, so a burst that finishes between two fetches is one
 repaint; this is not a stress test.
+
+## Four panes, a screen of fresh CJK in each
+
+Three splits, then the CJK screen sent to all four at once: 4 frames, gaps
+17 ms, no long task, RSS +10 MB over the one-pane run. Four panes' quads
+go through the same allocator and draw call as one pane's; the fallback
+budget is shared, so the last pane's glyphs may arrive a frame later.
 
 ## After all of it
 

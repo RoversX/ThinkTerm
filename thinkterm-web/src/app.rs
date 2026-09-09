@@ -1265,8 +1265,69 @@ impl App {
         Some(target.clone())
     }
 
+    /// What the page has laid out, as JSON on the canvas element for the
+    /// smoke tests and anyone else curious: `canvas.dataset.layout`.
+    /// Rewritten whenever the strip is, which is whenever it changes.
+    fn publish_layout(inner: &Inner) {
+        let lease = inner.link.lease();
+        let dpr = inner.dpr.max(0.1);
+        let (cw, ch) = (
+            inner.glyphs.metrics.cell_size.width as f64 / dpr,
+            inner.glyphs.metrics.cell_size.height as f64 / dpr,
+        );
+        let mut json = format!(
+            "{{\"tab\":{},\"canvas\":[{},{}],\"cell\":[{cw:.3},{ch:.3}],\"focused\":{},\"owner\":{},\"may_type\":{},\"fit\":{},\"following\":{}",
+            inner.tab_id,
+            inner.cols,
+            inner.rows,
+            inner.focused_pane,
+            lease.owns_viewport(),
+            lease.may_type(),
+            lease.fit,
+            inner.following,
+        );
+        match &inner.tab_layout {
+            Some(layout) => {
+                json.push_str(&format!(",\"cols\":{},\"rows\":{},\"zoomed\":", layout.cols, layout.rows));
+                match layout.zoomed {
+                    Some(id) => json.push_str(&id.to_string()),
+                    None => json.push_str("null"),
+                }
+                json.push_str(",\"panes\":[");
+                for (i, p) in layout.panes.iter().enumerate() {
+                    if i > 0 {
+                        json.push(',');
+                    }
+                    json.push_str(&format!(
+                        "{{\"id\":{},\"left\":{},\"top\":{},\"cols\":{},\"rows\":{},\"content\":[{},{}]}}",
+                        p.pane_id, p.frame.left, p.frame.top, p.frame.cols, p.frame.rows, p.content.0, p.content.1
+                    ));
+                }
+                json.push_str("],\"dividers\":[");
+                for (i, d) in layout.dividers.iter().enumerate() {
+                    if i > 0 {
+                        json.push(',');
+                    }
+                    match *d {
+                        crate::layout::Divider::Col { col, top, rows } => {
+                            json.push_str(&format!("{{\"col\":{col},\"top\":{top},\"rows\":{rows}}}"))
+                        }
+                        crate::layout::Divider::Row { row, left, cols } => {
+                            json.push_str(&format!("{{\"row\":{row},\"left\":{left},\"cols\":{cols}}}"))
+                        }
+                    }
+                }
+                json.push(']');
+            }
+            None => json.push_str(",\"cols\":null,\"rows\":null,\"zoomed\":null,\"panes\":[],\"dividers\":[]"),
+        }
+        json.push('}');
+        let _ = inner.canvas.set_attribute("data-layout", &json);
+    }
+
     /// Draw the tab strip from what the page knows.
     fn render_strip(inner: &Inner) {
+        Self::publish_layout(inner);
         let (Some(strip), Some(layout)) = (&inner.strip, &inner.layout) else {
             return;
         };
@@ -1370,10 +1431,15 @@ impl App {
                 return;
             }
         }
-        let fresh = {
+        let (fresh, changed) = {
             let mut inner = self.inner.borrow_mut();
             inner.layout = Some(list);
+            let before = (inner.focused_pane, inner.tab_layout.clone());
             let fresh = Self::apply_layout(&mut inner, layout, want);
+            let changed = tab_changed
+                || !fresh.is_empty()
+                || before.0 != inner.focused_pane
+                || before.1 != inner.tab_layout;
             if tab_changed {
                 inner.selecting = false;
                 inner.ime_anchor = None;
@@ -1385,7 +1451,7 @@ impl App {
                 doc.set_title(&format!("{} — ThinkTerm", inner.title()));
             }
             Self::render_strip(&inner);
-            fresh
+            (fresh, changed)
         };
         // A pane's first push comes when something asks after it: one
         // liveness poll each, and the answer is not waited for.
@@ -1406,8 +1472,12 @@ impl App {
         if tab_changed {
             self.resize();
         }
-        self.refresh_status();
-        self.request_frame();
+        // A listing that changed nothing (the timer's, mostly) is not a
+        // reason to paint.
+        if changed {
+            self.refresh_status();
+            self.request_frame();
+        }
     }
 
     /// Make `inner.panes` match `layout`, focusing `want` if it is drawn

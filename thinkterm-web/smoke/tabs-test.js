@@ -1,7 +1,14 @@
-// End-to-end check of the tab strip, driven through tabs.sh (not part of
-// the served bundle): with two tabs on the server the page lists both, a
-// click switches panes and typing lands in the new one, and with following
-// turned back on a focus change on the server side moves the page back.
+// End-to-end check of the page's tabs and panes, driven through tabs.sh
+// (not part of the served bundle). With two tabs on the server the page
+// lists both, a click switches, typing lands in the new pane, and with
+// following turned back on a focus change on the server side moves the
+// page back. Then the strip's buttons: a split appears in the page's
+// layout (read from `canvas.dataset.layout`) with the divider one cell
+// past the first pane, a real mouse click into the second pane focuses it
+// and makes the server's active pane follow, typing lands there and not
+// beside it, the panes' sizes on the server are unchanged by any of it,
+// zoom and close do what they say, and a new tab takes the page with it.
+// Last, the listener is switched off and on: the split comes back.
 //
 //   node tabs-test.js <url> <cli prefix> <out.png>
 //
@@ -33,32 +40,97 @@ const sh = (cmd) => execSync(cmd, { encoding: "utf8" });
   const status = () => ev("document.getElementById('status')?.textContent || ''");
   const until = async (what, expr, ms = 10000) => { const t = Date.now(); while (Date.now() - t < ms) { const v = await ev(expr); if (v) return v; await sleep(100); } throw new Error("timeout waiting for " + what + ": " + JSON.stringify({ status: await status(), strip: await ev("document.getElementById('tabs').innerText") })); };
   const out = {};
+  const layout = async () => JSON.parse(await ev("document.getElementById('term').dataset.layout || '{}'"));
+  const click = (action) => ev(`document.querySelector('[data-action=${JSON.stringify(action)}]').click(); 1`);
+  const type = async (text) => { await ev(`(() => { const kbd = document.getElementById('kbd'); kbd.focus(); const fire = (key, code) => kbd.dispatchEvent(new KeyboardEvent('keydown', { key, code, bubbles: true, cancelable: true })); for (const ch of ${JSON.stringify(text)}) fire(ch, ch === ' ' ? 'Space' : 'Key' + ch.toUpperCase()); fire('Enter', 'Enter'); return 1; })()`); await sleep(1200); };
+  const has = (pane, text) => new RegExp(text).test(sh(`${cli} get-text --pane-id ${pane}`));
+  const list = () => JSON.parse(sh(`${cli} list --format json`));
+  const sizes = () => list().map((p) => [p.pane_id, p.size.cols + "x" + p.size.rows]);
+  const fail = (what) => { throw new Error(what); };
+
   await send("Page.navigate", { url }, s);
-  await until("attach", "/this browser has|following/.test(document.getElementById('status').textContent)", 20000);
+  await until("attach", "/this browser has|mirroring|following/.test(document.getElementById('status').textContent)", 20000);
+
+  // --- tabs: two on the server, click the other, type, follow back
   out.strip_at_start = await until("two tabs", "document.querySelectorAll('#tabs .tab').length === 2 && document.getElementById('tabs').innerText");
-  out.current_at_start = await ev("document.querySelector('#tabs .tab.current').dataset.pane");
-  // Click the other tab.
+  const first = await ev("document.querySelector('#tabs .tab.current').dataset.pane");
   await ev("document.querySelector('#tabs .tab:not(.current)').click()");
-  await until("switch", `document.querySelector('#tabs .tab.current').dataset.pane !== ${JSON.stringify(out.current_at_start)}`);
+  await until("switch", `document.querySelector('#tabs .tab.current').dataset.pane !== ${JSON.stringify(first)}`);
   await sleep(400);
-  out.current_after_click = await ev("document.querySelector('#tabs .tab.current').dataset.pane");
+  const second = await ev("document.querySelector('#tabs .tab.current').dataset.pane");
   out.follow_after_click = await ev("document.querySelector('#tabs .follow').textContent");
-  out.status_after_click = await status();
-  // Type into it through the real key path.
-  await ev(`(() => { const kbd = document.getElementById('kbd'); kbd.focus(); const fire = (key, code) => kbd.dispatchEvent(new KeyboardEvent('keydown', { key, code, bubbles: true, cancelable: true })); for (const ch of 'echo TAB2-OK') fire(ch, ch === ' ' ? 'Space' : 'Key' + ch.toUpperCase()); fire('Enter', 'Enter'); return 1; })()`);
-  await sleep(1500);
-  out.pane1_text = sh(`${cli} get-text --pane-id 1`).split("\n").filter((l) => /TAB2-OK/.test(l));
-  out.pane0_text = sh(`${cli} get-text --pane-id 0`).split("\n").filter((l) => /TAB2-OK/.test(l));
-  // Follow the desktop again, then focus pane 0 from the server side.
+  await type("echo TAB2-OK");
+  if (!has(second, "TAB2-OK") || has(first, "TAB2-OK")) fail("typing after a tab click went to the wrong pane");
   await ev("document.querySelector('#tabs .follow').click()");
-  out.follow_after_toggle = await ev("document.querySelector('#tabs .follow').textContent");
-  sh(`${cli} activate-pane --pane-id 0`);
-  await until("follow back", `document.querySelector('#tabs .tab.current').dataset.pane === ${JSON.stringify(out.current_at_start)}`);
+  sh(`${cli} activate-pane --pane-id ${first}`);
+  await until("follow back", `document.querySelector('#tabs .tab.current').dataset.pane === ${JSON.stringify(first)}`);
+  out.tabs = "ok";
+
+  // --- split: the layout has two placements and one divider
+  const before = sizes();
+  await click("split-right");
+  await until("two panes", "document.querySelectorAll('#tabs .pane').length === 2", 8000);
   await sleep(400);
-  out.current_after_focus = await ev("document.querySelector('#tabs .tab.current').dataset.pane");
-  out.status_after_focus = await status();
+  let l = await layout();
+  if (l.panes.length !== 2) fail("expected two placements: " + JSON.stringify(l));
+  const [a, b] = l.panes[0].left < l.panes[1].left ? [l.panes[0], l.panes[1]] : [l.panes[1], l.panes[0]];
+  if (b.left !== a.left + a.cols + 1) fail(`second pane at ${b.left}, expected ${a.left + a.cols + 1}`);
+  if (l.dividers.length !== 1 || l.dividers[0].col !== a.left + a.cols) fail("divider not in the gap cell: " + JSON.stringify(l.dividers));
+  if (l.focused !== b.id) fail("the new pane is not focused");
+  out.split = { a: [a.id, a.cols, a.rows], b: [b.id, b.cols, b.rows], divider: l.dividers[0] };
+
+  // --- a real click into the left pane focuses it, on the server too
+  const rect = await ev("(r => [r.left, r.top])(document.getElementById('term').getBoundingClientRect())");
+  const px = rect[0] + (a.left + Math.floor(a.cols / 2)) * l.cell[0] + 2;
+  const py = rect[1] + (a.top + 3) * l.cell[1] + 2;
+  await send("Input.dispatchMouseEvent", { type: "mousePressed", x: px, y: py, button: "left", clickCount: 1 }, s);
+  await send("Input.dispatchMouseEvent", { type: "mouseReleased", x: px, y: py, button: "left", clickCount: 1 }, s);
+  await until("focus moved", `document.querySelector('#tabs .pane.current').dataset.pane === ${JSON.stringify(String(a.id))}`);
+  await sleep(300);
+  const active = list().find((p) => p.is_active);
+  if (!active || active.pane_id !== a.id) fail("the server's active pane did not follow the click: " + JSON.stringify(list().map((p) => [p.pane_id, p.is_active])));
+  await type("echo CLICKED");
+  if (!has(a.id, "CLICKED") || has(b.id, "CLICKED")) fail("typing after a click went to the wrong pane");
+  const after = sizes();
+  if (JSON.stringify(after) !== JSON.stringify(sizes())) fail("sizes changed while the page typed");
+  out.click = { focused: a.id, sizes_after: after };
+
+  // --- zoom, unzoom, close (twice), new tab
+  await click("zoom");
+  await until("zoomed", "document.querySelector('[data-action=zoom]').classList.contains('on')", 8000);
+  l = await layout();
+  if (l.zoomed !== a.id || l.panes.length !== 1 || l.dividers.length !== 0) fail("zoom not reflected: " + JSON.stringify(l));
+  await click("zoom");
+  await until("unzoomed", "!document.querySelector('[data-action=zoom]').classList.contains('on')", 8000);
+  await click("close");
+  if ((await ev("document.querySelector('[data-action=close]').textContent")) !== "close pane?") fail("close did not ask");
+  await click("close");
+  await until("one pane", "document.querySelectorAll('#tabs .pane').length === 0", 8000);
+  if (list().some((p) => p.pane_id === a.id)) fail("the pane was not closed");
+  out.zoom_close = "ok";
+  await click("new-tab");
+  await until("three tabs", "document.querySelectorAll('#tabs .tab').length === 3", 8000);
+  const newest = Math.max(...list().map((p) => p.pane_id));
+  await until("moved to the new tab", `document.querySelector('#tabs .tab.current').dataset.pane === ${JSON.stringify(String(newest))}`);
+  out.new_tab = newest;
+
+  // --- reconnect keeps a split
+  await click("split-below");
+  await until("two panes again", "document.querySelectorAll('#tabs .pane').length === 2", 8000);
+  sh(`${cli} web-server off`);
+  await until("disconnected", "/reconnect/.test(document.getElementById('status').textContent)", 10000);
+  await sleep(1200);
+  sh(`${cli} web-server on`);
+  await until("back", "/this browser has|mirroring/.test(document.getElementById('status').textContent)", 25000);
+  await sleep(600);
+  l = await layout();
+  if (l.panes.length !== 2) fail("the split did not survive the reconnect: " + JSON.stringify(l));
+  await type("echo BACK");
+  if (!has(l.focused, "BACK")) fail("typing after the reconnect went nowhere");
+  out.reconnect = "ok";
+
   const shot = await send("Page.captureScreenshot", { format: "png" }, s); fs.writeFileSync(outPng, Buffer.from(shot.data, "base64"));
-  out.logs = logs.filter((l) => !/^\s*$/.test(l)).slice(-8);
-  console.log(JSON.stringify(out, null, 1));
+  out.logs = logs.filter((l) => !/^\s*$/.test(l) && !/INFO/.test(l)).slice(-6);
+  console.log(JSON.stringify(out));
   ws.close(); chrome.kill(); process.exit(0);
 })().catch((e) => { console.error(e); chrome.kill(); process.exit(1); });

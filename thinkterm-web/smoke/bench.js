@@ -154,6 +154,17 @@ const INSTRUMENT = `
   const cjk_other = line(`clear; cat ${cjkFile2}`);
   const seq = line("seq 1 20000");
   const trickle = line('python3 -c "import time\nfor i in range(300): print(i, flush=True); time.sleep(0.01)"');
+  // Four panes: three splits, then the CJK screen into every one of them.
+  // `sendPrefix` names pane 0; the others are addressed by replacing it.
+  const toPane = (id) => sendPrefix.replace(/--pane-id \d+/, `--pane-id ${id}`);
+  const cliPrefix = sendPrefix.replace(/ send-text.*$/, "");
+  const fourPanes = () => {
+    execSync(`${cliPrefix} split-pane --pane-id 0 --right`, { stdio: "ignore" });
+    execSync(`${cliPrefix} split-pane --pane-id 0 --bottom`, { stdio: "ignore" });
+    execSync(`${cliPrefix} split-pane --pane-id 1 --bottom`, { stdio: "ignore" });
+    const ids = JSON.parse(execSync(`${cliPrefix} list --format json`, { encoding: "utf8" })).map((p) => p.pane_id);
+    return ids.map((id) => `printf '%s\\n' 'clear; cat ${cjkFile}' | ${toPane(id)}`).join(" & ") + " & wait";
+  };
   const results = {
     bundle: wasmRes, load: { dom_content_loaded_ms: Math.round(nav.domContentLoadedEventEnd), first_status_ms: tFirst, attached_ms: tAttached },
     idle_after_attach: await scenario("idle 3 s", null, 3000),
@@ -162,6 +173,7 @@ const INSTRUMENT = `
     cjk_cold_other: await profiled(() => scenario("a second screen of different fresh CJK", cjk_other, 3000)),
     trickle: await scenario("300 lines, one every 10 ms", trickle, 5000),
     ascii_scroll: await scenario("seq 1 20000", seq, 6000),
+    four_panes_cjk: await scenario("four panes, a screen of CJK in each", fourPanes(), 4000),
     idle_after: await scenario("idle 3 s after", null, 3000),
     metrics: await metrics().then((m) => ({ js_heap_mb: +(m.JSHeapUsedSize / 1048576).toFixed(1), documents: m.Documents, nodes: m.Nodes })),
     logs,

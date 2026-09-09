@@ -99,19 +99,27 @@ on a laptop; `ci/macos-package.sh --build` builds it.
 
 ## What the first version does not do
 
-Images (kitty, sixel, iTerm2) are not drawn. The page shows one pane at a
-time: a strip along the top lists the server's tabs, and the panes of the
-tab on show, and a click moves the page there. It follows the desktop's
-focus by default; choosing a pane pins the page to it, and the switch at the
-right of the strip turns following back on. Splits are not drawn side by
-side, and the ThinkTerm tree is not shown; the cursor does not blink. The input
+Images (kitty, sixel, iTerm2) are not drawn. The page shows the tab the
+desktop shows, every pane of it in the desktop's split layout, and follows
+the desktop's focus by default: a strip along the top lists the server's
+tabs and, for the tab on show, its panes; clicking one focuses it here and
+on the desktop, and the switch at the right of the strip pins the page to
+what it is showing instead. The tab keeps the desktop's size -- the page
+letterboxes it, and clips when the desktop's grid is larger, saying so on
+the status line -- even while the page types; the fit button (or
+Ctrl+Shift+F) reshapes the tab to this window until the desktop next takes
+it. The strip's other buttons open a new tab beside this one, split the
+focused pane to the right or below, zoom it, and close it (asking twice);
+Ctrl+Shift with an arrow moves the focus between panes. In Handoff mode a
+page that does not hold the terminal can look but not type, and offers to
+take over. The ThinkTerm tree is not shown; the cursor does not blink. The input
 method's hidden field follows the terminal cursor, including scrolling and
 resizing, so the browser can place its candidate window there; pre-edit
 text and its underline are not yet drawn in the grid.
 
 A dropped socket is reopened by the page itself, with a backoff, on the same
-pane; the status line says so while it is down. It gives up only when there
-is nothing to come back to -- the pane was closed, or the server speaks a
+tab; the status line says so while it is down. It gives up only when there
+is nothing to come back to -- the server has no panes, or speaks a
 different protocol version -- and says which.
 
 ## Fonts

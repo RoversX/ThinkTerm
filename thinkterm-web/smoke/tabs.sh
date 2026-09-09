@@ -30,5 +30,8 @@ URL=$($CLI web-token mint --label tabs --ttl 1h --url-only 2>/dev/null | head -1
 status=0
 HOME=$REAL_HOME node "$REPO/thinkterm-web/smoke/tabs-test.js" "$URL" "$CLI" "$OUT" || status=$?
 for p in $(pgrep -f "$T/web.lua" || true); do kill "$p"; done
-rm -rf "$T"
+# The server may still be closing its files; a leftover directory is not
+# worth a failure.
+sleep 0.5
+rm -rf "$T" 2>/dev/null || true
 exit $status

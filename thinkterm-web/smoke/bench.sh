@@ -30,5 +30,8 @@ SEND="env HOME=$HOME THINKTERM_NO_PRIVACY_DISCLAIM=1 $CLI send-text --no-paste -
 status=0
 HOME=$REAL_HOME node "$REPO/thinkterm-web/smoke/bench.js" "$URL" "$SEND" --timeout 60000 || status=$?
 for p in $(pgrep -f "$T/web.lua" || true); do kill "$p"; done
-rm -rf "$T"
+# The server may still be closing its files; a leftover directory is not
+# worth a failure.
+sleep 0.5
+rm -rf "$T" 2>/dev/null || true
 exit $status
