@@ -77,22 +77,35 @@ pub async fn attach(link: &WsLink, size: Option<TerminalSize>) -> Result<Attache
         .find_map(active_pane)
         .ok_or_else(|| anyhow!("the server has no panes to show"))?;
 
-    link.lease_mut().tab_id = Some(entry.tab_id);
-    if let Some(size) = size {
-        let state = request(
-            link,
-            Pdu::SetClientViewport(codec::SetClientViewport {
-                tab_id: entry.tab_id,
-                viewport: codec::ClientViewport::CellGrid { size },
-            }),
-            |pdu| match pdu {
-                Pdu::ClientViewportState(s) => Ok(s),
-                other => Err(other),
-            },
-        )
-        .await?;
+    // The page's own grid is kept for a later "fit"; what the server hears
+    // is the tab's own size, so that whatever it claims for this page
+    // (it claims a client's last report when it types) reshapes nothing.
+    let tab_size = panes
+        .tabs
+        .iter()
+        .find(|tab| crate::layout::leaves(tab).iter().any(|e| e.pane_id == entry.pane_id))
+        .and_then(|tab| tab.root_size())
+        .unwrap_or(entry.size);
+    {
         let mut lease = link.lease_mut();
-        lease.reported = Some(size);
+        lease.tab_id = Some(entry.tab_id);
+        lease.reported = size;
+    }
+    let state = request(
+        link,
+        Pdu::SetClientViewport(codec::SetClientViewport {
+            tab_id: entry.tab_id,
+            viewport: codec::ClientViewport::CellGrid { size: tab_size },
+        }),
+        |pdu| match pdu {
+            Pdu::ClientViewportState(s) => Ok(s),
+            other => Err(other),
+        },
+    )
+    .await?;
+    {
+        let mut lease = link.lease_mut();
+        lease.reported_canonical = Some(tab_size);
         lease.apply_viewport(&state);
     }
 
@@ -206,12 +219,22 @@ pub async fn reattach(
         return Err(PaneGone(pane_id).into());
     }
 
-    if let Some(size) = size {
+    let tab_size = panes
+        .tabs
+        .iter()
+        .find(|tab| contains_pane(tab, pane_id))
+        .and_then(|tab| tab.root_size());
+    {
+        let mut lease = link.lease_mut();
+        lease.tab_id = Some(tab_id);
+        lease.reported = size;
+    }
+    if let Some(tab_size) = tab_size {
         let state = request(
             link,
             Pdu::SetClientViewport(codec::SetClientViewport {
                 tab_id,
-                viewport: codec::ClientViewport::CellGrid { size },
+                viewport: codec::ClientViewport::CellGrid { size: tab_size },
             }),
             |pdu| match pdu {
                 Pdu::ClientViewportState(s) => Ok(s),
@@ -220,8 +243,7 @@ pub async fn reattach(
         )
         .await?;
         let mut lease = link.lease_mut();
-        lease.tab_id = Some(tab_id);
-        lease.reported = Some(size);
+        lease.reported_canonical = Some(tab_size);
         lease.apply_viewport(&state);
     }
 

@@ -12,7 +12,6 @@ use codec::Pdu;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
-use thinkterm_session::host::SessionEvents as _;
 use termwiz::input::{KeyCode, Modifiers};
 use thinkterm_font_web::FontSet;
 use thinkterm_proto::{PaneId, TabId};
@@ -490,7 +489,16 @@ impl App {
                 }
             }
             Pdu::ClientViewportState(_) | Pdu::FrontendAccessState(_) => {
+                let (link, tab_id) = (inner.link.clone(), inner.tab_id);
                 drop(inner);
+                // The desktop may have resized: keep the server's copy of
+                // this page's report at the tab's size, or the next
+                // keystroke would claim the old one.
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(err) = link.report_canonical(tab_id).await {
+                        log::warn!("reporting the tab size: {err:#}");
+                    }
+                });
                 self.refresh_status();
                 self.request_frame();
             }
@@ -684,14 +692,21 @@ impl App {
             .as_ref()
             .map(|l| (l.cols, l.rows))
             .unwrap_or((inner.cols, inner.rows));
+        let lease = inner.link.lease();
         let mut text = if owner {
             format!("{}  ·  {}x{}  ·  this browser has the terminal", inner.title(), cols, rows)
-        } else {
+        } else if !lease.may_type() {
             format!(
-                "{}  ·  {}x{}  ·  following another device (type or click to take over)",
+                "{}  ·  {}x{}  ·  another device has the terminal (Ctrl+Shift+T to take over)",
                 inner.title(), cols, rows
             )
+        } else {
+            format!("{}  ·  {}x{}  ·  mirroring the desktop", inner.title(), cols, rows)
         };
+        if lease.fit {
+            text.push_str("  ·  fitted to this window (Ctrl+Shift+F again to let go)");
+        }
+        drop(lease);
         if cols > inner.cols || rows > inner.rows {
             text.push_str(&format!("  ·  this window fits {}x{}", inner.cols, inner.rows));
         }
@@ -721,6 +736,9 @@ impl App {
         if inner.composing || inner.disconnected.is_some() {
             return false;
         }
+        if !Self::may_type(&inner) {
+            return true;
+        }
         // Copy and paste chords belong to the page: Cmd+C/V on a Mac,
         // Ctrl+Shift+C/V elsewhere. Copy what is selected; let the paste
         // event carry the clipboard. Every other Cmd chord is the
@@ -735,6 +753,18 @@ impl App {
                 return true;
             }
             KeyCode::Char('v') | KeyCode::Char('V') if cmd || ctrl_shift => return false,
+            // Ctrl+Shift+F fits the tab to this window; Ctrl+Shift+T
+            // takes the terminal over from another device (Handoff mode).
+            KeyCode::Char('f') | KeyCode::Char('F') if ctrl_shift => {
+                drop(inner);
+                self.fit(true);
+                return true;
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') if ctrl_shift => {
+                drop(inner);
+                self.take_over();
+                return true;
+            }
             // Ctrl+Shift+arrow moves the focus between the tab's panes,
             // locally: dragging the desktop along is a click's job.
             KeyCode::LeftArrow | KeyCode::RightArrow | KeyCode::UpArrow | KeyCode::DownArrow
@@ -769,10 +799,24 @@ impl App {
         self.inner.borrow_mut().composing = composing;
     }
 
+    /// Whether input may go out at all. In Handoff mode with the
+    /// terminal in someone else's hands the server would drop it; the
+    /// status line says so and offers to take over.
+    fn may_type(inner: &Inner) -> bool {
+        if inner.link.lease().may_type() {
+            return true;
+        }
+        Self::set_status(
+            inner,
+            "another device is using this terminal; press Ctrl+Shift+T to take it over",
+        );
+        false
+    }
+
     /// Text the IME composed: bytes, not a paste, so no bracketing.
     pub fn text(&self, text: &str) {
         let mut inner = self.inner.borrow_mut();
-        if inner.disconnected.is_some() {
+        if inner.disconnected.is_some() || !Self::may_type(&inner) {
             return;
         }
         let cell = inner.focused_mut();
@@ -785,7 +829,7 @@ impl App {
 
     pub fn paste(&self, text: &str) {
         let mut inner = self.inner.borrow_mut();
-        if inner.disconnected.is_some() {
+        if inner.disconnected.is_some() || !Self::may_type(&inner) {
             return;
         }
         let cell = inner.focused_mut();
@@ -963,6 +1007,9 @@ impl App {
             self.focus_pane(hit.pane_id, advise);
         }
         let mut inner = self.inner.borrow_mut();
+        if what == Pointer::Down && !Self::may_type(&inner) {
+            return;
+        }
         let Some(cell) = inner.panes.get(&hit.pane_id) else {
             return;
         };
@@ -1253,40 +1300,28 @@ impl App {
             Self::set_status(&inner, "the server has no panes to show");
             return;
         };
-        let (link, size, tab_changed) = {
+        let (link, tab_changed) = {
             let mut inner = self.inner.borrow_mut();
             if inner.switching || inner.disconnected.is_some() {
                 return;
             }
             let tab_changed = layout.tab_id != inner.tab_id;
             inner.switching = tab_changed;
-            let reported = inner.link.lease().reported;
-            (inner.link.clone(), reported, tab_changed)
+            (inner.link.clone(), tab_changed)
         };
         if tab_changed {
-            // The lease is per tab: a follower's report, never a claim.
-            // Typing or clicking claims, as at attach.
+            // The lease is per tab: a follower's report of the tab's own
+            // size, never a claim. Typing or clicking claims, as at attach.
             let outcome: Result<()> = async {
-                if let Some(size) = size {
-                    let state = thinkterm_session::host::request(
-                        &link,
-                        Pdu::SetClientViewport(codec::SetClientViewport {
-                            tab_id: layout.tab_id,
-                            viewport: codec::ClientViewport::CellGrid { size },
-                        }),
-                        |pdu| match pdu {
-                            Pdu::ClientViewportState(s) => Ok(s),
-                            other => Err(other),
-                        },
-                    )
-                    .await?;
+                {
                     let mut lease = link.lease_mut();
                     lease.tab_id = Some(layout.tab_id);
-                    lease.apply_viewport(&state);
-                } else {
-                    link.lease_mut().tab_id = Some(layout.tab_id);
+                    lease.tab_owner = None;
+                    lease.canonical_size = Some(layout.size);
+                    lease.reported_canonical = None;
+                    lease.fit = false;
                 }
-                Ok(())
+                link.report_canonical(layout.tab_id).await
             }
             .await;
             let mut inner = self.inner.borrow_mut();
@@ -1481,6 +1516,56 @@ impl App {
         });
     }
 
+    /// Reshape the tab to this window's grid (`on`), or go back to the
+    /// desktop's size (`off`): a claim either way, at the size the lease
+    /// then picks.
+    pub fn fit(self: &Rc<Self>, on: bool) {
+        let (link, tab_id) = {
+            let inner = self.inner.borrow();
+            inner.link.lease_mut().fit = on;
+            (inner.link.clone(), inner.tab_id)
+        };
+        let app = Rc::clone(self);
+        wasm_bindgen_futures::spawn_local(async move {
+            match link.claim(tab_id).await {
+                Ok(_) => {
+                    app.refresh_status();
+                    app.request_frame();
+                }
+                Err(err) => {
+                    let inner = app.inner.borrow();
+                    Self::set_status(&inner, &format!("could not resize the tab: {err:#}"));
+                }
+            }
+        });
+    }
+
+    /// Take the terminal from whichever device holds it (Handoff mode).
+    /// There is no giving it back: the desktop takes it by interacting.
+    pub fn take_over(self: &Rc<Self>) {
+        let (link, tab_id) = {
+            let inner = self.inner.borrow();
+            (inner.link.clone(), inner.tab_id)
+        };
+        let app = Rc::clone(self);
+        wasm_bindgen_futures::spawn_local(async move {
+            match link.claim(tab_id).await {
+                Ok(true) => {
+                    app.refresh_status();
+                    app.request_frame();
+                }
+                Ok(false) => {
+                    let inner = app.inner.borrow();
+                    Self::set_status(&inner, "the server did not hand the terminal over");
+                }
+                Err(err) => {
+                    let inner = app.inner.borrow();
+                    Self::set_status(&inner, &format!("could not take over: {err:#}"));
+                }
+            }
+        });
+    }
+
     /// See `GlyphCache::warm`. Called once, after the first frame.
     pub fn warm_glyph_canvas(&self) {
         self.inner.borrow_mut().glyphs.warm();
@@ -1538,6 +1623,10 @@ impl App {
         inner.cols = cols;
         inner.rows = rows;
         if changed {
+            // The page's grid is its own business: the tab keeps the
+            // desktop's size and this canvas letterboxes it. Only a page
+            // that asked to fit the tab to itself sends its grid, and then
+            // as a claim, because that is what changing the tab's size is.
             let size = TerminalSize {
                 rows,
                 cols,
@@ -1545,50 +1634,17 @@ impl App {
                 pixel_height: rows * ch as usize,
                 dpi: (96.0 * dpr) as u32,
             };
-            let owner = inner.link.lease().owns_viewport();
-            inner.link.lease_mut().reported = Some(size);
-            let link = inner.link.clone();
-            let (tab_id, pane_id) = (inner.tab_id, inner.focused_pane);
-            if owner {
-                inner.focused().session.apply_local_resize(size);
-                let session = Arc::clone(&inner.focused().session);
-                let host = Arc::clone(&inner.host);
+            let fitting = {
+                let mut lease = inner.link.lease_mut();
+                lease.reported = Some(size);
+                lease.fit && lease.owns_viewport()
+            };
+            if fitting {
+                let link = inner.link.clone();
+                let tab_id = inner.tab_id;
                 wasm_bindgen_futures::spawn_local(async move {
-                    let pdu = Pdu::Resize(codec::Resize {
-                        containing_tab_id: tab_id,
-                        pane_id,
-                        size,
-                    });
-                    if let Err(err) = thinkterm_session::host::request(&link, pdu, |p| match p {
-                        Pdu::UnitResponse(_) => Ok(()),
-                        other => Err(other),
-                    })
-                    .await
-                    {
-                        // The reflow above was optimistic. Refused, it would
-                        // show a grid the server does not have, for ever:
-                        // back to the canonical one, and repaint.
-                        log::warn!("resize refused: {err:#}");
-                        if let Some(canonical) = link.lease().canonical_size {
-                            session.apply_local_resize(canonical);
-                            session.make_all_stale();
-                            host.events.pane_output(0);
-                        }
-                    }
-                });
-            } else {
-                wasm_bindgen_futures::spawn_local(async move {
-                    let pdu = Pdu::SetClientViewport(codec::SetClientViewport {
-                        tab_id,
-                        viewport: codec::ClientViewport::CellGrid { size },
-                    });
-                    if let Ok(state) = thinkterm_session::host::request(&link, pdu, |p| match p {
-                        Pdu::ClientViewportState(s) => Ok(s),
-                        other => Err(other),
-                    })
-                    .await
-                    {
-                        link.lease_mut().apply_viewport(&state);
+                    if let Err(err) = link.claim(tab_id).await {
+                        log::warn!("fitting the tab to this window: {err:#}");
                     }
                 });
             }

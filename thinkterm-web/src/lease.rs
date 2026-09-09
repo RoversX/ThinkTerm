@@ -15,8 +15,17 @@ pub struct Lease {
     /// Per-tab owner (TmuxLatest mode).
     pub tab_owner: Option<ClientId>,
     pub canonical_size: Option<TerminalSize>,
-    /// The grid this browser last reported.
+    /// The grid this page could show: its canvas in cells. Never sent as
+    /// a viewport unless `fit` is on; see `claim_size`.
     pub reported: Option<TerminalSize>,
+    /// The canonical size this page last told the server about. The
+    /// server claims a client's last report for it when it types, so
+    /// the report must be kept current or a keystroke would reshape the
+    /// tab to a size the desktop has since left.
+    pub reported_canonical: Option<TerminalSize>,
+    /// The page wants the tab at its own grid rather than the desktop's.
+    /// Cleared when a push shows the tab in someone else's hands.
+    pub fit: bool,
 }
 
 fn same_client(a: &ClientId, b: &ClientId) -> bool {
@@ -53,6 +62,42 @@ impl Lease {
         self.tab_owner = state.owner.clone();
         self.canonical_size = Some(state.canonical_size);
         self.apply_access(&state.access);
+        if self.fit && !self.owns_viewport() {
+            self.fit = false;
+        }
+    }
+
+    /// Whether the tab (TmuxLatest) or the connection (Handoff) has no
+    /// owner at all.
+    pub fn ownerless(&self) -> bool {
+        match self.mode {
+            Some(codec::FrontendAccessMode::TmuxLatest) => self.tab_owner.is_none(),
+            Some(codec::FrontendAccessMode::Handoff) => self.owner.is_none(),
+            None => true,
+        }
+    }
+
+    /// Whether this page's input will be accepted. In TmuxLatest anyone
+    /// may type (the server hands the tab to whoever does); in Handoff
+    /// only the owner, or anyone when there is none.
+    pub fn may_type(&self) -> bool {
+        match self.mode {
+            Some(codec::FrontendAccessMode::Handoff) => self.owns_viewport() || self.owner.is_none(),
+            _ => true,
+        }
+    }
+
+    /// The grid to claim the tab with. The desktop's own (canonical) size
+    /// unless this page asked to fit the tab to itself or nobody holds
+    /// the tab yet -- so typing here does not reshape what the desktop
+    /// shows. Echoed verbatim: the server's resize is a no-op only when
+    /// every field matches.
+    pub fn claim_size(&self) -> Option<TerminalSize> {
+        if self.fit || self.ownerless() {
+            self.reported.or(self.canonical_size)
+        } else {
+            self.canonical_size.or(self.reported)
+        }
     }
 }
 
@@ -121,5 +166,84 @@ mod tests {
         assert!(!lease.owns_viewport(), "another tab's owner is not ours");
         lease.apply_viewport(&state(7, Some(id(1))));
         assert!(lease.owns_viewport());
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+
+    fn id(n: usize) -> ClientId {
+        ClientId {
+            hostname: "h".into(),
+            username: "u".into(),
+            pid: 1,
+            epoch: 1,
+            id: n,
+            ssh_auth_sock: None,
+        }
+    }
+    fn size(cols: usize, rows: usize) -> TerminalSize {
+        TerminalSize { cols, rows, pixel_width: cols * 7, pixel_height: rows * 15, dpi: 96 }
+    }
+    fn lease(mode: codec::FrontendAccessMode) -> Lease {
+        Lease {
+            tab_id: Some(1),
+            me: Some(id(1)),
+            mode: Some(mode),
+            owner: None,
+            tab_owner: None,
+            canonical_size: Some(size(120, 40)),
+            reported: Some(size(96, 30)),
+            reported_canonical: None,
+            fit: false,
+        }
+    }
+
+    #[test]
+    fn a_tab_someone_else_holds_is_claimed_at_its_own_size() {
+        let mut l = lease(codec::FrontendAccessMode::TmuxLatest);
+        l.tab_owner = Some(id(2));
+        assert_eq!(l.claim_size(), Some(size(120, 40)), "the desktop's grid, verbatim");
+        assert!(l.may_type(), "TmuxLatest: typing hands the tab over, at that size");
+    }
+
+    #[test]
+    fn an_ownerless_tab_and_a_fit_take_the_page_s_own_grid() {
+        let mut l = lease(codec::FrontendAccessMode::TmuxLatest);
+        assert_eq!(l.claim_size(), Some(size(96, 30)));
+        l.tab_owner = Some(id(2));
+        l.fit = true;
+        assert_eq!(l.claim_size(), Some(size(96, 30)));
+    }
+
+    #[test]
+    fn a_tab_this_page_holds_keeps_the_size_it_was_claimed_at() {
+        let mut l = lease(codec::FrontendAccessMode::TmuxLatest);
+        l.tab_owner = Some(id(1));
+        assert_eq!(l.claim_size(), Some(size(120, 40)));
+    }
+
+    #[test]
+    fn handoff_lets_only_the_owner_type_and_a_push_ends_a_fit() {
+        let mut l = lease(codec::FrontendAccessMode::Handoff);
+        assert!(l.may_type(), "nobody holds the connection");
+        l.owner = Some(id(2));
+        assert!(!l.may_type());
+        assert_eq!(l.claim_size(), Some(size(120, 40)));
+        l.owner = Some(id(1));
+        assert!(l.may_type());
+        l.fit = true;
+        let state = codec::ClientViewportState {
+            tab_id: 1,
+            owner: Some(id(2)),
+            canonical_size: size(100, 50),
+            view: None,
+            generation: 3,
+            access: codec::FrontendAccessState { mode: codec::FrontendAccessMode::Handoff, owner: Some(id(2)), generation: 3 },
+        };
+        l.apply_viewport(&state);
+        assert!(!l.fit, "the tab is in someone else's hands");
+        assert_eq!(l.canonical_size, Some(size(100, 50)));
     }
 }

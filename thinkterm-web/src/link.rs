@@ -456,16 +456,31 @@ impl WsLink {
 
     /// Become the tab's viewport owner, if this browser is not already.
     /// Called before input goes out, and answered from what the server
-    /// says about ownership afterwards.
+    /// says about ownership afterwards. In Handoff mode with the
+    /// terminal in someone else's hands this refuses rather than takes;
+    /// `take_over` is the explicit way.
     pub async fn ensure_owner(&self, tab_id: TabId) -> Result<bool> {
-        if self.0.lease.borrow().owns_viewport() {
-            return Ok(true);
-        }
-        let size = {
+        {
             let lease = self.0.lease.borrow();
-            lease.reported.or(lease.canonical_size)
+            if lease.owns_viewport() {
+                return Ok(true);
+            }
+            if !lease.may_type() {
+                return Ok(false);
+            }
         }
-        .ok_or_else(|| anyhow!("no viewport has been reported yet"))?;
+        self.claim(tab_id).await
+    }
+
+    /// Claim the tab, at the size `Lease::claim_size` says: the desktop's
+    /// own unless this page is fitting the tab to itself.
+    pub async fn claim(&self, tab_id: TabId) -> Result<bool> {
+        let size = self
+            .0
+            .lease
+            .borrow()
+            .claim_size()
+            .ok_or_else(|| anyhow!("no viewport has been reported yet"))?;
         let state = thinkterm_session::host::request(
             self,
             Pdu::ClaimClientViewport(codec::ClaimClientViewport {
@@ -481,6 +496,39 @@ impl WsLink {
         let mut lease = self.0.lease.borrow_mut();
         lease.apply_viewport(&state);
         Ok(lease.owns_viewport())
+    }
+
+    /// Tell the server the tab's own size, so that a claim the server
+    /// makes for this page (it claims a client's last report when it
+    /// types) reshapes nothing. Sent whenever the canonical size the page
+    /// knows differs from what it last reported; inert for a follower.
+    pub async fn report_canonical(&self, tab_id: TabId) -> Result<()> {
+        let size = {
+            let lease = self.0.lease.borrow();
+            if lease.fit {
+                return Ok(());
+            }
+            match lease.canonical_size {
+                Some(size) if lease.reported_canonical != Some(size) => size,
+                _ => return Ok(()),
+            }
+        };
+        let state = thinkterm_session::host::request(
+            self,
+            Pdu::SetClientViewport(codec::SetClientViewport {
+                tab_id,
+                viewport: codec::ClientViewport::CellGrid { size },
+            }),
+            |pdu| match pdu {
+                Pdu::ClientViewportState(state) => Ok(state),
+                other => Err(other),
+            },
+        )
+        .await?;
+        let mut lease = self.0.lease.borrow_mut();
+        lease.reported_canonical = Some(size);
+        lease.apply_viewport(&state);
+        Ok(())
     }
 }
 
