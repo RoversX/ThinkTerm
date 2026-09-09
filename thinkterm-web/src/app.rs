@@ -103,6 +103,16 @@ pub struct Setup {
 /// One pane on the page: its session and the state that is the page's
 /// own for it. Everything here is per pane; what is per page lives on
 /// `Inner`.
+/// A point on the canvas, resolved to a pane and a cell within it.
+#[derive(Debug, Clone, Copy)]
+struct Hit {
+    pane_id: PaneId,
+    col: usize,
+    row: usize,
+    x_off: isize,
+    y_off: isize,
+}
+
 pub struct PaneCell {
     pub session: Arc<PaneSession<WebHost>>,
     pub scroll_from_bottom: usize,
@@ -151,6 +161,8 @@ pub struct Inner {
     rows: usize,
     /// Word/line selection extends by units; the pointer is down.
     selecting: bool,
+    /// The pane a drag started in; it keeps the drag until the release.
+    drag_pane: Option<PaneId>,
     click_count: u8,
     last_click_ms: f64,
     focused: bool,
@@ -311,6 +323,7 @@ impl App {
             cols: setup.cols,
             rows: setup.rows,
             selecting: false,
+            drag_pane: None,
             click_count: 0,
             last_click_ms: 0.0,
             focused: true,
@@ -703,7 +716,7 @@ impl App {
     /// on it). `shift` is the key's real Shift state: for printable keys
     /// it is folded into the character and absent from `mods`, and the
     /// character's case cannot stand in for it (Caps Lock).
-    pub fn key_down(&self, key: KeyCode, mods: Modifiers, shift: bool) -> bool {
+    pub fn key_down(self: &Rc<Self>, key: KeyCode, mods: Modifiers, shift: bool) -> bool {
         let mut inner = self.inner.borrow_mut();
         if inner.composing || inner.disconnected.is_some() {
             return false;
@@ -722,6 +735,18 @@ impl App {
                 return true;
             }
             KeyCode::Char('v') | KeyCode::Char('V') if cmd || ctrl_shift => return false,
+            // Ctrl+Shift+arrow moves the focus between the tab's panes,
+            // locally: dragging the desktop along is a click's job.
+            KeyCode::LeftArrow | KeyCode::RightArrow | KeyCode::UpArrow | KeyCode::DownArrow
+                if mods == Modifiers::CTRL | Modifiers::SHIFT || ctrl_shift =>
+            {
+                let next = Self::neighbour(&inner, key);
+                drop(inner);
+                if let Some(next) = next {
+                    self.focus_pane(next, false);
+                }
+                return true;
+            }
             _ if mods.contains(Modifiers::SUPER) => return false,
             _ => {}
         }
@@ -771,18 +796,39 @@ impl App {
         self.request_frame();
     }
 
-    fn cell_under(inner: &Inner, ev: &web_sys::PointerEvent) -> (usize, usize, isize, isize) {
+    /// Where a point on the canvas lands: which pane, and the cell within
+    /// it. `None` on a divider or past the tab.
+    fn hit_under(inner: &Inner, client_x: f64, client_y: f64) -> Option<Hit> {
         let rect = inner.canvas.get_bounding_client_rect();
-        let px = (ev.client_x() as f64 - rect.left()) * inner.dpr;
-        let py = (ev.client_y() as f64 - rect.top()) * inner.dpr;
+        let px = (client_x - rect.left()) * inner.dpr;
+        let py = (client_y - rect.top()) * inner.dpr;
         let (cw, ch) = (
             inner.glyphs.metrics.cell_size.width as f64,
             inner.glyphs.metrics.cell_size.height as f64,
         );
         let (col, row) = cell_at(px, py, cw, ch);
-        let x_off = (px - col as f64 * cw) as isize;
-        let y_off = (py - row as f64 * ch) as isize;
-        (col, row, x_off, y_off)
+        let place = match &inner.tab_layout {
+            Some(layout) => crate::layout::hit(layout, col, row)?.clone(),
+            None => Self::focused_placement(inner)?,
+        };
+        Some(Self::hit_in(&place, col, row, px, py, cw, ch))
+    }
+
+    /// The cell of `place` under a canvas cell, clamped into the pane:
+    /// a drag that leaves the pane keeps reporting its edge.
+    fn hit_in(place: &crate::layout::PanePlacement, col: usize, row: usize, px: f64, py: f64, cw: f64, ch: f64) -> Hit {
+        let (cols, rows) = Self::shown(place);
+        let local_col = col.saturating_sub(place.frame.left).min(cols.saturating_sub(1));
+        let local_row = row.saturating_sub(place.frame.top).min(rows.saturating_sub(1));
+        let x_off = (px - (place.frame.left + local_col) as f64 * cw).clamp(0.0, cw) as isize;
+        let y_off = (py - (place.frame.top + local_row) as f64 * ch).clamp(0.0, ch) as isize;
+        Hit {
+            pane_id: place.pane_id,
+            col: local_col,
+            row: local_row,
+            x_off,
+            y_off,
+        }
     }
 
     fn mouse_modifiers(ev: &web_sys::MouseEvent) -> KeyModifiers {
@@ -802,7 +848,79 @@ impl App {
         m
     }
 
-    pub fn pointer(&self, ev: &web_sys::PointerEvent, what: Pointer) {
+    /// Focus a pane that is on the page. `advise` tells the server, so
+    /// the desktop follows: a click does when the page is following, a
+    /// focus push (which came from the server) never does.
+    pub fn focus_pane(self: &Rc<Self>, pane_id: PaneId, advise: bool) {
+        let link = {
+            let mut inner = self.inner.borrow_mut();
+            if !inner.panes.contains_key(&pane_id) || inner.focused_pane == pane_id {
+                return;
+            }
+            inner.focused_pane = pane_id;
+            inner.selecting = false;
+            inner.drag_pane = None;
+            inner.ime_anchor = None;
+            if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                doc.set_title(&format!("{} — ThinkTerm", inner.title()));
+            }
+            Self::render_strip(&inner);
+            inner.link.clone()
+        };
+        self.refresh_status();
+        self.request_frame();
+        if advise {
+            // Sent and forgotten. The desktop may ignore it for a few
+            // seconds after a focus move of its own, and the server's echo
+            // is the pane already focused here.
+            wasm_bindgen_futures::spawn_local(async move {
+                let pdu = Pdu::SetFocusedPane(codec::SetFocusedPane {
+                    pane_id,
+                    configured_palette: None,
+                });
+                if let Err(err) = thinkterm_session::host::request(&link, pdu, |p| match p {
+                    Pdu::UnitResponse(_) => Ok(()),
+                    other => Err(other),
+                })
+                .await
+                {
+                    log::warn!("focus not advised: {err:#}");
+                }
+            });
+        }
+    }
+
+    /// The pane next to the focused one in `direction`: the nearest whose
+    /// frame lies past the focused frame's edge on that side.
+    fn neighbour(inner: &Inner, direction: KeyCode) -> Option<PaneId> {
+        let layout = inner.tab_layout.as_ref()?;
+        let me = layout.panes.iter().find(|p| p.pane_id == inner.focused_pane)?;
+        let (mx, my) = (
+            me.frame.left as isize + me.frame.cols as isize / 2,
+            me.frame.top as isize + me.frame.rows as isize / 2,
+        );
+        layout
+            .panes
+            .iter()
+            .filter(|p| p.pane_id != me.pane_id)
+            .filter(|p| match direction {
+                KeyCode::LeftArrow => p.frame.left + p.frame.cols <= me.frame.left,
+                KeyCode::RightArrow => p.frame.left >= me.frame.left + me.frame.cols,
+                KeyCode::UpArrow => p.frame.top + p.frame.rows <= me.frame.top,
+                KeyCode::DownArrow => p.frame.top >= me.frame.top + me.frame.rows,
+                _ => false,
+            })
+            .min_by_key(|p| {
+                let (x, y) = (
+                    p.frame.left as isize + p.frame.cols as isize / 2,
+                    p.frame.top as isize + p.frame.rows as isize / 2,
+                );
+                (x - mx).abs() + (y - my).abs()
+            })
+            .map(|p| p.pane_id)
+    }
+
+    pub fn pointer(self: &Rc<Self>, ev: &web_sys::PointerEvent, what: Pointer) {
         if what == Pointer::Down {
             // Focus first, outside any borrow: focus() dispatches events
             // synchronously and a listener may look at the app.
@@ -811,14 +929,53 @@ impl App {
             let canvas = self.inner.borrow().canvas.clone();
             let _ = canvas.set_pointer_capture(ev.pointer_id());
         }
-        let mut inner = self.inner.borrow_mut();
-        if inner.disconnected.is_some() {
+        // A press lands on the pane under it and focuses it; a drag stays
+        // with the pane it started in.
+        let hit = {
+            let inner = self.inner.borrow();
+            if inner.disconnected.is_some() {
+                return;
+            }
+            match (what, inner.drag_pane) {
+                (Pointer::Down, _) => Self::hit_under(&inner, ev.client_x() as f64, ev.client_y() as f64),
+                (_, Some(drag)) => {
+                    let place = Self::placements(&inner).into_iter().find(|p| p.pane_id == drag);
+                    place.map(|place| {
+                        let rect = inner.canvas.get_bounding_client_rect();
+                        let px = (ev.client_x() as f64 - rect.left()) * inner.dpr;
+                        let py = (ev.client_y() as f64 - rect.top()) * inner.dpr;
+                        let (cw, ch) = (
+                            inner.glyphs.metrics.cell_size.width as f64,
+                            inner.glyphs.metrics.cell_size.height as f64,
+                        );
+                        let (col, row) = cell_at(px.max(0.0), py.max(0.0), cw, ch);
+                        Self::hit_in(&place, col, row, px, py, cw, ch)
+                    })
+                }
+                (_, None) => Self::hit_under(&inner, ev.client_x() as f64, ev.client_y() as f64),
+            }
+        };
+        let Some(hit) = hit else {
             return;
+        };
+        if what == Pointer::Down {
+            let advise = self.inner.borrow().following;
+            self.focus_pane(hit.pane_id, advise);
         }
-        let (col, row, x_off, y_off) = Self::cell_under(&inner, ev);
-        let dims = inner.focused().session.dimensions();
-        let visible = visible_rows(&dims, inner.rows, inner.focused().scroll_from_bottom);
-        let stable_row = visible.start + row as StableRowIndex;
+        let mut inner = self.inner.borrow_mut();
+        let Some(cell) = inner.panes.get(&hit.pane_id) else {
+            return;
+        };
+        let session = Arc::clone(&cell.session);
+        let scroll = cell.scroll_from_bottom;
+        let dims = session.dimensions();
+        let rows_shown = Self::placements(&inner)
+            .into_iter()
+            .find(|p| p.pane_id == hit.pane_id)
+            .map(|p| Self::shown(&p).1)
+            .unwrap_or(inner.rows);
+        let visible = visible_rows(&dims, rows_shown, scroll);
+        let stable_row = visible.start + hit.row as StableRowIndex;
         let button = match ev.button() {
             0 => MouseButton::Left,
             1 => MouseButton::Middle,
@@ -828,7 +985,7 @@ impl App {
 
         // A program that asked for the mouse gets it, unless Shift holds
         // the event back for the page's own selection.
-        if inner.focused().session.is_mouse_grabbed() && !ev.shift_key() {
+        if session.is_mouse_grabbed() && !ev.shift_key() {
             let kind = match what {
                 Pointer::Down => MouseEventKind::Press,
                 Pointer::Up => MouseEventKind::Release,
@@ -838,16 +995,15 @@ impl App {
             // those are nowhere for a program, as on the desktop.
             let event = MouseEvent {
                 kind,
-                x: col,
+                x: hit.col,
                 y: (stable_row - dims.physical_top).max(0) as i64,
-                x_pixel_offset: x_off,
-                y_pixel_offset: y_off,
+                x_pixel_offset: hit.x_off,
+                y_pixel_offset: hit.y_off,
                 button: if what == Pointer::Move && ev.buttons() == 0 { MouseButton::None } else { button },
                 modifiers: Self::mouse_modifiers(ev),
             };
-            let session = &inner.focused().session;
             let start = session.mouse_event(event);
-            Self::spawn_drain(session, start);
+            Self::spawn_drain(&session, start);
             return;
         }
 
@@ -861,12 +1017,15 @@ impl App {
                 };
                 inner.last_click_ms = t;
                 let mode = inner.click_count;
-                inner.focused_mut().selection = Some(Selection {
-                    anchor: (stable_row, col),
-                    head: (stable_row, col),
-                    mode,
-                });
+                if let Some(cell) = inner.panes.get_mut(&hit.pane_id) {
+                    cell.selection = Some(Selection {
+                        anchor: (stable_row, hit.col),
+                        head: (stable_row, hit.col),
+                        mode,
+                    });
+                }
                 inner.selecting = true;
+                inner.drag_pane = Some(hit.pane_id);
                 // A click is a real interaction: it takes the terminal over.
                 let link = inner.link.clone();
                 let tab_id = inner.tab_id;
@@ -875,22 +1034,26 @@ impl App {
                 });
             }
             Pointer::Move if inner.selecting => {
-                if let Some(sel) = &mut inner.focused_mut().selection {
-                    sel.head = (stable_row, col);
+                if let Some(sel) = inner.panes.get_mut(&hit.pane_id).and_then(|c| c.selection.as_mut()) {
+                    sel.head = (stable_row, hit.col);
                 }
             }
             Pointer::Up if inner.selecting => {
                 inner.selecting = false;
-                if let Some(sel) = &mut inner.focused_mut().selection {
-                    sel.head = (stable_row, col);
+                inner.drag_pane = None;
+                if let Some(sel) = inner.panes.get_mut(&hit.pane_id).and_then(|c| c.selection.as_mut()) {
+                    sel.head = (stable_row, hit.col);
                 }
                 let empty = inner
-                    .focused()
-                    .selection
+                    .panes
+                    .get(&hit.pane_id)
+                    .and_then(|c| c.selection)
                     .map(|s| s.mode == 1 && s.anchor == s.head)
                     .unwrap_or(true);
                 if empty {
-                    inner.focused_mut().selection = None;
+                    if let Some(cell) = inner.panes.get_mut(&hit.pane_id) {
+                        cell.selection = None;
+                    }
                 } else if let Some(text) = Self::selection_text(&inner) {
                     write_clipboard(&text);
                 }
@@ -952,57 +1115,57 @@ impl App {
     }
 
     /// Returns true when the page acted on the wheel (the browser must
-    /// not). A program that has the mouse gets every wheel with its real
+    /// not). The pane under the pointer scrolls, as on the desktop. A
+    /// program that has the mouse gets every wheel with its real
     /// modifiers; otherwise Ctrl+wheel and pinch are the browser's zoom.
     pub fn wheel(&self, ev: &web_sys::WheelEvent) -> bool {
         let mut inner = self.inner.borrow_mut();
         if inner.disconnected.is_some() {
             return false;
         }
+        let Some(hit) = Self::hit_under(&inner, ev.client_x() as f64, ev.client_y() as f64) else {
+            return false;
+        };
+        let rows_shown = Self::placements(&inner)
+            .into_iter()
+            .find(|p| p.pane_id == hit.pane_id)
+            .map(|p| Self::shown(&p).1)
+            .unwrap_or(inner.rows);
         let cell_h_css = inner.glyphs.metrics.cell_size.height as f64 / inner.dpr;
         let lines = match ev.delta_mode() {
             web_sys::WheelEvent::DOM_DELTA_LINE => ev.delta_y(),
-            web_sys::WheelEvent::DOM_DELTA_PAGE => ev.delta_y() * inner.rows as f64,
+            web_sys::WheelEvent::DOM_DELTA_PAGE => ev.delta_y() * rows_shown as f64,
             _ => ev.delta_y() / cell_h_css,
         };
         let notches = lines.abs().round().max(if lines == 0.0 { 0.0 } else { 1.0 }) as usize;
         if notches == 0 {
             return false;
         }
-        if inner.focused().session.is_alt_screen() || inner.focused().session.is_mouse_grabbed() {
+        let Some(cell) = inner.panes.get_mut(&hit.pane_id) else {
+            return false;
+        };
+        let session = Arc::clone(&cell.session);
+        if session.is_alt_screen() || session.is_mouse_grabbed() {
             let button = if lines < 0.0 { MouseButton::WheelUp(notches) } else { MouseButton::WheelDown(notches) };
-            let (col, row, x_off, y_off) = {
-                let rect = inner.canvas.get_bounding_client_rect();
-                let px = (ev.client_x() as f64 - rect.left()) * inner.dpr;
-                let py = (ev.client_y() as f64 - rect.top()) * inner.dpr;
-                let (cw, ch) = (
-                    inner.glyphs.metrics.cell_size.width as f64,
-                    inner.glyphs.metrics.cell_size.height as f64,
-                );
-                let (c, r) = cell_at(px, py, cw, ch);
-                (c, r, (px - c as f64 * cw) as isize, (py - r as f64 * ch) as isize)
-            };
-            let dims = inner.focused().session.dimensions();
-            let visible = visible_rows(&dims, inner.rows, inner.focused().scroll_from_bottom);
+            let dims = session.dimensions();
+            let visible = visible_rows(&dims, rows_shown, cell.scroll_from_bottom);
             let event = MouseEvent {
                 kind: MouseEventKind::Press,
-                x: col,
-                y: (visible.start + row as StableRowIndex - dims.physical_top).max(0) as i64,
-                x_pixel_offset: x_off,
-                y_pixel_offset: y_off,
+                x: hit.col,
+                y: (visible.start + hit.row as StableRowIndex - dims.physical_top).max(0) as i64,
+                x_pixel_offset: hit.x_off,
+                y_pixel_offset: hit.y_off,
                 button,
                 modifiers: Self::mouse_modifiers(ev),
             };
-            let session = &inner.focused().session;
             let start = session.mouse_event(event);
-            Self::spawn_drain(session, start);
+            Self::spawn_drain(&session, start);
             return true;
         }
         if ev.ctrl_key() {
             return false;
         }
-        let cell = inner.focused_mut();
-        let max = max_scroll(&cell.session.dimensions());
+        let max = max_scroll(&session.dimensions());
         cell.scroll_from_bottom = if lines < 0.0 {
             (cell.scroll_from_bottom + notches).min(max)
         } else {
@@ -1292,25 +1455,13 @@ impl App {
         if chosen {
             self.inner.borrow_mut().following = false;
         }
-        // Already drawn: a focus change and nothing else.
-        {
-            let mut inner = self.inner.borrow_mut();
-            if inner.panes.contains_key(&pane_id) {
-                if inner.focused_pane != pane_id {
-                    inner.focused_pane = pane_id;
-                    inner.selecting = false;
-                    inner.ime_anchor = None;
-                    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-                        doc.set_title(&format!("{} — ThinkTerm", inner.title()));
-                    }
-                    Self::render_strip(&inner);
-                    let _ = inner.textarea.focus();
-                }
-                drop(inner);
-                self.refresh_status();
-                self.request_frame();
-                return;
-            }
+        // Already drawn: a focus change and nothing else. Not advised to
+        // the server: a strip click has just pinned the page, and a focus
+        // push is the server's own news.
+        if self.inner.borrow().panes.contains_key(&pane_id) {
+            self.focus_pane(pane_id, false);
+            let _ = self.inner.borrow().textarea.focus();
+            return;
         }
         // Elsewhere: listed again either way, since the entry carries the
         // pane's size and screen state and the listing may be seconds old.
