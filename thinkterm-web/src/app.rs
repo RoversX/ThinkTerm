@@ -86,6 +86,7 @@ pub struct Setup {
     pub cols: usize,
     pub rows: usize,
     pub title: String,
+    pub strip: Option<crate::chrome::TabStrip>,
 }
 
 pub struct Inner {
@@ -135,6 +136,18 @@ pub struct Inner {
     title: String,
     /// What to do about an atlas that has run out of room for good.
     capacity: Capacity,
+    /// The server's tabs and panes as last listed, for the strip and for
+    /// switching. Refreshed on the pushes that change it and on a timer.
+    layout: Option<codec::ListPanesResponse>,
+    /// Whether the page moves to whatever pane the desktop focuses. On by
+    /// default: a page opened to "see my terminal" wants the one being
+    /// used. Choosing a pane here turns it off.
+    following: bool,
+    strip: Option<crate::chrome::TabStrip>,
+    layout_refresh_pending: bool,
+    /// A switch is under way; a second request waits for the next push
+    /// or click rather than racing it.
+    switching: bool,
 }
 
 pub struct App {
@@ -185,6 +198,34 @@ pub(crate) fn monotonic_ms() -> f64 {
         .unwrap_or_else(now_ms)
 }
 
+/// A session for one pane, configured the way this page runs them.
+pub fn build_session(
+    host: &Arc<WebHost>,
+    pane_id: PaneId,
+    tab_id: TabId,
+    dims: thinkterm_proto::RenderableDimensions,
+    title: &str,
+    alt_screen: bool,
+) -> Arc<PaneSession<WebHost>> {
+    PaneSession::new(
+        Arc::clone(host),
+        Arc::new(thinkterm_session::Lock::new(
+            thinkterm_session::images::ImageStore::default(),
+        )),
+        thinkterm_session::SessionConfig {
+            scrollback_lines: 3500,
+            local_echo_threshold_ms: Some(100),
+            overlay_lag_indicator: false,
+        },
+        pane_id,
+        Arc::new(std::sync::atomic::AtomicUsize::new(tab_id)),
+        0,
+        dims,
+        title,
+        alt_screen,
+    )
+}
+
 impl App {
     pub fn new(setup: Setup) -> Rc<Self> {
         let inner = Inner {
@@ -223,6 +264,11 @@ impl App {
             quads: HeapQuadAllocator::default(),
             vertices: Vec::new(),
             title: setup.title,
+            layout: None,
+            following: true,
+            strip: setup.strip,
+            layout_refresh_pending: false,
+            switching: false,
         };
         let app = Rc::new(Self {
             inner: RefCell::new(inner),
@@ -310,7 +356,7 @@ impl App {
     }
 
     /// The server pushed something for us.
-    pub fn on_push(&self, pdu: Pdu) {
+    pub fn on_push(self: &Rc<Self>, pdu: Pdu) {
         let inner = self.inner.borrow();
         match pdu {
             Pdu::GetPaneRenderChangesResponse(delta) if delta.pane_id == inner.pane_id => {
@@ -319,6 +365,27 @@ impl App {
             Pdu::PaneRemoved(removed) if removed.pane_id == inner.pane_id => {
                 inner.session.set_dead(true);
                 Self::set_status(&inner, "the pane was closed on the server");
+                // Something else to show, if the server has anything.
+                drop(inner);
+                self.refresh_layout();
+            }
+            // The desktop moved. Followed only while following; a page
+            // that chose a pane is not dragged off it.
+            Pdu::PaneFocused(focused) if inner.following && focused.pane_id != inner.pane_id => {
+                drop(inner);
+                self.switch_to_pane(focused.pane_id, false);
+            }
+            // The strip is stale: a tab came or went, a pane closed
+            // elsewhere, a title changed. Listed again, a moment later,
+            // so a burst of these is one request.
+            Pdu::PaneRemoved(_)
+            | Pdu::TabAddedToWindow(_)
+            | Pdu::TabTitleChanged(_)
+            | Pdu::WindowTitleChanged(_)
+            | Pdu::TabResized(_)
+            | Pdu::WindowWorkspaceChanged(_) => {
+                drop(inner);
+                self.refresh_layout_soon();
             }
             // Sent once per connection, before the first line change: a
             // program's OSC 4/10/11 colours. Dropping it would leave the
@@ -851,6 +918,271 @@ impl App {
         self.request_frame();
     }
 
+    pub fn strip_element(&self) -> Option<web_sys::EventTarget> {
+        let inner = self.inner.borrow();
+        let strip = inner.strip.as_ref()?;
+        let target: &web_sys::EventTarget = strip.element().as_ref();
+        Some(target.clone())
+    }
+
+    /// Draw the tab strip from what the page knows.
+    fn render_strip(inner: &Inner) {
+        let (Some(strip), Some(layout)) = (&inner.strip, &inner.layout) else {
+            return;
+        };
+        let tabs = crate::chrome::model(layout, inner.pane_id, &inner.title);
+        strip.render(&tabs, inner.following);
+    }
+
+    /// List the server's panes again and redraw the strip. If the pane on
+    /// show is gone, move to the first tab's pane: a dead pane is not
+    /// something to look at.
+    pub fn refresh_layout(self: &Rc<Self>) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.layout_refresh_pending || inner.disconnected.is_some() {
+                return;
+            }
+            inner.layout_refresh_pending = true;
+        }
+        let app = Rc::clone(self);
+        wasm_bindgen_futures::spawn_local(async move {
+            let link = app.inner.borrow().link.clone();
+            let listed = thinkterm_session::host::request(
+                &link,
+                Pdu::ListPanes(codec::ListPanes {}),
+                |pdu| match pdu {
+                    Pdu::ListPanesResponse(p) => Ok(p),
+                    other => Err(other),
+                },
+            )
+            .await;
+            let replacement = {
+                let mut inner = app.inner.borrow_mut();
+                inner.layout_refresh_pending = false;
+                match listed {
+                    Ok(layout) => {
+                        let gone = crate::chrome::entry(&layout, inner.pane_id).is_none();
+                        let replacement = if gone {
+                            crate::chrome::first_choice(&layout)
+                        } else {
+                            None
+                        };
+                        inner.layout = Some(layout);
+                        Self::render_strip(&inner);
+                        replacement
+                    }
+                    Err(err) => {
+                        log::warn!("listing panes: {err:#}");
+                        None
+                    }
+                }
+            };
+            if let Some(entry) = replacement {
+                app.switch_to(entry).await;
+            }
+        });
+    }
+
+    /// `refresh_layout`, a moment from now, so a burst of pushes is one
+    /// listing.
+    fn refresh_layout_soon(self: &Rc<Self>) {
+        let app = Rc::clone(self);
+        let closure = Closure::once_into_js(move || app.refresh_layout());
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                closure.as_ref().unchecked_ref(),
+                150,
+            );
+        }
+    }
+
+    /// Ask the server again every so often, whatever the pushes said:
+    /// pane titles elsewhere change without one.
+    pub fn poll_layout(self: &Rc<Self>, every_ms: i32) {
+        let weak = Rc::downgrade(self);
+        let closure = Closure::<dyn FnMut()>::new(move || {
+            if let Some(app) = weak.upgrade() {
+                app.refresh_layout();
+            }
+        });
+        if let Some(window) = web_sys::window() {
+            if window
+                .set_interval_with_callback_and_timeout_and_arguments_0(
+                    closure.as_ref().unchecked_ref(),
+                    every_ms,
+                )
+                .is_ok()
+            {
+                // One per page, for the life of the page.
+                closure.forget();
+            }
+        }
+    }
+
+    /// A click on the strip.
+    pub fn on_chrome_click(self: &Rc<Self>, click: crate::chrome::Click) {
+        match click {
+            crate::chrome::Click::Pane(pane_id) => self.switch_to_pane(pane_id, true),
+            crate::chrome::Click::Follow => {
+                let mut inner = self.inner.borrow_mut();
+                inner.following = !inner.following;
+                Self::render_strip(&inner);
+                let _ = inner.textarea.focus();
+            }
+        }
+    }
+
+    /// Show `pane_id`. `chosen` is a person's click, which also stops the
+    /// page following the desktop; a focus push is not.
+    pub fn switch_to_pane(self: &Rc<Self>, pane_id: PaneId, chosen: bool) {
+        if chosen {
+            self.inner.borrow_mut().following = false;
+        }
+        let known = self
+            .inner
+            .borrow()
+            .layout
+            .as_ref()
+            .and_then(|layout| crate::chrome::entry(layout, pane_id));
+        let app = Rc::clone(self);
+        wasm_bindgen_futures::spawn_local(async move {
+            // Listed again either way: the entry carries the pane's size
+            // and screen state, and the listing may be seconds old.
+            let link = app.inner.borrow().link.clone();
+            let fresh = thinkterm_session::host::request(
+                &link,
+                Pdu::ListPanes(codec::ListPanes {}),
+                |pdu| match pdu {
+                    Pdu::ListPanesResponse(p) => Ok(p),
+                    other => Err(other),
+                },
+            )
+            .await
+            .ok();
+            let entry = match fresh {
+                Some(layout) => {
+                    let entry = crate::chrome::entry(&layout, pane_id);
+                    let mut inner = app.inner.borrow_mut();
+                    inner.layout = Some(layout);
+                    Self::render_strip(&inner);
+                    entry
+                }
+                None => known,
+            };
+            match entry {
+                Some(entry) => app.switch_to(entry).await,
+                None => {
+                    log::warn!("pane {pane_id} is not on the server");
+                    Self::render_strip(&app.inner.borrow());
+                }
+            }
+        });
+    }
+
+    /// Put another pane on the canvas: report this page's grid against
+    /// its tab, subscribe to it, and start a session for it in place of
+    /// the old one. Everything that hangs off the session -- input, the
+    /// watchdog, the delta queue -- follows, because it all goes through
+    /// `inner.session`.
+    async fn switch_to(self: &Rc<Self>, entry: thinkterm_proto::layout::PaneEntry) {
+        let (link, size) = {
+            let mut inner = self.inner.borrow_mut();
+            if entry.pane_id == inner.pane_id || inner.switching || inner.disconnected.is_some() {
+                return;
+            }
+            inner.switching = true;
+            let size = inner.link.lease().reported;
+            (inner.link.clone(), size)
+        };
+        let outcome: Result<()> = async {
+            // The lease is per tab: a follower's report, never a claim.
+            // Typing or clicking claims, as at attach.
+            if let Some(size) = size {
+                let state = thinkterm_session::host::request(
+                    &link,
+                    Pdu::SetClientViewport(codec::SetClientViewport {
+                        tab_id: entry.tab_id,
+                        viewport: codec::ClientViewport::CellGrid { size },
+                    }),
+                    |pdu| match pdu {
+                        Pdu::ClientViewportState(s) => Ok(s),
+                        other => Err(other),
+                    },
+                )
+                .await?;
+                let mut lease = link.lease_mut();
+                lease.tab_id = Some(entry.tab_id);
+                lease.apply_viewport(&state);
+            } else {
+                link.lease_mut().tab_id = Some(entry.tab_id);
+            }
+            thinkterm_session::host::request(
+                &link,
+                Pdu::GetPaneRenderChanges(codec::GetPaneRenderChanges {
+                    pane_id: entry.pane_id,
+                }),
+                |pdu| match pdu {
+                    Pdu::LivenessResponse(_) | Pdu::UnitResponse(_) => Ok(()),
+                    other => Err(other),
+                },
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.switching = false;
+            if let Err(err) = outcome {
+                log::warn!("switching to pane {}: {err:#}", entry.pane_id);
+                Self::set_status(&inner, &format!("could not switch panes: {err:#}"));
+                return;
+            }
+            let rows = entry.size.rows;
+            let dims = thinkterm_proto::RenderableDimensions {
+                cols: entry.size.cols,
+                viewport_rows: rows,
+                scrollback_rows: rows,
+                physical_top: entry.physical_top,
+                scrollback_top: entry.physical_top,
+                dpi: entry.size.dpi,
+                pixel_width: entry.size.pixel_width,
+                pixel_height: entry.size.pixel_height,
+                reverse_video: false,
+            };
+            inner.session = build_session(
+                &inner.host,
+                entry.pane_id,
+                entry.tab_id,
+                dims,
+                &entry.title,
+                entry.alt_screen,
+            );
+            inner.pane_id = entry.pane_id;
+            inner.tab_id = entry.tab_id;
+            inner.title = entry.title.clone();
+            inner.scroll_from_bottom = 0;
+            inner.selection = None;
+            inner.selecting = false;
+            inner.ime_anchor = None;
+            // The palette is a pane's; the new one says its own, if it has
+            // one, right after the subscription.
+            inner.palette = ColorPalette::default();
+            // Forces `resize` to see a change: the new pane is reflowed to
+            // this grid if the page owns its tab, or reported against it.
+            inner.cols = 0;
+            if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                doc.set_title(&format!("{} — ThinkTerm", inner.title));
+            }
+            Self::render_strip(&inner);
+            let _ = inner.textarea.focus();
+        }
+        self.resize();
+        self.refresh_status();
+        self.request_frame();
+    }
+
     /// See `GlyphCache::warm`. Called once, after the first frame.
     pub fn warm_glyph_canvas(&self) {
         self.inner.borrow_mut().glyphs.warm();
@@ -986,6 +1318,7 @@ impl App {
         let title = inner.session.title();
         if title != inner.title {
             inner.title = title;
+            Self::render_strip(&inner);
             if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
                 doc.set_title(&format!("{} — ThinkTerm", inner.title));
             }

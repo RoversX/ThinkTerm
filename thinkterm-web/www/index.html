@@ -6,7 +6,18 @@
 <title>ThinkTerm</title>
 <style>
   html, body { margin: 0; height: 100%; background: #000; color: #ccc; font: 12px system-ui, sans-serif; overflow: hidden; }
-  #term { position: absolute; inset: 0 0 22px 0; width: 100%; height: calc(100% - 22px); display: block; outline: none; }
+  #tabs { position: absolute; left: 0; right: 0; top: 0; height: 28px; display: flex; align-items: center; gap: 4px; padding: 0 6px; background: #111; overflow-x: auto; overflow-y: hidden; white-space: nowrap; user-select: none; scrollbar-width: none; }
+  #tabs .tab { display: inline-flex; align-items: center; gap: 6px; padding: 0 10px; height: 20px; line-height: 20px; border-radius: 10px; color: #9a9a9a; cursor: pointer; }
+  #tabs .tab:hover { background: #1c1c1c; color: #ddd; }
+  #tabs .tab.current { background: #2a2a2a; color: #eee; }
+  #tabs .panes { display: inline-flex; gap: 3px; margin-left: 2px; }
+  #tabs .pane { padding: 0 7px; height: 16px; line-height: 16px; border-radius: 8px; background: #1a1a1a; color: #9a9a9a; font-size: 11px; cursor: pointer; }
+  #tabs .pane:hover { color: #ddd; }
+  #tabs .pane.current { background: #3a3a3a; color: #fff; }
+  #tabs .follow { margin-left: auto; padding: 0 10px; height: 20px; line-height: 20px; border-radius: 10px; color: #777; cursor: pointer; font-size: 11px; }
+  #tabs .follow.on { color: #6cb6ff; }
+  #tabs .follow:hover { background: #1c1c1c; }
+  #term { position: absolute; inset: 28px 0 22px 0; width: 100%; height: calc(100% - 50px); display: block; outline: none; }
   #status { position: absolute; left: 0; right: 0; bottom: 0; height: 22px; line-height: 22px; padding: 0 8px; background: #111; color: #9a9a9a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #status.error { color: #f66; }
   /* Focus lives here so the IME composes into a real text field; the
@@ -15,6 +26,7 @@
 </style>
 </head>
 <body>
+<div id="tabs"></div>
 <canvas id="term"></canvas>
 <textarea id="kbd" wrap="off" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
 <div id="status">loading…</div>

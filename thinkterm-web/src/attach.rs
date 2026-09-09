@@ -5,7 +5,8 @@
 use crate::link::WsLink;
 use anyhow::{anyhow, bail, Result};
 use codec::Pdu;
-use thinkterm_proto::layout::{PaneEntry, PaneNode};
+use crate::chrome::active_pane;
+use thinkterm_proto::layout::PaneNode;
 use thinkterm_proto::{ClientId, PaneId, RenderableDimensions, TabId};
 use thinkterm_session::host::request;
 use wezterm_term::TerminalSize;
@@ -17,22 +18,6 @@ pub struct Attached {
     pub dims: RenderableDimensions,
     pub alt_screen: bool,
     pub server_version: String,
-}
-
-fn active_pane(node: &PaneNode) -> Option<PaneEntry> {
-    match node {
-        PaneNode::Empty => None,
-        PaneNode::Leaf(e) => Some(e.clone()),
-        PaneNode::Stack(s) => s.panes.get(s.active).or(s.panes.first()).cloned(),
-        PaneNode::Split { left, right, .. } => {
-            let (l, r) = (active_pane(left), active_pane(right));
-            match (&l, &r) {
-                (Some(a), _) if a.is_active_pane => l,
-                (_, Some(b)) if b.is_active_pane => r,
-                _ => l.or(r),
-            }
-        }
-    }
 }
 
 /// `size` is the grid this page can show, or `None` when it cannot show

@@ -4,6 +4,7 @@
 //! build everywhere; everything that touches the page is `wasm32` only.
 
 pub mod braille;
+pub mod chrome;
 pub mod fallback;
 pub mod ime;
 pub mod keymap;

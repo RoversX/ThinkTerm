@@ -9,15 +9,12 @@ use crate::host::{LocalSpawner, WebClock, WebConfig, WebEvents, WebHost};
 use crate::link::WsLink;
 use anyhow::{anyhow, Context, Result};
 use std::rc::Rc;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use thinkterm_font_core::FontShaper;
 use thinkterm_font_web::{Face, FontSet};
 use thinkterm_render::bitmaps::BitmapImage;
 use thinkterm_render::pipeline::GpuTexture;
 use thinkterm_render::quad::HeapQuadAllocator;
-use thinkterm_session::pane::PaneSession;
-use thinkterm_session::{Lock, SessionConfig};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -211,17 +208,10 @@ async fn start_attached(
         link: link.clone(),
         config: WebConfig::default(),
     });
-    let session = PaneSession::new(
-        Arc::clone(&host),
-        Arc::new(Lock::new(thinkterm_session::images::ImageStore::default())),
-        SessionConfig {
-            scrollback_lines: 3500,
-            local_echo_threshold_ms: Some(100),
-            overlay_lag_indicator: false,
-        },
+    let session = crate::app::build_session(
+        &host,
         attached.pane_id,
-        Arc::new(AtomicUsize::new(attached.tab_id)),
-        0,
+        attached.tab_id,
         attached.dims,
         &attached.title,
         attached.alt_screen,
@@ -245,6 +235,7 @@ async fn start_attached(
         cols,
         rows,
         title: attached.title.clone(),
+        strip: crate::chrome::TabStrip::mount("tabs"),
     });
     host.events.set_wake(app.wake());
     {
@@ -256,6 +247,19 @@ async fn start_attached(
         link.set_close_handler(move |reason| app.on_close(reason));
     }
     crate::input::install(Rc::clone(&app), canvas, textarea);
+    // The strip: one listener on its root, so rebuilding its contents
+    // costs nothing to keep wired.
+    if let Some(root) = app.strip_element() {
+        let app = Rc::clone(&app);
+        crate::input::listen::<web_sys::MouseEvent>(&root, "click", move |ev| {
+            if let Some(click) = crate::chrome::TabStrip::click_target(&ev) {
+                ev.prevent_default();
+                app.on_chrome_click(click);
+            }
+        });
+    }
+    app.refresh_layout();
+    app.poll_layout(5_000);
     let _ = textarea.focus();
     app.resize();
     app.request_frame();

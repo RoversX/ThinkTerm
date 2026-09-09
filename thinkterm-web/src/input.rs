@@ -12,7 +12,7 @@ use web_sys::{
     KeyboardEvent, PointerEvent, WheelEvent,
 };
 
-fn listen<E: JsCast + 'static>(
+pub(crate) fn listen<E: JsCast + 'static>(
     target: &web_sys::EventTarget,
     name: &str,
     handler: impl FnMut(E) + 'static,

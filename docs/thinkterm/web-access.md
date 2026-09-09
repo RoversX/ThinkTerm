@@ -99,9 +99,12 @@ on a laptop; `ci/macos-package.sh --build` builds it.
 
 ## What the first version does not do
 
-Images (kitty, sixel, iTerm2) are not drawn; tabs, splits and the ThinkTerm
-tree are not shown -- the page mirrors one pane, chosen when it connects,
-and does not follow the desktop to another; the cursor does not blink. The input
+Images (kitty, sixel, iTerm2) are not drawn. The page shows one pane at a
+time: a strip along the top lists the server's tabs, and the panes of the
+tab on show, and a click moves the page there. It follows the desktop's
+focus by default; choosing a pane pins the page to it, and the switch at the
+right of the strip turns following back on. Splits are not drawn side by
+side, and the ThinkTerm tree is not shown; the cursor does not blink. The input
 method's hidden field follows the terminal cursor, including scrolling and
 resizing, so the browser can place its candidate window there; pre-edit
 text and its underline are not yet drawn in the grid.
