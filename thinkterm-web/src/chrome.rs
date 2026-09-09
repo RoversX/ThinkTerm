@@ -135,6 +135,23 @@ mod dom {
     pub enum Click {
         Pane(PaneId),
         Follow,
+        NewTab,
+        SplitRight,
+        SplitBelow,
+        Zoom,
+        Close,
+        Fit,
+    }
+
+    /// The state the strip's buttons show.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct Controls {
+        pub following: bool,
+        pub zoomed: bool,
+        pub fit: bool,
+        /// The close button was pressed once and waits for the second
+        /// press that means it.
+        pub closing: bool,
     }
 
     fn escape(text: &str) -> String {
@@ -174,7 +191,8 @@ mod dom {
 
         /// Redraw the whole strip. It is a few dozen elements; rebuilding
         /// them is cheaper to get right than diffing them.
-        pub fn render(&self, tabs: &[TabView], following: bool) {
+        pub fn render(&self, tabs: &[TabView], controls: Controls) {
+            let following = controls.following;
             let mut html = String::new();
             for tab in tabs {
                 let class = if tab.current { "tab current" } else { "tab" };
@@ -212,6 +230,33 @@ mod dom {
                     "This page stays on this pane. Click to follow the desktop's focus again.",
                 )
             };
+            html.push_str(
+                "<span class=\"act\" data-action=\"new-tab\" title=\"New tab, next to this one on the desktop\">+</span>",
+            );
+            html.push_str("<span class=\"actions\">");
+            html.push_str(
+                "<span class=\"act\" data-action=\"split-right\" title=\"Split the focused pane: new pane to the right\">◧</span>",
+            );
+            html.push_str(
+                "<span class=\"act\" data-action=\"split-below\" title=\"Split the focused pane: new pane below\">⬒</span>",
+            );
+            let zoom_class = if controls.zoomed { "act on" } else { "act" };
+            html.push_str(&format!(
+                "<span class=\"{zoom_class}\" data-action=\"zoom\" title=\"Zoom the focused pane to the whole tab (again to unzoom)\">⤢</span>"
+            ));
+            let fit_class = if controls.fit { "act on" } else { "act" };
+            html.push_str(&format!(
+                "<span class=\"{fit_class}\" data-action=\"fit\" title=\"Fit the tab to this window; the desktop letterboxes. Again to give the size back. (Ctrl+Shift+F)\">⤡</span>"
+            ));
+            let (close_class, close_text) = if controls.closing {
+                ("act danger", "close pane?")
+            } else {
+                ("act", "×")
+            };
+            html.push_str(&format!(
+                "<span class=\"{close_class}\" data-action=\"close\" title=\"Close the focused pane and end its program. Asks twice.\">{close_text}</span>"
+            ));
+            html.push_str("</span>");
             html.push_str(&format!(
                 "<span class=\"{class}\" data-follow=\"\" title=\"{hint}\">{text}</span>"
             ));
@@ -221,9 +266,20 @@ mod dom {
         /// What a click landed on, if anything the strip owns.
         pub fn click_target(ev: &web_sys::MouseEvent) -> Option<Click> {
             let target: web_sys::Element = ev.target()?.dyn_into().ok()?;
-            let hit = target.closest("[data-pane],[data-follow]").ok()??;
+            let hit = target.closest("[data-pane],[data-follow],[data-action]").ok()??;
             if hit.has_attribute("data-follow") {
                 return Some(Click::Follow);
+            }
+            if let Some(action) = hit.get_attribute("data-action") {
+                return match action.as_str() {
+                    "new-tab" => Some(Click::NewTab),
+                    "split-right" => Some(Click::SplitRight),
+                    "split-below" => Some(Click::SplitBelow),
+                    "zoom" => Some(Click::Zoom),
+                    "close" => Some(Click::Close),
+                    "fit" => Some(Click::Fit),
+                    _ => None,
+                };
             }
             hit.get_attribute("data-pane")?.parse().ok().map(Click::Pane)
         }
@@ -231,7 +287,7 @@ mod dom {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use dom::{Click, TabStrip};
+pub use dom::{Click, Controls, TabStrip};
 
 #[cfg(test)]
 mod tests {

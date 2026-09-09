@@ -14,7 +14,12 @@
   #tabs .pane { padding: 0 7px; height: 16px; line-height: 16px; border-radius: 8px; background: #1a1a1a; color: #9a9a9a; font-size: 11px; cursor: pointer; }
   #tabs .pane:hover { color: #ddd; }
   #tabs .pane.current { background: #3a3a3a; color: #fff; }
-  #tabs .follow { margin-left: auto; padding: 0 10px; height: 20px; line-height: 20px; border-radius: 10px; color: #777; cursor: pointer; font-size: 11px; }
+  #tabs .act { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 20px; padding: 0 6px; border-radius: 10px; color: #8a8a8a; cursor: pointer; font-size: 13px; }
+  #tabs .act:hover { background: #1c1c1c; color: #eee; }
+  #tabs .act.on { color: #6cb6ff; }
+  #tabs .act.danger { background: #5a1e1e; color: #ffb4b4; font-size: 11px; }
+  #tabs .actions { display: inline-flex; gap: 2px; margin-left: auto; }
+  #tabs .follow { padding: 0 10px; height: 20px; line-height: 20px; border-radius: 10px; color: #777; cursor: pointer; font-size: 11px; }
   #tabs .follow.on { color: #6cb6ff; }
   #tabs .follow:hover { background: #1c1c1c; }
   #term { position: absolute; inset: 28px 0 22px 0; width: 100%; height: calc(100% - 50px); display: block; outline: none; }

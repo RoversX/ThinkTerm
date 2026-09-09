@@ -65,6 +65,8 @@ const RECONNECT_DOUBT_AFTER: u32 = 6;
 /// Shorter than the shortest useful outage and longer than the time a
 /// server that is restarting in a loop stays up.
 const RECONNECT_STABLE_MS: f64 = 5_000.0;
+/// How long the close button waits for its second press.
+const CLOSE_CONFIRM_MS: f64 = 3_000.0;
 /// The desktop's `inactive_pane_hsb` default: panes without the focus are
 /// a little darker and a little greyer.
 const INACTIVE_PANE_HSB: wezterm_color_types::HsbTransform = wezterm_color_types::HsbTransform {
@@ -202,6 +204,9 @@ pub struct Inner {
     /// A switch is under way; a second request waits for the next push
     /// or click rather than racing it.
     switching: bool,
+    /// The close button was pressed once; the second press, within a
+    /// few seconds, is the one that closes.
+    closing_since: Option<f64>,
 }
 
 pub struct App {
@@ -345,6 +350,7 @@ impl App {
             strip: setup.strip,
             layout_refresh_pending: false,
             switching: false,
+            closing_since: None,
         };
         let app = Rc::new(Self {
             inner: RefCell::new(inner),
@@ -753,6 +759,23 @@ impl App {
                 return true;
             }
             KeyCode::Char('v') | KeyCode::Char('V') if cmd || ctrl_shift => return false,
+            // Ctrl+Shift+Enter splits to the right, Ctrl+Shift+\ below,
+            // Ctrl+Shift+Z zooms; the same as the strip's buttons.
+            KeyCode::Enter if ctrl_shift => {
+                drop(inner);
+                self.split(thinkterm_proto::SplitDirection::Horizontal);
+                return true;
+            }
+            KeyCode::Char('\\') | KeyCode::Char('|') if ctrl_shift => {
+                drop(inner);
+                self.split(thinkterm_proto::SplitDirection::Vertical);
+                return true;
+            }
+            KeyCode::Char('z') | KeyCode::Char('Z') if ctrl_shift => {
+                drop(inner);
+                self.toggle_zoom();
+                return true;
+            }
             // Ctrl+Shift+F fits the tab to this window; Ctrl+Shift+T
             // takes the terminal over from another device (Handoff mode).
             KeyCode::Char('f') | KeyCode::Char('F') if ctrl_shift => {
@@ -1241,7 +1264,15 @@ impl App {
             return;
         };
         let tabs = crate::chrome::model(layout, inner.focused_pane, inner.title());
-        strip.render(&tabs, inner.following);
+        let controls = crate::chrome::Controls {
+            following: inner.following,
+            zoomed: inner.tab_layout.as_ref().is_some_and(|l| l.zoomed.is_some()),
+            fit: inner.link.lease().fit,
+            closing: inner
+                .closing_since
+                .is_some_and(|since| monotonic_ms() - since < CLOSE_CONFIRM_MS),
+        };
+        strip.render(&tabs, controls);
     }
 
     /// List the server's panes again, redraw the strip, and bring the tab
@@ -1472,15 +1503,172 @@ impl App {
 
     /// A click on the strip.
     pub fn on_chrome_click(self: &Rc<Self>, click: crate::chrome::Click) {
+        use crate::chrome::Click;
+        // Any other click withdraws a pending close.
+        if click != Click::Close {
+            self.inner.borrow_mut().closing_since = None;
+        }
         match click {
-            crate::chrome::Click::Pane(pane_id) => self.switch_to_pane(pane_id, true),
-            crate::chrome::Click::Follow => {
+            Click::Pane(pane_id) => self.switch_to_pane(pane_id, true),
+            Click::Follow => {
                 let mut inner = self.inner.borrow_mut();
                 inner.following = !inner.following;
                 Self::render_strip(&inner);
                 let _ = inner.textarea.focus();
             }
+            Click::NewTab => self.new_tab(),
+            Click::SplitRight => self.split(thinkterm_proto::SplitDirection::Horizontal),
+            Click::SplitBelow => self.split(thinkterm_proto::SplitDirection::Vertical),
+            Click::Zoom => self.toggle_zoom(),
+            Click::Fit => {
+                let on = !self.inner.borrow().link.lease().fit;
+                self.fit(on);
+            }
+            Click::Close => {
+                let confirmed = {
+                    let mut inner = self.inner.borrow_mut();
+                    let now = monotonic_ms();
+                    match inner.closing_since {
+                        Some(since) if now - since < CLOSE_CONFIRM_MS => {
+                            inner.closing_since = None;
+                            true
+                        }
+                        _ => {
+                            inner.closing_since = Some(now);
+                            Self::render_strip(&inner);
+                            let _ = inner.textarea.focus();
+                            false
+                        }
+                    }
+                };
+                if confirmed {
+                    self.close_pane();
+                } else {
+                    // Back to a plain × when the moment passes.
+                    let app = Rc::clone(self);
+                    let closure = Closure::once_into_js(move || {
+                        let inner = app.inner.borrow();
+                        Self::render_strip(&inner);
+                    });
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                            closure.as_ref().unchecked_ref(),
+                            CLOSE_CONFIRM_MS as i32 + 50,
+                        );
+                    }
+                }
+            }
         }
+    }
+
+    /// One request to the server, its refusal shown rather than logged,
+    /// and the layout listed again afterwards; the server's own pushes
+    /// list it too, which is harmless.
+    fn act<F>(self: &Rc<Self>, what: &'static str, pdu: Pdu, done: F)
+    where
+        F: FnOnce(&Rc<Self>, Pdu) + 'static,
+    {
+        let link = self.inner.borrow().link.clone();
+        let app = Rc::clone(self);
+        wasm_bindgen_futures::spawn_local(async move {
+            match thinkterm_session::host::request(&link, pdu, Ok).await {
+                Ok(answer) => {
+                    done(&app, answer);
+                    app.refresh_layout();
+                }
+                Err(err) => {
+                    log::warn!("{what}: {err:#}");
+                    let inner = app.inner.borrow();
+                    Self::set_status(&inner, &format!("could not {what}: {err:#}"));
+                }
+            }
+            let _ = app.inner.borrow().textarea.focus();
+        });
+    }
+
+    /// A new tab in the window this tab is in, at the tab's own size.
+    pub fn new_tab(self: &Rc<Self>) {
+        let (window_id, workspace, size) = {
+            let inner = self.inner.borrow();
+            let size = inner
+                .link
+                .lease()
+                .canonical_size
+                .or_else(|| inner.tab_layout.as_ref().map(|l| l.size))
+                .unwrap_or_default();
+            (inner.window_id, inner.workspace.clone(), size)
+        };
+        self.act(
+            "open a new tab",
+            Pdu::SpawnV2(codec::SpawnV2 {
+                domain: thinkterm_proto::SpawnTabDomain::CurrentPaneDomain,
+                window_id: Some(window_id),
+                command: None,
+                command_dir: None,
+                size,
+                workspace,
+            }),
+            |app, answer| {
+                if let Pdu::SpawnResponse(spawned) = answer {
+                    // The page moves with it; the desktop already has.
+                    app.switch_to_pane(spawned.pane_id, false);
+                }
+            },
+        );
+    }
+
+    /// Split the focused pane; the new pane takes the focus.
+    pub fn split(self: &Rc<Self>, direction: thinkterm_proto::SplitDirection) {
+        let pane_id = self.inner.borrow().focused_pane;
+        self.act(
+            "split the pane",
+            Pdu::SplitPane(codec::SplitPane {
+                pane_id,
+                split_request: thinkterm_proto::SplitRequest {
+                    direction,
+                    target_is_second: true,
+                    top_level: false,
+                    size: thinkterm_proto::SplitSize::Percent(50),
+                },
+                command: None,
+                command_dir: None,
+                domain: thinkterm_proto::SpawnTabDomain::CurrentPaneDomain,
+                move_pane_id: None,
+            }),
+            |app, answer| {
+                if let Pdu::SpawnResponse(spawned) = answer {
+                    app.switch_to_pane(spawned.pane_id, false);
+                }
+            },
+        );
+    }
+
+    /// Zoom the focused pane to the whole tab, or back.
+    pub fn toggle_zoom(self: &Rc<Self>) {
+        let (tab_id, pane_id, zoomed) = {
+            let inner = self.inner.borrow();
+            let zoomed = inner.tab_layout.as_ref().is_some_and(|l| l.zoomed.is_some());
+            (inner.tab_id, inner.focused_pane, zoomed)
+        };
+        self.act(
+            "zoom the pane",
+            Pdu::SetPaneZoomed(codec::SetPaneZoomed {
+                containing_tab_id: tab_id,
+                pane_id,
+                zoomed: !zoomed,
+            }),
+            |_, _| {},
+        );
+    }
+
+    /// Close the focused pane, ending its program.
+    pub fn close_pane(self: &Rc<Self>) {
+        let pane_id = self.inner.borrow().focused_pane;
+        self.act(
+            "close the pane",
+            Pdu::KillPane(codec::KillPane { pane_id }),
+            |_, _| {},
+        );
     }
 
     /// The pane at `pane_id`, and the page's focus with it. `chosen` is a
