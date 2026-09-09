@@ -12,7 +12,7 @@ use codec::{ListPanesResponse, ThinkTermSessionState, ThinkTermSessionThread, Th
 use std::collections::{HashMap, HashSet};
 use thinkterm_proto::{AgentState, AgentStatus, PaneId, TabId, WindowId};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Status {
     Idle,
     Running,
@@ -20,7 +20,7 @@ pub enum Status {
     Done,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Dot {
     Active,
     Unread,
@@ -29,22 +29,31 @@ pub enum Dot {
     Quiet,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Serialised for the page as `{"kind": …}` rows, the shape the sidebar
+/// probe has always read.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Row {
-    Space { name: String },
+    Space { id: String, name: String },
     NewThread,
     Pinned,
     Workspaces,
     Project { id: String, name: String, path: String, collapsed: bool, archived: bool },
     Thread(ThreadRow),
-    Archived { count: usize, open: bool },
+    Archived { count: usize, open: bool, label: String },
     Others,
-    Window { window_id: WindowId, title: String, selected: bool },
+    Window {
+        #[serde(rename = "id")]
+        window_id: WindowId,
+        title: String,
+        selected: bool,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ThreadRow {
     pub id: String,
+    #[serde(rename = "project")]
     pub project_id: String,
     pub name: String,
     pub status: Status,
@@ -58,13 +67,26 @@ pub struct ThreadRow {
     pub deleting: bool,
 }
 
+/// A Space as the Space menu lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceEntry {
+    pub id: String,
+    pub name: String,
+    pub current: bool,
+    pub default: bool,
+}
+
 #[derive(Default)]
 pub struct TreeModel {
     pub session: Option<ThinkTermSessionState>,
     pub tree: Option<ThinkTermTree>,
     pub agents: HashMap<PaneId, AgentState>,
+    /// The agent's id and the pane's title as the server reported them.
+    agent_details: HashMap<PaneId, (String, String)>,
     pub collapsed: HashSet<String>,
     pub archived_open: bool,
+    /// The Space the sidebar shows; the first one until chosen.
+    pub space: Option<String>,
     /// Every window on the server, with its workspace and a title.
     windows: Vec<(WindowId, String, String)>,
 }
@@ -87,13 +109,48 @@ impl TreeModel {
         self.tree = Some(tree);
     }
 
+    /// Every pane an agent runs in: pane, agent id, state, reported title.
+    pub fn agent_entries(&self) -> impl Iterator<Item = (PaneId, &str, AgentState, &str)> {
+        self.agents.iter().map(|(pane, state)| {
+            let (id, title) = self
+                .agent_details
+                .get(pane)
+                .map(|(id, title)| (id.as_str(), title.as_str()))
+                .unwrap_or(("", ""));
+            (*pane, id, *state, title)
+        })
+    }
+
+    /// Where a pane is: "Project · Thread" and its window, from the
+    /// thread whose tabs hold it; a window's workspace otherwise.
+    pub fn place_of_pane(&self, pane: PaneId) -> (String, Option<WindowId>) {
+        if let Some(session) = &self.session {
+            for project in &session.projects {
+                for thread in &project.threads {
+                    if let Some(tab) = thread.tabs.iter().find(|t| t.pane_ids.contains(&pane)) {
+                        return (format!("{} · {}", project.name, thread.name), Some(tab.window_id));
+                    }
+                }
+            }
+        }
+        (String::new(), None)
+    }
+
+    /// The title the server reported with an agent's status, when it did.
+    pub fn record_agent_details(&mut self, pane_id: PaneId, agent_id: &str, title: &str) {
+        self.agent_details.insert(pane_id, (agent_id.to_string(), title.to_string()));
+    }
+
     pub fn apply_agent(&mut self, pane_id: PaneId, status: Option<&AgentStatus>) {
         match status {
             Some(s) => {
                 self.agents.insert(pane_id, s.state);
+                let title = self.agent_details.get(&pane_id).map(|(_, t)| t.clone()).unwrap_or_default();
+                self.agent_details.insert(pane_id, (s.agent_id.clone(), title));
             }
             None => {
                 self.agents.remove(&pane_id);
+                self.agent_details.remove(&pane_id);
             }
         }
     }
@@ -116,8 +173,7 @@ impl TreeModel {
                 .filter(|t| !t.is_empty())
                 .cloned()
                 .unwrap_or_else(|| {
-                    let (title, _) = crate::navbar::display_title(&first.title);
-                    title.to_string()
+                    crate::navbar::display_title(&first.title).0
                 });
             self.windows.push((first.window_id, first.workspace.clone(), title));
         }
@@ -130,6 +186,31 @@ impl TreeModel {
             .iter()
             .flat_map(|p| p.threads.iter())
             .find(|t| t.id == id)
+    }
+
+    /// Every pane the project's threads have on the server.
+    pub fn live_panes_of_project(&self, project_id: &str) -> Vec<PaneId> {
+        self.session
+            .as_ref()
+            .and_then(|s| s.projects.iter().find(|p| p.id == project_id))
+            .map(|p| p.threads.iter().flat_map(|t| t.tabs.iter().flat_map(|tab| tab.pane_ids.iter().copied())).collect())
+            .unwrap_or_default()
+    }
+
+    /// How many threads a project has in the tree (archived ones included).
+    pub fn thread_count_of_project(&self, project_id: &str) -> usize {
+        self.tree
+            .as_ref()
+            .and_then(|t| t.projects.iter().find(|p| p.id == project_id))
+            .map(|p| p.threads.len())
+            .unwrap_or(0)
+    }
+
+    pub fn archived_count(&self) -> usize {
+        self.tree
+            .as_ref()
+            .map(|t| t.projects.iter().filter(|p| p.archived_at.is_some()).count())
+            .unwrap_or(0)
     }
 
     pub fn project_of(&self, thread_id: &str) -> Option<&codec::ThinkTermSessionProject> {
@@ -178,6 +259,57 @@ impl TreeModel {
 
     /// The thread on show: the one holding the tab on show, else the one
     /// whose workspace the page is in.
+    /// The Space on show: the chosen one while the server still has it,
+    /// else the first.
+    pub fn current_space(&self) -> Option<&codec::ThinkTermSessionSpace> {
+        let spaces = &self.session.as_ref()?.spaces;
+        self.space
+            .as_deref()
+            .and_then(|id| spaces.iter().find(|s| s.id == id))
+            .or_else(|| spaces.first())
+    }
+
+    /// Choose a Space; false when the server has no such Space.
+    pub fn set_space(&mut self, id: &str) -> bool {
+        let known = self.session.as_ref().is_some_and(|s| s.spaces.iter().any(|s| s.id == id));
+        if known {
+            self.space = Some(id.to_string());
+        }
+        known
+    }
+
+    /// Every Space, for the Space menu.
+    pub fn spaces(&self) -> Vec<SpaceEntry> {
+        let current = self.current_space().map(|s| s.id.clone());
+        self.session
+            .as_ref()
+            .map(|s| {
+                s.spaces
+                    .iter()
+                    .map(|space| SpaceEntry {
+                        id: space.id.clone(),
+                        name: space.name.clone(),
+                        current: current.as_deref() == Some(space.id.as_str()),
+                        default: space.is_default,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The project a new thread goes to when none is named: the selected
+    /// thread's when it is in the Space on show, else the Space's first.
+    pub fn default_project(&self, current_tab: TabId, current_workspace: &str) -> Option<String> {
+        let space = self.current_space()?.id.clone();
+        let session = self.session.as_ref()?;
+        let selected = self
+            .selected_thread(current_tab, current_workspace)
+            .and_then(|t| self.project_of(t))
+            .filter(|p| p.space_id == space)
+            .map(|p| p.id.clone());
+        selected.or_else(|| session.projects.iter().find(|p| p.space_id == space).map(|p| p.id.clone()))
+    }
+
     pub fn selected_thread(&self, current_tab: TabId, current_workspace: &str) -> Option<&str> {
         let session = self.session.as_ref()?;
         let threads = || session.projects.iter().flat_map(|p| p.threads.iter());
@@ -204,13 +336,14 @@ impl TreeModel {
             return rows;
         };
         let selected = self.selected_thread(current_tab, current_workspace);
-        let space_name = session
-            .spaces
-            .first()
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| "Default".to_string());
-        rows.push(Row::Space { name: space_name });
+        let space = self.current_space();
+        let space_id = space.map(|s| s.id.clone()).unwrap_or_default();
+        rows.push(Row::Space {
+            id: space_id.clone(),
+            name: space.map(|s| s.name.clone()).unwrap_or_else(|| "Default".to_string()),
+        });
         rows.push(Row::NewThread);
+        let in_space = |p: &&codec::ThinkTermSessionProject| p.space_id == space_id;
         let thread_row = |t: &ThinkTermSessionThread, project_id: &str| {
             let live = !t.tabs.is_empty();
             let is_selected = selected == Some(t.id.as_str());
@@ -241,6 +374,7 @@ impl TreeModel {
         let pinned: Vec<Row> = session
             .projects
             .iter()
+            .filter(in_space)
             .flat_map(|p| p.threads.iter().filter(|t| t.is_pinned).map(move |t| thread_row(t, &p.id)))
             .collect();
         if !pinned.is_empty() {
@@ -248,7 +382,7 @@ impl TreeModel {
             rows.extend(pinned);
         }
         rows.push(Row::Workspaces);
-        for project in &session.projects {
+        for project in session.projects.iter().filter(in_space) {
             let collapsed = self.collapsed.contains(&project.id);
             rows.push(Row::Project {
                 id: project.id.clone(),
@@ -265,10 +399,16 @@ impl TreeModel {
         let archived: Vec<&codec::TtProject> = self
             .tree
             .as_ref()
-            .map(|t| t.projects.iter().filter(|p| p.archived_at.is_some()).collect())
+            .map(|t| t.projects.iter().filter(|p| p.archived_at.is_some() && p.space_id == space_id).collect())
             .unwrap_or_default();
         if !archived.is_empty() {
-            rows.push(Row::Archived { count: archived.len(), open: self.archived_open });
+            let mut args = thinkterm_i18n::FluentArgs::new();
+            args.set("count", archived.len() as i64);
+            rows.push(Row::Archived {
+                count: archived.len(),
+                open: self.archived_open,
+                label: thinkterm_i18n::tr_args("menu-show-archived-count", &args),
+            });
             if self.archived_open {
                 for p in archived {
                     rows.push(Row::Project {
@@ -322,6 +462,11 @@ pub enum Expect {
     ProjectExists(String),
     ProjectNamed(String, String),
     ProjectArchived(String, bool),
+    ThreadUnread(String, bool),
+    ProjectGone(String),
+    SpaceExists(String),
+    SpaceNamed(String, String),
+    SpaceGone(String),
 }
 
 impl Expect {
@@ -352,6 +497,25 @@ impl Expect {
                 Some(p) if &p.name == name => Ok(()),
                 Some(_) => Err("the server kept the old name".into()),
                 None => Err("the project is gone".into()),
+            },
+            Expect::SpaceExists(id) => tree.spaces.iter().any(|s| &s.id == id).then_some(()).ok_or_else(|| "the server did not create the Space".into()),
+            Expect::SpaceNamed(id, name) => match tree.spaces.iter().find(|s| &s.id == id) {
+                Some(s) if &s.name == name => Ok(()),
+                Some(_) => Err("the server kept the old name".into()),
+                None => Err("the Space is gone".into()),
+            },
+            Expect::SpaceGone(id) => match tree.spaces.iter().find(|s| &s.id == id) {
+                None => Ok(()),
+                Some(_) => Err("the server did not delete the Space".into()),
+            },
+            Expect::ThreadUnread(id, unread) => match thread(id) {
+                Some(t) if t.is_unread == *unread => Ok(()),
+                Some(_) => Err("the server did not change the unread mark".into()),
+                None => Err("the thread is gone".into()),
+            },
+            Expect::ProjectGone(id) => match project(id) {
+                None => Ok(()),
+                Some(_) => Err("the server did not remove the project".into()),
             },
             Expect::ProjectArchived(id, archived) => match project(id) {
                 Some(p) if p.archived_at.is_some() == *archived => Ok(()),
@@ -448,6 +612,43 @@ pub fn delete_thread(id: &str) -> Intent {
     Intent {
         ops: vec![TreeOp::DeleteThread { thread_id: id.to_string() }],
         expect: Expect::ThreadGone(id.to_string()),
+    }
+}
+
+pub fn create_space(id: String, name: &str) -> Intent {
+    Intent {
+        ops: vec![TreeOp::CreateSpace { space_id: id.clone(), name: name.to_string() }],
+        expect: Expect::SpaceExists(id),
+    }
+}
+
+pub fn rename_space(id: &str, name: &str) -> Intent {
+    Intent {
+        ops: vec![TreeOp::RenameSpace { space_id: id.to_string(), name: name.to_string() }],
+        expect: Expect::SpaceNamed(id.to_string(), name.to_string()),
+    }
+}
+
+/// Delete a Space; the server drops its projects and threads with it.
+pub fn delete_space(id: &str) -> Intent {
+    Intent {
+        ops: vec![TreeOp::DeleteSpace { space_id: id.to_string() }],
+        expect: Expect::SpaceGone(id.to_string()),
+    }
+}
+
+pub fn set_unread(id: &str, unread: bool) -> Intent {
+    Intent {
+        ops: vec![TreeOp::SetThreadUnread { thread_id: id.to_string(), unread }],
+        expect: Expect::ThreadUnread(id.to_string(), unread),
+    }
+}
+
+/// Remove a project and its threads for good.
+pub fn remove_project(id: &str) -> Intent {
+    Intent {
+        ops: vec![TreeOp::RemoveProject { project_id: id.to_string() }],
+        expect: Expect::ProjectGone(id.to_string()),
     }
 }
 

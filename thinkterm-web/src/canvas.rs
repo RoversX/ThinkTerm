@@ -25,7 +25,7 @@ pub const MAX_FALLBACK_CELLS: u8 = 4;
 /// The fonts the canvas draws with, in CSS order.
 ///
 /// The page gives the terminal no font stack of its own -- `#term` is a
-/// bare canvas, and the two names in `app.js` identify the files we parse
+/// bare canvas, and the two names in `ui/src/main.ts` identify the files we parse
 /// ourselves, not CSS families -- so this is it, and `?glyphfont=`
 /// replaces it.
 ///

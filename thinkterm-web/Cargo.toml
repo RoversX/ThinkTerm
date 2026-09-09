@@ -21,9 +21,13 @@ codec.workspace = true
 euclid.workspace = true
 futures.workspace = true
 log.workspace = true
+nucleo-matcher.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 termwiz = { workspace = true, features = ["use_serde"] }
 thinkterm-font-core.workspace = true
 thinkterm-font-web.workspace = true
+thinkterm-i18n.workspace = true
 thinkterm-proto.workspace = true
 thinkterm-render = { workspace = true, features = ["wgpu"] }
 thinkterm-session.workspace = true
@@ -45,10 +49,10 @@ web-sys = { workspace = true, features = [
   "BinaryType", "CanvasRenderingContext2d", "Clipboard", "ClipboardEvent",
   "CloseEvent", "CompositionEvent",
   "console", "CssStyleDeclaration", "DataTransfer", "Document", "DomRect",
-  "DomRectReadOnly", "Element", "Event", "EventTarget", "FocusEvent", "History",
-  "HtmlCanvasElement", "HtmlElement", "HtmlInputElement", "HtmlTextAreaElement", "ImageData",
+  "DomRectReadOnly", "Element", "Event", "EventTarget", "FocusEvent",
+  "HtmlCanvasElement", "HtmlElement", "HtmlTextAreaElement", "ImageData",
   "InputEvent",
   "KeyboardEvent", "Location", "MessageEvent", "MouseEvent", "Navigator",
-  "Performance", "PointerEvent", "ResizeObserver", "ResizeObserverEntry", "Storage",
+  "Performance", "PointerEvent", "ResizeObserver", "ResizeObserverEntry",
   "WebSocket", "WheelEvent", "Window",
 ] }

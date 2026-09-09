@@ -1,0 +1,201 @@
+//! The handle the page holds: what the chrome shows, as JSON (`views`),
+//! and the few things it can ask for. The display layer is not told what
+//! changed, only that something did; it reads the views it draws.
+
+use crate::app::App;
+use std::rc::Rc;
+use wasm_bindgen::prelude::*;
+
+#[wasm_bindgen]
+pub struct Client {
+    app: Rc<App>,
+}
+
+impl Client {
+    pub(crate) fn new(app: Rc<App>) -> Self {
+        Self { app }
+    }
+}
+
+fn json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_else(|err| format!("{{\"error\":{:?}}}", err.to_string()))
+}
+
+#[wasm_bindgen]
+impl Client {
+    /// Called once right away, then once per task in which any view
+    /// changed.
+    pub fn on_change(&self, callback: js_sys::Function) {
+        self.app.set_on_change(callback);
+    }
+
+    pub fn sidebar(&self) -> String {
+        json(&self.app.sidebar_view())
+    }
+
+    pub fn tabs(&self) -> String {
+        json(&self.app.tabs_view())
+    }
+
+    pub fn navs(&self) -> String {
+        json(&self.app.navs_view())
+    }
+
+    pub fn status(&self) -> String {
+        json(&self.app.status_view())
+    }
+
+    pub fn layout(&self) -> String {
+        self.app.layout_view()
+    }
+
+    /// The page's own labels in the active locale, keyed by catalogue id.
+    pub fn strings(&self) -> String {
+        json(&crate::views::strings())
+    }
+
+    /// Switch the language: a preference (`"system"` or a tag) and the
+    /// browser's own list. Returns the locale it resolved to.
+    pub fn set_locale(&self, preference: String, languages: Vec<String>) -> String {
+        let code = thinkterm_i18n::activate_preference(&preference, &languages);
+        self.app.locale_changed();
+        code.to_string()
+    }
+
+    /// A click in the sidebar: `kind` names the row or button, `id` the
+    /// thread, project or window it is about, `flag` the pin state.
+    /// Returns false for a kind the model does not know.
+    pub fn side_click(&self, kind: String, id: Option<String>, flag: Option<bool>) -> bool {
+        use crate::sidebar::SideClick;
+        let click = match (kind.as_str(), id) {
+            ("thread", Some(id)) => SideClick::Thread(id),
+            ("window", Some(id)) => match id.parse() {
+                Ok(w) => SideClick::Window(w),
+                Err(_) => return false,
+            },
+            ("toggle-project", Some(id)) => SideClick::ToggleProject(id),
+            ("toggle-archived", _) => SideClick::ToggleArchived,
+            ("new-thread", project) => SideClick::NewThread(project),
+            ("new-project", _) => SideClick::NewProject,
+            ("pin", Some(id)) => SideClick::Pin(id, flag.unwrap_or(true)),
+            ("delete", Some(id)) => SideClick::Delete(id),
+            ("rename-thread", Some(id)) => SideClick::RenameThread(id),
+            ("rename-project", Some(id)) => SideClick::RenameProject(id),
+            ("archive", Some(id)) => SideClick::Archive(id),
+            ("unarchive", Some(id)) => SideClick::Unarchive(id),
+            ("space-menu", _) => SideClick::SpaceMenu,
+            _ => return false,
+        };
+        self.app.on_side_click(click);
+        true
+    }
+
+    /// The context menu for `kind` ("pane", "tab", "thread", "project",
+    /// "archived-project", "sidebar-options") and `id`: JSON `MenuItem[]`.
+    pub fn context_menu(&self, kind: String, id: String) -> String {
+        json(&self.app.context_menu(&kind, &id))
+    }
+
+    /// Perform a menu row's action by its id: JSON `MenuOutcome`.
+    pub fn menu_action(&self, id: String) -> String {
+        json(&self.app.menu_action(&id))
+    }
+
+    /// The Agents panel: JSON `AgentsView`.
+    pub fn agents(&self) -> String {
+        json(&self.app.agents_view())
+    }
+
+    /// Bring an agent's pane on show.
+    pub fn agent_reveal(&self, pane: u32) -> bool {
+        self.app.agent_reveal(pane as usize)
+    }
+
+    /// The languages the page can be set to: JSON `[{preference, label}]`,
+    /// "system" first, labelled in the active locale.
+    pub fn languages(&self) -> String {
+        let list: Vec<serde_json::Value> = thinkterm_i18n::LANGUAGE_OPTIONS
+            .iter()
+            .map(|o| serde_json::json!({ "preference": o.preference, "label": thinkterm_i18n::language_option_label(*o) }))
+            .collect();
+        json(&list)
+    }
+
+    /// The page's preferences as the model holds them: JSON `WebSettings`.
+    pub fn settings(&self) -> String {
+        json(&self.app.settings_view())
+    }
+
+    /// The stored preferences, whole, at boot. Returns an error text or "".
+    pub fn apply_settings(&self, json: String) -> String {
+        self.app.apply_settings(&json).err().unwrap_or_default()
+    }
+
+    /// One preference (`key` as in the JSON, `value` as JSON). Returns an
+    /// error text or "".
+    pub fn set_setting(&self, key: String, value: String) -> String {
+        self.app.set_setting(&key, &value).err().unwrap_or_default()
+    }
+
+    /// The search palette's entries for `query`, ranked: JSON `Results`.
+    pub fn palette(&self, query: String) -> String {
+        json(&self.app.palette(&query))
+    }
+
+    /// Perform a palette pick by its entry id: JSON `PaletteOutcome`.
+    pub fn palette_run(&self, id: String) -> String {
+        json(&self.app.palette_run(&id))
+    }
+
+    /// The page's remembered picks (most recent first), at boot.
+    pub fn set_recent(&self, ids: Vec<String>) {
+        self.app.set_recent(ids);
+    }
+
+    /// Show a Space in the sidebar (the page remembers the last one).
+    pub fn set_space(&self, id: String) -> bool {
+        self.app.set_space(&id)
+    }
+
+    /// A key the page pressed for the user (its key bar on a phone), by
+    /// its DOM name ("Escape", "ArrowUp", "c"), with modifiers. Returns
+    /// whether the terminal took it.
+    pub fn key(&self, name: String, ctrl: bool, alt: bool, shift: bool) -> bool {
+        let dom = crate::keymap::DomKey { key: &name, code: "", ctrl, alt, shift, meta: false, composing: false };
+        match crate::keymap::map_key(&dom) {
+            Some((key, mods)) => self.app.key_down(key, mods, shift),
+            None => false,
+        }
+    }
+
+    /// Text from the page's clipboard, typed into the focused pane.
+    pub fn paste(&self, text: String) {
+        self.app.paste(&text);
+    }
+
+    /// Enter or Escape in the sidebar's inline input, with its value.
+    pub fn side_key(&self, key: String, value: String) {
+        self.app.on_side_key(&key, value);
+    }
+
+    /// A click on the tab row or a pane's bar. Returns false for an
+    /// action the model does not know.
+    pub fn chrome_click(&self, action: String, pane: Option<u32>, tab: Option<u32>) -> bool {
+        use crate::chrome::Click;
+        let pane = pane.map(|p| p as usize);
+        let click = match (action.as_str(), pane, tab) {
+            ("pane", Some(p), _) => Click::Pane(p),
+            ("follow", _, _) => Click::Follow,
+            ("new-tab", _, _) => Click::NewTab,
+            ("split-right", p, _) => Click::SplitRight(p),
+            ("split-below", p, _) => Click::SplitBelow(p),
+            ("zoom", p, _) => Click::Zoom(p),
+            ("close", _, _) => Click::Close,
+            ("close-pane", Some(p), _) => Click::ClosePane(p),
+            ("close-tab", _, Some(t)) => Click::CloseTab(t as usize),
+            _ => return false,
+        };
+        self.app.on_chrome_click(click);
+        true
+    }
+}

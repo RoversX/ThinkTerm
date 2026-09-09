@@ -61,7 +61,6 @@ pub fn init() {
 pub async fn start(
     canvas_id: String,
     textarea_id: String,
-    status_id: String,
     url: String,
     token: String,
     font_names: Vec<String>,
@@ -72,12 +71,17 @@ pub async fn start(
     glyph_font: String,
     // `?font=` was given: keep that size rather than the desktop's cell.
     font_pinned: bool,
-) -> Result<(), JsValue> {
+    // The language: a preference ("system" or a tag) and the browser's list.
+    locale: String,
+    languages: Vec<String>,
+) -> Result<crate::bridge::Client, JsValue> {
+    thinkterm_i18n::activate_preference(&locale, &languages);
     run(
-        canvas_id, textarea_id, status_id, url, token, font_names, fonts, size_pt, glyph_font,
-        font_pinned,
+        canvas_id, textarea_id, url, token, font_names, fonts, size_pt, glyph_font, font_pinned,
+        languages,
     )
     .await
+    .map(crate::bridge::Client::new)
     .map_err(js_err)
 }
 
@@ -93,7 +97,6 @@ fn families(requested: &str) -> Rc<str> {
 async fn run(
     canvas_id: String,
     textarea_id: String,
-    status_id: String,
     url: String,
     token: String,
     font_names: Vec<String>,
@@ -101,15 +104,12 @@ async fn run(
     size_pt: f64,
     glyph_font: String,
     font_pinned: bool,
-) -> Result<()> {
+    languages: Vec<String>,
+) -> Result<Rc<crate::app::App>> {
     let canvas: web_sys::HtmlCanvasElement = element(&canvas_id)?;
     let textarea: web_sys::HtmlTextAreaElement = element(&textarea_id)?;
-    let status: Option<web_sys::Element> = element(&status_id).ok();
-    let set_status = |text: &str| {
-        if let Some(s) = &status {
-            s.set_text_content(Some(text));
-        }
-    };
+    // The page draws its own status; the boot's progress is logged.
+    let set_status = |text: &str| log::info!("{text}");
     let window = web_sys::window().ok_or_else(|| anyhow!("no window"))?;
     if js_sys::Reflect::get(&window.navigator(), &JsValue::from_str("gpu"))
         .map(|v| v.is_undefined())
@@ -136,8 +136,8 @@ async fn run(
     // server keeps a registered client and a TCP session for a page that
     // gave up, and the reader keeps answering its pings.
     let outcome = start_attached(
-        &link, &canvas, &textarea, status.clone(), &url, &token, fonts, size_pt, &glyph_font, dpr,
-        dpi, font_pinned,
+        &link, &canvas, &textarea, &url, &token, fonts, size_pt, &glyph_font, dpr,
+        dpi, font_pinned, languages,
     )
     .await;
     if outcome.is_err() {
@@ -150,7 +150,6 @@ async fn start_attached(
     link: &WsLink,
     canvas: &web_sys::HtmlCanvasElement,
     textarea: &web_sys::HtmlTextAreaElement,
-    status: Option<web_sys::Element>,
     url: &str,
     token: &str,
     fonts: Rc<FontSet>,
@@ -159,12 +158,9 @@ async fn start_attached(
     dpr: f64,
     dpi: u32,
     font_pinned: bool,
-) -> Result<()> {
-    let set_status = |text: &str| {
-        if let Some(s) = &status {
-            s.set_text_content(Some(text));
-        }
-    };
+    languages: Vec<String>,
+) -> Result<Rc<crate::app::App>> {
+    let set_status = |text: &str| log::info!("{text}");
     set_status("starting WebGPU…");
     let rect = canvas.get_bounding_client_rect();
     let dev_w = (rect.width() * dpr).floor().max(1.0) as u32;
@@ -242,7 +238,6 @@ async fn start_attached(
         fonts,
         canvas: canvas.clone(),
         textarea: textarea.clone(),
-        status,
         url: url.to_string(),
         token: token.to_string(),
         pane_id: attached.pane_id,
@@ -252,10 +247,8 @@ async fn start_attached(
         dpr,
         cols,
         rows,
-        strip: crate::chrome::TabStrip::mount("tabs"),
-        navs: crate::navbar::NavBars::mount("panes"),
-        side: crate::sidebar::Sidebar::mount("side"),
         font_pinned,
+        languages,
     });
     host.events.set_wake(app.wake());
     {
@@ -267,68 +260,7 @@ async fn start_attached(
         link.set_close_handler(move |reason| app.on_close(reason));
     }
     crate::input::install(Rc::clone(&app), canvas, textarea);
-    // The strip: one listener on its root, so rebuilding its contents
-    // costs nothing to keep wired.
-    for root in [app.strip_element(), app.navs_element()].into_iter().flatten() {
-        let app = Rc::clone(&app);
-        crate::input::listen::<web_sys::MouseEvent>(&root, "click", move |ev| {
-            if let Some(click) = crate::chrome::TabStrip::click_target(&ev) {
-                ev.prevent_default();
-                app.on_chrome_click(click);
-            }
-        });
-    }
-    if let (Some(root), Some(window)) = (app.side_element(), web_sys::window()) {
-        let app2 = Rc::clone(&app);
-        crate::input::listen::<web_sys::MouseEvent>(&root, "click", move |ev| {
-            if let Some(click) = crate::sidebar::Sidebar::click_target(&ev) {
-                ev.prevent_default();
-                app2.on_side_click(click);
-            }
-        });
-        {
-            let app = Rc::clone(&app);
-            crate::input::listen::<web_sys::KeyboardEvent>(&root, "keydown", move |ev| {
-                let Some(input) = ev.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()) else {
-                    return;
-                };
-                let key = ev.key();
-                if key == "Enter" || key == "Escape" {
-                    ev.prevent_default();
-                    app.on_side_key(&key, input.value());
-                }
-                ev.stop_propagation();
-            });
-        }
-        // The resize handle: drag the panel's edge, within the desktop's bounds.
-        let dragging = Rc::new(std::cell::Cell::new(false));
-        {
-            let dragging = Rc::clone(&dragging);
-            crate::input::listen::<web_sys::PointerEvent>(&root, "pointerdown", move |ev| {
-                let target: Option<web_sys::Element> = ev.target().and_then(|t| t.dyn_into().ok());
-                if target.is_some_and(|t| t.get_attribute("class").as_deref() == Some("handle")) {
-                    dragging.set(true);
-                    ev.prevent_default();
-                }
-            });
-        }
-        {
-            let dragging = Rc::clone(&dragging);
-            let app = Rc::clone(&app);
-            crate::input::listen::<web_sys::PointerEvent>(&window, "pointermove", move |ev| {
-                if dragging.get() {
-                    app.set_sidebar_width(ev.client_x() as f64);
-                }
-            });
-        }
-        crate::input::listen::<web_sys::PointerEvent>(&window, "pointerup", move |_| dragging.set(false));
-        if let Some(px) = crate::sidebar::stored_width() {
-            app.set_sidebar_width(px);
-        }
-    }
     app.fetch_tree();
-    // The boot messages were shown in the status element directly; from
-    // here it is the page's passing remark, shown only when there is one.
     app.hide_status();
     app.refresh_layout();
     app.poll_layout(5_000);
@@ -350,8 +282,9 @@ async fn start_attached(
             );
         }
     }
-    // The push and close handlers and every DOM listener hold the app.
-    Ok(())
+    // The push and close handlers and every DOM listener hold the app;
+    // so does the page, through the handle it gets back.
+    Ok(app)
 }
 
 /// Render a mid-grey quad and read the pixel back: linear 0.5 must come

@@ -14,6 +14,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use termwiz::input::{KeyCode, Modifiers};
 use thinkterm_font_core::FontShaper as _;
+use thinkterm_i18n::tr;
 use thinkterm_font_web::FontSet;
 use thinkterm_proto::{PaneId, TabId};
 use thinkterm_render::atlas::OutOfTextureSpace;
@@ -88,7 +89,6 @@ pub struct Setup {
     pub fonts: Rc<FontSet>,
     pub canvas: web_sys::HtmlCanvasElement,
     pub textarea: web_sys::HtmlTextAreaElement,
-    pub status: Option<web_sys::Element>,
     /// Kept so the page can reopen the socket by itself.
     pub url: String,
     pub token: String,
@@ -99,11 +99,10 @@ pub struct Setup {
     pub dpr: f64,
     pub cols: usize,
     pub rows: usize,
-    pub strip: Option<crate::chrome::TabStrip>,
-    pub navs: Option<crate::navbar::NavBars>,
-    pub side: Option<crate::sidebar::Sidebar>,
     /// `?font=` was given: the size is the user's, not the desktop's.
     pub font_pinned: bool,
+    /// The browser's languages, for switching the locale by preference.
+    pub languages: Vec<String>,
 }
 
 /// One pane on the page: its session and the state that is the page's
@@ -158,7 +157,6 @@ pub struct Inner {
     fonts: Rc<FontSet>,
     canvas: web_sys::HtmlCanvasElement,
     textarea: web_sys::HtmlTextAreaElement,
-    status: Option<web_sys::Element>,
     tab_id: TabId,
     /// Tabs this page has shown, most recent first: a thread opens on
     /// the tab it was left at, not the window's active one, since the
@@ -170,6 +168,11 @@ pub struct Inner {
     cols: usize,
     rows: usize,
     font_pinned: bool,
+    languages: Vec<String>,
+    /// Palette picks, most recent first; the page keeps them across loads.
+    recent: Vec<String>,
+    /// The page's preferences, as it handed them over.
+    settings: crate::settings::WebSettings,
     /// Word/line selection extends by units; the pointer is down.
     selecting: bool,
     /// The pane a drag started in; it keeps the drag until the release.
@@ -216,15 +219,15 @@ pub struct Inner {
     /// default: a page opened to "see my terminal" wants the one being
     /// used. Choosing a pane here turns it off.
     following: bool,
-    strip: Option<crate::chrome::TabStrip>,
-    navs: Option<crate::navbar::NavBars>,
-    /// The bars' last markup, so an unchanged layout costs no DOM work.
-    nav_html: std::cell::RefCell<String>,
+    /// The page's display layer, told once per animation frame that
+    /// something it shows changed; it reads the views it wants.
+    on_change: Option<js_sys::Function>,
+    notify_pending: Rc<Cell<bool>>,
+    /// What the status views report: the current remark and the summary.
+    toast: RefCell<Option<crate::views::Toast>>,
+    summary: RefCell<String>,
     /// The timer that hides the passing remark, so a new one restarts it.
-    toast_timer: Cell<Option<i32>>,
     tree: crate::tree::TreeModel,
-    side: Option<crate::sidebar::Sidebar>,
-    side_html: RefCell<String>,
     session_refresh_pending: bool,
     /// A thread's delete button was pressed once, and when.
     deleting: Option<(String, f64)>,
@@ -351,6 +354,14 @@ impl Inner {
     }
 }
 
+/// The toast for a request that failed: `what` is a `web-act-*` key.
+fn failed(what: &str, err: &dyn std::fmt::Display) -> String {
+    let mut args = thinkterm_i18n::FluentArgs::new();
+    args.set("what", tr(what));
+    args.set("error", format!("{err:#}"));
+    thinkterm_i18n::tr_args("web-toast-failed", &args)
+}
+
 impl App {
     pub fn new(setup: Setup) -> Rc<Self> {
         let mut panes = std::collections::BTreeMap::new();
@@ -367,7 +378,6 @@ impl App {
             fonts: setup.fonts,
             canvas: setup.canvas,
             textarea: setup.textarea,
-            status: setup.status,
             tab_id: setup.tab_id,
             recent_tabs: vec![setup.tab_id],
             window_id: setup.window_id,
@@ -393,19 +403,20 @@ impl App {
             connected_since: None,
             capacity: Capacity::new(),
             font_pinned: setup.font_pinned,
+            languages: setup.languages,
+            recent: Vec::new(),
+            settings: crate::settings::WebSettings::default(),
             quads: HeapQuadAllocator::default(),
             vertices: Vec::new(),
             pane_fonts: Default::default(),
             layout: None,
             tab_layout: None,
             following: true,
-            strip: setup.strip,
-            navs: setup.navs,
-            nav_html: std::cell::RefCell::new(String::new()),
-            toast_timer: Cell::new(None),
+            on_change: None,
+            notify_pending: Rc::new(Cell::new(false)),
+            toast: RefCell::new(None),
+            summary: RefCell::new(String::new()),
             tree: crate::tree::TreeModel::default(),
-            side: setup.side,
-            side_html: RefCell::new(String::new()),
             session_refresh_pending: false,
             deleting: None,
             editing: crate::sidebar::Editing::None,
@@ -498,71 +509,105 @@ impl App {
     /// desktop has no status line, and neither does the page. It stays
     /// while the connection is down: that is not a remark but the state.
     fn set_status(inner: &Inner, text: &str) {
-        let Some(el) = &inner.status else {
-            return;
-        };
-        el.set_text_content(Some(text));
-        let _ = el.remove_attribute("hidden");
-        let Some(window) = web_sys::window() else {
-            return;
-        };
-        if let Some(id) = inner.toast_timer.take() {
-            window.clear_timeout_with_handle(id);
-        }
+        *inner.toast.borrow_mut() = Some(crate::views::Toast {
+            text: text.to_string(),
+            sticky: inner.disconnected.is_some(),
+            at: monotonic_ms(),
+        });
         if inner.disconnected.is_some() {
             // Not a remark but the state: probes read it there too.
-            let _ = el.set_attribute("data-summary", text);
-            return;
+            *inner.summary.borrow_mut() = text.to_string();
         }
-        let el = el.clone();
-        let hide = Closure::once_into_js(move || {
-            let _ = el.set_attribute("hidden", "");
-        });
-        inner.toast_timer.set(
-            window
-                .set_timeout_with_callback_and_timeout_and_arguments_0(hide.as_ref().unchecked_ref(), 4000)
-                .ok(),
-        );
+        Self::notify(inner);
     }
 
     pub fn hide_status(&self) {
-        if let Some(el) = &self.inner.borrow().status {
-            let _ = el.set_attribute("hidden", "");
+        let inner = self.inner.borrow();
+        *inner.toast.borrow_mut() = None;
+        Self::notify(&inner);
+    }
+
+    /// The desktop's words over a terminal another device holds, or none
+    /// when this page may type.
+    fn card(inner: &Inner) -> Option<crate::views::Card> {
+        let lease = inner.link.lease();
+        match lease.mode {
+            Some(codec::FrontendAccessMode::Handoff) if !lease.owns_viewport() => Some(if lease.owner.is_some() {
+                crate::views::Card { title: tr("web-card-busy-title"), hint: tr("web-card-busy-hint") }
+            } else {
+                crate::views::Card { title: tr("web-card-free-title"), hint: tr("web-card-free-hint") }
+            }),
+            _ => None,
         }
     }
 
-    /// The card the desktop shows over a terminal another device holds,
-    /// with its words; hidden when this page may type.
-    fn show_card(inner: &Inner) {
-        let Some(card) = web_sys::window()
-            .and_then(|w| w.document())
-            .and_then(|d| d.get_element_by_id("card"))
-        else {
+    /// Tell the display layer that a view changed: once per task, so a
+    /// burst of changes is one notice. A task rather than an animation
+    /// frame, since the page's frames are the terminal's, and a notice
+    /// that waited for one would be counted -- and paced -- as a paint.
+    fn notify(inner: &Inner) {
+        let Some(cb) = inner.on_change.clone() else {
             return;
         };
-        let lease = inner.link.lease();
-        let words = match lease.mode {
-            Some(codec::FrontendAccessMode::Handoff) if !lease.owns_viewport() => Some(if lease.owner.is_some() {
-                ("Terminal is being used on another device", "Click or scroll to continue")
-            } else {
-                ("Terminal is available", "Click or scroll to take control")
-            }),
-            _ => None,
-        };
-        match words {
-            Some((title, hint)) => {
-                if let Some(t) = card.query_selector(".title").ok().flatten() {
-                    t.set_text_content(Some(title));
-                }
-                if let Some(h) = card.query_selector(".hint").ok().flatten() {
-                    h.set_text_content(Some(hint));
-                }
-                let _ = card.remove_attribute("hidden");
-            }
-            None => {
-                let _ = card.set_attribute("hidden", "");
-            }
+        if inner.notify_pending.replace(true) {
+            return;
         }
+        let pending = Rc::clone(&inner.notify_pending);
+        let tick = Closure::once_into_js(move || {
+            pending.set(false);
+            if let Err(err) = cb.call0(&JsValue::NULL) {
+                log::warn!("the page's change handler failed: {err:?}");
+            }
+        });
+        let queued = web_sys::window()
+            .map(|w| w.set_timeout_with_callback_and_timeout_and_arguments_0(tick.as_ref().unchecked_ref(), 0).is_ok())
+            .unwrap_or(false);
+        if !queued {
+            inner.notify_pending.set(false);
+        }
+    }
+
+    /// The language changed: every view carries text, so all are stale.
+    pub fn locale_changed(&self) {
+        let inner = self.inner.borrow();
+        Self::render_strip(&inner);
+    }
+
+    pub fn set_on_change(&self, cb: js_sys::Function) {
+        let mut inner = self.inner.borrow_mut();
+        inner.on_change = Some(cb);
+        drop(inner);
+        Self::notify(&self.inner.borrow());
+    }
+
+    pub fn sidebar_view(&self) -> crate::views::SidebarView {
+        let inner = self.inner.borrow();
+        crate::views::SidebarView {
+            rows: Self::side_rows(&inner),
+            editing: inner.editing.clone(),
+            space: inner.tree.current_space().map(|s| s.id.clone()),
+        }
+    }
+
+    pub fn tabs_view(&self) -> crate::views::TabsView {
+        let inner = self.inner.borrow();
+        let (tabs, controls) = Self::strip_model(&inner).unwrap_or_default();
+        crate::views::TabsView { tabs, controls }
+    }
+
+    pub fn navs_view(&self) -> crate::views::NavsView {
+        Self::nav_views(&self.inner.borrow())
+    }
+
+    pub fn status_view(&self) -> crate::views::StatusView {
+        let inner = self.inner.borrow();
+        let toast = inner.toast.borrow().clone();
+        let summary = inner.summary.borrow().clone();
+        crate::views::StatusView { toast, card: Self::card(&inner), summary }
+    }
+
+    pub fn layout_view(&self) -> String {
+        Self::layout_json(&self.inner.borrow())
     }
 
     /// The server pushed something for us.
@@ -581,7 +626,7 @@ impl App {
                 let cell = &inner.panes[&removed.pane_id];
                 cell.session.set_dead(true);
                 if removed.pane_id == inner.focused_pane {
-                    Self::set_status(&inner, "the pane was closed on the server");
+                    Self::set_status(&inner, &tr("web-toast-pane-closed"));
                 }
                 // Something else to show, if the server has anything.
                 drop(inner);
@@ -628,13 +673,13 @@ impl App {
                 self.inner.borrow_mut().tree.apply_tree(state.tree);
                 // The session view is not pushed with it: ask.
                 self.refresh_session_soon();
-                Self::render_side(&self.inner.borrow());
+                Self::notify(&self.inner.borrow());
             }
             Pdu::ThinkTermSessionState(state) => {
                 drop(inner);
                 let changed = self.inner.borrow_mut().tree.apply_session(state);
                 if changed {
-                    Self::render_side(&self.inner.borrow());
+                    Self::notify(&self.inner.borrow());
                 }
             }
             Pdu::AgentStatusChanged(codec::AgentStatusChanged { pane_id, status }) => {
@@ -872,10 +917,7 @@ impl App {
         }
         // The one-line summary is for probes and tests; the page shows
         // the card and the strip's hint instead.
-        if let Some(el) = &inner.status {
-            let _ = el.set_attribute("data-summary", &text);
-        }
-        Self::show_card(&inner);
+        *inner.summary.borrow_mut() = text;
         Self::render_strip(&inner);
     }
 
@@ -1190,7 +1232,7 @@ impl App {
             .await;
             app.focus_pane(pane, false);
             app.act(
-                "resize the pane",
+                "web-act-resize-pane",
                 Pdu::AdjustPaneSize(codec::AdjustPaneSize { pane_id: pane, direction, amount }),
                 |_, _| {},
             );
@@ -1628,17 +1670,16 @@ impl App {
         self.request_frame();
     }
 
-    pub fn strip_element(&self) -> Option<web_sys::EventTarget> {
-        let inner = self.inner.borrow();
-        let strip = inner.strip.as_ref()?;
-        let target: &web_sys::EventTarget = strip.element().as_ref();
-        Some(target.clone())
-    }
-
     /// What the page has laid out, as JSON on the canvas element for the
     /// smoke tests and anyone else curious: `canvas.dataset.layout`.
     /// Rewritten whenever the strip is, which is whenever it changes.
     fn publish_layout(inner: &Inner) {
+        let json = Self::layout_json(inner);
+        let _ = inner.canvas.set_attribute("data-layout", &json);
+    }
+
+    /// The layout as a probe reads it.
+    fn layout_json(inner: &Inner) -> String {
         let lease = inner.link.lease();
         let dpr = inner.dpr.max(0.1);
         let (cw, ch) = (
@@ -1700,7 +1741,7 @@ impl App {
             None => json.push_str(",\"cols\":null,\"rows\":null,\"zoomed\":null,\"panes\":[],\"dividers\":[]"),
         }
         json.push('}');
-        let _ = inner.canvas.set_attribute("data-layout", &json);
+        json
     }
 
     /// Draw the tab strip from what the page knows.
@@ -1739,11 +1780,8 @@ impl App {
         crate::navbar::nav_rows(Self::nav_css(inner) * inner.dpr, inner.glyphs.metrics.cell_size.height as f64)
     }
 
-    /// One bar per drawn pane, positioned from the layout's cells.
-    fn render_navs(inner: &Inner) {
-        let Some(navs) = &inner.navs else {
-            return;
-        };
+    /// One bar per drawn pane, as the page shows them.
+    fn nav_views(inner: &Inner) -> Vec<crate::navbar::NavView> {
         let mut views = Vec::new();
         if let Some(layout) = &inner.tab_layout {
             let dpr = inner.dpr.max(0.1);
@@ -1791,92 +1829,17 @@ impl App {
                 });
             }
         }
-        let html = crate::navbar::NavBars::html(&views);
-        let mut last = inner.nav_html.borrow_mut();
-        if *last != html {
-            navs.set(&html);
-            *last = html;
-        }
+        views
     }
 
-    pub fn navs_element(&self) -> Option<web_sys::EventTarget> {
-        let inner = self.inner.borrow();
-        inner.navs.as_ref().map(|n| n.element().clone().into())
-    }
-
-    /// The sidebar from the model, when its markup changed.
-    fn render_side(inner: &Inner) {
-        let Some(side) = &inner.side else {
-            return;
-        };
+    /// The sidebar's rows from the model, with the pending delete shown.
+    fn side_rows(inner: &Inner) -> Vec<crate::tree::Row> {
         let deleting = inner
             .deleting
             .as_ref()
             .filter(|(_, since)| monotonic_ms() - since < CLOSE_CONFIRM_MS)
             .map(|(id, _)| id.as_str());
-        let rows = inner.tree.rows_with(inner.tab_id, &inner.workspace, inner.window_id, deleting);
-        let html = crate::sidebar::html(&rows, &inner.editing);
-        let mut last = inner.side_html.borrow_mut();
-        if *last != html {
-            side.set(&html);
-            *last = html;
-            if inner.editing != crate::sidebar::Editing::None {
-                if let Some(input) = side.element().query_selector("input").ok().flatten() {
-                    if let Ok(input) = input.dyn_into::<web_sys::HtmlInputElement>() {
-                        let _ = input.focus();
-                        input.select();
-                    }
-                }
-            }
-        }
-        let _ = side.element().set_attribute("data-rows", &Self::rows_json(&rows));
-    }
-
-    /// The rows as a probe reads them.
-    fn rows_json(rows: &[crate::tree::Row]) -> String {
-        use crate::tree::Row;
-        let mut json = String::from("[");
-        for (i, row) in rows.iter().enumerate() {
-            if i > 0 {
-                json.push(',');
-            }
-            let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-            match row {
-                Row::Space { name } => json.push_str(&format!("{{\"kind\":\"space\",\"name\":\"{}\"}}", esc(name))),
-                Row::NewThread => json.push_str("{\"kind\":\"new-thread\"}"),
-                Row::Pinned => json.push_str("{\"kind\":\"pinned\"}"),
-                Row::Workspaces => json.push_str("{\"kind\":\"workspaces\"}"),
-                Row::Project { id, name, collapsed, archived, .. } => json.push_str(&format!(
-                    "{{\"kind\":\"project\",\"id\":\"{}\",\"name\":\"{}\",\"collapsed\":{collapsed},\"archived\":{archived}}}",
-                    esc(id),
-                    esc(name)
-                )),
-                Row::Thread(t) => json.push_str(&format!(
-                    "{{\"kind\":\"thread\",\"id\":\"{}\",\"project\":\"{}\",\"name\":\"{}\",\"status\":\"{:?}\",\"dot\":\"{:?}\",\"pinned\":{},\"live\":{},\"selected\":{}}}",
-                    esc(&t.id),
-                    esc(&t.project_id),
-                    esc(&t.name),
-                    t.status,
-                    t.dot,
-                    t.pinned,
-                    t.live,
-                    t.selected
-                )),
-                Row::Archived { count, open } => json.push_str(&format!("{{\"kind\":\"archived\",\"count\":{count},\"open\":{open}}}")),
-                Row::Others => json.push_str("{\"kind\":\"others\"}"),
-                Row::Window { window_id, title, selected } => json.push_str(&format!(
-                    "{{\"kind\":\"window\",\"id\":{window_id},\"title\":\"{}\",\"selected\":{selected}}}",
-                    esc(title)
-                )),
-            }
-        }
-        json.push(']');
-        json
-    }
-
-    pub fn side_element(&self) -> Option<web_sys::EventTarget> {
-        let inner = self.inner.borrow();
-        inner.side.as_ref().map(|s| s.element().clone().into())
+        inner.tree.rows_with(inner.tab_id, &inner.workspace, inner.window_id, deleting)
     }
 
     /// Ask the server for its tree, its session view and the agents in
@@ -1905,6 +1868,7 @@ impl App {
                     inner.tree.agents.clear();
                     for e in entries {
                         inner.tree.apply_agent(e.pane_id, Some(&e.status));
+                        inner.tree.record_agent_details(e.pane_id, &e.status.agent_id, &e.title);
                     }
                 }
                 Err(err) => log::warn!("fetching agent statuses: {err:#}"),
@@ -1924,7 +1888,7 @@ impl App {
         match state {
             Ok(state) => {
                 self.inner.borrow_mut().tree.apply_session(state);
-                Self::render_side(&self.inner.borrow());
+                Self::notify(&self.inner.borrow());
             }
             Err(err) => log::warn!("fetching the session view: {err:#}"),
         }
@@ -1994,12 +1958,12 @@ impl App {
                 if !inner.tree.collapsed.remove(&id) {
                     inner.tree.collapsed.insert(id);
                 }
-                Self::render_side(inner);
+                Self::notify(inner);
             }
             SideClick::ToggleArchived => {
                 let inner = &mut *self.inner.borrow_mut();
                 inner.tree.archived_open = !inner.tree.archived_open;
-                Self::render_side(inner);
+                Self::notify(inner);
             }
             other => self.on_side_write(other),
         }
@@ -2057,7 +2021,7 @@ impl App {
 
     fn kill_panes(self: &Rc<Self>, panes: Vec<PaneId>) {
         for pane_id in panes {
-            self.act("close the pane", Pdu::KillPane(codec::KillPane { pane_id }), |_, _| {});
+            self.act("web-act-close-pane", Pdu::KillPane(codec::KillPane { pane_id }), |_, _| {});
         }
     }
 
@@ -2071,10 +2035,7 @@ impl App {
             SideClick::NewThread(project) => {
                 let (project, size) = {
                     let inner = self.inner.borrow();
-                    let selected = inner.tree.selected_thread(inner.tab_id, &inner.workspace).map(String::from);
-                    let project = project
-                        .or_else(|| selected.and_then(|t| inner.tree.project_of(&t).map(|p| p.id.clone())))
-                        .or_else(|| inner.tree.session.as_ref().and_then(|s| s.projects.first().map(|p| p.id.clone())));
+                    let project = project.or_else(|| inner.tree.default_project(inner.tab_id, &inner.workspace));
                     let size = inner.link.lease().canonical_size.unwrap_or_default();
                     (project, size)
                 };
@@ -2104,7 +2065,7 @@ impl App {
                                     app.fetch_tree();
                                     app.activate_thread(r.thread_id);
                                 }
-                                Err(err) => Self::set_status(&app.inner.borrow(), &format!("could not start a thread: {err:#}")),
+                                Err(err) => Self::set_status(&app.inner.borrow(), &failed("web-act-start-thread", &err)),
                             }
                         });
                     }
@@ -2113,17 +2074,17 @@ impl App {
             SideClick::NewProject => {
                 let inner = &mut *self.inner.borrow_mut();
                 inner.editing = Editing::NewProject;
-                Self::render_side(inner);
+                Self::notify(inner);
             }
             SideClick::RenameThread(id) => {
                 let inner = &mut *self.inner.borrow_mut();
                 inner.editing = Editing::Thread(id);
-                Self::render_side(inner);
+                Self::notify(inner);
             }
             SideClick::RenameProject(id) => {
                 let inner = &mut *self.inner.borrow_mut();
                 inner.editing = Editing::Project(id);
-                Self::render_side(inner);
+                Self::notify(inner);
             }
             SideClick::Pin(id, on) => {
                 self.mutate(crate::tree::set_pinned(&id, on, Self::now_secs()), |_| {});
@@ -2139,7 +2100,7 @@ impl App {
                         }
                         _ => {
                             inner.deleting = Some((id.clone(), now));
-                            Self::render_side(&inner);
+                            Self::notify(&inner);
                             false
                         }
                     }
@@ -2167,9 +2128,8 @@ impl App {
             SideClick::Unarchive(id) => {
                 self.mutate(crate::tree::archive_project(&id, false, Self::now_secs()), |_| {});
             }
-            SideClick::SpaceMenu => {
-                Self::set_status(&self.inner.borrow(), "Spaces are managed on the desktop");
-            }
+            // The page opens the Space menu itself (`context_menu("space")`).
+            SideClick::SpaceMenu => {}
             _ => {}
         }
     }
@@ -2182,14 +2142,14 @@ impl App {
             "Escape" => {
                 let inner = &mut *self.inner.borrow_mut();
                 inner.editing = Editing::None;
-                Self::render_side(inner);
+                Self::notify(inner);
                 let _ = inner.textarea.focus();
             }
             "Enter" => {
                 {
                     let inner = &mut *self.inner.borrow_mut();
                     inner.editing = Editing::None;
-                    Self::render_side(inner);
+                    Self::notify(inner);
                     let _ = inner.textarea.focus();
                 }
                 let value = value.trim().to_string();
@@ -2199,15 +2159,14 @@ impl App {
                 match editing {
                     Editing::Thread(id) => self.mutate(crate::tree::rename_thread(&id, &value, Self::now_secs()), |_| {}),
                     Editing::Project(id) => self.mutate(crate::tree::rename_project(&id, &value), |_| {}),
+                    Editing::Space(id) => self.mutate(crate::tree::rename_space(&id, &value), |_| {}),
                     Editing::NewProject => {
                         if !(value.starts_with('/') || value.starts_with('~')) {
                             Self::set_status(&self.inner.borrow(), "a project is a directory: ~/dir or /dir");
                             return;
                         }
-                        let space = {
-                            let inner = self.inner.borrow();
-                            inner.tree.tree.as_ref().and_then(|t| t.spaces.first().map(|s| s.id.clone()))
-                        };
+                        // The new project lands in the Space on show.
+                        let space = self.inner.borrow().tree.current_space().map(|s| s.id.clone());
                         let project = Self::new_id("project");
                         let thread = Self::new_id("thread");
                         let intent = crate::tree::create_project(space.as_deref(), project, thread.clone(), &value, Self::now_secs());
@@ -2265,7 +2224,7 @@ impl App {
                     Ok(r) => workspace = Some(r.workspace),
                     Err(err) => {
                         log::warn!("opening thread {id}: {err:#}");
-                        Self::set_status(&app.inner.borrow(), &format!("could not open the thread: {err:#}"));
+                        Self::set_status(&app.inner.borrow(), &failed("web-act-open-thread", &err));
                         return;
                     }
                 }
@@ -2305,24 +2264,16 @@ impl App {
         });
     }
 
-    /// The sidebar's width, kept per browser, within the desktop's bounds.
-    pub fn set_sidebar_width(&self, css: f64) {
-        let css = css.clamp(crate::sidebar::MIN_WIDTH, crate::sidebar::MAX_WIDTH);
-        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-            if let Some(root) = doc.document_element().and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok()) {
-                let _ = root.style().set_property("--side-w", &format!("{css:.0}px"));
-            }
-        }
-        crate::sidebar::store_width(css);
-    }
-
+    /// Something the chrome shows changed: the probe's attribute is
+    /// rewritten and the page is told.
     fn render_strip(inner: &Inner) {
         Self::publish_layout(inner);
-        Self::render_navs(inner);
-        Self::render_side(inner);
-        let (Some(strip), Some(layout)) = (&inner.strip, &inner.layout) else {
-            return;
-        };
+        Self::notify(inner);
+    }
+
+    /// The strip's tabs and state, once there is a listing.
+    fn strip_model(inner: &Inner) -> Option<(Vec<crate::chrome::TabView>, crate::chrome::Controls)> {
+        let layout = inner.layout.as_ref()?;
         let tabs = crate::chrome::model(layout, inner.focused_pane, inner.title(), Some(inner.window_id));
         let (cols, rows) = inner
             .tab_layout
@@ -2338,7 +2289,7 @@ impl App {
                 .map(|(tab, _)| tab),
             clipped: (cols > inner.cols || rows > inner.rows).then_some((inner.cols, inner.rows)),
         };
-        strip.render(&tabs, controls);
+        Some((tabs, controls))
     }
 
     /// List the server's panes again, redraw the strip, and bring the tab
@@ -2401,7 +2352,7 @@ impl App {
             let mut inner = self.inner.borrow_mut();
             inner.layout = Some(list);
             Self::render_strip(&inner);
-            Self::set_status(&inner, "the server has no panes to show");
+            Self::set_status(&inner, &tr("web-toast-no-panes"));
             return;
         };
         let (link, tab_changed) = {
@@ -2436,7 +2387,7 @@ impl App {
             inner.switching = false;
             if let Err(err) = outcome {
                 log::warn!("switching to tab {}: {err:#}", layout.tab_id);
-                Self::set_status(&inner, &format!("could not switch tabs: {err:#}"));
+                Self::set_status(&inner, &failed("web-act-switch-tabs", &err));
                 return;
             }
         }
@@ -2499,7 +2450,7 @@ impl App {
         if !dragging {
             if let Err(err) = link.report_viewport(tab_id).await {
                 log::warn!("reporting the tab shape: {err:#}");
-                Self::set_status(&self.inner.borrow(), &format!("could not report the tab's shape: {err:#}"));
+                Self::set_status(&self.inner.borrow(), &failed("web-act-report-shape", &err));
             }
         }
         // A listing that changed nothing (the timer's, mostly) is not a
@@ -2633,25 +2584,13 @@ impl App {
                     // A stack member behind the drawn one: the server
                     // brings it to the front, then it is focused.
                     self.act(
-                        "activate the pane",
+                        "web-act-activate-pane",
                         Pdu::ActivatePaneInStack(codec::ActivatePaneInStack { pane_id }),
                         move |app, _| app.switch_to_pane(pane_id, true),
                     );
                 } else {
                     self.switch_to_pane(pane_id, true);
                 }
-            }
-            Click::Sidebar => {
-                if let Some(body) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.body()) {
-                    let off = body.get_attribute("data-side").as_deref() == Some("off");
-                    if off {
-                        let _ = body.remove_attribute("data-side");
-                    } else {
-                        let _ = body.set_attribute("data-side", "off");
-                    }
-                }
-                // The canvas's box moved; its observer resizes it.
-                let _ = self.inner.borrow().textarea.focus();
             }
             Click::CloseTab(tab_id) => {
                 let panes: Vec<PaneId> = {
@@ -2683,7 +2622,7 @@ impl App {
                 };
                 for pane_id in panes {
                     self.act(
-                        "close the tab",
+                        "web-act-close-tab",
                         Pdu::KillPane(codec::KillPane { pane_id }),
                         |_, _| {},
                     );
@@ -2765,7 +2704,7 @@ impl App {
                 Err(err) => {
                     log::warn!("{what}: {err:#}");
                     let inner = app.inner.borrow();
-                    Self::set_status(&inner, &format!("could not {what}: {err:#}"));
+                    Self::set_status(&inner, &failed(what, &err));
                 }
             }
             let _ = app.inner.borrow().textarea.focus();
@@ -2785,7 +2724,7 @@ impl App {
             (inner.window_id, inner.workspace.clone(), size)
         };
         self.act(
-            "open a new tab",
+            "web-act-new-tab",
             Pdu::SpawnV2(codec::SpawnV2 {
                 domain: thinkterm_proto::SpawnTabDomain::CurrentPaneDomain,
                 window_id: Some(window_id),
@@ -2805,14 +2744,19 @@ impl App {
 
     /// Split the focused pane; the new pane takes the focus.
     pub fn split(self: &Rc<Self>, pane: Option<PaneId>, direction: thinkterm_proto::SplitDirection) {
+        self.split_at(pane, direction, true);
+    }
+
+    /// Split with the new pane after (`second`) or before the target.
+    pub fn split_at(self: &Rc<Self>, pane: Option<PaneId>, direction: thinkterm_proto::SplitDirection, second: bool) {
         let pane_id = self.target_pane(pane);
         self.act(
-            "split the pane",
+            "web-act-split-pane",
             Pdu::SplitPane(codec::SplitPane {
                 pane_id,
                 split_request: thinkterm_proto::SplitRequest {
                     direction,
-                    target_is_second: true,
+                    target_is_second: second,
                     top_level: false,
                     size: thinkterm_proto::SplitSize::Percent(50),
                 },
@@ -2827,6 +2771,415 @@ impl App {
                 }
             },
         );
+    }
+
+    /// A context menu for something on the page: `kind` names what was
+    /// clicked, `id` which one. Empty when there is nothing to offer.
+    pub fn context_menu(&self, kind: &str, id: &str) -> Vec<crate::menu::MenuItem> {
+        use crate::menu;
+        let inner = self.inner.borrow();
+        let menu = match kind {
+            "pane" => id.parse().ok().map(|pane| menu::for_pane(pane, inner.link.lease().mode)),
+            "tab" => id.parse().ok().and_then(|tab: TabId| {
+                let (tabs, _) = Self::strip_model(&inner)?;
+                let index = tabs.iter().position(|t| t.tab_id == tab)?;
+                Some(menu::for_tab(tab, index, tabs.len(), tabs[index].target))
+            }),
+            "thread" => Self::side_rows(&inner).into_iter().find_map(|row| match row {
+                crate::tree::Row::Thread(t) if t.id == id => Some(menu::for_thread(&t)),
+                _ => None,
+            }),
+            "project" => Some(menu::for_project(id, inner.tree.live_panes_of_project(id).len())),
+            "archived-project" => Some(menu::for_archived_project(id, inner.tree.thread_count_of_project(id))),
+            "sidebar-options" => Some(menu::for_sidebar_options(inner.tree.archived_open, inner.tree.archived_count())),
+            "space" => Some(menu::for_space(&inner.tree.spaces())),
+            "notifications" => Some(menu::for_notifications()),
+            _ => None,
+        };
+        menu.unwrap_or_default()
+    }
+
+    /// The Agents panel: every pane an agent runs in, and the summary line.
+    pub fn agents_view(&self) -> crate::agents::AgentsView {
+        let inner = self.inner.borrow();
+        let rows = crate::agents::rows(&inner.tree, inner.window_id, |pane| {
+            inner.panes.get(&pane).map(|c| crate::navbar::display_title(&c.title).0)
+        });
+        let summary = crate::agents::summary(&rows);
+        crate::agents::AgentsView { rows, summary }
+    }
+
+    /// Bring an agent's pane on show: switch to it here, or open the
+    /// thread that holds it when it is in another window.
+    pub fn agent_reveal(self: &Rc<Self>, pane: PaneId) -> bool {
+        let (here, thread) = {
+            let inner = self.inner.borrow();
+            let here = inner.tab_layout.as_ref().is_some_and(|l| l.panes.iter().any(|p| p.stack.iter().any(|m| m.pane_id == pane)))
+                || inner.layout.as_ref().is_some_and(|l| {
+                    l.tabs
+                        .iter()
+                        .filter(|t| t.window_and_tab_ids().is_some_and(|(w, _)| w == inner.window_id))
+                        .any(|t| crate::layout::leaves(t).iter().any(|e| e.pane_id == pane))
+                });
+            let thread = inner.tree.session.as_ref().and_then(|s| {
+                s.projects.iter().flat_map(|p| p.threads.iter()).find(|t| t.tabs.iter().any(|tab| tab.pane_ids.contains(&pane))).map(|t| t.id.clone())
+            });
+            (here, thread)
+        };
+        if here {
+            self.switch_to_pane(pane, true);
+            return true;
+        }
+        match thread {
+            Some(id) => {
+                let space = self.inner.borrow().tree.project_of(&id).map(|p| p.space_id.clone());
+                if let Some(space) = space {
+                    self.set_space(&space);
+                }
+                self.activate_thread(id);
+                true
+            }
+            None => {
+                // A window no thread claims: its listing knows the pane.
+                self.switch_to_pane(pane, true);
+                true
+            }
+        }
+    }
+
+    /// The page's preferences, as the model holds them.
+    pub fn settings_view(&self) -> crate::settings::WebSettings {
+        self.inner.borrow().settings.clone()
+    }
+
+    /// The page's stored preferences, at boot: applied whole.
+    pub fn apply_settings(self: &Rc<Self>, json: &str) -> Result<(), String> {
+        let settings = crate::settings::WebSettings::parse(json)?;
+        self.inner.borrow_mut().settings = settings.clone();
+        self.apply_language(&settings.language);
+        self.set_font_mode(settings.font);
+        Ok(())
+    }
+
+    /// One preference changed on the page.
+    pub fn set_setting(self: &Rc<Self>, key: &str, value: &str) -> Result<(), String> {
+        let (language, font) = {
+            let mut inner = self.inner.borrow_mut();
+            inner.settings.set(key, value)?;
+            (inner.settings.language.clone(), inner.settings.font)
+        };
+        match key {
+            "language" => self.apply_language(&language),
+            "font" => self.set_font_mode(font),
+            _ => Self::notify(&self.inner.borrow()),
+        }
+        Ok(())
+    }
+
+    fn apply_language(&self, preference: &str) {
+        let languages = self.inner.borrow().languages.clone();
+        thinkterm_i18n::activate_preference(preference, &languages);
+        self.locale_changed();
+    }
+
+    /// The base font: a size of the page's own, or the desktop's cell
+    /// again. Pinning rasterises at that size and refits the grid.
+    pub fn set_font_mode(self: &Rc<Self>, mode: crate::settings::FontMode) {
+        use crate::settings::FontMode;
+        match mode {
+            FontMode::Pinned { pt } => {
+                let pt = pt.clamp(6.0, 72.0);
+                let mut inner = self.inner.borrow_mut();
+                inner.font_pinned = true;
+                if (inner.glyphs.size_pt - pt).abs() >= 0.125 {
+                    let dpi = (96.0 * inner.dpr) as u32;
+                    Self::rerasterise(&mut inner, pt, dpi);
+                    inner.cols = 0;
+                }
+                drop(inner);
+                self.resize();
+                self.request_frame();
+            }
+            FontMode::Follow => {
+                self.inner.borrow_mut().font_pinned = false;
+                self.match_desktop_cell();
+                self.request_frame();
+            }
+        }
+    }
+
+    /// What the palette can find, from the model, ranked for `query`.
+    pub fn palette(&self, query: &str) -> crate::palette::Results {
+        use crate::palette::{path_terms, Entry, Group};
+        let inner = self.inner.borrow();
+        let mut entries = Vec::new();
+        if let Some(session) = &inner.tree.session {
+            let space_name = |id: &str| session.spaces.iter().find(|s| s.id == id).map(|s| s.name.clone()).unwrap_or_default();
+            for project in &session.projects {
+                for thread in &project.threads {
+                    let icon = match inner.tree.status_of(thread) {
+                        crate::tree::Status::Running => "loader-circle",
+                        crate::tree::Status::NeedsAttention => "circle-alert",
+                        crate::tree::Status::Done => "circle-check",
+                        crate::tree::Status::Idle => "square-terminal",
+                    };
+                    entries.push(Entry {
+                        id: format!("thread:{}", thread.id),
+                        title: thread.name.clone(),
+                        subtitle: project.name.clone(),
+                        icon,
+                        accessory: space_name(&project.space_id),
+                        group: Group::Threads,
+                        terms: path_terms(&project.path),
+                    });
+                }
+            }
+        }
+        if let Some((tabs, _)) = Self::strip_model(&inner) {
+            for tab in tabs {
+                entries.push(Entry {
+                    id: format!("tab:{}", tab.tab_id),
+                    title: tab.label,
+                    subtitle: String::new(),
+                    icon: "square-terminal",
+                    accessory: String::new(),
+                    group: Group::Tabs,
+                    terms: tab.title,
+                });
+            }
+        }
+        if let Some(layout) = &inner.tab_layout {
+            for place in &layout.panes {
+                for member in &place.stack {
+                    let raw = inner.panes.get(&member.pane_id).map(|c| c.title.as_str()).unwrap_or(&member.title);
+                    let (title, _) = crate::navbar::display_title(raw);
+                    entries.push(Entry {
+                        id: format!("pane:{}", member.pane_id),
+                        title,
+                        subtitle: String::new(),
+                        icon: "square-terminal",
+                        accessory: String::new(),
+                        group: Group::Panes,
+                        terms: raw.to_string(),
+                    });
+                }
+            }
+        }
+        let spaces = inner.tree.spaces();
+        if spaces.len() > 1 {
+            for space in spaces {
+                entries.push(Entry {
+                    id: format!("space:{}", space.id),
+                    title: space.name,
+                    subtitle: String::new(),
+                    icon: if space.default { "house" } else { "layers" },
+                    accessory: String::new(),
+                    group: Group::Spaces,
+                    terms: String::new(),
+                });
+            }
+        }
+        entries.extend(crate::palette::commands());
+        crate::palette::results(query, entries, &inner.recent)
+    }
+
+    /// The page's remembered picks, given back at boot.
+    pub fn set_recent(&self, ids: Vec<String>) {
+        self.inner.borrow_mut().recent = ids;
+    }
+
+    /// Do what a palette pick asks. `page` names what only the page can
+    /// do (its sidebar, its settings panel, remembering the language).
+    pub fn palette_run(self: &Rc<Self>, id: &str) -> crate::views::PaletteOutcome {
+        use crate::sidebar::SideClick;
+        let mut outcome = crate::views::PaletteOutcome { handled: true, page: None, recent: Vec::new() };
+        let (kind, arg) = id.split_once(':').unwrap_or((id, ""));
+        match (kind, arg) {
+            ("thread", id) => {
+                // A thread in another Space: the sidebar follows it there.
+                let space = self.inner.borrow().tree.project_of(id).map(|p| p.space_id.clone());
+                if let Some(space) = space {
+                    self.set_space(&space);
+                }
+                self.activate_thread(id.to_string());
+            }
+            ("tab", id) => {
+                let target = id.parse().ok().and_then(|tab: TabId| {
+                    let inner = self.inner.borrow();
+                    Self::strip_model(&inner)?.0.into_iter().find(|t| t.tab_id == tab).map(|t| t.target)
+                });
+                match target {
+                    Some(pane) => self.switch_to_pane(pane, true),
+                    None => outcome.handled = false,
+                }
+            }
+            ("pane", id) => match id.parse() {
+                Ok(pane) => self.switch_to_pane(pane, true),
+                Err(_) => outcome.handled = false,
+            },
+            ("space", id) => outcome.handled = self.set_space(id),
+            ("cmd", "new-thread") => self.on_side_click(SideClick::NewThread(None)),
+            ("cmd", "new-tab") => self.new_tab(),
+            ("cmd", "split-right") => self.split(None, thinkterm_proto::SplitDirection::Horizontal),
+            ("cmd", "split-down") => self.split(None, thinkterm_proto::SplitDirection::Vertical),
+            ("cmd", "zoom") => self.toggle_zoom(None),
+            ("cmd", "close-pane") => self.close_pane(),
+            ("cmd", "take-over") => self.take_over(),
+            ("cmd", "follow") => self.on_chrome_click(crate::chrome::Click::Follow),
+            ("cmd", "toggle-sidebar") | ("cmd", "settings") => outcome.page = Some(arg.to_string()),
+            ("cmd", "font-up") => self.step_font(1.0),
+            ("cmd", "font-down") => self.step_font(-1.0),
+            ("cmd", "font-reset") => self.step_font(0.0),
+            _ => outcome.handled = false,
+        }
+        if outcome.handled {
+            let inner = &mut *self.inner.borrow_mut();
+            crate::palette::remember(&mut inner.recent, id);
+            outcome.recent = inner.recent.clone();
+        }
+        outcome
+    }
+
+    /// Show a Space in the sidebar; false when the server has no such Space.
+    pub fn set_space(&self, id: &str) -> bool {
+        let inner = &mut *self.inner.borrow_mut();
+        let known = inner.tree.set_space(id);
+        if known {
+            inner.editing = crate::sidebar::Editing::None;
+            Self::notify(inner);
+        }
+        known
+    }
+
+    /// Every pane of a tab, from the last listing.
+    fn tab_panes(inner: &Inner, tab: TabId) -> Vec<PaneId> {
+        inner
+            .layout
+            .as_ref()
+            .and_then(|l| l.tabs.iter().find(|t| t.window_and_tab_ids().is_some_and(|(_, id)| id == tab)))
+            .map(|node| crate::layout::leaves(node).iter().map(|e| e.pane_id).collect())
+            .unwrap_or_default()
+    }
+
+    /// Do what a menu row asks. Copy hands the selection back for the
+    /// page to put on the clipboard; Paste asks the page to read it.
+    pub fn menu_action(self: &Rc<Self>, id: &str) -> crate::views::MenuOutcome {
+        use crate::menu::{MenuAction, Side};
+        use crate::sidebar::SideClick;
+        let mut outcome = crate::views::MenuOutcome { handled: true, copy: None, paste: false };
+        let Some(action) = MenuAction::parse(id) else {
+            outcome.handled = false;
+            return outcome;
+        };
+        match action {
+            MenuAction::Copy => outcome.copy = Self::selection_text(&self.inner.borrow()),
+            MenuAction::Paste => outcome.paste = true,
+            MenuAction::Split { pane, side } => {
+                use thinkterm_proto::SplitDirection::{Horizontal, Vertical};
+                let (direction, second) = match side {
+                    Side::Right => (Horizontal, true),
+                    Side::Left => (Horizontal, false),
+                    Side::Down => (Vertical, true),
+                    Side::Up => (Vertical, false),
+                };
+                self.split_at(Some(pane), direction, second);
+            }
+            MenuAction::FrontendAccess(mode) => {
+                let (tab_id, viewport) = {
+                    let inner = self.inner.borrow();
+                    let viewport = inner.link.lease().claim_viewport();
+                    (inner.tab_id, viewport)
+                };
+                match viewport {
+                    Some(viewport) => self.act(
+                        "web-act-set-access",
+                        Pdu::SetFrontendAccessMode(codec::SetFrontendAccessMode { mode, tab_id, viewport }),
+                        |_, _| {},
+                    ),
+                    None => outcome.handled = false,
+                }
+            }
+            MenuAction::CloseTabsLeft(tab) | MenuAction::CloseTabsRight(tab) | MenuAction::CloseOtherTabs(tab) => {
+                let panes: Vec<PaneId> = {
+                    let inner = self.inner.borrow();
+                    let tabs = Self::strip_model(&inner).map(|(t, _)| t).unwrap_or_default();
+                    let at = tabs.iter().position(|t| t.tab_id == tab).unwrap_or(0);
+                    tabs.iter()
+                        .enumerate()
+                        .filter(|(i, t)| match action {
+                            MenuAction::CloseTabsLeft(_) => *i < at,
+                            MenuAction::CloseTabsRight(_) => *i > at,
+                            _ => t.tab_id != tab,
+                        })
+                        .flat_map(|(_, t)| Self::tab_panes(&inner, t.tab_id))
+                        .collect()
+                };
+                self.kill_panes(panes);
+            }
+            MenuAction::NewTabRight => self.new_tab(),
+            MenuAction::Zoom(pane) => self.toggle_zoom(Some(pane)),
+            MenuAction::Pin(id, on) => self.on_side_click(SideClick::Pin(id, on)),
+            MenuAction::RenameThread(id) => self.on_side_click(SideClick::RenameThread(id)),
+            MenuAction::DeleteThread(id) => {
+                // The desktop's menu deletes at once; the two presses are
+                // the sidebar button's.
+                let panes = Self::thread_panes(&self.inner.borrow(), &id);
+                self.kill_panes(panes);
+                self.mutate(crate::tree::delete_thread(&id), |_| {});
+            }
+            MenuAction::MarkUnread(id) => self.mutate(crate::tree::set_unread(&id, true), |_| {}),
+            MenuAction::RenameProject(id) => self.on_side_click(SideClick::RenameProject(id)),
+            MenuAction::NewThread(id) => self.on_side_click(SideClick::NewThread(Some(id))),
+            MenuAction::ToggleCollapsed(id) => self.on_side_click(SideClick::ToggleProject(id)),
+            MenuAction::ArchiveProject(id) => self.on_side_click(SideClick::Archive(id)),
+            MenuAction::UnarchiveProject(id) => self.on_side_click(SideClick::Unarchive(id)),
+            MenuAction::RemoveProject(id) => {
+                let panes = self.inner.borrow().tree.live_panes_of_project(&id);
+                self.kill_panes(panes);
+                self.mutate(crate::tree::remove_project(&id), |_| {});
+            }
+            MenuAction::ShowArchived => self.on_side_click(SideClick::ToggleArchived),
+            MenuAction::SwitchSpace(id) => outcome.handled = self.set_space(&id),
+            MenuAction::NewSpace => {
+                let id = Self::new_id("space");
+                let count = self.inner.borrow().tree.spaces().len();
+                let name = format!("Space {}", count + 1);
+                let chosen = id.clone();
+                self.mutate(crate::tree::create_space(id, &name), move |app| {
+                    app.set_space(&chosen);
+                });
+            }
+            MenuAction::RenameSpace(id) => {
+                let inner = &mut *self.inner.borrow_mut();
+                inner.editing = crate::sidebar::Editing::Space(id);
+                Self::notify(inner);
+            }
+            MenuAction::DeleteSpace(id) => {
+                let panes: Vec<PaneId> = {
+                    let inner = self.inner.borrow();
+                    inner
+                        .tree
+                        .session
+                        .as_ref()
+                        .map(|s| {
+                            s.projects
+                                .iter()
+                                .filter(|p| p.space_id == id)
+                                .flat_map(|p| inner.tree.live_panes_of_project(&p.id))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                self.kill_panes(panes);
+                self.mutate(crate::tree::delete_space(&id), |app| {
+                    let first = app.inner.borrow().tree.spaces().first().map(|s| s.id.clone());
+                    if let Some(first) = first {
+                        app.set_space(&first);
+                    }
+                });
+            }
+        }
+        outcome
     }
 
     /// The pane a bar's button or a chord acts on: the bar's pane, which
@@ -2850,7 +3203,7 @@ impl App {
             (inner.tab_id, zoomed)
         };
         self.act(
-            "zoom the pane",
+            "web-act-zoom-pane",
             Pdu::SetPaneZoomed(codec::SetPaneZoomed {
                 containing_tab_id: tab_id,
                 pane_id,
@@ -2864,7 +3217,7 @@ impl App {
     pub fn close_pane(self: &Rc<Self>) {
         let pane_id = self.inner.borrow().focused_pane;
         self.act(
-            "close the pane",
+            "web-act-close-pane",
             Pdu::KillPane(codec::KillPane { pane_id }),
             |_, _| {},
         );
@@ -2921,7 +3274,7 @@ impl App {
                 }
                 Err(err) => {
                     let inner = app.inner.borrow();
-                    Self::set_status(&inner, &format!("could not resize the tab: {err:#}"));
+                    Self::set_status(&inner, &failed("web-act-resize-tab", &err));
                 }
             }
         });
@@ -2932,7 +3285,7 @@ impl App {
     pub fn take_over(self: &Rc<Self>) {
         let (link, tab_id) = {
             let inner = self.inner.borrow();
-            Self::set_status(&inner, "taking the terminal over…");
+            Self::set_status(&inner, &tr("web-toast-taking-over"));
             // Taken by an interaction here: at this page's own shape.
             inner.link.lease_mut().fit = true;
             (inner.link.clone(), inner.tab_id)
@@ -2948,13 +3301,13 @@ impl App {
                 Ok(false) => {
                     let mut inner = app.inner.borrow_mut();
                     inner.after_take_over = None;
-                    Self::set_status(&inner, "the server did not hand the terminal over");
+                    Self::set_status(&inner, &tr("web-toast-not-handed-over"));
                     None
                 }
                 Err(err) => {
                     let mut inner = app.inner.borrow_mut();
                     inner.after_take_over = None;
-                    Self::set_status(&inner, &format!("could not take over: {err:#}"));
+                    Self::set_status(&inner, &failed("web-act-take-over", &err));
                     None
                 }
             };
@@ -3134,7 +3487,7 @@ impl App {
                         );
                     }
                     Err(err) => {
-                        Self::set_status(&inner, &format!("could not size the font: {err:#}"));
+                        Self::set_status(&inner, &failed("web-act-size-font", &err));
                         return;
                     }
                 }
@@ -3265,7 +3618,7 @@ impl App {
         inner.cols = cols;
         inner.rows = rows;
         // The bars are placed from the cell size, which may just have moved.
-        Self::render_navs(&inner);
+        Self::notify(&inner);
         if changed {
             // The page's grid is its own business: the tab keeps the
             // desktop's size and this canvas letterboxes it. Only a page

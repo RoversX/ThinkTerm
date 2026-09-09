@@ -42,8 +42,9 @@ pub fn content_offset_dev(place: &PanePlacement, nav_dev: f32, cell_h_dev: f32) 
 }
 
 /// Where a bar goes, in CSS px from the canvas's top-left.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct NavRect {
+    #[serde(rename = "pane")]
     pub pane_id: thinkterm_proto::PaneId,
     pub left: f64,
     pub top: f64,
@@ -93,7 +94,7 @@ pub fn rects(
 /// `terminal_title_for_display`): a bare shell at its prompt is
 /// "Terminal", and a leading busy marker (the spinner some agents put in
 /// the title) is lifted off into the `busy` flag.
-pub fn display_title(title: &str) -> (&str, bool) {
+pub fn display_title(title: &str) -> (String, bool) {
     let trimmed = title.trim_start();
     let (title, busy) = match trimmed.chars().next() {
         Some(ch) if is_busy_marker(ch) => (trimmed[ch.len_utf8()..].trim_start(), true),
@@ -101,9 +102,9 @@ pub fn display_title(title: &str) -> (&str, bool) {
     };
     let title = title.trim();
     if title.is_empty() || is_default_shell_title(title) {
-        ("Terminal", busy)
+        (thinkterm_i18n::tr("web-title-terminal"), busy)
     } else {
-        (title, busy)
+        (title.to_string(), busy)
     }
 }
 
@@ -124,7 +125,7 @@ fn is_default_shell_title(title: &str) -> bool {
 }
 
 /// What one bar shows.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct NavView {
     pub rect: NavRect,
     pub members: Vec<CapsuleView>,
@@ -134,90 +135,15 @@ pub struct NavView {
     pub closing: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct CapsuleView {
+    #[serde(rename = "pane")]
     pub pane_id: thinkterm_proto::PaneId,
     pub title: String,
     pub busy: bool,
     pub current: bool,
 }
 
-#[cfg(target_arch = "wasm32")]
-mod dom {
-    use super::NavView;
-
-    pub struct NavBars {
-        root: web_sys::Element,
-    }
-
-    fn escape(text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
-        for c in text.chars() {
-            match c {
-                '&' => out.push_str("&amp;"),
-                '<' => out.push_str("&lt;"),
-                '>' => out.push_str("&gt;"),
-                '"' => out.push_str("&quot;"),
-                c => out.push(c),
-            }
-        }
-        out
-    }
-
-    impl NavBars {
-        pub fn mount(id: &str) -> Option<Self> {
-            let root = web_sys::window()?.document()?.get_element_by_id(id)?;
-            Some(Self { root })
-        }
-
-        pub fn element(&self) -> &web_sys::Element {
-            &self.root
-        }
-
-        /// The markup for every bar. The caller keeps the last string and
-        /// only sets it when it changed: layouts are re-listed often and
-        /// mostly unchanged.
-        pub fn html(bars: &[NavView]) -> String {
-            let icon = crate::icons::svg;
-            let mut html = String::new();
-            for bar in bars {
-                let class = if bar.focused { "nav focused" } else { "nav" };
-                html.push_str(&format!(
-                    "<div class=\"{class}\" data-nav=\"{}\" style=\"left:{:.2}px;top:{:.2}px;width:{:.2}px;height:{:.2}px\"><span class=\"caps\">",
-                    bar.rect.pane_id, bar.rect.left, bar.rect.top, bar.rect.width, bar.rect.height
-                ));
-                for m in &bar.members {
-                    let class = if m.current { "cap current" } else { "cap" };
-                    let glyph = if m.busy { format!("<span class=\"spin\">{}</span>", icon("loader-circle")) } else { icon("square-terminal").to_string() };
-                    let (close_class, close_body) = if bar.closing && m.current {
-                        ("x danger", "close?")
-                    } else {
-                        ("x", icon("x"))
-                    };
-                    html.push_str(&format!(
-                        "<span class=\"{class}\" data-pane=\"{}\" title=\"{}\">{glyph}<span class=\"t\">{}</span><span class=\"{close_class}\" data-action=\"close-pane\" data-pane=\"{}\" title=\"Close this pane and end its program. Asks twice.\">{close_body}</span></span>",
-                        m.pane_id, escape(&m.title), escape(&m.title), m.pane_id
-                    ));
-                }
-                html.push_str("</span><span class=\"acts\">");
-                html.push_str(&format!("<span class=\"act\" data-action=\"new-tab\" title=\"New tab\">{}</span>", icon("plus")));
-                html.push_str(&format!("<span class=\"act\" data-action=\"split-below\" title=\"Split down\">{}</span>", icon("square-split-vertical")));
-                html.push_str(&format!("<span class=\"act\" data-action=\"split-right\" title=\"Split right\">{}</span>", icon("square-split-horizontal")));
-                let (zoom_icon, zoom_title) = if bar.zoomed { ("minimize-2", "Unzoom") } else { ("maximize-2", "Zoom this pane to the whole tab") };
-                html.push_str(&format!("<span class=\"act\" data-action=\"zoom\" title=\"{zoom_title}\">{}</span>", icon(zoom_icon)));
-                html.push_str("</span></div>");
-            }
-            html
-        }
-
-        pub fn set(&self, html: &str) {
-            self.root.set_inner_html(html);
-        }
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-pub use dom::NavBars;
 
 #[cfg(test)]
 mod tests {
@@ -289,12 +215,17 @@ mod tests {
 
     #[test]
     fn titles_read_like_the_desktop_s() {
-        assert_eq!(display_title("zsh"), ("Terminal", false));
-        assert_eq!(display_title("/usr/bin/fish"), ("Terminal", false));
-        assert_eq!(display_title("pwsh.exe"), ("Terminal", false));
-        assert_eq!(display_title("vim notes.md"), ("vim notes.md", false));
-        assert_eq!(display_title("\u{25d1} claude"), ("claude", true));
-        assert_eq!(display_title("\u{2733} claude"), ("\u{2733} claude", false), "the idle marker stays");
-        assert_eq!(display_title("  "), ("Terminal", false));
+        let dt = |s: &str| {
+            let (title, busy) = display_title(s);
+            (title, busy)
+        };
+        let t = |s: &str, b: bool| (s.to_string(), b);
+        assert_eq!(dt("zsh"), t("Terminal", false));
+        assert_eq!(dt("/usr/bin/fish"), t("Terminal", false));
+        assert_eq!(dt("pwsh.exe"), t("Terminal", false));
+        assert_eq!(dt("vim notes.md"), t("vim notes.md", false));
+        assert_eq!(dt("\u{25d1} claude"), t("claude", true));
+        assert_eq!(dt("\u{2733} claude"), t("\u{2733} claude", false), "the idle marker stays");
+        assert_eq!(dt("  "), t("Terminal", false));
     }
 }

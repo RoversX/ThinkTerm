@@ -12,11 +12,16 @@ use thinkterm_proto::layout::{PaneEntry, PaneNode};
 use thinkterm_proto::{PaneId, TabId, WindowId};
 
 /// One tab in the strip.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TabView {
+    #[serde(rename = "tab")]
     pub tab_id: TabId,
+    #[serde(rename = "window")]
     pub window_id: WindowId,
+    /// The tab's title as the server has it: the tooltip.
     pub title: String,
+    /// What the capsule says: the desktop's title rule applied.
+    pub label: String,
     /// The pane a click on the tab shows: the one on show if it is in
     /// this tab, else the tab's active pane.
     pub target: PaneId,
@@ -26,14 +31,28 @@ pub struct TabView {
     pub panes: Vec<PaneView>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PaneView {
+    #[serde(rename = "pane")]
     pub pane_id: PaneId,
     pub title: String,
     pub current: bool,
 }
 
 pub use crate::layout::leaves;
+
+/// The state the strip shows besides its tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct Controls {
+    pub following: bool,
+    pub fit: bool,
+    /// The tab whose close button was pressed once and waits for the
+    /// press that means it.
+    #[serde(rename = "closing")]
+    pub closing_tab: Option<TabId>,
+    /// The page shows less than the tab: the grid it fits.
+    pub clipped: Option<(usize, usize)>,
+}
 
 /// The pane a tab is showing: its active one, or the first.
 pub fn active_pane(node: &PaneNode) -> Option<PaneEntry> {
@@ -122,6 +141,7 @@ pub fn model(
         tabs.push(TabView {
             tab_id: first.tab_id,
             window_id: first.window_id,
+            label: crate::navbar::display_title(&title).0,
             title,
             target,
             current: is_current,
@@ -131,169 +151,23 @@ pub fn model(
     tabs
 }
 
-#[cfg(target_arch = "wasm32")]
-mod dom {
-    use super::TabView;
-    use thinkterm_proto::{PaneId, TabId};
-    use wasm_bindgen::JsCast;
-
-    /// The strip's element and what it draws into it.
-    pub struct TabStrip {
-        root: web_sys::Element,
-    }
-
-    /// What a click on the strip meant.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Click {
-        Pane(PaneId),
-        Follow,
-        NewTab,
-        /// The bar's pane, or the focused one from a chord.
-        SplitRight(Option<PaneId>),
-        SplitBelow(Option<PaneId>),
-        Zoom(Option<PaneId>),
-        /// The focused pane's close button (a chord, or a bar).
-        Close,
-        /// A capsule's own close button.
-        ClosePane(PaneId),
-        /// A tab's close button: every pane of it.
-        CloseTab(TabId),
-        /// The sidebar toggle at the row's start.
-        Sidebar,
-    }
-
-    /// The state the strip shows.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub struct Controls {
-        pub following: bool,
-        pub fit: bool,
-        /// The tab whose close button was pressed once and waits for the
-        /// press that means it.
-        pub closing_tab: Option<TabId>,
-        /// The page shows less than the tab: the grid it fits.
-        pub clipped: Option<(usize, usize)>,
-    }
-
-    fn escape(text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
-        for c in text.chars() {
-            match c {
-                '&' => out.push_str("&amp;"),
-                '<' => out.push_str("&lt;"),
-                '>' => out.push_str("&gt;"),
-                '"' => out.push_str("&quot;"),
-                c => out.push(c),
-            }
-        }
-        out
-    }
-
-    /// Titles are shown short; the full one is the tooltip.
-    fn short(title: &str) -> String {
-        const MAX: usize = 28;
-        if title.chars().count() <= MAX {
-            title.to_string()
-        } else {
-            let head: String = title.chars().take(MAX - 1).collect();
-            format!("{head}…")
-        }
-    }
-
-    impl TabStrip {
-        pub fn mount(id: &str) -> Option<Self> {
-            let root = web_sys::window()?.document()?.get_element_by_id(id)?;
-            Some(Self { root })
-        }
-
-        pub fn element(&self) -> &web_sys::Element {
-            &self.root
-        }
-
-        /// Redraw the whole strip. It is a few dozen elements; rebuilding
-        /// them is cheaper to get right than diffing them.
-        pub fn render(&self, tabs: &[TabView], controls: Controls) {
-            let following = controls.following;
-            let icon = crate::icons::svg;
-            let mut html = format!(
-                "<span class=\"act\" data-action=\"sidebar\" title=\"Show or hide the sidebar\">{}</span>",
-                icon("panel-left")
-            );
-            for tab in tabs {
-                let class = if tab.current { "tab current" } else { "tab" };
-                let (title, _) = crate::navbar::display_title(&tab.title);
-                let (close_class, close_body) = if controls.closing_tab == Some(tab.tab_id) {
-                    ("x danger", "close?")
-                } else {
-                    ("x", icon("x"))
-                };
-                html.push_str(&format!(
-                    "<span class=\"{class}\" data-pane=\"{}\" title=\"{}\">{}<span class=\"t\">{}</span><span class=\"{close_class}\" data-action=\"close-tab\" data-tab=\"{}\" title=\"Close this tab and end its programs. Asks twice.\">{close_body}</span></span>",
-                    tab.target,
-                    escape(&tab.title),
-                    icon("square-terminal"),
-                    escape(&short(title)),
-                    tab.tab_id
-                ));
-            }
-            let (class, text, hint) = if following {
-                (
-                    "follow on",
-                    "following the desktop",
-                    "This page shows whichever pane the desktop focuses. Click to stay on this one.",
-                )
-            } else {
-                (
-                    "follow off",
-                    "staying here",
-                    "This page stays on this pane. Click to follow the desktop's focus again.",
-                )
-            };
-            html.push_str(&format!(
-                "<span class=\"act\" data-action=\"new-tab\" title=\"New tab\">{}</span>",
-                icon("plus")
-            ));
-            if controls.fit {
-                html.push_str(
-                    "<span class=\"trail\"><span class=\"hint\" title=\"The tab is fitted to this window; Ctrl+Shift+F gives the size back\">fitted</span></span>",
-                );
-            }
-            let _ = (following, class, text, hint);
-            self.root.set_inner_html(&html);
-        }
-
-        /// What a click landed on, if anything the strip owns.
-        pub fn click_target(ev: &web_sys::MouseEvent) -> Option<Click> {
-            let target: web_sys::Element = ev.target()?.dyn_into().ok()?;
-            let hit = target.closest("[data-pane],[data-follow],[data-action]").ok()??;
-            if hit.has_attribute("data-follow") {
-                return Some(Click::Follow);
-            }
-            if let Some(action) = hit.get_attribute("data-action") {
-                // A bar's buttons act on the bar's pane, whichever is focused.
-                let bar = hit
-                    .closest("[data-nav]")
-                    .ok()
-                    .flatten()
-                    .and_then(|nav| nav.get_attribute("data-nav")?.parse::<PaneId>().ok());
-                return match action.as_str() {
-                    "new-tab" => Some(Click::NewTab),
-                    "split-right" => Some(Click::SplitRight(bar)),
-                    "split-below" => Some(Click::SplitBelow(bar)),
-                    "zoom" => Some(Click::Zoom(bar)),
-                    "close" => Some(Click::Close),
-                    "close-pane" => hit.get_attribute("data-pane")?.parse().ok().map(Click::ClosePane),
-                    "close-tab" => hit.get_attribute("data-tab")?.parse().ok().map(Click::CloseTab),
-                    "sidebar" => Some(Click::Sidebar),
-                    _ => None,
-                };
-            }
-            hit.get_attribute("data-pane")?.parse().ok().map(Click::Pane)
-        }
-    }
+/// What a click on the tab row or a pane's bar meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Click {
+    Pane(PaneId),
+    Follow,
+    NewTab,
+    /// The bar's pane, or the focused one from a chord.
+    SplitRight(Option<PaneId>),
+    SplitBelow(Option<PaneId>),
+    Zoom(Option<PaneId>),
+    /// The focused pane's close button (a chord, or a bar).
+    Close,
+    /// A capsule's own close button.
+    ClosePane(PaneId),
+    /// A tab's close button: every pane of it.
+    CloseTab(TabId),
 }
-
-#[cfg(target_arch = "wasm32")]
-pub use dom::{Click, Controls, TabStrip};
 
 #[cfg(test)]
 mod tests {
