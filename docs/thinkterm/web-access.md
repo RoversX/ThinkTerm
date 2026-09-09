@@ -97,30 +97,69 @@ environment variable point it elsewhere, for instance at a development
 checkout. `ci/deploy.sh` refuses to package without the bundle in CI and warns
 on a laptop; `ci/macos-package.sh --build` builds it.
 
-## What the first version does not do
+## What the page shows
 
-Images (kitty, sixel, iTerm2) are not drawn. The page shows the tab the
-desktop shows, every pane of it in the desktop's split layout, and follows
-the desktop's focus by default: a strip along the top lists the server's
-tabs and, for the tab on show, its panes; clicking one focuses it here and
-on the desktop, and the switch at the right of the strip pins the page to
-what it is showing instead. The tab keeps the desktop's size -- the page
-letterboxes it, and clips when the desktop's grid is larger, saying so on
-the status line -- even while the page types; the fit button (or
-Ctrl+Shift+F) reshapes the tab to this window until the desktop next takes
-it. The strip's other buttons open a new tab beside this one, split the
-focused pane to the right or below, zoom it, and close it (asking twice);
-Ctrl+Shift with an arrow moves the focus between panes. In Handoff mode a
-page that does not hold the terminal can look but not type, and offers to
-take over. The ThinkTerm tree is not shown; the cursor does not blink. The input
-method's hidden field follows the terminal cursor, including scrolling and
-resizing, so the browser can place its candidate window there; pre-edit
-text and its underline are not yet drawn in the grid.
+The page is the desktop, as far as the wire allows. Its chrome is the
+desktop's: the 40 px tab row of 160 px capsules (the tabs of the window on
+show; `+` opens one, the x on a tab closes it, asking twice), a bar above
+every pane like the desktop's pane nav bar (the pane's capsule with its
+title -- a bare shell is "Terminal" -- and, on the right, new tab, split
+down, split right and zoom; a stack's members are its capsules), and on the
+left the sidebar described below. The palette is the desktop's dark set;
+`?theme=light` picks the other. There is no status line: refusals and
+reconnects are a passing remark at the bottom right, and a page that does
+not hold the terminal in Handoff mode sees the desktop's card ("Terminal is
+being used on another device -- Click or scroll to continue") over the
+mirror, which stays visible.
+
+The tab keeps the desktop's size and shape. The page's own font size is
+derived from the desktop's cell so that a cell here is as large as one
+there, and the desktop's pixel geometry (the bar above each pane, the
+padding around the grid) lands on the page one to one; the page clips when
+the tab is larger than the window and says so in the tab row. `?font=`
+pins a size instead; Ctrl+Shift+F fits the tab to this window until the
+desktop next takes it. Every claim the page makes is pane by pane
+(`ClientViewport::Native`): taking the terminal over from the desktop
+changes no pane's grid, and a tab a CLI laid out gets the same rows above
+each pane the desktop would leave.
+
+Taking the terminal works as it does on the desktop: a click, a scroll or a
+keystroke in a pane takes it, and the first one is not lost -- the click's
+focus is passed on and the key is typed once the server has handed over.
+Chrome clicks (tabs, bars, sidebar) never take it. Ctrl+Shift+T asks
+explicitly; Ctrl+Shift with an arrow moves the focus between panes.
+
+The sidebar is the server's own tree of Spaces, Projects and Threads
+(`ThinkTermSessionState`, `ThinkTermTree`), drawn like the desktop's with
+the same status marks: a spinner while an agent in the thread works, an
+alert when one waits on you, a check when it finished unseen, a dot
+otherwise. Clicking a thread shows its active tab, or has the server create
+its terminal in the project's directory (`EnsureThinkTermThread`); New
+Thread, the `+` on a project, double-click to rename, pin, delete (asking
+twice; its programs end), a new project from a path (`~/dir` or `/dir`, with
+a `main` thread) and archive/restore all send the desktop's own tree
+operations, and a refusal -- the server answers only with its tree, so one
+is inferred from it -- is a remark. Windows no thread claims are listed
+under "Other windows" so nothing is out of reach. The panel's width is
+dragged at its edge and kept per browser; the button at the start of the
+tab row hides it.
+
+One thing to know: a desktop's own sidebar is its own store. It mirrors a
+server's tree only for Spaces bound to a remote host, and its local session
+host is excluded, so a page attached to the desktop's own machine sees the
+server's tree, not the desktop's sidebar, until the desktop is taught to
+keep its local Space on that server too. Against a remote mux server the
+page and the desktop show the same tree.
+
+Images (kitty, sixel, iTerm2) are not drawn; the cursor does not blink. The
+input method's hidden field follows the terminal cursor, including
+scrolling and resizing, so the browser can place its candidate window
+there; pre-edit text and its underline are not yet drawn in the grid.
 
 A dropped socket is reopened by the page itself, with a backoff, on the same
-tab; the status line says so while it is down. It gives up only when there
-is nothing to come back to -- the server has no panes, or speaks a
-different protocol version -- and says which.
+tab; the remark stays while it is down. It gives up only when there is
+nothing to come back to -- the server has no panes, or speaks a different
+protocol version -- and says which.
 
 ## Fonts
 

@@ -71,7 +71,7 @@ const INSTRUMENT = `
   await send("Performance.enable", {}, s);
   await send("Page.addScriptToEvaluateOnNewDocument", { source: INSTRUMENT }, s);
   const ev = async (expr) => (await send("Runtime.evaluate", { expression: expr, returnByValue: true }, s)).result?.value;
-  const status = () => ev("document.getElementById('status')?.textContent || ''");
+  const status = () => ev("document.getElementById('status')?.dataset.summary || ''");
   const snap = async () => ({ ...(await ev("JSON.stringify(window.__tt)").then(JSON.parse)), heap: await ev("performance.memory ? performance.memory.usedJSHeapSize : null") });
   const metrics = async () => Object.fromEntries((await send("Performance.getMetrics", {}, s)).metrics.map((m) => [m.name, m.value]));
   const rendererRss = () => {

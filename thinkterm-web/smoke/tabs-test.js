@@ -37,7 +37,7 @@ const sh = (cmd) => execSync(cmd, { encoding: "utf8" });
   const s = (await send("Target.attachToTarget", { targetId, flatten: true })).sessionId;
   await send("Runtime.enable", {}, s); await send("Page.enable", {}, s);
   const ev = async (expr) => (await send("Runtime.evaluate", { expression: expr, returnByValue: true }, s)).result?.value;
-  const status = () => ev("document.getElementById('status')?.textContent || ''");
+  const status = () => ev("document.getElementById('status')?.dataset.summary || ''");
   const until = async (what, expr, ms = 10000) => { const t = Date.now(); while (Date.now() - t < ms) { const v = await ev(expr); if (v) return v; await sleep(100); } throw new Error("timeout waiting for " + what + ": " + JSON.stringify({ status: await status(), strip: await ev("document.getElementById('tabs').innerText") })); };
   const out = {};
   const layout = async () => JSON.parse(await ev("document.getElementById('term').dataset.layout || '{}'"));
@@ -49,7 +49,7 @@ const sh = (cmd) => execSync(cmd, { encoding: "utf8" });
   const fail = (what) => { throw new Error(what); };
 
   await send("Page.navigate", { url }, s);
-  await until("attach", "/this browser has|mirroring|following/.test(document.getElementById('status').textContent)", 20000);
+  await until("attach", "/this browser has|mirroring|following/.test((document.getElementById('status').dataset.summary || ''))", 20000);
 
   // --- tabs: two on the server, click the other, type, follow back
   out.strip_at_start = await until("two tabs", "document.querySelectorAll('#tabs .tab').length === 2 && document.getElementById('tabs').innerText");
@@ -58,18 +58,18 @@ const sh = (cmd) => execSync(cmd, { encoding: "utf8" });
   await until("switch", `document.querySelector('#tabs .tab.current').dataset.pane !== ${JSON.stringify(first)}`);
   await sleep(400);
   const second = await ev("document.querySelector('#tabs .tab.current').dataset.pane");
-  out.follow_after_click = await ev("document.querySelector('#tabs .follow').textContent");
   await type("echo TAB2-OK");
   if (!has(second, "TAB2-OK") || has(first, "TAB2-OK")) fail("typing after a tab click went to the wrong pane");
-  await ev("document.querySelector('#tabs .follow').click()");
+  // The page always follows the desktop's focus.
   sh(`${cli} activate-pane --pane-id ${first}`);
   await until("follow back", `document.querySelector('#tabs .tab.current').dataset.pane === ${JSON.stringify(first)}`);
   out.tabs = "ok";
 
   // --- split: the layout has two placements and one divider
   const before = sizes();
+  const L = "JSON.parse(document.getElementById('term').dataset.layout || '{}')";
   await click("split-right");
-  await until("two panes", "document.querySelectorAll('#tabs .pane').length === 2", 8000);
+  await until("two panes", `(${L}.panes || []).length === 2`, 8000);
   await sleep(400);
   let l = await layout();
   if (l.panes.length !== 2) fail("expected two placements: " + JSON.stringify(l));
@@ -82,10 +82,11 @@ const sh = (cmd) => execSync(cmd, { encoding: "utf8" });
   // --- a real click into the left pane focuses it, on the server too
   const rect = await ev("(r => [r.left, r.top])(document.getElementById('term').getBoundingClientRect())");
   const px = rect[0] + (a.left + Math.floor(a.cols / 2)) * l.cell[0] + 2;
-  const py = rect[1] + (a.top + 3) * l.cell[1] + 2;
+  // Below the pane's bar (the top ~47 px of a frame are its nav bar).
+  const py = rect[1] + (a.top + 5) * l.cell[1] + 2;
   await send("Input.dispatchMouseEvent", { type: "mousePressed", x: px, y: py, button: "left", clickCount: 1 }, s);
   await send("Input.dispatchMouseEvent", { type: "mouseReleased", x: px, y: py, button: "left", clickCount: 1 }, s);
-  await until("focus moved", `document.querySelector('#tabs .pane.current').dataset.pane === ${JSON.stringify(String(a.id))}`);
+  await until("focus moved", `document.querySelector('.nav.focused')?.dataset.nav === ${JSON.stringify(String(a.id))}`);
   await sleep(300);
   const active = list().find((p) => p.is_active);
   if (!active || active.pane_id !== a.id) fail("the server's active pane did not follow the click: " + JSON.stringify(list().map((p) => [p.pane_id, p.is_active])));
@@ -97,15 +98,16 @@ const sh = (cmd) => execSync(cmd, { encoding: "utf8" });
 
   // --- zoom, unzoom, close (twice), new tab
   await click("zoom");
-  await until("zoomed", "document.querySelector('[data-action=zoom]').classList.contains('on')", 8000);
+  await until("zoomed", `${L}.zoomed != null`, 8000);
   l = await layout();
   if (l.zoomed !== a.id || l.panes.length !== 1 || l.dividers.length !== 0) fail("zoom not reflected: " + JSON.stringify(l));
   await click("zoom");
-  await until("unzoomed", "!document.querySelector('[data-action=zoom]').classList.contains('on')", 8000);
-  await click("close");
-  if ((await ev("document.querySelector('[data-action=close]').textContent")) !== "close pane?") fail("close did not ask");
-  await click("close");
-  await until("one pane", "document.querySelectorAll('#tabs .pane').length === 0", 8000);
+  await until("unzoomed", `${L}.zoomed == null`, 8000);
+  const closeBtn = "document.querySelector('.nav.focused .cap.current .x')";
+  await ev(`${closeBtn}.click(); 1`);
+  if ((await ev(`${closeBtn}.textContent`)) !== "close?") fail("close did not ask");
+  await ev(`${closeBtn}.click(); 1`);
+  await until("one pane", `(${L}.panes || []).length === 1`, 8000);
   if (list().some((p) => p.pane_id === a.id)) fail("the pane was not closed");
   out.zoom_close = "ok";
   await click("new-tab");
@@ -116,12 +118,12 @@ const sh = (cmd) => execSync(cmd, { encoding: "utf8" });
 
   // --- reconnect keeps a split
   await click("split-below");
-  await until("two panes again", "document.querySelectorAll('#tabs .pane').length === 2", 8000);
+  await until("two panes again", `(${L}.panes || []).length === 2`, 8000);
   sh(`${cli} web-server off`);
-  await until("disconnected", "/reconnect/.test(document.getElementById('status').textContent)", 10000);
+  await until("disconnected", "/reconnect/.test((document.getElementById('status').dataset.summary || ''))", 10000);
   await sleep(1200);
   sh(`${cli} web-server on`);
-  await until("back", "/this browser has|mirroring/.test(document.getElementById('status').textContent)", 25000);
+  await until("back", "/this browser has|mirroring/.test((document.getElementById('status').dataset.summary || ''))", 25000);
   await sleep(600);
   l = await layout();
   if (l.panes.length !== 2) fail("the split did not survive the reconnect: " + JSON.stringify(l));
