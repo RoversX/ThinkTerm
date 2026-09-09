@@ -36,11 +36,18 @@ console_error_panic_hook.workspace = true
 js-sys.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
+# CanvasRenderingContext2d and ImageData are what the glyph fallback draws
+# missing graphemes with (see canvas.rs). TextMetrics is deliberately absent:
+# `measureText` only offers an advance, and using an advance as a column
+# count would put fallback glyphs on the wrong grid -- leaving the feature
+# off makes that mistake unavailable rather than merely discouraged.
 web-sys = { workspace = true, features = [
-  "BinaryType", "Clipboard", "ClipboardEvent", "CloseEvent", "CompositionEvent",
+  "BinaryType", "CanvasRenderingContext2d", "Clipboard", "ClipboardEvent",
+  "CloseEvent", "CompositionEvent",
   "console", "CssStyleDeclaration", "DataTransfer", "Document", "DomRect",
   "DomRectReadOnly", "Element", "Event", "EventTarget", "FocusEvent", "History",
-  "HtmlCanvasElement", "HtmlElement", "HtmlTextAreaElement", "InputEvent",
+  "HtmlCanvasElement", "HtmlElement", "HtmlTextAreaElement", "ImageData",
+  "InputEvent",
   "KeyboardEvent", "Location", "MessageEvent", "MouseEvent", "Navigator",
   "Performance", "PointerEvent", "ResizeObserver", "ResizeObserverEntry", "Storage",
   "WebSocket", "WheelEvent", "Window",

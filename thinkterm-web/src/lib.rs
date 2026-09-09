@@ -1,9 +1,11 @@
 //! The ThinkTerm browser client. See Cargo.toml for the charter.
 //!
-//! `braille`, `keymap`, `lease` and `viewport` are pure and build
-//! everywhere; everything that touches the page is `wasm32` only.
+//! `braille`, `fallback`, `keymap`, `lease` and `viewport` are pure and
+//! build everywhere; everything that touches the page is `wasm32` only.
 
 pub mod braille;
+pub mod fallback;
+pub mod ime;
 pub mod keymap;
 pub mod lease;
 pub mod viewport;
@@ -13,11 +15,15 @@ mod app;
 #[cfg(target_arch = "wasm32")]
 mod attach;
 #[cfg(target_arch = "wasm32")]
+mod canvas;
+#[cfg(target_arch = "wasm32")]
 mod emit;
 #[cfg(target_arch = "wasm32")]
 mod glyphs;
 #[cfg(target_arch = "wasm32")]
 mod gpu;
+#[cfg(target_arch = "wasm32")]
+mod graphics_check;
 #[cfg(target_arch = "wasm32")]
 mod host;
 #[cfg(target_arch = "wasm32")]

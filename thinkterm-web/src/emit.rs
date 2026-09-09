@@ -4,12 +4,15 @@
 //! into strips wherever the cursor or the selection changes their colour.
 //! No images, no bidi, no hyperlink hover, no blink.
 
-use crate::glyphs::GlyphCache;
+use crate::fallback::FallbackBudget;
+use crate::glyphs::{CachedGlyph, GlyphCache};
 use anyhow::{Context, Result};
 use std::ops::Range;
+use std::rc::Rc;
 use termwiz::cell::{Intensity, Underline};
 use termwiz::surface::{CursorShape, CursorVisibility, Line};
 use thinkterm_font_core::PresentationWidth;
+use thinkterm_font_web::GlyphRole;
 use thinkterm_proto::StableCursorPosition;
 use thinkterm_render::quad::{HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocatorTrait};
 use wezterm_color_types::LinearRgba;
@@ -90,6 +93,7 @@ fn is_block(shape: CursorShape) -> bool {
 pub fn emit_line(
     cache: &mut GlyphCache,
     layers: &mut HeapQuadAllocator,
+    budget: &mut FallbackBudget,
     p: &LineParams<'_>,
 ) -> Result<()> {
     if p.line.is_double_height_bottom() {
@@ -157,7 +161,7 @@ pub fn emit_line(
         bg_is_default: bool,
         invisible: bool,
         underline: Option<(thinkterm_render::bitmaps::TextureRect, LinearRgba)>,
-        glyphs: Vec<(u8, std::rc::Rc<crate::glyphs::CachedGlyph>)>,
+        glyphs: Vec<(u8, Rc<CachedGlyph>)>,
     }
     let clusters = p.line.cluster(None);
     let mut shaped: Vec<Shaped> = Vec::with_capacity(clusters.len());
@@ -184,16 +188,71 @@ pub fn emit_line(
         } else {
             None
         };
-        let infos = cache.shape(
+        let widths = PresentationWidth::with_cluster(cluster);
+        let run = cache.shape(
             &cluster.text,
             Some(cluster.presentation),
-            Some(&PresentationWidth::with_cluster(cluster)),
+            Some(&widths),
+            cluster.width,
         )?;
-        let mut glyphs = Vec::with_capacity(infos.len());
-        for (idx, info) in infos.iter().enumerate() {
-            let followed_by_space = infos.get(idx + 1).map(|n| n.is_space).unwrap_or(false);
-            let glyph = cache.cached_glyph(info, followed_by_space, info.num_cells)?;
-            glyphs.push((info.num_cells, glyph));
+        // Nothing off the right edge gets a fallback. The stand-in used to
+        // be one shared `.notdef` and cost nothing; a fallback is a canvas
+        // draw and an atlas slot each, out of a budget the whole frame
+        // shares.
+        //
+        // Asked per gap, not per cluster. `CellCluster` breaks only on an
+        // attribute change or whitespace, and Chinese prose has no
+        // whitespace, so a 150-column row of Han is one cluster starting at
+        // column 0: a test on where the cluster starts called all 150
+        // visible in an 80-column viewport and paid for 70 draws the strip
+        // loop below then threw away.
+        let mut fallbacks: Vec<Option<Rc<CachedGlyph>>> = vec![None; run.gaps.len()];
+        let mut columns: Vec<u8> = vec![0; run.gaps.len()];
+        if !attrs.invisible() {
+            for (g, gap) in run.gaps.iter().enumerate() {
+                // Already absolute: `CellCluster::byte_to_cell_idx` adds
+                // `first_cell_idx` itself (cellcluster.rs:34, :295). Adding
+                // it again put every cluster but the first too far right,
+                // so its gaps were taken for off-screen and left as boxes.
+                let cell = widths.byte_to_cell_idx(gap.bytes.start);
+                if (cell as f32) * cell_width >= pixel_width {
+                    break;
+                }
+                // Counted from the row in hand, not read back from the
+                // shape cache. `ShapeKey` holds the cluster's *total*
+                // columns, so two rows that spend the same total
+                // differently -- `[1,2,1]` and `[2,1,1]` for the same text,
+                // which explicit cell widths allow -- share an entry, and
+                // the second would inherit the first's per-gap count and
+                // shift everything after it.
+                columns[g] = widths.num_cells(gap.bytes.clone());
+                fallbacks[g] = cache.fallback_glyph(gap, columns[g], budget)?;
+            }
+        }
+        let mut glyphs = Vec::with_capacity(run.infos.len());
+        for (idx, info) in run.infos.iter().enumerate() {
+            // Read from the list as it was shaped: whether a space follows
+            // decides if this glyph may overflow its cell, and that must not
+            // change because the gap after it got replaced.
+            let followed_by_space =
+                run.infos.get(idx + 1).map(|n| n.is_space).unwrap_or(false);
+            match run.roles[idx] {
+                GlyphRole::GapLead(g) if fallbacks[g as usize].is_some() => {
+                    // The whole grapheme, in the columns the row's own width
+                    // data gave it. No `.max(1)`: a zero-column gap was
+                    // refused before it got here, and inventing a column
+                    // shifts the rest of the line with nothing to report it.
+                    let glyph = Rc::clone(fallbacks[g as usize].as_ref().expect("just checked"));
+                    glyphs.push((columns[g as usize], glyph));
+                }
+                // The gap's other stand-ins. Keeping one draws the cell
+                // twice and advances the column twice.
+                GlyphRole::GapTail(g) if fallbacks[g as usize].is_some() => {}
+                _ => glyphs.push((
+                    info.num_cells,
+                    cache.cached_glyph(info, followed_by_space, info.num_cells)?,
+                )),
+            }
         }
         shaped.push(Shaped {
             first_cell: cluster.first_cell_idx,
@@ -296,7 +355,11 @@ pub fn emit_line(
                     } else {
                         (item.fg, item.bg)
                     };
-                    if glyph_color == bg_color || item.invisible {
+                    // A colour glyph takes its colour from the texture, not
+                    // from the foreground, so a foreground that happens to
+                    // equal the background says nothing about whether it
+                    // would be visible. `invisible` still hides everything.
+                    if item.invisible || (!glyph.has_color && glyph_color == bg_color) {
                         continue;
                     }
                     let pixel_rect = euclid::rect(

@@ -153,6 +153,10 @@ pub fn install(app: Rc<App>, canvas: &HtmlCanvasElement, textarea: &HtmlTextArea
         listen::<Event>(&window, "resize", move |_| app.resize());
     }
     {
+        let app = app.clone();
+        listen::<Event>(&window, "scroll", move |_| app.resize());
+    }
+    {
         // The canvas's own box, not just the window: CSS can resize it.
         let app = app.clone();
         let closure = Closure::<dyn FnMut(js_sys::Array)>::new(move |_entries: js_sys::Array| app.resize());

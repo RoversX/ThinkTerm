@@ -11,12 +11,12 @@
   #status.error { color: #f66; }
   /* Focus lives here so the IME composes into a real text field; the
      field itself stays out of sight. */
-  #kbd { position: absolute; left: 0; top: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; resize: none; overflow: hidden; }
+  #kbd { position: fixed; left: 0; top: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; margin: 0; resize: none; overflow: hidden; pointer-events: none; }
 </style>
 </head>
 <body>
 <canvas id="term"></canvas>
-<textarea id="kbd" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
+<textarea id="kbd" wrap="off" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
 <div id="status">loading…</div>
 <script type="module" src="./app.js"></script>
 </body>

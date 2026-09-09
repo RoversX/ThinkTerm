@@ -34,6 +34,32 @@ struct Socket {
     _closures: RefCell<Vec<Closure<dyn FnMut(JsValue)>>>,
 }
 
+impl Socket {
+    /// Let go of a socket this link is done with.
+    ///
+    /// The four event closures each hold an `Rc` to the very Socket that
+    /// owns them, so its strong count never falls below four and neither
+    /// it nor its `WebSocket` is ever dropped. That was harmless while
+    /// exactly one existed per page; a link that reconnects makes a new one
+    /// per attempt, and an overnight outage is thousands of them. Clearing
+    /// the handlers first is what makes emptying the vector actually free
+    /// anything.
+    fn retire(&self) {
+        self.ws.set_onmessage(None);
+        self.ws.set_onopen(None);
+        self.ws.set_onclose(None);
+        self.ws.set_onerror(None);
+        self._closures.borrow_mut().clear();
+        self.closed.set(true);
+        // Nothing is listening any more, so a socket still open is a socket
+        // the server is holding a session for. 1000 is a normal close.
+        let _ = self.ws.close_with_code(1000);
+        if let Some(waker) = self.waker.borrow_mut().take() {
+            waker.wake();
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SocketReader(Rc<Socket>);
 
@@ -90,7 +116,10 @@ impl AsyncWrite for SocketReader {
 use crate::lease::Lease;
 
 struct Inner {
-    socket: Rc<Socket>,
+    /// Replaced wholesale by `reconnect`, so the handle every other part of
+    /// the page holds survives a dropped connection. Read it into a local
+    /// before awaiting: the borrow must not be held across a reconnect.
+    socket: RefCell<Rc<Socket>>,
     serials: RefCell<SerialTable<oneshot::Sender<Pdu>>>,
     pushes: RefCell<Option<Box<dyn FnMut(Pdu)>>>,
     /// Pushes that arrived before a handler was installed (the server
@@ -98,7 +127,10 @@ struct Inner {
     /// setting up), replayed in order once one is. The server never
     /// resends a push, so none may be dropped.
     pending_pushes: RefCell<Vec<Pdu>>,
-    on_close: RefCell<Option<Box<dyn FnOnce(String)>>>,
+    /// `FnMut`, not `FnOnce`: a link that reconnects can close more than
+    /// once, and the second close has to reach the page as well as the
+    /// first.
+    on_close: RefCell<Option<Box<dyn FnMut(String)>>>,
     /// The close that happened before a handler was installed.
     closed_early: RefCell<Option<String>>,
     pub lease: RefCell<Lease>,
@@ -112,6 +144,22 @@ impl WsLink {
     /// Open the socket with the token in the subprotocol list, and wait for
     /// the server to accept it.
     pub async fn connect(url: &str, token: &str) -> Result<Self> {
+        let socket = Self::open(url, token).await?;
+        let link = Self(Rc::new(Inner {
+            socket: RefCell::new(socket),
+            serials: RefCell::new(SerialTable::new()),
+            pushes: RefCell::new(None),
+            pending_pushes: RefCell::new(Vec::new()),
+            on_close: RefCell::new(None),
+            closed_early: RefCell::new(None),
+            lease: RefCell::new(Lease::default()),
+        }));
+        link.spawn_reader();
+        Ok(link)
+    }
+
+    /// Open a socket and wait for the server to accept the token.
+    async fn open(url: &str, token: &str) -> Result<Rc<Socket>> {
         let protocols = js_sys::Array::new();
         protocols.push(&JsValue::from_str(SUBPROTOCOL));
         protocols.push(&JsValue::from_str(&format!("{TOKEN_PROTOCOL_PREFIX}{token}")));
@@ -186,12 +234,18 @@ impl WsLink {
         }
         *socket._closures.borrow_mut() = closures;
 
-        futures::future::poll_fn(|cx| {
+        let opened = futures::future::poll_fn(|cx| {
             if socket.open.get() {
                 Poll::Ready(Ok(()))
             } else if socket.closed.get() {
+                // Which of the two it was is not knowable from here: a
+                // browser is not told why a WebSocket upgrade failed, so a
+                // refused token and a server that is not running arrive
+                // as the same closed socket. Saying "the token expired"
+                // was wrong every time the server was simply down.
                 Poll::Ready(Err(anyhow!(
-                    "the server refused the connection ({}); the token may be wrong or expired",
+                    "the connection was not accepted ({}); the server may be down, \
+                     or the link may have expired",
                     socket.close_reason.borrow()
                 )))
             } else {
@@ -199,22 +253,50 @@ impl WsLink {
                 Poll::Pending
             }
         })
-        .await?;
+        .await;
+        // A socket that never made it is still a Socket with four closures
+        // pointing back at it: every failed attempt during an outage would
+        // otherwise leak one, which is exactly the case `retire` exists for.
+        if let Err(err) = opened {
+            socket.retire();
+            return Err(err);
+        }
         if socket.ws.protocol() != SUBPROTOCOL {
+            socket.retire();
             anyhow::bail!("the server did not select the {SUBPROTOCOL} subprotocol");
         }
 
-        let link = Self(Rc::new(Inner {
-            socket,
-            serials: RefCell::new(SerialTable::new()),
-            pushes: RefCell::new(None),
-            pending_pushes: RefCell::new(Vec::new()),
-            on_close: RefCell::new(None),
-            closed_early: RefCell::new(None),
-            lease: RefCell::new(Lease::default()),
-        }));
-        link.spawn_reader();
-        Ok(link)
+        Ok(socket)
+    }
+
+    /// Put a fresh socket under this handle.
+    ///
+    /// The point of doing it here rather than building a new `WsLink` is
+    /// that the session, the host and the app all hold clones of this one:
+    /// swapping the socket underneath them is what makes a reconnect
+    /// invisible to everything above.
+    pub async fn reconnect(&self, url: &str, token: &str) -> Result<()> {
+        let socket = Self::open(url, token).await?;
+        // Anything still waiting was waiting on the old socket and will
+        // never be answered; the new server has never heard of those
+        // serials.
+        self.0.serials.borrow_mut().drain();
+        self.0.closed_early.borrow_mut().take();
+        let old = std::mem::replace(&mut *self.0.socket.borrow_mut(), socket);
+        old.retire();
+        self.spawn_reader();
+        Ok(())
+    }
+
+    /// Give up on this link: close the socket and stop reading.
+    ///
+    /// The page calls this when it has decided not to reconnect. Without
+    /// it the socket stays open, its reader keeps answering pings, and the
+    /// server keeps the registered client and the TCP session for as long
+    /// as the tab is open -- a session nobody is watching.
+    pub fn shutdown(&self) {
+        self.0.serials.borrow_mut().drain();
+        self.0.socket.borrow().retire();
     }
 
     pub fn lease(&self) -> std::cell::Ref<'_, Lease> {
@@ -235,13 +317,13 @@ impl WsLink {
         }
     }
 
-    /// Told once, when the socket ends -- at once, if it already has.
-    pub fn set_close_handler(&self, handler: impl FnOnce(String) + 'static) {
+    /// Told whenever the socket ends -- at once, if it already has.
+    pub fn set_close_handler(&self, handler: impl FnMut(String) + 'static) {
+        let mut handler = Box::new(handler) as Box<dyn FnMut(String)>;
         if let Some(reason) = self.0.closed_early.borrow_mut().take() {
             handler(reason);
-            return;
         }
-        *self.0.on_close.borrow_mut() = Some(Box::new(handler));
+        *self.0.on_close.borrow_mut() = Some(handler);
     }
 
     fn send(&self, pdu: &Pdu, serial: u64) -> Result<(), LinkError> {
@@ -250,35 +332,71 @@ impl WsLink {
             message: format!("encoding {}: {e:#}", pdu.pdu_name()),
             retryable: false,
         })?;
-        self.0
-            .socket
-            .ws
-            .send_with_u8_array(&bytes)
-            .map_err(|e| LinkError {
-                message: format!("sending {}: {e:?}", pdu.pdu_name()),
-                retryable: false,
-            })
+        let socket = self.0.socket.borrow();
+        // `WebSocket.send` throws only while CONNECTING; on a CLOSING or
+        // CLOSED socket it quietly buffers and returns. Without this check
+        // `request` registers a serial, gets `Ok`, and waits on an answer
+        // that can never come -- there is no timeout on this link, so the
+        // page hangs where it stood. It is reachable at startup: the socket
+        // can die during the WebGPU init that runs between `connect` and
+        // the first handshake request.
+        if socket.closed.get() || socket.ws.ready_state() != web_sys::WebSocket::OPEN {
+            return Err(LinkError {
+                message: format!("sending {}: the connection is not open", pdu.pdu_name()),
+                retryable: true,
+            });
+        }
+        socket.ws.send_with_u8_array(&bytes).map_err(|e| LinkError {
+            message: format!("sending {}: {e:?}", pdu.pdu_name()),
+            retryable: false,
+        })
     }
 
     fn spawn_reader(&self) {
         let link = self.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut reader = SocketReader(link.0.socket.clone());
+            // The socket this reader owns. A later reconnect installs a
+            // different one and spawns its own reader; this one ends when
+            // its own socket does.
+            let socket = link.0.socket.borrow().clone();
+            let mut reader = SocketReader(socket.clone());
             loop {
+                // Checked every time round: a reconnect may have replaced
+                // this socket while the read was parked, and a retiring
+                // reader must not answer pings or hand pushes to the page
+                // through the *new* socket. The error arm below repeats the
+                // check for the same reason.
+                if !Rc::ptr_eq(&socket, &link.0.socket.borrow()) {
+                    return;
+                }
                 let DecodedPdu { serial, pdu } = match Pdu::decode_async(&mut reader, None).await {
                     Ok(d) => d,
                     Err(err) => {
                         let reason = {
-                            let r = link.0.socket.close_reason.borrow().clone();
+                            let r = socket.close_reason.borrow().clone();
                             if r.is_empty() { format!("{err:#}") } else { r }
                         };
-                        link.0.socket.closed.set(true);
+                        socket.closed.set(true);
+                        // A reconnect already replaced this socket: its
+                        // reader is live and this one is just retiring, so
+                        // it must not drain the new socket's serials or
+                        // report a close that has already been handled.
+                        if !Rc::ptr_eq(&socket, &link.0.socket.borrow()) {
+                            return;
+                        }
                         // Every request still waiting fails now; the
                         // senders drop and the receivers see Canceled.
                         link.0.serials.borrow_mut().drain();
-                        let on_close = link.0.on_close.borrow_mut().take();
-                        match on_close {
-                            Some(on_close) => on_close(reason),
+                        // Taken out before it is called and put back
+                        // after: the handler reaches straight back into
+                        // this link to start reconnecting, so the borrow
+                        // must not be held across it.
+                        let taken = link.0.on_close.borrow_mut().take();
+                        match taken {
+                            Some(mut on_close) => {
+                                on_close(reason);
+                                *link.0.on_close.borrow_mut() = Some(on_close);
+                            }
                             None => *link.0.closed_early.borrow_mut() = Some(reason),
                         }
                         return;
@@ -391,7 +509,9 @@ impl PduLink for WsLink {
     }
 
     fn is_reconnectable(&self) -> bool {
-        false
+        // The page reopens the socket on its own, so a request that timed
+        // out is a connection that went away, not a pane that died.
+        true
     }
 
     fn connection_generation(&self) -> u64 {

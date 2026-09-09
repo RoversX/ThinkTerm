@@ -9,6 +9,7 @@
 const { spawn } = require("child_process");
 const http = require("http");
 const fs = require("fs");
+const os = require("os");
 const WebSocket = require("ws");
 
 const args = process.argv.slice(2);
@@ -23,8 +24,13 @@ const port = 9333 + Math.floor(Math.random() * 500);
 // Whatever happens, this process ends.
 setTimeout(() => { console.error("cdp: watchdog"); try { chrome.kill(); } catch {} process.exit(4); }, timeoutMs + 30000).unref();
 
+// A profile of our own. Without one, launching the app bundle hands the
+// request to the Chrome the user already has open and exits, so this script
+// would drive their tabs -- or nothing at all -- instead of the page.
+const profile = fs.mkdtempSync(`${os.tmpdir()}/tt-cdp-`);
 const chrome = spawn(chromePath, [
   "--headless=new", "--no-first-run", `--remote-debugging-port=${port}`,
+  `--user-data-dir=${profile}`,
   "--window-size=1240,720", "--hide-scrollbars", "--enable-unsafe-webgpu", "about:blank",
 ], { stdio: "ignore" });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -63,10 +69,15 @@ async function browserWs() {
   const deadline = Date.now() + timeoutMs;
   let text = "";
   const re = waitStatus ? new RegExp(waitStatus) : null;
+  // The probes (?check=graphics, ?check=fallback, the colour check) end in
+  // a JSON line whose `ok` says whether they passed; a probe line that says
+  // false is a failure whatever else the status looks like.
+  const probeFailed = (t) => /^(FALLBACK|GRAPHICS|COLOR)\b/.test(t) && !/"ok"\s*:\s*true\b/.test(t);
+  const hardFailed = (t) => /^(disconnected|no token|WebGPU|error)/i.test(t) || /^FAIL/.test(t) || probeFailed(t);
   while (Date.now() < deadline) {
     text = await status();
     if (re ? re.test(text) : text && !/…$/.test(text)) break;
-    if (/^(disconnected|no token|WebGPU|error)/i.test(text) || /^FAIL/.test(text)) break;
+    if (hardFailed(text)) break;
     await sleep(250);
   }
   console.log("STATUS " + text);
@@ -87,5 +98,10 @@ async function browserWs() {
   fs.writeFileSync(outPng, Buffer.from(shot.data, "base64"));
   console.log(logs.join("\n"));
   ws.close(); chrome.kill();
-  process.exit(re && !re.test(text) ? 3 : 0);
+  // Without --wait-status this used to exit 0 no matter what the page said,
+  // so a smoke run that reported an error still passed CI.
+  // A probe that reports ok:false fails even when --wait-status matched it:
+  // the pattern says the probe finished, the JSON says how.
+  const failed = (re ? !re.test(text) : !text) || hardFailed(text);
+  process.exit(failed ? 3 : 0);
 })().catch((e) => { console.error(e); chrome.kill(); process.exit(1); });

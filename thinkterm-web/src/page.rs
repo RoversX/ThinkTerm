@@ -11,6 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use std::rc::Rc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use thinkterm_font_core::FontShaper;
 use thinkterm_font_web::{Face, FontSet};
 use thinkterm_render::bitmaps::BitmapImage;
 use thinkterm_render::pipeline::GpuTexture;
@@ -69,10 +70,23 @@ pub async fn start(
     font_names: Vec<String>,
     fonts: Vec<js_sys::Uint8Array>,
     size_pt: f64,
+    // `glyph_font` is the CSS font stack the glyph fallback draws with,
+    // from `?glyphfont=`; empty means the built-in list.
+    glyph_font: String,
 ) -> Result<(), JsValue> {
-    run(canvas_id, textarea_id, status_id, url, token, font_names, fonts, size_pt)
-        .await
-        .map_err(js_err)
+    run(
+        canvas_id, textarea_id, status_id, url, token, font_names, fonts, size_pt, glyph_font,
+    )
+    .await
+    .map_err(js_err)
+}
+
+/// The stack to hand the fallback canvas.
+fn families(requested: &str) -> Rc<str> {
+    match requested.trim() {
+        "" => crate::canvas::DEFAULT_FAMILIES.into(),
+        given => given.into(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -85,6 +99,7 @@ async fn run(
     font_names: Vec<String>,
     fonts: Vec<js_sys::Uint8Array>,
     size_pt: f64,
+    glyph_font: String,
 ) -> Result<()> {
     let canvas: web_sys::HtmlCanvasElement = element(&canvas_id)?;
     let textarea: web_sys::HtmlTextAreaElement = element(&textarea_id)?;
@@ -116,7 +131,38 @@ async fn run(
 
     set_status("connecting…");
     let link = WsLink::connect(&url, &token).await?;
+    // From here on a failure must hand the socket back: without this the
+    // server keeps a registered client and a TCP session for a page that
+    // gave up, and the reader keeps answering its pings.
+    let outcome = start_attached(
+        &link, &canvas, &textarea, status.clone(), &url, &token, fonts, size_pt, &glyph_font, dpr,
+        dpi,
+    )
+    .await;
+    if outcome.is_err() {
+        link.shutdown();
+    }
+    outcome
+}
 
+async fn start_attached(
+    link: &WsLink,
+    canvas: &web_sys::HtmlCanvasElement,
+    textarea: &web_sys::HtmlTextAreaElement,
+    status: Option<web_sys::Element>,
+    url: &str,
+    token: &str,
+    fonts: Rc<FontSet>,
+    size_pt: f64,
+    glyph_font: &str,
+    dpr: f64,
+    dpi: u32,
+) -> Result<()> {
+    let set_status = |text: &str| {
+        if let Some(s) = &status {
+            s.set_text_content(Some(text));
+        }
+    };
     set_status("starting WebGPU…");
     let rect = canvas.get_bounding_client_rect();
     let dev_w = (rect.width() * dpr).floor().max(1.0) as u32;
@@ -126,7 +172,7 @@ async fn run(
     let gpu = Gpu::new(canvas.clone(), dev_w, dev_h).await?;
     let atlas_side = 1024u32.min(gpu.max_texture_dimension());
     let texture = Rc::new(GpuTexture::new(&gpu.device, Arc::clone(&gpu.queue), atlas_side, atlas_side)?);
-    let glyphs = GlyphCache::new(Rc::clone(&fonts), size_pt, dpi, texture)?;
+    let glyphs = GlyphCache::new(Rc::clone(&fonts), size_pt, dpi, texture, families(glyph_font))?;
     let (cw, ch) = (
         glyphs.metrics.cell_size.width as u32,
         glyphs.metrics.cell_size.height as u32,
@@ -191,6 +237,8 @@ async fn run(
         canvas: canvas.clone(),
         textarea: textarea.clone(),
         status,
+        url: url.to_string(),
+        token: token.to_string(),
         pane_id: attached.pane_id,
         tab_id: attached.tab_id,
         dpr,
@@ -207,7 +255,7 @@ async fn run(
         let app = Rc::clone(&app);
         link.set_close_handler(move |reason| app.on_close(reason));
     }
-    crate::input::install(Rc::clone(&app), &canvas, &textarea);
+    crate::input::install(Rc::clone(&app), canvas, textarea);
     let _ = textarea.focus();
     app.resize();
     app.request_frame();
@@ -261,4 +309,181 @@ pub async fn color_check(canvas_id: String) -> Result<String, JsValue> {
         ))
     }
     run(canvas_id).await.map_err(js_err)
+}
+
+/// Every kind of glyph the fallback has to get right, and whether it should
+/// come back carrying its own colour.
+///
+/// `\u{2713}` and `\u{2714}` sit together on purpose: JetBrains Mono has the
+/// first and not the second, so they come from different fonts while looking
+/// almost the same. That is the mismatch most likely to be reported.
+const SAMPLES: &[(&str, &str, u8, bool)] = &[
+    ("latin", "A", 1, false),
+    ("braille", "\u{2801}", 1, false),
+    ("han", "\u{4e2d}", 2, false),
+    ("han-punct", "\u{3002}", 2, false),
+    ("han-bracket", "\u{300c}", 2, false),
+    ("kana", "\u{3042}", 2, false),
+    ("han-shared-1", "\u{76f4}", 2, false),
+    ("han-shared-2", "\u{9aa8}", 2, false),
+    ("hangul", "\u{d55c}", 2, false),
+    ("combining", "e\u{301}", 1, false),
+    // rustybuzz clusters this Burmese syllable as one where UAX#29 sees
+    // three graphemes -- the case that used to make the vowel signs vanish.
+    ("burmese", "\u{1005}\u{102c}\u{1038}", 1, false),
+    ("arabic", "\u{628}", 1, false),
+    ("hebrew", "\u{5d0}", 1, false),
+    ("thai", "\u{e01}", 1, false),
+    ("devanagari", "\u{915}", 1, false),
+    ("check-present", "\u{2713}", 1, false),
+    ("check-missing", "\u{2714}", 1, false),
+    ("cross", "\u{2718}", 1, false),
+    ("star", "\u{2605}", 1, false),
+    ("info", "\u{2139}", 1, false),
+    ("arrow", "\u{27a4}", 1, false),
+    ("return", "\u{21b5}", 1, false),
+    ("circle", "\u{25d0}", 1, false),
+    ("gear-text", "\u{2699}\u{fe0e}", 1, false),
+    ("gear-emoji", "\u{2699}\u{fe0f}", 2, true),
+    ("emoji", "\u{1f600}", 2, true),
+    ("emoji-zwj", "\u{1f468}\u{200d}\u{1f4bb}", 2, true),
+    ("emoji-flag", "\u{1f3f3}\u{fe0f}\u{200d}\u{1f308}", 2, true),
+    ("emoji-heart", "\u{2764}\u{fe0f}", 2, true),
+];
+
+/// Draw the sample matrix on a scratch canvas and report what happened, as
+/// JSON, with the assertions already evaluated.
+///
+/// This needs no server, no token, no pane and **no WebGPU**, which makes it
+/// the only automatic check that can run on Safari, on Firefox, and on a
+/// machine with hardly any fonts installed. It reports the geometry it used
+/// as well as the results: an early round of measurements was done at a cell
+/// size the product never uses, and nothing in the output said so.
+#[wasm_bindgen]
+pub fn fallback_check(
+    font_names: Vec<String>,
+    fonts: Vec<js_sys::Uint8Array>,
+    size_pt: f64,
+    glyph_font: String,
+) -> Result<String, JsValue> {
+    fn run(
+        font_names: Vec<String>,
+        fonts: Vec<js_sys::Uint8Array>,
+        size_pt: f64,
+        glyph_font: String,
+    ) -> Result<String> {
+        let mut faces = Vec::new();
+        for (name, data) in font_names.iter().zip(fonts.iter()) {
+            faces.push(Face::new(name, data.to_vec(), 0).with_context(|| name.clone())?);
+        }
+        let set = FontSet::new(faces)?;
+        let dpr = web_sys::window().map(|w| w.device_pixel_ratio()).unwrap_or(1.0);
+        let dpi = (96.0 * dpr) as u32;
+        let metrics = crate::glyphs::RenderMetrics::with_font_metrics(&set.metrics(size_pt, dpi)?);
+        let stack = families(&glyph_font);
+        let px = size_pt * dpi as f64 / 72.0;
+        let scratch =
+            crate::canvas::Scratch::new(metrics.cell_size, metrics.descender.get(), px, &stack)?;
+        let (canvas_w, canvas_h, pen_x, baseline) = scratch.geometry();
+
+        let mut rows = Vec::new();
+        let (mut drawn, mut wrong_colour, mut clipped, mut blank) = (0, 0, 0, 0);
+        for (name, text, cells, expect_color) in SAMPLES {
+            let points: Vec<String> =
+                text.chars().map(|c| format!("\"U+{:04X}\"", c as u32)).collect();
+            // Whether the terminal would actually use the canvas here --
+            // asked of the real thing, not of half of it. Production routes
+            // a grapheme to the canvas only when the bundled faces cannot
+            // draw it AND `keeps_notdef` lets it through; consulting only
+            // the second half marked `A` and the check mark U+2713 as
+            // routed, so on a machine whose default monospace lacks U+2713
+            // the probe failed over a character JetBrains Mono draws and the
+            // canvas is never asked for. It also meant the U+2713/U+2714
+            // pair -- there precisely because they look alike and come from
+            // different fonts -- was measured from the canvas on both sides
+            // and could never show the mismatch it exists to show.
+            let routed = !set
+                .shape_web(
+                    text,
+                    size_pt,
+                    dpi,
+                    None,
+                    thinkterm_font_core::Direction::LeftToRight,
+                    None,
+                    None,
+                    &crate::fallback::keeps_notdef,
+                )?
+                .gaps
+                .is_empty();
+            let row = match scratch.measure(text, *cells)? {
+                None => {
+                    if routed {
+                        blank += 1;
+                    }
+                    format!(
+                        "{{\"name\":\"{name}\",\"cp\":[{}],\"routed\":{routed},\
+                         \"ink\":null,\"ok\":{}}}",
+                        points.join(","),
+                        !routed
+                    )
+                }
+                Some((ink, placement, has_color)) => {
+                    drawn += 1;
+                    let mut ok = true;
+                    if routed {
+                        if has_color != *expect_color {
+                            wrong_colour += 1;
+                            ok = false;
+                        }
+                        if ink.clipped {
+                            clipped += 1;
+                            ok = false;
+                        }
+                    }
+                    format!(
+                        "{{\"name\":\"{name}\",\"cp\":[{}],\"routed\":{routed},\
+                         \"ink\":{{\"left\":{},\"top\":{},\"width\":{},\"height\":{}}},\
+                         \"clipped\":{},\"has_color\":{},\"expect_color\":{},\
+                         \"bearing_x\":{:.2},\"bearing_y\":{:.2},\"scale\":{:.3},\"ok\":{ok}}}",
+                        points.join(","),
+                        ink.left,
+                        ink.top,
+                        ink.width,
+                        ink.height,
+                        ink.clipped,
+                        has_color,
+                        expect_color,
+                        placement.bearing_x,
+                        placement.bearing_y,
+                        placement.scale,
+                    )
+                }
+            };
+            rows.push(row);
+        }
+        // The counts are the assertions. The first round of measurements had
+        // a silent bug in exactly this place -- both branches produced
+        // plausible numbers, and only printing "how many were judged
+        // coloured" exposed it -- so they are printed whether or not anyone
+        // is looking at them.
+        let ok = blank == 0 && wrong_colour == 0 && clipped == 0;
+        Ok(format!(
+            "{{\"ok\":{ok},\"drawn\":{drawn},\"blank\":{blank},\"wrong_colour\":{wrong_colour},\
+             \"clipped\":{clipped},\"samples\":{},\
+             \"cell\":[{},{}],\"descender\":{:.2},\"px\":{:.2},\"dpr\":{dpr},\
+             \"canvas\":[{canvas_w},{canvas_h}],\"pen_x\":{pen_x:.2},\"baseline\":{baseline:.2},\
+             \"families\":\"{}\",\"results\":[{}]}}",
+            SAMPLES.len(),
+            metrics.cell_size.width,
+            metrics.cell_size.height,
+            metrics.descender.get(),
+            px,
+            // The stack comes from the query string, so it is data: a
+            // stray quote or backslash would produce JSON the harness
+            // cannot parse, and the harness is the point of this.
+            stack.replace(['"', '\\'], "'"),
+            rows.join(",")
+        ))
+    }
+    run(font_names, fonts, size_pt, glyph_font).map_err(js_err)
 }

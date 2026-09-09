@@ -92,9 +92,47 @@ for instance at a development checkout.
 
 ## What the first version does not do
 
-Images (kitty, sixel, iTerm2) and colour emoji are not drawn; tabs, splits and
-the ThinkTerm tree are not shown -- the page mirrors one pane; there is no
-reconnect after the socket drops (reload the page); the cursor does not blink;
-box-drawing comes from the font rather than the desktop's custom block glyphs;
-font fallback is the bundled list (JetBrains Mono, Symbols Nerd Font Mono), so
-scripts outside it show as missing-glyph boxes.
+Images (kitty, sixel, iTerm2) are not drawn; tabs, splits and the ThinkTerm
+tree are not shown -- the page mirrors one pane, chosen when it connects,
+and does not follow the desktop to another; the cursor does not blink. The input
+method's hidden field follows the terminal cursor, including scrolling and
+resizing, so the browser can place its candidate window there; pre-edit
+text and its underline are not yet drawn in the grid.
+
+A dropped socket is reopened by the page itself, with a backoff, on the same
+pane; the status line says so while it is down. It gives up only when there
+is nothing to come back to -- the pane was closed, or the server speaks a
+different protocol version -- and says which.
+
+## Fonts
+
+The page ships two faces (JetBrains Mono, Symbols Nerd Font Mono) and shapes
+with them. Anything they do not cover -- CJK, Hangul, emoji, a scattering of
+symbols -- is drawn with **your own machine's fonts**, on a 2D canvas, and
+kept in the same glyph atlas as everything else. Braille is drawn from the
+dot pattern rather than from a font, as the desktop does.
+
+Blocks, fractions, shades and box-drawing use the desktop's shared geometric
+glyph renderer instead of font outlines, so adjacent cells meet at their
+edges. These glyphs are cached in the same atlas and obey its allocation
+freeze and recovery rules. They do not use the Canvas font fallback budget.
+
+`?glyphfont=` sets the CSS font stack used for that, which is also how the
+regional shape of a Han character is chosen: pass a Japanese face to get
+Japanese forms. A grapheme your machine has no font for either is still a
+missing-glyph box, the same as it would be in a native terminal there.
+
+Right-to-left scripts stay as boxes on purpose: the page does not do bidi,
+so drawing them would put correct glyphs in the wrong order, which is harder
+to notice than a box.
+
+`?check=fallback` draws a sample of every kind and prints what it measured,
+as JSON, in the status line. It needs no server, no token and no WebGPU, so
+it is the way to check a browser or a machine before relying on it.
+
+`?check=graphics` checks the real WebGPU line renderer for block seams,
+cache reuse, recovery of a frozen cache miss, and the input field's DOM
+position. It needs WebGPU but no token or pane. It reports CPU emission
+timings for its sample, not end-to-end terminal latency. Use a real input
+method to verify the native candidate window; the DOM check cannot inspect
+that operating-system UI.
