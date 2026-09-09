@@ -9,12 +9,13 @@
 
 use codec::ListPanesResponse;
 use thinkterm_proto::layout::{PaneEntry, PaneNode};
-use thinkterm_proto::{PaneId, TabId};
+use thinkterm_proto::{PaneId, TabId, WindowId};
 
 /// One tab in the strip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabView {
     pub tab_id: TabId,
+    pub window_id: WindowId,
     pub title: String,
     /// The pane a click on the tab shows: the one on show if it is in
     /// this tab, else the tab's active pane.
@@ -69,13 +70,23 @@ pub fn first_choice(layout: &ListPanesResponse) -> Option<PaneEntry> {
 /// The strip for a layout, given the pane on show. `current_title` is
 /// that pane's title as the page knows it, which is fresher than the
 /// listing's copy.
-pub fn model(layout: &ListPanesResponse, current: PaneId, current_title: &str) -> Vec<TabView> {
+/// The tabs of one window, like a desktop window's row; every window's
+/// when `window` is `None`.
+pub fn model(
+    layout: &ListPanesResponse,
+    current: PaneId,
+    current_title: &str,
+    window: Option<WindowId>,
+) -> Vec<TabView> {
     let mut tabs = Vec::new();
     for (i, node) in layout.tabs.iter().enumerate() {
         let panes = leaves(node);
         let Some(first) = panes.first() else {
             continue;
         };
+        if window.is_some_and(|w| w != first.window_id) {
+            continue;
+        }
         let is_current = panes.iter().any(|e| e.pane_id == current);
         let target = if is_current {
             current
@@ -110,6 +121,7 @@ pub fn model(layout: &ListPanesResponse, current: PaneId, current_title: &str) -
         };
         tabs.push(TabView {
             tab_id: first.tab_id,
+            window_id: first.window_id,
             title,
             target,
             current: is_current,
@@ -122,7 +134,7 @@ pub fn model(layout: &ListPanesResponse, current: PaneId, current_title: &str) -
 #[cfg(target_arch = "wasm32")]
 mod dom {
     use super::TabView;
-    use thinkterm_proto::PaneId;
+    use thinkterm_proto::{PaneId, TabId};
     use wasm_bindgen::JsCast;
 
     /// The strip's element and what it draws into it.
@@ -136,22 +148,30 @@ mod dom {
         Pane(PaneId),
         Follow,
         NewTab,
-        SplitRight,
-        SplitBelow,
-        Zoom,
+        /// The bar's pane, or the focused one from a chord.
+        SplitRight(Option<PaneId>),
+        SplitBelow(Option<PaneId>),
+        Zoom(Option<PaneId>),
+        /// The focused pane's close button (a chord, or a bar).
         Close,
-        Fit,
+        /// A capsule's own close button.
+        ClosePane(PaneId),
+        /// A tab's close button: every pane of it.
+        CloseTab(TabId),
+        /// The sidebar toggle at the row's start.
+        Sidebar,
     }
 
-    /// The state the strip's buttons show.
+    /// The state the strip shows.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct Controls {
         pub following: bool,
-        pub zoomed: bool,
         pub fit: bool,
-        /// The close button was pressed once and waits for the second
+        /// The tab whose close button was pressed once and waits for the
         /// press that means it.
-        pub closing: bool,
+        pub closing_tab: Option<TabId>,
+        /// The page shows less than the tab: the grid it fits.
+        pub clipped: Option<(usize, usize)>,
     }
 
     fn escape(text: &str) -> String {
@@ -193,29 +213,27 @@ mod dom {
         /// them is cheaper to get right than diffing them.
         pub fn render(&self, tabs: &[TabView], controls: Controls) {
             let following = controls.following;
-            let mut html = String::new();
+            let icon = crate::icons::svg;
+            let mut html = format!(
+                "<span class=\"act\" data-action=\"sidebar\" title=\"Show or hide the sidebar\">{}</span>",
+                icon("panel-left")
+            );
             for tab in tabs {
                 let class = if tab.current { "tab current" } else { "tab" };
+                let (title, _) = crate::navbar::display_title(&tab.title);
+                let (close_class, close_body) = if controls.closing_tab == Some(tab.tab_id) {
+                    ("x danger", "close?")
+                } else {
+                    ("x", icon("x"))
+                };
                 html.push_str(&format!(
-                    "<span class=\"{class}\" data-pane=\"{}\" title=\"{}\">{}",
+                    "<span class=\"{class}\" data-pane=\"{}\" title=\"{}\">{}<span class=\"t\">{}</span><span class=\"{close_class}\" data-action=\"close-tab\" data-tab=\"{}\" title=\"Close this tab and end its programs. Asks twice.\">{close_body}</span></span>",
                     tab.target,
                     escape(&tab.title),
-                    escape(&short(&tab.title))
+                    icon("square-terminal"),
+                    escape(&short(title)),
+                    tab.tab_id
                 ));
-                if !tab.panes.is_empty() {
-                    html.push_str("<span class=\"panes\">");
-                    for pane in &tab.panes {
-                        let class = if pane.current { "pane current" } else { "pane" };
-                        html.push_str(&format!(
-                            "<span class=\"{class}\" data-pane=\"{}\" title=\"{}\">{}</span>",
-                            pane.pane_id,
-                            escape(&pane.title),
-                            escape(&short(&pane.title))
-                        ));
-                    }
-                    html.push_str("</span>");
-                }
-                html.push_str("</span>");
             }
             let (class, text, hint) = if following {
                 (
@@ -230,36 +248,16 @@ mod dom {
                     "This page stays on this pane. Click to follow the desktop's focus again.",
                 )
             };
-            html.push_str(
-                "<span class=\"act\" data-action=\"new-tab\" title=\"New tab, next to this one on the desktop\">+</span>",
-            );
-            html.push_str("<span class=\"actions\">");
-            html.push_str(
-                "<span class=\"act\" data-action=\"split-right\" title=\"Split the focused pane: new pane to the right\">◧</span>",
-            );
-            html.push_str(
-                "<span class=\"act\" data-action=\"split-below\" title=\"Split the focused pane: new pane below\">⬒</span>",
-            );
-            let zoom_class = if controls.zoomed { "act on" } else { "act" };
             html.push_str(&format!(
-                "<span class=\"{zoom_class}\" data-action=\"zoom\" title=\"Zoom the focused pane to the whole tab (again to unzoom)\">⤢</span>"
+                "<span class=\"act\" data-action=\"new-tab\" title=\"New tab\">{}</span>",
+                icon("plus")
             ));
-            let fit_class = if controls.fit { "act on" } else { "act" };
-            html.push_str(&format!(
-                "<span class=\"{fit_class}\" data-action=\"fit\" title=\"Fit the tab to this window; the desktop letterboxes. Again to give the size back. (Ctrl+Shift+F)\">⤡</span>"
-            ));
-            let (close_class, close_text) = if controls.closing {
-                ("act danger", "close pane?")
-            } else {
-                ("act", "×")
-            };
-            html.push_str(&format!(
-                "<span class=\"{close_class}\" data-action=\"close\" title=\"Close the focused pane and end its program. Asks twice.\">{close_text}</span>"
-            ));
-            html.push_str("</span>");
-            html.push_str(&format!(
-                "<span class=\"{class}\" data-follow=\"\" title=\"{hint}\">{text}</span>"
-            ));
+            if controls.fit {
+                html.push_str(
+                    "<span class=\"trail\"><span class=\"hint\" title=\"The tab is fitted to this window; Ctrl+Shift+F gives the size back\">fitted</span></span>",
+                );
+            }
+            let _ = (following, class, text, hint);
             self.root.set_inner_html(&html);
         }
 
@@ -271,13 +269,21 @@ mod dom {
                 return Some(Click::Follow);
             }
             if let Some(action) = hit.get_attribute("data-action") {
+                // A bar's buttons act on the bar's pane, whichever is focused.
+                let bar = hit
+                    .closest("[data-nav]")
+                    .ok()
+                    .flatten()
+                    .and_then(|nav| nav.get_attribute("data-nav")?.parse::<PaneId>().ok());
                 return match action.as_str() {
                     "new-tab" => Some(Click::NewTab),
-                    "split-right" => Some(Click::SplitRight),
-                    "split-below" => Some(Click::SplitBelow),
-                    "zoom" => Some(Click::Zoom),
+                    "split-right" => Some(Click::SplitRight(bar)),
+                    "split-below" => Some(Click::SplitBelow(bar)),
+                    "zoom" => Some(Click::Zoom(bar)),
                     "close" => Some(Click::Close),
-                    "fit" => Some(Click::Fit),
+                    "close-pane" => hit.get_attribute("data-pane")?.parse().ok().map(Click::ClosePane),
+                    "close-tab" => hit.get_attribute("data-tab")?.parse().ok().map(Click::CloseTab),
+                    "sidebar" => Some(Click::Sidebar),
                     _ => None,
                 };
             }
@@ -338,8 +344,10 @@ mod tests {
 
     #[test]
     fn a_tab_is_named_by_its_title_or_its_target_pane() {
-        let tabs = model(&layout(), 10, "zsh · ~");
+        let tabs = model(&layout(), 10, "zsh · ~", None);
         assert_eq!(tabs.len(), 2, "the empty tab is not listed");
+        assert_eq!(model(&layout(), 10, "zsh · ~", Some(0)).len(), 2, "both tabs are in window 0");
+        assert!(model(&layout(), 10, "zsh · ~", Some(9)).is_empty(), "no tab is in window 9");
         assert_eq!(tabs[0].title, "zsh · ~", "the page's own title is fresher");
         assert_eq!(tabs[1].title, "work");
         assert!(tabs[0].current && !tabs[1].current);
@@ -348,7 +356,7 @@ mod tests {
 
     #[test]
     fn panes_are_listed_only_for_the_tab_on_show_and_only_when_there_are_several() {
-        let tabs = model(&layout(), 20, "vim");
+        let tabs = model(&layout(), 20, "vim", None);
         assert!(tabs[0].panes.is_empty());
         assert_eq!(
             tabs[1].panes,
@@ -358,7 +366,7 @@ mod tests {
             ]
         );
         assert_eq!(tabs[1].target, 20, "the tab on show points at the pane on show");
-        let tabs = model(&layout(), 10, "zsh");
+        let tabs = model(&layout(), 10, "zsh", None);
         assert!(tabs[0].panes.is_empty(), "one pane is not a choice");
     }
 

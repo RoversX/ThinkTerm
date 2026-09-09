@@ -30,10 +30,14 @@ try {
   console.warn("session storage unavailable; the token is kept for this load only", e);
 }
 const requested = Number(params.get("font"));
-const fontSize = Number.isFinite(requested) && requested >= 6 && requested <= 72 ? requested : 12;
+// Without `?font=` the page takes the desktop's cell size once attached.
+const fontPinned = Number.isFinite(requested) && requested >= 6 && requested <= 72;
+const fontSize = fontPinned ? requested : 12;
 // The CSS font stack the glyph fallback draws with. This is also how the
 // regional shape of a Han character is chosen; see canvas.rs.
 const glyphFont = params.get("glyphfont") || "";
+// The desktop is dark unless told otherwise; so is the page.
+if (params.get("theme") === "light") document.documentElement.dataset.theme = "light";
 
 const FONTS = [
   ["JetBrains Mono", "./fonts/JetBrainsMono-Regular.ttf"],
@@ -70,7 +74,7 @@ try {
     const names = FONTS.map(([n]) => n);
     const data = await Promise.all(FONTS.map(([, u]) => fetchFont(u)));
     const scheme = location.protocol === "https:" ? "wss" : "ws";
-    await start("term", "kbd", "status", `${scheme}://${location.host}/ws`, token, names, data, fontSize, glyphFont);
+    await start("term", "kbd", "status", `${scheme}://${location.host}/ws`, token, names, data, fontSize, glyphFont, fontPinned);
   }
 } catch (e) {
   fail(String(e && e.message ? e.message : e));

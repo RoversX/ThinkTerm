@@ -24,7 +24,10 @@ pub struct Gpu {
     vertex_capacity: usize,
     index_buffer: wgpu::Buffer,
     index_quads: usize,
-    atlas_bind_groups: Option<(usize, AtlasBindGroups)>,
+    /// Bind groups per atlas texture, by identity: a page with panes at
+    /// their own font sizes draws from several atlases each frame.
+    atlas_bind_groups: Vec<(usize, AtlasBindGroups)>,
+    scratch: Vec<Vertex>,
     pub adapter_info: wgpu::AdapterInfo,
 }
 
@@ -105,7 +108,8 @@ impl Gpu {
             vertex_capacity,
             index_buffer,
             index_quads,
-            atlas_bind_groups: None,
+            atlas_bind_groups: Vec::new(),
+            scratch: Vec::new(),
             adapter_info,
         })
     }
@@ -167,22 +171,25 @@ impl Gpu {
         self.device.limits().max_texture_dimension_2d
     }
 
-    fn atlas_groups(&mut self, atlas: &GpuTexture) -> &AtlasBindGroups {
+    fn atlas_groups(&mut self, atlas: &GpuTexture) -> usize {
         let identity = atlas.id();
-        if self.atlas_bind_groups.as_ref().map(|(id, _)| *id) != Some(identity) {
-            let groups = self.pipeline.atlas_bind_groups(&self.device, &atlas.view());
-            self.atlas_bind_groups = Some((identity, groups));
+        if let Some(i) = self.atlas_bind_groups.iter().position(|(id, _)| *id == identity) {
+            return i;
         }
-        &self.atlas_bind_groups.as_ref().expect("just set").1
+        // A handful at a time is the most a page has; old ones go.
+        if self.atlas_bind_groups.len() >= 8 {
+            self.atlas_bind_groups.remove(0);
+        }
+        let groups = self.pipeline.atlas_bind_groups(&self.device, &atlas.view());
+        self.atlas_bind_groups.push((identity, groups));
+        self.atlas_bind_groups.len() - 1
     }
 
-    /// Draw `vertices` (four per quad, TL TR BL BR) over a cleared frame.
-    /// `background` is the pane's default background, painted as the
-    /// clear colour so letterboxed margins match it.
-    pub fn draw(
+    /// One frame from several batches, each from its own atlas: one pass,
+    /// one vertex upload, one draw per batch.
+    pub fn draw_batches(
         &mut self,
-        vertices: &[Vertex],
-        atlas: &GpuTexture,
+        batches: &[(&[Vertex], &GpuTexture)],
         background: [f32; 4],
         millis: u32,
     ) -> Result<()> {
@@ -197,8 +204,20 @@ impl Gpu {
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
-        let quads = self.upload_vertices(vertices);
-        self.atlas_groups(atlas);
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.clear();
+        let mut ranges = Vec::with_capacity(batches.len());
+        for (vertices, atlas) in batches {
+            let start = scratch.len() / 4;
+            scratch.extend_from_slice(vertices);
+            let end = scratch.len() / 4;
+            let group = self.atlas_groups(atlas);
+            if end > start {
+                ranges.push((start as u32, end as u32, group));
+            }
+        }
+        self.upload_vertices(&scratch);
+        self.scratch = scratch;
 
         let frame = self
             .surface
@@ -209,7 +228,6 @@ impl Gpu {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         {
-            let groups = &self.atlas_bind_groups.as_ref().expect("set above").1;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("pane"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -229,14 +247,17 @@ impl Gpu {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            if quads > 0 {
+            if !ranges.is_empty() {
                 pass.set_pipeline(&self.pipeline.render_pipeline);
                 pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                pass.set_bind_group(1, &groups.linear, &[]);
-                pass.set_bind_group(2, &groups.nearest, &[]);
                 pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
                 pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..(quads * 6) as u32, 0, 0..1);
+                for (start, end, group) in ranges {
+                    let groups = &self.atlas_bind_groups[group].1;
+                    pass.set_bind_group(1, &groups.linear, &[]);
+                    pass.set_bind_group(2, &groups.nearest, &[]);
+                    pass.draw_indexed(start * 6..end * 6, 0, 0..1);
+                }
             }
         }
         self.queue.submit(Some(encoder.finish()));
@@ -265,7 +286,7 @@ impl Gpu {
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
         let quads = self.upload_vertices(vertices);
-        self.atlas_groups(atlas);
+        let group = self.atlas_groups(atlas);
 
         let frame = self
             .surface
@@ -282,7 +303,7 @@ impl Gpu {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("check") });
         {
-            let groups = &self.atlas_bind_groups.as_ref().expect("set above").1;
+            let groups = &self.atlas_bind_groups[group].1;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("check"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {

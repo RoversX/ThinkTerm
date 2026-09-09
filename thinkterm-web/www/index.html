@@ -5,34 +5,112 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ThinkTerm</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #000; color: #ccc; font: 12px system-ui, sans-serif; overflow: hidden; }
-  #tabs { position: absolute; left: 0; right: 0; top: 0; height: 28px; display: flex; align-items: center; gap: 4px; padding: 0 6px; background: #111; overflow-x: auto; overflow-y: hidden; white-space: nowrap; user-select: none; scrollbar-width: none; }
-  #tabs .tab { display: inline-flex; align-items: center; gap: 6px; padding: 0 10px; height: 20px; line-height: 20px; border-radius: 10px; color: #9a9a9a; cursor: pointer; }
-  #tabs .tab:hover { background: #1c1c1c; color: #ddd; }
-  #tabs .tab.current { background: #2a2a2a; color: #eee; }
-  #tabs .panes { display: inline-flex; gap: 3px; margin-left: 2px; }
-  #tabs .pane { padding: 0 7px; height: 16px; line-height: 16px; border-radius: 8px; background: #1a1a1a; color: #9a9a9a; font-size: 11px; cursor: pointer; }
-  #tabs .pane:hover { color: #ddd; }
-  #tabs .pane.current { background: #3a3a3a; color: #fff; }
-  #tabs .act { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 20px; padding: 0 6px; border-radius: 10px; color: #8a8a8a; cursor: pointer; font-size: 13px; }
-  #tabs .act:hover { background: #1c1c1c; color: #eee; }
-  #tabs .act.on { color: #6cb6ff; }
-  #tabs .act.danger { background: #5a1e1e; color: #ffb4b4; font-size: 11px; }
-  #tabs .actions { display: inline-flex; gap: 2px; margin-left: auto; }
-  #tabs .follow { padding: 0 10px; height: 20px; line-height: 20px; border-radius: 10px; color: #777; cursor: pointer; font-size: 11px; }
-  #tabs .follow.on { color: #6cb6ff; }
-  #tabs .follow:hover { background: #1c1c1c; }
-  #term { position: absolute; inset: 28px 0 22px 0; width: 100%; height: calc(100% - 50px); display: block; outline: none; }
-  #status { position: absolute; left: 0; right: 0; bottom: 0; height: 22px; line-height: 22px; padding: 0 8px; background: #111; color: #9a9a9a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  #status.error { color: #f66; }
+  /* The desktop's chrome (wezterm-gui/src/ui/tokens.rs, fancy_tab_bar.rs,
+     render/pane.rs): its palette, its 40 px tab row of 160 px capsules,
+     its bar above every pane. Dark is the desktop's default whatever the
+     OS says; ?theme=light picks the other set. */
+  :root {
+    --bg: #19191A; --side-bg: #121214; --sep: rgba(84,84,88,.22);
+    --ctl: rgba(45,45,47,.98); --ctl-hover: rgba(55,55,57,.98); --ctl-pressed: rgba(66,66,69,.98); --ctl-border: rgba(118,118,128,.28);
+    --text: #F2F2F7; --text2: #C7C7CC; --muted: #8E8E93; --accent: #0A84FF; --danger: #FF453A;
+    --wash: rgba(242,242,247,.025); --ring: rgba(242,242,247,.12); --edge: rgba(242,242,247,.38); --shadow: 0 .5px 0 1px rgba(0,0,0,.12);
+    --ui: -apple-system, "SF Pro Text", "Helvetica Neue", Roboto, system-ui, sans-serif;
+    --tabs: 40px; --side-w: 220px;
+    --done: #7CE5A2; --open: #61B8FF;
+  }
+  body[data-side=off] { --side-w: 0px; }
+  [data-theme=light] {
+    --bg: #EEEEF2; --side-bg: #E2E2E8; --sep: rgba(60,60,67,.18);
+    --ctl: rgba(255,255,255,.94); --ctl-hover: rgba(247,247,250,.98); --ctl-pressed: rgba(232,242,255,.98); --ctl-border: rgba(60,60,67,.20);
+    --text: #1C1C1E; --text2: #48484A; --muted: #8E8E93; --accent: #007AFF; --danger: #D7263D;
+    --wash: rgba(28,28,30,.025); --ring: rgba(28,28,30,.12); --edge: rgba(28,28,30,.38); --shadow: 0 .5px 0 1px rgba(0,0,0,.04);
+  }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text2); font: 500 14px var(--ui); overflow: hidden; }
+  svg { width: 16px; height: 16px; flex: none; }
+  /* The window's tab row. Capsules never shrink; the row scrolls. */
+  #tabs { position: absolute; left: var(--side-w); right: 0; top: 0; height: var(--tabs); box-sizing: border-box; display: flex; align-items: center; gap: 9px; padding: 2px 8px 0 8px; background: var(--bg); overflow-x: auto; overflow-y: hidden; white-space: nowrap; user-select: none; scrollbar-width: none; }
+  #tabs::-webkit-scrollbar { display: none; }
+  #tabs .tab { display: inline-flex; align-items: center; flex: 0 0 auto; width: 160px; height: 30px; box-sizing: border-box; padding: 0 9px; border-radius: 999px; border: 1px solid transparent; color: var(--text2); cursor: default; }
+  #tabs .tab:hover { background: var(--ctl-hover); }
+  #tabs .tab.current { background: var(--ctl); border-color: var(--ctl-border); box-shadow: var(--shadow); color: var(--text); }
+  .t { margin-left: 4px; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .x { display: none; margin-left: 4px; width: 22px; height: 22px; border-radius: 999px; align-items: center; justify-content: center; opacity: .82; flex: none; }
+  .current .x, .tab:hover .x, .cap:hover .x { display: inline-flex; }
+  .x:hover { background: var(--ring); opacity: 1; }
+  .x.danger { width: auto; padding: 0 6px; font-size: 11px; color: var(--danger); opacity: 1; }
+  .act { width: 30px; height: 30px; flex: none; border-radius: 999px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid transparent; box-sizing: border-box; color: var(--text2); }
+  .act:hover { background: var(--ctl-hover); border-color: var(--edge); color: var(--text); }
+  #tabs .trail { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; flex: none; }
+  #tabs .hint { color: var(--muted); font-size: 12px; padding: 0 6px; }
+  #tabs .follow { color: var(--muted); font-size: 12px; padding: 0 8px; height: 24px; line-height: 24px; border-radius: 999px; cursor: default; }
+  #tabs .follow.on { color: var(--accent); }
+  #tabs .follow:hover { background: var(--ctl-hover); }
+  #term { position: absolute; inset: var(--tabs) 0 0 var(--side-w); width: calc(100% - var(--side-w)); height: calc(100% - var(--tabs)); display: block; outline: none; }
+  /* One bar over each pane, laid out from the canvas's cells. */
+  #panes { position: absolute; inset: var(--tabs) 0 0 var(--side-w); pointer-events: none; overflow: hidden; }
+  /* The desktop's left sidebar: Spaces, Projects, Threads. */
+  #side { position: absolute; left: 0; top: 0; bottom: 0; width: var(--side-w); box-sizing: border-box; background: var(--side-bg); border-right: 1px solid var(--sep); font: 500 15px var(--ui); color: var(--text2); user-select: none; overflow: hidden; }
+  body[data-side=off] #side { display: none; }
+  #side .list { position: absolute; inset: 26px 5px 0 5px; overflow-y: auto; scrollbar-width: thin; display: flex; flex-direction: column; gap: 5px; padding-bottom: 32px; }
+  #side .handle { position: absolute; right: -2px; top: 0; bottom: 0; width: 4px; cursor: col-resize; z-index: 1; }
+  #side .row { display: flex; align-items: center; min-height: 33px; box-sizing: border-box; padding: 0 5px; border-radius: 10px; border: 1px solid transparent; flex: none; }
+  #side .row.thread { padding-left: 25px; }
+  #side .row .t { margin-left: 5px; color: var(--text); }
+  #side .row.project .t, #side .row.space .t { color: var(--text2); }
+  #side .row:hover { background: rgba(42,42,44,.98); }
+  #side .row.selected { background: rgba(62,62,65,.98); border-color: rgba(118,118,128,.22); box-shadow: var(--shadow); }
+  #side .row.archived { opacity: .55; }
+  #side .chev { display: inline-flex; width: 16px; margin-right: 2px; color: var(--muted); }
+  #side .hov { display: none; margin-left: auto; gap: 2px; }
+  #side .row:hover .hov { display: inline-flex; }
+  #side .act { width: 24px; height: 24px; }
+  #side .act svg { width: 13px; height: 13px; }
+  #side .hdr { display: flex; align-items: center; gap: 5px; min-height: 33px; padding: 0 10px; color: var(--text2); font-size: 14px; margin-top: 6px; }
+  #side .hdr .act { margin-left: auto; }
+  #side .hdr.sub { cursor: default; }
+  #side .pill { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 30px; margin: 4px 10px 6px 10px; border-radius: 999px; background: rgba(36,36,38,.94); border: 1px solid rgba(118,118,128,.22); color: var(--text); flex: none; }
+  #side .pill:hover { background: rgba(48,48,50,.98); }
+  #side .st { display: inline-flex; width: 13px; height: 13px; align-items: center; justify-content: center; margin-left: 6px; flex: none; }
+  #side .st svg { width: 13px; height: 13px; }
+  #side .st.alert svg { width: 10px; height: 10px; }
+  #side .st.done { color: var(--done); }
+  #side .st.dot::before { content: ""; width: 5px; height: 5px; border-radius: 999px; background: rgba(242,242,247,.16); }
+  #side .st.dot.active::before { background: var(--done); }
+  #side .st.dot.unread::before { background: #3A3A3C; }
+  #side .st.dot.pinned::before { background: rgba(242,242,247,.68); }
+  #side .st.dot.open::before { background: var(--open); }
+  #side input.rename { font: 500 15px var(--ui); color: var(--text); background: #3A3A3C; border: 0; border-radius: 4px; padding: 2px 4px; margin-left: 5px; flex: 1 1 auto; min-width: 0; outline: none; }
+  #side .path { display: flex; align-items: center; gap: 5px; padding: 0 10px; }
+  #side .path input { flex: 1 1 auto; min-width: 0; font: 14px var(--ui); color: var(--text); background: var(--ctl); border: 1px solid var(--ctl-border); border-radius: 6px; padding: 4px 6px; outline: none; }
+  .nav { position: absolute; pointer-events: auto; box-sizing: border-box; display: flex; align-items: center; gap: 9px; padding: 0 5px; background: var(--bg); color: var(--text2); user-select: none; overflow: hidden; }
+  .nav.focused { color: var(--text); }
+  .nav .caps { display: flex; gap: 9px; flex: 1 1 auto; min-width: 0; overflow: hidden; }
+  .nav .cap { display: inline-flex; align-items: center; flex: 0 0 auto; width: 160px; height: 30px; box-sizing: border-box; padding: 0 9px; border-radius: 999px; border: 1px solid transparent; background: var(--wash); color: var(--text2); cursor: default; }
+  .nav .cap.current { background: var(--ctl); border-color: var(--ctl-border); box-shadow: var(--shadow); color: inherit; }
+  .nav .cap:hover:not(.current) { background: var(--ctl-hover); }
+  .nav .acts { display: flex; gap: 2px; margin-left: auto; flex: none; }
+  .nav .act svg { width: 13px; height: 13px; }
+  .spin { display: inline-flex; animation: spin .96s steps(12) infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  /* What the desktop shows over a terminal another device holds. */
+  #card { position: absolute; left: 50%; top: 45%; transform: translate(-50%, -50%); text-align: center; padding: 26px 36px; border-radius: 18px; background: color-mix(in srgb, var(--bg) 86%, transparent); border: 1px solid var(--ctl-border); pointer-events: none; user-select: none; }
+  #card .eyes { font: 17px var(--ui); color: var(--muted); letter-spacing: 2px; margin-bottom: 8px; }
+  #card .title { font: 500 17px var(--ui); color: var(--text); }
+  #card .hint { font: 15px var(--ui); color: var(--text2); margin-top: 10px; }
+  /* Passing remarks: refusals, reconnects. */
+  #status { position: absolute; right: 12px; bottom: 12px; max-width: 60%; padding: 7px 11px; border-radius: 8px; background: var(--ctl); border: 1px solid var(--ctl-border); color: var(--text); font: 13px var(--ui); box-shadow: 0 2px 12px rgba(0,0,0,.35); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+  #status.error { color: var(--danger); }
   /* Focus lives here so the IME composes into a real text field; the
      field itself stays out of sight. */
   #kbd { position: fixed; left: 0; top: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; margin: 0; resize: none; overflow: hidden; pointer-events: none; }
 </style>
 </head>
 <body>
+<aside id="side"></aside>
 <div id="tabs"></div>
 <canvas id="term"></canvas>
+<div id="panes"></div>
+<div id="card" hidden><div class="eyes">•  •</div><div class="title"></div><div class="hint"></div></div>
 <textarea id="kbd" wrap="off" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
 <div id="status">loading…</div>
 <script type="module" src="./app.js"></script>

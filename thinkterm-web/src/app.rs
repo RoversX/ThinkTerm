@@ -13,6 +13,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use termwiz::input::{KeyCode, Modifiers};
+use thinkterm_font_core::FontShaper as _;
 use thinkterm_font_web::FontSet;
 use thinkterm_proto::{PaneId, TabId};
 use thinkterm_render::atlas::OutOfTextureSpace;
@@ -99,6 +100,10 @@ pub struct Setup {
     pub cols: usize,
     pub rows: usize,
     pub strip: Option<crate::chrome::TabStrip>,
+    pub navs: Option<crate::navbar::NavBars>,
+    pub side: Option<crate::sidebar::Sidebar>,
+    /// `?font=` was given: the size is the user's, not the desktop's.
+    pub font_pinned: bool,
 }
 
 /// One pane on the page: its session and the state that is the page's
@@ -155,15 +160,23 @@ pub struct Inner {
     textarea: web_sys::HtmlTextAreaElement,
     status: Option<web_sys::Element>,
     tab_id: TabId,
+    /// Tabs this page has shown, most recent first: a thread opens on
+    /// the tab it was left at, not the window's active one, since the
+    /// page's tab switches are its own and never move the server's.
+    recent_tabs: Vec<TabId>,
     window_id: thinkterm_proto::WindowId,
     workspace: String,
     dpr: f64,
     cols: usize,
     rows: usize,
+    font_pinned: bool,
     /// Word/line selection extends by units; the pointer is down.
     selecting: bool,
     /// The pane a drag started in; it keeps the drag until the release.
     drag_pane: Option<PaneId>,
+    /// A divider being dragged: which, where the press was along its
+    /// axis (device px), and the cells already sent to the server.
+    drag_divider: Option<(usize, f64, isize)>,
     click_count: u8,
     last_click_ms: f64,
     focused: bool,
@@ -188,6 +201,10 @@ pub struct Inner {
     connected_since: Option<f64>,
     quads: HeapQuadAllocator,
     vertices: Vec<Vertex>,
+    /// Panes at their own font size (Cmd+= / Cmd+-), as on the desktop:
+    /// each has its own glyph cache and atlas, and is drawn as its own
+    /// batch. Absent means the page's size.
+    pane_fonts: std::collections::BTreeMap<PaneId, PaneFont>,
     /// What to do about an atlas that has run out of room for good.
     capacity: Capacity,
     /// The server's tabs and panes as last listed, for the strip and for
@@ -200,6 +217,20 @@ pub struct Inner {
     /// used. Choosing a pane here turns it off.
     following: bool,
     strip: Option<crate::chrome::TabStrip>,
+    navs: Option<crate::navbar::NavBars>,
+    /// The bars' last markup, so an unchanged layout costs no DOM work.
+    nav_html: std::cell::RefCell<String>,
+    /// The timer that hides the passing remark, so a new one restarts it.
+    toast_timer: Cell<Option<i32>>,
+    tree: crate::tree::TreeModel,
+    side: Option<crate::sidebar::Sidebar>,
+    side_html: RefCell<String>,
+    session_refresh_pending: bool,
+    /// A thread's delete button was pressed once, and when.
+    deleting: Option<(String, f64)>,
+    editing: crate::sidebar::Editing,
+    /// A tab's close button was pressed once, and when.
+    closing_tab: Option<(TabId, f64)>,
     layout_refresh_pending: bool,
     /// A switch is under way; a second request waits for the next push
     /// or click rather than racing it.
@@ -207,6 +238,23 @@ pub struct Inner {
     /// The close button was pressed once; the second press, within a
     /// few seconds, is the one that closes.
     closing_since: Option<f64>,
+    /// What the interaction that asked for the terminal wanted done once
+    /// the server hands it over.
+    after_take_over: Option<AfterTakeOver>,
+}
+
+/// One pane's own font: its scale over the page's size, and what draws it.
+struct PaneFont {
+    scale: f64,
+    glyphs: GlyphCache,
+    quads: HeapQuadAllocator,
+    vertices: Vec<Vertex>,
+}
+
+/// Continuation of a take-over that an interaction started.
+enum AfterTakeOver {
+    Focus(PaneId),
+    Key(KeyCode, Modifiers, bool),
 }
 
 pub struct App {
@@ -321,6 +369,7 @@ impl App {
             textarea: setup.textarea,
             status: setup.status,
             tab_id: setup.tab_id,
+            recent_tabs: vec![setup.tab_id],
             window_id: setup.window_id,
             workspace: setup.workspace,
             dpr: setup.dpr,
@@ -328,6 +377,7 @@ impl App {
             rows: setup.rows,
             selecting: false,
             drag_pane: None,
+            drag_divider: None,
             click_count: 0,
             last_click_ms: 0.0,
             focused: true,
@@ -342,15 +392,28 @@ impl App {
             reconnect_attempts: 0,
             connected_since: None,
             capacity: Capacity::new(),
+            font_pinned: setup.font_pinned,
             quads: HeapQuadAllocator::default(),
             vertices: Vec::new(),
+            pane_fonts: Default::default(),
             layout: None,
             tab_layout: None,
             following: true,
             strip: setup.strip,
+            navs: setup.navs,
+            nav_html: std::cell::RefCell::new(String::new()),
+            toast_timer: Cell::new(None),
+            tree: crate::tree::TreeModel::default(),
+            side: setup.side,
+            side_html: RefCell::new(String::new()),
+            session_refresh_pending: false,
+            deleting: None,
+            editing: crate::sidebar::Editing::None,
+            closing_tab: None,
             layout_refresh_pending: false,
             switching: false,
             closing_since: None,
+            after_take_over: None,
         };
         let app = Rc::new(Self {
             inner: RefCell::new(inner),
@@ -431,9 +494,74 @@ impl App {
         }
     }
 
+    /// A passing remark, bottom right, gone after a few seconds -- the
+    /// desktop has no status line, and neither does the page. It stays
+    /// while the connection is down: that is not a remark but the state.
     fn set_status(inner: &Inner, text: &str) {
-        if let Some(el) = &inner.status {
-            el.set_text_content(Some(text));
+        let Some(el) = &inner.status else {
+            return;
+        };
+        el.set_text_content(Some(text));
+        let _ = el.remove_attribute("hidden");
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        if let Some(id) = inner.toast_timer.take() {
+            window.clear_timeout_with_handle(id);
+        }
+        if inner.disconnected.is_some() {
+            // Not a remark but the state: probes read it there too.
+            let _ = el.set_attribute("data-summary", text);
+            return;
+        }
+        let el = el.clone();
+        let hide = Closure::once_into_js(move || {
+            let _ = el.set_attribute("hidden", "");
+        });
+        inner.toast_timer.set(
+            window
+                .set_timeout_with_callback_and_timeout_and_arguments_0(hide.as_ref().unchecked_ref(), 4000)
+                .ok(),
+        );
+    }
+
+    pub fn hide_status(&self) {
+        if let Some(el) = &self.inner.borrow().status {
+            let _ = el.set_attribute("hidden", "");
+        }
+    }
+
+    /// The card the desktop shows over a terminal another device holds,
+    /// with its words; hidden when this page may type.
+    fn show_card(inner: &Inner) {
+        let Some(card) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id("card"))
+        else {
+            return;
+        };
+        let lease = inner.link.lease();
+        let words = match lease.mode {
+            Some(codec::FrontendAccessMode::Handoff) if !lease.owns_viewport() => Some(if lease.owner.is_some() {
+                ("Terminal is being used on another device", "Click or scroll to continue")
+            } else {
+                ("Terminal is available", "Click or scroll to take control")
+            }),
+            _ => None,
+        };
+        match words {
+            Some((title, hint)) => {
+                if let Some(t) = card.query_selector(".title").ok().flatten() {
+                    t.set_text_content(Some(title));
+                }
+                if let Some(h) = card.query_selector(".hint").ok().flatten() {
+                    h.set_text_content(Some(hint));
+                }
+                let _ = card.remove_attribute("hidden");
+            }
+            None => {
+                let _ = card.set_attribute("hidden", "");
+            }
         }
     }
 
@@ -476,6 +604,7 @@ impl App {
             | Pdu::WindowWorkspaceChanged(_) => {
                 drop(inner);
                 self.refresh_layout_soon();
+                self.refresh_session_soon();
             }
             // Sent once per connection, before the first line change: a
             // program's OSC 4/10/11 colours. Dropping it would leave the
@@ -494,17 +623,33 @@ impl App {
                     self.request_frame();
                 }
             }
-            Pdu::ClientViewportState(_) | Pdu::FrontendAccessState(_) => {
-                let (link, tab_id) = (inner.link.clone(), inner.tab_id);
+            Pdu::ThinkTermTreeState(state) => {
                 drop(inner);
-                // The desktop may have resized: keep the server's copy of
-                // this page's report at the tab's size, or the next
-                // keystroke would claim the old one.
-                wasm_bindgen_futures::spawn_local(async move {
-                    if let Err(err) = link.report_canonical(tab_id).await {
-                        log::warn!("reporting the tab size: {err:#}");
-                    }
-                });
+                self.inner.borrow_mut().tree.apply_tree(state.tree);
+                // The session view is not pushed with it: ask.
+                self.refresh_session_soon();
+                Self::render_side(&self.inner.borrow());
+            }
+            Pdu::ThinkTermSessionState(state) => {
+                drop(inner);
+                let changed = self.inner.borrow_mut().tree.apply_session(state);
+                if changed {
+                    Self::render_side(&self.inner.borrow());
+                }
+            }
+            Pdu::AgentStatusChanged(codec::AgentStatusChanged { pane_id, status }) => {
+                drop(inner);
+                self.inner.borrow_mut().tree.apply_agent(pane_id, status.as_ref());
+                Self::render_strip(&self.inner.borrow());
+            }
+            Pdu::ClientViewportState(_) | Pdu::FrontendAccessState(_) => {
+                drop(inner);
+                // The desktop may have resized: the panes are listed again
+                // and the page's report follows that listing (a report
+                // from the old frames would not compose to the new size);
+                // its cell is taken now.
+                self.match_desktop_cell();
+                self.refresh_layout_soon();
                 self.refresh_status();
                 self.request_frame();
             }
@@ -604,7 +749,7 @@ impl App {
     /// One attempt: reopen the socket, redo the handshake on the same pane,
     /// and refetch everything on screen.
     async fn try_reconnect(self: Rc<Self>) {
-        let (link, url, token, pane_id, tab_id, size) = {
+        let (link, url, token, pane_id, tab_id, size, nav_rows) = {
             let inner = self.inner.borrow();
             if inner.disconnected.is_none() {
                 return;
@@ -617,11 +762,12 @@ impl App {
                 inner.focused_pane,
                 inner.tab_id,
                 size,
+                Self::nav_rows(&inner),
             )
         };
         let outcome = async {
             link.reconnect(&url, &token).await?;
-            crate::attach::reattach(&link, tab_id, pane_id, size).await
+            crate::attach::reattach(&link, tab_id, pane_id, size, nav_rows).await
         }
         .await;
         match outcome {
@@ -678,6 +824,7 @@ impl App {
             // takes to hand back a socket. `frame` clears it once the
             // connection has proved it can carry a frame.
             inner.connected_since = Some(monotonic_ms());
+            inner.session_refresh_pending = false;
             for cell in inner.panes.values() {
                 cell.session.set_dead(false);
                 cell.session.make_all_stale();
@@ -723,7 +870,13 @@ impl App {
         if cols > inner.cols || rows > inner.rows {
             text.push_str(&format!("  ·  this window fits {}x{}", inner.cols, inner.rows));
         }
-        Self::set_status(&inner, &text);
+        // The one-line summary is for probes and tests; the page shows
+        // the card and the strip's hint instead.
+        if let Some(el) = &inner.status {
+            let _ = el.set_attribute("data-summary", &text);
+        }
+        Self::show_card(&inner);
+        Self::render_strip(&inner);
     }
 
     fn spawn_drain(
@@ -749,9 +902,6 @@ impl App {
         if inner.composing || inner.disconnected.is_some() {
             return false;
         }
-        if !Self::may_type(&inner) {
-            return true;
-        }
         // Copy and paste chords belong to the page: Cmd+C/V on a Mac,
         // Ctrl+Shift+C/V elsewhere. Copy what is selected; let the paste
         // event carry the clipboard. Every other Cmd chord is the
@@ -770,17 +920,17 @@ impl App {
             // Ctrl+Shift+Z zooms; the same as the strip's buttons.
             KeyCode::Enter if ctrl_shift => {
                 drop(inner);
-                self.split(thinkterm_proto::SplitDirection::Horizontal);
+                self.split(None, thinkterm_proto::SplitDirection::Horizontal);
                 return true;
             }
             KeyCode::Char('\\') | KeyCode::Char('|') if ctrl_shift => {
                 drop(inner);
-                self.split(thinkterm_proto::SplitDirection::Vertical);
+                self.split(None, thinkterm_proto::SplitDirection::Vertical);
                 return true;
             }
             KeyCode::Char('z') | KeyCode::Char('Z') if ctrl_shift => {
                 drop(inner);
-                self.toggle_zoom();
+                self.toggle_zoom(None);
                 return true;
             }
             // Ctrl+Shift+F fits the tab to this window; Ctrl+Shift+T
@@ -788,6 +938,23 @@ impl App {
             KeyCode::Char('f') | KeyCode::Char('F') if ctrl_shift => {
                 drop(inner);
                 self.fit(true);
+                return true;
+            }
+            // Cmd+= / Cmd+- / Cmd+0 change the terminal's size here, as on
+            // the desktop, not the browser's zoom.
+            KeyCode::Char('=') | KeyCode::Char('+') if cmd => {
+                drop(inner);
+                self.step_font(1.0);
+                return true;
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') if cmd => {
+                drop(inner);
+                self.step_font(-1.0);
+                return true;
+            }
+            KeyCode::Char('0') if cmd => {
+                drop(inner);
+                self.step_font(0.0);
                 return true;
             }
             KeyCode::Char('t') | KeyCode::Char('T') if ctrl_shift => {
@@ -809,6 +976,15 @@ impl App {
             }
             _ if mods.contains(Modifiers::SUPER) => return false,
             _ => {}
+        }
+        // After the chords: a key from a page that does not hold the
+        // terminal asks for it, like a click on the desktop takes it back,
+        // and is typed once the server hands it over.
+        if inner.link.lease().needs_claim() {
+            inner.after_take_over = Some(AfterTakeOver::Key(key, mods, shift));
+            drop(inner);
+            self.take_over();
+            return true;
         }
         let serial = codec::InputSerial::from_millis(
             thinkterm_session::clock::Clock::wall_millis(&inner.host.clock),
@@ -870,12 +1046,167 @@ impl App {
         self.request_frame();
     }
 
+    fn set_cursor(inner: &Inner, cursor: &str) {
+        let el: &web_sys::HtmlElement = inner.canvas.as_ref();
+        let _ = el.style().set_property("cursor", cursor);
+    }
+
+    /// The divider under a point on the canvas, and the point's position
+    /// along the divider's axis in device px.
+    fn divider_under(inner: &Inner, client_x: f64, client_y: f64) -> Option<(usize, f64)> {
+        let layout = inner.tab_layout.as_ref()?;
+        let rect = inner.canvas.get_bounding_client_rect();
+        let pad = Self::pad(inner);
+        let px = (client_x - rect.left()) * inner.dpr - pad.0 as f64;
+        let py = (client_y - rect.top()) * inner.dpr - pad.1 as f64;
+        let (cw, ch) = (
+            inner.glyphs.metrics.cell_size.width as f64,
+            inner.glyphs.metrics.cell_size.height as f64,
+        );
+        let (col, row) = cell_at(px.max(0.0), py.max(0.0), cw, ch);
+        layout.dividers.iter().enumerate().find_map(|(i, d)| match *d {
+            crate::layout::Divider::Col { col: c, top, rows } if col == c && row >= top && row < top + rows => Some((i, px)),
+            crate::layout::Divider::Row { row: r, left, cols } if row == r && col >= left && col < left + cols => Some((i, py)),
+            _ => None,
+        })
+    }
+
+    /// A press on a divider starts dragging it; moves send whole cells
+    /// to the server as they accrue; the release ends it. A move over a
+    /// divider shows the resize cursor.
+    fn divider_pointer(self: &Rc<Self>, ev: &web_sys::PointerEvent, what: Pointer) {
+        let (x, y) = (ev.client_x() as f64, ev.client_y() as f64);
+        match what {
+            Pointer::Down => {
+                let mut inner = self.inner.borrow_mut();
+                if let Some((idx, at)) = Self::divider_under(&inner, x, y) {
+                    inner.drag_divider = Some((idx, at, 0));
+                }
+            }
+            Pointer::Move => {
+                let step = {
+                    let mut inner = self.inner.borrow_mut();
+                    let Some((idx, start, sent)) = inner.drag_divider else {
+                        let over = Self::divider_under(&inner, x, y).and_then(|(i, _)| inner.tab_layout.as_ref()?.dividers.get(i).copied());
+                        let cursor = match over {
+                            Some(crate::layout::Divider::Col { .. }) => "col-resize",
+                            Some(crate::layout::Divider::Row { .. }) => "row-resize",
+                            None => "default",
+                        };
+                        Self::set_cursor(&inner, cursor);
+                        return;
+                    };
+                    let rect = inner.canvas.get_bounding_client_rect();
+                    let pad = Self::pad(&inner);
+                    let divider = inner.tab_layout.as_ref().and_then(|l| l.dividers.get(idx).copied());
+                    let (pos, cell) = match divider {
+                        Some(crate::layout::Divider::Col { .. }) => (
+                            (x - rect.left()) * inner.dpr - pad.0 as f64,
+                            inner.glyphs.metrics.cell_size.width as f64,
+                        ),
+                        Some(crate::layout::Divider::Row { .. }) => (
+                            (y - rect.top()) * inner.dpr - pad.1 as f64,
+                            inner.glyphs.metrics.cell_size.height as f64,
+                        ),
+                        None => return,
+                    };
+                    let cells = ((pos - start) / cell.max(1.0)).round() as isize;
+                    if cells == sent {
+                        return;
+                    }
+                    inner.drag_divider = Some((idx, start, cells));
+                    (idx, cells - sent)
+                };
+                self.adjust_divider(step.0, step.1);
+            }
+            Pointer::Up => {
+                let was = self.inner.borrow_mut().drag_divider.take();
+                if was.is_some() {
+                    // The held-back report goes out with a fresh listing,
+                    // and not deduplicated: the drag put every pane at its
+                    // whole frame, whatever this page reported last, even
+                    // when the divider is back where it started.
+                    self.inner.borrow().link.lease_mut().reported_viewport = None;
+                    self.refresh_layout();
+                }
+            }
+        }
+    }
+
+    /// Move divider `idx` by `delta` cells (right/down positive): the
+    /// server grows the pane on one side of it in that direction, so the
+    /// pane next to the divider is focused first. Nested splits are
+    /// approximate: the server picks the nearest split of that
+    /// orientation above the pane.
+    fn adjust_divider(self: &Rc<Self>, idx: usize, delta: isize) {
+        use thinkterm_proto::keyassignment::PaneDirection;
+        let (pane, direction, link) = {
+            let inner = self.inner.borrow();
+            let Some(layout) = inner.tab_layout.as_ref() else {
+                return;
+            };
+            let Some(divider) = layout.dividers.get(idx).copied() else {
+                return;
+            };
+            let pick = |before: bool| -> Option<PaneId> {
+                layout
+                    .panes
+                    .iter()
+                    .find(|p| match divider {
+                        crate::layout::Divider::Col { col, top, rows } => {
+                            let edge = if before { p.frame.left + p.frame.cols == col } else { p.frame.left == col + 1 };
+                            edge && p.frame.top < top + rows && p.frame.top + p.frame.rows > top
+                        }
+                        crate::layout::Divider::Row { row, left, cols } => {
+                            let edge = if before { p.frame.top + p.frame.rows == row } else { p.frame.top == row + 1 };
+                            edge && p.frame.left < left + cols && p.frame.left + p.frame.cols > left
+                        }
+                    })
+                    .map(|p| p.pane_id)
+            };
+            let horizontal = matches!(divider, crate::layout::Divider::Col { .. });
+            let (pane, direction) = if delta > 0 {
+                (pick(true), if horizontal { PaneDirection::Right } else { PaneDirection::Down })
+            } else {
+                (pick(false), if horizontal { PaneDirection::Left } else { PaneDirection::Up })
+            };
+            let Some(pane) = pane else {
+                return;
+            };
+            (pane, direction, inner.link.clone())
+        };
+        let amount = delta.unsigned_abs();
+        let app = Rc::clone(self);
+        wasm_bindgen_futures::spawn_local(async move {
+            // The server resizes the tab's active pane: make it this one.
+            let _ = thinkterm_session::host::request(
+                &link,
+                Pdu::SetFocusedPane(codec::SetFocusedPane { pane_id: pane, configured_palette: None }),
+                |p| match p {
+                    Pdu::UnitResponse(_) => Ok(()),
+                    other => Err(other),
+                },
+            )
+            .await;
+            app.focus_pane(pane, false);
+            app.act(
+                "resize the pane",
+                Pdu::AdjustPaneSize(codec::AdjustPaneSize { pane_id: pane, direction, amount }),
+                |_, _| {},
+            );
+        });
+    }
+
     /// Where a point on the canvas lands: which pane, and the cell within
     /// it. `None` on a divider or past the tab.
     fn hit_under(inner: &Inner, client_x: f64, client_y: f64) -> Option<Hit> {
         let rect = inner.canvas.get_bounding_client_rect();
-        let px = (client_x - rect.left()) * inner.dpr;
-        let py = (client_y - rect.top()) * inner.dpr;
+        let pad = Self::pad(inner);
+        let px = (client_x - rect.left()) * inner.dpr - pad.0 as f64;
+        let py = (client_y - rect.top()) * inner.dpr - pad.1 as f64;
+        if px < 0.0 || py < 0.0 {
+            return None;
+        }
         let (cw, ch) = (
             inner.glyphs.metrics.cell_size.width as f64,
             inner.glyphs.metrics.cell_size.height as f64,
@@ -885,17 +1216,23 @@ impl App {
             Some(layout) => crate::layout::hit(layout, col, row)?.clone(),
             None => Self::focused_placement(inner)?,
         };
-        Some(Self::hit_in(&place, col, row, px, py, cw, ch))
+        Some(Self::hit_in(inner, &place, px, py))
     }
 
-    /// The cell of `place` under a canvas cell, clamped into the pane:
-    /// a drag that leaves the pane keeps reporting its edge.
-    fn hit_in(place: &crate::layout::PanePlacement, col: usize, row: usize, px: f64, py: f64, cw: f64, ch: f64) -> Hit {
-        let (cols, rows) = Self::shown(place);
-        let local_col = col.saturating_sub(place.frame.left).min(cols.saturating_sub(1));
-        let local_row = row.saturating_sub(place.frame.top).min(rows.saturating_sub(1));
-        let x_off = (px - (place.frame.left + local_col) as f64 * cw).clamp(0.0, cw) as isize;
-        let y_off = (py - (place.frame.top + local_row) as f64 * ch).clamp(0.0, ch) as isize;
+    /// The cell of `place` under a canvas point (device px past the
+    /// padding), clamped into the pane: a drag that leaves the pane keeps
+    /// reporting its edge. The frame is in the page's cells, the cells
+    /// within it are the pane's own.
+    fn hit_in(inner: &Inner, place: &crate::layout::PanePlacement, px: f64, py: f64) -> Hit {
+        let (cols, rows) = Self::shown_in(inner, place);
+        let (cw, ch) = Self::pane_cell(inner, place);
+        let root = inner.glyphs.metrics.cell_size;
+        let nav = Self::content_offset(inner, place) as f64;
+        let origin = (place.frame.left as f64 * root.width as f64, place.frame.top as f64 * root.height as f64 + nav);
+        let local_col = (((px - origin.0) / cw).floor().max(0.0) as usize).min(cols.saturating_sub(1));
+        let local_row = (((py - origin.1) / ch).floor().max(0.0) as usize).min(rows.saturating_sub(1));
+        let x_off = (px - origin.0 - local_col as f64 * cw).clamp(0.0, cw) as isize;
+        let y_off = (py - origin.1 - local_row as f64 * ch).clamp(0.0, ch) as isize;
         Hit {
             pane_id: place.pane_id,
             col: local_col,
@@ -944,24 +1281,29 @@ impl App {
         self.refresh_status();
         self.request_frame();
         if advise {
-            // Sent and forgotten. The desktop may ignore it for a few
-            // seconds after a focus move of its own, and the server's echo
-            // is the pane already focused here.
-            wasm_bindgen_futures::spawn_local(async move {
-                let pdu = Pdu::SetFocusedPane(codec::SetFocusedPane {
-                    pane_id,
-                    configured_palette: None,
-                });
-                if let Err(err) = thinkterm_session::host::request(&link, pdu, |p| match p {
-                    Pdu::UnitResponse(_) => Ok(()),
-                    other => Err(other),
-                })
-                .await
-                {
-                    log::warn!("focus not advised: {err:#}");
-                }
-            });
+            Self::advise_focus(link, pane_id);
         }
+    }
+
+    /// Tell the server (and so the desktop) which pane has the focus.
+    /// Sent and forgotten: the desktop may ignore it for a few seconds
+    /// after a focus move of its own, and the echo is the pane already
+    /// focused here.
+    fn advise_focus(link: crate::link::WsLink, pane_id: PaneId) {
+        wasm_bindgen_futures::spawn_local(async move {
+            let pdu = Pdu::SetFocusedPane(codec::SetFocusedPane {
+                pane_id,
+                configured_palette: None,
+            });
+            if let Err(err) = thinkterm_session::host::request(&link, pdu, |p| match p {
+                Pdu::UnitResponse(_) => Ok(()),
+                other => Err(other),
+            })
+            .await
+            {
+                log::warn!("focus not advised: {err:#}");
+            }
+        });
     }
 
     /// The pane next to the focused one in `direction`: the nearest whose
@@ -1003,6 +1345,11 @@ impl App {
             let canvas = self.inner.borrow().canvas.clone();
             let _ = canvas.set_pointer_capture(ev.pointer_id());
         }
+        // A divider under the press is dragged, as on the desktop.
+        if what != Pointer::Down && self.inner.borrow().drag_divider.is_some() {
+            self.divider_pointer(ev, what);
+            return;
+        }
         // A press lands on the pane under it and focuses it; a drag stays
         // with the pane it started in.
         let hit = {
@@ -1016,24 +1363,37 @@ impl App {
                     let place = Self::placements(&inner).into_iter().find(|p| p.pane_id == drag);
                     place.map(|place| {
                         let rect = inner.canvas.get_bounding_client_rect();
-                        let px = (ev.client_x() as f64 - rect.left()) * inner.dpr;
-                        let py = (ev.client_y() as f64 - rect.top()) * inner.dpr;
-                        let (cw, ch) = (
-                            inner.glyphs.metrics.cell_size.width as f64,
-                            inner.glyphs.metrics.cell_size.height as f64,
-                        );
-                        let (col, row) = cell_at(px.max(0.0), py.max(0.0), cw, ch);
-                        Self::hit_in(&place, col, row, px, py, cw, ch)
+                        let pad = Self::pad(&inner);
+                        let px = (ev.client_x() as f64 - rect.left()) * inner.dpr - pad.0 as f64;
+                        let py = (ev.client_y() as f64 - rect.top()) * inner.dpr - pad.1 as f64;
+                        Self::hit_in(&inner, &place, px, py)
                     })
                 }
                 (_, None) => Self::hit_under(&inner, ev.client_x() as f64, ev.client_y() as f64),
             }
         };
         let Some(hit) = hit else {
+            self.divider_pointer(ev, what);
             return;
         };
+        if what == Pointer::Move {
+            Self::set_cursor(&self.inner.borrow(), "text");
+        }
         if what == Pointer::Down {
-            let advise = self.inner.borrow().following;
+            let (advise, claim) = {
+                let inner = self.inner.borrow();
+                let claim = inner.link.lease().needs_claim();
+                (inner.following, claim)
+            };
+            if claim {
+                // The press takes the terminal over; the desktop is told
+                // about the focus once the server has handed it over.
+                self.focus_pane(hit.pane_id, false);
+                self.inner.borrow_mut().after_take_over =
+                    advise.then_some(AfterTakeOver::Focus(hit.pane_id));
+                self.take_over();
+                return;
+            }
             self.focus_pane(hit.pane_id, advise);
         }
         let mut inner = self.inner.borrow_mut();
@@ -1049,7 +1409,7 @@ impl App {
         let rows_shown = Self::placements(&inner)
             .into_iter()
             .find(|p| p.pane_id == hit.pane_id)
-            .map(|p| Self::shown(&p).1)
+            .map(|p| Self::shown_in(&inner, &p).1)
             .unwrap_or(inner.rows);
         let visible = visible_rows(&dims, rows_shown, scroll);
         let stable_row = visible.start + hit.row as StableRowIndex;
@@ -1195,7 +1555,7 @@ impl App {
     /// not). The pane under the pointer scrolls, as on the desktop. A
     /// program that has the mouse gets every wheel with its real
     /// modifiers; otherwise Ctrl+wheel and pinch are the browser's zoom.
-    pub fn wheel(&self, ev: &web_sys::WheelEvent) -> bool {
+    pub fn wheel(self: &Rc<Self>, ev: &web_sys::WheelEvent) -> bool {
         let mut inner = self.inner.borrow_mut();
         if inner.disconnected.is_some() {
             return false;
@@ -1203,12 +1563,22 @@ impl App {
         let Some(hit) = Self::hit_under(&inner, ev.client_x() as f64, ev.client_y() as f64) else {
             return false;
         };
-        let rows_shown = Self::placements(&inner)
-            .into_iter()
-            .find(|p| p.pane_id == hit.pane_id)
-            .map(|p| Self::shown(&p).1)
-            .unwrap_or(inner.rows);
-        let cell_h_css = inner.glyphs.metrics.cell_size.height as f64 / inner.dpr;
+        // Scrolling asks for the terminal like a click does; this notch
+        // is spent on that.
+        if inner.link.lease().needs_claim() {
+            inner.after_take_over = inner.following.then_some(AfterTakeOver::Focus(hit.pane_id));
+            drop(inner);
+            self.focus_pane(hit.pane_id, false);
+            self.take_over();
+            return true;
+        }
+        let place = Self::placements(&inner).into_iter().find(|p| p.pane_id == hit.pane_id);
+        let rows_shown = place.as_ref().map(|p| Self::shown_in(&inner, p).1).unwrap_or(inner.rows);
+        let cell_h = place
+            .as_ref()
+            .map(|p| Self::pane_cell(&inner, p).1)
+            .unwrap_or(inner.glyphs.metrics.cell_size.height as f64);
+        let cell_h_css = cell_h / inner.dpr;
         let lines = match ev.delta_mode() {
             web_sys::WheelEvent::DOM_DELTA_LINE => ev.delta_y(),
             web_sys::WheelEvent::DOM_DELTA_PAGE => ev.delta_y() * rows_shown as f64,
@@ -1275,11 +1645,18 @@ impl App {
             inner.glyphs.metrics.cell_size.width as f64 / dpr,
             inner.glyphs.metrics.cell_size.height as f64 / dpr,
         );
+        // The desktop's cell in CSS px, from the canonical size's pixels.
+        let desktop_cell = lease
+            .canonical_size
+            .filter(|s| s.rows > 0 && s.dpi > 0)
+            .map(|s| s.pixel_height as f64 / s.rows as f64 * 96.0 / s.dpi as f64)
+            .unwrap_or(0.0);
         let mut json = format!(
-            "{{\"tab\":{},\"canvas\":[{},{}],\"cell\":[{cw:.3},{ch:.3}],\"focused\":{},\"owner\":{},\"may_type\":{},\"fit\":{},\"following\":{}",
+            "{{\"tab\":{},\"canvas\":[{},{}],\"cell\":[{cw:.3},{ch:.3}],\"font_pt\":{},\"desktop_cell\":{desktop_cell:.3},\"focused\":{},\"owner\":{},\"may_type\":{},\"fit\":{},\"following\":{}",
             inner.tab_id,
             inner.cols,
             inner.rows,
+            inner.glyphs.size_pt,
             inner.focused_pane,
             lease.owns_viewport(),
             lease.may_type(),
@@ -1298,9 +1675,10 @@ impl App {
                     if i > 0 {
                         json.push(',');
                     }
+                    let shown = Self::shown_in(inner, p);
                     json.push_str(&format!(
-                        "{{\"id\":{},\"left\":{},\"top\":{},\"cols\":{},\"rows\":{},\"content\":[{},{}]}}",
-                        p.pane_id, p.frame.left, p.frame.top, p.frame.cols, p.frame.rows, p.content.0, p.content.1
+                        "{{\"id\":{},\"left\":{},\"top\":{},\"cols\":{},\"rows\":{},\"content\":[{},{}],\"shown\":[{},{}]}}",
+                        p.pane_id, p.frame.left, p.frame.top, p.frame.cols, p.frame.rows, p.content.0, p.content.1, shown.0, shown.1
                     ));
                 }
                 json.push_str("],\"dividers\":[");
@@ -1326,19 +1704,639 @@ impl App {
     }
 
     /// Draw the tab strip from what the page knows.
+    /// The desktop's cell in CSS px, from the canonical size's pixels.
+    fn desktop_cell_css(inner: &Inner) -> Option<f64> {
+        inner
+            .link
+            .lease()
+            .canonical_size
+            .filter(|s| s.rows > 0 && s.dpi > 0)
+            .map(|s| s.pixel_height as f64 / s.rows as f64 * 96.0 / s.dpi as f64)
+    }
+
+    /// The bar above each pane, in CSS px.
+    fn nav_css(inner: &Inner) -> f64 {
+        let cell_css = inner.glyphs.metrics.cell_size.height as f64 / inner.dpr.max(0.1);
+        crate::navbar::nav_css(cell_css, Self::desktop_cell_css(inner))
+    }
+
+    fn nav_dev(inner: &Inner) -> f32 {
+        (Self::nav_css(inner) * inner.dpr) as f32
+    }
+
+    /// Where the grid starts in the canvas, in device px: the desktop's
+    /// window padding of a cell left and right and half a cell top and
+    /// bottom.
+    fn pad(inner: &Inner) -> (f32, f32) {
+        (
+            inner.glyphs.metrics.cell_size.width as f32,
+            inner.glyphs.metrics.cell_size.height as f32 / 2.0,
+        )
+    }
+
+    /// Rows of a frame the bar takes from the pane.
+    fn nav_rows(inner: &Inner) -> usize {
+        crate::navbar::nav_rows(Self::nav_css(inner) * inner.dpr, inner.glyphs.metrics.cell_size.height as f64)
+    }
+
+    /// One bar per drawn pane, positioned from the layout's cells.
+    fn render_navs(inner: &Inner) {
+        let Some(navs) = &inner.navs else {
+            return;
+        };
+        let mut views = Vec::new();
+        if let Some(layout) = &inner.tab_layout {
+            let dpr = inner.dpr.max(0.1);
+            let cell_css = (
+                inner.glyphs.metrics.cell_size.width as f64 / dpr,
+                inner.glyphs.metrics.cell_size.height as f64 / dpr,
+            );
+            let closing = inner
+                .closing_since
+                .is_some_and(|since| monotonic_ms() - since < CLOSE_CONFIRM_MS);
+            let pad = Self::pad(inner);
+            let pad_css = (pad.0 as f64 / dpr, pad.1 as f64 / dpr);
+            let width_css = inner.canvas.width() as f64 / dpr;
+            for (rect, place) in crate::navbar::rects(layout, cell_css, Self::nav_css(inner), pad_css, width_css)
+                .into_iter()
+                .zip(&layout.panes)
+            {
+                let members = place
+                    .stack
+                    .iter()
+                    .map(|m| {
+                        // The page's own copy of a drawn pane's title is fresher.
+                        let raw = inner
+                            .panes
+                            .get(&m.pane_id)
+                            .map(|c| c.title.as_str())
+                            .unwrap_or(&m.title);
+                        let (title, busy) = crate::navbar::display_title(raw);
+                        let busy = busy || inner.tree.agents.get(&m.pane_id) == Some(&thinkterm_proto::AgentState::Working);
+                        crate::navbar::CapsuleView {
+                            pane_id: m.pane_id,
+                            title: title.to_string(),
+                            busy,
+                            current: m.pane_id == place.pane_id,
+                        }
+                    })
+                    .collect();
+                let focused = place.pane_id == inner.focused_pane;
+                views.push(crate::navbar::NavView {
+                    rect,
+                    members,
+                    focused,
+                    zoomed: layout.zoomed.is_some(),
+                    closing: closing && focused,
+                });
+            }
+        }
+        let html = crate::navbar::NavBars::html(&views);
+        let mut last = inner.nav_html.borrow_mut();
+        if *last != html {
+            navs.set(&html);
+            *last = html;
+        }
+    }
+
+    pub fn navs_element(&self) -> Option<web_sys::EventTarget> {
+        let inner = self.inner.borrow();
+        inner.navs.as_ref().map(|n| n.element().clone().into())
+    }
+
+    /// The sidebar from the model, when its markup changed.
+    fn render_side(inner: &Inner) {
+        let Some(side) = &inner.side else {
+            return;
+        };
+        let deleting = inner
+            .deleting
+            .as_ref()
+            .filter(|(_, since)| monotonic_ms() - since < CLOSE_CONFIRM_MS)
+            .map(|(id, _)| id.as_str());
+        let rows = inner.tree.rows_with(inner.tab_id, &inner.workspace, inner.window_id, deleting);
+        let html = crate::sidebar::html(&rows, &inner.editing);
+        let mut last = inner.side_html.borrow_mut();
+        if *last != html {
+            side.set(&html);
+            *last = html;
+            if inner.editing != crate::sidebar::Editing::None {
+                if let Some(input) = side.element().query_selector("input").ok().flatten() {
+                    if let Ok(input) = input.dyn_into::<web_sys::HtmlInputElement>() {
+                        let _ = input.focus();
+                        input.select();
+                    }
+                }
+            }
+        }
+        let _ = side.element().set_attribute("data-rows", &Self::rows_json(&rows));
+    }
+
+    /// The rows as a probe reads them.
+    fn rows_json(rows: &[crate::tree::Row]) -> String {
+        use crate::tree::Row;
+        let mut json = String::from("[");
+        for (i, row) in rows.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+            match row {
+                Row::Space { name } => json.push_str(&format!("{{\"kind\":\"space\",\"name\":\"{}\"}}", esc(name))),
+                Row::NewThread => json.push_str("{\"kind\":\"new-thread\"}"),
+                Row::Pinned => json.push_str("{\"kind\":\"pinned\"}"),
+                Row::Workspaces => json.push_str("{\"kind\":\"workspaces\"}"),
+                Row::Project { id, name, collapsed, archived, .. } => json.push_str(&format!(
+                    "{{\"kind\":\"project\",\"id\":\"{}\",\"name\":\"{}\",\"collapsed\":{collapsed},\"archived\":{archived}}}",
+                    esc(id),
+                    esc(name)
+                )),
+                Row::Thread(t) => json.push_str(&format!(
+                    "{{\"kind\":\"thread\",\"id\":\"{}\",\"project\":\"{}\",\"name\":\"{}\",\"status\":\"{:?}\",\"dot\":\"{:?}\",\"pinned\":{},\"live\":{},\"selected\":{}}}",
+                    esc(&t.id),
+                    esc(&t.project_id),
+                    esc(&t.name),
+                    t.status,
+                    t.dot,
+                    t.pinned,
+                    t.live,
+                    t.selected
+                )),
+                Row::Archived { count, open } => json.push_str(&format!("{{\"kind\":\"archived\",\"count\":{count},\"open\":{open}}}")),
+                Row::Others => json.push_str("{\"kind\":\"others\"}"),
+                Row::Window { window_id, title, selected } => json.push_str(&format!(
+                    "{{\"kind\":\"window\",\"id\":{window_id},\"title\":\"{}\",\"selected\":{selected}}}",
+                    esc(title)
+                )),
+            }
+        }
+        json.push(']');
+        json
+    }
+
+    pub fn side_element(&self) -> Option<web_sys::EventTarget> {
+        let inner = self.inner.borrow();
+        inner.side.as_ref().map(|s| s.element().clone().into())
+    }
+
+    /// Ask the server for its tree, its session view and the agents in
+    /// its panes: at the start, and again after a reconnect.
+    pub fn fetch_tree(self: &Rc<Self>) {
+        let link = self.inner.borrow().link.clone();
+        let app = Rc::clone(self);
+        wasm_bindgen_futures::spawn_local(async move {
+            let tree = thinkterm_session::host::request(&link, Pdu::GetThinkTermTree(codec::GetThinkTermTree {}), |p| match p {
+                Pdu::ThinkTermTreeState(s) => Ok(s.tree),
+                other => Err(other),
+            })
+            .await;
+            match tree {
+                Ok(tree) => app.inner.borrow_mut().tree.apply_tree(tree),
+                Err(err) => log::warn!("fetching the tree: {err:#}"),
+            }
+            let agents = thinkterm_session::host::request(&link, Pdu::GetAgentStatuses(codec::GetAgentStatuses {}), |p| match p {
+                Pdu::GetAgentStatusesResponse(r) => Ok(r.statuses),
+                other => Err(other),
+            })
+            .await;
+            match agents {
+                Ok(entries) => {
+                    let mut inner = app.inner.borrow_mut();
+                    inner.tree.agents.clear();
+                    for e in entries {
+                        inner.tree.apply_agent(e.pane_id, Some(&e.status));
+                    }
+                }
+                Err(err) => log::warn!("fetching agent statuses: {err:#}"),
+            }
+            app.fetch_session().await;
+            Self::render_strip(&app.inner.borrow());
+        });
+    }
+
+    async fn fetch_session(self: &Rc<Self>) {
+        let link = self.inner.borrow().link.clone();
+        let state = thinkterm_session::host::request(&link, Pdu::GetThinkTermSessionState(codec::GetThinkTermSessionState {}), |p| match p {
+            Pdu::ThinkTermSessionState(s) => Ok(s),
+            other => Err(other),
+        })
+        .await;
+        match state {
+            Ok(state) => {
+                self.inner.borrow_mut().tree.apply_session(state);
+                Self::render_side(&self.inner.borrow());
+            }
+            Err(err) => log::warn!("fetching the session view: {err:#}"),
+        }
+    }
+
+    /// The session view is not pushed when the tree or the panes change;
+    /// it is asked for, a moment after the last such push.
+    fn refresh_session_soon(self: &Rc<Self>) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.session_refresh_pending || inner.disconnected.is_some() {
+                return;
+            }
+            inner.session_refresh_pending = true;
+        }
+        let app = Rc::clone(self);
+        let closure = Closure::once_into_js(move || {
+            app.inner.borrow_mut().session_refresh_pending = false;
+            let app = Rc::clone(&app);
+            wasm_bindgen_futures::spawn_local(async move { app.fetch_session().await });
+        });
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(closure.as_ref().unchecked_ref(), 150);
+        }
+    }
+
+    /// A click in the sidebar.
+    pub fn on_side_click(self: &Rc<Self>, click: crate::sidebar::SideClick) {
+        use crate::sidebar::SideClick;
+        if !matches!(click, SideClick::Delete(_)) {
+            self.inner.borrow_mut().deleting = None;
+        }
+        if !matches!(click, SideClick::RenameThread(_) | SideClick::RenameProject(_) | SideClick::NewProject)
+            && self.inner.borrow().editing != crate::sidebar::Editing::None
+        {
+            self.inner.borrow_mut().editing = crate::sidebar::Editing::None;
+        }
+        match click {
+            SideClick::Thread(id) => self.activate_thread(id),
+            SideClick::Window(window_id) => {
+                let pane = {
+                    let inner = self.inner.borrow();
+                    // The tab this page last showed in that window, else its first.
+                    inner.layout.as_ref().and_then(|l| {
+                        let tabs: Vec<_> = l
+                            .tabs
+                            .iter()
+                            .filter_map(|t| Some((t.window_and_tab_ids()?, t)))
+                            .filter(|((w, _), _)| *w == window_id)
+                            .collect();
+                        let recent = inner
+                            .recent_tabs
+                            .iter()
+                            .find_map(|r| tabs.iter().find(|((_, id), _)| id == r));
+                        recent
+                            .or(tabs.first())
+                            .and_then(|(_, t)| crate::chrome::active_pane(t))
+                            .map(|e| e.pane_id)
+                    })
+                };
+                if let Some(pane) = pane {
+                    self.switch_to_pane(pane, true);
+                }
+            }
+            SideClick::ToggleProject(id) => {
+                let inner = &mut *self.inner.borrow_mut();
+                if !inner.tree.collapsed.remove(&id) {
+                    inner.tree.collapsed.insert(id);
+                }
+                Self::render_side(inner);
+            }
+            SideClick::ToggleArchived => {
+                let inner = &mut *self.inner.borrow_mut();
+                inner.tree.archived_open = !inner.tree.archived_open;
+                Self::render_side(inner);
+            }
+            other => self.on_side_write(other),
+        }
+    }
+
+    fn now_secs() -> i64 {
+        (js_sys::Date::now() / 1000.0) as i64
+    }
+
+    fn new_id(kind: &str) -> String {
+        crate::tree::new_id(kind, || (js_sys::Math::random() * u32::MAX as f64) as u32)
+    }
+
+    /// Send a write, take the tree that comes back, check the intent
+    /// against it (a refusal is a remark, never an error), then ask for
+    /// the session view the server does not push, and go on.
+    fn mutate(self: &Rc<Self>, intent: crate::tree::Intent, then: impl FnOnce(&Rc<Self>) + 'static) {
+        let link = self.inner.borrow().link.clone();
+        let app = Rc::clone(self);
+        wasm_bindgen_futures::spawn_local(async move {
+            let tree = thinkterm_session::host::request(
+                &link,
+                Pdu::MutateThinkTermTree(codec::MutateThinkTermTree { ops: intent.ops }),
+                |p| match p {
+                    Pdu::ThinkTermTreeState(s) => Ok(s.tree),
+                    other => Err(other),
+                },
+            )
+            .await;
+            let tree = match tree {
+                Ok(tree) => tree,
+                Err(err) => {
+                    Self::set_status(&app.inner.borrow(), &format!("the server refused: {err:#}"));
+                    return;
+                }
+            };
+            let verdict = intent.expect.check(&tree);
+            app.inner.borrow_mut().tree.apply_tree(tree);
+            app.fetch_session().await;
+            match verdict {
+                Ok(()) => then(&app),
+                Err(why) => Self::set_status(&app.inner.borrow(), &why),
+            }
+        });
+    }
+
+    /// Every pane a thread has, for ending its programs.
+    fn thread_panes(inner: &Inner, id: &str) -> Vec<PaneId> {
+        inner
+            .tree
+            .thread(id)
+            .map(|t| t.tabs.iter().flat_map(|tab| tab.pane_ids.iter().copied()).collect())
+            .unwrap_or_default()
+    }
+
+    fn kill_panes(self: &Rc<Self>, panes: Vec<PaneId>) {
+        for pane_id in panes {
+            self.act("close the pane", Pdu::KillPane(codec::KillPane { pane_id }), |_, _| {});
+        }
+    }
+
+    /// The sidebar's writes: the same ops the desktop sends.
+    fn on_side_write(self: &Rc<Self>, click: crate::sidebar::SideClick) {
+        use crate::sidebar::{Editing, SideClick};
+        if !matches!(click, SideClick::RenameThread(_) | SideClick::RenameProject(_) | SideClick::NewProject) {
+            self.inner.borrow_mut().editing = Editing::None;
+        }
+        match click {
+            SideClick::NewThread(project) => {
+                let (project, size) = {
+                    let inner = self.inner.borrow();
+                    let selected = inner.tree.selected_thread(inner.tab_id, &inner.workspace).map(String::from);
+                    let project = project
+                        .or_else(|| selected.and_then(|t| inner.tree.project_of(&t).map(|p| p.id.clone())))
+                        .or_else(|| inner.tree.session.as_ref().and_then(|s| s.projects.first().map(|p| p.id.clone())));
+                    let size = inner.link.lease().canonical_size.unwrap_or_default();
+                    (project, size)
+                };
+                match project {
+                    Some(project) => {
+                        let id = Self::new_id("thread");
+                        let intent = crate::tree::create_thread(&project, id.clone(), Self::now_secs());
+                        self.mutate(intent, move |app| app.activate_thread(id));
+                    }
+                    None => {
+                        // No project yet: the server's landing thread
+                        // (Default / Home / main) is the first one.
+                        let app = Rc::clone(self);
+                        wasm_bindgen_futures::spawn_local(async move {
+                            let link = app.inner.borrow().link.clone();
+                            let ensured = thinkterm_session::host::request(
+                                &link,
+                                Pdu::EnsureThinkTermThread(codec::EnsureThinkTermThread { preferred_thread_id: None, size }),
+                                |p| match p {
+                                    Pdu::EnsureThinkTermThreadResponse(r) => Ok(r),
+                                    other => Err(other),
+                                },
+                            )
+                            .await;
+                            match ensured {
+                                Ok(r) => {
+                                    app.fetch_tree();
+                                    app.activate_thread(r.thread_id);
+                                }
+                                Err(err) => Self::set_status(&app.inner.borrow(), &format!("could not start a thread: {err:#}")),
+                            }
+                        });
+                    }
+                }
+            }
+            SideClick::NewProject => {
+                let inner = &mut *self.inner.borrow_mut();
+                inner.editing = Editing::NewProject;
+                Self::render_side(inner);
+            }
+            SideClick::RenameThread(id) => {
+                let inner = &mut *self.inner.borrow_mut();
+                inner.editing = Editing::Thread(id);
+                Self::render_side(inner);
+            }
+            SideClick::RenameProject(id) => {
+                let inner = &mut *self.inner.borrow_mut();
+                inner.editing = Editing::Project(id);
+                Self::render_side(inner);
+            }
+            SideClick::Pin(id, on) => {
+                self.mutate(crate::tree::set_pinned(&id, on, Self::now_secs()), |_| {});
+            }
+            SideClick::Delete(id) => {
+                let confirmed = {
+                    let mut inner = self.inner.borrow_mut();
+                    let now = monotonic_ms();
+                    match &inner.deleting {
+                        Some((pending, since)) if *pending == id && now - since < CLOSE_CONFIRM_MS => {
+                            inner.deleting = None;
+                            true
+                        }
+                        _ => {
+                            inner.deleting = Some((id.clone(), now));
+                            Self::render_side(&inner);
+                            false
+                        }
+                    }
+                };
+                if confirmed {
+                    let panes = Self::thread_panes(&self.inner.borrow(), &id);
+                    self.kill_panes(panes);
+                    self.mutate(crate::tree::delete_thread(&id), |_| {});
+                }
+            }
+            SideClick::Archive(id) => {
+                let panes: Vec<PaneId> = {
+                    let inner = self.inner.borrow();
+                    inner
+                        .tree
+                        .session
+                        .as_ref()
+                        .and_then(|s| s.projects.iter().find(|p| p.id == id))
+                        .map(|p| p.threads.iter().flat_map(|t| t.tabs.iter()).flat_map(|t| t.pane_ids.iter().copied()).collect())
+                        .unwrap_or_default()
+                };
+                // The flag lands first; the programs end once it has.
+                self.mutate(crate::tree::archive_project(&id, true, Self::now_secs()), move |app| app.kill_panes(panes));
+            }
+            SideClick::Unarchive(id) => {
+                self.mutate(crate::tree::archive_project(&id, false, Self::now_secs()), |_| {});
+            }
+            SideClick::SpaceMenu => {
+                Self::set_status(&self.inner.borrow(), "Spaces are managed on the desktop");
+            }
+            _ => {}
+        }
+    }
+
+    /// A key in the sidebar's text field: Enter commits, Escape cancels.
+    pub fn on_side_key(self: &Rc<Self>, key: &str, value: String) {
+        use crate::sidebar::Editing;
+        let editing = self.inner.borrow().editing.clone();
+        match key {
+            "Escape" => {
+                let inner = &mut *self.inner.borrow_mut();
+                inner.editing = Editing::None;
+                Self::render_side(inner);
+                let _ = inner.textarea.focus();
+            }
+            "Enter" => {
+                {
+                    let inner = &mut *self.inner.borrow_mut();
+                    inner.editing = Editing::None;
+                    Self::render_side(inner);
+                    let _ = inner.textarea.focus();
+                }
+                let value = value.trim().to_string();
+                if value.is_empty() {
+                    return;
+                }
+                match editing {
+                    Editing::Thread(id) => self.mutate(crate::tree::rename_thread(&id, &value, Self::now_secs()), |_| {}),
+                    Editing::Project(id) => self.mutate(crate::tree::rename_project(&id, &value), |_| {}),
+                    Editing::NewProject => {
+                        if !(value.starts_with('/') || value.starts_with('~')) {
+                            Self::set_status(&self.inner.borrow(), "a project is a directory: ~/dir or /dir");
+                            return;
+                        }
+                        let space = {
+                            let inner = self.inner.borrow();
+                            inner.tree.tree.as_ref().and_then(|t| t.spaces.first().map(|s| s.id.clone()))
+                        };
+                        let project = Self::new_id("project");
+                        let thread = Self::new_id("thread");
+                        let intent = crate::tree::create_project(space.as_deref(), project, thread.clone(), &value, Self::now_secs());
+                        self.mutate(intent, move |app| app.activate_thread(thread));
+                    }
+                    Editing::None => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Show a thread: its active tab when it has terminals, else have the
+    /// server make them (`EnsureThinkTermThread`) and show what it made.
+    /// Either way the thread is touched and read, as the desktop does.
+    pub fn activate_thread(self: &Rc<Self>, id: String) {
+        let (live_tab, size) = {
+            let inner = self.inner.borrow();
+            // A thread the model has not seen yet (just created) is
+            // opened like a cold one: the server knows it.
+            let tab = inner.tree.thread(&id).and_then(|thread| {
+                inner
+                    .recent_tabs
+                    .iter()
+                    .find(|recent| thread.tabs.iter().any(|t| t.tab_id == **recent))
+                    .copied()
+                    .or_else(|| thread.tabs.iter().find(|t| t.is_active).or(thread.tabs.first()).map(|t| t.tab_id))
+            });
+            let size = inner
+                .link
+                .lease()
+                .canonical_size
+                .or_else(|| inner.tab_layout.as_ref().map(|l| l.size))
+                .unwrap_or_default();
+            (tab, size)
+        };
+        let app = Rc::clone(self);
+        wasm_bindgen_futures::spawn_local(async move {
+            let link = app.inner.borrow().link.clone();
+            let mut workspace = None;
+            if live_tab.is_none() {
+                let ensured = thinkterm_session::host::request(
+                    &link,
+                    Pdu::EnsureThinkTermThread(codec::EnsureThinkTermThread {
+                        preferred_thread_id: Some(id.clone()),
+                        size,
+                    }),
+                    |p| match p {
+                        Pdu::EnsureThinkTermThreadResponse(r) => Ok(r),
+                        other => Err(other),
+                    },
+                )
+                .await;
+                match ensured {
+                    Ok(r) => workspace = Some(r.workspace),
+                    Err(err) => {
+                        log::warn!("opening thread {id}: {err:#}");
+                        Self::set_status(&app.inner.borrow(), &format!("could not open the thread: {err:#}"));
+                        return;
+                    }
+                }
+            }
+            let Some(list) = app.list_panes().await else {
+                return;
+            };
+            let pane = list
+                .tabs
+                .iter()
+                .filter(|t| match (&live_tab, &workspace) {
+                    (Some(tab), _) => t.window_and_tab_ids().is_some_and(|(_, id)| id == *tab),
+                    (None, Some(ws)) => crate::layout::leaves(t).first().is_some_and(|e| &e.workspace == ws),
+                    _ => false,
+                })
+                .find_map(crate::chrome::active_pane)
+                .map(|e| e.pane_id);
+            if let Some(pane) = pane {
+                app.show(list, pane).await;
+            }
+            let now = (js_sys::Date::now() / 1000.0) as i64;
+            let _ = thinkterm_session::host::request(
+                &link,
+                Pdu::MutateThinkTermTree(codec::MutateThinkTermTree {
+                    ops: vec![
+                        codec::TreeOp::TouchThread { thread_id: id.clone(), at: now },
+                        codec::TreeOp::SetThreadUnread { thread_id: id.clone(), unread: false },
+                    ],
+                }),
+                |p| match p {
+                    Pdu::ThinkTermTreeState(s) => Ok(s.tree),
+                    other => Err(other),
+                },
+            )
+            .await;
+            app.fetch_session().await;
+        });
+    }
+
+    /// The sidebar's width, kept per browser, within the desktop's bounds.
+    pub fn set_sidebar_width(&self, css: f64) {
+        let css = css.clamp(crate::sidebar::MIN_WIDTH, crate::sidebar::MAX_WIDTH);
+        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+            if let Some(root) = doc.document_element().and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok()) {
+                let _ = root.style().set_property("--side-w", &format!("{css:.0}px"));
+            }
+        }
+        crate::sidebar::store_width(css);
+    }
+
     fn render_strip(inner: &Inner) {
         Self::publish_layout(inner);
+        Self::render_navs(inner);
+        Self::render_side(inner);
         let (Some(strip), Some(layout)) = (&inner.strip, &inner.layout) else {
             return;
         };
-        let tabs = crate::chrome::model(layout, inner.focused_pane, inner.title());
+        let tabs = crate::chrome::model(layout, inner.focused_pane, inner.title(), Some(inner.window_id));
+        let (cols, rows) = inner
+            .tab_layout
+            .as_ref()
+            .map(|l| (l.cols, l.rows))
+            .unwrap_or((inner.cols, inner.rows));
         let controls = crate::chrome::Controls {
             following: inner.following,
-            zoomed: inner.tab_layout.as_ref().is_some_and(|l| l.zoomed.is_some()),
             fit: inner.link.lease().fit,
-            closing: inner
-                .closing_since
-                .is_some_and(|since| monotonic_ms() - since < CLOSE_CONFIRM_MS),
+            closing_tab: inner
+                .closing_tab
+                .filter(|(_, since)| monotonic_ms() - since < CLOSE_CONFIRM_MS)
+                .map(|(tab, _)| tab),
+            clipped: (cols > inner.cols || rows > inner.rows).then_some((inner.cols, inner.rows)),
         };
         strip.render(&tabs, controls);
     }
@@ -1390,9 +2388,16 @@ impl App {
     /// a fresh listing. The same tab is reconciled in place; another tab
     /// is reported to the server first, since the lease is per tab.
     async fn show(self: &Rc<Self>, list: codec::ListPanesResponse, want: PaneId) {
+        let nav_rows = Self::nav_rows(&self.inner.borrow());
         let node = crate::layout::tab_containing(&list, want)
             .or_else(|| list.tabs.iter().find(|t| crate::layout::layout(t).is_some()));
-        let Some(layout) = node.and_then(crate::layout::layout) else {
+        let lay = |node: &thinkterm_proto::layout::PaneNode| {
+            let tab_size = node
+                .window_and_tab_ids()
+                .and_then(|(_, tab_id)| self.inner.borrow().link.lease().tab_sizes.get(&tab_id).copied());
+            crate::layout::layout_in(node, tab_size, nav_rows)
+        };
+        let Some(layout) = node.and_then(lay) else {
             let mut inner = self.inner.borrow_mut();
             inner.layout = Some(list);
             Self::render_strip(&inner);
@@ -1413,14 +2418,18 @@ impl App {
             // size, never a claim. Typing or clicking claims, as at attach.
             let outcome: Result<()> = async {
                 {
+                    // Computed before the lease is held: it reads the lease.
+                    let panes = Self::native_panes(&self.inner.borrow(), &layout);
                     let mut lease = link.lease_mut();
                     lease.tab_id = Some(layout.tab_id);
                     lease.tab_owner = None;
                     lease.canonical_size = Some(layout.size);
-                    lease.reported_canonical = None;
+                    lease.reported_viewport = None;
+                    lease.native = panes;
+                    lease.native_root = Some(layout.size);
                     lease.fit = false;
                 }
-                link.report_canonical(layout.tab_id).await
+                link.report_viewport(layout.tab_id).await
             }
             .await;
             let mut inner = self.inner.borrow_mut();
@@ -1431,11 +2440,20 @@ impl App {
                 return;
             }
         }
+        let tab_id = layout.tab_id;
         let (fresh, changed) = {
             let mut inner = self.inner.borrow_mut();
+            inner.tree.apply_panes(&list);
             inner.layout = Some(list);
             let before = (inner.focused_pane, inner.tab_layout.clone());
             let fresh = Self::apply_layout(&mut inner, layout, want);
+            // What a keystroke would claim follows the drawn layout.
+            if let Some(layout) = &inner.tab_layout {
+                let panes = Self::native_panes(&inner, layout);
+                let mut lease = link.lease_mut();
+                lease.native = panes;
+                lease.native_root = Some(layout.size);
+            }
             let changed = tab_changed
                 || !fresh.is_empty()
                 || before.0 != inner.focused_pane
@@ -1470,7 +2488,19 @@ impl App {
             });
         }
         if tab_changed {
+            self.match_desktop_cell();
             self.resize();
+        }
+        // What the page would claim follows the listing; the report is
+        // skipped when it is what the server already has, and held back
+        // while a divider is being dragged (each step would otherwise
+        // reshape the panes twice: the server's resize, then ours).
+        let dragging = self.inner.borrow().drag_divider.is_some();
+        if !dragging {
+            if let Err(err) = link.report_viewport(tab_id).await {
+                log::warn!("reporting the tab shape: {err:#}");
+                Self::set_status(&self.inner.borrow(), &format!("could not report the tab's shape: {err:#}"));
+            }
         }
         // A listing that changed nothing (the timer's, mostly) is not a
         // reason to paint.
@@ -1491,6 +2521,9 @@ impl App {
             inner.panes.clear();
             inner.tab_id = layout.tab_id;
         }
+        inner.recent_tabs.retain(|t| *t != layout.tab_id);
+        inner.recent_tabs.insert(0, layout.tab_id);
+        inner.recent_tabs.truncate(64);
         inner.window_id = layout.window_id;
         inner.workspace = layout.workspace.clone();
         let drawn: std::collections::BTreeSet<PaneId> =
@@ -1582,11 +2615,91 @@ impl App {
     pub fn on_chrome_click(self: &Rc<Self>, click: crate::chrome::Click) {
         use crate::chrome::Click;
         // Any other click withdraws a pending close.
-        if click != Click::Close {
+        if !matches!(click, Click::Close | Click::ClosePane(_)) {
             self.inner.borrow_mut().closing_since = None;
         }
+        if !matches!(click, Click::CloseTab(_)) {
+            self.inner.borrow_mut().closing_tab = None;
+        }
         match click {
-            Click::Pane(pane_id) => self.switch_to_pane(pane_id, true),
+            Click::Pane(pane_id) => {
+                let hidden = self
+                    .inner
+                    .borrow()
+                    .tab_layout
+                    .as_ref()
+                    .is_some_and(|l| l.hidden.contains(&pane_id));
+                if hidden {
+                    // A stack member behind the drawn one: the server
+                    // brings it to the front, then it is focused.
+                    self.act(
+                        "activate the pane",
+                        Pdu::ActivatePaneInStack(codec::ActivatePaneInStack { pane_id }),
+                        move |app, _| app.switch_to_pane(pane_id, true),
+                    );
+                } else {
+                    self.switch_to_pane(pane_id, true);
+                }
+            }
+            Click::Sidebar => {
+                if let Some(body) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.body()) {
+                    let off = body.get_attribute("data-side").as_deref() == Some("off");
+                    if off {
+                        let _ = body.remove_attribute("data-side");
+                    } else {
+                        let _ = body.set_attribute("data-side", "off");
+                    }
+                }
+                // The canvas's box moved; its observer resizes it.
+                let _ = self.inner.borrow().textarea.focus();
+            }
+            Click::CloseTab(tab_id) => {
+                let panes: Vec<PaneId> = {
+                    let mut inner = self.inner.borrow_mut();
+                    let now = monotonic_ms();
+                    match inner.closing_tab {
+                        Some((tab, since)) if tab == tab_id && now - since < CLOSE_CONFIRM_MS => {
+                            inner.closing_tab = None;
+                            inner
+                                .layout
+                                .as_ref()
+                                .map(|l| {
+                                    l.tabs
+                                        .iter()
+                                        .flat_map(crate::layout::leaves)
+                                        .filter(|e| e.tab_id == tab_id)
+                                        .map(|e| e.pane_id)
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        }
+                        _ => {
+                            inner.closing_tab = Some((tab_id, now));
+                            Self::render_strip(&inner);
+                            let _ = inner.textarea.focus();
+                            vec![]
+                        }
+                    }
+                };
+                for pane_id in panes {
+                    self.act(
+                        "close the tab",
+                        Pdu::KillPane(codec::KillPane { pane_id }),
+                        |_, _| {},
+                    );
+                }
+            }
+            Click::ClosePane(pane_id) => {
+                let (focused, following) = {
+                    let inner = self.inner.borrow();
+                    (inner.focused_pane, inner.following)
+                };
+                if pane_id != focused {
+                    self.inner.borrow_mut().closing_since = None;
+                    self.focus_pane(pane_id, following);
+                }
+                self.on_chrome_click(Click::Close);
+            }
             Click::Follow => {
                 let mut inner = self.inner.borrow_mut();
                 inner.following = !inner.following;
@@ -1594,13 +2707,9 @@ impl App {
                 let _ = inner.textarea.focus();
             }
             Click::NewTab => self.new_tab(),
-            Click::SplitRight => self.split(thinkterm_proto::SplitDirection::Horizontal),
-            Click::SplitBelow => self.split(thinkterm_proto::SplitDirection::Vertical),
-            Click::Zoom => self.toggle_zoom(),
-            Click::Fit => {
-                let on = !self.inner.borrow().link.lease().fit;
-                self.fit(on);
-            }
+            Click::SplitRight(pane) => self.split(pane, thinkterm_proto::SplitDirection::Horizontal),
+            Click::SplitBelow(pane) => self.split(pane, thinkterm_proto::SplitDirection::Vertical),
+            Click::Zoom(pane) => self.toggle_zoom(pane),
             Click::Close => {
                 let confirmed = {
                     let mut inner = self.inner.borrow_mut();
@@ -1695,8 +2804,8 @@ impl App {
     }
 
     /// Split the focused pane; the new pane takes the focus.
-    pub fn split(self: &Rc<Self>, direction: thinkterm_proto::SplitDirection) {
-        let pane_id = self.inner.borrow().focused_pane;
+    pub fn split(self: &Rc<Self>, pane: Option<PaneId>, direction: thinkterm_proto::SplitDirection) {
+        let pane_id = self.target_pane(pane);
         self.act(
             "split the pane",
             Pdu::SplitPane(codec::SplitPane {
@@ -1720,12 +2829,25 @@ impl App {
         );
     }
 
+    /// The pane a bar's button or a chord acts on: the bar's pane, which
+    /// the page focuses first as the desktop does, else the focused one.
+    fn target_pane(self: &Rc<Self>, pane: Option<PaneId>) -> PaneId {
+        match pane {
+            Some(pane_id) => {
+                self.focus_pane(pane_id, true);
+                pane_id
+            }
+            None => self.inner.borrow().focused_pane,
+        }
+    }
+
     /// Zoom the focused pane to the whole tab, or back.
-    pub fn toggle_zoom(self: &Rc<Self>) {
-        let (tab_id, pane_id, zoomed) = {
+    pub fn toggle_zoom(self: &Rc<Self>, pane: Option<PaneId>) {
+        let pane_id = self.target_pane(pane);
+        let (tab_id, zoomed) = {
             let inner = self.inner.borrow();
             let zoomed = inner.tab_layout.as_ref().is_some_and(|l| l.zoomed.is_some());
-            (inner.tab_id, inner.focused_pane, zoomed)
+            (inner.tab_id, zoomed)
         };
         self.act(
             "zoom the pane",
@@ -1752,9 +2874,9 @@ impl App {
     /// person's click, which also stops the page following the desktop;
     /// a focus push is not.
     pub fn switch_to_pane(self: &Rc<Self>, pane_id: PaneId, chosen: bool) {
-        if chosen {
-            self.inner.borrow_mut().following = false;
-        }
+        // `chosen` is a person's click: the desktop is told, as with a
+        // click in a pane, so both screens keep one focus.
+        let _ = chosen;
         // Already drawn: a focus change and nothing else. Not advised to
         // the server: a strip click has just pinned the page, and a focus
         // push is the server's own news.
@@ -1810,23 +2932,41 @@ impl App {
     pub fn take_over(self: &Rc<Self>) {
         let (link, tab_id) = {
             let inner = self.inner.borrow();
+            Self::set_status(&inner, "taking the terminal over…");
+            // Taken by an interaction here: at this page's own shape.
+            inner.link.lease_mut().fit = true;
             (inner.link.clone(), inner.tab_id)
         };
         let app = Rc::clone(self);
         wasm_bindgen_futures::spawn_local(async move {
-            match link.claim(tab_id).await {
+            let after = match link.claim(tab_id).await {
                 Ok(true) => {
                     app.refresh_status();
                     app.request_frame();
+                    app.inner.borrow_mut().after_take_over.take()
                 }
                 Ok(false) => {
-                    let inner = app.inner.borrow();
+                    let mut inner = app.inner.borrow_mut();
+                    inner.after_take_over = None;
                     Self::set_status(&inner, "the server did not hand the terminal over");
+                    None
                 }
                 Err(err) => {
-                    let inner = app.inner.borrow();
+                    let mut inner = app.inner.borrow_mut();
+                    inner.after_take_over = None;
                     Self::set_status(&inner, &format!("could not take over: {err:#}"));
+                    None
                 }
+            };
+            match after {
+                Some(AfterTakeOver::Focus(pane_id)) => {
+                    let link = app.inner.borrow().link.clone();
+                    Self::advise_focus(link, pane_id);
+                }
+                Some(AfterTakeOver::Key(key, mods, shift)) => {
+                    app.key_down(key, mods, shift);
+                }
+                None => {}
             }
         });
     }
@@ -1834,6 +2974,244 @@ impl App {
     /// See `GlyphCache::warm`. Called once, after the first frame.
     pub fn warm_glyph_canvas(&self) {
         self.inner.borrow_mut().glyphs.warm();
+    }
+
+    /// Rasterise for another size or density: a fresh cache on a fresh
+    /// texture. A new cell size makes "what fits" a different question,
+    /// so the atlas backoff starts over rather than carrying a grudge
+    /// from the old one.
+    fn rerasterise(inner: &mut Inner, size_pt: f64, dpi: u32) {
+        let side = inner.glyphs.atlas.size() as u32;
+        match GpuTexture::new(&inner.gpu.device, Arc::clone(&inner.gpu.queue), side, side).and_then(
+            |t| {
+                GlyphCache::new(
+                    Rc::clone(&inner.fonts),
+                    size_pt,
+                    dpi,
+                    Rc::new(t),
+                    Rc::clone(&inner.glyphs.families),
+                )
+            },
+        ) {
+            Ok(glyphs) => inner.glyphs = glyphs,
+            Err(err) => log::error!("glyph cache at {size_pt} pt, {dpi} dpi: {err:#}"),
+        }
+        inner.capacity.reset();
+        Self::rebuild_pane_fonts(inner);
+    }
+
+    /// The scaled panes' caches follow the page's size, density and atlas
+    /// side; a cache that cannot be built leaves the pane at the page's
+    /// size.
+    fn rebuild_pane_fonts(inner: &mut Inner) {
+        let side = inner.glyphs.atlas.size() as u32;
+        let (size_pt, dpi) = (inner.glyphs.size_pt, inner.glyphs.dpi);
+        let mut failed = Vec::new();
+        for (pane_id, font) in inner.pane_fonts.iter_mut() {
+            let built = GpuTexture::new(&inner.gpu.device, Arc::clone(&inner.gpu.queue), side, side).and_then(|t| {
+                GlyphCache::new(
+                    Rc::clone(&inner.fonts),
+                    size_pt * font.scale,
+                    dpi,
+                    Rc::new(t),
+                    Rc::clone(&inner.glyphs.families),
+                )
+            });
+            match built {
+                Ok(glyphs) => font.glyphs = glyphs,
+                Err(err) => {
+                    log::error!("glyph cache for pane {pane_id} at scale {}: {err:#}", font.scale);
+                    failed.push(*pane_id);
+                }
+            }
+        }
+        for pane_id in failed {
+            inner.pane_fonts.remove(&pane_id);
+        }
+    }
+
+    /// Whether a pane's own font is what the page draws it with. It is
+    /// while this page holds the terminal (its claim shapes the pane to
+    /// that cell), and otherwise only when the pane, as the server has
+    /// it, fits its frame at that cell -- a follower never clips a pane.
+    fn pane_font_shown(inner: &Inner, place: &crate::layout::PanePlacement) -> bool {
+        let Some(font) = inner.pane_fonts.get(&place.pane_id) else {
+            return false;
+        };
+        if inner.link.lease().owns_viewport() {
+            return true;
+        }
+        let root = inner.glyphs.metrics.cell_size;
+        let m = font.glyphs.metrics.cell_size;
+        let nav = Self::nav_dev(inner) as f64;
+        place.content.0 as f64 * m.width as f64 <= place.frame.cols as f64 * root.width as f64
+            && place.content.1 as f64 * m.height as f64 + nav <= place.frame.rows as f64 * root.height as f64
+    }
+
+    /// A pane's cell in device px: its own font's when that is shown.
+    fn pane_cell(inner: &Inner, place: &crate::layout::PanePlacement) -> (f64, f64) {
+        let m = if Self::pane_font_shown(inner, place) {
+            inner.pane_fonts[&place.pane_id].glyphs.metrics
+        } else {
+            inner.glyphs.metrics
+        };
+        (m.cell_size.width as f64, m.cell_size.height as f64)
+    }
+
+    /// The grid a placement shows at its own cell: the pane's own size,
+    /// or less where its frame cannot hold it.
+    fn shown_in(inner: &Inner, place: &crate::layout::PanePlacement) -> (usize, usize) {
+        let (cw, ch) = Self::pane_cell(inner, place);
+        let root = inner.glyphs.metrics.cell_size;
+        let frame_w = place.frame.cols as f64 * root.width as f64;
+        let frame_h = place.frame.rows as f64 * root.height as f64;
+        let offset = Self::content_offset(inner, place) as f64;
+        (
+            place.content.0.min((frame_w / cw).floor() as usize),
+            place.content.1.min(((frame_h - offset) / ch).floor().max(0.0) as usize),
+        )
+    }
+
+    /// How far below its frame's top a pane's content starts: the bar.
+    /// A pane the server has at its whole frame (a layout nobody with a
+    /// bar has claimed yet) loses its last rows under the frame's bottom
+    /// rather than its first under the bar -- the prompt is at the top,
+    /// and the next claim from here makes room.
+    fn content_offset(inner: &Inner, _place: &crate::layout::PanePlacement) -> f32 {
+        Self::nav_dev(inner)
+    }
+
+    /// The panes as this page would claim them: the desktop's rule for
+    /// each, at its own cell where it has its own font.
+    fn native_panes(inner: &Inner, layout: &crate::layout::TabLayout) -> Vec<codec::ClientPaneViewport> {
+        let nav_rows = Self::nav_rows(inner);
+        let mut panes = layout.viewport(nav_rows);
+        let root = inner.glyphs.metrics.cell_size;
+        let nav = Self::nav_dev(inner) as f64;
+        for pane in panes.iter_mut() {
+            let Some(font) = inner.pane_fonts.get(&pane.pane_id) else {
+                continue;
+            };
+            let Some(place) = layout.panes.iter().find(|p| p.pane_id == pane.pane_id) else {
+                continue;
+            };
+            let (cw, ch) = (font.glyphs.metrics.cell_size.width as f64, font.glyphs.metrics.cell_size.height as f64);
+            let cols = ((place.frame.cols as f64 * root.width as f64) / cw).floor().max(1.0) as usize;
+            let rows = ((place.frame.rows as f64 * root.height as f64 - nav) / ch).floor().max(1.0) as usize;
+            pane.size = TerminalSize {
+                cols,
+                rows,
+                pixel_width: cols * cw as usize,
+                pixel_height: rows * ch as usize,
+                dpi: font.glyphs.dpi,
+            };
+        }
+        panes
+    }
+
+    /// Cmd+= / Cmd+- scale the focused pane's font by a tenth, as the
+    /// desktop does; Cmd+0 takes it back to the page's size. The pane's
+    /// grid follows when this page holds the terminal.
+    pub fn step_font(self: &Rc<Self>, by: f64) {
+        let pane_id = self.inner.borrow().focused_pane;
+        {
+            let mut inner = self.inner.borrow_mut();
+            let current = inner.pane_fonts.get(&pane_id).map(|f| f.scale).unwrap_or(1.0);
+            let scale = if by == 0.0 { 1.0 } else { (current * 1.1f64.powf(by)).clamp(0.25, 4.0) };
+            if (scale - 1.0).abs() < 1e-6 {
+                inner.pane_fonts.remove(&pane_id);
+            } else {
+                let side = inner.glyphs.atlas.size() as u32;
+                let (size_pt, dpi) = (inner.glyphs.size_pt, inner.glyphs.dpi);
+                let built = GpuTexture::new(&inner.gpu.device, Arc::clone(&inner.gpu.queue), side, side).and_then(|t| {
+                    GlyphCache::new(Rc::clone(&inner.fonts), size_pt * scale, dpi, Rc::new(t), Rc::clone(&inner.glyphs.families))
+                });
+                match built {
+                    Ok(glyphs) => {
+                        inner.pane_fonts.insert(
+                            pane_id,
+                            PaneFont { scale, glyphs, quads: HeapQuadAllocator::default(), vertices: Vec::new() },
+                        );
+                    }
+                    Err(err) => {
+                        Self::set_status(&inner, &format!("could not size the font: {err:#}"));
+                        return;
+                    }
+                }
+            }
+            if let Some(layout) = &inner.tab_layout {
+                let panes = Self::native_panes(&inner, layout);
+                let mut lease = inner.link.lease_mut();
+                lease.native = panes;
+                lease.native_root = Some(layout.size);
+            }
+        }
+        self.request_frame();
+        // The pane's grid changes with its cell: claimed when this page
+        // drives, and a page that does not takes the terminal first, as
+        // any interaction here does.
+        let (link, tab_id, owns) = {
+            let inner = self.inner.borrow();
+            let owns = inner.link.lease().owns_viewport();
+            (inner.link.clone(), inner.tab_id, owns)
+        };
+        if owns {
+            let app = Rc::clone(self);
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(err) = link.claim(tab_id).await {
+                    log::warn!("resizing the pane for its font: {err:#}");
+                }
+                app.refresh_layout();
+            });
+        } else {
+            self.take_over();
+        }
+    }
+
+    /// The font size this page wants (`viewport::choose_size_pt`): the
+    /// desktop's cell, and for a follower no larger than lets the whole
+    /// tab fit the canvas. `None` when the size is right or pinned by
+    /// `?font=`.
+    fn desired_size_pt(inner: &Inner, dev_w: u32, dev_h: u32) -> Option<f64> {
+        if inner.font_pinned {
+            return None;
+        }
+        let (desktop, fit) = {
+            let lease = inner.link.lease();
+            (lease.canonical_size, lease.fit)
+        };
+        let desktop = desktop?;
+        let page_dpi = 96.0 * inner.dpr;
+        let dpi = page_dpi as u32;
+        let fonts = Rc::clone(&inner.fonts);
+        let cell = |pt: f64| {
+            fonts.metrics(pt, dpi).ok().map(|m| {
+                let r = crate::glyphs::RenderMetrics::with_font_metrics(&m);
+                (r.cell_size.width as f64, r.cell_size.height as f64)
+            })
+        };
+        let desktop_cell_h = (desktop.rows > 0 && desktop.dpi > 0 && desktop.pixel_height > 0)
+            .then(|| desktop.pixel_height as f64 / desktop.rows as f64 / desktop.dpi as f64 * page_dpi);
+        // Holding the terminal at this page's own shape, the tab takes the
+        // grid this window has at the desktop's cell size; only a follower
+        // shrinks the cell to show all of the desktop's tab.
+        let grid = (!fit && desktop.cols > 0 && desktop.rows > 0).then_some((desktop.cols, desktop.rows));
+        crate::viewport::choose_size_pt(cell, inner.glyphs.size_pt, desktop_cell_h, grid, (dev_w as f64, dev_h as f64))
+    }
+
+    /// The desktop's size changed: settle the font, and only then the
+    /// grid. Nothing happens when the size is already right -- a forced
+    /// pass through `resize` would re-claim the tab on every push.
+    pub fn match_desktop_cell(&self) {
+        let wanted = {
+            let inner = self.inner.borrow();
+            Self::desired_size_pt(&inner, inner.canvas.width(), inner.canvas.height())
+        };
+        if wanted.is_some() {
+            self.inner.borrow_mut().cols = 0;
+            self.resize();
+            self.request_frame();
+        }
     }
 
     /// Fit the grid to the canvas's CSS box at the device pixel ratio, and
@@ -1846,39 +3224,38 @@ impl App {
         if (dpr - inner.dpr).abs() > f64::EPSILON {
             // Another monitor: glyphs are rasterised for the new density.
             inner.dpr = dpr;
-            let dpi = (96.0 * dpr) as u32;
-            let side = inner.glyphs.atlas.size() as u32;
-            match GpuTexture::new(&inner.gpu.device, Arc::clone(&inner.gpu.queue), side, side)
-                .and_then(|t| {
-                    GlyphCache::new(
-                        Rc::clone(&inner.fonts),
-                        inner.glyphs.size_pt,
-                        dpi,
-                        Rc::new(t),
-                        Rc::clone(&inner.glyphs.families),
-                    )
-                })
-            {
-                Ok(glyphs) => inner.glyphs = glyphs,
-                Err(err) => log::error!("glyph cache for dpr {dpr}: {err:#}"),
-            }
-            // A new cell size makes "what fits" a different question, so
-            // the atlas backoff starts over rather than carrying a grudge
-            // from the old one.
-            inner.capacity.reset();
+            let size_pt = inner.glyphs.size_pt;
+            Self::rerasterise(&mut inner, size_pt, (96.0 * dpr) as u32);
         }
         let dev_w = (rect.width() * dpr).floor().max(1.0) as u32;
         let dev_h = (rect.height() * dpr).floor().max(1.0) as u32;
-        if inner.canvas.width() != dev_w || inner.canvas.height() != dev_h {
+        // Setting the backing store's size clears it: the frame is
+        // painted again right away below, not at the next animation
+        // frame, or the page's ground shows through for a frame.
+        let cleared = inner.canvas.width() != dev_w || inner.canvas.height() != dev_h;
+        if cleared {
             inner.canvas.set_width(dev_w);
             inner.canvas.set_height(dev_h);
         }
         inner.gpu.resize(dev_w, dev_h);
+        // The font follows the desktop's cell and the window's box.
+        if let Some(size_pt) = Self::desired_size_pt(&inner, dev_w, dev_h) {
+            log::info!("font {} pt -> {size_pt} pt for the desktop's cell in this window", inner.glyphs.size_pt);
+            let dpi = (96.0 * inner.dpr) as u32;
+            Self::rerasterise(&mut inner, size_pt, dpi);
+            inner.cols = 0;
+        }
         let (cw, ch) = (
             inner.glyphs.metrics.cell_size.width as u32,
             inner.glyphs.metrics.cell_size.height as u32,
         );
-        let Some((cols, rows)) = grid_for(dev_w, dev_h, cw, ch) else {
+        let pad = Self::pad(&inner);
+        let Some((cols, rows)) = grid_for(
+            dev_w.saturating_sub(2 * pad.0 as u32),
+            dev_h.saturating_sub(2 * pad.1 as u32),
+            cw,
+            ch,
+        ) else {
             // A box too small for a cell is a hidden or collapsed page,
             // not a size anyone asked for: keep the last real grid rather
             // than resize every client's shell to it.
@@ -1887,6 +3264,8 @@ impl App {
         let changed = cols != inner.cols || rows != inner.rows;
         inner.cols = cols;
         inner.rows = rows;
+        // The bars are placed from the cell size, which may just have moved.
+        Self::render_navs(&inner);
         if changed {
             // The page's grid is its own business: the tab keeps the
             // desktop's size and this canvas letterboxes it. Only a page
@@ -1916,7 +3295,11 @@ impl App {
         }
         drop(inner);
         self.refresh_status();
-        self.request_frame();
+        if cleared {
+            self.frame();
+        } else {
+            self.request_frame();
+        }
     }
 
     /// Paint. Lines the session does not have yet come back blank and are
@@ -2098,6 +3481,7 @@ impl App {
             side as u32,
         )?);
         Self::rebuild_glyphs(inner, texture)?;
+        Self::rebuild_pane_fonts(inner);
         Ok(Grown::Larger)
     }
 
@@ -2114,7 +3498,9 @@ impl App {
             inner.glyphs.atlas.size()
         );
         let texture = inner.glyphs.texture_rc();
-        Self::rebuild_glyphs(inner, texture)
+        Self::rebuild_glyphs(inner, texture)?;
+        Self::rebuild_pane_fonts(inner);
+        Ok(())
     }
 
     fn rebuild_glyphs(inner: &mut Inner, texture: Rc<GpuTexture>) -> Result<()> {
@@ -2149,6 +3535,7 @@ impl App {
             physical_top: size.physical_top,
             size: TerminalSize::default(),
             workspace: inner.workspace.clone(),
+            stack: vec![],
         }]
     }
 
@@ -2161,16 +3548,24 @@ impl App {
     /// Returns what this frame owes: glyphs the budget put off, and sprites
     /// a full atlas declined.
     fn paint(inner: &mut Inner, budget: &mut FallbackBudget) -> Result<(u32, u32)> {
-        inner.glyphs.begin_frame(inner.capacity.frozen());
+        let frozen = inner.capacity.frozen();
+        inner.glyphs.begin_frame(frozen);
+        for font in inner.pane_fonts.values_mut() {
+            font.glyphs.begin_frame(frozen);
+            font.quads.recycle();
+        }
         let (w, h) = inner.gpu.size();
         let surface = (w as f32, h as f32);
-        let cell_w = inner.glyphs.metrics.cell_size.width as f32;
-        let cell_h = inner.glyphs.metrics.cell_size.height as f32;
+        let root_w = inner.glyphs.metrics.cell_size.width as f32;
+        let root_h = inner.glyphs.metrics.cell_size.height as f32;
         let owns = inner.link.lease().owns_viewport();
         let placements = Self::placements(inner);
         let focused_palette = inner.focused().palette.clone();
+        let pad = Self::pad(inner);
         inner.quads.recycle();
         for place in &placements {
+            let (cols_shown, rows_shown) = Self::shown_in(inner, place);
+            let offset = Self::content_offset(inner, place);
             let Some(cell) = inner.panes.get_mut(&place.pane_id) else {
                 continue;
             };
@@ -2180,7 +3575,6 @@ impl App {
             if cell.scroll_from_bottom > max {
                 cell.scroll_from_bottom = max;
             }
-            let (cols_shown, rows_shown) = Self::shown(place);
             let visible = visible_rows(&dims, rows_shown, cell.scroll_from_bottom);
             let (first, lines) = session.get_lines(visible);
             let cursor = session.cursor_position();
@@ -2188,18 +3582,32 @@ impl App {
             let selection = cell.selection;
             let is_focused = place.pane_id == inner.focused_pane;
             let hsv = if is_focused { None } else { Some(INACTIVE_PANE_HSB) };
-            let origin = (place.frame.left as f32 * cell_w, place.frame.top as f32 * cell_h);
+            // A pane with its own font draws from its own cache, into its
+            // own batch.
+            let own_font = Self::pane_font_shown(inner, place);
+            let (glyphs, quads): (&mut GlyphCache, &mut HeapQuadAllocator) = match inner.pane_fonts.get_mut(&place.pane_id) {
+                Some(font) if own_font => (&mut font.glyphs, &mut font.quads),
+                _ => (&mut inner.glyphs, &mut inner.quads),
+            };
+            let cell_w = glyphs.metrics.cell_size.width as f32;
+            let cell_h = glyphs.metrics.cell_size.height as f32;
+            let frame_origin = (
+                pad.0 + place.frame.left as f32 * root_w,
+                pad.1 + place.frame.top as f32 * root_h,
+            );
+            // The content sits below the pane's bar, as on the desktop.
+            let origin = (frame_origin.0, frame_origin.1 + offset);
             let clip = (cols_shown as f32 * cell_w, rows_shown as f32 * cell_h);
             // The pane's own ground, over its whole frame: it carries the
-            // pane's colours, and covers the chrome rows of a frame the
-            // desktop reserved.
+            // pane's colours, and covers the rows of a frame the desktop
+            // reserved below its bar.
             crate::emit::fill_rect(
-                &inner.glyphs,
-                &mut inner.quads,
+                glyphs,
+                quads,
                 0,
                 surface,
-                origin,
-                (place.frame.cols as f32 * cell_w, place.frame.rows as f32 * cell_h),
+                frame_origin,
+                (place.frame.cols as f32 * root_w, place.frame.rows as f32 * root_h),
                 palette.background.to_linear(),
                 hsv,
             )?;
@@ -2245,9 +3653,10 @@ impl App {
                     hsv,
                     draw_cursor: is_focused,
                 };
-                crate::emit::emit_line(&mut inner.glyphs, &mut inner.quads, budget, &params)?;
+                crate::emit::emit_line(glyphs, quads, budget, &params)?;
             }
         }
+        let (cell_w, cell_h) = (root_w, root_h);
         // Dividers, centred in the gap cell like the desktop's.
         if let Some(layout) = &inner.tab_layout {
             let t = (inner.glyphs.metrics.underline_height.max(1)) as f32;
@@ -2267,17 +3676,50 @@ impl App {
                         t,
                     ),
                 };
-                crate::emit::fill_rect(&inner.glyphs, &mut inner.quads, 0, surface, (x, y), (dw, dh), colour, None)?;
+                crate::emit::fill_rect(&inner.glyphs, &mut inner.quads, 0, surface, (pad.0 + x, pad.1 + y), (dw, dh), colour, None)?;
+            }
+            // A follower larger than the tab sees the desktop's faint
+            // grid over what the tab does not reach.
+            let lease = inner.link.lease();
+            let follower = matches!(lease.mode, Some(codec::FrontendAccessMode::TmuxLatest)) && !lease.owns_viewport();
+            drop(lease);
+            if follower && (inner.cols > layout.cols || inner.rows > layout.rows) {
+                let faint = wezterm_color_types::LinearRgba::with_srgba(0x8e, 0x8e, 0x93, 26);
+                let (tab_w, tab_h) = (layout.cols as f32 * cell_w, layout.rows as f32 * cell_h);
+                let (page_w, page_h) = (inner.cols as f32 * cell_w, inner.rows as f32 * cell_h);
+                let mut line = |x: f32, y: f32, w: f32, h: f32| {
+                    crate::emit::fill_rect(&inner.glyphs, &mut inner.quads, 0, surface, (pad.0 + x, pad.1 + y), (w, h), faint, None)
+                };
+                for c in layout.cols..=inner.cols {
+                    line(c as f32 * cell_w, 0.0, 1.0, page_h)?;
+                }
+                for r in layout.rows..=inner.rows {
+                    line(0.0, r as f32 * cell_h, page_w, 1.0)?;
+                }
+                for r in 0..layout.rows {
+                    line(tab_w, r as f32 * cell_h, page_w - tab_w, 1.0)?;
+                }
+                for c in 0..layout.cols {
+                    line(c as f32 * cell_w, tab_h, 1.0, page_h - tab_h)?;
+                }
             }
         }
         inner.vertices.clear();
         inner.quads.extract_vertices(&mut inner.vertices);
+        let mut declined = inner.glyphs.declined();
+        for font in inner.pane_fonts.values_mut() {
+            font.vertices.clear();
+            font.quads.extract_vertices(&mut font.vertices);
+            declined += font.glyphs.declined();
+        }
         let bg = focused_palette.background.to_linear().tuple();
         let millis = (js_sys::Date::now() % (u32::MAX as f64)) as u32;
-        inner
-            .gpu
-            .draw(&inner.vertices, inner.glyphs.texture(), [bg.0, bg.1, bg.2, bg.3], millis)?;
-        Ok((budget.deferred(), inner.glyphs.declined()))
+        let mut batches: Vec<(&[Vertex], &GpuTexture)> = vec![(&inner.vertices, inner.glyphs.texture())];
+        for font in inner.pane_fonts.values() {
+            batches.push((&font.vertices, font.glyphs.texture()));
+        }
+        inner.gpu.draw_batches(&batches, [bg.0, bg.1, bg.2, bg.3], millis)?;
+        Ok((budget.deferred(), declined))
     }
 }
 

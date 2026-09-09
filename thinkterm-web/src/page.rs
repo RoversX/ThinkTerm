@@ -70,9 +70,12 @@ pub async fn start(
     // `glyph_font` is the CSS font stack the glyph fallback draws with,
     // from `?glyphfont=`; empty means the built-in list.
     glyph_font: String,
+    // `?font=` was given: keep that size rather than the desktop's cell.
+    font_pinned: bool,
 ) -> Result<(), JsValue> {
     run(
         canvas_id, textarea_id, status_id, url, token, font_names, fonts, size_pt, glyph_font,
+        font_pinned,
     )
     .await
     .map_err(js_err)
@@ -97,6 +100,7 @@ async fn run(
     fonts: Vec<js_sys::Uint8Array>,
     size_pt: f64,
     glyph_font: String,
+    font_pinned: bool,
 ) -> Result<()> {
     let canvas: web_sys::HtmlCanvasElement = element(&canvas_id)?;
     let textarea: web_sys::HtmlTextAreaElement = element(&textarea_id)?;
@@ -133,7 +137,7 @@ async fn run(
     // gave up, and the reader keeps answering its pings.
     let outcome = start_attached(
         &link, &canvas, &textarea, status.clone(), &url, &token, fonts, size_pt, &glyph_font, dpr,
-        dpi,
+        dpi, font_pinned,
     )
     .await;
     if outcome.is_err() {
@@ -154,6 +158,7 @@ async fn start_attached(
     glyph_font: &str,
     dpr: f64,
     dpi: u32,
+    font_pinned: bool,
 ) -> Result<()> {
     let set_status = |text: &str| {
         if let Some(s) = &status {
@@ -176,7 +181,9 @@ async fn start_attached(
     );
     // A page too small for a cell (hidden, collapsed, mid-layout) reports
     // no viewport: it follows the pane's own size until it has a real one.
-    let size = crate::app::grid_for(dev_w, dev_h, cw, ch).map(|(cols, rows)| {
+    // Inside the desktop's window padding: a cell left and right, half
+    // a cell top and bottom.
+    let size = crate::app::grid_for(dev_w.saturating_sub(2 * cw), dev_h.saturating_sub(ch), cw, ch).map(|(cols, rows)| {
         wezterm_term::TerminalSize {
             rows,
             cols,
@@ -187,7 +194,9 @@ async fn start_attached(
     });
 
     set_status("attaching…");
-    let attached = attach(&link, size).await?;
+    // Rows the bar above each pane takes, for the first report.
+    let nav_rows = crate::navbar::nav_rows(crate::navbar::nav_css(ch as f64 / dpr, None) * dpr, ch as f64);
+    let attached = attach(&link, size, nav_rows).await?;
     let (cols, rows) = match size {
         Some(size) => (size.cols, size.rows),
         None => (attached.dims.cols, attached.dims.viewport_rows),
@@ -244,6 +253,9 @@ async fn start_attached(
         cols,
         rows,
         strip: crate::chrome::TabStrip::mount("tabs"),
+        navs: crate::navbar::NavBars::mount("panes"),
+        side: crate::sidebar::Sidebar::mount("side"),
+        font_pinned,
     });
     host.events.set_wake(app.wake());
     {
@@ -257,7 +269,7 @@ async fn start_attached(
     crate::input::install(Rc::clone(&app), canvas, textarea);
     // The strip: one listener on its root, so rebuilding its contents
     // costs nothing to keep wired.
-    if let Some(root) = app.strip_element() {
+    for root in [app.strip_element(), app.navs_element()].into_iter().flatten() {
         let app = Rc::clone(&app);
         crate::input::listen::<web_sys::MouseEvent>(&root, "click", move |ev| {
             if let Some(click) = crate::chrome::TabStrip::click_target(&ev) {
@@ -266,9 +278,62 @@ async fn start_attached(
             }
         });
     }
+    if let (Some(root), Some(window)) = (app.side_element(), web_sys::window()) {
+        let app2 = Rc::clone(&app);
+        crate::input::listen::<web_sys::MouseEvent>(&root, "click", move |ev| {
+            if let Some(click) = crate::sidebar::Sidebar::click_target(&ev) {
+                ev.prevent_default();
+                app2.on_side_click(click);
+            }
+        });
+        {
+            let app = Rc::clone(&app);
+            crate::input::listen::<web_sys::KeyboardEvent>(&root, "keydown", move |ev| {
+                let Some(input) = ev.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()) else {
+                    return;
+                };
+                let key = ev.key();
+                if key == "Enter" || key == "Escape" {
+                    ev.prevent_default();
+                    app.on_side_key(&key, input.value());
+                }
+                ev.stop_propagation();
+            });
+        }
+        // The resize handle: drag the panel's edge, within the desktop's bounds.
+        let dragging = Rc::new(std::cell::Cell::new(false));
+        {
+            let dragging = Rc::clone(&dragging);
+            crate::input::listen::<web_sys::PointerEvent>(&root, "pointerdown", move |ev| {
+                let target: Option<web_sys::Element> = ev.target().and_then(|t| t.dyn_into().ok());
+                if target.is_some_and(|t| t.get_attribute("class").as_deref() == Some("handle")) {
+                    dragging.set(true);
+                    ev.prevent_default();
+                }
+            });
+        }
+        {
+            let dragging = Rc::clone(&dragging);
+            let app = Rc::clone(&app);
+            crate::input::listen::<web_sys::PointerEvent>(&window, "pointermove", move |ev| {
+                if dragging.get() {
+                    app.set_sidebar_width(ev.client_x() as f64);
+                }
+            });
+        }
+        crate::input::listen::<web_sys::PointerEvent>(&window, "pointerup", move |_| dragging.set(false));
+        if let Some(px) = crate::sidebar::stored_width() {
+            app.set_sidebar_width(px);
+        }
+    }
+    app.fetch_tree();
+    // The boot messages were shown in the status element directly; from
+    // here it is the page's passing remark, shown only when there is one.
+    app.hide_status();
     app.refresh_layout();
     app.poll_layout(5_000);
     let _ = textarea.focus();
+    app.match_desktop_cell();
     app.resize();
     app.request_frame();
     // A moment after the first frame, in its own task: the fallback

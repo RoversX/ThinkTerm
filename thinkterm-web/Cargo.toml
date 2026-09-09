@@ -46,7 +46,7 @@ web-sys = { workspace = true, features = [
   "CloseEvent", "CompositionEvent",
   "console", "CssStyleDeclaration", "DataTransfer", "Document", "DomRect",
   "DomRectReadOnly", "Element", "Event", "EventTarget", "FocusEvent", "History",
-  "HtmlCanvasElement", "HtmlElement", "HtmlTextAreaElement", "ImageData",
+  "HtmlCanvasElement", "HtmlElement", "HtmlInputElement", "HtmlTextAreaElement", "ImageData",
   "InputEvent",
   "KeyboardEvent", "Location", "MessageEvent", "MouseEvent", "Navigator",
   "Performance", "PointerEvent", "ResizeObserver", "ResizeObserverEntry", "Storage",
