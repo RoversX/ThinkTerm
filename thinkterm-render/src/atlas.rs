@@ -10,6 +10,35 @@ use thiserror::*;
 
 const PADDING: i32 = 1;
 
+/// How many rows of the texture are zeroed at a time.
+///
+/// A side-sized `Image` is `side * side * 4` bytes -- 268 MB at the 8192 a
+/// WebGPU device commonly allows, on a heap that never gives memory back --
+/// and both `new` and `clear` used to build one. A strip is 2 MB at that
+/// size and the uploads are the same total work.
+const ZERO_STRIP_ROWS: usize = 64;
+
+/// Blank the whole texture without holding a full-size copy of it.
+fn zero(texture: &Rc<dyn Texture2d>, side: usize) {
+    let mut rows = ZERO_STRIP_ROWS.min(side);
+    let mut strip = Image::new(side, rows);
+    let mut y = 0;
+    while y < side {
+        if side - y < rows {
+            rows = side - y;
+            strip = Image::new(side, rows);
+        }
+        texture.write(
+            Rect::new(
+                Point::new(0, y as isize),
+                Size::new(side as isize, rows as isize),
+            ),
+            &strip,
+        );
+        y += rows;
+    }
+}
+
 #[derive(Debug, Error)]
 #[error("Texture Size exceeded, need {:?}", size)]
 pub struct OutOfTextureSpace {
@@ -103,14 +132,15 @@ impl Atlas {
             "texture must be square!"
         );
         let side = texture.width();
-        let iside = side as isize;
-
-        let image = Image::new(side, side);
-        let rect = Rect::new(Point::new(0, 0), Size::new(iside, iside));
-        texture.write(rect, &image);
-
+        // Everything that can fail happens before the texture is touched.
+        // `Atlas::new` is called on a texture that is already on screen --
+        // that is how the web client clears a full atlas -- and wiping it
+        // and then returning `Err` leaves the caller holding a cache whose
+        // every sprite points at blank pixels: a terminal that draws
+        // nothing, with no way back.
         let allocator =
             SimpleAtlasAllocator::new(AtlasSize::new(side.try_into()?, side.try_into()?));
+        zero(texture, side);
         Ok(Self {
             texture: Rc::clone(texture),
             side,
@@ -226,10 +256,7 @@ impl Atlas {
 
     /// Zero out the texture, and forget all allocated regions
     pub fn clear(&mut self) {
-        let iside = self.side as isize;
-        let image = Image::new(self.side, self.side);
-        let rect = Rect::new(Point::new(0, 0), Size::new(iside, iside));
-        self.texture.write(rect, &image);
+        zero(&self.texture, self.side);
         self.allocator.clear();
         self.usage = AtlasUsage::default();
     }
