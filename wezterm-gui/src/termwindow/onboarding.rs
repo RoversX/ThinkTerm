@@ -52,7 +52,6 @@ const LABEL_GAP: f32 = 24.0;
 const CHIP_PAD_X: f32 = 28.0;
 const CHIP_PAD_Y: f32 = 18.0;
 const CHIP_GAP: f32 = 16.0;
-const CHIP_RADIUS: f32 = 18.0;
 
 /// Appearance previews. Big enough to actually depict a light and a dark
 /// surface, because that is the one thing on this page that communicates
@@ -84,7 +83,17 @@ const RING_FOCUS: f32 = 6.0;
 const BTN_PAD_X: f32 = 40.0;
 const BTN_PAD_Y: f32 = 22.0;
 const BTN_GAP: f32 = 20.0;
-const BTN_RADIUS: f32 = 18.0;
+
+/// A pill: the ends are half-circles, so the radius is half the control's
+/// height rather than a fixed figure. The height is settled by the font at
+/// layout time -- a long translation or a larger UI size makes these taller
+/// -- so a constant radius would have read as a pill at one size and as a
+/// rounded rectangle at another. `pixel_snap_rounded_rect` clamps to half
+/// the shorter side, so this stays correct for a control that is somehow
+/// taller than it is wide.
+fn pill_radius(area: RectF) -> f32 {
+    area.size.height / 2.0
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum OnboardingAction {
@@ -395,8 +404,14 @@ impl OnboardingView {
     }
 
     /// One chip's width: its label plus symmetric padding.
+    ///
+    /// Rounded up, because the label is then drawn into exactly
+    /// `width - padding * 2` and a chip sized to the measurement with no
+    /// slack loses its last glyph to any rounding in between -- "Français"
+    /// came out as "Françai". A whole pixel of headroom costs nothing and
+    /// removes the whole class of near-miss.
     fn chip_w(ctx: &DrawContext, font: &Rc<LoadedFont>, label: &str) -> f32 {
-        ctx.measure_text_width(font, label) + ctx.px(CHIP_PAD_X) * 2.0
+        (ctx.measure_text_width(font, label) + ctx.px(CHIP_PAD_X) * 2.0).ceil()
     }
 
     /// Wrap chips into rows that fit `max_w`. Returns one vector of indices per
@@ -685,8 +700,10 @@ impl OnboardingView {
         // --- actions, right aligned
         let start_label = crate::i18n::tr("onboarding-start");
         let skip_label = crate::i18n::tr("onboarding-skip");
-        let start_w = ctx.measure_text_width(font, &start_label) + ctx.px(BTN_PAD_X) * 2.0;
-        let skip_w = ctx.measure_text_width(font, &skip_label) + ctx.px(BTN_PAD_X) * 2.0;
+        // Rounded up for the same reason as `chip_w`.
+        let start_w =
+            (ctx.measure_text_width(font, &start_label) + ctx.px(BTN_PAD_X) * 2.0).ceil();
+        let skip_w = (ctx.measure_text_width(font, &skip_label) + ctx.px(BTN_PAD_X) * 2.0).ceil();
 
         let start_x = col_x + col_w - start_w;
         self.paint_button(
@@ -997,7 +1014,7 @@ impl OnboardingView {
                 _ => (skin.chip_bg, skin.chip_border, skin.secondary_text),
             }
         };
-        self.paint_ring(ctx, layers, area, skin, action, ctx.px(CHIP_RADIUS), false)?;
+        self.paint_ring(ctx, layers, area, skin, action, pill_radius(area), false)?;
         ctx.draw_rounded_frame(
             layers,
             0,
@@ -1007,7 +1024,7 @@ impl OnboardingView {
             area.size.height,
             bg,
             border,
-            ctx.px(CHIP_RADIUS),
+            pill_radius(area),
         )?;
         Ok(text)
     }
@@ -1041,7 +1058,7 @@ impl OnboardingView {
             };
             (bg, skin.chip_border, skin.secondary_text)
         };
-        self.paint_ring(ctx, layers, area, skin, action, ctx.px(BTN_RADIUS), false)?;
+        self.paint_ring(ctx, layers, area, skin, action, pill_radius(area), false)?;
         ctx.draw_rounded_frame(
             layers,
             0,
@@ -1051,7 +1068,7 @@ impl OnboardingView {
             area.size.height,
             bg,
             border,
-            ctx.px(BTN_RADIUS),
+            pill_radius(area),
         )?;
         let text_w = ctx.measure_text_width(font, label).min(area.size.width);
         ctx.draw_text(
