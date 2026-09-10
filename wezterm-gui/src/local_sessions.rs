@@ -214,9 +214,6 @@ pub(crate) fn finish_stop_at_exit(config: &ConfigHandle) {
     }
 }
 
-/// The pid written in `pid_file`, when a running server holds its lock.
-#[cfg(unix)]
-
 /// The host's domain name for this launch, if local sessions run in it.
 pub(crate) fn host_domain_name() -> Option<String> {
     if *FELL_BACK.lock().unwrap() {
