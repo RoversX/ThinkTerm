@@ -37,6 +37,8 @@ struct Listening {
     /// The address `accept()` actually returned, not the configured
     /// string: an unspecified bind has to be woken through a real address.
     local: SocketAddr,
+    /// Set by the loop as it returns: the port is free from then on.
+    done: Option<Arc<AtomicBool>>,
 }
 
 /// The bind addresses currently accepting, in configuration order.
@@ -85,10 +87,18 @@ pub fn stop_web_listener(bind_address: &str) -> bool {
         return false;
     };
     entry.stop.store(true, Ordering::SeqCst);
-    // The knock is refused by the loop, which is the point: it is only
-    // there to return from `accept`. A failure here means nobody was
-    // blocked on it any more, which is equally fine.
+    // The loop waits in `poll` with a timeout and looks at the flag
+    // between waits (a `shutdown` on a listening socket is ENOTCONN on
+    // macOS and does not wake `accept`); the knock only shortens the wait
+    // where it lands on this listener rather than a more specific one.
     let _ = TcpStream::connect_timeout(&wake_address(entry.local), Duration::from_secs(1));
+    if let Some(done) = entry.done.as_ref() {
+        // Bounded: the port is free once the loop has returned.
+        let waited = std::time::Instant::now();
+        while !done.load(Ordering::SeqCst) && waited.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     log::error!("stopped listening for web clients on {bind_address}");
     true
 }
@@ -239,6 +249,7 @@ pub fn spawn_web_listener(server: &WebServer) -> anyhow::Result<()> {
     );
 
     let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
     // Registered before the thread starts, so a stop that arrives in the
     // same breath as the start still finds it.
     LISTENERS.lock().map_or_else(|e| e.into_inner(), |g| g).insert(
@@ -247,12 +258,13 @@ pub fn spawn_web_listener(server: &WebServer) -> anyhow::Result<()> {
             effective: effective.clone(),
             stop: Arc::clone(&stop),
             local,
+            done: Some(Arc::clone(&done)),
         },
     );
     let bind_address = server.bind_address.clone();
     match std::thread::Builder::new()
         .name(format!("web-accept-{}", server.bind_address))
-        .spawn(move || accept_loop(listener, acceptor, site, stop))
+        .spawn(move || accept_loop(listener, acceptor, site, stop, done))
     {
         Ok(_) => {
             // The other half of `disconnect_all`, which stops admissions
@@ -279,22 +291,61 @@ pub fn spawn_web_listener(server: &WebServer) -> anyhow::Result<()> {
 /// peer costs nothing; an exhausted descriptor table would otherwise spin.
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
+/// How long the loop waits for a connection before it looks at the stop
+/// flag again: a stop is seen within this, knock or no knock.
+const ACCEPT_WAIT: Duration = Duration::from_millis(250);
+
+/// Wait for a connection to be ready, `ACCEPT_WAIT` at most. Blocking
+/// `accept` cannot be woken from another thread on every platform (a
+/// `shutdown` of a listening socket is ENOTCONN on macOS), so the wait
+/// is a `poll` and the accept never blocks.
+fn connection_ready(listener: &TcpListener) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let mut fds = [libc::pollfd { fd: listener.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, ACCEPT_WAIT.as_millis() as libc::c_int) };
+        n > 0
+    }
+    #[cfg(not(unix))]
+    {
+        std::thread::sleep(Duration::from_millis(20));
+        true
+    }
+}
+
 fn accept_loop(
     listener: TcpListener,
     acceptor: Option<SslAcceptor>,
     site: Arc<WebSite>,
     stop: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
 ) {
-    for stream in listener.incoming() {
+    let _ = listener.set_nonblocking(true);
+    loop {
         // Checked before the connection is looked at, so the knock that
         // woke us is dropped rather than served.
         if stop.load(Ordering::SeqCst) {
             log::info!("web accept loop for {} is done", site.describe);
+            done.store(true, Ordering::SeqCst);
             return;
         }
-        let stream = match stream {
-            Ok(stream) => stream,
+        if !connection_ready(&listener) {
+            continue;
+        }
+        let stream = match listener.accept() {
+            // Blocking again for the handshake; `Async::new` sets its own.
+            Ok((stream, _)) => {
+                let _ = stream.set_nonblocking(false);
+                stream
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(err) => {
+                if stop.load(Ordering::SeqCst) {
+                    log::info!("web accept loop for {} is done", site.describe);
+                    done.store(true, Ordering::SeqCst);
+                    return;
+                }
                 // One bad client (or a moment without descriptors) is one
                 // refused connection, not the end of the listener.
                 log::error!("web accept failed on {}: {err}", site.describe);

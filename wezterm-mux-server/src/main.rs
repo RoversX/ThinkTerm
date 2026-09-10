@@ -279,6 +279,9 @@ fn run() -> anyhow::Result<()> {
     ))?;
 
     let no_initial_pane = opts.no_initial_pane;
+    // Only the desktop launches the server this way; its tree is then the
+    // desktop's to seed, never this server's.
+    wezterm_mux_server_impl::thinkterm_tree::set_hosted_by_desktop(no_initial_pane);
     let need_builder = !opts.prog.is_empty() || opts.cwd.is_some();
 
     let cmd = if need_builder {
@@ -530,6 +533,9 @@ async fn async_run(
             if let Err(err) = update_mux_domains_for_server(&config::configuration()) {
                 log::error!("Error updating mux domains: {:#}", err);
             }
+            // The reloaded config may name a different color_scheme; every
+            // connection is told, so browsers repaint with it.
+            Mux::get().notify(mux::MuxNotification::DefaultPaletteChanged);
         })
         .detach();
         true

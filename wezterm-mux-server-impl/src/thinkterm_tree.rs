@@ -17,6 +17,7 @@ use codec::{
 use mux::{Mux, MuxNotification};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use uuid::Uuid;
 
@@ -119,14 +120,32 @@ fn workspace_name(project_id: &str, thread_id: &str) -> String {
     format!("thinkterm:{project_id}:{thread_id}")
 }
 
+/// Whether a desktop on this machine owns the tree. Set from the launch
+/// (`--no-initial-pane`, which only the desktop passes): its Spaces are
+/// published to this server, so an empty tree means the desktop has not
+/// spoken yet, not that there is nothing -- and minting a landing here
+/// would leave a second "Default" beside the desktop's for good.
+static HOSTED_BY_DESKTOP: AtomicBool = AtomicBool::new(false);
+
+pub fn set_hosted_by_desktop(hosted: bool) {
+    HOSTED_BY_DESKTOP.store(hosted, Ordering::SeqCst);
+}
+
+pub fn hosted_by_desktop() -> bool {
+    HOSTED_BY_DESKTOP.load(Ordering::SeqCst)
+}
+
 /// Resolve a landing Thread against the authoritative tree.  Missing
-/// Default/Home/main rows are created here, never reconstructed from a client
-/// cache.  The operation is idempotent: once a usable Thread exists, repeated
-/// calls only return it.
+/// Default/Home/main rows are created here when `may_mint`, never
+/// reconstructed from a client cache; a server whose tree a desktop owns
+/// refuses instead, since the rows are the desktop's to publish.  The
+/// operation is idempotent: once a usable Thread exists, repeated calls
+/// only return it.
 fn ensure_landing_in_tree(
     tree: &mut ThinkTermTree,
     preferred_thread_id: Option<&str>,
-) -> (LandingRecord, bool) {
+    may_mint: bool,
+) -> Result<(LandingRecord, bool)> {
     let mut changed = false;
     // Archived projects never serve as a landing target: a fresh attach
     // must not silently resurrect a project the user put away. When every
@@ -157,6 +176,9 @@ fn ensure_landing_in_tree(
 
     let (project_index, thread_index) = match selected {
         Some(selected) => selected,
+        None if !may_mint => anyhow::bail!(
+            "no thread to open: the desktop on this machine has not published its workspaces yet"
+        ),
         None => {
             if tree.spaces.is_empty() {
                 tree.spaces.push(TtSpace {
@@ -220,14 +242,14 @@ fn ensure_landing_in_tree(
         changed = true;
     }
 
-    (
+    Ok((
         LandingRecord {
             thread_id: thread.id.clone(),
             workspace,
             project_path: project.path.clone(),
         },
         changed,
-    )
+    ))
 }
 
 /// Ensure a server-owned landing Thread and persist it before any terminal is
@@ -238,7 +260,8 @@ pub fn ensure_landing(preferred_thread_id: Option<&str>) -> Result<LandingRecord
     let (landing, changed) = {
         let mut guard = TREE.lock().unwrap();
         let mut candidate = guard.clone();
-        let (landing, changed) = ensure_landing_in_tree(&mut candidate, preferred_thread_id);
+        let (landing, changed) =
+            ensure_landing_in_tree(&mut candidate, preferred_thread_id, !hosted_by_desktop())?;
         if changed {
             ensure_unique_thread_names(&mut candidate);
             candidate.revision = candidate.revision.saturating_add(1);
@@ -466,7 +489,7 @@ mod test {
     #[test]
     fn landing_bootstraps_default_home_main_once() {
         let mut tree = ThinkTermTree::default();
-        let (first, changed) = ensure_landing_in_tree(&mut tree, None);
+        let (first, changed) = ensure_landing_in_tree(&mut tree, None, true).unwrap();
         assert!(changed);
         assert_eq!(tree.spaces.len(), 1);
         assert_eq!(tree.spaces[0].name, "Default");
@@ -477,7 +500,7 @@ mod test {
         assert_eq!(tree.projects[0].threads[0].name, "main");
         assert_eq!(first.thread_id, tree.projects[0].threads[0].id);
 
-        let (second, changed) = ensure_landing_in_tree(&mut tree, None);
+        let (second, changed) = ensure_landing_in_tree(&mut tree, None, true).unwrap();
         assert!(!changed);
         assert_eq!(second, first);
         assert_eq!(tree.spaces.len(), 1);
@@ -485,10 +508,25 @@ mod test {
         assert_eq!(tree.projects[0].threads.len(), 1);
     }
 
+    /// A server the desktop hosts never invents rows: the desktop's are
+    /// coming, and a second "Default" beside them would stay for good.
+    #[test]
+    fn a_desktop_hosted_server_does_not_mint_a_landing() {
+        let mut tree = ThinkTermTree::default();
+        let err = ensure_landing_in_tree(&mut tree, None, false).unwrap_err();
+        assert!(err.to_string().contains("not published"));
+        assert!(tree.spaces.is_empty() && tree.projects.is_empty());
+        // With rows published, it lands in them as ever.
+        let mut tree = sample();
+        let (landing, changed) = ensure_landing_in_tree(&mut tree, None, false).unwrap();
+        assert!(!changed);
+        assert_eq!(landing.thread_id, "t1");
+    }
+
     #[test]
     fn landing_honors_an_existing_preferred_thread() {
         let mut tree = sample();
-        let (landing, changed) = ensure_landing_in_tree(&mut tree, Some("t1"));
+        let (landing, changed) = ensure_landing_in_tree(&mut tree, Some("t1"), true).unwrap();
         assert!(!changed);
         assert_eq!(landing.thread_id, "t1");
         assert_eq!(landing.workspace, "thinkterm:p1:t1");
@@ -501,7 +539,7 @@ mod test {
             revision: 9,
             ..ThinkTermTree::default()
         };
-        let (landing, changed) = ensure_landing_in_tree(&mut tree, Some("stale-thread"));
+        let (landing, changed) = ensure_landing_in_tree(&mut tree, Some("stale-thread"), true).unwrap();
         assert!(changed);
         assert_ne!(landing.thread_id, "stale-thread");
         assert!(landing.thread_id.starts_with("thread-"));
@@ -541,7 +579,7 @@ mod test {
             }
         ));
 
-        let (landing, changed) = ensure_landing_in_tree(&mut tree, Some("t1"));
+        let (landing, changed) = ensure_landing_in_tree(&mut tree, Some("t1"), true).unwrap();
         assert!(!changed);
         assert_eq!(
             landing.thread_id, "t2",
@@ -557,7 +595,7 @@ mod test {
             .find(|project| project.id == "p2")
             .unwrap()
             .archived_at = Some(101);
-        let (landing, changed) = ensure_landing_in_tree(&mut tree, None);
+        let (landing, changed) = ensure_landing_in_tree(&mut tree, None, true).unwrap();
         assert!(changed);
         let host = tree
             .projects
