@@ -356,11 +356,6 @@ pub fn reveal_path(path: &std::path::Path) {
             }
             return;
         };
-        // It also returns a `\\?\` verbatim path, which Explorer does not
-        // understand.
-        let full = full.to_string_lossy();
-        let full = full.strip_prefix(r"\\?\").unwrap_or(&full);
-
         // Explorer parses its own command line and wants `/select,` and the
         // path as one argument; the usual quoting splits that into two paths
         // as soon as the path has a space, so it is passed verbatim.
@@ -369,9 +364,44 @@ pub fn reveal_path(path: &std::path::Path) {
         // worked -- so nothing here may branch on it. In particular there is
         // no falling back to `shell_execute`, which is what ran the file.
         let _ = std::process::Command::new("explorer.exe")
-            .raw_arg(format!("/select,\"{full}\""))
+            .raw_arg(select_argument(&full.to_string_lossy()))
             .spawn();
     });
+}
+
+/// The `/select,` argument for a full path.
+///
+/// `canonicalize` hands back a verbatim path, which Explorer does not
+/// understand in either of its forms: `\\?\C:\x` has to lose the prefix, and
+/// `\\?\UNC\server\share` is spelled `\\server\share` everywhere else.
+#[cfg(windows)]
+fn select_argument(full: &str) -> String {
+    let full = match full.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => full.strip_prefix(r"\\?\").unwrap_or(full).to_string(),
+    };
+    format!("/select,\"{full}\"")
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    /// One argument, quoted, and an ordinary path inside it. Explorer reads
+    /// its own command line: unquoted, a path with a space becomes two
+    /// paths, and a verbatim prefix is not a path it knows at all.
+    #[test]
+    fn the_select_argument_is_one_quoted_ordinary_path() {
+        assert_eq!(
+            super::select_argument(r"\\?\C:\Users\ada\Q3 plan.bat"),
+            r#"/select,"C:\Users\ada\Q3 plan.bat""#
+        );
+        // A UNC path keeps its UNC spelling, not the verbatim one.
+        assert_eq!(
+            super::select_argument(r"\\?\UNC\server\share\f.txt"),
+            r#"/select,"\\server\share\f.txt""#
+        );
+        // Never canonicalized, so never prefixed: unchanged.
+        assert_eq!(super::select_argument(r"C:\x.txt"), r#"/select,"C:\x.txt""#);
+    }
 }
 
 #[cfg(target_os = "macos")]
