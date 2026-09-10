@@ -957,7 +957,7 @@ mod tests {
         assert!(matches!(route(&site, &ip), Route::Static(_)));
         let rebound = request("GET", "/", &[("Host", "evil.example:8088")]);
         assert_eq!(route(&site, &rebound), reject(403, "Host not served here"));
-        let wrong_port = request("GET", "/", &[("Host", "10.0.0.5:9999")]);
+        let wrong_port = request("GET", "/", &[("Host", "192.0.2.5:9999")]);
         assert_eq!(route(&site, &wrong_port), reject(403, "Host not served here"));
         // Through `ssh -L 9000:127.0.0.1:8088`: a loopback name on a port
         // the listener never heard of is still this machine.

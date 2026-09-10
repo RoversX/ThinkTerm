@@ -324,15 +324,15 @@ mod tests {
     #[test]
     fn a_listener_bound_everywhere_names_the_machine_s_addresses() {
         let server = WebServer { bind_address: "0.0.0.0:8443".into(), ..WebServer::default() };
-        let addrs = vec!["192.168.1.7".parse().unwrap(), "100.100.5.5".parse().unwrap(), "fd7a:115c:a1e0::1".parse().unwrap()];
+        let addrs = vec!["192.0.2.7".parse().unwrap(), "100.64.0.1".parse().unwrap(), "fd7a:115c:a1e0::1".parse().unwrap()];
         assert_eq!(
             server.url_hosts_with(&addrs),
-            vec!["127.0.0.1:8443", "localhost:8443", "[::1]:8443", "192.168.1.7:8443", "100.100.5.5:8443"]
+            vec!["127.0.0.1:8443", "localhost:8443", "[::1]:8443", "192.0.2.7:8443", "100.64.0.1:8443"]
         );
         let v6 = WebServer { bind_address: "[::]:8443".into(), ..WebServer::default() };
         assert!(v6.url_hosts_with(&addrs).contains(&"[fd7a:115c:a1e0::1]:8443".to_string()));
-        assert!(is_tailscale(&"100.100.5.5".parse().unwrap()));
-        assert!(!is_tailscale(&"192.168.1.7".parse().unwrap()));
+        assert!(is_tailscale(&"100.64.0.1".parse().unwrap()));
+        assert!(!is_tailscale(&"192.0.2.7".parse().unwrap()));
     }
 
     #[test]
@@ -411,7 +411,7 @@ mod tests {
         assert!(is_loopback_host("127.0.0.1"));
         assert!(is_loopback_host("::1"));
         assert!(is_loopback_host("LOCALHOST"));
-        assert!(!is_loopback_host("10.0.0.5"));
+        assert!(!is_loopback_host("192.0.2.5"));
         assert!(!is_loopback_host("localhost.example"));
     }
 }

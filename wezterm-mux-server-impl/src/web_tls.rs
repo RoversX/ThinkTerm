@@ -148,10 +148,10 @@ mod tests {
 
     #[test]
     fn the_names_always_carry_loopback_and_the_addresses() {
-        let (dns, ips) = names(&["192.168.1.7".parse().unwrap()]);
+        let (dns, ips) = names(&["192.0.2.7".parse().unwrap()]);
         assert!(dns.contains(&"localhost".to_string()));
         assert!(ips.contains(&"127.0.0.1".parse().unwrap()));
-        assert!(ips.contains(&"192.168.1.7".parse().unwrap()));
+        assert!(ips.contains(&"192.0.2.7".parse().unwrap()));
         assert_eq!(base64_decode("aGVsbG8="), Some(b"hello".to_vec()));
     }
 

@@ -47,6 +47,51 @@ infer any information from it.
 If you wish, you can disable update checking by setting
 `check_for_updates = false`.
 
+## Browser Access
+
+ThinkTerm's multiplexer can serve a browser client, so that a phone or
+another machine can open the terminals running on this one. It is off
+unless you turn it on: no port is opened until a `web_servers` entry is
+configured, or until you switch one on in Settings → Web or with
+`thinkterm cli web-server on`. Nothing about it reports anywhere. The
+page, its JavaScript, its wasm and its fonts are all served by your own
+machine, the page makes no request to any third party, and no usage of it
+is collected.
+
+A browser is admitted by a web token that you mint yourself with
+`thinkterm cli web-token mint`. A token is a login as your user on that
+machine: anyone holding it can open a shell and read every pane, so treat
+it like an ssh key. The page takes it out of the address bar as soon as it
+loads and keeps it in that tab's `sessionStorage`, which the browser
+discards when the tab closes.
+
+While a listener is on, ThinkTerm keeps two things on the local disk,
+readable by your user only, and sends neither anywhere.
+
+The first is the tokens, and only if a `token_file` is configured: unset
+means memory only, and restarting the server forgets every token. What is
+written for each is its id, the name you gave it, a sha256 digest of the
+token -- never the token itself, so a copied file admits nobody -- when it
+was created, when it expires, when it was last used, and a coarse
+description of the browser that last used it, taken from the User-Agent it
+sent ("iPhone · Safari"). No address of any device that connected is
+recorded, and the server's log names the token that was admitted rather
+than who used it.
+
+The second is a self-signed certificate and its private key, under
+`web-tls/` in ThinkTerm's data directory (`~/.local/share/thinkterm` on
+Linux, `~/Library/Application Support/thinkterm` on macOS). It is made
+only when you bind a listener off loopback without supplying a certificate
+of your own, and it names the machine's hostname and every non-loopback
+address it has, so that a browser reaching it by any of them lands in a
+secure context. Those names are shown to whoever connects to that port,
+which is what a certificate is for; nothing else is in it.
+
+The browser keeps your own choices for that page -- language, theme, font
+size, colour scheme, the Space it was showing, panel widths, recent
+palette picks -- in its `localStorage`, on your device. Clearing the
+site's data forgets them.
+
 ## Third-Party Builds
 
 The above is true of the ThinkTerm source code and the binaries produced by
