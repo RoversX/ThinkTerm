@@ -3535,6 +3535,9 @@ impl ClientDomain {
         // session.
         let mut live_mirrors_in_response = 0usize;
 
+        // Where each local window's next tab goes: the wire lists a
+        // window's tabs in its order, and a mirror keeps that order.
+        let mut placed: HashMap<WindowId, usize> = HashMap::new();
         for (mut tabroot, tab_title) in panes.tabs.into_iter().zip(panes.tab_titles.iter()) {
             // Translate remote stack ids into stable local ids BEFORE the
             // tree rebuild, so that GUI state keyed by pane_stack_id
@@ -3602,7 +3605,18 @@ impl ClientDomain {
 
                 log::debug!("domain: {} tree: {:#?}", inner.local_domain_id, tabroot);
                 let mut workspace = None;
-                tab.sync_with_pane_tree(sync_size, tabroot, |entry| {
+                // The local window is the geometry authority only while
+                // this client holds the tab; a follower draws whatever
+                // splits the owner made, which only the wire carries.
+                let keep_local_geometry = inner.owns_remote_viewport(remote_tab_id).unwrap_or(true);
+                // A follower shows the owner's grid whole (the GUI paints
+                // it at the canonical size): the wire root is its size,
+                // so the sync is a no-op resize rather than a fresh
+                // TabResized per push, and the splits keep their ratios.
+                if !keep_local_geometry {
+                    sync_size = root_size;
+                }
+                tab.sync_with_pane_tree_keeping(sync_size, tabroot, keep_local_geometry, |entry| {
                     workspace.replace(entry.workspace.clone());
                     remote_panes_to_forget.remove(&entry.pane_id);
                     live_mirrors_in_response += 1;
@@ -3680,6 +3694,19 @@ impl ClientDomain {
                             // reservation).
                             mux.add_tab_to_window(&tab, local_window_id)?;
                         }
+                        let slot = placed.entry(local_window_id).or_insert(0);
+                        if let Some(mut window) = mux.get_window_mut(local_window_id) {
+                            let at = window.idx_by_id(tab.tab_id());
+                            if let Some(at) = at.filter(|at| *at != *slot && *slot < window.len()) {
+                                let active = window.get_active().map(|t| t.tab_id());
+                                let moved = window.remove_by_idx(at);
+                                window.insert(*slot, &moved);
+                                if let Some(active) = active.and_then(|id| window.idx_by_id(id)) {
+                                    window.set_active_without_saving(active);
+                                }
+                            }
+                        }
+                        *slot += 1;
                         continue;
                     }
                     // The mapping went stale after the initial sweep. Fall

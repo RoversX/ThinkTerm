@@ -509,6 +509,9 @@ fn compute_min_size(tree: &mut Tree) -> (usize, usize) {
 fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &TerminalSize) {
     let (min_x, _) = compute_min_size(tree);
     while x_adjust != 0 {
+        // A pass that moved nothing (both sides at their minimum) would
+        // move nothing next time either.
+        let asked = x_adjust;
         match tree {
             Tree::Empty | Tree::Leaf(_) => return,
             Tree::Node { data: None, .. } => return,
@@ -573,12 +576,16 @@ fn adjust_x_size(tree: &mut Tree, mut x_adjust: isize, cell_dimensions: &Termina
                 }
             }
         }
+        if x_adjust == asked {
+            return;
+        }
     }
 }
 
 fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &TerminalSize) {
     let (_, min_y) = compute_min_size(tree);
     while y_adjust != 0 {
+        let asked = y_adjust;
         match tree {
             Tree::Empty | Tree::Leaf(_) => return,
             Tree::Node { data: None, .. } => return,
@@ -645,6 +652,9 @@ fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &Termina
                     }
                 }
             }
+        }
+        if y_adjust == asked {
+            return;
         }
     }
 }
@@ -994,7 +1004,25 @@ impl Tab {
     where
         F: FnMut(PaneEntry) -> Arc<dyn Pane>,
     {
-        self.inner.lock().sync_with_pane_tree(size, root, make_pane)
+        self.sync_with_pane_tree_keeping(size, root, true, make_pane)
+    }
+
+    /// `sync_with_pane_tree`, keeping the local split geometry across an
+    /// unchanged topology only when `keep_local_geometry`: the local
+    /// window is the authority for a tab this client holds, while a
+    /// follower draws the owner's splits and takes them from the wire.
+    pub fn sync_with_pane_tree_keeping<F>(
+        &self,
+        size: TerminalSize,
+        root: PaneNode,
+        keep_local_geometry: bool,
+        make_pane: F,
+    ) where
+        F: FnMut(PaneEntry) -> Arc<dyn Pane>,
+    {
+        self.inner
+            .lock()
+            .sync_with_pane_tree(size, root, keep_local_geometry, make_pane)
     }
 
     pub fn codec_pane_tree(&self) -> PaneNode {
@@ -1344,8 +1372,13 @@ impl TabInner {
         }
     }
 
-    fn sync_with_pane_tree<F>(&mut self, size: TerminalSize, root: PaneNode, mut make_pane: F)
-    where
+    fn sync_with_pane_tree<F>(
+        &mut self,
+        size: TerminalSize,
+        root: PaneNode,
+        keep_local_geometry: bool,
+        mut make_pane: F,
+    ) where
         F: FnMut(PaneEntry) -> Arc<dyn Pane>,
     {
         let mut active = None;
@@ -1359,9 +1392,12 @@ impl TabInner {
         // geometry (and self.size): the local window is the geometry
         // authority for client tabs, and the wire sizes are pane
         // dimensions that sit below the cells by the per-pane chrome.
-        let geometry_preserved = self.pane.as_ref().map_or(false, |old| {
-            copy_split_geometry_if_topology_matches(old, &mut t)
-        });
+        // Not for a follower: another frontend moved these dividers, and
+        // the wire is the only place it says where.
+        let geometry_preserved = keep_local_geometry
+            && self.pane.as_ref().map_or(false, |old| {
+                copy_split_geometry_if_topology_matches(old, &mut t)
+            });
         log::debug!(
             "sync_with_pane_tree tab {}: geometry_preserved={} old_size={:?}",
             self.id,
@@ -1458,7 +1494,14 @@ impl TabInner {
         // round-tripped through the server. When the topology (and thus
         // the geometry) was preserved above, skip the recompute so the
         // resize sees agreeing sizes and no-ops without a TabResized.
-        if !geometry_preserved {
+        if !keep_local_geometry {
+            // A follower: the wire's split records are the owner's frames
+            // and compose to the root it sent, which is the size asked for
+            // here. Measuring the ptys instead (the frames less each bar)
+            // would put the tab a few rows short and have the resize
+            // below re-deal the dividers on every push.
+            self.size = size;
+        } else if !geometry_preserved {
             // Measure the wire's panes against the cells of the size we are
             // about to impose; a pane carrying its own font scale counts a
             // different number of its own cells across the same pixels.
@@ -2003,19 +2046,36 @@ impl TabInner {
         self.size
     }
 
+    /// What the split tree adds up to, when there is a split to add up:
+    /// the size the tree really has, which `self.size` only claims.
+    fn split_tree_size(&self) -> Option<(usize, usize)> {
+        match self.pane.as_ref()? {
+            Tree::Node { data: Some(data), .. } => Some((data.width(), data.height())),
+            _ => None,
+        }
+    }
+
     fn resize(&mut self, size: TerminalSize) -> bool {
         if size.rows == 0 || size.cols == 0 {
             // Ignore "impossible" resize requests
             return false;
         }
         let current = self.size;
+        // The tree can lag `self.size`: a mirror zoomed on the wire takes
+        // window resizes on `self.size` alone, and its unzoom arrives by
+        // sync, not `toggle_zoom`. Measured from the tree, the adjustment
+        // below closes that gap instead of carrying it for good.
+        let tree = self.split_tree_size();
+        let tree_agrees = |size: &TerminalSize| {
+            tree.map_or(true, |(cols, rows)| cols == size.cols && rows == size.rows)
+        };
 
         // No-op resizes must not emit TabResized: for mux client tabs the
         // notification round-trips through the server and triggers a resync
         // (which itself calls resize), so an unconditional notify turns any
         // transient client/server size disagreement into an endless
         // resize/resync storm that visibly flickers the window contents.
-        if size == self.size {
+        if size == self.size && (self.zoomed.is_some() || tree_agrees(&size)) {
             crate::zoom_trace!(
                 "tab.resize.noop tab={} reason=unchanged want={}",
                 self.id,
@@ -2052,7 +2112,7 @@ impl TabInner {
             // hold; treat that as the same no-op as an exact request. Without
             // this second check, a GUI recovery pass can emit TabResized on
             // every frame even though no geometry can change.
-            if size == self.size {
+            if size == self.size && tree_agrees(&size) {
                 crate::zoom_trace!(
                     "tab.resize.noop tab={} reason=clamped_to_min want={} min={min_x}x{min_y}",
                     self.id,
@@ -2061,15 +2121,17 @@ impl TabInner {
                 return false;
             }
 
-            // Update the split nodes with adjusted sizes
+            // Update the split nodes with adjusted sizes, from what they
+            // hold now rather than from what the tab last claimed.
+            let (tree_cols, tree_rows) = tree.unwrap_or((current_size.cols, current_size.rows));
             adjust_x_size(
                 self.pane.as_mut().unwrap(),
-                cols as isize - current_size.cols as isize,
+                cols as isize - tree_cols as isize,
                 &dims,
             );
             adjust_y_size(
                 self.pane.as_mut().unwrap(),
-                rows as isize - current_size.rows as isize,
+                rows as isize - tree_rows as isize,
                 &dims,
             );
 
@@ -5567,6 +5629,125 @@ mod test {
             top_row: 0,
             left_col: 0,
             tty_name: None,
+        }
+    }
+
+    /// A shrink that reaches a nested split already at its minimum
+    /// returns instead of spinning under the tab lock.
+    #[test]
+    fn a_shrink_past_a_crushed_nested_split_returns() {
+        let size = test_size();
+        let mut one = size;
+        one.cols = 1;
+        one.pixel_width = 10;
+        let mut three = size;
+        three.cols = 3;
+        three.pixel_width = 30;
+        let mut rest = size;
+        rest.cols = 76;
+        rest.pixel_width = 760;
+        let root = PaneNode::Split {
+            left: Box::new(PaneNode::Split {
+                left: Box::new(PaneNode::Leaf(pane_entry(1, one, true))),
+                right: Box::new(PaneNode::Leaf(pane_entry(2, one, false))),
+                node: SplitDirectionAndSize { direction: SplitDirection::Horizontal, first: one, second: one },
+            }),
+            right: Box::new(PaneNode::Leaf(pane_entry(3, rest, false))),
+            node: SplitDirectionAndSize { direction: SplitDirection::Horizontal, first: three, second: rest },
+        };
+        let tab = Tab::new(&size);
+        tab.sync_with_pane_tree(size, root, |entry| FakePane::new(entry.pane_id, entry.size));
+        let mut narrow = size;
+        narrow.cols = 40;
+        narrow.pixel_width = 400;
+        let done = std::thread::spawn(move || tab.resize(narrow));
+        let started = std::time::Instant::now();
+        while !done.is_finished() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(5), "resize spins");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// A mirror zoomed on the wire is resized on `self.size` alone; when
+    /// the wire unzooms it, the sync's resize has to bring the tree to
+    /// the size the tab claims, or every later resize carries the gap and
+    /// the panes overflow the window for good.
+    #[test]
+    fn a_resize_while_zoomed_on_the_wire_reaches_the_tree_at_unzoom() {
+        let size = test_size();
+        let root = |zoomed: bool| {
+            let mut first = size;
+            first.cols = 40;
+            first.pixel_width = 400;
+            let mut second = size;
+            second.cols = 39;
+            second.pixel_width = 390;
+            let mut left = pane_entry(1, first, true);
+            left.is_zoomed_pane = zoomed;
+            PaneNode::Split {
+                left: Box::new(PaneNode::Leaf(left)),
+                right: Box::new(PaneNode::Leaf(pane_entry(2, second, false))),
+                node: SplitDirectionAndSize {
+                    direction: SplitDirection::Horizontal,
+                    first,
+                    second,
+                },
+            }
+        };
+        let tab = Tab::new(&size);
+        tab.sync_with_pane_tree(size, root(true), |entry| FakePane::new(entry.pane_id, entry.size));
+        assert!(tab.get_zoomed_pane().is_some());
+        let mut narrower = size;
+        narrower.cols = 70;
+        narrower.pixel_width = 700;
+        assert!(tab.resize(narrower));
+        assert_eq!(tab.get_size().cols, 70);
+        // Unzoomed by the wire, at the size the window still wants.
+        tab.sync_with_pane_tree(narrower, root(false), |entry| FakePane::new(entry.pane_id, entry.size));
+        assert!(tab.get_zoomed_pane().is_none());
+        let widths: Vec<usize> = tab.iter_panes().into_iter().map(|p| p.width).collect();
+        assert_eq!(widths.iter().sum::<usize>() + 1, 70, "{widths:?}");
+        // And a resize that changes nothing stays silent.
+        assert!(!tab.resize(narrower));
+    }
+
+    /// A follower's dividers are the owner's: a resync with the same
+    /// topology but other split sizes moves them, where the owner's own
+    /// tab keeps its local geometry.
+    #[test]
+    fn sync_with_pane_tree_takes_the_wire_geometry_for_a_follower() {
+        let size = test_size();
+        let split = |first_cols: usize| {
+            let mut first = size;
+            first.cols = first_cols;
+            first.pixel_width = first_cols * 10;
+            let mut second = size;
+            second.cols = size.cols - first_cols - 1;
+            second.pixel_width = second.cols * 10;
+            PaneNode::Split {
+                left: Box::new(PaneNode::Leaf(pane_entry(1, first, true))),
+                right: Box::new(PaneNode::Leaf(pane_entry(2, second, false))),
+                node: SplitDirectionAndSize {
+                    direction: SplitDirection::Horizontal,
+                    first,
+                    second,
+                },
+            }
+        };
+        let widths = |tab: &Tab| {
+            tab.iter_panes()
+                .into_iter()
+                .map(|p| (p.pane.pane_id(), p.width))
+                .collect::<Vec<_>>()
+        };
+        for (keep, expected) in [(true, 40), (false, 60)] {
+            let tab = Tab::new(&size);
+            tab.sync_with_pane_tree(size, split(40), |entry| FakePane::new(entry.pane_id, entry.size));
+            assert_eq!(widths(&tab), vec![(1, 40), (2, 39)]);
+            tab.sync_with_pane_tree_keeping(size, split(60), keep, |entry| {
+                FakePane::new(entry.pane_id, entry.size)
+            });
+            assert_eq!(widths(&tab), vec![(1, expected), (2, 79 - expected)], "keep={keep}");
         }
     }
 
