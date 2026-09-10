@@ -3913,6 +3913,15 @@ impl crate::TermWindow {
         );
     }
 
+    /// The first component of a vault-relative note path this system cannot
+    /// store as a file name, if any. The path arrives `/`-joined from
+    /// [`workspace_threads::normalize_vault_markdown_path`], which has
+    /// already refused anything that could leave the vault.
+    fn unstorable_note_component(relative: &str) -> Option<&str> {
+        let rules = crate::termwindow::remote_walk::DownloadNameRules::host();
+        relative.split('/').find(|part| !rules.accepts(part))
+    }
+
     pub(crate) fn activate_or_create_right_sidebar_wiki_link(
         &mut self,
         target: &str,
@@ -3944,6 +3953,20 @@ impl crate::TermWindow {
                 return;
             }
         };
+        // A wiki link names the note it opens, so a name this system cannot
+        // store is refused rather than rewritten the way a download is:
+        // creating `Q3_ Planning.md` for `[[Q3: Planning]]` would leave the
+        // link pointing at a note that does not exist. `normalize_vault_
+        // markdown_path` above only guards traversal, and is shared with
+        // every other note path, so the character rules belong here where
+        // they can be asked of this host alone -- `:` and the rest are
+        // ordinary characters in a note name on unix.
+        if let Some(part) = Self::unstorable_note_component(&relative) {
+            self.right_sidebar_note.load_error = Some(format!(
+                "cannot create a note named {part:?}: this system does not allow that file name"
+            ));
+            return;
+        }
         let Some(project_id) =
             workspace_threads::active_project_id_for_space(&self.active_space_id)
         else {
@@ -21662,6 +21685,31 @@ mod tests {
                     "untranslated hint {hint:?} for {problem:?}"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod wiki_link_name_tests {
+    use crate::TermWindow;
+
+    /// A wiki link names the note it opens, so a component this system
+    /// cannot store is refused rather than rewritten the way a download is:
+    /// creating the note under a near-miss of the name would leave the link
+    /// pointing at nothing. Off Windows those names are ordinary and stay.
+    #[test]
+    fn a_note_name_this_system_cannot_store_is_refused() {
+        assert_eq!(
+            TermWindow::unstorable_note_component("Design/Overview.md"),
+            None
+        );
+        assert_eq!(TermWindow::unstorable_note_component("Overview.md"), None);
+
+        let refused = TermWindow::unstorable_note_component("Design/Q3: Planning.md");
+        if cfg!(windows) {
+            assert_eq!(refused, Some("Q3: Planning.md"));
+        } else {
+            assert_eq!(refused, None, "an ordinary note name here");
         }
     }
 }
