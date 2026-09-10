@@ -2,6 +2,7 @@ use crate::workspace_threads::{RemoteFilesSource, RemoteFilesTarget};
 use config::SshDomain;
 use smol::channel::Sender;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -506,6 +507,25 @@ fn sanitized_download_name(file_name: &str) -> &str {
         .unwrap_or("download")
 }
 
+/// A server-supplied name reduced to something this host can store: a single
+/// component that the host's filename rules then accept. Unchanged off
+/// Windows, where those rules are the identity.
+///
+/// The order is load-bearing. `/` and `\` are reserved *characters* under the
+/// Windows rules, so sanitizing before taking the basename would rewrite
+/// `../../etc/passwd` into one long name on Windows while Linux still landed
+/// `passwd` -- one server, two platforms, two different files. Taking the
+/// basename first keeps them together, and hands `extension_split_index` a
+/// string whose bytes will not shift under it.
+///
+/// Deliberately not folded into `sanitized_download_name`, and so not into
+/// `download_name_candidates`: that is also how an *upload* picks a free name
+/// on the remote server, where this host's rules have no business.
+fn host_download_name(name: &str) -> Cow<'_, str> {
+    crate::termwindow::remote_walk::DownloadNameRules::host()
+        .sanitize(sanitized_download_name(name))
+}
+
 /// Where a name's extension begins, for collision numbering. The LAST dot,
 /// not the first: dots inside a stem are ordinary characters (a macOS
 /// screenshot is `… at 12.50.59 PM.png`, and numbering it at the first dot
@@ -559,7 +579,8 @@ pub(crate) fn reserve_download_directory(
     name: &str,
     mut reserve: impl FnMut(&Path) -> bool,
 ) -> Option<PathBuf> {
-    for candidate in folder_download_name_candidates(name) {
+    let name = host_download_name(name);
+    for candidate in folder_download_name_candidates(&name) {
         let destination = directory.join(&candidate);
         if reserve(&destination) {
             return Some(destination);
@@ -581,7 +602,8 @@ pub(crate) fn reserve_download_path(
     exists: impl Fn(&Path) -> bool,
     mut reserve: impl FnMut(&Path) -> bool,
 ) -> Option<(PathBuf, PathBuf)> {
-    for name in download_name_candidates(file_name) {
+    let file_name = host_download_name(file_name);
+    for name in download_name_candidates(&file_name) {
         let destination = directory.join(&name);
         if exists(&destination) {
             continue;
@@ -3649,6 +3671,27 @@ mod tests {
                 destination.display()
             );
             assert_eq!(partial.parent(), Some(dir));
+            // And whatever it landed as, this host can actually store it.
+            let landed = destination.file_name().and_then(|n| n.to_str()).unwrap();
+            assert!(
+                crate::termwindow::remote_walk::DownloadNameRules::host().accepts(landed),
+                "{hostile:?} landed as {landed:?}, which this host refuses"
+            );
+        }
+        // Names this host cannot store are rewritten rather than refused: the
+        // transfer is what was asked for, the spelling is incidental. On unix
+        // they are ordinary names and come through untouched.
+        for reserved in ["report:2024.txt", "why?.txt", "CON", "trailing."] {
+            let (destination, _) =
+                reserve_download_path(dir, reserved, |_| false, |_| true).expect("a name");
+            let landed = destination.file_name().and_then(|n| n.to_str()).unwrap();
+            assert!(
+                crate::termwindow::remote_walk::DownloadNameRules::host().accepts(landed),
+                "{reserved:?} landed as {landed:?}, which this host refuses"
+            );
+            if cfg!(unix) {
+                assert_eq!(landed, reserved, "unix has no quarrel with this name");
+            }
         }
         // A dotfile keeps its leading dot instead of being read as extension.
         let mut names = download_name_candidates(".bashrc");

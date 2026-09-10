@@ -1,4 +1,5 @@
 use anyhow::Context;
+use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -26,16 +27,22 @@ fn neuter_name(name: &str) -> Option<&str> {
 /// files in that folder.
 /// Returns the selected name and the opened File on success.
 fn resolve_file_name(name: Option<&str>) -> anyhow::Result<(PathBuf, File)> {
+    // `neuter_name` is left exactly as it is, refusal of every `:` included:
+    // that is stricter than Linux needs, but relaxing it there would change
+    // what this does on a platform that has no problem with the name. The
+    // host's own filename rules are applied to what it returns -- and never
+    // to the fallback, which needs nothing done to it.
     let name = name
         .and_then(neuter_name)
-        .unwrap_or("downloaded-via-wezterm");
+        .map(|name| crate::termwindow::remote_walk::DownloadNameRules::host().sanitize(name))
+        .unwrap_or(Cow::Borrowed("downloaded-via-wezterm"));
 
     let download_dir = dirs_next::download_dir()
         .ok_or_else(|| anyhow::anyhow!("unable to locate download directory"))?;
 
     for n in 0..20 {
         let candidate = if n == 0 {
-            download_dir.join(name)
+            download_dir.join(&*name)
         } else {
             download_dir.join(&format!("{}.{}", name, n))
         };
@@ -71,4 +78,27 @@ pub fn save_to_downloads(orig_name: Option<String>, data: &[u8]) -> anyhow::Resu
     log::info!("Downloaded {}", name.display());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::neuter_name;
+
+    /// `neuter_name` refuses a `:` on every platform, and must go on doing
+    /// so. It is stricter than unix needs -- `a:b.txt` is an ordinary name
+    /// there -- but it is what this has always done, and the host filename
+    /// rules are layered on top of it rather than replacing it, so that
+    /// tightening Windows leaves the other platforms exactly as they were.
+    #[test]
+    fn a_stream_supplied_name_never_keeps_a_colon() {
+        assert_eq!(neuter_name("report:2024.txt"), None);
+        assert_eq!(neuter_name("C:evil.txt"), None);
+        assert_eq!(neuter_name("."), None);
+        assert_eq!(neuter_name(".."), None);
+        // Separators are cut, not refused -- both of them, on every
+        // platform, which is stricter than `Path::file_name` on unix.
+        assert_eq!(neuter_name("a/b/c.txt"), Some("c.txt"));
+        assert_eq!(neuter_name("a\\b\\c.txt"), Some("c.txt"));
+        assert_eq!(neuter_name("report.txt"), Some("report.txt"));
+    }
 }

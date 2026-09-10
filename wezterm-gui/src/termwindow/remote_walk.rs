@@ -13,6 +13,7 @@
 use super::remote_files::{
     RemoteFileBackend, RemoteFileKind, RemotePath, RemoteTransferProgress, REMOTE_TRANSFER_CANCELED,
 };
+use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Component, Path};
 
@@ -77,14 +78,14 @@ fn name_is_single_host_component(name: &str) -> bool {
 /// Kept explicit rather than hidden behind `cfg` so macOS and Windows
 /// behavior can be exercised by the ordinary Linux test suite.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DownloadNameRules {
+pub(crate) enum DownloadNameRules {
     Unix,
     MacOs,
     Windows,
 }
 
 impl DownloadNameRules {
-    fn host() -> Self {
+    pub(crate) fn host() -> Self {
         if cfg!(target_os = "windows") {
             Self::Windows
         } else if cfg!(target_os = "macos") {
@@ -99,10 +100,29 @@ impl DownloadNameRules {
         }
     }
 
-    fn accepts(self, name: &str) -> bool {
+    pub(crate) fn accepts(self, name: &str) -> bool {
         match self {
             Self::Unix | Self::MacOs => name_is_single_host_component(name),
             Self::Windows => windows_download_name_is_valid(name),
+        }
+    }
+
+    /// `name` rewritten until [`Self::accepts`] takes it, borrowed unchanged
+    /// when it already does -- for a destination whose name is incidental,
+    /// like a download, where refusing the transfer over a character is
+    /// worse than landing it under a near-miss of the server's name.
+    ///
+    /// Only the Windows rules rewrite anything. `:`, `?` and the rest are
+    /// ordinary characters elsewhere, and renaming a file a user asked for
+    /// by name is its own kind of wrong.
+    ///
+    /// Expects a single component: run it after the name has been reduced to
+    /// a basename, never before, or `/` and `\` are rewritten into the name
+    /// instead of splitting it and the two platforms land different files.
+    pub(crate) fn sanitize(self, name: &str) -> Cow<'_, str> {
+        match self {
+            Self::Unix | Self::MacOs => Cow::Borrowed(name),
+            Self::Windows => windows_download_name(name),
         }
     }
 
@@ -119,37 +139,86 @@ impl DownloadNameRules {
     }
 }
 
-fn windows_download_name_is_valid(name: &str) -> bool {
-    if name.is_empty()
-        || matches!(name, "." | "..")
-        || name.ends_with([' ', '.'])
-        || name.encode_utf16().count() > 255
-        || name.chars().any(|ch| {
-            ch <= '\u{1f}' || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
-        })
-    {
-        return false;
-    }
+/// A character Win32 refuses in a path component, plus the control range.
+fn windows_reserved_char(ch: char) -> bool {
+    ch <= '\u{1f}' || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+}
 
-    // Device names remain reserved even with an extension (for example
-    // `CON.txt`). Windows also recognizes the ISO-8859-1 superscript forms of
-    // COM/LPT 1-3.
+/// Whether the name's stem is a reserved device. They remain reserved with
+/// an extension (`CON.txt` is `CON`), and Windows also recognizes the
+/// ISO-8859-1 superscript forms of COM/LPT 1-3.
+fn windows_reserved_stem(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or(name).to_uppercase();
-    if matches!(
+    matches!(
         stem.as_str(),
         "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
-    ) {
-        return false;
-    }
-    let reserved_port = ["COM", "LPT"].iter().any(|prefix| {
+    ) || ["COM", "LPT"].iter().any(|prefix| {
         stem.strip_prefix(prefix).is_some_and(|suffix| {
             matches!(
                 suffix,
                 "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
             )
         })
-    });
-    !reserved_port
+    })
+}
+
+fn windows_download_name_is_valid(name: &str) -> bool {
+    !name.is_empty()
+        && !matches!(name, "." | "..")
+        && !name.ends_with([' ', '.'])
+        && name.encode_utf16().count() <= 255
+        && !name.chars().any(windows_reserved_char)
+        && !windows_reserved_stem(name)
+}
+
+/// Drop the trailing dots and spaces Windows would drop anyway. Left in
+/// place they are how one name silently becomes another: `report.` and
+/// `report` are the same file, and only one of them is what was asked for.
+fn trim_trailing_dots_and_spaces(name: &mut String) {
+    while name.ends_with([' ', '.']) {
+        name.pop();
+    }
+}
+
+/// `name` rewritten until [`windows_download_name_is_valid`] takes it.
+///
+/// Reserved characters become `_`, a reserved device stem is pushed out of
+/// the way with a prefix, and the length is cut on a character boundary.
+/// A name that survives none of that is `download`.
+fn windows_download_name(name: &str) -> Cow<'_, str> {
+    if windows_download_name_is_valid(name) {
+        return Cow::Borrowed(name);
+    }
+    let mut out: String = name
+        .chars()
+        .map(|ch| if windows_reserved_char(ch) { '_' } else { ch })
+        .collect();
+    trim_trailing_dots_and_spaces(&mut out);
+    if windows_reserved_stem(&out) {
+        out.insert(0, '_');
+    }
+    // The limit counts UTF-16 units, so the cut has to be found by walking
+    // characters rather than by slicing bytes. Trimming again afterwards
+    // because the cut can expose a dot or a space; the stem cannot become
+    // reserved this way, since cutting the end leaves a stem shorter than
+    // itself only when the stem was already over the limit.
+    if out.encode_utf16().count() > 255 {
+        let mut units = 0usize;
+        let mut end = out.len();
+        for (index, ch) in out.char_indices() {
+            if units + ch.len_utf16() > 255 {
+                end = index;
+                break;
+            }
+            units += ch.len_utf16();
+        }
+        out.truncate(end);
+        trim_trailing_dots_and_spaces(&mut out);
+    }
+    if out.is_empty() {
+        out.push_str("download");
+    }
+    Cow::Owned(out)
 }
 
 /// Walk `root` into a flat, parents-first plan.
@@ -592,6 +661,56 @@ mod tests {
                 name
             );
         }
+    }
+
+    /// The invariant the download path leans on: whatever `sanitize` returns
+    /// is a name the same rules accept. Without it the edges are easy to get
+    /// half-right -- a trailing dot removed but the reserved stem it exposes
+    /// left alone, a length cut that re-exposes a dot.
+    #[test]
+    fn sanitizing_a_windows_name_always_yields_one_windows_accepts() {
+        let long = "a".repeat(300);
+        let long_tail = format!("{}.", "b".repeat(255));
+        let wide = "😀".repeat(200);
+        for name in [
+            "report:2024.txt",
+            "a<b>c|d?e*f\"g",
+            "trailing.",
+            "trailing ",
+            "CON",
+            "con.txt",
+            "AUX.log",
+            "COM1",
+            "LPT9.data",
+            "COM¹",
+            "CONIN$",
+            "CON.",
+            "..",
+            ".",
+            "....",
+            ".. ",
+            "",
+            "\u{1}\u{2}",
+            &long,
+            &long_tail,
+            &wide,
+        ] {
+            let sanitized = DownloadNameRules::Windows.sanitize(name);
+            assert!(
+                DownloadNameRules::Windows.accepts(&sanitized),
+                "sanitize({name:?}) produced {sanitized:?}, which is still refused"
+            );
+        }
+        // A name that is already fine is handed back untouched, not copied.
+        assert!(matches!(
+            DownloadNameRules::Windows.sanitize("report.txt"),
+            Cow::Borrowed("report.txt")
+        ));
+        // Elsewhere the name is the user's, and stays theirs.
+        assert_eq!(
+            DownloadNameRules::Unix.sanitize("report:2024.txt"),
+            "report:2024.txt"
+        );
     }
 
     #[test]
