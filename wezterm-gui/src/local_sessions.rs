@@ -423,14 +423,18 @@ mod tests {
         let path = dir.path().join("pid");
         let mut holder = std::fs::File::create(&path).unwrap();
         writeln!(holder, "4242").unwrap();
-        assert_eq!(super::pid_of_server_holding(&path), None, "nobody holds the lock");
+        assert_eq!(
+            mux::session_server::pid_holding(&path),
+            None,
+            "nobody holds the lock"
+        );
         assert_eq!(
             unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
         );
-        assert_eq!(super::pid_of_server_holding(&path), Some(4242));
+        assert_eq!(mux::session_server::pid_holding(&path), Some(4242));
         drop(holder);
-        assert_eq!(super::pid_of_server_holding(&path), None);
+        assert_eq!(mux::session_server::pid_holding(&path), None);
     }
 
     fn unix(name: &str, proxy: bool) -> UnixDomain {
