@@ -120,12 +120,19 @@ $ cargo test --all
 
 Formatting settings live in `.rustfmt.toml`.
 
-### There is no CI on pull requests
+### What CI does on a pull request
 
-Everything in `.github/workflows/` runs only on manual dispatch, a push to the
-`ci/probe` branch, or a `v*` tag. Nothing runs automatically when you open a
-pull request. The commands above are the only check between a change and `main`,
-so please actually run them.
+`.github/workflows/ci.yml` builds and runs `cargo test --workspace` on Linux
+and on Windows, and `wasm.yml` checks that the terminal core and the mux
+protocol still compile for `wasm32-unknown-unknown`. Both run on every push to
+`main` and on every pull request.
+
+Nothing else does. `release.yml` is manual dispatch only, on purpose. The
+browser client's own smoke suite (`thinkterm-web/smoke/`) needs a built bundle
+and a real browser, and is not part of this.
+
+Run the commands above anyway: they are faster than waiting for a runner, and
+they are what tells you which of the two platforms you broke.
 
 ## Documentation
 

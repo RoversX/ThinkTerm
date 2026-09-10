@@ -13,12 +13,12 @@
 #    wasm (thread::spawn, SystemTime::now, fs) on the paths it exercises.
 name: wasm-sentinel
 
-# Manual-only for now; flip the push trigger on when automatic coverage is
-# wanted:
-#
-#   push:
-#     branches: ["main"]
+# A sentinel nobody runs is not one, and this is the only place the browser
+# client is compiled for the target it actually ships to.
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 concurrency:

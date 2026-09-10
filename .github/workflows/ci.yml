@@ -1,0 +1,108 @@
+# Build and test on every push and pull request.
+#
+# Until this existed, nothing in .github/workflows ran automatically except a
+# probe on one branch, and nothing anywhere ran `cargo test` on Windows or in
+# a pull request. Two consequences were live in the tree at the time this was
+# added: a stray attribute left the Windows build broken for a stretch of
+# commits, and a test calling a function that had moved crates left
+# `cargo test` on unix not compiling at all. Neither could have survived a
+# green run of this file.
+#
+# Both platforms, because the two failures above were each invisible from the
+# other one: the test that did not compile is `#[cfg(unix)]`, and the build
+# that broke was Windows-only.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel a superseded run when several commits are pushed back to back
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  linux:
+    name: linux x86_64
+    runs-on: ubuntu-latest
+    # Backstop: a hung job would otherwise burn the default 6h, which on a
+    # private repo is 360 billed minutes.
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Check submodules
+        run: bash ci/check-submodules.sh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-linux-x86_64
+          cache-on-failure: true
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Install dependencies
+        run: env CI=yes PATH=$PATH ./get-deps
+
+      # `cargo test` compiles the whole workspace, binaries included, so this
+      # is the build as well. --no-fail-fast because one crate's failure
+      # should not hide the rest of the tree's.
+      - name: Build and test
+        run: cargo test --workspace --no-fail-fast
+
+  windows:
+    name: windows x86_64
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    env:
+      RUSTUP_WINDOWS_PATH_ADD_BIN: '1'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      # `shell: bash` is required here; the default on Windows is pwsh.
+      - name: Check submodules
+        shell: bash
+        run: bash ci/check-submodules.sh
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-windows-x86_64
+          cache-on-failure: true
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      # openssl-src needs perl; Strawberry Perl ships on the runner but is not
+      # on PATH by default. `cmd`'s builtin `PATH <value>` form, as the
+      # release workflow uses.
+      - name: Build and test
+        shell: cmd
+        run: |
+          PATH C:\Strawberry\perl\bin;%PATH%
+          cargo test --workspace --no-fail-fast
+
+# The wasm32 portability sentinel runs on the same events, from its own file:
+# see .github/workflows/wasm.yml.
