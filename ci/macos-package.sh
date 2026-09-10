@@ -233,9 +233,13 @@ BIN_DIR="target/$RUST_TARGET/release"
 # `rustc` on PATH is often the one Homebrew installed, and a toolchain from a
 # package manager carries only its own host's standard library: a cross build
 # against it dies in the first dependency with E0463.  rustup's has both, so
-# prefer it whenever there is one.
-if toolchain_bin=$(rustup which cargo 2>/dev/null); then
-  PATH="$(dirname "$toolchain_bin"):$PATH"
+# prefer it whenever there is one -- through rustup's proxies, not the
+# toolchain's own bin directory: run bare, rust-lld and rust-objcopy cannot
+# find libLLVM.dylib (the proxies set the dyld fallback path) and the wasm
+# link dies with SIGABRT.
+if rustup_bin=$(command -v rustup 2>/dev/null) &&
+  [[ -x "$(dirname "$rustup_bin")/cargo" ]]; then
+  PATH="$(dirname "$rustup_bin"):$PATH"
 fi
 
 echo "==> Checking prerequisites"

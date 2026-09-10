@@ -104,5 +104,6 @@ __pycache__/
 /thinkterm-web/www/fonts/
 /thinkterm-web/www/assets/
 /thinkterm-web/www/index.html
+/thinkterm-web/www/schemes.json
 /thinkterm-web/www/*.gz
 /thinkterm-web/ui/node_modules/

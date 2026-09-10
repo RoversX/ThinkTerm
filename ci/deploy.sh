@@ -71,7 +71,7 @@ case $OSTYPE in
       # -p throughout: the server decides whether a .gz still stands for
       # its file by comparing their modification times, and a copy that
       # rewrites them can make a stale sibling look current.
-      cp -p thinkterm-web/www/index.html $zipdir/ThinkTerm.app/Contents/Resources/web/
+      cp -p thinkterm-web/www/index.html thinkterm-web/www/schemes.json $zipdir/ThinkTerm.app/Contents/Resources/web/
       # The precompressed siblings, when ci/build-web.sh made them.
       for gz in thinkterm-web/www/*.gz ; do
         [[ -f "$gz" ]] && cp -p "$gz" $zipdir/ThinkTerm.app/Contents/Resources/web/
@@ -240,7 +240,7 @@ case $OSTYPE in
     # times the .gz freshness check reads.
     if require_web_bundle ; then
       mkdir -p $zipdir/web
-      cp -p thinkterm-web/www/index.html $zipdir/web/
+      cp -p thinkterm-web/www/index.html thinkterm-web/www/schemes.json $zipdir/web/
       for gz in thinkterm-web/www/*.gz ; do
         [[ -f "$gz" ]] && cp -p "$gz" $zipdir/web/
       done
@@ -604,7 +604,7 @@ EOF
           # server finds it at <exe>/../share/thinkterm/web.
           if require_web_bundle ; then
             # -p keeps the modification times the .gz freshness check reads.
-            install -Dpm644 -t "$tardir/share/thinkterm/web" thinkterm-web/www/index.html
+            install -Dpm644 -t "$tardir/share/thinkterm/web" thinkterm-web/www/index.html thinkterm-web/www/schemes.json
             for gz in thinkterm-web/www/*.gz ; do
               [[ -f "$gz" ]] && install -Dpm644 -t "$tardir/share/thinkterm/web" "$gz"
             done

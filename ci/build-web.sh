@@ -30,6 +30,10 @@ wasm-bindgen --target web --out-dir "$OUT/pkg" "$WASM"
 if command -v wasm-opt >/dev/null 2>&1 && [ "$PROFILE" = release ]; then
   wasm-opt -Oz -o "$OUT/pkg/thinkterm_web_bg.wasm" "$OUT/pkg/thinkterm_web_bg.wasm"
 fi
+# The colour-scheme table the picker fetches. Compiled into the binary, so
+# this is a build step and not a file in the tree.
+cargo build -p wezterm --bin thinkterm $CARGO_FLAGS
+"$TARGET_DIR/$PROFILE/thinkterm" cli color-schemes --json > "$OUT/schemes.json"
 mkdir -p "$OUT/fonts"
 cp assets/fonts/JetBrainsMono-Regular.ttf assets/fonts/SymbolsNerdFontMono-Regular.ttf "$OUT/fonts/"
 # The page itself. Vite writes index.html and assets/ into $OUT and leaves
@@ -46,7 +50,7 @@ npm run --prefix "$UI" --silent build
 # once here instead of per request, and -9 beats what a server would spend
 # in a request's time. -n leaves out the name and timestamp so the output
 # is the same for the same input.
-for f in "$OUT/index.html" "$OUT/assets"/*.js "$OUT/assets"/*.css "$OUT/pkg"/*.js "$OUT/pkg"/*.wasm "$OUT/fonts"/*.ttf; do
+for f in "$OUT/index.html" "$OUT/schemes.json" "$OUT/assets"/*.js "$OUT/assets"/*.css "$OUT/pkg"/*.js "$OUT/pkg"/*.wasm "$OUT/fonts"/*.ttf; do
   [ -f "$f" ] || continue
   gzip -9 -n -c "$f" > "$f.gz"
 done

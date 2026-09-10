@@ -5,8 +5,9 @@
 ThinkTerm's multiplexer can serve a browser client. One TCP port per
 `web_servers` entry delivers the page, its JavaScript and wasm over HTTP and
 accepts a WebSocket that speaks the same protocol as every other client. The
-browser mirrors a pane the way the desktop does and takes over input the
-moment you type into it.
+browser draws a tab the way the desktop does and holds it: a tab it shows
+is claimed at the browser's own shape, and the desktop takes it back only
+when someone interacts there.
 
 ## `web_servers`
 
@@ -181,13 +182,16 @@ not hold the terminal in Handoff mode sees the desktop's card ("Terminal is
 being used on another device -- Click or scroll to continue") over the
 mirror, which stays visible.
 
-The tab keeps the desktop's size and shape. The page's own font size is
+A tab the page shows is reshaped to this window as soon as it is on
+screen, so the page is the terminal's size while it holds it. Only while
+the desktop holds the tab (someone interacted there) does the page keep
+the desktop's size and shape instead: the page's own font size is then
 derived from the desktop's cell so that a cell here is as large as one
-there, and the desktop's pixel geometry (the bar above each pane, the
-padding around the grid) lands on the page one to one; the page clips when
-the tab is larger than the window and says so in the tab row. `?font=`
-pins a size instead; Ctrl+Shift+F fits the tab to this window until the
-desktop next takes it. Every claim the page makes is pane by pane
+there, the desktop's pixel geometry (the bar above each pane, the padding
+around the grid) lands on the page one to one, and the page clips when
+the tab is larger than the window and says so in the tab row; a click or
+a keystroke takes the tab back at this window's shape. `?font=` pins a
+size; Ctrl+Shift+F reshapes the tab to this window on demand. Every claim the page makes is pane by pane
 (`ClientViewport::Native`): taking the terminal over from the desktop
 changes no pane's grid, and a tab a CLI laid out gets the same rows above
 each pane the desktop would leave.
@@ -232,6 +236,26 @@ A dropped socket is reopened by the page itself, with a backoff, on the same
 tab; the remark stays while it is down. It gives up only when there is
 nothing to come back to -- the server has no panes, or speaks a different
 protocol version -- and says which.
+
+### Colours
+
+The terminal draws with the colour scheme the **server** is configured with:
+`color_scheme` (or `colors`) in `thinkterm.lua`, resolved once and pushed to
+every client as `DefaultPalette` right after the handshake, and again
+whenever the configuration reloads. A program's own OSC 4/10/11 colours
+still win over it, per pane, exactly as on the desktop.
+
+Settings → Appearance → **Color scheme** overrides that for this browser
+alone: "Follow the desktop", or any of the built-in schemes, searchable with
+a swatch and a live preview. The pick is kept in `localStorage` with its
+colours, so a reload draws in it before anything is fetched. The table
+itself is a build output -- `ci/build-web.sh` runs `thinkterm cli
+color-schemes --json` into `thinkterm-web/www/schemes.json`, which the
+picker fetches the first time it opens.
+
+`DefaultPalette` arrived with **codec version 70**; a server older than that
+simply never pushes it, and the page falls back to the stock palette unless
+this browser picked a scheme.
 
 ## Fonts
 
