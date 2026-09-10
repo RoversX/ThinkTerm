@@ -8,6 +8,7 @@ mod activate_pane_direction;
 mod activate_tab;
 mod adjust_pane_size;
 mod agent;
+mod color_schemes;
 mod get_pane_direction;
 mod get_text;
 mod kill_pane;
@@ -21,6 +22,7 @@ mod set_tab_title;
 mod set_window_title;
 mod spawn_command;
 mod split_pane;
+mod stop_server;
 mod tls_creds;
 mod web_server;
 mod web_token;
@@ -179,9 +181,27 @@ Outputs the pane-id for the newly created pane on success"
     /// Query agent statuses
     #[command(name = "agent")]
     Agent(agent::AgentCommand),
+
+    /// List the built-in color schemes and their colors
+    #[command(name = "color-schemes", rename_all = "kebab")]
+    ColorSchemes(color_schemes::ColorSchemesCommand),
+
+    /// Stop the background session server; the terminals in it end
+    #[command(name = "stop-server")]
+    StopServer(stop_server::StopServerCommand),
 }
 
 async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()> {
+    // The scheme table is compiled in; asking a server for it (or starting
+    // one) would only get in the way.
+    if let CliSubCommand::ColorSchemes(cmd) = &cli.sub {
+        return cmd.run();
+    }
+    // Stopping must not start one: handled before a client is made.
+    if let CliSubCommand::StopServer(cmd) = &cli.sub {
+        return cmd.run(&crate::init_config(opts)?);
+    }
+
     let mut ui = mux::connui::ConnectionUI::new_headless();
     let initial = true;
 
@@ -237,6 +257,9 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::RenameWorkspace(cmd) => cmd.run(client).await,
         CliSubCommand::ZoomPane(cmd) => cmd.run(client).await,
         CliSubCommand::Agent(cmd) => cmd.run(client).await,
+        CliSubCommand::ColorSchemes(_) | CliSubCommand::StopServer(_) => {
+            unreachable!("handled without a client above")
+        }
     }
 }
 

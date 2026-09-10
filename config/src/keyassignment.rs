@@ -637,6 +637,8 @@ pub enum KeyAssignment {
     ResetTerminal,
     OpenUri(String),
     OpenSettings,
+    /// Quit, and stop the background session server with its terminals.
+    QuitAndStopSessionServer,
     CheckForUpdates,
     OpenSshHosts,
     /// Open the SSH host manager on a blank host form. Distinct from

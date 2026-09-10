@@ -145,7 +145,7 @@ pub(crate) fn stop_background_server_when_off(config: &ConfigHandle) {
         return;
     }
     let pid_file = config.daemon_options.pid_file();
-    let Some(pid) = pid_of_server_holding(&pid_file) else {
+    if mux::session_server::pid_holding(&pid_file).is_none() {
         log::warn!(
             "local sessions: the setting is off but a server answers at {}; nothing holds {}, \
              so it is left running",
@@ -153,42 +153,69 @@ pub(crate) fn stop_background_server_when_off(config: &ConfigHandle) {
             pid_file.display()
         );
         return;
-    };
+    }
     log::info!(
-        "local sessions: the setting is off; stopping the session server (pid {pid}) at {}",
+        "local sessions: the setting is off; stopping the session server at {}",
         socket.display()
     );
-    if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
-        log::warn!(
-            "local sessions: could not stop the session server (pid {pid}): {}",
-            std::io::Error::last_os_error()
-        );
-        return;
+    match mux::session_server::stop(&pid_file, &socket, std::time::Duration::from_secs(5)) {
+        Ok(_) => {
+            std::fs::remove_file(&marker).ok();
+        }
+        Err(err) => log::warn!("local sessions: {err:#}"),
     }
-    std::fs::remove_file(&marker).ok();
 }
 
 #[cfg(not(unix))]
 pub(crate) fn stop_background_server_when_off(_config: &ConfigHandle) {}
 
+/// The pid file and socket of the session server at the default socket.
+fn server_files(config: &ConfigHandle) -> (std::path::PathBuf, std::path::PathBuf) {
+    (
+        config.daemon_options.pid_file(),
+        config::RUNTIME_DIR.join(config::runtime_file_name("sock")),
+    )
+}
+
+/// Whether a session server runs at the default socket right now.
+pub(crate) fn server_running(config: &ConfigHandle) -> bool {
+    let (pid_file, socket) = server_files(config);
+    mux::session_server::is_running(&pid_file, &socket)
+}
+
+/// Stop the session server now, on the user's say-so: its terminals end
+/// with it. Whoever started it -- this setting, a hand-run
+/// `thinkterm-mux-server` -- it is the one at the default socket.
+pub(crate) fn stop_server_now(config: &ConfigHandle) -> anyhow::Result<mux::session_server::StopOutcome> {
+    let (pid_file, socket) = server_files(config);
+    let outcome = mux::session_server::stop(&pid_file, &socket, std::time::Duration::from_secs(5))?;
+    if !matches!(outcome, mux::session_server::StopOutcome::NotRunning) {
+        std::fs::remove_file(managed_marker()).ok();
+    }
+    Ok(outcome)
+}
+
+/// "Quit and stop the session server": the stop is done once the GUI's
+/// message loop has ended, so the windows close first and nothing here
+/// reconnects to a server that is going away.
+static STOP_AT_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn stop_server_at_exit() {
+    STOP_AT_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn finish_stop_at_exit(config: &ConfigHandle) {
+    if !STOP_AT_EXIT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    match stop_server_now(config) {
+        Ok(outcome) => log::info!("session server at exit: {outcome:?}"),
+        Err(err) => log::warn!("stopping the session server at exit: {err:#}"),
+    }
+}
+
 /// The pid written in `pid_file`, when a running server holds its lock.
 #[cfg(unix)]
-fn pid_of_server_holding(pid_file: &std::path::Path) -> Option<u32> {
-    use std::os::unix::io::AsRawFd as _;
-    let file = std::fs::File::open(pid_file).ok()?;
-    let locked_by_someone =
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0;
-    if !locked_by_someone {
-        // We hold it now: no server does. The lock goes with the file.
-        return None;
-    }
-    std::fs::read_to_string(pid_file)
-        .ok()?
-        .trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|pid| *pid > 1)
-}
 
 /// The host's domain name for this launch, if local sessions run in it.
 pub(crate) fn host_domain_name() -> Option<String> {

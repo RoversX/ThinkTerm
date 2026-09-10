@@ -33,7 +33,7 @@ pub mod keyassignment;
 mod keys;
 pub mod lua;
 pub mod meta;
-mod scheme_data;
+pub mod scheme_data;
 mod serial;
 mod ssh;
 mod terminal;

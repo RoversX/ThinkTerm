@@ -4601,6 +4601,7 @@ impl TermWindow {
                 MuxNotification::SaveToDownloads { .. } => {
                     // Handled by frontend
                 }
+                MuxNotification::DefaultPaletteChanged => {}
                 MuxNotification::ThinkTermTreeChanged => {
                     // Server-side only; the remote tree reaches this process
                     // as a pushed ThinkTermTreeState PDU instead.
@@ -5210,6 +5211,7 @@ impl TermWindow {
             | MuxNotification::WorkspaceRenamed { .. }
             | MuxNotification::Empty
             | MuxNotification::ThinkTermTreeChanged
+            | MuxNotification::DefaultPaletteChanged
             | MuxNotification::ThinkTermSessionChanged
             | MuxNotification::WindowWorkspaceChanged(_) => return true,
             MuxNotification::Alert {
@@ -9111,6 +9113,12 @@ impl TermWindow {
             }
             OpenSettings => {
                 crate::settings_window::show();
+            }
+            QuitAndStopSessionServer => {
+                // The stop happens after the loop ends; the quit itself
+                // goes through the same confirmation as any quit.
+                crate::local_sessions::stop_server_at_exit();
+                return self.perform_key_assignment(pane, &QuitApplication);
             }
             CheckForUpdates => {
                 crate::settings_window::show_update_page();

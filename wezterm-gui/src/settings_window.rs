@@ -788,6 +788,7 @@ enum SettingsAction {
     ToggleNotificationSounds,
     ToggleRemoteUpdateKeepsSessions,
     ToggleLocalSessionsViaMux,
+    StopSessionServer,
     /// The ⓘ after a label; hovering it shows the text under this i18n key.
     Hint(&'static str),
     /// Turn one right-sidebar panel on or off.
@@ -1332,6 +1333,8 @@ struct SettingsUiState {
     /// Two-step delete: the project id whose Delete button was clicked
     /// once. A second click executes; any other action clears it.
     confirm_delete_archived: Option<String>,
+    /// The stop-server row was pressed once; the next press stops it.
+    confirm_stop_server: bool,
     input_diagnostics_copied_until: Option<Instant>,
     /// The Update page's view of the on-disk check cache. Read when the
     /// section is entered and when Check Now is clicked, never while
@@ -1383,6 +1386,7 @@ impl SettingsUiState {
             web_tokens: Vec::new(),
             shell_catalog: Vec::new(),
             confirm_delete_archived: None,
+            confirm_stop_server: false,
             input_diagnostics_copied_until: None,
             update_status: None,
             update_checked_until: None,
@@ -3475,15 +3479,22 @@ impl SettingsWindow {
     /// Where the listener binds: every address when the page is to be
     /// reachable from other devices, else the configured or default one.
     fn web_bind_address(&self) -> String {
+        // The address the listener is up on comes first: one started by
+        // the CLI on another port is what the switch must keep.
         let state = crate::web_settings::state();
         let configured = state
             .status
             .as_ref()
-            .and_then(|status| status.configured.first().cloned())
+            .and_then(|status| status.listening.first().or(status.configured.first()).cloned())
             .unwrap_or_else(|| config::WebServer::default().bind_address);
+        let port = configured.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).unwrap_or(8088);
+        let wildcard = configured.starts_with("0.0.0.0:") || configured.starts_with("[::]:");
         if self.native_settings.web.reachable {
-            let port = configured.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).unwrap_or(8088);
             format!("0.0.0.0:{port}")
+        } else if wildcard {
+            // Off means off the network: a listener found on the wildcard
+            // goes back to loopback on the same port.
+            format!("127.0.0.1:{port}")
         } else {
             configured
         }
@@ -3834,6 +3845,30 @@ impl SettingsWindow {
                 self.status = crate::i18n::tr("settings-status-quitting");
                 if let Some(conn) = Connection::get() {
                     conn.terminate_message_loop();
+                }
+            }
+            SettingsAction::StopSessionServer => {
+                self.ui.open_dropdown = None;
+                if !self.ui.confirm_stop_server {
+                    self.ui.confirm_stop_server = true;
+                    self.status = crate::i18n::tr("settings-status-stop-session-server-confirm");
+                } else {
+                    self.ui.confirm_stop_server = false;
+                    self.status = match crate::local_sessions::stop_server_now(&config::configuration()) {
+                        Ok(mux::session_server::StopOutcome::Stopped { .. }) => {
+                            crate::i18n::tr("settings-status-stop-session-server-done")
+                        }
+                        Ok(mux::session_server::StopOutcome::NotRunning) => {
+                            crate::i18n::tr("settings-status-stop-session-server-none")
+                        }
+                        Ok(mux::session_server::StopOutcome::Lingering { .. }) => {
+                            crate::i18n::tr("settings-status-stop-session-server-lingering")
+                        }
+                        Err(err) => settings_tr(
+                            "settings-status-stop-session-server-error",
+                            &[("error", format!("{err:#}"))],
+                        ),
+                    };
                 }
             }
             SettingsAction::ToggleBottomQuote => {
@@ -5384,9 +5419,11 @@ impl SettingsWindow {
         let card_height = self.settings_card_height(row_count);
         // One more card under the rows, where the platform can run local
         // sessions in a server.
+        let server_running = crate::local_sessions::supported()
+            && crate::local_sessions::server_running(&config::configuration());
         let sessions_card = crate::local_sessions::supported().then(|| {
             let y = card_y + card_height + self.settings_section_card_gap();
-            (y, self.compact_card_height(1))
+            (y, self.compact_card_height(if server_running { 2 } else { 1 }))
         });
         let content_bottom = sessions_card
             .map(|(y, height)| y + height)
@@ -5491,6 +5528,25 @@ impl SettingsWindow {
                 self.native_settings.workspaces.local_sessions_via_mux,
                 SettingsAction::ToggleLocalSessionsViaMux,
             )?;
+            if server_running {
+                let button = crate::i18n::tr(if self.ui.confirm_stop_server {
+                    "settings-stop-session-server-confirm"
+                } else {
+                    "settings-stop-session-server-now"
+                });
+                self.paint_button_setting_row_with_hint(
+                    layers,
+                    row_x,
+                    sessions_card_y + self.ui_px(12.0) + self.compact_row_step(),
+                    row_width,
+                    self.compact_row_step(),
+                    &crate::i18n::tr("settings-stop-session-server"),
+                    "settings-stop-session-server-description",
+                    &button,
+                    SettingsAction::StopSessionServer,
+                    true,
+                )?;
+            }
         }
         Ok(())
     }
@@ -8907,6 +8963,75 @@ impl SettingsWindow {
     /// A toggle row whose explanation lives behind an ⓘ after the label:
     /// hovering the icon shows it in a bubble (`paint_hint_overlay`), so a
     /// long one is neither cut short nor given a line of its own.
+    /// A single-line band like `paint_toggle_setting_row_with_hint`, with a
+    /// button on the right instead of a switch: the label and its hint
+    /// icon on the left, the button centred in the band.
+    fn paint_button_setting_row_with_hint(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        band_height: f32,
+        label: &str,
+        hint_key: &'static str,
+        button: &str,
+        action: SettingsAction,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        if draw_top_rule {
+            self.paint_separator(layers, x, y, width)?;
+        }
+        let control_height = self.ui_px(CONTROL_HEIGHT);
+        let control_y = y + ((band_height - control_height) / 2.0).max(0.0);
+        let button_width = self.button_width_for_label(button, 120.0);
+        let button_x = x + width - button_width;
+        let cell_height = self.metrics.cell_size.height as f32;
+        let icon_size = self.ui_px(20.0);
+        let icon_gap = self.ui_px(8.0);
+        let text_width = (button_x - x - icon_size - icon_gap - 24.0).max(width * 0.45);
+
+        let label_y = control_y + (control_height - cell_height) / 2.0;
+        self.draw_text(layers, &ui_font, x, label_y, label, palette.text, text_width)?;
+        let shown = self.text_with_ellipsis(&ui_font, label, text_width);
+        let label_width = self.measure_text_width(&ui_font, &shown);
+
+        let icon_x = x + label_width + icon_gap;
+        let icon_y = label_y + (cell_height - icon_size) / 2.0;
+        let hint = SettingsAction::Hint(hint_key);
+        let reach = self.ui_px(6.0);
+        self.ui_context.push(
+            rect(
+                icon_x - reach,
+                icon_y - reach,
+                icon_size + reach * 2.0,
+                icon_size + reach * 2.0,
+            ),
+            WidgetKind::Hint,
+            hint,
+        );
+        let icon_hovered = self.ui.interaction.hovered == Some(hint);
+        self.draw_svg_icon(
+            layers,
+            SvgIcon::Info,
+            icon_x,
+            icon_y,
+            icon_size,
+            if icon_hovered {
+                palette.text
+            } else {
+                palette.muted_text
+            },
+        )?;
+        if icon_hovered {
+            self.ui.hint = Some((hint_key, icon_x, icon_y, icon_size));
+        }
+
+        self.draw_button(layers, button_x, control_y, button_width, button, action)
+    }
+
     fn paint_toggle_setting_row_with_hint(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,

@@ -218,7 +218,9 @@ fn run_ssh(opts: SshCommand) -> anyhow::Result<()> {
     .detach();
 
     maybe_show_configuration_error_window();
-    gui.run_forever()
+    let outcome = gui.run_forever();
+    crate::local_sessions::finish_stop_at_exit(&config::configuration());
+    outcome
 }
 
 async fn async_run_serial(opts: SerialCommand) -> anyhow::Result<()> {
@@ -269,7 +271,9 @@ fn run_serial(config: config::ConfigHandle, opts: SerialCommand) -> anyhow::Resu
     .detach();
 
     maybe_show_configuration_error_window();
-    gui.run_forever()
+    let outcome = gui.run_forever();
+    crate::local_sessions::finish_stop_at_exit(&config::configuration());
+    outcome
 }
 
 fn have_panes_in_domain_and_ws(domain: &Arc<dyn Domain>, workspace: &Option<String>) -> bool {

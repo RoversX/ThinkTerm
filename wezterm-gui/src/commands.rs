@@ -763,6 +763,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["ThinkTerm"],
             icon: Some("cod_settings_gear"),
         },
+        QuitAndStopSessionServer => CommandDef {
+            brief: "Quit and Stop Session Server".into(),
+            doc: "Quits ThinkTerm and stops the background session server; the terminals in it end".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["ThinkTerm"],
+            icon: Some("md_power"),
+        },
         CheckForUpdates => CommandDef {
             brief: "Check for Updates...".into(),
             doc: "Opens Settings on the Software Update page".into(),
@@ -2382,6 +2390,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         HideApplication,
         #[cfg(target_os = "macos")]
         QuitApplication,
+        QuitAndStopSessionServer,
         // ----------------- Shell
         ToggleLiveOverview,
         OpenSshHosts,

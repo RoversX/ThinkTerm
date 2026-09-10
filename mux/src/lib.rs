@@ -48,6 +48,7 @@ pub mod localpane;
 pub mod pane;
 mod parse_watchdog;
 pub mod renderable;
+pub mod session_server;
 pub mod ssh;
 pub mod ssh_agent;
 pub mod tab;
@@ -118,6 +119,9 @@ pub enum MuxNotification {
     FrontendLeaseChanged(FrontendViewportState),
     /// The connection-wide A/B mode or the exclusive handoff owner changed.
     FrontendAccessChanged(FrontendAccessState),
+    /// The server's configuration reloaded and its resolved colour scheme may
+    /// have changed; every connection re-sends its default palette.
+    DefaultPaletteChanged,
 }
 
 static SUB_ID: AtomicUsize = AtomicUsize::new(0);
