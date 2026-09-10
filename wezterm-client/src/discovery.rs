@@ -235,9 +235,13 @@ mod windows {
                 let path = std::str::from_utf8(&source_slice[0..len])
                     .context("reading path from shared memory")?;
 
-                let path: PathBuf = path.into();
-
-                Ok(path)
+                // What is published is the file name alone, so that a long
+                // runtime dir cannot push the socket past `MAX_NAME`. It
+                // names a file *in* the runtime dir, exactly as the symlink
+                // the unix side publishes does; resolving it as written
+                // would hand the caller a path relative to whatever
+                // directory it happened to be started in.
+                Ok(config::RUNTIME_DIR.join(path))
             })
         }
     }
@@ -549,3 +553,28 @@ fn meta_age(meta: &std::fs::Metadata) -> Duration {
 /// guard `discover_gui_socks` applies to `gui-sock-*` entries.
 #[cfg(unix)]
 const PUBLISHED_LINK_GRACE: Duration = Duration::from_secs(1);
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    /// What is published as a bare file name comes back as a path in the
+    /// runtime directory. Resolving it as written gave a relative path,
+    /// which the caller then connected to against whatever directory it had
+    /// been started in -- so `thinkterm cli` reached the running GUI only
+    /// from inside the runtime dir itself, and fell back to a mux server of
+    /// its own everywhere else.
+    #[test]
+    fn a_published_name_resolves_inside_the_runtime_dir() {
+        let class = format!("discovery-test-{}", std::process::id());
+        let published = config::RUNTIME_DIR.join(format!("{class}.sock"));
+
+        let _holder = super::publish_gui_sock_path(&published, &class).unwrap();
+        let resolved = super::resolve_gui_sock_path(&class).unwrap();
+
+        assert_eq!(resolved, published);
+        assert!(
+            resolved.is_absolute(),
+            "{} must not depend on the working directory",
+            resolved.display()
+        );
+    }
+}
