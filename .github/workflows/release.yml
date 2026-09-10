@@ -202,15 +202,20 @@ jobs:
       # from Cargo.toml rather than written here twice. The prebuilt binary
       # takes seconds where `cargo install` takes minutes. binaryen is
       # wasm-opt, which takes a quarter off the wasm.
+      #
+      # Retried, because this job gates all three packaging jobs: a GitHub
+      # release 502 or an apt mirror hiccup would otherwise take the whole
+      # release with it.
       - name: Install wasm-bindgen and wasm-opt
         run: |
           set -euo pipefail
           version=$(grep -E '^wasm-bindgen = "=' Cargo.toml | sed -E 's/.*"=([0-9.]+)".*/\1/')
           dir="wasm-bindgen-${version}-x86_64-unknown-linux-musl"
-          curl -sSfL "https://github.com/rustwasm/wasm-bindgen/releases/download/${version}/${dir}.tar.gz" \
-            | tar -xz -C "$HOME/.cargo/bin" --strip-components=1 "${dir}/wasm-bindgen"
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends binaryen
+          bash ci/retry.sh bash -c "curl -sSfL \
+            'https://github.com/rustwasm/wasm-bindgen/releases/download/${version}/${dir}.tar.gz' \
+            | tar -xz -C \"\$HOME/.cargo/bin\" --strip-components=1 '${dir}/wasm-bindgen'"
+          bash ci/retry.sh sudo apt-get update
+          bash ci/retry.sh sudo apt-get install -y --no-install-recommends binaryen
           wasm-bindgen --version
           wasm-opt --version
 

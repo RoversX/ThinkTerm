@@ -41,8 +41,13 @@ cp assets/fonts/JetBrainsMono-Regular.ttf assets/fonts/SymbolsNerdFontMono-Regul
 # an earlier build are cleared here. npm ci installs exactly the lockfile.
 rm -rf "$OUT/assets" "$OUT/index.html" "$OUT/index.html.gz"
 UI=thinkterm-web/ui
+# The one step here that reaches the network, and the one worth retrying:
+# a registry hiccup would otherwise fail a release build whose packaging
+# jobs all wait on this bundle. The rest of this script is local work, so
+# retrying the script as a whole would only multiply the cost of a genuine
+# failure.
 if [ ! -d "$UI/node_modules" ] || [ "$UI/package-lock.json" -nt "$UI/node_modules/.package-lock.json" ]; then
-  npm ci --prefix "$UI" --no-audit --no-fund
+  bash ci/retry.sh npm ci --prefix "$UI" --no-audit --no-fund
 fi
 npm run --prefix "$UI" --silent build
 # Precompress what a browser will take compressed. The mux server sends a
