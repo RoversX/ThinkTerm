@@ -24,6 +24,14 @@ use url::Url;
 /// This machine's distro id, read once. Clients ask for it in the version
 /// handshake so that a host reached through the mux can show the right logo
 /// without anyone opening a second connection to go and look.
+/// The palette the server's `color_scheme`/`colors` resolve to, or the
+/// built-in default when the configuration names neither.
+pub fn configured_default_palette() -> ColorPalette {
+    // `resolved_palette`, as every local pane uses: the named scheme
+    // with the `colors` overlay on it, or the overlay alone.
+    ColorPalette::from(config::configuration().resolved_palette.clone())
+}
+
 fn local_os_release_id() -> &'static Option<String> {
     static ID: OnceLock<Option<String>> = OnceLock::new();
     ID.get_or_init(|| {
@@ -943,6 +951,7 @@ fn requires_existing_frontend_access(pdu: &Pdu) -> bool {
             | Pdu::ActivatePaneInStack(_)
             | Pdu::MovePaneToStack(_)
             | Pdu::MovePaneToNewTab(_)
+            | Pdu::MoveTab(_)
             | Pdu::AdjustPaneSize(_)
     )
 }
@@ -1044,6 +1053,7 @@ fn web_peer_may_send(pdu: &Pdu) -> bool {
             | Pdu::RenameWorkspace(_)
             | Pdu::SetFocusedPane(_)
             | Pdu::MovePaneToNewTab(_)
+            | Pdu::MoveTab(_)
             | Pdu::ActivatePaneDirection(_)
             | Pdu::GetPaneDirection(_)
             | Pdu::AdjustPaneSize(_)
@@ -1112,6 +1122,18 @@ impl SessionHandler {
     /// never going to come, and sat behind "Restoring terminal state".
     /// Queued behind the registration's acknowledgement on the same
     /// channel, so it arrives after it.
+    /// The palette the server's own configuration resolves to. Browsers use
+    /// it as their base palette; a GUI client renders from its own config and
+    /// ignores the push.
+    fn push_default_palette(&self) {
+        let _ = self.to_write_tx.send(DecodedPdu {
+            serial: 0,
+            pdu: Pdu::DefaultPalette(codec::DefaultPalette {
+                palette: configured_default_palette(),
+            }),
+        });
+    }
+
     fn push_frontend_state(&self) {
         let mux = Mux::get();
         let mut pdus = vec![Pdu::FrontendAccessState(codec_access_state(
@@ -1337,6 +1359,7 @@ impl SessionHandler {
                 }
                 if !is_proxy {
                     self.push_frontend_state();
+                    self.push_default_palette();
                 }
             }
             Pdu::SetFocusedPane(SetFocusedPane {
@@ -2042,6 +2065,39 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::MoveTab(MoveTab { window_id, tab_id, index }) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = Mux::get();
+                            let mut window = mux
+                                .get_window_mut(window_id)
+                                .ok_or_else(|| anyhow!("no such window {window_id}"))?;
+                            let from = window
+                                .idx_by_id(tab_id)
+                                .ok_or_else(|| anyhow!("tab {tab_id} is not in window {window_id}"))?;
+                            let index = index.min(window.len().saturating_sub(1));
+                            let active = window.get_active().map(|tab| tab.tab_id());
+                            if from != index {
+                                let tab = window.remove_by_idx(from);
+                                window.insert(index, &tab);
+                                if let Some(active) = active.and_then(|id| window.idx_by_id(id)) {
+                                    window.set_active_without_saving(active);
+                                }
+                            }
+                            drop(window);
+                            // A reorder is a topology change to the mirrors:
+                            // `TabAddedToWindow` is what reaches them and
+                            // has them list the window again.
+                            mux.notify(mux::MuxNotification::TabAddedToWindow { tab_id, window_id });
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
+
             Pdu::MovePaneToNewTab(request) => {
                 let client_id = self.client_id.clone();
                 spawn_into_main_thread(async move {
@@ -2491,6 +2547,7 @@ impl SessionHandler {
             | Pdu::GetAgentStatusesResponse { .. }
             | Pdu::ListPanesResponse { .. }
             | Pdu::SetApplicationPalette { .. }
+            | Pdu::DefaultPalette { .. }
             | Pdu::SetClipboard { .. }
             | Pdu::NotifyAlert { .. }
             | Pdu::SpawnResponse { .. }
@@ -2944,7 +3001,11 @@ mod tests {
         let names: Vec<(u64, &str)> = sent.iter().map(|d| (d.serial, d.pdu.pdu_name())).collect();
         assert_eq!(
             names,
-            vec![(7, "UnitResponse"), (0, "FrontendAccessState")],
+            vec![
+                (7, "UnitResponse"),
+                (0, "FrontendAccessState"),
+                (0, "DefaultPalette")
+            ],
             "the acknowledgement first, then the state; no tabs, so no viewports"
         );
     }

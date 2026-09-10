@@ -576,7 +576,7 @@ macro_rules! pdu {
 /// 67: Web tokens: the credential a browser presents at the server's web
 ///     port is minted, listed and revoked over the mux connection
 ///     (WebTokenMint/List/Revoke), the way TLS credentials are obtained.
-pub const CODEC_VERSION: usize = 69;
+pub const CODEC_VERSION: usize = 71;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -668,6 +668,8 @@ pdu! {
     GetWebServerStatus: 91,
     SetWebServer: 92,
     WebServerStatus: 93,
+    DefaultPalette: 94,
+    MoveTab: 95,
 }
 
 impl Pdu {
@@ -707,7 +709,8 @@ impl Pdu {
             | Self::SpawnV2(_)
             | Self::SpawnPaneInStack(_)
             | Self::ActivatePaneInStack(_)
-            | Self::MovePaneToStack(_) => true,
+            | Self::MovePaneToStack(_)
+            | Self::MoveTab(_) => true,
             _ => false,
         }
     }
@@ -1139,6 +1142,15 @@ pub struct SetPalette {
 /// Server-to-client state of the palette override owned by the application
 /// running in the pane. `None` means that the client must render using its own
 /// configured palette; `Some` is authoritative until a later reset.
+/// Server-to-client push of the palette the server's own configuration
+/// resolves to (`color_scheme`/`colors`). Clients that render with their own
+/// configuration may ignore it; the browser client uses it as its base
+/// palette, under any per-browser override.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct DefaultPalette {
+    pub palette: ColorPalette,
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
 pub struct SetApplicationPalette {
     pub pane_id: PaneId,
@@ -1496,6 +1508,15 @@ pub struct Resize {
     pub containing_tab_id: TabId,
     pub pane_id: PaneId,
     pub size: TerminalSize,
+}
+
+/// Put a tab at `index` among its window's tabs; the active tab stays
+/// active. Answered with `UnitResponse`.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct MoveTab {
+    pub window_id: WindowId,
+    pub tab_id: TabId,
+    pub index: usize,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -2420,7 +2441,7 @@ mod test {
         // The exact assertion is the tripwire: whoever bumps the codec must
         // come here, confirm the round-trips still cover the new version,
         // and advance it deliberately.
-        assert_eq!(CODEC_VERSION, 69);
+        assert_eq!(CODEC_VERSION, 71);
         use thinkterm_proto::{AgentEvidence, AgentState, AgentStatus};
 
         fn round_trip(pdu: Pdu) {
@@ -2642,6 +2663,25 @@ mod test {
                 }
             );
         }
+    }
+
+    #[test]
+    fn default_palette_round_trip() {
+        let mut palette = ColorPalette::default();
+        palette.background = wezterm_term::color::SrgbaTuple(0.1, 0.2, 0.3, 1.0).into();
+        let mut encoded = Vec::new();
+        Pdu::DefaultPalette(DefaultPalette {
+            palette: palette.clone(),
+        })
+        .encode(&mut encoded, 0x44)
+        .unwrap();
+        assert_eq!(
+            Pdu::decode(encoded.as_slice()).unwrap(),
+            DecodedPdu {
+                serial: 0x44,
+                pdu: Pdu::DefaultPalette(DefaultPalette { palette }),
+            }
+        );
     }
 
     #[test]

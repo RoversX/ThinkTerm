@@ -605,6 +605,11 @@ fn process_unilateral(
             .detach();
             return Ok(());
         }
+        // A GUI client renders from its own configuration; the server's
+        // resolved palette is only for clients that have none of their own.
+        Pdu::DefaultPalette(_) => {
+            return Ok(());
+        }
         Pdu::TabResized(_) | Pdu::TabAddedToWindow(_) => {
             log::trace!("resync due to {:?}", decoded.pdu);
             promise::spawn::spawn_into_main_thread(async move {
@@ -2298,6 +2303,7 @@ impl Client {
     rpc!(mouse_event, SendMouseEvent, UnitResponse);
     rpc!(resize, Resize, UnitResponse);
     rpc!(set_zoomed, SetPaneZoomed, UnitResponse);
+    rpc!(move_tab, MoveTab, UnitResponse);
     rpc!(activate_pane_direction, ActivatePaneDirection, UnitResponse);
     rpc!(
         get_pane_render_changes,

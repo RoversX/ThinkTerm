@@ -702,6 +702,9 @@ fn item_for_notification(n: MuxNotification) -> Option<Item> {
         MuxNotification::FrontendAccessChanged(state) => write(Pdu::FrontendAccessState(
             crate::sessionhandler::codec_access_state(state),
         )),
+        MuxNotification::DefaultPaletteChanged => write(Pdu::DefaultPalette(codec::DefaultPalette {
+            palette: crate::sessionhandler::configured_default_palette(),
+        })),
         MuxNotification::PaneAdded(_)
         | MuxNotification::SaveToDownloads { .. }
         | MuxNotification::WindowRemoved(_)

@@ -312,7 +312,7 @@ impl GuiFrontEnd {
                 MuxNotification::TabResized(_) => {}
                 // Server-side only: a GUI mux owns no ThinkTerm tree. The
                 // remote tree arrives as a pushed PDU, not as a notification.
-                MuxNotification::ThinkTermTreeChanged => {}
+                MuxNotification::ThinkTermTreeChanged | MuxNotification::DefaultPaletteChanged => {}
                 MuxNotification::ThinkTermSessionChanged => {}
                 MuxNotification::FrontendLeaseChanged(_) => {}
                 MuxNotification::FrontendAccessChanged(_) => {}
