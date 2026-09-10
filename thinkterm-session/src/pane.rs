@@ -15,6 +15,7 @@ use codec::{GetLines, GetPaneRenderChanges, GetPaneRenderChangesResponse, InputS
 use rangeset::RangeSet;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use thinkterm_proto::TabId;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use termwiz::cell::CellAttributes;
@@ -87,6 +88,11 @@ impl<H: SessionHost> PaneSession<H> {
         self.remote_pane_id
     }
 
+    /// The tab the server files the pane under, as last told.
+    pub fn remote_tab_id(&self) -> TabId {
+        self.remote_tab_id.load(Ordering::Relaxed)
+    }
+
     pub fn host_pane_id(&self) -> HostPaneId {
         self.host_pane_id
     }
@@ -99,6 +105,12 @@ impl<H: SessionHost> PaneSession<H> {
 
     pub fn cursor_position(&self) -> StableCursorPosition {
         self.state().cursor_position
+    }
+
+    /// Whether a render delta has arrived: until then the pane has no
+    /// picture of its own, only placeholders.
+    pub fn has_received(&self) -> bool {
+        self.state().received
     }
 
     pub fn current_seqno(&self) -> SequenceNo {
@@ -595,6 +607,7 @@ impl<H: SessionHost> PaneSession<H> {
         let now = self.now();
         st.poll_interval = BASE_POLL_INTERVAL;
         st.last_recv_time = now;
+        st.received = true;
 
         if delta.alt_screen != st.alt_screen {
             st.alt_screen = delta.alt_screen;

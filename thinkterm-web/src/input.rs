@@ -45,7 +45,13 @@ pub fn install(app: Rc<App>, canvas: &HtmlCanvasElement, textarea: &HtmlTextArea
                 alt: ev.alt_key(),
                 shift: ev.shift_key(),
                 meta: ev.meta_key(),
-                composing: ev.is_composing(),
+                // Chrome on macOS names the key the IME took (`h`, not
+                // `Process`) and only marks it by keyCode 229; a Pinyin
+                // `htop` would otherwise send `h` and then `htop`.
+                // Only a printable key: an IME that is on but idle (an
+                // Android keyboard, a CJK IME in ASCII mode) marks every
+                // key 229, and Backspace or Enter must still get through.
+                composing: ev.is_composing() || (ev.key_code() == 229 && key.chars().count() == 1),
             };
             match map_key(&dom) {
                 Some((key, mods)) => {

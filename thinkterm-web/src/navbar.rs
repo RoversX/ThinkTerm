@@ -78,7 +78,9 @@ pub fn rects(
             };
             // A pane on the tab's top row starts at the window's edge,
             // over the padding, like one at its left edge.
-            let top = if p.frame.top == 0 { 0.0 } else { pad_css.1 + p.frame.top as f64 * ch };
+            // Below a divider the bar starts right under the line, which
+            // sits in the middle of the gap row, as the desktop's does.
+            let top = if p.frame.top == 0 { 0.0 } else { pad_css.1 + p.frame.top as f64 * ch - ch / 2.0 + 1.0 };
             NavRect {
                 pane_id: p.pane_id,
                 left,

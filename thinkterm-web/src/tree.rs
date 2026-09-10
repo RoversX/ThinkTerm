@@ -467,6 +467,10 @@ pub enum Expect {
     SpaceExists(String),
     SpaceNamed(String, String),
     SpaceGone(String),
+    /// The unpinned threads of a project, in order.
+    ThreadOrder(String, Vec<String>),
+    /// The projects of a Space, in order.
+    ProjectOrder(String, Vec<String>),
 }
 
 impl Expect {
@@ -513,6 +517,27 @@ impl Expect {
                 Some(_) => Err("the server did not change the unread mark".into()),
                 None => Err("the thread is gone".into()),
             },
+            Expect::ThreadOrder(project_id, order) => match project(project_id) {
+                Some(p) => {
+                    let now: Vec<&str> = p.threads.iter().filter(|t| !t.is_pinned).map(|t| t.id.as_str()).collect();
+                    (now == order.iter().map(String::as_str).collect::<Vec<_>>())
+                        .then_some(())
+                        .ok_or_else(|| "the server did not move the thread".into())
+                }
+                None => Err("the project is gone".into()),
+            },
+            Expect::ProjectOrder(space_id, order) => {
+                // Archived projects are not in the session view the
+                // wanted order was built from; they hold no place in it.
+                let now: Vec<&str> = tree
+                    .projects_in_space(space_id)
+                    .filter(|p| p.archived_at.is_none())
+                    .map(|p| p.id.as_str())
+                    .collect();
+                (now == order.iter().map(String::as_str).collect::<Vec<_>>())
+                    .then_some(())
+                    .ok_or_else(|| "the server did not move the project".into())
+            }
             Expect::ProjectGone(id) => match project(id) {
                 None => Ok(()),
                 Some(_) => Err("the server did not remove the project".into()),
@@ -591,6 +616,37 @@ pub fn rename_thread(id: &str, name: &str, now: i64) -> Intent {
     Intent {
         ops: vec![TreeOp::RenameThread { thread_id: id.to_string(), name: name.to_string(), last_active_at: now }],
         expect: Expect::ThreadNamed(id.to_string(), name.to_string()),
+    }
+}
+
+/// Put an unpinned thread before `before` (None: last) among its
+/// project's unpinned threads; `order` is that list as it stands.
+pub fn move_thread_before(project_id: &str, id: &str, before: Option<&str>, order: &[String]) -> Intent {
+    let mut want: Vec<String> = order.iter().filter(|t| t.as_str() != id).cloned().collect();
+    let at = before.and_then(|b| want.iter().position(|t| t == b)).unwrap_or(want.len());
+    want.insert(at, id.to_string());
+    Intent {
+        ops: vec![TreeOp::MoveThreadBefore {
+            project_id: project_id.to_string(),
+            thread_id: id.to_string(),
+            before: before.map(str::to_string),
+        }],
+        expect: Expect::ThreadOrder(project_id.to_string(), want),
+    }
+}
+
+/// Put a project before `before` (None: last) among its Space's projects.
+pub fn move_project_before(space_id: &str, id: &str, before: Option<&str>, order: &[String]) -> Intent {
+    let mut want: Vec<String> = order.iter().filter(|p| p.as_str() != id).cloned().collect();
+    let at = before.and_then(|b| want.iter().position(|p| p == b)).unwrap_or(want.len());
+    want.insert(at, id.to_string());
+    Intent {
+        ops: vec![TreeOp::MoveProjectBefore {
+            space_id: space_id.to_string(),
+            project_id: id.to_string(),
+            before: before.map(str::to_string),
+        }],
+        expect: Expect::ProjectOrder(space_id.to_string(), want),
     }
 }
 
@@ -685,6 +741,33 @@ mod tests {
         assert_eq!(project_name_for_path("~"), "Home");
         assert_eq!(project_name_for_path("/srv/app/"), "app");
         assert!(new_id("thread", || 0xabcd).starts_with("thread-0000abcd"));
+    }
+
+    #[test]
+    fn reorder_intents_expect_the_order_they_asked_for() {
+        let mut tree = ThinkTermTree::default();
+        for op in create_project(None, "p1".into(), "t1".into(), "~/a", 1).ops {
+            assert!(codec::apply_op(&mut tree, &op));
+        }
+        for id in ["t2", "t3"] {
+            assert!(codec::apply_op(&mut tree, &TreeOp::CreateThread {
+                thread_id: id.into(), project_id: "p1".into(), name: id.into(), workspace: None, created_at: 2,
+            }));
+        }
+        let order = ["t1", "t2", "t3"].map(String::from);
+        let intent = move_thread_before("p1", "t3", Some("t1"), &order);
+        assert!(codec::apply_op(&mut tree, &intent.ops[0]));
+        assert!(intent.expect.check(&tree).is_ok());
+        assert_eq!(intent.expect, Expect::ThreadOrder("p1".into(), ["t3", "t1", "t2"].map(String::from).to_vec()));
+        // A move the server did not apply is a refusal.
+        assert!(move_thread_before("p1", "t2", None, &order).expect.check(&tree).is_err());
+        let space = tree.spaces[0].id.clone();
+        assert!(codec::apply_op(&mut tree, &TreeOp::CreateProject {
+            project_id: "p2".into(), space_id: space.clone(), name: "b".into(), path: "~/b".into(),
+        }));
+        let intent = move_project_before(&space, "p2", Some("p1"), &["p1".to_string(), "p2".to_string()]);
+        assert!(codec::apply_op(&mut tree, &intent.ops[0]));
+        assert!(intent.expect.check(&tree).is_ok());
     }
 
     fn thread(id: &str, ws: Option<&str>, tabs: Vec<(TabId, Vec<PaneId>)>) -> ThinkTermSessionThread {

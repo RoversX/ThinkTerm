@@ -24,10 +24,51 @@ pub struct AgentRow {
     pub icon: &'static str,
 }
 
+/// One tab of the right panel's selector, as the desktop lists them
+/// (`RightSidebarMode::ALL`: Files, Notes, Code, Agents). Which exist and
+/// which the browser can open is decided here, not in the display layer.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PanelTab {
+    pub id: &'static str,
+    /// A lucide name, as the menus name theirs.
+    pub icon: &'static str,
+    pub label: String,
+    /// Off for the panels whose APIs the browser has not got; the tip
+    /// says so, and a press does nothing.
+    pub available: bool,
+    pub tip: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AgentsView {
     pub rows: Vec<AgentRow>,
     pub summary: String,
+    /// The selector above the panel, and which of its tabs is showing.
+    pub tabs: Vec<PanelTab>,
+    pub active: &'static str,
+}
+
+/// The panel's sections, in the desktop's order, but only those the page
+/// can open: a button for a feature the browser lacks is noise. Files,
+/// Notes and Code join here when they get a wire.
+pub fn panel_tabs() -> Vec<PanelTab> {
+    [("agents", "bot", "right-mode-agents")]
+        .into_iter()
+        .map(|(id, icon, key)| {
+            let label = tr(key);
+            PanelTab { id, icon, label: label.clone(), available: true, tip: label }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod panel_tests {
+    #[test]
+    fn only_agents_is_available_in_a_browser() {
+        let tabs = super::panel_tabs();
+        assert!(tabs.iter().map(|t| t.id).eq(["agents"]));
+        assert!(tabs.iter().all(|t| t.available));
+    }
 }
 
 /// The curated names the desktop uses; anything else is its id, title-cased.

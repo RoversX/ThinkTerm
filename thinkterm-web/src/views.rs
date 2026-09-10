@@ -5,7 +5,7 @@
 
 use crate::chrome::{Controls, TabView};
 use crate::navbar::NavView;
-use crate::sidebar::Editing;
+use crate::sidebar::{Editing, FooterAction, Reveal};
 use crate::tree::Row;
 use serde::Serialize;
 
@@ -15,6 +15,15 @@ pub struct SidebarView {
     pub editing: Editing,
     /// The Space on show, for the page to remember.
     pub space: Option<String>,
+    /// Why the last "add workspace" path was refused, shown next to the
+    /// field it was typed into rather than as a passing remark.
+    pub new_project_error: Option<String>,
+    /// What a hover over the window's left edge does with the panel put
+    /// away, and the footer the panel ends with. Rules, not drawing: a
+    /// native shell reads the same values.
+    pub reveal: Reveal,
+    pub footer: Vec<FooterAction>,
+    pub footer_label_min_width: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -66,6 +75,11 @@ pub struct Toast {
 pub struct Card {
     pub title: String,
     pub hint: String,
+    /// `busy` (another device holds it), `free` (nobody does), `taking`
+    /// (this page asked), `refused` (the server kept it there).
+    pub state: &'static str,
+    /// The button's words; a press asks for the terminal.
+    pub action: String,
 }
 
 /// The static labels the page draws itself (tooltips, headers, the
@@ -76,6 +90,8 @@ pub const STRING_KEYS: &[&str] = &[
     "sidebar-workspaces",
     "web-sidebar-other-windows",
     "web-path-placeholder",
+    "web-add-workspace",
+    "web-add-workspace-hint",
     "web-tip-space",
     "web-tip-new-thread",
     "web-tip-new-thread-here",
@@ -95,17 +111,12 @@ pub const STRING_KEYS: &[&str] = &[
     "web-tip-zoom",
     "web-tip-unzoom",
     "web-tip-sidebar",
-    "web-fitted",
-    "web-tip-fitted",
     "web-tip-sidebar-options",
     "tooltip-sidebar-notifications",
-    "tooltip-sidebar-thread-search",
-    "tooltip-sidebar-settings",
     "web-tip-search",
     "web-tip-agents",
     "web-tip-settings",
     "web-agents-title",
-    "sidebar-settings",
     "settings-language",
     "web-settings-theme",
     "web-theme-dark",
@@ -132,11 +143,18 @@ pub const STRING_KEYS: &[&str] = &[
     "web-settings-hotkey-description",
     "web-settings-theme-description",
     "web-settings-font-description",
+    "web-settings-scheme",
+    "web-settings-scheme-description",
+    "web-scheme-desktop",
+    "web-scheme-search",
+    "web-scheme-preview",
     "web-settings-hover-reveal-description",
     "web-settings-agents-panel-description",
     "web-settings-sidebar-reset-description",
     "web-cmd-font-reset",
     "common-reset",
+    "web-tip-new-pane",
+    "command-palette-empty",
 ];
 
 pub fn strings() -> std::collections::BTreeMap<&'static str, String> {
@@ -168,7 +186,16 @@ mod tests {
             }),
             Row::Window { window_id: 3, title: "Terminal".into(), selected: false },
         ];
-        let v = to_value(SidebarView { rows, editing: Editing::Thread("thread-1".into()), space: Some("space-1".into()) }).unwrap();
+        let v = to_value(SidebarView {
+            rows,
+            editing: Editing::Thread("thread-1".into()),
+            space: Some("space-1".into()),
+            new_project_error: None,
+            reveal: crate::sidebar::REVEAL,
+            footer: vec![],
+            footer_label_min_width: crate::sidebar::FOOTER_LABEL_MIN_WIDTH,
+        })
+        .unwrap();
         assert_eq!(v["rows"][0], json!({"kind": "space", "id": "space-1", "name": "Default"}));
         assert_eq!(v["space"], "space-1");
         assert_eq!(v["rows"][1], json!({"kind": "new-thread"}));
@@ -181,6 +208,9 @@ mod tests {
         assert_eq!(v["rows"][3], json!({"kind": "window", "id": 3, "title": "Terminal", "selected": false}));
         assert_eq!(v["editing"], json!({"kind": "thread", "id": "thread-1"}));
         assert_eq!(to_value(Editing::None).unwrap(), json!({"kind": "none"}));
+        // The rules the display layer reads rather than decides.
+        assert_eq!(v["reveal"], json!({"edge": 6.0, "dwell_ms": 150, "retreat_ms": 250}));
+        assert_eq!(v["footer_label_min_width"], 168.0);
     }
 
     #[test]
@@ -188,7 +218,7 @@ mod tests {
         for key in STRING_KEYS {
             assert!(thinkterm_i18n::has_key(key), "{key}");
         }
-        assert_eq!(strings()["web-fitted"], "fitted");
+        assert_eq!(strings()["web-tip-sidebar"].is_empty(), false);
     }
 
     #[test]
@@ -212,7 +242,7 @@ mod tests {
         assert_eq!(v["controls"], json!({"following": true, "fit": false, "closing": 7, "clipped": [80, 24]}));
         let s = to_value(StatusView {
             toast: Some(Toast { text: "hi".into(), sticky: false, at: 12.5 }),
-            card: Some(Card { title: "Terminal is available".into(), hint: "Click or scroll to take control".into() }),
+            card: Some(Card { title: "Terminal is available".into(), hint: "Click or scroll to take control".into(), state: "free", action: "Take control".into() }),
             summary: "zsh".into(),
         })
         .unwrap();

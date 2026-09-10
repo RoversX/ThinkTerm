@@ -128,7 +128,9 @@ impl Lease {
     /// pane keeps the rows above it for its bar -- and as a bare grid
     /// otherwise (the size just changed; the next listing catches up).
     pub fn claim_viewport(&self) -> Option<codec::ClientViewport> {
-        let size = if self.fit || (self.ownerless() && self.canonical_size.is_none()) {
+        // The holder shapes the tab to its own grid: this page while it
+        // owns the tab, whatever `fit` says (a push can clear it mid-claim).
+        let size = if self.fit || self.owns_viewport() || (self.ownerless() && self.canonical_size.is_none()) {
             self.reported.or(self.canonical_size)?
         } else {
             self.canonical_size.or(self.reported)?
@@ -276,10 +278,11 @@ mod claim_tests {
     }
 
     #[test]
-    fn a_tab_this_page_holds_keeps_the_size_it_was_claimed_at() {
+    fn a_tab_this_page_holds_takes_the_page_s_own_grid() {
         let mut l = lease(codec::FrontendAccessMode::TmuxLatest);
         l.tab_owner = Some(id(1));
-        assert_eq!(grid(&l), Some(size(120, 40)));
+        // The holder shapes the tab, whether or not a push cleared `fit`.
+        assert_eq!(grid(&l), Some(size(96, 30)));
     }
 
     #[test]

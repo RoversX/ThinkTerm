@@ -157,6 +157,8 @@ pub enum Click {
     Pane(PaneId),
     Follow,
     NewTab,
+    /// A bar's `+`: another pane in that pane's stack, as the desktop's.
+    NewInStack(PaneId),
     /// The bar's pane, or the focused one from a chord.
     SplitRight(Option<PaneId>),
     SplitBelow(Option<PaneId>),

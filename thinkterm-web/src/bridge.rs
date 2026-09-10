@@ -62,6 +62,25 @@ impl Client {
         code.to_string()
     }
 
+    /// A panel's edge is being dragged (`on`) or was let go: while it is,
+    /// the canvas follows but the tab is not reshaped on the server; the
+    /// one reshape comes at the end.
+    pub fn panel_drag(&self, on: bool) {
+        self.app.set_panel_drag(on);
+    }
+
+    /// Refit the canvas to its box now, in the same task as the layout
+    /// change that moved it, so no frame shows the old bitmap stretched.
+    pub fn resize(&self) {
+        self.app.resize();
+    }
+
+    /// The card's button, or a press on the card: ask for the terminal
+    /// another device holds. What comes of it is the card's next state.
+    pub fn take_over(&self) {
+        self.app.take_over();
+    }
+
     /// A click in the sidebar: `kind` names the row or button, `id` the
     /// thread, project or window it is about, `flag` the pin state.
     /// Returns false for a kind the model does not know.
@@ -137,6 +156,23 @@ impl Client {
         self.app.set_setting(&key, &value).err().unwrap_or_default()
     }
 
+    /// The colours of the scheme named by `terminal-scheme`, as the page
+    /// read them out of `schemes.json`; `None` follows the server's
+    /// configuration. Returns an error text or "".
+    pub fn set_terminal_palette(&self, json: Option<String>) -> String {
+        let palette = match json.as_deref() {
+            None => None,
+            Some(text) => match crate::settings::SchemeColors::parse(text)
+                .and_then(|colors| colors.to_palette())
+            {
+                Ok(palette) => Some(palette),
+                Err(err) => return err,
+            },
+        };
+        self.app.set_terminal_palette(palette);
+        String::new()
+    }
+
     /// The search palette's entries for `query`, ranked: JSON `Results`.
     pub fn palette(&self, query: String) -> String {
         json(&self.app.palette(&query))
@@ -180,6 +216,38 @@ impl Client {
 
     /// A click on the tab row or a pane's bar. Returns false for an
     /// action the model does not know.
+    /// A drop, decided here: `kind` is "tab" (id = tab id, `at` = the
+    /// index it lands on), "pane" (id = pane id, `target` = the pane it
+    /// was dropped on, `edge` = "left"|"right"|"top"|"bottom"), "thread"
+    /// or "project" (`target` = the row it lands before, None for last).
+    /// False when the model refuses; the listing or tree that follows
+    /// redraws the page.
+    pub fn drop(&self, kind: String, id: String, target: Option<String>, edge: Option<String>, at: Option<u32>) -> bool {
+        use thinkterm_proto::SplitDirection;
+        match kind.as_str() {
+            "tab" => match (id.parse(), at) {
+                (Ok(tab), Some(at)) => self.app.move_tab(tab, at as usize),
+                _ => false,
+            },
+            "pane" => {
+                let (Ok(pane), Some(Ok(target))) = (id.parse(), target.map(|t| t.parse())) else {
+                    return false;
+                };
+                let (direction, second) = match edge.as_deref() {
+                    Some("left") => (SplitDirection::Horizontal, false),
+                    Some("right") => (SplitDirection::Horizontal, true),
+                    Some("top") => (SplitDirection::Vertical, false),
+                    Some("bottom") => (SplitDirection::Vertical, true),
+                    _ => return false,
+                };
+                self.app.move_pane(pane, target, direction, second)
+            }
+            "thread" => self.app.move_thread(&id, target.as_deref()),
+            "project" => self.app.move_project(&id, target.as_deref()),
+            _ => false,
+        }
+    }
+
     pub fn chrome_click(&self, action: String, pane: Option<u32>, tab: Option<u32>) -> bool {
         use crate::chrome::Click;
         let pane = pane.map(|p| p as usize);
@@ -187,6 +255,7 @@ impl Client {
             ("pane", Some(p), _) => Click::Pane(p),
             ("follow", _, _) => Click::Follow,
             ("new-tab", _, _) => Click::NewTab,
+            ("new-pane", Some(p), _) => Click::NewInStack(p),
             ("split-right", p, _) => Click::SplitRight(p),
             ("split-below", p, _) => Click::SplitBelow(p),
             ("zoom", p, _) => Click::Zoom(p),

@@ -68,6 +68,9 @@ pub struct PaneState {
 
     pub(crate) last_send_time: Timestamp,
     pub(crate) last_recv_time: Timestamp,
+    /// Whether the server has said anything about this pane yet: before
+    /// that its cursor and rows are placeholders, not a picture.
+    pub(crate) received: bool,
     pub(crate) last_late_dirty: Timestamp,
     pub(crate) last_input_rtt: u64,
 
@@ -107,6 +110,7 @@ impl PaneState {
             fetch_limiter: RateLimiter::new(fetch_rate_per_second, now),
             last_send_time: now,
             last_recv_time: now,
+            received: false,
             last_late_dirty: now,
             last_input_rtt: 0,
             input_serial: InputSerial::empty(),

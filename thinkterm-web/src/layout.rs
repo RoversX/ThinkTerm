@@ -123,6 +123,127 @@ impl TabLayout {
     }
 }
 
+/// The layout with divider `idx` moved `cells` (right/down positive):
+/// the panes ending at it along its extent grow, the ones starting past
+/// it shrink, and the move is clamped so each keeps `nav_rows` + 1 rows
+/// (or one column). `cells` is a displacement from `layout`, so zero
+/// (asked, or clamped to) is `layout` itself: a drag back to where it
+/// started has to restore what it started from. `None` for a divider
+/// that is not there or has nothing on one side.
+pub fn with_divider_moved(layout: &TabLayout, idx: usize, cells: isize, nav_rows: usize) -> Option<TabLayout> {
+    let divider = *layout.dividers.get(idx)?;
+    let mut moved = layout.clone();
+    let (before, after): (Vec<usize>, Vec<usize>) = match divider {
+        Divider::Col { col, top, rows } => {
+            let spans = |p: &PanePlacement| p.frame.top < top + rows && p.frame.top + p.frame.rows > top;
+            let b = moved.panes.iter().enumerate().filter(|(_, p)| spans(p) && p.frame.left + p.frame.cols == col).map(|(i, _)| i).collect();
+            let a = moved.panes.iter().enumerate().filter(|(_, p)| spans(p) && p.frame.left == col + 1).map(|(i, _)| i).collect();
+            (b, a)
+        }
+        Divider::Row { row, left, cols } => {
+            let spans = |p: &PanePlacement| p.frame.left < left + cols && p.frame.left + p.frame.cols > left;
+            let b = moved.panes.iter().enumerate().filter(|(_, p)| spans(p) && p.frame.top + p.frame.rows == row).map(|(i, _)| i).collect();
+            let a = moved.panes.iter().enumerate().filter(|(_, p)| spans(p) && p.frame.top == row + 1).map(|(i, _)| i).collect();
+            (b, a)
+        }
+    };
+    if before.is_empty() || after.is_empty() {
+        return None;
+    }
+    let horizontal = matches!(divider, Divider::Col { .. });
+    let min = if horizontal { 1 } else { nav_rows + 1 };
+    let extent = |p: &PanePlacement| if horizontal { p.frame.cols } else { p.frame.rows } as isize;
+    // Room to shrink on whichever side loses cells.
+    let room = |side: &[usize]| side.iter().map(|&i| extent(&moved.panes[i]) - min as isize).min().unwrap_or(0).max(0);
+    let cells = if cells > 0 { cells.min(room(&after)) } else { cells.max(-room(&before)) };
+    if cells == 0 {
+        return Some(moved);
+    }
+    for &i in &before {
+        let f = &mut moved.panes[i].frame;
+        if horizontal { f.cols = (f.cols as isize + cells) as usize } else { f.rows = (f.rows as isize + cells) as usize }
+    }
+    for &i in &after {
+        let f = &mut moved.panes[i].frame;
+        if horizontal {
+            f.left = (f.left as isize + cells) as usize;
+            f.cols = (f.cols as isize - cells) as usize;
+        } else {
+            f.top = (f.top as isize + cells) as usize;
+            f.rows = (f.rows as isize - cells) as usize;
+        }
+    }
+    match &mut moved.dividers[idx] {
+        Divider::Col { col, .. } => *col = (*col as isize + cells) as usize,
+        Divider::Row { row, .. } => *row = (*row as isize + cells) as usize,
+    }
+    Some(moved)
+}
+
+/// The layout with every frame scaled to `size`'s grid, the dividers
+/// kept to one cell: pane edges next to a divider are put at the
+/// divider's new place, so the frames still compose to the grid as the
+/// server requires. Near enough to claim pane by pane. `None` when a
+/// pane would be left without a cell: padding one out would break the
+/// composition, and the server would refuse the lot.
+pub fn scaled(layout: &TabLayout, size: TerminalSize) -> Option<TabLayout> {
+    let (cols, rows) = (size.cols, size.rows);
+    let sx = |c: usize| (c * cols + layout.cols / 2) / layout.cols;
+    let sy = |r: usize| (r * rows + layout.rows / 2) / layout.rows;
+    let mut scaled = layout.clone();
+    scaled.cols = cols;
+    scaled.rows = rows;
+    scaled.size = size;
+    for p in scaled.panes.iter_mut() {
+        let old = p.frame;
+        let (mut l, mut t) = (sx(old.left), sy(old.top));
+        let (mut r, mut b) = (sx(old.left + old.cols), sy(old.top + old.rows));
+        // Edges on a divider follow it: the gap stays one cell.
+        for d in &layout.dividers {
+            match *d {
+                Divider::Col { col, top, rows: n } if old.top < top + n && old.top + old.rows > top => {
+                    if old.left + old.cols == col {
+                        r = sx(col);
+                    }
+                    if old.left == col + 1 {
+                        l = sx(col) + 1;
+                    }
+                }
+                Divider::Row { row, left, cols: n } if old.left < left + n && old.left + old.cols > left => {
+                    if old.top + old.rows == row {
+                        b = sy(row);
+                    }
+                    if old.top == row + 1 {
+                        t = sy(row) + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if r <= l || b <= t {
+            return None;
+        }
+        p.frame = Rect { left: l, top: t, cols: r - l, rows: b - t };
+    }
+    for d in scaled.dividers.iter_mut() {
+        match d {
+            Divider::Col { col, top, rows: n } => {
+                let (t, b) = (sy(*top), sy(*top + *n));
+                *col = sx(*col);
+                *top = t;
+                *n = b.saturating_sub(t).max(1);
+            }
+            Divider::Row { row, left, cols: n } => {
+                let (l, r) = (sx(*left), sx(*left + *n));
+                *row = sy(*row);
+                *left = l;
+                *n = r.saturating_sub(l).max(1);
+            }
+        }
+    }
+    Some(scaled)
+}
+
 /// Every pane in a tab, left to right, top to bottom, stacks included.
 pub fn leaves(node: &PaneNode) -> Vec<&PaneEntry> {
     match node {
@@ -232,16 +353,24 @@ pub fn layout(node: &PaneNode) -> Option<TabLayout> {
 /// size of the pane would shrink the pane by the bar's rows each time.
 pub fn layout_in(node: &PaneNode, tab_size: Option<TerminalSize>, nav_rows: usize) -> Option<TabLayout> {
     let listed = node.root_size()?;
-    let size = match node {
-        PaneNode::Split { .. } => listed,
-        _ => tab_size.unwrap_or_else(|| {
-            let rows = listed.rows + nav_rows;
+    let framed = |grid: TerminalSize| {
+        tab_size.unwrap_or_else(|| {
+            let rows = grid.rows + nav_rows;
             TerminalSize {
                 rows,
-                pixel_height: listed.pixel_height.checked_div(listed.rows).unwrap_or(0) * rows,
-                ..listed
+                pixel_height: grid.pixel_height.checked_div(grid.rows).unwrap_or(0) * rows,
+                ..grid
             }
-        }),
+        })
+    };
+    // A zoomed pane's own size is the tab's: the split tree it hides is
+    // not resized while it is zoomed, so the root the server lists is
+    // wherever the tab stood at the zoom.
+    let zoomed_grid = leaves(node).into_iter().find(|e| e.is_zoomed_pane).map(|e| e.size);
+    let size = match (node, zoomed_grid) {
+        (PaneNode::Split { .. }, None) => listed,
+        (_, Some(grid)) => framed(grid),
+        _ => framed(listed),
     };
     let (window_id, tab_id) = node.window_and_tab_ids()?;
     let root = Rect {
@@ -295,6 +424,35 @@ pub fn hit(layout: &TabLayout, col: usize, row: usize) -> Option<&PanePlacement>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn moving_a_divider_shifts_the_panes_on_both_sides_within_bounds() {
+        let place = |id: usize, top: usize, rows: usize| PanePlacement {
+            pane_id: id, tab_id: 1, window_id: 1,
+            frame: Rect { left: 0, top, cols: 80, rows },
+            content: (80, rows.saturating_sub(2)), is_active: id == 1, is_zoomed: false,
+            title: String::new(), alt_screen: false, physical_top: 0,
+            size: TerminalSize { rows: rows.saturating_sub(2), cols: 80, pixel_width: 800, pixel_height: 0, dpi: 96 },
+            workspace: "w".into(), stack: vec![],
+        };
+        let layout = TabLayout {
+            tab_id: 1, window_id: 1, workspace: "w".into(), cols: 80, rows: 41,
+            size: TerminalSize { rows: 41, cols: 80, pixel_width: 800, pixel_height: 820, dpi: 96 },
+            panes: vec![place(1, 0, 20), place(2, 21, 20)],
+            dividers: vec![Divider::Row { row: 20, left: 0, cols: 80 }],
+            zoomed: None, hidden: vec![],
+        };
+        let moved = with_divider_moved(&layout, 0, 5, 2).unwrap();
+        assert_eq!((moved.panes[0].frame.rows, moved.panes[1].frame.top, moved.panes[1].frame.rows), (25, 26, 15));
+        assert!(matches!(moved.dividers[0], Divider::Row { row: 25, .. }));
+        // Clamped: the lower pane keeps its bar and one row.
+        let moved = with_divider_moved(&layout, 0, 30, 2).unwrap();
+        assert_eq!(moved.panes[1].frame.rows, 3);
+        // Back at the origin, or pushed against the clamp from the other
+        // side: the starting layout, not nothing.
+        assert_eq!(with_divider_moved(&layout, 0, 0, 2).unwrap(), layout);
+        assert_eq!(with_divider_moved(&layout, 0, -40, 2).unwrap().panes[0].frame.rows, 3);
+        assert!(with_divider_moved(&layout, 1, 3, 2).is_none());
+    }
     use super::*;
     use thinkterm_proto::layout::PaneStackEntry;
     use thinkterm_proto::split::SplitDirectionAndSize;
@@ -488,6 +646,56 @@ mod tests {
         assert_eq!(l.panes[0].frame, Rect { left: 0, top: 0, cols: 80, rows: 24 });
         assert!(l.dividers.is_empty());
         assert_eq!(l.hidden, vec![1]);
+    }
+
+    /// The server's tree keeps the pre-zoom sizes while a pane is zoomed;
+    /// the zoomed pane's own size, resized since, is the tab's.
+    #[test]
+    fn a_zoomed_pane_resized_since_the_zoom_sizes_the_tab() {
+        let mut zoomed = pane(2, 165, 22, 41, 0, true);
+        zoomed.is_zoomed_pane = true;
+        let node = split(
+            SplitDirection::Horizontal,
+            size(70, 36),
+            size(39, 36),
+            PaneNode::Leaf(pane(1, 70, 36, 0, 0, false)),
+            PaneNode::Leaf(zoomed),
+        );
+        let l = layout_in(&node, None, 3).unwrap();
+        assert_eq!((l.cols, l.rows), (165, 25));
+        assert_eq!(l.panes[0].frame, Rect { left: 0, top: 0, cols: 165, rows: 25 });
+        // With the server's word for the tab, that.
+        let l = layout_in(&node, Some(size(165, 25)), 3).unwrap();
+        assert_eq!((l.cols, l.rows), (165, 25));
+    }
+
+    /// Doubling an 80-column tab split 40 | 39 gives 80 | 79 with the
+    /// divider still one cell, not 80 | 78 with a two-cell gap the
+    /// server would refuse.
+    #[test]
+    fn scaling_keeps_dividers_one_cell_wide() {
+        let mut zoomed = pane(2, 39, 24, 41, 0, true);
+        zoomed.is_zoomed_pane = false;
+        let node = split(
+            SplitDirection::Horizontal,
+            size(40, 24),
+            size(39, 24),
+            PaneNode::Leaf(pane(1, 40, 24, 0, 0, false)),
+            PaneNode::Leaf(zoomed),
+        );
+        let l = layout(&node).unwrap();
+        let big = scaled(&l, size(160, 24)).unwrap();
+        let frames: Vec<(usize, usize)> = big.panes.iter().map(|p| (p.frame.left, p.frame.cols)).collect();
+        assert_eq!(frames, vec![(0, 80), (81, 79)]);
+        assert!(matches!(big.dividers[0], Divider::Col { col: 80, .. }));
+        // And back down, still composing.
+        let small = scaled(&big, size(60, 24)).unwrap();
+        let frames: Vec<(usize, usize)> = small.panes.iter().map(|p| (p.frame.left, p.frame.cols)).collect();
+        assert_eq!(frames[0].0 + frames[0].1 + 1, frames[1].0);
+        assert_eq!(frames[1].0 + frames[1].1, 60);
+        // A one-column pane has nowhere to go at 3 columns: no layout,
+        // rather than one a column too wide.
+        assert!(scaled(&l, size(3, 24)).is_none());
     }
 
     #[test]
