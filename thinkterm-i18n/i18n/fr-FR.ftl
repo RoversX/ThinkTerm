@@ -692,6 +692,8 @@ settings-web-heading = Ouvrir ces terminaux depuis un navigateur
 settings-web-enable = Autoriser l'accès par navigateur
 settings-web-enable-description = Désactivé. Rien n'écoute, et aucun lien ne s'ouvrira.
 settings-web-on-at = À l'écoute sur { $address }. Seul quelqu'un muni d'un lien peut entrer.
+settings-web-elsewhere-on-at = À l'écoute sur { $address }, sur { $host } et non sur cet ordinateur. Seul quelqu'un muni d'un lien peut entrer.
+settings-web-elsewhere-off = Désactivé sur { $host }. Cette section concerne ce serveur, pas cet ordinateur.
 settings-web-link = Lien d'accès
 settings-web-link-description = Qui l'ouvre obtient un shell à votre nom.
 settings-web-ttl = Expiration du lien
@@ -723,13 +725,13 @@ settings-web-revoke-all-description = Coupe tous les navigateurs d'un coup.
 settings-web-no-server = Aucun serveur mux à interroger. L'accès par navigateur en requiert un.
 settings-web-no-listener = Rien n'écoute, un lien ne pointerait nulle part. Activez d'abord l'accès par navigateur.
 settings-web-reachable = Accessible depuis d'autres appareils
-settings-web-reachable-description = Écoute sur toutes les adresses réseau avec un certificat à lui ; un téléphone sur le même réseau ou tailnet peut ouvrir le lien. Désactivé, seul cet ordinateur le peut.
+settings-web-reachable-description = Écoute sur toutes les adresses réseau avec un certificat à lui ; un téléphone sur le même réseau ou tailnet peut ouvrir le lien. Désactivé, seule la machine qui l'exécute le peut.
 settings-web-reachable-restart = L'accès par navigateur a été coupé puis rétabli à la nouvelle adresse.
 settings-web-qr = Scanner sur votre téléphone
 settings-web-qr-description = Crée un lien et l'affiche sous forme de code ; le navigateur avertit une fois au sujet du certificat, puis continue.
 settings-web-qr-show = Afficher le code
 settings-web-qr-hide = Masquer le code
-settings-web-qr-loopback = Seul cet ordinateur atteint ce qui écoute ; activez « Accessible depuis d'autres appareils » pour un code utilisable depuis un téléphone.
+settings-web-qr-loopback = Seule la machine qui l'exécute atteint ce qui écoute ; activez « Accessible depuis d'autres appareils » pour un code utilisable depuis un téléphone.
 
 ## Client navigateur (thinkterm-web) : l’interface de la page elle-même. Les
 ## clés que le bureau possède déjà (sidebar-*, menu-*) sont réutilisées par la

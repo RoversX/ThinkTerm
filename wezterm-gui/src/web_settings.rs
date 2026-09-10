@@ -20,6 +20,11 @@ use window::{Clipboard, Window, WindowOps};
 pub struct WebState {
     pub status: Option<WebServerStatus>,
     pub tokens: Vec<WebTokenInfo>,
+    /// The domain everything else here is about, when it is not this
+    /// machine's own session host: `client()` falls back to an attached
+    /// remote when there is no host to prefer, and then "Web" means that
+    /// server's port and not this computer's. `None` is the ordinary case.
+    pub elsewhere: Option<String>,
     /// The last failure, shown until an answer replaces it.
     pub error: Option<String>,
     /// A user's request is out. Controls stay where they are rather than
@@ -103,6 +108,7 @@ fn client() -> Option<Client> {
         .iter()
         .find(|(id, _, _)| crate::local_sessions::is_host_domain_id(*id))
     {
+        with_state(|s| s.elsewhere = None);
         return Some(client.clone());
     }
     if clients.len() > 1 {
@@ -116,7 +122,15 @@ fn client() -> Option<Client> {
                 .join(", ")
         );
     }
-    clients.into_iter().next().map(|(_, _, client)| client)
+    let chosen = clients.into_iter().next();
+    // Which server was picked is recorded rather than only logged. The
+    // warning above fires at two attached domains and up, so the case that
+    // needed saying most -- a single remote, on a platform with no session
+    // host of its own, silently becoming what "Allow browser access" opens
+    // a port on -- said nothing at all. The section reads this to name the
+    // machine instead of claiming to be about this one.
+    with_state(|s| s.elsewhere = chosen.as_ref().map(|(_, name, _)| name.clone()));
+    chosen.map(|(_, _, client)| client)
 }
 
 /// Which gate an answer releases. They are separate on purpose: a poll

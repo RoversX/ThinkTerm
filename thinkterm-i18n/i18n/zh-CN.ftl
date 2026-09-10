@@ -680,6 +680,8 @@ settings-web-heading = 用浏览器打开这里的终端
 settings-web-enable = 允许浏览器访问
 settings-web-enable-description = 未开启。没有在监听,链接也打不开。
 settings-web-on-at = 正在监听 { $address }。只有拿到链接的人进得来。
+settings-web-elsewhere-on-at = 正在 { $host } 上监听 { $address },不是这台电脑。只有拿到链接的人进得来。
+settings-web-elsewhere-off = { $host } 上未开启。这一节说的是那台服务器,不是这台电脑。
 settings-web-link = 访问链接
 settings-web-link-description = 打开它的人拿到的是你的 shell。
 settings-web-ttl = 链接有效期
@@ -704,13 +706,13 @@ settings-web-revoke-all-description = 一次性切断所有浏览器。
 settings-web-no-server = 没有可询问的 mux 服务端。网页访问需要它在运行。
 settings-web-no-listener = 没有在监听,链接无处指向。请先打开浏览器访问。
 settings-web-reachable = 其他设备也能访问
-settings-web-reachable-description = 在所有网络地址上监听,并使用自己的证书;同一网络或 tailnet 里的手机就能打开链接。关闭时只有这台电脑能访问。
+settings-web-reachable-description = 在所有网络地址上监听,并使用自己的证书;同一网络或 tailnet 里的手机就能打开链接。关闭时只有它所在的那台机器能访问。
 settings-web-reachable-restart = 已把浏览器访问关掉再打开,换到了新地址。
 settings-web-qr = 用手机扫码
 settings-web-qr-description = 生成一个链接,并显示成二维码;浏览器会就证书提醒一次,继续即可。
 settings-web-qr-show = 显示二维码
 settings-web-qr-hide = 隐藏二维码
-settings-web-qr-loopback = 只有这台电脑连得上正在监听的地址;打开“其他设备也能访问”,才能得到手机用得上的二维码。
+settings-web-qr-loopback = 只有它所在的那台机器连得上正在监听的地址;打开“其他设备也能访问”,才能得到手机用得上的二维码。
 
 ## 浏览器端(thinkterm-web):网页自身的界面。桌面端已经有的键
 ## (sidebar-*、menu-*)网页会直接复用,这里只放

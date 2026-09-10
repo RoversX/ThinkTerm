@@ -680,6 +680,8 @@ settings-web-heading = ブラウザからこの端末を開く
 settings-web-enable = ブラウザからのアクセスを許可
 settings-web-enable-description = オフです。待ち受けておらず、リンクも開きません。
 settings-web-on-at = { $address } で待ち受け中。リンクを持つ人だけが入れます。
+settings-web-elsewhere-on-at = { $host } の { $address } で待ち受け中。このコンピューターではありません。リンクを持つ人だけが入れます。
+settings-web-elsewhere-off = { $host } ではオフです。この節はそのサーバーについてであり、このコンピューターのことではありません。
 settings-web-link = アクセスリンク
 settings-web-link-description = 開いた人はあなたのシェルを得ます。
 settings-web-ttl = リンクの有効期限
@@ -704,13 +706,13 @@ settings-web-revoke-all-description = すべてのブラウザを一度に切断
 settings-web-no-server = 問い合わせ先の mux サーバーがありません。ブラウザアクセスには必要です。
 settings-web-no-listener = 待ち受けていないため、リンクの向き先がありません。先にブラウザアクセスを有効にしてください。
 settings-web-reachable = 他のデバイスから接続できる
-settings-web-reachable-description = すべてのネットワークアドレスで、自前の証明書を使って待ち受けます。同じネットワークや tailnet のスマートフォンからリンクを開けます。オフなら、このコンピューターだけです。
+settings-web-reachable-description = すべてのネットワークアドレスで、自前の証明書を使って待ち受けます。同じネットワークや tailnet のスマートフォンからリンクを開けます。オフなら、それが動いているマシンだけです。
 settings-web-reachable-restart = ブラウザアクセスを切り、新しいアドレスで入れ直しました。
 settings-web-qr = スマートフォンで読み取る
 settings-web-qr-description = リンクを作り、コードとして表示します。ブラウザは証明書について一度警告しますが、そのまま進めます。
 settings-web-qr-show = コードを表示
 settings-web-qr-hide = コードを隠す
-settings-web-qr-loopback = 待ち受けにはこのコンピューターからしか届きません。スマートフォンで使えるコードには「他のデバイスから接続できる」をオンにしてください。
+settings-web-qr-loopback = 待ち受けにはそれが動いているマシンからしか届きません。スマートフォンで使えるコードには「他のデバイスから接続できる」をオンにしてください。
 
 ## ブラウザクライアント(thinkterm-web):ページ自身の UI。デスクトップに
 ## 既にあるキー(sidebar-*、menu-*)はページでもそのまま使うため、ここには

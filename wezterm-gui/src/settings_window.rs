@@ -5778,14 +5778,33 @@ impl SettingsWindow {
             .as_ref()
             .map(|status| status.urls.iter().map(|u| u.trim_end_matches('/').to_string()).collect::<Vec<_>>())
             .unwrap_or_default();
-        let description = match (&state.error, &address) {
-            (Some(error), _) => error.clone(),
-            (None, Some(address)) => {
+        // Everything in this section is the server's. Where this platform
+        // runs no local session host, that server is whichever domain is
+        // attached -- so the text names it rather than saying "this
+        // computer", which is what the switch would otherwise be read as.
+        // Whole sentences per case rather than a prefix glued on: the row
+        // clips at one line, and translations are not built by
+        // concatenation.
+        let description = match (&state.error, &state.elsewhere, &address) {
+            (Some(error), _, _) => error.clone(),
+            (None, elsewhere, address) => {
                 let mut args = FluentArgs::new();
-                args.set("address", if urls.is_empty() { address.clone() } else { urls.join("  ·  ") });
-                crate::i18n::tr_args("settings-web-on-at", &args)
+                if let Some(host) = elsewhere {
+                    args.set("host", host.clone());
+                }
+                match (elsewhere, address) {
+                    (Some(_), Some(address)) => {
+                        args.set("address", if urls.is_empty() { address.clone() } else { urls.join("  ·  ") });
+                        crate::i18n::tr_args("settings-web-elsewhere-on-at", &args)
+                    }
+                    (Some(_), None) => crate::i18n::tr_args("settings-web-elsewhere-off", &args),
+                    (None, Some(address)) => {
+                        args.set("address", if urls.is_empty() { address.clone() } else { urls.join("  ·  ") });
+                        crate::i18n::tr_args("settings-web-on-at", &args)
+                    }
+                    (None, None) => crate::i18n::tr("settings-web-enable-description"),
+                }
             }
-            (None, None) => crate::i18n::tr("settings-web-enable-description"),
         };
         self.paint_toggle_setting_row(
             layers,

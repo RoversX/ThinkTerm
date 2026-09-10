@@ -695,6 +695,8 @@ settings-web-heading = Diese Terminals im Browser erreichen
 settings-web-enable = Browserzugriff erlauben
 settings-web-enable-description = Aus. Nichts lauscht, und kein Link lässt sich öffnen.
 settings-web-on-at = Lauscht auf { $address }. Nur wer einen Link hat, kommt hinein.
+settings-web-elsewhere-on-at = Lauscht auf { $address }, auf { $host } und nicht auf diesem Computer. Nur wer einen Link hat, kommt hinein.
+settings-web-elsewhere-off = Auf { $host } aus. Dieser Abschnitt betrifft jenen Server, nicht diesen Computer.
 settings-web-link = Zugriffslink
 settings-web-link-description = Wer ihn öffnet, bekommt eine Shell als Sie.
 settings-web-ttl = Link läuft ab
@@ -726,13 +728,13 @@ settings-web-revoke-all-description = Trennt alle Browser auf einmal.
 settings-web-no-server = Kein Mux-Server zum Abfragen. Der Browserzugriff braucht einen laufenden.
 settings-web-no-listener = Nichts lauscht, also gibt es kein Ziel für einen Link. Schalten Sie zuerst den Browserzugriff ein.
 settings-web-reachable = Von anderen Geräten erreichbar
-settings-web-reachable-description = Lauscht auf allen Netzwerkadressen mit einem eigenen Zertifikat; ein Telefon im selben Netzwerk oder Tailnet kann den Link öffnen. Aus kommt nur dieser Computer heran.
+settings-web-reachable-description = Lauscht auf allen Netzwerkadressen mit einem eigenen Zertifikat; ein Telefon im selben Netzwerk oder Tailnet kann den Link öffnen. Aus kommt nur die Maschine heran, auf der er läuft.
 settings-web-reachable-restart = Der Browserzugriff wurde aus- und unter der neuen Adresse wieder eingeschaltet.
 settings-web-qr = Mit dem Telefon scannen
 settings-web-qr-description = Erzeugt einen Link und zeigt ihn als Code; der Browser warnt einmal wegen des Zertifikats, dann geht es weiter.
 settings-web-qr-show = Code zeigen
 settings-web-qr-hide = Code verbergen
-settings-web-qr-loopback = Nur dieser Computer erreicht, was hier lauscht; schalten Sie „Von anderen Geräten erreichbar“ ein, um einen Code für ein Telefon zu bekommen.
+settings-web-qr-loopback = Nur die Maschine, auf der er läuft, erreicht was hier lauscht; schalten Sie „Von anderen Geräten erreichbar“ ein, um einen Code für ein Telefon zu bekommen.
 
 ## Browser-Client (thinkterm-web): die Oberfläche der Seite selbst. Schlüssel,
 ## die der Desktop schon hat (sidebar-*, menu-*), verwendet die Seite mit;
