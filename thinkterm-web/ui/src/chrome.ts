@@ -2,6 +2,7 @@
 // read it: the nearest element that carries one of the three marks, and
 // the bar it sits in for the buttons that act on a bar's pane.
 
+import { handle } from './client';
 import { chromeClick, views } from './client.svelte';
 import { mobile, openSide } from './mobile.svelte';
 import { openPalette } from './palette.svelte';
@@ -21,6 +22,9 @@ export function toggleSidebar() {
   }
   const off = document.body.dataset.side === 'off';
   if (off) delete document.body.dataset.side; else document.body.dataset.side = 'off';
+  // Refit in this task, before the browser paints the moved box with the
+  // old bitmap stretched across it.
+  handle.client?.resize();
   document.getElementById('kbd')?.focus();
 }
 
@@ -63,7 +67,7 @@ export function onChromeClick(ev: MouseEvent) {
     // is a preference the wasm keeps.
     setSetting('agents-panel', !views.settings['agents-panel']);
     handled = true;
-  } else if (action === 'split-right' || action === 'split-below' || action === 'zoom') {
+  } else if (action === 'split-right' || action === 'split-below' || action === 'zoom' || action === 'new-pane') {
     // A bar's buttons act on the bar's pane, whichever is focused.
     handled = chromeClick(action, id(hit.closest('[data-nav]'), 'data-nav'));
   } else {

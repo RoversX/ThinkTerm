@@ -5,7 +5,13 @@
   // brings that pane on show.
   import { handle } from './client';
   import { refreshViews, s, views } from './client.svelte';
-  import { agentIcon, circleAlert, circleCheck, loaderCircle } from './icons';
+  import { agentIcon, circleAlert, circleCheck, iconByName, loaderCircle } from './icons';
+
+  // The desktop's segmented mode selector. Which tabs exist, which this
+  // browser can open and what each is called are the model's
+  // (thinkterm-web/src/agents.rs `panel_tabs`); drawn here.
+  const tabs = $derived(views.agents.tabs);
+  const active = $derived(views.agents.active);
 
   const rows = $derived(views.agents.rows);
   const summary = $derived(views.agents.summary);
@@ -36,16 +42,21 @@
   }
 
   // The panel's width: a preference of this browser's, within the bounds
-  // the desktop gives its right sidebar.
+  // the desktop gives its right sidebar, which is a wider panel than the
+  // left one -- 340px at its narrowest (RIGHT_SIDEBAR_MIN_WIDTH), because
+  // its rows carry two lines. A browser window has less to spare than a
+  // desktop one, so the floor is lower and the default is the desktop's
+  // own minimum.
   const STORE = 'thinkterm.agents-width';
-  const MIN = 200;
-  const MAX = 360;
-  const DEFAULT = 260;
+  const MIN = 240;
+  const MAX = 520;
+  const DEFAULT = 300;
   let width = DEFAULT;
 
   function setWidth(px: number): number {
     const w = Math.round(Math.min(MAX, Math.max(MIN, px)));
     document.documentElement.style.setProperty('--agents-w', `${w}px`);
+    handle.client?.resize();
     return w;
   }
 
@@ -62,49 +73,44 @@
 
   let dragging = false;
   /** The canvas whose box is held still for the drag, so it resizes once. */
-  let frozen: HTMLCanvasElement | null = null;
 
   function onPointerDown(ev: PointerEvent) {
     const target = ev.target;
     if (!(target instanceof HTMLElement) || !target.classList.contains('handle')) return;
     ev.preventDefault();
     dragging = true;
+    handle.client?.panel_drag(true);
     try {
       target.setPointerCapture(ev.pointerId);
     } catch {
       // Without capture the drag still follows the pointer over the panel.
     }
-    // As the sidebar's edge does: the terminal is resized from the canvas's
-    // box, so a drag that moved it would resize the whole grid on every
-    // frame. Its size is pinned for the drag, and the one real resize
-    // happens on release.
-    const canvas = document.getElementById('term');
-    if (canvas instanceof HTMLCanvasElement) {
-      const box = canvas.getBoundingClientRect();
-      canvas.style.width = `${box.width}px`;
-      canvas.style.height = `${box.height}px`;
-      frozen = canvas;
-    }
+    // The canvas follows the panel's edge as it moves: the grid is
+    // resized live, as the desktop's is.
   }
 
   // The panel is against the right edge, so its width is what is left of the
   // window to the right of the pointer.
   function onPointerMove(ev: PointerEvent) {
-    if (dragging) width = setWidth(window.innerWidth - ev.clientX);
+    if (!dragging) return;
+    // A release the page never saw (over another window, say) ends the
+    // drag on the next move with no button down.
+    if (ev.buttons === 0) {
+      onPointerUp();
+      return;
+    }
+    width = setWidth(window.innerWidth - ev.clientX);
+    handle.client?.resize();
   }
 
   function onPointerUp() {
     if (!dragging) return;
     dragging = false;
+    handle.client?.panel_drag(false);
     try {
       localStorage.setItem(STORE, String(width));
     } catch {
       // As above: the width is then this page load's only.
-    }
-    if (frozen) {
-      frozen.style.width = '';
-      frozen.style.height = '';
-      frozen = null;
     }
   }
 </script>
@@ -121,10 +127,27 @@
   onpointermove={onPointerMove}
   onpointerup={onPointerUp}
   onpointercancel={onPointerUp}
+  onlostpointercapture={onPointerUp}
 >
   <div class="handle"></div>
   <div class="hd">
     <span class="ti">{s('web-agents-title')}</span>
+    <!-- The desktop's selector: four segments, the active one a filled pill
+         carrying its label, the rest icon-only. -->
+    <div class="modes" role="tablist">
+      {#each tabs as tab (tab.id)}
+        <span
+          class="mode"
+          class:on={tab.id === active}
+          class:off={!tab.available}
+          role="tab"
+          aria-selected={tab.id === active}
+          aria-disabled={!tab.available}
+          data-mode={tab.id}
+          title={tab.tip}
+        >{@html iconByName(tab.icon) ?? ''}{#if tab.id === active}<span class="ml">{tab.label}</span>{/if}</span>
+      {/each}
+    </div>
     <span class="sum">{summary}</span>
   </div>
   <div class="list">

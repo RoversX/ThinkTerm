@@ -30,7 +30,7 @@ async function browserWs() { for (let i = 0; i < 50; i++) { try { return await n
   const until = async (what, fn, ms = 12000) => { const t = Date.now(); while (Date.now() - t < ms) { const v = await fn(); if (v) return v; await sleep(120); } throw new Error("timeout waiting for " + what + ": settings=" + JSON.stringify(await settings()) + " layout=" + JSON.stringify(await layout())); };
   const click = (sel) => ev(`(() => { const el = document.querySelector(${JSON.stringify(sel)}); if (!el) return false; el.click(); return true; })()`);
   const fail = (what) => { throw new Error(what); };
-  const attached = async () => /this browser has|mirroring|following/.test(await ev("document.getElementById('status').dataset.summary || ''"));
+  const attached = async () => /this browser has/.test(await ev("document.getElementById('status').dataset.summary || ''"));
   const fontPt = async () => (await layout()).font_pt;
   // The number field commits on change, as it does when the pointer leaves it.
   const setSize = (pt) => ev(`(() => { const n = document.querySelector('#settings .num'); if (!n || n.disabled) return false;
@@ -65,7 +65,22 @@ async function browserWs() { for (let i = 0; i < 50; i++) { try { return await n
   await until("the light theme", () => ev("document.documentElement.dataset.theme === 'light'"));
   out.theme = "ok";
 
-  // --- (d) what was chosen survives a reload.
+  // --- (d) the server's colour scheme arrives on its own, and a scheme
+  // picked here overrides it. The cleared ground is behind WebGPU, so the
+  // canvas publishes it as data-bg instead.
+  const bg = () => ev("document.getElementById('term').dataset.bg || ''");
+  await until("the server's scheme", async () => (await bg()) === "#1d2021");
+  out.server_scheme = "ok";
+  await click("#settings [data-section=appearance]");
+  if (!(await click("#settings [data-setting=terminal-scheme]"))) fail("no colour scheme row");
+  await until("the scheme picker", () => ev("!!document.getElementById('schemes')"));
+  if (!(await ev("(() => { const q = document.querySelector('#schemes .q'); if (!q) return false; q.value = 'Dracula'; q.dispatchEvent(new Event('input', { bubbles: true })); return true; })()"))) fail("no scheme search field");
+  await until("Dracula in the list", () => ev("!!document.querySelector('#schemes .pe[data-scheme=\"Dracula\"]')"), 20000);
+  if (!(await click('#schemes .pe[data-scheme="Dracula"]'))) fail("Dracula did not click");
+  await until("the terminal in Dracula", async () => (await bg()) === "#1e1f29");
+  out.scheme = await ev("(document.querySelector('#settings [data-setting=terminal-scheme]') || {}).dataset?.scheme");
+
+  // --- (e) what was chosen survives a reload.
   await click("#settings [data-section=appearance]");
   if (!(await click("#settings input[data-font=pinned]"))) fail("no fixed-size choice");
   if (!(await setSize(14))) fail("the size field is not there or still disabled");
@@ -81,6 +96,7 @@ async function browserWs() { for (let i = 0; i < 50; i++) { try { return await n
   await until("attach again", attached, 20000);
   await until("the stored theme", () => ev("document.documentElement.dataset.theme === 'light'"));
   await until("the stored size", async () => (await fontPt()) === 14);
+  await until("the stored scheme", async () => (await bg()) === "#1e1f29");
   if (await ev("!!document.getElementById('settings')")) fail("the panel came back up on its own");
   out.stored = await settings();
   out.persist = "ok";

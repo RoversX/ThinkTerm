@@ -52,7 +52,7 @@ const sh = (cmd) => execSync(cmd, { encoding: "utf8" });
   const out = {};
 
   await send("Page.navigate", { url }, s);
-  await until("attach", async () => /this browser has|mirroring|following/.test(await ev("document.getElementById('status').dataset.summary || ''")), 20000);
+  await until("attach", async () => /this browser has/.test(await ev("document.getElementById('status').dataset.summary || ''")), 20000);
   await sleep(900);
 
   // --- (a) the pane's menu, from a right-click in the terminal itself.

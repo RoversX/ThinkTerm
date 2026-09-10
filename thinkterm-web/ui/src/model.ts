@@ -45,7 +45,7 @@ export type NavsView = NavView[];
 export type Strings = Record<string, string>;
 
 export type Toast = { text: string; sticky: boolean; at: number };
-export type Card = { title: string; hint: string };
+export type Card = { title: string; hint: string; state: 'busy' | 'free' | 'taking' | 'refused'; action: string };
 export type StatusView = { toast: Toast | null; card: Card | null; summary: string };
 
 // The sidebar (thinkterm-web/src/tree.rs `Row`, `ThreadRow`; sidebar.rs
@@ -90,8 +90,35 @@ export type Editing =
   | { kind: 'project'; id: string }
   | { kind: 'space'; id: string };
 
-/** `space` is the Space on show, for the page to remember. */
-export type SidebarView = { rows: SideRow[]; editing: Editing; space: string | null };
+/** `space` is the Space on show, for the page to remember;
+    `new_project_error` is why the last path typed into Add workspace was
+    refused, shown beside the field. */
+/** What a hover over the window's left edge does with the panel put away
+    (thinkterm-web/src/sidebar.rs `REVEAL`). Lengths are CSS pixels. */
+export type Reveal = { edge: number; dwell_ms: number; retreat_ms: number };
+
+/** One action in the panel's footer (`sidebar.rs` `FooterAction`); `label`
+    is drawn beside the icon while the panel is wide enough for it. */
+export type FooterAction = {
+  id: string;
+  icon: string;
+  label: string | null;
+  tip: string;
+  enabled: boolean;
+  /** Right-aligned, as the desktop keeps everything but the gear. */
+  trailing: boolean;
+};
+
+export type SidebarView = {
+  rows: SideRow[];
+  editing: Editing;
+  space: string | null;
+  new_project_error: string | null;
+  reveal: Reveal;
+  footer: FooterAction[];
+  /** Below this the footer shows the gear without its label. */
+  footer_label_min_width: number;
+};
 
 // The context menus (thinkterm-web/src/menu.rs `MenuItem`, `Kind`; views.rs
 // `MenuOutcome`): what a menu offers, and what running a row came to.
@@ -164,7 +191,17 @@ export type AgentRow = {
 };
 
 /** `summary` is the line above the rows; "No agents detected" when empty. */
-export type AgentsView = { rows: AgentRow[]; summary: string };
+/** One tab of the right panel's selector (`agents.rs` `PanelTab`): which
+    exist, and which this browser can open. */
+export type PanelTab = {
+  id: string;
+  icon: string;
+  label: string;
+  available: boolean;
+  tip: string;
+};
+
+export type AgentsView = { rows: AgentRow[]; summary: string; tabs: PanelTab[]; active: string };
 
 // The page's own preferences (thinkterm-web/src/settings.rs `WebSettings`),
 // whose JSON names are kebab-case.
@@ -182,6 +219,23 @@ export type WebSettings = {
   'agents-panel': boolean;
   'palette-hotkey': Hotkey;
   'sidebar-width': number;
+  /** `"desktop"` follows the server's configuration; else a scheme's name. */
+  'terminal-scheme': string;
+};
+
+/** One entry of `schemes.json`, built by `thinkterm cli color-schemes
+    --json`. Every colour is a `#rrggbb` string. */
+export type Scheme = {
+  name: string;
+  foreground: string;
+  background: string;
+  cursor_bg: string;
+  cursor_fg: string;
+  cursor_border: string;
+  selection_bg: string;
+  selection_fg: string;
+  ansi: string[];
+  brights: string[];
 };
 
 /** One row of `client.languages()`. */

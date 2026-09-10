@@ -1,8 +1,8 @@
 #!/bin/sh
 # The settings panel, end to end: a release server with an empty tree under
 # a throwaway HOME, the release bundle, headless Chrome, pinning the font,
-# following the desktop again, the light theme, and a reload that keeps
-# what was chosen.
+# following the desktop again, the light theme, the server's colour scheme
+# and a browser's own, and a reload that keeps what was chosen.
 #
 #   NODE_PATH=<dir with node_modules/ws> thinkterm-web/smoke/settings.sh [out.png]
 #
@@ -17,7 +17,9 @@ if lsof -nP -t -i :$PORT >/dev/null 2>&1; then echo "port $PORT busy" >&2; exit 
 REAL_HOME=$HOME
 T=$(mktemp -d "${TMPDIR:-/tmp}/tt-settings.XXXXXX")
 cat > "$T/web.lua" <<LUA
-return { web_servers = { { bind_address = "127.0.0.1:$PORT" } } }
+-- The scheme is the server's; the page must draw in it on attach, before
+-- anyone picks anything.
+return { color_scheme = "Gruvbox dark, hard (base16)", web_servers = { { bind_address = "127.0.0.1:$PORT" } } }
 LUA
 export HOME="$T/home"; mkdir -p "$HOME"
 export THINKTERM_NO_PRIVACY_DISCLAIM=1

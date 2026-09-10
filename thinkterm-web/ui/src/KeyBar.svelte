@@ -45,6 +45,9 @@
   /** Where the bar sits: the foot of the *visual* viewport, which is what
       the soft keyboard takes a bite out of. */
   let top = $state(0);
+  /** The bar itself, so what it measures -- KEYBAR plus whatever the home
+      indicator's safe area adds under it -- is what the page leaves room for. */
+  let bar = $state<HTMLDivElement | null>(null);
 
   function disarm() {
     ctrl = false;
@@ -157,11 +160,16 @@
     const vv = window.visualViewport;
     const read = () => {
       const height = vv ? vv.height : window.innerHeight;
-      top = (vv ? vv.offsetTop : 0) + height - KEYBAR;
+      const mine = bar?.offsetHeight || KEYBAR;
+      top = (vv ? vv.offsetTop : 0) + height - mine;
+      document.documentElement.style.setProperty('--keybar', `${mine}px`);
       document.documentElement.style.setProperty('--vvh', `${height}px`);
     };
     document.documentElement.style.setProperty('--keybar', `${KEYBAR}px`);
     read();
+    // The first read runs before the bar has been laid out with its safe
+    // area, so its real height is taken on the next frame.
+    requestAnimationFrame(read);
     vv?.addEventListener('resize', read);
     vv?.addEventListener('scroll', read);
     window.addEventListener('resize', read);
@@ -180,7 +188,7 @@
 <!-- The keys are the bar's, delegated, as the tab row's and the sidebar's
      are; a release anywhere ends a repeat. -->
 <svelte:window onpointerup={stopRepeat} onpointercancel={stopRepeat} />
-<div id="keybar" role="toolbar" aria-label="Terminal keys" tabindex="-1" style="top:{top.toFixed(2)}px" onpointerdown={onDown}>
+<div bind:this={bar} id="keybar" role="toolbar" aria-label="Terminal keys" tabindex="-1" style="top:{top.toFixed(2)}px" onpointerdown={onDown}>
   {#each HEAD as k (k.name)}
     <button class="k" type="button" data-key={k.name} aria-label={k.label}>{k.label}</button>
   {/each}

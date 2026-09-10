@@ -38,7 +38,7 @@ async function browserWs() { for (let i = 0; i < 50; i++) { try { return await n
   const out = {};
 
   await send("Page.navigate", { url }, s);
-  await until("attach", async () => /this browser has|mirroring|following/.test(await ev("document.getElementById('status').dataset.summary || ''")), 20000);
+  await until("attach", async () => /this browser has/.test(await ev("document.getElementById('status').dataset.summary || ''")), 20000);
   await sleep(800);
 
   // --- (a) the field being typed into survives the panel's re-listings.
@@ -93,8 +93,8 @@ async function browserWs() { for (let i = 0; i < 50; i++) { try { return await n
   out.side_w = await ev("getComputedStyle(document.documentElement).getPropertyValue('--side-w').trim()");
   out.stored = await ev("localStorage.getItem('thinkterm.sidebar')");
   if (midWidth !== "180px") fail("the panel did not follow the pointer: " + midWidth);
-  if (out.resizes_during_drag !== 0) fail("the terminal was resized " + out.resizes_during_drag + " times during the drag");
-  if (out.resizes_after_release !== 1) fail("the release should resize the terminal exactly once, not " + out.resizes_after_release);
+  if (out.resizes_during_drag < 1) fail("the terminal did not follow the drag");
+  if (out.resizes_after_release > 1) fail("the release resized the terminal " + out.resizes_after_release + " times");
   if (out.side_w !== "180px") fail("the width ended at " + out.side_w);
   if (out.stored !== "180") fail("the width stored is " + JSON.stringify(out.stored));
   out.drag = "ok";

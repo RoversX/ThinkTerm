@@ -29,7 +29,7 @@ async function browserWs() { for (let i = 0; i < 50; i++) { try { return await n
   const click = (sel) => ev(`(() => { const el = document.querySelector(${JSON.stringify(sel)}); if (!el) return false; el.click(); return true; })()`);
   const mouse = (type, x, y, extra = {}) => send("Input.dispatchMouseEvent", { type, x, y, button: "left", clickCount: 1, ...extra }, s);
   const fail = (what) => { throw new Error(what); };
-  const attached = async () => /this browser has|mirroring|following/.test(await ev("document.getElementById('status').dataset.summary || ''"));
+  const attached = async () => /this browser has/.test(await ev("document.getElementById('status').dataset.summary || ''"));
   const canvasWidth = () => ev("document.querySelector('canvas#term').getBoundingClientRect().width");
   const agentsW = () => ev("getComputedStyle(document.documentElement).getPropertyValue('--agents-w').trim()");
   // The switch lives in the settings panel; the gear opens it, and the
@@ -58,12 +58,12 @@ async function browserWs() { for (let i = 0; i < 50; i++) { try { return await n
   if (!(await ev("document.body.hasAttribute('data-agents')"))) fail("the body carries no data-agents mark");
   if (!(await ev("document.querySelector('#tabs [data-action=agents]').classList.contains('on')"))) fail("the tab row's button does not show the panel is on");
   out.width = await agentsW();
-  if (out.width !== "260px") fail("the panel did not open at its default width: " + out.width);
+  if (out.width !== "300px") fail("the panel did not open at its default width: " + out.width);
   out.summary = await ev("document.querySelector('#agents .hd .sum').textContent");
   if (out.summary !== "No agents detected") fail("the header does not carry the wasm's summary: " + JSON.stringify(out.summary));
   out.title = await ev("document.querySelector('#agents .hd .ti').textContent");
   if (out.title !== "Agents") fail("the header is not titled: " + JSON.stringify(out.title));
-  await until("the terminal to give up the room", async () => Math.abs(wide - (await canvasWidth()) - 260) < 1);
+  await until("the terminal to give up the room", async () => Math.abs(wide - (await canvasWidth()) - 300) < 1);
   out.canvas_with = await canvasWidth();
   out.panel = "ok";
 
@@ -76,9 +76,12 @@ async function browserWs() { for (let i = 0; i < 50; i++) { try { return await n
     const el = document.elementFromPoint(x, 400);
     return { x, on: el ? (el.className || el.id || el.tagName) : null }; })()`);
   if (grab.on !== "handle") fail(`${grab.x},400 is not the handle but ` + JSON.stringify(grab.on));
-  // 40 px further left is 40 px more panel; the pointer's distance from the
+  // 60 px further left is 60 px more panel; the pointer's distance from the
   // right edge is the width, so this is where it has to end up.
-  const target = (await ev("window.innerWidth")) - 300;
+  const target = (await ev("window.innerWidth")) - 360;
+  // The backing store follows the panel's opening by a frame or two; let
+  // that settle, or the opening resize is counted against the drag.
+  await sleep(600);
   // Every change of the canvas's backing store, which is what one terminal
   // resize costs; the count is read before the release and after it.
   await ev(`(() => { const c = document.querySelector('canvas#term'); window.__resizes = 0; window.__last = c.width;
@@ -95,11 +98,11 @@ async function browserWs() { for (let i = 0; i < 50; i++) { try { return await n
   out.resizes_after_release = (await ev("window.__resizes")) - out.resizes_during_drag;
   out.agents_w = await agentsW();
   out.stored = await ev("localStorage.getItem('thinkterm.agents-width')");
-  if (midWidth !== "300px") fail("the panel did not follow the pointer: " + midWidth);
-  if (out.resizes_during_drag !== 0) fail("the terminal was resized " + out.resizes_during_drag + " times during the drag");
-  if (out.resizes_after_release !== 1) fail("the release should resize the terminal exactly once, not " + out.resizes_after_release);
-  if (out.agents_w !== "300px") fail("the width ended at " + out.agents_w);
-  if (out.stored !== "300") fail("the width stored is " + JSON.stringify(out.stored));
+  if (midWidth !== "360px") fail("the panel did not follow the pointer: " + midWidth);
+  if (out.resizes_during_drag < 1) fail("the terminal did not follow the drag");
+  if (out.resizes_after_release > 1) fail("the release resized the terminal " + out.resizes_after_release + " times");
+  if (out.agents_w !== "360px") fail("the width ended at " + out.agents_w);
+  if (out.stored !== "360") fail("the width stored is " + JSON.stringify(out.stored));
   out.drag = "ok";
 
   const shot = await send("Page.captureScreenshot", { format: "png" }, s); fs.writeFileSync(outPng, Buffer.from(shot.data, "base64"));
@@ -115,7 +118,7 @@ async function browserWs() { for (let i = 0; i < 50; i++) { try { return await n
   // --- (d) the tab row's button is the same switch.
   if (!(await click("#tabs [data-action=agents]"))) fail("no agents button in the tab row");
   await until("the panel again", () => ev("!!document.getElementById('agents')"));
-  if ((await agentsW()) !== "300px") fail("the panel did not come back at the width it was dragged to");
+  if ((await agentsW()) !== "360px") fail("the panel did not come back at the width it was dragged to");
   if (!(await ev("JSON.parse(window.thinkterm.client.settings())['agents-panel']")))
     fail("the button did not put the preference on");
   await click("#tabs [data-action=agents]");

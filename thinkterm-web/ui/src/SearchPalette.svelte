@@ -5,6 +5,8 @@
   // arrows, and closed by anything that means the page moved on.
   import { iconByName } from './icons';
   import { closePalette, move, palette, run, search, select, selectedId, shownSections } from './palette.svelte';
+  import { POP, ms } from './motion';
+  import { fade, scale } from 'svelte/transition';
 
   const sections = $derived(shownSections());
   const current = $derived(selectedId());
@@ -52,8 +54,13 @@
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 {#if palette.open}
-  <div id="palette-back" onpointerdown={closePalette}></div>
-  <div id="palette" role="dialog" aria-modal="true">
+  <div id="palette-back" onpointerdown={closePalette} transition:fade={{ duration: ms(POP) }}></div>
+  <div
+    id="palette"
+    role="dialog"
+    aria-modal="true"
+    transition:scale={{ duration: ms(POP), start: 0.97, opacity: 0 }}
+  >
     <input
       class="q"
       value={palette.query}

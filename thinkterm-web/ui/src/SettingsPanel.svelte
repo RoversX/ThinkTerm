@@ -5,8 +5,22 @@
   // whatever it concerns.
   import { s, views } from './client.svelte';
   import { bot, info, minus, palette, panelLeft, plus, rotateCcw, search, slidersHorizontal, x } from './icons';
-  import { applyTheme, closeSettings, panel, setSetting } from './settings.svelte';
-  import type { Hotkey, Theme } from './model';
+  import { applyTheme, closeSettings, FOLLOW_DESKTOP, loadSchemes, panel, pickScheme, previewScheme, schemes, setSetting, storedScheme } from './settings.svelte';
+  import type { Hotkey, Scheme, Theme } from './model';
+  import { POP, WINDOW, ms } from './motion';
+  import { fade, scale } from 'svelte/transition';
+  import { cubicOut } from 'svelte/easing';
+
+  /** Fade and an 8px rise: the settings window arriving, and leaving the
+      way it came. */
+  function rise(_node: Element, { duration }: { duration: number }) {
+    return {
+      duration,
+      easing: cubicOut,
+      css: (t: number) =>
+        `opacity: ${t}; transform: var(--settings-tf) translateY(${(1 - t) * 8}px)`,
+    };
+  }
 
   const settings = $derived(views.settings);
 
@@ -128,6 +142,72 @@
     closeSettings();
   }
 
+  // The colour-scheme picker: a searchable list over the panel, with the
+  // terminal drawn in whatever row is under the cursor. Escape restores
+  // what was picked before it opened.
+  let picking = $state(false);
+  let schemeQuery = $state('');
+  let cursor = $state(0);
+  const chosen = $derived(settings['terminal-scheme'] ?? FOLLOW_DESKTOP);
+  const following = $derived(chosen === FOLLOW_DESKTOP);
+  const schemeLabel = $derived(following ? s('web-scheme-desktop') : chosen);
+
+  /** The list: "Follow the desktop" first, then whatever matches. */
+  const matches = $derived.by(() => {
+    const q = schemeQuery.trim().toLowerCase();
+    const rows: (Scheme | null)[] = q === '' || s('web-scheme-desktop').toLowerCase().includes(q) ? [null] : [];
+    for (const scheme of schemes.all) {
+      if (q === '' || scheme.name.toLowerCase().includes(q)) rows.push(scheme);
+    }
+    return rows;
+  });
+
+  function openPicker() {
+    schemeQuery = '';
+    cursor = 0;
+    picking = true;
+    void loadSchemes();
+  }
+
+  /** Put back what was picked before the picker opened: the stored
+      colours when the catalogue has not arrived yet. */
+  function restoreScheme() {
+    picking = false;
+    previewScheme(following ? null : (schemes.all.find((scheme) => scheme.name === chosen) ?? storedScheme()));
+  }
+
+  function commit(row: Scheme | null) {
+    picking = false;
+    pickScheme(row);
+  }
+
+  $effect(() => {
+    if (!picking) return;
+    // Keep the cursor on the list, and show what it is on.
+    const row = matches[Math.min(cursor, matches.length - 1)] ?? null;
+    previewScheme(row);
+  });
+
+  function onPickerKeydown(ev: KeyboardEvent) {
+    ev.stopPropagation();
+    if (ev.key === 'Escape') {
+      ev.preventDefault();
+      restoreScheme();
+    } else if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      const next = cursor + (ev.key === 'ArrowDown' ? 1 : -1);
+      cursor = Math.max(0, Math.min(matches.length - 1, next));
+    } else if (ev.key === 'Enter') {
+      ev.preventDefault();
+      // No row under the cursor is no choice; `null` is a row of its own.
+      if (cursor < matches.length) commit(matches[cursor]);
+    }
+  }
+
+  function focusField(node: HTMLInputElement) {
+    node.focus({ preventScroll: true });
+  }
+
   function focusHere(node: HTMLDivElement) {
     node.focus({ preventScroll: true });
   }
@@ -138,8 +218,18 @@
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 {#if panel.open}
-  <div id="settings-back" onpointerdown={closeSettings}></div>
-  <div id="settings" role="dialog" aria-modal="true" tabindex="-1" onkeydown={onKeydown} use:focusHere>
+  <div id="settings-back" onpointerdown={closeSettings} transition:fade={{ duration: ms(WINDOW) }}></div>
+  <!-- The desktop's window comes up rather than in: a fade and an 8px
+       rise, at the length a window takes rather than a menu's. -->
+  <div
+    id="settings"
+    role="dialog"
+    aria-modal="true"
+    tabindex="-1"
+    onkeydown={onKeydown}
+    use:focusHere
+    transition:rise={{ duration: ms(WINDOW) }}
+  >
     <button class="sc" type="button" title={s('web-settings-close')} onclick={closeSettings}>{@html x}</button>
     <div class="snav">
       <div class="app">ThinkTerm</div>
@@ -180,8 +270,14 @@
         </div>
       {/if}
 
-      {#if shows('appearance', s('web-settings-theme')) || shows('appearance', s('web-settings-font'))}
+      {#if shows('appearance', s('web-settings-theme')) || shows('appearance', s('web-settings-font')) || shows('appearance', s('web-settings-scheme'))}
         <div class="card">
+          {#if shows('appearance', s('web-settings-scheme'))}
+            <div class="srow">
+              <div class="tx"><div class="lab">{s('web-settings-scheme')}</div><div class="desc">{d('web-settings-scheme-description')}</div></div>
+              <button class="pillsel" type="button" data-setting="terminal-scheme" data-scheme={chosen} onclick={openPicker}>{schemeLabel}</button>
+            </div>
+          {/if}
           {#if shows('appearance', s('web-settings-theme'))}
             <div class="srow">
               <div class="tx"><div class="lab">{s('web-settings-theme')}</div><div class="desc">{d('web-settings-theme-description')}</div></div>
@@ -252,4 +348,31 @@
       {#if panel.error !== ''}<div class="err">{panel.error}</div>{/if}
     </div>
   </div>
+  {#if picking}
+    <div id="schemes-back" onpointerdown={restoreScheme} transition:fade={{ duration: ms(POP) }}></div>
+    <div
+      id="schemes"
+      role="dialog"
+      aria-modal="true"
+      tabindex="-1"
+      onkeydown={onPickerKeydown}
+      transition:scale={{ duration: ms(POP), start: 0.97, opacity: 0 }}
+    >
+      <input class="q" placeholder={s('web-scheme-search')} bind:value={schemeQuery} spellcheck="false" oninput={() => (cursor = 0)} use:focusField />
+      <div class="pl">
+        {#each matches as row, i (row ? row.name : '')}
+          <div class="pe" class:on={i === Math.min(cursor, matches.length - 1)} data-scheme={row ? row.name : FOLLOW_DESKTOP}
+               onpointerenter={() => (cursor = i)} onclick={() => commit(row)}>
+            <span class="sw" style:background={row ? row.background : 'transparent'}>
+              {#if row}{#each row.ansi as colour, n (n)}<i style:background={colour}></i>{/each}{/if}
+            </span>
+            <span class="t">{row ? row.name : s('web-scheme-desktop')}</span>
+            {#if (row ? row.name : FOLLOW_DESKTOP) === chosen}<span class="acc">{s('web-scheme-preview')}</span>{/if}
+          </div>
+        {:else}
+          <div class="pn">{schemes.loading ? '…' : schemes.error || s('command-palette-empty')}</div>
+        {/each}
+      </div>
+    </div>
+  {/if}
 {/if}

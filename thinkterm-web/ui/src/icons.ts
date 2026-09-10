@@ -7,6 +7,7 @@ import archiveRestore from '../../../third_party/lucide/icons/archive-restore.sv
 import bell from '../../../third_party/lucide/icons/bell.svg?raw';
 import info from '../../../third_party/lucide/icons/info.svg?raw';
 import minus from '../../../third_party/lucide/icons/minus.svg?raw';
+import notebookTabs from '../../../third_party/lucide/icons/notebook-tabs.svg?raw';
 import palette from '../../../third_party/lucide/icons/palette.svg?raw';
 import bot from '../../../third_party/lucide/icons/bot.svg?raw';
 import check from '../../../third_party/lucide/icons/check.svg?raw';
@@ -15,13 +16,17 @@ import chevronRight from '../../../third_party/lucide/icons/chevron-right.svg?ra
 import circleAlert from '../../../third_party/lucide/icons/circle-alert.svg?raw';
 import circleCheck from '../../../third_party/lucide/icons/circle-check.svg?raw';
 import circlePlus from '../../../third_party/lucide/icons/circle-plus.svg?raw';
+import codeXml from '../../../third_party/lucide/icons/code-xml.svg?raw';
 import clipboardPaste from '../../../third_party/lucide/icons/clipboard-paste.svg?raw';
 import copy from '../../../third_party/lucide/icons/copy.svg?raw';
 import ellipsis from '../../../third_party/lucide/icons/ellipsis.svg?raw';
 import eye from '../../../third_party/lucide/icons/eye.svg?raw';
+import folderTree from '../../../third_party/lucide/icons/folder-tree.svg?raw';
 import folder from '../../../third_party/lucide/icons/folder.svg?raw';
 import folderOpen from '../../../third_party/lucide/icons/folder-open.svg?raw';
 import folderPlus from '../../../third_party/lucide/icons/folder-plus.svg?raw';
+import globe from '../../../third_party/lucide/icons/globe.svg?raw';
+import grid2x2 from '../../../third_party/lucide/icons/grid-2x2.svg?raw';
 import house from '../../../third_party/lucide/icons/house.svg?raw';
 import languages from '../../../third_party/lucide/icons/languages.svg?raw';
 import layers from '../../../third_party/lucide/icons/layers.svg?raw';
@@ -66,11 +71,15 @@ export {
   circleCheck,
   circlePlus,
   clipboardPaste,
+  codeXml,
   copy,
   ellipsis,
   eye,
   folder,
   folderOpen,
+  folderTree,
+  globe,
+  grid2x2,
   folderPlus,
   house,
   info,
@@ -81,6 +90,7 @@ export {
   maximize2,
   minimize2,
   minus,
+  notebookTabs,
   palette,
   panelLeft,
   panelRight,
@@ -124,6 +134,11 @@ const BY_NAME: Record<string, string> = {
   folder,
   'folder-open': folderOpen,
   'folder-plus': folderPlus,
+  'folder-tree': folderTree,
+  'notebook-tabs': notebookTabs,
+  'code-xml': codeXml,
+  globe,
+  'grid-2x2': grid2x2,
   house,
   languages,
   layers,

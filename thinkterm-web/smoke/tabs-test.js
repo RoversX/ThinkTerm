@@ -49,7 +49,7 @@ const sh = (cmd) => execSync(cmd, { encoding: "utf8" });
   const fail = (what) => { throw new Error(what); };
 
   await send("Page.navigate", { url }, s);
-  await until("attach", "/this browser has|mirroring|following/.test((document.getElementById('status').dataset.summary || ''))", 20000);
+  await until("attach", "/this browser has/.test((document.getElementById('status').dataset.summary || ''))", 20000);
 
   // --- tabs: two on the server, click the other, type, follow back
   out.strip_at_start = await until("two tabs", "document.querySelectorAll('#tabs .tab').length === 2 && document.getElementById('tabs').innerText");
@@ -104,8 +104,7 @@ const sh = (cmd) => execSync(cmd, { encoding: "utf8" });
   await click("zoom");
   await until("unzoomed", `${L}.zoomed == null`, 8000);
   const closeBtn = "document.querySelector('.nav.focused .cap.current .x')";
-  await ev(`${closeBtn}.click(); 1`);
-  if ((await ev(`${closeBtn}.textContent`)) !== "close?") fail("close did not ask");
+  // One press closes, as the desktop's × does.
   await ev(`${closeBtn}.click(); 1`);
   await until("one pane", `(${L}.panes || []).length === 1`, 8000);
   if (list().some((p) => p.pane_id === a.id)) fail("the pane was not closed");

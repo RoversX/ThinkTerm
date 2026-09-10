@@ -5,7 +5,7 @@ import { handle } from './client';
 import { attach, setBoot } from './client.svelte';
 import { watchMobile } from './mobile.svelte';
 import { storedPicks, watchHotkey } from './palette.svelte';
-import { applyTheme, storedSettings, storedSpace } from './settings.svelte';
+import { applyTheme, previewScheme, storedScheme, storedSettings, storedSpace } from './settings.svelte';
 import type { Theme } from './model';
 import './tokens.css';
 
@@ -126,6 +126,9 @@ try {
     // console, not a failed boot -- the defaults are perfectly usable.
     const refused = handle.client.apply_settings(JSON.stringify(settings));
     if (refused !== "") console.warn("stored settings: " + refused);
+    // The picked scheme's colours were stored with its name, so the first
+    // frame is already in it and nothing waits on schemes.json.
+    if (settings["terminal-scheme"] && settings["terminal-scheme"] !== "desktop") previewScheme(storedScheme());
     attach(handle.client);
     // Which locale the preference came to, for the settings panel to name.
     document.documentElement.lang = handle.client.set_locale(locale, languages);

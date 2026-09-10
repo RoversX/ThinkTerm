@@ -10,6 +10,12 @@
   --ui: -apple-system, "SF Pro Text", "Helvetica Neue", Roboto, system-ui, sans-serif;
   --tabs: 40px; --side-w: 220px; --side-px: 220px; --agents-w: 0px; --keybar: 0px;
   --done: #7CE5A2; --open: #61B8FF; --warn: #DB7320;
+  /* Measured off the desktop's own frames: its round buttons and pills
+     (#262628), its selected row (#3E3E41), its settings card (#1D1D1F). */
+  --btn: #262628; --btn-hover: #313134; --btn-border: rgba(118,118,128,.35);
+  --row-hover: #232326; --row-sel: #3E3E41;
+  --card: #1D1D1F; --card-border: rgba(118,118,128,.22); --card-line: rgba(118,118,128,.24); --dot: rgba(242,242,247,.16);
+  --fade: background-color .12s ease, border-color .12s ease, color .12s ease, box-shadow .12s ease;
 }
 body[data-side=off] { --side-w: 0px; }
 /* The right panel's width lives on the root, as the sidebar's does; without
@@ -22,6 +28,10 @@ body:not([data-agents]) { --agents-w: 0px; }
   --text: #1C1C1E; --text2: #48484A; --muted: #8E8E93; --accent: #007AFF; --danger: #D7263D;
   --wash: rgba(28,28,30,.025); --ring: rgba(28,28,30,.12); --edge: rgba(28,28,30,.38); --shadow: 0 .5px 0 1px rgba(0,0,0,.04);
   --warn: #C05F14;
+  --btn: rgba(255,255,255,.86); --btn-hover: #FFFFFF; --btn-border: rgba(60,60,67,.24);
+  --row-hover: rgba(28,28,30,.06); --row-sel: rgba(255,255,255,.94);
+  --card: rgba(255,255,255,.72); --card-border: rgba(60,60,67,.16); --card-line: rgba(60,60,67,.14);
+  --dot: rgba(28,28,30,.22);
 }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text2); font: 500 14px var(--ui); overflow: hidden; }
 /* The page is mounted into #app; it generates no box of its own, so the
@@ -32,7 +42,7 @@ svg { width: 16px; height: 16px; flex: none; }
 /* The window's tab row. Capsules never shrink; the row scrolls. */
 #tabs { position: absolute; left: var(--side-w); right: var(--agents-w); top: 0; height: var(--tabs); box-sizing: border-box; display: flex; align-items: center; gap: 9px; padding: 2px 8px 0 8px; background: var(--bg); overflow-x: auto; overflow-y: hidden; white-space: nowrap; user-select: none; scrollbar-width: none; }
 #tabs::-webkit-scrollbar { display: none; }
-#tabs .tab { display: inline-flex; align-items: center; flex: 0 0 auto; width: 160px; height: 30px; box-sizing: border-box; padding: 0 9px; border-radius: 999px; border: 1px solid transparent; color: var(--text2); cursor: default; }
+#tabs .tab { display: inline-flex; align-items: center; flex: 0 0 auto; width: 128px; height: 30px; box-sizing: border-box; padding: 0 9px; border-radius: 999px; border: 1px solid transparent; color: var(--text2); cursor: default; transition: var(--fade); }
 #tabs .tab:hover { background: var(--ctl-hover); }
 #tabs .tab.current { background: var(--ctl); border-color: var(--ctl-border); box-shadow: var(--shadow); color: var(--text); }
 .t { margin-left: 4px; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -40,11 +50,10 @@ svg { width: 16px; height: 16px; flex: none; }
 .current .x, .tab:hover .x, .cap:hover .x { display: inline-flex; }
 .x:hover { background: var(--ring); opacity: 1; }
 .x.danger { width: auto; padding: 0 6px; font-size: 11px; color: var(--danger); opacity: 1; }
-.act { width: 30px; height: 30px; flex: none; border-radius: 999px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid transparent; box-sizing: border-box; color: var(--text2); }
+.act { width: 30px; height: 30px; flex: none; border-radius: 999px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid transparent; box-sizing: border-box; color: var(--text2); transition: var(--fade); }
 .act:hover { background: var(--ctl-hover); border-color: var(--edge); color: var(--text); }
 #tabs .act.on { color: var(--accent); }
 #tabs .trail { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; flex: none; }
-#tabs .hint { color: var(--muted); font-size: 12px; padding: 0 6px; }
 #tabs .follow { color: var(--muted); font-size: 12px; padding: 0 8px; height: 24px; line-height: 24px; border-radius: 999px; cursor: default; }
 #tabs .follow.on { color: var(--accent); }
 #tabs .follow:hover { background: var(--ctl-hover); }
@@ -54,89 +63,179 @@ svg { width: 16px; height: 16px; flex: none; }
 canvas#term { will-change: transform; }
 /* One bar over each pane, laid out from the canvas's cells. */
 #panes { position: absolute; inset: var(--tabs) var(--agents-w) 0 var(--side-w); pointer-events: none; overflow: hidden; }
-/* The desktop's left sidebar: Spaces, Projects, Threads. */
-#side { position: absolute; left: 0; top: 0; bottom: 0; width: var(--side-w); box-sizing: border-box; background: var(--side-bg); border-right: 1px solid var(--sep); font: 500 15px var(--ui); color: var(--text2); user-select: none; overflow: hidden; }
-body[data-side=off] #side:not(.revealed) { display: none; }
-/* Hovering the window's left edge, or the toggle, while the panel is put
-   away: it comes back over the canvas rather than beside it, so nothing is
-   resized -- `--side-w` stays 0 and the width comes from `--side-px`. */
-#side.revealed { top: var(--tabs); width: var(--side-px); z-index: 15; box-shadow: 0 8px 28px rgba(0,0,0,.42); }
-#side .list { position: absolute; inset: 26px 5px 44px 5px; overflow-y: auto; scrollbar-width: thin; display: flex; flex-direction: column; gap: 5px; padding-bottom: 8px; }
-/* The footer, as the desktop's sidebar ends: Settings as a row on the left,
-   the thread search as a button on the right. */
-/* The footer as the desktop ends its sidebar: a row of icons, the gear
-   at the left inset and the thread search at the right, no rule above. */
-#side .foot { position: absolute; left: 12px; right: 12px; bottom: 0; height: 44px; display: flex; align-items: center; justify-content: space-between; }
+/* The desktop's left sidebar: Spaces, Projects, Threads. Every row's box
+   spans the panel's 10px insets, so a trailing control's centre lands 25px
+   from the right edge, round button or hover action alike. */
+#side { position: absolute; left: 0; top: 0; bottom: 0; width: var(--side-w); box-sizing: border-box; background: var(--side-bg); border-right: 1px solid var(--sep); font: 400 15px var(--ui); color: var(--text2); user-select: none; overflow: hidden; }
+/* Put away, the panel waits off the left edge rather than leaving the tree:
+   the reveal is then a 150ms slide in and a 150ms slide back, which
+   `display: none` could not animate. */
+body[data-side=off]:not([data-mobile]) #side {
+  top: 0; width: var(--side-px); z-index: 17; box-shadow: 0 8px 28px rgba(0,0,0,.42);
+  transform: translateX(-101%); visibility: hidden; pointer-events: none; will-change: transform;
+  transition: transform .15s cubic-bezier(.4,0,1,1), visibility 0s linear .15s;
+}
+body[data-side=off]:not([data-mobile]) #side.revealed {
+  transform: translateX(0); visibility: visible; pointer-events: auto;
+  transition: transform .15s cubic-bezier(0,0,.2,1), visibility 0s;
+}
+@media (prefers-reduced-motion: reduce) {
+  body[data-side=off]:not([data-mobile]) #side { transition: none; }
+}
+#side .list { position: absolute; inset: 26px 10px 44px 10px; overflow-y: auto; scrollbar-width: thin; display: flex; flex-direction: column; gap: 5px; padding-bottom: 8px; }
+/* The footer as the desktop ends its sidebar: a row of icons, the gear at
+   the left inset and the thread search at the right, no rule above. */
+#side .foot { position: absolute; left: 13px; right: 13px; bottom: 0; height: 58px; display: flex; align-items: center; justify-content: space-between; }
 #side .foot .act { width: 28px; height: 28px; color: var(--text2); border-radius: 8px; }
-#side .foot .act svg { width: 15px; height: 15px; }
-#side .foot .act:hover { color: var(--text); background: rgba(42,42,44,.98); }
+/* The gear carries its label, as the desktop's footer does; the row is the
+   label's own width, and the search stays at the right inset. */
+#side .foot .act.lbl { width: auto; min-width: 28px; max-width: calc(100% - 34px); padding: 0 7px; gap: 6px; justify-content: flex-start; font-size: 14px; }
+#side .foot .act.lbl .tl { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Under the width the model says the label needs, the gear is a lone
+   button again -- `.narrow` is set from that number, not from a media
+   query with a number of its own. */
+#side.narrow .foot .act.lbl .tl { display: none; }
+#side .foot .act svg { width: 16px; height: 16px; }
+#side .foot .acts { display: inline-flex; align-items: center; gap: 3px; }
+#side .foot .act:hover { color: var(--text); background: var(--row-hover); }
+/* Nothing behind them yet: shown, as the desktop shows them, and inert. */
+#side .foot .act.off { color: var(--muted); opacity: .5; }
+#side .foot .act.off:hover { background: transparent; color: var(--muted); }
+/* The tab row's toggle stays above the revealed panel: a quick press pins
+   the panel open without the reveal getting in the way. */
+#tabs [data-action=sidebar] { position: relative; z-index: 18; }
+/* Pinned open, the panel carries the toggle itself at its top-left, as the
+   desktop's titlebar does; the tab row's copy shows only while it is away. */
+body:not([data-side=off]):not([data-mobile]) #tabs [data-action=sidebar] { display: none; }
+#side .bar { display: none; position: absolute; left: 10px; top: 5px; height: 30px; align-items: center; }
+body:not([data-side=off]):not([data-mobile]) #side .bar { display: flex; }
+body:not([data-side=off]):not([data-mobile]) #side .list { top: var(--tabs); }
+#side .bar .act { width: 30px; height: 30px; border-radius: 8px; color: var(--text2); }
+#side .bar .act:hover { background: var(--ctl-hover); color: var(--text); }
+body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 #side .handle { position: absolute; right: -2px; top: 0; bottom: 0; width: 4px; cursor: col-resize; z-index: 1; }
-#side .row { display: flex; align-items: center; min-height: 33px; box-sizing: border-box; padding: 0 5px; border-radius: 10px; border: 1px solid transparent; flex: none; }
-#side .row.thread { padding-left: 25px; }
-#side .row .t { margin-left: 5px; color: var(--text); }
+/* 34px rows on a 4px pitch, 10px corners: the desktop's selected thread
+   measures 68 device px tall with a 20 px corner at 2x. */
+#side .row { display: flex; align-items: center; min-height: 33px; box-sizing: border-box; padding: 0 0 0 5px; border-radius: 10px; border: 1px solid transparent; flex: none; transition: var(--fade); }
+#side .row.thread { margin-left: 15px; }
+/* WORKSPACE_SECTION_LABEL_GAP (12 design px) above a section label that
+   follows rows, and WORKSPACE_GROUP_EXTRA_GAP (8) between folders. */
+#side .row + .hdr { margin-top: 6px; }
+#side .row.project { margin-top: 4px; }
+#side .hdr + .row.project, #side .list > .row.project:first-child { margin-top: 0; }
+#side .row.project { padding-left: 2px; }
+#side .row .t { margin-left: 6px; color: var(--text); }
 #side .row.project .t, #side .row.space .t { color: var(--text2); }
-#side .row:hover { background: rgba(42,42,44,.98); }
-#side .row.selected { background: rgba(62,62,65,.98); border-color: rgba(118,118,128,.22); box-shadow: var(--shadow); }
+/* The Space row is the pill's height plus 6 design px, not a list row. */
+#side .row.space { min-height: 32px; cursor: default; }
+#side .row.space .act { width: 29px; height: 29px; margin-left: auto; color: var(--text2); }
+#side .row:hover { background: var(--row-hover); }
+#side .row.selected { background: var(--row-sel); border-color: rgba(118,118,128,.22); box-shadow: var(--shadow); }
+#side .row.selected .t { color: var(--text); }
 #side .row.archived { opacity: .55; }
-#side .chev { display: inline-flex; width: 16px; margin-right: 2px; color: var(--muted); }
+#side .chev { display: inline-flex; align-items: center; justify-content: center; width: 13px; flex: none; color: var(--muted); }
+#side .chev svg { width: 12px; height: 12px; }
 #side .hov { display: none; margin-left: auto; gap: 2px; }
 #side .row:hover .hov { display: inline-flex; }
-#side .act { width: 24px; height: 24px; }
-#side .act svg { width: 13px; height: 13px; }
-/* The desktop's round buttons: the bell, the new project, a project's plus. */
-#side .act.round { width: 28px; height: 28px; border-radius: 999px; border: 1px solid rgba(118,118,128,.22); background: rgba(36,36,38,.94); color: var(--text); flex: none; }
-#side .act.round:hover { background: rgba(48,48,50,.98); }
-#side .act.round svg { width: 14px; height: 14px; }
-#side .top { display: flex; align-items: center; gap: 8px; margin: 4px 10px 6px 10px; flex: none; }
-#side .top .pill { flex: 1 1 auto; margin: 0; }
+#side .row.thread .hov { margin-right: 3px; }
+#side .act { width: 24px; height: 24px; border-radius: 8px; transition: var(--fade); }
+#side .act svg { width: 14px; height: 14px; }
+#side .act:hover { background: var(--btn-hover); border-color: transparent; color: var(--text); }
+/* The desktop's round buttons: the bell, the new project, a project's plus.
+   All three measure 60x60 device px at 2x. */
+#side .act.round { width: 29px; height: 29px; border-radius: 999px; border: 1px solid var(--btn-border); background: var(--btn); color: var(--text); flex: none; }
+#side .act.round:hover { background: var(--btn-hover); border-color: var(--btn-border); }
+#side .act.round svg { width: 15px; height: 15px; }
+#side .top { display: flex; align-items: center; gap: 7px; margin: 0 1px; flex: none; box-sizing: border-box; border: 0; }
+#side .top .pill { flex: 1 1 auto; margin: 0; min-width: 0; }
 #side .row.project .act.round { margin-left: auto; }
 #side .row.project .hov { margin-left: auto; margin-right: 2px; }
 #side .row.project:hover .act.round { margin-left: 0; }
-#side .hdr { display: flex; align-items: center; gap: 5px; min-height: 33px; padding: 0 10px; color: var(--text2); font-size: 14px; margin-top: 6px; }
+#side .hdr { display: flex; align-items: center; gap: 6px; min-height: 33px; padding: 0; box-sizing: border-box; border: 1px solid transparent; color: var(--text2); font-size: 15px; margin-top: 0px; }
 #side .hdr .act { margin-left: auto; }
 #side .hdr.sub { cursor: default; }
-#side .pill { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 30px; margin: 4px 10px 6px 10px; border-radius: 999px; background: rgba(36,36,38,.94); border: 1px solid rgba(118,118,128,.22); color: var(--text); flex: none; }
-#side .pill:hover { background: rgba(48,48,50,.98); }
-#side .st { display: inline-flex; width: 13px; height: 13px; align-items: center; justify-content: center; margin-left: 6px; flex: none; }
+#side .pill span { overflow: hidden; text-overflow: ellipsis; }
+#side .pill { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 29px; margin: 0; padding: 0 10px; box-sizing: border-box; min-width: 0; white-space: nowrap; overflow: hidden; border-radius: 999px; background: var(--btn); border: 1px solid var(--btn-border); color: var(--text); flex: none; transition: var(--fade); }
+#side .pill svg { width: 15px; height: 15px; }
+#side .pill:hover { background: var(--btn-hover); }
+#side .st { display: inline-flex; width: 14px; height: 14px; align-items: center; justify-content: center; margin: 0; flex: none; }
 #side .st svg { width: 13px; height: 13px; }
 #side .st.alert svg { width: 10px; height: 10px; }
 #side .st.done { color: var(--done); }
-#side .st.dot::before { content: ""; width: 5px; height: 5px; border-radius: 999px; background: rgba(242,242,247,.16); }
+/* 10 device px at 2x, so 5. */
+#side .st.dot::before { content: ""; width: 5px; height: 5px; border-radius: 999px; background: var(--dot); }
 #side .st.dot.active::before { background: var(--done); }
-#side .st.dot.unread::before { background: #3A3A3C; }
-#side .st.dot.pinned::before { background: rgba(242,242,247,.68); }
+#side .st.dot.unread::before { background: var(--muted); }
+#side .st.dot.pinned::before { background: var(--text2); }
 #side .st.dot.open::before { background: var(--open); }
-#side input.rename { font: 500 15px var(--ui); color: var(--text); background: #3A3A3C; border: 0; border-radius: 4px; padding: 2px 4px; margin-left: 5px; flex: 1 1 auto; min-width: 0; outline: none; }
-#side .path { display: flex; align-items: center; gap: 5px; padding: 0 10px; }
-#side .path input { flex: 1 1 auto; min-width: 0; font: 14px var(--ui); color: var(--text); background: var(--ctl); border: 1px solid var(--ctl-border); border-radius: 6px; padding: 4px 6px; outline: none; }
-/* The desktop's right-hand Agents panel: one row per pane an agent runs
-   in (wezterm-gui/src/termwindow/ui/agent_panel.rs). */
-#agents { position: absolute; right: 0; top: 0; bottom: 0; width: var(--agents-w); box-sizing: border-box; background: var(--side-bg); border-left: 1px solid var(--sep); font: 500 13px var(--ui); color: var(--text2); user-select: none; overflow: hidden; }
+#side input.rename { font: 400 15px var(--ui); color: var(--text); background: var(--ctl); border: 1px solid var(--ctl-border); border-radius: 4px; padding: 2px 4px; margin-left: 6px; flex: 1 1 auto; min-width: 0; outline: none; }
+#side input { user-select: text; -webkit-user-select: text; }
+/* Add workspace: a labelled block under the Workspaces header rather than
+   a bare field, with the hint under the input and the refusal in its place
+   when a path came back refused. */
+#side .path { display: flex; flex-direction: column; gap: 6px; margin: 1px 0 3px 0; padding: 8px 9px 9px 9px; box-sizing: border-box; border-radius: 10px; background: var(--card); border: 1px solid var(--card-border); flex: none; }
+#side .path .lb { display: flex; align-items: center; gap: 6px; color: var(--text); font-size: 13px; }
+#side .path .lb svg { width: 14px; height: 14px; color: var(--text2); }
+#side .path input { width: 100%; box-sizing: border-box; font: 400 14px var(--ui); color: var(--text); background: var(--ctl); border: 1px solid var(--ctl-border); border-radius: 7px; padding: 6px 8px; outline: none; transition: var(--fade); }
+#side .path input::placeholder { color: var(--muted); }
+#side .path input:focus { border-color: var(--accent); }
+#side .path .hint { color: var(--muted); font-size: 12px; font-weight: 500; line-height: 1.35; word-break: break-word; }
+#side .path.bad input { border-color: var(--danger); }
+#side .path.bad .hint { color: var(--danger); }
+/* With no workspace yet, the header's round button is the only way in and
+   nothing says so; this row does. */
+#side .hdr.add { gap: 7px; min-height: 33px; padding: 0 8px; border-radius: 10px; border: 1px dashed var(--card-line); color: var(--muted); transition: var(--fade); }
+#side .hdr.add svg { width: 15px; height: 15px; }
+#side .hdr.add:hover { color: var(--text); background: var(--row-hover); border-color: var(--edge); }
+/* The desktop's right-hand Agents panel (wezterm-gui/src/termwindow/ui/
+   agent_panel.rs). A sibling of the left sidebar: the same 10px insets,
+   10px row corners and 15px face, on rows that are three of the desktop's
+   text lines tall because they carry two -- identity, then state and
+   place. The desktop's own empty state is the toolbar line and nothing
+   else, which is what this draws too. */
+#agents { position: absolute; right: 0; top: 0; bottom: 0; width: var(--agents-w); box-sizing: border-box; background: var(--side-bg); border-left: 1px solid var(--sep); font: 500 15px var(--ui); color: var(--text2); user-select: none; overflow: hidden; }
 #agents .handle { position: absolute; left: -2px; top: 0; bottom: 0; width: 4px; cursor: col-resize; z-index: 1; }
-#agents .hd { position: absolute; left: 0; right: 0; top: 0; box-sizing: border-box; padding: 9px 12px 7px 12px; display: flex; flex-direction: column; gap: 2px; }
-#agents .hd .ti { color: var(--text); font-size: 14px; }
-#agents .hd .sum { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#agents .list { position: absolute; inset: 56px 5px 0 5px; overflow-y: auto; scrollbar-width: thin; display: flex; flex-direction: column; gap: 2px; padding-bottom: 32px; }
-/* Two lines and a chip, the row height the desktop gives them. */
-#agents .ag { display: flex; align-items: center; gap: 9px; min-height: 46px; box-sizing: border-box; padding: 5px 7px; border-radius: 10px; flex: none; }
-#agents .ag:hover { background: rgba(42,42,44,.98); }
+/* The title, then the desktop's toolbar line: what the panel is showing,
+   or why it is showing nothing. */
+#agents .hd { position: absolute; left: 0; right: 0; top: 0; box-sizing: border-box; padding: 8px 10px 0 10px; display: flex; flex-direction: column; }
+#agents .hd .ti { display: flex; align-items: center; min-height: 30px; color: var(--text); font-size: 15px; }
+#agents .hd .sum { display: flex; align-items: center; min-height: 32px; color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The desktop's segmented mode selector (`right_sidebar.rs`, the block
+   under RIGHT_SIDEBAR_MODE_HEIGHT): a bordered capsule of four segments,
+   the active one a filled pill with its label, on a 5px inner inset. Only
+   Agents has a wire behind it here; the other three say so and refuse. */
+#agents .modes { display: flex; align-items: stretch; height: 34px; margin: 6px 0 0 0; box-sizing: border-box; border-radius: 999px; background: var(--btn); border: 1px solid var(--btn-border); padding: 2px; gap: 0; }
+#agents .mode { display: inline-flex; align-items: center; justify-content: center; gap: 6px; flex: 1 1 0; min-width: 0; box-sizing: border-box; border-radius: 999px; border: 1px solid transparent; color: var(--text2); font-size: 13px; cursor: default; transition: var(--fade); }
+#agents .mode svg { width: 15px; height: 15px; }
+#agents .mode.on { flex: 0 1 auto; padding: 0 11px; background: var(--ctl); border-color: var(--ctl-border); box-shadow: var(--shadow); color: var(--text); }
+#agents .mode .ml { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Nothing to press: the tooltip is the whole answer, so no hover lift. */
+#agents .mode.off { color: var(--muted); opacity: .55; }
+#agents .list { position: absolute; inset: 110px 10px 0 10px; overflow-y: auto; scrollbar-width: thin; display: flex; flex-direction: column; gap: 2px; padding-bottom: 24px; }
+/* 60px: three lines of the row's own 20px leading, as the desktop's
+   `agents_row_height` gives two lines a file row's share of padding. */
+#agents .ag { display: flex; align-items: center; gap: 10px; min-height: 60px; box-sizing: border-box; padding: 0 6px; border-radius: 10px; border: 1px solid transparent; flex: none; transition: var(--fade); }
+#agents .ag:hover { background: var(--row-hover); }
 #agents .ag.elsewhere { opacity: .62; }
 #agents .ic { display: inline-flex; width: 20px; height: 20px; flex: none; align-items: center; justify-content: center; color: var(--text2); }
 #agents .ic svg { width: 20px; height: 20px; }
 /* The brand marks carry no stroke and no fill of their own. */
 #agents .ic svg[role=img] { fill: currentColor; }
-#agents .tx { display: flex; flex-direction: column; gap: 2px; flex: 1 1 auto; min-width: 0; }
-#agents .n { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#agents .tx { display: flex; flex-direction: column; gap: 6px; flex: 1 1 auto; min-width: 0; }
+#agents .n { color: var(--text); line-height: 20px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #agents .n .d { color: var(--muted); }
-#agents .p { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#agents .p { color: var(--muted); line-height: 20px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #agents .st { display: inline-flex; width: 16px; height: 16px; flex: none; align-items: center; justify-content: center; }
 #agents .st svg { width: 16px; height: 16px; }
+/* The desktop's three: the sidebar's live blue for working, its amber for
+   waiting on a human, a muted tick for idle. Unknown gets no icon at all. */
+#agents .st.spin { color: var(--open); }
 #agents .st.alert { color: var(--warn); }
 #agents .st.idle { color: var(--muted); }
 .nav { position: absolute; pointer-events: auto; box-sizing: border-box; display: flex; align-items: center; gap: 9px; padding: 0 5px; background: var(--bg); color: var(--text2); user-select: none; overflow: hidden; }
 .nav.focused { color: var(--text); }
 .nav .caps { display: flex; gap: 9px; flex: 1 1 auto; min-width: 0; overflow: hidden; }
-.nav .cap { display: inline-flex; align-items: center; flex: 0 0 auto; width: 160px; height: 30px; box-sizing: border-box; padding: 0 9px; border-radius: 999px; border: 1px solid transparent; background: var(--wash); color: var(--text2); cursor: default; }
+.nav .cap { display: inline-flex; align-items: center; flex: 0 0 auto; width: 128px; height: 30px; box-sizing: border-box; padding: 0 9px; border-radius: 999px; border: 1px solid transparent; background: var(--wash); color: var(--text2); cursor: default; }
 .nav .cap.current { background: var(--ctl); border-color: var(--ctl-border); box-shadow: var(--shadow); color: inherit; }
 .nav .cap:hover:not(.current) { background: var(--ctl-hover); }
 .nav .acts { display: flex; gap: 2px; margin-left: auto; flex: none; }
@@ -144,16 +243,31 @@ body[data-side=off] #side:not(.revealed) { display: none; }
 .spin { display: inline-flex; animation: spin .96s steps(12) infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 /* What the desktop shows over a terminal another device holds. */
-#card { position: absolute; left: 50%; top: 45%; transform: translate(-50%, -50%); text-align: center; padding: 26px 36px; border-radius: 18px; background: color-mix(in srgb, var(--bg) 86%, transparent); border: 1px solid var(--ctl-border); pointer-events: none; user-select: none; }
-#card .eyes { font: 17px var(--ui); color: var(--muted); letter-spacing: 2px; margin-bottom: 8px; }
+@keyframes card-in { from { opacity: 0; } to { opacity: 1; } }
+#card:not([hidden]) { animation: card-in .16s cubic-bezier(0,0,.2,1); }
+/* The desktop's opaque surface: the terminal area, nothing of the pane
+   showing through, the text a little above centre as the desktop's is. */
+#card { position: absolute; inset: var(--tabs) var(--agents-w) 0 var(--side-w); z-index: 12; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; box-sizing: border-box; text-align: center; background: var(--bg); user-select: none; cursor: default; }
+#card[hidden] { display: none; }
+#card .eyes { font: 20px var(--ui); color: var(--text); letter-spacing: 2px; margin-bottom: 18px; }
 #card .title { font: 500 17px var(--ui); color: var(--text); }
-#card .hint { font: 15px var(--ui); color: var(--text2); margin-top: 10px; }
+#card .hint { font: 14px var(--ui); color: var(--text2); margin-top: 10px; max-width: 420px; }
+#card .go { margin-top: 22px; height: 32px; padding: 0 18px; font: 500 13px var(--ui); color: var(--text); background: var(--ctl); border: 1px solid var(--btn-border); border-radius: 8px; cursor: pointer; transition: var(--fade); }
+#card .go:hover:not(:disabled) { background: var(--ctl-hover); }
+#card .go:disabled { opacity: .55; cursor: default; }
+#card[data-state=refused] .title { color: var(--danger); }
+@keyframes card-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+#card[data-state=taking] .eyes { animation: card-pulse 1.2s ease-in-out infinite; }
 /* Passing remarks: refusals, reconnects. */
 #status { position: absolute; right: 12px; bottom: 12px; max-width: 60%; padding: 7px 11px; border-radius: 8px; background: var(--ctl); border: 1px solid var(--ctl-border); color: var(--text); font: 13px var(--ui); box-shadow: 0 2px 12px rgba(0,0,0,.35); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
 #status.error { color: var(--danger); }
 /* The context menus: one panel per open submenu, over everything the page
    draws, the desktop's control colours at the page's smaller size. */
-.menu { position: fixed; z-index: 20; min-width: 168px; max-width: 340px; box-sizing: border-box; padding: 5px; border-radius: 10px; background: var(--ctl); border: 1px solid var(--ctl-border); box-shadow: 0 8px 28px rgba(0,0,0,.42); color: var(--text); font: 500 13px var(--ui); user-select: none; outline: none; }
+/* The panel arrives at the point it was asked for: a 120ms fade and a
+   hair of scale from that corner. Its own measuring reads offsetWidth,
+   which a transform does not move. */
+@keyframes menu-in { from { opacity: 0; transform: scale(.97); } to { opacity: 1; transform: scale(1); } }
+.menu { animation: menu-in .12s cubic-bezier(0,0,.2,1); transform-origin: top left; position: fixed; z-index: 20; min-width: 168px; max-width: 340px; box-sizing: border-box; padding: 5px; border-radius: 10px; background: var(--ctl); border: 1px solid var(--ctl-border); box-shadow: 0 8px 28px rgba(0,0,0,.42); color: var(--text); font: 500 13px var(--ui); user-select: none; outline: none; }
 .menu .mi { display: flex; align-items: center; gap: 8px; height: 28px; box-sizing: border-box; padding: 0 8px; border-radius: 6px; white-space: nowrap; }
 .menu .mi:hover, .menu .mi.on { background: var(--ctl-hover); }
 .menu .mi.disabled { color: var(--muted); }
@@ -183,48 +297,70 @@ body[data-side=off] #side:not(.revealed) { display: none; }
 #palette .st { flex: none; max-width: 34%; overflow: hidden; text-overflow: ellipsis; color: var(--muted); font-size: 12px; }
 #palette .acc { flex: none; margin-left: auto; padding-left: 10px; color: var(--muted); font-size: 12px; }
 #palette .pn { padding: 14px 9px; color: var(--muted); }
-/* The settings panel: the page's own preferences, one row each. */
-/* The settings window, as the desktop draws it: a nav column with the
-   sections, and the section's cards of rows on the right. */
-#settings { position: fixed; z-index: 31; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(920px, 94vw); height: min(602px, 90vh); box-sizing: border-box; display: flex; background: var(--bg); border: 1px solid var(--ctl-border); border-radius: 12px; box-shadow: 0 24px 80px rgba(0,0,0,.55); color: var(--text); font: 500 14px var(--ui); overflow: hidden; outline: none; }
-#settings .sc { position: absolute; right: 12px; top: 12px; z-index: 1; display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: 999px; background: transparent; border: 0; color: var(--muted); }
-#settings .sc:hover { color: var(--text); background: var(--ctl-hover); }
+/* The colour-scheme picker: the palette's list, over the settings window,
+   with a swatch of the scheme's ground and its eight ANSI colours. */
+#schemes-back { position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,.28); }
+#schemes { position: fixed; z-index: 41; left: 50%; top: 12vh; transform: translateX(-50%); width: min(520px, 90vw); box-sizing: border-box; display: flex; flex-direction: column; border-radius: 12px; background: var(--ctl); border: 1px solid var(--ctl-border); box-shadow: 0 16px 48px rgba(0,0,0,.46); color: var(--text); font: 500 13px var(--ui); overflow: hidden; }
+#schemes .q { flex: none; box-sizing: border-box; width: 100%; padding: 10px 12px; font: 400 15px var(--ui); color: var(--text); background: transparent; border: 0; border-bottom: 1px solid var(--sep); outline: none; }
+#schemes .q::placeholder { color: var(--muted); }
+#schemes .pl { flex: 1 1 auto; max-height: 52vh; overflow-y: auto; scrollbar-width: thin; padding: 10px; }
+#schemes .pe { display: flex; align-items: center; gap: 10px; height: 34px; box-sizing: border-box; padding: 0 10px; border-radius: 8px; white-space: nowrap; cursor: default; }
+#schemes .pe.on { background: var(--ctl-hover); }
+#schemes .sw { flex: none; display: inline-flex; align-items: center; gap: 1px; width: 74px; height: 18px; padding: 0 3px; border-radius: 4px; border: 1px solid var(--card-border); box-sizing: border-box; }
+#schemes .sw i { flex: 1 1 auto; height: 10px; border-radius: 1px; }
+#schemes .t { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
+#schemes .acc { flex: none; margin-left: auto; padding-left: 10px; color: var(--muted); font-size: 12px; }
+#schemes .pn { padding: 14px 10px; color: var(--muted); }
+#settings .pillsel[data-setting="terminal-scheme"] { text-align: left; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The settings window, as the desktop draws it (desktop-settings.png, 2x):
+   a 220px nav column, then cards of 55px rows on a #1D1D1F ground with the
+   control pills right-aligned to the card's 18px inset. */
+#settings { --settings-tf: translate(-50%, -50%); position: fixed; z-index: 31; left: 50%; top: 50%; transform: var(--settings-tf); width: min(960px, 94vw); height: min(602px, 90vh); box-sizing: border-box; display: flex; background: var(--bg); border: 1px solid var(--ctl-border); border-radius: 20px; box-shadow: 0 24px 80px rgba(0,0,0,.55); color: var(--text); font: 500 14px var(--ui); overflow: hidden; outline: none; }
+#settings .sc { position: absolute; right: 12px; top: 12px; z-index: 1; display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: 999px; background: transparent; border: 0; color: var(--muted); transition: var(--fade); }
+#settings .sc:hover { color: var(--text); background: var(--row-hover); }
 #settings .sc svg { width: 15px; height: 15px; }
-#settings .snav { flex: 0 0 220px; box-sizing: border-box; padding: 18px 14px; background: var(--side-bg); border-right: 1px solid var(--sep); display: flex; flex-direction: column; gap: 10px; }
-#settings .app { font-size: 17px; font-weight: 700; color: var(--text); padding: 12px 2px 6px 2px; }
-#settings .find { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 12px; border-radius: 999px; background: var(--ctl); border: 1px solid var(--ctl-border); color: var(--muted); }
+#settings .snav { flex: 0 0 220px; box-sizing: border-box; padding: 18px 14px; background: var(--side-bg); border-right: 1px solid var(--sep); display: flex; flex-direction: column; }
+#settings .app { font-size: 17px; font-weight: 700; color: var(--text); padding: 18px 3px 15px 3px; }
+#settings .find { display: flex; align-items: center; gap: 7px; height: 28px; box-sizing: border-box; padding: 0 10px; border-radius: 999px; background: var(--ctl); border: 1px solid var(--ctl-border); color: var(--muted); }
 #settings .find svg { width: 14px; height: 14px; flex: none; }
-#settings .find input { flex: 1 1 auto; min-width: 0; background: transparent; border: 0; outline: none; color: var(--text); font: 500 14px var(--ui); }
-#settings .secs { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; }
-#settings .sec { display: flex; align-items: center; gap: 10px; height: 36px; padding: 0 12px; border-radius: 10px; color: var(--text); cursor: default; }
-#settings .sec svg { width: 16px; height: 16px; flex: none; color: var(--text2); }
-#settings .sec:hover { background: rgba(42,42,44,.98); }
-#settings .sec.on { background: var(--ctl); border: 1px solid var(--ctl-border); box-shadow: var(--shadow); }
-#settings .body { flex: 1 1 auto; min-width: 0; overflow-y: auto; scrollbar-width: thin; padding: 30px 34px 24px 24px; }
-#settings .title { font-size: 20px; font-weight: 700; margin: 6px 0 18px 0; }
-#settings .card { background: var(--ctl); border: 1px solid var(--ctl-border); border-radius: 12px; padding: 0 18px; margin-bottom: 18px; }
-#settings .srow { display: flex; align-items: center; gap: 18px; padding: 14px 0; border-bottom: 1px solid var(--sep); }
+#settings .find input { flex: 1 1 auto; min-width: 0; background: transparent; border: 0; outline: none; color: var(--text); font: 500 13px var(--ui); }
+#settings .secs { display: flex; flex-direction: column; gap: 4px; margin-top: 11px; }
+/* 68 device px tall on a 76 px pitch at 2x, and the selected row is the
+   sidebar's own #3E3E41. A shadow rather than a border: a border on the
+   selected row alone would move the text by a pixel. */
+#settings .sec { display: flex; align-items: center; gap: 7px; height: 34px; box-sizing: border-box; padding: 0 9px; border-radius: 10px; color: var(--text); cursor: default; transition: var(--fade); }
+#settings .sec svg { width: 15px; height: 15px; flex: none; color: var(--text2); }
+#settings .sec:hover { background: var(--row-hover); }
+#settings .sec.on { background: var(--row-sel); box-shadow: var(--shadow); }
+#settings .body { flex: 1 1 auto; min-width: 0; overflow-y: auto; scrollbar-width: thin; padding: 28px 26px 24px 22px; }
+#settings .title { font-size: 19px; font-weight: 700; margin: 0 0 20px 0; }
+#settings .card { background: var(--card); border: 1px solid var(--card-border); border-radius: 17px; padding: 0 18px; margin-bottom: 18px; }
+#settings .srow { display: flex; align-items: center; gap: 18px; padding: 11px 0; border-bottom: 1px solid var(--card-line); }
 #settings .srow:last-child { border-bottom: 0; }
 #settings .tx { flex: 1 1 auto; min-width: 0; }
 #settings .lab { font-weight: 600; color: var(--text); }
-#settings .desc { margin-top: 3px; color: var(--muted); font-size: 13px; font-weight: 500; }
-#settings .ctl { display: flex; align-items: center; gap: 10px; flex: none; }
-#settings .pillsel, #settings .pillbtn { flex: none; font: 500 13px var(--ui); color: var(--text); background: var(--ctl-hover); border: 1px solid var(--ctl-border); border-radius: 8px; padding: 6px 12px; min-width: 120px; }
+#settings .desc { margin-top: 4px; color: var(--muted); font-size: 13px; font-weight: 500; }
+#settings .ctl { display: flex; align-items: center; gap: 8px; flex: none; }
+/* The desktop's control pill: 280x54 device px at 2x, flush with the card's
+   right inset. */
+#settings .pillsel, #settings .pillbtn { flex: none; box-sizing: border-box; height: 28px; font: 500 13px var(--ui); color: var(--text); background: var(--ctl); border: 1px solid var(--btn-border); border-radius: 8px; padding: 0 12px; min-width: 140px; transition: var(--fade); }
 #settings .pillsel { appearance: none; -webkit-appearance: none; padding-right: 28px; background-image: linear-gradient(45deg, transparent 50%, var(--text2) 50%), linear-gradient(135deg, var(--text2) 50%, transparent 50%); background-position: calc(100% - 16px) 55%, calc(100% - 11px) 55%; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; }
+#settings .pillsel:hover, #settings .pillbtn:hover { background-color: var(--ctl-hover); }
 #settings .pillbtn { min-width: 0; }
-#settings .pillbtn:hover { background: var(--ctl-pressed); }
-#settings .seg { display: inline-flex; border: 1px solid var(--ctl-border); border-radius: 8px; overflow: hidden; }
-#settings .sg { display: inline-flex; align-items: center; gap: 6px; padding: 5px 11px; color: var(--text2); font: 500 13px var(--ui); cursor: default; }
+#settings .seg { display: inline-flex; height: 28px; box-sizing: border-box; border: 1px solid var(--btn-border); border-radius: 8px; overflow: hidden; background: var(--ctl); }
+#settings .sg { display: inline-flex; align-items: center; gap: 6px; padding: 0 11px; color: var(--text2); font: 500 13px var(--ui); cursor: default; transition: var(--fade); }
 #settings .sg input { position: absolute; opacity: 0; width: 0; height: 0; }
+#settings .sg:hover { color: var(--text); }
 #settings .sg.on { background: var(--ctl-pressed); color: var(--text); }
-#settings .stepper { display: inline-flex; align-items: center; height: 30px; border-radius: 8px; background: var(--ctl-hover); border: 1px solid var(--ctl-border); overflow: hidden; }
+#settings .stepper { display: inline-flex; align-items: center; height: 28px; box-sizing: border-box; border-radius: 8px; background: var(--ctl); border: 1px solid var(--btn-border); overflow: hidden; }
 #settings .stepper.off { opacity: .5; }
-#settings .stepper button { width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 0; color: var(--text); }
+#settings .stepper button { width: 28px; height: 26px; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: 0; color: var(--text); transition: var(--fade); }
+#settings .stepper button:hover:not(:disabled) { background: var(--ctl-hover); }
 #settings .stepper button svg { width: 13px; height: 13px; }
-#settings .stepper .num { width: 54px; height: 28px; text-align: center; background: transparent; border: 0; color: var(--text); font: 500 13px var(--ui); outline: none; -moz-appearance: textfield; }
+#settings .stepper .num { width: 52px; height: 26px; text-align: center; background: transparent; border: 0; color: var(--text); font: 500 13px var(--ui); outline: none; -moz-appearance: textfield; }
 #settings .stepper .num::-webkit-inner-spin-button { display: none; }
-#settings .reset { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 999px; background: transparent; border: 0; color: var(--muted); }
-#settings .reset:hover:not(:disabled) { color: var(--text); background: var(--ctl-hover); }
+#settings .reset { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 999px; background: transparent; border: 0; color: var(--muted); transition: var(--fade); }
+#settings .reset:hover:not(:disabled) { color: var(--text); background: var(--row-hover); }
 #settings .reset:disabled { opacity: .35; }
 #settings .reset svg { width: 15px; height: 15px; }
 #settings .switch { position: relative; display: inline-block; width: 40px; height: 24px; flex: none; }
@@ -244,7 +380,29 @@ body[data-side=off] #side:not(.revealed) { display: none; }
    exactly the page it was. Termux is the shape this follows -- the terminal
    takes the width, the two panels become drawers over it, and a key bar
    supplies the keys a soft keyboard has not got. */
-body[data-mobile] { --side-w: 0px; --agents-w: 0px; }
+body[data-mobile] {
+  --side-w: 0px; --agents-w: 0px; --tabs: 46px;
+  /* What the notch, the rounded corners and the home indicator take. Zero
+     everywhere the browser reports nothing, which is every desktop. */
+  --safe-t: env(safe-area-inset-top, 0px);
+  --safe-r: env(safe-area-inset-right, 0px);
+  --safe-b: env(safe-area-inset-bottom, 0px);
+  --safe-l: env(safe-area-inset-left, 0px);
+}
+/* Nothing in the chrome is a document to select or double-tap into: a
+   second tap is a second key, never a zoom, and no grey flash follows a
+   finger. The canvas is exempt below, where every finger is the terminal's. */
+body[data-mobile] #tabs, body[data-mobile] #panes, body[data-mobile] #side,
+body[data-mobile] #agents, body[data-mobile] #keybar, body[data-mobile] .menu,
+body[data-mobile] #palette, body[data-mobile] #settings, body[data-mobile] #scrim {
+  touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none; user-select: none;
+}
+/* A field is still typed into, and iOS zooms the page for anything under
+   16px; every field the phone shape shows is that big. */
+body[data-mobile] input, body[data-mobile] textarea, body[data-mobile] select {
+  -webkit-user-select: text; user-select: text; font-size: 16px;
+}
 /* The soft keyboard shrinks the *visual* viewport and nothing else, so the
    canvas is sized from that rather than from the window: --vvh and --keybar
    are KeyBar.svelte's, set on the root while the bar is mounted. */
@@ -256,52 +414,186 @@ body[data-mobile] #panes {
 }
 /* The browser must not pan or zoom the page: every finger on the canvas is
    the terminal's, and touch.ts decides what it meant. */
-body[data-mobile] canvas#term { touch-action: none; }
-body[data-mobile] #tabs { -webkit-overflow-scrolling: touch; }
+body[data-mobile] canvas#term { touch-action: none; -webkit-tap-highlight-color: transparent; }
+/* The tab row clears the notch and the corners, and its capsules are the
+   height a thumb needs. */
+body[data-mobile] #tabs {
+  height: calc(var(--tabs) + var(--safe-t));
+  padding: calc(2px + var(--safe-t)) calc(8px + var(--safe-r)) 0 calc(8px + var(--safe-l));
+  gap: 7px; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain;
+}
+body[data-mobile] #term, body[data-mobile] #panes { top: calc(var(--tabs) + var(--safe-t)); }
+body[data-mobile] #term, body[data-mobile] #panes { height: calc(var(--vvh, 100%) - var(--tabs) - var(--safe-t) - var(--keybar)); }
+body[data-mobile] #tabs .tab { height: 36px; width: 150px; padding: 0 6px 0 10px; }
+body[data-mobile] .act { width: 38px; height: 38px; }
+/* A close button between two capsules is easy to hit by mistake; on a
+   phone it is only on the tab in front, and big enough to mean it. */
+body[data-mobile] .x { width: 28px; height: 28px; margin-left: 2px; }
+body[data-mobile] #tabs .tab:not(.current) .x { display: none; }
 /* Only the zoom button fits beside the capsules on a phone; a split and a
    new tab are the tab row's and the menus'. */
 body[data-mobile] .nav .act[data-action=new-tab],
 body[data-mobile] .nav .act[data-action=split-right],
 body[data-mobile] .nav .act[data-action=split-below] { display: none; }
+/* The pane's own capsule has the width the tab row's has not: a 160px box
+   on a 390px screen left two thirds of the bar empty. */
+body[data-mobile] .nav .cap { width: auto; flex: 1 1 auto; min-width: 0; max-width: 100%; }
+body[data-mobile] .nav .acts .act { width: 34px; height: 34px; }
 /* The two panels are drawers: over the canvas, resizing nothing, or not
    there at all. */
 body[data-mobile] #side,
 body[data-mobile] #agents {
-  top: var(--tabs);
+  top: calc(var(--tabs) + var(--safe-t));
   bottom: auto;
-  height: calc(var(--vvh, 100%) - var(--tabs) - var(--keybar));
-  width: min(300px, 85vw);
+  height: calc(var(--vvh, 100%) - var(--tabs) - var(--safe-t) - var(--keybar));
+  width: min(320px, 86vw);
   z-index: 15;
   box-shadow: 0 8px 28px rgba(0,0,0,.42);
+  overscroll-behavior: contain;
 }
-body[data-mobile] #side { display: none; }
-body[data-mobile] #side.open { display: block; }
+body[data-mobile] #side {
+  padding-left: var(--safe-l);
+  transform: translateX(-101%); visibility: hidden; pointer-events: none; will-change: transform;
+  transition: transform .15s cubic-bezier(.4,0,1,1), visibility 0s linear .15s;
+}
+body[data-mobile] #side.open {
+  transform: translateX(0); visibility: visible; pointer-events: auto;
+  transition: transform .15s cubic-bezier(0,0,.2,1), visibility 0s;
+}
+/* The right drawer is mounted when it opens, so it arrives rather than
+   transitions. */
+@keyframes drawer-in { from { transform: translateX(101%); } to { transform: translateX(0); } }
+body[data-mobile] #agents { animation: drawer-in .15s cubic-bezier(0,0,.2,1); }
+body[data-mobile] #agents { padding-right: var(--safe-r); }
 /* Their edges are dragged with a pointer, which a phone has not got. */
 body[data-mobile] #side .handle,
 body[data-mobile] #agents .handle { display: none; }
+/* A row, a button and a footer icon a thumb can hit. The list's insets and
+   the panel's rhythm are the desktop's; only the heights grow. */
+body[data-mobile] #side .row { min-height: 44px; }
+body[data-mobile] #side .hdr { min-height: 36px; }
+body[data-mobile] #side .top .pill, body[data-mobile] #side .pill { height: 38px; }
+body[data-mobile] #side .act.round { width: 38px; height: 38px; }
+body[data-mobile] #side .act { width: 34px; height: 34px; }
+body[data-mobile] #side .foot { height: 52px; left: 12px; right: 12px; }
+body[data-mobile] #side .foot .act { width: 40px; height: 40px; }
+body[data-mobile] #side .list { inset: 12px 10px 52px 10px; }
+/* A finger has no hover, so a thread's pin and delete would never appear. */
+body[data-mobile] #side .hov { display: inline-flex; }
+body[data-mobile] #side .path input { padding: 9px 10px; }
 /* Behind whichever drawer is out: a press here puts it away. */
 #scrim { position: fixed; inset: 0; z-index: 14; background: rgba(0,0,0,.34); }
-/* A menu row a finger can hit. */
-body[data-mobile] .menu .mi { height: 40px; }
+/* A menu row a finger can hit, clear of the corners and the indicator. */
+body[data-mobile] .menu {
+  min-width: 200px; padding: 6px;
+  max-height: calc(var(--vvh, 100%) - var(--keybar) - 24px); overflow-y: auto;
+}
+body[data-mobile] .menu .mi { height: 44px; font-size: 14px; }
+/* The palette is a sheet on a phone: the window's width, above the key bar,
+   with rows a thumb can pick from. */
+body[data-mobile] #palette {
+  top: calc(var(--safe-t) + 10px); width: calc(100vw - 20px - var(--safe-l) - var(--safe-r));
+  max-height: calc(var(--vvh, 100%) - var(--keybar) - var(--safe-t) - 20px);
+}
+body[data-mobile] #palette .pl { max-height: none; flex: 1 1 auto; }
+body[data-mobile] #palette .pe { height: 44px; }
+body[data-mobile] #palette .st { display: none; }
+/* The settings window has no room for its 220px nav column beside the
+   cards: on a phone it fills the window and the sections become a strip
+   of chips over one column of rows. */
+body[data-mobile] #settings {
+  left: 0; top: 0; --settings-tf: translate(0, 0); transform: var(--settings-tf); width: 100%;
+  height: calc(var(--vvh, 100%) - var(--keybar));
+  border-radius: 0; border: 0; flex-direction: column;
+}
+body[data-mobile] #settings .snav {
+  flex: none; padding: calc(var(--safe-t) + 10px) calc(12px + var(--safe-r)) 10px calc(12px + var(--safe-l));
+  border-right: 0; border-bottom: 1px solid var(--sep);
+}
+body[data-mobile] #settings .app { padding: 0 2px 10px 2px; font-size: 16px; }
+body[data-mobile] #settings .find { display: none; }
+body[data-mobile] #settings .secs {
+  flex-direction: row; margin-top: 0; gap: 6px;
+  overflow-x: auto; scrollbar-width: none; padding-bottom: 2px;
+}
+body[data-mobile] #settings .secs::-webkit-scrollbar { display: none; }
+body[data-mobile] #settings .sec { flex: 0 0 auto; height: 38px; border-radius: 999px; background: var(--ctl); }
+body[data-mobile] #settings .sec.on { background: var(--row-sel); }
+body[data-mobile] #settings .body { padding: 18px calc(14px + var(--safe-r)) 24px calc(14px + var(--safe-l)); }
+body[data-mobile] #settings .title { font-size: 20px; margin-bottom: 14px; }
+body[data-mobile] #settings .card { padding: 0 14px; }
+/* Label over control, so a description never squeezes into one word a line. */
+body[data-mobile] #settings .srow { flex-direction: column; align-items: stretch; gap: 10px; padding: 14px 0; }
+body[data-mobile] #settings .ctl { justify-content: flex-start; flex-wrap: wrap; }
+body[data-mobile] #settings .pillsel, body[data-mobile] #settings .pillbtn,
+body[data-mobile] #settings .seg, body[data-mobile] #settings .stepper { height: 38px; }
+body[data-mobile] #settings .pillsel { flex: 1 1 auto; min-width: 0; }
+body[data-mobile] #settings .sc { top: calc(var(--safe-t) + 10px); right: calc(10px + var(--safe-r)); width: 34px; height: 34px; }
+/* The remark and the takeover card sit clear of the key bar. */
+body[data-mobile] #status {
+  right: calc(10px + var(--safe-r)); left: calc(10px + var(--safe-l)); max-width: none;
+  bottom: calc(var(--keybar) + 10px); white-space: normal;
+}
+body[data-mobile] #card { padding: 22px 24px calc(var(--keybar) + 22px); }
+body[data-mobile] #card .go { height: 38px; }
 /* The key bar, along the foot of the visual viewport; `top` is the bar's
    own, since the soft keyboard moves that foot up the window. It scrolls
-   sideways when the keys do not fit. */
+   sideways when the keys do not fit, and its own height -- the keys plus
+   whatever the home indicator takes under them -- is what the page above
+   leaves room for. */
 #keybar {
-  position: fixed; left: 0; right: 0; height: 44px; z-index: 16; box-sizing: border-box;
-  display: flex; align-items: center; gap: 4px; padding: 0 6px;
+  position: fixed; left: 0; right: 0; z-index: 16; box-sizing: border-box;
+  height: calc(52px + env(safe-area-inset-bottom, 0px));
+  padding: 0 6px env(safe-area-inset-bottom, 0px) 6px;
+  display: flex; align-items: center; gap: 5px;
   background: var(--ctl); border-top: 1px solid var(--ctl-border);
-  overflow-x: auto; overflow-y: hidden; white-space: nowrap;
-  scrollbar-width: none; user-select: none; touch-action: manipulation;
+  overflow-x: auto; overflow-y: hidden; white-space: nowrap; overscroll-behavior-x: contain;
+  scrollbar-width: none; user-select: none; -webkit-user-select: none; touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
 }
 #keybar::-webkit-scrollbar { display: none; }
 #keybar .k {
-  flex: 0 0 auto; min-width: 44px; height: 34px; margin: 0; padding: 0 8px;
+  flex: 0 0 auto; min-width: 44px; height: 44px; margin: 0; padding: 0 10px;
   display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box;
-  border-radius: 8px; border: 1px solid var(--ctl-border); background: var(--ctl-hover);
-  color: var(--text); font: 500 13px var(--ui);
-  touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+  border-radius: 10px; border: 1px solid var(--ctl-border); background: var(--ctl-hover);
+  color: var(--text); font: 500 14px var(--ui);
+  touch-action: manipulation; -webkit-tap-highlight-color: transparent; -webkit-user-select: none; user-select: none;
 }
 #keybar .k:active { background: var(--ctl-pressed); }
 /* An armed modifier: it is spent on the next key, from here or from the
-   soft keyboard. */
-#keybar .k.armed { background: var(--accent); border-color: transparent; color: #FFFFFF; }
+   soft keyboard. The ring says so from across the bar, not only the fill. */
+#keybar .k.armed {
+  background: var(--accent); border-color: var(--accent); color: #FFFFFF; font-weight: 700;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 34%, transparent);
+}
+/* Landscape on a phone: the window is 390px tall and the chrome would take
+   a third of it. The rows shrink; nothing else changes. */
+@media (orientation: landscape) and (max-height: 500px) {
+  body[data-mobile] { --tabs: 40px; }
+  body[data-mobile] #tabs .tab { height: 30px; }
+  body[data-mobile] .act { width: 32px; height: 32px; }
+  #keybar { height: calc(44px + env(safe-area-inset-bottom, 0px)); }
+  #keybar .k { height: 36px; min-width: 40px; }
+  body[data-mobile] #settings .srow { flex-direction: row; align-items: center; gap: 14px; }
+  body[data-mobile] #settings .pillsel { flex: none; min-width: 140px; }
+}
+
+/* A reader who has asked the system for less motion gets none of it: the
+   page still opens and closes exactly the same things. */
+@media (prefers-reduced-motion: reduce) {
+  #side, body[data-mobile] #side, body[data-mobile] #agents,
+  .menu, #card:not([hidden]) { animation: none; transition: none; }
+}
+
+/* A drag in flight: the ghost under the pointer, the 2px line where the row
+   or tab would land, and the half of the pane a capsule would take. The
+   accent is the desktop's own (render/paint.rs), and nothing here takes the
+   pointer -- the drag is driven from the window. */
+#dnd { position: fixed; inset: 0; z-index: 50; pointer-events: none; }
+#dnd .ghost { position: fixed; transform: translate(10px, 8px); max-width: 240px; padding: 5px 10px; border-radius: 999px; background: var(--ctl); border: 1px solid var(--ctl-border); box-shadow: 0 8px 28px rgba(0,0,0,.42); color: var(--text); font: 500 13px var(--ui); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: .78; }
+#dnd .line { position: fixed; border-radius: 2px; background: var(--accent); }
+#dnd .zone { position: fixed; box-sizing: border-box; border-radius: 8px; background: color-mix(in srgb, var(--accent) 28%, transparent); border: 2px solid color-mix(in srgb, var(--accent) 80%, transparent); }
+/* The cursor says what letting go would do, over whatever it is above. */
+body.dnd, body.dnd * { cursor: grabbing !important; }
+body.dnd.dnd-no, body.dnd.dnd-no * { cursor: not-allowed !important; }
+body.dnd { touch-action: none; }

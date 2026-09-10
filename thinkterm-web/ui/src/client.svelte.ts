@@ -10,9 +10,12 @@ export const views = $state({
   tabs: null as TabsView | null,
   navs: [] as NavsView,
   status: { toast: null, card: null, summary: '' } as StatusView,
-  sidebar: { rows: [], editing: { kind: 'none' }, space: null } as SidebarView,
+  sidebar: {
+    rows: [], editing: { kind: 'none' }, space: null, new_project_error: null,
+    reveal: { edge: 6, dwell_ms: 150, retreat_ms: 250 }, footer: [], footer_label_min_width: 168,
+  } as SidebarView,
   /** The right-hand panel's rows, whether it is on show or not. */
-  agents: { rows: [], summary: '' } as AgentsView,
+  agents: { rows: [], summary: '', tabs: [], active: 'agents' } as AgentsView,
   /** The page's own preferences, as the wasm holds them (settings.rs). */
   settings: {
     language: 'system',

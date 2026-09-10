@@ -38,7 +38,7 @@ const sh = (cmd) => execSync(cmd, { encoding: "utf8" });
   const out = {};
 
   await send("Page.navigate", { url }, s);
-  await until("attach", async () => /this browser has|mirroring|following/.test(await ev("document.getElementById('status').dataset.summary || ''")), 20000);
+  await until("attach", async () => /this browser has/.test(await ev("document.getElementById('status').dataset.summary || ''")), 20000);
   await sleep(800);
   out.rows_at_start = (await rows()).map((r) => r.kind);
   if (!(await rows()).some((r) => r.kind === "others")) fail("the CLI window is not listed under Other windows");
@@ -61,8 +61,7 @@ const sh = (cmd) => execSync(cmd, { encoding: "utf8" });
   await click(`[data-action=pin][data-thread="${second.id}"]`);
   await until("pinned", async () => { const r = await rows(); const i = r.findIndex((x) => x.kind === "pinned"); const t = r.find((x) => x.kind === "thread" && x.id === second.id); return i >= 0 && t && t.pinned && r.indexOf(t) > i; });
   const before = list().length;
-  await click(`[data-action=delete][data-thread="${second.id}"]`);
-  if (!/delete\?/.test(await ev(`document.querySelector('[data-action=delete][data-thread="${second.id}"]').textContent`))) fail("delete did not ask");
+  // One press deletes, as the desktop's menu item does.
   await click(`[data-action=delete][data-thread="${second.id}"]`);
   await until("deleted", async () => !(await threads()).some((t) => t.id === second.id), 15000);
   await until("its pane is gone", () => list().length < before, 15000);
@@ -120,7 +119,7 @@ const sh = (cmd) => execSync(cmd, { encoding: "utf8" });
   await ev("window.__landed = 1");
   await send("Page.reload", { ignoreCache: true }, s);
   await until("a fresh document", () => ev("window.__landed === undefined"), 20000);
-  await until("attach again", async () => /this browser has|mirroring|following/.test(await ev("document.getElementById('status').dataset.summary || ''")), 20000);
+  await until("attach again", async () => /this browser has/.test(await ev("document.getElementById('status').dataset.summary || ''")), 20000);
   const reopened = await until("the same Space on show", async () => {
     const row = await space();
     return row && row.kind === "space" && row.id === made.id ? row : null;

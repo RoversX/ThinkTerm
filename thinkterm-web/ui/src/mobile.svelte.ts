@@ -7,9 +7,11 @@
 /** A window narrower than this is the phone shape whatever the pointer is. */
 const NARROW = 720;
 
-/** The key bar's height. The canvas and the drawers leave room for it, and
-    it is what the bar is offset by from the foot of the visual viewport. */
-export const KEYBAR = 44;
+/** The key bar's height, safe area aside: 44px keys with 4px of air above
+    and below, so every key clears the 44px a thumb needs. The bar reports
+    what it really measures as `--keybar`, which is this plus whatever the
+    home indicator takes; the canvas and the drawers leave room for that. */
+export const KEYBAR = 52;
 
 export const mobile = $state({
   /** The page is in its phone shape. */

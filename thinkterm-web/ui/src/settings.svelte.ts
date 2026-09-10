@@ -6,12 +6,16 @@
 
 import { handle } from './client';
 import { refreshViews, setLocale, views } from './client.svelte';
-import type { LanguageOption, Theme } from './model';
+import type { LanguageOption, Scheme, Theme } from './model';
 
 /** Where this browser keeps the preferences, whole, as the wasm's JSON. */
 const STORE = 'thinkterm.settings';
 /** The Space the sidebar was showing, so the next load opens on it. */
 const SPACE = 'thinkterm.space';
+/** The picked scheme, colours and all, so a boot needs no `schemes.json`. */
+const SCHEME = 'thinkterm.scheme';
+/** The `terminal-scheme` value that means "whatever the server is set to". */
+export const FOLLOW_DESKTOP = 'desktop';
 
 export const panel = $state({
   /** The modal is up. */
@@ -143,4 +147,67 @@ export function applyTheme(theme: Theme) {
   media = query;
   follow = listener;
   paint(query.matches);
+}
+
+
+// The colour schemes. The table is a build output (ci/build-web.sh runs
+// `thinkterm cli color-schemes --json` into www/schemes.json), a megabyte
+// or so, so it is fetched when the picker first opens and never at boot:
+// the picked scheme's own colours are stored with its name.
+
+export const schemes = $state({
+  /** The table, once fetched. */
+  all: [] as Scheme[],
+  /** A fetch is in flight. */
+  loading: false,
+  /** Why the table could not be read; empty when it could. */
+  error: '',
+});
+
+export async function loadSchemes() {
+  if (schemes.all.length > 0 || schemes.loading) return;
+  schemes.loading = true;
+  schemes.error = '';
+  try {
+    const res = await fetch(new URL('schemes.json', document.baseURI).href);
+    if (!res.ok) throw new Error(String(res.status));
+    schemes.all = (await res.json()) as Scheme[];
+  } catch (e) {
+    schemes.error = String((e as { message?: string })?.message ?? e);
+  } finally {
+    schemes.loading = false;
+  }
+}
+
+/** The scheme this browser picked, as it was stored, or nothing. */
+export function storedScheme(): Scheme | null {
+  try {
+    const raw = localStorage.getItem(SCHEME);
+    if (!raw) return null;
+    const value = JSON.parse(raw) as Scheme;
+    return value && typeof value.name === 'string' && Array.isArray(value.ansi) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Draw with `scheme` without keeping it: what a hover shows. `null` goes
+    back to the server's own scheme. */
+export function previewScheme(scheme: Scheme | null) {
+  const client = handle.client;
+  if (!client) return;
+  client.set_terminal_palette(scheme ? JSON.stringify(scheme) : undefined);
+}
+
+/** Keep `scheme` for this browser: the colours beside the name, so the next
+    boot draws with it before `schemes.json` is anywhere near. */
+export function pickScheme(scheme: Scheme | null) {
+  previewScheme(scheme);
+  try {
+    if (scheme) localStorage.setItem(SCHEME, JSON.stringify(scheme));
+    else localStorage.removeItem(SCHEME);
+  } catch {
+    // A browser that blocks storage keeps it for this load only.
+  }
+  setSetting('terminal-scheme', scheme ? scheme.name : FOLLOW_DESKTOP);
 }

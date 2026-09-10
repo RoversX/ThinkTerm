@@ -5,6 +5,7 @@
   import AgentsPanel from './AgentsPanel.svelte';
   import Card from './Card.svelte';
   import ContextMenu from './ContextMenu.svelte';
+  import DragLayer from './DragLayer.svelte';
   import KeyBar from './KeyBar.svelte';
   import NavBars from './NavBars.svelte';
   import SearchPalette from './SearchPalette.svelte';
@@ -57,5 +58,6 @@
 {#if views.settings['agents-panel']}<AgentsPanel />{/if}
 {#if mobile.on}<KeyBar />{/if}
 <ContextMenu />
+<DragLayer />
 <SearchPalette />
 <SettingsPanel />

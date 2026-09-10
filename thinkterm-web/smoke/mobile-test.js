@@ -21,7 +21,7 @@ const sh = (cmd) => execSync(cmd, { encoding: "utf8" });
 /** The phone the page is emulated on. */
 const PHONE = { width: 390, height: 844, deviceScaleFactor: 3, mobile: true };
 /** The key bar's height, as tokens.css and mobile.svelte.ts have it. */
-const BAR = 44;
+const BAR = 52;
 
 (async () => {
   const ws = new WebSocket(await browserWs()); await new Promise((r) => ws.on("open", r));
@@ -68,7 +68,7 @@ const BAR = 44;
   await send("Emulation.setDeviceMetricsOverride", PHONE, s);
   await send("Emulation.setTouchEmulationEnabled", { enabled: true }, s);
   await send("Page.navigate", { url }, s);
-  await until("attach", async () => /this browser has|mirroring|following/.test(await summary()), 25000);
+  await until("attach", async () => /this browser has/.test(await summary()), 25000);
   await sleep(900);
 
   // --- (a) the shape: the mark on the body, the bar at the foot of the
@@ -84,7 +84,7 @@ const BAR = 44;
   if (Math.abs(bar.height - BAR) > 1) fail("the key bar is " + bar.height + " tall");
   if (bar.keys !== 17) fail("the key bar has " + bar.keys + " keys");
   const box = await ev(`(() => { const r = document.getElementById('term').getBoundingClientRect();
-    const tabs = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--tabs'));
+    const tabs = parseFloat(getComputedStyle(document.body).getPropertyValue('--tabs'));
     return { height: r.height, want: window.innerHeight - tabs - ${BAR}, width: r.width, inner: window.innerWidth }; })()`);
   if (Math.abs(box.height - box.want) > 2) fail("the canvas is " + box.height + " tall, not " + box.want);
   if (Math.abs(box.width - box.inner) > 1) fail("the canvas is " + box.width + " wide, not the window's " + box.inner);
@@ -158,7 +158,7 @@ const BAR = 44;
   await touch("touchEnd", []);
   await until("the drawer out", () => ev("!!document.querySelector('#side.open')"), 3000);
   const drawer = await ev("(() => { const r = document.getElementById('side').getBoundingClientRect(); return { w: r.width, top: r.top, bottom: r.bottom }; })()");
-  if (!(drawer.w > 0 && drawer.w <= 300)) fail("the drawer is " + drawer.w + " wide");
+  if (!(drawer.w > 0 && drawer.w <= 320)) fail("the drawer is " + drawer.w + " wide");
   if (!(await ev("!!document.getElementById('scrim')"))) fail("no backdrop behind the drawer");
   await tap(360, 420);
   await until("the drawer away", () => ev("!document.querySelector('#side.open')"), 3000);
@@ -173,7 +173,7 @@ const BAR = 44;
   const labels = await ev("Array.from(document.querySelectorAll('.menu .mi .lb')).map((e) => e.textContent)");
   if (labels[0] !== "Copy") fail("the long press opened " + JSON.stringify(labels));
   const row = await ev("(() => { const r = document.querySelector('.menu .mi').getBoundingClientRect(); return r.height; })()");
-  if (Math.abs(row - 40) > 1) fail("a menu row is " + row + " tall, not the 40 a finger needs");
+  if (Math.abs(row - 44) > 1) fail("a menu row is " + row + " tall, not the 44 a finger needs");
   out.longpress = "ok";
 
   const shot = await send("Page.captureScreenshot", { format: "png" }, s); fs.writeFileSync(outPng, Buffer.from(shot.data, "base64"));
