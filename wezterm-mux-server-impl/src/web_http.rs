@@ -173,10 +173,22 @@ impl WebSite {
     }
 
     /// Whether `origin` may open the socket, given the `Host` the same
-    /// request carried. Without configured origins a loopback listener
-    /// also accepts the page it served itself through a forward: a
-    /// loopback origin, on our scheme, at exactly the authority the
-    /// request was addressed to.
+    /// request carried.
+    ///
+    /// Configured origins are the whole answer when there are any.
+    /// Otherwise the rule is same-origin: the page this listener served
+    /// itself, by whatever name it was reached under. That covers every way
+    /// the listener is legitimately reached -- an `ssh -L` forward on a
+    /// local port of the user's choosing, an address the machine gained
+    /// after the listener came up, a tailnet, a NAT -- because in all of
+    /// them a browser sends the same authority in both headers.
+    ///
+    /// It used to also accept any non-loopback IP-literal origin carrying
+    /// our port, whatever `Host` said, on the grounds that an IP literal
+    /// cannot be a DNS-rebinding name. True, but it does not follow that
+    /// every IP literal is ours: a page on an unrelated address could open
+    /// this socket. It still needed a token, so this was depth rather than
+    /// a way in, but the depth is worth having.
     fn origin_allowed(&self, origin: &str, host: Option<&str>) -> bool {
         let Some(origin) = Origin::parse(origin) else {
             return false;
@@ -184,19 +196,13 @@ impl WebSite {
         if self.allowed_origins.iter().any(|o| o.same_as(&origin)) {
             return true;
         }
-        // An address of this machine that came up after the listener did
-        // (a tailnet joined, a new network): an IP literal cannot be a
-        // DNS-rebinding name, and at our scheme and port it is this page.
-        if !self.configured_origins
-            && origin.scheme == self.scheme
-            && origin.port == self.port
-            && origin.host.parse::<std::net::IpAddr>().is_ok_and(|ip| !ip.is_loopback())
-        {
-            return true;
-        }
-        if self.configured_origins || !self.loopback || !is_loopback_host(&origin.host) {
+        if self.configured_origins {
             return false;
         }
+        // `Host` has already been checked by the time this runs, so the two
+        // agreeing is what a browser only produces same-origin: a
+        // cross-origin request carries our host and the *other* page's
+        // origin.
         origin.scheme == self.scheme
             && host.and_then(|h| self.host_name(h)) == Some((origin.host, origin.port))
     }
@@ -1033,6 +1039,80 @@ mod tests {
         headers.push(("Host", "localhost:9000"));
         let wrong_scheme = request("GET", "/ws", &headers);
         assert_eq!(route(&site, &wrong_scheme), reject(403, "Origin not allowed"));
+    }
+
+    /// Same-origin is the rule, and `0.0.0.0` is the shape that proves it.
+    /// A listener bound to one address *derives* that address as an allowed
+    /// origin, so a test written the obvious way is answered by the derived
+    /// list and never reaches the comparison -- it would pass whatever the
+    /// comparison said. TEST-NET addresses cannot be among this machine's
+    /// own, so these do reach it.
+    #[test]
+    fn a_page_this_listener_served_may_open_the_socket_and_no_other() {
+        fn upgrade(site: &WebSite, host: &str, origin: &str) -> Route {
+            let mut headers = upgrade_headers(origin, "thinkterm.v1, tt-token.abc");
+            headers.retain(|(n, _)| *n != "Host");
+            headers.push(("Host", host));
+            route(site, &request("GET", "/ws", &headers))
+        }
+        fn listener(server: config::WebServer) -> WebSite {
+            WebSite::from_config(&server, Some("/srv/web".into()), "me".into())
+        }
+
+        let anywhere = listener(config::WebServer {
+            bind_address: "0.0.0.0:8088".into(),
+            ..config::WebServer::default()
+        });
+        // The page, reached by an address that is not in this machine's own
+        // list: a NAT, or a tailnet joined after the listener came up.
+        assert!(matches!(
+            upgrade(&anywhere, "203.0.113.5:8088", "http://203.0.113.5:8088"),
+            Route::Upgrade { .. }
+        ));
+        // The fix itself: a page on an unrelated address, carrying our port.
+        // The old rule admitted this on the strength of the origin being an
+        // IP literal, whatever `Host` said.
+        assert_eq!(
+            upgrade(&anywhere, "198.51.100.7:8088", "http://203.0.113.5:8088"),
+            reject(403, "Origin not allowed")
+        );
+
+        // A loopback listener reached through a forward bound to a real
+        // address: `ssh -L 203.0.113.5:8088:127.0.0.1:8088`. Allowed before
+        // and allowed now -- this is the case the old rule existed for.
+        assert!(matches!(
+            upgrade(&site(), "203.0.113.5:8088", "http://203.0.113.5:8088"),
+            Route::Upgrade { .. }
+        ));
+
+        // A default port is spelled by leaving it out, in both headers, and
+        // both sides have to fill it in the same way to agree.
+        let secure = listener(config::WebServer {
+            bind_address: "0.0.0.0:443".into(),
+            pem_cert: Some("/c.pem".into()),
+            pem_private_key: Some("/k.pem".into()),
+            ..config::WebServer::default()
+        });
+        assert!(matches!(
+            upgrade(&secure, "203.0.113.5", "https://203.0.113.5"),
+            Route::Upgrade { .. }
+        ));
+        // The scheme is part of an origin.
+        assert_eq!(
+            upgrade(&secure, "203.0.113.5", "http://203.0.113.5:443"),
+            reject(403, "Origin not allowed")
+        );
+
+        // With origins configured, that list is the whole answer: the page
+        // served from this very port is not automatically one of them.
+        let configured = listener(config::WebServer {
+            allowed_origins: vec!["https://app.example.net".into()],
+            ..config::WebServer::default()
+        });
+        assert_eq!(
+            upgrade(&configured, "127.0.0.1:8088", "http://127.0.0.1:8088"),
+            reject(403, "Origin not allowed")
+        );
     }
 
     /// A listener on a scheme's default port is named without it, which
