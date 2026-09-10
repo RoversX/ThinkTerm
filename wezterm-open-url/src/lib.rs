@@ -338,9 +338,40 @@ pub fn open_with(url: &str, app: &str) {
     shell_execute(url.to_string(), Some(app.to_string()));
 }
 
+/// Show `path` in Explorer with the item selected.
+///
+/// Deliberately not `shell_execute`: that is the same `ShellExecuteW("open")`
+/// that `open_url` uses, so revealing a `.exe`, `.bat` or `.ps1` ran it.
 #[cfg(windows)]
 pub fn reveal_path(path: &std::path::Path) {
-    shell_execute(path.to_string_lossy().to_string(), None);
+    use std::os::windows::process::CommandExt as _;
+
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        // `canonicalize` fails when the item is gone; open the folder that
+        // would have held it rather than nothing. Never the item itself.
+        let Ok(full) = std::fs::canonicalize(&path) else {
+            if let Some(parent) = path.parent() {
+                let _ = std::process::Command::new("explorer.exe").arg(parent).spawn();
+            }
+            return;
+        };
+        // It also returns a `\\?\` verbatim path, which Explorer does not
+        // understand.
+        let full = full.to_string_lossy();
+        let full = full.strip_prefix(r"\\?\").unwrap_or(&full);
+
+        // Explorer parses its own command line and wants `/select,` and the
+        // path as one argument; the usual quoting splits that into two paths
+        // as soon as the path has a space, so it is passed verbatim.
+        //
+        // Its exit status says nothing -- Explorer returns 1 even when it
+        // worked -- so nothing here may branch on it. In particular there is
+        // no falling back to `shell_execute`, which is what ran the file.
+        let _ = std::process::Command::new("explorer.exe")
+            .raw_arg(format!("/select,\"{full}\""))
+            .spawn();
+    });
 }
 
 #[cfg(target_os = "macos")]
