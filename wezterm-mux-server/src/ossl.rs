@@ -87,6 +87,7 @@ impl OpenSSLNetListener {
                                 log::debug!("Making new AsyncSslStream");
                                 if let Err(err) = wezterm_mux_server_impl::dispatch::process(
                                     AsyncSslStream::new(stream),
+                                    wezterm_mux_server_impl::sessionhandler::ConnectionPeer::Tls,
                                 )
                                 .await
                                 {

@@ -155,7 +155,11 @@ impl Liveness {
 /// threads (see `connections`), never on the main thread: everything
 /// here that changes the mux hops there explicitly, and everything that
 /// does not is answered whatever the main thread is doing.
-pub async fn process<T>(stream: T) -> anyhow::Result<()>
+/// `peer` says how the accept layer got it: the unix socket is
+/// [`ConnectionPeer::Local`] and the mTLS port [`ConnectionPeer::Tls`].
+/// Both are this user by construction; they differ in whether the client is
+/// on the machine.
+pub async fn process<T>(stream: T, peer: ConnectionPeer) -> anyhow::Result<()>
 where
     T: 'static,
     T: std::io::Read,
@@ -166,7 +170,7 @@ where
     T: Send + Sync,
 {
     let stream = smol::Async::new(stream)?;
-    process_async(stream).await
+    process_stream(stream, peer).await
 }
 
 pub async fn process_async<S: ConnectionStream>(stream: S) -> anyhow::Result<()> {
@@ -197,7 +201,7 @@ async fn process_async_with_peer<S: ConnectionStream>(
     log::trace!("process_async called");
     let revoked = match &peer {
         ConnectionPeer::Web(web) => Some(web.revoked.clone()),
-        ConnectionPeer::Local => None,
+        ConnectionPeer::Local | ConnectionPeer::Tls => None,
     };
 
     let (item_tx, item_rx) = smol::channel::unbounded::<Item>();

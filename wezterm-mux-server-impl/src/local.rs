@@ -68,7 +68,12 @@ impl LocalListener {
             match stream {
                 Ok(stream) => {
                     crate::connections::spawn(async move {
-                        if let Err(err) = crate::dispatch::process(stream).await {
+                        if let Err(err) = crate::dispatch::process(
+                            stream,
+                            crate::sessionhandler::ConnectionPeer::Local,
+                        )
+                        .await
+                        {
                             log::error!("{err:#}");
                         }
                     });

@@ -999,7 +999,15 @@ fn schedule_palette_session_cleanup(session_id: PaletteSessionId, reason: &'stat
 /// user by construction; a browser is whoever presented a web token.
 #[derive(Debug, Clone)]
 pub enum ConnectionPeer {
+    /// The unix socket: a client already on this machine, running as this
+    /// user.
     Local,
+    /// The mTLS port: a client that presented a certificate for this user,
+    /// from somewhere else. It may do what the user could -- that is what
+    /// the certificate means -- but not everything a session on the machine
+    /// itself may do; opening a listener the rest of the network can reach
+    /// is not a thing to be able to arrange from off it.
+    Tls,
     Web(WebPeer),
 }
 
@@ -2387,6 +2395,17 @@ impl SessionHandler {
                 enabled,
                 bind_address,
             }) => {
+                // A client certificate says "this user", which is what lets
+                // a remote peer do everything a local one can. It does not
+                // say "on this machine", and opening a port the rest of the
+                // network can reach is not a thing to be able to arrange
+                // from off the machine: the port outlives the connection
+                // that asked for it, and a token minted through it outlives
+                // the certificate, which cannot be revoked. The reverse
+                // direction was already closed -- see `web_peer_may_send`,
+                // which keeps a browser from turning its token into a
+                // certificate -- and this is the same argument.
+                let on_this_machine = matches!(self.peer, ConnectionPeer::Local);
                 catch(
                     move || {
                         let Some(control) = crate::web_control::get() else {
@@ -2396,6 +2415,13 @@ impl SessionHandler {
                         };
                         if enabled {
                             let server = web_server_to_start(bind_address.as_deref())?;
+                            if !server.is_loopback() && !on_this_machine {
+                                anyhow::bail!(
+                                    "a client connected over TLS may not open a listener on {}; \
+                                     turn it on from a session on that machine, or over ssh",
+                                    server.bind_address
+                                );
+                            }
                             if !crate::web_control::listening().contains(&server.bind_address) {
                                 // The token store is set up by whoever starts
                                 // the first listener. A server configured with
@@ -2893,6 +2919,45 @@ async fn move_pane(
 }
 
 #[cfg(test)]
+mod web_server_address_tests {
+    /// An address arriving over the wire is checked before it becomes a
+    /// listener, so a typo names itself instead of surfacing as a bind
+    /// error. A hostname is as valid as a literal -- `bind_address` takes
+    /// either -- but the port is not optional.
+    #[test]
+    fn an_address_to_listen_on_needs_a_port_and_nothing_stranger() {
+        for good in [
+            "127.0.0.1:8088",
+            "0.0.0.0:8088",
+            "[::1]:8088",
+            "[::]:8088",
+            "mux.example.net:8443",
+        ] {
+            assert!(
+                super::web_server_to_start(Some(good)).is_ok(),
+                "{good:?} should be a listenable address"
+            );
+        }
+        for bad in [
+            "",
+            "127.0.0.1",
+            "mux.example.net",
+            "127.0.0.1:",
+            "127.0.0.1:notaport",
+            "127.0.0.1:8088/ws",
+            "http://127.0.0.1:8088",
+            "127.0.0.1:8088 ",
+        ] {
+            let err = super::web_server_to_start(Some(bad)).unwrap_err().to_string();
+            assert!(
+                err.contains("address:port"),
+                "{bad:?} was accepted, or refused for another reason: {err}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         claim_viewport_for_pane, requires_existing_frontend_access, workspace_for_moved_pane,
@@ -3206,6 +3271,20 @@ fn web_urls(listening: &[String]) -> Vec<String> {
 fn web_server_to_start(bind_address: Option<&str>) -> anyhow::Result<config::WebServer> {
     let config = config::configuration();
     if let Some(address) = bind_address {
+        // An address off the wire, so it is checked before it becomes a
+        // listener: a typo should fail here, naming itself, rather than as
+        // a bind error with no context. A name is as good as a literal --
+        // `bind_address` is documented to take either -- but a port is not
+        // optional.
+        // `split_authority` trims before it parses, so the address has to be
+        // checked for being already trimmed as well: what is bound is the
+        // string as it arrived, and " 127.0.0.1:8088" would pass the parse
+        // and fail the bind, which is the outcome this check is for.
+        if address.trim() != address
+            || config::split_authority(address).is_none_or(|(_, port)| port.is_none())
+        {
+            anyhow::bail!("{address:?} is not an address:port to listen on");
+        }
         if let Some(server) = config
             .web_servers
             .iter()
