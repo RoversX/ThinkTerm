@@ -473,25 +473,8 @@ impl WebTokenStore {
     }
 }
 
-/// Write `bytes` to `path` readable by the owner only, replacing whatever
-/// was there in one step. A uniquely named temporary file (created 0600,
-/// never following a planted symlink), synced before the rename so a
-/// crash leaves either the old file or the new one, never a torn one.
 fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let dir = match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir,
-        _ => Path::new("."),
-    };
-    std::fs::create_dir_all(dir)?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".web-tokens.")
-        .tempfile_in(dir)
-        .with_context(|| format!("creating a temporary file in {}", dir.display()))?;
-    std::io::Write::write_all(&mut tmp, bytes)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path)
-        .with_context(|| format!("replacing {}", path.display()))?;
-    Ok(())
+    crate::private_file::replace(path, ".web-tokens.", bytes)
 }
 
 #[cfg(test)]

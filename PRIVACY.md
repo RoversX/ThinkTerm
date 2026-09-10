@@ -66,7 +66,13 @@ loads and keeps it in that tab's `sessionStorage`, which the browser
 discards when the tab closes.
 
 While a listener is on, ThinkTerm keeps two things on the local disk,
-readable by your user only, and sends neither anywhere.
+for your user, and sends neither anywhere. On Linux and macOS both are
+written readable by their owner alone. Windows has no equivalent to set:
+they take the permissions of the directory they land in, which for a
+default user profile is you, SYSTEM and the Administrators group, and
+nobody else. An administrator of the machine can therefore read them --
+though an administrator can read the terminals themselves and does not
+need either file to do it.
 
 The first is the tokens, and only if a `token_file` is configured: unset
 means memory only, and restarting the server forgets every token. What is
@@ -80,7 +86,8 @@ than who used it.
 
 The second is a self-signed certificate and its private key, under
 `web-tls/` in ThinkTerm's data directory (`~/.local/share/thinkterm` on
-Linux, `~/Library/Application Support/thinkterm` on macOS). It is made
+Linux, `~/Library/Application Support/thinkterm` on macOS,
+`%APPDATA%\thinkterm` on Windows). It is made
 only when you bind a listener off loopback without supplying a certificate
 of your own, and it names the machine's hostname and every non-loopback
 address it has, so that a browser reaching it by any of them lands in a

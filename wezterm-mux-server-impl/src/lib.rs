@@ -11,6 +11,7 @@ pub mod dispatch;
 pub mod handoff;
 pub mod local;
 pub mod pki;
+mod private_file;
 mod sent_images;
 pub mod sessionhandler;
 pub mod thinkterm_access;

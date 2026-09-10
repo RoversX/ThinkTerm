@@ -56,20 +56,7 @@ fn fingerprint(der: &[u8]) -> String {
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
-        std::io::Write::write_all(&mut file, bytes)?;
-    }
-    std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
-    Ok(())
+    crate::private_file::replace(path, ".web-tls.", bytes)
 }
 
 /// The listener's certificate: the stored one when it still names every
