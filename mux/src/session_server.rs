@@ -35,6 +35,10 @@ pub fn pid_holding(pid_file: &Path) -> Option<u32> {
         .filter(|pid| *pid > 1)
 }
 
+/// No answer off unix: `daemonize` is `#![cfg(unix)]` entire, so no pid
+/// file is written to hold a lock on. Everything downstream -- `is_running`,
+/// `stop`, and the GUI's session host -- is short-circuited by this, which
+/// is why `socket_answers` below stays a stub too.
 #[cfg(not(unix))]
 pub fn pid_holding(_pid_file: &Path) -> Option<u32> {
     None
@@ -78,6 +82,13 @@ pub fn socket_answers(path: &Path) -> bool {
         )
 }
 
+/// Deliberately not `wezterm_uds::someone_listens`, which the mux server
+/// uses to decide whether it may bind over a socket. That question fails
+/// safe towards "someone is there"; this one asks whether *our* server is
+/// up and fails safe towards "it is not", as the unix version above does on
+/// every error. Sharing one probe would invert one of them. Moot in
+/// practice: `pid_holding` returns `None` here, so both callers stop before
+/// they reach this.
 #[cfg(not(unix))]
 pub fn socket_answers(_path: &Path) -> bool {
     false

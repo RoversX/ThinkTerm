@@ -152,3 +152,55 @@ impl std::ops::DerefMut for UnixListener {
         &mut self.0
     }
 }
+
+/// Whether a listener answers on the socket at `path`.
+///
+/// Windows only. The unix side asks this question in two places with two
+/// different answers for "the probe itself failed", so each keeps its own
+/// `sockaddr_un` version; there is one Windows implementation because
+/// `uds_windows` gives no way to spell those differences anyway.
+///
+/// Windows answers a connect to a stale socket file and to a path that does
+/// not exist with the same `WSAECONNREFUSED`, so that error is the only one
+/// that means nobody is there. Every other failure counts as someone,
+/// because binding over a live server is the outcome this exists to
+/// prevent. A listener whose accept backlog is full also answers
+/// `WSAECONNREFUSED` and will be read as absent; that is the same gap the
+/// unix daemon path closes with a pid file, and Windows has none.
+#[cfg(windows)]
+pub fn someone_listens(path: &Path) -> bool {
+    const WSAECONNREFUSED: i32 = 10061;
+    match UnixStream::connect(path) {
+        Ok(_) => true,
+        Err(err) => err.raw_os_error() != Some(WSAECONNREFUSED),
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    /// A live listener answers; the file it leaves behind does not. The
+    /// second half is what makes the probe usable: Windows keeps the socket
+    /// file after the listener is gone, so its presence proves nothing.
+    #[test]
+    fn only_a_live_listener_answers() {
+        let path = std::env::temp_dir()
+            .join(format!("wezterm-uds-probe-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            !super::someone_listens(&path),
+            "nothing is bound at {}",
+            path.display()
+        );
+
+        let listener = super::UnixListener::bind(&path).unwrap();
+        assert!(super::someone_listens(&path), "the listener must answer");
+
+        drop(listener);
+        assert!(path.exists(), "windows leaves the socket file behind");
+        assert!(
+            !super::someone_listens(&path),
+            "a stale file must not read as a listener"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+}

@@ -153,6 +153,11 @@ fn other_server_holding_pid_file(pid_file: &std::path::Path) -> Option<u32> {
     (unsafe { libc::kill(pid as libc::pid_t, 0) } == 0).then_some(pid)
 }
 
+/// No answer off unix: the pid file is written by `daemonize`, which is
+/// `#![cfg(unix)]` entire, so on Windows there is nothing holding a lock to
+/// ask about. `someone_listens` carries the whole guard there, which leaves
+/// a server stalled long enough to fill its accept backlog able to be bound
+/// over -- the case this pid file exists to catch on unix.
 #[cfg(not(unix))]
 fn other_server_holding_pid_file(_pid_file: &std::path::Path) -> Option<u32> {
     None
@@ -204,7 +209,15 @@ pub fn someone_listens(path: &std::path::Path) -> bool {
     )
 }
 
-#[cfg(not(unix))]
+/// Windows has real `AF_UNIX`, so the same question has a real answer; see
+/// [`wezterm_uds::someone_listens`] for what its error codes can and cannot
+/// distinguish.
+#[cfg(windows)]
+pub fn someone_listens(path: &std::path::Path) -> bool {
+    wezterm_uds::someone_listens(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn someone_listens(_path: &std::path::Path) -> bool {
     false
 }
