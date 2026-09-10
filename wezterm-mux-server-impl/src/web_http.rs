@@ -410,9 +410,15 @@ fn response_head(
     extra: &[(&str, &str)],
     body_len: Option<usize>,
 ) -> Vec<u8> {
+    // `frame-ancestors` and its older spelling: a page that opens a shell
+    // has no business inside someone else's frame. Deliberately not a whole
+    // Content-Security-Policy -- `script-src` and `style-src` rules are how
+    // one breaks a wasm and WebGPU page, and framing is the gap that was
+    // actually open.
     let mut out = format!(
         "HTTP/1.1 {status} {reason}\r\nConnection: close\r\n\
-         X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n"
+         X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n\
+         Content-Security-Policy: frame-ancestors 'none'\r\nX-Frame-Options: DENY\r\n"
     );
     for (name, value) in extra {
         out.push_str(name);
@@ -1039,6 +1045,25 @@ mod tests {
         headers.push(("Host", "localhost:9000"));
         let wrong_scheme = request("GET", "/ws", &headers);
         assert_eq!(route(&site, &wrong_scheme), reject(403, "Origin not allowed"));
+    }
+
+    /// Every response, not just the page: an error body or a 304 lands in a
+    /// frame just as well as the page does.
+    #[test]
+    fn no_response_may_be_framed() {
+        for (status, reason, body_len) in
+            [(200u16, "OK", Some(3usize)), (403, "Forbidden", Some(0)), (304, "Not Modified", None)]
+        {
+            let head = String::from_utf8(response_head(status, reason, &[], body_len)).unwrap();
+            assert!(
+                head.contains("\r\nContent-Security-Policy: frame-ancestors 'none'\r\n"),
+                "{status} carries no frame-ancestors: {head:?}"
+            );
+            assert!(
+                head.contains("\r\nX-Frame-Options: DENY\r\n"),
+                "{status} carries no X-Frame-Options: {head:?}"
+            );
+        }
     }
 
     /// Same-origin is the rule, and `0.0.0.0` is the shape that proves it.
