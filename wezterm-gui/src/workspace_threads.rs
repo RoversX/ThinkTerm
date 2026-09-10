@@ -17,7 +17,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use wezterm_term::Progress;
@@ -953,7 +953,114 @@ pub fn save_workspace_thread_store(store: &WorkspaceThreadStore) -> Result<()> {
     // once cost every open thread its working directory, unrecoverably.
     static BACKUP_ONCE: std::sync::Once = std::sync::Once::new();
     BACKUP_ONCE.call_once(|| rotate_store_backups(&path));
-    save_workspace_thread_store_to_path(&path, store)
+    guard_against_shrink(&path, store);
+    save_workspace_thread_store_to_path(&path, store)?;
+    LAST_SAVED_ROWS.store(store_rows(store), Ordering::Release);
+    Ok(())
+}
+
+/// Rows the previous successful save held; 0 until the first save, when
+/// the file itself is counted.
+static LAST_SAVED_ROWS: AtomicUsize = AtomicUsize::new(0);
+
+fn store_rows(store: &WorkspaceThreadStore) -> usize {
+    store.spaces.len()
+        + store.projects.len()
+        + store.projects.iter().map(|project| project.threads.len()).sum::<usize>()
+}
+
+/// Whether a save that takes `before` rows to `after` is a large enough
+/// loss to keep the previous file: at least three rows and a third of
+/// them. A user's own deletes are one row at a time, or one Space; a
+/// sync gone wrong takes everything, and the copy is cheap either way.
+fn shrink_wants_copy(before: usize, after: usize) -> bool {
+    let dropped = before.saturating_sub(after);
+    dropped >= 3 && dropped * 100 >= before * 30
+}
+
+/// Independent of whatever produced `store`: if this save would lose a
+/// large share of the rows the file holds, keep the file first. The one
+/// defence that does not depend on the sync being right.
+fn guard_against_shrink(path: &Path, store: &WorkspaceThreadStore) {
+    let before = match LAST_SAVED_ROWS.load(Ordering::Acquire) {
+        0 => load_workspace_thread_store_from_path(path)
+            .map(|on_disk| store_rows(&on_disk))
+            .unwrap_or(0),
+        rows => rows,
+    };
+    let after = store_rows(store);
+    if !shrink_wants_copy(before, after) {
+        return;
+    }
+    match keep_store_copy(path, "shrink") {
+        Some(copy) => log::warn!(
+            "the ThinkTerm workspace store is about to drop from {before} to {after} rows; \
+             the previous file is kept at {}",
+            copy.display()
+        ),
+        None => log::warn!(
+            "the ThinkTerm workspace store is about to drop from {before} to {after} rows"
+        ),
+    }
+}
+
+/// How many dated copies each tag keeps.
+const STORE_COPIES_PER_TAG: usize = 10;
+
+/// Copy the store file aside as `workspace_threads.<tag>-<stamp>.json`,
+/// keeping the newest `STORE_COPIES_PER_TAG` for the tag. Never fails
+/// the caller; None when there was nothing to copy or the copy failed.
+fn keep_store_copy(path: &Path, tag: &str) -> Option<PathBuf> {
+    if !path.is_file() {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?.to_string();
+    let prefix = format!("{stem}.{tag}-");
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    // Two copies within a second are two copies: the second is not
+    // written over the first.
+    let mut copy = path.with_file_name(format!("{prefix}{stamp}.json"));
+    let mut serial = 1;
+    while copy.exists() {
+        serial += 1;
+        copy = path.with_file_name(format!("{prefix}{stamp}-{serial}.json"));
+    }
+    if let Err(err) = fs::copy(path, &copy) {
+        log::warn!("cannot keep a copy of {}: {err:#}", path.display());
+        return None;
+    }
+    prune_store_copies(path, &prefix, &copy);
+    Some(copy)
+}
+
+/// Keep the newest `STORE_COPIES_PER_TAG` copies for the tag; `just_made`
+/// is never one of the ones let go, whatever its stamp says next to the
+/// others' (the clock can step back; `fs::copy` keeps the source's
+/// modification time, so that is no better).
+fn prune_store_copies(path: &Path, prefix: &str, just_made: &Path) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut copies: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate != just_made
+                && candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(prefix) && name.ends_with(".json"))
+        })
+        .collect();
+    // The stamp sorts by name, oldest first among the others.
+    copies.sort();
+    let excess = (copies.len() + 1).saturating_sub(STORE_COPIES_PER_TAG);
+    for stale in copies.into_iter().take(excess) {
+        let _ = fs::remove_file(stale);
+    }
 }
 
 /// Keep the last few pre-session generations as `.json.bak1` (newest)
@@ -4304,13 +4411,55 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
 
     let scope = publish_scope(domain_name);
     let host = scope == PublishScope::Host;
+    let mut tree_for_store = tree_for_store;
+    if host && first_of_connection {
+        // A Space the server minted on its own (a browser's first attach,
+        // before the desktop published) is only noise next to the
+        // desktop's: drop it unless something is still running in it. The
+        // reconcile below deletes it there, since `tree` keeps it.
+        let mut store = THREAD_STORE.lock();
+        // Once per launch, before anything the host's first tree does to
+        // the local rows -- the leftover deletion below included: the
+        // copy that does not depend on any of it being right.
+        static PRE_SYNC_COPY: std::sync::Once = std::sync::Once::new();
+        PRE_SYNC_COPY.call_once(|| {
+            if !STORE_IS_UNREADABLE.load(Ordering::Acquire) {
+                keep_store_copy(&workspace_thread_store_path(), "before-host-sync");
+            }
+        });
+        let mut dead = dead_server_only_spaces(&store, &tree_for_store);
+        let leftovers = adopted_landing_leftovers(&store, &tree_for_store);
+        for id in &leftovers {
+            match store.delete_space(id) {
+                Ok(_) => {
+                    dead.insert(id.clone());
+                }
+                Err(err) => log::warn!("keeping the host's landing Space {id}: {err:?}"),
+            }
+        }
+        if !leftovers.is_empty() {
+            persist_locked(&store);
+        }
+        drop(store);
+        if !dead.is_empty() {
+            log::info!("dropping {} Space(s) the host minted without the desktop: {dead:?}", dead.len());
+            strip_hidden_spaces(&mut tree_for_store, &dead);
+        }
+    }
     let mut store = THREAD_STORE.lock();
     // Which Spaces belonged to this server *before* it spoke. Only a window
     // parked on one of these can have been orphaned by this push, and the set
     // has to be taken now because the ingest below is what removes them.
     let owned_before = store.space_ids_in_scope(scope);
     let mut changed = if host {
-        store.ingest_host_tree(&tree_for_store, first_of_connection)
+        // The baseline this server gave us on this connection, if any;
+        // `note_remote_connected` clears it, so a first tree has none.
+        let known = if first_of_connection {
+            None
+        } else {
+            LAST_KNOWN_REMOTE_TREES.lock().get(domain_name).cloned()
+        };
+        store.ingest_host_tree(&tree_for_store, known.as_ref())
     } else {
         store.ingest_remote_tree(domain_name, &tree_for_store)
     };
@@ -4352,10 +4501,13 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
         // place it has to reach for the other devices to see it too.
         reconcile_remote_subtree(domain_name);
     }
-    // The host's first tree was merged, not adopted: whatever the desktop
-    // holds that the server lacks is published now.
+    // The host's tree was merged, not adopted: whatever the desktop holds
+    // that the server lacks is published now (at once on a connection's
+    // first tree, coalesced otherwise).
     if host && first_of_connection {
         reconcile_remote_subtree(domain_name);
+    } else if host {
+        schedule_host_tree_reconcile();
     }
 
     if changed {
@@ -4398,6 +4550,103 @@ pub fn note_remote_connected(domain_name: &str) {
 /// asking this to make an exception.
 fn tree_is_stale(arriving: u64, known: Option<u64>) -> bool {
     known.map_or(false, |known| arriving < known)
+}
+
+/// Spaces of the host's tree the desktop does not have that hold nothing
+/// but what the server mints for a landing ("Default", a "Home" project at
+/// `~`, threads named "main") or the desktop's own `wezterm-mux://`
+/// sentinel, none of it with a window on the mux. A Space someone named or
+/// shaped is kept whether or not the desktop knew it: not being in the
+/// cache says the desktop was away, not that the rows are disposable.
+/// Only for the desktop's local Spaces; a store with none adopts everything.
+fn dead_server_only_spaces(
+    store: &WorkspaceThreadStore,
+    tree: &codec::ThinkTermTree,
+) -> std::collections::HashSet<SpaceId> {
+    if !store.spaces.iter().any(|space| space.client_domain.is_none()) {
+        return Default::default();
+    }
+    tree.spaces
+        .iter()
+        .filter(|space| !store.has_space(&space.id) && is_hosts_own_landing(tree, space))
+        .map(|space| space.id.clone())
+        .collect()
+}
+
+/// An id the server minted (`new_id`: kind, then a dashed uuid). The
+/// desktop and the browser mint theirs without dashes, so the shape
+/// tells a row the server made from one somebody made with the same
+/// words in it.
+fn server_minted_id(id: &str, kind: &str) -> bool {
+    id.strip_prefix(kind)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|uuid| {
+            uuid.len() == 36
+                && uuid.char_indices().all(|(i, c)| match i {
+                    8 | 13 | 18 | 23 => c == '-',
+                    _ => c.is_ascii_hexdigit(),
+                })
+        })
+}
+
+/// Whether `space` holds nothing but what the server minted for a
+/// landing (`ensure_landing`: server-minted ids, "Default", Home at `~`,
+/// threads named "main") or the desktop's own sentinel, none of it
+/// running. A Space the browser made with the same words has the
+/// browser's ids and is kept.
+fn is_hosts_own_landing(tree: &codec::ThinkTermTree, space: &codec::TtSpace) -> bool {
+    let live = |workspace: &str| {
+        Mux::try_get().is_some_and(|mux| !mux.iter_windows_in_workspace(workspace).is_empty())
+    };
+    let minted_thread = |thread: &codec::TtThread| {
+        server_minted_id(&thread.id, "thread")
+            && thread.name == "main"
+            && !thread.is_pinned
+            && !thread
+                .materialized_workspace_name
+                .as_deref()
+                .or(thread.planned_workspace_name.as_deref())
+                .is_some_and(live)
+    };
+    let minted_project = |project: &codec::TtProject| {
+        let sentinel = project.path.starts_with("wezterm-mux://")
+            || space_id_from_remote_project_id(&project.id).is_some();
+        let landing = server_minted_id(&project.id, "project")
+            && project.name == "Home"
+            && project.path == "~"
+            && project.archived_at.is_none();
+        (sentinel || landing) && project.threads.iter().all(minted_thread)
+    };
+    let mut projects = tree.projects_in_space(&space.id).peekable();
+    server_minted_id(&space.id, "space")
+        && space.name == "Default"
+        && projects.peek().is_some()
+        && projects.all(minted_project)
+}
+
+/// The server's own landing Space, adopted into the desktop's store
+/// before it was told apart (2026-09-10) and still nothing but that:
+/// a second "Default" next to the desktop's. Only a Space with the
+/// server's uuid id shape, never the default one, never the last local
+/// one, and only while the store holds no more for it than the tree.
+fn adopted_landing_leftovers(store: &WorkspaceThreadStore, tree: &codec::ThinkTermTree) -> Vec<SpaceId> {
+    let uuid_shaped = |id: &str| server_minted_id(id, "space");
+    let locals = store.spaces.iter().filter(|s| s.client_domain.is_none()).count();
+    store
+        .spaces
+        .iter()
+        .filter(|space| space.client_domain.is_none() && !space.is_default && locals > 1)
+        .filter(|space| uuid_shaped(&space.id))
+        .filter(|space| tree.spaces.iter().any(|s| s.id == space.id && is_hosts_own_landing(tree, s)))
+        .filter(|space| {
+            store
+                .projects
+                .iter()
+                .filter(|p| p.space_id == space.id)
+                .all(|p| p.name == "Home" && p.threads.iter().all(|t| t.name == "main"))
+        })
+        .map(|space| space.id.clone())
+        .collect()
 }
 
 /// Windows whose recorded Space vanished, paired with where they should go.
@@ -6846,11 +7095,24 @@ impl WorkspaceThreadStore {
     /// thread's stored layout, are carried across by id, and ssh-host
     /// projects, which the host never sees, are left alone. Space order is
     /// this device's (the tree has no reorder for Spaces); Spaces new to
-    /// it are appended. On a connection's first tree (`merge`) rows the
-    /// server lacks are kept for the reconcile that follows to publish;
-    /// afterwards a published row it lacks was deleted elsewhere.
-    fn ingest_host_tree(&mut self, tree: &codec::ThinkTermTree, merge: bool) -> bool {
+    /// it are appended.
+    ///
+    /// A local row the tree lacks is dropped only when `known` -- the tree
+    /// this server last sent on this connection -- had it: only then was
+    /// it deleted elsewhere. Without that evidence (the connection's first
+    /// tree, or a push that overtook the connect bookkeeping) the row is
+    /// kept and the reconcile that follows publishes it. The desktop is
+    /// the primary author of these rows; losing them is the one outcome
+    /// this must never produce.
+    fn ingest_host_tree(
+        &mut self,
+        tree: &codec::ThinkTermTree,
+        known: Option<&codec::ThinkTermTree>,
+    ) -> bool {
         let scope = PublishScope::Host;
+        let server_had_space = |id: &str| known.is_some_and(|known| known.space(id).is_some());
+        let server_had_project = |id: &str| known.is_some_and(|known| known.project(id).is_some());
+        let server_had_thread = |id: &str| known.is_some_and(|known| known.thread(id).is_some());
         let published: std::collections::HashSet<ProjectId> = self
             .projects
             .iter()
@@ -6870,7 +7132,7 @@ impl WorkspaceThreadStore {
                     space.name = known.name.clone();
                     spaces.push(space);
                 }
-                None if merge => spaces.push(space.clone()),
+                None if !server_had_space(&space.id) => spaces.push(space.clone()),
                 None => {}
             }
         }
@@ -6939,15 +7201,14 @@ impl WorkspaceThreadStore {
                             from_tree(thread, project.threads.iter().find(|t| t.id == thread.id))
                         })
                         .collect();
-                    if merge {
-                        threads.extend(
-                            project
-                                .threads
-                                .iter()
-                                .filter(|t| !known.threads.iter().any(|k| k.id == t.id))
-                                .cloned(),
-                        );
-                    }
+                    threads.extend(
+                        project
+                            .threads
+                            .iter()
+                            .filter(|t| !known.threads.iter().any(|k| k.id == t.id))
+                            .filter(|t| !server_had_thread(&t.id))
+                            .cloned(),
+                    );
                     let active_thread_id = project
                         .active_thread_id
                         .clone()
@@ -6964,7 +7225,7 @@ impl WorkspaceThreadStore {
                         archived_at: known.archived_at,
                     });
                 }
-                None if merge => projects.push(project.clone()),
+                None if !server_had_project(&project.id) => projects.push(project.clone()),
                 None => {}
             }
         }
@@ -6985,6 +7246,51 @@ impl WorkspaceThreadStore {
                 active_note_path: None,
                 archived_at: known.archived_at,
             });
+        }
+
+        // The order of the published projects is the server's too: what
+        // the desktop shows is its Space's `folder_order`, so that is
+        // where the server's sequence goes, in the slots the published
+        // projects hold there (ref groups keep theirs), the rest after.
+        let spaces_for_scope = spaces.clone();
+        for space in spaces.iter_mut().filter(|space| space.client_domain.is_none()) {
+            // Published as the rows now stand, adoptions included, so the
+            // same tree twice over settles at once.
+            let servers: Vec<&str> = tree
+                .projects_in_space(&space.id)
+                .filter(|known| {
+                    projects.iter().any(|p| p.id == known.id && !is_remote_project(p, &spaces_for_scope))
+                })
+                .map(|known| known.id.as_str())
+                .collect();
+            // As shown now: listed first, in list order, the rest as held.
+            let mut shown: Vec<&str> = servers.clone();
+            shown.sort_by_key(|id| {
+                space
+                    .folder_order
+                    .iter()
+                    .position(|key| key == id)
+                    .map_or((1, projects.iter().position(|p| p.id == *id).unwrap_or(0)), |at| (0, at))
+            });
+            if shown == servers {
+                continue;
+            }
+            let mut next = servers.iter();
+            let mut order: Vec<String> = space
+                .folder_order
+                .iter()
+                .map(|key| {
+                    if servers.contains(&key.as_str()) {
+                        next.next().map_or_else(|| key.clone(), |id| id.to_string())
+                    } else {
+                        key.clone()
+                    }
+                })
+                .collect();
+            order.extend(next.map(|id| id.to_string()));
+            let mut seen = std::collections::HashSet::new();
+            order.retain(|key| seen.insert(key.clone()));
+            space.folder_order = order;
         }
 
         if spaces == self.spaces && projects == self.projects {
@@ -12793,7 +13099,7 @@ mod tests {
         store.projects[0].threads_collapsed = true;
         let tree = host_tree(&store);
 
-        assert!(store.ingest_host_tree(&tree, false));
+        assert!(store.ingest_host_tree(&tree, Some(&tree)));
 
         let space = &store.spaces[0];
         assert_eq!(space.name, "Main");
@@ -12828,7 +13134,7 @@ mod tests {
         assert_eq!(phone.client_domain, None);
         assert!(!phone.is_default);
         // Same tree again: nothing to repaint or write.
-        assert!(!store.ingest_host_tree(&tree, false));
+        assert!(!store.ingest_host_tree(&tree, Some(&tree)));
         // And nothing left to publish.
         assert!(store
             .reconcile_ops_for_scope(PublishScope::Host, &tree)
@@ -12836,10 +13142,286 @@ mod tests {
     }
 
     #[test]
+    fn a_large_shrink_is_worth_a_copy_and_a_users_delete_is_not() {
+        assert!(!shrink_wants_copy(100, 99));
+        assert!(!shrink_wants_copy(100, 75));
+        assert!(!shrink_wants_copy(4, 2));
+        assert!(shrink_wants_copy(10, 7));
+        assert!(shrink_wants_copy(100, 0));
+        assert!(!shrink_wants_copy(0, 0));
+        assert!(!shrink_wants_copy(5, 8));
+    }
+
+    #[test]
+    fn store_copies_are_dated_and_pruned_per_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace_threads.json");
+        assert!(keep_store_copy(&path, "shrink").is_none(), "nothing to copy yet");
+        fs::write(&path, "{}").unwrap();
+        for i in 0..STORE_COPIES_PER_TAG + 2 {
+            // Stamps are to the second: spell older ones out by hand.
+            fs::write(
+                dir.path().join(format!("workspace_threads.shrink-20260101-0000{i:02}.json")),
+                "{}",
+            )
+            .unwrap();
+        }
+        fs::write(dir.path().join("workspace_threads.before-host-sync-20260101-000000.json"), "{}")
+            .unwrap();
+        let copy = keep_store_copy(&path, "shrink").unwrap();
+        assert!(copy.is_file());
+        let name = copy.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(name.starts_with("workspace_threads.shrink-") && name.ends_with(".json"));
+        let shrink_copies = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_str().unwrap().starts_with("workspace_threads.shrink-"))
+            .count();
+        assert_eq!(shrink_copies, STORE_COPIES_PER_TAG);
+        // Newest kept, oldest gone, other tags untouched.
+        assert!(copy.is_file());
+        assert!(!dir.path().join("workspace_threads.shrink-20260101-000000.json").exists());
+        assert!(dir.path().join("workspace_threads.before-host-sync-20260101-000000.json").is_file());
+        assert!(path.is_file());
+    }
+
+    /// Two copies within the same second are two files, not one written
+    /// over the other: the earlier, fuller state is what the copy is for.
+    #[test]
+    fn store_copies_in_the_same_second_do_not_overwrite_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace_threads.json");
+        fs::write(&path, b"{\"rows\":30}").unwrap();
+        let first = keep_store_copy(&path, "shrink").unwrap();
+        fs::write(&path, b"{\"rows\":20}").unwrap();
+        let second = keep_store_copy(&path, "shrink").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fs::read(&first).unwrap(), b"{\"rows\":30}");
+        assert_eq!(fs::read(&second).unwrap(), b"{\"rows\":20}");
+    }
+
+    /// The tree a server holds before the desktop ever published to it:
+    /// only the landing rows a browser's first attach minted.
+    fn landing_only_tree() -> codec::ThinkTermTree {
+        let mut tree = codec::ThinkTermTree::default();
+        for op in [
+            codec::TreeOp::CreateSpace {
+                space_id: "space-5871f4ae-c86b-4e3f-a5fa-05761131bc18".to_string(),
+                name: "Default".to_string(),
+            },
+            codec::TreeOp::CreateProject {
+                project_id: "project-47c5cc1b-6703-4cb6-8b33-c1cf48150000".to_string(),
+                space_id: "space-5871f4ae-c86b-4e3f-a5fa-05761131bc18".to_string(),
+                name: "Home".to_string(),
+                path: "~".to_string(),
+            },
+            codec::TreeOp::CreateThread {
+                thread_id: "thread-0b1c2d3e-4f50-4617-8899-aabbccddeeff".to_string(),
+                project_id: "project-47c5cc1b-6703-4cb6-8b33-c1cf48150000".to_string(),
+                name: "main".to_string(),
+                workspace: None,
+                created_at: 1,
+            },
+        ] {
+            assert!(codec::apply_op(&mut tree, &op));
+        }
+        tree.revision = 7;
+        tree
+    }
+
+    /// Only the rows the server minted by itself are noise next to the
+    /// desktop's; a Space made in a browser while the desktop was away is
+    /// someone's work and is adopted, closed terminals or not.
+    #[test]
+    fn only_the_servers_own_landing_is_dropped_on_the_hosts_first_tree() {
+        let store = host_test_store();
+        let landing = landing_only_tree();
+        assert!(dead_server_only_spaces(&store, &landing).contains("space-5871f4ae-c86b-4e3f-a5fa-05761131bc18"));
+
+        // The same Space with a thread someone named.
+        let mut named = landing.clone();
+        named.projects[0].threads[0].name = "release".to_string();
+        assert!(dead_server_only_spaces(&store, &named).is_empty());
+
+        // The same words from the browser (`create_project` with `~`):
+        // its ids are not the server's, and it is someone's.
+        let mut browsers = landing.clone();
+        browsers.spaces[0].id = "space-0123456789abcdef0123456789abcdef".to_string();
+        browsers.projects[0].space_id = browsers.spaces[0].id.clone();
+        assert!(dead_server_only_spaces(&store, &browsers).is_empty());
+
+        // A Space someone made and emptied out.
+        let mut made = landing.clone();
+        assert!(codec::apply_op(
+            &mut made,
+            &codec::TreeOp::CreateSpace { space_id: "space-writing".to_string(), name: "Writing".to_string() }
+        ));
+        let dead = dead_server_only_spaces(&store, &made);
+        assert!(dead.contains("space-5871f4ae-c86b-4e3f-a5fa-05761131bc18") && !dead.contains("space-writing"));
+
+        // A "Default" someone emptied out is theirs, not a landing.
+        let mut emptied = landing.clone();
+        emptied.projects.clear();
+        assert!(dead_server_only_spaces(&store, &emptied).is_empty());
+
+        // A Home project the user put away is a decision, not a bootstrap.
+        let mut archived = landing.clone();
+        archived.projects[0].archived_at = Some(5);
+        assert!(dead_server_only_spaces(&store, &archived).is_empty());
+
+        // Rows already in the desktop's cache are never the server's alone.
+        let mut known = store.clone();
+        known.spaces.push(Space { id: "space-5871f4ae-c86b-4e3f-a5fa-05761131bc18".to_string(), ..known.spaces[0].clone() });
+        assert!(dead_server_only_spaces(&known, &landing).is_empty());
+    }
+
+    /// The landing Space a desktop adopted before it learnt to tell it
+    /// apart: still the server's shape, so it goes; the desktop's own
+    /// "Default" and anything someone touched stay.
+    #[test]
+    fn an_adopted_landing_space_is_a_leftover_only_while_untouched() {
+        let mut store = host_test_store();
+        let landing = landing_only_tree();
+        let mut tree = host_tree(&store);
+        tree.spaces.extend(landing.spaces.iter().cloned());
+        tree.projects.extend(landing.projects.iter().cloned());
+        // Not in the store: not a leftover (that is `dead_server_only_spaces`).
+        assert!(adopted_landing_leftovers(&store, &tree).is_empty());
+
+        let mut space = Space { id: "space-5871f4ae-c86b-4e3f-a5fa-05761131bc18".to_string(), ..store.spaces[0].clone() };
+        space.is_default = false;
+        let id = space.id.clone();
+        store.spaces.push(space);
+        store.projects.push(Project {
+            id: "project-47c5cc1b-6703-4cb6-8b33-c1cf48150000".to_string(),
+            space_id: id.clone(),
+            name: "Home".to_string(),
+            path: PathBuf::from("~"),
+            threads: vec![WorkspaceThread::new("project-47c5cc1b-6703-4cb6-8b33-c1cf48150000".to_string(), "main".to_string(), None)],
+            active_thread_id: None,
+            threads_collapsed: false,
+            active_note_path: None,
+            archived_at: None,
+        });
+        assert_eq!(adopted_landing_leftovers(&store, &tree), vec![id.clone()]);
+
+        // A thread someone named there, on either side, keeps it.
+        let mut named = store.clone();
+        named.projects.iter_mut().find(|p| p.id == "project-47c5cc1b-6703-4cb6-8b33-c1cf48150000").unwrap().threads[0].name = "work".into();
+        assert!(adopted_landing_leftovers(&named, &tree).is_empty());
+        let mut named_tree = tree.clone();
+        named_tree.projects.iter_mut().find(|p| p.id == "project-47c5cc1b-6703-4cb6-8b33-c1cf48150000").unwrap().threads[0].name = "work".into();
+        assert!(adopted_landing_leftovers(&store, &named_tree).is_empty());
+        // The desktop's own default, whatever it holds, is never one.
+        let mut mine = store.clone();
+        mine.spaces.iter_mut().find(|s| s.id == id).unwrap().is_default = true;
+        assert!(adopted_landing_leftovers(&mine, &tree).is_empty());
+    }
+
+    /// A project dragged in the browser stays where it was put: the
+    /// host's order is adopted, so the reconcile that follows has no
+    /// move to send back.
+    #[test]
+    fn a_host_push_that_only_reorders_projects_is_adopted_not_undone() {
+        let mut store = host_test_store();
+        let space_id = store.spaces[0].id.clone();
+        let extra = Project {
+            id: "local-2".to_string(),
+            space_id: space_id.clone(),
+            name: "Second".to_string(),
+            path: PathBuf::from("/tmp/second"),
+            threads: vec![WorkspaceThread::new("local-2".to_string(), "main".to_string(), None)],
+            active_thread_id: None,
+            threads_collapsed: false,
+            active_note_path: None,
+            archived_at: None,
+        };
+        store.projects.push(extra);
+        // An ssh project and a ref group sit in the folder order too;
+        // they keep their slots.
+        store.spaces[0].folder_order =
+            vec!["ssh-box".to_string(), "local-1".to_string(), "machine:devbox".to_string(), "local-2".to_string()];
+        let tree = host_tree(&store);
+        store.ingest_host_tree(&tree, None);
+        let before: Vec<String> = store
+            .published_projects_in_space(&store.spaces[0], PublishScope::Host)
+            .iter()
+            .map(|p| p.id.clone())
+            .collect();
+        assert_eq!(before, ["local-1", "local-2", "web-1"]);
+
+        // The browser moved Second first.
+        let mut moved = tree.clone();
+        let second = moved.projects.iter().position(|p| p.id == "local-2").unwrap();
+        let project = moved.projects.remove(second);
+        let first = moved.projects.iter().position(|p| p.id == "local-1").unwrap();
+        moved.projects.insert(first, project);
+        moved.revision += 1;
+        assert!(store.ingest_host_tree(&moved, Some(&tree)));
+        let after: Vec<String> = store
+            .published_projects_in_space(&store.spaces[0], PublishScope::Host)
+            .iter()
+            .map(|p| p.id.clone())
+            .collect();
+        assert_eq!(after, ["local-2", "local-1", "web-1"]);
+        assert_eq!(
+            store.spaces[0].folder_order,
+            ["ssh-box", "local-2", "machine:devbox", "local-1", "web-1"]
+        );
+        assert!(!store
+            .reconcile_ops_for_scope(PublishScope::Host, &moved)
+            .iter()
+            .any(|op| matches!(op, codec::TreeOp::MoveProjectBefore { .. })));
+    }
+
+    /// The failure that cost a user their sidebar on 2026-09-10: a tree
+    /// that never held the desktop's rows arriving without any baseline,
+    /// whichever way the connect bookkeeping and the push were ordered.
+    #[test]
+    fn a_host_tree_never_drops_rows_the_server_was_not_known_to_have() {
+        let mut store = host_test_store();
+        let before = store.clone();
+        let tree = landing_only_tree();
+
+        assert!(store.ingest_host_tree(&tree, None));
+
+        // Every local row survives; the server's rows are adopted next to
+        // them; the remote domain's Space and the ssh project are untouched.
+        for space in &before.spaces {
+            assert!(store.spaces.iter().any(|s| s.id == space.id), "{}", space.id);
+        }
+        for project in &before.projects {
+            let now = store.projects.iter().find(|p| p.id == project.id).unwrap();
+            assert_eq!(now.threads.len(), project.threads.len(), "{}", project.id);
+        }
+        assert!(store.spaces.iter().any(|s| s.id == "space-5871f4ae-c86b-4e3f-a5fa-05761131bc18"));
+        assert!(store.projects.iter().any(|p| p.id == "project-47c5cc1b-6703-4cb6-8b33-c1cf48150000"));
+        // And the reconcile that follows publishes what the server lacks.
+        let ops = store.reconcile_ops_for_scope(PublishScope::Host, &tree);
+        assert!(ops.iter().any(|op| matches!(
+            op,
+            codec::TreeOp::CreateProject { project_id, .. } if project_id == "local-1"
+        )));
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            codec::TreeOp::DeleteThread { .. }
+                | codec::TreeOp::RemoveProject { .. }
+                | codec::TreeOp::DeleteSpace { .. }
+        )));
+
+        // The same tree arriving again with itself as the baseline still
+        // cannot drop what it never listed.
+        let tree_for_store = store.clone();
+        assert!(!store.ingest_host_tree(&tree, Some(&tree)));
+        assert_eq!(store, tree_for_store);
+    }
+
+    #[test]
     fn the_hosts_first_tree_merges_and_later_ones_drop_deleted_rows() {
         let mut store = host_test_store();
         let ids = local_thread_ids(&store);
-        let mut tree = host_tree(&store);
+        let full = host_tree(&store);
+        let mut tree = full.clone();
         // The server never heard of the second thread, nor of the project
         // the desktop made while detached.
         tree.projects[0].threads.pop();
@@ -12853,7 +13435,7 @@ mod tests {
 
         // First tree of the connection: keep ours, take theirs, and the
         // reconcile that follows publishes the difference.
-        assert!(store.ingest_host_tree(&tree, true));
+        assert!(store.ingest_host_tree(&tree, None));
         assert_eq!(local_thread_ids(&store), ids);
         assert!(store.projects.iter().any(|project| project.id == "offline-1"));
         assert!(store.projects.iter().any(|project| project.id == "web-1"));
@@ -12873,8 +13455,19 @@ mod tests {
                 | codec::TreeOp::DeleteSpace { .. }
         )));
 
-        // A later push without those rows means another client deleted them.
-        assert!(store.ingest_host_tree(&tree, false));
+        // A later push without a row the server was known to hold means
+        // another client deleted it; a row it never held stays.
+        let mut known = full.clone();
+        assert!(codec::apply_op(
+            &mut known,
+            &codec::TreeOp::CreateProject {
+                project_id: "offline-1".to_string(),
+                space_id: DEFAULT_SPACE_ID.to_string(),
+                name: "offline".to_string(),
+                path: "/tmp/offline".to_string(),
+            }
+        ));
+        assert!(store.ingest_host_tree(&tree, Some(&known)));
         assert_eq!(local_thread_ids(&store), ids[..1]);
         assert!(!store.projects.iter().any(|project| project.id == "offline-1"));
     }
