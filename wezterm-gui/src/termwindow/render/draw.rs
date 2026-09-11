@@ -216,6 +216,9 @@ pub(crate) fn draw_webgpu_layers(
     card_scratch: &mut Option<CardScratch>,
     frame_verts: &mut Vec<crate::quad::Vertex>,
 ) -> anyhow::Result<()> {
+    // Back-pressure: do not let this frame's uploads pile onto a device that
+    // has not finished the frame before last. See `WebGpuState::in_flight_submissions`.
+    webgpu.wait_for_frame_slot();
     let acquire_start = crate::perf::now();
     let output = webgpu.surface.get_current_texture()?;
     crate::perf::log_duration("webgpu_surface_acquire", acquire_start);
@@ -507,7 +510,8 @@ pub(crate) fn draw_webgpu_layers(
     crate::perf::log_counter("webgpu_draw_calls", draw_calls);
     crate::perf::log_counter("webgpu_vertices", vertices_total);
     let submit_start = crate::perf::now();
-    webgpu.queue.submit(std::iter::once(encoder.finish()));
+    let submission = webgpu.queue.submit(std::iter::once(encoder.finish()));
+    webgpu.note_submission(submission);
     if crate::framedump::should_dump(window_label) {
         if let Err(err) = crate::framedump::dump_texture(
             &webgpu.device,

@@ -70,8 +70,24 @@ pub struct WebGpuState {
     /// the calling thread, so it is never done eagerly on focus change;
     /// the next paint's resize() call picks it up.
     pending_frame_latency: Cell<Option<u32>>,
+    /// Submission indices of the most recent frames, oldest first, so the
+    /// paint path can bound how far the queue runs ahead of the device.
+    ///
+    /// Nothing else applies back-pressure: `queue.submit` never blocks, the
+    /// swapchain's frame latency only bounds *presents*, and every frame's
+    /// `write_buffer` calls mint staging buffers that wgpu cannot free until
+    /// that frame's fence completes. On a device that cannot keep up (WARP,
+    /// a busy integrated GPU) the backlog grew without limit: measured at
+    /// ~460 MB/min of staging under three fast-refreshing btop panes, with
+    /// the device up to 9 s behind. Waiting for the frame before last keeps
+    /// at most two frames of uploads alive.
+    in_flight_submissions: RefCell<std::collections::VecDeque<wgpu::SubmissionIndex>>,
     pub handle: RawHandlePair,
 }
+
+/// How many frames may be submitted ahead of the device before the paint
+/// path blocks on the oldest one. Two matches `desired_maximum_frame_latency`.
+pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 pub struct RawHandlePair {
     window: RawWindowHandle,
@@ -659,7 +675,39 @@ impl WebGpuState {
             frame_uniforms: RefCell::new(FrameUniforms::default()),
             atlas_bind_groups: RefCell::new(None),
             pending_frame_latency: Cell::new(None),
+            in_flight_submissions: RefCell::new(std::collections::VecDeque::with_capacity(
+                MAX_FRAMES_IN_FLIGHT + 1,
+            )),
         })
+    }
+
+    /// Block until the device has finished the oldest frame still in flight,
+    /// when `MAX_FRAMES_IN_FLIGHT` frames are already queued ahead of it.
+    /// Call once per frame, before the frame's first `write_buffer`, so the
+    /// backlog of upload staging never exceeds that many frames.
+    pub fn wait_for_frame_slot(&self) {
+        let oldest = {
+            let mut queue = self.in_flight_submissions.borrow_mut();
+            if queue.len() < MAX_FRAMES_IN_FLIGHT {
+                return;
+            }
+            queue.pop_front()
+        };
+        if let Some(index) = oldest {
+            let started = crate::perf::now();
+            if let Err(err) = self
+                .device
+                .poll(wgpu::PollType::WaitForSubmissionIndex(index))
+            {
+                log::warn!("waiting for an in-flight frame submission: {err:?}");
+            }
+            crate::perf::log_duration("webgpu_frame_slot_wait", started);
+        }
+    }
+
+    /// Record a frame's submission index so `wait_for_frame_slot` can wait on it.
+    pub fn note_submission(&self, index: wgpu::SubmissionIndex) {
+        self.in_flight_submissions.borrow_mut().push_back(index);
     }
 
     /// Ask for a different swapchain frame latency. Applied lazily: the
