@@ -728,6 +728,13 @@ impl super::TermWindow {
                             );
                         }
 
+                        // Typing into a terminal another device holds is as
+                        // deliberate as clicking in it: take the viewport
+                        // back, or the keystrokes land in a grid shaped for
+                        // that device and drawn at its size here.
+                        if is_down {
+                            self.claim_frontend_viewport_for_interaction();
+                        }
                         let stage = crate::input_diagnostics::StageTimer::begin("process_pane_key");
                         let res = if is_down {
                             pane.key_down(term_key, tw_raw_modifiers)
@@ -1251,6 +1258,11 @@ impl super::TermWindow {
                         );
                     }
 
+                    // See process_key: a keystroke claims the viewport the
+                    // way a click does.
+                    if window_key.key_is_down {
+                        self.claim_frontend_viewport_for_interaction();
+                    }
                     let stage = crate::input_diagnostics::StageTimer::begin("pane_key");
                     let res = if window_key.key_is_down {
                         pane.key_down(key, modifiers)
