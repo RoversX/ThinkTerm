@@ -562,7 +562,7 @@ impl WebGpuState {
                 }
                 .using_resolution(adapter.limits()),
                 label: None,
-                memory_hints: Default::default(),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
                 trace: wgpu::Trace::Off,
             })
             .await?;
