@@ -552,6 +552,25 @@ fn schedule_apply_decoration(hwnd: HWND, decorations: WindowDecorations) {
     .detach();
 }
 
+/// Re-theme every window, after the application was asked to present a
+/// different appearance. `apply_theme` reads that appearance for itself, and
+/// its own comparison against the window's last-seen value decides whether an
+/// `AppearanceChanged` is worth dispatching.
+///
+/// The handles are collected before any of them is themed: `apply_theme`
+/// borrows each window's inner state and dispatches from inside that borrow,
+/// which it cannot do while the window map is also borrowed here.
+pub(crate) fn reapply_appearance_to_all_windows() {
+    let conn = match Connection::get() {
+        Some(conn) => conn,
+        None => return,
+    };
+    let hwnds: Vec<HWND> = conn.windows.borrow().keys().map(|window| window.0).collect();
+    for hwnd in hwnds {
+        apply_theme(hwnd);
+    }
+}
+
 fn apply_decoration_immediate(hwnd: HWND, decorations: WindowDecorations) {
     match rc_from_hwnd(hwnd) {
         Some(inner) => {

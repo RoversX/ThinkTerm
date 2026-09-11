@@ -38,7 +38,10 @@ pub struct Connection {
     pub(crate) gl_connection: RefCell<Option<Rc<crate::egl::GlConnection>>>,
 }
 
-pub(crate) fn get_appearance() -> Appearance {
+/// What the system is set to, ignoring any appearance the application was
+/// asked to present. Use [`get_appearance`] unless you specifically want to
+/// know what Windows itself says.
+pub(crate) fn system_appearance() -> Appearance {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     match hkcu.open_subkey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize") {
         Ok(theme) => {
@@ -51,6 +54,13 @@ pub(crate) fn get_appearance() -> Appearance {
         }
         _ => Appearance::Light,
     }
+}
+
+/// The appearance the application presents: whatever it was asked to present,
+/// else whatever the system is set to. The override short-circuits the
+/// registry read, so a window that is already themed costs nothing to re-check.
+pub(crate) fn get_appearance() -> Appearance {
+    crate::connection::preferred_appearance().unwrap_or_else(system_appearance)
 }
 
 /// The monitor the user is working on: the one holding our focused window,
@@ -74,6 +84,10 @@ impl ConnectionOps for Connection {
 
     fn get_appearance(&self) -> Appearance {
         get_appearance()
+    }
+
+    fn reapply_appearance(&self) {
+        super::window::reapply_appearance_to_all_windows();
     }
 
     fn name(&self) -> String {
