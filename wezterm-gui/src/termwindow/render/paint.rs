@@ -874,6 +874,31 @@ impl crate::TermWindow {
                             // so the counter can be read as a distribution
                             // rather than as "something went wrong once".
                             crate::perf::log_counter("paint_passes", pass + 1);
+                            // Entry counts alone cannot say whether the render
+                            // caches' byte budgets are set sensibly: these
+                            // caches hold entries of wildly different sizes.
+                            // The weights are already computed on every insert,
+                            // and without these counters the only way to read
+                            // them is the settings window, which a scripted
+                            // measurement cannot open.
+                            if crate::perf::enabled() {
+                                crate::perf::log_counter(
+                                    "shape_cache_bytes",
+                                    self.shape_cache.borrow().total_weight(),
+                                );
+                                crate::perf::log_counter(
+                                    "line_shape_cache_bytes",
+                                    self.line_to_ele_shape_cache.borrow().total_weight(),
+                                );
+                                crate::perf::log_counter(
+                                    "line_quad_cache_bytes",
+                                    self.line_quad_cache.borrow().total_weight(),
+                                );
+                                crate::perf::log_counter(
+                                    "line_state_cache_bytes",
+                                    self.line_state_cache.borrow().total_weight(),
+                                );
+                            }
                             frame_complete = true;
                             break 'pass;
                         }

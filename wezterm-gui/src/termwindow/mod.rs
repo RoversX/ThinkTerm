@@ -259,6 +259,53 @@ pub(crate) struct LocalThreadActivationState {
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
 
+/// Byte budgets for the render caches, per TermWindow.
+///
+/// These caches were built with an entry-count cap and no byte budget, which
+/// meant their memory was `cap x whatever an entry happens to weigh` and never
+/// shrank once warm -- so a cap read as resident memory multiplied by the
+/// number of windows. Every insert already computes a weight (see
+/// `estimate_line_quad_entry_bytes` and friends in `render/mod.rs`) and
+/// `LfuCache::enforce_limits` already knows how to honour a budget; all that
+/// was missing was passing one in.
+///
+/// Each budget is `configured cap x a per-entry allowance`, not a flat
+/// constant, so that raising a cap is not silently defeated by the budget. The
+/// cap is the knob a user turns to trade memory for hit rate; the budget only
+/// bounds an entry that turns out larger than expected. A flat constant would
+/// quietly clamp `line_quad_cache_size` above ~1400 with nothing in the log to
+/// say why.
+///
+/// The floor on any budget is the *visible* working set: `line_quad_cache`
+/// needs an entry for every visible line of every pane on every frame, so a
+/// budget below that turns each frame into a full miss and costs more CPU than
+/// the memory is worth. Measure with `THINKTERM_PERF=1` and the
+/// `*_cache_bytes` counters before tightening any of these.
+///
+/// Allowances against what was measured here (120 columns): shape ~83 B/entry
+/// against a 2 KiB allowance, line_to_ele ~230 B against 2 KiB -- those two
+/// have so much headroom they will never bind, and exist only for symmetry.
+/// `line_quad` is ~23 KiB/entry against a 32 KiB allowance, i.e. only ~1.4x,
+/// and entry size scales with column count. That is deliberate and it is the
+/// one case where these budgets ever do anything: on a wide window the budget
+/// starts bounding memory below the 1024-entry cap, which is exactly the
+/// configuration an entry-count cap alone fails to bound.
+///
+/// `line_state_cache` deliberately has no budget: its entries are a
+/// compile-time constant size, so its existing 1024-entry cap already bounds
+/// its bytes and a budget would be redundant.
+fn shape_cache_budget(config: &ConfigHandle) -> usize {
+    config.shape_cache_size.saturating_mul(2 * 1024)
+}
+
+fn line_quad_cache_budget(config: &ConfigHandle) -> usize {
+    config.line_quad_cache_size.saturating_mul(32 * 1024)
+}
+
+fn line_to_ele_shape_cache_budget(config: &ConfigHandle) -> usize {
+    config.line_to_ele_shape_cache_size.saturating_mul(2 * 1024)
+}
+
 const ATLAS_SIZE: usize = 128;
 
 /// Ceiling on growing the glyph atlas to fit a working set, in texels per side.
@@ -3514,10 +3561,11 @@ impl TermWindow {
             current_highlight: None,
             quad_generation: 0,
             shape_generation: 0,
-            shape_cache: RefCell::new(LfuCache::new(
+            shape_cache: RefCell::new(LfuCache::new_weighted(
                 "shape_cache.hit.rate",
                 "shape_cache.miss.rate",
                 |config| config.shape_cache_size,
+                shape_cache_budget,
                 &config,
             )),
             ui_shape_caches: RefCell::new(crate::shapecache::UiShapeCaches::new(&config)),
@@ -3530,16 +3578,18 @@ impl TermWindow {
                 &config,
             )),
             next_line_state_id: 0,
-            line_quad_cache: RefCell::new(LfuCache::new(
+            line_quad_cache: RefCell::new(LfuCache::new_weighted(
                 "line_quad_cache.hit.rate",
                 "line_quad_cache.miss.rate",
                 |config| config.line_quad_cache_size,
+                line_quad_cache_budget,
                 &config,
             )),
-            line_to_ele_shape_cache: RefCell::new(LfuCache::new(
+            line_to_ele_shape_cache: RefCell::new(LfuCache::new_weighted(
                 "line_to_ele_shape_cache.hit.rate",
                 "line_to_ele_shape_cache.miss.rate",
                 |config| config.line_to_ele_shape_cache_size,
+                line_to_ele_shape_cache_budget,
                 &config,
             )),
             last_status_call: Instant::now(),
