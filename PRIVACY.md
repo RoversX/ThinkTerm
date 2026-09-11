@@ -72,7 +72,10 @@ they take the permissions of the directory they land in, which for a
 default user profile is you, SYSTEM and the Administrators group, and
 nobody else. An administrator of the machine can therefore read them --
 though an administrator can read the terminals themselves and does not
-need either file to do it.
+need either file to do it. That directory is the roaming half of the
+Windows profile: on a standalone machine it stays where it is, but on a
+domain that has roaming profiles turned on, Windows copies it to the
+profile server at sign-out, and both files go with it.
 
 The first is the tokens, and only if a `token_file` is configured: unset
 means memory only, and restarting the server forgets every token. What is

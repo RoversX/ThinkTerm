@@ -309,6 +309,19 @@ pub fn restart(window: Window, bind_address: String) {
         return;
     };
     promise::spawn::spawn_into_main_thread(async move {
+        // Off and on are two requests, and the second can be refused after
+        // the first has already succeeded: the server will not open a
+        // non-loopback listener for a client that reached it over TLS, and
+        // any address can fail to bind. Either would leave the listener off
+        // with nothing to say so. What was listening is asked for first, so
+        // a refused "on" puts it back before the error is shown.
+        let before = match client.get_web_server_status().await {
+            Ok(status) => status.listening,
+            Err(err) => {
+                finish(&window, Some(format!("{err:#}")), Gate::Action);
+                return;
+            }
+        };
         let off = client
             .set_web_server(codec::SetWebServer { enabled: false, bind_address: None })
             .await;
@@ -327,7 +340,23 @@ pub fn restart(window: Window, bind_address: String) {
                 finish(&window, None, Gate::Action);
                 refresh(window);
             }
-            Err(err) => finish(&window, Some(format!("{err:#}")), Gate::Action),
+            Err(err) => {
+                let mut restored = Ok(());
+                for address in before {
+                    let put_back = client
+                        .set_web_server(codec::SetWebServer { enabled: true, bind_address: Some(address) })
+                        .await;
+                    if let Err(err) = put_back {
+                        restored = Err(err);
+                    }
+                }
+                let message = match restored {
+                    Ok(()) => format!("{err:#}"),
+                    Err(restore_err) => format!("{err:#}; and putting the previous listener back failed: {restore_err:#}"),
+                };
+                finish(&window, Some(message), Gate::Action);
+                refresh(window);
+            }
         }
     })
     .detach();

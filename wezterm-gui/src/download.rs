@@ -12,7 +12,11 @@ fn neuter_name(name: &str) -> Option<&str> {
         None => name,
     };
 
-    if name == "." || name == ".." {
+    // A name that ends in a separator, or was nothing to begin with, has
+    // no basename. Without this it came back as `Some("")`, which
+    // `download_dir.join("")` turned into the directory itself; creating
+    // that failed, and the retry loop then wrote the file as `.1`.
+    if name.is_empty() || name == "." || name == ".." {
         return None;
     }
 
@@ -95,6 +99,11 @@ mod tests {
         assert_eq!(neuter_name("C:evil.txt"), None);
         assert_eq!(neuter_name("."), None);
         assert_eq!(neuter_name(".."), None);
+        // No basename at all falls through to the fallback name rather than
+        // to `Some("")`, which named the download directory itself.
+        assert_eq!(neuter_name(""), None);
+        assert_eq!(neuter_name("a/"), None);
+        assert_eq!(neuter_name("a\\"), None);
         // Separators are cut, not refused -- both of them, on every
         // platform, which is stricter than `Path::file_name` on unix.
         assert_eq!(neuter_name("a/b/c.txt"), Some("c.txt"));

@@ -162,11 +162,20 @@ fn windows_reserved_stem(name: &str) -> bool {
     })
 }
 
+/// The longest name these rules accept, in UTF-16 units. NTFS allows 255
+/// per component, but a name is never stored bare: a download lands as
+/// `name.part` first (`partial_download_path`) and, when the name is taken,
+/// as `name (n)` for `n` up to `DOWNLOAD_NAME_ATTEMPTS` -- and both suffixes
+/// have to fit within the same 255, or a name that passed here is refused
+/// by the filesystem a moment later. Twelve units covers ` (1000)` and
+/// `.part` together.
+const WINDOWS_NAME_LIMIT: usize = 255 - 12;
+
 fn windows_download_name_is_valid(name: &str) -> bool {
     !name.is_empty()
         && !matches!(name, "." | "..")
         && !name.ends_with([' ', '.'])
-        && name.encode_utf16().count() <= 255
+        && name.encode_utf16().count() <= WINDOWS_NAME_LIMIT
         && !name.chars().any(windows_reserved_char)
         && !windows_reserved_stem(name)
 }
@@ -200,13 +209,13 @@ fn windows_download_name(name: &str) -> Cow<'_, str> {
     // which is exactly how the stem changes underneath: `CON` followed by
     // 252 spaces is not a device name until the cut and the trim have taken
     // the spaces away, and then it is.
-    cut_to_255_utf16_units(&mut out);
+    cut_to_name_limit(&mut out);
     if windows_reserved_stem(&out) {
         out.insert(0, '_');
         // The prefix can put it back over the limit. Cutting again is safe
         // to do once: the stem now begins with `_`, so no amount of taking
         // from the end can make it a device name a second time.
-        cut_to_255_utf16_units(&mut out);
+        cut_to_name_limit(&mut out);
     }
     if out.is_empty() {
         out.push_str("download");
@@ -214,14 +223,16 @@ fn windows_download_name(name: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn cut_to_255_utf16_units(name: &mut String) {
-    if name.encode_utf16().count() <= 255 {
+/// Cut `name` to [`WINDOWS_NAME_LIMIT`] UTF-16 units on a character
+/// boundary, then trim what the cut may have exposed.
+fn cut_to_name_limit(name: &mut String) {
+    if name.encode_utf16().count() <= WINDOWS_NAME_LIMIT {
         return;
     }
     let mut units = 0usize;
     let mut end = name.len();
     for (index, ch) in name.char_indices() {
-        if units + ch.len_utf16() > 255 {
+        if units + ch.len_utf16() > WINDOWS_NAME_LIMIT {
             end = index;
             break;
         }
@@ -717,6 +728,17 @@ mod tests {
                 "sanitize({:?}) produced {:?}, which is still refused",
                 name,
                 sanitized
+            );
+            // And it still fits once the download path has dressed it: a
+            // `.part` while it streams, ` (n)` when the name is taken. NTFS
+            // counts 255 UTF-16 units per component, and a name that only
+            // fits bare is refused by the filesystem a moment later.
+            let dressed = format!("{sanitized} (1000).part");
+            assert!(
+                dressed.encode_utf16().count() <= 255,
+                "sanitize({:?}) left no room for a suffix: {:?}",
+                name,
+                dressed
             );
         }
         // A name that is already fine is handed back untouched, not copied.
