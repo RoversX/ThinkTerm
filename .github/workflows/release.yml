@@ -182,8 +182,15 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # Submodules too: thinkterm-web `include_str!`s its icons from
+      # third_party/lucide, so a bare checkout fails to compile it.
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Check submodules
+        run: bash ci/check-submodules.sh
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
