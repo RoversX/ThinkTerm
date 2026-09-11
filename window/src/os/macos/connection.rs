@@ -150,6 +150,13 @@ impl ConnectionOps for Connection {
     }
 
     fn get_appearance(&self) -> Appearance {
+        // `setAppearance:` below already makes `effectiveAppearance` report an
+        // override, so this is belt and braces -- but it makes the answer the
+        // same on every platform, and independent of when AppKit gets around
+        // to propagating the change.
+        if let Some(appearance) = crate::connection::preferred_appearance() {
+            return appearance;
+        }
         let name = unsafe {
             let appearance: id = msg_send![self.ns_app, effectiveAppearance];
             nsstring_to_str(msg_send![appearance, name])
@@ -169,7 +176,11 @@ impl ConnectionOps for Connection {
         }
     }
 
-    fn set_preferred_appearance(&self, appearance: Option<Appearance>) {
+    fn reapply_appearance(&self) {
+        // Read the override rather than `get_appearance()`: that now returns
+        // the override itself, so clearing one would hand back the very value
+        // being cleared and `nil` would never be sent.
+        let appearance = crate::connection::preferred_appearance();
         unsafe {
             let ns_appearance: id = match appearance {
                 Some(Appearance::Light | Appearance::LightHighContrast) => {
