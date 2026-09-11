@@ -30,8 +30,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      # No submodules: the crates below don't touch the vendored assets.
+      # Submodules too: thinkterm-web `include_str!`s its icons from
+      # third_party/lucide, so a bare checkout fails to compile it.
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
