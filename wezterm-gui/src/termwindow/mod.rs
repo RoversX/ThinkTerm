@@ -282,14 +282,14 @@ use prevcursor::PrevCursorPos;
 /// the memory is worth. Measure with `THINKTERM_PERF=1` and the
 /// `*_cache_bytes` counters before tightening any of these.
 ///
-/// Allowances against what was measured here (120 columns): shape ~83 B/entry
-/// against a 2 KiB allowance, line_to_ele ~230 B against 2 KiB -- those two
-/// have so much headroom they will never bind, and exist only for symmetry.
-/// `line_quad` is ~23 KiB/entry against a 32 KiB allowance, i.e. only ~1.4x,
-/// and entry size scales with column count. That is deliberate and it is the
-/// one case where these budgets ever do anything: on a wide window the budget
-/// starts bounding memory below the 1024-entry cap, which is exactly the
-/// configuration an entry-count cap alone fails to bound.
+/// Entry sizes vary enormously with content, so the allowances are set for the
+/// worst case rather than the typical one. `line_quad` measured ~1.2 KiB/entry
+/// on ordinary terminal content but ~23 KiB/entry on synthetic lines packed
+/// edge to edge with glyphs, and it scales with column count on top of that.
+/// A 32 KiB allowance therefore never binds on real content -- these budgets
+/// are a ceiling for the pathological case, not a routine reduction. Do not
+/// tighten them toward the typical figure: the floor is the visible working
+/// set, and dropping below it costs more CPU than the memory is worth.
 ///
 /// `line_state_cache` deliberately has no budget: its entries are a
 /// compile-time constant size, so its existing 1024-entry cap already bounds
@@ -2645,6 +2645,18 @@ impl TermWindow {
             self.get_panes_to_render().len(),
             tab_count
         )];
+
+        // Which adapter we actually got decides how to read every other number
+        // in this report: on a discrete GPU the swapchain and textures are VRAM
+        // and appear in neither working set nor commit, on an integrated one
+        // they are system memory, and on a Cpu adapter (WARP) everything is.
+        if let Some(webgpu) = self.webgpu.as_ref() {
+            let info = &webgpu.adapter_info;
+            lines.push(format!(
+                "{label}: adapter name={} device_type={:?} backend={:?} driver={} driver_info={}",
+                info.name, info.device_type, info.backend, info.driver, info.driver_info,
+            ));
+        }
 
         if let Some(render_state) = self.render_state.as_ref() {
             let stats = render_state.stats();
