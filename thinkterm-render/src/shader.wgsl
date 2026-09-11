@@ -14,7 +14,12 @@ struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) tex: vec2<f32>,
     @location(1) fg_color: vec4<f32>,
-    @location(2) hsv: vec3<f32>,
+    // Flat, not interpolated: `apply_hsv` compares this against identity to
+    // skip the round trip, and `set_hsv` writes the same value to all four
+    // corners of a quad. Interpolating a constant is exact in practice, but
+    // flat makes the comparison correct by construction rather than by
+    // argument about attribute gradients.
+    @location(2) @interpolate(flat) hsv: vec3<f32>,
     @location(3) has_color: f32,
 };
 
@@ -70,6 +75,17 @@ fn hsv2rgb(c: vec3<f32>) -> vec3<f32>
 
 fn apply_hsv(c: vec4<f32>, transform: vec3<f32>) -> vec4<f32>
 {
+  // The default transform is exactly (1,1,1) -- `foreground_text_hsb` defaults
+  // to 1.0 on all three axes and `set_hsv(None)` writes a literal (1,1,1) --
+  // so without this guard every fragment of a default-configured terminal pays
+  // for a full rgb2hsv/hsv2rgb round trip that returns (very nearly) its input.
+  // The GLSL renderer has had the same short-circuit all along; this brings the
+  // two into agreement. Note the round trip is itself lossy (the epsilons in
+  // rgb2hsv, the fract/clamp in hsv2rgb), so returning `c` untouched is not
+  // bit-identical to the old output -- it is about one f32 ULP closer to right.
+  if all(transform == vec3<f32>(1.0)) {
+    return c;
+  }
   let hsv = rgb2hsv(c.rgb) * transform;
   return vec4<f32>(hsv2rgb(hsv).rgb, c.a);
 }
