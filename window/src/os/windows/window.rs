@@ -2195,6 +2195,19 @@ unsafe fn wm_paint(hwnd: HWND, _msg: UINT, _wparam: WPARAM, _lparam: LPARAM) -> 
 
     if inner.paint_throttled {
         inner.invalidated = true;
+        // Returning Some(0) suppresses DefWindowProcW, which is the only other
+        // thing that would have validated the update region -- so without this
+        // the region stays dirty, PeekMessageW keeps synthesising WM_PAINT and
+        // never returns 0, and the message loop never reaches wait_message().
+        // That spins a core flat out for the whole throttle window (~8ms at the
+        // default max_fps of 120), every window, whenever output is flowing.
+        //
+        // No frame is lost: `invalidated` is now true, and the timer that
+        // clears `paint_throttled` re-issues InvalidateRect for the whole
+        // client area in the same closure under the same borrow. Discarding the
+        // OS's partial expose region is fine because nothing reads ps.rcPaint;
+        // repaints are always full-window.
+        ValidateRect(hwnd, null());
         return Some(0);
     }
 
