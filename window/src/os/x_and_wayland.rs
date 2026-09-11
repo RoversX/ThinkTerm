@@ -160,6 +160,12 @@ impl Connection {
     }
 
     pub(crate) fn advise_of_appearance_change(&self, appearance: Appearance) {
+        // Resolved here rather than at each caller: the xdg-desktop-portal
+        // watcher reports what the *system* changed to, which is not what the
+        // windows should be told while the application has been asked to
+        // present something else. Both that watcher and `reapply_appearance`
+        // arrive through this one method.
+        let appearance = crate::connection::preferred_appearance().unwrap_or(appearance);
         log::trace!("Appearance changed to {appearance:?}");
         match self {
             Self::X11(x) => x.advise_of_appearance_change(appearance),
@@ -209,6 +215,13 @@ impl ConnectionOps for Connection {
             #[cfg(feature = "wayland")]
             Self::Wayland(w) => w.get_appearance(),
         }
+    }
+
+    fn reapply_appearance(&self) {
+        // Neither backend can recolour a window frame it does not draw, so
+        // this exists to tell the windows -- and through them the config
+        // reload -- that the appearance they should paint for has changed.
+        self.advise_of_appearance_change(self.get_appearance());
     }
 
     fn beep(&self) {

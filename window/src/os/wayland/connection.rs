@@ -47,7 +47,17 @@ impl WaylandConnection {
     }
 
     pub(crate) fn advise_of_appearance_change(&self, appearance: crate::Appearance) {
-        for win in self.wayland_state.borrow().windows.borrow().values() {
+        // Collected first: `appearance_changed` dispatches an event, and a
+        // handler that closes a window would reach back into this same map.
+        let windows: Vec<_> = self
+            .wayland_state
+            .borrow()
+            .windows
+            .borrow()
+            .values()
+            .cloned()
+            .collect();
+        for win in windows {
             win.borrow_mut().appearance_changed(appearance);
         }
     }
@@ -177,6 +187,12 @@ impl ConnectionOps for WaylandConnection {
     }
 
     fn get_appearance(&self) -> Appearance {
+        // Ahead of everything else: an appearance the application was asked to
+        // present is the answer, and skipping the rest spares the main thread
+        // a blocking D-Bus round trip on every read.
+        if let Some(appearance) = crate::connection::preferred_appearance() {
+            return appearance;
+        }
         match promise::spawn::block_on(crate::os::xdg_desktop_portal::get_appearance()) {
             Ok(Some(appearance)) => return appearance,
             Ok(None) => {}
