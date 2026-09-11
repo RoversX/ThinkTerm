@@ -348,11 +348,12 @@ pub fn reveal_path(path: &std::path::Path) {
 
     let path = path.to_path_buf();
     std::thread::spawn(move || {
+        let explorer = system_explorer();
         // `canonicalize` fails when the item is gone; open the folder that
         // would have held it rather than nothing. Never the item itself.
         let Ok(full) = std::fs::canonicalize(&path) else {
             if let Some(parent) = path.parent() {
-                let _ = std::process::Command::new("explorer.exe").arg(parent).spawn();
+                let _ = std::process::Command::new(&explorer).arg(parent).spawn();
             }
             return;
         };
@@ -363,10 +364,25 @@ pub fn reveal_path(path: &std::path::Path) {
         // Its exit status says nothing -- Explorer returns 1 even when it
         // worked -- so nothing here may branch on it. In particular there is
         // no falling back to `shell_execute`, which is what ran the file.
-        let _ = std::process::Command::new("explorer.exe")
+        let _ = std::process::Command::new(&explorer)
             .raw_arg(select_argument(&full.to_string_lossy()))
             .spawn();
     });
+}
+
+/// Explorer, by absolute path.
+///
+/// `Command::new("explorer.exe")` searches for the name, and that search
+/// reaches the directory of the *running executable* before System32. An
+/// `explorer.exe` dropped beside ThinkTerm -- a portable zip unpacked under
+/// Downloads, a per-user install, a build tree -- would therefore run as the
+/// user the first time anyone revealed a file. That is precisely the
+/// arbitrary execution this function exists to remove, and it must not come
+/// back in through the name lookup.
+#[cfg(windows)]
+fn system_explorer() -> PathBuf {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    Path::new(&root).join("explorer.exe")
 }
 
 /// The `/select,` argument for a full path.
@@ -401,6 +417,19 @@ mod tests {
         );
         // Never canonicalized, so never prefixed: unchanged.
         assert_eq!(super::select_argument(r"C:\x.txt"), r#"/select,"C:\x.txt""#);
+    }
+
+    /// Named absolutely, because the search for a bare `explorer.exe` looks
+    /// in the running executable's own directory before System32.
+    #[test]
+    fn explorer_is_named_absolutely() {
+        let explorer = super::system_explorer();
+        assert!(explorer.is_absolute(), "{}", explorer.display());
+        assert_eq!(
+            explorer.file_name().and_then(|n| n.to_str()),
+            Some("explorer.exe")
+        );
+        assert!(explorer.is_file(), "{} is not there", explorer.display());
     }
 }
 

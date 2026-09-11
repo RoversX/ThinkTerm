@@ -1057,11 +1057,15 @@ mod tests {
             let head = String::from_utf8(response_head(status, reason, &[], body_len)).unwrap();
             assert!(
                 head.contains("\r\nContent-Security-Policy: frame-ancestors 'none'\r\n"),
-                "{status} carries no frame-ancestors: {head:?}"
+                "{} carries no frame-ancestors: {:?}",
+                status,
+                head
             );
             assert!(
                 head.contains("\r\nX-Frame-Options: DENY\r\n"),
-                "{status} carries no X-Frame-Options: {head:?}"
+                "{} carries no X-Frame-Options: {:?}",
+                status,
+                head
             );
         }
     }

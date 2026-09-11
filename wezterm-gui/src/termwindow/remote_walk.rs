@@ -194,31 +194,41 @@ fn windows_download_name(name: &str) -> Cow<'_, str> {
         .map(|ch| if windows_reserved_char(ch) { '_' } else { ch })
         .collect();
     trim_trailing_dots_and_spaces(&mut out);
+    // Length before the device check, not after. The limit counts UTF-16
+    // units, so the cut walks characters rather than slicing bytes, and the
+    // trim has to run again because the cut can expose a dot or a space --
+    // which is exactly how the stem changes underneath: `CON` followed by
+    // 252 spaces is not a device name until the cut and the trim have taken
+    // the spaces away, and then it is.
+    cut_to_255_utf16_units(&mut out);
     if windows_reserved_stem(&out) {
         out.insert(0, '_');
-    }
-    // The limit counts UTF-16 units, so the cut has to be found by walking
-    // characters rather than by slicing bytes. Trimming again afterwards
-    // because the cut can expose a dot or a space; the stem cannot become
-    // reserved this way, since cutting the end leaves a stem shorter than
-    // itself only when the stem was already over the limit.
-    if out.encode_utf16().count() > 255 {
-        let mut units = 0usize;
-        let mut end = out.len();
-        for (index, ch) in out.char_indices() {
-            if units + ch.len_utf16() > 255 {
-                end = index;
-                break;
-            }
-            units += ch.len_utf16();
-        }
-        out.truncate(end);
-        trim_trailing_dots_and_spaces(&mut out);
+        // The prefix can put it back over the limit. Cutting again is safe
+        // to do once: the stem now begins with `_`, so no amount of taking
+        // from the end can make it a device name a second time.
+        cut_to_255_utf16_units(&mut out);
     }
     if out.is_empty() {
         out.push_str("download");
     }
     Cow::Owned(out)
+}
+
+fn cut_to_255_utf16_units(name: &mut String) {
+    if name.encode_utf16().count() <= 255 {
+        return;
+    }
+    let mut units = 0usize;
+    let mut end = name.len();
+    for (index, ch) in name.char_indices() {
+        if units + ch.len_utf16() > 255 {
+            end = index;
+            break;
+        }
+        units += ch.len_utf16();
+    }
+    name.truncate(end);
+    trim_trailing_dots_and_spaces(name);
 }
 
 /// Walk `root` into a flat, parents-first plan.
@@ -672,6 +682,10 @@ mod tests {
         let long = "a".repeat(300);
         let long_tail = format!("{}.", "b".repeat(255));
         let wide = "😀".repeat(200);
+        // Over the limit, and what the cut leaves behind once its trailing
+        // spaces go is a device name again.
+        let device_after_cut = format!("CON{}abc", " ".repeat(252));
+        let port_after_cut = format!("COM1{}x", " ".repeat(300));
         for name in [
             "report:2024.txt",
             "a<b>c|d?e*f\"g",
@@ -694,11 +708,15 @@ mod tests {
             &long,
             &long_tail,
             &wide,
+            &device_after_cut,
+            &port_after_cut,
         ] {
             let sanitized = DownloadNameRules::Windows.sanitize(name);
             assert!(
                 DownloadNameRules::Windows.accepts(&sanitized),
-                "sanitize({name:?}) produced {sanitized:?}, which is still refused"
+                "sanitize({:?}) produced {:?}, which is still refused",
+                name,
+                sanitized
             );
         }
         // A name that is already fine is handed back untouched, not copied.

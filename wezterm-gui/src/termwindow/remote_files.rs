@@ -3675,7 +3675,9 @@ mod tests {
             let landed = destination.file_name().and_then(|n| n.to_str()).unwrap();
             assert!(
                 crate::termwindow::remote_walk::DownloadNameRules::host().accepts(landed),
-                "{hostile:?} landed as {landed:?}, which this host refuses"
+                "{:?} landed as {:?}, which this host refuses",
+                hostile,
+                landed
             );
         }
         // Names this host cannot store are rewritten rather than refused: the
@@ -3687,7 +3689,9 @@ mod tests {
             let landed = destination.file_name().and_then(|n| n.to_str()).unwrap();
             assert!(
                 crate::termwindow::remote_walk::DownloadNameRules::host().accepts(landed),
-                "{reserved:?} landed as {landed:?}, which this host refuses"
+                "{:?} landed as {:?}, which this host refuses",
+                reserved,
+                landed
             );
             if cfg!(unix) {
                 assert_eq!(landed, reserved, "unix has no quarrel with this name");

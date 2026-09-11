@@ -8,7 +8,6 @@
 //! nothing, and revoking a token drops the connections it admitted on the
 //! spot.
 
-use anyhow::Context;
 use base64::Engine;
 use codec::WebTokenInfo;
 use serde::{Deserialize, Serialize};

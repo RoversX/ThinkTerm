@@ -2935,7 +2935,8 @@ mod web_server_address_tests {
         ] {
             assert!(
                 super::web_server_to_start(Some(good)).is_ok(),
-                "{good:?} should be a listenable address"
+                "{:?} should be a listenable address",
+                good
             );
         }
         for bad in [
@@ -2951,7 +2952,9 @@ mod web_server_address_tests {
             let err = super::web_server_to_start(Some(bad)).unwrap_err().to_string();
             assert!(
                 err.contains("address:port"),
-                "{bad:?} was accepted, or refused for another reason: {err}"
+                "{:?} was accepted, or refused for another reason: {}",
+                bad,
+                err
             );
         }
     }
