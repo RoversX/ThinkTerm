@@ -109,6 +109,7 @@ settings-remote-update-keep-sessions = 更新远端 server 时保留会话
 settings-remote-update-keep-sessions-description = 运行中的 server 把 pane 交给新版本而不是停掉，里面跑的程序不会中断。
 settings-local-sessions-via-mux = 本地终端放在后台会话 server 里
 settings-local-sessions-via-mux-description = 本地终端跑在本机的 mux server 中，ThinkTerm 退出、崩溃或更新后会话仍在。下次启动 ThinkTerm 时生效。
+settings-local-sessions-via-mux-description-windows = 本地终端跑在本机的 mux server 中，ThinkTerm 退出或崩溃后会话仍在；更新 ThinkTerm 会停止该 server。下次启动 ThinkTerm 时生效。
 settings-terminal-heading = 终端配置
 settings-default-shell = 默认 Shell
 settings-default-shell-description = 新开终端运行的程序,下次打开时生效。

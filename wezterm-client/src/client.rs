@@ -1289,6 +1289,14 @@ impl Reconnectable {
                     }
                 }
 
+                // The server is a console-subsystem binary; without this a
+                // console window flashes every time the GUI starts it.
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt as _;
+                    cmd.creation_flags(winapi::um::winbase::CREATE_NO_WINDOW);
+                }
+
                 log::warn!("Running: {:?}", cmd);
                 ui.output_str(&format!("Running: {:?}\n", cmd));
 

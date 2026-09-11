@@ -76,6 +76,14 @@ struct Opt {
     #[arg(long, hide = true)]
     takeover_report_fd: Option<i32>,
 
+    /// The pid file the launching `--daemonize` process locked and made
+    /// inheritable, as a raw handle value; this process writes its pid into
+    /// it and keeps it open for its lifetime. The Windows sibling of
+    /// `--pid-file-fd`.
+    #[cfg(windows)]
+    #[arg(long, hide = true)]
+    pid_file_handle: Option<usize>,
+
     /// Instead of executing your shell, run PROG.
     /// For example: `thinkterm start -- bash -l` will spawn bash
     /// as if it were a login shell.
@@ -116,6 +124,9 @@ fn run() -> anyhow::Result<()> {
         }
     }
 
+    #[cfg(windows)]
+    windows_daemon::adopt(opts.pid_file_handle)?;
+
     config::common_init(
         opts.config_file.as_ref(),
         &opts.config_override,
@@ -123,6 +134,9 @@ fn run() -> anyhow::Result<()> {
     )?;
 
     let config = config::configuration();
+
+    #[cfg(windows)]
+    windows_daemon::lock_own_pid_file(&config)?;
 
     config.update_ulimit()?;
     if let Some(value) = &config.default_ssh_auth_sock {
@@ -200,14 +214,7 @@ fn run() -> anyhow::Result<()> {
 
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
-            cmd.stdout(config.daemon_options.open_stdout()?);
-            cmd.stderr(config.daemon_options.open_stderr()?);
-
-            cmd.creation_flags(winapi::um::winbase::DETACHED_PROCESS);
-            let child = cmd.spawn();
-            drop(child);
-            return Ok(());
+            return windows_daemon::spawn_detached(cmd, &config);
         }
 
         #[cfg(unix)]
@@ -619,9 +626,164 @@ fn install_shutdown_signal_handler() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+/// The Windows sibling of the SIGTERM thread above: the stop event created
+/// in `windows_daemon::adopt` (before the pid was published, so a stopper
+/// that reads the pid always finds it) and Ctrl+C on a foreground server
+/// both flush the layouts and exit.
+#[cfg(windows)]
+fn install_shutdown_signal_handler() -> anyhow::Result<()> {
+    windows_daemon::install_shutdown_handler()
+}
+
+#[cfg(not(any(unix, windows)))]
 fn install_shutdown_signal_handler() -> anyhow::Result<()> {
     Ok(())
+}
+
+/// What `daemonize.rs` does on unix, for Windows: the launching process
+/// locks the pid file and hands it to a detached child, the child publishes
+/// its pid and answers a named stop event instead of SIGTERM. There is no
+/// takeover: an in-place update passes descriptors, which this platform
+/// cannot, so a running server keeps serving until it is stopped.
+#[cfg(windows)]
+mod windows_daemon {
+    use anyhow::Context as _;
+    use mux::session_server::StopEvent;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, RawHandle};
+    use std::os::windows::process::CommandExt as _;
+    use std::sync::Mutex;
+    use winapi::shared::minwindef::{BOOL, DWORD, TRUE};
+    use winapi::shared::winerror::ERROR_ACCESS_DENIED;
+    use winapi::um::consoleapi::SetConsoleCtrlHandler;
+    use winapi::um::handleapi::SetHandleInformation;
+    use winapi::um::winbase::{
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS, HANDLE_FLAG_INHERIT,
+    };
+    use winapi::um::winnt::HANDLE;
+
+    /// Held from `adopt` until `install_shutdown_handler` takes it.
+    static STOP_EVENT: Mutex<Option<StopEvent>> = Mutex::new(None);
+
+    /// Runs first thing after argument parsing, in every server process:
+    /// create the stop event, and when a launcher handed over the locked pid
+    /// file, take it out of inheritance (shells spawned later must not carry
+    /// it, as `set_cloexec` does on unix) and write this pid into it.
+    pub fn adopt(pid_file_handle: Option<usize>) -> anyhow::Result<()> {
+        let event = mux::session_server::create_stop_event()?;
+        *STOP_EVENT.lock().unwrap() = Some(event);
+        if let Some(raw) = pid_file_handle {
+            let mut file = unsafe { std::fs::File::from_raw_handle(raw as RawHandle) };
+            unsafe { SetHandleInformation(raw as HANDLE, HANDLE_FLAG_INHERIT, 0) };
+            match mux::session_server::write_pid(&mut file) {
+                Ok(()) => std::mem::forget(file),
+                Err(err) => {
+                    // The handle did not survive the spawn. The launcher is
+                    // exiting and lets go of its lock; `lock_own_pid_file`
+                    // takes one once the configuration says where it is.
+                    log::warn!(
+                        "the inherited pid file handle is unusable ({err:#}); \
+                         the pid file is locked directly instead"
+                    );
+                    std::mem::forget(file);
+                    NEEDS_OWN_LOCK.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    static NEEDS_OWN_LOCK: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// After the configuration is loaded: the fallback lock for a daemon
+    /// whose inherited handle was unusable. The launcher's lock is released
+    /// as it exits, which `lock_pid_file` waits out.
+    pub fn lock_own_pid_file(config: &config::ConfigHandle) -> anyhow::Result<()> {
+        if !NEEDS_OWN_LOCK.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        let mut own = mux::session_server::lock_pid_file(&config.daemon_options.pid_file())?;
+        mux::session_server::write_pid(&mut own)?;
+        std::mem::forget(own);
+        Ok(())
+    }
+
+    /// The `--daemonize` launcher: lock the pid file (a second launcher
+    /// fails here with the unix wording), then start the server detached,
+    /// with the locked file inherited. Returns once the child is running;
+    /// the client connects to the socket with retries, as on unix.
+    pub fn spawn_detached(
+        mut cmd: std::process::Command,
+        config: &config::ConfigHandle,
+    ) -> anyhow::Result<()> {
+        let pid_file = mux::session_server::lock_pid_file(&config.daemon_options.pid_file())?;
+        let raw = pid_file.as_raw_handle();
+        if unsafe { SetHandleInformation(raw as HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0
+        {
+            return Err(std::io::Error::last_os_error()).context("making the pid file inheritable");
+        }
+        cmd.arg("--pid-file-handle");
+        cmd.arg((raw as usize).to_string());
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(config.daemon_options.open_stdout()?);
+        cmd.stderr(config.daemon_options.open_stderr()?);
+
+        // Detached from this console and from the launcher's job, so a GUI
+        // started under a kill-on-close job (installers, some launchers)
+        // does not take the server down with it.
+        let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+        cmd.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB);
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) if err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+                log::warn!(
+                    "the launcher's job does not allow breaking away; the session server stays \
+                     in it and ends with the job"
+                );
+                cmd.creation_flags(flags);
+                cmd.spawn().context("spawning the session server")?
+            }
+            Err(err) => return Err(err).context("spawning the session server"),
+        };
+        log::info!("session server started as pid {}", child.id());
+        // The child holds its own copy of the lock; this one closes with us.
+        drop(child);
+        drop(pid_file);
+        Ok(())
+    }
+
+    unsafe extern "system" fn ctrl_handler(_ctrl_type: DWORD) -> BOOL {
+        request_shutdown();
+        TRUE
+    }
+
+    fn request_shutdown() {
+        promise::spawn::spawn_into_main_thread(async move {
+            if let Err(err) = wezterm_mux_server_impl::thinkterm_layout::flush_now() {
+                log::error!("flushing ThinkTerm layouts before shutdown: {err:#}");
+            }
+            std::process::exit(0);
+        })
+        .detach();
+    }
+
+    pub fn install_shutdown_handler() -> anyhow::Result<()> {
+        let event = STOP_EVENT
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("the stop event was not created"))?;
+        std::thread::Builder::new()
+            .name("stop-event".into())
+            .spawn(move || {
+                event.wait();
+                log::info!("stop requested; flushing and exiting");
+                request_shutdown();
+            })
+            .context("spawning the stop-event thread")?;
+        unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), TRUE) };
+        Ok(())
+    }
 }
 
 mod ossl;

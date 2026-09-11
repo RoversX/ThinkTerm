@@ -5516,7 +5516,64 @@ impl ClientDomain {
                         // not something a takeover repairs.
                         Err(_) => return Err(verified.unwrap_err()),
                     };
-                    if needs_takeover {
+                    if needs_takeover && !cfg!(unix) {
+                        // No handoff on this platform (it passes descriptors).
+                        // A server that still speaks our codec keeps serving;
+                        // one that does not is stopped, and the reconnect
+                        // starts this build's server. Its terminals end, which
+                        // is what an update without a handoff means here.
+                        match &verified {
+                            Ok(info) => log::info!(
+                                "the session server runs ThinkTerm {} and this is {}; it keeps \
+                                 serving, since this platform has no in-place handoff",
+                                info.version_string,
+                                config::wezterm_version()
+                            ),
+                            Err(err) => {
+                                ui.output_str(&format!(
+                                    "The running session server cannot be used ({err:#}) and this \
+                                     platform cannot hand its sessions over; stopping it and \
+                                     starting this build's server. Its terminals end.\n"
+                                ));
+                                let pid_file = config::configuration().daemon_options.pid_file();
+                                let socket = unix.socket_path();
+                                let outcome = spawn_into_new_thread(move || {
+                                    mux::session_server::stop(
+                                        &pid_file,
+                                        &socket,
+                                        std::time::Duration::from_secs(10),
+                                    )
+                                })
+                                .await;
+                                match outcome {
+                                    Ok(mux::session_server::StopOutcome::NotRunning) => {
+                                        // A server left by a build that wrote no pid
+                                        // file cannot be found; only a person can
+                                        // stop that one.
+                                        ui.output_str(
+                                            "Nothing holds the session server's pid file, so it \
+                                             cannot be stopped from here: stop thinkterm-mux-server \
+                                             by hand, then start ThinkTerm again.\n",
+                                        );
+                                        verified?;
+                                    }
+                                    Ok(_) => {
+                                        ui.output_str("Reconnecting to a fresh server\n");
+                                        *self.early_remote_state.lock().unwrap() =
+                                            EarlyRemoteState::default();
+                                        client = connect(config.clone(), ui.clone()).await?;
+                                        client.verify_version_compat(&ui).await?;
+                                    }
+                                    Err(stop_err) => {
+                                        ui.output_str(&format!(
+                                            "Could not stop the session server: {stop_err:#}\n"
+                                        ));
+                                        verified?;
+                                    }
+                                }
+                            }
+                        }
+                    } else if needs_takeover {
                         let outcome = {
                             let unix = unix.clone();
                             let ui = ui.clone();

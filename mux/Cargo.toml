@@ -54,12 +54,18 @@ wezterm-term = { workspace=true, features=["use_serde"] }
 
 [target."cfg(windows)".dependencies]
 ntapi.workspace = true
+wezterm-uds.workspace = true
 winapi = { workspace=true, features = [
+    "errhandlingapi",
     "handleapi",
     "memoryapi",
     "psapi",
     "processthreadsapi",
+    "synchapi",
     "tlhelp32",
+    "winbase",
+    "winerror",
+    "winnt",
 ]}
 
 [dev-dependencies]

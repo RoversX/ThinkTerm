@@ -5638,7 +5638,13 @@ impl SettingsWindow {
                 row_width,
                 self.compact_row_step(),
                 &crate::i18n::tr("settings-local-sessions-via-mux"),
-                "settings-local-sessions-via-mux-description",
+                // Windows has no in-place handoff: sessions survive quitting
+                // and crashing there, not updating, and the text says so.
+                if cfg!(windows) {
+                    "settings-local-sessions-via-mux-description-windows"
+                } else {
+                    "settings-local-sessions-via-mux-description"
+                },
                 self.native_settings.workspaces.local_sessions_via_mux,
                 SettingsAction::ToggleLocalSessionsViaMux,
             )?;

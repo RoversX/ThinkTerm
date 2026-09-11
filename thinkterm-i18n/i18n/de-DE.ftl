@@ -112,6 +112,7 @@ settings-remote-update-keep-sessions = Sitzungen beim Update eines Remote-Server
 settings-remote-update-keep-sessions-description = Der laufende Server übergibt seine Panes an die neue Version, statt zu stoppen; nichts, was darin läuft, endet.
 settings-local-sessions-via-mux = Lokale Terminals in einem Hintergrund-Sitzungsserver halten
 settings-local-sessions-via-mux-description = Lokale Terminals laufen in einem Mux-Server auf diesem Rechner und überstehen das Beenden, Abstürzen oder Aktualisieren von ThinkTerm. Wird beim nächsten Start von ThinkTerm wirksam.
+settings-local-sessions-via-mux-description-windows = Lokale Terminals laufen in einem Mux-Server auf diesem Rechner und überstehen das Beenden oder Abstürzen von ThinkTerm. Eine Aktualisierung von ThinkTerm beendet den Server. Wird beim nächsten Start von ThinkTerm wirksam.
 settings-terminal-heading = Terminal-Konfiguration
 settings-default-shell = Standard-Shell
 settings-default-shell-description = Das Programm, das ein neues Terminal startet. Wird beim nächsten Öffnen wirksam.

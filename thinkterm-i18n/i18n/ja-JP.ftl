@@ -109,6 +109,7 @@ settings-remote-update-keep-sessions = リモートサーバー更新時にセ�
 settings-remote-update-keep-sessions-description = 実行中のサーバーは停止せず、ペインを新しいバージョンに引き継ぎます。実行中の処理は中断されません。
 settings-local-sessions-via-mux = ローカル端末をバックグラウンドのセッションサーバーに置く
 settings-local-sessions-via-mux-description = ローカル端末はこのマシンの mux サーバーで動作し、ThinkTerm の終了・クラッシュ・更新後も残ります。次回起動時に有効になります。
+settings-local-sessions-via-mux-description-windows = ローカル端末はこのマシンの mux サーバーで動作し、ThinkTerm の終了・クラッシュ後も残ります。ThinkTerm を更新するとサーバーは停止します。次回起動時に有効になります。
 settings-terminal-heading = ターミナル設定
 settings-default-shell = 既定のシェル
 settings-default-shell-description = 新しいターミナルで実行するプログラムです。次に開いたときから有効になります。

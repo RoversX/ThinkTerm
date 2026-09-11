@@ -158,12 +158,17 @@ fn other_server_holding_pid_file(pid_file: &std::path::Path) -> Option<u32> {
     (unsafe { libc::kill(pid as libc::pid_t, 0) } == 0).then_some(pid)
 }
 
-/// No answer off unix: the pid file is written by `daemonize`, which is
-/// `#![cfg(unix)]` entire, so on Windows there is nothing holding a lock to
-/// ask about. `someone_listens` carries the whole guard there, which leaves
-/// a server stalled long enough to fill its accept backlog able to be bound
-/// over -- the case this pid file exists to catch on unix.
-#[cfg(not(unix))]
+/// On Windows the daemon holds the pid file open with write sharing denied
+/// (`mux::session_server::lock_pid_file`); the probe there is the same
+/// question flock answers above, and our own lock is excluded by pid too.
+#[cfg(windows)]
+fn other_server_holding_pid_file(pid_file: &std::path::Path) -> Option<u32> {
+    mux::session_server::pid_holding(pid_file).filter(|pid| *pid != std::process::id())
+}
+
+/// No pid file is written on other platforms; `someone_listens` carries the
+/// whole guard there.
+#[cfg(not(any(unix, windows)))]
 fn other_server_holding_pid_file(_pid_file: &std::path::Path) -> Option<u32> {
     None
 }

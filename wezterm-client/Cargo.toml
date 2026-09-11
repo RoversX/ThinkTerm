@@ -44,5 +44,6 @@ tempfile.workspace = true
 
 [target."cfg(windows)".dependencies]
 winapi = { workspace=true, features = [
+    "winbase",
     "winuser",
 ]}

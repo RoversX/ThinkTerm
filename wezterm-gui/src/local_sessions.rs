@@ -27,11 +27,13 @@ static HOST: OnceLock<Option<String>> = OnceLock::new();
 /// its terminals in process as if the setting were off.
 static FELL_BACK: Mutex<bool> = Mutex::new(false);
 
-/// Whether this build and platform can run local sessions in a server:
-/// the handoff that keeps sessions across an update passes descriptors,
-/// which has no Windows implementation.
+/// Whether this build and platform can run local sessions in a server.
+/// Unix and Windows both can; what Windows lacks is the handoff that keeps
+/// sessions across an update (it passes descriptors), so there the server
+/// simply keeps serving and a newly launched GUI reconnects to it, and an
+/// update stops it.
 pub(crate) fn supported() -> bool {
-    cfg!(unix)
+    cfg!(any(unix, windows))
 }
 
 /// The setting, as it applies to this launch.
@@ -121,7 +123,6 @@ pub(crate) fn note_host_attached() {
 /// Its terminals end with it, which is what turning the setting off asks
 /// for. Runs once this process is the GUI, never from a launch that hands
 /// its command to a GUI already running.
-#[cfg(unix)]
 pub(crate) fn stop_background_server_when_off(config: &ConfigHandle) {
     if !supported() || wanted() {
         return;
@@ -165,9 +166,6 @@ pub(crate) fn stop_background_server_when_off(config: &ConfigHandle) {
         Err(err) => log::warn!("local sessions: {err:#}"),
     }
 }
-
-#[cfg(not(unix))]
-pub(crate) fn stop_background_server_when_off(_config: &ConfigHandle) {}
 
 /// The pid file and socket of the session server at the default socket.
 fn server_files(config: &ConfigHandle) -> (std::path::PathBuf, std::path::PathBuf) {
