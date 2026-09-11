@@ -209,6 +209,8 @@ export type AgentsView = { rows: AgentRow[]; summary: string; tabs: PanelTab[]; 
 export type Theme = 'dark' | 'light' | 'system';
 export type FontMode = { mode: 'follow' } | { mode: 'pinned'; pt: number };
 export type Hotkey = 'cmd-k' | 'cmd-shift-p' | 'ctrl-shift-p';
+/** By the pixel, so the rows follow the hand, or a whole row at a time. */
+export type ScrollMode = 'stepped' | 'smooth';
 
 export type WebSettings = {
   /** `"system"` or a locale tag. */
@@ -219,6 +221,7 @@ export type WebSettings = {
   'agents-panel': boolean;
   'palette-hotkey': Hotkey;
   'sidebar-width': number;
+  'scroll-mode': ScrollMode;
   /** `"desktop"` follows the server's configuration; else a scheme's name. */
   'terminal-scheme': string;
 };

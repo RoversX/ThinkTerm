@@ -25,6 +25,7 @@ export const views = $state({
     'agents-panel': false,
     'palette-hotkey': 'cmd-k',
     'sidebar-width': 220,
+    'scroll-mode': 'smooth',
   } as WebSettings,
   layout: '',
   /** The page's own labels in the active language; empty until attached. */

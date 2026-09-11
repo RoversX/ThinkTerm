@@ -6,7 +6,7 @@
   import { s, views } from './client.svelte';
   import { bot, info, minus, palette, panelLeft, plus, rotateCcw, search, slidersHorizontal, x } from './icons';
   import { applyTheme, closeSettings, FOLLOW_DESKTOP, loadSchemes, panel, pickScheme, previewScheme, schemes, setSetting, storedScheme } from './settings.svelte';
-  import type { Hotkey, Scheme, Theme } from './model';
+  import type { Hotkey, Scheme, ScrollMode, Theme } from './model';
   import { POP, WINDOW, ms } from './motion';
   import { fade, scale } from 'svelte/transition';
   import { cubicOut } from 'svelte/easing';
@@ -57,6 +57,10 @@
     ['dark', 'web-theme-dark'],
     ['light', 'web-theme-light'],
     ['system', 'web-theme-system'],
+  ];
+  const SCROLL_MODES: [ScrollMode, string][] = [
+    ['smooth', 'web-scroll-mode-smooth'],
+    ['stepped', 'web-scroll-mode-stepped'],
   ];
   // The shortcuts as they are pressed, not as they are stored.
   const HOTKEYS: [Hotkey, string][] = [
@@ -243,7 +247,7 @@
     <div class="body">
       <div class="title">{query.trim() === '' ? s(SECTIONS.find(([id]) => id === section)?.[1] ?? '') : s('web-settings-search')}</div>
 
-      {#if shows('general', s('settings-language')) || shows('general', s('web-settings-palette-hotkey'))}
+      {#if shows('general', s('settings-language')) || shows('general', s('web-settings-palette-hotkey')) || shows('general', s('web-settings-scroll-mode'))}
         <div class="card">
           {#if shows('general', s('settings-language'))}
             <div class="srow">
@@ -253,6 +257,16 @@
                   <option value={option.preference}>{option.label}</option>
                 {:else}
                   <option value="system">{s('language-system')}</option>
+                {/each}
+              </select>
+            </div>
+          {/if}
+          {#if shows('general', s('web-settings-scroll-mode'))}
+            <div class="srow">
+              <div class="tx"><div class="lab">{s('web-settings-scroll-mode')}</div><div class="desc">{d('web-settings-scroll-mode-description')}</div></div>
+              <select class="pillsel" data-setting="scroll-mode" value={settings['scroll-mode']} onchange={(ev) => setSetting('scroll-mode', (ev.currentTarget as HTMLSelectElement).value)}>
+                {#each SCROLL_MODES as [value, label] (value)}
+                  <option value={value}>{s(label)}</option>
                 {/each}
               </select>
             </div>

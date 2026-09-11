@@ -6,7 +6,7 @@ use crate::glyphs::GlyphCache;
 use crate::gpu::Gpu;
 use crate::host::WebHost;
 use crate::link::WsLink;
-use crate::viewport::{cell_at, max_scroll, visible_rows};
+use crate::viewport::{cell_at, max_scroll, visible_rows, visible_rows_px};
 use anyhow::Result;
 use codec::Pdu;
 use std::cell::{Cell, RefCell};
@@ -121,6 +121,12 @@ struct Hit {
 pub struct PaneCell {
     pub session: Arc<PaneSession<WebHost>>,
     pub scroll_from_bottom: usize,
+    /// How far the top visible row is cut off at its top, in device px,
+    /// always inside `[0, cell_h)`: the part of a row that smooth
+    /// scrolling is through. Zero means the view sits on a row boundary,
+    /// which is the only position stepped mode ever holds and the only
+    /// one either end of the scrollback allows.
+    pub scroll_px: f32,
     pub selection: Option<Selection>,
     /// The pane's own colours (OSC 4/10/11), pushed as `SetApplicationPalette`,
     /// exactly as they arrived. `None` means the base palette shows through.
@@ -143,6 +149,7 @@ impl PaneCell {
             reconnect_stale: false,
             session,
             scroll_from_bottom: 0,
+            scroll_px: 0.0,
             selection: None,
             application: None,
             palette: ColorPalette::default(),
@@ -250,6 +257,11 @@ pub struct Inner {
     connected_since: Option<f64>,
     quads: HeapQuadAllocator,
     vertices: Vec<Vertex>,
+    /// Where a row that hangs over the edge of its pane's content box is
+    /// recorded before being replayed cropped. One row at a time, emptied
+    /// and refilled: at most two rows per pane per frame go through it,
+    /// and it is never allocated inside the paint.
+    scratch: HeapQuadAllocator,
     /// Panes at their own font size (Cmd+= / Cmd+-), as on the desktop:
     /// each has its own glyph cache and atlas, and is drawn as its own
     /// batch. Absent means the page's size.
@@ -512,6 +524,7 @@ impl App {
             published_bg: None,
             quads: HeapQuadAllocator::default(),
             vertices: Vec::new(),
+            scratch: HeapQuadAllocator::default(),
             pane_fonts: Default::default(),
             layout: None,
             tab_layout: None,
@@ -1232,6 +1245,7 @@ impl App {
         // Typing goes back to following the output.
         let cell = inner.focused_mut();
         cell.scroll_from_bottom = 0;
+        cell.scroll_px = 0.0;
         cell.selection = None;
         let start = cell.session.key_down(serial, key, mods);
         Self::spawn_drain(&cell.session, start);
@@ -1266,6 +1280,7 @@ impl App {
         }
         let cell = inner.focused_mut();
         cell.scroll_from_bottom = 0;
+        cell.scroll_px = 0.0;
         let start = cell.session.write_bytes(text.as_bytes());
         Self::spawn_drain(&cell.session, start);
         drop(inner);
@@ -1279,6 +1294,7 @@ impl App {
         }
         let cell = inner.focused_mut();
         cell.scroll_from_bottom = 0;
+        cell.scroll_px = 0.0;
         let start = cell.session.paste(text);
         Self::spawn_drain(&cell.session, start);
         drop(inner);
@@ -1679,10 +1695,22 @@ impl App {
         let root = inner.glyphs.metrics.cell_size;
         let nav = Self::content_offset(inner, place) as f64;
         let origin = (place.frame.left as f64 * root.width as f64, place.frame.top as f64 * root.height as f64 + nav);
+        // Smooth scrolling draws the rows shifted up by `scroll_px`, with
+        // one more row filling the strip that leaves at the bottom; the
+        // row under a pixel moves with them, and the extra row is one the
+        // pointer can reach. `row` stays an offset from the first row
+        // drawn, which is what every caller adds to `visible_rows`'s start.
+        let scroll_px = inner
+            .panes
+            .get(&place.pane_id)
+            .map(|cell| (cell.scroll_px as f64).clamp(0.0, ch))
+            .unwrap_or(0.0);
+        let last = if scroll_px > 0.0 && rows > 0 { rows } else { rows.saturating_sub(1) };
         let local_col = (((px - origin.0) / cw).floor().max(0.0) as usize).min(cols.saturating_sub(1));
-        let local_row = (((py - origin.1) / ch).floor().max(0.0) as usize).min(rows.saturating_sub(1));
+        let local_y = py - origin.1 + scroll_px;
+        let local_row = ((local_y / ch).floor().max(0.0) as usize).min(last);
         let x_off = (px - origin.0 - local_col as f64 * cw).clamp(0.0, cw) as isize;
-        let y_off = (py - origin.1 - local_row as f64 * ch).clamp(0.0, ch) as isize;
+        let y_off = (local_y - local_row as f64 * ch).clamp(0.0, ch) as isize;
         Hit {
             pane_id: place.pane_id,
             col: local_col,
@@ -2041,6 +2069,7 @@ impl App {
         if notches == 0 {
             return false;
         }
+        let smooth = inner.settings.scroll_mode.is_smooth();
         let Some(cell) = inner.panes.get_mut(&hit.pane_id) else {
             return false;
         };
@@ -2078,11 +2107,28 @@ impl App {
             return true;
         }
         let max = max_scroll(&session.dimensions());
-        cell.scroll_from_bottom = if lines < 0.0 {
-            (cell.scroll_from_bottom + notches).min(max)
+        if smooth {
+            // Down the page (a positive delta) is towards the newest row,
+            // which is the way `normalize_scroll_px` counts. A trackpad or
+            // a finger hands over a fraction of a row at a time and keeps
+            // it: nothing is rounded up to a notch.
+            let (scroll, px) = crate::viewport::normalize_scroll_px(
+                cell.scroll_from_bottom,
+                cell.scroll_px,
+                (lines * cell_h) as f32,
+                cell_h as f32,
+                max,
+            );
+            cell.scroll_from_bottom = scroll;
+            cell.scroll_px = px;
         } else {
-            cell.scroll_from_bottom.saturating_sub(notches)
-        };
+            cell.scroll_from_bottom = if lines < 0.0 {
+                (cell.scroll_from_bottom + notches).min(max)
+            } else {
+                cell.scroll_from_bottom.saturating_sub(notches)
+            };
+            cell.scroll_px = 0.0;
+        }
         drop(inner);
         self.request_frame();
         true
@@ -3529,6 +3575,15 @@ impl App {
             "terminal-scheme" if scheme == crate::settings::FOLLOW_DESKTOP => {
                 self.set_terminal_palette(None)
             }
+            // Stepped mode holds no part of a row: whatever a pane was
+            // through goes, rather than staying frozen until it is scrolled.
+            "scroll-mode" => {
+                for cell in self.inner.borrow_mut().panes.values_mut() {
+                    cell.scroll_px = 0.0;
+                }
+                Self::notify(&self.inner.borrow());
+                self.request_frame();
+            }
             _ => Self::notify(&self.inner.borrow()),
         }
         Ok(())
@@ -4482,7 +4537,11 @@ impl App {
                 continue;
             };
             let dims = cell.session.dimensions();
-            let visible = visible_rows(&dims, Self::shown(&place).1, cell.scroll_from_bottom);
+            // The extra row a fractional scroll draws is one whose fetch can
+            // stall like any other; asking about the range that was painted
+            // is what keeps a dropped `GetLines` for it being retried.
+            let visible =
+                visible_rows_px(&dims, Self::shown(&place).1, cell.scroll_from_bottom, cell.scroll_px);
             stalled |= cell.session.render_looks_stalled_in(visible);
         }
         let mut again = owed > 0 || stalled;
@@ -4633,9 +4692,13 @@ impl App {
         let pad = Self::pad(inner);
         let tab = inner.tab_layout.as_ref().map(|l| (l.cols, l.rows)).unwrap_or((usize::MAX, usize::MAX));
         inner.quads.recycle();
+        let smooth = inner.settings.scroll_mode.is_smooth();
         for place in &placements {
             let (cols_shown, rows_shown) = Self::shown_in(inner, place);
             let offset = Self::content_offset(inner, place);
+            // The pane's own cell height, before its glyph cache is borrowed
+            // to draw with: what a fractional scroll offset is measured in.
+            let pane_cell_h = Self::pane_cell(inner, place).1 as f32;
             let Some(cell) = inner.panes.get_mut(&place.pane_id) else {
                 continue;
             };
@@ -4644,8 +4707,21 @@ impl App {
             let max = max_scroll(&dims);
             if cell.scroll_from_bottom > max {
                 cell.scroll_from_bottom = max;
+                cell.scroll_px = 0.0;
             }
-            let visible = visible_rows(&dims, rows_shown, cell.scroll_from_bottom);
+            // The offset only means anything inside the row it is measured
+            // against, and only above the tail: a font change, a switch to
+            // stepped mode or a scroll back to the newest row all leave it
+            // behind, and a whole row is what each of those wants.
+            if !smooth
+                || cell.scroll_from_bottom == 0
+                || !(cell.scroll_px > 0.0)
+                || cell.scroll_px >= pane_cell_h
+            {
+                cell.scroll_px = 0.0;
+            }
+            let px = cell.scroll_px;
+            let visible = visible_rows_px(&dims, rows_shown, cell.scroll_from_bottom, px);
             let (first, lines) = session.get_lines(visible);
             // No cursor before the server has placed one: a fresh cell's
             // sits at the origin, which is nowhere real.
@@ -4664,15 +4740,33 @@ impl App {
                 Some(font) if own_font => (&mut font.glyphs, &mut font.quads),
                 _ => (&mut inner.glyphs, &mut inner.quads),
             };
+            let scratch = &mut inner.scratch;
             let cell_w = glyphs.metrics.cell_size.width as f32;
             let cell_h = glyphs.metrics.cell_size.height as f32;
             let frame_origin = (
                 pad.0 + place.frame.left as f32 * root_w,
                 pad.1 + place.frame.top as f32 * root_h,
             );
-            // The content sits below the pane's bar, as on the desktop.
-            let origin = (frame_origin.0, frame_origin.1 + offset);
+            // The content sits below the pane's bar, as on the desktop, and
+            // a fractional scroll lifts the rows by the part of the top one
+            // that is cut off; the extra row fetched above fills the strip
+            // that leaves at the bottom.
+            let content_top = frame_origin.1 + offset;
+            let origin = (frame_origin.0, content_top - px);
             let clip = (cols_shown as f32 * cell_w, rows_shown as f32 * cell_h);
+            // The content box, in the quads' own centre-relative space: what
+            // the two rows hanging over its edges are cropped to.
+            let content_clip = thinkterm_render::quad::QuadClipRect::from_top_left_pixels(
+                frame_origin.0,
+                content_top,
+                frame_origin.0 + clip.0,
+                content_top + clip.1,
+                &thinkterm_render::geom::Dimensions {
+                    pixel_width: w as usize,
+                    pixel_height: h as usize,
+                    dpi: dims.dpi as usize,
+                },
+            );
             // The pane's own ground: its frame, plus the padding out to the
             // canvas edge where it touches the tab's edge and half a cell
             // into the divider where it does not, so the panes tile the
@@ -4721,6 +4815,7 @@ impl App {
                 crate::ime::update_field(&inner.textarea, &mut inner.ime_anchor, anchor)
                     .map_err(|e| anyhow::anyhow!("IME anchor: {e:?}"))?;
             }
+            let last = lines.len().saturating_sub(1);
             for (i, line) in lines.iter().enumerate() {
                 let row = first + i as StableRowIndex;
                 let sel_range = match &selection {
@@ -4742,7 +4837,18 @@ impl App {
                     hsv,
                     draw_cursor: is_focused,
                 };
-                crate::emit::emit_line(glyphs, quads, budget, &params)?;
+                if px > 0.0 && (i == 0 || i == last) {
+                    // Only the two rows that hang over the content box are
+                    // worth cropping quad by quad: the clip does a bilerp
+                    // and a box per quad, which no interior row needs. The
+                    // scratch buffer is the one kept on `Inner`, emptied
+                    // rather than allocated.
+                    scratch.recycle();
+                    crate::emit::emit_line(glyphs, scratch, budget, &params)?;
+                    scratch.apply_to_clipped_at(&mut *quads, 0.0, 0.0, content_clip, 1.0)?;
+                } else {
+                    crate::emit::emit_line(glyphs, quads, budget, &params)?;
+                }
             }
         }
         let (cell_w, cell_h) = (root_w, root_h);

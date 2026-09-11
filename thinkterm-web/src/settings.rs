@@ -43,6 +43,7 @@ pub struct WebSettings {
     pub agents_panel: bool,
     pub palette_hotkey: Hotkey,
     pub sidebar_width: f64,
+    pub scroll_mode: ScrollMode,
     /// `"desktop"` follows the server's configured scheme; anything else
     /// names a scheme this browser picked.
     pub terminal_scheme: String,
@@ -104,6 +105,7 @@ impl Default for WebSettings {
             agents_panel: false,
             palette_hotkey: Hotkey::CmdK,
             sidebar_width: 220.0,
+            scroll_mode: ScrollMode::Smooth,
             terminal_scheme: FOLLOW_DESKTOP.to_string(),
         }
     }
@@ -115,6 +117,22 @@ pub enum Theme {
     Dark,
     Light,
     System,
+}
+
+/// How the scrollback follows a finger, a trackpad or a wheel: by the
+/// pixel, so the rows move with the hand, or a whole row at a time as a
+/// wheel's notch always has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScrollMode {
+    Stepped,
+    Smooth,
+}
+
+impl ScrollMode {
+    pub fn is_smooth(self) -> bool {
+        matches!(self, Self::Smooth)
+    }
 }
 
 /// The base font size: the desktop's cell, or a size of the page's own.
@@ -218,6 +236,15 @@ mod tests {
         assert_eq!((s.language.as_str(), s.palette_hotkey), ("de-DE", Hotkey::CtrlShiftP));
         s.set("terminal-scheme", "\"Dracula\"").unwrap();
         assert_eq!(s.terminal_scheme, "Dracula");
+        assert_eq!(WebSettings::default().scroll_mode, ScrollMode::Smooth, "pixels by default");
+        s.set("scroll-mode", "\"stepped\"").unwrap();
+        assert_eq!(s.scroll_mode, ScrollMode::Stepped);
+        assert!(!s.scroll_mode.is_smooth());
+        assert_eq!(serde_json::to_value(&s).unwrap()["scroll-mode"], serde_json::json!("stepped"));
+        s.set("scroll-mode", "\"smooth\"").unwrap();
+        assert!(s.scroll_mode.is_smooth());
+        assert!(s.set("scroll-mode", "\"glide\"").is_err());
+        assert_eq!(s.scroll_mode, ScrollMode::Smooth, "a refused value changes nothing");
         assert!(s.set("colour", "1").is_err());
         assert!(s.set("theme", "\"blue\"").is_err());
         let json = serde_json::to_value(&s).unwrap();

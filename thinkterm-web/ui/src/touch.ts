@@ -17,6 +17,7 @@
 import { openMenu } from './menu.svelte';
 import { mobile, openSide } from './mobile.svelte';
 import { cellHeight, paneAt } from './pane';
+import { smoothScroll } from './settings.svelte';
 
 /** How far a finger may wander and still be a tap. */
 const SLOP = 8;
@@ -149,19 +150,27 @@ export function installTouch(canvas: HTMLCanvasElement): () => void {
     );
   };
 
-  /** Scroll by what the fingers moved, a whole cell at a time: the wasm
-      rounds any wheel up to one notch, so a few pixels handed over one
-      event at a time would run away from the finger. */
+  /** Scroll by what the fingers moved. In smooth mode every move goes over
+      as it is, so the rows follow the finger; in stepped mode the wasm
+      rounds any wheel up to a whole notch, so a few pixels handed over one
+      event at a time would run away from the finger and the pixels are
+      held back here until they are worth a cell. */
   const scrollBy = (dy: number, at: Finger) => {
-    pending += dy;
-    const cell = cellHeight(canvas, CELL);
-    const cells = Math.trunc(pending / cell);
-    if (cells === 0) return;
-    pending -= cells * cell;
+    let by = dy;
+    if (!smoothScroll()) {
+      pending += dy;
+      const cell = cellHeight(canvas, CELL);
+      const cells = Math.trunc(pending / cell);
+      if (cells === 0) return;
+      pending -= cells * cell;
+      by = cells * cell;
+    } else if (by === 0) {
+      return;
+    }
     // Down the screen is back through the scrollback, as a wheel's is.
     canvas.dispatchEvent(
       new WheelEvent('wheel', {
-        deltaY: -cells * cell,
+        deltaY: -by,
         deltaMode: 0,
         bubbles: true,
         cancelable: true,

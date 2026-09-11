@@ -90,6 +90,13 @@ export function setSetting(key: string, value: unknown) {
   persist();
 }
 
+/** Whether the scrollback follows a finger by the pixel (`scroll-mode`).
+    Read on every touch move, so it is a plain read of what the wasm last
+    handed back rather than anything the gesture has to be told about. */
+export function smoothScroll(): boolean {
+  return views.settings['scroll-mode'] !== 'stepped';
+}
+
 export function storedSpace(): string {
   try {
     return localStorage.getItem(SPACE) ?? '';
