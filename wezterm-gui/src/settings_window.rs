@@ -4592,6 +4592,7 @@ impl SettingsWindow {
                 }
             }
             SettingsAction::SetThemeMode(mode) => {
+                let previous_mode = self.native_settings.appearance.theme_mode;
                 self.native_settings.appearance.theme_mode = mode;
                 self.ui.open_dropdown = None;
                 match crate::native_settings::save(&self.native_settings) {
@@ -4605,6 +4606,10 @@ impl SettingsWindow {
                         self.status = crate::i18n::tr_args("settings-theme-changed", &args);
                     }
                     Err(err) => {
+                        // Put it back: nothing else in the process took the
+                        // new mode, so leaving it here would have this window
+                        // previewing a theme that was never saved.
+                        self.native_settings.appearance.theme_mode = previous_mode;
                         let mut args = FluentArgs::new();
                         args.set("error", format!("{err:#}"));
                         self.status = crate::i18n::tr_args("settings-theme-save-error", &args);
