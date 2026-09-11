@@ -1125,6 +1125,11 @@ struct MemorySnapshot {
     resident_size: Option<u64>,
     physical_footprint: Option<u64>,
     peak_physical_footprint: Option<u64>,
+    /// Windows only: committed private bytes. Deliberately separate from
+    /// `physical_footprint` -- see `ProcessMemoryInfo`.
+    commit_size: Option<u64>,
+    /// Windows only: peak working set.
+    peak_resident_size: Option<u64>,
     vmmap_total_resident: Option<u64>,
     vmmap_graphics_resident: Option<u64>,
     vmmap_malloc_resident: Option<u64>,
@@ -1135,6 +1140,36 @@ struct MemorySnapshot {
 }
 
 impl MemorySnapshot {
+    /// The headline resident number and what to call it. macOS and Windows
+    /// both have one; only the name differs.
+    fn resident_metric(&self) -> (&'static str, Option<u64>) {
+        if cfg!(windows) {
+            ("working_set", self.resident_size)
+        } else {
+            ("rss", self.resident_size)
+        }
+    }
+
+    /// The second number, which is a genuinely *different measure* per
+    /// platform rather than the same one renamed: macOS reports
+    /// `phys_footprint` (resident-ish), Windows reports commit charge. Keeping
+    /// one label for both is how commit gets mistaken for resident memory.
+    fn secondary_metric(&self) -> (&'static str, Option<u64>) {
+        if cfg!(windows) {
+            ("commit_private_bytes", self.commit_size)
+        } else {
+            ("physical_footprint", self.physical_footprint)
+        }
+    }
+
+    fn peak_metric(&self) -> (&'static str, Option<u64>) {
+        if cfg!(windows) {
+            ("peak_working_set", self.peak_resident_size)
+        } else {
+            ("peak_physical_footprint", self.peak_physical_footprint)
+        }
+    }
+
     fn has_vmmap_breakdown(&self) -> bool {
         self.vmmap_total_resident.is_some()
             || self.vmmap_graphics_resident.is_some()
@@ -1144,16 +1179,19 @@ impl MemorySnapshot {
     }
 
     fn log_line(&self) -> String {
+        let (resident_label, resident) = self.resident_metric();
+        let (secondary_label, secondary) = self.secondary_metric();
+        let (peak_label, peak) = self.peak_metric();
         format!(
-            "pid={} rss={} physical_footprint={} peak_physical_footprint={} vmmap_total_resident={} graphics_resident={} malloc_resident={}{}{}",
+            "pid={} {resident_label}={} {secondary_label}={} {peak_label}={} vmmap_total_resident={} graphics_resident={} malloc_resident={}{}{}",
             self.pid,
-            self.resident_size
+            resident
                 .map(format_bytes)
                 .unwrap_or_else(|| "unavailable".to_string()),
-            self.physical_footprint
+            secondary
                 .map(format_bytes)
                 .unwrap_or_else(|| "unavailable".to_string()),
-            self.peak_physical_footprint
+            peak
                 .map(format_bytes)
                 .unwrap_or_else(|| "unavailable".to_string()),
             self.vmmap_total_resident
@@ -1177,24 +1215,27 @@ impl MemorySnapshot {
     }
 
     fn summary_for_clipboard(&self) -> String {
+        let (resident_label, resident) = self.resident_metric();
+        let (secondary_label, secondary) = self.secondary_metric();
+        let (peak_label, peak) = self.peak_metric();
         let mut lines = vec![
             "ThinkTerm Memory Snapshot".to_string(),
             format!("pid: {}", self.pid),
             format!(
-                "rss: {}",
-                self.resident_size
+                "{resident_label}: {}",
+                resident
                     .map(format_bytes)
                     .unwrap_or_else(|| "unavailable".to_string())
             ),
             format!(
-                "physical_footprint: {}",
-                self.physical_footprint
+                "{secondary_label}: {}",
+                secondary
                     .map(format_bytes)
                     .unwrap_or_else(|| "unavailable".to_string())
             ),
             format!(
-                "peak_physical_footprint: {}",
-                self.peak_physical_footprint
+                "{peak_label}: {}",
+                peak
                     .map(format_bytes)
                     .unwrap_or_else(|| "unavailable".to_string())
             ),
@@ -1416,6 +1457,8 @@ fn capture_memory_snapshot(detailed: bool) -> MemorySnapshot {
         resident_size: None,
         physical_footprint: None,
         peak_physical_footprint: None,
+        commit_size: None,
+        peak_resident_size: None,
         vmmap_total_resident: None,
         vmmap_graphics_resident: None,
         vmmap_malloc_resident: None,
@@ -1428,15 +1471,21 @@ fn capture_memory_snapshot(detailed: bool) -> MemorySnapshot {
     match capture_process_memory_info(pid) {
         Ok(info) => {
             snapshot.resident_size = Some(info.resident_size);
-            snapshot.physical_footprint = Some(info.physical_footprint);
-            snapshot.peak_physical_footprint = Some(info.peak_physical_footprint);
+            snapshot.physical_footprint = info.physical_footprint;
+            snapshot.peak_physical_footprint = info.peak_physical_footprint;
+            snapshot.commit_size = info.commit_size;
+            snapshot.peak_resident_size = info.peak_resident_size;
         }
         Err(err) => {
             snapshot.error = Some(err);
         }
     }
 
-    if detailed {
+    // vmmap is a macOS tool. Before the panel worked on Windows this branch was
+    // unreachable in practice; now it would spawn a nonexistent /usr/bin/vmmap
+    // on every Refresh and Copy, and write the resulting "path not found" into
+    // the UI and the clipboard summary as though it were a diagnostic.
+    if detailed && cfg!(target_os = "macos") {
         match capture_vmmap_breakdown(pid) {
             Ok(breakdown) => {
                 snapshot.vmmap_total_resident = breakdown.total_resident;
@@ -1671,9 +1720,20 @@ mod config_candidate_tests {
 
 #[derive(Debug, Clone, Copy)]
 struct ProcessMemoryInfo {
+    /// What the OS considers resident right now: `ri_resident_size` on macOS,
+    /// `WorkingSetSize` on Windows.
     resident_size: u64,
-    physical_footprint: u64,
-    peak_physical_footprint: u64,
+    /// macOS `phys_footprint`. There is no Windows equivalent, so it stays
+    /// `None` there -- commit charge is a different measure and lives in
+    /// `commit_size` rather than being mislabelled as this one.
+    physical_footprint: Option<u64>,
+    peak_physical_footprint: Option<u64>,
+    /// Windows `PrivateUsage`: private bytes committed, which is *not* a
+    /// resident measure. `None` on macOS.
+    commit_size: Option<u64>,
+    /// Windows `PeakWorkingSetSize`. `None` on macOS, where the peak that is
+    /// reported is the footprint one above.
+    peak_resident_size: Option<u64>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1742,14 +1802,63 @@ fn capture_process_memory_info(pid: u32) -> Result<ProcessMemoryInfo, String> {
     let info = unsafe { info.assume_init() };
     Ok(ProcessMemoryInfo {
         resident_size: info.ri_resident_size,
-        physical_footprint: info.ri_phys_footprint,
-        peak_physical_footprint: info.ri_lifetime_max_phys_footprint,
+        physical_footprint: Some(info.ri_phys_footprint),
+        peak_physical_footprint: Some(info.ri_lifetime_max_phys_footprint),
+        commit_size: None,
+        peak_resident_size: None,
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows has no `phys_footprint`, so this reports the two numbers Task
+/// Manager actually shows and keeps them apart: the working set (its default
+/// "Memory" column) and the commit charge (its opt-in "Commit size" column).
+/// Conflating the two is not academic -- they differ by hundreds of megabytes
+/// for this process, and reading the wrong one sends a memory investigation
+/// after the wrong cause.
+#[cfg(windows)]
+fn capture_process_memory_info(pid: u32) -> Result<ProcessMemoryInfo, String> {
+    use winapi::um::processthreadsapi::GetCurrentProcess;
+    use winapi::um::psapi::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+
+    // This samples the calling process. Say so rather than silently returning
+    // our own numbers for someone else's pid: reading another process (the mux
+    // server, a pane's child) is a reasonable next step, and it would need
+    // OpenProcess plus a handle to close.
+    if pid != std::process::id() {
+        return Err(format!(
+            "Windows memory diagnostics can only sample this process (asked for pid {pid})"
+        ));
+    }
+
+    let mut counters = std::mem::MaybeUninit::<PROCESS_MEMORY_COUNTERS_EX>::zeroed();
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+
+    // GetProcessMemoryInfo takes a PROCESS_MEMORY_COUNTERS pointer; passing the
+    // _EX layout plus its larger cb is how PrivateUsage is requested.
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            counters.as_mut_ptr() as *mut _,
+            size,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+
+    let counters = unsafe { counters.assume_init() };
+    Ok(ProcessMemoryInfo {
+        resident_size: counters.WorkingSetSize as u64,
+        physical_footprint: None,
+        peak_physical_footprint: None,
+        commit_size: Some(counters.PrivateUsage as u64),
+        peak_resident_size: Some(counters.PeakWorkingSetSize as u64),
+    })
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn capture_process_memory_info(_pid: u32) -> Result<ProcessMemoryInfo, String> {
-    Err("memory diagnostics are only wired on macOS for now".to_string())
+    Err("memory diagnostics are only wired on macOS and Windows for now".to_string())
 }
 
 struct StyleToken<'a> {
@@ -7345,43 +7454,78 @@ impl SettingsWindow {
         }
         let age_label = format!("{:.1}s ago", snapshot.captured_at.elapsed().as_secs_f32());
         let footprint = snapshot
-            .physical_footprint
+            .secondary_metric()
+            .1
             .map(format_bytes)
             .unwrap_or_else(|| "Unavailable".to_string());
         let rss = snapshot
-            .resident_size
+            .resident_metric()
+            .1
             .map(format_bytes)
             .unwrap_or_else(|| "Unavailable".to_string());
         let peak = snapshot
-            .peak_physical_footprint
+            .peak_metric()
+            .1
             .map(format_bytes)
             .unwrap_or_else(|| "Unavailable".to_string());
+        // The two platforms report different measures here, not the same one
+        // under different names, so the row titles have to differ too.
+        let (footprint_title, footprint_help, rss_title, rss_help, peak_title, peak_help) =
+            if cfg!(windows) {
+                (
+                    "Commit (Private Bytes)",
+                    "Committed private bytes. This is NOT resident memory -- it is Task Manager's \"Commit size\" column.",
+                    "Working Set",
+                    "Resident process memory: Task Manager's default \"Memory\" column.",
+                    "Peak Working Set",
+                    "Highest working set reached by this process.",
+                )
+            } else {
+                (
+                    "Physical Footprint",
+                    "Matches the macOS memory pressure number more closely than RSS.",
+                    "Resident Size",
+                    "Current resident process memory from proc_pid_rusage.",
+                    "Peak Physical Footprint",
+                    "Highest physical footprint reported for this process lifetime.",
+                )
+            };
+        // vmmap is macOS-only, so on every other platform these rows can never
+        // fill in. Telling the user to press Refresh would be an instruction
+        // that does nothing, forever.
+        let no_breakdown = if cfg!(target_os = "macos") {
+            "Run Refresh Now"
+        } else {
+            "Unavailable on this platform"
+        };
         let total_resident = snapshot
             .vmmap_total_resident
             .map(format_bytes)
-            .unwrap_or_else(|| "Run Refresh Now".to_string());
+            .unwrap_or_else(|| no_breakdown.to_string());
         let graphics = snapshot
             .vmmap_graphics_resident
             .map(format_bytes)
-            .unwrap_or_else(|| "Run Refresh Now".to_string());
+            .unwrap_or_else(|| no_breakdown.to_string());
         let iosurface = snapshot
             .vmmap_iosurface_resident
             .map(format_bytes)
-            .unwrap_or_else(|| "Run Refresh Now".to_string());
+            .unwrap_or_else(|| no_breakdown.to_string());
         let malloc = snapshot
             .vmmap_malloc_resident
             .map(format_bytes)
-            .unwrap_or_else(|| "Run Refresh Now".to_string());
+            .unwrap_or_else(|| no_breakdown.to_string());
         let text = snapshot
             .vmmap_text_resident
             .map(format_bytes)
-            .unwrap_or_else(|| "Run Refresh Now".to_string());
+            .unwrap_or_else(|| no_breakdown.to_string());
         let breakdown_status = if snapshot.has_vmmap_breakdown() {
             "Captured"
         } else if snapshot.vmmap_error.is_some() {
             "Unavailable"
-        } else {
+        } else if cfg!(target_os = "macos") {
             "Refresh for vmmap"
+        } else {
+            "macOS only"
         };
         let input = crate::input_diagnostics::snapshot();
         let input_events = format!("{} events", input.key_events);
@@ -7429,8 +7573,8 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step,
             row_width,
-            "Physical Footprint",
-            "Matches the macOS memory pressure number more closely than RSS.",
+            footprint_title,
+            footprint_help,
             &footprint,
             true,
         )?;
@@ -7439,8 +7583,8 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step * 2.0,
             row_width,
-            "Resident Size",
-            "Current resident process memory from proc_pid_rusage.",
+            rss_title,
+            rss_help,
             &rss,
             true,
         )?;
@@ -7449,8 +7593,8 @@ impl SettingsWindow {
             row_x,
             first_row_y + row_step * 3.0,
             row_width,
-            "Peak Physical Footprint",
-            "Highest physical footprint reported for this process lifetime.",
+            peak_title,
+            peak_help,
             &peak,
             true,
         )?;

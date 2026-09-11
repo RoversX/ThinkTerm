@@ -150,6 +150,8 @@ winapi = { workspace=true, features = [
     "handleapi",
     "fileapi",
     "namedpipeapi",
+    "processthreadsapi",
+    "psapi",
     "synchapi",
     "winsock2",
 ]}
