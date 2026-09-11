@@ -6,10 +6,14 @@ use anyhow::Context;
 use config::{Config, FontAttributes};
 use rangeset::RangeSet;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 
 pub struct FontDatabase {
     by_full_name: HashMap<String, Vec<ParsedFont>>,
 }
+
+/// Process-wide built-in font database; see [`FontDatabase::shared_built_in`].
+static BUILT_IN: OnceLock<Result<Arc<FontDatabase>, String>> = OnceLock::new();
 
 impl FontDatabase {
     pub fn new() -> Self {
@@ -75,6 +79,34 @@ impl FontDatabase {
         let mut db = Self::new();
         db.load_font_info(font_info);
         Ok(db)
+    }
+
+    /// The built-in database, built once per process.
+    ///
+    /// `with_built_in` takes no arguments and reads only `include_bytes!`
+    /// data, so its result cannot vary by config, DPI or window -- yet every
+    /// `FontConfiguration` used to build its own, paying ~30 FreeType face
+    /// opens and name-table walks each time. That sits on an interactive path:
+    /// the terminal-preview fit loop constructs up to `MAX_PREVIEW_SCALE_STEPS`
+    /// configurations in a single layout pass, each a cache miss.
+    ///
+    /// Sharing also shares each `ParsedFont`'s lazily computed `coverage`
+    /// (guarded by its own `Mutex`), which each instance would otherwise
+    /// recompute for itself.
+    ///
+    /// Note the one behavioural change: a failure here is cached, so it is
+    /// permanent for the process rather than retried per configuration. The
+    /// inputs are compiled-in bytes, so a failure is deterministic and a retry
+    /// could not have succeeded anyway.
+    pub fn shared_built_in() -> anyhow::Result<Arc<Self>> {
+        match BUILT_IN.get_or_init(|| {
+            Self::with_built_in()
+                .map(Arc::new)
+                .map_err(|err| format!("{err:#}"))
+        }) {
+            Ok(db) => Ok(Arc::clone(db)),
+            Err(err) => anyhow::bail!("{err}"),
+        }
     }
 
     pub fn resolve_multiple(

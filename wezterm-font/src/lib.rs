@@ -604,7 +604,7 @@ impl FontConfigInner {
             dpi: RefCell::new(dpi),
             config: RefCell::new(config.clone()),
             font_dirs: RefCell::new(Arc::new(FontDatabase::with_font_dirs(&config)?)),
-            built_in: RefCell::new(Arc::new(FontDatabase::with_built_in()?)),
+            built_in: RefCell::new(FontDatabase::shared_built_in()?),
             fallback_channel: RefCell::new(None),
         })
     }
