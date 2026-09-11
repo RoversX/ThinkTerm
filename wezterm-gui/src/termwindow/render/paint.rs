@@ -898,6 +898,11 @@ impl crate::TermWindow {
                                     "line_state_cache_bytes",
                                     self.line_state_cache.borrow().total_weight(),
                                 );
+                                // The GPU allocator is the other half of the
+                                // picture and the cache counters cannot see it.
+                                // Throttled because generating the report walks
+                                // every live allocation.
+                                self.log_gpu_allocator_throttled();
                             }
                             frame_complete = true;
                             break 'pass;

@@ -259,6 +259,84 @@ pub(crate) struct LocalThreadActivationState {
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
 
+/// What the GPU-side allocator is actually holding, by name.
+///
+/// The render-cache counters describe CPU-side memory only, which on a DX12 or
+/// Vulkan backend is a minority of what the process has committed: those
+/// backends sub-allocate through gpu-allocator, and neither the cache lines nor
+/// the process totals say whether growth there is live buffers or retained
+/// blocks. This distinguishes them: `reserved - allocated` growing means the
+/// allocator is holding fragmented blocks, `allocated` growing means live
+/// resources are accumulating, and the names say which call site minted them.
+///
+/// Returns nothing on backends that do not sub-allocate (Metal, GL), which is
+/// also why this cannot be inferred from the totals on one platform and applied
+/// to another.
+fn gpu_allocator_lines(device: &wgpu::Device, label: &str) -> Vec<String> {
+    let Some(report) = device.generate_allocator_report() else {
+        return vec![];
+    };
+
+    let mib = |bytes: u64| format!("{:.1}MiB", bytes as f64 / (1024.0 * 1024.0));
+    let mut lines = vec![format!(
+        "{label}: gpu_allocator allocated={} reserved={} overhead={} blocks={} live_allocations={}",
+        mib(report.total_allocated_bytes),
+        mib(report.total_reserved_bytes),
+        mib(report
+            .total_reserved_bytes
+            .saturating_sub(report.total_allocated_bytes)),
+        report.blocks.len(),
+        report.allocations.len(),
+    )];
+
+    // Group by the label wgpu was given at creation, so the biggest consumers
+    // are attributable to a call site rather than being one line per buffer.
+    let mut by_name: HashMap<&str, (u64, usize)> = HashMap::new();
+    for alloc in &report.allocations {
+        let name = if alloc.name.is_empty() {
+            "<unnamed>"
+        } else {
+            alloc.name.as_str()
+        };
+        let entry = by_name.entry(name).or_insert((0, 0));
+        entry.0 += alloc.size;
+        entry.1 += 1;
+    }
+    let mut ranked: Vec<_> = by_name.into_iter().collect();
+    ranked.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+    for (name, (bytes, count)) in ranked.into_iter().take(8) {
+        lines.push(format!(
+            "{label}: gpu_allocator   {} x{} {}",
+            mib(bytes),
+            count,
+            name
+        ));
+    }
+
+    // Staging buffers all share one wgpu label, so their sizes are the only
+    // thing that says which write_buffer / write_texture call minted them.
+    let mut staging_sizes: HashMap<u64, usize> = HashMap::new();
+    for alloc in &report.allocations {
+        if alloc.name.contains("Staging") {
+            *staging_sizes.entry(alloc.size).or_insert(0) += 1;
+        }
+    }
+    if !staging_sizes.is_empty() {
+        let mut sizes: Vec<_> = staging_sizes.into_iter().collect();
+        sizes.sort_by(|a, b| (b.0 * b.1 as u64).cmp(&(a.0 * a.1 as u64)));
+        let summary: Vec<String> = sizes
+            .iter()
+            .take(6)
+            .map(|(size, count)| format!("{}x{}", size, count))
+            .collect();
+        lines.push(format!(
+            "{label}: gpu_allocator   staging_sizes={}",
+            summary.join(",")
+        ));
+    }
+    lines
+}
+
 /// Byte budgets for the render caches, per TermWindow.
 ///
 /// These caches were built with an entry-count cap and no byte budget, which
@@ -2253,6 +2331,8 @@ pub struct TermWindow {
     line_quad_cache: RefCell<LfuCache<LineQuadCacheKey, LineQuadCacheValue>>,
 
     last_status_call: Instant,
+    /// Throttle for `log_gpu_allocator_throttled`; runtime-only diagnostics.
+    last_gpu_allocator_log: Cell<Option<Instant>>,
     cursor_blink_state: RefCell<ColorEase>,
     blink_state: RefCell<ColorEase>,
     rapid_blink_state: RefCell<ColorEase>,
@@ -2625,6 +2705,44 @@ impl TermWindow {
         });
     }
 
+    /// Emit the GPU allocator breakdown to the log at most once every 15s.
+    ///
+    /// The settings panel shows the same thing, but a scripted measurement
+    /// cannot open the settings panel -- and opening it adds a second window
+    /// with its own device and swapchain, which perturbs exactly the numbers
+    /// being measured.
+    pub(crate) fn log_gpu_allocator_throttled(&self) {
+        const INTERVAL: Duration = Duration::from_secs(15);
+        let now = Instant::now();
+        if let Some(last) = self.last_gpu_allocator_log.get() {
+            if now.saturating_duration_since(last) < INTERVAL {
+                return;
+            }
+        }
+        self.last_gpu_allocator_log.set(Some(now));
+        if let Some(webgpu) = self.webgpu.as_ref() {
+            for line in gpu_allocator_lines(&webgpu.device, "perf") {
+                log::info!("thinkterm_perf {line}");
+            }
+            // Diagnostic probe: does blocking until the GPU is idle release
+            // the staging buffers? If it does, they were merely in flight
+            // (the queue was outrunning the device); if it does not, nothing
+            // is going to free them.
+            if std::env::var_os("THINKTERM_GPU_WAIT_PROBE").is_some() {
+                let started = Instant::now();
+                let status = webgpu.device.poll(wgpu::PollType::Wait);
+                log::info!(
+                    "thinkterm_perf perf: gpu_wait_probe status={:?} took={:?}",
+                    status,
+                    started.elapsed()
+                );
+                for line in gpu_allocator_lines(&webgpu.device, "after_wait") {
+                    log::info!("thinkterm_perf {line}");
+                }
+            }
+        }
+    }
+
     pub(crate) fn memory_resource_lines(&self, label: &str) -> Vec<String> {
         let backend = if self.webgpu.is_some() {
             "WebGpu"
@@ -2656,6 +2774,9 @@ impl TermWindow {
                 "{label}: adapter name={} device_type={:?} backend={:?} driver={} driver_info={}",
                 info.name, info.device_type, info.backend, info.driver, info.driver_info,
             ));
+            for line in gpu_allocator_lines(&webgpu.device, label) {
+                lines.push(line);
+            }
         }
 
         if let Some(render_state) = self.render_state.as_ref() {
@@ -3605,6 +3726,7 @@ impl TermWindow {
                 &config,
             )),
             last_status_call: Instant::now(),
+            last_gpu_allocator_log: Cell::new(None),
             cursor_blink_state: RefCell::new(ColorEase::new(
                 config.cursor_blink_rate,
                 config.cursor_blink_ease_in,
