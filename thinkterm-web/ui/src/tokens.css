@@ -408,8 +408,10 @@ body[data-mobile] input, body[data-mobile] textarea, body[data-mobile] select {
    are KeyBar.svelte's, set on the root while the bar is mounted. */
 body[data-mobile] #term,
 body[data-mobile] #panes {
-  inset: var(--tabs) 0 auto 0;
-  width: 100%;
+  /* Clear of the notch and the rounded corners in landscape, as the tab
+     row and the drawers already are. */
+  inset: var(--tabs) var(--safe-r) auto var(--safe-l);
+  width: auto;
   height: calc(var(--vvh, 100%) - var(--tabs) - var(--keybar));
 }
 /* The browser must not pan or zoom the page: every finger on the canvas is
@@ -424,11 +426,18 @@ body[data-mobile] #tabs {
 }
 body[data-mobile] #term, body[data-mobile] #panes { top: calc(var(--tabs) + var(--safe-t)); }
 body[data-mobile] #term, body[data-mobile] #panes { height: calc(var(--vvh, 100%) - var(--tabs) - var(--safe-t) - var(--keybar)); }
-body[data-mobile] #tabs .tab { height: 36px; width: 150px; padding: 0 6px 0 10px; }
+/* A capsule takes what its title needs, up to under half the screen, so
+   two or three tabs share a 390px row instead of one 150px box pushing the
+   rest off the edge; the same rule the pane capsules got below. */
+body[data-mobile] #tabs .tab { height: 36px; flex: 0 1 auto; width: auto; min-width: 88px; max-width: min(150px, 44vw); padding: 0 6px 0 10px; }
+/* The drawer toggle and the trailing buttons stay put while the capsules
+   scroll under them, so neither end is ever out of reach. */
+body[data-mobile] #tabs [data-action=sidebar] { position: sticky; left: 0; background: var(--bg); box-shadow: 4px 0 6px -2px var(--bg); }
+body[data-mobile] #tabs .trail { position: sticky; right: 0; margin-left: auto; padding-left: 6px; background: var(--bg); box-shadow: -4px 0 6px -2px var(--bg); z-index: 1; }
 body[data-mobile] .act { width: 38px; height: 38px; }
 /* A close button between two capsules is easy to hit by mistake; on a
    phone it is only on the tab in front, and big enough to mean it. */
-body[data-mobile] .x { width: 28px; height: 28px; margin-left: 2px; }
+body[data-mobile] .x { width: 32px; height: 32px; margin-left: 2px; }
 body[data-mobile] #tabs .tab:not(.current) .x { display: none; }
 /* Only the zoom button fits beside the capsules on a phone; a split and a
    new tab are the tab row's and the menus'. */
@@ -438,7 +447,7 @@ body[data-mobile] .nav .act[data-action=split-below] { display: none; }
 /* The pane's own capsule has the width the tab row's has not: a 160px box
    on a 390px screen left two thirds of the bar empty. */
 body[data-mobile] .nav .cap { width: auto; flex: 1 1 auto; min-width: 0; max-width: 100%; }
-body[data-mobile] .nav .acts .act { width: 34px; height: 34px; }
+body[data-mobile] .nav .acts .act { width: 40px; height: 40px; }
 /* The two panels are drawers: over the canvas, resizing nothing, or not
    there at all. */
 body[data-mobile] #side,
@@ -474,7 +483,7 @@ body[data-mobile] #side .row { min-height: 44px; }
 body[data-mobile] #side .hdr { min-height: 36px; }
 body[data-mobile] #side .top .pill, body[data-mobile] #side .pill { height: 38px; }
 body[data-mobile] #side .act.round { width: 38px; height: 38px; }
-body[data-mobile] #side .act { width: 34px; height: 34px; }
+body[data-mobile] #side .act { width: 40px; height: 40px; }
 body[data-mobile] #side .foot { height: 52px; left: 12px; right: 12px; }
 body[data-mobile] #side .foot .act { width: 40px; height: 40px; }
 body[data-mobile] #side .list { inset: 12px 10px 52px 10px; }
@@ -528,7 +537,7 @@ body[data-mobile] #settings .ctl { justify-content: flex-start; flex-wrap: wrap;
 body[data-mobile] #settings .pillsel, body[data-mobile] #settings .pillbtn,
 body[data-mobile] #settings .seg, body[data-mobile] #settings .stepper { height: 38px; }
 body[data-mobile] #settings .pillsel { flex: 1 1 auto; min-width: 0; }
-body[data-mobile] #settings .sc { top: calc(var(--safe-t) + 10px); right: calc(10px + var(--safe-r)); width: 34px; height: 34px; }
+body[data-mobile] #settings .sc { top: calc(var(--safe-t) + 10px); right: calc(10px + var(--safe-r)); width: 40px; height: 40px; }
 /* The remark and the takeover card sit clear of the key bar. */
 body[data-mobile] #status {
   right: calc(10px + var(--safe-r)); left: calc(10px + var(--safe-l)); max-width: none;

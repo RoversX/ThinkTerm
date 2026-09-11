@@ -2063,7 +2063,19 @@ impl App {
             return true;
         }
         if ev.ctrl_key() {
-            return false;
+            // A real Ctrl+wheel (a trackpad pinch on the desktop) stays the
+            // browser's zoom. The page synthesises one for a two-finger
+            // pinch on the canvas (touch.ts), where the browser's zoom is
+            // switched off; that one changes the pane's font instead.
+            if ev.is_trusted() {
+                return false;
+            }
+            let pane_id = hit.pane_id;
+            let step = if ev.delta_y() < 0.0 { 1.0 } else { -1.0 };
+            drop(inner);
+            self.focus_pane(pane_id, false);
+            self.step_font(step);
+            return true;
         }
         let max = max_scroll(&session.dimensions());
         cell.scroll_from_bottom = if lines < 0.0 {

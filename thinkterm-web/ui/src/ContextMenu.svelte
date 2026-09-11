@@ -5,10 +5,24 @@
   // keyboard, and closed by anything that means the page moved on.
   import { closeInnermost, closeMenu, menu, runItem } from './menu.svelte';
   import { chevronRight, iconByName } from './icons';
+  import { mobile } from './mobile.svelte';
   import type { MenuItem } from './model';
 
   /** How near an edge a panel may come before it flips. */
   const EDGE = 6;
+
+  /** The edges a panel must stay inside. On a phone that is the visual
+      viewport less the key bar -- the soft keyboard shrinks the former and
+      the bar sits at its foot -- not the layout viewport, which is the whole
+      window whatever is drawn over its lower half. */
+  function bounds(): { right: number; bottom: number } {
+    const vv = window.visualViewport;
+    if (!mobile.on || !vv) {
+      return { right: window.innerWidth - EDGE, bottom: window.innerHeight - EDGE };
+    }
+    const keybar = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--keybar')) || 0;
+    return { right: vv.offsetLeft + vv.width - EDGE, bottom: vv.offsetTop + vv.height - keybar - EDGE };
+  }
   /** How long the pointer rests on a submenu row before it opens. */
   const HOVER = 150;
 
@@ -47,8 +61,7 @@
       }
       const w = el.offsetWidth;
       const h = el.offsetHeight;
-      const right = window.innerWidth - EDGE;
-      const bottom = window.innerHeight - EDGE;
+      const { right, bottom } = bounds();
       let x: number;
       let y: number;
       if (k === 0) {
@@ -90,14 +103,20 @@
       if (!inside(ev.target)) closeMenu();
     };
     const away = () => closeMenu();
+    // On a phone a resize is the soft keyboard coming or going, which is
+    // not the page moving on; the menu that opened the keyboard's owner
+    // must not vanish because of it.
+    const resized = () => {
+      if (!mobile.on) closeMenu();
+    };
     window.addEventListener('pointerdown', down, true);
     window.addEventListener('blur', away);
-    window.addEventListener('resize', away);
+    window.addEventListener('resize', resized);
     window.addEventListener('wheel', away, { capture: true, passive: true });
     return () => {
       window.removeEventListener('pointerdown', down, true);
       window.removeEventListener('blur', away);
-      window.removeEventListener('resize', away);
+      window.removeEventListener('resize', resized);
       window.removeEventListener('wheel', away, { capture: true });
     };
   });

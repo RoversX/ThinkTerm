@@ -28,6 +28,12 @@ const TAP = 300;
 const CELL = 17;
 /** How long after a long press the browser's own menu is still refused. */
 const SETTLED = 1000;
+/** How much of a fling's speed is left after 16ms, and the speed (px/ms)
+    below which it has stopped. */
+const FLING_DECAY = 0.94;
+const FLING_MIN = 0.04;
+/** How far two fingers have to spread or close for one font step. */
+const PINCH_STEP = 48;
 
 type Finger = { x: number; y: number };
 
@@ -50,11 +56,69 @@ export function installTouch(canvas: HTMLCanvasElement): () => void {
   /** When the long press last opened a menu, so the browser's own -- which
       some phones fire on top of it -- can be refused. */
   let opened = 0;
+  /** The finger's speed down the screen (px/ms, smoothed) and when it was
+      last measured, for the fling that carries on after it lifts. */
+  let vy = 0;
+  let lastMoveAt = 0;
+  let lastAt: Finger = { x: 0, y: 0 };
+  let fling: number | null = null;
+  /** The distance between two fingers the last time a font step was
+      taken, so a pinch steps once per PINCH_STEP of travel. */
+  let pinchBase = 0;
 
   const stopHold = () => {
     if (hold === null) return;
     clearTimeout(hold);
     hold = null;
+  };
+
+  const stopFling = () => {
+    if (fling === null) return;
+    cancelAnimationFrame(fling);
+    fling = null;
+  };
+
+  /** Keep scrolling after the finger lifts, slowing down until it stops.
+      Each frame hands the same synthetic wheels over as the finger did. */
+  const startFling = () => {
+    if (Math.abs(vy) < FLING_MIN) return;
+    let last = performance.now();
+    const tick = (now: number) => {
+      const dt = Math.min(now - last, 64);
+      last = now;
+      scrollBy(vy * dt, lastAt);
+      vy *= Math.pow(FLING_DECAY, dt / 16);
+      if (Math.abs(vy) < FLING_MIN) {
+        fling = null;
+        return;
+      }
+      fling = requestAnimationFrame(tick);
+    };
+    fling = requestAnimationFrame(tick);
+  };
+
+  /** How far apart the two fingers are, or 0 with fewer than two. */
+  const spread = (): number => {
+    const pts = [...fingers.values()];
+    if (pts.length < 2) return 0;
+    return Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+  };
+
+  /** One font step for the pane under the fingers: a Ctrl+wheel the wasm
+      knows is the page's (untrusted), since the browser's own pinch-zoom is
+      off on the canvas. Spreading is zooming in, as Ctrl+wheel-up is. */
+  const zoomStep = (dir: 1 | -1, at: Finger) => {
+    canvas.dispatchEvent(
+      new WheelEvent('wheel', {
+        deltaY: -dir,
+        deltaMode: 0,
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+        clientX: at.x,
+        clientY: at.y,
+      }),
+    );
   };
 
   /** The midpoint of the fingers down, which is what two of them scroll by. */
@@ -116,10 +180,14 @@ export function installTouch(canvas: HTMLCanvasElement): () => void {
     const mid = midpoint();
     lastY = mid ? mid.y : startY;
     pending = 0;
+    vy = 0;
+    pinchBase = spread();
   };
 
   const down = (ev: PointerEvent) => {
     if (!ev.isTrusted || ev.pointerType !== 'touch') return;
+    // A finger on the glass stops whatever a fling was still scrolling.
+    stopFling();
     fingers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
     if (first === null) {
       first = ev.pointerId;
@@ -127,7 +195,10 @@ export function installTouch(canvas: HTMLCanvasElement): () => void {
       startY = ev.clientY;
       startAt = ev.timeStamp;
       lastY = ev.clientY;
+      lastMoveAt = ev.timeStamp;
+      lastAt = { x: ev.clientX, y: ev.clientY };
       pending = 0;
+      vy = 0;
       mode = 'press';
       hold = setTimeout(() => {
         hold = null;
@@ -141,10 +212,12 @@ export function installTouch(canvas: HTMLCanvasElement): () => void {
       // the terminal over, which is what a tap is for.
       return;
     }
-    // A second finger is the page's, not the wasm's: two fingers scroll.
+    // A second finger is the page's, not the wasm's: two fingers scroll,
+    // and pinch to change the font.
     ev.stopImmediatePropagation();
     ev.preventDefault();
     if (mode === 'press') takeOver('scroll');
+    else pinchBase = spread();
   };
 
   const move = (ev: PointerEvent) => {
@@ -163,8 +236,27 @@ export function installTouch(canvas: HTMLCanvasElement): () => void {
     ev.stopImmediatePropagation();
     const mid = midpoint();
     if (!mid) return;
+    lastAt = mid;
+    // Two fingers: the change in their distance is a pinch, one font step
+    // per PINCH_STEP of it; what is left of their motion scrolls.
+    if (fingers.size >= 2) {
+      const now = spread();
+      if (pinchBase === 0) pinchBase = now;
+      const grown = now - pinchBase;
+      if (Math.abs(grown) >= PINCH_STEP) {
+        zoomStep(grown > 0 ? 1 : -1, mid);
+        pinchBase = now;
+      }
+    }
     const dy = mid.y - lastY;
     lastY = mid.y;
+    const dt = ev.timeStamp - lastMoveAt;
+    if (dt > 0) {
+      // Smoothed, so one slow last sample does not cancel a quick flick and
+      // one jittery sample does not launch one.
+      vy = vy * 0.6 + (dy / dt) * 0.4;
+      lastMoveAt = ev.timeStamp;
+    }
     if (dy !== 0) scrollBy(dy, mid);
   };
 
@@ -185,8 +277,18 @@ export function installTouch(canvas: HTMLCanvasElement): () => void {
       // ask for, and asking has to happen inside the press itself.
       document.getElementById('kbd')?.focus();
     }
-    if (ev.pointerId !== first) return;
+    if (ev.pointerId !== first) {
+      // One of two fingers lifted: the other carries on scrolling from
+      // where it is, not from where the pair's midpoint was.
+      const mid = midpoint();
+      if (mid) lastY = mid.y;
+      pinchBase = 0;
+      return;
+    }
     stopHold();
+    // A flick keeps the scrollback moving; a finger that stopped before
+    // lifting (more than a frame ago) does not.
+    if (mode === 'scroll' && ev.timeStamp - lastMoveAt < 80) startFling();
     first = null;
     mode = 'press';
     fingers.clear();
@@ -207,6 +309,7 @@ export function installTouch(canvas: HTMLCanvasElement): () => void {
   canvas.addEventListener('contextmenu', contextmenu, true);
   return () => {
     stopHold();
+    stopFling();
     canvas.removeEventListener('pointerdown', down, true);
     canvas.removeEventListener('pointermove', move, true);
     canvas.removeEventListener('pointerup', up, true);
