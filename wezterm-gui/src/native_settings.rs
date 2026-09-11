@@ -175,6 +175,30 @@ impl NativeRemotePaneResizeMode {
     }
 }
 
+/// How the terminal scrolls its scrollback under a wheel, trackpad or
+/// finger: a whole row at a time, or by the exact distance travelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeScrollMode {
+    Stepped,
+    Smooth,
+}
+
+impl Default for NativeScrollMode {
+    fn default() -> Self {
+        Self::Smooth
+    }
+}
+
+impl NativeScrollMode {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Stepped => Self::Smooth,
+            Self::Smooth => Self::Stepped,
+        }
+    }
+}
+
 impl Default for NativeBottomQuoteMode {
     fn default() -> Self {
         Self::Timed
@@ -206,6 +230,7 @@ pub(crate) struct NativeTerminalSettings {
     pub(crate) font_size: Option<f64>,
     pub(crate) font_family: Option<String>,
     pub(crate) remote_pane_resize_mode: NativeRemotePaneResizeMode,
+    pub(crate) scroll_mode: NativeScrollMode,
     pub(crate) bottom_quote_enabled: bool,
     pub(crate) bottom_quote_mode: NativeBottomQuoteMode,
     pub(crate) bottom_quote_interval_minutes: Option<u32>,
@@ -217,6 +242,12 @@ pub(crate) struct NativeTerminalSettings {
 
 pub(crate) fn remote_pane_resize_mode() -> NativeRemotePaneResizeMode {
     load().terminal.remote_pane_resize_mode
+}
+
+/// Read on every wheel event, so through the shared handle rather than
+/// `load`, which deep-clones the whole settings tree.
+pub(crate) fn scroll_mode() -> NativeScrollMode {
+    load_shared().terminal.scroll_mode
 }
 
 /// The shell the user picked, if any. Read on every local spawn, so it

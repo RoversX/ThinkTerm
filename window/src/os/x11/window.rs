@@ -753,6 +753,7 @@ impl XWindowInner {
             precise_scroll_delta: None,
             scroll_phase: None,
             momentum_phase: None,
+            precise_wheel_lines: None,
         };
         self.do_mouse_event(event)
     }
@@ -1060,6 +1061,7 @@ impl XWindowInner {
                     precise_scroll_delta: None,
                     scroll_phase: None,
                     momentum_phase: None,
+                    precise_wheel_lines: None,
                 };
                 self.do_mouse_event(event)?;
             }

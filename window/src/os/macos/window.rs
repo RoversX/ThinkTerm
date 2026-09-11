@@ -3783,6 +3783,7 @@ impl WindowView {
             precise_scroll_delta,
             scroll_phase,
             momentum_phase,
+            precise_wheel_lines: None,
         };
 
         if let Some(myself) = Self::get_this(this) {

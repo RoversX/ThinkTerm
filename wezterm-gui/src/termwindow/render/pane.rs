@@ -1288,6 +1288,9 @@ impl crate::TermWindow {
         }
 
         let pane_id = pos.pane.pane_id();
+        // A wheel notch in smooth mode is paid out over frames; this frame's
+        // slice moves the viewport before it is read below.
+        self.advance_scroll_glide(&pos.pane);
         let current_viewport = self.get_viewport(pane_id);
         let dims = pos.pane.get_dimensions();
         let global_render_metrics = self.render_metrics;
@@ -1570,18 +1573,55 @@ impl crate::TermWindow {
             palette.cursor_fg == global_cursor_fg && palette.cursor_bg == global_cursor_bg;
 
         {
+            // A smooth scroll cuts the top row off by `scroll_px`, which
+            // uncovers that much of one more row at the bottom; it is drawn
+            // too, and the two edge rows are cropped to the pane. The clamp
+            // in set_viewport_px keeps the extra row inside the terminal.
+            let scroll_px = match current_viewport {
+                Some(_) => self.get_viewport_px(pane_id),
+                None => 0.0,
+            };
+            let extra_row = if scroll_px > 0.0 { 1 } else { 0 };
             let stable_range = match current_viewport {
-                Some(top) => top..top + render_dims.viewport_rows as StableRowIndex,
+                Some(top) => top..top + (render_dims.viewport_rows + extra_row) as StableRowIndex,
                 None => {
                     dims.physical_top
                         ..dims.physical_top + render_dims.viewport_rows as StableRowIndex
                 }
             };
+            let row_count = (stable_range.end - stable_range.start).max(0) as usize;
 
             pos.pane
                 .apply_hyperlinks(stable_range.clone(), &self.config.hyperlink_rules);
 
+            /// Copy one line's recorded quads into the frame, shifted up by
+            /// the smooth-scroll remainder. Only the rows at the pane's top
+            /// and bottom can poke out of it, so only those pay for
+            /// cropping; the rest are moved as they are. With no remainder
+            /// this is the plain replay it always was.
+            fn replay_line(
+                layers: &mut dyn TripleLayerQuadAllocatorTrait,
+                heap: &HeapQuadAllocator,
+                scroll_px: f32,
+                pane_clip: QuadClipRect,
+                line_idx: usize,
+                row_count: usize,
+            ) -> anyhow::Result<()> {
+                if scroll_px == 0.0 {
+                    return heap.apply_to(layers);
+                }
+                let edge = line_idx == 0 || line_idx + 1 >= row_count;
+                if edge {
+                    heap.apply_to_clipped_at(layers, 0.0, -scroll_px, pane_clip, 1.0)
+                } else {
+                    heap.apply_to_at(layers, 0.0, -scroll_px)
+                }
+            }
+
             struct LineRender<'a, 'b> {
+                scroll_px: f32,
+                pane_clip: QuadClipRect,
+                row_count: usize,
                 term_window: &'a mut crate::TermWindow,
                 selrange: Option<SelectionRange>,
                 rectangular: bool,
@@ -1621,12 +1661,27 @@ impl crate::TermWindow {
                     stable_range.start,
                     &render_dims,
                     left_pixel_x,
-                    pane_top_pixel_y,
+                    // The rows are drawn shifted up by the smooth-scroll
+                    // remainder; the IME popup follows the drawn cursor.
+                    pane_top_pixel_y - scroll_px,
                     pane_render_metrics.cell_size,
                 );
             }
 
+            let pane_clip = QuadClipRect::from_top_left_pixels(
+                left_pixel_x,
+                pane_top_pixel_y,
+                left_pixel_x
+                    + render_dims.cols as f32 * pane_render_metrics.cell_size.width as f32,
+                pane_top_pixel_y
+                    + render_dims.viewport_rows as f32
+                        * pane_render_metrics.cell_size.height as f32,
+                &self.dimensions,
+            );
             let mut render = LineRender {
+                scroll_px,
+                pane_clip,
+                row_count,
                 term_window: self,
                 selrange,
                 rectangular,
@@ -1751,10 +1806,15 @@ impl crate::TermWindow {
                             false
                         };
                         if !expired && !hover_changed {
-                            cached_quad
-                                .layers
-                                .apply_to(self.layers)
-                                .context("cached_quad.layers.apply_to")?;
+                            replay_line(
+                                self.layers,
+                                &cached_quad.layers,
+                                self.scroll_px,
+                                self.pane_clip,
+                                line_idx,
+                                self.row_count,
+                            )
+                            .context("cached_quad.layers.apply_to")?;
                             self.term_window.update_next_frame_time(cached_quad.expires);
                             return Ok(());
                         }
@@ -1830,8 +1890,15 @@ impl crate::TermWindow {
                     let expires = self.term_window.has_animation.borrow().as_ref().cloned();
                     self.term_window.update_next_frame_time(next_due);
 
-                    buf.apply_to(self.layers)
-                        .context("HeapQuadAllocator::apply_to")?;
+                    replay_line(
+                        self.layers,
+                        &buf,
+                        self.scroll_px,
+                        self.pane_clip,
+                        line_idx,
+                        self.row_count,
+                    )
+                    .context("HeapQuadAllocator::apply_to")?;
 
                     let quad_value = LineQuadCacheValue {
                         layers: buf,
@@ -1877,7 +1944,11 @@ impl crate::TermWindow {
                 .term_window
                 .track_pane_output_generations_for_frame
                 .then(|| mux::Mux::get().pane_output_generation(pane_id));
+            // Painters that bypass the line layers (dedicated image
+            // composites) read the same shift from here for the duration.
+            render.term_window.line_render_y_offset.set(-scroll_px);
             pos.pane.with_lines_mut(stable_range.clone(), &mut render);
+            render.term_window.line_render_y_offset.set(0.0);
             if let Some(error) = render.error.take() {
                 return Err(error).context("error while calling with_lines_mut");
             }

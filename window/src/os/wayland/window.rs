@@ -978,6 +978,7 @@ impl WaylandWindowInner {
                     precise_scroll_delta: None,
                     scroll_phase: None,
                     momentum_phase: None,
+                    precise_wheel_lines: None,
                 };
                 self.events.dispatch(WindowEvent::MouseEvent(event));
             }
@@ -1029,6 +1030,7 @@ impl WaylandWindowInner {
                 precise_scroll_delta: None,
                 scroll_phase: None,
                 momentum_phase: None,
+                precise_wheel_lines: None,
             };
             self.events.dispatch(WindowEvent::MouseEvent(event));
         }
@@ -1059,6 +1061,7 @@ impl WaylandWindowInner {
                     }),
                     scroll_phase: None,
                     momentum_phase: None,
+                    precise_wheel_lines: None,
                 };
                 self.events.dispatch(WindowEvent::MouseEvent(event));
             }
@@ -1085,6 +1088,7 @@ impl WaylandWindowInner {
                     }),
                     scroll_phase: None,
                     momentum_phase: None,
+                    precise_wheel_lines: None,
                 };
                 self.events.dispatch(WindowEvent::MouseEvent(event));
             }

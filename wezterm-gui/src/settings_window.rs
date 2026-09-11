@@ -754,6 +754,14 @@ fn localized_remote_pane_resize_mode_label(mode: NativeRemotePaneResizeMode) -> 
     })
 }
 
+fn localized_scroll_mode_label(mode: crate::native_settings::NativeScrollMode) -> String {
+    use crate::native_settings::NativeScrollMode;
+    crate::i18n::tr(match mode {
+        NativeScrollMode::Stepped => "settings-scroll-mode-stepped",
+        NativeScrollMode::Smooth => "settings-scroll-mode-smooth",
+    })
+}
+
 fn settings_tr(id: &'static str, values: &[(&'static str, String)]) -> String {
     let mut args = FluentArgs::new();
     for (name, value) in values {
@@ -859,6 +867,7 @@ enum SettingsAction {
     QuitApplication,
     ToggleBottomQuote,
     CycleRemotePaneResizeMode,
+    CycleScrollMode,
     CycleBottomQuoteMode,
     DecreaseBottomQuoteFontSize,
     IncreaseBottomQuoteFontSize,
@@ -3994,6 +4003,33 @@ impl SettingsWindow {
                 };
                 self.save_and_apply_bottom_quote_settings(status);
             }
+            SettingsAction::CycleScrollMode => {
+                self.ui.open_dropdown = None;
+                self.native_settings.terminal.scroll_mode =
+                    self.native_settings.terminal.scroll_mode.next();
+                match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => {
+                        self.status = settings_tr(
+                            "settings-status-value-now",
+                            &[
+                                ("setting", crate::i18n::tr("settings-scroll-mode")),
+                                (
+                                    "value",
+                                    localized_scroll_mode_label(
+                                        self.native_settings.terminal.scroll_mode,
+                                    ),
+                                ),
+                            ],
+                        );
+                    }
+                    Err(err) => {
+                        self.status = settings_tr(
+                            "settings-status-terminal-error",
+                            &[("error", format!("{err:#}"))],
+                        );
+                    }
+                }
+            }
             SettingsAction::CycleRemotePaneResizeMode => {
                 self.ui.open_dropdown = None;
                 self.native_settings.terminal.remote_pane_resize_mode =
@@ -6929,11 +6965,11 @@ impl SettingsWindow {
         let row_step = self.settings_row_step();
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         // Each settings card owns its row count because rows are painted manually.
-        // Terminal currently paints nine rows below; the count drives card height and scroll extent.
+        // Terminal currently paints ten rows below; the count drives card height and scroll extent.
         // What must stay in sync with paint_open_dropdown_overlay is not this
         // number but each row's `row_step * N` multiplier, which that function
         // copies by hand to place an open menu.
-        let row_count = 9;
+        let row_count = 10;
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let card_height = self.settings_card_height(row_count);
         let button_y = card_y + card_height + self.settings_section_card_gap();
@@ -7022,10 +7058,21 @@ impl SettingsWindow {
             SettingsAction::CycleRemotePaneResizeMode,
             true,
         )?;
-        self.paint_toggle_setting_row(
+        self.paint_action_setting_row(
             layers,
             row_x,
             first_row_y + row_step * 5.0,
+            row_width,
+            &crate::i18n::tr("settings-scroll-mode"),
+            &crate::i18n::tr("settings-scroll-mode-description"),
+            &localized_scroll_mode_label(self.native_settings.terminal.scroll_mode),
+            SettingsAction::CycleScrollMode,
+            true,
+        )?;
+        self.paint_toggle_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step * 6.0,
             row_width,
             &crate::i18n::tr("settings-bottom-quote"),
             &crate::i18n::tr("settings-bottom-quote-description"),
@@ -7036,7 +7083,7 @@ impl SettingsWindow {
         self.paint_font_size_stepper_row(
             layers,
             row_x,
-            first_row_y + row_step * 6.0,
+            first_row_y + row_step * 7.0,
             row_width,
             &crate::i18n::tr("settings-quote-font-size"),
             &crate::i18n::tr("settings-quote-font-size-description"),
@@ -7050,7 +7097,7 @@ impl SettingsWindow {
         self.paint_action_setting_row(
             layers,
             row_x,
-            first_row_y + row_step * 7.0,
+            first_row_y + row_step * 8.0,
             row_width,
             &crate::i18n::tr("settings-quote-rotation"),
             &crate::i18n::tr("settings-quote-rotation-description"),
@@ -7061,7 +7108,7 @@ impl SettingsWindow {
         self.paint_font_size_stepper_row(
             layers,
             row_x,
-            first_row_y + row_step * 8.0,
+            first_row_y + row_step * 9.0,
             row_width,
             &crate::i18n::tr("settings-quote-interval"),
             &crate::i18n::tr("settings-quote-interval-description"),

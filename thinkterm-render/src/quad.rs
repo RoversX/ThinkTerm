@@ -763,6 +763,30 @@ impl HeapQuadAllocator {
         Ok(())
     }
 
+    /// `apply_to`, with every quad shifted by `offset` on the way out and
+    /// nothing else touched: no cropping, no texture arithmetic, no
+    /// allocation. The replay for rows that are wholly inside their pane
+    /// while the pane is scrolled by a fraction of a row; the two rows at
+    /// the edges go through `apply_to_clipped_at` instead.
+    pub fn apply_to_at(
+        &self,
+        other: &mut dyn TripleLayerQuadAllocatorTrait,
+        offset_x: f32,
+        offset_y: f32,
+    ) -> anyhow::Result<()> {
+        for (layer_num, quads) in self.layers() {
+            for quad in quads {
+                let mut vertices = quad.to_vertices();
+                for vertex in vertices.iter_mut() {
+                    vertex.position[0] += offset_x;
+                    vertex.position[1] += offset_y;
+                }
+                other.extend_with(layer_num, &vertices);
+            }
+        }
+        Ok(())
+    }
+
     /// Copy every recorded quad into `other`, cropped to `clip` and scaled to
     /// `opacity`.
     /// Flatten the recorded quads into a plain vertex stream: sub-layer 0,

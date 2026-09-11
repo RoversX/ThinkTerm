@@ -1742,7 +1742,10 @@ impl super::TermWindow {
         let pane_nav_height = self.pane_nav_bar_height() as isize;
 
         let local_x = event.coords.x.sub(pane_left);
-        let local_y = event.coords.y.sub(pane_top + pane_nav_height);
+        // A smooth scroll draws the top row cut off by `viewport_px`, so
+        // the row under the pointer is that much further down the grid.
+        let scroll_px = self.get_viewport_px(pane.pane_id()).round() as isize;
+        let local_y = event.coords.y.sub(pane_top + pane_nav_height) + scroll_px;
 
         let x = (local_x.max(0) as f32) / pane_cell_size.width.max(1) as f32;
         let column = if !pane.is_mouse_grabbed() {
@@ -8503,6 +8506,20 @@ impl super::TermWindow {
                 }
             }
             WMEK::VertWheel(amount) => Some(match *amount {
+                // Less than a line of travel, but the device said how much:
+                // smooth scrolling moves the grid by exactly that, so the
+                // wheel binding still has to fire. An application that
+                // reports the mouse gets whole notches only, as before.
+                0 if !pane.is_mouse_grabbed() && sub_line_wheel_direction(&event) != 0 => {
+                    MouseEventTrigger::Down {
+                        streak: 1,
+                        button: if sub_line_wheel_direction(&event) > 0 {
+                            MouseButton::WheelUp(1)
+                        } else {
+                            MouseButton::WheelDown(1)
+                        },
+                    }
+                }
                 0 => return,
                 1.. => MouseEventTrigger::Down {
                     streak: 1,
@@ -9180,5 +9197,21 @@ mod adaptive_tab_width_tests {
             adaptive_tab_width_pixels(6, 400.0, GAP, 100.0, 250.0),
             100.0
         );
+    }
+}
+
+/// Which way a wheel event that travelled less than a whole line was
+/// going, from the finer data the device supplied: positive is up (towards
+/// older rows), 0 when there is no such data.
+fn sub_line_wheel_direction(event: &::window::MouseEvent) -> i8 {
+    let travel = event
+        .precise_scroll_delta
+        .map(|delta| delta.y)
+        .filter(|y| *y != 0.0)
+        .or(event.precise_wheel_lines.filter(|lines| *lines != 0.0));
+    match travel {
+        Some(value) if value > 0.0 => 1,
+        Some(_) => -1,
+        None => 0,
     }
 }

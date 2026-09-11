@@ -1734,6 +1734,18 @@ pub struct PaneState {
     /// Otherwise, the viewport is at the bottom of the
     /// scrollback.
     viewport: Option<StableRowIndex>,
+    /// Smooth scrolling: how far, in physical pixels, the row `viewport`
+    /// is cut off at its top. Always in `[0, cell height)` and always 0
+    /// while following the bottom; every row-granular caller of
+    /// `set_viewport` leaves it 0.
+    viewport_px: f32,
+    /// Smooth scrolling: distance, in physical pixels, that a wheel notch
+    /// still has to travel. Consumed a fraction per frame by
+    /// `advance_scroll_glide`; positive is down, towards newer rows.
+    glide_remaining: f32,
+    /// When the glide last advanced, so a frame that comes late moves the
+    /// viewport by the time that actually passed.
+    glide_last_tick: Option<Instant>,
     selection: Selection,
     /// If is_some(), rather than display the actual tab
     /// contents, we're overlaying a little internal application
@@ -2288,6 +2300,10 @@ pub struct TermWindow {
     /// picture from a dedicated texture; the pane renderer then keeps that
     /// line out of the line quad cache, whose replay would lose the picture.
     dedicated_image_in_line: std::cell::Cell<bool>,
+    /// Smooth scrolling: the vertical shift the line replay applies while
+    /// a pane is scrolled by a fraction of a row, for painters that bypass
+    /// the line layers (dedicated image composites). 0 outside the loop.
+    line_render_y_offset: std::cell::Cell<f32>,
     /// The (layer, cell) whose latest picture went to a dedicated texture,
     /// so pictures stacked above it in the same cell follow it there and
     /// keep their z-order; reset at the start of every line.
@@ -3707,6 +3723,7 @@ impl TermWindow {
             card_composites: RefCell::new(Vec::new()),
             image_composites: RefCell::new(Default::default()),
             dedicated_image_in_line: std::cell::Cell::new(false),
+            line_render_y_offset: std::cell::Cell::new(0.0),
             dedicated_image_cell: std::cell::Cell::new(None),
             content_view_last_composites: RefCell::new(Vec::new()),
             card_scratch: RefCell::new(None),
@@ -8470,11 +8487,38 @@ impl TermWindow {
     }
 
     fn scroll_by_current_event_wheel_delta(&mut self, pane: &Arc<dyn Pane>) -> anyhow::Result<()> {
-        if let Some(event) = &self.current_mouse_event {
-            let amount = match event.kind {
-                MouseEventKind::VertWheel(amount) => -amount,
-                _ => return Ok(()),
-            };
+        let Some(event) = self.current_mouse_event.clone() else {
+            return Ok(());
+        };
+        let amount = match event.kind {
+            MouseEventKind::VertWheel(amount) => -amount,
+            _ => return Ok(()),
+        };
+        if crate::native_settings::scroll_mode() == crate::native_settings::NativeScrollMode::Smooth
+        {
+            // A device that reports pixels (a trackpad on macOS or Wayland,
+            // a precision touchpad on Windows) moves the viewport by exactly
+            // those pixels; a notched wheel glides the same distance over a
+            // few frames instead of jumping.
+            let cell_h = self.pane_cell_height(pane.pane_id());
+            if let Some(delta) = event.precise_scroll_delta {
+                if delta.y != 0.0 {
+                    self.scroll_by_pixels(-delta.y, pane)?;
+                }
+                return Ok(());
+            }
+            if let Some(lines) = event.precise_wheel_lines {
+                if lines != 0.0 {
+                    self.scroll_by_pixels(-lines * cell_h, pane)?;
+                }
+                return Ok(());
+            }
+            if amount != 0 {
+                self.start_scroll_glide(amount as f32 * cell_h, pane);
+            }
+            return Ok(());
+        }
+        if amount != 0 {
             self.scroll_by_line(amount.into(), pane)?;
         }
         Ok(())
@@ -8491,6 +8535,121 @@ impl TermWindow {
             win.invalidate();
         }
         Ok(())
+    }
+
+    /// The height of one cell of `pane_id` in physical pixels, honouring a
+    /// per-pane font scale.
+    pub(crate) fn pane_cell_height(&self, pane_id: PaneId) -> f32 {
+        let global = self.render_metrics.cell_size.height as f32;
+        let scale = self.pane_font_scale(pane_id);
+        if scale.to_bits() == self.fonts.get_font_scale().to_bits() {
+            return global.max(1.0);
+        }
+        self.pane_font_resources(scale)
+            .map(|(_, metrics)| metrics.cell_size.height as f32)
+            .unwrap_or(global)
+            .max(1.0)
+    }
+
+    /// Move the viewport by `delta_px` physical pixels (positive is down,
+    /// towards newer rows), carrying whole rows into `viewport` and keeping
+    /// the remainder in `viewport_px`.
+    fn scroll_by_pixels(&mut self, delta_px: f32, pane: &Arc<dyn Pane>) -> anyhow::Result<()> {
+        let dims = pane.get_dimensions();
+        let pane_id = pane.pane_id();
+        let cell_h = self.pane_cell_height(pane_id);
+        let (row, px) = {
+            let state = self.pane_state(pane_id);
+            (
+                state.viewport.unwrap_or(dims.physical_top),
+                state.viewport_px,
+            )
+        };
+        let (row, px) = Self::normalize_scroll_px(row, px, delta_px, cell_h);
+        self.set_viewport_px(pane_id, Some(row), px, dims);
+        if let Some(win) = self.window.as_ref() {
+            win.invalidate();
+        }
+        Ok(())
+    }
+
+    /// Queue `distance_px` of scrolling to be spread over the next frames.
+    fn start_scroll_glide(&mut self, distance_px: f32, pane: &Arc<dyn Pane>) {
+        {
+            let mut state = self.pane_state(pane.pane_id());
+            state.glide_remaining += distance_px;
+            state.glide_last_tick = Some(Instant::now());
+        }
+        // The first step lands at once, so a single notch is felt without
+        // waiting a frame; the rest follows from paint.
+        self.advance_scroll_glide(pane);
+    }
+
+    /// Pay out a slice of a pending glide, sized by the time since the last
+    /// slice, and ask for another frame while distance remains. Called once
+    /// per painted frame for each pane; free when nothing is gliding.
+    pub(crate) fn advance_scroll_glide(&mut self, pane: &Arc<dyn Pane>) {
+        const RATE: f32 = 22.0;
+        const SETTLED_PX: f32 = 0.5;
+        let pane_id = pane.pane_id();
+        let (remaining, last) = {
+            let state = self.pane_state(pane_id);
+            (state.glide_remaining, state.glide_last_tick)
+        };
+        if remaining == 0.0 {
+            return;
+        }
+        let now = Instant::now();
+        let dt = last
+            .map(|last| now.saturating_duration_since(last).as_secs_f32())
+            .unwrap_or(1.0 / 120.0)
+            .clamp(1.0 / 240.0, 1.0 / 30.0);
+        let step = if remaining.abs() <= SETTLED_PX {
+            remaining
+        } else {
+            remaining * (1.0 - (-RATE * dt).exp())
+        };
+        {
+            let mut state = self.pane_state(pane_id);
+            state.glide_remaining -= step;
+            state.glide_last_tick = Some(now);
+            if state.glide_remaining.abs() <= SETTLED_PX {
+                state.glide_remaining = 0.0;
+                state.glide_last_tick = None;
+            }
+        }
+        if let Err(err) = self.scroll_by_pixels(step, pane) {
+            log::warn!("scroll glide: {err:#}");
+        }
+        if self.pane_state(pane_id).glide_remaining != 0.0 {
+            self.update_next_frame_time(Some(now + Duration::from_millis(8)));
+        }
+    }
+
+    /// Carry `delta_px` into `(row, px)`: whole cells move the row, the
+    /// remainder stays in `[0, cell_h)`. `floor` rather than `trunc`, so
+    /// scrolling up through a row boundary is the mirror of scrolling down.
+    pub(crate) fn normalize_scroll_px(
+        row: StableRowIndex,
+        px: f32,
+        delta_px: f32,
+        cell_h: f32,
+    ) -> (StableRowIndex, f32) {
+        if !(cell_h > 0.0) {
+            return (row, 0.0);
+        }
+        let total = px + delta_px;
+        let rows = (total / cell_h).floor();
+        let mut px = total - rows * cell_h;
+        let mut rows = rows as isize;
+        // Float drift at a boundary must not leave px at cell_h.
+        if px >= cell_h {
+            px = 0.0;
+            rows += 1;
+        } else if px < 0.0 {
+            px = 0.0;
+        }
+        (row.saturating_add(rows), px)
     }
 
     fn move_tab_relative(&mut self, delta: isize) -> anyhow::Result<()> {
@@ -9811,10 +9970,33 @@ impl TermWindow {
         }
     }
 
+    /// Row-granular viewport change: every caller that thinks in rows
+    /// (keys, prompt jumps, the copy overlay, stale-viewport fixes) lands on
+    /// a whole row, so any smooth-scroll remainder is dropped.
     pub fn set_viewport(
         &mut self,
         pane_id: PaneId,
         position: Option<StableRowIndex>,
+        dims: RenderableDimensions,
+    ) {
+        self.set_viewport_px(pane_id, position, 0.0, dims)
+    }
+
+    /// The pixel remainder of a smooth scroll for `pane_id`; 0 unless the
+    /// viewport sits between two rows.
+    pub fn get_viewport_px(&self, pane_id: PaneId) -> f32 {
+        self.pane_state(pane_id).viewport_px
+    }
+
+    /// The one place the viewport is written. `px` is how far `position`
+    /// is cut off at its top; it only survives when `position` was taken
+    /// as given -- a clamp at either end of the scrollback, or following
+    /// the bottom, always lands on a whole row.
+    pub fn set_viewport_px(
+        &mut self,
+        pane_id: PaneId,
+        position: Option<StableRowIndex>,
+        px: f32,
         dims: RenderableDimensions,
     ) {
         let pos = match position {
@@ -9828,8 +10010,21 @@ impl TermWindow {
             }
             None => None,
         };
+        let px = if pos.is_some() && pos == position && px.is_finite() {
+            px.max(0.0)
+        } else {
+            0.0
+        };
 
         let mut state = self.pane_state(pane_id);
+        if px != state.viewport_px {
+            state.viewport_px = px;
+        }
+        if pos.is_none() || pos != position {
+            // Nothing left to glide towards past the end.
+            state.glide_remaining = 0.0;
+            state.glide_last_tick = None;
+        }
         if pos != state.viewport {
             state.viewport = pos;
 
@@ -9858,7 +10053,11 @@ impl TermWindow {
     }
 
     fn scroll_to_bottom(&mut self, pane: &Arc<dyn Pane>) {
-        self.pane_state(pane.pane_id()).viewport = None;
+        let mut state = self.pane_state(pane.pane_id());
+        state.viewport = None;
+        state.viewport_px = 0.0;
+        state.glide_remaining = 0.0;
+        state.glide_last_tick = None;
     }
 
     fn get_active_pane_no_overlay(&self) -> Option<Arc<dyn Pane>> {
@@ -10247,5 +10446,37 @@ mod occlusion_release_tests {
     #[test]
     fn an_episode_releases_once_until_marked_dirty_again() {
         assert!(!occlusion_release_due(Some(past_grace()), true));
+    }
+}
+
+#[cfg(test)]
+mod scroll_px_tests {
+    use super::TermWindow;
+
+    const CELL: f32 = 20.0;
+
+    #[test]
+    fn whole_cells_move_the_row_and_the_remainder_stays_in_range() {
+        assert_eq!(TermWindow::normalize_scroll_px(10, 0.0, 45.0, CELL), (12, 5.0));
+        assert_eq!(TermWindow::normalize_scroll_px(10, 5.0, 15.0, CELL), (11, 0.0));
+        assert_eq!(TermWindow::normalize_scroll_px(10, 5.0, 40.0, CELL), (12, 5.0));
+        let (_, px) = TermWindow::normalize_scroll_px(10, 19.9, 0.2, CELL);
+        assert!(px >= 0.0 && px < CELL, "px={px}");
+    }
+
+    #[test]
+    fn scrolling_up_mirrors_scrolling_down() {
+        // Five pixels into row 10, then twelve pixels up: seven pixels
+        // short of row 10's top, i.e. thirteen pixels into row 9.
+        assert_eq!(TermWindow::normalize_scroll_px(10, 5.0, -12.0, CELL), (9, 13.0));
+        // Back down by the same amount lands where it started.
+        assert_eq!(TermWindow::normalize_scroll_px(9, 13.0, 12.0, CELL), (10, 5.0));
+        // Exactly one row up from a row boundary is the previous boundary.
+        assert_eq!(TermWindow::normalize_scroll_px(10, 0.0, -20.0, CELL), (9, 0.0));
+    }
+
+    #[test]
+    fn a_zero_cell_height_never_produces_a_remainder() {
+        assert_eq!(TermWindow::normalize_scroll_px(10, 3.0, 50.0, 0.0), (10, 0.0));
     }
 }

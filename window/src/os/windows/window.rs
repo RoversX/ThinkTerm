@@ -2556,6 +2556,7 @@ unsafe fn mouse_button(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) ->
         precise_scroll_delta: None,
         scroll_phase: None,
         momentum_phase: None,
+        precise_wheel_lines: None,
     };
     inner
         .borrow_mut()
@@ -2609,6 +2610,7 @@ unsafe fn nc_mouse_button(
         precise_scroll_delta: None,
         scroll_phase: None,
         momentum_phase: None,
+        precise_wheel_lines: None,
     };
     inner
         .borrow_mut()
@@ -2645,6 +2647,7 @@ unsafe fn mouse_move(hwnd: HWND, _msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         precise_scroll_delta: None,
         scroll_phase: None,
         momentum_phase: None,
+        precise_wheel_lines: None,
     };
 
     inner.events.dispatch(WindowEvent::MouseEvent(event));
@@ -2684,6 +2687,7 @@ unsafe fn nc_mouse_move(hwnd: HWND, _msg: UINT, wparam: WPARAM, lparam: LPARAM) 
         precise_scroll_delta: None,
         scroll_phase: None,
         momentum_phase: None,
+        precise_wheel_lines: None,
     };
 
     inner.events.dispatch(WindowEvent::MouseEvent(event));
@@ -2767,7 +2771,11 @@ unsafe fn mouse_wheel(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
                 inner.vscroll_remainder,
                 position
             );
-            if position == 0 {
+            // A precision touchpad sends many deltas smaller than a line.
+            // They still go out, as VertWheel(0) with the fractional travel
+            // beside it, so a surface that scrolls by pixels can follow
+            // them; everything else treats VertWheel(0) as nothing.
+            if position == 0 && delta == 0 {
                 return Some(0);
             }
             MouseEventKind::VertWheel(position)
@@ -2779,6 +2787,13 @@ unsafe fn mouse_wheel(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
         precise_scroll_delta: None,
         scroll_phase: None,
         momentum_phase: None,
+        // The travel in lines before it was rounded to notches, so a
+        // sub-line step is not lost; horizontal wheels keep the old path.
+        precise_wheel_lines: if msg == WM_MOUSEWHEEL {
+            Some(scaled_delta as f32 / WHEEL_DELTA as f32)
+        } else {
+            None
+        },
     };
     inner
         .borrow_mut()
