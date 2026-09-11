@@ -349,8 +349,60 @@ fn probe_dirs() -> &'static Vec<std::path::PathBuf> {
                 dirs.push(local_bin);
             }
         }
+        #[cfg(windows)]
+        {
+            // Where npm and winget put their launchers; both add themselves
+            // to the user's PATH in the registry, which a GUI started before
+            // the install does not see until the next login.
+            let mut fallbacks = Vec::new();
+            if let Some(appdata) = std::env::var_os("APPDATA") {
+                fallbacks.push(std::path::PathBuf::from(appdata).join("npm"));
+            }
+            if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+                fallbacks.push(
+                    std::path::PathBuf::from(local)
+                        .join("Microsoft")
+                        .join("WinGet")
+                        .join("Links"),
+                );
+            }
+            fallbacks.push(config::HOME_DIR.join(".local").join("bin"));
+            for dir in fallbacks {
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
         dirs
     })
+}
+
+/// The file names an agent called `name` can have on this platform. On
+/// Windows a command is one of `name` plus a PATHEXT extension: winget and
+/// installers ship `.exe`, npm ships `.cmd` (and a `.ps1` for PowerShell),
+/// so probing `name.exe` alone reports an npm-installed agent as missing.
+fn candidate_file_names(name: &str) -> Vec<String> {
+    if cfg!(windows) {
+        let pathext = std::env::var("PATHEXT").unwrap_or_default();
+        windows_candidate_file_names(name, &pathext)
+    } else {
+        vec![name.to_string()]
+    }
+}
+
+fn windows_candidate_file_names(name: &str, pathext: &str) -> Vec<String> {
+    let mut exts: Vec<String> = pathext
+        .split(';')
+        .map(|ext| ext.trim().to_ascii_lowercase())
+        .filter(|ext| ext.starts_with('.'))
+        .collect();
+    // What the launchers actually produce, whether or not PATHEXT lists it.
+    for must in [".exe", ".cmd", ".bat", ".com", ".ps1"] {
+        if !exts.iter().any(|ext| ext == must) {
+            exts.push(must.to_string());
+        }
+    }
+    exts.into_iter().map(|ext| format!("{name}{ext}")).collect()
 }
 
 /// The login shell's `$PATH`, bounded in time. Shell profiles can block
@@ -467,12 +519,9 @@ pub(crate) fn refresh_path_probe() {
         for (id, names, _) in SUPPORTED_AGENTS {
             let found = dirs.iter().any(|dir| {
                 names.iter().any(|name| {
-                    let file = if cfg!(windows) {
-                        format!("{name}.exe")
-                    } else {
-                        (*name).to_string()
-                    };
-                    is_executable_file(&dir.join(file))
+                    candidate_file_names(name)
+                        .iter()
+                        .any(|file| is_executable_file(&dir.join(file)))
                 })
             });
             map.insert(*id, found);
@@ -496,6 +545,21 @@ pub(crate) fn refresh_path_probe() {
 #[cfg(test)]
 mod tests {
     use super::display_name;
+
+    /// npm ships `claude.cmd`, winget ships `.exe`; both must count, and a
+    /// PATHEXT that omits one of them must not hide it.
+    #[test]
+    fn windows_candidates_cover_every_launcher_kind() {
+        let names = super::windows_candidate_file_names("claude", ".COM;.EXE;.BAT;.CMD");
+        assert_eq!(
+            names,
+            vec!["claude.com", "claude.exe", "claude.bat", "claude.cmd", "claude.ps1"]
+        );
+        let names = super::windows_candidate_file_names("claude", "");
+        assert!(names.contains(&"claude.cmd".to_string()));
+        assert!(names.contains(&"claude.exe".to_string()));
+        assert!(!names.contains(&"claude".to_string()));
+    }
 
     fn row(place: &str, agent: &str, pane_id: mux::pane::PaneId) -> super::AgentPaneStatus {
         super::AgentPaneStatus {
