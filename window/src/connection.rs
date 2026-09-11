@@ -15,6 +15,33 @@ fn nop_event_handler(_event: ApplicationEvent) {}
 
 static EVENT_HANDLER: Mutex<fn(ApplicationEvent)> = Mutex::new(nop_event_handler);
 
+/// The appearance the application has been asked to present, overriding
+/// whatever the system is set to. `None` follows the system.
+///
+/// A `Mutex` rather than a `thread_local!` on purpose: it is written from
+/// wherever the setting is applied and read from the platform's UI thread,
+/// and those are not always the same thread.
+static PREFERRED_APPEARANCE: Mutex<Option<Appearance>> = Mutex::new(None);
+
+/// The appearance the application has been asked to present, if it has been
+/// asked for one at all.
+pub fn preferred_appearance() -> Option<Appearance> {
+    *PREFERRED_APPEARANCE.lock().unwrap()
+}
+
+/// Record the preferred appearance, reporting whether it actually changed.
+///
+/// Pure, over the slot rather than the static, so that the tests below never
+/// touch process-wide state: `cargo test` runs them in parallel threads of one
+/// process and they would otherwise clobber each other.
+fn store_appearance(slot: &mut Option<Appearance>, appearance: Option<Appearance>) -> bool {
+    if *slot == appearance {
+        return false;
+    }
+    *slot = appearance;
+    true
+}
+
 pub fn shutdown() {
     CONN.with(|m| drop(m.borrow_mut().take()));
 }
@@ -65,11 +92,48 @@ pub trait ConnectionOps {
 
     /// Retrieve the current appearance for the application.
     fn get_appearance(&self) -> Appearance {
+        if let Some(appearance) = preferred_appearance() {
+            return appearance;
+        }
         Appearance::Light
     }
 
     /// Override the application appearance. Passing `None` follows the system.
-    fn set_preferred_appearance(&self, _appearance: Option<Appearance>) {}
+    ///
+    /// The value is stored synchronously, so a `get_appearance()` on the way
+    /// back out of this call already reports it. Startup depends on that: the
+    /// lua configuration is evaluated right after this runs, and
+    /// `wezterm.gui.get_appearance()` has to agree with what the user picked.
+    ///
+    /// Handing it to the OS is deferred instead; see `reapply_appearance`.
+    fn set_preferred_appearance(&self, appearance: Option<Appearance>) {
+        let changed = {
+            let mut slot = PREFERRED_APPEARANCE.lock().unwrap();
+            store_appearance(&mut slot, appearance)
+        };
+        // The guard is gone before anything below can read the slot back.
+        if !changed {
+            return;
+        }
+        promise::spawn::spawn(async move {
+            if let Some(conn) = Connection::get() {
+                conn.reapply_appearance();
+            }
+        })
+        .detach();
+    }
+
+    /// Present the appearance recorded by `set_preferred_appearance`: tell the
+    /// OS about it, and let the windows know it changed.
+    ///
+    /// Runs from the spawn queue, **never** synchronously from inside an event
+    /// dispatch. Every caller of `set_preferred_appearance` is one: the theme
+    /// is picked with the mouse, and each platform holds the dispatching
+    /// window's inner state for the duration of that dispatch. Re-entering it
+    /// here is a `BorrowMutError` on Windows -- which `wnd_proc` turns into
+    /// `exit(1)` -- and a deadlock on X11. Implementations may therefore
+    /// assume nothing is borrowed.
+    fn reapply_appearance(&self) {}
 
     /// Hide the application.
     /// This actions hides all of the windows of the application and switches
@@ -151,5 +215,55 @@ pub trait ConnectionOps {
             width,
             height,
         }
+    }
+}
+
+#[cfg(test)]
+mod appearance_override_tests {
+    use super::{store_appearance, Appearance};
+
+    #[test]
+    fn the_first_pick_is_a_change() {
+        let mut slot = None;
+        assert!(
+            store_appearance(&mut slot, Some(Appearance::Dark)),
+            "picking a theme where none was set has to reach the windows"
+        );
+        assert_eq!(slot, Some(Appearance::Dark));
+    }
+
+    /// Startup under "System" stores `None` over `None`. Treating that as a
+    /// change would queue a window sweep, and a `setAppearance: nil`, for a
+    /// setting nobody touched.
+    #[test]
+    fn following_the_system_over_and_over_is_not_a_change() {
+        let mut slot = None;
+        assert!(!store_appearance(&mut slot, None));
+        assert_eq!(slot, None);
+    }
+
+    /// Saving any other setting re-applies the whole settings struct, theme
+    /// included; that must not re-theme every window each time.
+    #[test]
+    fn repeating_the_same_choice_is_not_a_change() {
+        let mut slot = Some(Appearance::Dark);
+        assert!(!store_appearance(&mut slot, Some(Appearance::Dark)));
+        assert_eq!(slot, Some(Appearance::Dark));
+    }
+
+    /// Going back to "System" has to fire, or the title bar and the config
+    /// reload never catch up with the system's own theme.
+    #[test]
+    fn giving_the_choice_back_to_the_system_is_a_change() {
+        let mut slot = Some(Appearance::Dark);
+        assert!(store_appearance(&mut slot, None));
+        assert_eq!(slot, None);
+    }
+
+    #[test]
+    fn swapping_one_choice_for_the_other_is_a_change() {
+        let mut slot = Some(Appearance::Dark);
+        assert!(store_appearance(&mut slot, Some(Appearance::Light)));
+        assert_eq!(slot, Some(Appearance::Light));
     }
 }
