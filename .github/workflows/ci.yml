@@ -1,4 +1,4 @@
-# Build and test on every push and pull request.
+# Build and test on Linux and Windows, when asked to from the Actions tab.
 #
 # Until this existed, nothing in .github/workflows ran automatically except a
 # probe on one branch, and nothing anywhere ran `cargo test` on Windows or in
@@ -14,10 +14,9 @@
 
 name: ci
 
+# Manual only: start it from the Actions tab when the answer is wanted.
+# Every run bills minutes on a private repo, Windows at twice the rate.
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 # Cancel a superseded run when several commits are pushed back to back

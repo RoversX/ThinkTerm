@@ -120,19 +120,14 @@ $ cargo test --all
 
 Formatting settings live in `.rustfmt.toml`.
 
-### What CI does on a pull request
+### CI is manual
 
 `.github/workflows/ci.yml` builds and runs `cargo test --workspace` on Linux
 and on Windows, and `wasm.yml` checks that the terminal core and the mux
-protocol still compile for `wasm32-unknown-unknown`. Both run on every push to
-`main` and on every pull request.
-
-Nothing else does. `release.yml` is manual dispatch only, on purpose. The
-browser client's own smoke suite (`thinkterm-web/smoke/`) needs a built bundle
-and a real browser, and is not part of this.
-
-Run the commands above anyway: they are faster than waiting for a runner, and
-they are what tells you which of the two platforms you broke.
+protocol still compile for `wasm32-unknown-unknown`. Neither runs on its own:
+start them from the Actions tab when you want the answer. Nothing runs
+automatically on a push or a pull request, so the commands above are the only
+check between a change and `main`; please actually run them.
 
 ## Documentation
 
