@@ -665,6 +665,14 @@ pub(crate) fn save_color_scheme(name: Option<String>) {
     }
 }
 
+/// The appearance the windowing connection reports.
+///
+/// Despite the name this is **not** necessarily what the operating system is
+/// set to: once a theme has been picked here, `get_appearance()` reports that
+/// instead, on every platform. Nothing is lost by it -- `effective_appearance`
+/// below ignores this argument for Light and Dark, and under System there is
+/// no override to report -- but do not reach for this expecting to learn what
+/// the OS itself says.
 pub(crate) fn system_appearance() -> Appearance {
     Connection::get()
         .map(|conn| conn.get_appearance())
