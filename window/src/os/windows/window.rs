@@ -28,7 +28,6 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::rc::Rc;
-use std::sync::Mutex;
 use wezterm_color_types::LinearRgba;
 use wezterm_font::FontConfiguration;
 use wezterm_input_types::KeyboardLedStatus;
@@ -52,10 +51,8 @@ use winapi::um::shobjidl::{
 use winapi::um::shobjidl_core::{CLSID_FileOpenDialog, IShellItem, SIGDN_FILESYSPATH};
 use winapi::um::shtypes::COMDLG_FILTERSPEC;
 use winapi::um::sysinfoapi::{GetTickCount, GetVersionExW};
-use winapi::um::uxtheme::{
-    CloseThemeData, GetThemeFont, GetThemeSysFont, OpenThemeData, SetWindowTheme,
-};
-use winapi::um::wingdi::{LOGFONTW, MAKEPOINTS};
+use winapi::um::uxtheme::SetWindowTheme;
+use winapi::um::wingdi::MAKEPOINTS;
 use winapi::um::winnt::OSVERSIONINFOW;
 use winapi::um::winuser::*;
 use winapi::Interface;
@@ -108,7 +105,6 @@ lazy_static! {
             true
         }
     };
-    static ref TITLE_FONT: Mutex<Option<parameters::FontAndSize>> = Mutex::new(None);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -1452,17 +1448,18 @@ impl WindowOps for Window {
         const BASE_BORDER: ULength = ULength::new(0);
         let is_resize = config.window_decorations == WindowDecorations::RESIZE;
 
-        let title_font = {
-            let font = TITLE_FONT.lock().expect("locking title_font");
-            (*font).clone()
-        };
-
         Ok(Some(Parameters {
             title_bar: parameters::TitleBar {
                 padding_left: ULength::new(0),
                 padding_right: ULength::new(0),
                 height: None,
-                font_and_size: title_font,
+                // Nothing reads this: the only consumer of `Parameters` is the
+                // GUI's border drawing, which uses `border_dimensions` alone.
+                // Populating it meant copying the whole system caption font
+                // file into the heap with GetFontData and FreeType-parsing it
+                // on every theme change, for a value that was then dropped.
+                // macOS has always passed None here for the same reason.
+                font_and_size: None,
             },
             border_dimensions: Some(parameters::Border {
                 top: if is_resize && !*IS_WIN10 && !is_full_screen {
@@ -1481,50 +1478,6 @@ impl WindowOps for Window {
             }),
         }))
     }
-}
-
-unsafe fn get_title_log_font(hwnd: HWND, hdc: HDC) -> Option<LOGFONTW> {
-    let mut log_font = LOGFONTW::default();
-    let theme = OpenThemeData(hwnd, wide_string("HEADER").as_ptr());
-    if !theme.is_null() {
-        let res = GetThemeFont(
-            theme,
-            hdc,
-            extra_constants::HP_HEADERITEM,
-            extra_constants::HIS_NORMAL,
-            extra_constants::TMT_CAPTIONFONT,
-            &mut log_font,
-        );
-        if res == S_OK {
-            CloseThemeData(theme);
-            return Some(log_font);
-        }
-    }
-
-    let res = GetThemeSysFont(theme, extra_constants::TMT_CAPTIONFONT, &mut log_font);
-    if !theme.is_null() {
-        CloseThemeData(theme);
-    }
-
-    if res == S_OK {
-        Some(log_font)
-    } else {
-        None
-    }
-}
-
-unsafe fn update_title_font(hwnd: HWND) {
-    let hdc = GetDC(hwnd);
-    if hdc.is_null() {
-        return;
-    }
-
-    let mut font = TITLE_FONT.lock().expect("locking title_font");
-    if let Some(lf) = get_title_log_font(hwnd, hdc) {
-        *font = wezterm_font::locator::gdi::parse_log_font(&lf, hdc).ok();
-    }
-
-    ReleaseDC(hwnd, hdc);
 }
 
 /// Set up bidirectional pointers:
@@ -1835,8 +1788,6 @@ fn apply_theme(hwnd: HWND) -> Option<LRESULT> {
     }
 
     unsafe {
-        update_title_font(hwnd);
-
         let appearance = get_appearance();
         let theme_string = if appearance == Appearance::Dark {
             "DarkMode_Explorer"
