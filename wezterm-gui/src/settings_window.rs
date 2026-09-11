@@ -2178,6 +2178,9 @@ impl SettingsWindow {
             x: None,
             y: None,
             macos_frame_autosave_name: None,
+            // The Settings window is not the main window: it neither restores
+            // a remembered frame nor records one.
+            windows_frame_rect: None,
             origin: GeometryOrigin::default(),
         };
 

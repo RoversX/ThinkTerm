@@ -138,6 +138,10 @@ pub(crate) struct WindowInner {
     /// Last effective visibility sent to the platform-neutral window layer.
     /// WM_WINDOWPOSCHANGED is noisy, so only edges should restart its timers.
     occlusion_visible: Option<bool>,
+    /// Last restore geometry reported as `WindowFrameChanged`, for the same
+    /// reason as `occlusion_visible`: the owner wants the edges, not a message
+    /// per pixel of a drag.
+    last_frame_event: Option<(ScreenRect, bool)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -750,6 +754,7 @@ impl Window {
         class_name: &str,
         name: &str,
         geometry: ResolvedGeometry,
+        frame_rect: Option<ScreenRect>,
         lparam: *const RefCell<WindowInner>,
     ) -> anyhow::Result<HWND> {
         let class_name = wide_string(class_name);
@@ -781,6 +786,40 @@ impl Window {
 
         let decorations = config.window_decorations;
         let style = decorations_to_style(decorations);
+
+        // A remembered frame is already in the units CreateWindowExW wants --
+        // an outer-frame rect in screen pixels -- so it goes straight through,
+        // with none of the client-to-window growing or monitor guessing that
+        // the rest of this function does. That is what makes the round trip
+        // exact: what `GetWindowRect` gave us last time is what it gives us
+        // again, with no frame thickness added and no dpi re-derivation.
+        if let Some(frame) = frame_rect {
+            let name = wide_string(name);
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    0,
+                    class_name.as_ptr(),
+                    name.as_ptr(),
+                    style,
+                    frame.origin.x as i32,
+                    frame.origin.y as i32,
+                    frame.size.width as i32,
+                    frame.size.height as i32,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    std::mem::transmute(lparam),
+                )
+            };
+
+            if hwnd.is_null() {
+                let err = IoError::last_os_error();
+                bail!("CreateWindowExW: {}", err);
+            }
+
+            schedule_apply_decoration(hwnd, decorations);
+            return Ok(hwnd);
+        }
 
         // A WS_POPUP window has no system frame to place, so we choose its
         // position ourselves. Put it on the monitor `active_monitor` picks,
@@ -892,6 +931,7 @@ impl Window {
             paint_throttled: false,
             invalidated: true,
             occlusion_visible: None,
+            last_frame_event: None,
         }));
 
         // Careful: `raw` owns a ref to inner, but there is no Drop impl
@@ -903,17 +943,26 @@ impl Window {
         // measures the requested size against this dpi, and `create_window`
         // needs to know which monitor's scale the result assumed.
         let creation_dpi = conn.default_dpi() as usize;
+        // Taken before `resolve_geometry` consumes the request: a remembered
+        // frame bypasses the resolution entirely.
+        let frame_rect = geometry.windows_frame_rect;
         let geometry = conn.resolve_geometry(geometry);
 
-        let hwnd =
-            match Self::create_window(config.clone(), class_name, name, geometry.clone(), raw) {
-                Ok(hwnd) => HWindow(hwnd),
-                Err(err) => {
-                    // Ensure that we drop the extra ref to raw before we return
-                    drop(unsafe { Rc::from_raw(raw) });
-                    return Err(err);
-                }
-            };
+        let hwnd = match Self::create_window(
+            config.clone(),
+            class_name,
+            name,
+            geometry.clone(),
+            frame_rect,
+            raw,
+        ) {
+            Ok(hwnd) => HWindow(hwnd),
+            Err(err) => {
+                // Ensure that we drop the extra ref to raw before we return
+                drop(unsafe { Rc::from_raw(raw) });
+                return Err(err);
+            }
+        };
         let window_handle = Window(hwnd);
         inner
             .borrow_mut()
@@ -926,13 +975,19 @@ impl Window {
         // the new size in `last_size` regardless - so correcting the size any
         // earlier would leave the owner believing the dimensions it asked for
         // while the later, real resize deduped itself away as "no change".
-        resize_client_for_actual_monitor(
-            hwnd.0,
-            decorations_to_style(config.window_decorations),
-            &config,
-            &geometry,
-            creation_dpi,
-        );
+        // Skipped for a restored frame: that correction exists to re-derive a
+        // window size from a requested *client* size once the real monitor is
+        // known, and the restored rect is already the size we want, measured
+        // on this same desktop the last time the window was open.
+        if frame_rect.is_none() {
+            resize_client_for_actual_monitor(
+                hwnd.0,
+                decorations_to_style(config.window_decorations),
+                &config,
+                &geometry,
+                creation_dpi,
+            );
+        }
 
         apply_theme(hwnd.0);
         enable_blur_behind(hwnd.0);
@@ -1205,6 +1260,27 @@ impl WindowOps for Window {
                 );
 
                 SetForegroundWindow(handle);
+            }
+        })
+        .detach();
+    }
+
+    fn set_frame_rect(&self, rect: ScreenRect) {
+        let hwnd = self.0;
+        // Scheduled rather than immediate for the same reason the other window
+        // ops here are: SetWindowPos re-enters the window proc, which wants a
+        // borrow of the inner state the caller may still be holding.
+        promise::spawn::spawn(async move {
+            unsafe {
+                SetWindowPos(
+                    hwnd.0,
+                    null_mut(),
+                    rect.origin.x as i32,
+                    rect.origin.y as i32,
+                    rect.size.width as i32,
+                    rect.size.height as i32,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
             }
         })
         .detach();
@@ -2133,8 +2209,113 @@ unsafe fn wm_windowposchanged(
 ) -> Option<LRESULT> {
     // let pos = &*(lparam as *const WINDOWPOS);
     dispatch_occlusion_changed_if_needed(hwnd);
+    dispatch_frame_changed_if_needed(hwnd);
     wm_size(hwnd, 0, 0, 0)?;
     Some(0)
+}
+
+/// The restore geometry of the window, or `None` if this is a moment whose
+/// geometry is not worth remembering.
+///
+/// A minimized window has no meaningful rect at all. A full-screen one -- ours
+/// or the system's idea of one -- has the monitor's, which is not something a
+/// later launch should reopen at. A maximized window has the work area's, so
+/// its *restore* rect is read from `GetWindowPlacement` instead: that is the
+/// rect Windows itself would put the window back at.
+///
+/// `rcNormalPosition` is documented as being in workspace coordinates, which
+/// differ from screen coordinates when the taskbar is docked to the top or the
+/// left edge, so it is shifted by the monitor's work-area origin to match what
+/// `GetWindowRect` would have said. The ordinary, unmaximized path takes
+/// `GetWindowRect` directly and needs no such correction.
+unsafe fn restore_frame_rect(
+    hwnd: HWND,
+    self_drawn_full_screen: bool,
+) -> Option<(ScreenRect, bool)> {
+    if IsIconic(hwnd) != winapi::shared::minwindef::FALSE {
+        return None;
+    }
+
+    let state = get_window_state(hwnd);
+    if self_drawn_full_screen || state == WindowState::FULL_SCREEN {
+        return None;
+    }
+
+    let maximized = state == WindowState::MAXIMIZED;
+
+    let rect = if maximized {
+        let mut placement = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as _,
+            ..Default::default()
+        };
+        if GetWindowPlacement(hwnd, &mut placement) != winapi::shared::minwindef::TRUE {
+            return None;
+        }
+
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        let (dx, dy) =
+            if GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi) != 0 {
+                (
+                    mi.rcWork.left - mi.rcMonitor.left,
+                    mi.rcWork.top - mi.rcMonitor.top,
+                )
+            } else {
+                (0, 0)
+            };
+
+        let mut rect = placement.rcNormalPosition;
+        rect.left += dx;
+        rect.right += dx;
+        rect.top += dy;
+        rect.bottom += dy;
+        rect
+    } else {
+        let mut rect: RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            return None;
+        }
+        rect
+    };
+
+    let width = rect_width(&rect);
+    let height = rect_height(&rect);
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+
+    Some((
+        euclid::rect(
+            rect.left as isize,
+            rect.top as isize,
+            width as isize,
+            height as isize,
+        ),
+        maximized,
+    ))
+}
+
+/// Tell the owner where the window would want to reopen. WM_WINDOWPOSCHANGED
+/// is the only message that covers plain moves as well as resizes, and it is
+/// noisy, so -- as with the occlusion dispatch above -- only edges go out.
+unsafe fn dispatch_frame_changed_if_needed(hwnd: HWND) {
+    let Some(inner) = rc_from_hwnd(hwnd) else {
+        return;
+    };
+    let mut inner = inner.borrow_mut();
+
+    let Some(current) = restore_frame_rect(hwnd, inner.saved_placement.is_some()) else {
+        return;
+    };
+    if inner.last_frame_event == Some(current) {
+        return;
+    }
+    inner.last_frame_event = Some(current);
+
+    let (frame, maximized) = current;
+    inner
+        .events
+        .dispatch(WindowEvent::WindowFrameChanged { frame, maximized });
 }
 
 fn window_is_effectively_visible(is_visible: bool, is_iconic: bool) -> bool {

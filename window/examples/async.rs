@@ -96,6 +96,7 @@ impl MyWindow {
             | WindowEvent::ToggleWorkspaceSidebar
             | WindowEvent::WorkspaceSidebarButtonHover(_)
             | WindowEvent::MouseLeave
+            | WindowEvent::WindowFrameChanged { .. }
             | WindowEvent::SetInnerSizeCompleted => {}
         }
     }

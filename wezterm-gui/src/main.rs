@@ -47,6 +47,7 @@ mod glyphcache;
 mod i18n;
 mod input_diagnostics;
 mod inputmap;
+mod main_window_placement;
 mod markdown_editor;
 mod local_sessions;
 mod native_paths;

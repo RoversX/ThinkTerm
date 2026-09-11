@@ -2107,6 +2107,16 @@ pub(crate) struct CapturedSidebar {
     pub(crate) list: Option<(HeapQuadMark, HeapQuadMark)>,
 }
 
+/// How many times a restored window may be put back on its remembered frame
+/// while startup settles. Enough for the handful of resizes a launch produces,
+/// short enough that it cannot turn into a loop.
+const RESTORED_FRAME_ATTEMPTS: u8 = 8;
+
+/// How long after opening a restored window its frame is still worth
+/// correcting. Long enough to cover the resizes a launch produces, short
+/// enough that it is over before the user has reached for the window.
+const RESTORED_FRAME_SETTLE_TIME: Duration = Duration::from_secs(3);
+
 pub struct TermWindow {
     pub window: Option<Window>,
     pub config: ConfigHandle,
@@ -2300,6 +2310,19 @@ pub struct TermWindow {
     current_mouse_capture: Option<MouseCapture>,
 
     opengl_info: Option<String>,
+
+    /// The frame a restored main window is meant to occupy, until the startup
+    /// resizes have settled on it. See `reassert_restored_frame`.
+    restored_frame_target: Option<ScreenRect>,
+    /// How many more times that correction may be applied before giving up, so
+    /// a backend that will not take the frame cannot be fought forever.
+    restored_frame_attempts: u8,
+    /// When to stop correcting regardless. Startup does not always disturb the
+    /// frame -- a window that reopens at a size the GUI is happy with is left
+    /// alone -- and without a deadline the correction would still be armed
+    /// much later, when the first thing it "corrected" would be the user
+    /// resizing their own window.
+    restored_frame_deadline: Option<Instant>,
 
     /// Keeps track of double and triple clicks
     last_mouse_click: Option<LastMouseClick>,
@@ -3926,6 +3949,9 @@ impl TermWindow {
             key_table_state: KeyTableState::default(),
             modal: RefCell::new(None),
             opengl_info: None,
+            restored_frame_target: None,
+            restored_frame_attempts: 0,
+            restored_frame_deadline: None,
         };
 
         let tw = Rc::new(RefCell::new(myself));
@@ -3945,6 +3971,28 @@ impl TermWindow {
             origin = position.origin;
         }
 
+        // The main window -- the first one this process opens -- reopens where
+        // it was last left, provided that is still somewhere on this desktop.
+        // `claim_main_window` runs first and unconditionally: a window that is
+        // not restoring its frame is still the window that records one, should
+        // the setting be turned on while it is open.
+        //
+        // An explicit position outranks a remembered one. Someone who passed
+        // `--position`, or moved the window from the CLI, is asking about this
+        // launch, not the last one.
+        //
+        // macOS is untouched by any of this and keeps using AppKit's frame
+        // autosave below; `frame_to_restore` yields nothing there.
+        let restored_frame = if crate::main_window_placement::claim_main_window(mux_window_id)
+            && native_settings.window.restore_main_window_frame
+            && x.is_none()
+            && y.is_none()
+        {
+            crate::main_window_placement::frame_to_restore()
+        } else {
+            None
+        };
+
         let geometry = RequestedWindowGeometry {
             width: Dimension::Pixels(dimensions.pixel_width as f32),
             height: Dimension::Pixels(dimensions.pixel_height as f32),
@@ -3957,6 +4005,7 @@ impl TermWindow {
             } else {
                 None
             },
+            windows_frame_rect: restored_frame.map(|restored| restored.frame),
             origin,
         };
         log::trace!("{:?}", geometry);
@@ -3976,7 +4025,17 @@ impl TermWindow {
         )
         .await?;
         window.set_titlebar_sidebar_button_visible(true);
-        tw.borrow_mut().window.replace(window.clone());
+        {
+            let mut tw = tw.borrow_mut();
+            tw.window.replace(window.clone());
+            // Opening at the remembered rect is only half of it; see
+            // `settle_restored_frame` for what startup does to it afterwards.
+            if let Some(restored) = restored_frame.filter(|restored| !restored.maximized) {
+                tw.restored_frame_target = Some(restored.frame);
+                tw.restored_frame_attempts = RESTORED_FRAME_ATTEMPTS;
+                tw.restored_frame_deadline = Some(Instant::now() + RESTORED_FRAME_SETTLE_TIME);
+            }
+        }
 
         Self::apply_icon(&window)?;
 
@@ -4088,6 +4147,15 @@ impl TermWindow {
                 myself.resize_mux_tabs_to_current_terminal_size();
             }
             window.show();
+            // Maximizing after the window is shown, rather than asking for a
+            // maximized window up front: `show` is an ordinary "restore and
+            // show" on Windows and would undo an earlier maximize. Doing it
+            // this way round also leaves the rect we opened at as the one
+            // Windows puts the window back at, so unmaximizing lands on the
+            // size the window had before it was maximized.
+            if restored_frame.map_or(false, |restored| restored.maximized) {
+                window.maximize();
+            }
             myself.subscribe_to_pane_updates();
             myself.emit_window_event("window-config-reloaded", None);
             myself.emit_status_event();
@@ -4127,6 +4195,7 @@ impl TermWindow {
         log::debug!("{event:?}");
         match event {
             WindowEvent::Destroyed => {
+                crate::main_window_placement::window_closed(self.mux_window_id);
                 self.flush_right_sidebar_note_blocking();
                 self.clear_gui_recovery_intent();
                 // Ensure that we cancel any overlays we had running, so
@@ -4139,7 +4208,20 @@ impl TermWindow {
                 Ok(false)
             }
             WindowEvent::CloseRequested => {
+                // Get the placement on disk before anything that might quit
+                // the process gets going. The claim is kept: the close may
+                // still be called off by a confirmation prompt.
+                crate::main_window_placement::close_requested(self.mux_window_id);
                 self.close_requested(window);
+                Ok(true)
+            }
+            WindowEvent::WindowFrameChanged { frame, maximized } => {
+                // While a restored frame is still being asserted the window is
+                // passing through geometry nobody chose; recording it would
+                // save the startup wobble rather than where the window lives.
+                if !self.settle_restored_frame(frame, maximized, window) {
+                    crate::main_window_placement::record(self.mux_window_id, frame, maximized);
+                }
                 Ok(true)
             }
             WindowEvent::AppearanceChanged(appearance) => {
@@ -4441,6 +4523,53 @@ impl TermWindow {
                 Ok(true)
             }
         }
+    }
+
+    /// Put a restored window back on the frame it reopened at, if startup has
+    /// moved it off. Returns true while that is still in progress.
+    ///
+    /// Opening at the remembered rect is not enough on its own: the first real
+    /// resize event makes the GUI recompute its pixel size from the font
+    /// metrics and the configured rows and columns and ask the window for
+    /// *that*, which throws away the size we just reopened at. Suppressing
+    /// that recalculation is the wrong fix -- it is what keeps the terminal's
+    /// shape across a dpi change -- so the remembered frame is simply asserted
+    /// again afterwards.
+    ///
+    /// Each correction produces another frame-changed event, so this settles
+    /// as soon as the frame matches; the attempt budget keeps it from becoming
+    /// a tug of war with a backend that will not take the rect. A window that
+    /// comes back maximized is left alone: its frame is the screen's, and the
+    /// rect we opened at is already its restore rect.
+    fn settle_restored_frame(
+        &mut self,
+        frame: ScreenRect,
+        maximized: bool,
+        window: &Window,
+    ) -> bool {
+        let Some(target) = self.restored_frame_target else {
+            return false;
+        };
+
+        let expired = self
+            .restored_frame_deadline
+            .map_or(true, |deadline| Instant::now() > deadline);
+
+        if maximized || frame == target || self.restored_frame_attempts == 0 || expired {
+            if frame != target && !maximized {
+                log::warn!(
+                    "gave up restoring the main window frame to {target:?}; it settled at {frame:?}"
+                );
+            }
+            self.restored_frame_target = None;
+            self.restored_frame_deadline = None;
+            return false;
+        }
+
+        self.restored_frame_attempts -= 1;
+        log::trace!("re-asserting restored main window frame {target:?}, saw {frame:?}");
+        window.set_frame_rect(target);
+        true
     }
 
     fn do_paint(&mut self, window: &Window) -> bool {

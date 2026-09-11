@@ -614,6 +614,26 @@ pub enum WindowEvent {
     /// Called when a program-requested set_inner_size() has finished
     SetInnerSizeCompleted,
 
+    /// The geometry a later launch would want to restore this window to has
+    /// changed: the window was moved, resized, maximized or unmaximized.
+    ///
+    /// `frame` is the *outer frame* rect in physical screen pixels -- the rect
+    /// the platform reports for the window itself, not its client area -- and
+    /// it is always the **normal-state** rect, so a maximized window reports
+    /// the rect it would return to rather than the screen it now covers.
+    ///
+    /// Nothing is dispatched while the window is minimized or full screen:
+    /// neither state describes a geometry worth remembering.
+    ///
+    /// Only the Windows backend sends this. It is the only one where the GUI
+    /// would otherwise never hear about a plain move, and the only one whose
+    /// placement ThinkTerm persists itself; macOS restores its main window
+    /// through the system's frame autosave instead.
+    WindowFrameChanged {
+        frame: ScreenRect,
+        maximized: bool,
+    },
+
     /// Called when the window has been invalidated and needs to
     /// be repainted
     NeedRepaint,
@@ -814,6 +834,18 @@ pub trait WindowOps {
     /// windows to move themselves (not Wayland).
     fn set_window_position(&self, _coords: ScreenPoint) {}
 
+    /// Move and size the window to an exact outer-frame rect, in physical
+    /// screen pixels -- the same coordinates
+    /// [`WindowEvent::WindowFrameChanged`] reports and
+    /// [`RequestedWindowGeometry::windows_frame_rect`] opens at.
+    ///
+    /// Unlike `set_inner_size`, this says nothing about the client area, so a
+    /// remembered frame can be re-applied without the frame-to-client
+    /// arithmetic that would round-trip it inexactly.
+    ///
+    /// Only the Windows backend implements it.
+    fn set_frame_rect(&self, _rect: ScreenRect) {}
+
     /// inform the windowing system of the current textual
     /// cursor input location.  This is used primarily for
     /// the platform specific input method editor
@@ -902,6 +934,19 @@ pub struct RequestedWindowGeometry {
     pub x: Option<Dimension>,
     pub y: Option<Dimension>,
     pub macos_frame_autosave_name: Option<String>,
+    /// An exact outer-frame rect, in physical screen pixels, to open the
+    /// window at -- the counterpart of [`WindowEvent::WindowFrameChanged`],
+    /// and the only way to reproduce a remembered placement exactly.
+    ///
+    /// When set it supersedes `width`, `height`, `x`, `y` and `origin`. Those
+    /// describe a *client* area, which the backend then grows by whatever
+    /// frame the system draws; a window whose frame is being restored must not
+    /// go through that conversion or it gains the frame's thickness on every
+    /// launch. ThinkTerm also draws its own title bar, so the frame-to-client
+    /// relationship the conversion assumes is not the one it has.
+    ///
+    /// Only the Windows backend honours it; elsewhere it is ignored.
+    pub windows_frame_rect: Option<ScreenRect>,
     /// Specifies basis for evaluating x/y coords.
     /// Also applies to width/height when computing % based dimensions
     pub origin: GeometryOrigin,

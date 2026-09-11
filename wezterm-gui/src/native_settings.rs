@@ -329,11 +329,50 @@ pub(crate) struct NativeCompatibilitySettings {
     pub(crate) last_imported_at: Option<String>,
 }
 
+/// A rectangle in physical screen pixels, as the platform reports it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct NativeScreenRect {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+}
+
+/// Where the main window was the last time it was moved, resized or closed,
+/// so the next launch can reopen it there.
+///
+/// The rect is the window's **outer frame** in physical screen pixels, in its
+/// normal (unmaximized) state -- a maximized window remembers the rect it
+/// would return to, next to `maximized: true`, so both the state and the size
+/// behind it survive.
+///
+/// `work_area` is the work area of the display the window was on when this was
+/// written. It is not what decides whether the placement is still usable --
+/// the displays attached *now* decide that, see
+/// `main_window_placement::placement_is_usable` -- but it records which desktop
+/// layout the rect was measured against, which makes an unchanged layout cheap
+/// to recognise and a rejected placement possible to explain.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct NativeMainWindowPlacement {
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) maximized: bool,
+    pub(crate) work_area: NativeScreenRect,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct NativeWindowSettings {
     pub(crate) restore_main_window_frame: bool,
     pub(crate) main_renderer: Option<NativeRendererBackend>,
+    /// Written by the GUI rather than by the Settings UI; `None` until the
+    /// main window has been placed somewhere worth remembering. Only consulted
+    /// when `restore_main_window_frame` is on.
+    pub(crate) main_window_placement: Option<NativeMainWindowPlacement>,
 }
 
 impl Default for NativeWindowSettings {
@@ -341,6 +380,7 @@ impl Default for NativeWindowSettings {
         Self {
             restore_main_window_frame: true,
             main_renderer: None,
+            main_window_placement: None,
         }
     }
 }
@@ -650,6 +690,38 @@ pub(crate) fn save(settings: &ThinkTermNativeSettings) -> anyhow::Result<()> {
     fs::rename(tmp, path)?;
     *settings_cache().lock() = Arc::new(settings.clone());
     Ok(())
+}
+
+/// Where the main window should reopen, or `None` if nothing has been
+/// remembered yet or the user turned the setting off.
+pub(crate) fn main_window_placement() -> Option<NativeMainWindowPlacement> {
+    let settings = load_shared();
+    if !settings.window.restore_main_window_frame {
+        return None;
+    }
+    settings.window.main_window_placement
+}
+
+/// Whether moving or resizing the main window should still be recorded.
+/// Read per move/resize edge rather than cached, so turning the setting off
+/// in Settings takes effect on the next drag rather than the next launch.
+pub(crate) fn restore_main_window_frame_enabled() -> bool {
+    load_shared().window.restore_main_window_frame
+}
+
+/// Persist where the main window is. A no-op when nothing changed, which is
+/// the common case: the debounce upstream of this already collapses a drag
+/// into one call, and a drag that ends where it started should not rewrite
+/// the file.
+pub(crate) fn save_main_window_placement(placement: NativeMainWindowPlacement) {
+    let mut settings = load();
+    if settings.window.main_window_placement == Some(placement) {
+        return;
+    }
+    settings.window.main_window_placement = Some(placement);
+    if let Err(err) = save(&settings) {
+        log::warn!("failed to save main window placement: {err:#}");
+    }
 }
 
 /// Persist the palette-picked color scheme so new windows and the next
