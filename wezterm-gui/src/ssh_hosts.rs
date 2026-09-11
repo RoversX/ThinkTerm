@@ -765,11 +765,14 @@ Host prod *.internal
         assert_eq!(spec.host, "prod");
         assert_eq!(spec.username.as_deref(), Some("deploy"));
         assert_eq!(spec.port, Some(2202));
-        assert!(spec
-            .identity_file
-            .as_deref()
-            .unwrap()
-            .ends_with("/.ssh/prod"));
+        // `~` expands to this machine's home, which on Windows is spelled
+        // with backslashes; compare components rather than text.
+        let identity = std::path::Path::new(spec.identity_file.as_deref().unwrap());
+        assert!(
+            identity.ends_with(std::path::Path::new(".ssh").join("prod")),
+            "{}",
+            identity.display()
+        );
     }
 
     /// The two names one host can attach a mux domain under. A Space is tagged

@@ -129,8 +129,11 @@ pub(crate) fn discover_with(
 
     for (label, program) in UNIX_SHELLS {
         for prefix in UNIX_PREFIXES {
-            let path = PathBuf::from(prefix).join(program);
-            let path = path.to_string_lossy().into_owned();
+            // Joined as text, not as a `PathBuf`: these are POSIX prefixes,
+            // and on Windows `PathBuf::join` would spell `/bin/bash` as
+            // `/bin\bash` -- a path nothing answers to, and one the tests
+            // (which exercise the unix table from any host) never see.
+            let path = format!("{prefix}/{program}");
             if exists(&path) {
                 push(DiscoveredShell::new(label, &path), &mut seen, &mut found);
                 break;

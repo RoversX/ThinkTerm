@@ -62,6 +62,9 @@ pub fn clipboard_contents_from_uri_list(
 mod tests {
     use super::*;
 
+    // `file:///home/x` is not a local path on Windows, where `to_file_path`
+    // wants a drive; the lists this decodes come from X11 and Wayland.
+    #[cfg(unix)]
     #[test]
     fn a_uri_list_decodes_paths_and_skips_noise() {
         let list = b"# comment line\r\nfile:///home/x/a%20b.txt\r\n\r\nhttps://example.com/nope\r\nfile:///tmp/plain.png\r\n";

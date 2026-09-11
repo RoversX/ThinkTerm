@@ -144,7 +144,13 @@ mod tests {
     fn the_default_serve_command_is_the_bundled_server() {
         let argv = takeover_argv(&UnixDomain::default()).unwrap();
         let exe = std::path::Path::new(&argv[0]);
-        assert!(exe.ends_with("thinkterm-mux-server"), "{exe:?}");
+        // The stem, so the `.exe` a Windows build carries does not count.
+        assert_eq!(
+            exe.file_stem().and_then(|stem| stem.to_str()),
+            Some("thinkterm-mux-server"),
+            "{:?}",
+            exe
+        );
         assert_eq!(argv[1], "--daemonize");
         assert_eq!(argv[2], "--takeover");
     }
