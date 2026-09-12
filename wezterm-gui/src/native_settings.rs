@@ -166,13 +166,8 @@ impl Default for NativeRemotePaneResizeMode {
 }
 
 impl NativeRemotePaneResizeMode {
-    pub(crate) fn next(self) -> Self {
-        match self {
-            Self::Auto => Self::Live,
-            Self::Live => Self::OnRelease,
-            Self::OnRelease => Self::Auto,
-        }
-    }
+    /// Every mode, in the order the settings window offers them.
+    pub(crate) const ALL: [Self; 3] = [Self::Auto, Self::Live, Self::OnRelease];
 }
 
 /// How the terminal scrolls its scrollback under a wheel, trackpad or
@@ -191,12 +186,8 @@ impl Default for NativeScrollMode {
 }
 
 impl NativeScrollMode {
-    pub(crate) fn next(self) -> Self {
-        match self {
-            Self::Stepped => Self::Smooth,
-            Self::Smooth => Self::Stepped,
-        }
-    }
+    /// Every mode, in the order the settings window offers them.
+    pub(crate) const ALL: [Self; 2] = [Self::Smooth, Self::Stepped];
 }
 
 impl Default for NativeBottomQuoteMode {
@@ -206,12 +197,8 @@ impl Default for NativeBottomQuoteMode {
 }
 
 impl NativeBottomQuoteMode {
-    pub(crate) fn next(self) -> Self {
-        match self {
-            Self::Timed => Self::PseudoRandom,
-            Self::PseudoRandom => Self::Timed,
-        }
-    }
+    /// Every mode, in the order the settings window offers them.
+    pub(crate) const ALL: [Self; 2] = [Self::Timed, Self::PseudoRandom];
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

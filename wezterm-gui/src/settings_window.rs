@@ -866,10 +866,10 @@ enum SettingsAction {
     RestartApplication,
     QuitApplication,
     ToggleBottomQuote,
-    CycleRemotePaneResizeMode,
-    CycleScrollMode,
+    SetRemotePaneResizeMode(NativeRemotePaneResizeMode),
+    SetScrollMode(crate::native_settings::NativeScrollMode),
     ToggleOverlayScrollbar,
-    CycleBottomQuoteMode,
+    SetBottomQuoteMode(NativeBottomQuoteMode),
     DecreaseBottomQuoteFontSize,
     IncreaseBottomQuoteFontSize,
     ResetBottomQuoteFontSize,
@@ -3405,6 +3405,68 @@ impl SettingsWindow {
         }
     }
 
+    fn apply_scroll_mode(&mut self, mode: crate::native_settings::NativeScrollMode) {
+        self.ui.open_dropdown = None;
+        self.native_settings.terminal.scroll_mode = mode;
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                self.status = settings_tr(
+                    "settings-status-value-now",
+                    &[
+                        ("setting", crate::i18n::tr("settings-scroll-mode")),
+                        ("value", localized_scroll_mode_label(mode)),
+                    ],
+                );
+            }
+            Err(err) => {
+                self.status = settings_tr(
+                    "settings-status-terminal-error",
+                    &[("error", format!("{err:#}"))],
+                );
+            }
+        }
+    }
+
+    fn apply_remote_pane_resize_mode(&mut self, mode: NativeRemotePaneResizeMode) {
+        self.ui.open_dropdown = None;
+        self.native_settings.terminal.remote_pane_resize_mode = mode;
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                if let Some(front_end) = crate::frontend::try_front_end() {
+                    front_end.invalidate_all_windows();
+                }
+                self.status = settings_tr(
+                    "settings-status-value-now",
+                    &[
+                        (
+                            "setting",
+                            crate::i18n::tr("settings-remote-pane-resize-mode"),
+                        ),
+                        ("value", localized_remote_pane_resize_mode_label(mode)),
+                    ],
+                );
+            }
+            Err(err) => {
+                self.status = settings_tr(
+                    "settings-status-terminal-error",
+                    &[("error", format!("{err:#}"))],
+                );
+            }
+        }
+    }
+
+    fn apply_bottom_quote_mode(&mut self, mode: NativeBottomQuoteMode) {
+        self.ui.open_dropdown = None;
+        self.native_settings.terminal.bottom_quote_mode = mode;
+        self.save_and_apply_bottom_quote_settings(settings_tr(
+            "settings-status-value-now",
+            &[
+                ("setting", crate::i18n::tr("settings-quote-rotation")),
+                ("value", localized_quote_mode_label(mode)),
+            ],
+        ));
+    }
+
     fn save_and_apply_bottom_quote_settings(&mut self, status: String) {
         match crate::native_settings::save(&self.native_settings) {
             Ok(()) => {
@@ -3578,11 +3640,14 @@ impl SettingsWindow {
     /// Width of the control column shared by every settings row kind, so a
     /// value pill, a toggle and a link button all line up on the same right
     /// edge no matter which rows a card mixes.
-    fn settings_control_width(width: f32) -> f32 {
-        if width >= 680.0 {
-            280.0_f32.min(width * 0.36)
+    fn settings_control_width(&self, width: f32) -> f32 {
+        // Design pixels, like every other layout constant here: the column
+        // was 280 physical pixels regardless of DPI, which made it twice as
+        // wide as designed on a 96-dpi screen.
+        if width >= self.ui_px(680.0) {
+            self.ui_px(280.0).min(width * 0.36)
         } else {
-            220.0_f32.min(width * 0.44)
+            self.ui_px(220.0).min(width * 0.44)
         }
     }
 
@@ -4038,83 +4103,11 @@ impl SettingsWindow {
                     }
                 }
             }
-            SettingsAction::CycleScrollMode => {
-                self.ui.open_dropdown = None;
-                self.native_settings.terminal.scroll_mode =
-                    self.native_settings.terminal.scroll_mode.next();
-                match crate::native_settings::save(&self.native_settings) {
-                    Ok(()) => {
-                        self.status = settings_tr(
-                            "settings-status-value-now",
-                            &[
-                                ("setting", crate::i18n::tr("settings-scroll-mode")),
-                                (
-                                    "value",
-                                    localized_scroll_mode_label(
-                                        self.native_settings.terminal.scroll_mode,
-                                    ),
-                                ),
-                            ],
-                        );
-                    }
-                    Err(err) => {
-                        self.status = settings_tr(
-                            "settings-status-terminal-error",
-                            &[("error", format!("{err:#}"))],
-                        );
-                    }
-                }
+            SettingsAction::SetScrollMode(mode) => self.apply_scroll_mode(mode),
+            SettingsAction::SetRemotePaneResizeMode(mode) => {
+                self.apply_remote_pane_resize_mode(mode)
             }
-            SettingsAction::CycleRemotePaneResizeMode => {
-                self.ui.open_dropdown = None;
-                self.native_settings.terminal.remote_pane_resize_mode =
-                    self.native_settings.terminal.remote_pane_resize_mode.next();
-                match crate::native_settings::save(&self.native_settings) {
-                    Ok(()) => {
-                        if let Some(front_end) = crate::frontend::try_front_end() {
-                            front_end.invalidate_all_windows();
-                        }
-                        self.status = settings_tr(
-                            "settings-status-value-now",
-                            &[
-                                (
-                                    "setting",
-                                    crate::i18n::tr("settings-remote-pane-resize-mode"),
-                                ),
-                                (
-                                    "value",
-                                    localized_remote_pane_resize_mode_label(
-                                        self.native_settings.terminal.remote_pane_resize_mode,
-                                    ),
-                                ),
-                            ],
-                        );
-                    }
-                    Err(err) => {
-                        self.status = settings_tr(
-                            "settings-status-terminal-error",
-                            &[("error", format!("{err:#}"))],
-                        );
-                    }
-                }
-            }
-            SettingsAction::CycleBottomQuoteMode => {
-                self.ui.open_dropdown = None;
-                self.native_settings.terminal.bottom_quote_mode =
-                    self.native_settings.terminal.bottom_quote_mode.next();
-                self.save_and_apply_bottom_quote_settings(settings_tr(
-                    "settings-status-value-now",
-                    &[
-                        ("setting", crate::i18n::tr("settings-quote-rotation")),
-                        (
-                            "value",
-                            localized_quote_mode_label(
-                                self.native_settings.terminal.bottom_quote_mode,
-                            ),
-                        ),
-                    ],
-                ));
-            }
+            SettingsAction::SetBottomQuoteMode(mode) => self.apply_bottom_quote_mode(mode),
             SettingsAction::DecreaseBottomQuoteFontSize => self.step_bottom_quote_font_size(-1.0),
             SettingsAction::IncreaseBottomQuoteFontSize => self.step_bottom_quote_font_size(1.0),
             SettingsAction::ResetBottomQuoteFontSize => self.reset_bottom_quote_font_size(),
@@ -5466,8 +5459,9 @@ impl SettingsWindow {
         let title_font = Rc::clone(&self.title_font);
         let sidebar_width = self.ui.sidebar.width;
         let window_width = self.dimensions.pixel_width as f32;
-        let content_gap = if window_width < 980.0 { 30.0 } else { 46.0 };
-        let right_margin = if window_width < 980.0 { 34.0 } else { 50.0 };
+        let narrow = window_width < self.ui_px(980.0);
+        let content_gap = self.ui_px(if narrow { 30.0 } else { 46.0 });
+        let right_margin = self.ui_px(if narrow { 34.0 } else { 50.0 });
         let x = sidebar_width + content_gap;
         let max_width = (window_width - x - right_margin).max(self.ui_px(280.0));
         let content_top = self.content_scroll_area_top();
@@ -5646,7 +5640,7 @@ impl SettingsWindow {
         )?;
 
         let card_x = x;
-        let card_padding = 36.0;
+        let card_padding = self.ui_px(36.0);
         let row_x = card_x + card_padding;
         let row_width = max_width - card_padding * 2.0;
         self.paint_group_card(layers, card_x, card_y, max_width, card_height)?;
@@ -5788,7 +5782,7 @@ impl SettingsWindow {
             max_width,
         )?;
 
-        let card_padding = 36.0;
+        let card_padding = self.ui_px(36.0);
         let row_x = x + card_padding;
         let row_width = max_width - card_padding * 2.0;
         self.paint_group_card(layers, x, theme_card_y, max_width, theme_card_height)?;
@@ -7040,7 +7034,7 @@ impl SettingsWindow {
             max_width,
         )?;
 
-        let card_padding = 36.0;
+        let card_padding = self.ui_px(36.0);
         let card_x = x;
         let row_x = card_x + card_padding;
         let row_width = max_width - card_padding * 2.0;
@@ -7080,30 +7074,59 @@ impl SettingsWindow {
             SettingsAction::IncreaseFontSize,
             true,
         )?;
-        self.paint_action_setting_row(
-            layers,
-            row_x,
-            first_row_y + row_step * 4.0,
-            row_width,
-            &crate::i18n::tr("settings-remote-pane-resize-mode"),
-            &crate::i18n::tr("settings-remote-pane-resize-mode-description"),
-            &localized_remote_pane_resize_mode_label(
-                self.native_settings.terminal.remote_pane_resize_mode,
-            ),
-            SettingsAction::CycleRemotePaneResizeMode,
-            true,
-        )?;
-        self.paint_action_setting_row(
-            layers,
-            row_x,
-            first_row_y + row_step * 5.0,
-            row_width,
-            &crate::i18n::tr("settings-scroll-mode"),
-            &crate::i18n::tr("settings-scroll-mode-description"),
-            &localized_scroll_mode_label(self.native_settings.terminal.scroll_mode),
-            SettingsAction::CycleScrollMode,
-            true,
-        )?;
+        {
+            use crate::native_settings::NativeScrollMode;
+            let resize_modes = NativeRemotePaneResizeMode::ALL;
+            let resize_options: Vec<(String, SettingsAction)> = resize_modes
+                .iter()
+                .map(|mode| {
+                    (
+                        localized_remote_pane_resize_mode_label(*mode),
+                        SettingsAction::SetRemotePaneResizeMode(*mode),
+                    )
+                })
+                .collect();
+            let resize_selected = resize_modes
+                .iter()
+                .position(|mode| *mode == self.native_settings.terminal.remote_pane_resize_mode)
+                .unwrap_or(0);
+            self.paint_segmented_setting_row(
+                layers,
+                row_x,
+                first_row_y + row_step * 4.0,
+                row_width,
+                &crate::i18n::tr("settings-remote-pane-resize-mode"),
+                &crate::i18n::tr("settings-remote-pane-resize-mode-description"),
+                &resize_options,
+                resize_selected,
+                true,
+            )?;
+            let scroll_modes = NativeScrollMode::ALL;
+            let scroll_options: Vec<(String, SettingsAction)> = scroll_modes
+                .iter()
+                .map(|mode| {
+                    (
+                        localized_scroll_mode_label(*mode),
+                        SettingsAction::SetScrollMode(*mode),
+                    )
+                })
+                .collect();
+            let scroll_selected = scroll_modes
+                .iter()
+                .position(|mode| *mode == self.native_settings.terminal.scroll_mode)
+                .unwrap_or(0);
+            self.paint_segmented_setting_row(
+                layers,
+                row_x,
+                first_row_y + row_step * 5.0,
+                row_width,
+                &crate::i18n::tr("settings-scroll-mode"),
+                &crate::i18n::tr("settings-scroll-mode-description"),
+                &scroll_options,
+                scroll_selected,
+                true,
+            )?;
+        }
         self.paint_toggle_setting_row(
             layers,
             row_x,
@@ -7140,17 +7163,33 @@ impl SettingsWindow {
             SettingsAction::IncreaseBottomQuoteFontSize,
             true,
         )?;
-        self.paint_action_setting_row(
-            layers,
-            row_x,
-            first_row_y + row_step * 9.0,
-            row_width,
-            &crate::i18n::tr("settings-quote-rotation"),
-            &crate::i18n::tr("settings-quote-rotation-description"),
-            &localized_quote_mode_label(self.native_settings.terminal.bottom_quote_mode),
-            SettingsAction::CycleBottomQuoteMode,
-            true,
-        )?;
+        {
+            let quote_modes = NativeBottomQuoteMode::ALL;
+            let quote_options: Vec<(String, SettingsAction)> = quote_modes
+                .iter()
+                .map(|mode| {
+                    (
+                        localized_quote_mode_label(*mode),
+                        SettingsAction::SetBottomQuoteMode(*mode),
+                    )
+                })
+                .collect();
+            let quote_selected = quote_modes
+                .iter()
+                .position(|mode| *mode == self.native_settings.terminal.bottom_quote_mode)
+                .unwrap_or(0);
+            self.paint_segmented_setting_row(
+                layers,
+                row_x,
+                first_row_y + row_step * 9.0,
+                row_width,
+                &crate::i18n::tr("settings-quote-rotation"),
+                &crate::i18n::tr("settings-quote-rotation-description"),
+                &quote_options,
+                quote_selected,
+                true,
+            )?;
+        }
         self.paint_font_size_stepper_row(
             layers,
             row_x,
@@ -7217,7 +7256,7 @@ impl SettingsWindow {
             max_width,
         )?;
 
-        let card_padding = 36.0;
+        let card_padding = self.ui_px(36.0);
         let row_x = x + card_padding;
         let row_width = max_width - card_padding * 2.0;
         let developer_tabs_value = if self.developer_mode_enabled() {
@@ -7660,7 +7699,7 @@ impl SettingsWindow {
             self.settings_content_extent(resource_card_y + scroll + resource_card_height),
         );
 
-        let card_padding = 36.0;
+        let card_padding = self.ui_px(36.0);
         let row_x = x + card_padding;
         let row_width = max_width - card_padding * 2.0;
         self.paint_group_card(layers, x, card_y, max_width, card_height)?;
@@ -8224,7 +8263,7 @@ impl SettingsWindow {
             palette.secondary_text,
             max_width,
         )?;
-        let card_padding = 36.0;
+        let card_padding = self.ui_px(36.0);
         let row_x = x + card_padding;
         let row_width = max_width - card_padding * 2.0;
         self.paint_group_card(layers, x, card_y, max_width, card_height)?;
@@ -8649,7 +8688,7 @@ impl SettingsWindow {
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
-        let card_padding = 36.0;
+        let card_padding = self.ui_px(36.0);
         let row_x = x + card_padding;
         let row_width = max_width - card_padding * 2.0;
 
@@ -9089,10 +9128,10 @@ impl SettingsWindow {
         if draw_top_rule {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
-        let control_width = Self::settings_control_width(width);
+        let control_width = self.settings_control_width(width);
         let control_x = x + width - control_width;
         let control_y = y + self.ui_px(4.0);
-        let text_width = (control_x - x - 24.0).max(width * 0.45);
+        let text_width = (control_x - x - self.ui_px(24.0)).max(width * 0.45);
         self.draw_text(layers, &ui_font, x, y, label, palette.text, text_width)?;
         self.draw_text(
             layers,
@@ -9192,10 +9231,10 @@ impl SettingsWindow {
         if draw_top_rule {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
-        let control_width = Self::settings_control_width(width);
+        let control_width = self.settings_control_width(width);
         let control_x = x + width - control_width;
         let control_y = y + self.ui_px(4.0);
-        let text_width = (control_x - x - 24.0).max(width * 0.45);
+        let text_width = (control_x - x - self.ui_px(24.0)).max(width * 0.45);
         let control_rect = rect(
             control_x,
             control_y,
@@ -9316,7 +9355,7 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
-        let control_width = Self::settings_control_width(width);
+        let control_width = self.settings_control_width(width);
         let control_x = x + width - control_width;
         let control_height = self.ui_px(CONTROL_HEIGHT);
         // `y` is the top of a single-line band; the switch and the label
@@ -9398,33 +9437,77 @@ impl SettingsWindow {
         if draw_top_rule {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
-        let control_width = Self::settings_control_width(width);
+        // A button sized to its label and pushed to the column's right
+        // edge, like System Settings; the column width is only a cap.
+        let column_width = self.settings_control_width(width);
+        let control_width = self.button_width_for_label(value, 0.0).min(column_width);
         let control_x = x + width - control_width;
         let control_y = y + self.ui_px(4.0);
-        let text_width = (control_x - x - 24.0).max(width * 0.45);
-        let control_rect = rect(
-            control_x,
-            control_y,
-            control_width,
-            self.ui_px(CONTROL_HEIGHT),
-        );
-        self.ui_context
-            .push(control_rect, WidgetKind::Button, action);
+        let text_width = (control_x - x - self.ui_px(24.0)).max(width * 0.45);
 
-        let hovered = self.ui.interaction.hovered == Some(action);
-        let pressed = self.ui.interaction.pressed == Some(action);
-        let bg = if pressed {
-            palette.control_pressed_bg
-        } else if hovered {
-            palette.control_hover_bg
+        self.draw_text(layers, &ui_font, x, y, label, palette.text, text_width)?;
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            self.settings_row_description_y(y),
+            description,
+            palette.secondary_text,
+            text_width,
+        )?;
+        self.draw_button(layers, control_x, control_y, control_width, value, action)?;
+        Ok(())
+    }
+
+    /// A row whose control is a segmented control: one track holding every
+    /// choice, the current one filled. Each segment is its own hit target
+    /// carrying a *set* action, so a click lands on the value it shows
+    /// rather than cycling to whatever comes next.
+    fn paint_segmented_setting_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        label: &str,
+        description: &str,
+        options: &[(String, SettingsAction)],
+        selected: usize,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
+        if draw_top_rule {
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
+        }
+        let column_width = self.settings_control_width(width);
+        let control_y = y + self.ui_px(4.0);
+        let control_height = self.ui_px(CONTROL_HEIGHT);
+        let inset = self.ui_px(3.0);
+
+        // Natural width: every segment fits its label; if that overflows the
+        // column, shrink the segments evenly and ellipsise their labels.
+        let natural: Vec<f32> = options
+            .iter()
+            .map(|(text, _)| {
+                (self.measure_text_width(&ui_font, text) + self.ui_px(28.0)).max(self.ui_px(72.0))
+            })
+            .collect();
+        let natural_total: f32 = natural.iter().sum::<f32>() + inset * 2.0;
+        // The column is the target width, but three labels can need more
+        // than it offers (fonts scale with the point size, the column with
+        // the UI scale, and the two diverge at 96 dpi). Let the control
+        // borrow from the label side before ellipsising its options.
+        let max_width = column_width.max(width * 0.45);
+        let control_width = natural_total.min(max_width);
+        let shrink = if natural_total > inset * 2.0 {
+            (control_width - inset * 2.0) / (natural_total - inset * 2.0)
         } else {
-            palette.control_bg
+            1.0
         };
-        let border = if hovered || pressed {
-            palette.separator
-        } else {
-            palette.control_border
-        };
+        let control_x = x + width - control_width;
+        let text_width = (control_x - x - self.ui_px(24.0)).max(width * 0.45);
 
         self.draw_text(layers, &ui_font, x, y, label, palette.text, text_width)?;
         self.draw_text(
@@ -9442,7 +9525,106 @@ impl SettingsWindow {
             control_x,
             control_y,
             control_width,
+            control_height,
+            palette.control_bg,
+            palette.control_border,
+            self.ui_px(CONTROL_RADIUS),
+        )?;
+
+        let mut segment_x = control_x + inset;
+        let segment_y = control_y + inset;
+        let segment_height = control_height - inset * 2.0;
+        let segment_radius = (self.ui_px(CONTROL_RADIUS) - inset).max(self.ui_px(4.0));
+        for (index, ((text, action), natural_width)) in
+            options.iter().zip(natural.iter()).enumerate()
+        {
+            let segment_width = natural_width * shrink;
+            let segment_rect = rect(segment_x, segment_y, segment_width, segment_height);
+            self.ui_context
+                .push(segment_rect, WidgetKind::Button, *action);
+            let is_selected = index == selected;
+            let hovered = self.ui.interaction.hovered == Some(*action);
+            let pressed = self.ui.interaction.pressed == Some(*action);
+            let fill = if is_selected {
+                Some(palette.nav_selected_bg)
+            } else if pressed {
+                Some(palette.control_pressed_bg)
+            } else if hovered {
+                Some(palette.control_hover_bg)
+            } else {
+                None
+            };
+            if let Some(fill) = fill {
+                self.draw_rounded_rect(
+                    layers,
+                    0,
+                    segment_x,
+                    segment_y,
+                    segment_width,
+                    segment_height,
+                    fill,
+                    segment_radius,
+                )?;
+            }
+            let available = (segment_width - self.ui_px(12.0)).max(0.0);
+            let shown = self.text_with_ellipsis(&ui_font, text, available);
+            let shown_width = self.measure_text_width(&ui_font, &shown);
+            let text_x = segment_x + ((segment_width - shown_width) / 2.0).max(self.ui_px(6.0));
+            self.draw_text(
+                layers,
+                &ui_font,
+                text_x,
+                self.control_text_y(segment_y, segment_height),
+                &shown,
+                if is_selected || hovered || pressed {
+                    palette.text
+                } else {
+                    palette.secondary_text
+                },
+                available,
+            )?;
+            segment_x += segment_width;
+        }
+        Ok(())
+    }
+
+    /// The closed face of a dropdown: a pill wide enough for its current
+    /// value plus the chevron, capped at the column and flush with the
+    /// column's right edge (where the open menu also anchors).
+    fn dropdown_pill_rect(
+        &self,
+        control_x: f32,
+        control_y: f32,
+        column_width: f32,
+        label: &str,
+    ) -> window::RectF {
+        let natural = self.measure_text_width(&self.ui_font, label) + self.ui_px(60.0);
+        let pill_width = natural.max(self.ui_px(120.0)).min(column_width);
+        rect(
+            control_x + column_width - pill_width,
+            control_y,
+            pill_width,
             self.ui_px(CONTROL_HEIGHT),
+        )
+    }
+
+    fn paint_dropdown_pill(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        pill: window::RectF,
+        label: &str,
+        bg: LinearRgba,
+        border: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        self.draw_rounded_frame(
+            layers,
+            0,
+            pill.origin.x,
+            pill.origin.y,
+            pill.size.width,
+            pill.size.height,
             bg,
             border,
             self.ui_px(CONTROL_RADIUS),
@@ -9450,11 +9632,19 @@ impl SettingsWindow {
         self.draw_text(
             layers,
             &ui_font,
-            control_x + self.ui_px(14.0),
-            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
-            value,
+            pill.origin.x + self.ui_px(16.0),
+            self.control_text_y(pill.origin.y, pill.size.height),
+            label,
             palette.text,
-            control_width - self.ui_px(26.0),
+            pill.size.width - self.ui_px(60.0),
+        )?;
+        self.draw_svg_icon(
+            layers,
+            SvgIcon::ChevronDown,
+            pill.origin.x + pill.size.width - self.ui_px(38.0),
+            pill.origin.y + (pill.size.height - self.ui_px(22.0)) / 2.0,
+            self.ui_px(22.0),
+            palette.secondary_text,
         )?;
         Ok(())
     }
@@ -9673,7 +9863,8 @@ impl SettingsWindow {
         width: f32,
     ) -> anyhow::Result<()> {
         let palette = self.palette();
-        self.draw_rounded_rect(layers, 0, x, y, width, 2.0, palette.rule, 1.0)
+        let height = self.ui_px(2.0).max(1.0);
+        self.draw_rounded_rect(layers, 0, x, y, width, height, palette.rule, height / 2.0)
     }
 
     fn paint_font_size_stepper_row(
@@ -9698,15 +9889,15 @@ impl SettingsWindow {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
 
-        let control_width = Self::settings_control_width(width);
+        let control_width = self.ui_px(200.0).min(self.settings_control_width(width));
         let control_x = x + width - control_width;
         let control_y = y + self.ui_px(4.0);
         let dynamic_icon_size =
             (self.metrics.cell_size.height as f32 + 4.0).clamp(self.ui_px(24.0), self.ui_px(34.0));
         let reset_size = self.ui_px(CONTROL_HEIGHT);
-        let reset_gap = 14.0;
+        let reset_gap = self.ui_px(14.0);
         let reset_x = (control_x - reset_gap - reset_size).max(x + width * 0.62);
-        let text_width = (reset_x - x - 24.0).max(width * 0.40);
+        let text_width = (reset_x - x - self.ui_px(24.0)).max(width * 0.40);
 
         self.draw_text(layers, &ui_font, x, y, label, palette.text, text_width)?;
         self.draw_text(
@@ -9740,7 +9931,7 @@ impl SettingsWindow {
             self.ui_px(CONTROL_RADIUS),
         )?;
 
-        let button_width = 62.0_f32.min(control_width * 0.28);
+        let button_width = self.ui_px(62.0).min(control_width * 0.28);
         let minus_rect = rect(
             control_x,
             control_y,
@@ -9828,10 +10019,10 @@ impl SettingsWindow {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
 
-        let control_width = Self::settings_control_width(width);
+        let control_width = self.settings_control_width(width);
         let control_x = x + width - control_width;
         let control_y = y + self.ui_px(4.0);
-        let text_width = (control_x - x - 24.0).max(width * 0.45);
+        let text_width = (control_x - x - self.ui_px(24.0)).max(width * 0.45);
         let focused = self.ui.interaction.focused == Some(action);
         let hovered = self.ui.interaction.hovered == Some(action);
         let pressed = self.ui.interaction.pressed == Some(action);
@@ -9968,14 +10159,11 @@ impl SettingsWindow {
         }
 
         let (control_x, control_y, control_width) = self.dropdown_control_geometry(x, y, width);
-        let text_width = (control_x - x - 24.0).max(width * 0.45);
+        let text_width = (control_x - x - self.ui_px(24.0)).max(width * 0.45);
         let action = SettingsAction::ToggleWebLinkTtlMenu;
-        let control_rect = rect(
-            control_x,
-            control_y,
-            control_width,
-            self.ui_px(CONTROL_HEIGHT),
-        );
+        let dropdown_label = (&web_link_ttl_label(self.native_settings.web.link_ttl_secs)).to_string();
+        let control_rect =
+            self.dropdown_pill_rect(control_x, control_y, control_width, &dropdown_label);
         let open = self.ui.open_dropdown == Some(SettingsDropdown::WebLinkTtl);
         let hovered = self.ui.interaction.hovered == Some(action);
         let pressed = self.ui.interaction.pressed == Some(action);
@@ -10012,34 +10200,7 @@ impl SettingsWindow {
             palette.secondary_text,
             text_width,
         )?;
-        self.draw_rounded_frame(
-            layers,
-            0,
-            control_rect.origin.x,
-            control_rect.origin.y,
-            control_rect.size.width,
-            control_rect.size.height,
-            bg,
-            border,
-            self.ui_px(CONTROL_RADIUS),
-        )?;
-        self.draw_text(
-            layers,
-            &ui_font,
-            control_x + self.ui_px(16.0),
-            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
-            &web_link_ttl_label(self.native_settings.web.link_ttl_secs),
-            palette.text,
-            control_width - self.ui_px(60.0),
-        )?;
-        self.draw_svg_icon(
-            layers,
-            SvgIcon::ChevronDown,
-            control_x + control_width - self.ui_px(38.0),
-            control_y + (self.ui_px(CONTROL_HEIGHT) - 22.0) / 2.0,
-            self.ui_px(22.0),
-            palette.secondary_text,
-        )?;
+        self.paint_dropdown_pill(layers, control_rect, &dropdown_label, bg, border)?;
         Ok(())
     }
 
@@ -10081,14 +10242,11 @@ impl SettingsWindow {
         }
 
         let (control_x, control_y, control_width) = self.dropdown_control_geometry(x, y, width);
-        let text_width = (control_x - x - 24.0).max(width * 0.45);
+        let text_width = (control_x - x - self.ui_px(24.0)).max(width * 0.45);
         let action = SettingsAction::ToggleCommandPaletteHotkeyMenu;
-        let control_rect = rect(
-            control_x,
-            control_y,
-            control_width,
-            self.ui_px(CONTROL_HEIGHT),
-        );
+        let dropdown_label = (self.native_settings.command_palette.hotkey.label()).to_string();
+        let control_rect =
+            self.dropdown_pill_rect(control_x, control_y, control_width, &dropdown_label);
         let open = self.ui.open_dropdown == Some(SettingsDropdown::CommandPaletteHotkey);
         let hovered = self.ui.interaction.hovered == Some(action);
         let pressed = self.ui.interaction.pressed == Some(action);
@@ -10125,34 +10283,7 @@ impl SettingsWindow {
             palette.secondary_text,
             text_width,
         )?;
-        self.draw_rounded_frame(
-            layers,
-            0,
-            control_rect.origin.x,
-            control_rect.origin.y,
-            control_rect.size.width,
-            control_rect.size.height,
-            bg,
-            border,
-            self.ui_px(CONTROL_RADIUS),
-        )?;
-        self.draw_text(
-            layers,
-            &ui_font,
-            control_x + self.ui_px(16.0),
-            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
-            self.native_settings.command_palette.hotkey.label(),
-            palette.text,
-            control_width - self.ui_px(60.0),
-        )?;
-        self.draw_svg_icon(
-            layers,
-            SvgIcon::ChevronDown,
-            control_x + control_width - self.ui_px(38.0),
-            control_y + (self.ui_px(CONTROL_HEIGHT) - 22.0) / 2.0,
-            self.ui_px(22.0),
-            palette.secondary_text,
-        )?;
+        self.paint_dropdown_pill(layers, control_rect, &dropdown_label, bg, border)?;
 
         Ok(())
     }
@@ -10202,14 +10333,11 @@ impl SettingsWindow {
         }
 
         let (control_x, control_y, control_width) = self.theme_mode_control_geometry(x, y, width);
-        let text_width = (control_x - x - 24.0).max(width * 0.45);
+        let text_width = (control_x - x - self.ui_px(24.0)).max(width * 0.45);
         let action = SettingsAction::ToggleThemeModeMenu;
-        let control_rect = rect(
-            control_x,
-            control_y,
-            control_width,
-            self.ui_px(CONTROL_HEIGHT),
-        );
+        let dropdown_label = (&localized_theme_mode_label(self.native_settings.appearance.theme_mode)).to_string();
+        let control_rect =
+            self.dropdown_pill_rect(control_x, control_y, control_width, &dropdown_label);
         let open = self.ui.open_dropdown == Some(SettingsDropdown::ThemeMode);
         let hovered = self.ui.interaction.hovered == Some(action);
         let pressed = self.ui.interaction.pressed == Some(action);
@@ -10246,34 +10374,7 @@ impl SettingsWindow {
             palette.secondary_text,
             text_width,
         )?;
-        self.draw_rounded_frame(
-            layers,
-            0,
-            control_rect.origin.x,
-            control_rect.origin.y,
-            control_rect.size.width,
-            control_rect.size.height,
-            bg,
-            border,
-            self.ui_px(CONTROL_RADIUS),
-        )?;
-        self.draw_text(
-            layers,
-            &ui_font,
-            control_x + self.ui_px(16.0),
-            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
-            &localized_theme_mode_label(self.native_settings.appearance.theme_mode),
-            palette.text,
-            control_width - self.ui_px(60.0),
-        )?;
-        self.draw_svg_icon(
-            layers,
-            SvgIcon::ChevronDown,
-            control_x + control_width - self.ui_px(38.0),
-            control_y + (self.ui_px(CONTROL_HEIGHT) - 22.0) / 2.0,
-            self.ui_px(22.0),
-            palette.secondary_text,
-        )?;
+        self.paint_dropdown_pill(layers, control_rect, &dropdown_label, bg, border)?;
 
         Ok(())
     }
@@ -10294,14 +10395,11 @@ impl SettingsWindow {
         }
 
         let (control_x, control_y, control_width) = self.dropdown_control_geometry(x, y, width);
-        let text_width = (control_x - x - 24.0).max(width * 0.45);
+        let text_width = (control_x - x - self.ui_px(24.0)).max(width * 0.45);
         let action = SettingsAction::ToggleLanguageMenu;
-        let control_rect = rect(
-            control_x,
-            control_y,
-            control_width,
-            self.ui_px(CONTROL_HEIGHT),
-        );
+        let dropdown_label = (&crate::i18n::configured_language_label(&self.native_settings)).to_string();
+        let control_rect =
+            self.dropdown_pill_rect(control_x, control_y, control_width, &dropdown_label);
         let open = self.ui.open_dropdown == Some(SettingsDropdown::Language);
         let hovered = self.ui.interaction.hovered == Some(action);
         let pressed = self.ui.interaction.pressed == Some(action);
@@ -10338,34 +10436,7 @@ impl SettingsWindow {
             palette.secondary_text,
             text_width,
         )?;
-        self.draw_rounded_frame(
-            layers,
-            0,
-            control_rect.origin.x,
-            control_rect.origin.y,
-            control_rect.size.width,
-            control_rect.size.height,
-            bg,
-            border,
-            self.ui_px(CONTROL_RADIUS),
-        )?;
-        self.draw_text(
-            layers,
-            &ui_font,
-            control_x + self.ui_px(16.0),
-            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
-            &crate::i18n::configured_language_label(&self.native_settings),
-            palette.text,
-            control_width - self.ui_px(60.0),
-        )?;
-        self.draw_svg_icon(
-            layers,
-            SvgIcon::ChevronDown,
-            control_x + control_width - self.ui_px(38.0),
-            control_y + (self.ui_px(CONTROL_HEIGHT) - 22.0) / 2.0,
-            self.ui_px(22.0),
-            palette.secondary_text,
-        )?;
+        self.paint_dropdown_pill(layers, control_rect, &dropdown_label, bg, border)?;
         Ok(())
     }
 
@@ -10387,14 +10458,11 @@ impl SettingsWindow {
         }
 
         let (control_x, control_y, control_width) = self.dropdown_control_geometry(x, y, width);
-        let text_width = (control_x - x - 24.0).max(width * 0.45);
+        let text_width = (control_x - x - self.ui_px(24.0)).max(width * 0.45);
         let action = SettingsAction::ToggleAppIconMenu;
-        let control_rect = rect(
-            control_x,
-            control_y,
-            control_width,
-            self.ui_px(CONTROL_HEIGHT),
-        );
+        let dropdown_label = (&localized_app_icon_label(self.native_settings.appearance.app_icon)).to_string();
+        let control_rect =
+            self.dropdown_pill_rect(control_x, control_y, control_width, &dropdown_label);
         let open = self.ui.open_dropdown == Some(SettingsDropdown::AppIcon);
         let hovered = self.ui.interaction.hovered == Some(action);
         let pressed = self.ui.interaction.pressed == Some(action);
@@ -10442,34 +10510,7 @@ impl SettingsWindow {
             palette.muted_text,
             text_width,
         )?;
-        self.draw_rounded_frame(
-            layers,
-            0,
-            control_rect.origin.x,
-            control_rect.origin.y,
-            control_rect.size.width,
-            control_rect.size.height,
-            bg,
-            border,
-            self.ui_px(CONTROL_RADIUS),
-        )?;
-        self.draw_text(
-            layers,
-            &ui_font,
-            control_x + self.ui_px(16.0),
-            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
-            &localized_app_icon_label(self.native_settings.appearance.app_icon),
-            palette.text,
-            control_width - self.ui_px(60.0),
-        )?;
-        self.draw_svg_icon(
-            layers,
-            SvgIcon::ChevronDown,
-            control_x + control_width - self.ui_px(38.0),
-            control_y + (self.ui_px(CONTROL_HEIGHT) - 22.0) / 2.0,
-            self.ui_px(22.0),
-            palette.secondary_text,
-        )?;
+        self.paint_dropdown_pill(layers, control_rect, &dropdown_label, bg, border)?;
 
         Ok(())
     }
@@ -10528,14 +10569,11 @@ impl SettingsWindow {
         }
 
         let (control_x, control_y, control_width) = self.dropdown_control_geometry(x, y, width);
-        let text_width = (control_x - x - 24.0).max(width * 0.45);
+        let text_width = (control_x - x - self.ui_px(24.0)).max(width * 0.45);
         let action = SettingsAction::ToggleDefaultShellMenu;
-        let control_rect = rect(
-            control_x,
-            control_y,
-            control_width,
-            self.ui_px(CONTROL_HEIGHT),
-        );
+        let dropdown_label = (&self.current_default_shell_label()).to_string();
+        let control_rect =
+            self.dropdown_pill_rect(control_x, control_y, control_width, &dropdown_label);
         let open = self.ui.open_dropdown == Some(SettingsDropdown::DefaultShell);
         let hovered = self.ui.interaction.hovered == Some(action);
         let pressed = self.ui.interaction.pressed == Some(action);
@@ -10581,35 +10619,7 @@ impl SettingsWindow {
             palette.secondary_text,
             text_width,
         )?;
-        self.draw_rounded_frame(
-            layers,
-            0,
-            control_rect.origin.x,
-            control_rect.origin.y,
-            control_rect.size.width,
-            control_rect.size.height,
-            bg,
-            border,
-            self.ui_px(CONTROL_RADIUS),
-        )?;
-        let current = self.current_default_shell_label();
-        self.draw_text(
-            layers,
-            &ui_font,
-            control_x + self.ui_px(16.0),
-            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
-            &current,
-            palette.text,
-            control_width - self.ui_px(60.0),
-        )?;
-        self.draw_svg_icon(
-            layers,
-            SvgIcon::ChevronDown,
-            control_x + control_width - self.ui_px(38.0),
-            control_y + (self.ui_px(CONTROL_HEIGHT) - 22.0) / 2.0,
-            self.ui_px(22.0),
-            palette.secondary_text,
-        )?;
+        self.paint_dropdown_pill(layers, control_rect, &dropdown_label, bg, border)?;
 
         Ok(())
     }
@@ -10653,14 +10663,11 @@ impl SettingsWindow {
         }
 
         let (control_x, control_y, control_width) = self.dropdown_control_geometry(x, y, width);
-        let text_width = (control_x - x - 24.0).max(width * 0.45);
+        let text_width = (control_x - x - self.ui_px(24.0)).max(width * 0.45);
         let action = SettingsAction::ToggleMainRendererMenu;
-        let control_rect = rect(
-            control_x,
-            control_y,
-            control_width,
-            self.ui_px(CONTROL_HEIGHT),
-        );
+        let dropdown_label = (self.current_main_renderer().label()).to_string();
+        let control_rect =
+            self.dropdown_pill_rect(control_x, control_y, control_width, &dropdown_label);
         let open = self.ui.open_dropdown == Some(SettingsDropdown::MainRenderer);
         let hovered = self.ui.interaction.hovered == Some(action);
         let pressed = self.ui.interaction.pressed == Some(action);
@@ -10697,34 +10704,7 @@ impl SettingsWindow {
             palette.secondary_text,
             text_width,
         )?;
-        self.draw_rounded_frame(
-            layers,
-            0,
-            control_rect.origin.x,
-            control_rect.origin.y,
-            control_rect.size.width,
-            control_rect.size.height,
-            bg,
-            border,
-            self.ui_px(CONTROL_RADIUS),
-        )?;
-        self.draw_text(
-            layers,
-            &ui_font,
-            control_x + self.ui_px(16.0),
-            self.control_text_y(control_y, self.ui_px(CONTROL_HEIGHT)),
-            self.current_main_renderer().label(),
-            palette.text,
-            control_width - self.ui_px(60.0),
-        )?;
-        self.draw_svg_icon(
-            layers,
-            SvgIcon::ChevronDown,
-            control_x + control_width - self.ui_px(38.0),
-            control_y + (self.ui_px(CONTROL_HEIGHT) - 22.0) / 2.0,
-            self.ui_px(22.0),
-            palette.secondary_text,
-        )?;
+        self.paint_dropdown_pill(layers, control_rect, &dropdown_label, bg, border)?;
 
         Ok(())
     }
@@ -10792,7 +10772,7 @@ impl SettingsWindow {
     }
 
     fn dropdown_control_geometry(&self, x: f32, y: f32, width: f32) -> (f32, f32, f32) {
-        let control_width = Self::settings_control_width(width);
+        let control_width = self.settings_control_width(width);
         (
             x + width - control_width,
             y + self.ui_px(4.0),
@@ -10811,7 +10791,7 @@ impl SettingsWindow {
         };
 
         let scroll = self.ui.content_scroll.offset;
-        let card_padding = 36.0;
+        let card_padding = self.ui_px(36.0);
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         let row_count = match self.selected {
             SettingsSection::General => 8,
@@ -10888,43 +10868,43 @@ impl SettingsWindow {
             SettingsDropdown::Language => self.paint_language_menu(
                 layers,
                 control_x,
-                control_y + self.ui_px(CONTROL_HEIGHT) + 8.0,
+                control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
                 control_width,
             ),
             SettingsDropdown::ThemeMode => self.paint_theme_mode_menu(
                 layers,
                 control_x,
-                control_y + self.ui_px(CONTROL_HEIGHT) + 8.0,
+                control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
                 control_width,
             ),
             SettingsDropdown::AppIcon => self.paint_app_icon_menu(
                 layers,
                 control_x,
-                control_y + self.ui_px(CONTROL_HEIGHT) + 8.0,
+                control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
                 control_width,
             ),
             SettingsDropdown::MainRenderer => self.paint_main_renderer_menu(
                 layers,
                 control_x,
-                control_y + self.ui_px(CONTROL_HEIGHT) + 8.0,
+                control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
                 control_width,
             ),
             SettingsDropdown::DefaultShell => self.paint_default_shell_menu(
                 layers,
                 control_x,
-                control_y + self.ui_px(CONTROL_HEIGHT) + 8.0,
+                control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
                 control_width,
             ),
             SettingsDropdown::CommandPaletteHotkey => self.paint_command_palette_hotkey_menu(
                 layers,
                 control_x,
-                control_y + self.ui_px(CONTROL_HEIGHT) + 8.0,
+                control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
                 control_width,
             ),
             SettingsDropdown::WebLinkTtl => self.paint_web_link_ttl_menu(
                 layers,
                 control_x,
-                control_y + self.ui_px(CONTROL_HEIGHT) + 8.0,
+                control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
                 control_width,
             ),
         }
@@ -11033,9 +11013,9 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
-        let row_height = 46.0;
-        let row_gap = 6.0;
-        let menu_padding = 8.0;
+        let row_height = self.ui_px(46.0);
+        let row_gap = self.ui_px(6.0);
+        let menu_padding = self.ui_px(8.0);
         let menu_height = menu_padding * 2.0
             + row_height * options.len() as f32
             + row_gap * options.len().saturating_sub(1) as f32;
