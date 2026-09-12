@@ -1263,7 +1263,17 @@ impl crate::TermWindow {
             track_height as usize,
             tokens.scrollbar_min_thumb as usize,
         );
-        let thumb_x = content_right - tokens.scrollbar_inset - tokens.scrollbar_width;
+        // Under the pointer the thumb grows leftwards from its resting
+        // line, like the macOS overlay scroller, so it is easier to grab.
+        let hovered = self.overlay_scrollbar_hovered(pane_id);
+        let (expand, next_frame) = self.overlay_scrollbar_expand(pane_id, hovered, now);
+        if let Some(due) = next_frame {
+            self.update_next_frame_time(Some(due));
+        }
+        let expand = crate::ui::anim::Easing::Smooth.apply(expand);
+        let thumb_width = tokens.scrollbar_width
+            * (1.0 + crate::termwindow::OVERLAY_SCROLLBAR_HOVER_GROWTH * expand);
+        let thumb_x = content_right - tokens.scrollbar_inset - thumb_width;
         let thumb_top = track_top + thumb.top as f32;
 
         // Hit areas: a strip three thumbs wide, so the pointer need not
@@ -1305,10 +1315,13 @@ impl crate::TermWindow {
             2,
             thumb_x,
             thumb_top,
-            tokens.scrollbar_width,
+            thumb_width,
             thumb.height as f32,
-            ui_palette.scrollbar_thumb.mul_alpha(opacity),
-            tokens.scrollbar_width / 2.0,
+            // A little more solid under the pointer, too.
+            ui_palette
+                .scrollbar_thumb
+                .mul_alpha(opacity * (1.0 + 0.5 * expand)),
+            thumb_width / 2.0,
         )
         .context("overlay scrollbar thumb")
     }

@@ -388,6 +388,11 @@ fn line_to_ele_shape_cache_budget(config: &ConfigHandle) -> usize {
 /// and how much of that is spent fading out.
 pub(crate) const OVERLAY_SCROLLBAR_SHOW: Duration = Duration::from_millis(1200);
 pub(crate) const OVERLAY_SCROLLBAR_FADE: Duration = Duration::from_millis(250);
+/// How long the overlay scrollbar takes to grow to its hovered thickness,
+/// and to shrink back.
+pub(crate) const OVERLAY_SCROLLBAR_EXPAND: Duration = Duration::from_millis(150);
+/// The hovered thumb is this much wider than the resting one.
+pub(crate) const OVERLAY_SCROLLBAR_HOVER_GROWTH: f32 = 1.2;
 
 const ATLAS_SIZE: usize = 128;
 
@@ -1767,6 +1772,13 @@ pub struct PaneState {
     /// whenever the viewport moves, or the thumb is hovered or dragged;
     /// the last stretch before it is spent fading out.
     scrollbar_visible_until: Option<Instant>,
+    /// Overlay scrollbar: how far the thumb has grown towards its hovered
+    /// thickness, 0 (resting) to 1 (pointer on it or dragging it), moved
+    /// a little each frame by `paint_overlay_scrollbar`.
+    scrollbar_expand: f32,
+    /// When `scrollbar_expand` last moved, so the growth is paced by wall
+    /// time rather than by however many frames happened to paint.
+    scrollbar_expand_tick: Option<Instant>,
     selection: Selection,
     /// If is_some(), rather than display the actual tab
     /// contents, we're overlaying a little internal application
@@ -3279,7 +3291,62 @@ impl TermWindow {
             state
                 .scrollbar_visible_until
                 .is_some_and(|until| until > now)
+                || state.scrollbar_expand_tick.is_some()
         })
+    }
+
+    /// Whether the pane's overlay scrollbar should be at its hovered
+    /// thickness: the pointer is on its strip, or its thumb is being
+    /// dragged.
+    pub(crate) fn overlay_scrollbar_hovered(&self, pane_id: PaneId) -> bool {
+        let on_track = |item: &UIItem| {
+            matches!(
+                item.item_type,
+                UIItemType::ScrollThumb(track)
+                    | UIItemType::AboveScrollThumb(track)
+                    | UIItemType::BelowScrollThumb(track)
+                    if track.pane_id == pane_id
+            )
+        };
+        self.dragging.as_ref().is_some_and(|(item, _)| on_track(item))
+            || (self.current_mouse_event.is_some()
+                && self.last_ui_item.as_ref().is_some_and(on_track))
+    }
+
+    /// Advance the pane's overlay scrollbar towards its hovered or resting
+    /// thickness and return the current factor, 0 to 1. Says when the next
+    /// frame is due while the change is still in flight.
+    pub(crate) fn overlay_scrollbar_expand(
+        &self,
+        pane_id: PaneId,
+        hovered: bool,
+        now: Instant,
+    ) -> (f32, Option<Instant>) {
+        let mut state = self.pane_state(pane_id);
+        let target = if hovered { 1.0 } else { 0.0 };
+        if state.scrollbar_expand == target {
+            state.scrollbar_expand_tick = None;
+            return (target, None);
+        }
+        let step = match state.scrollbar_expand_tick {
+            Some(tick) => {
+                now.duration_since(tick).as_secs_f32() / OVERLAY_SCROLLBAR_EXPAND.as_secs_f32()
+            }
+            None => 0.0,
+        };
+        let expand = if target > state.scrollbar_expand {
+            (state.scrollbar_expand + step).min(1.0)
+        } else {
+            (state.scrollbar_expand - step).max(0.0)
+        };
+        state.scrollbar_expand = expand;
+        if expand == target {
+            state.scrollbar_expand_tick = None;
+            (expand, None)
+        } else {
+            state.scrollbar_expand_tick = Some(now);
+            (expand, Some(now + Duration::from_millis(16)))
+        }
     }
 
     /// Tracks whether the user can see this window at all. macOS reports

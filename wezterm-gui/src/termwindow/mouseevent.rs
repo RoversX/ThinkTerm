@@ -4348,16 +4348,16 @@ impl super::TermWindow {
             UIItemType::ContextMenuItem(_) => {
                 context.set_cursor(Some(MouseCursor::Hand));
             }
-            UIItemType::ScrollThumb(track) => {
-                // Hovering the thumb keeps the overlay scrollbar up.
+            UIItemType::ScrollThumb(track)
+            | UIItemType::AboveScrollThumb(track)
+            | UIItemType::BelowScrollThumb(track) => {
+                // Hovering the strip keeps the overlay scrollbar up, and
+                // the paint grows the thumb while the pointer is there.
                 self.reveal_scrollbar(track.pane_id);
                 context.invalidate();
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
-            UIItemType::AboveScrollThumb(_)
-            | UIItemType::BelowScrollThumb(_)
-            | UIItemType::Split(_)
-            | UIItemType::PaneNav { .. } => {
+            UIItemType::Split(_) | UIItemType::PaneNav { .. } => {
                 context.set_cursor(Some(MouseCursor::Arrow));
             }
         }
