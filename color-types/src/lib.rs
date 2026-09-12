@@ -1054,8 +1054,12 @@ impl LinearRgba {
         }
     }
 
+    /// Decompose into OkLab: perceptual lightness, then the two opponent
+    /// axes. Public because moving a colour's lightness while keeping its hue
+    /// is the only way to restyle one without muddying it, and sRGB cannot do
+    /// that.
     #[cfg(feature = "std")]
-    fn to_oklaba(&self) -> [f32; 4] {
+    pub fn to_oklaba(&self) -> [f32; 4] {
         let (r, g, b, alpha) = (self.0, self.1, self.2, self.3);
         let l_ = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b).cbrt();
         let m_ = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b).cbrt();
@@ -1066,8 +1070,11 @@ impl LinearRgba {
         [l, a, b, alpha]
     }
 
+    /// The inverse of [`Self::to_oklaba`]. The result can fall outside the
+    /// sRGB gamut for an extreme lightness paired with a strong chroma;
+    /// callers that care should clamp.
     #[cfg(feature = "std")]
-    fn from_oklaba(l: f32, a: f32, b: f32, alpha: f32) -> Self {
+    pub fn from_oklaba(l: f32, a: f32, b: f32, alpha: f32) -> Self {
         let l_ = (l + 0.3963377774 * a + 0.2158037573 * b).powi(3);
         let m_ = (l - 0.1055613458 * a - 0.0638541728 * b).powi(3);
         let s_ = (l - 0.0894841775 * a - 1.2914855480 * b).powi(3);
@@ -1101,47 +1108,203 @@ impl LinearRgba {
             return None;
         }
 
-        let [_fg_l, fg_a, fg_b, fg_alpha] = self.to_oklaba();
+        // Walk the colour's perceptual lightness and measure the contrast at
+        // each step, rather than computing a target lightness in closed form.
+        //
+        // The closed form this replaced solved for a WCAG *relative
+        // luminance* and then handed that number to `from_oklaba` as an OkLab
+        // *lightness*. They are different scales -- roughly L = Y^(1/3) --
+        // so the "brighten until readable" branch produced a colour darker
+        // than the one it started from, and the function reported success.
+        // There is no closed form worth having here anyway: OkLab lightness
+        // is not a function of luminance alone, it moves with chroma too.
+        let [fg_l, fg_a, fg_b, fg_alpha] = self.to_oklaba();
 
-        let reduced_lum = ((bg_lum + 0.05) / min_ratio - 0.05).clamp(0.05, 1.0);
-        let reduced_col = Self::from_oklaba(reduced_lum, fg_a, fg_b, fg_alpha);
-        let reduced_ratio = reduced_col.contrast_ratio(other);
+        // Perceptual lightness is monotonic along a straight walk, and so is
+        // the contrast against a fixed background *as long as the foreground
+        // stays on its own side of it*. That makes the direction away from
+        // the background a binary search: twelve comparisons resolve it finer
+        // than a hundred-step scan would.
+        //
+        // This runs per cell when `text_min_contrast_ratio` is set, so the
+        // difference between a search and a scan is the difference between
+        // paying for it and not.
+        let candidate = |l: f32| -> Self {
+            let c = Self::from_oklaba(l, fg_a, fg_b, fg_alpha);
+            Self::with_components(
+                c.0.clamp(0.0, 1.0),
+                c.1.clamp(0.0, 1.0),
+                c.2.clamp(0.0, 1.0),
+                fg_alpha,
+            )
+        };
 
-        let increased_lum = ((bg_lum + 0.05) * min_ratio - 0.05).clamp(0.05, 1.0);
-        let increased_col = Self::from_oklaba(increased_lum, fg_a, fg_b, fg_alpha);
-        let increased_ratio = reduced_col.contrast_ratio(other);
+        // Away from the background: a light foreground on a dark ground wants
+        // to get lighter, not to cross over and invert the design. Crossing
+        // over is the fallback for when it cannot get far enough -- a
+        // near-white glyph on a near-white ground has nowhere brighter to go.
+        let away_end = if fg_lum >= bg_lum { 1.0 } else { 0.0 };
+        let end_color = candidate(away_end);
+        let end_ratio = end_color.contrast_ratio(other);
+        let across_color = candidate(1.0 - away_end);
+        let across_ratio = across_color.contrast_ratio(other);
+        let end = if end_ratio >= min_ratio {
+            Some(away_end)
+        } else if across_ratio >= min_ratio {
+            Some(1.0 - away_end)
+        } else {
+            None
+        };
 
-        // Prefer the reduced luminance version if the fg is dimmer than bg
-        if fg_lum < bg_lum {
-            if reduced_ratio >= min_ratio {
-                return Some(reduced_col);
+        if let Some(end) = end {
+            // Somewhere between here and there is the first colour that
+            // reads; find the nearest one so the result stays close to what
+            // the caller asked for.
+            //
+            // Searchable in the crossing-over direction too, which is worth
+            // being explicit about because the contrast is *not* monotonic
+            // there: it falls to 1.0 as the walk passes the background's own
+            // luminance before climbing the far side. What the search needs
+            // is a monotonic *predicate*, and "reads well enough" is one --
+            // it starts false (we only got here because it is) and is false
+            // everywhere up to the first colour that clears the bar, which
+            // lies past the dip. Returning the far endpoint instead is what
+            // turned btop's near-white graph fill into a solid black block on
+            // a light scheme: pure black against #fdf0ed is 18.9:1 when 4.5
+            // was asked for.
+            //
+            // Eight halvings resolve lightness to 1/256, and the result is
+            // quantised to an 8-bit channel on its way to the screen: finer
+            // than this cannot change the colour that gets painted. This runs
+            // per cell when `text_min_contrast_ratio` is set, so the
+            // iterations that cannot matter are iterations not to do.
+            let (mut lo, mut hi) = (fg_l, end);
+            for _ in 0..8 {
+                let mid = (lo + hi) * 0.5;
+                if candidate(mid).contrast_ratio(other) >= min_ratio {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
             }
-        }
-        // Otherwise, let's find a satisfactory alternative
-        if increased_ratio >= min_ratio {
-            return Some(increased_col);
-        }
-        if reduced_ratio >= min_ratio {
-            return Some(reduced_col);
+            return Some(candidate(hi));
         }
 
-        // Didn't find one that satifies the min_ratio, but did we find
-        // one that is better than the existing ratio?
-        if reduced_ratio > ratio {
-            return Some(reduced_col);
+        // Neither reaches it: hand back whichever got furthest, and only if it
+        // beats what the caller already had.
+        let (best, best_ratio) = if end_ratio >= across_ratio {
+            (end_color, end_ratio)
+        } else {
+            (across_color, across_ratio)
+        };
+        if best_ratio > ratio {
+            Some(best)
+        } else {
+            None
         }
-        if increased_ratio > ratio {
-            return Some(increased_col);
-        }
-
-        // What they had was as good as it gets
-        None
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lin(r: u8, g: u8, b: u8) -> LinearRgba {
+        SrgbaTuple::from_str(&format!("#{r:02x}{g:02x}{b:02x}"))
+            .unwrap()
+            .to_linear()
+    }
+
+    /// The case that exposed the old implementation: it solved for a WCAG
+    /// relative luminance and passed that number to `from_oklaba` as an OkLab
+    /// lightness. Asked to brighten a grey against pure black it returned
+    /// something darker and called it done.
+    #[test]
+    fn a_foreground_is_brightened_away_from_a_black_background() {
+        let bg = lin(0, 0, 0);
+        let fg = lin(90, 90, 94);
+        assert!(fg.contrast_ratio(&bg) < 4.5, "the test needs a failing start");
+
+        let fixed = fg.ensure_contrast_ratio(&bg, 4.5).expect("should adjust");
+        assert!(
+            fixed.contrast_ratio(&bg) >= 4.5,
+            "ratio after fixing is {}",
+            fixed.contrast_ratio(&bg)
+        );
+        assert!(
+            fixed.relative_luminance() > fg.relative_luminance(),
+            "against black the fix has to go lighter, not darker"
+        );
+    }
+
+    #[test]
+    fn a_foreground_is_darkened_away_from_a_white_background() {
+        let bg = lin(255, 255, 255);
+        let fg = lin(200, 200, 205);
+        let fixed = fg.ensure_contrast_ratio(&bg, 4.5).expect("should adjust");
+        assert!(fixed.contrast_ratio(&bg) >= 4.5);
+        assert!(fixed.relative_luminance() < fg.relative_luminance());
+    }
+
+    /// A colour that already reads is left alone, so a caller can tell "I
+    /// changed it" from "it was fine".
+    #[test]
+    fn a_readable_foreground_is_left_alone() {
+        let bg = lin(0, 0, 0);
+        let fg = lin(255, 255, 255);
+        assert!(fg.ensure_contrast_ratio(&bg, 4.5).is_none());
+    }
+
+    /// Nothing can be readable against itself; saying so beats returning an
+    /// arbitrary other colour.
+    #[test]
+    fn a_foreground_equal_to_its_background_is_not_fixed_up() {
+        let c = lin(128, 128, 128);
+        assert!(c.ensure_contrast_ratio(&c, 4.5).is_none());
+    }
+
+    /// The case that made btop's graph area a solid black rectangle on a
+    /// light colour scheme: a near-white foreground has nowhere brighter to
+    /// go, so the fix has to cross over -- and crossing over used to mean
+    /// jumping to the far endpoint. Pure black against #fdf0ed is 18.9:1
+    /// when 4.5 was asked for.
+    #[test]
+    fn crossing_over_stops_at_the_first_colour_that_reads() {
+        for bg in [lin(0xfd, 0xf0, 0xed), lin(0xf7, 0xf7, 0xf7)] {
+            let fg = lin(0xf8, 0xf8, 0xf8);
+            assert!(fg.contrast_ratio(&bg) < 4.5, "the test needs a failing start");
+
+            let fixed = fg.ensure_contrast_ratio(&bg, 4.5).expect("should adjust");
+            let ratio = fixed.contrast_ratio(&bg);
+            assert!(ratio >= 4.5, "ratio after fixing is {}", ratio);
+            assert!(
+                ratio < 6.0,
+                "asked for 4.5 and got {}: this is the endpoint jump again",
+                ratio
+            );
+            assert!(
+                fixed.relative_luminance() > 0.01,
+                "a near-white glyph must not come back as pure black"
+            );
+        }
+    }
+
+    /// Whatever it returns has to be paintable.
+    #[test]
+    fn the_adjusted_colour_stays_inside_the_gamut() {
+        for (fg, bg) in [
+            (lin(90, 90, 94), lin(0, 0, 0)),
+            (lin(200, 200, 205), lin(255, 255, 255)),
+            (lin(120, 60, 200), lin(20, 20, 24)),
+            (lin(253, 246, 227), lin(238, 232, 213)),
+        ] {
+            if let Some(fixed) = fg.ensure_contrast_ratio(&bg, 7.0) {
+                for ch in [fixed.0, fixed.1, fixed.2, fixed.3] {
+                    assert!((0.0..=1.0).contains(&ch), "channel {} out of gamut", ch);
+                }
+            }
+        }
+    }
     #[test]
     fn named_rgb() {
         let dark_green = SrgbaTuple::from_named("DarkGreen").unwrap();
@@ -1231,3 +1394,7 @@ mod tests {
         );
     }
 }
+
+
+
+
