@@ -673,6 +673,19 @@ impl<H: SessionHost> PaneSession<H> {
             // prevents a blank flash as a full-screen application redraws.
             st.invalidate_line_cache(preserve_lines);
         }
+        // Retaining rows is not enough when the resize rewrapped the
+        // scrollback: the viewport's stable range moved and the retained
+        // rows are keyed by where it was. Before the bonus rows land (they
+        // replace seeds), carry the old rows over by screen position so the
+        // step draws them instead of blank. See `seed_moved_viewport_rows`.
+        if render_geometry_changed(prior_server_dimensions, delta.dimensions) {
+            seed_moved_viewport_rows(
+                &mut st.lines,
+                prior_server_dimensions.physical_top,
+                delta.dimensions.physical_top,
+                st.dimensions.viewport_rows,
+            );
+        }
         st.title = delta.title;
         st.working_dir = delta.working_dir.map(Into::into);
         log::trace!(
@@ -691,6 +704,16 @@ impl<H: SessionHost> PaneSession<H> {
             // the final-width cache is exactly how old-width fragments survive
             // after the divider stops.
             if !live_preview_accepts_snapshot {
+                // ...but not dropped either. The seqno below advances past
+                // this grid whether or not its rows are kept, so the rows it
+                // rewrapped are in no later delta's dirty set: dropped, they
+                // were a blank row each until the paint's own refetch came
+                // back -- one blank frame per intermediate step of a fast
+                // drag. Kept as Stale they are drawn meanwhile and still
+                // refetched by the next paint, which is when the final grid
+                // answers; and the row stays in `dirty` for the same reason.
+                st.put_line(stable_row, line, &rules, None);
+                st.make_stale(stable_row);
                 continue;
             }
             log::trace!("bonus line {} seqno={}", stable_row, line.current_seqno());
@@ -717,8 +740,23 @@ impl<H: SessionHost> PaneSession<H> {
                 let prior = st.lines.pop(&stable_row);
                 let prior_kind = prior.as_ref().map(|e| e.kind());
                 if !fetchable {
+                    // Above the server's viewport: keep what we have, as
+                    // Stale, and let the paint refetch it when it is next
+                    // shown. The entry is already popped, so it goes back
+                    // here -- `make_stale` after the pop found nothing and
+                    // dropped the row, which is what left a scrolled-up pane
+                    // (or a preview drawn from the old top) blank across
+                    // every step of a divider drag: a rewrap dirties the
+                    // whole scrollback, and every row of it fell out.
                     log::trace!("make {} stale bcos not fetchable", stable_row);
-                    st.make_stale(stable_row);
+                    match prior {
+                        Some(LineEntry::Stale(line))
+                        | Some(LineEntry::Line(line))
+                        | Some(LineEntry::LineAndFetching(line, _)) => {
+                            st.lines.put(stable_row, LineEntry::Stale(line));
+                        }
+                        Some(LineEntry::Fetching(_)) | None => {}
+                    }
                     continue;
                 }
                 to_fetch.add(stable_row);

@@ -220,6 +220,46 @@ pub fn resize_stale_line_entries(lines: &mut LruCache<StableRowIndex, LineEntry>
     *lines = stale;
 }
 
+/// Carry the rows a moved viewport is missing over from the old one.
+///
+/// A width change rewraps the scrollback and the viewport's stable row
+/// range moves with it, often by dozens of rows for a few columns of
+/// divider travel. The rows retained across the resize are keyed by the
+/// old indices, so the new range finds nothing at most of its rows and
+/// paints them blank until the refetch lands: with a live divider that is
+/// a flash on every step of the drag. Seed each missing row from the old
+/// row at the same screen position, as `Stale`: drawn now, refetched as
+/// before, replaced by the server's answer the moment it arrives.
+///
+/// Rows that already have an entry are left alone, and the seeds are taken
+/// before any are put, so a seed never copies another seed.
+pub fn seed_moved_viewport_rows(
+    lines: &mut LruCache<StableRowIndex, LineEntry>,
+    old_top: StableRowIndex,
+    new_top: StableRowIndex,
+    viewport_rows: usize,
+) {
+    if old_top == new_top {
+        return;
+    }
+    let shift = new_top - old_top;
+    let mut seeds = Vec::new();
+    for idx in new_top..new_top + viewport_rows as StableRowIndex {
+        if lines.peek(&idx).is_some() {
+            continue;
+        }
+        if let Some(
+            LineEntry::Stale(line) | LineEntry::Line(line) | LineEntry::LineAndFetching(line, _),
+        ) = lines.peek(&(idx - shift))
+        {
+            seeds.push((idx, line.clone()));
+        }
+    }
+    for (idx, line) in seeds {
+        lines.put(idx, LineEntry::Stale(line));
+    }
+}
+
 pub fn render_geometry_changed(current: RenderableDimensions, next: RenderableDimensions) -> bool {
     current.cols != next.cols
         || current.viewport_rows != next.viewport_rows
@@ -283,6 +323,15 @@ pub fn resolve_server_geometry(
 ) -> (RenderableDimensions, Option<bool>) {
     if preview_active {
         let invalidation = render_geometry_changed(previous_server, next_server).then_some(true);
+        // The grid stays the preview's, but *where* it sits in the
+        // scrollback is the server's call: a rewrap moves the viewport's
+        // stable range, by dozens of rows for a few columns of divider
+        // travel, and a grid drawn from the old top straddles rows the
+        // server never sends -- blank, every step of the drag.
+        let mut visible = visible;
+        visible.physical_top = next_server.physical_top;
+        visible.scrollback_top = next_server.scrollback_top;
+        visible.scrollback_rows = next_server.scrollback_rows;
         (visible, invalidation)
     } else if render_geometry_changed(visible, next_server) {
         (next_server, Some(visible.cols == next_server.cols))
@@ -298,6 +347,71 @@ pub fn fetch_token_is_current(token: FetchToken, epoch: u64) -> bool {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn text_line(text: &str) -> Line {
+        Line::from_text(text, &Default::default(), SEQ_ZERO, None)
+    }
+
+    fn entries(rows: &[(StableRowIndex, &str)]) -> LruCache<StableRowIndex, LineEntry> {
+        let mut lines = LruCache::new(NonZeroUsize::new(128).unwrap());
+        for (idx, text) in rows {
+            lines.put(*idx, LineEntry::Stale(text_line(text)));
+        }
+        lines
+    }
+
+    fn text_at(lines: &mut LruCache<StableRowIndex, LineEntry>, idx: StableRowIndex) -> Option<String> {
+        match lines.peek(&idx) {
+            Some(LineEntry::Stale(line)) => Some(line.as_str().trim_end().to_string()),
+            _ => None,
+        }
+    }
+
+    /// The viewport moved up by 30 rows after a widening unwrapped the
+    /// scrollback: the top of the new range is empty and takes the rows
+    /// that were drawn there, the overlap keeps its own.
+    #[test]
+    fn a_viewport_that_moved_takes_the_rows_at_the_same_screen_position() {
+        let mut lines = entries(&[(100, "a"), (101, "b"), (102, "c"), (103, "d")]);
+        seed_moved_viewport_rows(&mut lines, 100, 70, 4);
+        assert_eq!(text_at(&mut lines, 70).as_deref(), Some("a"));
+        assert_eq!(text_at(&mut lines, 71).as_deref(), Some("b"));
+        assert_eq!(text_at(&mut lines, 72).as_deref(), Some("c"));
+        assert_eq!(text_at(&mut lines, 73).as_deref(), Some("d"));
+        // The old rows stay where they were: they are still the server's
+        // rows at those indices.
+        assert_eq!(text_at(&mut lines, 100).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn a_row_the_new_range_already_has_is_not_overwritten() {
+        let mut lines = entries(&[(100, "a"), (101, "b"), (102, "c")]);
+        // The range moves down by one: 101 and 102 overlap and keep theirs,
+        // 103 is missing and takes what was drawn on its screen row, 102.
+        seed_moved_viewport_rows(&mut lines, 100, 101, 3);
+        assert_eq!(text_at(&mut lines, 101).as_deref(), Some("b"));
+        assert_eq!(text_at(&mut lines, 102).as_deref(), Some("c"));
+        assert_eq!(text_at(&mut lines, 103).as_deref(), Some("c"));
+    }
+
+    /// Seeds come from the rows as they were, never from another seed: a
+    /// range that moves by less than its height must not smear one row
+    /// down the whole viewport.
+    #[test]
+    fn seeds_do_not_cascade() {
+        let mut lines = entries(&[(10, "top"), (11, "mid"), (12, "bot")]);
+        seed_moved_viewport_rows(&mut lines, 10, 13, 3);
+        assert_eq!(text_at(&mut lines, 13).as_deref(), Some("top"));
+        assert_eq!(text_at(&mut lines, 14).as_deref(), Some("mid"));
+        assert_eq!(text_at(&mut lines, 15).as_deref(), Some("bot"));
+    }
+
+    #[test]
+    fn a_viewport_that_did_not_move_is_left_alone() {
+        let mut lines = entries(&[(5, "x")]);
+        seed_moved_viewport_rows(&mut lines, 5, 5, 3);
+        assert!(lines.peek(&6).is_none());
+    }
     use std::num::NonZeroUsize;
     use termwiz::surface::SEQ_ZERO;
 
@@ -401,7 +515,16 @@ mod test {
         let next_server = dimensions(100, 30, 96);
 
         let (visible, invalidation) = resolve_server_geometry(preview, server, next_server, true);
-        assert_eq!(visible, preview);
+        // The grid is the preview's; its place in the scrollback is the
+        // server's, or the rows drawn straddle rows the server never sends.
+        assert_eq!(visible.cols, preview.cols);
+        assert_eq!(visible.viewport_rows, preview.viewport_rows);
+        assert_eq!(visible.pixel_width, preview.pixel_width);
+        assert_eq!(visible.pixel_height, preview.pixel_height);
+        assert_eq!(visible.dpi, preview.dpi);
+        assert_eq!(visible.physical_top, next_server.physical_top);
+        assert_eq!(visible.scrollback_top, next_server.scrollback_top);
+        assert_eq!(visible.scrollback_rows, next_server.scrollback_rows);
         assert_eq!(invalidation, Some(true));
 
         let (visible, invalidation) = resolve_server_geometry(server, server, next_server, false);
