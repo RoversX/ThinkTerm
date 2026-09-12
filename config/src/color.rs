@@ -332,6 +332,135 @@ impl TabBarColor {
     }
 }
 
+/// Overrides for ThinkTerm's own interface colours: the sidebars, the tab
+/// bar, the pane nav bars, the settings window and the menus.
+///
+/// Every field is optional and overrides exactly one slot; whatever is left
+/// unset keeps the colour the interface would have used, so a file that names
+/// two colours changes two colours. Distinct from `colors` and `color_scheme`,
+/// which are the *terminal's* palette.
+///
+/// ```lua
+/// config.ui_colors = {
+///   sidebar_bg = '#282828',
+///   accent = '#d79921',
+/// }
+/// ```
+#[derive(Default, Debug, Clone, PartialEq, FromDynamic, ToDynamic)]
+pub struct UiColors {
+    /// The window's own ground, behind everything else.
+    #[dynamic(default)]
+    pub window_bg: Option<RgbaColor>,
+
+    /// The left sidebar's ground.
+    #[dynamic(default)]
+    pub sidebar_bg: Option<RgbaColor>,
+
+    /// The Spaces strip, recessed from `sidebar_bg`.
+    #[dynamic(default)]
+    pub workspace_sidebar_bg: Option<RgbaColor>,
+
+    /// The strip above the tabs.
+    #[dynamic(default)]
+    pub header_bg: Option<RgbaColor>,
+
+    /// Hairline rules. Usually translucent.
+    #[dynamic(default)]
+    pub separator: Option<RgbaColor>,
+
+    /// A button or field at rest.
+    #[dynamic(default)]
+    pub control_bg: Option<RgbaColor>,
+
+    /// ...under the pointer.
+    #[dynamic(default)]
+    pub control_hover_bg: Option<RgbaColor>,
+
+    /// ...while held.
+    #[dynamic(default)]
+    pub control_pressed_bg: Option<RgbaColor>,
+
+    /// A control's hairline outline.
+    #[dynamic(default)]
+    pub control_border: Option<RgbaColor>,
+
+    /// The round sidebar buttons at rest.
+    #[dynamic(default)]
+    pub sidebar_button_bg: Option<RgbaColor>,
+
+    /// ...under the pointer.
+    #[dynamic(default)]
+    pub sidebar_button_hover_bg: Option<RgbaColor>,
+
+    /// A thread row under the pointer.
+    #[dynamic(default)]
+    pub sidebar_row_hover_bg: Option<RgbaColor>,
+
+    /// ...while held.
+    #[dynamic(default)]
+    pub sidebar_row_pressed_bg: Option<RgbaColor>,
+
+    /// The row whose thread is on show.
+    #[dynamic(default)]
+    pub sidebar_row_active_bg: Option<RgbaColor>,
+
+    /// That row's outline.
+    #[dynamic(default)]
+    pub sidebar_row_active_border: Option<RgbaColor>,
+
+    /// The fill behind a selected item.
+    #[dynamic(default)]
+    pub selected_bg: Option<RgbaColor>,
+
+    /// The accent: focus rings, switches, the active state.
+    #[dynamic(default)]
+    pub accent: Option<RgbaColor>,
+
+    /// The accent under the pointer.
+    #[dynamic(default)]
+    pub accent_hover: Option<RgbaColor>,
+
+    /// Text and icons drawn on top of `accent`.
+    #[dynamic(default)]
+    pub on_accent: Option<RgbaColor>,
+
+    /// Destructive actions and error text.
+    #[dynamic(default)]
+    pub danger: Option<RgbaColor>,
+
+    /// The off half of a switch track.
+    #[dynamic(default)]
+    pub track_off: Option<RgbaColor>,
+
+    /// A grouped card floating on `window_bg`.
+    #[dynamic(default)]
+    pub card_bg: Option<RgbaColor>,
+
+    /// Primary text.
+    #[dynamic(default)]
+    pub text: Option<RgbaColor>,
+
+    /// Text that supports the primary.
+    #[dynamic(default)]
+    pub secondary_text: Option<RgbaColor>,
+
+    /// Text that is present but not being read.
+    #[dynamic(default)]
+    pub muted_text: Option<RgbaColor>,
+
+    /// Text on a selected row.
+    #[dynamic(default)]
+    pub selected_text: Option<RgbaColor>,
+
+    /// The overlay scrollbar's thumb.
+    #[dynamic(default)]
+    pub scrollbar_thumb: Option<RgbaColor>,
+
+    /// The squiggle under a misspelling.
+    #[dynamic(default)]
+    pub spelling_error: Option<RgbaColor>,
+}
+
 /// Specifies the colors to use for the tab bar portion of the UI.
 /// These are not part of the terminal model and cannot be updated
 /// in the same way that the dynamic color schemes are.

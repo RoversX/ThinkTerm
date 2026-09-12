@@ -34,6 +34,7 @@ mod keys;
 pub mod lua;
 pub mod meta;
 pub mod scheme_data;
+mod thinkterm_schemes;
 mod serial;
 mod ssh;
 mod terminal;
@@ -187,7 +188,10 @@ fn json_to_dynamic(value: &serde_json::Value) -> Value {
 
 pub fn build_default_schemes() -> HashMap<String, Palette> {
     let mut color_schemes = HashMap::new();
-    for (scheme_name, data) in scheme_data::SCHEMES.iter() {
+    for (scheme_name, data) in scheme_data::SCHEMES
+        .iter()
+        .chain(thinkterm_schemes::SCHEMES.iter())
+    {
         let scheme_name = scheme_name.to_string();
         let scheme = ColorSchemeFile::from_toml_str(data).unwrap();
         color_schemes.insert(scheme_name, scheme.colors.clone());
@@ -903,3 +907,4 @@ mod runtime_file_name_tests {
         }
     }
 }
+

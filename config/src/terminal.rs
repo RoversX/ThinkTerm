@@ -10,6 +10,9 @@ use wezterm_term::config::BidiMode;
 pub struct TermConfig {
     config: Mutex<Option<ConfigHandle>>,
     client_palette: Mutex<Option<ColorPalette>>,
+    /// True while `client_palette` is a scheme being *shown* rather than
+    /// chosen. See [`TermConfig::set_preview_palette`].
+    client_palette_is_preview: Mutex<bool>,
 }
 
 impl TermConfig {
@@ -17,6 +20,7 @@ impl TermConfig {
         Self {
             config: Mutex::new(None),
             client_palette: Mutex::new(None),
+            client_palette_is_preview: Mutex::new(false),
         }
     }
 
@@ -24,6 +28,7 @@ impl TermConfig {
         Self {
             config: Mutex::new(Some(config)),
             client_palette: Mutex::new(None),
+            client_palette_is_preview: Mutex::new(false),
         }
     }
 
@@ -33,10 +38,28 @@ impl TermConfig {
 
     pub fn set_client_palette(&self, palette: ColorPalette) {
         self.client_palette.lock().unwrap().replace(palette);
+        *self.client_palette_is_preview.lock().unwrap() = false;
+    }
+
+    /// A palette the window is *showing* rather than choosing.
+    ///
+    /// Rendered like any other client palette, but a remote pane must not
+    /// carry it any further: telling the mux server would leave a scheme the
+    /// user may abandon with Escape installed as the server's answer to OSC
+    /// colour queries, and would spend a round trip per pane on every arrow
+    /// key through a thousand-entry list.
+    pub fn set_preview_palette(&self, palette: ColorPalette) {
+        self.client_palette.lock().unwrap().replace(palette);
+        *self.client_palette_is_preview.lock().unwrap() = true;
+    }
+
+    pub fn client_palette_is_preview(&self) -> bool {
+        *self.client_palette_is_preview.lock().unwrap()
     }
 
     pub fn clear_client_palette(&self) {
         self.client_palette.lock().unwrap().take();
+        *self.client_palette_is_preview.lock().unwrap() = false;
     }
 
     fn configuration(&self) -> ConfigHandle {

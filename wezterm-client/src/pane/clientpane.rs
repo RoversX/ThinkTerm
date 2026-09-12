@@ -311,7 +311,6 @@ impl ClientPane {
                     was_application_palette,
                     palette,
                 );
-
                 *self.application_palette.lock() = transition.application_palette;
                 if transition.palette_changed {
                     *self.palette.lock() = transition.palette;
@@ -1085,6 +1084,16 @@ impl Pane for ClientPane {
 
     fn set_config(&self, config: Arc<dyn TerminalConfiguration>) {
         let palette = config.color_palette();
+        // A scheme the window is showing rather than choosing stops here: it
+        // is adopted for rendering below, but the server is not told and the
+        // configured palette -- what this pane falls back to when an
+        // application clears its own -- is left as it was. Otherwise every
+        // arrow key through the colour-scheme list would spend a round trip
+        // per remote pane and leave an abandoned scheme installed on the
+        // server as the answer to its OSC colour queries.
+        let is_preview = config
+            .downcast_ref::<config::TermConfig>()
+            .is_some_and(|term_config| term_config.client_palette_is_preview());
         // Skip the send only when the SERVER is known to hold this exact
         // palette. "The value didn't change locally" is not that: the
         // initial advisory can be lost in attach races, and comparing
@@ -1101,9 +1110,11 @@ impl Pane for ClientPane {
         if !*self.application_palette.lock() {
             *self.palette.lock() = palette.clone();
         }
-        *self.configured_palette.lock() = palette.clone();
+        if !is_preview {
+            *self.configured_palette.lock() = palette.clone();
+        }
 
-        if send {
+        if send && !is_preview {
             Self::advise_server_palette(
                 Arc::clone(&self.client),
                 self.remote_pane_id,

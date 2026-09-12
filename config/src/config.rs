@@ -1,7 +1,7 @@
 use crate::background::{BackgroundLayer, Gradient};
 use crate::bell::{AudibleBell, EasingFunction, VisualBell};
 use crate::color::{
-    ColorSchemeFile, HsbTransform, Palette, SrgbaTuple, TabBarStyle, WindowFrameConfig,
+    ColorSchemeFile, HsbTransform, Palette, SrgbaTuple, TabBarStyle, UiColors, WindowFrameConfig,
 };
 use crate::daemon::DaemonOptions;
 use crate::web::WebServer;
@@ -49,7 +49,14 @@ use wezterm_input_types::{
 };
 use wezterm_term::TerminalSize;
 
-const MACOS_DEFAULT_COLOR_SCHEME: &str = "Apple System Colors";
+/// What macOS gets when the configuration names no scheme. Public because
+/// the settings layer has to tell "the user chose this" apart from "we filled
+/// it in", and by the time it reads a `ConfigHandle` the two look identical.
+pub const MACOS_DEFAULT_COLOR_SCHEME: &str = "Apple System Colors";
+
+/// The light half of the above, for when the interface is on that side. See
+/// `native_settings::effective_color_scheme`.
+pub const MACOS_LIGHT_COLOR_SCHEME: &str = "Apple System Colors (Light)";
 const PRODUCT_DIR_NAME: &str = "thinkterm";
 const LEGACY_PRODUCT_DIR_NAME: &str = "wezterm";
 const DURABLE_LEGACY_DATA_ITEMS: &[&str] = &[
@@ -140,6 +147,12 @@ pub struct Config {
 
     /// The color palette
     pub colors: Option<Palette>,
+
+    /// Overrides for ThinkTerm's own interface colours -- the sidebars, the
+    /// tab bar, the settings window -- as opposed to `colors` above, which is
+    /// the terminal's palette. Each field overrides one slot and the rest are
+    /// left as they were.
+    pub ui_colors: Option<UiColors>,
 
     #[dynamic(default)]
     pub switch_to_last_active_tab_when_closing_tab: bool,
