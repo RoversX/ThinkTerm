@@ -7,6 +7,7 @@
 import { handle } from './client';
 import { refreshViews } from './client.svelte';
 import type { MenuItem, MenuOutcome } from './model';
+import { focusTerminal } from './mobile.svelte';
 
 export const menu = $state({
   /** The root list; empty when no menu is open. */
@@ -51,7 +52,7 @@ export function closeMenu() {
   menu.selected = -1;
   // The menu took focus off the field the terminal types through, so
   // closing it has to hand focus back or the next key goes nowhere.
-  document.getElementById('kbd')?.focus();
+  focusTerminal();
 }
 
 /** Close the innermost submenu; the whole menu when none is open. */

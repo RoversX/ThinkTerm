@@ -9,6 +9,7 @@ import { refreshViews, views } from './client.svelte';
 import { toggleSidebar } from './chrome';
 import type { Hotkey, PaletteEntry, PaletteOutcome, PaletteResults } from './model';
 import { openSettings, setSetting } from './settings.svelte';
+import { focusTerminal } from './mobile.svelte';
 
 /** Where this browser keeps the picks, most recent first. */
 const RECENT = 'thinkterm.recent';
@@ -68,7 +69,7 @@ export function closePalette() {
   palette.results = EMPTY;
   palette.selected = 0;
   // The palette took focus off the field the terminal types through.
-  document.getElementById('kbd')?.focus();
+  focusTerminal();
 }
 
 /** The keyboard's row, `delta` rows on, wrapping through every section. */

@@ -4,7 +4,7 @@
 
 import { handle } from './client';
 import { chromeClick, views } from './client.svelte';
-import { mobile, openSide } from './mobile.svelte';
+import { focusTerminal, mobile, openSide } from './mobile.svelte';
 import { openPalette } from './palette.svelte';
 import { openSettings, setSetting } from './settings.svelte';
 
@@ -25,7 +25,7 @@ export function toggleSidebar() {
   // Refit in this task, before the browser paints the moved box with the
   // old bitmap stretched across it.
   handle.client?.resize();
-  document.getElementById('kbd')?.focus();
+  focusTerminal();
 }
 
 function id(el: Element | null, attr: string): number | null {

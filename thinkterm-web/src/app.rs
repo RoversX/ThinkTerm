@@ -1817,12 +1817,29 @@ impl App {
             .map(|p| p.pane_id)
     }
 
+    /// Focus the field the terminal types through -- unless the page says
+    /// the soft keyboard is not wanted. On a phone (`body[data-mobile]`)
+    /// focusing it raises the keyboard over half the screen, so only the
+    /// key bar's keyboard button asks for it (`body[data-keyboard]`, kept by
+    /// mobile.svelte.ts); a press or a finished rename must not.
+    fn focus_terminal(textarea: &web_sys::HtmlElement) {
+        if let Some(body) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.body())
+        {
+            if body.has_attribute("data-mobile") && !body.has_attribute("data-keyboard") {
+                return;
+            }
+        }
+        let _ = textarea.focus();
+    }
+
     pub fn pointer(self: &Rc<Self>, ev: &web_sys::PointerEvent, what: Pointer) {
         if what == Pointer::Down {
             // Focus first, outside any borrow: focus() dispatches events
             // synchronously and a listener may look at the app.
             let textarea = self.inner.borrow().textarea.clone();
-            let _ = textarea.focus();
+            Self::focus_terminal(&textarea);
             let canvas = self.inner.borrow().canvas.clone();
             let _ = canvas.set_pointer_capture(ev.pointer_id());
         }
@@ -2620,7 +2637,7 @@ impl App {
                 inner.editing = Editing::None;
                 inner.new_project_error = None;
                 Self::notify(inner);
-                let _ = inner.textarea.focus();
+                Self::focus_terminal(&inner.textarea);
             }
             "Enter" if editing == Editing::NewProject => self.add_workspace(value.trim()),
             "Enter" => {
@@ -2628,7 +2645,7 @@ impl App {
                     let inner = &mut *self.inner.borrow_mut();
                     inner.editing = Editing::None;
                     Self::notify(inner);
-                    let _ = inner.textarea.focus();
+                    Self::focus_terminal(&inner.textarea);
                 }
                 let value = value.trim().to_string();
                 if value.is_empty() {
@@ -2686,7 +2703,7 @@ impl App {
             inner.editing = crate::sidebar::Editing::None;
             inner.new_project_error = None;
             Self::notify(inner);
-            let _ = inner.textarea.focus();
+            Self::focus_terminal(&inner.textarea);
         }
         if let Some(thread) = existing {
             self.activate_thread(thread);
@@ -3211,7 +3228,7 @@ impl App {
                 let mut inner = self.inner.borrow_mut();
                 inner.following = !inner.following;
                 Self::render_strip(&inner);
-                let _ = inner.textarea.focus();
+                Self::focus_terminal(&inner.textarea);
             }
             Click::NewTab => self.new_tab(),
             Click::NewInStack(pane) => self.new_in_stack(pane),

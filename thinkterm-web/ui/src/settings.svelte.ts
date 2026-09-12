@@ -7,6 +7,7 @@
 import { handle } from './client';
 import { refreshViews, setLocale, views } from './client.svelte';
 import type { LanguageOption, Scheme, Theme } from './model';
+import { focusTerminal } from './mobile.svelte';
 
 /** Where this browser keeps the preferences, whole, as the wasm's JSON. */
 const STORE = 'thinkterm.settings';
@@ -36,7 +37,7 @@ export function closeSettings() {
   if (!panel.open) return;
   panel.open = false;
   // The panel took focus off the field the terminal types through.
-  document.getElementById('kbd')?.focus();
+  focusTerminal();
 }
 
 /** Read the wasm's views back and the language list with them: a change of

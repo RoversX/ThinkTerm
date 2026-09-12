@@ -6,7 +6,7 @@
   // (thinkterm-web/src/bridge.rs); Ctrl and Alt are sticky, and apply to
   // the next key from the bar or from the soft keyboard, whichever comes.
   import { handle } from './client';
-  import { KEYBAR } from './mobile.svelte';
+  import { KEYBAR, toggleKeyboard } from './mobile.svelte';
 
   /** A key: `name` is the DOM name the wasm maps, `label` what it says. */
   type Key = { name: string; label: string };
@@ -36,6 +36,10 @@
   const REPEATS = new Set(['ArrowLeft', 'ArrowUp', 'ArrowDown', 'ArrowRight']);
   /** How long an arrow is held before it repeats, and how often it then does. */
   const HOLD = 500;
+  /** How long the visual viewport has to hold still before the canvas is
+      cut to it: longer than the gap between the keyboard's animation
+      steps, shorter than a person notices. */
+  const SETTLE = 150;
   const EVERY = 60;
 
   /** The sticky modifiers: armed by a tap, spent by the next key. */
@@ -82,13 +86,6 @@
     }, HOLD);
   }
 
-  /** Ask for the soft keyboard, or send it away. */
-  function toggleKeyboard() {
-    const kbd = document.getElementById('kbd');
-    if (!(kbd instanceof HTMLTextAreaElement)) return;
-    if (document.activeElement === kbd) kbd.blur();
-    else kbd.focus();
-  }
 
   // One delegated handler, as the tab row and the sidebar have. The press
   // must not move focus: #kbd keeps it, so the soft keyboard stays up while
@@ -158,14 +155,35 @@
   // keyboard shrinks that viewport and nothing else.
   $effect(() => {
     const vv = window.visualViewport;
+    let settle: ReturnType<typeof setTimeout> | null = null;
+    let applied = 0;
+    /** The height the canvas is cut to, once the viewport has stopped
+        moving. The soft keyboard slides in over a few hundred milliseconds
+        and the viewport reports every step of it; cutting the canvas at
+        each step resized the terminal that many times, and every resize
+        reflowed and redrew it -- the flicker seen when the keyboard came
+        up. The bar itself still follows every step, so it never floats
+        away from the keyboard's edge. */
+    const apply = (height: number, mine: number) => {
+      document.documentElement.style.setProperty('--keybar', `${mine}px`);
+      if (height === applied) return;
+      applied = height;
+      document.documentElement.style.setProperty('--vvh', `${height}px`);
+    };
     const read = () => {
       const height = vv ? vv.height : window.innerHeight;
       const mine = bar?.offsetHeight || KEYBAR;
       top = (vv ? vv.offsetTop : 0) + height - mine;
-      document.documentElement.style.setProperty('--keybar', `${mine}px`);
-      document.documentElement.style.setProperty('--vvh', `${height}px`);
+      if (settle !== null) clearTimeout(settle);
+      settle = setTimeout(() => {
+        settle = null;
+        apply(height, mine);
+      }, SETTLE);
     };
     document.documentElement.style.setProperty('--keybar', `${KEYBAR}px`);
+    // The first cut is immediate: nothing is moving yet, and the terminal
+    // must not sit at the window's height for SETTLE before it fits.
+    apply(vv ? vv.height : window.innerHeight, bar?.offsetHeight || KEYBAR);
     read();
     // The first read runs before the bar has been laid out with its safe
     // area, so its real height is taken on the next frame.
@@ -174,6 +192,7 @@
     vv?.addEventListener('scroll', read);
     window.addEventListener('resize', read);
     return () => {
+      if (settle !== null) clearTimeout(settle);
       vv?.removeEventListener('resize', read);
       vv?.removeEventListener('scroll', read);
       window.removeEventListener('resize', read);

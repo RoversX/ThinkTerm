@@ -15,7 +15,7 @@
 // case its Up throws the selection away instead of copying it.
 
 import { openMenu } from './menu.svelte';
-import { mobile, openSide } from './mobile.svelte';
+import { focusTerminal, mobile, openSide } from './mobile.svelte';
 import { cellHeight, paneAt } from './pane';
 import { smoothScroll } from './settings.svelte';
 
@@ -23,8 +23,6 @@ import { smoothScroll } from './settings.svelte';
 const SLOP = 8;
 /** How long a press has to rest before it is the pane's menu. */
 const HOLD = 500;
-/** A press shorter than this, that did not wander, is a tap. */
-const TAP = 300;
 /** A cell to scroll by while the layout has not named one. */
 const CELL = 17;
 /** How long after a long press the browser's own menu is still refused. */
@@ -47,7 +45,6 @@ export function installTouch(canvas: HTMLCanvasElement): () => void {
   let first: number | null = null;
   let startX = 0;
   let startY = 0;
-  let startAt = 0;
   let mode: Mode = 'press';
   let hold: ReturnType<typeof setTimeout> | null = null;
   /** Where the last wheel was measured from, and the pixels not yet worth
@@ -135,19 +132,24 @@ export function installTouch(canvas: HTMLCanvasElement): () => void {
     return n === 0 ? null : { x: x / n, y: y / n };
   };
 
-  /** Tell the wasm the press it saw is over, at the point it began. */
-  const cancelPress = () => {
-    canvas.dispatchEvent(
-      new PointerEvent('pointercancel', {
-        pointerId: first ?? 1,
-        pointerType: 'touch',
-        isPrimary: true,
-        bubbles: true,
-        cancelable: true,
-        clientX: startX,
-        clientY: startY,
-      }),
-    );
+  /** Hand the wasm the tap it was kept from: a press and a release at
+      the point the finger first touched, as one event each. The finger's
+      own events never reached it (see `down`), so this is the whole of
+      what it learns about the gesture. Untrusted, which the handlers here
+      and the drawer's swipe use to tell it from a finger. */
+  const deliverTap = () => {
+    const at = {
+      pointerId: first ?? 1,
+      pointerType: 'touch',
+      isPrimary: true,
+      bubbles: true,
+      cancelable: true,
+      clientX: startX,
+      clientY: startY,
+      button: 0,
+    };
+    canvas.dispatchEvent(new PointerEvent('pointerdown', { ...at, buttons: 1 }));
+    canvas.dispatchEvent(new PointerEvent('pointerup', { ...at, buttons: 0 }));
   };
 
   /** Scroll by what the fingers moved. In smooth mode every move goes over
@@ -180,12 +182,11 @@ export function installTouch(canvas: HTMLCanvasElement): () => void {
     );
   };
 
-  /** The gesture is the page's from here on: the wasm's press is undone
-      and every event left in the gesture is swallowed. */
+  /** The gesture is the page's from here on: the wasm never hears of it,
+      and every event left in it is swallowed. */
   const takeOver = (next: Mode) => {
     stopHold();
     mode = next;
-    cancelPress();
     const mid = midpoint();
     lastY = mid ? mid.y : startY;
     pending = 0;
@@ -202,7 +203,6 @@ export function installTouch(canvas: HTMLCanvasElement): () => void {
       first = ev.pointerId;
       startX = ev.clientX;
       startY = ev.clientY;
-      startAt = ev.timeStamp;
       lastY = ev.clientY;
       lastMoveAt = ev.timeStamp;
       lastAt = { x: ev.clientX, y: ev.clientY };
@@ -217,8 +217,14 @@ export function installTouch(canvas: HTMLCanvasElement): () => void {
         const pane = paneAt(canvas, startX, startY);
         if (pane !== null) openMenu('pane', String(pane), startX, startY);
       }, HOLD);
-      // The press itself goes to the wasm: it focuses the pane and takes
-      // the terminal over, which is what a tap is for.
+      // The press is kept from the wasm until the finger says what it is.
+      // Handed over at once, every scroll and every long press began as a
+      // click in whatever cell the finger landed on -- a stray press in a
+      // full-screen program, a moved cursor in a shell -- with a cancel
+      // chasing it that the program had no way to honour. A tap is
+      // delivered whole when the finger lifts (`deliverTap`).
+      ev.stopImmediatePropagation();
+      ev.preventDefault();
       return;
     }
     // A second finger is the page's, not the wasm's: two fingers scroll,
@@ -272,19 +278,16 @@ export function installTouch(canvas: HTMLCanvasElement): () => void {
   const up = (ev: PointerEvent) => {
     if (!ev.isTrusted || ev.pointerType !== 'touch') return;
     if (!fingers.delete(ev.pointerId)) return;
-    if (mode !== 'press') {
-      // The wasm was told the press was cancelled; the release must not
-      // reach it as a click in whatever cell the finger ended over.
-      ev.stopImmediatePropagation();
-    } else if (
-      ev.pointerId === first &&
-      ev.timeStamp - startAt < TAP &&
-      Math.abs(ev.clientX - startX) <= SLOP &&
-      Math.abs(ev.clientY - startY) <= SLOP
-    ) {
-      // A tap goes through untouched. The soft keyboard is the page's to
-      // ask for, and asking has to happen inside the press itself.
-      document.getElementById('kbd')?.focus();
+    // The wasm never saw this finger go down, so it must not see it come
+    // up either; what it gets is the tap below, or nothing.
+    ev.stopImmediatePropagation();
+    if (mode === 'press' && ev.pointerId === first) {
+      // Neither scrolled nor held: a tap, however long the finger rested,
+      // and it lands where the finger first touched rather than where a
+      // slight roll left it. The soft keyboard is a separate question,
+      // answered by the key bar's button (see `focusTerminal`).
+      deliverTap();
+      focusTerminal();
     }
     if (ev.pointerId !== first) {
       // One of two fingers lifted: the other carries on scrolling from
