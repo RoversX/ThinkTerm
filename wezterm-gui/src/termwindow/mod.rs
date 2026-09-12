@@ -4199,6 +4199,13 @@ impl TermWindow {
 
         Self::apply_icon(&window)?;
 
+        // Content attached before this window existed -- the local session
+        // server's panes on startup -- was configured from the global
+        // configuration; give it this window's, colour scheme included.
+        window.notify(TermWindowNotif::Apply(Box::new(|tw| {
+            tw.push_window_config_to_all_tabs();
+        })));
+
         let config_subscription = config::subscribe_to_config_reload({
             let window = window.clone();
             move || {
@@ -5012,6 +5019,10 @@ impl TermWindow {
                     window_id: _,
                     tab_id,
                 } => {
+                    // Before anything paints it: a tab attached rather than
+                    // spawned carries the global configuration, not this
+                    // window's colour scheme.
+                    self.push_window_config_to_tab(tab_id);
                     let mux = Mux::get();
                     if let Some(tab) = mux.get_tab(tab_id) {
                         let is_remote_thinkterm_tab = tab.get_active_pane().is_some_and(|pane| {
@@ -5138,6 +5149,7 @@ impl TermWindow {
                     self.update_title_post_status();
                 }
                 MuxNotification::PaneAdded(pane_id) => {
+                    self.push_window_config_to_pane(pane_id);
                     self.refresh_thread_work_for_pane(pane_id);
                     self.persist_workspace_layout_after_mutation("pane added");
                 }
@@ -5270,6 +5282,13 @@ impl TermWindow {
         self.current_highlight.take();
         self.invalidate_fancy_tab_bar();
         self.invalidate_modal();
+
+        // The adopted window's panes were built under the mux window this
+        // GUI window is leaving -- or, for the local session server, under
+        // no GUI window at all -- and carry the global configuration; this
+        // window's colour scheme has to reach them the same way it reaches a
+        // tab that is added to it.
+        self.push_window_config_to_all_tabs();
 
         // Restore every destination-side geometry input before sizing panes.
         // consume_pending_sidebar_reflow can synchronously apply dimensions,
@@ -6386,6 +6405,84 @@ impl TermWindow {
                         term_window.apply_color_scheme_override(name);
                     })));
             }
+        }
+    }
+
+    /// This window's terminal configuration, as `config_was_reloaded` hands
+    /// it to every pane: the global configuration with this window's
+    /// `config_overrides` -- the colour scheme picked in the palette or the
+    /// settings window -- applied.
+    fn window_term_config(&self) -> Arc<dyn TerminalConfiguration> {
+        Arc::new(TermConfig::with_config(self.config.clone()))
+    }
+
+    /// Hand `tab`'s panes this window's configuration.
+    ///
+    /// A pane this window spawns gets it from `spawn_command_impl`. A pane
+    /// that arrives any other way -- attached from the local session server
+    /// when the window opens, restored with a thread, spawned by another
+    /// client -- is born with the *global* configuration (`ClientPane::new`
+    /// reads `configuration()`), which knows nothing about the scheme in
+    /// this window's `config_overrides`. `config_was_reloaded` pushes the
+    /// window's configuration to every pane it has, but only when the
+    /// configuration changes; nothing pushed it to a pane that turned up in
+    /// between, so a mux-backed pane painted the file's colours until the
+    /// next reload. Pushing again to a pane that already has it is idle:
+    /// `ClientPane::set_config` skips the server round trip for a palette
+    /// the server already holds.
+    fn push_window_config_to_tab(&self, tab_id: TabId) {
+        let mux = Mux::get();
+        let Some(window) = mux.get_window(self.mux_window_id) else {
+            return;
+        };
+        let Some(tab) = window.iter().find(|tab| tab.tab_id() == tab_id) else {
+            return;
+        };
+        let term_config = self.window_term_config();
+        for pos in tab.iter_panes_ignoring_zoom() {
+            log::debug!(
+                "pushing window config to pane {} of tab {tab_id} (window {})",
+                pos.pane.pane_id(),
+                self.mux_window_id
+            );
+            pos.pane.set_config(Arc::clone(&term_config));
+        }
+    }
+
+    /// The single-pane form of [`Self::push_window_config_to_tab`], for a
+    /// pane added to a tab this window already holds. A pane whose tab is not
+    /// in this window yet is left alone: `TabAddedToWindow` covers it.
+    fn push_window_config_to_pane(&self, pane_id: PaneId) {
+        let mux = Mux::get();
+        let Some(window) = mux.get_window(self.mux_window_id) else {
+            return;
+        };
+        for tab in window.iter() {
+            if let Some(pos) = tab
+                .iter_panes_ignoring_zoom()
+                .into_iter()
+                .find(|pos| pos.pane.pane_id() == pane_id)
+            {
+                log::debug!(
+                    "pushing window config to added pane {pane_id} (window {})",
+                    self.mux_window_id
+                );
+                pos.pane.set_config(self.window_term_config());
+                return;
+            }
+        }
+    }
+
+    /// Every tab this window holds; for a window opened over content that
+    /// was attached before it existed.
+    pub(crate) fn push_window_config_to_all_tabs(&self) {
+        let mux = Mux::get();
+        let Some(window) = mux.get_window(self.mux_window_id) else {
+            return;
+        };
+        let tab_ids: Vec<TabId> = window.iter().map(|tab| tab.tab_id()).collect();
+        for tab_id in tab_ids {
+            self.push_window_config_to_tab(tab_id);
         }
     }
 
