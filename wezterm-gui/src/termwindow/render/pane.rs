@@ -17,7 +17,7 @@ use crate::termwindow::ui::tokens::{
     TAB_CLOSE_HOVER_RADIUS, TAB_CONTENT_INSET, TAB_ICON_SIZE,
     TAB_VERTICAL_PADDING,
 };
-use crate::termwindow::{PaneNavAction, ScrollHit, UIItem, UIItemType};
+use crate::termwindow::{PaneNavAction, ScrollHit, ScrollTrack, UIItem, UIItemType};
 use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
 use ::window::bitmaps::TextureRect;
@@ -1217,6 +1217,102 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// The thin, auto-hiding scrollbar over the right edge of a pane's
+    /// content: a rounded thumb the height of the visible share of the
+    /// scrollback, positioned by the pixel, shown while the view moves and
+    /// fading out afterwards. Nothing is reserved for it in the layout.
+    /// The hit area is wider than the thumb so a 5px line can be grabbed.
+    fn paint_overlay_scrollbar(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        pos: &PositionedPane,
+        current_viewport: Option<StableRowIndex>,
+        viewport_frac: f32,
+        content_right: f32,
+        content_top: f32,
+        content_bottom: f32,
+    ) -> anyhow::Result<()> {
+        let pane_id = pos.pane.pane_id();
+        let dims = pos.pane.get_dimensions();
+        // Nothing to indicate while the whole history fits on screen.
+        if dims.scrollback_rows <= dims.viewport_rows {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let (opacity, next_frame) = self.overlay_scrollbar_opacity(pane_id, now);
+        if let Some(due) = next_frame {
+            self.update_next_frame_time(Some(due));
+        }
+        if opacity <= 0.0 {
+            return Ok(());
+        }
+
+        let tokens = crate::ui::UiTokens::for_dpi(self.dimensions.dpi);
+        let ui_palette =
+            crate::ui::UiPalette::for_appearance(crate::native_settings::effective_appearance());
+        let track_top = content_top + tokens.scrollbar_margin_y;
+        let track_height =
+            (content_bottom - content_top - 2.0 * tokens.scrollbar_margin_y).max(0.0);
+        if track_height < tokens.scrollbar_min_thumb {
+            return Ok(());
+        }
+        let thumb = ScrollHit::thumb_px(
+            &*pos.pane,
+            current_viewport,
+            viewport_frac,
+            track_height as usize,
+            tokens.scrollbar_min_thumb as usize,
+        );
+        let thumb_x = content_right - tokens.scrollbar_inset - tokens.scrollbar_width;
+        let thumb_top = track_top + thumb.top as f32;
+
+        // Hit areas: a strip three thumbs wide, so the pointer need not
+        // land on the line itself. Pushed after the pane's own items, so
+        // they win the reverse walk in resolve_ui_item.
+        let hit_width = (tokens.scrollbar_width * 3.0).max(12.0);
+        let hit_x = (content_right - tokens.scrollbar_inset - hit_width).max(0.0) as usize;
+        let track = ScrollTrack {
+            pane_id,
+            track_top: track_top as usize,
+            track_height: track_height as usize,
+        };
+        self.ui_items.push(UIItem {
+            x: hit_x,
+            width: hit_width as usize,
+            y: track_top as usize,
+            height: thumb.top,
+            item_type: UIItemType::AboveScrollThumb(track),
+        });
+        self.ui_items.push(UIItem {
+            x: hit_x,
+            width: hit_width as usize,
+            y: thumb_top as usize,
+            height: thumb.height,
+            item_type: UIItemType::ScrollThumb(track),
+        });
+        self.ui_items.push(UIItem {
+            x: hit_x,
+            width: hit_width as usize,
+            y: thumb_top as usize + thumb.height,
+            height: (track_height as usize).saturating_sub(thumb.top + thumb.height),
+            item_type: UIItemType::BelowScrollThumb(track),
+        });
+
+        let gl_state = self.render_state.as_ref().unwrap();
+        let ctx = crate::ui::DrawContext::new(gl_state, self.dimensions, &self.render_metrics);
+        ctx.draw_rounded_rect(
+            layers,
+            2,
+            thumb_x,
+            thumb_top,
+            tokens.scrollbar_width,
+            thumb.height as f32,
+            ui_palette.scrollbar_thumb.mul_alpha(opacity),
+            tokens.scrollbar_width / 2.0,
+        )
+        .context("overlay scrollbar thumb")
+    }
+
     fn paint_pane_box_model(&mut self, pos: &PositionedPane) -> anyhow::Result<()> {
         let pane_id = pos.pane.pane_id();
         let output_generation = self
@@ -1491,27 +1587,31 @@ impl crate::TermWindow {
             return Ok(());
         }
 
-        // TODO: we only have a single scrollbar in a single position.
-        // We only update it for the active pane, but we should probably
-        // do a per-pane scrollbar.  That will require more extensive
-        // changes to ScrollHit, mouse positioning, PositionedPane
-        // and tab size calculation.
+        // The Lua `enable_scroll_bar` gutter: one window-wide bar for the
+        // active pane, kept as it was. The per-pane overlay scrollbar is
+        // drawn after the lines, at the end of this function.
         if pos.is_active && self.show_scroll_bar {
             let thumb_y_offset = top_bar_height as usize + border.top.get();
 
             let min_height = self.min_scroll_bar_height();
 
+            let track_height = self.dimensions.pixel_height.saturating_sub(
+                thumb_y_offset + border.bottom.get() + bottom_bar_height as usize,
+            );
             let info = ScrollHit::thumb(
                 &*pos.pane,
                 current_viewport,
-                self.dimensions.pixel_height.saturating_sub(
-                    thumb_y_offset + border.bottom.get() + bottom_bar_height as usize,
-                ),
+                track_height,
                 min_height as usize,
             );
             let abs_thumb_top = thumb_y_offset + info.top;
             let thumb_size = info.height;
             let color = palette.scrollbar_thumb.to_linear();
+            let track = ScrollTrack {
+                pane_id: pos.pane.pane_id(),
+                track_top: thumb_y_offset,
+                track_height,
+            };
 
             // Adjust the scrollbar thumb position
             let config = &self.config;
@@ -1525,14 +1625,14 @@ impl crate::TermWindow {
                 width: padding as usize,
                 y: thumb_y_offset,
                 height: info.top,
-                item_type: UIItemType::AboveScrollThumb,
+                item_type: UIItemType::AboveScrollThumb(track),
             });
             self.ui_items.push(UIItem {
                 x: thumb_x,
                 width: padding as usize,
                 y: abs_thumb_top,
                 height: thumb_size,
-                item_type: UIItemType::ScrollThumb,
+                item_type: UIItemType::ScrollThumb(track),
             });
             self.ui_items.push(UIItem {
                 x: thumb_x,
@@ -1542,7 +1642,7 @@ impl crate::TermWindow {
                     .dimensions
                     .pixel_height
                     .saturating_sub(abs_thumb_top + thumb_size),
-                item_type: UIItemType::BelowScrollThumb,
+                item_type: UIItemType::BelowScrollThumb(track),
             });
 
             self.filled_rectangle(
@@ -1951,6 +2051,22 @@ impl crate::TermWindow {
             render.term_window.line_render_y_offset.set(0.0);
             if let Some(error) = render.error.take() {
                 return Err(error).context("error while calling with_lines_mut");
+            }
+
+            // The overlay scrollbar goes on after the text it sits over.
+            if !render.term_window.show_scroll_bar && crate::native_settings::overlay_scrollbar() {
+                let content_bottom = pane_top_pixel_y
+                    + render_dims.viewport_rows as f32
+                        * pane_render_metrics.cell_size.height as f32;
+                render.term_window.paint_overlay_scrollbar(
+                    render.layers,
+                    pos,
+                    current_viewport,
+                    scroll_px / pane_render_metrics.cell_size.height.max(1) as f32,
+                    pane_content_right,
+                    pane_top_pixel_y,
+                    content_bottom,
+                )?;
             }
             if let Some(generation) = output_generation {
                 render

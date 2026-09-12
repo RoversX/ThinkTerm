@@ -224,9 +224,18 @@ pub(crate) struct NativeAppearanceSettings {
     pub(crate) color_scheme: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct NativeTerminalSettings {
+    /// The thin auto-hiding scrollbar drawn over each pane's right edge.
+    /// Off means no indicator at all; the Lua `enable_scroll_bar` gutter is
+    /// a separate, older thing and wins when it is on.
+    #[serde(default = "default_true")]
+    pub(crate) overlay_scrollbar: bool,
     pub(crate) font_size: Option<f64>,
     pub(crate) font_family: Option<String>,
     pub(crate) remote_pane_resize_mode: NativeRemotePaneResizeMode,
@@ -240,6 +249,23 @@ pub(crate) struct NativeTerminalSettings {
     pub(crate) default_shell: Option<Vec<String>>,
 }
 
+impl Default for NativeTerminalSettings {
+    fn default() -> Self {
+        Self {
+            overlay_scrollbar: true,
+            font_size: None,
+            font_family: None,
+            remote_pane_resize_mode: NativeRemotePaneResizeMode::default(),
+            scroll_mode: NativeScrollMode::default(),
+            bottom_quote_enabled: false,
+            bottom_quote_mode: NativeBottomQuoteMode::default(),
+            bottom_quote_interval_minutes: None,
+            bottom_quote_font_size: None,
+            default_shell: None,
+        }
+    }
+}
+
 pub(crate) fn remote_pane_resize_mode() -> NativeRemotePaneResizeMode {
     load().terminal.remote_pane_resize_mode
 }
@@ -248,6 +274,11 @@ pub(crate) fn remote_pane_resize_mode() -> NativeRemotePaneResizeMode {
 /// `load`, which deep-clones the whole settings tree.
 pub(crate) fn scroll_mode() -> NativeScrollMode {
     load_shared().terminal.scroll_mode
+}
+
+/// Read once per painted pane, through the shared handle.
+pub(crate) fn overlay_scrollbar() -> bool {
+    load_shared().terminal.overlay_scrollbar
 }
 
 /// The shell the user picked, if any. Read on every local spawn, so it

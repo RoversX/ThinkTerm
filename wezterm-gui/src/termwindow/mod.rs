@@ -384,6 +384,11 @@ fn line_to_ele_shape_cache_budget(config: &ConfigHandle) -> usize {
     config.line_to_ele_shape_cache_size.saturating_mul(2 * 1024)
 }
 
+/// How long a pane's overlay scrollbar stays up after the view last moved,
+/// and how much of that is spent fading out.
+pub(crate) const OVERLAY_SCROLLBAR_SHOW: Duration = Duration::from_millis(1200);
+pub(crate) const OVERLAY_SCROLLBAR_FADE: Duration = Duration::from_millis(250);
+
 const ATLAS_SIZE: usize = 128;
 
 /// Ceiling on growing the glyph atlas to fit a working set, in texels per side.
@@ -706,6 +711,18 @@ pub(crate) enum ContextMenuApplicationAction {
     ResolveLocalCopyConflict(transfer_walk::ConflictChoice),
 }
 
+/// The scrollbar track a thumb, or the space above or below it, belongs
+/// to: which pane it scrolls and where the track runs, so a drag can be
+/// turned back into a row without knowing which window layout drew it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollTrack {
+    pub pane_id: PaneId,
+    /// Top of the track in window pixels, and its height: the range the
+    /// thumb's top moves through is `track_top .. track_top + track_height - thumb`.
+    pub track_top: usize,
+    pub track_height: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UIItemType {
     TabBar(TabBarItem),
@@ -819,9 +836,9 @@ pub enum UIItemType {
     /// Backdrop of the command palette; the palette routes its own pointer
     /// events, this item only keeps clicks from reading as terminal surface.
     CommandPalette,
-    AboveScrollThumb,
-    ScrollThumb,
-    BelowScrollThumb,
+    AboveScrollThumb(ScrollTrack),
+    ScrollThumb(ScrollTrack),
+    BelowScrollThumb(ScrollTrack),
     Split(PositionedSplit),
     /// Close button on the synthetic content-view tab.
     ContentViewClose(ContentViewId),
@@ -1746,6 +1763,10 @@ pub struct PaneState {
     /// When the glide last advanced, so a frame that comes late moves the
     /// viewport by the time that actually passed.
     glide_last_tick: Option<Instant>,
+    /// Overlay scrollbar: until when the pane's indicator stays up. Set
+    /// whenever the viewport moves, or the thumb is hovered or dragged;
+    /// the last stretch before it is spent fading out.
+    scrollbar_visible_until: Option<Instant>,
     selection: Selection,
     /// If is_some(), rather than display the actual tab
     /// contents, we're overlaying a little internal application
@@ -3246,6 +3267,19 @@ impl TermWindow {
         self.content_view_fade.is_some()
             || self.active_content_view_index().is_some()
             || self.workspace_sidebar_hover.needs_frames()
+            || self.overlay_scrollbar_owes_frames()
+    }
+
+    /// An overlay scrollbar that is still up has a fade to finish; the
+    /// wheel scrolls an unfocused window too, and a thumb left standing
+    /// until some output happens to repaint would be a visible glitch.
+    fn overlay_scrollbar_owes_frames(&self) -> bool {
+        let now = Instant::now();
+        self.pane_state.borrow().values().any(|state| {
+            state
+                .scrollbar_visible_until
+                .is_some_and(|until| until > now)
+        })
     }
 
     /// Tracks whether the user can see this window at all. macOS reports
@@ -8626,6 +8660,44 @@ impl TermWindow {
         }
     }
 
+    /// Keep the pane's overlay scrollbar up: the pointer is on its thumb,
+    /// or dragging it.
+    pub(crate) fn reveal_scrollbar(&mut self, pane_id: PaneId) {
+        self.pane_state(pane_id).scrollbar_visible_until =
+            Some(Instant::now() + OVERLAY_SCROLLBAR_SHOW);
+    }
+
+    /// How visible the pane's overlay scrollbar is right now: 1 while it
+    /// has more than the fade left, easing to 0 over the fade, 0 once it
+    /// has expired or was never shown. Dragging the thumb pins it at 1.
+    /// Also says when the next frame is due, so the caller can arm it.
+    pub(crate) fn overlay_scrollbar_opacity(
+        &self,
+        pane_id: PaneId,
+        now: Instant,
+    ) -> (f32, Option<Instant>) {
+        let dragging_this = self.dragging.as_ref().is_some_and(|(item, _)| {
+            matches!(item.item_type, UIItemType::ScrollThumb(track) if track.pane_id == pane_id)
+        });
+        if dragging_this {
+            return (1.0, None);
+        }
+        let Some(until) = self.pane_state(pane_id).scrollbar_visible_until else {
+            return (0.0, None);
+        };
+        let Some(remaining) = until.checked_duration_since(now) else {
+            return (0.0, None);
+        };
+        if remaining > OVERLAY_SCROLLBAR_FADE {
+            return (1.0, Some(until - OVERLAY_SCROLLBAR_FADE));
+        }
+        let t = remaining.as_secs_f32() / OVERLAY_SCROLLBAR_FADE.as_secs_f32();
+        (
+            crate::ui::anim::Easing::Smooth.apply(t),
+            Some(now + Duration::from_millis(16)),
+        )
+    }
+
     /// Carry `delta_px` into `(row, px)`: whole cells move the row, the
     /// remainder stays in `[0, cell_h)`. `floor` rather than `trunc`, so
     /// scrolling up through a row boundary is the mirror of scrolling down.
@@ -10017,6 +10089,7 @@ impl TermWindow {
         };
 
         let mut state = self.pane_state(pane_id);
+        let moved = px != state.viewport_px || pos != state.viewport;
         if px != state.viewport_px {
             state.viewport_px = px;
         }
@@ -10024,6 +10097,10 @@ impl TermWindow {
             // Nothing left to glide towards past the end.
             state.glide_remaining = 0.0;
             state.glide_last_tick = None;
+        }
+        if moved {
+            // The overlay scrollbar shows where the view went.
+            state.scrollbar_visible_until = Some(Instant::now() + OVERLAY_SCROLLBAR_SHOW);
         }
         if pos != state.viewport {
             state.viewport = pos;

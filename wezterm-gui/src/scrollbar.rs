@@ -17,12 +17,28 @@ impl ScrollHit {
         max_thumb_height: usize,
         min_thumb_size: usize,
     ) -> Self {
+        Self::thumb_px(pane, viewport, 0.0, max_thumb_height, min_thumb_size)
+    }
+
+    /// `thumb`, with the smooth-scroll remainder folded in: `viewport_frac`
+    /// is how far into the top row the view sits, as a fraction of a row
+    /// (`viewport_px / cell height`), so the thumb moves between the
+    /// positions two whole rows would give it.
+    pub fn thumb_px(
+        pane: &dyn Pane,
+        viewport: Option<StableRowIndex>,
+        viewport_frac: f32,
+        max_thumb_height: usize,
+        min_thumb_size: usize,
+    ) -> Self {
         let render_dims = pane.get_dimensions();
 
-        let scroll_top = render_dims
+        let scroll_top = (render_dims
             .physical_top
             .saturating_sub(viewport.unwrap_or(render_dims.physical_top))
-            as f32;
+            as f32
+            - viewport_frac.clamp(0.0, 1.0))
+        .max(0.0);
 
         let scroll_size = render_dims.scrollback_rows as f32;
 
@@ -36,10 +52,14 @@ impl ScrollHit {
         }
         .ceil() as usize;
 
-        let scroll_percent =
-            1.0 - (scroll_top / (render_dims.physical_top - render_dims.scrollback_top) as f32);
+        let travel = (render_dims.physical_top - render_dims.scrollback_top) as f32;
+        let scroll_percent = if travel > 0.0 {
+            (1.0 - scroll_top / travel).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         let thumb_top =
-            (scroll_percent * (max_thumb_height.saturating_sub(thumb_size)) as f32).ceil() as usize;
+            (scroll_percent * (max_thumb_height.saturating_sub(thumb_size)) as f32).round() as usize;
 
         Self {
             top: thumb_top,

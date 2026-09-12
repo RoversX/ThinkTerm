@@ -12,7 +12,7 @@ use crate::termwindow::ui::tokens::{
 };
 use crate::termwindow::{
     pane_drop_action, pane_drop_zone, zone_split_request, GuiWin, MouseCapture, PaneDropKind,
-    PaneDropZone, PaneNavAction, PaneTabDragState, PaneTabDropTarget, PositionedSplit, ScrollHit,
+    PaneDropZone, PaneNavAction, PaneTabDragState, PaneTabDropTarget, PositionedSplit, ScrollHit, ScrollTrack,
     TabWheelSurface, TermWindowNotif, UIItem, UIItemType, TMB,
 };
 #[cfg(target_os = "macos")]
@@ -34,7 +34,6 @@ use mux::tab::{PositionedPane, SplitDirection};
 use mux::window::WindowId as MuxWindowId;
 use mux::Mux;
 use mux_lua::MuxPane;
-use std::convert::TryInto;
 use std::ops::Sub;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1582,9 +1581,9 @@ impl super::TermWindow {
             | UIItemType::ContextMenuBackdrop
             | UIItemType::ContextMenuItem(_)
             | UIItemType::CommandPalette
-            | UIItemType::AboveScrollThumb
-            | UIItemType::BelowScrollThumb
-            | UIItemType::ScrollThumb
+            | UIItemType::AboveScrollThumb(_)
+            | UIItemType::BelowScrollThumb(_)
+            | UIItemType::ScrollThumb(_)
             | UIItemType::Split(_)
             | UIItemType::ContentViewClose(_) => {}
         }
@@ -1703,9 +1702,9 @@ impl super::TermWindow {
             | UIItemType::ContextMenuBackdrop
             | UIItemType::ContextMenuItem(_)
             | UIItemType::CommandPalette
-            | UIItemType::AboveScrollThumb
-            | UIItemType::BelowScrollThumb
-            | UIItemType::ScrollThumb
+            | UIItemType::AboveScrollThumb(_)
+            | UIItemType::BelowScrollThumb(_)
+            | UIItemType::ScrollThumb(_)
             | UIItemType::Split(_)
             | UIItemType::ContentViewClose(_) => {}
         }
@@ -1847,9 +1846,9 @@ impl super::TermWindow {
             matches!(
                 item.item_type,
                 UIItemType::PaneNav { .. }
-                    | UIItemType::AboveScrollThumb
-                    | UIItemType::ScrollThumb
-                    | UIItemType::BelowScrollThumb
+                    | UIItemType::AboveScrollThumb(_)
+                    | UIItemType::ScrollThumb(_)
+                    | UIItemType::BelowScrollThumb(_)
                     | UIItemType::Split(_)
             )
         });
@@ -2397,14 +2396,20 @@ impl super::TermWindow {
         self.dragging.replace((item, start_event));
     }
 
+    /// The pane a scrollbar track belongs to, if it is still around.
+    fn scroll_track_pane(&self, track: ScrollTrack) -> Option<Arc<dyn Pane>> {
+        Mux::get().get_pane(track.pane_id)
+    }
+
     fn drag_scroll_thumb(
         &mut self,
         item: UIItem,
+        track: ScrollTrack,
         start_event: MouseEvent,
         event: MouseEvent,
         context: &dyn WindowOps,
     ) {
-        let pane = match self.get_active_pane_or_overlay() {
+        let pane = match self.scroll_track_pane(track) {
             Some(pane) => pane,
             None => return,
         };
@@ -2412,26 +2417,19 @@ impl super::TermWindow {
         let dims = pane.get_dimensions();
         let current_viewport = self.get_viewport(pane.pane_id());
 
-        let tab_bar_height = if self.show_tab_bar {
-            self.tab_bar_pixel_height().unwrap_or(0.)
-        } else {
-            0.
-        };
-        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
-        } else {
-            (tab_bar_height, 0.0)
-        };
-
-        let border = self.get_os_border();
-        let y_offset = top_bar_height + border.top.get() as f32;
-
+        // The track the thumb was drawn on came with the item: the gutter
+        // bar's spans the window, the overlay's spans its pane's content.
         let from_top = start_event.coords.y.saturating_sub(item.y as isize);
         let effective_thumb_top = event
             .coords
             .y
-            .saturating_sub(y_offset as isize + from_top)
+            .saturating_sub(track.track_top as isize + from_top)
             .max(0) as usize;
+        let min_thumb = if self.show_scroll_bar {
+            self.min_scroll_bar_height() as usize
+        } else {
+            crate::ui::UiTokens::for_dpi(self.dimensions.dpi).scrollbar_min_thumb as usize
+        };
 
         // Convert thumb top into a row index by reversing the math
         // in ScrollHit::thumb
@@ -2439,12 +2437,11 @@ impl super::TermWindow {
             effective_thumb_top,
             &*pane,
             current_viewport,
-            self.dimensions.pixel_height.saturating_sub(
-                y_offset as usize + border.bottom.get() + bottom_bar_height as usize,
-            ),
-            self.min_scroll_bar_height() as usize,
+            track.track_height,
+            min_thumb,
         );
         self.set_viewport(pane.pane_id(), Some(row), dims);
+        self.reveal_scrollbar(pane.pane_id());
         context.invalidate();
         self.dragging.replace((item, start_event));
     }
@@ -2707,8 +2704,8 @@ impl super::TermWindow {
             UIItemType::Split(split) => {
                 self.drag_split(item, split, start_event, x, y, context);
             }
-            UIItemType::ScrollThumb => {
-                self.drag_scroll_thumb(item, start_event, event, context);
+            UIItemType::ScrollThumb(track) => {
+                self.drag_scroll_thumb(item, track, start_event, event, context);
             }
             UIItemType::WorkspaceSidebarResize => {
                 self.drag_workspace_sidebar_resize(item, start_event, event, context);
@@ -3569,13 +3566,16 @@ impl super::TermWindow {
             UIItemType::TabBar(item) => {
                 self.mouse_event_tab_bar(item, event, context);
             }
-            UIItemType::AboveScrollThumb => {
+            UIItemType::AboveScrollThumb(track) => {
+                let pane = self.scroll_track_pane(track).unwrap_or(pane);
                 self.mouse_event_above_scroll_thumb(item, pane, event, context);
             }
-            UIItemType::ScrollThumb => {
+            UIItemType::ScrollThumb(track) => {
+                let pane = self.scroll_track_pane(track).unwrap_or(pane);
                 self.mouse_event_scroll_thumb(item, pane, event, context);
             }
-            UIItemType::BelowScrollThumb => {
+            UIItemType::BelowScrollThumb(track) => {
+                let pane = self.scroll_track_pane(track).unwrap_or(pane);
                 self.mouse_event_below_scroll_thumb(item, pane, event, context);
             }
             UIItemType::Split(split) => {
@@ -4348,9 +4348,14 @@ impl super::TermWindow {
             UIItemType::ContextMenuItem(_) => {
                 context.set_cursor(Some(MouseCursor::Hand));
             }
-            UIItemType::AboveScrollThumb
-            | UIItemType::ScrollThumb
-            | UIItemType::BelowScrollThumb
+            UIItemType::ScrollThumb(track) => {
+                // Hovering the thumb keeps the overlay scrollbar up.
+                self.reveal_scrollbar(track.pane_id);
+                context.invalidate();
+                context.set_cursor(Some(MouseCursor::Arrow));
+            }
+            UIItemType::AboveScrollThumb(_)
+            | UIItemType::BelowScrollThumb(_)
             | UIItemType::Split(_)
             | UIItemType::PaneNav { .. } => {
                 context.set_cursor(Some(MouseCursor::Arrow));
@@ -7965,13 +7970,13 @@ impl super::TermWindow {
         if let WMEK::Press(MousePress::Left) = event.kind {
             let dims = pane.get_dimensions();
             let current_viewport = self.get_viewport(pane.pane_id());
-            // Page up
+            // Page up, by this pane's own height
             self.set_viewport(
                 pane.pane_id(),
                 Some(
                     current_viewport
                         .unwrap_or(dims.physical_top)
-                        .saturating_sub(self.terminal_size.rows.try_into().unwrap()),
+                        .saturating_sub(dims.viewport_rows as StableRowIndex),
                 ),
                 dims,
             );
@@ -7990,13 +7995,13 @@ impl super::TermWindow {
         if let WMEK::Press(MousePress::Left) = event.kind {
             let dims = pane.get_dimensions();
             let current_viewport = self.get_viewport(pane.pane_id());
-            // Page down
+            // Page down, by this pane's own height
             self.set_viewport(
                 pane.pane_id(),
                 Some(
                     current_viewport
                         .unwrap_or(dims.physical_top)
-                        .saturating_add(self.terminal_size.rows.try_into().unwrap()),
+                        .saturating_add(dims.viewport_rows as StableRowIndex),
                 ),
                 dims,
             );
