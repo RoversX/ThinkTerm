@@ -186,10 +186,29 @@ pub fn with_divider_moved(layout: &TabLayout, idx: usize, cells: isize, nav_rows
 /// server requires. Near enough to claim pane by pane. `None` when a
 /// pane would be left without a cell: padding one out would break the
 /// composition, and the server would refuse the lot.
+/// The least a pane keeps when a layout is scaled down to this page: a
+/// prompt's worth of columns and a few rows. Scaled in proportion alone, a
+/// desktop's 70/46 split lands on a phone as 33 columns beside 21, and a
+/// narrower one leaves the smaller pane a strip a few cells wide -- its
+/// content unreadable, its bar's buttons pushed off the end. A divider is
+/// moved as far as it has to be to give both sides this much, when the
+/// grid has it to give.
+const MIN_COLS: usize = 20;
+const MIN_ROWS: usize = 4;
+
 pub fn scaled(layout: &TabLayout, size: TerminalSize) -> Option<TabLayout> {
     let (cols, rows) = (size.cols, size.rows);
     let sx = |c: usize| (c * cols + layout.cols / 2) / layout.cols;
     let sy = |r: usize| (r * rows + layout.rows / 2) / layout.rows;
+    // Dividers, unlike edges, are held away from the grid's ends.
+    let sxd = |c: usize| {
+        let c = sx(c);
+        if cols > 2 * MIN_COLS + 1 { c.clamp(MIN_COLS, cols - 1 - MIN_COLS) } else { c }
+    };
+    let syd = |r: usize| {
+        let r = sy(r);
+        if rows > 2 * MIN_ROWS + 1 { r.clamp(MIN_ROWS, rows - 1 - MIN_ROWS) } else { r }
+    };
     let mut scaled = layout.clone();
     scaled.cols = cols;
     scaled.rows = rows;
@@ -203,18 +222,18 @@ pub fn scaled(layout: &TabLayout, size: TerminalSize) -> Option<TabLayout> {
             match *d {
                 Divider::Col { col, top, rows: n } if old.top < top + n && old.top + old.rows > top => {
                     if old.left + old.cols == col {
-                        r = sx(col);
+                        r = sxd(col);
                     }
                     if old.left == col + 1 {
-                        l = sx(col) + 1;
+                        l = sxd(col) + 1;
                     }
                 }
                 Divider::Row { row, left, cols: n } if old.left < left + n && old.left + old.cols > left => {
                     if old.top + old.rows == row {
-                        b = sy(row);
+                        b = syd(row);
                     }
                     if old.top == row + 1 {
-                        t = sy(row) + 1;
+                        t = syd(row) + 1;
                     }
                 }
                 _ => {}
@@ -229,13 +248,13 @@ pub fn scaled(layout: &TabLayout, size: TerminalSize) -> Option<TabLayout> {
         match d {
             Divider::Col { col, top, rows: n } => {
                 let (t, b) = (sy(*top), sy(*top + *n));
-                *col = sx(*col);
+                *col = sxd(*col);
                 *top = t;
                 *n = b.saturating_sub(t).max(1);
             }
             Divider::Row { row, left, cols: n } => {
                 let (l, r) = (sx(*left), sx(*left + *n));
-                *row = sy(*row);
+                *row = syd(*row);
                 *left = l;
                 *n = r.saturating_sub(l).max(1);
             }

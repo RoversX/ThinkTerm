@@ -238,7 +238,10 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 .nav .cap { display: inline-flex; align-items: center; flex: 0 0 auto; width: 128px; height: 30px; box-sizing: border-box; padding: 0 9px; border-radius: 999px; border: 1px solid transparent; background: var(--wash); color: var(--text2); cursor: default; }
 .nav .cap.current { background: var(--ctl); border-color: var(--ctl-border); box-shadow: var(--shadow); color: inherit; }
 .nav .cap:hover:not(.current) { background: var(--ctl-hover); }
+/* The buttons are what a narrow pane keeps: the capsules give way first
+   (min-width: 0 on .caps), and the bar never lets these shrink or clip. */
 .nav .acts { display: flex; gap: 2px; margin-left: auto; flex: none; }
+.nav .cap { min-width: 0; max-width: 128px; flex: 1 1 auto; }
 .nav .act svg { width: 13px; height: 13px; }
 .spin { display: inline-flex; animation: spin .96s steps(12) infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -411,7 +414,12 @@ body[data-mobile] #panes {
   /* Clear of the notch and the rounded corners in landscape, as the tab
      row and the drawers already are. */
   inset: var(--tabs) var(--safe-r) auto var(--safe-l);
-  width: auto;
+  /* Spelled out rather than `auto`: a canvas is a replaced element, and
+     for those `width: auto` is the intrinsic width -- the backing store's
+     pixel count, which resize() sets from this very box at the device
+     pixel ratio. The box then fed itself: 2x too wide on a phone, and
+     once the window shrank, whatever width the store had last been. */
+  width: calc(100% - var(--safe-l) - var(--safe-r));
   height: calc(var(--vvh, 100%) - var(--tabs) - var(--keybar));
 }
 /* The browser must not pan or zoom the page: every finger on the canvas is

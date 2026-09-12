@@ -280,6 +280,9 @@ pub struct Inner {
     /// The tab the page last claimed on its own, on showing it; see
     /// `show`. A tab is claimed once per showing, not on every listing.
     auto_claimed: Option<TabId>,
+    /// The page is in its phone shape (`body[data-mobile]`), read at each
+    /// resize: the grid is padded differently there.
+    mobile: bool,
     /// The page's display layer, told once per animation frame that
     /// something it shows changed; it reads the views it wants.
     on_change: Option<js_sys::Function>,
@@ -530,6 +533,7 @@ impl App {
             tab_layout: None,
             following: true,
             auto_claimed: None,
+            mobile: false,
             on_change: None,
             notify_pending: Rc::new(Cell::new(false)),
             toast: RefCell::new(None),
@@ -2247,18 +2251,44 @@ impl App {
         crate::navbar::nav_css(cell_css, Self::desktop_cell_css(inner))
     }
 
+    /// The bar's height as the grid pays for it: whole rows. The bar's
+    /// own height is a fraction of a row, and the pane gives up the
+    /// rounded-up count; drawing the content a fraction below the bar
+    /// left the difference as a blank strip under the last row, on top of
+    /// the half-cell pad -- a row and a half of nothing at the bottom of
+    /// every pane. The bar is drawn to the rounded height (`nav_views`), so
+    /// bar and content meet.
     fn nav_dev(inner: &Inner) -> f32 {
-        (Self::nav_css(inner) * inner.dpr) as f32
+        Self::nav_rows(inner) as f32 * inner.glyphs.metrics.cell_size.height as f32
     }
 
     /// Where the grid starts in the canvas, in device px: the desktop's
     /// window padding of a cell left and right and half a cell top and
     /// bottom.
     fn pad(inner: &Inner) -> (f32, f32) {
-        (
-            inner.glyphs.metrics.cell_size.width as f32,
-            inner.glyphs.metrics.cell_size.height as f32 / 2.0,
-        )
+        let cw = inner.glyphs.metrics.cell_size.width as f32;
+        let ch = inner.glyphs.metrics.cell_size.height as f32;
+        if inner.mobile {
+            // A phone has no room to give the grid a margin above and
+            // below, and a gap under the last row reads as a cut-off
+            // prompt: the rows sit flush with the bottom of the canvas,
+            // and whatever part of a row the height cannot fit is the gap
+            // under the tab row instead, where it reads as a margin.
+            let rows = (inner.canvas.height() as f32 / ch.max(1.0)).floor();
+            return (cw, inner.canvas.height() as f32 - rows * ch);
+        }
+        (cw, ch / 2.0)
+    }
+
+    /// What the grid's rows cannot use of the canvas's height: the pad
+    /// above and below on a desktop, nothing on a phone (the leftover is
+    /// the pad there, see `pad`).
+    fn pad_y_total(inner: &Inner) -> u32 {
+        if inner.mobile {
+            0
+        } else {
+            (2.0 * Self::pad(inner).1) as u32
+        }
     }
 
     /// Rows of a frame the bar takes from the pane.
@@ -2281,7 +2311,8 @@ impl App {
             let pad = Self::pad(inner);
             let pad_css = (pad.0 as f64 / dpr, pad.1 as f64 / dpr);
             let width_css = inner.canvas.width() as f64 / dpr;
-            for (rect, place) in crate::navbar::rects(layout, cell_css, Self::nav_css(inner), pad_css, width_css)
+            let nav_rows_css = Self::nav_rows(inner) as f64 * cell_css.1;
+            for (rect, place) in crate::navbar::rects(layout, cell_css, nav_rows_css, pad_css, width_css)
                 .into_iter()
                 .zip(&layout.panes)
             {
@@ -4373,10 +4404,14 @@ impl App {
             inner.glyphs.metrics.cell_size.width as u32,
             inner.glyphs.metrics.cell_size.height as u32,
         );
+        inner.mobile = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.body())
+            .is_some_and(|body| body.has_attribute("data-mobile"));
         let pad = Self::pad(&inner);
         let Some((cols, rows)) = grid_for(
             dev_w.saturating_sub(2 * pad.0 as u32),
-            dev_h.saturating_sub(2 * pad.1 as u32),
+            dev_h.saturating_sub(Self::pad_y_total(&inner)),
             cw,
             ch,
         ) else {
