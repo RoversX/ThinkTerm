@@ -4,7 +4,7 @@ use crate::quad::{
 use crate::termwindow::content_view::{ContentViewTypography, TerminalPreviewRequest};
 use crate::termwindow::render::{LineToEleShapeCacheKey, RenderScreenLineParams};
 use crate::termwindow::{PaintOutcome, RenderFrame, TermWindowNotif, UIItem, UIItemType};
-use crate::ui::{DrawContext, UiPalette};
+use crate::ui::DrawContext;
 use ::window::bitmaps::atlas::OutOfTextureSpace;
 use ::window::color::LinearRgba;
 use ::window::RectF;
@@ -611,7 +611,7 @@ impl crate::TermWindow {
         // fully draw-on-demand.
         self.update_next_frame_time(Some(now + Duration::from_millis(125)));
         let area = self.content_view_area();
-        let palette = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+        let palette = self.chrome();
         self.filled_rectangle(layers, 0, area, palette.window_bg)
             .context("frontend handoff opaque background")?;
 
@@ -706,7 +706,7 @@ impl crate::TermWindow {
         if used_w >= area.size.width && used_h >= area.size.height {
             return Ok(());
         }
-        let palette = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+        let palette = self.chrome();
         let line = palette.muted_text.mul_alpha(0.10);
         let right_x = area.origin.x + used_w;
         let bottom_y = area.origin.y + used_h;
@@ -1610,7 +1610,7 @@ impl crate::TermWindow {
         let render_metrics =
             crate::utilsprites::RenderMetrics::with_font_metrics(&ui_font.metrics());
         let dimensions = self.dimensions;
-        let palette = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+        let palette = self.chrome();
 
         // Occupy the terminal content area between the workspace and right
         // sidebars, below the top tab bar and above a bottom tab bar.
@@ -3005,7 +3005,7 @@ impl crate::TermWindow {
         // From the shared chrome palette, not a hand-picked grey: the tag sits
         // directly against the sidebar it overhangs, so anything lighter than
         // the sidebar's own controls reads as a foreign surface.
-        let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+        let chrome = self.chrome();
 
         let gl_state = self.render_state.as_ref().unwrap();
         let layer = gl_state
@@ -3680,7 +3680,7 @@ impl crate::TermWindow {
                 crate::native_settings::effective_appearance(),
                 window::Appearance::Dark | window::Appearance::DarkHighContrast
             ) {
-                UiPalette::for_appearance(crate::native_settings::effective_appearance())
+                self.chrome()
                     .sidebar_bg
                     .mul_alpha(self.config.window_background_opacity)
             } else if panes.len() == 1 {
@@ -3716,7 +3716,7 @@ impl crate::TermWindow {
         let border = self.get_os_border();
         let header_height = border.top.get() as f32;
         if header_height > 0.0 {
-            let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+            let chrome = self.chrome();
             self.filled_rectangle(
                 &mut layers,
                 0,
@@ -4083,7 +4083,7 @@ impl crate::TermWindow {
                     let hint_width =
                         self.ui_px(crate::termwindow::ui::tokens::SIDEBAR_HOVER_HINT_WIDTH) as f32;
                     let palette =
-                        UiPalette::for_appearance(crate::native_settings::effective_appearance());
+                        self.chrome();
                     let mut hint_layers = layer.quad_allocator();
                     self.filled_rectangle(
                         &mut hint_layers,

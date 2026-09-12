@@ -5,8 +5,8 @@ use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
 use ::window::color::LinearRgba;
 use ::window::{
-    Appearance, ContextMenuAction, ContextMenuIcon, ContextMenuItem, MouseCursor, MouseEvent,
-    MouseEventKind, MousePress, WindowOps,
+    ContextMenuAction, ContextMenuIcon, ContextMenuItem, MouseCursor, MouseEvent, MouseEventKind,
+    MousePress, WindowOps,
 };
 use anyhow::Context;
 use mux::pane::Pane;
@@ -574,7 +574,10 @@ impl crate::TermWindow {
         let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
         let row_height = (ui_metrics.cell_size.height as usize + self.ui_px(MENU_ROW_EXTRA_HEIGHT))
             .max(self.ui_px(44));
-        let palette = context_menu_palette(crate::native_settings::effective_appearance());
+        let mut palette = context_menu_palette(self.chrome());
+        // Last word to the user: the menu tuning above overwrites slots the
+        // chrome already resolved, `ui_colors` among them.
+        crate::native_settings::apply_ui_colors(&mut palette, self.config.ui_colors.as_ref());
 
         let gl_state = self.render_state.as_ref().unwrap();
         let layer = gl_state.layer_for_zindex(0).context("context menu layer")?;
@@ -1083,26 +1086,12 @@ fn paint_menu_rows(
     Ok(())
 }
 
-fn context_menu_palette(appearance: Appearance) -> UiPalette {
-    let mut palette = UiPalette::for_appearance(appearance);
-    match appearance {
-        Appearance::Dark | Appearance::DarkHighContrast => {
-            palette.control_bg = LinearRgba::with_srgba(30, 30, 32, 255);
-            palette.control_hover_bg = LinearRgba::with_srgba(255, 255, 255, 255).mul_alpha(0.08);
-            palette.control_border = LinearRgba::with_srgba(118, 118, 128, 255).mul_alpha(0.34);
-            palette.separator = LinearRgba::with_srgba(84, 84, 88, 255).mul_alpha(0.36);
-            palette.text = LinearRgba::with_srgba(242, 242, 247, 255);
-            palette.secondary_text = LinearRgba::with_srgba(226, 226, 232, 255);
-            palette.muted_text = LinearRgba::with_srgba(150, 150, 156, 255);
-        }
-        Appearance::Light | Appearance::LightHighContrast => {
-            palette.control_bg = LinearRgba::with_srgba(246, 246, 248, 255);
-            palette.control_hover_bg = LinearRgba::with_srgba(60, 60, 67, 255).mul_alpha(0.08);
-            palette.control_border = LinearRgba::with_srgba(60, 60, 67, 255).mul_alpha(0.22);
-            palette.separator = LinearRgba::with_srgba(60, 60, 67, 255).mul_alpha(0.20);
-        }
-    }
-    palette
+/// The chrome's colours, tuned for a floating menu card.
+///
+/// Takes the window's palette rather than an appearance so the caller pays for
+/// resolving it once per configuration instead of once per menu paint.
+fn context_menu_palette(palette: UiPalette) -> UiPalette {
+    palette.as_menu_card()
 }
 
 fn menu_icon(icon: &ContextMenuIcon) -> Option<SvgIcon> {

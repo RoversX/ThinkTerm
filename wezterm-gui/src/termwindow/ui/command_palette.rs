@@ -8,6 +8,9 @@
 //! before the terminal's).
 
 use crate::commands::ExpandedCommand;
+use config::TermConfig;
+use std::sync::Arc;
+use wezterm_term::TerminalConfiguration;
 use crate::overlay::selector::{matcher_pattern, matcher_score};
 use crate::workspace_threads::{ThreadSearchEntry, WorkspaceThreadWorkStatus};
 use crate::termwindow::palette::{build_commands, format_key_label, frecency_scores, save_recent};
@@ -315,6 +318,28 @@ impl CommandPaletteState {
                 PaletteItem::Header(_) => Some(EntryKind::Header),
             },
             MatchEntry::Nested(..) => Some(EntryKind::Leaf),
+        }
+    }
+
+    /// The command an entry runs, borrowed. `command_for_entry` clones a
+    /// whole `ExpandedCommand` -- two strings and a key vector -- which is
+    /// waste on the paths that only want to look at the action, and those
+    /// paths run on every pointer move across the list.
+    fn action_for_entry(&self, order_idx: usize) -> Option<&KeyAssignment> {
+        match self.entry(order_idx)? {
+            MatchEntry::Item(idx) => match self.current_items().get(idx)? {
+                PaletteItem::Leaf(cmd) => Some(&cmd.action),
+                PaletteItem::Group(_) | PaletteItem::Header(_) => None,
+            },
+            MatchEntry::Nested(group_idx, child_idx) => {
+                match self.current_items().get(group_idx)? {
+                    PaletteItem::Group(group) => match group.items.get(child_idx)? {
+                        PaletteItem::Leaf(cmd) => Some(&cmd.action),
+                        PaletteItem::Group(_) | PaletteItem::Header(_) => None,
+                    },
+                    PaletteItem::Leaf(_) | PaletteItem::Header(_) => None,
+                }
+            }
         }
     }
 
@@ -873,27 +898,62 @@ fn thread_leaf(entry: ThreadSearchEntry, archived_suffix: &str) -> (ExpandedComm
 
 /// The floating-menu palette, tuned like `context_menu_palette` so the card
 /// reads as native chrome in both appearances.
-fn command_palette_colors(appearance: Appearance) -> UiPalette {
-    let mut palette = UiPalette::for_appearance(appearance);
-    match appearance {
-        Appearance::Dark | Appearance::DarkHighContrast => {
-            palette.control_bg = LinearRgba::with_srgba(30, 30, 32, 255);
-            palette.control_hover_bg = LinearRgba::with_srgba(255, 255, 255, 255).mul_alpha(0.08);
-            palette.control_border = LinearRgba::with_srgba(118, 118, 128, 255).mul_alpha(0.34);
-            palette.separator = LinearRgba::with_srgba(84, 84, 88, 255).mul_alpha(0.36);
-            palette.text = LinearRgba::with_srgba(242, 242, 247, 255);
-            palette.secondary_text = LinearRgba::with_srgba(226, 226, 232, 255);
-            palette.muted_text = LinearRgba::with_srgba(150, 150, 156, 255);
-            palette.selected_bg = LinearRgba::with_srgba(70, 70, 74, 255);
-        }
-        Appearance::Light | Appearance::LightHighContrast => {
-            palette.control_bg = LinearRgba::with_srgba(246, 246, 248, 255);
-            palette.control_hover_bg = LinearRgba::with_srgba(60, 60, 67, 255).mul_alpha(0.08);
-            palette.control_border = LinearRgba::with_srgba(60, 60, 67, 255).mul_alpha(0.22);
-            palette.separator = LinearRgba::with_srgba(60, 60, 67, 255).mul_alpha(0.20);
-        }
+fn command_palette_colors(palette: UiPalette) -> UiPalette {
+    let mut palette = palette.as_menu_card();
+    // The one place this card differs from a context menu: its rows carry a
+    // selection, and the menu's own dark grey reads better under one than the
+    // sidebar's does.
+    if !palette.derived && palette.is_dark() {
+        palette.selected_bg = LinearRgba::with_srgba(70, 70, 74, 255);
     }
     palette
+}
+
+/// Whether running `action` installs the scheme `preview` is showing, in which
+/// case winding the preview down can skip the restore -- the colours are about
+/// to be replaced by the same colours, and a restore in between would flash the
+/// old ones for a frame.
+///
+/// Everything else has to restore: a different scheme, a command that has
+/// nothing to do with colours, or no preview to begin with.
+fn execution_replaces_preview(
+    action: &KeyAssignment,
+    preview: &Option<Option<String>>,
+) -> bool {
+    match (action, preview) {
+        (KeyAssignment::SetColorScheme(name), Some(shown)) => name == shown,
+        _ => false,
+    }
+}
+
+/// What a preview step has to do to get from what is on screen to what the
+/// selection is asking for.
+#[derive(Debug, PartialEq, Eq)]
+enum PreviewStep {
+    /// Already right; touch nothing.
+    Nothing,
+    /// Show the wanted scheme.
+    Show,
+    /// Nothing is wanted any more; put the configuration's own colours back.
+    Restore,
+}
+
+/// `wanted` and `showing` are both "which scheme", where `None` means the
+/// selection is not on a scheme at all and `Some(None)` means the scheme list's
+/// "use the configured default" row.
+///
+/// Split out from the window so the four cases can be read, and tested,
+/// without one.
+fn preview_transition(
+    wanted: &Option<Option<String>>,
+    showing: &Option<Option<String>>,
+) -> PreviewStep {
+    match (wanted, showing) {
+        (None, None) => PreviewStep::Nothing,
+        (Some(w), Some(s)) if w == s => PreviewStep::Nothing,
+        (Some(_), _) => PreviewStep::Show,
+        (None, Some(_)) => PreviewStep::Restore,
+    }
 }
 
 enum PaletteOutcome {
@@ -969,6 +1029,171 @@ impl crate::TermWindow {
         state.enter_group(idx);
     }
 
+    /// The settings window's colour-scheme row: open the palette already
+    /// inside the scheme group.
+    ///
+    /// Settings does not carry a picker of its own. A thousand schemes need a
+    /// search box and a live preview to choose between, and this list already
+    /// is one -- building a second, worse one next to it is how two lists
+    /// drift apart.
+    pub(crate) fn open_color_scheme_picker(&mut self) {
+        self.open_command_palette();
+        let Some(state) = self.command_palette.as_mut() else {
+            return;
+        };
+        let Some(idx) = state.root.iter().position(|item| {
+            matches!(item, PaletteItem::Group(group) if group.kind == PaletteGroupKind::ColorScheme)
+        }) else {
+            return;
+        };
+        state.enter_group(idx);
+    }
+
+    /// Show the colour scheme the selection is sitting on, without choosing
+    /// it. Answers the difference between what the selection asks for and what
+    /// is already being shown, so calling it every paint is free when nothing
+    /// moved.
+    ///
+    /// Deliberately not `set_color_scheme_override`: that persists the choice,
+    /// broadcasts it, and reloads the configuration from disk -- which closes
+    /// this palette. Preview swaps the panes' palette and repaints, nothing
+    /// more.
+    fn drive_color_scheme_preview(&mut self, state: &CommandPaletteState) {
+        let wanted = state
+            .action_for_entry(state.selected)
+            .and_then(|action| match action {
+                KeyAssignment::SetColorScheme(name) => Some(name.clone()),
+                _ => None,
+            });
+
+        match preview_transition(&wanted, &self.scheme_preview) {
+            PreviewStep::Nothing => return,
+            PreviewStep::Show => {
+                if !self.show_scheme_preview(wanted.as_ref().unwrap().as_deref()) {
+                    // Nothing was shown, so nothing may be recorded as shown:
+                    // a record naming a scheme the panes never took makes the
+                    // next step onto that row a no-op and strands whatever is
+                    // actually on screen. Fall back to no preview at all,
+                    // which is a state the screen and the record agree on.
+                    self.restore_scheme_preview();
+                    self.scheme_preview = None;
+                    return;
+                }
+            }
+            PreviewStep::Restore => self.restore_scheme_preview(),
+        }
+        self.scheme_preview = wanted;
+    }
+
+    /// Paint every pane of this window in `name`, or in the configuration's
+    /// own scheme when `None`. False when `name` is a scheme we do not have,
+    /// in which case nothing was touched.
+    fn show_scheme_preview(&mut self, name: Option<&str>) -> bool {
+        let palette = match name {
+            Some(name) => match self
+                .config
+                .color_schemes
+                .get(name)
+                .or_else(|| config::COLOR_SCHEMES.get(name))
+            {
+                Some(palette) => palette.clone(),
+                None => {
+                    log::warn!("colour scheme {name} is not one we know; not previewing it");
+                    return false;
+                }
+            },
+            // The *configuration's* scheme, not this window's: `self.config`
+            // already carries the `color_scheme` override this row exists to
+            // take off, so previewing from it would show the override the user
+            // is leaving and then jump to something they never saw on Enter.
+            None => config::configuration().resolved_palette.clone(),
+        };
+        // The interface follows too when it is set to: previewing a scheme
+        // that repaints the terminal but leaves the sidebar on the old one
+        // shows the user half of what they are choosing.
+        // Through the same overlay as the committed configuration, so the
+        // interface does not decide it is on one side while the scheme it is
+        // previewing lands on the other. (The pane palette below is still the
+        // scheme raw: previewing "what this scheme looks like" is the point,
+        // and merging the whole `colors` table is `Config::resolve`'s job.)
+        self.scheme_preview_ground =
+            crate::native_settings::scheme_background(&self.config, &palette);
+        self.refresh_chrome();
+        self.push_pane_palette(Some(palette.into()));
+        true
+    }
+
+    /// Wind the preview down on the way into executing `command`.
+    ///
+    /// Skipping the restore is only right when the command is about to install
+    /// the very scheme being shown -- then a restore in between would flash the
+    /// old colours for a frame. A click can land on a row the selection was
+    /// never on, and the scheme it names may already be the one in
+    /// `config_overrides`, which makes applying it a no-op: without this the
+    /// palette closed with the *previewed* scheme still on the panes and the
+    /// clicked one saved. Anything else -- another scheme, or a command that
+    /// has nothing to do with colours -- has to put the panes back first.
+    fn finish_scheme_preview(&mut self, command: &ExpandedCommand) {
+        if !execution_replaces_preview(&command.action, &self.scheme_preview) {
+            self.restore_scheme_preview();
+        }
+        self.scheme_preview = None;
+        self.scheme_preview_ground = None;
+    }
+
+    /// Undo a preview: the panes go back to reading the configuration.
+    fn restore_scheme_preview(&mut self) {
+        self.scheme_preview_ground = None;
+        self.refresh_chrome();
+        self.push_pane_palette(None);
+    }
+
+    /// Hand every pane of this window a terminal configuration carrying
+    /// `palette` (or none, to follow the configuration again), then retire the
+    /// quads that were built with the old colours.
+    ///
+    /// The same three loops `config_was_reloaded` uses, because an overlay is
+    /// as much a pane as the terminal under it.
+    fn push_pane_palette(&mut self, palette: Option<wezterm_term::color::ColorPalette>) {
+        let term_config = TermConfig::with_config(self.config.clone());
+        match palette {
+            // A preview, not a choice: a remote pane renders it but does not
+            // carry it to the mux server. See `TermConfig::set_preview_palette`.
+            Some(palette) => term_config.set_preview_palette(palette),
+            None => term_config.clear_client_palette(),
+        }
+        let term_config: Arc<dyn TerminalConfiguration> = Arc::new(term_config);
+
+        let mux = Mux::get();
+        if let Some(window) = mux.get_window(self.mux_window_id) {
+            for tab in window.iter() {
+                for pane in tab.iter_panes_ignoring_zoom() {
+                    pane.pane.set_config(Arc::clone(&term_config));
+                }
+            }
+        }
+        for state in self.pane_state.borrow().values() {
+            if let Some(overlay) = &state.overlay {
+                overlay.pane.set_config(Arc::clone(&term_config));
+            }
+        }
+        for state in self.tab_state.borrow().values() {
+            if let Some(overlay) = &state.overlay {
+                overlay.pane.set_config(Arc::clone(&term_config));
+            }
+        }
+
+        // Colours are baked into the quad and shape cache *values* while the
+        // keys carry only this generation, so bumping it is what retires them.
+        // The UI text caches are deliberately left alone: their keys have no
+        // colours, and clearing them would re-shape the whole sidebar on every
+        // arrow key.
+        self.shape_generation += 1;
+        self.shape_cache.borrow_mut().clear();
+        self.invalidate_modal();
+        self.invalidate_window();
+    }
+
     pub(crate) fn close_command_palette(&mut self) {
         if self.command_palette.take().is_some() {
             self.remove_command_palette_ui_items();
@@ -977,6 +1202,16 @@ impl crate::TermWindow {
     }
 
     fn remove_command_palette_ui_items(&mut self) {
+        // Every way the palette closes comes through here -- Escape, the
+        // toggle chord, Ctrl-G, a click outside, a modal taking over, losing
+        // window focus, a configuration reload -- so this is the one place a
+        // preview can be sure of being undone. The activation paths clear
+        // `scheme_preview` first, because what they are about to apply is the
+        // very thing a restore would throw away.
+        if self.scheme_preview.take().is_some() {
+            self.restore_scheme_preview();
+        }
+        debug_assert!(self.scheme_preview_ground.is_none());
         self.last_ui_item = None;
         self.ui_items
             .retain(|item| !matches!(item.item_type, UIItemType::CommandPalette));
@@ -1443,12 +1678,23 @@ impl crate::TermWindow {
 
         match outcome {
             PaletteOutcome::Keep => {
+                // The selection has settled; show the scheme it landed on.
+                // Driven from here rather than from the paint because the
+                // preview bumps `shape_generation` and clears the shape cache,
+                // which a paint already part-way through must not have pulled
+                // out from under it. `ensure_matches` first because typing
+                // only marks the match cache stale -- the reselect to the top
+                // of the new results happens inside it.
+                let mut state = state;
+                state.ensure_matches();
+                self.drive_color_scheme_preview(&state);
                 self.command_palette = Some(state);
             }
             PaletteOutcome::Close => {
                 self.remove_command_palette_ui_items();
             }
             PaletteOutcome::Execute(cmd) => {
+                self.finish_scheme_preview(&cmd);
                 self.remove_command_palette_ui_items();
                 self.execute_palette_command(cmd);
             }
@@ -1577,6 +1823,16 @@ impl crate::TermWindow {
 
         match outcome {
             PaletteOutcome::Keep => {
+                // The selection has settled; show the scheme it landed on.
+                // Driven from here rather than from the paint because the
+                // preview bumps `shape_generation` and clears the shape cache,
+                // which a paint already part-way through must not have pulled
+                // out from under it. `ensure_matches` first because typing
+                // only marks the match cache stale -- the reselect to the top
+                // of the new results happens inside it.
+                let mut state = state;
+                state.ensure_matches();
+                self.drive_color_scheme_preview(&state);
                 self.command_palette = Some(state);
             }
             PaletteOutcome::Close => {
@@ -1585,6 +1841,10 @@ impl crate::TermWindow {
                 context.invalidate();
             }
             PaletteOutcome::Execute(cmd) => {
+                // A click can land on a row the selection never reached, so
+                // this one really can be executing something other than what is
+                // on screen.
+                self.finish_scheme_preview(&cmd);
                 self.remove_command_palette_ui_items();
                 self.execute_palette_command(cmd);
                 context.set_cursor(Some(MouseCursor::Arrow));
@@ -1655,8 +1915,10 @@ impl crate::TermWindow {
         let list_metrics = RenderMetrics::with_font_metrics(&list_font.metrics());
         let search_metrics = RenderMetrics::with_font_metrics(&search_font.metrics());
 
-        let mut palette =
-            command_palette_colors(crate::native_settings::effective_appearance());
+        let mut palette = command_palette_colors(self.chrome());
+        // Last word to the user: the card tuning above overwrites slots the
+        // chrome already resolved, `ui_colors` among them.
+        crate::native_settings::apply_ui_colors(&mut palette, self.config.ui_colors.as_ref());
         // The legacy config colors default to a dark-only pairing that would
         // wreck light mode; honour them only when the user changed them.
         let fg = self.config.command_palette_fg_color.to_linear();
@@ -2273,6 +2535,109 @@ impl crate::TermWindow {
 
 #[cfg(test)]
 mod tests {
+
+    fn named(name: &str) -> Option<Option<String>> {
+        Some(Some(name.to_string()))
+    }
+
+    /// Holding an arrow key walks the list; every step that lands on the same
+    /// scheme it is already showing has to cost nothing, or a thousand-entry
+    /// list would re-theme every pane per keypress.
+    /// A click can land on a row the keyboard selection never reached, so the
+    /// command being run is not always the one on screen. Getting this wrong
+    /// closed the palette with the *previewed* scheme on the panes and the
+    /// *clicked* one saved -- and applying the clicked one was a no-op,
+    /// because it was already the configured scheme.
+    #[test]
+    fn only_the_scheme_being_shown_may_skip_the_restore() {
+        let shown = Some(Some("Nord (base16)".to_string()));
+        assert!(execution_replaces_preview(
+            &KeyAssignment::SetColorScheme(Some("Nord (base16)".to_string())),
+            &shown
+        ));
+        assert!(
+            !execution_replaces_preview(
+                &KeyAssignment::SetColorScheme(Some("3024 Day".to_string())),
+                &shown
+            ),
+            "a different scheme has to put the panes back first"
+        );
+        assert!(
+            !execution_replaces_preview(&KeyAssignment::SetColorScheme(None), &shown),
+            "\"use the configured default\" is a different scheme too"
+        );
+        assert!(
+            !execution_replaces_preview(&KeyAssignment::ActivateCommandPalette, &shown),
+            "a command with nothing to do with colours has to restore"
+        );
+        assert!(
+            !execution_replaces_preview(
+                &KeyAssignment::SetColorScheme(Some("Nord (base16)".to_string())),
+                &None
+            ),
+            "nothing is being shown, so there is nothing to skip"
+        );
+    }
+
+    #[test]
+    fn a_selection_that_did_not_move_off_its_scheme_does_nothing() {
+        assert_eq!(
+            preview_transition(&named("Gruvbox"), &named("Gruvbox")),
+            PreviewStep::Nothing
+        );
+        assert_eq!(
+            preview_transition(&Some(None), &Some(None)),
+            PreviewStep::Nothing
+        );
+    }
+
+    /// Every other group in the palette, every keypress. Must not touch the
+    /// panes.
+    #[test]
+    fn a_selection_that_is_not_a_scheme_and_never_was_does_nothing() {
+        assert_eq!(preview_transition(&None, &None), PreviewStep::Nothing);
+    }
+
+    #[test]
+    fn moving_between_schemes_shows_the_new_one() {
+        assert_eq!(
+            preview_transition(&named("Nord"), &named("Gruvbox")),
+            PreviewStep::Show
+        );
+    }
+
+    #[test]
+    fn arriving_on_the_scheme_list_shows_the_first_one() {
+        assert_eq!(preview_transition(&named("Nord"), &None), PreviewStep::Show);
+    }
+
+    /// "Use the configured default" is a row like any other and previews like
+    /// one -- it is not the same as leaving the list.
+    #[test]
+    fn the_configured_default_row_is_a_preview_of_its_own() {
+        assert_eq!(
+            preview_transition(&Some(None), &named("Nord")),
+            PreviewStep::Show
+        );
+        assert_eq!(
+            preview_transition(&named("Nord"), &Some(None)),
+            PreviewStep::Show
+        );
+    }
+
+    /// Backing out of the scheme group, or typing a query that selects
+    /// something else: the terminal goes back to the configured colours.
+    #[test]
+    fn leaving_the_scheme_list_puts_the_configuration_back() {
+        assert_eq!(
+            preview_transition(&None, &named("Gruvbox")),
+            PreviewStep::Restore
+        );
+        assert_eq!(
+            preview_transition(&None, &Some(None)),
+            PreviewStep::Restore
+        );
+    }
     use super::*;
 
     fn leaf(brief: &str) -> PaletteItem {

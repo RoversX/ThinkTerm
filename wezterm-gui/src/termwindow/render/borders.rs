@@ -1,5 +1,4 @@
 use crate::quad::TripleLayerQuadAllocator;
-use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
 use ::window::ULength;
 use config::{ConfigHandle, DimensionContext};
@@ -19,7 +18,7 @@ impl crate::TermWindow {
             let height = self.dimensions.pixel_height as f32;
             let width = self.dimensions.pixel_width as f32;
             let chrome_border_color = self.config.use_fancy_tab_bar.then(|| {
-                UiPalette::for_appearance(crate::native_settings::effective_appearance()).sidebar_bg
+                self.chrome().sidebar_bg
             });
 
             let border_top = border_dimensions.top.get() as f32;

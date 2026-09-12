@@ -32,6 +32,7 @@ const WINDOW_TAB_ICON_GAP: usize = 8;
 const WINDOW_TAB_MIN_TEXT_COLS: usize = 3;
 const UI_SHAPE_CACHE_FONT_IDENTITY_BIT: u64 = 1u64 << 63;
 
+
 impl crate::TermWindow {
     pub fn invalidate_fancy_tab_bar(&mut self) {
         self.fancy_tab_bar.take();
@@ -41,7 +42,7 @@ impl crate::TermWindow {
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<Vec<UIItem>> {
-        let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+        let chrome = self.chrome();
         let row_height = self.tab_bar_pixel_height()?.ceil() as usize;
         if row_height == 0 {
             return Ok(vec![]);
@@ -53,7 +54,7 @@ impl crate::TermWindow {
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
         let tab_width = self.window_tab_width_pixels().ceil() as usize;
 
-        let background = chrome.sidebar_bg;
+        let background = chrome.header_bg;
         let foreground = chrome.text;
         let muted_fg = chrome.secondary_text;
 
@@ -427,7 +428,7 @@ impl crate::TermWindow {
         }];
 
         if self.fancy_tab_bar_shows_window_buttons() {
-            let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+            let chrome = self.chrome();
             let content_top_spacer = self.ui_px(WINDOW_TAB_TOP_SPACER).min(row_height);
             let content_row_y = row_y + content_top_spacer;
             let content_row_height = row_height.saturating_sub(content_top_spacer);
@@ -754,7 +755,7 @@ impl crate::TermWindow {
         let hover_width = visible_width.max(0.0) as usize;
         let is_hovered = self.is_pointer_over_ui_rect(hover_x, row_y, hover_width, row_height);
         let tab_surface_color = if active {
-            chrome.control_bg
+            chrome.active_tab_surface()
         } else if is_hovered && !is_renaming {
             chrome.control_hover_bg
         } else {
@@ -988,7 +989,7 @@ impl crate::TermWindow {
             row_height,
         );
         let surface = if active {
-            chrome.control_bg
+            chrome.active_tab_surface()
         } else if is_hovered {
             chrome.control_hover_bg
         } else {
@@ -1129,7 +1130,7 @@ impl crate::TermWindow {
         let press_inset = if pressed { 1 } else { 0 };
         let visual_size = button_size.saturating_sub(press_inset * 2);
         if hovered {
-            let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+            let chrome = self.chrome();
             let fill = if pressed {
                 chrome.control_pressed_bg
             } else {
@@ -1200,7 +1201,7 @@ impl crate::TermWindow {
         let press_inset = if pressed { 1 } else { 0 };
         let visual_size = button_size.saturating_sub(press_inset * 2);
         if hovered {
-            let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+            let chrome = self.chrome();
             let fill = if pressed {
                 chrome.control_pressed_bg
             } else {

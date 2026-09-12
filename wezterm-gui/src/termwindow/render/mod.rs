@@ -787,13 +787,46 @@ impl crate::TermWindow {
         self.dedicated_image_cell.set(Some((layer_num, cell_idx)));
     }
 
+    /// Beyond this the memo is cleared rather than grown. A frame draws from
+    /// a palette, so the distinct (foreground, background, ratio) triples in
+    /// flight are the ANSI colours against one or two backgrounds -- tens, not
+    /// one per cell. A number well above that only ever means something
+    /// unusual is on screen, and starting over costs a few misses.
+    const MIN_CONTRAST_MEMO_MAX: usize = 512;
+
     fn ensure_min_contrast(&self, fg_color: LinearRgba, bg_color: LinearRgba) -> LinearRgba {
-        match self.config.text_min_contrast_ratio {
-            Some(ratio) => fg_color
-                .ensure_contrast_ratio(&bg_color, ratio)
-                .unwrap_or(fg_color),
-            None => fg_color,
+        let Some(ratio) = self.text_min_contrast else {
+            return fg_color;
+        };
+
+        // Memoised because this is per cell, and finding a readable colour
+        // costs a short binary search through OkLab. `ensure_contrast_ratio`
+        // is a pure function of these three, so an entry cannot go stale and
+        // the map never needs invalidating -- only bounding.
+        let key = [
+            fg_color.0.to_bits(),
+            fg_color.1.to_bits(),
+            fg_color.2.to_bits(),
+            fg_color.3.to_bits(),
+            bg_color.0.to_bits(),
+            bg_color.1.to_bits(),
+            bg_color.2.to_bits(),
+            bg_color.3.to_bits(),
+            ratio.to_bits(),
+        ];
+        if let Some(hit) = self.min_contrast_memo.borrow().get(&key) {
+            return *hit;
         }
+
+        let adjusted = fg_color
+            .ensure_contrast_ratio(&bg_color, ratio)
+            .unwrap_or(fg_color);
+        let mut memo = self.min_contrast_memo.borrow_mut();
+        if memo.len() >= Self::MIN_CONTRAST_MEMO_MAX {
+            memo.clear();
+        }
+        memo.insert(key, adjusted);
+        adjusted
     }
 
     pub fn compute_cell_fg_bg(&self, params: ComputeCellFgBgParams) -> ComputeCellFgBgResult {

@@ -1,10 +1,11 @@
+use config::ConfigHandle;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
-use window::{Appearance, Connection, ConnectionOps};
+use window::{Appearance, Connection, ConnectionOps, WindowOps};
 
 // One point is one logical pixel on macOS but 4/3 px at 96dpi, so the
 // non-mac size is 0.75x for the same visual size (14px UI text).
@@ -46,6 +47,10 @@ pub(crate) enum NativeThemeMode {
     System,
     Light,
     Dark,
+    /// Take the interface's colours from the terminal's own colour scheme.
+    /// Light or dark is then the scheme's business, not a separate choice.
+    #[serde(rename = "follow_terminal")]
+    FollowTerminal,
 }
 
 impl Default for NativeThemeMode {
@@ -59,9 +64,19 @@ impl Default for NativeThemeMode {
 }
 
 impl NativeThemeMode {
+    /// Light or dark, for everything that needs one of the two.
+    ///
+    /// `FollowTerminal` answers `system` here, and under that mode `system`
+    /// is not the desktop: [`apply_preferred_appearance`] pushes the scheme's
+    /// own side onto the connection, so `system_appearance` -- and therefore
+    /// this -- reports the side the scheme is on. That is the point. Reading
+    /// the scheme a second time here would be the same answer arrived at
+    /// twice, and would be wrong in the window between a scheme changing and
+    /// that push landing. The interface's own colours go through
+    /// [`chrome_palette`], which reads the scheme directly.
     pub(crate) fn effective_appearance(self, system: Appearance) -> Appearance {
         match self {
-            Self::System => system,
+            Self::System | Self::FollowTerminal => system,
             Self::Light => Appearance::Light,
             Self::Dark => Appearance::Dark,
         }
@@ -69,11 +84,43 @@ impl NativeThemeMode {
 
     pub(crate) fn preferred_app_appearance(self) -> Option<Appearance> {
         match self {
-            Self::System => None,
+            Self::System | Self::FollowTerminal => None,
             Self::Light => Some(Appearance::Light),
             Self::Dark => Some(Appearance::Dark),
         }
     }
+
+    /// Every mode, in the order the settings window offers them.
+    pub(crate) const ALL: [Self; 4] = [
+        Self::System,
+        Self::Light,
+        Self::Dark,
+        Self::FollowTerminal,
+    ];
+}
+
+/// Read a theme mode, falling back to the default rather than failing.
+///
+/// A value this build does not know -- a newer one wrote it -- would
+/// otherwise fail the whole file, and `load_from_disk` answers a parse failure
+/// with `Default::default()`. The next save then writes those defaults back
+/// over the user's language, fonts and everything else. One unreadable field
+/// must not cost the file.
+fn theme_mode_or_default<'de, D>(deserializer: D) -> Result<NativeThemeMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(match raw.as_str() {
+        "system" => NativeThemeMode::System,
+        "light" => NativeThemeMode::Light,
+        "dark" => NativeThemeMode::Dark,
+        "follow_terminal" => NativeThemeMode::FollowTerminal,
+        other => {
+            log::warn!("unknown theme_mode {other:?} in the settings; using the default");
+            NativeThemeMode::default()
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -190,6 +237,72 @@ impl NativeScrollMode {
     pub(crate) const ALL: [Self; 2] = [Self::Smooth, Self::Stepped];
 }
 
+/// The floor the terminal holds text to against whatever it is drawn on.
+///
+/// A program that paints its own background is self-consistent and is never
+/// touched by this: the check is per cell, against that cell's real
+/// background. What it catches is the half-and-half case -- an application
+/// that leaves the background to the terminal but picks its foregrounds for
+/// a dark one. btop on a light colour scheme is the example: it hands the
+/// background back and then writes in near-white.
+///
+/// The ratios are WCAG 2.0: 3:1 is the floor for large text, 4.5:1 for body
+/// text (AA), 7:1 is AAA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeTextContrast {
+    /// Leave every colour as the application asked for it -- and leave the
+    /// Lua `text_min_contrast_ratio` in charge, the way `font_size: None`
+    /// leaves the configured font size in charge.
+    Off,
+    Ratio3,
+    Ratio45,
+    Ratio7,
+}
+
+impl Default for NativeTextContrast {
+    fn default() -> Self {
+        // Raising contrast also flattens what an application dimmed on
+        // purpose -- disabled entries, the unfilled half of a meter, comment
+        // colouring. That is a trade the user has to choose, not inherit.
+        Self::Off
+    }
+}
+
+impl NativeTextContrast {
+    /// Every choice, in the order the settings window offers them.
+    pub(crate) const ALL: [Self; 4] = [Self::Off, Self::Ratio3, Self::Ratio45, Self::Ratio7];
+
+    pub(crate) fn ratio(self) -> Option<f32> {
+        match self {
+            Self::Off => None,
+            Self::Ratio3 => Some(3.0),
+            Self::Ratio45 => Some(4.5),
+            Self::Ratio7 => Some(7.0),
+        }
+    }
+}
+
+/// A value this build does not know about must not cost the user the rest of
+/// their settings, so an unreadable choice reads as the default rather than
+/// failing the whole file. Same reasoning as `theme_mode_or_default`.
+fn text_contrast_or_default<'de, D>(deserializer: D) -> Result<NativeTextContrast, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(match raw.as_str() {
+        "off" => NativeTextContrast::Off,
+        "ratio3" => NativeTextContrast::Ratio3,
+        "ratio45" => NativeTextContrast::Ratio45,
+        "ratio7" => NativeTextContrast::Ratio7,
+        other => {
+            log::warn!("unknown text_contrast {other:?} in the settings; using the default");
+            NativeTextContrast::default()
+        }
+    })
+}
+
 impl Default for NativeBottomQuoteMode {
     fn default() -> Self {
         Self::Timed
@@ -204,6 +317,7 @@ impl NativeBottomQuoteMode {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct NativeAppearanceSettings {
+    #[serde(deserialize_with = "theme_mode_or_default")]
     pub(crate) theme_mode: NativeThemeMode,
     pub(crate) app_icon: NativeAppIcon,
     /// Color scheme picked in the command palette; overrides the config's
@@ -227,6 +341,10 @@ pub(crate) struct NativeTerminalSettings {
     pub(crate) font_family: Option<String>,
     pub(crate) remote_pane_resize_mode: NativeRemotePaneResizeMode,
     pub(crate) scroll_mode: NativeScrollMode,
+    /// See [`NativeTextContrast`]. `Off` defers to the Lua
+    /// `text_min_contrast_ratio`, which is itself off unless set.
+    #[serde(deserialize_with = "text_contrast_or_default")]
+    pub(crate) text_contrast: NativeTextContrast,
     pub(crate) bottom_quote_enabled: bool,
     pub(crate) bottom_quote_mode: NativeBottomQuoteMode,
     pub(crate) bottom_quote_interval_minutes: Option<u32>,
@@ -244,6 +362,7 @@ impl Default for NativeTerminalSettings {
             font_family: None,
             remote_pane_resize_mode: NativeRemotePaneResizeMode::default(),
             scroll_mode: NativeScrollMode::default(),
+            text_contrast: NativeTextContrast::default(),
             bottom_quote_enabled: false,
             bottom_quote_mode: NativeBottomQuoteMode::default(),
             bottom_quote_interval_minutes: None,
@@ -261,6 +380,20 @@ pub(crate) fn remote_pane_resize_mode() -> NativeRemotePaneResizeMode {
 /// `load`, which deep-clones the whole settings tree.
 pub(crate) fn scroll_mode() -> NativeScrollMode {
     load_shared().terminal.scroll_mode
+}
+
+/// The contrast floor in force, or `None` to leave colours alone. The
+/// settings window wins when it names a ratio; `Off` hands the question back
+/// to the configuration file.
+///
+/// Resolved once per window rather than per cell -- see
+/// `TermWindow::text_min_contrast`.
+pub(crate) fn text_min_contrast_ratio(config: &ConfigHandle) -> Option<f32> {
+    load_shared()
+        .terminal
+        .text_contrast
+        .ratio()
+        .or(config.text_min_contrast_ratio)
 }
 
 /// Read once per painted pane, through the shared handle.
@@ -808,11 +941,271 @@ pub(crate) fn effective_appearance() -> Appearance {
         .effective_appearance(system_appearance())
 }
 
+/// The interface's colours for `appearance`, with the user's `ui_colors`
+/// overrides applied on top.
+///
+/// The overrides live here rather than in `ui::tokens` so that module stays
+/// free of the configuration crate, and they are applied last so a colour the
+/// user named wins over everything derived.
+/// `mode` is handed in rather than read back out of the saved settings: the
+/// settings window previews a theme mode from its own copy before saving it,
+/// and reading the saved one there would derive the preview from the mode
+/// being left rather than the one being chosen.
+pub(crate) fn chrome_palette(
+    mode: NativeThemeMode,
+    appearance: Appearance,
+    config: &config::ConfigHandle,
+    preview_ground: Option<window::color::LinearRgba>,
+) -> crate::ui::UiPalette {
+    let mut palette = match mode {
+        NativeThemeMode::FollowTerminal => {
+            // `preview_ground` is the scheme the command palette is showing
+            // but the user has not chosen. Without it the interface would keep
+            // the configured scheme's colours while the terminal in front of
+            // it changed -- a preview that does not preview the thing this
+            // mode exists for.
+            let ground = preview_ground.unwrap_or_else(|| terminal_ground(config));
+            crate::ui::UiPalette::for_scheme(ground)
+        }
+        _ => crate::ui::UiPalette::for_appearance(appearance),
+    };
+    // The strip the tabs sit on is the terminal's header, not another piece of
+    // sidebar: a seam where one ends and the other begins is the thing people
+    // notice first. It takes the ground the terminal is actually painted with,
+    // which in a dark interface is already the chrome's own colour (see
+    // `dark_chrome_background` in `render/pane.rs`) and otherwise is the
+    // scheme's background.
+    palette.header_bg = match appearance {
+        Appearance::Dark | Appearance::DarkHighContrast => palette.sidebar_bg,
+        Appearance::Light | Appearance::LightHighContrast => {
+            let ground = preview_ground.unwrap_or_else(|| terminal_ground(config));
+            // Only when the scheme is on the same side as the interface. A
+            // light interface with an explicitly chosen dark scheme would
+            // otherwise get a dark strip carrying the light palette's dark
+            // text -- Nord's background against it is about 1.4:1. A seam is
+            // unavoidable when the two sides disagree; an unreadable tab bar
+            // is not.
+            if crate::ui::UiPalette::appearance_of(ground) == Appearance::Light {
+                ground
+            } else {
+                palette.sidebar_bg
+            }
+        }
+    };
+    // Applied last so a colour the user named wins over everything derived,
+    // `header_bg` included.
+    apply_ui_colors(&mut palette, config.ui_colors.as_ref());
+    palette
+}
+
+/// The colour scheme in force: the one the user picked, or -- when they have
+/// picked none -- the one that goes with the side the interface is on.
+///
+/// The two are one decision to the person making it. Choosing a light
+/// interface and being handed a terminal whose text was chosen for a black
+/// background is not a combination anyone asks for; it is what you get when
+/// the two settings are free to disagree and neither has a default that knows
+/// about the other.
+///
+/// An explicit choice always wins -- from the palette, from the settings
+/// window, or from `color_scheme` in the configuration file. Only the default
+/// has a side. `FollowTerminal` is left out on purpose: there the scheme is
+/// what decides the interface's side, so taking the default from that side
+/// would be circular.
+pub(crate) fn effective_color_scheme(
+    settings: &ThinkTermNativeSettings,
+    config: &ConfigHandle,
+) -> Option<String> {
+    resolve_color_scheme(
+        settings.appearance.color_scheme.as_deref(),
+        settings.appearance.theme_mode,
+        settings
+            .appearance
+            .theme_mode
+            .effective_appearance(system_appearance()),
+        config.color_scheme.as_deref(),
+        config.colors.is_some(),
+    )
+}
+
+/// The decision itself, off the settings and the configuration so its rules
+/// are testable without either.
+fn resolve_color_scheme(
+    picked: Option<&str>,
+    mode: NativeThemeMode,
+    appearance: Appearance,
+    config_scheme: Option<&str>,
+    config_has_inline_colors: bool,
+) -> Option<String> {
+    if let Some(picked) = picked {
+        return Some(picked.to_string());
+    }
+    if mode == NativeThemeMode::FollowTerminal {
+        return None;
+    }
+    // On macOS `color_scheme` is filled in with the dark default when the file
+    // names none, so "is it set" cannot tell a choice from that fill.
+    let chosen_in_the_file = match config_scheme {
+        Some(name) => name != config::MACOS_DEFAULT_COLOR_SCHEME,
+        None => config_has_inline_colors,
+    };
+    if chosen_in_the_file {
+        return None;
+    }
+    match appearance {
+        Appearance::Light | Appearance::LightHighContrast => {
+            Some(config::MACOS_LIGHT_COLOR_SCHEME.to_string())
+        }
+        // The configuration's own default is already the dark one; leaving it
+        // alone keeps the file in charge of everything it can be.
+        Appearance::Dark | Appearance::DarkHighContrast => None,
+    }
+}
+
+/// The terminal's own background: what the interface is being asked to sit
+/// next to. Falls back to the appearance's ground when the scheme names no
+/// background, which is what `resolved_palette` leaves for a configuration
+/// that sets neither `colors` nor `color_scheme`.
+/// A scheme's background as the terminal will actually paint it.
+///
+/// `colors` in the configuration overlays a scheme -- the precedence
+/// `resolved_palette` is built with -- so reading the scheme raw gets the
+/// wrong answer for anyone who sets both. A dark scheme with an inline white
+/// background was classified as dark, which under "follow terminal colours"
+/// put a dark interface behind black terminal text.
+pub(crate) fn scheme_background(
+    config: &config::ConfigHandle,
+    scheme: &config::Palette,
+) -> Option<window::color::LinearRgba> {
+    config
+        .colors
+        .as_ref()
+        .and_then(|colors| colors.background)
+        .or(scheme.background)
+        .map(|color| color.to_linear())
+}
+
+fn terminal_ground(config: &config::ConfigHandle) -> window::color::LinearRgba {
+    // A scheme picked in the command palette is kept here, not in the
+    // configuration: it reaches a terminal window through that window's own
+    // overrides. The settings window has no overrides, so reading only
+    // `config` would derive its colours from the scheme in the file while the
+    // terminal in front of it showed the one that was picked.
+    if let Some(name) = effective_color_scheme(&load(), config) {
+        let picked = config
+            .color_schemes
+            .get(&name)
+            .or_else(|| config::COLOR_SCHEMES.get(&name));
+        if let Some(background) = picked.and_then(|palette| scheme_background(config, palette)) {
+            return background;
+        }
+    }
+    match config.resolved_palette.background {
+        Some(background) => background.to_linear(),
+        None => crate::ui::UiPalette::for_appearance(system_appearance()).window_bg,
+    }
+}
+
+/// Paint the user's chosen colours over `palette`, leaving every slot they did
+/// not name alone.
+pub(crate) fn apply_ui_colors(
+    palette: &mut crate::ui::UiPalette,
+    overrides: Option<&config::UiColors>,
+) {
+    let Some(colors) = overrides else {
+        return;
+    };
+    macro_rules! apply_color {
+        ($name:ident) => {
+            if let Some(color) = colors.$name {
+                palette.$name = color.to_linear();
+            }
+        };
+    }
+    apply_color!(window_bg);
+    apply_color!(sidebar_bg);
+    apply_color!(workspace_sidebar_bg);
+    apply_color!(header_bg);
+    apply_color!(separator);
+    apply_color!(control_bg);
+    apply_color!(control_hover_bg);
+    apply_color!(control_pressed_bg);
+    apply_color!(control_border);
+    apply_color!(sidebar_button_bg);
+    apply_color!(sidebar_button_hover_bg);
+    apply_color!(sidebar_row_hover_bg);
+    apply_color!(sidebar_row_pressed_bg);
+    apply_color!(sidebar_row_active_bg);
+    apply_color!(sidebar_row_active_border);
+    apply_color!(selected_bg);
+    apply_color!(accent);
+    apply_color!(accent_hover);
+    apply_color!(on_accent);
+    apply_color!(danger);
+    apply_color!(track_off);
+    apply_color!(card_bg);
+    apply_color!(text);
+    apply_color!(secondary_text);
+    apply_color!(muted_text);
+    apply_color!(selected_text);
+    apply_color!(scrollbar_thumb);
+    apply_color!(spelling_error);
+}
+
+/// Tell the platform which appearance to present its own chrome in.
+///
+/// Under "follow terminal colours" that is the side the *scheme* is on, not
+/// the desktop's. The native chrome takes its tint from this: the title bar,
+/// and on macOS the sidebar button, which is an `NSButton` drawing a template
+/// SF Symbol. Left following the system it renders a white symbol onto the
+/// white interface a light scheme produces, and the button disappears.
+///
+/// Called when the theme mode changes and again when the scheme does, since a
+/// scheme change can move which side the interface is on.
+pub(crate) fn apply_preferred_appearance(mode: NativeThemeMode) {
+    let Some(conn) = Connection::get() else {
+        return;
+    };
+    let preferred = match mode {
+        NativeThemeMode::FollowTerminal => Some(crate::ui::UiPalette::appearance_of(
+            terminal_ground(&config::configuration()),
+        )),
+        mode => mode.preferred_app_appearance(),
+    };
+    conn.set_preferred_appearance(preferred);
+}
+
 pub(crate) fn apply_to_app(settings: &ThinkTermNativeSettings) {
     crate::i18n::activate_from_settings(settings);
-    if let Some(conn) = Connection::get() {
-        conn.set_preferred_appearance(settings.appearance.theme_mode.preferred_app_appearance());
+    apply_preferred_appearance(settings.appearance.theme_mode);
+    // Tell the windows directly rather than waiting for the appearance event
+    // the line above will eventually produce. That event is the normal route
+    // and it also reloads the configuration, but macOS drops it when the
+    // window is already dispatching something else (see
+    // `view_did_change_effective_appearance`), and a window that missed it
+    // would go on painting the old chrome. Refreshing twice costs a struct
+    // copy; refreshing never is a visibly stale sidebar.
+    // Moving between Light and Dark moves the *default* colour scheme with it
+    // (see `effective_color_scheme`), so the terminal has to be re-pointed at
+    // it, not just repainted. Applying a scheme the window already has is a
+    // no-op, so the common case -- a mode change that does not move the
+    // default -- costs nothing.
+    let scheme = effective_color_scheme(settings, &config::configuration());
+    if let Some(front_end) = crate::frontend::try_front_end() {
+        for gui_window in front_end.gui_windows() {
+            let scheme = scheme.clone();
+            gui_window
+                .window
+                .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                    move |term_window| {
+                        term_window.apply_color_scheme_override(scheme);
+                        term_window.refresh_chrome();
+                    },
+                )));
+        }
     }
+    // The settings window is standalone and in no broadcast list of its own.
+    crate::settings_window::refresh_open_settings_window_chrome();
 
     #[cfg(target_os = "macos")]
     if let Some(path) = app_icon_path(settings.appearance.app_icon) {
@@ -1113,6 +1506,281 @@ pub(crate) fn main_window_renderer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use config::UiColors;
+    use std::convert::TryFrom;
+    use window::Appearance;
+
+    fn color(hex: &str) -> config::RgbaColor {
+        config::RgbaColor::try_from(hex.to_string()).unwrap()
+    }
+
+    /// A file written before this setting existed has to keep working, and
+    /// keep meaning "leave the application's colours alone".
+    #[test]
+    fn a_settings_file_without_a_contrast_choice_reads_as_off() {
+        let json = r#"{
+            "version": 1,
+            "terminal": { "scroll_mode": "smooth" }
+        }"#;
+        let settings: ThinkTermNativeSettings =
+            serde_json::from_str(json).expect("the file has to survive");
+        assert_eq!(settings.terminal.text_contrast, NativeTextContrast::Off);
+        assert_eq!(settings.terminal.text_contrast.ratio(), None);
+        assert!(settings.terminal.scroll_mode == NativeScrollMode::Smooth);
+    }
+
+    #[test]
+    fn a_contrast_choice_round_trips_through_the_file() {
+        for (written, expected, ratio) in [
+            ("off", NativeTextContrast::Off, None),
+            ("ratio3", NativeTextContrast::Ratio3, Some(3.0)),
+            ("ratio45", NativeTextContrast::Ratio45, Some(4.5)),
+            ("ratio7", NativeTextContrast::Ratio7, Some(7.0)),
+        ] {
+            let json = format!(r#"{{"terminal": {{"text_contrast": "{written}"}}}}"#);
+            let settings: ThinkTermNativeSettings =
+                serde_json::from_str(&json).expect("the file has to survive");
+            assert_eq!(settings.terminal.text_contrast, expected, "{written}");
+            assert_eq!(settings.terminal.text_contrast.ratio(), ratio, "{written}");
+
+            let out = serde_json::to_string(&settings).expect("serialises");
+            assert!(
+                out.contains(&format!("\"text_contrast\":\"{written}\"")),
+                "{written} has to survive a save: {out}"
+            );
+        }
+    }
+
+    /// Same reasoning as the theme mode below: a ratio a newer build offers
+    /// must not cost this one the rest of the file.
+    #[test]
+    fn an_unknown_contrast_choice_falls_back_without_failing_the_file() {
+        let json = r#"{
+            "version": 1,
+            "terminal": { "text_contrast": "ratio21", "scroll_mode": "stepped" },
+            "localization": { "language": "fr-FR" }
+        }"#;
+        let settings: ThinkTermNativeSettings =
+            serde_json::from_str(json).expect("the file has to survive");
+        assert_eq!(settings.terminal.text_contrast, NativeTextContrast::Off);
+        assert_eq!(settings.terminal.scroll_mode, NativeScrollMode::Stepped);
+        assert_eq!(settings.localization.language.as_deref(), Some("fr-FR"));
+    }
+
+    /// A settings file written by a newer build names a theme this one has
+    /// never heard of. Failing the parse would be answered by
+    /// `load_from_disk` with `Default::default()`, and the next save would
+    /// write those defaults back over the language, the fonts and everything
+    /// else. One unreadable field must not cost the file.
+    #[test]
+    fn an_unknown_theme_mode_does_not_take_the_rest_of_the_settings_with_it() {
+        let json = r#"{
+            "version": 1,
+            "appearance": { "theme_mode": "some_future_theme" },
+            "localization": { "language": "ja-JP" },
+            "onboarding": { "seen_version": 7 }
+        }"#;
+        let settings: ThinkTermNativeSettings =
+            serde_json::from_str(json).expect("the file has to survive");
+        assert_eq!(
+            settings.appearance.theme_mode,
+            NativeThemeMode::default(),
+            "the unreadable field falls back"
+        );
+        assert_eq!(
+            settings.localization.language.as_deref(),
+            Some("ja-JP"),
+            "everything else is kept"
+        );
+        assert_eq!(settings.onboarding.seen_version, 7);
+    }
+
+    /// The four this build does know still round-trip.
+    #[test]
+    fn every_theme_mode_round_trips_through_the_settings_file() {
+        for mode in NativeThemeMode::ALL {
+            let mut settings = ThinkTermNativeSettings::default();
+            settings.appearance.theme_mode = mode;
+            let json = serde_json::to_string(&settings).unwrap();
+            let back: ThinkTermNativeSettings = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.appearance.theme_mode, mode, "{mode:?}");
+        }
+    }
+
+    /// A file that names two colours has to change two colours. The interface
+    /// has twenty-eight slots and nobody is going to write them all out.
+    #[test]
+    fn ui_colors_change_only_the_slots_they_name() {
+        let untouched = crate::ui::UiPalette::for_appearance(Appearance::Dark);
+        let mut palette = untouched;
+
+        let colors = UiColors {
+            sidebar_bg: Some(color("#282828")),
+            accent: Some(color("#d79921")),
+            ..UiColors::default()
+        };
+        apply_ui_colors(&mut palette, Some(&colors));
+
+        assert_eq!(palette.sidebar_bg, color("#282828").to_linear());
+        assert_eq!(palette.accent, color("#d79921").to_linear());
+        assert_eq!(palette.window_bg, untouched.window_bg);
+        assert_eq!(palette.text, untouched.text);
+        assert_eq!(palette.card_bg, untouched.card_bg);
+    }
+
+    fn resolved(
+        picked: Option<&str>,
+        mode: NativeThemeMode,
+        appearance: Appearance,
+        config_scheme: Option<&str>,
+    ) -> Option<String> {
+        resolve_color_scheme(picked, mode, appearance, config_scheme, false)
+    }
+
+    /// The interface's side and the terminal's colours are one decision.
+    /// Nothing picked plus a light interface has to mean a light terminal, or
+    /// the text is chosen for a background it is not on.
+    #[test]
+    fn a_light_interface_with_nothing_picked_gets_the_light_scheme() {
+        assert_eq!(
+            resolved(
+                None,
+                NativeThemeMode::Light,
+                Appearance::Light,
+                Some(config::MACOS_DEFAULT_COLOR_SCHEME)
+            ),
+            Some(config::MACOS_LIGHT_COLOR_SCHEME.to_string())
+        );
+    }
+
+    /// Dark hands the question back to the configuration, whose own default is
+    /// already the dark one. Nothing to override.
+    #[test]
+    fn a_dark_interface_leaves_the_configuration_in_charge() {
+        assert_eq!(
+            resolved(
+                None,
+                NativeThemeMode::Dark,
+                Appearance::Dark,
+                Some(config::MACOS_DEFAULT_COLOR_SCHEME)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_picked_scheme_beats_the_side_the_interface_is_on() {
+        assert_eq!(
+            resolved(
+                Some("Gruvbox Dark (Gogh)"),
+                NativeThemeMode::Light,
+                Appearance::Light,
+                None
+            ),
+            Some("Gruvbox Dark (Gogh)".to_string())
+        );
+    }
+
+    /// A scheme written in the configuration file is a choice too, and the
+    /// macOS fill-in is not -- by the time this runs the two look the same, so
+    /// the fill-in has to be recognised by name.
+    #[test]
+    fn a_scheme_named_in_the_configuration_is_left_alone() {
+        assert_eq!(
+            resolved(
+                None,
+                NativeThemeMode::Light,
+                Appearance::Light,
+                Some("Nord (base16)")
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_color_scheme(None, NativeThemeMode::Light, Appearance::Light, None, true),
+            None,
+            "inline `colors` is a choice as much as a named scheme"
+        );
+    }
+
+    /// Under "follow terminal colours" the scheme is what decides the
+    /// interface's side, so taking the default from that side is circular.
+    #[test]
+    fn follow_terminal_does_not_pick_a_scheme_for_itself() {
+        assert_eq!(
+            resolved(
+                None,
+                NativeThemeMode::FollowTerminal,
+                Appearance::Light,
+                Some(config::MACOS_DEFAULT_COLOR_SCHEME)
+            ),
+            None
+        );
+    }
+
+    /// The light half has to be a scheme that resolves, or the override names
+    /// nothing and the terminal silently keeps the dark one.
+    #[test]
+    fn the_light_half_is_a_scheme_we_ship_and_is_light() {
+        let palette = config::COLOR_SCHEMES
+            .get(config::MACOS_LIGHT_COLOR_SCHEME)
+            .expect("the light default has to be a scheme we ship");
+        let ground = palette
+            .background
+            .expect("it needs a background")
+            .to_linear();
+        assert_eq!(
+            crate::ui::UiPalette::appearance_of(ground),
+            Appearance::Light,
+            "the light half has to be on the light side"
+        );
+    }
+
+    /// The slot list is written out by hand in `UiColors`, again in
+    /// `apply_ui_colors` and again in the documentation, and nothing makes
+    /// the three agree. This catches the half that matters: a field the user
+    /// can name in their configuration that the code then never reads, which
+    /// would be a silently ignored setting rather than an error.
+    #[test]
+    fn every_slot_a_user_can_name_is_one_the_code_applies() {
+        use wezterm_dynamic::{FromDynamic, ToDynamic, Value};
+
+        for name in UiColors::possible_field_names() {
+            let mut object = wezterm_dynamic::Object::default();
+            object.insert(name.to_dynamic(), "#ff00ff".to_dynamic());
+            let colors = UiColors::from_dynamic(&Value::Object(object), Default::default())
+                .unwrap_or_else(|err| panic!("{} should deserialise: {:#}", name, err));
+
+            let untouched = crate::ui::UiPalette::for_appearance(Appearance::Dark);
+            let mut palette = untouched;
+            apply_ui_colors(&mut palette, Some(&colors));
+            assert_ne!(
+                palette, untouched,
+                "ui_colors.{} is a name the user can set and the code never reads",
+                name
+            );
+        }
+    }
+
+    /// No `ui_colors` at all is the common case and must cost nothing.
+    #[test]
+    fn no_ui_colors_leaves_the_palette_alone() {
+        let untouched = crate::ui::UiPalette::for_appearance(Appearance::Light);
+        let mut palette = untouched;
+        apply_ui_colors(&mut palette, None);
+        assert_eq!(palette.window_bg, untouched.window_bg);
+        assert_eq!(palette.accent, untouched.accent);
+    }
+
+    /// An empty table is not the same as no table, and must behave the same.
+    #[test]
+    fn an_empty_ui_colors_table_leaves_the_palette_alone() {
+        let untouched = crate::ui::UiPalette::for_appearance(Appearance::Dark);
+        let mut palette = untouched;
+        apply_ui_colors(&mut palette, Some(&UiColors::default()));
+        assert_eq!(palette.window_bg, untouched.window_bg);
+        assert_eq!(palette.muted_text, untouched.muted_text);
+    }
 
     #[test]
     fn onboarding_is_required_before_current_version() {

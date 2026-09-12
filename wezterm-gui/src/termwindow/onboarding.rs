@@ -860,7 +860,12 @@ impl OnboardingView {
                 )?;
             }
             NativeThemeMode::Light => self.paint_face(ctx, layers, inner, skin, true, fit)?,
-            NativeThemeMode::Dark => self.paint_face(ctx, layers, inner, skin, false, fit)?,
+            // Onboarding offers three tiles and builds the list itself, so
+            // `FollowTerminal` never reaches here; drawn as dark rather than
+            // left to panic if that list ever grows.
+            NativeThemeMode::Dark | NativeThemeMode::FollowTerminal => {
+                self.paint_face(ctx, layers, inner, skin, false, fit)?
+            }
         }
 
         let text_w = ctx.measure_text_width(font, label).min(tile.size.width);

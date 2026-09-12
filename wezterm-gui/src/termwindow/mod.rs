@@ -2380,6 +2380,15 @@ pub struct TermWindow {
     current_highlight: Option<Arc<Hyperlink>>,
 
     quad_generation: usize,
+    /// The chrome's colours, resolved once per configuration rather than once
+    /// per draw. Deriving them is cheap, but the appearance they are derived
+    /// from was not: `native_settings::effective_appearance()` deep-clones the
+    /// whole settings struct and asks the platform for its appearance, and the
+    /// paint path was calling it nineteen times a frame.
+    ///
+    /// Refreshed in `config_was_reloaded`, which is also where a colour scheme
+    /// override and an appearance change both land.
+    chrome_palette: crate::ui::UiPalette,
     shape_generation: usize,
     shape_cache: RefCell<LfuCache<ShapeCacheKey, anyhow::Result<Rc<Vec<ShapedInfo>>>>>,
     /// Per-domain shaping caches for proportional UI text (chrome / Note /
@@ -2414,6 +2423,24 @@ pub struct TermWindow {
     ui_items: Vec<UIItem>,
     context_menu: Option<ui::context_menu::ContextMenuState>,
     command_palette: Option<ui::command_palette::CommandPaletteState>,
+    /// The contrast floor text is held to, or `None` to leave the
+    /// application's colours alone. Resolved from the settings window's
+    /// choice and the configuration file once per reload rather than per
+    /// cell; see `native_settings::text_min_contrast_ratio`.
+    text_min_contrast: Option<f32>,
+    /// Adjusted foregrounds for the contrast floor, keyed on the
+    /// (foreground, background, ratio) that produced them. See
+    /// `ensure_min_contrast`.
+    min_contrast_memo: RefCell<HashMap<[u32; 9], LinearRgba>>,
+    /// The terminal background of a scheme being previewed, so the chrome can
+    /// follow a pick before it is made. `None` outside a preview.
+    scheme_preview_ground: Option<LinearRgba>,
+    /// The colour scheme the command palette is showing but the user has not
+    /// chosen: `Some(None)` the configured default, `Some(Some(name))` a named
+    /// scheme, `None` no preview. Lives here rather than on the palette state
+    /// because every path that closes the palette has already taken that state
+    /// away, and closing is exactly when the preview must be undone.
+    scheme_preview: Option<Option<String>>,
     context_menu_application_actions: HashMap<u64, ContextMenuApplicationAction>,
     next_context_menu_application_action_id: u64,
     context_menu_suppressed_release: Option<MousePress>,
@@ -3591,15 +3618,20 @@ impl TermWindow {
         let native_settings = crate::native_settings::load();
         // A palette-picked color scheme applies from the first frame; seeding
         // config_overrides here is what makes it stick for new windows.
-        let (config, config_overrides) = match native_settings.appearance.color_scheme.clone() {
+        let (config, config_overrides) = match crate::native_settings::effective_color_scheme(
+            &native_settings,
+            &config,
+        ) {
             Some(scheme) => {
                 use wezterm_dynamic::ToDynamic;
                 // Deliberately louder than trace: this silently overrides
                 // `color_scheme` from the config file, and "why doesn't my
                 // config change do anything" needs a breadcrumb.
                 log::info!(
-                    "color scheme overridden to {scheme:?} by the command palette choice; \
-                     pick \"Use configured default\" there to follow the config file again"
+                    "color scheme overridden to {scheme:?} -- either picked in the command \
+                     palette or in Settings, or the light default that goes with a light \
+                     interface; pick \"Use configured default\" in the palette to follow the \
+                     config file again"
                 );
                 let mut obj = wezterm_dynamic::Object::default();
                 obj.insert("color_scheme".to_dynamic(), scheme.to_dynamic());
@@ -3834,6 +3866,12 @@ impl TermWindow {
             last_mouse_click: None,
             current_highlight: None,
             quad_generation: 0,
+            chrome_palette: crate::native_settings::chrome_palette(
+                crate::native_settings::load_shared().appearance.theme_mode,
+                crate::native_settings::effective_appearance(),
+                &config,
+                None,
+            ),
             shape_generation: 0,
             shape_cache: RefCell::new(LfuCache::new_weighted(
                 "shape_cache.hit.rate",
@@ -3902,6 +3940,10 @@ impl TermWindow {
             ui_items: vec![],
             context_menu: None,
             command_palette: None,
+            text_min_contrast: crate::native_settings::text_min_contrast_ratio(&config),
+            min_contrast_memo: RefCell::new(HashMap::new()),
+            scheme_preview: None,
+            scheme_preview_ground: None,
             context_menu_application_actions: HashMap::new(),
             next_context_menu_application_action_id: 1,
             context_menu_suppressed_release: None,
@@ -4355,7 +4397,27 @@ impl TermWindow {
                 // be nasty for folks with a lot of windows.
                 // <https://github.com/wezterm/wezterm/issues/2295>
                 config::reload();
-                self.config_was_reloaded();
+                // The scheme the interface defaults to has a side (see
+                // `native_settings::effective_color_scheme`), and the side just
+                // moved. Under System theme with nothing picked, a window
+                // opened in light appearance has the light scheme sitting in
+                // its `config_overrides`; a reload alone keeps it there, so the
+                // desktop going dark would leave a dark interface in front of a
+                // light scheme's black-on-white text.
+                //
+                // Safe to recompute rather than remember: the only writer of
+                // `color_scheme` in the overrides is this pairing and the
+                // explicit picks it defers to, and `effective_color_scheme`
+                // returns the pick unchanged.
+                let reloaded = self.apply_color_scheme_override(
+                    crate::native_settings::effective_color_scheme(
+                        &crate::native_settings::load(),
+                        &self.config,
+                    ),
+                );
+                if !reloaded {
+                    self.config_was_reloaded();
+                }
                 Ok(true)
             }
             WindowEvent::PerformKeyAssignment(action) => {
@@ -6207,6 +6269,47 @@ impl TermWindow {
 }
 
 impl TermWindow {
+    /// The chrome's colours: the sidebars, the tab bar, the pane nav bars and
+    /// every other surface this window paints around the terminal.
+    ///
+    /// Resolved in `config_was_reloaded` rather than here, so a draw costs a
+    /// copy of a `Copy` struct. Distinct from [`Self::palette`] below, which is
+    /// the *terminal's* colours.
+    pub(crate) fn chrome(&self) -> crate::ui::UiPalette {
+        self.chrome_palette
+    }
+
+    /// Re-resolve the contrast floor and retire the quads that were built
+    /// under the old one. `config_was_reloaded` re-resolves it too; this is
+    /// the direct route, for the settings window, which writes the choice to
+    /// its own file and never touches the configuration.
+    pub(crate) fn refresh_text_min_contrast(&mut self) {
+        let next = crate::native_settings::text_min_contrast_ratio(&self.config);
+        if next == self.text_min_contrast {
+            return;
+        }
+        self.text_min_contrast = next;
+        // Colours are baked into the quad and shape cache *values* while the
+        // keys carry only this generation, so bumping it is what retires
+        // them. The memo below is keyed on the ratio and so cannot go stale.
+        self.shape_generation += 1;
+        self.shape_cache.borrow_mut().clear();
+        self.invalidate_window();
+    }
+
+    /// Re-resolve the cached chrome colours. `config_was_reloaded` does this
+    /// too; this is the direct route, for when the appearance moved without a
+    /// configuration reload behind it.
+    pub(crate) fn refresh_chrome(&mut self) {
+        self.chrome_palette = crate::native_settings::chrome_palette(
+            crate::native_settings::load_shared().appearance.theme_mode,
+            crate::native_settings::effective_appearance(),
+            &self.config,
+            self.scheme_preview_ground,
+        );
+        self.invalidate_window();
+    }
+
     fn palette(&mut self) -> &ColorPalette {
         if self.palette.is_none() {
             self.palette
@@ -6218,7 +6321,10 @@ impl TermWindow {
     /// Apply (or clear) a color-scheme override on this window without
     /// touching persistence — the same mechanism as
     /// `window:set_config_overrides`. A no-op when nothing changes.
-    pub(crate) fn apply_color_scheme_override(&mut self, name: Option<String>) {
+    /// True when the overrides moved, which means `config_was_reloaded` has
+    /// already run. Callers about to reload anyway can use that to not do it
+    /// twice -- a reload re-runs the Lua configuration from disk.
+    pub(crate) fn apply_color_scheme_override(&mut self, name: Option<String>) -> bool {
         use wezterm_dynamic::{ToDynamic, Value};
         let mut map = match &self.config_overrides {
             Value::Object(obj) => obj.clone(),
@@ -6238,10 +6344,11 @@ impl TermWindow {
             || (matches!(&next, Value::Object(obj) if obj.is_empty())
                 && matches!(&self.config_overrides, Value::Null))
         {
-            return;
+            return false;
         }
         self.config_overrides = next;
         self.config_was_reloaded();
+        true
     }
 
     /// The command palette's theme switch: apply to this window, persist the
@@ -6249,8 +6356,27 @@ impl TermWindow {
     /// window follow. The broadcast reaches this window too; the second
     /// application no-ops on the unchanged overrides.
     fn set_color_scheme_override(&mut self, name: Option<String>) {
-        self.apply_color_scheme_override(name.clone());
+        // Persisted *before* the override is applied. Applying it reloads the
+        // configuration, which re-resolves the chrome, which under "follow
+        // terminal colours" reads the chosen scheme back out of the settings.
+        // Saving second meant that read saw the previous scheme: the interface
+        // flashed the colours it was leaving before arriving at the ones it
+        // was asked for.
         crate::native_settings::save_color_scheme(name.clone());
+        // A scheme can move which side the interface is on, and the platform's
+        // own chrome takes its tint from that.
+        crate::native_settings::apply_preferred_appearance(
+            crate::native_settings::load_shared().appearance.theme_mode,
+        );
+        self.apply_color_scheme_override(name.clone());
+        // `apply_color_scheme_override` is a no-op when this window's
+        // overrides already name the scheme -- which is exactly the case after
+        // a preview -- so the chrome is refreshed here rather than relying on
+        // the reload that call may not perform.
+        self.refresh_chrome();
+        // The settings window derives its own surfaces from this scheme too,
+        // and is in no broadcast list of its own.
+        crate::settings_window::refresh_open_settings_window_chrome();
         if let Some(front_end) = crate::frontend::try_front_end() {
             for gui_window in front_end.gui_windows() {
                 let name = name.clone();
@@ -6283,6 +6409,38 @@ impl TermWindow {
         };
         self.config = config.clone();
         self.palette.take();
+        // One place for all three ways the chrome's colours can move: a
+        // configuration reload, a colour scheme override, and an appearance
+        // change (which routes here too).
+        //
+        // Above the `mux.get_window` bail below, not after it: a window that
+        // outlives its mux window still paints, and nothing else re-resolves
+        // these two -- the settings-window routes reach them only through
+        // their own notifies.
+        self.chrome_palette = crate::native_settings::chrome_palette(
+            crate::native_settings::load_shared().appearance.theme_mode,
+            crate::native_settings::effective_appearance(),
+            &config,
+            self.scheme_preview_ground,
+        );
+        self.text_min_contrast = crate::native_settings::text_min_contrast_ratio(&config);
+        // Under "follow terminal colours" a scheme changed in the
+        // configuration file moves which side the interface is on, and the
+        // platform's own chrome -- title bar, native buttons, menus -- takes
+        // its tint from the connection's appearance, which only
+        // `apply_preferred_appearance` moves. The settings window and the
+        // command palette call it on their own routes; this is the file's.
+        // Guarded on an actual change because setting it feeds an appearance
+        // event back through here.
+        {
+            let mode = crate::native_settings::load_shared().appearance.theme_mode;
+            if mode == crate::native_settings::NativeThemeMode::FollowTerminal
+                && self.chrome_palette.appearance
+                    != crate::native_settings::effective_appearance()
+            {
+                crate::native_settings::apply_preferred_appearance(mode);
+            }
+        }
 
         let mux = Mux::get();
         let window = match mux.get_window(self.mux_window_id) {
@@ -9723,7 +9881,7 @@ impl TermWindow {
                 wezterm_open_url::open_url(link);
             }
             OpenSettings => {
-                crate::settings_window::show();
+                crate::settings_window::show_from(self.mux_window_id);
             }
             QuitAndStopSessionServer => {
                 // The stop happens after the loop ends; the quit itself

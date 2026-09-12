@@ -6208,7 +6208,7 @@ impl crate::TermWindow {
             None => return Ok(()),
         };
         let rect = self.right_sidebar_tree_rect(total_rect);
-        let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+        let chrome = self.chrome();
         let foreground = chrome.text;
         let muted_fg = chrome.secondary_text;
         let sidebar_bg = chrome.workspace_sidebar_bg;

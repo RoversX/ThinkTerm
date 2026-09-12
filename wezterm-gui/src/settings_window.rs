@@ -16,6 +16,7 @@ use crate::ui::{
 };
 use crate::utilsprites::RenderMetrics;
 use anyhow::{Context, Error};
+use mux::window::WindowId as MuxWindowId;
 use config::{configuration, Dimension, GeometryOrigin};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -107,6 +108,11 @@ thread_local! {
     /// Updates opens Settings straight onto Software Update. Consumed by the
     /// next window to open, and only ever set when one is about to be.
     static PENDING_SECTION: Cell<Option<SettingsSection>> = const { Cell::new(None) };
+    /// The window Settings was opened from. The colour-scheme row hands the
+    /// choosing back to that window's command palette, and a preview belongs
+    /// in the terminal the user was looking at rather than in whichever
+    /// window happens to sort first.
+    static OPENED_FROM: Cell<Option<MuxWindowId>> = const { Cell::new(None) };
 }
 
 enum SettingsWindowSlot {
@@ -140,6 +146,33 @@ pub(crate) fn invalidate_open_settings_window() {
     SETTINGS_WINDOW.with(|slot| {
         if let SettingsWindowSlot::Open { settings, .. } = &*slot.borrow() {
             if let Ok(settings) = settings.try_borrow() {
+                if let Some(window) = settings.window.as_ref() {
+                    window.invalidate();
+                }
+            }
+        }
+    });
+}
+
+/// Re-resolve the open settings window's chrome colours and repaint it.
+///
+/// Same reason as `invalidate_open_settings_window`: this window is standalone
+/// and the broadcasts that reach the terminal windows do not reach it. It
+/// needs this whenever the colours it derives from move -- the theme mode, or
+/// the terminal colour scheme, which under "follow terminal colours" is what
+/// its own surfaces are built from.
+pub(crate) fn refresh_open_settings_window_chrome() {
+    SETTINGS_WINDOW.with(|slot| {
+        if let SettingsWindowSlot::Open { settings, .. } = &*slot.borrow() {
+            // `try_borrow_mut` because this can be reached from inside the
+            // settings window's own event handling, where it is already
+            // borrowed; there the refresh that follows covers it anyway.
+            if let Ok(mut settings) = settings.try_borrow_mut() {
+                // The snapshot too, not just the colours: the scheme just
+                // changed underneath this window, and a row that shows it --
+                // or a save that writes the whole struct back -- would
+                // otherwise be working from the value it was opened with.
+                settings.set_native_settings(crate::native_settings::load());
                 if let Some(window) = settings.window.as_ref() {
                     window.invalidate();
                 }
@@ -707,6 +740,7 @@ fn localized_theme_mode_label(mode: NativeThemeMode) -> String {
         NativeThemeMode::System => "settings-theme-system",
         NativeThemeMode::Light => "settings-theme-light",
         NativeThemeMode::Dark => "settings-theme-dark",
+        NativeThemeMode::FollowTerminal => "settings-theme-follow-terminal",
     })
 }
 
@@ -760,6 +794,32 @@ fn localized_scroll_mode_label(mode: crate::native_settings::NativeScrollMode) -
         NativeScrollMode::Stepped => "settings-scroll-mode-stepped",
         NativeScrollMode::Smooth => "settings-scroll-mode-smooth",
     })
+}
+
+fn localized_text_contrast_label(mode: crate::native_settings::NativeTextContrast) -> String {
+    use crate::native_settings::NativeTextContrast;
+    crate::i18n::tr(match mode {
+        NativeTextContrast::Off => "settings-text-contrast-off",
+        NativeTextContrast::Ratio3 => "settings-text-contrast-3",
+        NativeTextContrast::Ratio45 => "settings-text-contrast-45",
+        NativeTextContrast::Ratio7 => "settings-text-contrast-7",
+    })
+}
+
+/// The groove and the selected segment of a segmented control, which have to
+/// be told apart.
+///
+/// The dark palette does it by making the selection lighter than the groove.
+/// The light one cannot: its `control_bg` is already white, and its selected
+/// fill is white at 78% -- white on white, which is what the four choices in
+/// the Terminal pane looked like. So on the light side the groove is the grey
+/// and the selection is the white, which is also how the platform draws it.
+fn segmented_track_and_fill(palette: &SettingsPalette) -> (LinearRgba, LinearRgba) {
+    if palette.is_dark {
+        (palette.control_bg, palette.nav_selected_bg)
+    } else {
+        (palette.track_off, palette.control_bg)
+    }
 }
 
 fn settings_tr(id: &'static str, values: &[(&'static str, String)]) -> String {
@@ -868,6 +928,10 @@ enum SettingsAction {
     ToggleBottomQuote,
     SetRemotePaneResizeMode(NativeRemotePaneResizeMode),
     SetScrollMode(crate::native_settings::NativeScrollMode),
+    /// Hand the choosing to the command palette's scheme list, which already
+    /// has the search and the live preview a thousand entries need.
+    OpenColorSchemePicker,
+    SetTextContrast(crate::native_settings::NativeTextContrast),
     ToggleOverlayScrollbar,
     SetBottomQuoteMode(NativeBottomQuoteMode),
     DecreaseBottomQuoteFontSize,
@@ -1889,6 +1953,11 @@ struct SettingsPalette {
     nav_selected_bg: LinearRgba,
     nav_selected_border: LinearRgba,
     control_bg: LinearRgba,
+    /// The groove a segmented control's segments sit in, and whether this
+    /// palette is a dark one -- the two together decide which way a selected
+    /// segment has to go to be seen. See `segmented_track_and_fill`.
+    track_off: LinearRgba,
+    is_dark: bool,
     control_hover_bg: LinearRgba,
     control_pressed_bg: LinearRgba,
     control_border: LinearRgba,
@@ -1927,6 +1996,12 @@ pub fn show_update_page() {
     if !switched {
         PENDING_SECTION.with(|pending| pending.set(Some(SettingsSection::Update)));
     }
+    show();
+}
+
+/// Open Settings, remembering which window asked. See `OPENED_FROM`.
+pub fn show_from(mux_window_id: MuxWindowId) {
+    OPENED_FROM.with(|slot| slot.set(Some(mux_window_id)));
     show();
 }
 
@@ -2036,6 +2111,13 @@ struct SettingsWindow {
     /// Last system appearance seen. Not used for painting -- see
     /// `effective_appearance` -- only to notice that a repaint is due.
     appearance: Appearance,
+    /// The chrome's colours, resolved when the appearance they come from
+    /// moves rather than on each of the fifty-six `palette()` calls a paint
+    /// makes. Two things move it: the system appearance (the event below) and
+    /// this window's own `theme_mode`, which a dropdown edits directly so that
+    /// a pick previews before it is saved. `refresh_chrome` is called from
+    /// both.
+    chrome_palette: UiPalette,
     selected: SettingsSection,
     agents_expanded: Option<&'static str>,
     native_settings: ThinkTermNativeSettings,
@@ -2169,6 +2251,15 @@ impl SettingsWindow {
             render_state: None,
             webgpu: None,
             appearance,
+            chrome_palette: crate::native_settings::chrome_palette(
+                native_settings.appearance.theme_mode,
+                native_settings
+                    .appearance
+                    .theme_mode
+                    .effective_appearance(appearance),
+                &config,
+                None,
+            ),
             selected: initial_section(),
             agents_expanded: initial_expanded_agent(),
             native_settings,
@@ -2362,6 +2453,7 @@ impl SettingsWindow {
             }
             WindowEvent::AppearanceChanged(appearance) => {
                 self.appearance = appearance;
+                self.refresh_chrome();
                 window.invalidate();
                 Ok(true)
             }
@@ -3187,7 +3279,7 @@ impl SettingsWindow {
         self.ui.open_dropdown = None;
         match crate::native_settings::set_remote_download_directory(path) {
             Ok(()) => {
-                self.native_settings = crate::native_settings::load();
+                self.set_native_settings(crate::native_settings::load());
                 self.status = settings_tr(
                     "settings-status-download-path",
                     &[("path", self.remote_download_directory_label())],
@@ -3427,6 +3519,49 @@ impl SettingsWindow {
         }
     }
 
+    fn apply_text_contrast(&mut self, mode: crate::native_settings::NativeTextContrast) {
+        self.ui.open_dropdown = None;
+        // Merge into the freshest settings rather than writing this window's
+        // whole clone: the colour-scheme row hands the choosing to the command
+        // palette, which writes `appearance.color_scheme` while Settings is
+        // still open. A full write from a snapshot taken before that would put
+        // the old scheme back, and the revert would only show up in the next
+        // window or the next launch. Same reasoning as
+        // `save_command_palette_settings`.
+        let mut merged = crate::native_settings::load();
+        merged.terminal.text_contrast = mode;
+        self.set_native_settings(merged);
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                // Every open window resolves the floor for itself and retires
+                // the quads that were built under the old one; a plain repaint
+                // would redraw them in the colours they were already baked in.
+                if let Some(front_end) = crate::frontend::try_front_end() {
+                    for gui_window in front_end.gui_windows() {
+                        gui_window.window.notify(
+                            crate::termwindow::TermWindowNotif::Apply(Box::new(|term_window| {
+                                term_window.refresh_text_min_contrast();
+                            })),
+                        );
+                    }
+                }
+                self.status = settings_tr(
+                    "settings-status-value-now",
+                    &[
+                        ("setting", crate::i18n::tr("settings-text-contrast")),
+                        ("value", localized_text_contrast_label(mode)),
+                    ],
+                );
+            }
+            Err(err) => {
+                self.status = settings_tr(
+                    "settings-status-terminal-error",
+                    &[("error", format!("{err:#}"))],
+                );
+            }
+        }
+    }
+
     fn apply_remote_pane_resize_mode(&mut self, mode: NativeRemotePaneResizeMode) {
         self.ui.open_dropdown = None;
         self.native_settings.terminal.remote_pane_resize_mode = mode;
@@ -3531,13 +3666,52 @@ impl SettingsWindow {
             .effective_appearance(crate::native_settings::system_appearance())
     }
 
+    /// Re-resolve the cached chrome colours. Call after anything that moves
+    /// `effective_appearance`: the system appearance, or this window's own
+    /// `theme_mode`.
+    /// The window to hand the colour-scheme palette to: the one Settings was
+    /// opened from if it is still there, otherwise any terminal window, so
+    /// the row still works when that window has since been closed.
+    fn color_scheme_picker_target(&self) -> Option<crate::scripting::guiwin::GuiWin> {
+        let front_end = crate::frontend::try_front_end()?;
+        let windows = front_end.gui_windows();
+        let wanted = OPENED_FROM.with(|slot| slot.get());
+        windows
+            .iter()
+            .find(|gui_window| Some(gui_window.mux_window_id) == wanted)
+            .cloned()
+            .or_else(|| windows.into_iter().next())
+    }
+
+    fn refresh_chrome(&mut self) {
+        // The standalone window has no per-window overrides of its own, so it
+        // reads the configuration file's `ui_colors` rather than a terminal
+        // window's, which may carry a scheme picked only for that window.
+        self.chrome_palette = crate::native_settings::chrome_palette(
+            self.native_settings.appearance.theme_mode,
+            self.effective_appearance(),
+            &config::configuration(),
+            None,
+        );
+    }
+
+    /// Replace this window's copy of the settings, keeping the cached chrome
+    /// in step. Assign through here rather than to the field directly: the
+    /// merge-then-write helpers reload the shared settings, so a theme another
+    /// window picked arrives this way and the cache would otherwise be stale
+    /// until the next appearance event.
+    fn set_native_settings(&mut self, settings: ThinkTermNativeSettings) {
+        self.native_settings = settings;
+        self.refresh_chrome();
+    }
+
     /// Every field reads a `UiPalette` token, so Settings tracks the main
     /// window by construction. It stopped doing that once: two arms that
     /// differed only in a hand-written `card_bg`, which was the token's value
     /// copied out by hand and would have gone stale the first time the token
     /// moved.
     fn palette(&self) -> SettingsPalette {
-        let ui = UiPalette::for_appearance(self.effective_appearance());
+        let ui = self.chrome_palette;
         SettingsPalette {
             window_bg: ui.window_bg,
             sidebar_bg: ui.workspace_sidebar_bg,
@@ -3547,6 +3721,8 @@ impl SettingsWindow {
             nav_hover_bg: ui.sidebar_row_hover_bg,
             nav_pressed_bg: ui.sidebar_row_pressed_bg,
             nav_selected_bg: ui.sidebar_row_active_bg,
+            track_off: ui.track_off,
+            is_dark: ui.is_dark(),
             nav_selected_border: ui.sidebar_row_active_border,
             control_bg: ui.control_bg,
             control_hover_bg: ui.control_hover_bg,
@@ -3996,7 +4172,7 @@ impl SettingsWindow {
                 // the next terminal opened uses the new shell.
                 match crate::native_settings::save(&pending) {
                     Ok(()) => {
-                        self.native_settings = pending;
+                        self.set_native_settings(pending);
                         self.status = settings_tr(
                             "settings-status-value-now",
                             &[
@@ -4104,6 +4280,7 @@ impl SettingsWindow {
                 }
             }
             SettingsAction::SetScrollMode(mode) => self.apply_scroll_mode(mode),
+            SettingsAction::SetTextContrast(mode) => self.apply_text_contrast(mode),
             SettingsAction::SetRemotePaneResizeMode(mode) => {
                 self.apply_remote_pane_resize_mode(mode)
             }
@@ -4579,6 +4756,26 @@ impl SettingsWindow {
                         Some(SettingsDropdown::ThemeMode)
                     };
             }
+            SettingsAction::OpenColorSchemePicker => {
+                self.ui.open_dropdown = None;
+                self.set_focused_input(None);
+                match self.color_scheme_picker_target() {
+                    Some(gui_window) => {
+                        // Bring it forward first: the palette it is about to
+                        // open is a preview, and a preview behind the settings
+                        // window previews nothing.
+                        gui_window.window.focus();
+                        gui_window.window.notify(
+                            crate::termwindow::TermWindowNotif::Apply(Box::new(|term_window| {
+                                term_window.open_color_scheme_picker();
+                            })),
+                        );
+                    }
+                    None => {
+                        self.status = crate::i18n::tr("settings-color-scheme-needs-a-window");
+                    }
+                }
+            }
             SettingsAction::ToggleCommandPaletteHotkeyMenu => {
                 self.ui.open_dropdown =
                     if self.ui.open_dropdown == Some(SettingsDropdown::CommandPaletteHotkey) {
@@ -4661,6 +4858,10 @@ impl SettingsWindow {
             SettingsAction::SetThemeMode(mode) => {
                 let previous_mode = self.native_settings.appearance.theme_mode;
                 self.native_settings.appearance.theme_mode = mode;
+                // The pick previews from this window's own copy, so the cached
+                // chrome has to follow it here rather than waiting for an
+                // appearance event that only a system theme change sends.
+                self.refresh_chrome();
                 self.ui.open_dropdown = None;
                 match crate::native_settings::save(&self.native_settings) {
                     Ok(()) => {
@@ -4677,6 +4878,7 @@ impl SettingsWindow {
                         // new mode, so leaving it here would have this window
                         // previewing a theme that was never saved.
                         self.native_settings.appearance.theme_mode = previous_mode;
+                        self.refresh_chrome();
                         let mut args = FluentArgs::new();
                         args.set("error", format!("{err:#}"));
                         self.status = crate::i18n::tr_args("settings-theme-save-error", &args);
@@ -5805,14 +6007,16 @@ impl SettingsWindow {
             true,
         )?;
         y += row_step + app_icon_note_space;
-        self.paint_setting_row(
+        let color_scheme_label = self.effective_color_scheme_label(&config);
+        self.paint_action_setting_row(
             layers,
             row_x,
             y,
             row_width,
             &crate::i18n::tr("settings-effective-color-scheme"),
             &crate::i18n::tr("settings-effective-color-scheme-description"),
-            Self::effective_color_scheme_label(&config),
+            &color_scheme_label,
+            SettingsAction::OpenColorSchemePicker,
             true,
         )?;
         y += row_step;
@@ -6717,7 +6921,7 @@ impl SettingsWindow {
     fn save_web_settings(&mut self) {
         let mut merged = crate::native_settings::load();
         merged.web = self.native_settings.web.clone();
-        self.native_settings = merged;
+        self.set_native_settings(merged);
         if let Err(err) = crate::native_settings::save(&self.native_settings) {
             log::error!("failed to save the browser link expiry: {err:#}");
         }
@@ -6730,7 +6934,7 @@ impl SettingsWindow {
         // write here would silently revert that choice.
         let mut merged = crate::native_settings::load();
         merged.command_palette = self.native_settings.command_palette.clone();
-        self.native_settings = merged;
+        self.set_native_settings(merged);
         match crate::native_settings::save(&self.native_settings) {
             Ok(()) => {
                 // The palette re-reads its settings on every paint; a repaint
@@ -6994,11 +7198,11 @@ impl SettingsWindow {
         let row_step = self.settings_row_step();
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         // Each settings card owns its row count because rows are painted manually.
-        // Terminal currently paints eleven rows below; the count drives card height and scroll extent.
+        // Terminal currently paints twelve rows below; the count drives card height and scroll extent.
         // What must stay in sync with paint_open_dropdown_overlay is not this
         // number but each row's `row_step * N` multiplier, which that function
         // copies by hand to place an open menu.
-        let row_count = 11;
+        let row_count = 12;
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
         let card_height = self.settings_card_height(row_count);
         let button_y = card_y + card_height + self.settings_section_card_gap();
@@ -7075,7 +7279,7 @@ impl SettingsWindow {
             true,
         )?;
         {
-            use crate::native_settings::NativeScrollMode;
+            use crate::native_settings::{NativeScrollMode, NativeTextContrast};
             let resize_modes = NativeRemotePaneResizeMode::ALL;
             let resize_options: Vec<(String, SettingsAction)> = resize_modes
                 .iter()
@@ -7126,11 +7330,36 @@ impl SettingsWindow {
                 scroll_selected,
                 true,
             )?;
+            let contrast_modes = NativeTextContrast::ALL;
+            let contrast_options: Vec<(String, SettingsAction)> = contrast_modes
+                .iter()
+                .map(|mode| {
+                    (
+                        localized_text_contrast_label(*mode),
+                        SettingsAction::SetTextContrast(*mode),
+                    )
+                })
+                .collect();
+            let contrast_selected = contrast_modes
+                .iter()
+                .position(|mode| *mode == self.native_settings.terminal.text_contrast)
+                .unwrap_or(0);
+            self.paint_segmented_setting_row(
+                layers,
+                row_x,
+                first_row_y + row_step * 6.0,
+                row_width,
+                &crate::i18n::tr("settings-text-contrast"),
+                &crate::i18n::tr("settings-text-contrast-description"),
+                &contrast_options,
+                contrast_selected,
+                true,
+            )?;
         }
         self.paint_toggle_setting_row(
             layers,
             row_x,
-            first_row_y + row_step * 6.0,
+            first_row_y + row_step * 7.0,
             row_width,
             &crate::i18n::tr("settings-overlay-scrollbar"),
             &crate::i18n::tr("settings-overlay-scrollbar-description"),
@@ -7141,7 +7370,7 @@ impl SettingsWindow {
         self.paint_toggle_setting_row(
             layers,
             row_x,
-            first_row_y + row_step * 7.0,
+            first_row_y + row_step * 8.0,
             row_width,
             &crate::i18n::tr("settings-bottom-quote"),
             &crate::i18n::tr("settings-bottom-quote-description"),
@@ -7152,7 +7381,7 @@ impl SettingsWindow {
         self.paint_font_size_stepper_row(
             layers,
             row_x,
-            first_row_y + row_step * 8.0,
+            first_row_y + row_step * 9.0,
             row_width,
             &crate::i18n::tr("settings-quote-font-size"),
             &crate::i18n::tr("settings-quote-font-size-description"),
@@ -7181,7 +7410,7 @@ impl SettingsWindow {
             self.paint_segmented_setting_row(
                 layers,
                 row_x,
-                first_row_y + row_step * 9.0,
+                first_row_y + row_step * 10.0,
                 row_width,
                 &crate::i18n::tr("settings-quote-rotation"),
                 &crate::i18n::tr("settings-quote-rotation-description"),
@@ -7193,7 +7422,7 @@ impl SettingsWindow {
         self.paint_font_size_stepper_row(
             layers,
             row_x,
-            first_row_y + row_step * 10.0,
+            first_row_y + row_step * 11.0,
             row_width,
             &crate::i18n::tr("settings-quote-interval"),
             &crate::i18n::tr("settings-quote-interval-description"),
@@ -8888,7 +9117,7 @@ impl SettingsWindow {
             )),
             Some(UpdateInstall::Failed { error }) => notes.push((
                 settings_tr("settings-update-install-failed", &[("error", error.clone())]),
-                crate::ui::tokens::UiPalette::for_appearance(appearance).danger,
+                self.chrome_palette.danger,
             )),
             None => {}
         }
@@ -9186,7 +9415,7 @@ impl SettingsWindow {
         // Shared with the in-window switch, which this cannot call: that one
         // draws through a DrawContext and this window has its own primitives.
         let track = crate::ui::widgets::toggle_track_color(
-            UiPalette::for_appearance(self.effective_appearance()),
+            self.chrome_palette,
             enabled,
             hovered,
             pressed,
@@ -9437,10 +9666,16 @@ impl SettingsWindow {
         if draw_top_rule {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
-        // A button sized to its label and pushed to the column's right
-        // edge, like System Settings; the column width is only a cap.
+        // A button sized to its label and pushed to the column's right edge,
+        // like System Settings. The column is the target, but a value can be
+        // longer than it offers -- a colour scheme name runs to forty
+        // characters -- so let the button borrow from the label side before
+        // the label is ellipsised, the same trade `paint_segmented_setting_row`
+        // makes.
         let column_width = self.settings_control_width(width);
-        let control_width = self.button_width_for_label(value, 0.0).min(column_width);
+        let control_width = self
+            .button_width_for_label(value, 0.0)
+            .min(column_width.max(width * 0.45));
         let control_x = x + width - control_width;
         let control_y = y + self.ui_px(4.0);
         let text_width = (control_x - x - self.ui_px(24.0)).max(width * 0.45);
@@ -9481,6 +9716,7 @@ impl SettingsWindow {
         if draw_top_rule {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
+        let (track_bg, segment_fill) = segmented_track_and_fill(&palette);
         let column_width = self.settings_control_width(width);
         let control_y = y + self.ui_px(4.0);
         let control_height = self.ui_px(CONTROL_HEIGHT);
@@ -9526,7 +9762,7 @@ impl SettingsWindow {
             control_y,
             control_width,
             control_height,
-            palette.control_bg,
+            track_bg,
             palette.control_border,
             self.ui_px(CONTROL_RADIUS),
         )?;
@@ -9546,7 +9782,7 @@ impl SettingsWindow {
             let hovered = self.ui.interaction.hovered == Some(*action);
             let pressed = self.ui.interaction.pressed == Some(*action);
             let fill = if is_selected {
-                Some(palette.nav_selected_bg)
+                Some(segment_fill)
             } else if pressed {
                 Some(palette.control_pressed_bg)
             } else if hovered {
@@ -9598,7 +9834,12 @@ impl SettingsWindow {
         column_width: f32,
         label: &str,
     ) -> window::RectF {
-        let natural = self.measure_text_width(&self.ui_font, label) + self.ui_px(60.0);
+        // The 60 is what `paint_dropdown_pill` takes back out of the width for
+        // the inset and the chevron, so a label sized to exactly `text + 60`
+        // is handed a budget of exactly its own width -- which lands on the
+        // truncation boundary and loses its last character. "Dark" drew as
+        // "Dar". The slack is for that boundary, not for looks.
+        let natural = self.measure_text_width(&self.ui_font, label) + self.ui_px(68.0);
         let pill_width = natural.max(self.ui_px(120.0)).min(column_width);
         rect(
             control_x + column_width - pill_width,
@@ -10938,23 +11179,17 @@ impl SettingsWindow {
         y: f32,
         width: f32,
     ) -> anyhow::Result<()> {
-        let options = [
-            (
-                localized_theme_mode_label(NativeThemeMode::System),
-                SettingsAction::SetThemeMode(NativeThemeMode::System),
-                self.native_settings.appearance.theme_mode == NativeThemeMode::System,
-            ),
-            (
-                localized_theme_mode_label(NativeThemeMode::Light),
-                SettingsAction::SetThemeMode(NativeThemeMode::Light),
-                self.native_settings.appearance.theme_mode == NativeThemeMode::Light,
-            ),
-            (
-                localized_theme_mode_label(NativeThemeMode::Dark),
-                SettingsAction::SetThemeMode(NativeThemeMode::Dark),
-                self.native_settings.appearance.theme_mode == NativeThemeMode::Dark,
-            ),
-        ];
+        let chosen = self.native_settings.appearance.theme_mode;
+        let options: Vec<_> = NativeThemeMode::ALL
+            .iter()
+            .map(|mode| {
+                (
+                    localized_theme_mode_label(*mode),
+                    SettingsAction::SetThemeMode(*mode),
+                    chosen == *mode,
+                )
+            })
+            .collect();
         self.paint_dropdown_menu(layers, x, y, width, &options)
     }
 
@@ -11271,7 +11506,7 @@ impl SettingsWindow {
         if !visible {
             return Ok(());
         }
-        let ui_palette = UiPalette::for_appearance(self.effective_appearance());
+        let ui_palette = self.chrome_palette;
         let spec = ScrollbarSpec::from_area(area, self.ui.tokens);
         if let Some((thumb_y, thumb_h)) = scroll.thumb(spec.y, spec.height) {
             self.draw_rounded_rect(
@@ -11297,7 +11532,13 @@ impl SettingsWindow {
         label: &str,
         action: SettingsAction,
     ) -> anyhow::Result<()> {
-        let width = width.max(self.button_width_for_label(label, 0.0));
+        // The width given is the width drawn. This used to be
+        // `width.max(button_width_for_label(..))` -- a button whose label did
+        // not fit grew to the right and out of whatever was holding it, which
+        // is exactly what a caller passing a *capped* width is trying to
+        // prevent. The label is ellipsised to fit below instead. Every other
+        // caller already passes a width sized to its own label, so nothing
+        // else moves.
         let button = ButtonSpec {
             label,
             action,
@@ -11318,7 +11559,7 @@ impl SettingsWindow {
             .push(button.rect, button.kind, button.action);
 
         let palette = self.palette();
-        let ui_palette = UiPalette::for_appearance(self.effective_appearance());
+        let ui_palette = self.chrome_palette;
         let (background, border) = button.state.colors(ui_palette);
         // Fully rounded rather than CONTROL_RADIUS: a pill reads as a
         // button, which is what distinguishes it from the value pills and
@@ -12281,14 +12522,24 @@ return config
         out
     }
 
-    fn effective_color_scheme_label(config: &config::ConfigHandle) -> &str {
-        if let Some(name) = config.color_scheme.as_deref() {
-            name
-        } else if config.colors.is_some() {
-            "Custom inline colors"
-        } else {
-            "Default palette"
+    /// What the terminal is actually painted in.
+    ///
+    /// The picked scheme first: a scheme chosen here or in the command palette
+    /// lives in the native settings and reaches a window as that window's own
+    /// override, so it is never in the configuration handle. Reading only the
+    /// handle showed the file's scheme while the terminal in front of the user
+    /// showed the one they picked.
+    fn effective_color_scheme_label(&self, config: &config::ConfigHandle) -> String {
+        if let Some(name) = self.native_settings.appearance.color_scheme.as_deref() {
+            return name.to_string();
         }
+        if let Some(name) = config.color_scheme.as_deref() {
+            return name.to_string();
+        }
+        if config.colors.is_some() {
+            return crate::i18n::tr("settings-color-scheme-inline");
+        }
+        crate::i18n::tr("settings-color-scheme-default")
     }
 
     fn effective_font_family(config: &config::ConfigHandle) -> String {

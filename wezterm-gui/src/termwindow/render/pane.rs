@@ -18,7 +18,6 @@ use crate::termwindow::ui::tokens::{
     TAB_VERTICAL_PADDING,
 };
 use crate::termwindow::{PaneNavAction, ScrollHit, ScrollTrack, UIItem, UIItemType};
-use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
 use ::window::bitmaps::TextureRect;
 use ::window::{DeadKeyStatus, RectF};
@@ -290,7 +289,7 @@ impl crate::TermWindow {
         layout: CollapsedPaneLayout,
     ) -> anyhow::Result<usize> {
         let pane_rect = self.pane_frame_rect(pos)?;
-        let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+        let chrome = self.chrome();
         let foreground = chrome.text;
         let muted_fg = chrome.secondary_text;
 
@@ -470,7 +469,7 @@ impl crate::TermWindow {
             let is_hovered = !suppress_hover
                 && self.is_pointer_over_ui_rect(hover_x, tab_y, hover_width, tab_height);
             let tab_surface_color = if selected_tab {
-                chrome.control_bg
+                chrome.active_tab_surface()
             } else if is_hovered && !is_renaming_tab {
                 chrome.control_hover_bg
             } else {
@@ -739,8 +738,12 @@ impl crate::TermWindow {
         }
         let (pane_x, pane_width) = self.pane_chrome_span(pos)?;
 
-        let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
-        let background = chrome.sidebar_bg;
+        let chrome = self.chrome();
+        // Between the tab strip and the terminal, so it belongs to the
+        // terminal's header rather than to the sidebar -- same reasoning as
+        // the tab strip itself. `header_bg` is the chrome's own colour in a
+        // dark interface, so nothing moves there.
+        let background = chrome.header_bg;
         let foreground = chrome.text;
         let muted_fg = chrome.secondary_text;
         let tab_fg = if pos.is_active { foreground } else { muted_fg };
@@ -864,7 +867,7 @@ impl crate::TermWindow {
             let is_hovered = !suppress_hover
                 && self.is_pointer_over_ui_rect(hover_x, tab_y, hover_width, tab_height);
             let tab_surface_color = if selected_tab {
-                chrome.control_bg
+                chrome.active_tab_surface()
             } else if is_hovered && !is_renaming_tab {
                 chrome.control_hover_bg
             } else {
@@ -1120,7 +1123,7 @@ impl crate::TermWindow {
         let press_inset = if pressed { 1 } else { 0 };
         let visual_size = button_size.saturating_sub(press_inset * 2);
         if hovered {
-            let chrome = UiPalette::for_appearance(crate::native_settings::effective_appearance());
+            let chrome = self.chrome();
             let fill = if pressed {
                 chrome.control_pressed_bg
             } else {
@@ -1249,7 +1252,7 @@ impl crate::TermWindow {
 
         let tokens = crate::ui::UiTokens::for_dpi(self.dimensions.dpi);
         let ui_palette =
-            crate::ui::UiPalette::for_appearance(crate::native_settings::effective_appearance());
+            self.chrome();
         let track_top = content_top + tokens.scrollbar_margin_y;
         let track_height =
             (content_bottom - content_top - 2.0 * tokens.scrollbar_margin_y).max(0.0);
@@ -1466,7 +1469,7 @@ impl crate::TermWindow {
             window::Appearance::Dark | window::Appearance::DarkHighContrast
         )
         .then(|| {
-            UiPalette::for_appearance(crate::native_settings::effective_appearance()).sidebar_bg
+            self.chrome().sidebar_bg
         });
         let default_bg = dark_chrome_background
             .unwrap_or_else(|| palette.resolve_bg(ColorAttribute::Default).to_linear())
