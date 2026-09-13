@@ -131,6 +131,24 @@ const COLLAPSED_SECTION_GAP: usize = 10;
 /// released rather than pinned for the window's life.
 const LINE_QUAD_SCRATCH_MAX_BYTES: usize = 512 * 1024;
 
+/// Leaves the line quad scratch recorder empty, and within its size cap,
+/// on every way out of `LineRender::render_line` -- the cache insert, the
+/// uncached image line and both `?` error returns alike.
+struct LineQuadScratchExit<'a>(&'a mut HeapQuadAllocator);
+
+impl Drop for LineQuadScratchExit<'_> {
+    fn drop(&mut self) {
+        self.0.recycle();
+        // The scratch keeps its buffers between lines on purpose, but one
+        // unusually wide line must not pin them for the life of the window
+        // (only macOS and Windows report the occlusion that otherwise
+        // releases it).
+        if self.0.resident_bytes() > LINE_QUAD_SCRATCH_MAX_BYTES {
+            *self.0 = HeapQuadAllocator::default();
+        }
+    }
+}
+
 impl crate::TermWindow {
     /// Height of the nav bar for this pane: the metric height, clamped so
     /// that at least one terminal row of the pane's cell remains visible.
@@ -1944,9 +1962,9 @@ impl crate::TermWindow {
 
                     // Recorded into the window's one scratch recorder and
                     // moved out at exact size below, rather than growing a
-                    // fresh allocator from zero on every miss. Recycled on
-                    // entry as well as on exit, so an early `?` return
-                    // leaves nothing stale for the next line.
+                    // fresh allocator from zero on every miss. The exit
+                    // guard empties it on every return, `?` included, so
+                    // nothing is left stale for the next line.
                     // No painter re-enters this while a line is being
                     // recorded (the only other borrowers run outside a
                     // paint); should one ever do so, that line falls back to
@@ -1954,13 +1972,14 @@ impl crate::TermWindow {
                     // which costs the old doubling churn for that line only.
                     let mut scratch_guard = self.term_window.line_quad_scratch.try_borrow_mut();
                     let mut fallback = HeapQuadAllocator::default();
-                    let buf: &mut HeapQuadAllocator = match scratch_guard.as_mut() {
+                    let scratch_exit = LineQuadScratchExit(match scratch_guard.as_mut() {
                         Ok(scratch) => {
                             scratch.recycle();
                             &mut **scratch
                         }
                         Err(_) => &mut fallback,
-                    };
+                    });
+                    let buf: &mut HeapQuadAllocator = &mut *scratch_exit.0;
                     let next_due = self.term_window.has_animation.borrow_mut().take();
 
                     let shape_key = LineToEleShapeCacheKey {
@@ -2066,18 +2085,9 @@ impl crate::TermWindow {
                             .line_quad_cache
                             .borrow_mut()
                             .put_weighted(quad_key, quad_value, weight);
-                    } else {
-                        // Not cached: leave the scratch empty rather than
-                        // holding this line's quads until the next miss.
-                        buf.recycle();
                     }
-                    // The scratch keeps its buffers between lines on purpose,
-                    // but one unusually wide line must not pin them for the
-                    // life of the window (only macOS and Windows report the
-                    // occlusion that otherwise releases it).
-                    if buf.resident_bytes() > LINE_QUAD_SCRATCH_MAX_BYTES {
-                        *buf = HeapQuadAllocator::default();
-                    }
+                    // Not cached (or cached and already moved out): the exit
+                    // guard empties the scratch and applies the size cap.
 
                     Ok(())
                 }

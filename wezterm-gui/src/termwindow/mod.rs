@@ -3004,11 +3004,14 @@ impl TermWindow {
             self.semantic_zones.len(),
         ));
         lines.push(format!(
-            "{label}: line_quad_scratch={}KiB (entries are stored at exact size; line_quad above no longer includes doubling slack)",
-            self.line_quad_scratch
-                .try_borrow()
-                .map_or(0, |scratch| scratch.resident_bytes())
-                / 1024,
+            "{label}: line_quad_scratch={} (entries are stored at exact size; line_quad above no longer includes doubling slack)",
+            match self.line_quad_scratch.try_borrow() {
+                Ok(scratch) => format!("{}KiB", scratch.resident_bytes() / 1024),
+                // Only borrowed while a line is being recorded, which never
+                // overlaps this report; say so rather than print a 0 that
+                // reads as "empty".
+                Err(_) => "busy".to_string(),
+            },
         ));
         {
             let ui = self.ui_shape_caches.borrow();

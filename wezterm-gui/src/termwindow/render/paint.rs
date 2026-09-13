@@ -923,12 +923,15 @@ impl crate::TermWindow {
                                         ui.domain(UiTextDomain::FilePreview).total_weight(),
                                     );
                                 }
-                                crate::perf::log_counter(
-                                    "line_quad_scratch_bytes",
-                                    self.line_quad_scratch
-                                        .try_borrow()
-                                        .map_or(0, |scratch| scratch.resident_bytes()),
-                                );
+                                // Skipped rather than logged as 0 if a line is
+                                // somehow still being recorded: a 0 would read
+                                // as "empty", which is the healthy value.
+                                if let Ok(scratch) = self.line_quad_scratch.try_borrow() {
+                                    crate::perf::log_counter(
+                                        "line_quad_scratch_bytes",
+                                        scratch.resident_bytes(),
+                                    );
+                                }
                                 if let Some(render_state) = self.render_state.as_ref() {
                                     let glyphs = render_state.glyph_cache.borrow();
                                     crate::perf::log_counter(
