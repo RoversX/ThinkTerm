@@ -901,6 +901,43 @@ async fn client_thread_async(
     }
 }
 
+/// Connect to a server this process has just spawned: it answers the moment
+/// it binds, so watch for that rather than sleeping a guessed interval. The
+/// deadline is generous because overrunning it is worse than waiting -- the
+/// GUI then runs this launch's terminals in process, and only logs it.
+fn connect_to_spawned_server(path: &Path) -> anyhow::Result<UnixStream> {
+    const POLL: Duration = Duration::from_millis(15);
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    let started = std::time::Instant::now();
+    loop {
+        match UnixStream::connect(path) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => {
+                // Waiting only mends a socket that is missing or unattended.
+                // A name too long to be an address, a directory we may not
+                // enter, refuse as firmly in five seconds as they do now.
+                let mends_itself = matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::Interrupted
+                );
+                if !mends_itself || started.elapsed() >= DEADLINE {
+                    let waited = started.elapsed();
+                    return Err(err).with_context(|| {
+                        format!(
+                            "connecting to {} after spawning the server ({waited:.1?} elapsed)",
+                            path.display()
+                        )
+                    });
+                }
+                std::thread::sleep(POLL);
+            }
+        }
+    }
+}
+
 pub fn unix_connect_with_retry(
     target: &UnixTarget,
     just_spawned: bool,
@@ -909,6 +946,11 @@ pub fn unix_connect_with_retry(
     let mut error = None;
 
     if just_spawned {
+        // A proxy command is not a server that comes up by itself: the
+        // loop below runs it afresh each pass and decides for itself.
+        if let UnixTarget::Socket(path) = target {
+            return connect_to_spawned_server(path);
+        }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
@@ -1255,18 +1297,32 @@ impl Reconnectable {
         ui.output_str(&format!("Connect to {:?}\n", target));
         log::trace!("connect to {:?}", target);
 
-        let max_attempts = if no_auto_start { Some(1) } else { None };
+        // A socket nobody is about to bind does not begin answering while we
+        // wait, so ask it once: failing here goes on to spawn the server, and
+        // a domain that may not do that has nothing to wait for either. The
+        // ladder is for reconnects, which someone else may be reviving.
+        let will_spawn_on_failure = !no_auto_start
+            && !unix_dom.no_serve_automatically
+            && (initial || unix_dom.local_session_host);
+        let max_attempts = match &target {
+            UnixTarget::Socket(_) if initial || no_auto_start || will_spawn_on_failure => Some(1),
+            _ => {
+                if no_auto_start {
+                    Some(1)
+                } else {
+                    None
+                }
+            }
+        };
 
         let stream = match unix_connect_with_retry(&target, false, max_attempts) {
             Ok(stream) => stream,
             Err(e) => {
-                // The session server of this machine is started again on a
-                // reconnect too: nothing answering after the retries means
-                // it is gone, and the replacement restores the saved layout.
-                let may_start_on_reconnect = initial || unix_dom.local_session_host;
-                if no_auto_start || unix_dom.no_serve_automatically || !may_start_on_reconnect {
+                if !will_spawn_on_failure {
                     bail!("failed to connect to {:?}: {}", target, e);
                 }
+                // A host of this machine that stops answering is gone for
+                // good; the replacement started here restores its layout.
                 log::warn!(
                     "While connecting to {:?}: {}.  Will try spawning the server.",
                     target,
@@ -1308,6 +1364,12 @@ impl Reconnectable {
                 }
                 std::thread::spawn(move || match child.wait_with_output() {
                     Ok(out) => {
+                        // `--daemonize` returns once it has forked, so a
+                        // failing status is a server that never started at
+                        // all: it lost the pid lock, or could not bind.
+                        if !out.status.success() {
+                            log::warn!("the server we spawned exited with {}", out.status);
+                        }
                         if let Ok(stdout) = std::str::from_utf8(&out.stdout) {
                             if !stdout.is_empty() {
                                 log::warn!("stdout: {}", stdout);
