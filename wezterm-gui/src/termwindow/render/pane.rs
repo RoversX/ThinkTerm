@@ -1936,7 +1936,12 @@ impl crate::TermWindow {
                         }
                     }
 
-                    let mut buf = HeapQuadAllocator::default();
+                    // Recorded into the window's one scratch recorder and
+                    // moved out at exact size below, rather than growing a
+                    // fresh allocator from zero on every miss. Recycled on
+                    // entry so an early `?` return leaves nothing stale.
+                    let mut buf = self.term_window.line_quad_scratch.borrow_mut();
+                    buf.recycle();
                     let next_due = self.term_window.has_animation.borrow_mut().take();
 
                     let shape_key = LineToEleShapeCacheKey {
@@ -1999,7 +2004,7 @@ impl crate::TermWindow {
                                 allow_images: true,
                                 simple_shaping: false,
                             },
-                            &mut TripleLayerQuadAllocator::Heap(&mut buf),
+                            &mut TripleLayerQuadAllocator::Heap(&mut *buf),
                         )
                         .context("render_screen_line")?;
 
@@ -2008,7 +2013,7 @@ impl crate::TermWindow {
 
                     replay_line(
                         self.layers,
-                        &buf,
+                        &*buf,
                         self.scroll_px,
                         self.pane_clip,
                         line_idx,
@@ -2016,25 +2021,29 @@ impl crate::TermWindow {
                     )
                     .context("HeapQuadAllocator::apply_to")?;
 
-                    let quad_value = LineQuadCacheValue {
-                        layers: buf,
-                        expires,
-                        invalidate_on_hover_change: render_result.invalidate_on_hover_change,
-                        current_highlight: if render_result.invalidate_on_hover_change {
-                            self.term_window.current_highlight.clone()
-                        } else {
-                            None
-                        },
-                    };
-
-                    let weight = crate::termwindow::render::estimate_line_quad_entry_bytes(
-                        &quad_key,
-                        &quad_value,
-                    );
                     // A line that drew a picture from a dedicated texture
                     // emitted composites as a side effect; replaying its
                     // cached heap would repaint the line without the picture.
                     if !self.term_window.dedicated_image_in_line.replace(false) {
+                        // Moved out at exactly its length, so the weight
+                        // computed from `resident_bytes()` (which counts
+                        // capacity) is what the entry really holds, and the
+                        // scratch keeps its buffers for the next line.
+                        let quad_value = LineQuadCacheValue {
+                            layers: buf.take_exact(),
+                            expires,
+                            invalidate_on_hover_change: render_result.invalidate_on_hover_change,
+                            current_highlight: if render_result.invalidate_on_hover_change {
+                                self.term_window.current_highlight.clone()
+                            } else {
+                                None
+                            },
+                        };
+                        drop(buf);
+                        let weight = crate::termwindow::render::estimate_line_quad_entry_bytes(
+                            &quad_key,
+                            &quad_value,
+                        );
                         self.term_window
                             .line_quad_cache
                             .borrow_mut()

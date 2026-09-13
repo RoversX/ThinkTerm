@@ -718,6 +718,35 @@ impl HeapQuadAllocator {
         self.position_transform = None;
     }
 
+    /// Move the recording into a new allocator whose vectors have no spare
+    /// capacity, leaving this one empty but keeping its buffers for whatever
+    /// is recorded next.
+    ///
+    /// This is how a scratch recorder hands a finished surface to a
+    /// byte-accounted cache. `resident_bytes()` counts capacity, so a buffer
+    /// that grew by doubling would charge the cache ~33% more than it holds
+    /// and keep that hole resident for the life of the entry. The quads are
+    /// moved, not cloned: `BoxedQuad::clone` deep-copies every corner
+    /// gradient box, so a clone would trade the doubling slack for an
+    /// allocation per gradient quad.
+    pub fn take_exact(&mut self) -> Self {
+        fn drain_exact(src: &mut Vec<BoxedQuad>) -> Vec<BoxedQuad> {
+            // with_capacity + extend rather than collect: the exactness is
+            // the point, and must not depend on an iterator specialisation.
+            let mut out = Vec::with_capacity(src.len());
+            out.extend(src.drain(..));
+            out
+        }
+        let out = Self {
+            layer0: drain_exact(&mut self.layer0),
+            layer1: drain_exact(&mut self.layer1),
+            layer2: drain_exact(&mut self.layer2),
+            position_transform: self.position_transform,
+        };
+        self.position_transform = None;
+        out
+    }
+
     /// Estimated resident heap bytes for the recorded quads. Counts vector
     /// capacity, not length: a buffer that grew during recording keeps that
     /// allocation until it is dropped, and capacity is what a byte-accounted
@@ -1033,6 +1062,7 @@ impl TripleLayerQuadAllocatorTrait for HeapQuadAllocator {
         let src_quads: &[[Vertex; VERTICES_PER_CELL]] =
             unsafe { std::slice::from_raw_parts(vertices.as_ptr().cast(), vertices.len() / 4) };
 
+        dest_quads.reserve(src_quads.len());
         for quad in src_quads {
             let mut quad = BoxedQuad::from_vertices(quad);
             if let Some(transform) = position_transform {
@@ -1056,6 +1086,121 @@ const TEST_ORIGIN: Dimensions = Dimensions {
 fn size() {
     assert_eq!(std::mem::size_of::<Vertex>() * VERTICES_PER_CELL, 272);
     assert_eq!(std::mem::size_of::<BoxedQuad>(), 96);
+}
+
+#[cfg(test)]
+fn record_quads(heap: &mut HeapQuadAllocator, per_layer: [usize; 3]) {
+    let mut layers = heap;
+    for (layer_num, count) in per_layer.into_iter().enumerate() {
+        for i in 0..count {
+            let x = (layer_num * 1000 + i * 10) as f32;
+            let mut quad = layers.allocate(layer_num).unwrap();
+            quad.set_position(x, 0.0, x + 5.0, 5.0);
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn take_exact_produces_exact_capacity_and_keeps_the_scratch_buffers() {
+    let mut scratch = HeapQuadAllocator::default();
+    record_quads(&mut scratch, [5, 3, 0]);
+    let grown = scratch.resident_bytes();
+    // Doubling from zero leaves slack behind; that slack is the point.
+    assert!(grown > 8 * std::mem::size_of::<BoxedQuad>());
+
+    let out = scratch.take_exact();
+    assert_eq!(out.quad_count(), 8);
+    assert_eq!(out.resident_bytes(), 8 * std::mem::size_of::<BoxedQuad>());
+    assert_eq!(scratch.quad_count(), 0);
+    assert_eq!(scratch.resident_bytes(), grown, "the scratch keeps its buffers");
+}
+
+#[cfg(test)]
+#[test]
+fn take_exact_preserves_layer_assignment_and_recorded_order() {
+    let mut scratch = HeapQuadAllocator::default();
+    record_quads(&mut scratch, [2, 1, 3]);
+    let out = scratch.take_exact();
+    assert_eq!(out.layer0.len(), 2);
+    assert_eq!(out.layer1.len(), 1);
+    assert_eq!(out.layer2.len(), 3);
+    assert_eq!(out.layer0[1].position, (10.0, 0.0, 15.0, 5.0));
+    assert_eq!(out.layer1[0].position, (1000.0, 0.0, 1005.0, 5.0));
+    assert_eq!(out.layer2[2].position, (2020.0, 0.0, 2025.0, 5.0));
+}
+
+#[cfg(test)]
+#[test]
+fn take_exact_moves_corner_gradients_intact() {
+    let mut scratch = HeapQuadAllocator::default();
+    {
+        let mut layers = &mut scratch;
+        let mut quad = layers.allocate(1).unwrap();
+        quad.set_corner_gradient(
+            LinearRgba::with_components(0.1, 0.0, 0.0, 1.0),
+            LinearRgba::with_components(0.2, 0.0, 0.0, 1.0),
+            LinearRgba::with_components(0.3, 0.0, 0.0, 1.0),
+            LinearRgba::with_components(0.4, 0.0, 0.0, 1.0),
+        );
+    }
+    let out = scratch.take_exact();
+    let vertices = out.layer1[0].to_vertices();
+    assert_eq!(vertices[V_TOP_LEFT].fg_color, [0.1, 0.0, 0.0, 1.0]);
+    assert_eq!(vertices[V_TOP_RIGHT].fg_color, [0.2, 0.0, 0.0, 1.0]);
+    assert_eq!(vertices[V_BOT_LEFT].fg_color, [0.3, 0.0, 0.0, 1.0]);
+    assert_eq!(vertices[V_BOT_RIGHT].fg_color, [0.4, 0.0, 0.0, 1.0]);
+}
+
+#[cfg(test)]
+#[test]
+fn a_recycled_scratch_records_the_same_surface_as_a_fresh_allocator() {
+    let line_a = [4usize, 7, 1];
+    let mut fresh = HeapQuadAllocator::default();
+    record_quads(&mut fresh, line_a);
+
+    // A wider line first, so the scratch's buffers are larger than line A
+    // needs when it is recorded second.
+    let mut scratch = HeapQuadAllocator::default();
+    record_quads(&mut scratch, [40, 70, 10]);
+    let _wide = scratch.take_exact();
+    scratch.recycle();
+    record_quads(&mut scratch, line_a);
+    let reused = scratch.take_exact();
+
+    let (mut expected, mut actual) = (Vec::new(), Vec::new());
+    fresh.extract_vertices(&mut expected);
+    reused.extract_vertices(&mut actual);
+    assert_eq!(actual.len(), expected.len());
+    for (a, e) in actual.iter().zip(expected.iter()) {
+        assert_eq!(a.position, e.position);
+        assert_eq!(a.fg_color, e.fg_color);
+        assert_eq!(a.tex, e.tex);
+    }
+    assert_eq!(reused.quad_count(), fresh.quad_count());
+    assert_eq!(reused.resident_bytes(), 12 * std::mem::size_of::<BoxedQuad>());
+}
+
+#[cfg(test)]
+#[test]
+fn take_exact_clears_the_position_transform() {
+    let source = QuadClipRect::from_top_left_pixels(0.0, 0.0, 100.0, 100.0, &TEST_ORIGIN);
+    let target = QuadClipRect::from_top_left_pixels(0.0, 0.0, 200.0, 200.0, &TEST_ORIGIN);
+    let mut scratch = HeapQuadAllocator::default();
+    {
+        let mut layers = &mut scratch;
+        layers.set_position_transform(Some(QuadPositionTransform::new(source, target).unwrap()));
+        let mut quad = layers.allocate(0).unwrap();
+        quad.set_position(10.0, 10.0, 20.0, 20.0);
+    }
+    let out = scratch.take_exact();
+    assert_eq!(out.layer0[0].position, (20.0, 20.0, 40.0, 40.0));
+    {
+        let mut layers = &mut scratch;
+        let mut quad = layers.allocate(0).unwrap();
+        quad.set_position(10.0, 10.0, 20.0, 20.0);
+    }
+    assert_eq!(scratch.layer0[0].position, (10.0, 10.0, 20.0, 20.0));
 }
 
 #[cfg(test)]

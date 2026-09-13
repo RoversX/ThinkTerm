@@ -1462,4 +1462,31 @@ mod line_quad_cache_tests {
         assert_ne!(wide, key(80, 800));
         assert_ne!(wide, key(120, 1_000));
     }
+
+    #[test]
+    fn a_cached_line_quad_entry_is_weighed_at_exactly_what_it_holds() {
+        let mut scratch = HeapQuadAllocator::default();
+        {
+            let layers = &mut scratch;
+            for layer_num in [0usize, 1, 1, 1, 2] {
+                let mut quad = layers.allocate(layer_num).unwrap();
+                quad.set_position(0.0, 0.0, 8.0, 16.0);
+            }
+        }
+        let value = LineQuadCacheValue {
+            expires: None,
+            layers: scratch.take_exact(),
+            current_highlight: None,
+            invalidate_on_hover_change: false,
+        };
+        let quads = value.layers.quad_count() * std::mem::size_of::<crate::quad::BoxedQuad>();
+        assert_eq!(value.layers.resident_bytes(), quads, "no doubling slack");
+        assert_eq!(
+            estimate_line_quad_entry_bytes(&key(80, 800), &value),
+            CACHE_ENTRY_FIXED_OVERHEAD
+                + std::mem::size_of::<LineQuadCacheKey>()
+                + std::mem::size_of::<LineQuadCacheValue>()
+                + quads
+        );
+    }
 }

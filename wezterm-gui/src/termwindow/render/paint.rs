@@ -898,6 +898,47 @@ impl crate::TermWindow {
                                     "line_state_cache_bytes",
                                     self.line_state_cache.borrow().total_weight(),
                                 );
+                                // The UI shape caches, the glyph map and the
+                                // atlas are what the four counters above
+                                // cannot see, and together they are the larger
+                                // half of the render memory: note alone is
+                                // budgeted 32 MiB, file_preview 16, and the
+                                // glyph map has no bound at all. Every value
+                                // here is a field read or a len(), so unlike
+                                // the GPU allocator report below this needs no
+                                // throttle.
+                                {
+                                    use crate::shapecache::UiTextDomain;
+                                    let ui = self.ui_shape_caches.borrow();
+                                    crate::perf::log_counter(
+                                        "ui_shape_chrome_bytes",
+                                        ui.domain(UiTextDomain::Chrome).total_weight(),
+                                    );
+                                    crate::perf::log_counter(
+                                        "ui_shape_note_bytes",
+                                        ui.domain(UiTextDomain::Note).total_weight(),
+                                    );
+                                    crate::perf::log_counter(
+                                        "ui_shape_file_preview_bytes",
+                                        ui.domain(UiTextDomain::FilePreview).total_weight(),
+                                    );
+                                }
+                                crate::perf::log_counter(
+                                    "line_quad_scratch_bytes",
+                                    self.line_quad_scratch.borrow().resident_bytes(),
+                                );
+                                if let Some(render_state) = self.render_state.as_ref() {
+                                    let glyphs = render_state.glyph_cache.borrow();
+                                    crate::perf::log_counter(
+                                        "glyph_cache_entries",
+                                        glyphs.glyph_entries(),
+                                    );
+                                    crate::perf::log_counter("atlas_side", glyphs.atlas.size());
+                                    crate::perf::log_counter(
+                                        "atlas_packed_px",
+                                        glyphs.atlas.usage().allocated_px,
+                                    );
+                                }
                                 // The GPU allocator is the other half of the
                                 // picture and the cache counters cannot see it.
                                 // Throttled because generating the report walks

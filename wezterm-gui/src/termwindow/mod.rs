@@ -2410,6 +2410,19 @@ pub struct TermWindow {
     next_line_state_id: u64,
 
     line_quad_cache: RefCell<LfuCache<LineQuadCacheKey, LineQuadCacheValue>>,
+    /// Scratch recorder every line's quads go into before they are moved
+    /// into `line_quad_cache` at exact size. A fresh
+    /// `HeapQuadAllocator::default()` per cache miss reached a line's ~25 KiB
+    /// of quads by doubling from zero: measured 1.5 GiB of alloc/copy/free
+    /// in 15 minutes of a 4 Hz full-screen TUI, with the doubling slack
+    /// then kept resident by the cache. One reused recorder makes the
+    /// steady state allocation-free apart from the exact-size copy that
+    /// becomes the entry.
+    ///
+    /// Exactly one line is recorded at a time: `LineRender::render_line` is
+    /// the only borrower and nothing under `render_screen_line` re-enters
+    /// it, so a double borrow would be a real bug and should panic.
+    line_quad_scratch: RefCell<HeapQuadAllocator>,
 
     last_status_call: Instant,
     /// Throttle for `log_gpu_allocator_throttled`; runtime-only diagnostics.
@@ -3434,6 +3447,8 @@ impl TermWindow {
             render_state.dedicated_images.borrow_mut().clear();
         }
         self.line_quad_cache.borrow_mut().clear();
+        // Likewise the scratch recorder: a hidden window records no lines.
+        *self.line_quad_scratch.borrow_mut() = HeapQuadAllocator::default();
         // The buffers just dropped stay resident until a device maintain
         // runs, and an occluded window submits no frames — poll once so
         // the memory actually returns now rather than at the reveal.
@@ -3897,6 +3912,7 @@ impl TermWindow {
                 line_quad_cache_budget,
                 &config,
             )),
+            line_quad_scratch: RefCell::new(HeapQuadAllocator::default()),
             line_to_ele_shape_cache: RefCell::new(LfuCache::new_weighted(
                 "line_to_ele_shape_cache.hit.rate",
                 "line_to_ele_shape_cache.miss.rate",
