@@ -790,6 +790,127 @@ impl crate::TermWindow {
         }
     }
 
+    /// The render memory series for one paint: how many passes it took, and
+    /// what every CPU-side cache weighed when it finished.
+    ///
+    /// Called on every exit from `paint_impl`'s pass loop, not just the
+    /// successful one. A frame that gave up at the atlas retry cap is
+    /// precisely the frame a memory investigation wants to see, and emitting
+    /// this only where the frame completed left a hole in the series across
+    /// the blow-up. `frame_complete` distinguishes a capped frame from a
+    /// healthy one, so absent-from-the-log and gave-up stay separable.
+    ///
+    /// Safe to read the caches here: `paint_pass()` has returned by the time
+    /// this runs on any path, so nothing holds a borrow across it.
+    fn log_render_memory_counters(&self, passes: usize, frame_complete: bool) {
+        if !crate::perf::enabled() {
+            return;
+        }
+        // Recorded even for the ordinary single-pass frame, so the counter
+        // can be read as a distribution rather than as "something went
+        // wrong once".
+        crate::perf::log_counter("paint_passes", passes);
+        if !frame_complete {
+            // The pass loop gave up (retry cap or error). Marked rather
+            // than left absent so a post-processor can tell the two apart.
+            crate::perf::log_counter("paint_capped", 1);
+        }
+        // Entry counts alone cannot say whether the render caches' byte
+        // budgets are set sensibly: these caches hold entries of wildly
+        // different sizes. The weights are already computed on every
+        // insert, and without these counters the only way to read them is
+        // the settings window, which a scripted measurement cannot open.
+        crate::perf::log_counter("shape_cache_bytes", self.shape_cache.borrow().total_weight());
+        crate::perf::log_counter(
+            "line_shape_cache_bytes",
+            self.line_to_ele_shape_cache.borrow().total_weight(),
+        );
+        crate::perf::log_counter(
+            "line_quad_cache_bytes",
+            self.line_quad_cache.borrow().total_weight(),
+        );
+        crate::perf::log_counter(
+            "line_state_cache_bytes",
+            self.line_state_cache.borrow().total_weight(),
+        );
+        // The UI shape caches, the glyph map and the atlas are what the four
+        // counters above cannot see, and together they are the larger half
+        // of the render memory: note alone is budgeted 32 MiB, file_preview
+        // 16, and the glyph map has no bound at all. Every value here is a
+        // field read or a len(), so unlike the GPU allocator report below
+        // this needs no throttle.
+        {
+            use crate::shapecache::UiTextDomain;
+            let ui = self.ui_shape_caches.borrow();
+            for domain in [
+                UiTextDomain::Chrome,
+                UiTextDomain::Note,
+                UiTextDomain::FilePreview,
+            ] {
+                // The same name the diagnostics panel publishes this under
+                // (`publish_ui_shape_cache_diagnostics`), taken from the
+                // same table: the two surfaces have separate enable flags,
+                // so both are needed, but one value must not have two names.
+                crate::perf::log_counter(
+                    domain.gauge_names().bytes,
+                    ui.domain(domain).total_weight(),
+                );
+            }
+        }
+        // Skipped rather than logged as 0 if a line is somehow still being
+        // recorded: a 0 would read as "empty", which is the healthy value.
+        if let Ok(scratch) = self.line_quad_scratch.try_borrow() {
+            crate::perf::log_counter("line_quad_scratch_bytes", scratch.resident_bytes());
+        }
+        // The overview's thumbnails: one recorded heap per live card, plus
+        // the one rebuild that may be sliced across frames. Unlike the line
+        // cache these are stored with their doubling slack and are dropped
+        // only when the atlas is repacked, so they are the largest CPU-side
+        // quad population nothing else here can see. Capacity only, like
+        // every other figure in this block.
+        {
+            let cards = self.preview_quad_cache.borrow();
+            let partial = self.preview_rebuild_partial.borrow();
+            let card_bytes: usize = cards
+                .values()
+                .map(|entry| entry.heap.resident_bytes())
+                .sum();
+            // The rebuild owns the heap it took from its cache entry, so
+            // summing the map alone under-reads exactly while one is in
+            // flight.
+            let partial_bytes = partial
+                .as_ref()
+                .map_or(0, |partial| partial.heap.resident_bytes());
+            crate::perf::log_counter("preview_quad_cache_cards", cards.len());
+            crate::perf::log_counter(
+                "preview_quad_cache_bytes",
+                card_bytes.saturating_add(partial_bytes),
+            );
+        }
+        crate::perf::log_counter(
+            "content_view_last_frame_bytes",
+            self.content_view_last_frame
+                .as_ref()
+                .map_or(0, |heap| heap.resident_bytes()),
+        );
+        if let Some(render_state) = self.render_state.as_ref() {
+            let glyphs = render_state.glyph_cache.borrow();
+            crate::perf::log_counter("glyph_cache_entries", glyphs.glyph_entries());
+            // Texel counts, not bytes: the atlas is side x side x 4 bytes,
+            // and allocated_px is a high-water mark of packed area that only
+            // Atlas::clear resets.
+            crate::perf::log_counter("atlas_side_texels", glyphs.atlas.size());
+            crate::perf::log_counter(
+                "atlas_allocated_texels_high_water",
+                glyphs.atlas.usage().allocated_px,
+            );
+        }
+        // The GPU allocator is the other half of the picture and the cache
+        // counters cannot see it. Throttled because generating the report
+        // walks every live allocation.
+        self.log_gpu_allocator_throttled();
+    }
+
     pub(crate) fn paint_impl(&mut self, frame: &mut RenderFrame) -> anyhow::Result<PaintOutcome> {
         self.num_frames += 1;
         // If nothing on screen needs animating, then we can avoid
@@ -862,101 +983,18 @@ impl crate::TermWindow {
         // present undefined content, which is worse than a partial one.
         let mut present_frame = true;
         let mut frame_complete = false;
+        // Held outside the loop so the memory counters can be emitted on
+        // every way out of it, the retry cap and the error arms included.
+        let mut passes_used = 0usize;
 
         'pass: for pass in 0.. {
+            passes_used = pass + 1;
             self.frame_pane_output_generations.clear();
             self.track_pane_output_generations_for_frame = false;
             match self.paint_pass() {
                 Ok(_) => match self.render_state.as_mut().unwrap().allocated_more_quads() {
                     Ok(allocated) => {
                         if !allocated {
-                            // Recorded even for the ordinary single-pass frame,
-                            // so the counter can be read as a distribution
-                            // rather than as "something went wrong once".
-                            crate::perf::log_counter("paint_passes", pass + 1);
-                            // Entry counts alone cannot say whether the render
-                            // caches' byte budgets are set sensibly: these
-                            // caches hold entries of wildly different sizes.
-                            // The weights are already computed on every insert,
-                            // and without these counters the only way to read
-                            // them is the settings window, which a scripted
-                            // measurement cannot open.
-                            if crate::perf::enabled() {
-                                crate::perf::log_counter(
-                                    "shape_cache_bytes",
-                                    self.shape_cache.borrow().total_weight(),
-                                );
-                                crate::perf::log_counter(
-                                    "line_shape_cache_bytes",
-                                    self.line_to_ele_shape_cache.borrow().total_weight(),
-                                );
-                                crate::perf::log_counter(
-                                    "line_quad_cache_bytes",
-                                    self.line_quad_cache.borrow().total_weight(),
-                                );
-                                crate::perf::log_counter(
-                                    "line_state_cache_bytes",
-                                    self.line_state_cache.borrow().total_weight(),
-                                );
-                                // The UI shape caches, the glyph map and the
-                                // atlas are what the four counters above
-                                // cannot see, and together they are the larger
-                                // half of the render memory: note alone is
-                                // budgeted 32 MiB, file_preview 16, and the
-                                // glyph map has no bound at all. Every value
-                                // here is a field read or a len(), so unlike
-                                // the GPU allocator report below this needs no
-                                // throttle.
-                                {
-                                    use crate::shapecache::UiTextDomain;
-                                    let ui = self.ui_shape_caches.borrow();
-                                    crate::perf::log_counter(
-                                        "ui_shape_chrome_bytes",
-                                        ui.domain(UiTextDomain::Chrome).total_weight(),
-                                    );
-                                    crate::perf::log_counter(
-                                        "ui_shape_note_bytes",
-                                        ui.domain(UiTextDomain::Note).total_weight(),
-                                    );
-                                    crate::perf::log_counter(
-                                        "ui_shape_file_preview_bytes",
-                                        ui.domain(UiTextDomain::FilePreview).total_weight(),
-                                    );
-                                }
-                                // Skipped rather than logged as 0 if a line is
-                                // somehow still being recorded: a 0 would read
-                                // as "empty", which is the healthy value.
-                                if let Ok(scratch) = self.line_quad_scratch.try_borrow() {
-                                    crate::perf::log_counter(
-                                        "line_quad_scratch_bytes",
-                                        scratch.resident_bytes(),
-                                    );
-                                }
-                                if let Some(render_state) = self.render_state.as_ref() {
-                                    let glyphs = render_state.glyph_cache.borrow();
-                                    crate::perf::log_counter(
-                                        "glyph_cache_entries",
-                                        glyphs.glyph_entries(),
-                                    );
-                                    // Texel counts, not bytes: the atlas is
-                                    // side x side x 4 bytes, and allocated_px
-                                    // is a high-water mark of packed area
-                                    // that only Atlas::clear resets.
-                                    crate::perf::log_counter(
-                                        "atlas_side_texels",
-                                        glyphs.atlas.size(),
-                                    );
-                                    crate::perf::log_counter(
-                                        "atlas_allocated_texels_high_water",
-                                        glyphs.atlas.usage().allocated_px,
-                                    );
-                                }
-                                // The GPU allocator is the other half of the
-                                // picture and the cache counters cannot see it.
-                                // Throttled because generating the report walks
-                                // every live allocation.
-                                self.log_gpu_allocator_throttled();
-                            }
                             frame_complete = true;
                             break 'pass;
                         }
@@ -1141,6 +1179,10 @@ impl crate::TermWindow {
                 }
             }
         }
+        // After the loop rather than inside its successful arm: every exit
+        // above reaches here, so a frame that gave up still reports what the
+        // caches weighed when it did.
+        self.log_render_memory_counters(passes_used, frame_complete);
         log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
 
         // One paint, presented or not: retire dedicated textures nobody

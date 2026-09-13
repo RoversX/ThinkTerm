@@ -768,9 +768,35 @@ impl HeapQuadAllocator {
     /// capacity, not length: a buffer that grew during recording keeps that
     /// allocation until it is dropped, and capacity is what a byte-accounted
     /// cache needs to know about.
+    ///
+    /// Counts the vectors only, so it is O(1) and does not see the corner
+    /// gradient box a quad may own. That is what the per-line size checks
+    /// want; a cache weighing what an entry really holds wants
+    /// [`Self::cache_entry_bytes`] instead.
     pub fn resident_bytes(&self) -> usize {
         (self.layer0.capacity() + self.layer1.capacity() + self.layer2.capacity())
             .saturating_mul(std::mem::size_of::<BoxedQuad>())
+    }
+
+    /// Resident heap bytes including each quad's corner gradient box, which
+    /// `BoxedQuad` holds behind its own allocation and `resident_bytes()`
+    /// cannot see.
+    ///
+    /// Walks the quads, so this is for the once-per-insert weight of a
+    /// byte-budgeted cache, not for a per-line check on the hot path. A
+    /// gradient-free recording -- every terminal line today -- weighs the
+    /// same either way; a gradient-bearing one is 64 bytes per quad heavier
+    /// than the vectors suggest, which is what a byte budget must not miss.
+    pub fn cache_entry_bytes(&self) -> usize {
+        let gradients = self
+            .layer0
+            .iter()
+            .chain(self.layer1.iter())
+            .chain(self.layer2.iter())
+            .filter(|quad| quad.fg_color_corners.is_some())
+            .count();
+        self.resident_bytes()
+            .saturating_add(gradients.saturating_mul(std::mem::size_of::<[[f32; 4]; 4]>()))
     }
 
     /// Where the next quad will land, for later use with [`Self::apply_before`],
@@ -1236,6 +1262,44 @@ fn boxed_quad_preserves_vertical_gradient_colors() {
     assert_eq!(vertices[V_TOP_RIGHT].fg_color, top);
     assert_eq!(vertices[V_BOT_LEFT].fg_color, bottom);
     assert_eq!(vertices[V_BOT_RIGHT].fg_color, bottom);
+}
+
+#[cfg(test)]
+#[test]
+fn cache_entry_bytes_counts_the_corner_gradient_boxes_resident_bytes_cannot_see() {
+    const QUADS: usize = 256;
+    let mut heap = HeapQuadAllocator::default();
+    {
+        let layers = &mut heap;
+        for _ in 0..QUADS {
+            let mut quad = layers.allocate(0).unwrap();
+            quad.set_position(0.0, 0.0, 1.0, 1.0);
+            quad.set_corner_gradient(
+                LinearRgba::with_components(1.0, 0.0, 0.0, 1.0),
+                LinearRgba::with_components(0.0, 1.0, 0.0, 1.0),
+                LinearRgba::with_components(0.0, 0.0, 1.0, 1.0),
+                LinearRgba::with_components(1.0, 1.0, 0.0, 1.0),
+            );
+        }
+    }
+    let exact = heap.take_exact();
+    let vectors = QUADS * std::mem::size_of::<BoxedQuad>();
+    let boxes = QUADS * std::mem::size_of::<[[f32; 4]; 4]>();
+    // The O(1) counterpart sees the vectors only, which is all the per-line
+    // size check needs; the cache weight must see the boxes too, or a
+    // gradient-bearing entry is charged 40% less than it holds.
+    assert_eq!(exact.resident_bytes(), vectors);
+    assert_eq!(exact.cache_entry_bytes(), vectors + boxes);
+}
+
+#[cfg(test)]
+#[test]
+fn cache_entry_bytes_matches_resident_bytes_without_gradients() {
+    let mut heap = HeapQuadAllocator::default();
+    record_quads(&mut heap, [5, 3, 2]);
+    let exact = heap.take_exact();
+    // Every terminal line today: the walk must not invent bytes.
+    assert_eq!(exact.cache_entry_bytes(), exact.resident_bytes());
 }
 
 #[cfg(test)]

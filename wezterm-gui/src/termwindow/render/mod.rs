@@ -155,12 +155,17 @@ pub const LINE_STATE_ENTRY_BYTES: usize =
 
 /// Estimated resident bytes for one `line_quad_cache` entry. The dominant
 /// term is the `HeapQuadAllocator` capacity.
+///
+/// `cache_entry_bytes()` rather than `resident_bytes()`: the entry is what
+/// the byte budget holds, so a quad's corner gradient box counts even
+/// though no line painter mints one today. The scratch's own size check
+/// stays on the O(1) `resident_bytes()`.
 pub fn estimate_line_quad_entry_bytes(key: &LineQuadCacheKey, value: &LineQuadCacheValue) -> usize {
     CACHE_ENTRY_FIXED_OVERHEAD
         .saturating_add(std::mem::size_of::<LineQuadCacheKey>())
         .saturating_add(key.composing.as_ref().map_or(0, |s| s.capacity()))
         .saturating_add(std::mem::size_of::<LineQuadCacheValue>())
-        .saturating_add(value.layers.resident_bytes())
+        .saturating_add(value.layers.cache_entry_bytes())
 }
 
 /// Estimated resident bytes for one `line_to_ele_shape_cache` entry. The
@@ -1487,6 +1492,45 @@ mod line_quad_cache_tests {
                 + std::mem::size_of::<LineQuadCacheKey>()
                 + std::mem::size_of::<LineQuadCacheValue>()
                 + quads
+        );
+    }
+
+    #[test]
+    fn a_gradient_bearing_entry_is_charged_for_its_gradient_boxes() {
+        const QUADS: usize = 16;
+        let mut scratch = HeapQuadAllocator::default();
+        {
+            let layers = &mut scratch;
+            for _ in 0..QUADS {
+                let mut quad = layers.allocate(0).unwrap();
+                quad.set_position(0.0, 0.0, 8.0, 16.0);
+                quad.set_corner_gradient(
+                    LinearRgba::with_components(1.0, 0.0, 0.0, 1.0),
+                    LinearRgba::with_components(0.0, 1.0, 0.0, 1.0),
+                    LinearRgba::with_components(0.0, 0.0, 1.0, 1.0),
+                    LinearRgba::with_components(1.0, 1.0, 0.0, 1.0),
+                );
+            }
+        }
+        let value = LineQuadCacheValue {
+            expires: None,
+            layers: scratch.take_exact(),
+            current_highlight: None,
+            invalidate_on_hover_change: false,
+        };
+        // No line painter mints a gradient today, so this is the guard for
+        // the day one does: the budget must see the boxes, not just the
+        // vectors, or the cache holds well past what it thinks it holds.
+        let vectors = QUADS * std::mem::size_of::<crate::quad::BoxedQuad>();
+        let boxes = QUADS * std::mem::size_of::<[[f32; 4]; 4]>();
+        assert_eq!(value.layers.resident_bytes(), vectors);
+        assert_eq!(
+            estimate_line_quad_entry_bytes(&key(80, 800), &value),
+            CACHE_ENTRY_FIXED_OVERHEAD
+                + std::mem::size_of::<LineQuadCacheKey>()
+                + std::mem::size_of::<LineQuadCacheValue>()
+                + vectors
+                + boxes
         );
     }
 }
