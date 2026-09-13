@@ -5,11 +5,13 @@ set -e
 
 mkdir AppDir
 
-install -Dsm755 -t AppDir/usr/bin target/release/thinkterm-mux-server
-install -Dsm755 -t AppDir/usr/bin target/release/thinkterm
-install -Dsm755 -t AppDir/usr/bin target/release/wezterm
-install -Dsm755 -t AppDir/usr/bin target/release/thinkterm-gui
-install -Dsm755 -t AppDir/usr/bin target/release/strip-ansi-escapes
+# The cargo profile the binaries were built with, as ci/deploy.sh reads it.
+PROFILE=${CARGO_PROFILE:-release}
+install -Dsm755 -t AppDir/usr/bin target/$PROFILE/thinkterm-mux-server
+install -Dsm755 -t AppDir/usr/bin target/$PROFILE/thinkterm
+install -Dsm755 -t AppDir/usr/bin target/$PROFILE/wezterm
+install -Dsm755 -t AppDir/usr/bin target/$PROFILE/thinkterm-gui
+install -Dsm755 -t AppDir/usr/bin target/$PROFILE/strip-ansi-escapes
 install -Dm644 assets/icon/terminal.png AppDir/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
 install -Dm644 assets/wezterm.desktop AppDir/usr/share/applications/com.roversx.thinkterm.desktop
 install -Dm644 assets/wezterm.appdata.xml AppDir/usr/share/metainfo/com.roversx.thinkterm.appdata.xml

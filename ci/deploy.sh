@@ -20,6 +20,10 @@ require_web_bundle() {
 set -e
 
 TARGET_DIR=${1:-target}
+# The cargo profile the binaries were built with: `release` (target/release)
+# unless the caller built with `--profile dist` (target/dist), which is what
+# the release workflow and `ci/macos-package.sh --profile dist` do.
+PROFILE=${CARGO_PROFILE:-release}
 
 TAG_NAME=${TAG_NAME:-$(git -c "core.abbrev=8" show -s "--format=%cd-%h" "--date=format:%Y%m%d-%H%M%S")}
 
@@ -90,8 +94,8 @@ case $OSTYPE in
     macos_bin_dir=${MACOS_BIN_DIR:-}
     if [[ -z "$macos_bin_dir" ]] ; then
       case "${MACOS_ARCH:-}" in
-        arm64) macos_bin_dir=$TARGET_DIR/aarch64-apple-darwin/release ;;
-        x86_64) macos_bin_dir=$TARGET_DIR/x86_64-apple-darwin/release ;;
+        arm64) macos_bin_dir=$TARGET_DIR/aarch64-apple-darwin/$PROFILE ;;
+        x86_64) macos_bin_dir=$TARGET_DIR/x86_64-apple-darwin/$PROFILE ;;
         *) macos_bin_dir= ;;
       esac
     fi
@@ -101,17 +105,34 @@ case $OSTYPE in
         cp $macos_bin_dir/$bin $zipdir/ThinkTerm.app/Contents/MacOS/$bin
       # If the user ran a simple `cargo build --release`, then we want to allow
       # a single-arch package to be built
-      elif [[ -f $TARGET_DIR/release/$bin ]] ; then
-        cp $TARGET_DIR/release/$bin $zipdir/ThinkTerm.app/Contents/MacOS/$bin
+      elif [[ -f $TARGET_DIR/$PROFILE/$bin ]] ; then
+        cp $TARGET_DIR/$PROFILE/$bin $zipdir/ThinkTerm.app/Contents/MacOS/$bin
       else
         # The CI runs `cargo build --target XXX --release` which means that
         # the binaries will be deployed in `$TARGET_DIR/XXX/release` instead of
         # the plain path above.
         # In that situation, we have two architectures to assemble into a
         # Universal ("fat") binary, so we use the `lipo` tool for that.
-        lipo $TARGET_DIR/*/release/$bin -output $zipdir/ThinkTerm.app/Contents/MacOS/$bin -create
+        lipo $TARGET_DIR/*/$PROFILE/$bin -output $zipdir/ThinkTerm.app/Contents/MacOS/$bin -create
       fi
     done
+
+    # The symbols the dist profile writes beside each binary (split-debuginfo
+    # = "packed"): zipped next to the app, never inside it, so a crash
+    # report's addresses can be resolved against the matching build.
+    symdir="$zipdir-dSYM"
+    rm -rf "$symdir" "$symdir.zip"
+    for bin in wezterm thinkterm thinkterm-mux-server thinkterm-gui strip-ansi-escapes ; do
+      dsym="${macos_bin_dir:-$TARGET_DIR/$PROFILE}/$bin.dSYM"
+      if [[ -d "$dsym" ]] ; then
+        mkdir -p "$symdir"
+        cp -R "$dsym" "$symdir/"
+      fi
+    done
+    if [[ -d "$symdir" ]] ; then
+      zip -qr "$symdir.zip" "$symdir"
+      rm -rf "$symdir"
+    fi
 
     set +x
     # Only a Developer ID signature is eligible for notarization; the notary
@@ -211,11 +232,11 @@ case $OSTYPE in
     fi
     rm -rf $zipdir $zipname
     mkdir $zipdir
-    cp $TARGET_DIR/release/thinkterm.exe \
-      $TARGET_DIR/release/wezterm.exe \
-      $TARGET_DIR/release/thinkterm-mux-server.exe \
-      $TARGET_DIR/release/thinkterm-gui.exe \
-      $TARGET_DIR/release/strip-ansi-escapes.exe \
+    cp $TARGET_DIR/$PROFILE/thinkterm.exe \
+      $TARGET_DIR/$PROFILE/wezterm.exe \
+      $TARGET_DIR/$PROFILE/thinkterm-mux-server.exe \
+      $TARGET_DIR/$PROFILE/thinkterm-gui.exe \
+      $TARGET_DIR/$PROFILE/strip-ansi-escapes.exe \
       assets/windows/conhost/conpty.dll \
       assets/windows/conhost/OpenConsole.exe \
       assets/windows/angle/libEGL.dll \
@@ -225,11 +246,16 @@ case $OSTYPE in
       NOTICE \
       $zipdir
 
-    # `[profile.release]` leaves `debug` off, so no PDBs exist today and
-    # copying them unconditionally would abort the whole step under `set -e`.
-    # Glob rather than name them: turning debuginfo on should ship symbols for
-    # every binary, not just the two that happened to be listed here.
-    cp $TARGET_DIR/release/*.pdb $zipdir 2>/dev/null || true
+    # The dist profile writes a PDB per binary; `release` writes none. They
+    # go into a zip of their own next to the package, not into it: they are
+    # for resolving crash reports, and they would double the download.
+    rm -rf $zipdir-pdb $zipdir-pdb.zip
+    if ls $TARGET_DIR/$PROFILE/*.pdb >/dev/null 2>&1 ; then
+      mkdir $zipdir-pdb
+      cp $TARGET_DIR/$PROFILE/*.pdb $zipdir-pdb
+      7z a -tzip $zipdir-pdb.zip $zipdir-pdb >/dev/null
+      rm -rf $zipdir-pdb
+    fi
 
     # Same source as the four DLLs above -- wezterm-gui's build script only
     # stages a copy of it next to the exe, so take it from assets directly.
@@ -267,7 +293,7 @@ case $OSTYPE in
         if test -n "${COPR_SRPM}" ; then
           TAR_NAME=$(git -c "core.abbrev=8" show -s "--format=%cd_%h" "--date=format:%Y%m%d_%H%M%S")
           HERE="."
-          BUILD_SECTION=$(cat <<'BUILDEOFEOF'
+          BUILD_SECTION=$(cat <<BUILDEOFEOF
 %prep
 %autosetup
 %build
@@ -277,7 +303,7 @@ echo Here I am
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source ~/.cargo/env
 
-cargo build --release \
+cargo build --profile ${PROFILE} \
       -p wezterm-gui -p wezterm -p wezterm-mux-server \
       -p strip-ansi-escapes
 BUILDEOFEOF
@@ -357,11 +383,11 @@ set -x
 cd ${HERE}
 mkdir -p %{buildroot}/usr/bin %{buildroot}/etc/profile.d %{buildroot}/usr/share/icons/hicolor/128x128/apps %{buildroot}/usr/share/applications %{buildroot}/usr/share/metainfo %{buildroot}/usr/share/nautilus-python/extensions
 install -Dm755 assets/open-thinkterm-here assets/open-wezterm-here -t %{buildroot}/usr/bin
-install -Dsm755 $TARGET_DIR/release/thinkterm -t %{buildroot}/usr/bin
-install -Dsm755 $TARGET_DIR/release/wezterm -t %{buildroot}/usr/bin
-install -Dsm755 $TARGET_DIR/release/thinkterm-gui -t %{buildroot}/usr/bin
-install -Dsm755 $TARGET_DIR/release/thinkterm-mux-server -t %{buildroot}/usr/bin
-install -Dsm755 $TARGET_DIR/release/strip-ansi-escapes -t %{buildroot}/usr/bin
+install -Dsm755 $TARGET_DIR/$PROFILE/thinkterm -t %{buildroot}/usr/bin
+install -Dsm755 $TARGET_DIR/$PROFILE/wezterm -t %{buildroot}/usr/bin
+install -Dsm755 $TARGET_DIR/$PROFILE/thinkterm-gui -t %{buildroot}/usr/bin
+install -Dsm755 $TARGET_DIR/$PROFILE/thinkterm-mux-server -t %{buildroot}/usr/bin
+install -Dsm755 $TARGET_DIR/$PROFILE/strip-ansi-escapes -t %{buildroot}/usr/bin
 install -Dm644 assets/shell-integration/* -t %{buildroot}/etc/profile.d
 install -Dm644 assets/shell-completion/zsh %{buildroot}/usr/share/zsh/site-functions/_thinkterm
 install -Dm644 assets/shell-completion/bash %{buildroot}/etc/bash_completion.d/thinkterm
@@ -519,12 +545,12 @@ Description: ThinkTerm command line, TUI and multiplexer server, no GUI.
 EOF
           fi
 
-          install -Dsm755 -t $root/usr/bin $TARGET_DIR/release/thinkterm-mux-server
-          install -Dsm755 -t $root/usr/bin $TARGET_DIR/release/thinkterm
-          install -Dsm755 -t $root/usr/bin $TARGET_DIR/release/wezterm
-          install -Dsm755 -t $root/usr/bin $TARGET_DIR/release/strip-ansi-escapes
+          install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/thinkterm-mux-server
+          install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/thinkterm
+          install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/wezterm
+          install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/strip-ansi-escapes
           if [[ "$variant" == desktop ]] ; then
-            install -Dsm755 -t $root/usr/bin $TARGET_DIR/release/thinkterm-gui
+            install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/thinkterm-gui
             install -Dm755 -t $root/usr/bin assets/open-thinkterm-here assets/open-wezterm-here
             install -Dm644 assets/icon/terminal.png $root/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
             install -Dm644 assets/wezterm.desktop $root/usr/share/applications/com.roversx.thinkterm.desktop
@@ -624,16 +650,16 @@ EOF
           rm -rf "$tardir"
         }
         linux_tarball thinkterm \
-          $TARGET_DIR/release/thinkterm \
-          $TARGET_DIR/release/wezterm \
-          $TARGET_DIR/release/thinkterm-mux-server \
-          $TARGET_DIR/release/thinkterm-gui \
-          $TARGET_DIR/release/strip-ansi-escapes
+          $TARGET_DIR/$PROFILE/thinkterm \
+          $TARGET_DIR/$PROFILE/wezterm \
+          $TARGET_DIR/$PROFILE/thinkterm-mux-server \
+          $TARGET_DIR/$PROFILE/thinkterm-gui \
+          $TARGET_DIR/$PROFILE/strip-ansi-escapes
         linux_tarball thinkterm-server \
-          $TARGET_DIR/release/thinkterm \
-          $TARGET_DIR/release/wezterm \
-          $TARGET_DIR/release/thinkterm-mux-server \
-          $TARGET_DIR/release/strip-ansi-escapes
+          $TARGET_DIR/$PROFILE/thinkterm \
+          $TARGET_DIR/$PROFILE/wezterm \
+          $TARGET_DIR/$PROFILE/thinkterm-mux-server \
+          $TARGET_DIR/$PROFILE/strip-ansi-escapes
       ;;
     esac
     ;;
@@ -656,10 +682,10 @@ options="!check"
 url="https://github.com/RoversX/thinkterm"
 makedepends="cmd:tic"
 source="
-  $TARGET_DIR/release/thinkterm
-  $TARGET_DIR/release/wezterm
-  $TARGET_DIR/release/thinkterm-gui
-  $TARGET_DIR/release/thinkterm-mux-server
+  $TARGET_DIR/$PROFILE/thinkterm
+  $TARGET_DIR/$PROFILE/wezterm
+  $TARGET_DIR/$PROFILE/thinkterm-gui
+  $TARGET_DIR/$PROFILE/thinkterm-mux-server
   assets/open-thinkterm-here
   assets/open-wezterm-here
   assets/wezterm.desktop

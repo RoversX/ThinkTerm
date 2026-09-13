@@ -296,7 +296,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: macos-${{ matrix.arch }}
+          key: macos-${{ matrix.arch }}-dist
           cache-on-failure: true
           save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
@@ -305,7 +305,7 @@ jobs:
 
       - name: Build
         run: |
-          cargo build --release --target ${{ matrix.target }} \
+          cargo build --profile dist --target ${{ matrix.target }} \
             -p wezterm \
             -p wezterm-gui \
             -p wezterm-mux-server \
@@ -327,13 +327,26 @@ jobs:
           MACOS_CERT: ${{ secrets.MACOS_CERT }}
           MACOS_CERT_PW: ${{ secrets.MACOS_CERT_PW }}
           MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          CARGO_PROFILE: dist
         run: bash ci/deploy.sh
 
       - name: Upload
         uses: actions/upload-artifact@v7
         with:
           name: macos-${{ matrix.arch }}
-          path: ThinkTerm-macos-*.zip
+          path: |
+            ThinkTerm-macos-*.zip
+            !ThinkTerm-macos-*-dSYM.zip
+          if-no-files-found: error
+
+      # The symbols stay a workflow artifact (kept 90 days), not a release
+      # asset: nobody but us reads a crash report against them, and on the
+      # release page they would only look like another download.
+      - name: Upload symbols
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-${{ matrix.arch }}-symbols
+          path: ThinkTerm-macos-*-dSYM.zip
           if-no-files-found: error
 
   windows:
@@ -374,7 +387,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: windows-x86_64
+          key: windows-x86_64-dist
           cache-on-failure: true
           save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
@@ -397,7 +410,7 @@ jobs:
         shell: cmd
         run: |
           PATH C:\Strawberry\perl\bin;%PATH%
-          cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
+          cargo build --profile dist -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
 
       - name: Fetch the browser bundle
         uses: actions/download-artifact@v8
@@ -407,6 +420,8 @@ jobs:
 
       - name: Package
         shell: bash
+        env:
+          CARGO_PROFILE: dist
         run: bash ci/deploy.sh
 
       - name: Upload
@@ -415,7 +430,15 @@ jobs:
           name: windows-x86_64
           path: |
             ThinkTerm-*.zip
+            !ThinkTerm-*-pdb.zip
             ThinkTerm-*.exe
+          if-no-files-found: error
+
+      - name: Upload symbols
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-x86_64-symbols
+          path: ThinkTerm-*-pdb.zip
           if-no-files-found: error
 
   # Each distro builds inside its own container so the resulting deb/rpm links
@@ -490,7 +513,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.name }}-${{ matrix.arch }}
+          key: ${{ matrix.name }}-${{ matrix.arch }}-dist
           cache-on-failure: true
           save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
@@ -499,7 +522,7 @@ jobs:
 
       - name: Build
         run: |
-          cargo build --release \
+          cargo build --profile dist \
             -p wezterm \
             -p wezterm-gui \
             -p wezterm-mux-server \
@@ -512,6 +535,8 @@ jobs:
           path: thinkterm-web/www
 
       - name: Package
+        env:
+          CARGO_PROFILE: dist
         run: bash ci/deploy.sh
 
       - name: Collect RPMs
@@ -520,6 +545,8 @@ jobs:
 
       - name: Build AppImage
         if: matrix.appimage
+        env:
+          CARGO_PROFILE: dist
         run: |
           set -eu
           apt-get install -y --no-install-recommends file zsync
@@ -577,6 +604,9 @@ jobs:
           # A plan with every platform deselected reaches this job with nothing
           # downloaded. Stop here rather than let ci/create-release.sh mint an
           # empty draft on the default branch.
+          # The symbol zips are workflow artifacts for reading crash
+          # reports, not downloads: keep them off the release page.
+          rm -f dist/*-dSYM.zip dist/*-pdb.zip
           [ -d dist ] && [ -n "$(ls -A dist)" ] \
             || { echo "::error::no artifacts to publish"; exit 1; }
           ls -l dist

@@ -1,3 +1,21 @@
+/// Where cargo puts this package's executable: the directory three levels
+/// above OUT_DIR (`<target>/[<triple>/]<profile dir>/build/<pkg>-<hash>/out`).
+/// The `PROFILE` variable cannot name it: a custom profile such as `dist`
+/// reports the profile it inherits from, and a `--target` build lands in a
+/// per-triple directory that `PROFILE` knows nothing about.
+#[cfg(any(windows, target_os = "macos"))]
+fn exe_output_dir(repo_dir: &std::path::Path) -> std::path::PathBuf {
+    if let Some(out_dir) = std::env::var_os("OUT_DIR") {
+        if let Some(dir) = std::path::Path::new(&out_dir).ancestors().nth(3) {
+            if dir.is_dir() {
+                return dir.to_path_buf();
+            }
+        }
+    }
+    let profile = std::env::var("PROFILE").unwrap();
+    repo_dir.join("target").join(profile)
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     generate_material_icons().expect("generate material file icon lookup tables");
@@ -7,12 +25,11 @@ fn main() {
         use anyhow::Context as _;
         use std::io::Write;
         use std::path::Path;
-        let profile = std::env::var("PROFILE").unwrap();
         let repo_dir = std::env::current_dir()
             .ok()
             .and_then(|cwd| cwd.parent().map(|p| p.to_path_buf()))
             .unwrap();
-        let exe_output_dir = repo_dir.join("target").join(profile);
+        let exe_output_dir = exe_output_dir(&repo_dir);
         let windows_dir = repo_dir.join("assets").join("windows");
 
         let conhost_dir = windows_dir.join("conhost");
@@ -154,7 +171,6 @@ END
     #[cfg(target_os = "macos")]
     {
         use anyhow::Context as _;
-        let profile = std::env::var("PROFILE").unwrap();
         let repo_dir = std::env::current_dir()
             .ok()
             .and_then(|cwd| cwd.parent().map(|p| p.to_path_buf()))
@@ -168,9 +184,7 @@ END
             .join("ThinkTerm.app")
             .join("Contents")
             .join("Info.plist");
-        let build_target_dir = std::env::var("CARGO_TARGET_DIR")
-            .and_then(|s| Ok(std::path::PathBuf::from(s)))
-            .unwrap_or(repo_dir.join("target").join(profile));
+        let build_target_dir = exe_output_dir(&repo_dir);
         let dest_plist = build_target_dir.join("Info.plist");
         let src_icon = repo_dir.join("assets").join("icon").join("ThinkTerm.icns");
         let dest_icon = build_target_dir.join("ThinkTerm.icns");

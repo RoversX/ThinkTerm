@@ -19,9 +19,16 @@ NOTARY_PROFILE=${MACOS_NOTARY_PROFILE:-thinkterm}
 usage() {
   cat <<EOT
 usage: ci/macos-package.sh [--build] [--arch arm64|x86_64|both]
-                           [--upload] [adhoc|developerid] [tag]
+                           [--profile release|dist] [--upload]
+                           [adhoc|developerid] [tag]
 
   --build       Compile the binaries before packaging.
+  --profile     Which cargo profile the binaries come from (and, with
+                --build, are built with). Defaults to release, the everyday
+                build in target/release. dist is what the release workflow
+                ships: LTO, symbols stripped into a .dSYM zip beside the
+                app; it builds into target/dist and takes several times
+                longer to link.
   --arch        Which Mac the package is for.  Defaults to this one; the
                 other is cross-compiled, which needs its standard library
                 (\`rustup target add x86_64-apple-darwin\`).  \`both\` runs
@@ -46,11 +53,20 @@ EOT
 BUILD=no
 ARCH=
 UPLOAD=no
+PROFILE=release
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --build)
       BUILD=yes
       shift
+      ;;
+    --profile)
+      PROFILE=${2:-}
+      shift 2 || { usage >&2; exit 2; }
+      case "$PROFILE" in
+        release | dist) ;;
+        *) usage >&2; exit 2 ;;
+      esac
       ;;
     --arch)
       ARCH=${2:-}
@@ -85,16 +101,23 @@ ThinkTerm macOS packaging
      Signs with your Developer ID certificate, submits to Apple, staples
      the ticket into the bundle.  Uploads ~60MB and takes a few minutes.
      Opens on any Mac with no warning, and needs no network to verify.
-     Packages the binaries already in target/release, whatever their age.
+     Packages the binaries already built, whatever their age (from
+     target/release, or target/dist with --profile dist).
 
   3) Build, then Developer ID + notarized
      Everything option 2 does, but compiles all five binaries first so the
-     bundle cannot carry a mix of commits.  This is the one to use for a
-     release.
+     bundle cannot carry a mix of commits.  Uses the everyday release
+     profile, so it shares target/release with your normal builds.
+
+  4) Build with the dist profile, then Developer ID + notarized
+     Like option 3, but built the way the release workflow builds:
+     whole-program optimised, symbols stripped into a .dSYM zip beside
+     the app, about 55MB smaller.  Builds into target/dist and takes ten
+     minutes or so.  This is the one to use for a release.
 
 EOT
   while [[ -z "$MODE" ]]; do
-    printf "Select [1/2/3]: "
+    printf "Select [1/2/3/4]: "
     read -r reply || { echo; exit 1; }
     case "$reply" in
       1) MODE=adhoc ;;
@@ -103,7 +126,12 @@ EOT
         MODE=developerid
         BUILD=yes
         ;;
-      *) echo "Enter 1, 2 or 3." ;;
+      4)
+        MODE=developerid
+        BUILD=yes
+        PROFILE=dist
+        ;;
+      *) echo "Enter 1, 2, 3 or 4." ;;
     esac
   done
   echo
@@ -207,6 +235,7 @@ if [[ "$ARCH" == both ]]; then
   extra=()
   if [[ "$BUILD" == yes ]]; then extra+=(--build); fi
   if [[ "$UPLOAD" == yes ]]; then extra+=(--upload); fi
+  extra+=(--profile "$PROFILE")
   for one in arm64 x86_64; do
     echo
     echo "################  $one  ################"
@@ -228,7 +257,8 @@ esac
 # ci/deploy.sh reads this for both the archive name and which target directory
 # to take the binaries from.
 export MACOS_ARCH="$ARCH"
-BIN_DIR="target/$RUST_TARGET/release"
+export CARGO_PROFILE="$PROFILE"
+BIN_DIR="target/$RUST_TARGET/$PROFILE"
 
 # `rustc` on PATH is often the one Homebrew installed, and a toolchain from a
 # package manager carries only its own host's standard library: a cross build
@@ -283,11 +313,11 @@ if [[ "$BUILD" == yes ]]; then
   echo "    toolchain: $(cargo --version) at $(command -v cargo)"
 
   echo
-  echo "==> Building for $ARCH"
+  echo "==> Building for $ARCH ($PROFILE profile)"
   # The same four packages the release workflow builds, which between them
   # produce all five binaries the bundle carries.  Building the whole
   # workspace instead would compile crates no package ships.
-  cargo build --release --target "$RUST_TARGET" \
+  cargo build --profile "$PROFILE" --target "$RUST_TARGET" \
     -p wezterm \
     -p wezterm-gui \
     -p wezterm-mux-server \
@@ -315,8 +345,8 @@ fi
 # set of binaries. Keep accepting it, so packaging what is already built does
 # not force a second full build into a target-specific directory.
 if [[ ! -f "$BIN_DIR/thinkterm-gui" && "$ARCH" == "$HOST_ARCH" &&
-  -f target/release/thinkterm-gui ]]; then
-  BIN_DIR=target/release
+  -f "target/$PROFILE/thinkterm-gui" ]]; then
+  BIN_DIR="target/$PROFILE"
 fi
 export MACOS_BIN_DIR="$BIN_DIR"
 
@@ -328,13 +358,13 @@ for bin in $BINARIES; do
 done
 if [[ -n "$missing" ]]; then
   echo "Missing $ARCH binaries in $BIN_DIR:$missing" >&2
-  echo "Build them first with 'cargo build --release --target $RUST_TARGET'," >&2
+  echo "Build them first with 'cargo build --profile $PROFILE --target $RUST_TARGET'," >&2
   echo "or re-run with --build to have this script do it." >&2
   exit 1
 fi
 
 if [[ "$BUILD" == yes ]]; then
-  echo "    release binaries: just built"
+  echo "    $PROFILE binaries: just built"
 else
   # deploy.sh copies each binary independently, so a bundle can quietly carry
   # binaries from different commits: a partial `cargo build -p wezterm-gui`
@@ -351,12 +381,12 @@ else
     done
   fi
   if [[ -n "$stale" ]]; then
-    echo "    release binaries: PRESENT BUT OLDER THAN HEAD --$stale"
+    echo "    $PROFILE binaries: PRESENT BUT OLDER THAN HEAD --$stale"
     echo "    HEAD is $(git log -1 --format='%h %s')"
     echo "    Re-run with --build, or with option 3, unless you know those"
     echo "    binaries do not depend on anything that has changed since."
   else
-    echo "    release binaries: present, none older than HEAD"
+    echo "    $PROFILE binaries: present, none older than HEAD"
   fi
 fi
 
@@ -406,4 +436,8 @@ if [[ "$UPLOAD" == yes ]]; then
 else
   echo "Attach to the release:"
   echo "    $PWD/$zipname"
+fi
+if [[ -f "$zipdir-dSYM.zip" ]]; then
+  echo "Symbols for reading crash reports against this build (keep, do not publish):"
+  echo "    $PWD/$zipdir-dSYM.zip"
 fi

@@ -39,6 +39,19 @@ exclude = [
 opt-level = 3
 # debug = 2
 
+# What a release ships: whole-program optimisation and no symbol table in
+# the binaries, with the symbols written beside them (a .dSYM on macOS, a
+# .dwp on Linux, a .pdb on Windows) for symbolicating crash reports. It
+# builds into target/dist, so the everyday release profile and its cache
+# stay untouched; only the final LTO link is repeated per build.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"
+split-debuginfo = "packed"
+strip = "symbols"
+
 [profile.dev]
 debug = 0
 # https://jakedeichert.com/blog/reducing-rust-incremental-compilation-times-on-macos-by-70-percent/
