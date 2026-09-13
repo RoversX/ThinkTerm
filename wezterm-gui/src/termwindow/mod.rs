@@ -2104,6 +2104,10 @@ pub(crate) struct FrontendGeometryConfirmation {
     pub(crate) epoch: u64,
     pub(crate) panes: Vec<(PaneId, TerminalSize)>,
     pub(crate) ready_since: Option<Instant>,
+    pub(crate) created_at: Instant,
+    /// A repaint is scheduled for when the quiet period ends, so settling
+    /// does not wait for an incidental frame.
+    pub(crate) settle_timer_armed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2200,6 +2204,9 @@ pub struct TermWindow {
     /// redraw has reached this renderer. Keep its expected pane snapshots here
     /// and reveal only after every visible row has been refreshed and stable.
     frontend_geometry_confirmations: HashMap<TabId, FrontendGeometryConfirmation>,
+    /// Tabs whose last geometry preparation actually changed a pane size:
+    /// only those have a reflow to hide behind the takeover overlay.
+    frontend_geometry_resized: std::collections::HashSet<TabId>,
     /// Replacement-mux recovery is completed only after the matching geometry
     /// epoch reaches the normal local render-surface confirmation point.
     frontend_recovery_geometry: HashMap<TabId, FrontendRecoveryGeometry>,
@@ -3803,6 +3810,7 @@ impl TermWindow {
         let myself = Self {
             frontend_geometry_phases: HashMap::new(),
             frontend_geometry_confirmations: HashMap::new(),
+            frontend_geometry_resized: std::collections::HashSet::new(),
             frontend_recovery_geometry: HashMap::new(),
             frontend_geometry_resync_after_epoch: HashSet::new(),
             rejected_local_viewports: HashMap::new(),

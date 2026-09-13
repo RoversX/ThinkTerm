@@ -154,6 +154,7 @@ const FRONTEND_GEOMETRY_SETTLE: Duration = Duration::from_millis(200);
 fn geometry_confirmation_settled(
     ready: bool,
     now: std::time::Instant,
+    created: std::time::Instant,
     ready_since: &mut Option<std::time::Instant>,
 ) -> bool {
     if !ready {
@@ -162,7 +163,11 @@ fn geometry_confirmation_settled(
     }
 
     let started = ready_since.get_or_insert(now);
+    // The quiet time guards against a redraw trailing the resize that was
+    // issued when this confirmation was created. Long after that (a tab
+    // switched away from and back), any such redraw has long arrived.
     now.duration_since(*started) >= FRONTEND_GEOMETRY_SETTLE
+        || now.duration_since(created) >= FRONTEND_GEOMETRY_SETTLE * 2
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -382,6 +387,7 @@ impl super::TermWindow {
         }
 
         let mux = Mux::get();
+        let resized = self.frontend_geometry_resized.remove(&tab_id);
         for (pane_id, size) in adopted {
             let Some(pane) = mux.get_pane(*pane_id) else {
                 continue;
@@ -410,12 +416,38 @@ impl super::TermWindow {
                 .into_iter()
                 .map(|positioned| positioned.pane.pane_id())
                 .collect::<HashSet<_>>();
+            let mut targets = visible_geometry_targets(adopted, &visible_panes);
+            if targets.is_empty() {
+                // The rendered pane set can lag a tab that was activated a
+                // moment ago; with nothing to confirm the mask would never
+                // lift, so confirm what this epoch resized instead.
+                targets = adopted.to_vec();
+            }
+            // No pane changed size and the server already agrees on every
+            // one: no reflow is on its way, so there is nothing to hide.
+            let server_agrees = targets.iter().all(|(pane_id, size)| {
+                mux.get_pane(*pane_id)
+                    .and_then(|pane| {
+                        pane.downcast_ref::<ClientPane>()
+                            .map(|client| client.frontend_geometry_mismatch(*size).is_none())
+                    })
+                    .unwrap_or(false)
+            });
+            if !resized && server_agrees {
+                mux::zoom_trace!("gui.confirm.unchanged tab={tab_id} epoch={epoch}");
+                self.complete_frontend_geometry_epoch(tab_id, epoch);
+                self.update_title_post_status();
+                self.invalidate_window();
+                return;
+            }
             self.frontend_geometry_confirmations.insert(
                 tab_id,
                 super::FrontendGeometryConfirmation {
                     epoch,
-                    panes: visible_geometry_targets(adopted, &visible_panes),
+                    panes: targets,
                     ready_since: None,
+                    created_at: std::time::Instant::now(),
+                    settle_timer_armed: false,
                 },
             );
             self.advance_frontend_geometry_confirmation();
@@ -552,7 +584,7 @@ impl super::TermWindow {
 
         let now = std::time::Instant::now();
         let settled = if let Some(pending) = self.frontend_geometry_confirmations.get_mut(&tab_id) {
-            geometry_confirmation_settled(ready, now, &mut pending.ready_since)
+            geometry_confirmation_settled(ready, now, pending.created_at, &mut pending.ready_since)
         } else {
             false
         };
@@ -562,9 +594,42 @@ impl super::TermWindow {
             confirmation.epoch,
             blockers.join("; ")
         );
+        if ready && !settled {
+            self.arm_frontend_geometry_settle_timer(tab_id, confirmation.epoch);
+        }
         if settled {
             self.complete_frontend_geometry_epoch(tab_id, confirmation.epoch);
         }
+    }
+
+    /// Settling needs a frame at least `FRONTEND_GEOMETRY_SETTLE` after the
+    /// panes became ready; nothing else paints an idle terminal, so the
+    /// overlay used to stay until the mouse moved or the shell printed.
+    fn arm_frontend_geometry_settle_timer(&mut self, tab_id: mux::tab::TabId, epoch: u64) {
+        let Some(pending) = self.frontend_geometry_confirmations.get_mut(&tab_id) else {
+            return;
+        };
+        if pending.settle_timer_armed {
+            return;
+        }
+        pending.settle_timer_armed = true;
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        promise::spawn::spawn(async move {
+            smol::Timer::after(FRONTEND_GEOMETRY_SETTLE + Duration::from_millis(20)).await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                if let Some(pending) = term_window.frontend_geometry_confirmations.get_mut(&tab_id) {
+                    if pending.epoch == epoch {
+                        pending.settle_timer_armed = false;
+                    }
+                }
+                term_window.advance_frontend_geometry_confirmation();
+                term_window.invalidate_window();
+            })));
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
     }
 
     pub(crate) fn active_tab_is(&self, tab_id: mux::tab::TabId) -> bool {
@@ -622,13 +687,21 @@ impl super::TermWindow {
                 panes.push(viewport);
             }
         }
+        let mut resized = false;
         for (pane_id, size) in &adopted {
             let pane = Mux::get().get_pane(*pane_id)?;
             let pane = pane.downcast_ref::<ClientPane>()?;
             if let Some(epoch) = preview_epoch {
                 pane.preview_frontend_geometry(epoch, *size);
             } else {
-                pane.adopt_frontend_geometry(*size);
+                resized |= pane.adopt_frontend_geometry(*size);
+            }
+        }
+        if preview_epoch.is_none() {
+            if resized {
+                self.frontend_geometry_resized.insert(tab.tab_id());
+            } else {
+                self.frontend_geometry_resized.remove(&tab.tab_id());
             }
         }
 
@@ -3081,28 +3154,33 @@ mod frontend_geometry_tests {
         assert!(!geometry_confirmation_settled(
             true,
             start,
+            start,
             &mut ready_since
         ));
         assert!(!geometry_confirmation_settled(
             true,
             start + FRONTEND_GEOMETRY_SETTLE - Duration::from_millis(1),
+            start,
             &mut ready_since
         ));
         assert!(geometry_confirmation_settled(
             true,
             start + FRONTEND_GEOMETRY_SETTLE,
+            start,
             &mut ready_since
         ));
 
         assert!(!geometry_confirmation_settled(
             false,
             start + FRONTEND_GEOMETRY_SETTLE,
+            start,
             &mut ready_since
         ));
         assert_eq!(ready_since, None);
         assert!(!geometry_confirmation_settled(
             true,
             start + FRONTEND_GEOMETRY_SETTLE,
+            start,
             &mut ready_since
         ));
     }
