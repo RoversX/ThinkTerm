@@ -100,8 +100,8 @@ fn recent_file_name() -> PathBuf {
 
 fn load_recents() -> anyhow::Result<Vec<Recent>> {
     let file_name = recent_file_name();
-    let f = std::fs::File::open(&file_name)?;
-    let mut recents: Vec<Recent> = serde_json::from_reader(f)?;
+    let text = std::fs::read_to_string(&file_name)?;
+    let mut recents: Vec<Recent> = serde_json::from_str(&text)?;
     recents.sort_by(|a, b| b.frecency.score().partial_cmp(&a.frecency.score()).unwrap());
     Ok(recents)
 }

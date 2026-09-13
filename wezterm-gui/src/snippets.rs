@@ -85,8 +85,8 @@ fn load_snippet_store_from_path(path: &Path) -> Result<SnippetStore> {
     if !path.exists() {
         return Ok(SnippetStore::default());
     }
-    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    serde_json::from_reader(file).with_context(|| format!("parse {}", path.display()))
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
 }
 
 fn save_snippet_store(store: &SnippetStore) -> Result<()> {

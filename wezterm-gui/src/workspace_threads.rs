@@ -777,9 +777,12 @@ pub fn load_workspace_thread_store_from_path(path: &Path) -> Result<WorkspaceThr
     if !path.exists() {
         return Ok(WorkspaceThreadStore::default());
     }
-    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    // Read whole, then parse: `from_reader` on a bare `File` fetches one
+    // byte per `read` syscall, which for this store is ~140k syscalls on
+    // the main thread before the first window.
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut value: serde_json::Value =
-        serde_json::from_reader(file).with_context(|| format!("parse {}", path.display()))?;
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     migrate_legacy_remote_hosts(&value);
     let removed = drop_legacy_archived_threads(&mut value);
     if removed > 0 {
