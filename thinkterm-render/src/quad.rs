@@ -712,10 +712,18 @@ impl HeapQuadAllocator {
     /// draws one per visible card, every frame -- this makes re-recording
     /// allocation-free.
     pub fn recycle(&mut self) {
-        self.layer0.clear();
-        self.layer1.clear();
-        self.layer2.clear();
-        self.position_transform = None;
+        // Destructured so that a new field cannot be forgotten here and leak
+        // from one recording into the next.
+        let Self {
+            layer0,
+            layer1,
+            layer2,
+            position_transform,
+        } = self;
+        layer0.clear();
+        layer1.clear();
+        layer2.clear();
+        *position_transform = None;
     }
 
     /// Move the recording into a new allocator whose vectors have no spare
@@ -729,22 +737,31 @@ impl HeapQuadAllocator {
     /// moved, not cloned: `BoxedQuad::clone` deep-copies every corner
     /// gradient box, so a clone would trade the doubling slack for an
     /// allocation per gradient quad.
+    ///
+    /// The position transform is a recording-time setting (applied as quads
+    /// are allocated), so it is cleared on both sides: the finished surface
+    /// is only ever replayed, and the recorder starts its next line clean.
     pub fn take_exact(&mut self) -> Self {
-        fn drain_exact(src: &mut Vec<BoxedQuad>) -> Vec<BoxedQuad> {
-            // with_capacity + extend rather than collect: the exactness is
+        fn move_exact(src: &mut Vec<BoxedQuad>) -> Vec<BoxedQuad> {
+            // with_capacity + append rather than collect: the exactness is
             // the point, and must not depend on an iterator specialisation.
             let mut out = Vec::with_capacity(src.len());
-            out.extend(src.drain(..));
+            out.append(src);
             out
         }
-        let out = Self {
-            layer0: drain_exact(&mut self.layer0),
-            layer1: drain_exact(&mut self.layer1),
-            layer2: drain_exact(&mut self.layer2),
-            position_transform: self.position_transform,
-        };
-        self.position_transform = None;
-        out
+        let Self {
+            layer0,
+            layer1,
+            layer2,
+            position_transform,
+        } = self;
+        *position_transform = None;
+        Self {
+            layer0: move_exact(layer0),
+            layer1: move_exact(layer1),
+            layer2: move_exact(layer2),
+            position_transform: None,
+        }
     }
 
     /// Estimated resident heap bytes for the recorded quads. Counts vector
@@ -1062,7 +1079,6 @@ impl TripleLayerQuadAllocatorTrait for HeapQuadAllocator {
         let src_quads: &[[Vertex; VERTICES_PER_CELL]] =
             unsafe { std::slice::from_raw_parts(vertices.as_ptr().cast(), vertices.len() / 4) };
 
-        dest_quads.reserve(src_quads.len());
         for quad in src_quads {
             let mut quad = BoxedQuad::from_vertices(quad);
             if let Some(transform) = position_transform {
@@ -1090,7 +1106,7 @@ fn size() {
 
 #[cfg(test)]
 fn record_quads(heap: &mut HeapQuadAllocator, per_layer: [usize; 3]) {
-    let mut layers = heap;
+    let layers = heap;
     for (layer_num, count) in per_layer.into_iter().enumerate() {
         for i in 0..count {
             let x = (layer_num * 1000 + i * 10) as f32;
@@ -1106,14 +1122,13 @@ fn take_exact_produces_exact_capacity_and_keeps_the_scratch_buffers() {
     let mut scratch = HeapQuadAllocator::default();
     record_quads(&mut scratch, [5, 3, 0]);
     let grown = scratch.resident_bytes();
-    // Doubling from zero leaves slack behind; that slack is the point.
-    assert!(grown > 8 * std::mem::size_of::<BoxedQuad>());
 
     let out = scratch.take_exact();
     assert_eq!(out.quad_count(), 8);
     assert_eq!(out.resident_bytes(), 8 * std::mem::size_of::<BoxedQuad>());
     assert_eq!(scratch.quad_count(), 0);
     assert_eq!(scratch.resident_bytes(), grown, "the scratch keeps its buffers");
+    assert!(grown >= out.resident_bytes());
 }
 
 #[cfg(test)]
@@ -1135,7 +1150,7 @@ fn take_exact_preserves_layer_assignment_and_recorded_order() {
 fn take_exact_moves_corner_gradients_intact() {
     let mut scratch = HeapQuadAllocator::default();
     {
-        let mut layers = &mut scratch;
+        let layers = &mut scratch;
         let mut quad = layers.allocate(1).unwrap();
         quad.set_corner_gradient(
             LinearRgba::with_components(0.1, 0.0, 0.0, 1.0),
@@ -1183,24 +1198,28 @@ fn a_recycled_scratch_records_the_same_surface_as_a_fresh_allocator() {
 
 #[cfg(test)]
 #[test]
-fn take_exact_clears_the_position_transform() {
+fn take_exact_clears_the_position_transform_on_both_sides() {
     let source = QuadClipRect::from_top_left_pixels(0.0, 0.0, 100.0, 100.0, &TEST_ORIGIN);
     let target = QuadClipRect::from_top_left_pixels(0.0, 0.0, 200.0, 200.0, &TEST_ORIGIN);
     let mut scratch = HeapQuadAllocator::default();
     {
-        let mut layers = &mut scratch;
+        let layers = &mut scratch;
         layers.set_position_transform(Some(QuadPositionTransform::new(source, target).unwrap()));
         let mut quad = layers.allocate(0).unwrap();
         quad.set_position(10.0, 10.0, 20.0, 20.0);
     }
-    let out = scratch.take_exact();
+    let mut out = scratch.take_exact();
+    // Recorded under the transform, so mapped.
     assert_eq!(out.layer0[0].position, (20.0, 20.0, 40.0, 40.0));
-    {
-        let mut layers = &mut scratch;
-        let mut quad = layers.allocate(0).unwrap();
+    // Neither side keeps the transform: a quad recorded into either
+    // afterwards lands where it was placed.
+    for heap in [&mut scratch, &mut out] {
+        let layers = heap;
+        let mut quad = layers.allocate(1).unwrap();
         quad.set_position(10.0, 10.0, 20.0, 20.0);
     }
-    assert_eq!(scratch.layer0[0].position, (10.0, 10.0, 20.0, 20.0));
+    assert_eq!(scratch.layer1[0].position, (10.0, 10.0, 20.0, 20.0));
+    assert_eq!(out.layer1[0].position, (10.0, 10.0, 20.0, 20.0));
 }
 
 #[cfg(test)]

@@ -125,6 +125,12 @@ const COLLAPSED_EDGE_PADDING: usize = 8;
 /// Gap the collapsed strip leaves between its tabs and its action button.
 const COLLAPSED_SECTION_GAP: usize = 10;
 
+/// Most the line quad scratch recorder may keep between lines. A line of
+/// ordinary width needs a few tens of KiB across its three layers; one
+/// exceptionally wide line grows the buffers past this and they are
+/// released rather than pinned for the window's life.
+const LINE_QUAD_SCRATCH_MAX_BYTES: usize = 512 * 1024;
+
 impl crate::TermWindow {
     /// Height of the nav bar for this pane: the metric height, clamped so
     /// that at least one terminal row of the pane's cell remains visible.
@@ -1939,10 +1945,13 @@ impl crate::TermWindow {
                     // Recorded into the window's one scratch recorder and
                     // moved out at exact size below, rather than growing a
                     // fresh allocator from zero on every miss. Recycled on
-                    // entry so an early `?` return leaves nothing stale.
+                    // entry as well as on exit, so an early `?` return
+                    // leaves nothing stale for the next line.
                     // No painter re-enters this while a line is being
-                    // recorded; should one ever do so, that line falls back
-                    // to a private allocator rather than panicking mid-paint.
+                    // recorded (the only other borrowers run outside a
+                    // paint); should one ever do so, that line falls back to
+                    // a private allocator rather than panicking mid-paint,
+                    // which costs the old doubling churn for that line only.
                     let mut scratch_guard = self.term_window.line_quad_scratch.try_borrow_mut();
                     let mut fallback = HeapQuadAllocator::default();
                     let buf: &mut HeapQuadAllocator = match scratch_guard.as_mut() {
@@ -2049,7 +2058,6 @@ impl crate::TermWindow {
                                 None
                             },
                         };
-                        drop(scratch_guard);
                         let weight = crate::termwindow::render::estimate_line_quad_entry_bytes(
                             &quad_key,
                             &quad_value,
@@ -2058,6 +2066,17 @@ impl crate::TermWindow {
                             .line_quad_cache
                             .borrow_mut()
                             .put_weighted(quad_key, quad_value, weight);
+                    } else {
+                        // Not cached: leave the scratch empty rather than
+                        // holding this line's quads until the next miss.
+                        buf.recycle();
+                    }
+                    // The scratch keeps its buffers between lines on purpose,
+                    // but one unusually wide line must not pin them for the
+                    // life of the window (only macOS and Windows report the
+                    // occlusion that otherwise releases it).
+                    if buf.resident_bytes() > LINE_QUAD_SCRATCH_MAX_BYTES {
+                        *buf = HeapQuadAllocator::default();
                     }
 
                     Ok(())

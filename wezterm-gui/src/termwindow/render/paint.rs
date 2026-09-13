@@ -935,9 +935,16 @@ impl crate::TermWindow {
                                         "glyph_cache_entries",
                                         glyphs.glyph_entries(),
                                     );
-                                    crate::perf::log_counter("atlas_side", glyphs.atlas.size());
+                                    // Texel counts, not bytes: the atlas is
+                                    // side x side x 4 bytes, and allocated_px
+                                    // is a high-water mark of packed area
+                                    // that only Atlas::clear resets.
                                     crate::perf::log_counter(
-                                        "atlas_packed_px",
+                                        "atlas_side_texels",
+                                        glyphs.atlas.size(),
+                                    );
+                                    crate::perf::log_counter(
+                                        "atlas_allocated_texels_high_water",
                                         glyphs.atlas.usage().allocated_px,
                                     );
                                 }

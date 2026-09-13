@@ -2419,9 +2419,14 @@ pub struct TermWindow {
     /// steady state allocation-free apart from the exact-size copy that
     /// becomes the entry.
     ///
-    /// Exactly one line is recorded at a time: `LineRender::render_line` is
-    /// the only borrower and nothing under `render_screen_line` re-enters
-    /// it, so a double borrow would be a real bug and should panic.
+    /// Exactly one line is recorded at a time: `LineRender::render_line`
+    /// borrows it for the duration of a line and nothing under
+    /// `render_screen_line` re-enters it (it falls back to a private
+    /// allocator if that ever changes). The other borrowers, the perf
+    /// counter and the occlusion release, run outside a paint. Empty
+    /// between lines; its buffers are capped by
+    /// `LINE_QUAD_SCRATCH_MAX_BYTES` in pane.rs and dropped when the window
+    /// is occluded.
     line_quad_scratch: RefCell<HeapQuadAllocator>,
 
     last_status_call: Instant,
@@ -2997,6 +3002,13 @@ impl TermWindow {
             self.line_to_ele_shape_cache.borrow().total_weight() / 1024,
             self.pane_font_cache.borrow().len(),
             self.semantic_zones.len(),
+        ));
+        lines.push(format!(
+            "{label}: line_quad_scratch={}KiB (entries are stored at exact size; line_quad above no longer includes doubling slack)",
+            self.line_quad_scratch
+                .try_borrow()
+                .map_or(0, |scratch| scratch.resident_bytes())
+                / 1024,
         ));
         {
             let ui = self.ui_shape_caches.borrow();

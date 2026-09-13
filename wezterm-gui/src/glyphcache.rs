@@ -662,9 +662,10 @@ pub struct GlyphCacheStats {
 }
 
 impl GlyphCache {
-    /// Entry count only; `stats()` builds strings and is not per-frame
-    /// material. This is the counter for the one unbounded map in the
-    /// renderer, which is only cleared when the atlas is rebuilt.
+    /// Entry count of the main glyph map only; `stats()` builds strings and
+    /// is not per-frame material. Like the other maps in this struct it is
+    /// unbounded and only cleared when the atlas is rebuilt; it is the one
+    /// that grows with the text being rendered.
     pub fn glyph_entries(&self) -> usize {
         self.glyph_cache.len()
     }
