@@ -1368,12 +1368,22 @@ impl Mux {
     /// intentionally one-shot so a configuration reload cannot overwrite a
     /// mode selected while this server process is running.
     pub fn initialize_frontend_access_mode(&self, mode: FrontendAccessMode) {
-        let mut lease = self.frontend_lease.lock();
-        if lease.access_initialized {
-            return;
+        let changed = {
+            let mut lease = self.frontend_lease.lock();
+            if lease.access_initialized {
+                return;
+            }
+            let changed = lease.access_mode != mode;
+            lease.access_mode = mode;
+            lease.access_initialized = true;
+            changed
+        };
+        // A client that registered before this ran was told the default
+        // mode at generation 0 and drops later states at that generation;
+        // a published change is the only correction it will accept.
+        if changed {
+            self.publish_frontend_access_state();
         }
-        lease.access_mode = mode;
-        lease.access_initialized = true;
     }
 
     pub fn frontend_access_mode_is_initialized(&self) -> bool {
@@ -3853,6 +3863,25 @@ mod tests {
         // non-rendering client) does not count as a renderer.
         tabs.get_mut(&2).unwrap().viewports.remove(&other);
         assert!(is_sole_live_renderer(&tabs, &live, &me));
+    }
+
+    #[test]
+    fn initializing_a_different_mode_publishes_a_newer_generation() {
+        // The default state (Handoff, generation 0) may already have been
+        // sent to a client; the stored mode must arrive with a generation
+        // that client accepts, and an unchanged mode must stay quiet.
+        let mux = Mux::new(None);
+        let before = mux.frontend_access_state();
+        assert_eq!(before.mode, FrontendAccessMode::Handoff);
+        mux.initialize_frontend_access_mode(FrontendAccessMode::TmuxLatest);
+        let after = mux.frontend_access_state();
+        assert_eq!(after.mode, FrontendAccessMode::TmuxLatest);
+        assert!(after.generation > before.generation);
+
+        let quiet = Mux::new(None);
+        let before = quiet.frontend_access_state();
+        quiet.initialize_frontend_access_mode(FrontendAccessMode::Handoff);
+        assert_eq!(quiet.frontend_access_state().generation, before.generation);
     }
 
     #[test]

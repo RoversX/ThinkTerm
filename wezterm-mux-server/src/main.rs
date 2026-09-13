@@ -341,6 +341,9 @@ fn run() -> anyhow::Result<()> {
     #[cfg(not(unix))]
     let mux = Arc::new(mux::Mux::new(Some(domain.clone())));
     Mux::set_mux(&mux);
+    // Before the listener: a client registering earlier than the stored
+    // mode is loaded gets the default one and never accepts the fix-up.
+    wezterm_mux_server_impl::thinkterm_access::initialize_mux(&mux);
 
     install_shutdown_signal_handler()?;
 
