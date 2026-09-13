@@ -925,7 +925,9 @@ impl crate::TermWindow {
                                 }
                                 crate::perf::log_counter(
                                     "line_quad_scratch_bytes",
-                                    self.line_quad_scratch.borrow().resident_bytes(),
+                                    self.line_quad_scratch
+                                        .try_borrow()
+                                        .map_or(0, |scratch| scratch.resident_bytes()),
                                 );
                                 if let Some(render_state) = self.render_state.as_ref() {
                                     let glyphs = render_state.glyph_cache.borrow();

@@ -1940,8 +1940,18 @@ impl crate::TermWindow {
                     // moved out at exact size below, rather than growing a
                     // fresh allocator from zero on every miss. Recycled on
                     // entry so an early `?` return leaves nothing stale.
-                    let mut buf = self.term_window.line_quad_scratch.borrow_mut();
-                    buf.recycle();
+                    // No painter re-enters this while a line is being
+                    // recorded; should one ever do so, that line falls back
+                    // to a private allocator rather than panicking mid-paint.
+                    let mut scratch_guard = self.term_window.line_quad_scratch.try_borrow_mut();
+                    let mut fallback = HeapQuadAllocator::default();
+                    let buf: &mut HeapQuadAllocator = match scratch_guard.as_mut() {
+                        Ok(scratch) => {
+                            scratch.recycle();
+                            &mut **scratch
+                        }
+                        Err(_) => &mut fallback,
+                    };
                     let next_due = self.term_window.has_animation.borrow_mut().take();
 
                     let shape_key = LineToEleShapeCacheKey {
@@ -2004,7 +2014,7 @@ impl crate::TermWindow {
                                 allow_images: true,
                                 simple_shaping: false,
                             },
-                            &mut TripleLayerQuadAllocator::Heap(&mut *buf),
+                            &mut TripleLayerQuadAllocator::Heap(buf),
                         )
                         .context("render_screen_line")?;
 
@@ -2013,7 +2023,7 @@ impl crate::TermWindow {
 
                     replay_line(
                         self.layers,
-                        &*buf,
+                        buf,
                         self.scroll_px,
                         self.pane_clip,
                         line_idx,
@@ -2039,7 +2049,7 @@ impl crate::TermWindow {
                                 None
                             },
                         };
-                        drop(buf);
+                        drop(scratch_guard);
                         let weight = crate::termwindow::render::estimate_line_quad_entry_bytes(
                             &quad_key,
                             &quad_value,
