@@ -46,12 +46,17 @@ impl Clock for SystemClock {
 /// push: the session asks for them on every delta.
 pub(crate) struct DesktopConfig {
     rules: Mutex<Option<(usize, Arc<Vec<termwiz::hyperlink::Rule>>)>>,
+    /// The session server of this machine: a screenful of rows costs a
+    /// millisecond over its socket, so the pane fetches well ahead and
+    /// keeps its whole scrollback at hand.
+    local_session_host: bool,
 }
 
 impl DesktopConfig {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(local_session_host: bool) -> Self {
         Self {
             rules: Mutex::new(None),
+            local_session_host,
         }
     }
 }
@@ -73,6 +78,18 @@ impl HostConfig for DesktopConfig {
 
     fn fetch_rate_per_second(&self) -> u32 {
         configuration().ratelimit_mux_line_prefetches_per_second
+    }
+
+    fn scrollback_lookahead_screens(&self) -> usize {
+        if self.local_session_host {
+            2
+        } else {
+            1
+        }
+    }
+
+    fn warm_scrollback(&self) -> bool {
+        self.local_session_host
     }
 }
 
@@ -202,12 +219,13 @@ pub(crate) struct DesktopHost {
 
 impl DesktopHost {
     pub(crate) fn new(client: Arc<ClientInner>) -> Self {
+        let config = DesktopConfig::new(client.client.is_local_session_host());
         Self {
             image_domain: client.local_domain_id,
             link: DesktopLink::new(Arc::clone(&client)),
             events: MuxEvents::new(client),
             clock: SystemClock,
-            config: DesktopConfig::new(),
+            config,
             spawner: PromiseSpawner,
         }
     }

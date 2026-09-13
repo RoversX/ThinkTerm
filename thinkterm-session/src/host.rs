@@ -101,6 +101,12 @@ pub trait HostConfig {
     fn hyperlink_rules(&self) -> std::sync::Arc<Vec<termwiz::hyperlink::Rule>>;
     /// How many line prefetch batches a second the pane may ask for.
     fn fetch_rate_per_second(&self) -> u32;
+    /// How far past a painted range rows are fetched ahead, on each side,
+    /// in viewports. Zero fetches only what is painted.
+    fn scrollback_lookahead_screens(&self) -> usize;
+    /// Whether a pane's whole scrollback is fetched once it is first shown,
+    /// so scrolling never paints a row that is still on its way.
+    fn warm_scrollback(&self) -> bool;
 }
 
 /// Everything the session tells the host about a pane. Synchronous, and

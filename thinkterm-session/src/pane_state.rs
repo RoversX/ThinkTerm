@@ -55,6 +55,14 @@ pub struct PaneState {
 
     pub(crate) lines: LruCache<StableRowIndex, LineEntry>,
     pub(crate) line_cache_epoch: u64,
+    /// The cache epoch whose scrollback was last fetched whole; a flush
+    /// (screen switch, resize) moves the epoch and the next paint warms
+    /// the cache again.
+    pub(crate) warmed_epoch: Option<u64>,
+    /// Where the physical top was when the scrollback was last warmed;
+    /// rows that scrolled past since were never pushed, so a viewport of
+    /// growth warms again.
+    pub(crate) warmed_top: StableRowIndex,
     /// The epoch for which a discarded-fetch PaneOutput has already been
     /// emitted; during a live resize every frame bumps the epoch and can
     /// discard several in-flight fetches, and one repaint per epoch is
@@ -104,6 +112,8 @@ impl PaneState {
             frontend_preview: None,
             lines: LruCache::new(NonZeroUsize::new(config.scrollback_lines.max(128)).unwrap()),
             line_cache_epoch: 0,
+            warmed_epoch: None,
+            warmed_top: 0,
             epoch_discard_notified: 0,
             title: title.to_string(),
             working_dir: None,

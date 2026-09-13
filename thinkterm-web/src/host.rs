@@ -107,6 +107,12 @@ impl HostConfig for WebConfig {
         // ratelimit for line fetches is 10 per second per pane.
         10
     }
+    fn scrollback_lookahead_screens(&self) -> usize {
+        1
+    }
+    fn warm_scrollback(&self) -> bool {
+        false
+    }
 }
 
 pub struct WebHost {

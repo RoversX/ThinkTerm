@@ -442,7 +442,130 @@ impl<H: SessionHost> PaneSession<H> {
         );
 
         self.schedule_fetch_lines(st.dead, to_fetch, fetch_token);
+        self.fetch_ahead(st, &lines, fetch_token);
         (lines.start, result)
+    }
+
+    /// Rows a scroll is about to reveal are asked for before they are
+    /// painted: a row fetched on demand arrives a frame after it became
+    /// visible, and a fast scroll paints a fresh band of blank rows every
+    /// frame. Uncached rows around `painted` are tagged Fetching and
+    /// requested separately, so the painted rows' fetch is not held up;
+    /// once per cache epoch, the whole scrollback is fetched the same way
+    /// where the host asks for it (the session server of this machine).
+    ///
+    /// Two limits keep this speculation harmless. Rows are only tagged
+    /// while the cache can hold them beside the painted range: an insert
+    /// past the capacity would evict a painted row, whose fetch would then
+    /// be discarded and re-issued on every paint. And each speculative
+    /// batch is admitted by the host's fetch rate limit first, so a slow
+    /// link is not flooded; a refused batch leaves its rows untagged for a
+    /// later paint to try again.
+    fn fetch_ahead(
+        self: &Arc<Self>,
+        st: &mut PaneState,
+        painted: &Range<StableRowIndex>,
+        fetch_token: FetchToken,
+    ) {
+        if st.dead || !st.received {
+            return;
+        }
+        let config = self.host.config();
+        let dims = st.dimensions;
+        let lowest = dims.scrollback_top;
+        let highest = dims.physical_top + dims.viewport_rows as StableRowIndex;
+        let painted_rows = painted.end.saturating_sub(painted.start).max(0) as usize;
+        let mut budget = st.lines.cap().get().saturating_sub(painted_rows);
+        let rate = config.fetch_rate_per_second();
+        let now = self.now();
+
+        // Uncached rows among the `limit` rows of `rows` nearest its
+        // `nearest` end. The limit bounds the region, cached rows included:
+        // bounding only the misses would let a band wider than the cache
+        // fetch a different slice on every paint, each evicting the last.
+        let uncached =
+            |st: &mut PaneState, rows: Range<StableRowIndex>, limit: usize, nearest: Nearest| {
+                let mut set = RangeSet::new();
+                let mut seen = 0;
+                let mut walk = rows.clone();
+                while seen < limit {
+                    let idx = match nearest {
+                        Nearest::End => match walk.next_back() {
+                            Some(idx) => idx,
+                            None => break,
+                        },
+                        Nearest::Start => match walk.next() {
+                            Some(idx) => idx,
+                            None => break,
+                        },
+                    };
+                    if idx < lowest || idx >= highest {
+                        continue;
+                    }
+                    seen += 1;
+                    if !st.lines.contains(&idx) {
+                        set.add(idx);
+                    }
+                }
+                set
+            };
+        let tag = |st: &mut PaneState, set: &RangeSet<StableRowIndex>| {
+            for r in set.iter() {
+                for idx in r.clone() {
+                    st.lines.put(idx, LineEntry::Fetching(fetch_token));
+                }
+            }
+        };
+
+        let band =
+            (dims.viewport_rows.max(1) * config.scrollback_lookahead_screens()) as StableRowIndex;
+        if band > 0 && budget > 0 {
+            let mut ahead = uncached(
+                st,
+                painted.start - band..painted.start,
+                budget / 2,
+                Nearest::End,
+            );
+            let below = uncached(
+                st,
+                painted.end..painted.end + band,
+                budget / 2,
+                Nearest::Start,
+            );
+            for r in below.iter() {
+                ahead.add_range(r.clone());
+            }
+            if !ahead.is_empty() {
+                if !st.fetch_limiter.admit(rate, 1, now) {
+                    log::trace!("fetch ahead of {:?} refused by the rate limit", painted);
+                    return;
+                }
+                let count: usize = ahead.iter().map(|r| r.len()).sum();
+                budget = budget.saturating_sub(count);
+                tag(st, &ahead);
+                log::trace!("fetching ahead {:?} around {:?}", ahead, painted);
+                self.schedule_fetch_lines(st.dead, ahead, fetch_token);
+            }
+        }
+
+        let grew = dims.physical_top - st.warmed_top >= dims.viewport_rows as StableRowIndex;
+        if config.warm_scrollback()
+            && budget > 0
+            && (st.warmed_epoch != Some(st.line_cache_epoch) || grew)
+        {
+            let warm = uncached(st, lowest..highest, budget, Nearest::End);
+            if !warm.is_empty() {
+                if !st.fetch_limiter.admit(rate, 1, now) {
+                    log::trace!("scrollback warm refused by the rate limit");
+                    return;
+                }
+                tag(st, &warm);
+                log::trace!("warming scrollback {:?}", warm);
+                self.schedule_fetch_lines(st.dead, warm, fetch_token);
+            }
+            st.warmed_epoch = Some(st.line_cache_epoch);
+            st.warmed_top = dims.physical_top;
+        }
     }
 
     pub fn changed_since(
@@ -1042,6 +1165,13 @@ impl<H: SessionHost> Drop for DrainingDeltas<H> {
     }
 }
 
+/// Which end of a range `fetch_ahead` takes rows from first.
+#[derive(Clone, Copy)]
+enum Nearest {
+    Start,
+    End,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1117,13 +1247,32 @@ mod tests {
         fn input_recorded(&self) {}
     }
 
-    struct TestConfig;
+    struct TestConfig {
+        lookahead: Cell<usize>,
+        warm: Cell<bool>,
+        rate: Cell<u32>,
+    }
+    impl Default for TestConfig {
+        fn default() -> Self {
+            Self {
+                lookahead: Cell::new(0),
+                warm: Cell::new(false),
+                rate: Cell::new(100),
+            }
+        }
+    }
     impl HostConfig for TestConfig {
         fn hyperlink_rules(&self) -> Arc<Vec<termwiz::hyperlink::Rule>> {
             Arc::new(Vec::new())
         }
         fn fetch_rate_per_second(&self) -> u32 {
-            100
+            self.rate.get()
+        }
+        fn scrollback_lookahead_screens(&self) -> usize {
+            self.lookahead.get()
+        }
+        fn warm_scrollback(&self) -> bool {
+            self.warm.get()
         }
     }
 
@@ -1133,6 +1282,7 @@ mod tests {
     struct TestLink {
         rows: RefCell<Vec<(StableRowIndex, String)>>,
         asked: RefCell<Vec<&'static str>>,
+        rows_asked: Cell<usize>,
     }
     impl PduLink for TestLink {
         type Request = LocalFuture<Result<Pdu, LinkError>>;
@@ -1140,6 +1290,9 @@ mod tests {
             self.asked.borrow_mut().push(pdu.pdu_name());
             let answer = match pdu {
                 Pdu::GetLines(req) => {
+                    self.rows_asked.set(
+                        self.rows_asked.get() + req.lines.iter().map(|r| r.len()).sum::<usize>(),
+                    );
                     let table = self.rows.borrow();
                     let lines: Vec<(StableRowIndex, Line)> = req
                         .lines
@@ -1244,19 +1397,26 @@ mod tests {
     }
 
     fn session(rows: &[(StableRowIndex, &str)]) -> (Arc<TestHost>, Arc<PaneSession<TestHost>>) {
+        session_with_cache(rows, 256)
+    }
+
+    fn session_with_cache(
+        rows: &[(StableRowIndex, &str)],
+        scrollback_lines: usize,
+    ) -> (Arc<TestHost>, Arc<PaneSession<TestHost>>) {
         let host = Arc::new(TestHost {
             clock: TestClock(Cell::new(0)),
             spawner: TestSpawner::default(),
             events: TestEvents::default(),
             link: TestLink::default(),
-            config: TestConfig,
+            config: TestConfig::default(),
         });
         *host.link.rows.borrow_mut() = rows.iter().map(|(r, t)| (*r, t.to_string())).collect();
         let session = PaneSession::new(
             Arc::clone(&host),
             Arc::new(Lock::new(ImageStore::default())),
             SessionConfig {
-                scrollback_lines: 256,
+                scrollback_lines,
                 local_echo_threshold_ms: None,
                 overlay_lag_indicator: false,
             },
@@ -1369,6 +1529,182 @@ mod tests {
             session.state().line_cache_epoch > epoch_before,
             "the other screen's rows are stale"
         );
+    }
+
+    fn rows_requested(host: &TestHost) -> usize {
+        host.link.rows_asked.get()
+    }
+
+    /// Rows just outside a painted range are fetched with it, tagged so a
+    /// later paint does not ask twice, and only within the scrollback.
+    #[test]
+    fn a_paint_fetches_the_rows_a_scroll_would_reveal_next() {
+        let (host, session) = session(&(-24..24).map(|r| (r, "row")).collect::<Vec<_>>());
+        host.config.lookahead.set(1);
+        // dims(): 24 viewport rows, physical_top 0, scrollback_top 0.
+        session.queue_render_delta(delta(1, false, false));
+        host.spawner.run_all();
+        host.link.rows_asked.set(0);
+
+        let _ = session.get_lines(10..14);
+        host.spawner.run_all();
+        // 4 painted + up to 24 on each side, clamped to rows 0..24: 0..10
+        // below and 14..24 above, none beyond the scrollback top.
+        assert_eq!(rows_requested(&host), 24);
+        let st = session.state();
+        assert!(matches!(st.lines.peek(&0), Some(LineEntry::Line(_))));
+        assert!(matches!(st.lines.peek(&23), Some(LineEntry::Line(_))));
+        assert!(st.lines.peek(&-1).is_none(), "nothing above the scrollback top");
+        drop(st);
+
+        host.link.rows_asked.set(0);
+        let _ = session.get_lines(10..14);
+        host.spawner.run_all();
+        assert_eq!(rows_requested(&host), 0, "everything around is cached now");
+    }
+
+    /// The whole scrollback is fetched once per cache epoch when the host
+    /// asks for it, and again after the epoch moves.
+    #[test]
+    fn a_warming_host_fetches_the_scrollback_once_per_epoch() {
+        let (host, session) = session(&(0..24).map(|r| (r, "row")).collect::<Vec<_>>());
+        host.config.warm.set(true);
+        session.queue_render_delta(delta(1, false, false));
+        host.spawner.run_all();
+        host.link.rows_asked.set(0);
+
+        let _ = session.get_lines(20..24);
+        host.spawner.run_all();
+        assert_eq!(rows_requested(&host), 24, "the painted rows plus the rest");
+        let _ = session.get_lines(0..4);
+        host.spawner.run_all();
+        assert_eq!(rows_requested(&host), 24, "already warm");
+
+        let mut size = size();
+        size.cols += 1;
+        assert!(session.apply_local_resize(size));
+        let _ = session.get_lines(20..24);
+        host.spawner.run_all();
+        assert!(rows_requested(&host) > 24, "a new epoch warms again");
+    }
+
+    /// Output that scrolled past between two pushes was never sent; once
+    /// the physical top has moved a viewport, the scrollback is warmed
+    /// again for the rows that appeared.
+    #[test]
+    fn scrollback_that_grew_a_viewport_is_warmed_again() {
+        let (host, session) = session(&(0..72).map(|r| (r, "row")).collect::<Vec<_>>());
+        host.config.warm.set(true);
+        session.queue_render_delta(delta(1, false, false));
+        host.spawner.run_all();
+        let _ = session.get_lines(0..24);
+        host.spawner.run_all();
+        host.link.rows_asked.set(0);
+
+        let mut grown = delta(2, false, false);
+        grown.dimensions.physical_top = 48;
+        grown.dimensions.scrollback_rows = 72;
+        session.queue_render_delta(grown);
+        host.spawner.run_all();
+        let _ = session.get_lines(48..72);
+        host.spawner.run_all();
+        // The painted 48..72 plus the never-pushed 24..48; 0..24 is cached.
+        assert_eq!(rows_requested(&host), 48);
+    }
+
+    /// Speculation never pushes a painted row out of the cache: with a
+    /// cache barely larger than the viewport, the lookahead is cut to what
+    /// fits beside the painted rows, which all come back as lines.
+    #[test]
+    fn speculative_fetches_leave_the_painted_rows_in_the_cache() {
+        // scrollback_lines below the floor: the cache holds 128 rows.
+        let (host, session) =
+            session_with_cache(&(0..200).map(|r| (r, "row")).collect::<Vec<_>>(), 100);
+        host.config.lookahead.set(3);
+        let mut tall = delta(1, false, false);
+        tall.dimensions.physical_top = 176;
+        tall.dimensions.scrollback_rows = 200;
+        session.queue_render_delta(tall);
+        host.spawner.run_all();
+        host.link.rows_asked.set(0);
+
+        let _ = session.get_lines(176..200);
+        host.spawner.run_all();
+        let st = session.state();
+        for row in 176..200 {
+            assert!(
+                matches!(st.lines.peek(&row), Some(LineEntry::Line(_))),
+                "painted row {row} survived the speculation"
+            );
+        }
+        assert!(st.lines.len() <= 128);
+        // 24 painted plus at most the 104 the cache has room for.
+        assert!(rows_requested(&host) <= 128, "{}", rows_requested(&host));
+        assert!(rows_requested(&host) > 24, "some lookahead happened");
+    }
+
+    /// A band wider than the cache settles: the second paint of the same
+    /// range finds the bounded region cached and asks for nothing, rather
+    /// than fetching a fresh slice that evicts the last one every frame.
+    #[test]
+    fn speculation_wider_than_the_cache_settles_on_the_second_paint() {
+        let (host, session) =
+            session_with_cache(&(0..168).map(|r| (r, "row")).collect::<Vec<_>>(), 100);
+        host.config.lookahead.set(3);
+        let mut tall = delta(1, false, false);
+        tall.dimensions.physical_top = 128;
+        tall.dimensions.scrollback_rows = 168;
+        session.queue_render_delta(tall);
+        host.spawner.run_all();
+        host.link.rows_asked.set(0);
+
+        let _ = session.get_lines(64..104);
+        host.spawner.run_all();
+        let first = rows_requested(&host);
+        assert!(first > 40, "painted rows plus a bounded lookahead");
+
+        for _ in 0..3 {
+            let _ = session.get_lines(64..104);
+            host.spawner.run_all();
+        }
+        assert_eq!(rows_requested(&host), first, "nothing more on repeated paints");
+    }
+
+    /// A speculative batch that the fetch rate limit refuses leaves its
+    /// rows untagged, so a later paint can ask for them once the limit
+    /// allows.
+    #[test]
+    fn speculative_fetches_respect_the_fetch_rate_limit() {
+        let (host, session) = session(&(0..72).map(|r| (r, "row")).collect::<Vec<_>>());
+        host.config.lookahead.set(1);
+        host.config.rate.set(1);
+        let mut tall = delta(1, false, false);
+        tall.dimensions.physical_top = 48;
+        tall.dimensions.scrollback_rows = 72;
+        session.queue_render_delta(tall);
+        host.spawner.run_all();
+
+        // One batch is admitted: rows 36..60 and 64..72 around the paint.
+        let _ = session.get_lines(60..64);
+        host.spawner.run_all();
+        assert!(matches!(
+            session.state().lines.peek(&40),
+            Some(LineEntry::Line(_))
+        ));
+
+        // The next, in the same second, is refused: nothing is tagged.
+        let _ = session.get_lines(30..34);
+        host.spawner.run_all();
+        assert!(session.state().lines.peek(&10).is_none(), "left for later");
+
+        // A second later the limit allows it again.
+        host.clock.0.set(1_000_000);
+        let _ = session.get_lines(30..34);
+        host.spawner.run_all();
+        assert!(matches!(
+            session.state().lines.peek(&10),
+            Some(LineEntry::Line(_))
+        ));
     }
 
     /// The input path: queue, drain through the link in order, settle.
