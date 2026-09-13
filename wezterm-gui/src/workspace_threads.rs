@@ -4444,6 +4444,16 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
         if !dead.is_empty() {
             log::info!("dropping {} Space(s) the host minted without the desktop: {dead:?}", dead.len());
             strip_hidden_spaces(&mut tree_for_store, &dead);
+            // Hidden here alone, the rows stayed on the host for good, and
+            // every browser reading the host's tree showed a second
+            // "Default" beside the desktop's. Deleting them on the host is
+            // safe by construction: `dead` holds only Spaces the host minted
+            // for a landing, holding nothing anyone made and no live window.
+            let ops = dead
+                .iter()
+                .map(|space_id| codec::TreeOp::DeleteSpace { space_id: space_id.clone() })
+                .collect();
+            submit_tree_ops(domain_name.to_string(), ops);
         }
     }
     let mut store = THREAD_STORE.lock();
