@@ -501,6 +501,14 @@ impl Pane for LocalPane {
         }
     }
 
+    fn idle_image_tick(&self, ticks_until_release: u32) -> usize {
+        self.terminal.lock().idle_image_tick(ticks_until_release)
+    }
+
+    fn image_stats(&self) -> (usize, usize, usize) {
+        self.terminal.lock().kitty_image_stats()
+    }
+
     fn is_dead(&self) -> bool {
         let mut proc = self.process.lock();
 

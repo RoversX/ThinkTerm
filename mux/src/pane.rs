@@ -354,6 +354,19 @@ pub trait Pane: Downcast + Send + Sync {
     fn perform_actions(&self, _actions: Vec<termwiz::escape::Action>) {}
     fn is_dead(&self) -> bool;
     fn kill(&self) {}
+
+    /// One tick of the idle image sweep (`crate::spawn_idle_image_sweeper`):
+    /// drop the pictures nothing refers to any more once the pane has seen
+    /// no image traffic for `ticks_until_release` ticks. Returns the bytes
+    /// released; a pane without pictures of its own has nothing to do.
+    fn idle_image_tick(&self, _ticks_until_release: u32) -> usize {
+        0
+    }
+
+    /// (images, placements, bytes) of pictures this pane holds, for logs.
+    fn image_stats(&self) -> (usize, usize, usize) {
+        (0, 0, 0)
+    }
     fn palette(&self) -> ColorPalette;
     /// Palette state explicitly established by the application. `None`
     /// means that consumers should use their configured palette.

@@ -3706,6 +3706,51 @@ impl wezterm_term::DownloadHandler for MuxDownloader {
     }
 }
 
+/// How often every pane is asked to let go of pictures nothing refers to
+/// any more, and how many quiet sweeps that takes: five minutes without an
+/// image transfer. A frame stream that stopped (a browser pane closed, a
+/// viewer quit) otherwise keeps its last frames, within budget, for as
+/// long as the pane lives.
+pub const IDLE_IMAGE_SWEEP: Duration = Duration::from_secs(60);
+pub const IDLE_IMAGE_TICKS: u32 = 5;
+
+/// Start the idle image sweep on the main thread. Safe to call once per
+/// process that hosts panes; a process with no scheduler yet gets nothing.
+pub fn spawn_idle_image_sweeper() {
+    if !promise::spawn::is_scheduler_configured() {
+        log::warn!("idle image sweeper not started: no scheduler configured");
+        return;
+    }
+    log::debug!("idle image sweeper started: every {IDLE_IMAGE_SWEEP:?}, {IDLE_IMAGE_TICKS} quiet sweeps");
+    promise::spawn::spawn_into_main_thread(async {
+        loop {
+            smol::Timer::after(IDLE_IMAGE_SWEEP).await;
+            let Some(mux) = Mux::try_get() else {
+                return;
+            };
+            let panes = mux.iter_panes();
+            let released: usize = panes
+                .iter()
+                .map(|pane| pane.idle_image_tick(IDLE_IMAGE_TICKS))
+                .sum();
+            log::debug!(
+                "idle image sweep: {} panes, released {released} bytes of pictures",
+                panes.len()
+            );
+            for pane in &panes {
+                let (images, placements, bytes) = pane.image_stats();
+                if images > 0 {
+                    log::debug!(
+                        "idle image sweep: pane {} holds {images} pictures ({placements} placed) {bytes} bytes",
+                        pane.pane_id()
+                    );
+                }
+            }
+        }
+    })
+    .detach();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

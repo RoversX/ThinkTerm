@@ -443,6 +443,7 @@ async fn async_run(
     // are available before agent detection starts its safety tick.
     mux::agent_status::initialize_mux(&mux);
     update_mux_domains_for_server(&config)?;
+    mux::spawn_idle_image_sweeper();
 
     #[cfg(unix)]
     if let Some(mut takeover) = takeover {

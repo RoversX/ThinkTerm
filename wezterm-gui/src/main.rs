@@ -924,6 +924,9 @@ async fn async_run_terminal_gui(
     if let Err(err) = spawn_mux_server(unix_socket_path, should_publish) {
         log::warn!("{:#}", err);
     }
+    // For the terminals this process runs itself; the session server
+    // sweeps its own.
+    mux::spawn_idle_image_sweeper();
 
     // This process is the GUI now (a launch that handed its command to a
     // running GUI returned before this), so a server the setting no longer

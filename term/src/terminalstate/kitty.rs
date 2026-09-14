@@ -50,9 +50,9 @@ enum ChunkedTransfer {
 pub struct KittyImageState {
     accumulator: Vec<KittyImage>,
     accumulated_bytes: usize,
-    /// Set when a transfer was abandoned for exceeding the limits above, and
-    /// cleared by the `m=0` that ends it. Without it every subsequent chunk
-    /// would log and reply again, turning one bad transfer into a flood.
+    /// Set when a transfer was abandoned after exceeding the limits or
+    /// becoming idle. Discards its tail until `m=0` or a fresh keyed opening;
+    /// without it the remaining fragments would be parsed without their header.
     accumulator_overflowed: bool,
     max_image_id: u32,
     number_to_id: HashMap<u32, u32>,
@@ -64,6 +64,13 @@ pub struct KittyImageState {
     next_seq: u64,
     placements: HashMap<(u32, Option<u32>), PlacementInfo>,
     used_memory: usize,
+    /// The idle sweep's memory of `next_seq` and of the transfer in
+    /// progress, and how many sweeps in a row found both unchanged. Ticks,
+    /// not a clock: this crate also builds for the browser, where there is
+    /// no monotonic time to read.
+    idle_seen_seq: u64,
+    idle_seen_transfer: (usize, usize),
+    idle_ticks: u32,
 }
 
 impl TerminalState {
@@ -221,6 +228,63 @@ impl KittyImageState {
     /// Evict unplaced images, oldest transmission first, until the stored
     /// bytes fit `budget`. Placed images and the most recently transmitted
     /// image are never touched.
+    /// One sweep of the idle release. Anything that arrived since the last
+    /// sweep -- a stored picture, or one more fragment of a transfer still
+    /// being delivered -- resets the count; after `ticks_until_release`
+    /// quiet sweeps the fragments of the abandoned transfer and every image
+    /// no placement refers to are dropped. A frame stream that ended leaves
+    /// its last frames within budget and therefore kept for as long as the
+    /// pane lives; once it has been quiet this long nobody is going to
+    /// place them. Placed images stay: they are content, visible on screen
+    /// or further up the scrollback. The newest stored image stays too, for
+    /// the same reason the budget spares it: a transmission stores now and
+    /// places in a later escape. Returns the bytes released.
+    pub(crate) fn idle_tick(&mut self, ticks_until_release: u32) -> usize {
+        let transfer = (self.accumulator.len(), self.accumulated_bytes);
+        if self.next_seq != self.idle_seen_seq || transfer != self.idle_seen_transfer {
+            self.idle_seen_seq = self.next_seq;
+            self.idle_seen_transfer = transfer;
+            self.idle_ticks = 0;
+            return 0;
+        }
+        self.idle_ticks = self.idle_ticks.saturating_add(1);
+        if self.idle_ticks < ticks_until_release {
+            return 0;
+        }
+        // A transfer that never finished (its producer was killed between
+        // chunks) would otherwise hold its fragments until the pane closes.
+        // Discard any late tail just as for an over-limit transfer. Preserve
+        // an existing latch, but don't arm one when no transfer was pending.
+        let mut released = self.accumulated_bytes;
+        self.accumulator_overflowed |= !self.accumulator.is_empty();
+        self.accumulator = Vec::new();
+        self.accumulated_bytes = 0;
+        self.idle_seen_transfer = (0, 0);
+        let newest = self.next_seq;
+        let referenced: HashSet<u32> = self.placements.keys().map(|(k, _)| *k).collect();
+        let victims: Vec<u32> = self
+            .id_to_data
+            .keys()
+            .filter(|id| !referenced.contains(id) && self.id_seq.get(id).copied() != Some(newest))
+            .copied()
+            .collect();
+        if victims.is_empty() {
+            return released;
+        }
+        // Removed in one pass and measured once: `evict` re-measures the
+        // whole map on every call, which over a map this size is quadratic.
+        let before = self.used_memory;
+        for id in &victims {
+            self.id_to_data.remove(id);
+            self.id_seq.remove(id);
+        }
+        let gone: HashSet<u32> = victims.into_iter().collect();
+        self.number_to_id.retain(|_, id| !gone.contains(id));
+        self.recompute_used_memory();
+        released += before.saturating_sub(self.used_memory);
+        released
+    }
+
     pub(crate) fn prune_unreferenced(&mut self, budget: usize) {
         if self.used_memory <= budget {
             return;
@@ -265,6 +329,51 @@ mod prune_tests {
             side,
             vec![0u8; (side * side * 4) as usize],
         )))
+    }
+
+    #[test]
+    fn idle_ticks_release_unplaced_images_after_a_quiet_spell() {
+        let mut state = KittyImageState::default();
+        let one = image(16).len();
+        for id in 1..=3 {
+            state.record_id_to_data(id, image(16), 10 * one);
+        }
+        // The first tick only notices the transfers; the next ones count.
+        assert_eq!(state.idle_tick(2), 0);
+        assert_eq!(state.idle_tick(2), 0);
+        // A transfer in between starts the count over.
+        state.record_id_to_data(4, image(16), 10 * one);
+        assert_eq!(state.idle_tick(2), 0);
+        assert_eq!(state.idle_tick(2), 0);
+        assert_eq!(state.id_to_data.len(), 4, "still held");
+        assert_eq!(
+            state.idle_tick(2),
+            3 * one,
+            "quiet long enough: the unplaced ones go"
+        );
+        assert_eq!(
+            state.id_to_data.keys().copied().collect::<Vec<_>>(),
+            vec![4],
+            "the newest is still waiting to be placed"
+        );
+        assert_eq!(state.used_memory, one);
+        assert_eq!(state.idle_tick(2), 0, "nothing left to release");
+    }
+
+    #[test]
+    fn idle_sweeps_preserve_an_existing_discard_latch() {
+        let mut state = KittyImageState::default();
+        for _ in 0..3 {
+            assert_eq!(state.idle_tick(2), 0);
+            assert!(!state.accumulator_overflowed);
+        }
+        // A rejected transfer has already released its fragments but must
+        // keep discarding the tail, no matter how many idle sweeps follow.
+        state.accumulator_overflowed = true;
+        for _ in 0..3 {
+            assert_eq!(state.idle_tick(2), 0);
+            assert!(state.accumulator_overflowed);
+        }
     }
 
     #[test]
@@ -330,6 +439,21 @@ impl TerminalState {
     /// one -- grows the terminal without bound until it happens to clear
     /// the screen. Unplaced images go first; the image transmitted last is
     /// always kept.
+    /// See `KittyImageState::idle_tick`; driven by the mux's periodic sweep.
+    pub fn idle_image_tick(&mut self, ticks_until_release: u32) -> usize {
+        self.kitty_img.idle_tick(ticks_until_release)
+    }
+
+    /// Stored kitty images, their placements, and the bytes they hold: for
+    /// the sweep's log line, so a pane that keeps pictures says why.
+    pub fn kitty_image_stats(&self) -> (usize, usize, usize) {
+        (
+            self.kitty_img.id_to_data.len(),
+            self.kitty_img.placements.len(),
+            self.kitty_img.used_memory,
+        )
+    }
+
     pub(crate) fn kitty_enforce_image_budget(&mut self) {
         let budget = self.config.kitty_image_memory_budget();
         self.kitty_img.prune_unreferenced(budget);

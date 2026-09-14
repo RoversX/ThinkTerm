@@ -9,6 +9,7 @@
 
 use super::*;
 use crate::color::ColorPalette;
+use std::assert_eq;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
@@ -238,6 +239,74 @@ fn a_chunked_transfer_reassembles() {
         cell.attrs().images().is_some(),
         "the two chunks should have reassembled into a placeable image"
     );
+}
+
+#[test]
+fn idle_sweep_keeps_a_chunked_transfer_that_is_still_arriving() {
+    let (mut term, tap) = term_with_tap(640, 384);
+    term.advance_bytes(format!("\x1b_Ga=t,i=9,f=32,s=2,v=2,m=1;{HALF_2X2}\x1b\\"));
+    assert_eq!(term.idle_image_tick(2), 0);
+    assert_eq!(term.idle_image_tick(2), 0);
+    // Even an empty continuation is activity; only the chunk count changes.
+    for _ in 0..3 {
+        term.advance_bytes("\x1b_Gm=1;\x1b\\");
+        assert_eq!(term.idle_image_tick(2), 0);
+        assert_eq!(term.idle_image_tick(2), 0);
+    }
+    term.advance_bytes(format!("\x1b_Gm=0;{HALF_2X2}\x1b\\"));
+    // The newest completed image must survive idle sweeps until placement.
+    for _ in 0..4 {
+        assert_eq!(term.idle_image_tick(2), 0);
+    }
+    term.advance_bytes("\x1b_Ga=p,i=9\x1b\\");
+    assert!(term
+        .screen_mut()
+        .line_mut(0)
+        .get_cell(0)
+        .unwrap()
+        .attrs()
+        .images()
+        .is_some());
+    let reply = drain(&mut term, &tap);
+    assert!(reply.contains("i=9;OK"), "{:?}", reply);
+    assert!(!reply.contains(";E"), "{:?}", reply);
+}
+
+#[test]
+fn idle_sweep_discards_late_chunks_and_accepts_the_next_image() {
+    for tail_ends in [false, true] {
+        let (mut term, tap) = term_with_tap(640, 384);
+        term.advance_bytes(format!("\x1b_Ga=t,i=9,f=32,s=2,v=2,m=1;{HALF_2X2}\x1b\\"));
+        assert_eq!(term.idle_image_tick(2), 0);
+        assert_eq!(term.idle_image_tick(2), 0);
+        assert!(term.idle_image_tick(2) > 0);
+        term.advance_bytes(format!("\x1b_Gm=1;{HALF_2X2}\x1b\\"));
+        // A late continuation must not start accumulating again.
+        for _ in 0..3 {
+            assert_eq!(term.idle_image_tick(2), 0);
+        }
+        if tail_ends {
+            term.advance_bytes(format!("\x1b_Gm=0;{HALF_2X2}\x1b\\"));
+        }
+        // A fresh opening must work even when the old producer never sends m=0.
+        term.advance_bytes(XMIT_2X2);
+        term.advance_bytes("\x1b_Ga=p,i=1\x1b\\");
+        assert!(term
+            .screen_mut()
+            .line_mut(0)
+            .get_cell(0)
+            .unwrap()
+            .attrs()
+            .images()
+            .is_some());
+        let reply = drain(&mut term, &tap);
+        assert!(reply.contains("i=1;OK"), "{:?}", reply);
+        assert!(
+            !reply.contains(";E"),
+            "late chunks must be silent: {:?}",
+            reply
+        );
+    }
 }
 
 #[test]
