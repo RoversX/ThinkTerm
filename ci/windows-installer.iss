@@ -7,6 +7,9 @@
 #define MyAppPublisher "RoversX"
 #define MyAppURL "https://github.com/RoversX/thinkterm"
 #define MyAppExeName "thinkterm-gui.exe"
+#ifndef MyAppSourceDir
+  #error MyAppSourceDir must name the directory containing the built executables
+#endif
 
 [Setup]
 AppId={{56CBA99B-8F65-4EC0-8CE4-F13BFCB70274}
@@ -43,17 +46,17 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "..\target\release\thinkterm.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\target\release\wezterm.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\target\release\thinkterm-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\target\release\thinkterm-mux-server.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\target\release\mesa\opengl32.dll"; DestDir: "{app}\mesa"; Flags: ignoreversion
-Source: "..\target\release\libEGL.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\target\release\libGLESv2.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\target\release\conpty.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\target\release\OpenConsole.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSourceDir}\thinkterm.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSourceDir}\wezterm.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSourceDir}\thinkterm-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSourceDir}\thinkterm-mux-server.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSourceDir}\mesa\opengl32.dll"; DestDir: "{app}\mesa"; Flags: ignoreversion
+Source: "{#MyAppSourceDir}\libEGL.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSourceDir}\libGLESv2.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSourceDir}\conpty.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSourceDir}\OpenConsole.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\thinkterm-web\www\*"; DestDir: "{app}\web"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
-Source: "..\target\release\strip-ansi-escapes.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSourceDir}\strip-ansi-escapes.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE-MIT"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\NOTICE"; DestDir: "{app}"; Flags: ignoreversion

@@ -19,7 +19,7 @@ require_web_bundle() {
 }
 set -e
 
-TARGET_DIR=${1:-target}
+TARGET_DIR=${1:-${CARGO_TARGET_DIR:-target}}
 # The cargo profile the binaries were built with: `release` (target/release)
 # unless the caller built with `--profile dist` (target/dist), which is what
 # the release workflow and `ci/macos-package.sh --profile dist` do.
@@ -232,11 +232,12 @@ case $OSTYPE in
     fi
     rm -rf $zipdir $zipname
     mkdir $zipdir
-    cp $TARGET_DIR/$PROFILE/thinkterm.exe \
-      $TARGET_DIR/$PROFILE/wezterm.exe \
-      $TARGET_DIR/$PROFILE/thinkterm-mux-server.exe \
-      $TARGET_DIR/$PROFILE/thinkterm-gui.exe \
-      $TARGET_DIR/$PROFILE/strip-ansi-escapes.exe \
+    artifact_dir=$(cd "$TARGET_DIR/$PROFILE" && pwd)
+    cp "$artifact_dir/thinkterm.exe" \
+      "$artifact_dir/wezterm.exe" \
+      "$artifact_dir/thinkterm-mux-server.exe" \
+      "$artifact_dir/thinkterm-gui.exe" \
+      "$artifact_dir/strip-ansi-escapes.exe" \
       assets/windows/conhost/conpty.dll \
       assets/windows/conhost/OpenConsole.exe \
       assets/windows/angle/libEGL.dll \
@@ -250,9 +251,9 @@ case $OSTYPE in
     # go into a zip of their own next to the package, not into it: they are
     # for resolving crash reports, and they would double the download.
     rm -rf $zipdir-pdb $zipdir-pdb.zip
-    if ls $TARGET_DIR/$PROFILE/*.pdb >/dev/null 2>&1 ; then
+    if ls "$artifact_dir"/*.pdb >/dev/null 2>&1 ; then
       mkdir $zipdir-pdb
-      cp $TARGET_DIR/$PROFILE/*.pdb $zipdir-pdb
+      cp "$artifact_dir"/*.pdb $zipdir-pdb
       7z a -tzip $zipdir-pdb.zip $zipdir-pdb >/dev/null
       rm -rf $zipdir-pdb
     fi
@@ -273,7 +274,8 @@ case $OSTYPE in
       cp -Rp thinkterm-web/www/assets thinkterm-web/www/pkg thinkterm-web/www/fonts $zipdir/web/
     fi
     7z a -tzip $zipname $zipdir
-    iscc.exe -DMyAppVersion=${TAG_NAME#nightly} -F${instname} ci/windows-installer.iss
+    installer_source_dir=$(cygpath -w "$artifact_dir")
+    iscc.exe "-DMyAppVersion=${TAG_NAME#nightly}" "-DMyAppSourceDir=$installer_source_dir" "-F${instname}" ci/windows-installer.iss
     ;;
   linux-gnu|linux)
     distro=$(lsb_release -is 2>/dev/null || sh -c "source /etc/os-release && echo \$NAME")
