@@ -58,7 +58,10 @@ impl SimpleTempDir {
                         eprintln!("Failed to remove {}: {err:#}", path.display());
                     }
                 }
-                *count = 0;
+                // No lease or reader remains. Keep deletion and removal
+                // under the same lock as store(), but do not retain a
+                // zero-count entry for every image ever seen.
+                refs.remove(&content_id);
             }
             Some(count) => {
                 *count -= 1;
@@ -90,11 +93,13 @@ impl BlobStorage for SimpleTempDir {
     }
 
     fn lease_by_content(&self, content_id: ContentId, _lease_id: LeaseId) -> Result<(), Error> {
-        let _refs = self.refs.lock().unwrap();
+        let mut refs = self.refs.lock().unwrap();
 
         let path = self.path_for_content(content_id)?;
         if path.exists() {
-            self.add_ref(content_id);
+            // Keep existence checking and acquiring the reference atomic with
+            // del_ref(), without locking refs a second time via add_ref().
+            *refs.entry(content_id).or_insert(0) += 1;
             Ok(())
         } else {
             Err(Error::ContentNotFound(content_id))
@@ -168,5 +173,96 @@ impl BlobStorage for SimpleTempDir {
 
     fn advise_pid_terminated(&self, _pid: u32) -> Result<(), Error> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leasing_existing_content_completes_and_retains_it() {
+        let storage = std::sync::Arc::new(SimpleTempDir::new().unwrap());
+        let data = b"leased image";
+        let id = ContentId::for_bytes(data);
+        let first = LeaseId::new();
+        let second = LeaseId::new();
+        storage.store(id, data, first).unwrap();
+
+        // A recursive refs lock must fail the test rather than hang the suite.
+        let (send, recv) = std::sync::mpsc::channel();
+        let worker_storage = std::sync::Arc::clone(&storage);
+        let worker = std::thread::spawn(move || {
+            send.send(worker_storage.lease_by_content(id, second))
+                .unwrap();
+        });
+        recv.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("lease_by_content did not complete")
+            .unwrap();
+        worker.join().unwrap();
+
+        assert_eq!(storage.refs.lock().unwrap().get(&id), Some(&2));
+        storage.advise_lease_dropped(first, id).unwrap();
+        assert_eq!(storage.get_data(id, second).unwrap(), data);
+        storage.advise_lease_dropped(second, id).unwrap();
+        assert!(!storage.path_for_content(id).unwrap().exists());
+        assert!(storage.refs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn leasing_missing_content_does_not_create_a_reference() {
+        let storage = SimpleTempDir::new().unwrap();
+        let id = ContentId::for_bytes(b"missing image");
+        assert!(matches!(
+            storage.lease_by_content(id, LeaseId::new()),
+            Err(Error::ContentNotFound(missing)) if missing == id
+        ));
+        assert!(storage.refs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn released_content_does_not_accumulate_reference_entries() {
+        let storage = SimpleTempDir::new().unwrap();
+        for value in 0..256u32 {
+            let data = value.to_le_bytes();
+            let id = ContentId::for_bytes(&data);
+            let lease = LeaseId::new();
+            storage.store(id, &data, lease).unwrap();
+            storage.advise_lease_dropped(lease, id).unwrap();
+            assert!(!storage.path_for_content(id).unwrap().exists());
+            assert!(storage.refs.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn content_is_retained_until_its_last_reference() {
+        let storage = SimpleTempDir::new().unwrap();
+        let data = b"shared image";
+        let id = ContentId::for_bytes(data);
+        let first = LeaseId::new();
+        let second = LeaseId::new();
+        storage.store(id, data, first).unwrap();
+        storage.store(id, data, second).unwrap();
+        storage.advise_lease_dropped(first, id).unwrap();
+        assert_eq!(storage.refs.lock().unwrap().get(&id), Some(&1));
+        assert_eq!(storage.get_data(id, second).unwrap(), data);
+        storage.advise_lease_dropped(second, id).unwrap();
+        assert!(!storage.path_for_content(id).unwrap().exists());
+        assert!(storage.refs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn released_content_can_be_stored_again() {
+        let storage = SimpleTempDir::new().unwrap();
+        let data = b"same image again";
+        let id = ContentId::for_bytes(data);
+        for _ in 0..2 {
+            let lease = LeaseId::new();
+            storage.store(id, data, lease).unwrap();
+            assert_eq!(storage.refs.lock().unwrap().get(&id), Some(&1));
+            assert_eq!(storage.get_data(id, lease).unwrap(), data);
+            storage.advise_lease_dropped(lease, id).unwrap();
+            assert!(storage.refs.lock().unwrap().is_empty());
+        }
     }
 }
