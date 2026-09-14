@@ -235,6 +235,13 @@ mod session_probe {
         fn fetch_rate_per_second(&self) -> u32 {
             100
         }
+        // This probe supplies only the rows explicitly requested by its stages.
+        fn scrollback_lookahead_screens(&self) -> usize {
+            0
+        }
+        fn warm_scrollback(&self) -> bool {
+            false
+        }
     }
 
     /// Answers GetLines from a table of rows and everything else with
