@@ -48,6 +48,28 @@ use wezterm_term::{ClickPosition, LastMouseClick, StableRowIndex};
 const TAB_WHEEL_SURFACE_LOCK_MS: u64 = 700;
 const TAB_WHEEL_DIRECTION_LOCK_MS: u64 = 140;
 
+/// Consume the physical release without completing the action it would have
+/// performed. True asks the caller to cancel (not commit) divider preview RPCs.
+fn discard_blocked_pointer_release(
+    kind: &WMEK,
+    capture: &mut Option<MouseCapture>,
+    buttons: &mut Vec<MousePress>,
+    dragging: &mut Option<(UIItem, MouseEvent)>,
+    window_drag: &mut Option<MouseEvent>,
+) -> bool {
+    let WMEK::Release(press) = kind else {
+        return false;
+    };
+    *capture = None;
+    buttons.retain(|button| button != press);
+    if *press != MousePress::Left {
+        return false;
+    }
+    *dragging = None;
+    *window_drag = None;
+    true
+}
+
 /// Returns an in-flight startup-fallback repair to the pending state if its
 /// detached future is cancelled before it can report an outcome.
 struct DeniedProjectFallbackRepair {
@@ -1875,9 +1897,32 @@ impl super::TermWindow {
             context.invalidate();
             return;
         }
-        if terminal_surface && self.frontend_surface_blocked() {
-            // The opaque handoff surface consumes all pointer traffic while
-            // blocked; nothing leaks to the pane.
+        let captured_terminal_pointer = matches!(
+            self.current_mouse_capture,
+            Some(MouseCapture::TerminalPane(_))
+        ) || self.dragging.as_ref().is_some_and(|(item, _)| {
+            matches!(
+                item.item_type,
+                UIItemType::Split(_) | UIItemType::ScrollThumb(_)
+            )
+        });
+        if (terminal_surface || captured_terminal_pointer)
+            && self.frontend_terminal_gate().obscures_terminal()
+        {
+            // Claimable stays visible, but passive motion must not reach a
+            // GUI-local pane while another frontend owns it. Keep this gate
+            // here: LocalPane also serves input from the legitimate wire owner.
+            // A captured drag may be released outside the terminal rectangle.
+            if discard_blocked_pointer_release(
+                &event.kind,
+                &mut self.current_mouse_capture,
+                &mut self.current_mouse_buttons,
+                &mut self.dragging,
+                &mut self.window_drag_position,
+            ) {
+                self.cancel_remote_divider_resizes_except(None);
+                context.invalidate();
+            }
             return;
         }
         if terminal_surface && takeover_gesture {
@@ -8702,6 +8747,67 @@ fn mouse_press_to_tmb(press: &MousePress) -> TMB {
         MousePress::Left => TMB::Left,
         MousePress::Right => TMB::Right,
         MousePress::Middle => TMB::Middle,
+    }
+}
+
+#[cfg(test)]
+mod blocked_pointer_tests {
+    use super::*;
+
+    #[test]
+    fn blocked_left_release_cancels_drag_but_motion_and_other_buttons_do_not() {
+        let event = MouseEvent {
+            kind: WMEK::Press(MousePress::Left),
+            coords: window::Point::new(0, 0),
+            screen_coords: window::ScreenPoint::new(0, 0),
+            mouse_buttons: window::MouseButtons::LEFT,
+            modifiers: window::Modifiers::NONE,
+            precise_scroll_delta: None,
+            scroll_phase: None,
+            momentum_phase: None,
+            precise_wheel_lines: None,
+        };
+        let item = UIItem {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 24,
+            item_type: UIItemType::Split(mux::tab::PositionedSplit {
+                index: 0,
+                direction: SplitDirection::Horizontal,
+                left: 10,
+                top: 0,
+                size: 24,
+            }),
+        };
+        for kind in [
+            WMEK::Move,
+            WMEK::Release(MousePress::Right),
+            WMEK::Release(MousePress::Left),
+        ] {
+            let mut capture = Some(MouseCapture::UI);
+            let mut buttons = vec![MousePress::Left, MousePress::Right];
+            let mut dragging = Some((item.clone(), event.clone()));
+            let mut window_drag = Some(event.clone());
+            let cancel_divider = discard_blocked_pointer_release(
+                &kind,
+                &mut capture,
+                &mut buttons,
+                &mut dragging,
+                &mut window_drag,
+            );
+            let released = matches!(kind, WMEK::Release(_));
+            let left_released = kind == WMEK::Release(MousePress::Left);
+            assert_eq!(capture.is_none(), released);
+            assert_eq!(buttons.contains(&MousePress::Left), !left_released);
+            assert_eq!(
+                buttons.contains(&MousePress::Right),
+                kind != WMEK::Release(MousePress::Right)
+            );
+            assert_eq!(cancel_divider, left_released);
+            assert_eq!(dragging.is_none(), left_released);
+            assert_eq!(window_drag.is_none(), left_released);
+        }
     }
 }
 
