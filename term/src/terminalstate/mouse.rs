@@ -74,6 +74,18 @@ impl TerminalState {
     }
 
     fn mouse_wheel(&mut self, event: MouseEvent) -> anyhow::Result<()> {
+        // A fractional GUI scroll is not a whole terminal wheel event.
+        // Also guard other callers (including mux input) against producing
+        // a mouse report or alternate-screen cursor keys for zero travel.
+        if matches!(
+            event.button,
+            MouseButton::WheelUp(0)
+                | MouseButton::WheelDown(0)
+                | MouseButton::WheelLeft(0)
+                | MouseButton::WheelRight(0)
+        ) {
+            return Ok(());
+        }
         let (button, _button) = self.mouse_report_button_number(&event);
 
         if self.mouse_encoding == MouseEncoding::SGR

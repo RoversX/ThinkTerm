@@ -7,6 +7,7 @@ use bitflags::bitflags;
 mod c1;
 mod csi;
 mod graphics;
+mod mouse;
 #[cfg(feature = "use_serde")]
 mod snapshot;
 // mod selection; FIXME: port to render layer

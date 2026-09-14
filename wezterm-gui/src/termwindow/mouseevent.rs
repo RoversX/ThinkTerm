@@ -8655,6 +8655,11 @@ impl super::TermWindow {
                         TMB::None
                     }
                 }
+                // Sub-line motion may have been consumed by a pixel-scroll
+                // binding above. If it wasn't, it must not become terminal
+                // input: zero otherwise falls through to WheelDown/Right(0),
+                // which alternate-screen applications interpret as cursor keys.
+                WMEK::VertWheel(0) | WMEK::HorzWheel(0) => return,
                 WMEK::VertWheel(amount) => {
                     if amount > 0 {
                         TMB::WheelUp(amount as usize)
