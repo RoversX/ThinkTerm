@@ -225,20 +225,10 @@ impl KittyImageState {
         self.used_memory
     }
 
-    /// Evict unplaced images, oldest transmission first, until the stored
-    /// bytes fit `budget`. Placed images and the most recently transmitted
-    /// image are never touched.
-    /// One sweep of the idle release. Anything that arrived since the last
-    /// sweep -- a stored picture, or one more fragment of a transfer still
-    /// being delivered -- resets the count; after `ticks_until_release`
-    /// quiet sweeps the fragments of the abandoned transfer and every image
-    /// no placement refers to are dropped. A frame stream that ended leaves
-    /// its last frames within budget and therefore kept for as long as the
-    /// pane lives; once it has been quiet this long nobody is going to
-    /// place them. Placed images stay: they are content, visible on screen
-    /// or further up the scrollback. The newest stored image stays too, for
-    /// the same reason the budget spares it: a transmission stores now and
-    /// places in a later escape. Returns the bytes released.
+    /// Release fragments of an abandoned transfer after enough quiet sweeps.
+    /// Completed images remain reusable until explicit deletion or byte-budget
+    /// eviction, regardless of whether they currently have placements.
+    /// New image data or another fragment resets the quiet count.
     pub(crate) fn idle_tick(&mut self, ticks_until_release: u32) -> usize {
         let transfer = (self.accumulator.len(), self.accumulated_bytes);
         if self.next_seq != self.idle_seen_seq || transfer != self.idle_seen_transfer {
@@ -255,36 +245,16 @@ impl KittyImageState {
         // chunks) would otherwise hold its fragments until the pane closes.
         // Discard any late tail just as for an over-limit transfer. Preserve
         // an existing latch, but don't arm one when no transfer was pending.
-        let mut released = self.accumulated_bytes;
+        let released = self.accumulated_bytes;
         self.accumulator_overflowed |= !self.accumulator.is_empty();
         self.accumulator = Vec::new();
         self.accumulated_bytes = 0;
         self.idle_seen_transfer = (0, 0);
-        let newest = self.next_seq;
-        let referenced: HashSet<u32> = self.placements.keys().map(|(k, _)| *k).collect();
-        let victims: Vec<u32> = self
-            .id_to_data
-            .keys()
-            .filter(|id| !referenced.contains(id) && self.id_seq.get(id).copied() != Some(newest))
-            .copied()
-            .collect();
-        if victims.is_empty() {
-            return released;
-        }
-        // Removed in one pass and measured once: `evict` re-measures the
-        // whole map on every call, which over a map this size is quadratic.
-        let before = self.used_memory;
-        for id in &victims {
-            self.id_to_data.remove(id);
-            self.id_seq.remove(id);
-        }
-        let gone: HashSet<u32> = victims.into_iter().collect();
-        self.number_to_id.retain(|_, id| !gone.contains(id));
-        self.recompute_used_memory();
-        released += before.saturating_sub(self.used_memory);
         released
     }
 
+    /// Evict unplaced images, oldest use first, until the stored bytes fit
+    /// `budget`. Placed images and the most recently used image are spared.
     pub(crate) fn prune_unreferenced(&mut self, budget: usize) {
         if self.used_memory <= budget {
             return;
@@ -332,7 +302,7 @@ mod prune_tests {
     }
 
     #[test]
-    fn idle_ticks_release_unplaced_images_after_a_quiet_spell() {
+    fn idle_ticks_preserve_completed_images_until_budget_pressure() {
         let mut state = KittyImageState::default();
         let one = image(16).len();
         for id in 1..=3 {
@@ -346,15 +316,15 @@ mod prune_tests {
         assert_eq!(state.idle_tick(2), 0);
         assert_eq!(state.idle_tick(2), 0);
         assert_eq!(state.id_to_data.len(), 4, "still held");
-        assert_eq!(
-            state.idle_tick(2),
-            3 * one,
-            "quiet long enough: the unplaced ones go"
-        );
+        for _ in 0..10 {
+            assert_eq!(state.idle_tick(2), 0);
+        }
+        assert_eq!(state.id_to_data.len(), 4, "idle is not a deletion request");
+        state.prune_unreferenced(one);
         assert_eq!(
             state.id_to_data.keys().copied().collect::<Vec<_>>(),
             vec![4],
-            "the newest is still waiting to be placed"
+            "the byte budget still evicts older images"
         );
         assert_eq!(state.used_memory, one);
         assert_eq!(state.idle_tick(2), 0, "nothing left to release");

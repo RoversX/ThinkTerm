@@ -930,6 +930,8 @@ fn clearing_the_scrollback_and_viewport_keeps_reusable_image_data() {
     let mut term = term(640, 384, true);
     term.advance_bytes(XMIT_2X2);
     term.advance_bytes("\x1b_Ga=p,i=1\x1b\\");
+    // A second image makes id 1 ineligible for the newest-image exemption.
+    term.advance_bytes("\x1b_Ga=T,i=2,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
     assert!(term.kitty_used_memory() > 0);
 
     term.erase_scrollback_and_viewport();
@@ -943,6 +945,14 @@ fn clearing_the_scrollback_and_viewport_keeps_reusable_image_data() {
         "clearing must remove the painted placement"
     );
 
+    for _ in 0..4 {
+        term.idle_image_tick(2);
+    }
+    assert!(
+        term.kitty_image_data_for_id(1).is_some(),
+        "cleared image data must survive the idle sweep even when not newest"
+    );
+    assert!(term.kitty_image_data_for_id(2).is_some());
     term.advance_bytes("\x1b[H");
     term.advance_bytes("\x1b_Ga=p,i=1\x1b\\");
     assert!(
@@ -953,6 +963,45 @@ fn clearing_the_scrollback_and_viewport_keeps_reusable_image_data() {
             .is_some(),
         "the stored image data should still be placeable after a clear"
     );
+}
+
+#[test]
+fn deleting_one_or_all_placements_keeps_idle_image_data_reusable() {
+    for delete_placements in ["\x1b_Ga=d,d=i,i=1\x1b\\", "\x1b_Ga=d,d=a\x1b\\"] {
+        let mut term = term(640, 384, true);
+        term.advance_bytes(XMIT_2X2);
+        term.advance_bytes("\x1b_Ga=p,i=1\x1b\\");
+        term.advance_bytes("\x1b_Ga=T,i=2,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+        term.advance_bytes(delete_placements);
+        assert!(
+            term.screen_mut()
+                .line_mut(0)
+                .get_cell(0)
+                .and_then(|c| c.attrs().images())
+                .is_none()
+        );
+
+        for _ in 0..6 {
+            term.idle_image_tick(2);
+        }
+        assert!(term.kitty_image_data_for_id(1).is_some());
+        assert!(term.kitty_image_data_for_id(2).is_some());
+        term.advance_bytes("\x1b[H\x1b_Ga=p,i=1\x1b\\");
+        assert!(
+            term.screen_mut()
+                .line_mut(0)
+                .get_cell(0)
+                .and_then(|c| c.attrs().images())
+                .is_some(),
+            "deleting placements must not expire the reusable data: {:?}",
+            delete_placements
+        );
+
+        // Explicit data deletion still releases the image immediately.
+        term.advance_bytes("\x1b_Ga=d,d=I,i=1\x1b\\");
+        assert!(term.kitty_image_data_for_id(1).is_none());
+        assert!(term.kitty_image_data_for_id(2).is_some());
+    }
 }
 
 #[test]
