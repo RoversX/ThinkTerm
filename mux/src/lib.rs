@@ -3706,11 +3706,9 @@ impl wezterm_term::DownloadHandler for MuxDownloader {
     }
 }
 
-/// How often every pane is asked to let go of pictures nothing refers to
-/// any more, and how many quiet sweeps that takes: five minutes without an
-/// image transfer. A frame stream that stopped (a browser pane closed, a
-/// viewer quit) otherwise keeps its last frames, within budget, for as
-/// long as the pane lives.
+/// How often every pane checks for an abandoned image transfer, and how
+/// many quiet sweeps release its fragments. Completed kitty images remain
+/// reusable; explicit deletion and the byte budget control their lifetime.
 pub const IDLE_IMAGE_SWEEP: Duration = Duration::from_secs(60);
 pub const IDLE_IMAGE_TICKS: u32 = 5;
 
@@ -3737,13 +3735,15 @@ pub fn spawn_idle_image_sweeper() {
                 "idle image sweep: {} panes, released {released} bytes of pictures",
                 panes.len()
             );
-            for pane in &panes {
-                let (images, placements, bytes) = pane.image_stats();
-                if images > 0 {
-                    log::debug!(
-                        "idle image sweep: pane {} holds {images} pictures ({placements} placed) {bytes} bytes",
-                        pane.pane_id()
-                    );
+            if log::log_enabled!(log::Level::Debug) {
+                for pane in &panes {
+                    let (images, placements, bytes) = pane.image_stats();
+                    if images > 0 {
+                        log::debug!(
+                            "idle image sweep: pane {} holds {images} pictures ({placements} placed) {bytes} bytes",
+                            pane.pane_id()
+                        );
+                    }
                 }
             }
         }
