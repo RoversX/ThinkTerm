@@ -225,6 +225,10 @@ mod tests {
 /// own.
 pub const MAX_IMAGES: usize = 128;
 pub const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+/// How long the store is kept without any picture being looked up or
+/// added. The frames of a stream that stopped are refetched if a paint
+/// ever wants them again, which for a frame stream is never.
+pub const IDLE_IMAGE_RELEASE: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The images fetched from remote panes, by connection and hash, with the
 /// size each was last measured at.
@@ -232,6 +236,7 @@ pub struct ImageStore {
     images: lru::LruCache<(crate::host::ImageDomainKey, [u8; 32]), (Arc<ImageData>, usize)>,
     bytes: usize,
     max_bytes: usize,
+    last_touch: crate::clock::Timestamp,
 }
 
 impl Default for ImageStore {
@@ -246,7 +251,29 @@ impl ImageStore {
             images: lru::LruCache::new(std::num::NonZeroUsize::new(max_images.max(1)).unwrap()),
             bytes: 0,
             max_bytes,
+            last_touch: crate::clock::Timestamp::ZERO,
         }
+    }
+
+    /// Note that the store was used: `release_idle` counts from here.
+    pub fn touch(&mut self, now: crate::clock::Timestamp) {
+        self.last_touch = now;
+    }
+
+    /// Drop every picture once nothing has used the store for `idle_after`.
+    /// Returns the bytes let go.
+    pub fn release_idle(
+        &mut self,
+        now: crate::clock::Timestamp,
+        idle_after: std::time::Duration,
+    ) -> usize {
+        if self.images.is_empty() || now.saturating_duration_since(self.last_touch) < idle_after {
+            return 0;
+        }
+        let released = self.bytes;
+        self.images.clear();
+        self.bytes = 0;
+        released
     }
 
     pub fn get(&mut self, key: &(crate::host::ImageDomainKey, [u8; 32])) -> Option<Arc<ImageData>> {

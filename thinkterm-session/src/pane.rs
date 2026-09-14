@@ -1068,6 +1068,11 @@ impl<H: SessionHost> PaneSession<H> {
 
     fn poll(self: &Arc<Self>, st: &mut PaneState) {
         let now = self.now();
+        // A paint of any pane of this connection is the occasion to let a
+        // stopped stream's frames go; the store is shared across them.
+        self.images
+            .lock()
+            .release_idle(now, crate::images::IDLE_IMAGE_RELEASE);
         let mut forced_retry = false;
         let in_flight = st.poll_in_flight.load(Ordering::SeqCst);
         if in_flight != 0 {

@@ -1,5 +1,6 @@
 //! Attaching the pictures serialized lines name, fetching the ones not
 //! held, and keeping a held copy in step with the original.
+use crate::clock::Clock;
 use crate::host::{request, SessionHost};
 use crate::images::{file_image, frame_count, merge_into, ImageStore};
 use crate::Lock;
@@ -34,6 +35,7 @@ pub async fn hydrate_lines<H: SessionHost>(
     let mut requests = HashMap::new();
     let mut data_by_hash = HashMap::new();
     let domain = host.image_domain();
+    images.lock().touch(host.clock().now());
     for im in &image_cells {
         let held = images.lock().get(&(domain, im.data_hash));
         match held {

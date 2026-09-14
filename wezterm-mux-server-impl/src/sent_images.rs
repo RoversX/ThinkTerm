@@ -12,6 +12,9 @@
 //! So every image sent on a pane is remembered here for a while, keyed by
 //! hash, and a fetch is answered from memory first. The cell is still
 //! consulted for anything this has let go of.
+//! Entries expire only under the capacity and byte limits, not on an idle
+//! timer: elapsed time does not mean the client has fetched the pixels,
+//! and the original cell may no longer exist when a delayed request arrives.
 
 use lru::LruCache;
 use std::num::NonZeroUsize;
