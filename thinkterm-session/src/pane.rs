@@ -961,6 +961,16 @@ impl<H: SessionHost> PaneSession<H> {
 
             let result = match result {
                 Ok(result) => {
+                    // A reply may already belong to a dropped pane or an
+                    // obsolete screen. Reject it before fetching its images,
+                    // without holding the pane or its lock across hydration.
+                    // apply_lines checks again after that await.
+                    if !weak
+                        .upgrade()
+                        .is_some_and(|pane| pane.lock_current_line_fetch(fetch_token).is_some())
+                    {
+                        return;
+                    }
                     let (lines, _) =
                         hydrate_lines(&*host, &images, remote_pane_id, result.lines, true).await;
                     Ok(lines)
@@ -969,6 +979,34 @@ impl<H: SessionHost> PaneSession<H> {
             };
             Self::apply_lines(&weak, result, to_fetch, fetch_token);
         }));
+    }
+
+    /// Reject obsolete work at either side of image hydration. The same
+    /// epoch notification is used at both gates so an early discard still
+    /// schedules the repaint needed to refetch stale rows, once per epoch.
+    fn lock_current_line_fetch(
+        &self,
+        fetch_token: FetchToken,
+    ) -> Option<crate::LockGuard<'_, PaneState>> {
+        let mut st = self.state();
+        // A retained pane may become dead while a reply is in flight. Apply
+        // that reply as before; only a dropped pane or obsolete epoch discards it.
+        if fetch_token_is_current(fetch_token, st.line_cache_epoch) {
+            return Some(st);
+        }
+        log::trace!(
+            "discarding line fetch for pane {} from epoch {} because current epoch is {}",
+            self.host_pane_id,
+            fetch_token.epoch,
+            st.line_cache_epoch
+        );
+        let already_notified = st.epoch_discard_notified == st.line_cache_epoch;
+        st.epoch_discard_notified = st.line_cache_epoch;
+        drop(st);
+        if !already_notified {
+            self.host.events().pane_output(self.host_pane_id);
+        }
+        None
     }
 
     fn apply_lines(
@@ -983,29 +1021,9 @@ impl<H: SessionHost> PaneSession<H> {
         };
         let mut notify_pane_output = true;
         {
-            let mut st = me.state();
-
-            if !fetch_token_is_current(fetch_token, st.line_cache_epoch) {
-                log::trace!(
-                    "discarding line fetch for pane {} from epoch {} because current epoch is {}",
-                    me.host_pane_id,
-                    fetch_token.epoch,
-                    st.line_cache_epoch
-                );
-                // The rows this fetch covered were re-tagged Stale when the
-                // epoch moved, and only a paint re-fetches Stale rows. A
-                // paint is only scheduled by PaneOutput, so returning
-                // without notifying can leave the pane frozen until the
-                // user interacts with it. Once per epoch is enough: a live
-                // resize discards several in-flight fetches per frame.
-                let already_notified = st.epoch_discard_notified == st.line_cache_epoch;
-                st.epoch_discard_notified = st.line_cache_epoch;
-                drop(st);
-                if !already_notified {
-                    me.host.events().pane_output(me.host_pane_id);
-                }
+            let Some(mut st) = me.lock_current_line_fetch(fetch_token) else {
                 return;
-            }
+            };
 
             match result {
                 Ok(lines) => {
@@ -1185,12 +1203,14 @@ mod tests {
     use super::*;
     use crate::host::{DetachedFuture, HostConfig, LinkError};
     use crate::input::{LocalFuture, PaneLink};
-    use codec::{GetLinesResponse, UnitResponse};
+    use codec::{GetImageCellResponse, GetLinesResponse, UnitResponse};
     use std::cell::{Cell, RefCell};
     use std::future::Future;
     use std::pin::Pin;
+    use std::rc::Rc;
     use std::task::{Context, Poll, Waker};
     use termwiz::cell::CellAttributes;
+    use termwiz::image::{ImageCell, ImageData, TextureCoordinate};
     use thinkterm_proto::TabId;
 
     /// Poll to completion with a no-op waker: every future here is ready
@@ -1291,18 +1311,26 @@ mod tests {
         rows: RefCell<Vec<(StableRowIndex, String)>>,
         asked: RefCell<Vec<&'static str>>,
         rows_asked: Cell<usize>,
+        image: RefCell<Option<Arc<ImageData>>>,
+        line_reply_ready: RefCell<Option<Rc<Cell<bool>>>>,
+        image_reply_ready: RefCell<Option<Rc<Cell<bool>>>>,
     }
     impl PduLink for TestLink {
         type Request = LocalFuture<Result<Pdu, LinkError>>;
         fn request(&self, pdu: Pdu) -> Self::Request {
             self.asked.borrow_mut().push(pdu.pdu_name());
+            let ready = match &pdu {
+                Pdu::GetLines(_) => self.line_reply_ready.borrow().clone(),
+                Pdu::GetImageCell(_) => self.image_reply_ready.borrow().clone(),
+                _ => None,
+            };
             let answer = match pdu {
                 Pdu::GetLines(req) => {
                     self.rows_asked.set(
                         self.rows_asked.get() + req.lines.iter().map(|r| r.len()).sum::<usize>(),
                     );
                     let table = self.rows.borrow();
-                    let lines: Vec<(StableRowIndex, Line)> = req
+                    let mut lines: Vec<(StableRowIndex, Line)> = req
                         .lines
                         .iter()
                         .flat_map(|range| range.clone())
@@ -1320,6 +1348,17 @@ mod tests {
                             })
                         })
                         .collect();
+                    if let Some(image) = self.image.borrow().as_ref() {
+                        for (_, line) in &mut lines {
+                            line.cells_mut()[0]
+                                .attrs_mut()
+                                .attach_image(Box::new(ImageCell::new(
+                                    TextureCoordinate::new_f32(0.0, 0.0),
+                                    TextureCoordinate::new_f32(1.0, 1.0),
+                                    Arc::clone(image),
+                                )));
+                        }
+                    }
                     Pdu::GetLinesResponse(GetLinesResponse {
                         pane_id: req.pane_id,
                         lines: lines.into(),
@@ -1329,9 +1368,27 @@ mod tests {
                     pane_id: req.pane_id,
                     is_alive: true,
                 }),
+                Pdu::GetImageCell(req) => Pdu::GetImageCellResponse(GetImageCellResponse {
+                    pane_id: req.pane_id,
+                    data: self.image.borrow().clone(),
+                    data_generation: req.data_generation,
+                    frames_from: 0,
+                }),
                 _ => Pdu::UnitResponse(UnitResponse {}),
             };
-            Box::pin(async move { Ok(answer) })
+            Box::pin(async move {
+                if let Some(ready) = ready {
+                    std::future::poll_fn(|_| {
+                        if ready.get() {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+                Ok(answer)
+            })
         }
         fn is_reconnectable(&self) -> bool {
             true
@@ -1518,6 +1575,141 @@ mod tests {
                 "exactly one repaint per epoch of discards"
             );
         }
+    }
+
+    fn image_session() -> (Arc<TestHost>, Arc<PaneSession<TestHost>>) {
+        let (host, session) = session(&[(0, "image")]);
+        *host.link.image.borrow_mut() = Some(Arc::new(ImageData::with_raw_data(vec![1, 2, 3])));
+        (host, session)
+    }
+
+    fn pending_image_line_fetch(
+        host: &TestHost,
+        session: &Arc<PaneSession<TestHost>>,
+    ) -> (DetachedFuture, Rc<Cell<bool>>) {
+        let ready = Rc::new(Cell::new(false));
+        *host.link.line_reply_ready.borrow_mut() = Some(Rc::clone(&ready));
+        session.get_lines(0..1);
+        let mut task = host
+            .spawner
+            .0
+            .borrow_mut()
+            .pop()
+            .expect("scheduled line fetch");
+        assert!(task
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        assert_eq!(*host.link.asked.borrow(), ["GetLines"]);
+        (task, ready)
+    }
+
+    #[test]
+    fn obsolete_image_line_reply_skips_images_and_notifies_once() {
+        let (host, session) = image_session();
+        let (task, ready) = pending_image_line_fetch(&host, &session);
+        let mut resized = size();
+        resized.cols += 1;
+        session.apply_local_resize(resized);
+        ready.set(true);
+        spin_on(task);
+        assert_eq!(*host.link.asked.borrow(), ["GetLines"]);
+        assert_eq!(session.images.lock().footprint(), (0, 0));
+        assert_eq!(
+            host.events.outputs.get(),
+            1,
+            "discard still prompts a repaint"
+        );
+
+        // That repaint must be able to fetch and attach the current image.
+        session.get_lines(0..1);
+        host.spawner.run_all();
+        assert_eq!(
+            *host.link.asked.borrow(),
+            ["GetLines", "GetLines", "GetImageCell"]
+        );
+        assert!(
+            matches!(session.state().lines.peek(&0), Some(LineEntry::Line(line))
+            if line.visible_cells().next().unwrap().attrs().images().is_some())
+        );
+    }
+
+    #[test]
+    fn image_line_reply_after_pane_drop_skips_images() {
+        let (host, session) = image_session();
+        let images = Arc::clone(&session.images);
+        let (task, ready) = pending_image_line_fetch(&host, &session);
+        let weak = Arc::downgrade(&session);
+        drop(session);
+        assert!(
+            weak.upgrade().is_none(),
+            "the fetch does not retain the pane"
+        );
+        ready.set(true);
+        spin_on(task);
+        assert_eq!(*host.link.asked.borrow(), ["GetLines"]);
+        assert_eq!(images.lock().footprint(), (0, 0));
+        assert_eq!(host.events.outputs.get(), 0);
+    }
+
+    #[test]
+    fn image_line_reply_after_pane_death_still_applies_current_lines() {
+        let (host, session) = image_session();
+        let (task, ready) = pending_image_line_fetch(&host, &session);
+        assert!(matches!(
+            session.state().lines.peek(&0),
+            Some(LineEntry::Fetching(_))
+        ));
+        session.set_dead(true);
+        ready.set(true);
+        spin_on(task);
+        assert_eq!(*host.link.asked.borrow(), ["GetLines", "GetImageCell"]);
+        assert!(matches!(
+            session.state().lines.peek(&0),
+            Some(LineEntry::Line(line)) if line.as_str().trim_end() == "image"
+                && line.visible_cells().next().unwrap().attrs().images().is_some()
+        ));
+        assert_eq!(host.events.outputs.get(), 1);
+    }
+
+    #[test]
+    fn dead_pane_still_rejects_an_obsolete_line_reply() {
+        let (host, session) = image_session();
+        let (task, ready) = pending_image_line_fetch(&host, &session);
+        let mut resized = size();
+        resized.cols += 1;
+        session.apply_local_resize(resized);
+        session.set_dead(true);
+        ready.set(true);
+        spin_on(task);
+        assert_eq!(*host.link.asked.borrow(), ["GetLines"]);
+        assert!(session.state().lines.peek(&0).is_none());
+        assert_eq!(session.images.lock().footprint(), (0, 0));
+        assert_eq!(host.events.outputs.get(), 1);
+    }
+
+    #[test]
+    fn image_line_reply_is_rechecked_after_hydration() {
+        let (host, session) = image_session();
+        let image_ready = Rc::new(Cell::new(false));
+        *host.link.image_reply_ready.borrow_mut() = Some(Rc::clone(&image_ready));
+        let (mut task, ready) = pending_image_line_fetch(&host, &session);
+        ready.set(true);
+        assert!(task
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        assert_eq!(*host.link.asked.borrow(), ["GetLines", "GetImageCell"]);
+        let mut resized = size();
+        resized.cols += 1;
+        session.apply_local_resize(resized);
+        image_ready.set(true);
+        spin_on(task);
+        assert!(!matches!(
+            session.state().lines.peek(&0),
+            Some(LineEntry::Line(_))
+        ));
+        assert_eq!(host.events.outputs.get(), 1);
     }
 
     /// S12: the screen switch, the mouse grab and the cache flush land in
