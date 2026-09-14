@@ -286,8 +286,36 @@ impl super::TermWindow {
         }
     }
 
+    /// Whether the terminal is painted over: while connecting, syncing or
+    /// offline there is nothing worth showing. A terminal another device
+    /// holds is not blocked here: it is drawn as that device sees it, with
+    /// a badge saying a click takes it, so the picture never disappears.
     pub(crate) fn frontend_surface_blocked(&self) -> bool {
+        let gate = self.frontend_terminal_gate();
+        gate.obscures_terminal() && !gate.is_claimable()
+    }
+
+    /// Whether layout changes (splits, zoom, pane moves) are this GUI's to
+    /// make: not while the surface is blocked, and not for a terminal
+    /// another device holds until it is taken.
+    pub(crate) fn frontend_layout_locked(&self) -> bool {
         self.frontend_terminal_gate().obscures_terminal()
+    }
+
+    /// Whether a takeover of `tab` hides the terminal until the resized
+    /// screen has arrived. Tabs of this machine's session server were last
+    /// sized by this GUI or by nothing, so they keep showing the old
+    /// picture while the rows for the new size arrive, as a resize does.
+    /// A tab another device sized is masked: its picture would reflow
+    /// visibly from that device's shape to this one.
+    fn takeover_obscures(&self, tab: &Arc<mux::tab::Tab>) -> bool {
+        !tab
+            .get_active_pane()
+            .and_then(|pane| {
+                pane.downcast_ref::<ClientPane>()
+                    .map(|client| crate::local_sessions::is_host_domain_id(client.domain_id()))
+            })
+            .unwrap_or(false)
     }
 
     pub(crate) fn frontend_takeover_claimable(&self) -> bool {
@@ -606,6 +634,12 @@ impl super::TermWindow {
     /// panes became ready; nothing else paints an idle terminal, so the
     /// overlay used to stay until the mouse moved or the shell printed.
     fn arm_frontend_geometry_settle_timer(&mut self, tab_id: mux::tab::TabId, epoch: u64) {
+        // The window first: flagging the confirmation before knowing there
+        // is one to notify would latch it armed with no timer behind it,
+        // and this function refuses to arm a second time.
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
         let Some(pending) = self.frontend_geometry_confirmations.get_mut(&tab_id) else {
             return;
         };
@@ -613,9 +647,6 @@ impl super::TermWindow {
             return;
         }
         pending.settle_timer_armed = true;
-        let Some(window) = self.window.as_ref().cloned() else {
-            return;
-        };
         promise::spawn::spawn(async move {
             smol::Timer::after(FRONTEND_GEOMETRY_SETTLE + Duration::from_millis(20)).await;
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
@@ -1164,7 +1195,8 @@ impl super::TermWindow {
 
         // An explicit user takeover re-arms the remote publish path too.
         self.forget_rejected_local_viewport(tab_id);
-        let Some(epoch) = self.begin_frontend_geometry_epoch(tab_id, true) else {
+        let obscure = self.takeover_obscures(&tab);
+        let Some(epoch) = self.begin_frontend_geometry_epoch(tab_id, obscure) else {
             return;
         };
         let Some((domain, viewport, adopted)) = self.prepare_client_frontend_geometry(&tab) else {
@@ -1602,7 +1634,8 @@ impl super::TermWindow {
         }
         let takeover = action == FrontendGeometryAction::Set { takeover: true };
         let claim = action == FrontendGeometryAction::Claim;
-        let Some(epoch) = self.begin_frontend_geometry_epoch(tab_id, takeover) else {
+        let obscure = takeover && self.takeover_obscures(&tab);
+        let Some(epoch) = self.begin_frontend_geometry_epoch(tab_id, obscure) else {
             mux::zoom_trace!("gui.sync.skip tab={tab_id} reason=epoch_denied");
             return;
         };

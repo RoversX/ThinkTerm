@@ -9727,7 +9727,7 @@ impl TermWindow {
                 }
             }
             AdjustPaneSize(direction, amount) => {
-                if self.frontend_surface_blocked() {
+                if self.frontend_layout_locked() {
                     return Ok(PerformAssignmentResult::Handled);
                 }
                 let mux = Mux::get();
@@ -9746,7 +9746,7 @@ impl TermWindow {
                 }
             }
             ActivatePaneByIndex(index) => {
-                if self.frontend_surface_blocked() {
+                if self.frontend_layout_locked() {
                     return Ok(PerformAssignmentResult::Handled);
                 }
                 let mux = Mux::get();
@@ -9766,7 +9766,7 @@ impl TermWindow {
                 }
             }
             ActivatePaneDirection(direction) => {
-                if self.frontend_surface_blocked() {
+                if self.frontend_layout_locked() {
                     return Ok(PerformAssignmentResult::Handled);
                 }
                 let mux = Mux::get();
@@ -9783,7 +9783,7 @@ impl TermWindow {
                 }
             }
             TogglePaneZoomState => {
-                if self.frontend_surface_blocked() {
+                if self.frontend_layout_locked() {
                     return Ok(PerformAssignmentResult::Handled);
                 }
                 let mux = Mux::get();
@@ -9805,7 +9805,7 @@ impl TermWindow {
                 self.sync_active_tab_geometry_now();
             }
             SetPaneZoomState(zoomed) => {
-                if self.frontend_surface_blocked() {
+                if self.frontend_layout_locked() {
                     return Ok(PerformAssignmentResult::Handled);
                 }
                 let mux = Mux::get();
@@ -9949,7 +9949,7 @@ impl TermWindow {
                 // NOP here; handled by the overlay directly
             }
             RotatePanes(direction) => {
-                if self.frontend_surface_blocked() {
+                if self.frontend_layout_locked() {
                     return Ok(PerformAssignmentResult::Handled);
                 }
                 let mux = Mux::get();
@@ -9966,7 +9966,7 @@ impl TermWindow {
                 self.persist_workspace_layout_after_mutation("panes rotated");
             }
             SplitPane(split) => {
-                if self.frontend_surface_blocked() {
+                if self.frontend_layout_locked() {
                     return Ok(PerformAssignmentResult::Handled);
                 }
                 log::trace!("SplitPane {:?}", split);

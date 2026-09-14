@@ -683,7 +683,62 @@ impl crate::TermWindow {
         Ok(true)
     }
 
-    /// In A mode a follower keeps the canonical PTY grid. If its window is
+    /// A terminal another device holds is drawn as that device sees it; the
+    /// badge in the corner says so, and that a click or a scroll takes it.
+    /// Replaces the opaque card: the picture stays, only the input is gated.
+    fn paint_frontend_takeover_badge(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+    ) -> anyhow::Result<()> {
+        let gate = self.frontend_terminal_gate();
+        if !gate.is_claimable() {
+            return Ok(());
+        }
+        let Some((title, hint)) = gate.overlay_message() else {
+            return Ok(());
+        };
+        let text = format!("{title} \u{2014} {hint}");
+        let area = self.content_view_area();
+        let palette = self.chrome();
+        let font_size =
+            crate::native_settings::home_font_size(&crate::native_settings::load_shared());
+        let font = self.fonts.title_font_with_size(font_size)?;
+        let metrics = crate::utilsprites::RenderMetrics::with_font_metrics(&font.metrics());
+        let gl_state = self.render_state.as_ref().unwrap();
+        let ctx = DrawContext::new(gl_state, self.dimensions, &metrics);
+        let line_height = metrics.cell_size.height as f32;
+        let pad_x = line_height * 0.6;
+        let pad_y = line_height * 0.25;
+        let max_text = (area.size.width - pad_x * 4.0).max(0.0);
+        let text_width = ctx.measure_text_width(&font, &text).min(max_text);
+        if text_width <= 0.0 || area.size.height < line_height * 3.0 {
+            return Ok(());
+        }
+        let width = text_width + pad_x * 2.0;
+        let height = line_height + pad_y * 2.0;
+        let x = area.max_x() - width - pad_x;
+        let y = area.max_y() - height - pad_y;
+        self.filled_rectangle(
+            layers,
+            0,
+            euclid::rect(x, y, width, height),
+            palette.window_bg.mul_alpha(0.92),
+        )
+        .context("takeover badge background")?;
+        ctx.draw_text_on_layer(
+            layers,
+            2,
+            &font,
+            x + pad_x,
+            y + pad_y,
+            &text,
+            palette.text,
+            text_width,
+        )?;
+        Ok(())
+    }
+
+    /// A follower keeps the owner's canonical PTY grid. If its window is
     /// larger, mark the renderer-only remainder with a faint cell grid rather
     /// than stretching or reflowing terminal data that belongs to the owner.
     fn paint_frontend_shared_unused_grid(
@@ -693,9 +748,7 @@ impl crate::TermWindow {
         let Some(state) = self.active_remote_frontend_viewport_state() else {
             return Ok(());
         };
-        if state.access.mode != codec::FrontendAccessMode::TmuxLatest
-            || self.owns_frontend_viewport()
-        {
+        if self.owns_frontend_viewport() {
             return Ok(());
         }
         let area = self.content_view_area();
@@ -3887,6 +3940,8 @@ impl crate::TermWindow {
             }
             self.paint_frontend_shared_unused_grid(&mut layers)
                 .context("paint shared unused grid")?;
+            self.paint_frontend_takeover_badge(&mut layers)
+                .context("paint takeover badge")?;
         }
 
         if paint_terminal_world && !frontend_blocked {

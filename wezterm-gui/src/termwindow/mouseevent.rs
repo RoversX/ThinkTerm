@@ -1865,14 +1865,19 @@ impl super::TermWindow {
         };
         let takeover_gesture = matches!(event.kind, WMEK::Press(_)) || wheel_has_motion;
 
+        // The gesture that takes the terminal is not also terminal input:
+        // the badge asks for a click to take control, and that click stops
+        // here. Tested ahead of the blocked surface, which no longer covers
+        // a claimable terminal -- the badge leaves it in view.
+        if terminal_surface && takeover_gesture && self.frontend_takeover_claimable() {
+            self.frontend_handoff_consumed_press = matches!(event.kind, WMEK::Press(_));
+            self.claim_frontend_viewport_for_interaction();
+            context.invalidate();
+            return;
+        }
         if terminal_surface && self.frontend_surface_blocked() {
-            if takeover_gesture && self.frontend_takeover_claimable() {
-                self.frontend_handoff_consumed_press = matches!(event.kind, WMEK::Press(_));
-                self.claim_frontend_viewport_for_interaction();
-                context.invalidate();
-            }
-            // The opaque handoff surface consumes the triggering gesture and
-            // all pointer traffic while blocked; nothing leaks to the pane.
+            // The opaque handoff surface consumes all pointer traffic while
+            // blocked; nothing leaks to the pane.
             return;
         }
         if terminal_surface && takeover_gesture {
