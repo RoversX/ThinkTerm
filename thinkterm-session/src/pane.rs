@@ -553,7 +553,10 @@ impl<H: SessionHost> PaneSession<H> {
             && budget > 0
             && (st.warmed_epoch != Some(st.line_cache_epoch) || grew)
         {
-            let warm = uncached(st, lowest..highest, budget, Nearest::End);
+            // Speculation must not scale to the user's entire history limit.
+            // Bound the region as well as misses, so later paints do not
+            // gradually warm another 3,500 rows outside this recent window.
+            let warm = uncached(st, lowest..highest, budget.min(3500), Nearest::End);
             if !warm.is_empty() {
                 if !st.fetch_limiter.admit(rate, 1, now) {
                     log::trace!("scrollback warm refused by the rate limit");
@@ -1591,6 +1594,43 @@ mod tests {
         let _ = session.get_lines(20..24);
         host.spawner.run_all();
         assert!(rows_requested(&host) > 24, "a new epoch warms again");
+    }
+
+    #[test]
+    fn automatic_warming_is_bounded_without_limiting_requested_rows() {
+        let rows: Vec<_> = (96_500..100_000).map(|r| (r, "row")).collect();
+        let (host, session) = session_with_cache(&rows, 100_000);
+        host.config.warm.set(true);
+        let mut tall = delta(1, false, false);
+        tall.dimensions.physical_top = 99_976;
+        tall.dimensions.scrollback_rows = 100_000;
+        session.queue_render_delta(tall);
+        host.spawner.run_all();
+
+        let _ = session.get_lines(99_976..100_000);
+        host.spawner.run_all();
+        assert_eq!(rows_requested(&host), 3500, "only the recent region is warmed");
+        assert_eq!(
+            session.state().lines.cap().get(),
+            100_000,
+            "history capacity is unchanged"
+        );
+        let _ = session.get_lines(99_976..100_000);
+        host.spawner.run_all();
+        assert_eq!(
+            rows_requested(&host),
+            3500,
+            "another paint does not warm older rows"
+        );
+
+        host.link.rows_asked.set(0);
+        let _ = session.get_lines(0..4000);
+        host.spawner.run_all();
+        assert_eq!(
+            rows_requested(&host),
+            4000,
+            "explicit requests are not capped by warming"
+        );
     }
 
     /// Output that scrolled past between two pushes was never sent; once
