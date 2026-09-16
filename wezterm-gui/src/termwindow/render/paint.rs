@@ -3901,9 +3901,9 @@ impl crate::TermWindow {
             (!content_view_active && !fading_content_view) || recording_flight;
 
         if !content_view_active {
-            // Takeover remains opaque while this actively polls and hydrates
-            // the post-resize remote screen.  Once every pane is coherent the
-            // matching epoch is cleared before `frontend_blocked` is sampled.
+            // Poll and hydrate the post-resize screen before sampling the
+            // gate. Explicit takeovers may show the grid during this wait;
+            // connection recovery still uses the opaque surface.
             self.advance_frontend_geometry_confirmation();
         }
 

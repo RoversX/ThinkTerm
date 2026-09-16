@@ -650,6 +650,17 @@ impl super::TermWindow {
             return true;
         }
 
+        // The terminal can remain visible during takeover, but its new grid
+        // must be confirmed before unhandled keys (including IME text) enter it.
+        if only_key_bindings == OnlyKeyBindings::No
+            && matches!(
+                self.frontend_terminal_gate(),
+                wezterm_client::domain::RemoteFrontendGate::Syncing
+            )
+        {
+            return true;
+        }
+
         // While the leader modifier is active, only registered
         // keybindings are recognized.
         let only_key_bindings = match (only_key_bindings, leader_active) {

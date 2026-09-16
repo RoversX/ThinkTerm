@@ -26,6 +26,31 @@ enum FrontendGeometryAction {
     Claim,
 }
 
+fn frontend_gate_with_geometry(
+    gate: RemoteFrontendGate,
+    phase: Option<super::FrontendGeometryPhase>,
+    for_input: bool,
+) -> RemoteFrontendGate {
+    let blocked = phase.is_some_and(|phase| {
+        if for_input {
+            phase.blocks_terminal_input()
+        } else {
+            phase.obscures_terminal()
+        }
+    });
+    if blocked
+        && matches!(
+            gate,
+            RemoteFrontendGate::Visible | RemoteFrontendGate::Claimable { .. }
+        )
+    {
+        RemoteFrontendGate::Syncing
+    } else {
+        // A real connection/recovery state always takes precedence.
+        gate
+    }
+}
+
 fn frontend_geometry_action(
     ownership: Option<bool>,
     collaborative: bool,
@@ -242,6 +267,10 @@ impl super::TermWindow {
     }
 
     pub(crate) fn frontend_terminal_gate(&self) -> RemoteFrontendGate {
+        self.frontend_gate(true)
+    }
+
+    fn frontend_gate(&self, for_input: bool) -> RemoteFrontendGate {
         let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
             return RemoteFrontendGate::Visible;
         };
@@ -265,33 +294,19 @@ impl super::TermWindow {
                 RemoteFrontendGate::Claimable { owner: state.owner }
             }
         };
-        let obscured_by_geometry = self
-            .frontend_geometry_phases
-            .get(&tab.tab_id())
-            .copied()
-            .is_some_and(super::FrontendGeometryPhase::obscures_terminal);
-        if obscured_by_geometry
-            && matches!(
-                gate,
-                RemoteFrontendGate::Visible
-                    | RemoteFrontendGate::Claimable { .. }
-                    | RemoteFrontendGate::Syncing
-            )
-        {
-            RemoteFrontendGate::Syncing
-        } else {
-            // Connection health remains more informative than a geometry
-            // wait if the transport drops during takeover.
-            gate
-        }
+        frontend_gate_with_geometry(
+            gate,
+            self.frontend_geometry_phases.get(&tab.tab_id()).copied(),
+            for_input,
+        )
     }
 
-    /// Whether the terminal is painted over: while connecting, syncing or
-    /// offline there is nothing worth showing. A terminal another device
-    /// holds is not blocked here: it is drawn as that device sees it, with
+    /// Connection/recovery waits cover the terminal. An explicit takeover
+    /// keeps the existing grid visible while input stays gated. A terminal
+    /// another device holds is drawn as that device sees it, with
     /// a badge saying a click takes it, so the picture never disappears.
     pub(crate) fn frontend_surface_blocked(&self) -> bool {
-        let gate = self.frontend_terminal_gate();
+        let gate = self.frontend_gate(false);
         gate.obscures_terminal() && !gate.is_claimable()
     }
 
@@ -302,13 +317,12 @@ impl super::TermWindow {
         self.frontend_terminal_gate().obscures_terminal()
     }
 
-    /// Whether a takeover of `tab` hides the terminal until the resized
-    /// screen has arrived. Tabs of this machine's session server were last
-    /// sized by this GUI or by nothing, so they keep showing the old
+    /// Whether a takeover of `tab` waits for a confirmed resized screen.
+    /// Tabs of this machine's session server were last sized by this GUI
+    /// or by nothing, so they keep showing the old
     /// picture while the rows for the new size arrive, as a resize does.
-    /// A tab another device sized is masked: its picture would reflow
-    /// visibly from that device's shape to this one.
-    fn takeover_obscures(&self, tab: &Arc<mux::tab::Tab>) -> bool {
+    /// A remote tab must confirm that device's new shape before input resumes.
+    fn remote_takeover_needs_confirmation(&self, tab: &Arc<mux::tab::Tab>) -> bool {
         !tab
             .get_active_pane()
             .and_then(|pane| {
@@ -356,6 +370,7 @@ impl super::TermWindow {
         &mut self,
         tab_id: mux::tab::TabId,
         takeover: bool,
+        show_overlay: bool,
     ) -> Option<u64> {
         if self
             .frontend_geometry_phases
@@ -369,7 +384,7 @@ impl super::TermWindow {
         self.next_frontend_geometry_epoch =
             self.next_frontend_geometry_epoch.wrapping_add(1).max(1);
         let phase = if takeover {
-            super::FrontendGeometryPhase::TakeoverSyncing { epoch }
+            super::FrontendGeometryPhase::TakeoverSyncing { epoch, show_overlay }
         } else {
             super::FrontendGeometryPhase::Committing { epoch }
         };
@@ -427,18 +442,18 @@ impl super::TermWindow {
                 // A resync notification can race the RPC completion and
                 // temporarily put the advertised dimensions back. Validate
                 // the surface against the exact acknowledged viewport before
-                // allowing the first unmasked paint.
+                // allowing input on the new grid.
                 client.adopt_frontend_geometry(*size);
             } else {
                 client.forget_frontend_geometry(*size);
             }
         }
 
-        if succeeded && phase.obscures_terminal() {
+        if succeeded && phase.blocks_terminal_input() {
             // The RPC acknowledgement means that the server has issued the
             // PTY resize, not that the resized screen has reached this
-            // renderer. Keep the opaque takeover state and actively fetch a
-            // complete post-resize snapshot before revealing it.
+            // renderer. Keep input blocked and actively fetch a complete
+            // post-resize snapshot, even when the old grid remains visible.
             let visible_panes = self
                 .get_panes_to_render()
                 .into_iter()
@@ -447,12 +462,12 @@ impl super::TermWindow {
             let mut targets = visible_geometry_targets(adopted, &visible_panes);
             if targets.is_empty() {
                 // The rendered pane set can lag a tab that was activated a
-                // moment ago; with nothing to confirm the mask would never
-                // lift, so confirm what this epoch resized instead.
+                // moment ago; with nothing to confirm input would stay
+                // blocked, so confirm what this epoch resized instead.
                 targets = adopted.to_vec();
             }
             // No pane changed size and the server already agrees on every
-            // one: no reflow is on its way, so there is nothing to hide.
+            // one: no reflow is on its way, so there is nothing left to wait for.
             let server_agrees = targets.iter().all(|(pane_id, size)| {
                 mux.get_pane(*pane_id)
                     .and_then(|pane| {
@@ -494,7 +509,7 @@ impl super::TermWindow {
         if phase.epoch() != epoch {
             return;
         }
-        let keep_follow_up_obscured = phase.obscures_terminal();
+        let keep_follow_up_gated = phase.blocks_terminal_input();
         self.frontend_geometry_confirmations.remove(&tab_id);
         self.frontend_geometry_phases.remove(&tab_id);
         if let Some(recovery) = self.frontend_recovery_geometry.remove(&tab_id) {
@@ -526,16 +541,19 @@ impl super::TermWindow {
         if needs_follow_up && active {
             self.frontend_geometry_resync_after_epoch.remove(&tab_id);
             mux::zoom_trace!("gui.sync.followup tab={tab_id} after_epoch={epoch}");
-            // Starting the follow-up synchronously keeps the tab opaque: the
-            // old epoch is replaced before this callback can paint.
+            // Carry the input gate and presentation policy into the follow-up
+            // before another event can observe the new epoch.
             self.sync_active_tab_geometry_now();
-            if keep_follow_up_obscured {
+            if keep_follow_up_gated {
                 if let Some(super::FrontendGeometryPhase::Committing { epoch }) =
                     self.frontend_geometry_phases.get(&tab_id).copied()
                 {
                     self.frontend_geometry_phases.insert(
                         tab_id,
-                        super::FrontendGeometryPhase::TakeoverSyncing { epoch },
+                        super::FrontendGeometryPhase::TakeoverSyncing {
+                            epoch,
+                            show_overlay: phase.obscures_terminal(),
+                        },
                     );
                 }
             }
@@ -544,9 +562,9 @@ impl super::TermWindow {
         self.invalidate_window();
     }
 
-    /// Progress the active takeover without painting its old terminal grid.
+    /// Progress the active takeover independently of its presentation policy.
     /// Each call forces a remote render poll and primes missing visible rows;
-    /// PaneOutput and the overlay animation schedule subsequent checks.
+    /// PaneOutput and a scheduled frame drive subsequent checks.
     pub(crate) fn advance_frontend_geometry_confirmation(&mut self) {
         let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
             return;
@@ -627,6 +645,9 @@ impl super::TermWindow {
         }
         if settled {
             self.complete_frontend_geometry_epoch(tab_id, confirmation.epoch);
+        } else {
+            // A visible takeover has no animated overlay to drive checks.
+            self.update_next_frame_time(Some(now + Duration::from_millis(125)));
         }
     }
 
@@ -1195,8 +1216,9 @@ impl super::TermWindow {
 
         // An explicit user takeover re-arms the remote publish path too.
         self.forget_rejected_local_viewport(tab_id);
-        let obscure = self.takeover_obscures(&tab);
-        let Some(epoch) = self.begin_frontend_geometry_epoch(tab_id, obscure) else {
+        let confirm = self.remote_takeover_needs_confirmation(&tab);
+        // Keep the existing picture while confirming the new grid.
+        let Some(epoch) = self.begin_frontend_geometry_epoch(tab_id, confirm, false) else {
             return;
         };
         let Some((domain, viewport, adopted)) = self.prepare_client_frontend_geometry(&tab) else {
@@ -1549,7 +1571,10 @@ impl super::TermWindow {
         let epoch = phase.epoch();
         self.frontend_geometry_phases.insert(
             tab_id,
-            super::FrontendGeometryPhase::TakeoverSyncing { epoch },
+            super::FrontendGeometryPhase::TakeoverSyncing {
+                epoch,
+                show_overlay: true,
+            },
         );
         self.frontend_recovery_geometry.insert(
             tab_id,
@@ -1634,8 +1659,8 @@ impl super::TermWindow {
         }
         let takeover = action == FrontendGeometryAction::Set { takeover: true };
         let claim = action == FrontendGeometryAction::Claim;
-        let obscure = takeover && self.takeover_obscures(&tab);
-        let Some(epoch) = self.begin_frontend_geometry_epoch(tab_id, obscure) else {
+        let obscure = takeover && self.remote_takeover_needs_confirmation(&tab);
+        let Some(epoch) = self.begin_frontend_geometry_epoch(tab_id, obscure, obscure) else {
             mux::zoom_trace!("gui.sync.skip tab={tab_id} reason=epoch_denied");
             return;
         };
@@ -2998,15 +3023,17 @@ pub fn effective_right_padding(config: &ConfigHandle, context: DimensionContext)
 #[cfg(test)]
 mod frontend_geometry_tests {
     use super::{
-        client_viewport_publish_is_worthwhile, frontend_geometry_action,
+        client_viewport_publish_is_worthwhile, frontend_gate_with_geometry, frontend_geometry_action,
         geometry_confirmation_settled, local_viewport_publish_is_worthwhile,
-        remote_divider_can_pump, remote_divider_target_is_owed, visible_geometry_targets,
+        remote_divider_can_pump, remote_divider_target_is_owed,
+        visible_geometry_targets,
         FrontendGeometryAction, LocalTabShape, RejectedClientViewport, RejectedLocalViewport,
         FRONTEND_GEOMETRY_SETTLE, REJECTED_CLIENT_VIEWPORT_HOLD,
     };
     use crate::termwindow::{FrontendGeometryPhase, RemoteDividerResizeStrategy};
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
+    use wezterm_client::domain::RemoteFrontendGate;
     use wezterm_term::TerminalSize;
 
     fn test_size(cols: usize, rows: usize) -> TerminalSize {
@@ -3156,7 +3183,61 @@ mod frontend_geometry_tests {
     fn only_takeover_geometry_obscures_the_terminal() {
         assert!(!FrontendGeometryPhase::Previewing { epoch: 1 }.obscures_terminal());
         assert!(!FrontendGeometryPhase::Committing { epoch: 2 }.obscures_terminal());
-        assert!(FrontendGeometryPhase::TakeoverSyncing { epoch: 3 }.obscures_terminal());
+        assert!(FrontendGeometryPhase::TakeoverSyncing {
+            epoch: 3,
+            show_overlay: true,
+        }
+        .obscures_terminal());
+    }
+
+    #[test]
+    fn visible_takeover_keeps_the_input_gate_until_geometry_is_confirmed() {
+        let phase = FrontendGeometryPhase::TakeoverSyncing {
+            epoch: 7,
+            show_overlay: false,
+        };
+        assert_eq!(phase.epoch(), 7);
+        assert!(phase.is_in_flight());
+        assert!(phase.blocks_terminal_input());
+        assert!(!phase.obscures_terminal());
+
+        // Before the claim reply and after ownership arrives, presentation
+        // stays visible but terminal input still waits for grid confirmation.
+        for gate in [
+            RemoteFrontendGate::Claimable { owner: None },
+            RemoteFrontendGate::Visible,
+        ] {
+            assert_eq!(
+                frontend_gate_with_geometry(gate.clone(), Some(phase), false),
+                gate
+            );
+            assert_eq!(
+                frontend_gate_with_geometry(gate.clone(), Some(phase), true),
+                RemoteFrontendGate::Syncing
+            );
+            assert_eq!(frontend_gate_with_geometry(gate.clone(), None, true), gate);
+        }
+    }
+
+    #[test]
+    fn visible_takeover_does_not_hide_connection_or_recovery_waits() {
+        let phase = Some(FrontendGeometryPhase::TakeoverSyncing {
+            epoch: 7,
+            show_overlay: false,
+        });
+        for gate in [
+            RemoteFrontendGate::Connecting,
+            RemoteFrontendGate::Reconnecting,
+            RemoteFrontendGate::Offline,
+            RemoteFrontendGate::Syncing,
+        ] {
+            for for_input in [false, true] {
+                assert_eq!(
+                    frontend_gate_with_geometry(gate.clone(), phase, for_input),
+                    gate
+                );
+            }
+        }
     }
 
     #[test]

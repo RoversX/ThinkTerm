@@ -2078,7 +2078,7 @@ enum EventState {
 pub(crate) enum FrontendGeometryPhase {
     Previewing { epoch: u64 },
     Committing { epoch: u64 },
-    TakeoverSyncing { epoch: u64 },
+    TakeoverSyncing { epoch: u64, show_overlay: bool },
 }
 
 impl FrontendGeometryPhase {
@@ -2086,11 +2086,18 @@ impl FrontendGeometryPhase {
         match self {
             Self::Previewing { epoch }
             | Self::Committing { epoch }
-            | Self::TakeoverSyncing { epoch } => epoch,
+            | Self::TakeoverSyncing { epoch, .. } => epoch,
         }
     }
 
     pub(crate) fn obscures_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::TakeoverSyncing { show_overlay: true, .. }
+        )
+    }
+
+    pub(crate) fn blocks_terminal_input(self) -> bool {
         matches!(self, Self::TakeoverSyncing { .. })
     }
 
@@ -9171,6 +9178,17 @@ impl TermWindow {
                 self.copy_to_clipboard(*destination, text);
                 return Ok(PerformAssignmentResult::Handled);
             }
+        }
+
+        // A visible takeover is still waiting for a usable terminal grid.
+        // Keep terminal-directed bindings gated, without disabling GUI actions.
+        if matches!(assignment, PasteFrom(_) | SendString(_) | SendKey(_))
+            && matches!(
+                self.frontend_terminal_gate(),
+                wezterm_client::domain::RemoteFrontendGate::Syncing
+            )
+        {
+            return Ok(PerformAssignmentResult::Handled);
         }
 
         match pane.perform_assignment(assignment) {
