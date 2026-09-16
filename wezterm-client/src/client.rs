@@ -225,6 +225,23 @@ pub struct IncompatibleVersionError {
     pub codec_vers: usize,
 }
 
+/// The server answered an RPC with a refusal. The transport carried the
+/// request and the reply; only this request was rejected. Callers that
+/// keep going after a refusal downcast to this so that a transport
+/// failure, which returns a different error, still stops them.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[error("{reason}")]
+pub struct RemoteRpcError {
+    pub reason: String,
+}
+
+impl RemoteRpcError {
+    pub fn is_cause_of(err: &anyhow::Error) -> bool {
+        err.chain()
+            .any(|cause| cause.downcast_ref::<RemoteRpcError>().is_some())
+    }
+}
+
 macro_rules! rpc {
     ($method_name:ident, $request_type:ident, $response_type:ident) => {
         pub async fn $method_name(&self, pdu: $request_type) -> anyhow::Result<$response_type> {
@@ -235,7 +252,7 @@ macro_rules! rpc {
             metrics::counter!("rpc.count", "method" => stringify!($method_name)).increment(1);
             match result {
                 Ok(Pdu::$response_type(res)) => Ok(res),
-                Ok(Pdu::ErrorResponse(err)) => bail!(err.reason),
+                Ok(Pdu::ErrorResponse(err)) => Err(RemoteRpcError { reason: err.reason }.into()),
                 Ok(_) => bail!("unexpected response {:?}", result),
                 Err(err) => Err(err),
             }
@@ -255,7 +272,7 @@ macro_rules! rpc {
             metrics::counter!("rpc.count", "method" => stringify!($method_name)).increment(1);
             match result {
                 Ok(Pdu::$response_type(res)) => Ok(res),
-                Ok(Pdu::ErrorResponse(err)) => bail!(err.reason),
+                Ok(Pdu::ErrorResponse(err)) => Err(RemoteRpcError { reason: err.reason }.into()),
                 Ok(_) => bail!("unexpected response {:?}", result),
                 Err(err) => Err(err),
             }
@@ -2477,5 +2494,29 @@ mod tests {
         let cmd = Reconnectable::remote_mux_command(&None, "cli --prefer-mux proxy");
         assert!(cmd.contains("thinkterm cli --prefer-mux proxy"), "{}", cmd);
         assert!(cmd.contains("wezterm cli --prefer-mux proxy"), "{}", cmd);
+    }
+
+    /// A refusal stays recognisable under the context a caller adds,
+    /// and a transport failure is not mistaken for one.
+    #[test]
+    fn a_server_refusal_is_told_apart_from_a_transport_failure() {
+        use anyhow::Context;
+        let refused: anyhow::Result<()> = Err(super::RemoteRpcError {
+            reason: "Error: pane 9 is not contained by viewport tab 6".to_string(),
+        }
+        .into());
+        let refused = refused
+            .with_context(|| "restoring viewport and access state for remote tab 6")
+            .unwrap_err();
+        assert!(super::RemoteRpcError::is_cause_of(&refused));
+        assert_eq!(
+            format!("{refused:#}"),
+            "restoring viewport and access state for remote tab 6: \
+             Error: pane 9 is not contained by viewport tab 6"
+        );
+
+        let dropped = anyhow::anyhow!("EOF while reading leb128 encoded value")
+            .context("decoding a PDU");
+        assert!(!super::RemoteRpcError::is_cause_of(&dropped));
     }
 }

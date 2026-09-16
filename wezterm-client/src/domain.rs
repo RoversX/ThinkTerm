@@ -1437,6 +1437,86 @@ impl ClientInner {
             .insert(tab_id, viewport);
     }
 
+    fn forget_reported_viewport(&self, tab_id: TabId) {
+        self.reported_viewports.lock().unwrap().remove(&tab_id);
+    }
+
+    /// Re-advertise one viewport after reconnecting to the runtime that
+    /// last accepted it. A refusal the server explains is not a failure
+    /// of the reattach: the transport is up and the refused geometry is
+    /// simply out of date. The entry is retried without its panes, and
+    /// if that is refused too it is dropped; the frontend reports the
+    /// tab again from its live layout. `Ok(None)` is such a drop. A
+    /// transport failure is returned as it is, so the caller still
+    /// abandons the generation.
+    async fn restore_reported_viewport(
+        &self,
+        remote_tab_id: TabId,
+        viewport: codec::ClientViewport,
+        live_panes: Option<&HashSet<PaneId>>,
+        server_name: &str,
+    ) -> anyhow::Result<Option<codec::ClientViewportState>> {
+        let Some(live_panes) = live_panes else {
+            log::warn!(
+                "not restoring the viewport of remote tab {remote_tab_id} on {server_name}: \
+                 the server no longer lists that tab"
+            );
+            self.forget_reported_viewport(remote_tab_id);
+            return Ok(None);
+        };
+        let paneless = codec::ClientViewport::Native {
+            size: viewport.size(),
+            panes: Vec::new(),
+        };
+        // The recorded viewport first, then the paneless one as a last
+        // resort; one already known to be stale skips straight to that.
+        let attempts = match reattach_viewport_fallback(&viewport, live_panes) {
+            Some(fallback) => {
+                log::warn!(
+                    "restoring remote tab {remote_tab_id} on {server_name} without its pane \
+                     layout: it names a pane the tab no longer contains"
+                );
+                vec![fallback]
+            }
+            None if viewport_has_panes(&viewport) => vec![viewport.clone(), paneless],
+            None => vec![viewport.clone()],
+        };
+        for attempt in attempts {
+            match self
+                .client
+                .set_client_viewport(codec::SetClientViewport {
+                    tab_id: remote_tab_id,
+                    viewport: attempt.clone(),
+                })
+                .await
+            {
+                Ok(state) => {
+                    if attempt != viewport {
+                        self.remember_reported_viewport(remote_tab_id, attempt);
+                    }
+                    return Ok(Some(state));
+                }
+                Err(err) if crate::client::RemoteRpcError::is_cause_of(&err) => {
+                    log::warn!(
+                        "{server_name} refused the restored viewport of remote tab \
+                         {remote_tab_id}: {err:#}"
+                    );
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("restoring viewport and access state for remote tab {remote_tab_id}")
+                    });
+                }
+            }
+        }
+        log::warn!(
+            "dropping the recorded viewport of remote tab {remote_tab_id} on {server_name}; \
+             the frontend will report it again"
+        );
+        self.forget_reported_viewport(remote_tab_id);
+        Ok(None)
+    }
+
     fn claim_lock(&self, tab_id: TabId) -> Arc<futures::lock::Mutex<()>> {
         self.frontend_claim_locks
             .lock()
@@ -1645,6 +1725,63 @@ fn collect_pane_ids(node: &mux::tab::PaneNode, out: &mut Vec<PaneId>) {
             out.extend(stack.panes.iter().map(|entry| entry.pane_id))
         }
     }
+}
+
+/// The panes the server lists under each remote tab. A tab whose tree is
+/// empty has no entry.
+fn remote_tab_panes(tabs: &[mux::tab::PaneNode]) -> HashMap<TabId, HashSet<PaneId>> {
+    fn walk(node: &mux::tab::PaneNode, out: &mut HashMap<TabId, HashSet<PaneId>>) {
+        match node {
+            mux::tab::PaneNode::Empty => {}
+            mux::tab::PaneNode::Split { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            mux::tab::PaneNode::Leaf(entry) => {
+                out.entry(entry.tab_id).or_default().insert(entry.pane_id);
+            }
+            mux::tab::PaneNode::Stack(stack) => {
+                for entry in &stack.panes {
+                    out.entry(entry.tab_id).or_default().insert(entry.pane_id);
+                }
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    for node in tabs {
+        walk(node, &mut out);
+    }
+    out
+}
+
+/// A viewport recorded before an outage, checked against the panes the
+/// server still holds in its tab. `None` when it can be replayed as it
+/// is. One that names a pane the tab no longer contains would be refused
+/// outright, so it comes back with its panes removed: the tab keeps its
+/// size and the server's own split tree, and the frontend describes the
+/// layout again from what it really shows.
+fn reattach_viewport_fallback(
+    viewport: &codec::ClientViewport,
+    tab_panes: &HashSet<PaneId>,
+) -> Option<codec::ClientViewport> {
+    match viewport {
+        codec::ClientViewport::CellGrid { .. } => None,
+        codec::ClientViewport::Native { size, panes } => {
+            if panes.iter().all(|pane| tab_panes.contains(&pane.pane_id)) {
+                None
+            } else {
+                Some(codec::ClientViewport::Native {
+                    size: *size,
+                    panes: Vec::new(),
+                })
+            }
+        }
+    }
+}
+
+/// Whether a viewport carries pane geometry that a refusal could be about.
+fn viewport_has_panes(viewport: &codec::ClientViewport) -> bool {
+    matches!(viewport, codec::ClientViewport::Native { panes, .. } if !panes.is_empty())
 }
 
 impl ClientInner {
@@ -2671,6 +2808,7 @@ impl ClientDomain {
             None
         };
         let panes = inner.client.list_panes().await?;
+        let live_tab_panes = remote_tab_panes(&panes.tabs);
         if server_replaced && !restored_targets.is_empty() {
             let live_workspaces = panes
                 .tabs
@@ -2859,18 +2997,23 @@ impl ClientDomain {
             client.config.name(),
             inner.remote_to_local_tab.lock().unwrap().len()
         );
+        // A recorded viewport can be out of date: a pane it names may
+        // have gone while the transport was down. Replayed as it is, the
+        // server refuses it every time, and treating that refusal as a
+        // failed reattach made the client reconnect and replay the same
+        // entry without end, until the process was restarted.
         for (remote_tab_id, viewport) in reported {
-            let state = inner
-                .client
-                .set_client_viewport(codec::SetClientViewport {
-                    tab_id: remote_tab_id,
-                    viewport: viewport.clone(),
-                })
-                .await
-                .with_context(|| {
-                    format!("restoring viewport and access state for remote tab {remote_tab_id}")
-                })?;
-            client.process_remote_viewport_state(state);
+            if let Some(state) = inner
+                .restore_reported_viewport(
+                    remote_tab_id,
+                    viewport,
+                    live_tab_panes.get(&remote_tab_id),
+                    client.config.name(),
+                )
+                .await?
+            {
+                client.process_remote_viewport_state(state);
+            }
         }
         if !inner.remote_to_local_tab.lock().unwrap().is_empty()
             && inner.remote_access_state().is_none()
@@ -5688,5 +5831,119 @@ impl ClientDomain {
         drop(activity);
         ui.close();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod reattach_viewport_tests {
+    use super::{reattach_viewport_fallback, remote_tab_panes};
+    use mux::pane::PaneId;
+    use mux::tab::{PaneEntry, PaneNode, PaneStackEntry, SplitDirection, SplitDirectionAndSize};
+    use mux::renderable::StableCursorPosition;
+    use std::collections::HashSet;
+    use wezterm_term::TerminalSize;
+
+    fn size(rows: usize, cols: usize) -> TerminalSize {
+        TerminalSize {
+            rows,
+            cols,
+            pixel_width: cols * 8,
+            pixel_height: rows * 16,
+            dpi: 96,
+        }
+    }
+
+    fn entry(tab_id: usize, pane_id: PaneId) -> PaneEntry {
+        PaneEntry {
+            window_id: 1,
+            tab_id,
+            pane_id,
+            title: format!("pane {pane_id}"),
+            size: size(24, 80),
+            working_dir: None,
+            is_active_pane: false,
+            is_zoomed_pane: false,
+            alt_screen: false,
+            workspace: "default".to_string(),
+            cursor_pos: StableCursorPosition::default(),
+            physical_top: 0,
+            top_row: 0,
+            left_col: 0,
+            tty_name: None,
+        }
+    }
+
+    fn pane_viewport(pane_id: PaneId) -> codec::ClientPaneViewport {
+        codec::ClientPaneViewport {
+            pane_id,
+            size: size(24, 40),
+            frame: size(24, 40),
+        }
+    }
+
+    #[test]
+    fn remote_tab_panes_groups_leaves_splits_and_stacks_by_tab() {
+        let tabs = vec![
+            PaneNode::Split {
+                left: Box::new(PaneNode::Leaf(entry(6, 9))),
+                right: Box::new(PaneNode::Stack(PaneStackEntry {
+                    active: 0,
+                    panes: vec![entry(6, 12), entry(6, 13)],
+                    pane_stack_id: None,
+                })),
+                node: SplitDirectionAndSize {
+                    direction: SplitDirection::Horizontal,
+                    first: size(24, 40),
+                    second: size(24, 40),
+                },
+            },
+            PaneNode::Leaf(entry(7, 20)),
+            PaneNode::Empty,
+        ];
+        let panes = remote_tab_panes(&tabs);
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[&6], HashSet::from([9, 12, 13]));
+        assert_eq!(panes[&7], HashSet::from([20]));
+    }
+
+    #[test]
+    fn a_viewport_whose_panes_are_all_present_is_replayed_as_it_is() {
+        let viewport = codec::ClientViewport::Native {
+            size: size(24, 80),
+            panes: vec![pane_viewport(9), pane_viewport(12)],
+        };
+        assert_eq!(
+            reattach_viewport_fallback(&viewport, &HashSet::from([9, 12, 13])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_viewport_naming_a_missing_pane_falls_back_to_the_tab_size_alone() {
+        // The shape of the 2026-09-16 outage: pane 9 left tab 6 while the
+        // transport was down and the recorded viewport still named it.
+        let viewport = codec::ClientViewport::Native {
+            size: size(50, 200),
+            panes: vec![pane_viewport(9), pane_viewport(12)],
+        };
+        assert_eq!(
+            reattach_viewport_fallback(&viewport, &HashSet::from([12, 13])),
+            Some(codec::ClientViewport::Native {
+                size: size(50, 200),
+                panes: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn paneless_and_cell_grid_viewports_never_need_a_fallback() {
+        let empty = HashSet::new();
+        let paneless = codec::ClientViewport::Native {
+            size: size(24, 80),
+            panes: Vec::new(),
+        };
+        assert_eq!(reattach_viewport_fallback(&paneless, &empty), None);
+        let grid = codec::ClientViewport::CellGrid { size: size(24, 80) };
+        assert_eq!(reattach_viewport_fallback(&grid, &empty), None);
     }
 }
