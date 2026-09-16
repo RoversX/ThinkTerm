@@ -6626,6 +6626,7 @@ impl super::TermWindow {
 
         if !plan.needs_materialize {
             self.adopt_workspace_in_this_window(&plan.workspace_name);
+            self.land_remote_open_on_active_pane();
             // This workspace may be live only because startup fell back to a
             // `$HOME` shell for a refused Project; add the terminal that was
             // actually asked for. Added rather than swapped: the fallback
@@ -6713,7 +6714,19 @@ impl super::TermWindow {
                         // leaves nothing to activate.
                         Ok(false) => {}
                         Ok(true) => {
+                            let domain_id = Mux::get()
+                                .get_domain_by_name(&domain_name)
+                                .map(|domain| domain.domain_id());
                             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                                // Switching into a cold mux-domain Space is as
+                                // explicit an open as the Connect button, so it
+                                // gets the same one-shot claim. Armed only: the
+                                // retried activation releases it when its tab
+                                // is on screen, and the paint path consumes it
+                                // once that tab's gate is claimable.
+                                if let Some(domain_id) = domain_id {
+                                    term_window.note_remote_open_intent(domain_id);
+                                }
                                 if let Some(win) = term_window.window.clone() {
                                     term_window.activate_workspace_thread_impl(
                                         thread_id,
@@ -6990,6 +7003,9 @@ impl super::TermWindow {
 
         if let Err(err) = result {
             log::error!("failed to materialize ThinkTerm thread: {err:#}");
+            // Nothing landed, so there is nothing for the first-open claim
+            // to take; leaving it armed would claim the next tab shown.
+            self.remote_open_intent = None;
             // The mux-level backstop refuses *inside* `spawn_tab_or_window`,
             // which leaves a tab-less window behind; that would make the
             // workspace look materialized and stop any retry.
@@ -7019,10 +7035,12 @@ impl super::TermWindow {
 
         if !self.adopt_workspace_in_this_window(&workspace) {
             log::error!("materialized ThinkTerm workspace {workspace:?} has no window to adopt");
+            self.remote_open_intent = None;
             kill_workspace_windows(&workspaces_to_kill_after_adopt, None);
             release(self);
             return;
         }
+        self.land_remote_open_on_active_pane();
         cleanup_orphaned_mux_window(orphan_candidate_window_id);
         kill_workspace_windows(&workspaces_to_kill_after_adopt, Some(&workspace));
         front_end().set_switching_workspaces(false);

@@ -1235,6 +1235,46 @@ impl super::TermWindow {
         }
     }
 
+    /// Arm the one-shot first-open claim for a remote domain this window is
+    /// about to show, for the paths that attach in place instead of opening
+    /// a window through `connect_domain_into_space`. Not ready yet: the
+    /// activation that follows may still be materializing its tab, and a
+    /// ready intent would claim whichever tab of that domain the window
+    /// showed meanwhile. `land_remote_open_on_active_pane` releases it once
+    /// the activation has put its tab on screen.
+    pub(crate) fn note_remote_open_intent(&mut self, domain_id: mux::domain::DomainId) {
+        if !self.config.remote_mux_auto_claim_on_open {
+            return;
+        }
+        self.remote_open_intent = Some(super::RemoteOpenIntent {
+            domain_id,
+            ready: false,
+        });
+    }
+
+    /// The activation behind `note_remote_open_intent` has landed: the tab
+    /// now on screen is what the user asked for. Release the claim if that
+    /// tab belongs to the armed domain; a tab of some other remote domain
+    /// means the selection changed underneath, and the intent is dropped.
+    pub(crate) fn land_remote_open_on_active_pane(&mut self) {
+        let Some(intent) = self.remote_open_intent else {
+            return;
+        };
+        if intent.ready {
+            return;
+        }
+        let landed = Mux::get()
+            .get_active_tab_for_window(self.mux_window_id)
+            .and_then(|tab| tab.get_active_pane())
+            .filter(|pane| pane.downcast_ref::<ClientPane>().is_some())
+            .map(|pane| pane.domain_id());
+        match landed {
+            Some(domain_id) if domain_id == intent.domain_id => self.finish_remote_open(domain_id),
+            Some(_) => self.remote_open_intent = None,
+            None => {}
+        }
+    }
+
     pub(crate) fn finish_remote_open(&mut self, domain_id: mux::domain::DomainId) {
         if let Some(intent) = self.remote_open_intent.as_mut() {
             if intent.domain_id == domain_id {
