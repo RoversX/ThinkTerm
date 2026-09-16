@@ -1673,8 +1673,20 @@ impl Client {
             // read, so connect() reports success and the session dies within
             // a second.
             const SHORT_SESSION: Duration = Duration::from_secs(15);
+            // After this much continuous failure, stop hammering the
+            // network and park until the user asks for another round (the
+            // sidebar Reconnect button). Nothing is torn down: the domain
+            // stays attached and every window and pane survives, ready for
+            // the next attempt.
+            const GIVE_UP_AFTER: Duration = Duration::from_secs(120);
 
             let mut backoff = BASE_INTERVAL;
+            // When the outage in progress began, or None while the session
+            // is healthy. It is kept across rounds: a transport that comes
+            // back every time only for the restored session to be refused
+            // is as much an outage as a network that stays down, and a
+            // clock restarted on every round could never reach the give-up.
+            let mut outage_started: Option<std::time::Instant> = None;
             // Consecutive sessions that died within SHORT_SESSION of
             // connecting. Only established-then-dead sessions count; a
             // connect() that fails outright (network still down) does not.
@@ -1776,32 +1788,43 @@ impl Client {
                         break;
                     }
 
+                    // Whether the session that just ended had been restored
+                    // and marked usable; one that died while registering,
+                    // or whose reattach was refused, never was.
+                    let was_ready = reader_connection_phase.load(Ordering::Acquire)
+                        == ClientConnectionPhase::Ready as u8;
                     reader_connection_phase
                         .store(ClientConnectionPhase::Reconnecting as u8, Ordering::Release);
                     crate::domain::wake_thinkterm_frontend();
 
-                    if session_started.elapsed() >= SHORT_SESSION {
+                    let session_lasted = session_started.elapsed() >= SHORT_SESSION;
+                    if session_lasted {
                         // The previous connection genuinely worked; restart
                         // the retry schedule from scratch.
                         short_sessions = 0;
                         backoff = BASE_INTERVAL;
                     } else {
                         short_sessions += 1;
+                        // A session that dies at once is retried with the
+                        // same backoff as a transport that never comes up;
+                        // otherwise a refused restore was retried every
+                        // BASE_INTERVAL for as long as the process lived.
+                        backoff = (backoff + backoff).min(MAX_INTERVAL);
                     }
+                    // A session that was restored ends the outage, however
+                    // briefly it lived: a flapping link keeps being retried,
+                    // as it always was. One that never became usable keeps
+                    // the clock running.
+                    if was_ready {
+                        outage_started = None;
+                    }
+                    let outage_started = outage_started.get_or_insert_with(std::time::Instant::now);
 
                     // A successful reattach closes the UI behind our back;
                     // detect that so we build a fresh one when needed.
                     if reconnect_ui.as_ref().map_or(false, |ui| !ui.test_alive()) {
                         reconnect_ui = None;
                     }
-
-                    // After this much continuous failure, stop hammering
-                    // the network and park until the user asks for another
-                    // round (the sidebar Reconnect button). Nothing is torn
-                    // down: the domain stays attached and every window and
-                    // pane survives, ready for the next attempt.
-                    const GIVE_UP_AFTER: Duration = Duration::from_secs(120);
-                    let mut outage_started = std::time::Instant::now();
 
                     loop {
                         // Reconnect silently. The outage is already on screen
@@ -1830,7 +1853,33 @@ impl Client {
                         // than keep going or tear the domain down.
                         let mut suspend: Option<String> = None;
 
-                        if ui
+                        // Judged before the attempt, on how long the domain
+                        // has been unusable: the network staying down and a
+                        // transport that reconnects only for the restore to
+                        // fail both count.
+                        if outage_started.elapsed() >= GIVE_UP_AFTER {
+                            if reconnectable.is_local_session_host() {
+                                // The local session host keeps trying at the
+                                // capped interval: its Space is a local one
+                                // with no Reconnect row, so a parked retry
+                                // could never be resumed. And a server that
+                                // kept dying at once gets started again after
+                                // this long; nothing else would ever try.
+                                log::warn!(
+                                    "the session server has been unreachable for \
+                                     {GIVE_UP_AFTER:?}; starting it again if nothing answers"
+                                );
+                                short_sessions = 0;
+                                *outage_started = std::time::Instant::now();
+                            } else {
+                                suspend =
+                                    Some(format!("unable to reconnect for {GIVE_UP_AFTER:?}"));
+                            }
+                        }
+
+                        if suspend.is_some() {
+                            // Parked below; no further attempt this round.
+                        } else if ui
                             .sleep_with_reason(
                                 &format!("client disconnected {}; will reconnect", e),
                                 backoff,
@@ -1884,28 +1933,6 @@ impl Client {
                                         // We asked and they declined; another
                                         // attempt would only ask again.
                                         suspend = Some("authentication was declined".to_string());
-                                    } else if outage_started.elapsed() >= GIVE_UP_AFTER {
-                                        if reconnectable.is_local_session_host() {
-                                            // The local session host keeps
-                                            // trying at the capped interval:
-                                            // its Space is a local one with
-                                            // no Reconnect row, so a parked
-                                            // retry could never be resumed.
-                                            // And a server that kept dying
-                                            // at once gets started again
-                                            // after this long; nothing else
-                                            // would ever try.
-                                            log::warn!(
-                                                "the session server has been unreachable for \
-                                                 {GIVE_UP_AFTER:?}; starting it again if nothing answers"
-                                            );
-                                            short_sessions = 0;
-                                            outage_started = std::time::Instant::now();
-                                        } else {
-                                            suspend = Some(format!(
-                                                "unable to reconnect for {GIVE_UP_AFTER:?}"
-                                            ));
-                                        }
                                     }
                                 }
                             }
@@ -1925,7 +1952,7 @@ impl Client {
                                         ClientConnectionPhase::Reconnecting as u8,
                                         Ordering::Release,
                                     );
-                                    outage_started = std::time::Instant::now();
+                                    *outage_started = std::time::Instant::now();
                                     backoff = BASE_INTERVAL;
                                     short_sessions = 0;
                                 }
