@@ -1502,21 +1502,52 @@ impl TabInner {
             // below re-deal the dividers on every push.
             self.size = size;
         } else if !geometry_preserved {
-            // Measure the wire's panes against the cells of the size we are
-            // about to impose; a pane carrying its own font scale counts a
-            // different number of its own cells across the same pixels.
-            let cell = cell_dimensions(if size.rows > 0 && size.cols > 0 {
-                &size
-            } else {
-                &self.size
-            });
-            if let Some(root) = self.pane.as_mut() {
-                if let Some(tree_size) = compute_tree_size_from_panes(root, &cell) {
-                    self.size = tree_size;
+            match self.pane.as_mut() {
+                // The wire's split records are the peer's frames in tab
+                // cells and compose to its root. Measuring the pane objects
+                // instead mixes the new panes' wire sizes with the surviving
+                // panes' still-local ones: a server-side split of one
+                // 87-column pane into 43/43 measured 43+1+87, and the resize
+                // below took the excess off both sides, landing the divider
+                // at 21/65 while the server kept 43/43.
+                Some(Tree::Node {
+                    data: Some(data), ..
+                }) => {
+                    self.size = data.size();
                 }
+                // A lone leaf has no split record. Measure that pane against
+                // the cells of the size we are about to impose (a pane
+                // carrying its own font scale counts a different number of
+                // its own cells across the same pixels): its stale local
+                // size is what makes the resize below re-impose the root
+                // rather than no-op.
+                Some(root) => {
+                    let cell = cell_dimensions(if size.rows > 0 && size.cols > 0 {
+                        &size
+                    } else {
+                        &self.size
+                    });
+                    if let Some(tree_size) = compute_tree_size_from_panes(root, &cell) {
+                        self.size = tree_size;
+                    }
+                }
+                None => {}
             }
         }
-        self.resize(size);
+        let resized = self.resize(size);
+        if keep_local_geometry && !geometry_preserved && !resized {
+            // The wire tree already composes to the local root, so the
+            // resize had nothing to redistribute; the surviving panes still
+            // hold the sizes they had before the topology changed. Deal the
+            // split sizes down to them and say so, the way a real resize
+            // would, so the GUI adopts and publishes the new frames.
+            if let Some(root) = self.pane.as_ref() {
+                if let Err(err) = apply_sizes_from_splits(root, &self.size) {
+                    log::error!("failed to resize panes after topology change: {err:#}");
+                }
+            }
+            Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        }
 
         log::debug!(
             "sync tab: {:#?} zoomed: {} {:#?}",
@@ -5749,6 +5780,61 @@ mod test {
             });
             assert_eq!(widths(&tab), vec![(1, expected), (2, 79 - expected)], "keep={keep}");
         }
+    }
+
+    /// A server-side split (`thinkterm cli split-pane`) reaches a client
+    /// only as a resync with a changed topology. The surviving pane object
+    /// still reports its pre-split local size; the tree must take the wire's
+    /// split record rather than measure that stale object, or the divider
+    /// lands well off where the server dealt it.
+    #[test]
+    fn sync_with_pane_tree_takes_the_wire_split_over_stale_local_pane_sizes() {
+        let size = test_size();
+        let tab = Tab::new(&size);
+        // The local pty sits below the per-pane chrome: two rows short.
+        let mut local = size;
+        local.rows = 22;
+        local.pixel_height = 22 * (size.pixel_height / size.rows);
+        let existing = FakePane::new(0, local);
+        tab.sync_with_pane_tree(size, PaneNode::Leaf(pane_entry(0, size, true)), |_| {
+            Arc::clone(&existing)
+        });
+        assert_eq!(tab.iter_panes()[0].width, size.cols);
+
+        // The server split the 80-column pane into 40 | 39 with the new
+        // pane on the left.
+        let mut first = size;
+        first.cols = 40;
+        first.pixel_width = 40 * (size.pixel_width / size.cols);
+        let mut second = size;
+        second.cols = 39;
+        second.pixel_width = 39 * (size.pixel_width / size.cols);
+        let root = PaneNode::Split {
+            left: Box::new(PaneNode::Leaf(pane_entry(1, first, true))),
+            right: Box::new(PaneNode::Leaf(pane_entry(0, second, false))),
+            node: SplitDirectionAndSize {
+                direction: SplitDirection::Horizontal,
+                first,
+                second,
+            },
+        };
+        tab.sync_with_pane_tree(size, root, |entry| {
+            if entry.pane_id == 0 {
+                Arc::clone(&existing)
+            } else {
+                FakePane::new(entry.pane_id, entry.size)
+            }
+        });
+
+        let widths = tab
+            .iter_panes()
+            .into_iter()
+            .map(|p| (p.pane.pane_id(), p.width))
+            .collect::<Vec<_>>();
+        assert_eq!(widths, vec![(1, 40), (0, 39)]);
+        // The surviving pane was dealt its branch, not left at 80 columns.
+        assert_eq!(existing.get_dimensions().cols, 39);
+        assert_eq!(tab.get_size().cols, size.cols);
     }
 
     #[test]

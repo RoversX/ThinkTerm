@@ -5197,7 +5197,7 @@ impl TermWindow {
                     self.refresh_thread_work_for_pane(pane_id);
                     self.update_title_post_status();
                 }
-                MuxNotification::TabResized(_) => {
+                MuxNotification::TabResized(tab_id) => {
                     // Also handled by wezterm-client
                     self.update_title_post_status();
                     // A split lands here: PaneAdded goes out before the new
@@ -5207,6 +5207,26 @@ impl TermWindow {
                     // fingerprint, so live resizes cost a tree walk and no
                     // write.
                     self.persist_workspace_layout_if_structure_changed();
+                    // A server-side split (`thinkterm cli split-pane`) reaches
+                    // this window only as that resync: the tree now carries
+                    // the peer's split, but no gesture of ours follows it, so
+                    // nothing re-publishes the frames and the server keeps
+                    // driving the ptys at the split it dealt while we draw
+                    // ours. Offer the viewport the way a divider release
+                    // would. Only the tab on screen has frames worth sending,
+                    // and only while this client holds its lease; the
+                    // debounce and the unchanged-viewport check keep an
+                    // ordinary window resize from paying twice.
+                    if self.active_tab_is(tab_id) {
+                        if let Some(tab) = Mux::get().get_tab(tab_id) {
+                            let is_mirror = tab
+                                .get_active_pane()
+                                .is_some_and(|pane| pane.downcast_ref::<wezterm_client::pane::ClientPane>().is_some());
+                            if is_mirror && self.tab_owns_frontend_viewport(&tab) {
+                                self.report_frontend_viewport();
+                            }
+                        }
+                    }
                 }
                 MuxNotification::TabTitleChanged { .. } => {
                     self.update_title_post_status();
