@@ -1674,7 +1674,13 @@ impl crate::TermWindow {
         // them back -- is what makes an arrival look like several things
         // happening near each other rather than one thing happening.
         let composites_before = self.card_composites.borrow().len();
-        let mut heap = HeapQuadAllocator::default();
+        // Record into last frame's buffers. A settled view records the same
+        // surface every frame; dropping that heap to allocate its twin was
+        // one large free and one large malloc per frame for the life of
+        // the view. Nothing reads the previous recording once this frame's
+        // begins: the closing ghost is taken before any frame is painted.
+        let mut heap = self.content_view_last_frame.take().unwrap_or_default();
+        heap.recycle();
         {
             let mut recorded = TripleLayerQuadAllocator::Heap(&mut heap);
             self.paint_content_view(&mut recorded)?;
