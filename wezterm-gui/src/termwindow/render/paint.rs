@@ -179,6 +179,38 @@ pub(crate) struct CachedPreviewQuads {
     texture: Option<Rc<crate::termwindow::webgpu::CardRenderTexture>>,
 }
 
+/// What the card preview caches hold, for accounting.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct PreviewCacheFootprint {
+    pub cards: usize,
+    /// Resident quad bytes, the rebuild in flight included: it owns the
+    /// heap it took from its cache entry, so the map alone under-reads
+    /// exactly while one is in flight.
+    pub quad_bytes: usize,
+    /// GPU bytes of the card textures.
+    pub texture_bytes: usize,
+}
+
+impl crate::TermWindow {
+    pub(crate) fn preview_cache_footprint(&self) -> PreviewCacheFootprint {
+        let cards = self.preview_quad_cache.borrow();
+        let partial = self.preview_rebuild_partial.borrow();
+        PreviewCacheFootprint {
+            cards: cards.len(),
+            quad_bytes: cards
+                .values()
+                .map(|entry| entry.heap.resident_bytes())
+                .chain(partial.as_ref().map(|partial| partial.heap.resident_bytes()))
+                .sum(),
+            texture_bytes: cards
+                .values()
+                .filter_map(|entry| entry.texture.as_ref())
+                .map(|texture| texture.width as usize * texture.height as usize * 4)
+                .sum(),
+        }
+    }
+}
+
 /// A card rebuild in flight, sliced across frames.
 ///
 /// A single slot rather than a map: the per-frame rebuild budget is one card,
@@ -922,23 +954,10 @@ impl crate::TermWindow {
         // quad population nothing else here can see. Capacity only, like
         // every other figure in this block.
         {
-            let cards = self.preview_quad_cache.borrow();
-            let partial = self.preview_rebuild_partial.borrow();
-            let card_bytes: usize = cards
-                .values()
-                .map(|entry| entry.heap.resident_bytes())
-                .sum();
-            // The rebuild owns the heap it took from its cache entry, so
-            // summing the map alone under-reads exactly while one is in
-            // flight.
-            let partial_bytes = partial
-                .as_ref()
-                .map_or(0, |partial| partial.heap.resident_bytes());
-            crate::perf::log_counter("preview_quad_cache_cards", cards.len());
-            crate::perf::log_counter(
-                "preview_quad_cache_bytes",
-                card_bytes.saturating_add(partial_bytes),
-            );
+            let footprint = self.preview_cache_footprint();
+            crate::perf::log_counter("preview_quad_cache_cards", footprint.cards);
+            crate::perf::log_counter("preview_quad_cache_bytes", footprint.quad_bytes);
+            crate::perf::log_counter("preview_texture_bytes", footprint.texture_bytes);
         }
         crate::perf::log_counter(
             "content_view_last_frame_bytes",
@@ -1862,6 +1881,7 @@ impl crate::TermWindow {
         // about a closed overview says the cards are gone, and a stale entry
         // costs one key comparison to reject.
         if !previews.is_empty() {
+            self.preview_cache_last_wanted = Some(Instant::now());
             let live: HashSet<TabId> = previews.iter().map(|preview| preview.tab_id).collect();
             self.preview_quad_cache
                 .borrow_mut()

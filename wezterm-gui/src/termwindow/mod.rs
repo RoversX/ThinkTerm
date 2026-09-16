@@ -2431,6 +2431,9 @@ pub struct TermWindow {
     /// The one card rebuild currently sliced across frames, if any.
     preview_rebuild_partial:
         RefCell<Option<crate::termwindow::render::paint::PreviewRebuildPartial>>,
+    /// When a paint last asked for card previews; None once the caches
+    /// have been released. Drives the idle release of `preview_quad_cache`.
+    preview_cache_last_wanted: Option<Instant>,
     /// When each card's terminal first showed visible content, keyed like
     /// `preview_quad_cache`. Drives the blank->content fade-in; survives
     /// overview closes and atlas repacks so neither replays the fade.
@@ -3544,6 +3547,46 @@ impl TermWindow {
         }
     }
 
+    /// The card previews outlive the overview on purpose: reopening it
+    /// replays them instead of rebuilding every card in the revealing
+    /// frame. But an overview closed for good keeps its quads and card
+    /// textures resident for the life of the window. Once no paint has
+    /// asked for previews for the grace period, and no view or transition
+    /// can still be showing them, let them go; the next open rebuilds
+    /// them once. Driven from the 1s status heartbeat for the same reasons
+    /// as the occlusion release.
+    fn maybe_release_idle_preview_cache(&mut self) {
+        let showing = self.content_view_foreground() || self.content_view_fade.is_some();
+        if !preview_cache_release_due(
+            self.preview_cache_last_wanted.map(|since| since.elapsed()),
+            showing,
+        ) {
+            return;
+        }
+        self.preview_cache_last_wanted = None;
+        let footprint = self.preview_cache_footprint();
+        if footprint.cards == 0 && footprint.quad_bytes == 0 {
+            return;
+        }
+        log::debug!(
+            "overview idle for {PREVIEW_CACHE_RELEASE_SECS}s; releasing {} card previews \
+             ({} bytes of quads, {} bytes of card textures)",
+            footprint.cards,
+            footprint.quad_bytes,
+            footprint.texture_bytes
+        );
+        self.preview_quad_cache.borrow_mut().clear();
+        *self.preview_rebuild_partial.borrow_mut() = None;
+        // The textures just dropped stay resident until a device maintain
+        // runs; a window painting only its terminal may not submit one
+        // soon, so poll now, as the occlusion release does.
+        if let Some(webgpu) = self.webgpu.as_ref() {
+            if let Err(err) = webgpu.device.poll(wgpu::PollType::Poll) {
+                log::debug!("device poll after preview cache release: {err:?}");
+            }
+        }
+    }
+
     /// A window nobody can see keeps everything it ever cached. Once it
     /// has stayed hidden past the grace period, drop the caches that
     /// rebuild lazily on the reveal repaint: the note and file-preview
@@ -4017,6 +4060,7 @@ impl TermWindow {
             pane_font_cache_tick: Cell::new(0),
             preview_quad_cache: RefCell::new(HashMap::new()),
             preview_rebuild_partial: RefCell::new(None),
+            preview_cache_last_wanted: None,
             preview_content_fade: RefCell::new(HashMap::new()),
             pending_card_renders: RefCell::new(Vec::new()),
             card_frame_verts: RefCell::new(Vec::new()),
@@ -5377,6 +5421,7 @@ impl TermWindow {
                 self.refresh_all_thread_work();
                 self.terminal_render_watchdog();
                 self.maybe_release_occluded_memory();
+                self.maybe_release_idle_preview_cache();
             }
             TermWindowNotif::OpenProjectPath(path) => {
                 let path = path.to_string_lossy();
@@ -11146,6 +11191,51 @@ mod content_view_output_tests {
             content_view_output_repaint(true, now, next_allowed, INTERVAL),
             ContentViewOutputRepaint::Defer { due: next_allowed }
         );
+    }
+}
+
+/// How long the Live Overview must stay closed before its card previews
+/// are released. Long enough that flipping the overview open and closed
+/// while working never pays the rebuild; matches the idle image release.
+const PREVIEW_CACHE_RELEASE_SECS: u64 = 5 * 60;
+
+fn preview_cache_release_due(idle_for: Option<Duration>, showing: bool) -> bool {
+    match idle_for {
+        Some(elapsed) => !showing && elapsed >= Duration::from_secs(PREVIEW_CACHE_RELEASE_SECS),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod preview_cache_release_tests {
+    use super::{preview_cache_release_due, PREVIEW_CACHE_RELEASE_SECS};
+    use std::time::Duration;
+
+    fn past_grace() -> Duration {
+        Duration::from_secs(PREVIEW_CACHE_RELEASE_SECS + 1)
+    }
+
+    #[test]
+    fn an_overview_closed_past_the_grace_period_releases() {
+        assert!(preview_cache_release_due(Some(past_grace()), false));
+    }
+
+    #[test]
+    fn a_showing_or_transitioning_overview_never_releases() {
+        assert!(!preview_cache_release_due(Some(past_grace()), true));
+    }
+
+    #[test]
+    fn the_grace_period_is_respected() {
+        assert!(!preview_cache_release_due(
+            Some(Duration::from_secs(PREVIEW_CACHE_RELEASE_SECS - 1)),
+            false
+        ));
+    }
+
+    #[test]
+    fn nothing_to_release_is_never_due() {
+        assert!(!preview_cache_release_due(None, false));
     }
 }
 
