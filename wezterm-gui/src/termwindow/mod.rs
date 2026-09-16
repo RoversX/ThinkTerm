@@ -1285,6 +1285,58 @@ pub(crate) struct PaneTabDropTarget {
     pub rect: RectF,
 }
 
+/// The drop preview as it is currently drawn, easing toward the rectangle
+/// the drag state asks for. Kept apart from `PaneTabDragState` so the hit
+/// testing stays a pure function of the pointer while the picture lags a
+/// little behind it: a zone change slides and reshapes the highlight instead
+/// of blinking it from one half of the pane to the other.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PaneDropPreviewAnim {
+    pub rect: ::window::RectF,
+    /// 0 = invisible, 1 = fully shown. Fades in when a target first appears
+    /// and out when the pointer leaves every droppable spot.
+    pub alpha: f32,
+    pub last_tick: Instant,
+}
+
+impl PaneDropPreviewAnim {
+    /// Time constant of the exponential ease: ~95% of the way in three of
+    /// these, so a zone change settles in roughly 130 ms.
+    const TAU: Duration = Duration::from_millis(45);
+
+    /// Advance toward `target` (None = fade out in place). Returns whether
+    /// anything is still moving, so the caller can ask for another frame.
+    pub fn step(&mut self, target: Option<::window::RectF>, now: Instant) -> bool {
+        // A frame that was starved (window hidden, heavy paint) must not
+        // land as one huge jump either; clamp the step.
+        let dt = now
+            .saturating_duration_since(self.last_tick)
+            .min(Duration::from_millis(100));
+        self.last_tick = now;
+        let k = 1.0 - (-(dt.as_secs_f32() / Self::TAU.as_secs_f32())).exp();
+        let (want_rect, want_alpha) = match target {
+            Some(rect) => (rect, 1.0),
+            None => (self.rect, 0.0),
+        };
+        let lerp = |cur: f32, want: f32| cur + (want - cur) * k;
+        let mut moving = false;
+        let mut settle = |cur: &mut f32, want: f32, eps: f32| {
+            if (want - *cur).abs() <= eps {
+                *cur = want;
+            } else {
+                *cur = lerp(*cur, want);
+                moving = true;
+            }
+        };
+        settle(&mut self.rect.origin.x, want_rect.origin.x, 0.5);
+        settle(&mut self.rect.origin.y, want_rect.origin.y, 0.5);
+        settle(&mut self.rect.size.width, want_rect.size.width, 0.5);
+        settle(&mut self.rect.size.height, want_rect.size.height, 0.5);
+        settle(&mut self.alpha, want_alpha, 0.01);
+        moving
+    }
+}
+
 /// A level-2 pane tab being dragged toward another pane to move or split.
 #[derive(Clone, Debug)]
 pub(crate) struct PaneTabDragState {
@@ -1493,6 +1545,51 @@ mod tooltip_tests {
 #[cfg(test)]
 mod pane_drop_tests {
     use super::*;
+
+    #[test]
+    fn drop_preview_eases_toward_target_and_fades_out() {
+        let t0 = Instant::now();
+        let a = euclid::rect(0.0, 0.0, 100.0, 50.0);
+        let b = euclid::rect(200.0, 0.0, 100.0, 200.0);
+        let mut anim = PaneDropPreviewAnim {
+            rect: a,
+            alpha: 0.0,
+            last_tick: t0,
+        };
+        // Fades in without moving while the target is where it started.
+        assert!(anim.step(Some(a), t0 + Duration::from_millis(16)));
+        assert!(anim.alpha > 0.0 && anim.alpha < 1.0);
+        assert_eq!(anim.rect, a);
+
+        // A zone change slides and reshapes rather than jumping.
+        let mut now = t0 + Duration::from_millis(32);
+        assert!(anim.step(Some(b), now));
+        assert!(anim.rect.origin.x > a.origin.x && anim.rect.origin.x < b.origin.x);
+        assert!(anim.rect.size.height > a.size.height && anim.rect.size.height < b.size.height);
+        // ...and settles within a few hundred milliseconds.
+        let mut frames = 0;
+        while anim.step(Some(b), now) {
+            now += Duration::from_millis(16);
+            frames += 1;
+            assert!(frames < 60, "never settled: {anim:?}");
+        }
+        assert_eq!(anim.rect, b);
+        assert_eq!(anim.alpha, 1.0);
+
+        // Losing the target fades out in place; a stalled frame is clamped so
+        // it cannot finish the fade in one jump.
+        assert!(anim.step(None, now + Duration::from_secs(5)));
+        assert!(anim.alpha > 0.0 && anim.alpha < 1.0);
+        assert_eq!(anim.rect, b);
+        now += Duration::from_secs(5);
+        frames = 0;
+        while anim.step(None, now) {
+            now += Duration::from_millis(16);
+            frames += 1;
+            assert!(frames < 60, "never faded: {anim:?}");
+        }
+        assert_eq!(anim.alpha, 0.0);
+    }
 
     #[test]
     fn drop_zone_center_box_and_edges() {
@@ -2491,6 +2588,8 @@ pub struct TermWindow {
     right_sidebar_file_drag: Option<FileDragState>,
     /// In-flight drag of a level-2 pane tab toward a move/split drop.
     pane_tab_drag: Option<PaneTabDragState>,
+    /// Eased picture of `pane_tab_drag`'s drop target; see PaneDropPreviewAnim.
+    pane_drop_preview: Option<PaneDropPreviewAnim>,
     /// In-flight reorder drag of a left-sidebar Project or thread row.
     sidebar_row_drag: Option<SidebarRowDragState>,
     /// Content views (e.g. SSH hosts) shown as synthetic tabs.
@@ -4013,6 +4112,7 @@ impl TermWindow {
             dragging: None,
             right_sidebar_file_drag: None,
             pane_tab_drag: None,
+            pane_drop_preview: None,
             sidebar_row_drag: None,
             content_views: vec![],
             active_content_view_id: None,

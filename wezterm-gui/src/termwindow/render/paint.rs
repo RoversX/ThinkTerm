@@ -3017,16 +3017,54 @@ impl crate::TermWindow {
 
     fn paint_pane_tab_drag_overlay(&mut self) -> anyhow::Result<()> {
         let Some(state) = self.pane_tab_drag.as_ref() else {
+            // The drag ended (dropped or cancelled): the layout underneath
+            // has already changed, so a lingering highlight would point at
+            // nothing. Drop the picture rather than fade it.
+            self.pane_drop_preview = None;
             return Ok(());
         };
         if !state.active {
+            self.pane_drop_preview = None;
             return Ok(());
         }
         let label = state.title.clone();
         let anchor = state.current;
         let target_rect = state.target.as_ref().map(|target| target.rect);
 
-        if let Some(rect) = target_rect {
+        // Ease the drawn highlight toward the hit-tested target. Driven here
+        // and not from the mouse handler because paint_impl clears
+        // has_animation on entry, so only a deadline registered during paint
+        // survives to schedule the next frame.
+        let now = Instant::now();
+        let shown = match (self.pane_drop_preview.as_mut(), target_rect) {
+            (None, None) => None,
+            (None, Some(rect)) => {
+                // First target of this drag: fade in where it is.
+                let mut anim = crate::termwindow::PaneDropPreviewAnim {
+                    rect,
+                    alpha: 0.0,
+                    last_tick: now,
+                };
+                let moving = anim.step(target_rect, now);
+                self.pane_drop_preview = Some(anim);
+                Some((anim.rect, anim.alpha, moving))
+            }
+            (Some(anim), _) => {
+                let moving = anim.step(target_rect, now);
+                let shown = (anim.rect, anim.alpha, moving);
+                if target_rect.is_none() && !moving {
+                    // Faded out completely; forget it so the next target
+                    // fades in fresh instead of sliding from a stale spot.
+                    self.pane_drop_preview = None;
+                }
+                Some(shown)
+            }
+        };
+
+        if let Some((rect, alpha, moving)) = shown {
+            if moving {
+                self.update_next_frame_time(Some(now + Duration::from_millis(16)));
+            }
             // Explicit accent blue: the palette's selected_bg is gray in
             // dark mode, but the drop preview should read as blue in both.
             let accent = match crate::native_settings::effective_appearance() {
@@ -3037,8 +3075,8 @@ impl crate::TermWindow {
                     LinearRgba::with_srgba(10, 132, 255, 255)
                 }
             };
-            let fill = accent.mul_alpha(0.28);
-            let border = accent.mul_alpha(0.8);
+            let fill = accent.mul_alpha(0.28 * alpha);
+            let border = accent.mul_alpha(0.8 * alpha);
 
             let gl_state = self.render_state.as_ref().unwrap();
             let layer = gl_state
