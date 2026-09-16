@@ -10,6 +10,11 @@ use wezterm_term::color::ColorPalette;
 
 pub use wezterm_color_types::HsbTransform;
 
+/// Classify the terminal palette itself, independently of the OS appearance.
+pub fn is_light_terminal_background(background: SrgbaTuple) -> bool {
+    0.2126 * background.0 + 0.7152 * background.1 + 0.0722 * background.2 > 0.5
+}
+
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
 #[dynamic(try_from = "String", into = "String")]
 pub struct RgbaColor {
@@ -278,7 +283,12 @@ impl From<Palette> for ColorPalette {
             // Resolve after foreground/background overrides, not from the
             // fixed dark default. This follows light, dark and tinted schemes
             // without overriding an explicit theme or user split color.
-            p.split = p.background.interpolate(p.foreground, 0.22);
+            let contrast = if is_light_terminal_background(p.background) {
+                0.22
+            } else {
+                0.12
+            };
+            p.split = p.background.interpolate(p.foreground, contrast);
         }
 
         if let Some(ansi) = cfg.ansi {
@@ -905,7 +915,7 @@ fn default_split_follows_light_and_dark_palettes() {
     let light = resolve((255, 255, 255).into(), (0, 0, 0).into());
     let dark = resolve((0, 0, 0).into(), (255, 255, 255).into());
     assert!((light.split.0 - 0.78).abs() < 0.001);
-    assert!((dark.split.0 - 0.22).abs() < 0.001);
+    assert!((dark.split.0 - 0.12).abs() < 0.001);
     assert_ne!(light.split, dark.split);
 }
 
@@ -925,7 +935,7 @@ fn default_split_uses_the_final_overlaid_palette() {
     let resolved: ColorPalette = theme.overlay_with(&overrides).into();
     assert_eq!(
         resolved.split,
-        resolved.background.interpolate(resolved.foreground, 0.22)
+        resolved.background.interpolate(resolved.foreground, 0.12)
     );
     assert_ne!(original.split, resolved.split);
 }
