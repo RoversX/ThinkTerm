@@ -579,6 +579,36 @@ async fn adopt_materialized_workspace_window(
     Ok(())
 }
 
+/// Clear the first-open gate if authentication/materialization fails or the
+/// async Connect request is cancelled. Success hands the one-shot intent to
+/// the GUI, which waits for the selected remote tab before consuming it.
+struct RemoteOpenRequest {
+    window: Option<window::Window>,
+    domain_id: mux::domain::DomainId,
+}
+
+impl RemoteOpenRequest {
+    fn finish(mut self) {
+        if let Some(window) = self.window.take() {
+            let domain_id = self.domain_id;
+            window.notify(crate::termwindow::TermWindowNotif::Apply(Box::new(move |tw| {
+                tw.finish_remote_open(domain_id);
+            })));
+        }
+    }
+}
+
+impl Drop for RemoteOpenRequest {
+    fn drop(&mut self) {
+        if let Some(window) = self.window.take() {
+            let domain_id = self.domain_id;
+            window.notify(crate::termwindow::TermWindowNotif::Apply(Box::new(move |tw| {
+                tw.cancel_remote_open(domain_id);
+            })));
+        }
+    }
+}
+
 pub(crate) async fn connect_domain_into_space(
     cmd: Option<CommandBuilder>,
     domain: Arc<dyn Domain>,
@@ -601,6 +631,10 @@ pub(crate) async fn connect_domain_into_space(
             if let Some(gui_window) =
                 crate::frontend::front_end().gui_window_for_mux_window(window_id)
             {
+                let domain_id = domain.domain_id();
+                gui_window.window.notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                    move |tw| tw.claim_remote_viewport_for_explicit_open(domain_id),
+                )));
                 gui_window.window.focus();
                 return Ok(());
             }
@@ -621,6 +655,10 @@ pub(crate) async fn connect_domain_into_space(
             if let Some(gui_window) =
                 crate::frontend::front_end().gui_window_for_mux_window(window_id)
             {
+                let domain_id = domain.domain_id();
+                gui_window.window.notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                    move |tw| tw.claim_remote_viewport_for_explicit_open(domain_id),
+                )));
                 gui_window.window.focus();
                 return Ok(());
             }
@@ -649,8 +687,21 @@ pub(crate) async fn connect_domain_into_space(
         id
     };
 
-    TermWindow::new_window_with_claimed_space(window_id, space_owner_id, plan.space_id.clone())
-        .await?;
+    TermWindow::new_window_with_claimed_space(
+        window_id,
+        space_owner_id,
+        plan.space_id.clone(),
+        Some(domain.domain_id()),
+    )
+    .await?;
+    // Keep the native handle: adopting the restored workspace can replace
+    // its mux-window id while this explicit connection is in progress.
+    let remote_open = RemoteOpenRequest {
+        window: crate::frontend::front_end()
+            .gui_window_for_mux_window(window_id)
+            .map(|gui| gui.window),
+        domain_id: domain.domain_id(),
+    };
 
     let config = config::configuration();
     config.update_ulimit()?;
@@ -769,6 +820,7 @@ pub(crate) async fn connect_domain_into_space(
             let _tab = domain.spawn(size, cmd, None, window_id).await?;
         }
     }
+    remote_open.finish();
     drop(connect_activity);
     trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
 

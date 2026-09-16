@@ -3901,6 +3901,7 @@ impl crate::TermWindow {
             (!content_view_active && !fading_content_view) || recording_flight;
 
         if !content_view_active {
+            self.advance_remote_open();
             // Poll and hydrate the post-resize screen before sampling the
             // gate. Explicit takeovers may show the grid during this wait;
             // connection recovery still uses the opaque surface.

@@ -6104,6 +6104,7 @@ impl super::TermWindow {
     }
 
     pub(crate) fn activate_workspace_thread(&mut self, thread_id: String, context: &dyn WindowOps) {
+        self.remote_open_intent = None;
         self.activate_workspace_thread_impl(thread_id, context, None, Vec::new());
     }
 

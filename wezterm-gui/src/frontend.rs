@@ -783,6 +783,7 @@ impl GuiFrontEnd {
                     mux_window_id,
                     space_owner_id,
                     active_space_id.clone(),
+                    None,
                 )
                 .await
                 {

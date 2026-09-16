@@ -51,6 +51,33 @@ fn frontend_gate_with_geometry(
     }
 }
 
+fn take_ready_remote_open(
+    pending: &mut Option<super::RemoteOpenIntent>,
+    enabled: bool,
+    domain_id: mux::domain::DomainId,
+    gate: &RemoteFrontendGate,
+    geometry_in_flight: bool,
+) -> bool {
+    if !enabled {
+        *pending = None;
+        return false;
+    }
+    if pending.is_some_and(|intent| intent.ready && intent.domain_id == domain_id)
+        && !geometry_in_flight
+        && matches!(
+            gate,
+            RemoteFrontendGate::Visible | RemoteFrontendGate::Claimable { .. }
+        )
+    {
+        // Consume before starting the RPC: output, repaints and reconnects
+        // must never turn the same navigation into another ownership claim.
+        *pending = None;
+        true
+    } else {
+        false
+    }
+}
+
 fn frontend_geometry_action(
     ownership: Option<bool>,
     collaborative: bool,
@@ -294,6 +321,20 @@ impl super::TermWindow {
                 RemoteFrontendGate::Claimable { owner: state.owner }
             }
         };
+        if self.config.remote_mux_auto_claim_on_open
+            && self.remote_open_intent
+                .is_some_and(|intent| intent.domain_id == pane.domain_id())
+            && matches!(
+                gate,
+                RemoteFrontendGate::Visible
+                    | RemoteFrontendGate::Claimable { .. }
+                    | RemoteFrontendGate::Syncing
+            )
+        {
+            // The explicit connection has not selected and prepared its final
+            // landing tab yet. Do not reveal the old renderer's grid first.
+            return RemoteFrontendGate::Connecting;
+        }
         frontend_gate_with_geometry(
             gate,
             self.frontend_geometry_phases.get(&tab.tab_id()).copied(),
@@ -1174,6 +1215,78 @@ impl super::TermWindow {
     /// the overwhelmingly common case, so an ordinary click costs one
     /// comparison.
     pub(crate) fn claim_frontend_viewport_for_interaction(&mut self) {
+        self.claim_frontend_viewport(false);
+    }
+
+    /// Reopening an already visible remote window is an explicit takeover,
+    /// but does not need the first-open loading surface again.
+    pub(crate) fn claim_remote_viewport_for_explicit_open(
+        &mut self,
+        domain_id: mux::domain::DomainId,
+    ) {
+        let still_showing_domain = Mux::get()
+            .get_active_tab_for_window(self.mux_window_id)
+            .and_then(|tab| tab.get_active_pane())
+            .is_some_and(|pane| {
+                pane.domain_id() == domain_id && pane.downcast_ref::<ClientPane>().is_some()
+            });
+        if self.config.remote_mux_auto_claim_on_open && still_showing_domain {
+            self.claim_frontend_viewport_for_interaction();
+        }
+    }
+
+    pub(crate) fn finish_remote_open(&mut self, domain_id: mux::domain::DomainId) {
+        if let Some(intent) = self.remote_open_intent.as_mut() {
+            if intent.domain_id == domain_id {
+                intent.ready = true;
+                self.advance_remote_open();
+                self.invalidate_window();
+            }
+        }
+    }
+
+    pub(crate) fn cancel_remote_open(&mut self, domain_id: mux::domain::DomainId) {
+        if self.remote_open_intent
+            .is_some_and(|intent| intent.domain_id == domain_id)
+        {
+            self.remote_open_intent = None;
+            self.invalidate_window();
+        }
+    }
+
+    pub(crate) fn advance_remote_open(&mut self) {
+        if !self.config.remote_mux_auto_claim_on_open {
+            self.remote_open_intent = None;
+            return;
+        }
+        if !self.remote_open_intent.is_some_and(|intent| intent.ready) {
+            return;
+        }
+        let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
+            return;
+        };
+        let Some(pane) = tab.get_active_pane() else {
+            return;
+        };
+        let Some(client) = pane.downcast_ref::<ClientPane>() else {
+            return;
+        };
+        let in_flight = self
+            .frontend_geometry_phases
+            .get(&tab.tab_id())
+            .is_some_and(|phase| phase.is_in_flight());
+        if take_ready_remote_open(
+            &mut self.remote_open_intent,
+            self.config.remote_mux_auto_claim_on_open,
+            client.domain_id(),
+            &client.remote_frontend_gate(),
+            in_flight,
+        ) {
+            self.claim_frontend_viewport(true);
+        }
+    }
+
+    fn claim_frontend_viewport(&mut self, initial_open: bool) {
         if !matches!(
             self.frontend_terminal_gate(),
             RemoteFrontendGate::Visible | RemoteFrontendGate::Claimable { .. }
@@ -1190,7 +1303,7 @@ impl super::TermWindow {
             .get(&tab_id)
             .copied()
             .is_some_and(super::FrontendGeometryPhase::is_in_flight)
-            || self.owns_frontend_viewport()
+            || (!initial_open && self.owns_frontend_viewport())
         {
             return;
         }
@@ -1217,8 +1330,9 @@ impl super::TermWindow {
         // An explicit user takeover re-arms the remote publish path too.
         self.forget_rejected_local_viewport(tab_id);
         let confirm = self.remote_takeover_needs_confirmation(&tab);
-        // Keep the existing picture while confirming the new grid.
-        let Some(epoch) = self.begin_frontend_geometry_epoch(tab_id, confirm, false) else {
+        // A click keeps its existing picture. A new connection waits to reveal
+        // the terminal until its first usable local-sized grid is ready.
+        let Some(epoch) = self.begin_frontend_geometry_epoch(tab_id, confirm, initial_open) else {
             return;
         };
         let Some((domain, viewport, adopted)) = self.prepare_client_frontend_geometry(&tab) else {
@@ -1602,6 +1716,21 @@ impl super::TermWindow {
         let Some(active_pane) = tab.get_active_pane() else {
             return;
         };
+
+        // Manual Connect will submit the chosen landing layout once attach
+        // and materialization finish. Do not race it with a passive publish.
+        if self.config.remote_mux_auto_claim_on_open
+            && self.remote_open_intent
+                .is_some_and(|intent| intent.domain_id == active_pane.domain_id())
+            && active_pane.downcast_ref::<ClientPane>().is_some_and(|client| {
+                matches!(
+                    client.remote_frontend_gate(),
+                    RemoteFrontendGate::Visible | RemoteFrontendGate::Claimable { .. }
+                )
+            })
+        {
+            return;
+        }
 
         if active_pane.downcast_ref::<ClientPane>().is_none() {
             tab.resize(self.terminal_size);
@@ -3025,16 +3154,69 @@ mod frontend_geometry_tests {
     use super::{
         client_viewport_publish_is_worthwhile, frontend_gate_with_geometry, frontend_geometry_action,
         geometry_confirmation_settled, local_viewport_publish_is_worthwhile,
-        remote_divider_can_pump, remote_divider_target_is_owed,
+        remote_divider_can_pump, remote_divider_target_is_owed, take_ready_remote_open,
         visible_geometry_targets,
         FrontendGeometryAction, LocalTabShape, RejectedClientViewport, RejectedLocalViewport,
         FRONTEND_GEOMETRY_SETTLE, REJECTED_CLIENT_VIEWPORT_HOLD,
     };
-    use crate::termwindow::{FrontendGeometryPhase, RemoteDividerResizeStrategy};
+    use crate::termwindow::{FrontendGeometryPhase, RemoteDividerResizeStrategy, RemoteOpenIntent};
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
     use wezterm_client::domain::RemoteFrontendGate;
     use wezterm_term::TerminalSize;
+
+    #[test]
+    fn explicit_remote_open_is_consumed_once_after_the_landing_tab_is_ready() {
+        let mut pending = Some(RemoteOpenIntent {
+            domain_id: 7,
+            ready: false,
+        });
+        let gate = RemoteFrontendGate::Claimable { owner: None };
+        assert!(!take_ready_remote_open(&mut pending, true, 7, &gate, false));
+        pending.as_mut().unwrap().ready = true;
+        assert!(!take_ready_remote_open(&mut pending, true, 8, &gate, false));
+        assert!(!take_ready_remote_open(&mut pending, true, 7, &gate, true));
+        assert!(take_ready_remote_open(&mut pending, true, 7, &gate, false));
+        assert!(pending.is_none());
+        // Neither repainting nor returning from a later disconnect may claim again.
+        for gate in [
+            RemoteFrontendGate::Reconnecting,
+            gate,
+            RemoteFrontendGate::Visible,
+        ] {
+            assert!(!take_ready_remote_open(&mut pending, true, 7, &gate, false));
+        }
+    }
+
+    #[test]
+    fn disabling_auto_claim_drops_the_pending_intent_and_keeps_manual_takeover() {
+        let mut pending = Some(RemoteOpenIntent {
+            domain_id: 7,
+            ready: true,
+        });
+        let gate = RemoteFrontendGate::Claimable { owner: None };
+        assert!(!take_ready_remote_open(&mut pending, false, 7, &gate, false));
+        assert!(pending.is_none());
+        assert!(!take_ready_remote_open(&mut pending, true, 7, &gate, false));
+        assert!(frontend_gate_with_geometry(gate, None, true).is_claimable());
+    }
+
+    #[test]
+    fn pending_remote_open_does_not_claim_during_transport_recovery() {
+        let mut pending = Some(RemoteOpenIntent {
+            domain_id: 7,
+            ready: true,
+        });
+        for gate in [
+            RemoteFrontendGate::Connecting,
+            RemoteFrontendGate::Syncing,
+            RemoteFrontendGate::Reconnecting,
+            RemoteFrontendGate::Offline,
+        ] {
+            assert!(!take_ready_remote_open(&mut pending, true, 7, &gate, false));
+            assert!(pending.is_some());
+        }
+    }
 
     fn test_size(cols: usize, rows: usize) -> TerminalSize {
         TerminalSize {

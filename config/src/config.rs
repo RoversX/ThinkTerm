@@ -793,6 +793,12 @@ pub struct Config {
     #[dynamic(default = "default_true")]
     pub automatically_reload_config: bool,
 
+    /// Claim the active terminal after an explicit remote mux Connect action,
+    /// before showing its initial grid. Background reconnects never auto-claim.
+    /// Disable to keep viewing the remote terminal until clicking to take control.
+    #[dynamic(default = "default_true")]
+    pub remote_mux_auto_claim_on_open: bool,
+
     #[dynamic(default = "default_check_for_updates")]
     pub check_for_updates: bool,
     #[dynamic(
@@ -2572,6 +2578,19 @@ mod tests {
     #[test]
     fn remote_note_images_are_enabled_by_default() {
         assert!(Config::default().note_remote_images_enabled);
+    }
+
+    #[test]
+    fn remote_mux_auto_claim_can_be_disabled_in_config() {
+        use wezterm_dynamic::{FromDynamic, Object, Value};
+        assert!(Config::default().remote_mux_auto_claim_on_open);
+        let mut values = Object::default();
+        values.insert(
+            Value::String("remote_mux_auto_claim_on_open".to_string()),
+            Value::Bool(false),
+        );
+        let config = Config::from_dynamic(&Value::Object(values), Default::default()).unwrap();
+        assert!(!config.remote_mux_auto_claim_on_open);
     }
 
     #[test]

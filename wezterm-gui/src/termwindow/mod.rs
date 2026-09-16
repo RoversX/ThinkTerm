@@ -2081,6 +2081,12 @@ pub(crate) enum FrontendGeometryPhase {
     TakeoverSyncing { epoch: u64, show_overlay: bool },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RemoteOpenIntent {
+    domain_id: DomainId,
+    ready: bool,
+}
+
 impl FrontendGeometryPhase {
     pub(crate) fn epoch(self) -> u64 {
         match self {
@@ -2207,6 +2213,8 @@ pub struct TermWindow {
     /// remain visible; only a real takeover or unknown initial owner obscures
     /// the terminal until the matching epoch is acknowledged.
     frontend_geometry_phases: HashMap<TabId, FrontendGeometryPhase>,
+    /// One explicit Connect request, not a policy applied on every attach.
+    remote_open_intent: Option<RemoteOpenIntent>,
     /// A takeover RPC acknowledges PTY resize before the remote application
     /// redraw has reached this renderer. Keep its expected pane snapshots here
     /// and reveal only after every visible row has been refreshed and stable.
@@ -3629,7 +3637,7 @@ impl TermWindow {
 
 impl TermWindow {
     pub async fn new_window(mux_window_id: MuxWindowId) -> anyhow::Result<()> {
-        Self::new_window_impl(mux_window_id, None, true).await
+        Self::new_window_impl(mux_window_id, None, true, None).await
     }
 
     /// For domain-owned mux windows (remote mux windows arriving via a
@@ -3637,18 +3645,20 @@ impl TermWindow {
     /// a saved workspace thread. Restoring would adopt this window onto a
     /// different mux window, orphaning/killing the one the domain created.
     pub async fn new_window_without_restore(mux_window_id: MuxWindowId) -> anyhow::Result<()> {
-        Self::new_window_impl(mux_window_id, None, false).await
+        Self::new_window_impl(mux_window_id, None, false, None).await
     }
 
     pub async fn new_window_with_claimed_space(
         mux_window_id: MuxWindowId,
         space_owner_id: u64,
         active_space_id: String,
+        remote_open_domain: Option<DomainId>,
     ) -> anyhow::Result<()> {
         Self::new_window_impl(
             mux_window_id,
             Some((space_owner_id, active_space_id)),
             false,
+            remote_open_domain,
         )
         .await
     }
@@ -3657,6 +3667,7 @@ impl TermWindow {
         mux_window_id: MuxWindowId,
         claimed_space: Option<(u64, String)>,
         restore_saved_thread: bool,
+        remote_open_domain: Option<DomainId>,
     ) -> anyhow::Result<()> {
         let config = configuration();
         let native_settings = crate::native_settings::load();
@@ -3816,6 +3827,12 @@ impl TermWindow {
 
         let myself = Self {
             frontend_geometry_phases: HashMap::new(),
+            remote_open_intent: remote_open_domain
+                .filter(|_| config.remote_mux_auto_claim_on_open)
+                .map(|domain_id| RemoteOpenIntent {
+                    domain_id,
+                    ready: false,
+                }),
             frontend_geometry_confirmations: HashMap::new(),
             frontend_geometry_resized: std::collections::HashSet::new(),
             frontend_recovery_geometry: HashMap::new(),
@@ -5897,6 +5914,8 @@ impl TermWindow {
         preferred_thread: Option<String>,
         window: &Window,
     ) -> bool {
+        // Navigating elsewhere cancels the earlier window-opening intent.
+        self.remote_open_intent = None;
         if self.workspace_sidebar_swipe.pending_switch_target() != Some(space_id.as_str()) {
             self.workspace_sidebar_swipe.cancel_immediately();
             self.clear_workspace_space_swipe_frame_transition();
@@ -8032,6 +8051,7 @@ impl TermWindow {
     }
 
     fn activate_tab(&mut self, tab_idx: isize) -> anyhow::Result<()> {
+        self.remote_open_intent = None;
         let mux = Mux::get();
         let mut window = mux
             .get_window_mut(self.mux_window_id)
@@ -9185,7 +9205,8 @@ impl TermWindow {
         if matches!(assignment, PasteFrom(_) | SendString(_) | SendKey(_))
             && matches!(
                 self.frontend_terminal_gate(),
-                wezterm_client::domain::RemoteFrontendGate::Syncing
+                wezterm_client::domain::RemoteFrontendGate::Connecting
+                    | wezterm_client::domain::RemoteFrontendGate::Syncing
             )
         {
             return Ok(PerformAssignmentResult::Handled);

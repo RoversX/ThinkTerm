@@ -655,7 +655,8 @@ impl super::TermWindow {
         if only_key_bindings == OnlyKeyBindings::No
             && matches!(
                 self.frontend_terminal_gate(),
-                wezterm_client::domain::RemoteFrontendGate::Syncing
+                wezterm_client::domain::RemoteFrontendGate::Connecting
+                    | wezterm_client::domain::RemoteFrontendGate::Syncing
             )
         {
             return true;
