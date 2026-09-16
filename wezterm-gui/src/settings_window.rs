@@ -1126,12 +1126,15 @@ impl ImportFieldId {
                 .unwrap_or_else(|| crate::i18n::tr("settings-import-preview-custom-colors")),
             Self::WindowBackgroundOpacity => format!("{:.2}", config.window_background_opacity),
             Self::MacosWindowBackgroundBlur => config.macos_window_background_blur.to_string(),
-            Self::InactivePaneHsb => format!(
-                "h {:.2}, s {:.2}, b {:.2}",
-                config.inactive_pane_hsb.hue,
-                config.inactive_pane_hsb.saturation,
-                config.inactive_pane_hsb.brightness
-            ),
+            Self::InactivePaneHsb => {
+                let palette: wezterm_term::color::ColorPalette =
+                    config.resolved_palette.clone().into();
+                let hsb = config.inactive_pane_hsb_for_background(palette.background);
+                format!(
+                    "h {:.2}, s {:.2}, b {:.2}",
+                    hsb.hue, hsb.saturation, hsb.brightness
+                )
+            }
             Self::FontSize => format!("{:.1}", config.font_size),
             Self::Font => config
                 .font
@@ -12291,7 +12294,7 @@ impl SettingsWindow {
             ImportFieldId::MacosWindowBackgroundBlur => {
                 Some(config.macos_window_background_blur.to_dynamic())
             }
-            ImportFieldId::InactivePaneHsb => Some(config.inactive_pane_hsb.to_dynamic()),
+            ImportFieldId::InactivePaneHsb => config.inactive_pane_hsb.map(|hsb| hsb.to_dynamic()),
             ImportFieldId::FontSize => Some(config.font_size.to_dynamic()),
             ImportFieldId::Font => Some(config.font.to_dynamic()),
             ImportFieldId::LineHeight => Some(config.line_height.to_dynamic()),

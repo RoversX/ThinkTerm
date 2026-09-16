@@ -45,7 +45,7 @@ impl crate::TermWindow {
         let hsv = if params.is_active {
             None
         } else {
-            Some(params.config.inactive_pane_hsb)
+            Some(params.config.inactive_pane_hsb_for_background(params.palette.background))
         };
 
         let width_scale = if !params.line.is_single_width() {

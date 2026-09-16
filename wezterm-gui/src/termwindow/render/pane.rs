@@ -1567,7 +1567,7 @@ impl crate::TermWindow {
             quad.set_hsv(if pos.is_active {
                 None
             } else {
-                Some(config.inactive_pane_hsb)
+                Some(config.inactive_pane_hsb_for_background(palette.background))
             });
         }
 
@@ -1615,7 +1615,7 @@ impl crate::TermWindow {
                 quad.set_hsv(if pos.is_active {
                     None
                 } else {
-                    Some(config.inactive_pane_hsb)
+                    Some(config.inactive_pane_hsb_for_background(palette.background))
                 });
             }
         }

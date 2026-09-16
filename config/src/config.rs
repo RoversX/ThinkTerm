@@ -671,8 +671,9 @@ pub struct Config {
     /// A subtle dimming effect can be achieved by setting:
     /// inactive_pane_saturation = 0.9
     /// inactive_pane_brightness = 0.8
-    #[dynamic(default = "default_inactive_pane_hsb")]
-    pub inactive_pane_hsb: HsbTransform,
+    /// When unset, use brightness 0.95 on light terminal backgrounds and
+    /// 0.8 on dark ones, with saturation 0.9. Explicit values are unchanged.
+    pub inactive_pane_hsb: Option<HsbTransform>,
 
     #[dynamic(default = "default_one_point_oh")]
     pub text_background_opacity: f32,
@@ -1040,6 +1041,18 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn inactive_pane_hsb_for_background(&self, background: SrgbaTuple) -> HsbTransform {
+        self.inactive_pane_hsb.unwrap_or_else(|| HsbTransform {
+            brightness: if crate::color::is_light_terminal_background(background) {
+                0.95
+            } else {
+                0.8
+            },
+            saturation: 0.9,
+            hue: 1.0,
+        })
+    }
+
     pub fn load() -> LoadedConfig {
         Self::load_with_overrides(&wezterm_dynamic::Value::default())
     }
@@ -2177,14 +2190,6 @@ fn default_clean_exits() -> Vec<u32> {
     vec![]
 }
 
-fn default_inactive_pane_hsb() -> HsbTransform {
-    HsbTransform {
-        brightness: 0.8,
-        saturation: 0.9,
-        hue: 1.0,
-    }
-}
-
 #[derive(FromDynamic, ToDynamic, Clone, Copy, Debug, Default)]
 pub enum DefaultCursorStyle {
     BlinkingBlock,
@@ -2578,6 +2583,43 @@ mod tests {
     #[test]
     fn remote_note_images_are_enabled_by_default() {
         assert!(Config::default().note_remote_images_enabled);
+    }
+
+    #[test]
+    fn inactive_pane_defaults_follow_the_terminal_background() {
+        use super::SrgbaTuple;
+        let config = Config::default();
+        assert!(config.inactive_pane_hsb.is_none());
+        let light = config.inactive_pane_hsb_for_background(SrgbaTuple(1.0, 0.98, 0.9, 1.0));
+        let dark = config.inactive_pane_hsb_for_background(SrgbaTuple(0.1, 0.12, 0.15, 1.0));
+        assert_eq!(light.brightness, 0.95);
+        assert_eq!(dark.brightness, 0.8);
+        assert_eq!(light.saturation, 0.9);
+        assert_eq!(dark.saturation, 0.9);
+    }
+
+    #[test]
+    fn explicit_inactive_pane_values_survive_dynamic_config_loading() {
+        use super::{HsbTransform, SrgbaTuple};
+        use wezterm_dynamic::{FromDynamic, Object, ToDynamic, Value};
+        // Even an explicit choice equal to the old default must not be
+        // mistaken for an unset field on light backgrounds.
+        for brightness in [0.8, 0.4, 1.0] {
+            let hsb = HsbTransform {
+                hue: 1.0,
+                saturation: 0.9,
+                brightness,
+            };
+            let mut values = Object::default();
+            values.insert(Value::String("inactive_pane_hsb".into()), hsb.to_dynamic());
+            let config = Config::from_dynamic(&Value::Object(values), Default::default()).unwrap();
+            for background in [
+                SrgbaTuple(1.0, 1.0, 1.0, 1.0),
+                SrgbaTuple(0.0, 0.0, 0.0, 1.0),
+            ] {
+                assert_eq!(config.inactive_pane_hsb_for_background(background), hsb);
+            }
+        }
     }
 
     #[test]
