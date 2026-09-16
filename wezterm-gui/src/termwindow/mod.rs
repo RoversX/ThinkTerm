@@ -2886,6 +2886,12 @@ pub struct TermWindow {
     /// The earliest moment the next output-driven repaint of this window
     /// may happen while it is unfocused.
     unfocused_next_allowed: Instant,
+    /// Single-flight latch for the content-view output throttle: the
+    /// deadline of the in-flight trailing-edge timer, if any.
+    content_view_output_due: Option<Instant>,
+    /// The earliest moment a card's pane output may next repaint a
+    /// foreground content view.
+    content_view_output_next_allowed: Instant,
 
     created: Instant,
 
@@ -4095,6 +4101,8 @@ impl TermWindow {
             scheduled_animation: RefCell::new(None),
             unfocused_invalidate_due: None,
             unfocused_next_allowed: Instant::now(),
+            content_view_output_due: None,
+            content_view_output_next_allowed: Instant::now(),
             allow_images: AllowImage::Yes,
             atlas_scale_hold: None,
             atlas_overflow_log: std::collections::VecDeque::new(),
@@ -5736,17 +5744,24 @@ impl TermWindow {
             }
         }
 
+        // A foreground content view hides the terminal; the only pane
+        // output it can show is a Live Overview thumbnail, which is re-read
+        // at most once per preview refresh interval. Repainting the whole
+        // view on every chunk of output painted it at the output rate to
+        // notice changes it would only pick up every few hundred
+        // milliseconds. That path paces itself instead.
+        if self.content_view_foreground() {
+            self.content_view_pane_output_event(pane_id);
+            return;
+        }
+
         // One tab lookup serves both the visibility check and the
         // full-rate probe below.
         let tab = Mux::get().get_active_tab_for_window(self.mux_window_id);
-        let content_view_wants_output = self
-            .active_content_view()
-            .is_some_and(|view| view.wants_pane_output(pane_id));
-        let visible = content_view_wants_output
-            || match tab.as_ref() {
-                Some(tab) => self.is_pane_visible_in_tab(tab, pane_id),
-                None => false,
-            };
+        let visible = match tab.as_ref() {
+            Some(tab) => self.is_pane_visible_in_tab(tab, pane_id),
+            None => false,
+        };
         if !visible {
             return;
         }
@@ -5805,6 +5820,71 @@ impl TermWindow {
             })));
         })
         .detach();
+    }
+
+    /// Pane output while a content view is the foreground.
+    ///
+    /// Only the panes a Live Overview card currently shows can change what
+    /// is on screen, and a card re-reads its terminal at most every
+    /// `live_overview_preview_refresh_ms`; a repaint between two of those
+    /// moments replays every card to show no change. Five busy cards were
+    /// ~50 full frames a second this way. So: output from a pane no card
+    /// shows is ignored outright (the active tab's own panes are hidden
+    /// underneath the view, and the render watchdog repaints them once the
+    /// view is gone), and output from a shown pane is paced to the refresh
+    /// interval, with one trailing-edge timer so the last burst before a
+    /// pane goes quiet still reaches its card.
+    fn content_view_pane_output_event(&mut self, pane_id: PaneId) {
+        let now = Instant::now();
+        // An armed trailing-edge timer already owes this view a repaint
+        // that will cover this output. The staleness bound guards a timer
+        // swallowed by display sleep, as the unfocused latch does.
+        if let Some(due) = self.content_view_output_due {
+            if now.saturating_duration_since(due) < Duration::from_millis(250) {
+                return;
+            }
+        }
+        let wanted = self
+            .active_content_view()
+            .is_some_and(|view| view.wants_pane_output(pane_id));
+        let interval = Duration::from_millis(self.config.live_overview_preview_refresh_ms.max(1));
+        match content_view_output_repaint(
+            wanted,
+            now,
+            self.content_view_output_next_allowed,
+            interval,
+        ) {
+            ContentViewOutputRepaint::Ignore => {}
+            ContentViewOutputRepaint::Now { next_allowed } => {
+                self.content_view_output_due = None;
+                self.content_view_output_next_allowed = next_allowed;
+                self.invalidate_window();
+            }
+            ContentViewOutputRepaint::Defer { due } => {
+                let Some(window) = self.window.clone() else {
+                    return;
+                };
+                self.content_view_output_due = Some(due);
+                promise::spawn::spawn(async move {
+                    Timer::at(due).await;
+                    let win = window.clone();
+                    window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                        // Only the timer that owns the current latch may
+                        // act; see the unfocused throttle for why.
+                        if tw.content_view_output_due != Some(due) {
+                            return;
+                        }
+                        tw.content_view_output_due = None;
+                        tw.content_view_output_next_allowed = Instant::now()
+                            + Duration::from_millis(
+                                tw.config.live_overview_preview_refresh_ms.max(1),
+                            );
+                        win.invalidate();
+                    })));
+                })
+                .detach();
+            }
+        }
     }
 
     fn mux_pane_output_event_callback(
@@ -10999,6 +11079,73 @@ impl Drop for TermWindow {
                 fe.forget_known_window(&window);
             }
         }
+    }
+}
+
+/// What one pane's output should do to a window whose foreground is a
+/// content view rather than the terminal.
+#[derive(Debug, PartialEq, Eq)]
+enum ContentViewOutputRepaint {
+    /// No card shows this pane: nothing on screen would change.
+    Ignore,
+    /// Paint now; further output may paint again from `next_allowed`.
+    Now { next_allowed: Instant },
+    /// Inside the interval: arm one trailing-edge timer for `due`.
+    Defer { due: Instant },
+}
+
+fn content_view_output_repaint(
+    wanted: bool,
+    now: Instant,
+    next_allowed: Instant,
+    interval: Duration,
+) -> ContentViewOutputRepaint {
+    if !wanted {
+        ContentViewOutputRepaint::Ignore
+    } else if now >= next_allowed {
+        ContentViewOutputRepaint::Now {
+            next_allowed: now + interval,
+        }
+    } else {
+        ContentViewOutputRepaint::Defer { due: next_allowed }
+    }
+}
+
+#[cfg(test)]
+mod content_view_output_tests {
+    use super::{content_view_output_repaint, ContentViewOutputRepaint};
+    use std::time::{Duration, Instant};
+
+    const INTERVAL: Duration = Duration::from_millis(300);
+
+    #[test]
+    fn a_pane_no_card_shows_never_repaints() {
+        let now = Instant::now();
+        assert_eq!(
+            content_view_output_repaint(false, now, now - INTERVAL, INTERVAL),
+            ContentViewOutputRepaint::Ignore
+        );
+    }
+
+    #[test]
+    fn the_first_output_paints_and_opens_the_interval() {
+        let now = Instant::now();
+        assert_eq!(
+            content_view_output_repaint(true, now, now, INTERVAL),
+            ContentViewOutputRepaint::Now {
+                next_allowed: now + INTERVAL
+            }
+        );
+    }
+
+    #[test]
+    fn output_inside_the_interval_defers_to_its_end() {
+        let now = Instant::now();
+        let next_allowed = now + Duration::from_millis(120);
+        assert_eq!(
+            content_view_output_repaint(true, now, next_allowed, INTERVAL),
+            ContentViewOutputRepaint::Defer { due: next_allowed }
+        );
     }
 }
 
