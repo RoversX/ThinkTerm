@@ -135,7 +135,8 @@ pub struct Palette {
     /// The color of the "thumb" of the scrollbar; the segment that
     /// represents the current viewable area
     pub scrollbar_thumb: Option<RgbaColor>,
-    /// The color of the split line between panes
+    /// The color of the split line between panes. When unset, blend the
+    /// terminal background toward its foreground for a subtle divider.
     pub split: Option<RgbaColor>,
     /// The color of the visual bell. If unspecified, the foreground
     /// color is used instead.
@@ -272,6 +273,13 @@ impl From<Palette> for ColorPalette {
         apply_color!(selection_bg);
         apply_color!(scrollbar_thumb);
         apply_color!(split);
+
+        if cfg.split.is_none() {
+            // Resolve after foreground/background overrides, not from the
+            // fixed dark default. This follows light, dark and tinted schemes
+            // without overriding an explicit theme or user split color.
+            p.split = p.background.interpolate(p.foreground, 0.22);
+        }
 
         if let Some(ansi) = cfg.ansi {
             for (idx, col) in ansi.iter().enumerate() {
@@ -881,6 +889,63 @@ impl ColorSchemeFile {
         std::fs::write(&path, text)
             .with_context(|| format!("writing toml to {}", path.as_ref().display()))
     }
+}
+
+#[cfg(test)]
+#[test]
+fn default_split_follows_light_and_dark_palettes() {
+    let resolve = |background, foreground| -> ColorPalette {
+        Palette {
+            background: Some(background),
+            foreground: Some(foreground),
+            ..Palette::default()
+        }
+        .into()
+    };
+    let light = resolve((255, 255, 255).into(), (0, 0, 0).into());
+    let dark = resolve((0, 0, 0).into(), (255, 255, 255).into());
+    assert!((light.split.0 - 0.78).abs() < 0.001);
+    assert!((dark.split.0 - 0.22).abs() < 0.001);
+    assert_ne!(light.split, dark.split);
+}
+
+#[cfg(test)]
+#[test]
+fn default_split_uses_the_final_overlaid_palette() {
+    let theme = Palette {
+        background: Some((255, 250, 230).into()),
+        foreground: Some((100, 90, 70).into()),
+        ..Palette::default()
+    };
+    let overrides = Palette {
+        background: Some((30, 40, 50).into()),
+        ..Palette::default()
+    };
+    let original: ColorPalette = theme.clone().into();
+    let resolved: ColorPalette = theme.overlay_with(&overrides).into();
+    assert_eq!(
+        resolved.split,
+        resolved.background.interpolate(resolved.foreground, 0.22)
+    );
+    assert_ne!(original.split, resolved.split);
+}
+
+#[cfg(test)]
+#[test]
+fn explicit_split_colors_are_preserved() {
+    let theme = Palette {
+        split: Some((10, 80, 150).into()),
+        ..Palette::default()
+    };
+    let resolved: ColorPalette = theme.clone().into();
+    assert_eq!(resolved.split, theme.split.unwrap().color);
+
+    let overrides = Palette {
+        split: Some(SrgbaTuple(0.8, 0.2, 0.1, 0.5).into()),
+        ..Palette::default()
+    };
+    let resolved: ColorPalette = theme.overlay_with(&overrides).into();
+    assert_eq!(resolved.split, overrides.split.unwrap().color);
 }
 
 #[cfg(test)]
