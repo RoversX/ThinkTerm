@@ -1785,10 +1785,10 @@ impl crate::TermWindow {
                 // not a heading: a shade under the pane header size, and a
                 // caption a step below that in the same family.
                 self.fonts.title_font_with_size(
-                    (crate::native_settings::pane_header_font_size() * 0.78).max(9.0),
+                    (crate::native_settings::pane_header_font_size() * 0.66).max(8.0),
                 )?,
                 self.fonts.title_font_with_size(
-                    (crate::native_settings::pane_header_font_size() * 0.64).max(8.0),
+                    (crate::native_settings::pane_header_font_size() * 0.56).max(7.5),
                 )?,
             ),
         };
