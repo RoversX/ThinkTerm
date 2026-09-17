@@ -48,23 +48,25 @@ const CARD_MIN_WIDTH: f32 = 400.0;
 const CARD_ORPHAN_COMFORT_WIDTH: f32 = 480.0;
 const CARD_MAX_WIDTH: f32 = 640.0;
 /// The band above a card's panel: the floating capsule that names the thread
-/// and lists its tabs, plus the gap that keeps it floating.
-const CAPSULE_HEIGHT: f32 = 46.0;
-const CAPSULE_GAP: f32 = 12.0;
+/// and lists its tabs, plus the gap that keeps it floating. Like every other
+/// figure in this file these are design pixels (2x backing), so the capsule
+/// stands 46pt tall on a Retina display, as the design has it.
+const CAPSULE_HEIGHT: f32 = 92.0;
+const CAPSULE_GAP: f32 = 20.0;
 const CARD_HEADER_HEIGHT: f32 = CAPSULE_HEIGHT + CAPSULE_GAP;
-const CAPSULE_ICON: f32 = 16.0;
+const CAPSULE_ICON: f32 = 26.0;
 /// Padding either side of a capsule section's contents.
-const CAPSULE_SECTION_PAD: f32 = 14.0;
-const CAPSULE_TITLE_PAD: f32 = 18.0;
+const CAPSULE_SECTION_PAD: f32 = 18.0;
+const CAPSULE_TITLE_PAD: f32 = 20.0;
 /// Vertical inset of the hairlines between sections.
-const CAPSULE_DIVIDER_INSET: f32 = 13.0;
-const CAPSULE_DOT: f32 = 8.0;
-const CAPSULE_DOT_GAP: f32 = 11.0;
+const CAPSULE_DIVIDER_INSET: f32 = 26.0;
+const CAPSULE_DOT: f32 = 14.0;
+const CAPSULE_DOT_GAP: f32 = 16.0;
 /// Room either side of the hairline between two windows' dots.
-const CAPSULE_GROUP_GAP: f32 = 13.0;
+const CAPSULE_GROUP_GAP: f32 = 18.0;
 /// Margin the capsule leaves at both ends of the panel; the close button
 /// lives in the right-hand one.
-const CAPSULE_END_MARGIN: f32 = 40.0;
+const CAPSULE_END_MARGIN: f32 = 44.0;
 const CARD_RADIUS: f32 = 18.0;
 const CARD_INSET: f32 = 8.0;
 const CARD_CLOSE_BUTTON_SIZE: f32 = 32.0;
@@ -1871,14 +1873,7 @@ impl LiveOverviewView {
 
         let icon_width = pad * 2.0 + icon;
         let title_pad = ctx.px(CAPSULE_TITLE_PAD);
-        // A long thread name is shortened with an ellipsis to what the
-        // capsule can hold once the other sections have their room; the
-        // subtitle follows the same limit.
-        let title_room = (max_width * 0.6).max(ctx.px(80.0));
-        let title_text = title_ctx.text_with_ellipsis(title_font, &card.title, title_room);
-        let subtitle =
-            subtitle.map(|text| sub_ctx.text_with_ellipsis(sub_font, &text, title_room));
-        let title_text_width = title_ctx.measure_text_width(title_font, &title_text);
+        let title_text_width = title_ctx.measure_text_width(title_font, &card.title);
         let sub_text_width = subtitle
             .as_deref()
             .map_or(0.0, |text| sub_ctx.measure_text_width(sub_font, text));
@@ -1945,6 +1940,14 @@ impl LiveOverviewView {
         let title_folded = title_natural
             .min(max_width - icon_width - dots_folded - count_folded - dividers_folded)
             .max(0.0);
+        // A thread name longer than the room left once the other sections
+        // have theirs is shortened with an ellipsis; the subtitle follows.
+        let title_inner = (title_folded - title_pad * 2.0).max(1.0);
+        let title_text = title_ctx.text_with_ellipsis(title_font, &card.title, title_inner);
+        let subtitle =
+            subtitle.map(|text| sub_ctx.text_with_ellipsis(sub_font, &text, title_inner));
+        let title_text_width = title_text_width.min(title_inner);
+        let sub_text_width = sub_text_width.min(title_inner);
         let title_width = lerp(title_folded, 0.0);
         let dots_section = lerp(dots_folded, dots_open);
         let count_section = lerp(count_folded, count_open);
@@ -2031,7 +2034,7 @@ impl LiveOverviewView {
                 } else {
                     title_line
                 };
-                let title_y = y + (height - block) / 2.0 - ctx.px(2.0);
+                let title_y = y + (height - block) / 2.0 - ctx.px(4.0);
                 let shown = title_text_width.min(inner);
                 title_ctx.draw_text(
                     layers,
@@ -2135,7 +2138,7 @@ impl LiveOverviewView {
             draw_divider(layers, cursor)?;
             cursor += hairline;
             let section_x = cursor;
-            let inset = ctx.px(9.0);
+            let inset = ctx.px(18.0);
             if t > 0.0 {
                 ctx.draw_rounded_rect(
                     layers,
