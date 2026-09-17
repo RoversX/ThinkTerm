@@ -65,6 +65,11 @@ const TAB_PILL_CLOSE_GAP: f32 = 6.0;
 /// nothing else, and takes the title's room to say it.
 const TAB_PILL_MAX_DOTS: usize = 6;
 const TAB_PILL_FOLDED_DOTS: usize = 3;
+/// A folded pill opens once the pointer has rested on it: a pointer on its
+/// way across the card must not pop it. It stays open a little after the
+/// pointer leaves, so a slip off its edge is not a collapse.
+const TAB_PILL_OPEN_DELAY: Duration = Duration::from_millis(150);
+const TAB_PILL_CLOSE_DELAY: Duration = Duration::from_millis(200);
 /// Space between the thread name and the command it is running.
 const RUNNING_LABEL_GAP: f32 = 14.0;
 /// Below this there is no room to say anything useful, so say nothing rather
@@ -210,6 +215,92 @@ struct TabPillPlan {
     folded: usize,
 }
 
+/// A folded pill in the middle of opening or closing.
+///
+/// Opens only once the pointer has rested on the pill, closes only once it
+/// has been gone for a moment, and a click pins it open until the next.
+#[derive(Clone, Debug)]
+struct PillExpansion {
+    key: LiveThreadKey,
+    /// When the pointer arrived on the folded pill; cleared once it opens.
+    armed_at: Option<Instant>,
+    /// 0 folded, 1 open.
+    open: Timeline,
+    /// When the pointer left an open pill.
+    leave_at: Option<Instant>,
+    pinned: bool,
+}
+
+impl PillExpansion {
+    fn armed(key: LiveThreadKey, now: Instant) -> Self {
+        Self {
+            key,
+            armed_at: Some(now),
+            open: Timeline::settled(now, 0.0),
+            leave_at: None,
+            pinned: false,
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.open.target() >= 1.0
+    }
+
+    fn set_open(&mut self, open: bool, now: Instant) {
+        self.armed_at = None;
+        self.leave_at = None;
+        let to = if open { 1.0 } else { 0.0 };
+        if self.open.target() != to {
+            self.open.retarget(now, to, anim::SHORT, Easing::OutCubic);
+        }
+    }
+
+    /// Advance one frame. `over` says whether the pointer is on this pill.
+    /// Returns false once there is nothing left to show.
+    fn step(&mut self, over: bool, now: Instant) -> bool {
+        self.open.advance(now);
+        if over {
+            self.leave_at = None;
+            if let Some(armed_at) = self.armed_at {
+                if now.saturating_duration_since(armed_at) >= TAB_PILL_OPEN_DELAY {
+                    self.set_open(true, now);
+                }
+            }
+            return true;
+        }
+        if self.pinned {
+            return true;
+        }
+        if self.is_open() {
+            let leave_at = *self.leave_at.get_or_insert(now);
+            if now.saturating_duration_since(leave_at) >= TAB_PILL_CLOSE_DELAY {
+                self.set_open(false, now);
+            }
+            return true;
+        }
+        // Armed but never opened, or closing: gone once it has settled shut.
+        self.armed_at = None;
+        self.open.is_running() || self.open.value(now) > 0.0
+    }
+
+    /// When this expansion next needs a frame without any input arriving.
+    fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        if self.open.is_running() {
+            return Some(now);
+        }
+        let armed = self.armed_at.map(|at| at + TAB_PILL_OPEN_DELAY);
+        let leave = self.leave_at.map(|at| at + TAB_PILL_CLOSE_DELAY);
+        armed.into_iter().chain(leave).min()
+    }
+}
+
+/// What a card's tab pill returned to its caller: where it is, and the hit
+/// targets it wants pushed after the card's own.
+struct PillPaint {
+    rect: RectF,
+    dots: Vec<(RectF, TabId)>,
+}
+
 /// What a tab is up to, as its dot tells it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TabActivity {
@@ -251,6 +342,9 @@ enum OverviewAction {
     OpenThread(TabId),
     /// A dot of a card's tab pill: makes that tab the card's pick and opens it.
     SelectTab(TabId),
+    /// The pill itself, named by the card's previewed tab. Hovering it opens
+    /// a folded pill; clicking it toggles the pill open regardless.
+    ExpandTabs(TabId),
     CloseTab(TabId),
     ConfirmCloseTab,
     CancelCloseTab,
@@ -348,6 +442,8 @@ pub(crate) struct LiveOverviewView {
     /// Whether the active thread's card has been brought into view. Done once,
     /// on the first frame that has a layout to measure against.
     revealed_active: bool,
+    /// The one pill that is opening, open or closing, if any.
+    pill_expansion: Option<PillExpansion>,
     /// Whether the last frame drew a tab pill. Its dots say what a tab is
     /// doing, which changes without anything else asking for a frame -- an
     /// idle previewed tab means no output-driven repaint at all -- so a
@@ -431,6 +527,7 @@ impl LiveOverviewView {
             scroll: ScrollState::new(),
             revealed_active: false,
             pills_drawn: false,
+            pill_expansion: None,
             last_ui_scale: 1.0,
             viewport: euclid::rect(0.0, 0.0, 0.0, 0.0),
             widgets: UiContext::default(),
@@ -712,6 +809,7 @@ impl LiveOverviewView {
 
         let now = Instant::now();
         let groups = self.collect_groups(now);
+        self.update_pill_expansion(now);
         // Advance every card's travel once, before anything samples it.
         for motion in self.card_motion.values_mut() {
             motion.travel.advance(now);
@@ -905,7 +1003,7 @@ impl LiveOverviewView {
                         Some(OverviewAction::OpenThread(id) | OverviewAction::CloseTab(id)) => {
                             id == tab_id
                         }
-                        Some(OverviewAction::SelectTab(id)) => {
+                        Some(OverviewAction::SelectTab(id) | OverviewAction::ExpandTabs(id)) => {
                             self.tab_keys.get(&id) == Some(&card.key)
                         }
                         _ => false,
@@ -948,22 +1046,24 @@ impl LiveOverviewView {
                     let header_fully_visible =
                         row_fully_visible(rect.origin.y, card_header_height, self.viewport);
                     // One tab needs no pill: the card is that tab.
-                    let mut dot_hits = Vec::new();
+                    let mut pill_paint = None;
                     let title_right = if card.tabs.len() > 1 && header_fully_visible {
                         self.pills_drawn = true;
-                        let (pill, hits) = self.paint_tab_pill(
+                        let paint = self.paint_tab_pill(
                             ctx,
                             layers,
                             palette,
                             settings_font,
                             card,
+                            icon_x + icon_size + ctx.px(10.0),
                             close_x - ctx.px(TAB_PILL_CLOSE_GAP),
                             rect.origin.y,
                             card_header_height,
                             now,
                         )?;
-                        dot_hits = hits;
-                        pill.min_x()
+                        let right = paint.rect.min_x();
+                        pill_paint = Some(paint);
+                        right
                     } else {
                         close_x
                     };
@@ -1082,9 +1182,20 @@ impl LiveOverviewView {
 
                     self.card_titles.insert(tab_id, card.title.clone());
                     self.widgets.push(visible, WidgetKind::SidebarRow, action);
-                    for (hit, dot_tab) in dot_hits {
-                        self.widgets
-                            .push(hit, WidgetKind::Button, OverviewAction::SelectTab(dot_tab));
+                    if let Some(pill) = pill_paint {
+                        // The body first, the dots over it: last pushed wins.
+                        self.widgets.push(
+                            pill.rect,
+                            WidgetKind::Button,
+                            OverviewAction::ExpandTabs(tab_id),
+                        );
+                        for (hit, dot_tab) in pill.dots {
+                            self.widgets.push(
+                                hit,
+                                WidgetKind::Button,
+                                OverviewAction::SelectTab(dot_tab),
+                            );
+                        }
                     }
                     if header_fully_visible {
                         if card_hovered {
@@ -1300,6 +1411,10 @@ impl LiveOverviewView {
         // Dots follow the running labels, which are re-read on this interval;
         // between two of those readings there is nothing new for them to say.
         let pill_deadline = self.pills_drawn.then(|| now + RUNNING_LABEL_REFRESH);
+        let expansion_deadline = self
+            .pill_expansion
+            .as_ref()
+            .and_then(|expansion| expansion.next_deadline(now));
         // Before the fade begins one frame is enough -- the one that starts
         // it. Inside the fade every frame counts.
         let scrollbar_deadline = self.scrollbar_visible_until.and_then(|until| {
@@ -1316,6 +1431,7 @@ impl LiveOverviewView {
             motion_deadline,
             backlog_deadline,
             pill_deadline,
+            expansion_deadline,
             self.next_preview_refresh,
             scrollbar_deadline,
         ]
@@ -1548,6 +1664,74 @@ impl LiveOverviewView {
         )
     }
 
+    /// The card whose pill the pointer is on, if any: one of its dots, or the
+    /// pill's own body.
+    fn pill_hover_key(&self) -> Option<LiveThreadKey> {
+        match self.interaction.hovered {
+            Some(OverviewAction::SelectTab(tab_id) | OverviewAction::ExpandTabs(tab_id)) => {
+                self.tab_keys.get(&tab_id).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    fn update_pill_expansion(&mut self, now: Instant) {
+        let over = self.pill_hover_key();
+        match self.pill_expansion.as_mut() {
+            Some(expansion) => {
+                let on_this = over.as_ref() == Some(&expansion.key);
+                if !on_this && over.is_some() && !expansion.pinned && !expansion.is_open() {
+                    // Straight from one folded pill onto another: arm the
+                    // new one instead of waiting the old one out.
+                    self.pill_expansion =
+                        Some(PillExpansion::armed(over.expect("checked"), now));
+                    return;
+                }
+                if !expansion.step(on_this, now) {
+                    self.pill_expansion = None;
+                }
+            }
+            None => {
+                if let Some(key) = over {
+                    self.pill_expansion = Some(PillExpansion::armed(key, now));
+                }
+            }
+        }
+    }
+
+    /// How far open the pill of `key` is, 0 to 1.
+    fn pill_open_amount(&self, key: &LiveThreadKey, now: Instant) -> f32 {
+        self.pill_expansion
+            .as_ref()
+            .filter(|expansion| &expansion.key == key)
+            .map_or(0.0, |expansion| expansion.open.value(now).clamp(0.0, 1.0))
+    }
+
+    /// The pill body was clicked: open it and keep it open, or fold it.
+    fn toggle_pill(&mut self, tab_id: TabId) -> ContentViewResponse {
+        let Some(key) = self.tab_keys.get(&tab_id).cloned() else {
+            return ContentViewResponse::Redraw;
+        };
+        let now = Instant::now();
+        match self.pill_expansion.as_mut() {
+            Some(expansion) if expansion.key == key && expansion.is_open() => {
+                expansion.pinned = false;
+                expansion.set_open(false, now);
+            }
+            Some(expansion) if expansion.key == key => {
+                expansion.pinned = true;
+                expansion.set_open(true, now);
+            }
+            _ => {
+                let mut expansion = PillExpansion::armed(key, now);
+                expansion.pinned = true;
+                expansion.set_open(true, now);
+                self.pill_expansion = Some(expansion);
+            }
+        }
+        ContentViewResponse::Redraw
+    }
+
     /// What `tab`'s dot should say. The previewed tab is being looked at, so
     /// whatever it has produced counts as seen.
     fn tab_activity(&mut self, tab_id: TabId, previewed: bool, now: Instant) -> TabActivity {
@@ -1569,9 +1753,14 @@ impl LiveOverviewView {
     }
 
     /// Draw a card's tab pill with its right edge at `right_x`, vertically
-    /// centred in the header. Returns the pill's rectangle and the hit
-    /// rectangle of every dot; the caller pushes those after the card's own
-    /// target so that they win the hit test.
+    /// centred in the header, never reaching left of `left_limit`. Returns
+    /// where it is and the hit rectangle of every dot; the caller pushes those
+    /// after the card's own target so that they win the hit test.
+    ///
+    /// The pill has two layouts, folded and open, both anchored to the right
+    /// edge; opening lerps the width between them and crossfades the
+    /// contents, so the dots that are in both stay put and the count gives
+    /// way to the dots it stood for.
     #[allow(clippy::too_many_arguments)]
     fn paint_tab_pill(
         &mut self,
@@ -1580,38 +1769,60 @@ impl LiveOverviewView {
         palette: UiPalette,
         count_font: &Rc<LoadedFont>,
         card: &LiveCard,
+        left_limit: f32,
         right_x: f32,
         header_y: f32,
         header_height: f32,
         now: Instant,
-    ) -> anyhow::Result<(RectF, Vec<(RectF, TabId)>)> {
+    ) -> anyhow::Result<PillPaint> {
         let previewed_index = card
             .tabs
             .iter()
             .position(|tab| tab.tab_id == card.tab_id)
             .unwrap_or(0);
-        let plan = tab_pill_plan(card.tabs.len(), previewed_index);
         let dot = ctx.px(TAB_PILL_DOT);
         let gap = ctx.px(TAB_PILL_DOT_GAP);
         let pad = ctx.px(TAB_PILL_PAD_X);
         let height = ctx.px(TAB_PILL_HEIGHT).min(header_height);
-        let count_text = (plan.folded > 0).then(|| format!("+{}", plan.folded));
-        let count_width = count_text
-            .as_deref()
-            .map_or(0.0, |text| ctx.measure_text_width(count_font, text));
-        let dots_width = plan.dots.len() as f32 * dot + (plan.dots.len() as f32 - 1.0) * gap;
+        let count_width = |folded: usize| -> f32 {
+            if folded == 0 {
+                0.0
+            } else {
+                ctx.measure_text_width(count_font, &format!("+{folded}"))
+            }
+        };
         // The measured width of the count is its advance; the last glyph's
         // ink can sit a little past it, so give it half a gap of slack.
-        let width = pad * 2.0
-            + dots_width
-            + if count_width > 0.0 {
-                gap + count_width + gap / 2.0
+        let plan_width = |plan: &TabPillPlan| -> f32 {
+            let dots = plan.dots.len() as f32;
+            let count = count_width(plan.folded);
+            pad * 2.0
+                + dots * dot
+                + (dots - 1.0).max(0.0) * gap
+                + if count > 0.0 { gap + count + gap / 2.0 } else { 0.0 }
+        };
+
+        let folded = tab_pill_plan(card.tabs.len(), previewed_index);
+        let opened = if folded.folded == 0 {
+            folded.clone()
+        } else {
+            let room = (right_x - left_limit - pad * 2.0 + gap).max(0.0);
+            let fit_all = ((room / (dot + gap)).floor() as usize).max(TAB_PILL_FOLDED_DOTS);
+            if card.tabs.len() <= fit_all {
+                tab_pill_plan_with(card.tabs.len(), previewed_index, card.tabs.len())
             } else {
-                0.0
-            };
+                // Not all of them: leave room for the count of the rest.
+                let room = (room - gap - count_width(1) - gap / 2.0).max(0.0);
+                let fit = ((room / (dot + gap)).floor() as usize).max(TAB_PILL_FOLDED_DOTS);
+                tab_pill_plan_with(card.tabs.len(), previewed_index, fit)
+            }
+        };
+        let t = self.pill_open_amount(&card.key, now);
+        let (folded_width, open_width) = (plan_width(&folded), plan_width(&opened));
+        let width = folded_width + (open_width - folded_width) * t;
         let x = right_x - width;
         let y = header_y + (header_height - height) / 2.0;
-        let pill = euclid::rect(x, y, width, height);
+        let rect = euclid::rect(x, y, width, height);
         ctx.draw_rounded_frame(
             layers,
             0,
@@ -1624,53 +1835,76 @@ impl LiveOverviewView {
             height / 2.0,
         )?;
 
-        let mut hits = Vec::with_capacity(plan.dots.len());
         let dot_y = y + (height - dot) / 2.0;
-        let mut dot_x = x + pad;
-        for index in plan.dots {
-            let tab_id = card.tabs[index].tab_id;
-            let previewed = tab_id == card.tab_id;
-            let activity = self.tab_activity(tab_id, previewed, now);
-            let hovered = self.interaction.hovered == Some(OverviewAction::SelectTab(tab_id));
-            let (fill, border) = match (previewed, activity) {
-                (true, _) => (palette.text, palette.text),
-                (false, TabActivity::Running) => (palette.accent, palette.accent),
-                (false, TabActivity::Fresh) => (palette.secondary_text, palette.secondary_text),
-                (false, TabActivity::Idle) => (
-                    LinearRgba::TRANSPARENT,
-                    if hovered {
-                        palette.text
-                    } else {
-                        palette.muted_text
-                    },
-                ),
-            };
-            ctx.draw_rounded_frame(layers, 0, dot_x, dot_y, dot, dot, fill, border, dot / 2.0)?;
-            // The target is the pill's full height and reaches halfway to the
-            // neighbouring dots: an 8px disc is not something to aim at.
-            hits.push((
-                euclid::rect(dot_x - gap / 2.0, y, dot + gap, height),
-                tab_id,
-            ));
-            dot_x += dot + gap;
+        let mut dots = Vec::new();
+        for (plan, alpha) in [(&folded, 1.0 - t), (&opened, t)] {
+            if alpha <= 0.0 {
+                continue;
+            }
+            let hits = alpha >= 0.5;
+            let mut dot_x = right_x - plan_width(plan) + pad;
+            for index in &plan.dots {
+                let tab_id = card.tabs[*index].tab_id;
+                let previewed = tab_id == card.tab_id;
+                let activity = self.tab_activity(tab_id, previewed, now);
+                let hovered =
+                    self.interaction.hovered == Some(OverviewAction::SelectTab(tab_id));
+                let (fill, border) = match (previewed, activity) {
+                    (true, _) => (palette.text, palette.text),
+                    (false, TabActivity::Running) => (palette.accent, palette.accent),
+                    (false, TabActivity::Fresh) => {
+                        (palette.secondary_text, palette.secondary_text)
+                    }
+                    (false, TabActivity::Idle) => (
+                        LinearRgba::TRANSPARENT,
+                        if hovered {
+                            palette.text
+                        } else {
+                            palette.muted_text
+                        },
+                    ),
+                };
+                ctx.draw_rounded_frame(
+                    layers,
+                    0,
+                    dot_x,
+                    dot_y,
+                    dot,
+                    dot,
+                    fill.mul_alpha(alpha),
+                    border.mul_alpha(alpha),
+                    dot / 2.0,
+                )?;
+                if hits {
+                    // The target is the pill's full height and reaches
+                    // halfway to the neighbouring dots: an 8px disc is not
+                    // something to aim at.
+                    dots.push((
+                        euclid::rect(dot_x - gap / 2.0, y, dot + gap, height),
+                        tab_id,
+                    ));
+                }
+                dot_x += dot + gap;
+            }
+            if plan.folded > 0 {
+                let text = format!("+{}", plan.folded);
+                // Centred even when the line box is taller than the pill:
+                // the glyphs sit in the middle of their box, so clamping to
+                // the pill's top pushed them down past its bottom edge.
+                let line_height = count_font.metrics().cell_height.get() as f32;
+                let text_y = y + (height - line_height) / 2.0;
+                ctx.draw_text(
+                    layers,
+                    count_font,
+                    dot_x,
+                    text_y,
+                    &text,
+                    palette.muted_text.mul_alpha(alpha),
+                    count_width(plan.folded) + gap,
+                )?;
+            }
         }
-        if let Some(text) = count_text.as_deref() {
-            // Centred even when the line box is taller than the pill: the
-            // glyphs sit in the middle of their box, so clamping to the pill's
-            // top pushed them down past its bottom edge.
-            let line_height = count_font.metrics().cell_height.get() as f32;
-            let text_y = y + (height - line_height) / 2.0;
-            ctx.draw_text(
-                layers,
-                count_font,
-                dot_x,
-                text_y,
-                text,
-                palette.muted_text,
-                count_width + gap,
-            )?;
-        }
-        Ok((pill, hits))
+        Ok(PillPaint { rect, dots })
     }
 
     /// A pill dot was clicked: the card shows that tab from now on, and the
@@ -1770,6 +2004,7 @@ impl LiveOverviewView {
                             .map(|key| open_thread_response(key, tab_id, self.owner_id))
                             .unwrap_or(ContentViewResponse::Redraw),
                         OverviewAction::SelectTab(tab_id) => self.select_tab(tab_id),
+                        OverviewAction::ExpandTabs(tab_id) => self.toggle_pill(tab_id),
                         OverviewAction::CloseTab(tab_id) => self.request_close_tab(tab_id),
                         OverviewAction::ConfirmCloseTab => self.confirm_close_tab(),
                         OverviewAction::CancelCloseTab => self.cancel_close_tab(),
@@ -2115,14 +2350,17 @@ fn live_tab_for_workspace(workspace: &str) -> Option<TabId> {
 /// last place, so the pill never shows a card without the tab it is showing.
 fn tab_pill_plan(tab_count: usize, previewed: usize) -> TabPillPlan {
     if tab_count <= TAB_PILL_MAX_DOTS {
-        return TabPillPlan {
-            dots: (0..tab_count).collect(),
-            folded: 0,
-        };
+        return tab_pill_plan_with(tab_count, previewed, tab_count);
     }
-    let mut dots: Vec<usize> = (0..TAB_PILL_FOLDED_DOTS).collect();
-    if previewed >= TAB_PILL_FOLDED_DOTS {
-        dots[TAB_PILL_FOLDED_DOTS - 1] = previewed;
+    tab_pill_plan_with(tab_count, previewed, TAB_PILL_FOLDED_DOTS)
+}
+
+/// A plan showing at most `shown` dots; the rest are counted.
+fn tab_pill_plan_with(tab_count: usize, previewed: usize, shown: usize) -> TabPillPlan {
+    let shown = shown.min(tab_count);
+    let mut dots: Vec<usize> = (0..shown).collect();
+    if previewed >= shown && shown > 0 && previewed < tab_count {
+        dots[shown - 1] = previewed;
     }
     TabPillPlan {
         folded: tab_count - dots.len(),
@@ -3461,6 +3699,61 @@ mod tests {
             TabPillPlan {
                 dots: vec![0, 1, 7],
                 folded: 6
+            }
+        );
+    }
+
+    #[test]
+    fn a_folded_pill_opens_after_the_pointer_rests_and_closes_after_it_leaves() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut pill = PillExpansion::armed(card_key(), start);
+        assert!(pill.step(true, at(100)));
+        assert!(!pill.is_open(), "a pointer passing over must not open it");
+        assert!(pill.step(true, at(160)));
+        assert!(pill.is_open());
+        // Slipping off for a moment is not leaving.
+        assert!(pill.step(false, at(200)));
+        assert!(pill.step(true, at(300)));
+        assert!(pill.is_open());
+        assert!(pill.step(false, at(400)));
+        assert!(pill.is_open());
+        assert!(pill.step(false, at(610)));
+        assert!(!pill.is_open());
+    }
+
+    #[test]
+    fn a_pointer_that_leaves_before_the_delay_never_opens_the_pill() {
+        let start = Instant::now();
+        let mut pill = PillExpansion::armed(card_key(), start);
+        assert!(pill.step(true, start + Duration::from_millis(50)));
+        assert!(!pill.step(false, start + Duration::from_millis(60)));
+    }
+
+    #[test]
+    fn a_pinned_pill_ignores_the_pointer_leaving() {
+        let start = Instant::now();
+        let mut pill = PillExpansion::armed(card_key(), start);
+        pill.pinned = true;
+        pill.set_open(true, start);
+        assert!(pill.step(false, start + Duration::from_secs(5)));
+        assert!(pill.is_open());
+    }
+
+    #[test]
+    fn an_open_plan_shows_as_many_dots_as_fit_and_counts_the_rest() {
+        assert_eq!(
+            tab_pill_plan_with(9, 7, 9),
+            TabPillPlan {
+                dots: (0..9).collect(),
+                folded: 0
+            }
+        );
+        assert_eq!(
+            tab_pill_plan_with(9, 7, 5),
+            TabPillPlan {
+                dots: vec![0, 1, 2, 3, 7],
+                folded: 4
             }
         );
     }
