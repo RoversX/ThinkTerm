@@ -47,19 +47,28 @@ const CARD_GAP: f32 = 16.0;
 const CARD_MIN_WIDTH: f32 = 400.0;
 const CARD_ORPHAN_COMFORT_WIDTH: f32 = 480.0;
 const CARD_MAX_WIDTH: f32 = 640.0;
-const CARD_HEADER_HEIGHT: f32 = 44.0;
+/// The band above a card's panel: the floating capsule that names the thread
+/// and lists its tabs, plus the gap that keeps it floating.
+const CAPSULE_HEIGHT: f32 = 52.0;
+const CAPSULE_GAP: f32 = 12.0;
+const CARD_HEADER_HEIGHT: f32 = CAPSULE_HEIGHT + CAPSULE_GAP;
+const CAPSULE_ICON: f32 = 18.0;
+/// Padding either side of a capsule section's contents.
+const CAPSULE_SECTION_PAD: f32 = 14.0;
+const CAPSULE_TITLE_PAD: f32 = 18.0;
+/// Vertical inset of the hairlines between sections.
+const CAPSULE_DIVIDER_INSET: f32 = 15.0;
+const CAPSULE_DOT: f32 = 9.0;
+const CAPSULE_DOT_GAP: f32 = 12.0;
+/// Room either side of the hairline between two windows' dots.
+const CAPSULE_GROUP_GAP: f32 = 13.0;
+/// Margin the capsule leaves at both ends of the panel; the close button
+/// lives in the right-hand one.
+const CAPSULE_END_MARGIN: f32 = 40.0;
 const CARD_RADIUS: f32 = 18.0;
 const CARD_INSET: f32 = 8.0;
 const CARD_CLOSE_BUTTON_SIZE: f32 = 32.0;
 const CARD_CLOSE_RIGHT_PAD: f32 = 8.0;
-const CARD_TITLE_CLOSE_GAP: f32 = 8.0;
-/// The tab pill in a card's header: one dot per tab of the thread, sitting
-/// between the title and the close button.
-const TAB_PILL_HEIGHT: f32 = 22.0;
-const TAB_PILL_DOT: f32 = 8.0;
-const TAB_PILL_DOT_GAP: f32 = 7.0;
-const TAB_PILL_PAD_X: f32 = 8.0;
-const TAB_PILL_CLOSE_GAP: f32 = 6.0;
 /// Up to this many tabs every one gets a dot. Past it the pill folds to a
 /// few dots and a count: a row of a dozen identical dots says "many" and
 /// nothing else, and takes the title's room to say it.
@@ -70,11 +79,6 @@ const TAB_PILL_FOLDED_DOTS: usize = 3;
 /// pointer leaves, so a slip off its edge is not a collapse.
 const TAB_PILL_OPEN_DELAY: Duration = Duration::from_millis(150);
 const TAB_PILL_CLOSE_DELAY: Duration = Duration::from_millis(200);
-/// Space between the thread name and the command it is running.
-const RUNNING_LABEL_GAP: f32 = 14.0;
-/// Below this there is no room to say anything useful, so say nothing rather
-/// than showing two or three clipped letters.
-const RUNNING_LABEL_MIN_WIDTH: f32 = 56.0;
 const PREVIEW_RADIUS: f32 = 12.0;
 const CLOSE_BUTTON_SIZE: f32 = 44.0;
 const CONFIRM_MIN_WIDTH: f32 = 640.0;
@@ -203,6 +207,8 @@ struct CachedPreview<T> {
 struct CardTab {
     tab_id: TabId,
     title: String,
+    /// The mux window holding the tab; the capsule groups dots by it.
+    window_id: mux::window::WindowId,
 }
 
 /// What a card's tab pill shows: which tabs get a dot, and how many it is
@@ -294,11 +300,19 @@ impl PillExpansion {
     }
 }
 
-/// What a card's tab pill returned to its caller: where it is, and the hit
+/// What a card's capsule returned to its caller: where it is, and the hit
 /// targets it wants pushed after the card's own.
-struct PillPaint {
-    rect: RectF,
+struct CapsulePaint {
+    /// The dots and count sections: hovering or clicking here opens the pill.
+    expand: Option<RectF>,
     dots: Vec<(RectF, TabId)>,
+}
+
+/// A card whose preview is changing tab: the old picture on its way out.
+#[derive(Clone, Debug)]
+struct PreviewSwitch {
+    from: TabId,
+    fade: Timeline,
 }
 
 /// What a tab is up to, as its dot tells it.
@@ -432,6 +446,19 @@ struct OverviewColors {
     preview_border: LinearRgba,
     active_border: LinearRgba,
     modal_scrim: LinearRgba,
+    capsule: LinearRgba,
+    capsule_hover: LinearRgba,
+    capsule_pressed: LinearRgba,
+    capsule_border: LinearRgba,
+    capsule_shadow: LinearRgba,
+    capsule_text: LinearRgba,
+    capsule_subtext: LinearRgba,
+    capsule_divider: LinearRgba,
+    capsule_dot: LinearRgba,
+    capsule_dot_fresh: LinearRgba,
+    capsule_dot_running: LinearRgba,
+    capsule_dot_selected: LinearRgba,
+    capsule_button: LinearRgba,
 }
 
 pub(crate) struct LiveOverviewView {
@@ -444,6 +471,16 @@ pub(crate) struct LiveOverviewView {
     revealed_active: bool,
     /// The one pill that is opening, open or closing, if any.
     pill_expansion: Option<PillExpansion>,
+    /// How selected each dot looks, 0 to 1, so the mark slides from one dot
+    /// to the next rather than jumping.
+    dot_selection: HashMap<TabId, Timeline>,
+    /// Cards whose preview is crossfading from one tab to another.
+    preview_switches: HashMap<LiveThreadKey, PreviewSwitch>,
+    /// Which tab each card previewed last frame; a change starts a switch.
+    last_previewed: HashMap<LiveThreadKey, TabId>,
+    /// Whether any capsule animation (dot selection, preview switch) is
+    /// still running after this frame.
+    capsule_motion_running: bool,
     /// Whether the last frame drew a tab pill. Its dots say what a tab is
     /// doing, which changes without anything else asking for a frame -- an
     /// idle previewed tab means no output-driven repaint at all -- so a
@@ -528,6 +565,10 @@ impl LiveOverviewView {
             revealed_active: false,
             pills_drawn: false,
             pill_expansion: None,
+            dot_selection: HashMap::new(),
+            preview_switches: HashMap::new(),
+            last_previewed: HashMap::new(),
+            capsule_motion_running: false,
             last_ui_scale: 1.0,
             viewport: euclid::rect(0.0, 0.0, 0.0, 0.0),
             widgets: UiContext::default(),
@@ -680,6 +721,10 @@ impl LiveOverviewView {
         let tab_keys = &self.tab_keys;
         self.tab_output_seen
             .retain(|tab_id, _| tab_keys.contains_key(tab_id));
+        self.dot_selection
+            .retain(|tab_id, _| tab_keys.contains_key(tab_id));
+        self.preview_switches.retain(|key, _| live_keys.contains(key));
+        self.last_previewed.retain(|key, _| live_keys.contains(key));
 
         groups
     }
@@ -754,6 +799,7 @@ impl LiveOverviewView {
         settings_font: &Rc<LoadedFont>,
         group_font: &Rc<LoadedFont>,
         card_font: &Rc<LoadedFont>,
+        caption_font: &Rc<LoadedFont>,
     ) -> anyhow::Result<()> {
         self.last_ui_scale = ctx.scale();
         self.widgets.clear();
@@ -764,6 +810,7 @@ impl LiveOverviewView {
         self.visible_panes.clear();
         self.next_preview_refresh = None;
         self.pills_drawn = false;
+        self.capsule_motion_running = false;
 
         let appearance = crate::native_settings::effective_appearance();
         let colors = overview_colors(appearance);
@@ -1025,109 +1072,51 @@ impl LiveOverviewView {
                     // clip the overflow in the final pass; flattening `visible`
                     // into a plain rectangle destroys corners that are still on
                     // screen (notably the top corners of the last row).
+                    // The card is two things: a capsule floating in the band
+                    // above, naming the thread and listing its tabs, and the
+                    // panel below it holding the picture.
+                    let panel = euclid::rect(
+                        rect.origin.x,
+                        rect.origin.y + card_header_height,
+                        rect.size.width,
+                        (rect.size.height - card_header_height).max(1.0),
+                    );
                     ctx.draw_elevated_surface(
                         layers,
                         0,
-                        rect,
+                        panel,
                         fill,
                         border,
                         colors.shadow,
                         ctx.px(CARD_RADIUS),
                     )?;
-
-                    let icon_size = ctx.px(20.0);
-                    let icon_x = rect.origin.x + ctx.px(16.0);
-                    let icon_y = rect.origin.y + (card_header_height - icon_size) / 2.0;
-                    let title_y =
-                        rect.origin.y + (card_header_height - card_line_height).max(0.0) / 2.0;
+                    let capsule_visible =
+                        row_fully_visible(rect.origin.y, ctx.px(CAPSULE_HEIGHT), self.viewport);
+                    if card.tabs.len() > 1 {
+                        self.pills_drawn = true;
+                    }
+                    let capsule = self.paint_card_capsule(
+                        ctx,
+                        layers,
+                        &colors,
+                        card_font,
+                        caption_font,
+                        card,
+                        panel,
+                        rect.origin.y,
+                        card_hovered,
+                        self.interaction.pressed == Some(action),
+                        capsule_visible,
+                        now,
+                    )?;
                     let close_size = ctx.px(CARD_CLOSE_BUTTON_SIZE);
                     let close_x = rect.max_x() - ctx.px(CARD_CLOSE_RIGHT_PAD) - close_size;
-                    let close_y = rect.origin.y + (card_header_height - close_size) / 2.0;
-                    let header_fully_visible =
-                        row_fully_visible(rect.origin.y, card_header_height, self.viewport);
-                    // One tab needs no pill: the card is that tab.
-                    let mut pill_paint = None;
-                    let title_right = if card.tabs.len() > 1 && header_fully_visible {
-                        self.pills_drawn = true;
-                        let paint = self.paint_tab_pill(
-                            ctx,
-                            layers,
-                            palette,
-                            settings_font,
-                            card,
-                            icon_x + icon_size + ctx.px(10.0),
-                            close_x - ctx.px(TAB_PILL_CLOSE_GAP),
-                            rect.origin.y,
-                            card_header_height,
-                            now,
-                        )?;
-                        let right = paint.rect.min_x();
-                        pill_paint = Some(paint);
-                        right
-                    } else {
-                        close_x
-                    };
-                    if row_fully_visible(title_y, card_line_height, self.viewport) {
-                        ctx.draw_svg_icon(
-                            layers,
-                            SvgIcon::SquareTerminal,
-                            icon_x,
-                            icon_y,
-                            icon_size,
-                            palette.secondary_text,
-                        )?;
-                        let text_x = icon_x + icon_size + ctx.px(10.0);
-                        let text_limit =
-                            (title_right - ctx.px(CARD_TITLE_CLOSE_GAP) - text_x).max(1.0);
-                        ctx.draw_text(
-                            layers,
-                            card_font,
-                            text_x,
-                            title_y,
-                            &card.title,
-                            palette.text,
-                            text_limit,
-                        )?;
-                        // Only once the name of the thread has been given its
-                        // space: which terminal this is comes first, which of
-                        // its tabs and what it is doing after. A one-tab card
-                        // has no tab to name.
-                        let tab_title = card
-                            .tabs
-                            .iter()
-                            .find(|tab| tab.tab_id == tab_id)
-                            .map(|tab| tab.title.as_str())
-                            .filter(|title| {
-                                card.tabs.len() > 1 && !title.is_empty() && *title != card.title
-                            });
-                        let mut trailing_x = text_x
-                            + ctx
-                                .measure_text_width(card_font, &card.title)
-                                .min(text_limit);
-                        for (label, color) in [
-                            (tab_title, palette.secondary_text),
-                            (card.running.as_deref(), palette.muted_text),
-                        ] {
-                            let Some(label) = label else {
-                                continue;
-                            };
-                            let label_x = trailing_x + ctx.px(RUNNING_LABEL_GAP);
-                            let label_limit = text_x + text_limit - label_x;
-                            if label_limit < ctx.px(RUNNING_LABEL_MIN_WIDTH) {
-                                break;
-                            }
-                            ctx.draw_text(
-                                layers, card_font, label_x, title_y, label, color, label_limit,
-                            )?;
-                            trailing_x =
-                                label_x + ctx.measure_text_width(card_font, label).min(label_limit);
-                        }
-                    }
+                    let close_y = rect.origin.y + (ctx.px(CAPSULE_HEIGHT) - close_size) / 2.0;
 
                     let preview_width = (rect.size.width - card_inset * 2.0).max(1.0);
                     let preview = euclid::rect(
                         rect.origin.x + card_inset,
-                        rect.origin.y + card_header_height,
+                        panel.origin.y + card_inset,
                         preview_width,
                         preview_width / self.host_preview_aspect,
                     );
@@ -1159,16 +1148,38 @@ impl LiveOverviewView {
                                 preview_fill,
                                 ctx.px(PREVIEW_RADIUS),
                             )?;
-                            if let Some(snapshot) = snapshot.as_ref().filter(|_| !in_flight) {
-                                self.previews.push(TerminalPreviewRequest {
-                                    tab_id,
-                                    snapshot: Arc::clone(snapshot),
-                                    area: preview,
-                                    clip,
-                                    hold_scale: self.live_resizing,
-                                });
-                                self.visible_panes
-                                    .extend(snapshot.panes.iter().map(|pane| pane.pane_id));
+                            if !in_flight {
+                                // A card that changed tab fades the old
+                                // picture out under the new one. The old
+                                // tab's snapshot is kept warm for the length
+                                // of the fade.
+                                let (from, arrived) =
+                                    self.preview_switch_for(&card.key, tab_id, now);
+                                if let Some(from) = from {
+                                    if let Some(cached) = self.snapshot_cache.get(&from) {
+                                        warm_tabs.insert(from);
+                                        self.previews.push(TerminalPreviewRequest {
+                                            tab_id: from,
+                                            snapshot: Arc::clone(&cached.snapshot),
+                                            area: preview,
+                                            clip,
+                                            hold_scale: self.live_resizing,
+                                            opacity: 1.0 - arrived,
+                                        });
+                                    }
+                                }
+                                if let Some(snapshot) = snapshot.as_ref() {
+                                    self.previews.push(TerminalPreviewRequest {
+                                        tab_id,
+                                        snapshot: Arc::clone(snapshot),
+                                        area: preview,
+                                        clip,
+                                        hold_scale: self.live_resizing,
+                                        opacity: arrived,
+                                    });
+                                    self.visible_panes
+                                        .extend(snapshot.panes.iter().map(|pane| pane.pane_id));
+                                }
                             }
                             self.preview_chrome.push(CardChrome {
                                 preview,
@@ -1182,22 +1193,20 @@ impl LiveOverviewView {
 
                     self.card_titles.insert(tab_id, card.title.clone());
                     self.widgets.push(visible, WidgetKind::SidebarRow, action);
-                    if let Some(pill) = pill_paint {
-                        // The body first, the dots over it: last pushed wins.
+                    // The pill's sections first, the dots over them: last
+                    // pushed wins.
+                    if let Some(expand) = capsule.expand {
                         self.widgets.push(
-                            pill.rect,
+                            expand,
                             WidgetKind::Button,
                             OverviewAction::ExpandTabs(tab_id),
                         );
-                        for (hit, dot_tab) in pill.dots {
-                            self.widgets.push(
-                                hit,
-                                WidgetKind::Button,
-                                OverviewAction::SelectTab(dot_tab),
-                            );
-                        }
                     }
-                    if header_fully_visible {
+                    for (hit, dot_tab) in capsule.dots {
+                        self.widgets
+                            .push(hit, WidgetKind::Button, OverviewAction::SelectTab(dot_tab));
+                    }
+                    if capsule_visible {
                         if card_hovered {
                             draw_icon_button(
                                 ctx,
@@ -1411,6 +1420,7 @@ impl LiveOverviewView {
         // Dots follow the running labels, which are re-read on this interval;
         // between two of those readings there is nothing new for them to say.
         let pill_deadline = self.pills_drawn.then(|| now + RUNNING_LABEL_REFRESH);
+        let capsule_deadline = self.capsule_motion_running.then_some(now);
         let expansion_deadline = self
             .pill_expansion
             .as_ref()
@@ -1431,6 +1441,7 @@ impl LiveOverviewView {
             motion_deadline,
             backlog_deadline,
             pill_deadline,
+            capsule_deadline,
             expansion_deadline,
             self.next_preview_refresh,
             scrollbar_deadline,
@@ -1752,159 +1763,409 @@ impl LiveOverviewView {
         }
     }
 
-    /// Draw a card's tab pill with its right edge at `right_x`, vertically
-    /// centred in the header, never reaching left of `left_limit`. Returns
-    /// where it is and the hit rectangle of every dot; the caller pushes those
-    /// after the card's own target so that they win the hit test.
+    /// The old picture a card is fading out, and how far in the new one is.
+    /// Starts a crossfade the frame a card's previewed tab changes.
+    fn preview_switch_for(&mut self, key: &LiveThreadKey, tab_id: TabId, now: Instant) -> (Option<TabId>, f32) {
+        if let Some(previous) = self.last_previewed.insert(key.clone(), tab_id) {
+            if previous != tab_id {
+                self.preview_switches.insert(
+                    key.clone(),
+                    PreviewSwitch {
+                        from: previous,
+                        fade: Timeline::new(now, 0.0, 1.0, anim::SHORT, Easing::Smooth),
+                    },
+                );
+            }
+        }
+        let Some(switch) = self.preview_switches.get_mut(key) else {
+            return (None, 1.0);
+        };
+        switch.fade.advance(now);
+        let amount = switch.fade.value(now).clamp(0.0, 1.0);
+        if !switch.fade.is_running() && amount >= 1.0 {
+            self.preview_switches.remove(key);
+            return (None, 1.0);
+        }
+        self.capsule_motion_running = true;
+        (Some(switch.from), amount)
+    }
+
+    /// How selected `tab_id`'s dot looks right now, easing towards `selected`.
+    fn dot_selection_amount(&mut self, tab_id: TabId, selected: bool, now: Instant) -> f32 {
+        let target = if selected { 1.0 } else { 0.0 };
+        let timeline = self
+            .dot_selection
+            .entry(tab_id)
+            .or_insert_with(|| Timeline::settled(now, target));
+        if timeline.target() != target {
+            timeline.retarget(now, target, anim::MICRO, Easing::Smooth);
+        }
+        timeline.advance(now);
+        if timeline.is_running() {
+            self.capsule_motion_running = true;
+        }
+        timeline.value(now).clamp(0.0, 1.0)
+    }
+
+    /// Draw the capsule floating above a card's panel: icon, thread name
+    /// with the previewed tab under it, one dot per tab grouped by window,
+    /// and a count of the tabs the pill is not showing. Sections are divided
+    /// by hairlines; the capsule takes the width its contents need, centred
+    /// on the panel, and never reaches the panel's end margins.
     ///
-    /// The pill has two layouts, folded and open, both anchored to the right
-    /// edge; opening lerps the width between them and crossfades the
-    /// contents, so the dots that are in both stay put and the count gives
-    /// way to the dots it stood for.
+    /// Opening the pill (see `PillExpansion`) trades the title for dots: the
+    /// title section shrinks to nothing while the dots section grows to hold
+    /// as many dots as the width allows, and the contents crossfade.
     #[allow(clippy::too_many_arguments)]
-    fn paint_tab_pill(
+    fn paint_card_capsule(
         &mut self,
         ctx: &DrawContext,
         layers: &mut TripleLayerQuadAllocator<'_>,
-        palette: UiPalette,
-        count_font: &Rc<LoadedFont>,
+        colors: &OverviewColors,
+        title_font: &Rc<LoadedFont>,
+        sub_font: &Rc<LoadedFont>,
         card: &LiveCard,
-        left_limit: f32,
-        right_x: f32,
-        header_y: f32,
-        header_height: f32,
+        panel: RectF,
+        top: f32,
+        hovered: bool,
+        pressed: bool,
+        contents_visible: bool,
         now: Instant,
-    ) -> anyhow::Result<PillPaint> {
+    ) -> anyhow::Result<CapsulePaint> {
+        let height = ctx.px(CAPSULE_HEIGHT);
+        let pad = ctx.px(CAPSULE_SECTION_PAD);
+        let icon = ctx.px(CAPSULE_ICON);
+        let dot = ctx.px(CAPSULE_DOT);
+        let dot_gap = ctx.px(CAPSULE_DOT_GAP);
+        let group_gap = ctx.px(CAPSULE_GROUP_GAP);
+        let hairline = ctx.px(1.0).max(1.0);
+        let multi = card.tabs.len() > 1;
+        let t = if multi {
+            self.pill_open_amount(&card.key, now)
+        } else {
+            0.0
+        };
+        let max_width = (panel.size.width - ctx.px(CAPSULE_END_MARGIN) * 2.0).max(height);
+        // Text lands on the baseline of the context's metrics, not the font's:
+        // each size gets its own context.
+        let title_metrics =
+            crate::utilsprites::RenderMetrics::with_font_metrics(&title_font.metrics());
+        let sub_metrics = crate::utilsprites::RenderMetrics::with_font_metrics(&sub_font.metrics());
+        let title_ctx = ctx.with_metrics(&title_metrics);
+        let sub_ctx = ctx.with_metrics(&sub_metrics);
+        let title_line = title_metrics.cell_size.height as f32;
+        let sub_line = sub_metrics.cell_size.height as f32;
+
+        // What goes under the thread name: which tab is showing, and what
+        // it is running. A one-tab card has only the latter to say.
+        let previewed = card.tabs.iter().find(|tab| tab.tab_id == card.tab_id);
+        let tab_title = previewed
+            .map(|tab| tab.title.as_str())
+            .filter(|title| multi && !title.is_empty() && *title != card.title);
+        let subtitle = match (tab_title, card.running.as_deref()) {
+            (Some(title), Some(running)) => Some(format!("{title} · {running}")),
+            (Some(title), None) => Some(title.to_string()),
+            (None, Some(running)) => Some(running.to_string()),
+            (None, None) => None,
+        };
+
+        let icon_width = pad * 2.0 + icon;
+        let title_pad = ctx.px(CAPSULE_TITLE_PAD);
+        let title_text_width = title_ctx.measure_text_width(title_font, &card.title);
+        let sub_text_width = subtitle
+            .as_deref()
+            .map_or(0.0, |text| sub_ctx.measure_text_width(sub_font, text));
+        let title_natural = title_text_width.max(sub_text_width) + title_pad * 2.0;
+
+        let count_text = |folded: usize| format!("+{folded}");
+        let count_width = |folded: usize| -> f32 {
+            if folded == 0 {
+                0.0
+            } else {
+                pad * 2.0 + sub_ctx.measure_text_width(sub_font, &count_text(folded))
+            }
+        };
+        // Dots sit `dot_gap` apart; where the window changes, a hairline
+        // with `group_gap` either side takes the place of that gap.
+        let group_breaks = |plan: &TabPillPlan| -> usize {
+            plan.dots
+                .windows(2)
+                .filter(|pair| card.tabs[pair[0]].window_id != card.tabs[pair[1]].window_id)
+                .count()
+        };
+        let dots_width = |plan: &TabPillPlan| -> f32 {
+            let n = plan.dots.len() as f32;
+            if n == 0.0 {
+                return 0.0;
+            }
+            pad * 2.0
+                + n * dot
+                + (n - 1.0) * dot_gap
+                + group_breaks(plan) as f32 * (group_gap * 2.0 + hairline - dot_gap)
+        };
+
         let previewed_index = card
             .tabs
             .iter()
             .position(|tab| tab.tab_id == card.tab_id)
             .unwrap_or(0);
-        let dot = ctx.px(TAB_PILL_DOT);
-        let gap = ctx.px(TAB_PILL_DOT_GAP);
-        let pad = ctx.px(TAB_PILL_PAD_X);
-        let height = ctx.px(TAB_PILL_HEIGHT).min(header_height);
-        let count_width = |folded: usize| -> f32 {
-            if folded == 0 {
-                0.0
-            } else {
-                ctx.measure_text_width(count_font, &format!("+{folded}"))
+        let (folded, opened) = if multi {
+            let folded = tab_pill_plan(card.tabs.len(), previewed_index);
+            // Open: as many dots as the width allows once the title is gone.
+            let room = max_width - icon_width - hairline * 2.0;
+            let mut shown = card.tabs.len();
+            while shown > TAB_PILL_FOLDED_DOTS {
+                let plan = tab_pill_plan_with(card.tabs.len(), previewed_index, shown);
+                let count = count_width(plan.folded);
+                let needed = dots_width(&plan) + if count > 0.0 { count + hairline } else { 0.0 };
+                if needed <= room {
+                    break;
+                }
+                shown -= 1;
             }
-        };
-        // The measured width of the count is its advance; the last glyph's
-        // ink can sit a little past it, so give it half a gap of slack.
-        let plan_width = |plan: &TabPillPlan| -> f32 {
-            let dots = plan.dots.len() as f32;
-            let count = count_width(plan.folded);
-            pad * 2.0
-                + dots * dot
-                + (dots - 1.0).max(0.0) * gap
-                + if count > 0.0 { gap + count + gap / 2.0 } else { 0.0 }
-        };
-
-        let folded = tab_pill_plan(card.tabs.len(), previewed_index);
-        let opened = if folded.folded == 0 {
-            folded.clone()
+            let opened = tab_pill_plan_with(card.tabs.len(), previewed_index, shown);
+            (Some(folded), Some(opened))
         } else {
-            let room = (right_x - left_limit - pad * 2.0 + gap).max(0.0);
-            let fit_all = ((room / (dot + gap)).floor() as usize).max(TAB_PILL_FOLDED_DOTS);
-            if card.tabs.len() <= fit_all {
-                tab_pill_plan_with(card.tabs.len(), previewed_index, card.tabs.len())
-            } else {
-                // Not all of them: leave room for the count of the rest.
-                let room = (room - gap - count_width(1) - gap / 2.0).max(0.0);
-                let fit = ((room / (dot + gap)).floor() as usize).max(TAB_PILL_FOLDED_DOTS);
-                tab_pill_plan_with(card.tabs.len(), previewed_index, fit)
-            }
+            (None, None)
         };
-        let t = self.pill_open_amount(&card.key, now);
-        let (folded_width, open_width) = (plan_width(&folded), plan_width(&opened));
-        let width = folded_width + (open_width - folded_width) * t;
-        let x = right_x - width;
-        let y = header_y + (header_height - height) / 2.0;
+        let lerp = |a: f32, b: f32| a + (b - a) * t;
+        let dots_folded = folded.as_ref().map_or(0.0, |plan| dots_width(plan));
+        let dots_open = opened.as_ref().map_or(0.0, |plan| dots_width(plan));
+        let count_folded = folded.as_ref().map_or(0.0, |plan| count_width(plan.folded));
+        let count_open = opened.as_ref().map_or(0.0, |plan| count_width(plan.folded));
+        let dividers_folded =
+            hairline * (1.0 + if dots_folded > 0.0 { 1.0 } else { 0.0 } + if count_folded > 0.0 { 1.0 } else { 0.0 });
+        let title_folded = title_natural
+            .min(max_width - icon_width - dots_folded - count_folded - dividers_folded)
+            .max(0.0);
+        let title_width = lerp(title_folded, 0.0);
+        let dots_section = lerp(dots_folded, dots_open);
+        let count_section = lerp(count_folded, count_open);
+        let mut width = icon_width;
+        if title_width > 0.5 {
+            width += hairline + title_width;
+        }
+        if dots_section > 0.5 {
+            width += hairline + dots_section;
+        }
+        if count_section > 0.5 {
+            width += hairline + count_section;
+        }
+        let width = width.min(max_width);
+        let x = panel.origin.x + (panel.size.width - width) / 2.0;
+        let y = top;
         let rect = euclid::rect(x, y, width, height);
-        ctx.draw_rounded_frame(
+
+        let fill = if pressed {
+            colors.capsule_pressed
+        } else if hovered {
+            colors.capsule_hover
+        } else {
+            colors.capsule
+        };
+        ctx.draw_elevated_surface(
             layers,
             0,
-            x,
-            y,
-            width,
-            height,
-            palette.control_bg,
-            palette.control_border,
+            rect,
+            fill,
+            colors.capsule_border,
+            colors.capsule_shadow,
             height / 2.0,
         )?;
+        if !contents_visible {
+            return Ok(CapsulePaint {
+                expand: None,
+                dots: Vec::new(),
+            });
+        }
 
-        let dot_y = y + (height - dot) / 2.0;
-        let mut dots = Vec::new();
-        for (plan, alpha) in [(&folded, 1.0 - t), (&opened, t)] {
-            if alpha <= 0.0 {
-                continue;
-            }
-            let hits = alpha >= 0.5;
-            let mut dot_x = right_x - plan_width(plan) + pad;
-            for index in &plan.dots {
-                let tab_id = card.tabs[*index].tab_id;
-                let previewed = tab_id == card.tab_id;
-                let activity = self.tab_activity(tab_id, previewed, now);
-                let hovered =
-                    self.interaction.hovered == Some(OverviewAction::SelectTab(tab_id));
-                let (fill, border) = match (previewed, activity) {
-                    (true, _) => (palette.text, palette.text),
-                    (false, TabActivity::Running) => (palette.accent, palette.accent),
-                    (false, TabActivity::Fresh) => {
-                        (palette.secondary_text, palette.secondary_text)
-                    }
-                    (false, TabActivity::Idle) => (
-                        LinearRgba::TRANSPARENT,
-                        if hovered {
-                            palette.text
-                        } else {
-                            palette.muted_text
-                        },
-                    ),
+        let divider_inset = ctx.px(CAPSULE_DIVIDER_INSET);
+        let draw_divider = |layers: &mut TripleLayerQuadAllocator<'_>, at: f32| {
+            ctx.draw_rect(
+                layers,
+                0,
+                at,
+                y + divider_inset,
+                hairline,
+                height - divider_inset * 2.0,
+                colors.capsule_divider,
+            )
+        };
+
+        // Icon.
+        let mut cursor = x;
+        ctx.draw_svg_icon(
+            layers,
+            SvgIcon::SquareTerminal,
+            cursor + pad,
+            y + (height - icon) / 2.0,
+            icon,
+            colors.capsule_text,
+        )?;
+        cursor += icon_width;
+
+        // Title and subtitle, centred in their section; they fade out in
+        // the first part of the opening so the section can shrink under
+        // text that is already gone.
+        if title_width > 0.5 {
+            draw_divider(layers, cursor)?;
+            cursor += hairline;
+            let alpha = (1.0 - t * 2.0).clamp(0.0, 1.0);
+            let inner = (title_width - title_pad * 2.0).max(1.0);
+            if alpha > 0.0 {
+                // Line boxes carry their leading; stacked as they are, two
+                // lines would not fit the capsule. Overlapping them by a
+                // third of the smaller box sets the lines the way a caption
+                // sits under a heading, and the pair rides a little high
+                // because caps have no descenders to balance the caption's.
+                let overlap = sub_line * 0.35;
+                let block = if subtitle.is_some() {
+                    title_line + sub_line - overlap
+                } else {
+                    title_line
                 };
-                ctx.draw_rounded_frame(
+                let title_y = y + (height - block) / 2.0 - ctx.px(2.0);
+                let shown = title_text_width.min(inner);
+                title_ctx.draw_text(
+                    layers,
+                    title_font,
+                    cursor + title_pad + (inner - shown) / 2.0,
+                    title_y,
+                    &card.title,
+                    colors.capsule_text.mul_alpha(alpha),
+                    inner,
+                )?;
+                if let Some(text) = subtitle.as_deref() {
+                    let shown = sub_text_width.min(inner);
+                    sub_ctx.draw_text(
+                        layers,
+                        sub_font,
+                        cursor + title_pad + (inner - shown) / 2.0,
+                        title_y + title_line - overlap,
+                        text,
+                        colors.capsule_subtext.mul_alpha(alpha),
+                        inner,
+                    )?;
+                }
+            }
+            cursor += title_width;
+        }
+
+        // Dots: the folded and the open layout crossfade, each laid out
+        // from the section's left edge.
+        let mut dots = Vec::new();
+        let mut expand = None;
+        if dots_section > 0.5 {
+            draw_divider(layers, cursor)?;
+            cursor += hairline;
+            let section_x = cursor;
+            for (plan, alpha) in [(folded.as_ref(), 1.0 - t), (opened.as_ref(), t)] {
+                let Some(plan) = plan else { continue };
+                if alpha <= 0.0 {
+                    continue;
+                }
+                let hits = alpha >= 0.5;
+                let mut dot_x = section_x + pad;
+                let mut previous_window = None;
+                for index in &plan.dots {
+                    let tab = &card.tabs[*index];
+                    if let Some(previous) = previous_window {
+                        if previous != tab.window_id {
+                            // Back over the ordinary gap, then the group break.
+                            dot_x = dot_x - dot_gap + group_gap;
+                            ctx.draw_rect(
+                                layers,
+                                0,
+                                dot_x,
+                                y + divider_inset,
+                                hairline,
+                                height - divider_inset * 2.0,
+                                colors.capsule_divider.mul_alpha(alpha),
+                            )?;
+                            dot_x += hairline + group_gap;
+                        }
+                    }
+                    previous_window = Some(tab.window_id);
+                    let selected = tab.tab_id == card.tab_id;
+                    let activity = self.tab_activity(tab.tab_id, selected, now);
+                    let hovered_dot =
+                        self.interaction.hovered == Some(OverviewAction::SelectTab(tab.tab_id));
+                    let base = match activity {
+                        TabActivity::Running => colors.capsule_dot_running,
+                        TabActivity::Fresh => colors.capsule_dot_fresh,
+                        TabActivity::Idle if hovered_dot => colors.capsule_dot_fresh,
+                        TabActivity::Idle => colors.capsule_dot,
+                    };
+                    let picked = self.dot_selection_amount(tab.tab_id, selected, now);
+                    let color = interpolate_color(base, colors.capsule_dot_selected, picked);
+                    let size = dot * (1.0 + 0.3 * picked);
+                    ctx.draw_rounded_rect(
+                        layers,
+                        0,
+                        dot_x + (dot - size) / 2.0,
+                        y + (height - size) / 2.0,
+                        size,
+                        size,
+                        color.mul_alpha(alpha),
+                        size / 2.0,
+                    )?;
+                    if hits {
+                        dots.push((
+                            euclid::rect(dot_x - dot_gap / 2.0, y, dot + dot_gap, height),
+                            tab.tab_id,
+                        ));
+                    }
+                    dot_x += dot + dot_gap;
+                }
+            }
+            cursor = section_x + dots_section;
+            expand = Some(euclid::rect(section_x, y, dots_section, height));
+        }
+
+        // Count of the tabs not shown. Plain text while folded; a raised
+        // button once open, when it is the only way to the rest.
+        if count_section > 0.5 {
+            draw_divider(layers, cursor)?;
+            cursor += hairline;
+            let section_x = cursor;
+            let inset = ctx.px(9.0);
+            if t > 0.0 {
+                ctx.draw_rounded_rect(
                     layers,
                     0,
-                    dot_x,
-                    dot_y,
-                    dot,
-                    dot,
-                    fill.mul_alpha(alpha),
-                    border.mul_alpha(alpha),
-                    dot / 2.0,
+                    section_x + inset,
+                    y + inset,
+                    (count_section - inset * 2.0).max(1.0),
+                    height - inset * 2.0,
+                    colors.capsule_button.mul_alpha(t),
+                    (height - inset * 2.0) / 2.0,
                 )?;
-                if hits {
-                    // The target is the pill's full height and reaches
-                    // halfway to the neighbouring dots: an 8px disc is not
-                    // something to aim at.
-                    dots.push((
-                        euclid::rect(dot_x - gap / 2.0, y, dot + gap, height),
-                        tab_id,
-                    ));
-                }
-                dot_x += dot + gap;
             }
-            if plan.folded > 0 {
-                let text = format!("+{}", plan.folded);
-                // Centred even when the line box is taller than the pill:
-                // the glyphs sit in the middle of their box, so clamping to
-                // the pill's top pushed them down past its bottom edge.
-                let line_height = count_font.metrics().cell_height.get() as f32;
-                let text_y = y + (height - line_height) / 2.0;
-                ctx.draw_text(
+            for (plan, alpha) in [(folded.as_ref(), 1.0 - t), (opened.as_ref(), t)] {
+                let Some(plan) = plan.filter(|plan| plan.folded > 0) else {
+                    continue;
+                };
+                if alpha <= 0.0 {
+                    continue;
+                }
+                let text = count_text(plan.folded);
+                let text_width = sub_ctx.measure_text_width(sub_font, &text);
+                sub_ctx.draw_text(
                     layers,
-                    count_font,
-                    dot_x,
-                    text_y,
+                    sub_font,
+                    section_x + (count_section - text_width) / 2.0,
+                    y + (height - sub_line) / 2.0,
                     &text,
-                    palette.muted_text.mul_alpha(alpha),
-                    count_width(plan.folded) + gap,
+                    colors.capsule_text.mul_alpha(alpha),
+                    text_width + pad,
                 )?;
+            }
+            if let Some(expand) = expand.as_mut() {
+                expand.size.width += hairline + count_section;
             }
         }
-        Ok(PillPaint { rect, dots })
+
+        Ok(CapsulePaint { expand, dots })
     }
 
     /// A pill dot was clicked: the card shows that tab from now on, and the
@@ -2153,9 +2414,19 @@ impl ContentView for LiveOverviewView {
         font: &Rc<LoadedFont>,
         title_font: &Rc<LoadedFont>,
         section_font: &Rc<LoadedFont>,
+        caption_font: &Rc<LoadedFont>,
         _cursor_on: bool,
     ) -> anyhow::Result<()> {
-        self.paint_impl(ctx, layers, area, palette, font, title_font, section_font)
+        self.paint_impl(
+            ctx,
+            layers,
+            area,
+            palette,
+            font,
+            title_font,
+            section_font,
+            caption_font,
+        )
     }
 
     fn on_mouse(&mut self, x: f32, y: f32, kind: WMEK) -> ContentViewResponse {
@@ -2221,6 +2492,21 @@ fn overview_colors(appearance: Appearance) -> OverviewColors {
             preview_border: srgb(45, 45, 52, 42),
             active_border: srgb(60, 60, 64, 96),
             modal_scrim: srgb(18, 18, 22, 72),
+            // Dark on a light page: the capsule is the one thing on the card
+            // that is not a picture, and it reads as a control because of it.
+            capsule: srgb(30, 33, 40, 255),
+            capsule_hover: srgb(38, 41, 49, 255),
+            capsule_pressed: srgb(24, 27, 33, 255),
+            capsule_border: srgb(255, 255, 255, 18),
+            capsule_shadow: srgb(10, 12, 20, 150),
+            capsule_text: srgb(246, 247, 250, 255),
+            capsule_subtext: srgb(168, 172, 182, 255),
+            capsule_divider: srgb(255, 255, 255, 30),
+            capsule_dot: srgb(255, 255, 255, 76),
+            capsule_dot_fresh: srgb(255, 255, 255, 170),
+            capsule_dot_running: srgb(96, 170, 255, 255),
+            capsule_dot_selected: srgb(255, 255, 255, 255),
+            capsule_button: srgb(255, 255, 255, 26),
         },
         Appearance::Dark | Appearance::DarkHighContrast => OverviewColors {
             surface_top_left: srgb(25, 25, 26, 255),
@@ -2235,6 +2521,20 @@ fn overview_colors(appearance: Appearance) -> OverviewColors {
             preview_border: srgb(255, 255, 255, 28),
             active_border: srgb(205, 205, 210, 92),
             modal_scrim: srgb(0, 0, 0, 112),
+            // Lighter than the page, with a border: dark would sink into it.
+            capsule: srgb(56, 58, 66, 255),
+            capsule_hover: srgb(64, 66, 74, 255),
+            capsule_pressed: srgb(48, 50, 57, 255),
+            capsule_border: srgb(255, 255, 255, 34),
+            capsule_shadow: srgb(0, 0, 0, 170),
+            capsule_text: srgb(242, 242, 246, 255),
+            capsule_subtext: srgb(166, 169, 178, 255),
+            capsule_divider: srgb(255, 255, 255, 34),
+            capsule_dot: srgb(255, 255, 255, 84),
+            capsule_dot_fresh: srgb(255, 255, 255, 180),
+            capsule_dot_running: srgb(110, 176, 255, 255),
+            capsule_dot_selected: srgb(255, 255, 255, 255),
+            capsule_button: srgb(255, 255, 255, 30),
         },
     }
 }
@@ -2334,6 +2634,7 @@ fn live_tabs_for_workspace(workspace: &str) -> Option<(Vec<CardTab>, TabId)> {
             tabs.push(CardTab {
                 tab_id,
                 title: tab.get_title(),
+                window_id,
             });
         }
     }
@@ -2777,7 +3078,7 @@ fn group_grid(
         columns,
         rows: (count + columns - 1) / columns,
         card_width,
-        card_height: card_header_height + preview_width / preview_aspect + card_inset,
+        card_height: card_header_height + card_inset + preview_width / preview_aspect + card_inset,
     }
 }
 
@@ -3033,7 +3334,7 @@ mod tests {
                 count, 1332.0, 5, 400.0, 480.0, 640.0, 16.0, 44.0, 8.0, aspect,
             );
             let preview_width = grid.card_width - 16.0;
-            let preview_height = grid.card_height - 44.0 - 8.0;
+            let preview_height = grid.card_height - 44.0 - 16.0;
             assert!((preview_width / preview_height - aspect).abs() < 0.001);
         }
     }
@@ -3103,6 +3404,7 @@ mod tests {
                     tabs: vec![CardTab {
                         tab_id: index as TabId,
                         title: String::new(),
+                        window_id: 0,
                     }],
                     active: index == active,
                 })
@@ -3674,6 +3976,7 @@ mod tests {
             .map(|tab_id| CardTab {
                 tab_id: *tab_id,
                 title: format!("tab {tab_id}"),
+                window_id: 0,
             })
             .collect()
     }
@@ -3756,6 +4059,40 @@ mod tests {
                 folded: 4
             }
         );
+    }
+
+    #[test]
+    fn a_card_that_changes_tab_crossfades_from_the_old_picture() {
+        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
+        let key = card_key();
+        let start = Instant::now();
+        assert_eq!(view.preview_switch_for(&key, 7, start), (None, 1.0));
+        // Same tab again: nothing to fade.
+        assert_eq!(view.preview_switch_for(&key, 7, start), (None, 1.0));
+        let (from, arrived) = view.preview_switch_for(&key, 8, start);
+        assert_eq!(from, Some(7));
+        assert!(arrived < 1.0);
+        assert!(view.capsule_motion_running);
+        // The clock starts on the frame after the first sample, as every
+        // Timeline's does; then the fade runs its course.
+        let (from, _) = view.preview_switch_for(&key, 8, start + Duration::from_millis(16));
+        assert_eq!(from, Some(7));
+        let (from, arrived) = view.preview_switch_for(&key, 8, start + Duration::from_secs(2));
+        assert_eq!((from, arrived), (None, 1.0));
+    }
+
+    #[test]
+    fn the_selected_mark_eases_between_dots() {
+        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
+        let start = Instant::now();
+        assert_eq!(view.dot_selection_amount(7, true, start), 1.0);
+        assert_eq!(view.dot_selection_amount(8, false, start), 0.0);
+        // The pick moves: neither dot jumps.
+        let leaving = view.dot_selection_amount(7, false, start + Duration::from_millis(1));
+        let arriving = view.dot_selection_amount(8, true, start + Duration::from_millis(1));
+        assert!(leaving > 0.0 && leaving <= 1.0);
+        assert!(arriving < 1.0);
+        assert!(view.capsule_motion_running);
     }
 
     #[test]

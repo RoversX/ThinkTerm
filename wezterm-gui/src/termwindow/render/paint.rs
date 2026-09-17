@@ -1757,7 +1757,8 @@ impl crate::TermWindow {
         let typography = active_content_view_idx
             .map(|idx| self.content_views[idx].view.typography())
             .unwrap_or_default();
-        let (ui_font, title_font, section_font) = match typography {
+        // The caption is the smallest step: what sits under a title, a count.
+        let (ui_font, title_font, section_font, caption_font) = match typography {
             ContentViewTypography::Default => {
                 let font_size = crate::native_settings::home_font_size(&settings);
                 (
@@ -1767,6 +1768,10 @@ impl crate::TermWindow {
                         .title_font_with_size_and_weight(font_size + 10.0, font_weight.max(760))?,
                     self.fonts
                         .title_font_with_size_and_weight(font_size + 2.0, font_weight.max(700))?,
+                    self.fonts.command_palette_font_with_size_and_weight(
+                        (font_size - 2.0).max(9.0),
+                        font_weight,
+                    )?,
                 )
             }
             ContentViewTypography::Overview => (
@@ -1778,6 +1783,10 @@ impl crate::TermWindow {
                     .title_font_with_size(crate::native_settings::sidebar_font_size())?,
                 self.fonts
                     .title_font_with_size(crate::native_settings::pane_header_font_size())?,
+                // Same family and scale as the card title, a step down.
+                self.fonts.title_font_with_size(
+                    (crate::native_settings::pane_header_font_size() * 0.78).max(9.0),
+                )?,
             ),
         };
         let render_metrics =
@@ -1844,6 +1853,7 @@ impl crate::TermWindow {
                     &ui_font,
                     &title_font,
                     &section_font,
+                    &caption_font,
                     cursor_on,
                 )?;
                 (view.next_frame_time(), view.terminal_previews())
@@ -2017,7 +2027,7 @@ impl crate::TermWindow {
             self.preview_scale_estimate(preview),
         );
         let clip = quad_clip_rect(preview.clip, &self.dimensions);
-        let content_alpha = self.preview_content_alpha(preview);
+        let content_alpha = self.preview_content_alpha(preview) * preview.opacity.clamp(0.0, 1.0);
 
         // A hit replays. A miss replays too -- but only when the miss is the
         // snapshot alone and the budget is spent, because then the recorded
@@ -4365,6 +4375,7 @@ mod tests {
             area,
             clip: area,
             hold_scale: false,
+            opacity: 1.0,
         }
     }
 

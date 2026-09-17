@@ -699,6 +699,7 @@ impl ContentView for ProjectRootView {
         font: &Rc<LoadedFont>,
         title_font: &Rc<LoadedFont>,
         _section_font: &Rc<LoadedFont>,
+        _caption_font: &Rc<LoadedFont>,
         _cursor_on: bool,
     ) -> anyhow::Result<()> {
         self.paint_impl(ctx, layers, area, palette, font, title_font)

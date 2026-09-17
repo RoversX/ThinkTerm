@@ -333,6 +333,9 @@ pub(crate) struct TerminalPreviewRequest {
     /// font and rasterises a glyph set. Holding still for the duration costs a
     /// thumbnail that is briefly a little small.
     pub hold_scale: bool,
+    /// How opaque to draw it, 0 to 1. A card changing tab draws the old
+    /// picture fading out under the new one fading in.
+    pub opacity: f32,
 }
 
 /// Progress of an SSH connection that a content view kicked off, pushed by the
@@ -573,6 +576,7 @@ pub(crate) trait ContentView {
         font: &Rc<LoadedFont>,
         title_font: &Rc<LoadedFont>,
         section_font: &Rc<LoadedFont>,
+        caption_font: &Rc<LoadedFont>,
         cursor_on: bool,
     ) -> anyhow::Result<()>;
 

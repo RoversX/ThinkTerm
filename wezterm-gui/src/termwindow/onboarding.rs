@@ -1322,6 +1322,7 @@ impl ContentView for OnboardingView {
         font: &Rc<LoadedFont>,
         title_font: &Rc<LoadedFont>,
         section_font: &Rc<LoadedFont>,
+        _caption_font: &Rc<LoadedFont>,
         _cursor_on: bool,
     ) -> anyhow::Result<()> {
         self.paint_impl(ctx, layers, area, palette, font, title_font, section_font)
