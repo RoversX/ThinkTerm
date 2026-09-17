@@ -49,17 +49,17 @@ const CARD_ORPHAN_COMFORT_WIDTH: f32 = 480.0;
 const CARD_MAX_WIDTH: f32 = 640.0;
 /// The band above a card's panel: the floating capsule that names the thread
 /// and lists its tabs, plus the gap that keeps it floating.
-const CAPSULE_HEIGHT: f32 = 52.0;
+const CAPSULE_HEIGHT: f32 = 46.0;
 const CAPSULE_GAP: f32 = 12.0;
 const CARD_HEADER_HEIGHT: f32 = CAPSULE_HEIGHT + CAPSULE_GAP;
-const CAPSULE_ICON: f32 = 18.0;
+const CAPSULE_ICON: f32 = 16.0;
 /// Padding either side of a capsule section's contents.
 const CAPSULE_SECTION_PAD: f32 = 14.0;
 const CAPSULE_TITLE_PAD: f32 = 18.0;
 /// Vertical inset of the hairlines between sections.
-const CAPSULE_DIVIDER_INSET: f32 = 15.0;
-const CAPSULE_DOT: f32 = 9.0;
-const CAPSULE_DOT_GAP: f32 = 12.0;
+const CAPSULE_DIVIDER_INSET: f32 = 13.0;
+const CAPSULE_DOT: f32 = 8.0;
+const CAPSULE_DOT_GAP: f32 = 11.0;
 /// Room either side of the hairline between two windows' dots.
 const CAPSULE_GROUP_GAP: f32 = 13.0;
 /// Margin the capsule leaves at both ends of the panel; the close button
