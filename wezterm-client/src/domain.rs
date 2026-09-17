@@ -1849,6 +1849,17 @@ impl ClientInner {
                 "releasing the frontend recovery barrier for mux generation {generation} after {waited:?}: {}",
                 if superseded { "superseded" } else { "never acknowledged" }
             );
+            // An overdue barrier of the live generation was the last thing
+            // between this connection and Ready: the reattach returned early
+            // to wait for it, and nothing else marks the session usable.
+            // Left as it was, the panes sat behind "Restoring terminal
+            // state…" for as long as the connection lived, and the
+            // reconnect loop later read that as an outage still running.
+            if !superseded {
+                self.mark_server_recovered();
+                self.client.mark_ready();
+                wake_thinkterm_frontend();
+            }
         }
     }
 

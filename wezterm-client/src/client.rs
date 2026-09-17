@@ -1814,10 +1814,17 @@ impl Client {
                     // A session that was restored ends the outage, however
                     // briefly it lived: a flapping link keeps being retried,
                     // as it always was. One that never became usable keeps
-                    // the clock running.
-                    if was_ready {
-                        outage_started = None;
-                    }
+                    // the clock running -- unless it stayed up longer than
+                    // the whole give-up window, which no refused restore
+                    // does; that is a connection that worked without ever
+                    // being marked so, and its drop is a new outage, not the
+                    // hours-old one parking us on the first try.
+                    outage_started = outage_clock_after_session(
+                        outage_started,
+                        was_ready,
+                        session_started.elapsed(),
+                        GIVE_UP_AFTER,
+                    );
                     let outage_started = outage_started.get_or_insert_with(std::time::Instant::now);
 
                     // A successful reattach closes the UI behind our back;
@@ -2461,10 +2468,58 @@ impl Client {
     rpc!(adjust_pane_size, AdjustPaneSize, UnitResponse);
 }
 
+/// The outage clock to carry into the next reconnect round, given how the
+/// session that just ended fared. `None` means no outage is in progress.
+fn outage_clock_after_session(
+    prior: Option<std::time::Instant>,
+    was_ready: bool,
+    session_length: Duration,
+    give_up_after: Duration,
+) -> Option<std::time::Instant> {
+    if was_ready || session_length >= give_up_after {
+        None
+    } else {
+        prior
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_auth_cancelled, Reconnectable};
+    use super::{is_auth_cancelled, outage_clock_after_session, Reconnectable};
     use crate::domain::ClientDomainConfig;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_restored_session_ends_the_outage() {
+        let old = Some(Instant::now() - Duration::from_secs(3600));
+        assert_eq!(
+            outage_clock_after_session(old, true, Duration::from_secs(3), Duration::from_secs(120)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_short_refused_session_keeps_the_clock_running() {
+        let old = Some(Instant::now() - Duration::from_secs(3600));
+        assert_eq!(
+            outage_clock_after_session(old, false, Duration::from_secs(3), Duration::from_secs(120)),
+            old
+        );
+    }
+
+    #[test]
+    fn a_long_session_that_was_never_marked_ready_still_ends_the_outage() {
+        let old = Some(Instant::now() - Duration::from_secs(3600));
+        assert_eq!(
+            outage_clock_after_session(
+                old,
+                false,
+                Duration::from_secs(600),
+                Duration::from_secs(120)
+            ),
+            None
+        );
+    }
 
     #[test]
     fn only_the_local_session_host_reconnects_over_a_unix_socket() {
