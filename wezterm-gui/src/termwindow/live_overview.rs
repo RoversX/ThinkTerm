@@ -53,6 +53,18 @@ const CARD_INSET: f32 = 8.0;
 const CARD_CLOSE_BUTTON_SIZE: f32 = 32.0;
 const CARD_CLOSE_RIGHT_PAD: f32 = 8.0;
 const CARD_TITLE_CLOSE_GAP: f32 = 8.0;
+/// The tab pill in a card's header: one dot per tab of the thread, sitting
+/// between the title and the close button.
+const TAB_PILL_HEIGHT: f32 = 22.0;
+const TAB_PILL_DOT: f32 = 8.0;
+const TAB_PILL_DOT_GAP: f32 = 7.0;
+const TAB_PILL_PAD_X: f32 = 8.0;
+const TAB_PILL_CLOSE_GAP: f32 = 6.0;
+/// Up to this many tabs every one gets a dot. Past it the pill folds to a
+/// few dots and a count: a row of a dozen identical dots says "many" and
+/// nothing else, and takes the title's room to say it.
+const TAB_PILL_MAX_DOTS: usize = 6;
+const TAB_PILL_FOLDED_DOTS: usize = 3;
 /// Space between the thread name and the command it is running.
 const RUNNING_LABEL_GAP: f32 = 14.0;
 /// Below this there is no room to say anything useful, so say nothing rather
@@ -181,6 +193,33 @@ struct CachedPreview<T> {
     captured_at: Instant,
 }
 
+/// One tab of a thread's workspace, as the card's tab pill lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CardTab {
+    tab_id: TabId,
+    title: String,
+}
+
+/// What a card's tab pill shows: which tabs get a dot, and how many it is
+/// not showing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TabPillPlan {
+    /// Indices into the card's tabs, in pill order.
+    dots: Vec<usize>,
+    /// Tabs folded behind the "+N" count.
+    folded: usize,
+}
+
+/// What a tab is up to, as its dot tells it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TabActivity {
+    Idle,
+    /// A command is in the foreground.
+    Running,
+    /// Output arrived since the card last showed this tab.
+    Fresh,
+}
+
 #[derive(Clone, Debug)]
 struct LiveCard {
     key: LiveThreadKey,
@@ -190,7 +229,12 @@ struct LiveCard {
     /// is texture rather than information, and this is the line that actually
     /// answers "what is happening here".
     running: Option<String>,
+    /// The tab the preview shows and a click opens: the pill dot under the
+    /// pointer, else the user's pick, else the tab the thread's window is
+    /// showing. See [`previewed_tab`].
     tab_id: TabId,
+    /// Every tab of the thread's workspace, in window and tab order.
+    tabs: Vec<CardTab>,
     active: bool,
 }
 
@@ -205,6 +249,8 @@ struct LiveGroup {
 enum OverviewAction {
     CloseOverview,
     OpenThread(TabId),
+    /// A dot of a card's tab pill: makes that tab the card's pick and opens it.
+    SelectTab(TabId),
     CloseTab(TabId),
     ConfirmCloseTab,
     CancelCloseTab,
@@ -302,15 +348,32 @@ pub(crate) struct LiveOverviewView {
     /// Whether the active thread's card has been brought into view. Done once,
     /// on the first frame that has a layout to measure against.
     revealed_active: bool,
+    /// Whether the last frame drew a tab pill. Its dots say what a tab is
+    /// doing, which changes without anything else asking for a frame -- an
+    /// idle previewed tab means no output-driven repaint at all -- so a
+    /// pill asks for one at the running-label refresh interval.
+    pills_drawn: bool,
     last_ui_scale: f32,
     viewport: RectF,
     widgets: UiContext<OverviewAction>,
     interaction: InteractionState<OverviewAction>,
-    card_keys: HashMap<TabId, LiveThreadKey>,
+    /// Which thread every tab of every card belongs to; rebuilt each frame by
+    /// `collect_groups`, so it covers the pill's dots as well as the preview.
+    tab_keys: HashMap<TabId, LiveThreadKey>,
     card_titles: HashMap<TabId, String>,
+    /// The tab each card was last asked to show. Lives only as long as the
+    /// overview: closing it forgets the picks, and a reopened card shows
+    /// what its window is showing, which after a pick is the same tab.
+    selected_tabs: HashMap<LiveThreadKey, TabId>,
+    /// The output generation of each tab when a card last showed it, so a
+    /// dot can say that something has happened there since. A tab first met
+    /// is recorded, not flagged: its whole history is not news.
+    tab_output_seen: HashMap<TabId, u64>,
     pending_close: Option<PendingClose>,
     running_labels: HashMap<TabId, (Instant, Option<String>)>,
-    snapshot_cache: HashMap<LiveThreadKey, CachedPreview<TerminalPreviewSnapshot>>,
+    /// Keyed by the previewed tab rather than the card: a card can switch
+    /// which of its tabs it shows, and each tab's picture is its own.
+    snapshot_cache: HashMap<TabId, CachedPreview<TerminalPreviewSnapshot>>,
     previews: Vec<TerminalPreviewRequest>,
     preview_chrome: Vec<CardChrome>,
     /// Where each visible card shows its terminal, so an opening overview can
@@ -367,11 +430,14 @@ impl LiveOverviewView {
                 .clamp(HOST_PREVIEW_ASPECT_MIN, HOST_PREVIEW_ASPECT_MAX),
             scroll: ScrollState::new(),
             revealed_active: false,
+            pills_drawn: false,
             last_ui_scale: 1.0,
             viewport: euclid::rect(0.0, 0.0, 0.0, 0.0),
             widgets: UiContext::default(),
             interaction: InteractionState::default(),
-            card_keys: HashMap::new(),
+            tab_keys: HashMap::new(),
+            selected_tabs: HashMap::new(),
+            tab_output_seen: HashMap::new(),
             card_titles: HashMap::new(),
             pending_close: None,
             running_labels: HashMap::new(),
@@ -442,6 +508,12 @@ impl LiveOverviewView {
         let mux = Mux::get();
         let live_workspaces = mux.iter_workspaces();
         let mut groups = Vec::new();
+        let hovered_tab = match self.interaction.hovered {
+            Some(OverviewAction::SelectTab(tab_id)) => Some(tab_id),
+            _ => None,
+        };
+        self.tab_keys.clear();
+        let mut live_keys = HashSet::new();
 
         for space in workspace_threads::spaces_for_window(self.owner_id) {
             let offline = space.domain.as_deref().is_some_and(|domain_name| {
@@ -467,9 +539,20 @@ impl LiveOverviewView {
                             space_id: space.id.clone(),
                             thread_id: state.thread_id.clone(),
                         };
-                        let Some(tab_id) = live_tab_for_workspace(&state.workspace_name) else {
+                        let Some((tabs, shown)) = live_tabs_for_workspace(&state.workspace_name)
+                        else {
                             continue;
                         };
+                        for tab in &tabs {
+                            self.tab_keys.insert(tab.tab_id, key.clone());
+                        }
+                        live_keys.insert(key.clone());
+                        let tab_id = previewed_tab(
+                            &tabs,
+                            shown,
+                            self.selected_tabs.get(&key).copied(),
+                            hovered_tab,
+                        );
 
                         cards.push(LiveCard {
                             active: self.active.as_ref() == Some(&key),
@@ -477,6 +560,7 @@ impl LiveOverviewView {
                             title: card_title(&state.project_name, &state.thread_name),
                             running: self.running_label(tab_id, now),
                             tab_id,
+                            tabs,
                         });
                     }
                 }
@@ -495,6 +579,10 @@ impl LiveOverviewView {
         }
 
         retain_running_labels(&mut self.running_labels, &groups);
+        self.selected_tabs.retain(|key, _| live_keys.contains(key));
+        let tab_keys = &self.tab_keys;
+        self.tab_output_seen
+            .retain(|tab_id, _| tab_keys.contains_key(tab_id));
 
         groups
     }
@@ -572,13 +660,13 @@ impl LiveOverviewView {
     ) -> anyhow::Result<()> {
         self.last_ui_scale = ctx.scale();
         self.widgets.clear();
-        self.card_keys.clear();
         self.card_titles.clear();
         self.previews.clear();
         self.preview_chrome.clear();
         self.card_preview_rects.clear();
         self.visible_panes.clear();
         self.next_preview_refresh = None;
+        self.pills_drawn = false;
 
         let appearance = crate::native_settings::effective_appearance();
         let colors = overview_colors(appearance);
@@ -656,7 +744,7 @@ impl LiveOverviewView {
             MAX_PREVIEW_CAPTURES_PER_FRAME
         };
         self.capture_backlog = false;
-        let mut warm_keys = HashSet::new();
+        let mut warm_tabs = HashSet::new();
         let mut seen_keys = HashSet::new();
         if groups.is_empty() {
             self.scroll.set_extents(self.viewport.size.height, 0.0);
@@ -764,16 +852,16 @@ impl LiveOverviewView {
                     // other cards remain metadata-only.
                     let overscan = layout.grid.card_height + gap;
                     let snapshot = if card_is_warm(rect, self.viewport, overscan) {
-                        warm_keys.insert(card.key.clone());
+                        warm_tabs.insert(card.tab_id);
                         if self.defer_preview_captures {
                             self.snapshot_cache
-                                .get(&card.key)
+                                .get(&card.tab_id)
                                 .map(|cached| Arc::clone(&cached.snapshot))
                         } else {
                             let fingerprint = terminal_preview_fingerprint(card.tab_id);
                             let (snapshot, refresh_due) = resolve_snapshot(
                                 &mut self.snapshot_cache,
-                                &card.key,
+                                &card.tab_id,
                                 fingerprint,
                                 now,
                                 refresh_interval,
@@ -813,11 +901,15 @@ impl LiveOverviewView {
                     let tab_id = card.tab_id;
                     let action = OverviewAction::OpenThread(tab_id);
                     let close_action = OverviewAction::CloseTab(tab_id);
-                    let card_hovered = matches!(
-                        self.interaction.hovered,
-                        Some(OverviewAction::OpenThread(id) | OverviewAction::CloseTab(id))
-                            if id == tab_id
-                    );
+                    let card_hovered = match self.interaction.hovered {
+                        Some(OverviewAction::OpenThread(id) | OverviewAction::CloseTab(id)) => {
+                            id == tab_id
+                        }
+                        Some(OverviewAction::SelectTab(id)) => {
+                            self.tab_keys.get(&id) == Some(&card.key)
+                        }
+                        _ => false,
+                    };
                     let fill = if self.interaction.pressed == Some(action) {
                         colors.card_pressed
                     } else if card_hovered {
@@ -855,6 +947,26 @@ impl LiveOverviewView {
                     let close_y = rect.origin.y + (card_header_height - close_size) / 2.0;
                     let header_fully_visible =
                         row_fully_visible(rect.origin.y, card_header_height, self.viewport);
+                    // One tab needs no pill: the card is that tab.
+                    let mut dot_hits = Vec::new();
+                    let title_right = if card.tabs.len() > 1 && header_fully_visible {
+                        self.pills_drawn = true;
+                        let (pill, hits) = self.paint_tab_pill(
+                            ctx,
+                            layers,
+                            palette,
+                            settings_font,
+                            card,
+                            close_x - ctx.px(TAB_PILL_CLOSE_GAP),
+                            rect.origin.y,
+                            card_header_height,
+                            now,
+                        )?;
+                        dot_hits = hits;
+                        pill.min_x()
+                    } else {
+                        close_x
+                    };
                     if row_fully_visible(title_y, card_line_height, self.viewport) {
                         ctx.draw_svg_icon(
                             layers,
@@ -865,7 +977,8 @@ impl LiveOverviewView {
                             palette.secondary_text,
                         )?;
                         let text_x = icon_x + icon_size + ctx.px(10.0);
-                        let text_limit = (close_x - ctx.px(CARD_TITLE_CLOSE_GAP) - text_x).max(1.0);
+                        let text_limit =
+                            (title_right - ctx.px(CARD_TITLE_CLOSE_GAP) - text_x).max(1.0);
                         ctx.draw_text(
                             layers,
                             card_font,
@@ -875,26 +988,39 @@ impl LiveOverviewView {
                             palette.text,
                             text_limit,
                         )?;
-                        if let Some(running) = card.running.as_ref() {
-                            // Only once the name of the thread has been given
-                            // its space: which terminal this is comes first,
-                            // what it is doing second.
-                            let title_width = ctx
+                        // Only once the name of the thread has been given its
+                        // space: which terminal this is comes first, which of
+                        // its tabs and what it is doing after. A one-tab card
+                        // has no tab to name.
+                        let tab_title = card
+                            .tabs
+                            .iter()
+                            .find(|tab| tab.tab_id == tab_id)
+                            .map(|tab| tab.title.as_str())
+                            .filter(|title| {
+                                card.tabs.len() > 1 && !title.is_empty() && *title != card.title
+                            });
+                        let mut trailing_x = text_x
+                            + ctx
                                 .measure_text_width(card_font, &card.title)
                                 .min(text_limit);
-                            let running_x = text_x + title_width + ctx.px(RUNNING_LABEL_GAP);
-                            let running_limit = text_x + text_limit - running_x;
-                            if running_limit >= ctx.px(RUNNING_LABEL_MIN_WIDTH) {
-                                ctx.draw_text(
-                                    layers,
-                                    card_font,
-                                    running_x,
-                                    title_y,
-                                    running,
-                                    palette.muted_text,
-                                    running_limit,
-                                )?;
+                        for (label, color) in [
+                            (tab_title, palette.secondary_text),
+                            (card.running.as_deref(), palette.muted_text),
+                        ] {
+                            let Some(label) = label else {
+                                continue;
+                            };
+                            let label_x = trailing_x + ctx.px(RUNNING_LABEL_GAP);
+                            let label_limit = text_x + text_limit - label_x;
+                            if label_limit < ctx.px(RUNNING_LABEL_MIN_WIDTH) {
+                                break;
                             }
+                            ctx.draw_text(
+                                layers, card_font, label_x, title_y, label, color, label_limit,
+                            )?;
+                            trailing_x =
+                                label_x + ctx.measure_text_width(card_font, label).min(label_limit);
                         }
                     }
 
@@ -954,9 +1080,12 @@ impl LiveOverviewView {
                         }
                     }
 
-                    self.card_keys.insert(tab_id, card.key.clone());
                     self.card_titles.insert(tab_id, card.title.clone());
                     self.widgets.push(visible, WidgetKind::SidebarRow, action);
+                    for (hit, dot_tab) in dot_hits {
+                        self.widgets
+                            .push(hit, WidgetKind::Button, OverviewAction::SelectTab(dot_tab));
+                    }
                     if header_fully_visible {
                         if card_hovered {
                             draw_icon_button(
@@ -988,7 +1117,7 @@ impl LiveOverviewView {
         if self.scroll.max_offset() <= 0.0 {
             self.scrollbar_visible_until = None;
         }
-        self.snapshot_cache.retain(|key, _| warm_keys.contains(key));
+        self.snapshot_cache.retain(|tab_id, _| warm_tabs.contains(tab_id));
         // The running-label cache is pruned in `collect_groups`, against every
         // live tab rather than against the cards that happened to be drawn.
         // A card that is gone has nowhere left to travel to; keeping its
@@ -1168,6 +1297,9 @@ impl LiveOverviewView {
         // moments would replay every card's quads to show no change, which
         // at ten busy cards was measured as ~21% of the main thread.
         let backlog_deadline = self.capture_backlog.then_some(now);
+        // Dots follow the running labels, which are re-read on this interval;
+        // between two of those readings there is nothing new for them to say.
+        let pill_deadline = self.pills_drawn.then(|| now + RUNNING_LABEL_REFRESH);
         // Before the fade begins one frame is enough -- the one that starts
         // it. Inside the fade every frame counts.
         let scrollbar_deadline = self.scrollbar_visible_until.and_then(|until| {
@@ -1183,6 +1315,7 @@ impl LiveOverviewView {
         [
             motion_deadline,
             backlog_deadline,
+            pill_deadline,
             self.next_preview_refresh,
             scrollbar_deadline,
         ]
@@ -1415,6 +1548,141 @@ impl LiveOverviewView {
         )
     }
 
+    /// What `tab`'s dot should say. The previewed tab is being looked at, so
+    /// whatever it has produced counts as seen.
+    fn tab_activity(&mut self, tab_id: TabId, previewed: bool, now: Instant) -> TabActivity {
+        let generation = tab_output_generation(tab_id);
+        let seen = match self.tab_output_seen.get(&tab_id) {
+            Some(seen) if !previewed => *seen,
+            _ => {
+                self.tab_output_seen.insert(tab_id, generation);
+                generation
+            }
+        };
+        if self.running_label(tab_id, now).is_some() {
+            TabActivity::Running
+        } else if generation > seen {
+            TabActivity::Fresh
+        } else {
+            TabActivity::Idle
+        }
+    }
+
+    /// Draw a card's tab pill with its right edge at `right_x`, vertically
+    /// centred in the header. Returns the pill's rectangle and the hit
+    /// rectangle of every dot; the caller pushes those after the card's own
+    /// target so that they win the hit test.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_tab_pill(
+        &mut self,
+        ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        palette: UiPalette,
+        count_font: &Rc<LoadedFont>,
+        card: &LiveCard,
+        right_x: f32,
+        header_y: f32,
+        header_height: f32,
+        now: Instant,
+    ) -> anyhow::Result<(RectF, Vec<(RectF, TabId)>)> {
+        let previewed_index = card
+            .tabs
+            .iter()
+            .position(|tab| tab.tab_id == card.tab_id)
+            .unwrap_or(0);
+        let plan = tab_pill_plan(card.tabs.len(), previewed_index);
+        let dot = ctx.px(TAB_PILL_DOT);
+        let gap = ctx.px(TAB_PILL_DOT_GAP);
+        let pad = ctx.px(TAB_PILL_PAD_X);
+        let height = ctx.px(TAB_PILL_HEIGHT).min(header_height);
+        let count_text = (plan.folded > 0).then(|| format!("+{}", plan.folded));
+        let count_width = count_text
+            .as_deref()
+            .map_or(0.0, |text| ctx.measure_text_width(count_font, text));
+        let dots_width = plan.dots.len() as f32 * dot + (plan.dots.len() as f32 - 1.0) * gap;
+        // The measured width of the count is its advance; the last glyph's
+        // ink can sit a little past it, so give it half a gap of slack.
+        let width = pad * 2.0
+            + dots_width
+            + if count_width > 0.0 {
+                gap + count_width + gap / 2.0
+            } else {
+                0.0
+            };
+        let x = right_x - width;
+        let y = header_y + (header_height - height) / 2.0;
+        let pill = euclid::rect(x, y, width, height);
+        ctx.draw_rounded_frame(
+            layers,
+            0,
+            x,
+            y,
+            width,
+            height,
+            palette.control_bg,
+            palette.control_border,
+            height / 2.0,
+        )?;
+
+        let mut hits = Vec::with_capacity(plan.dots.len());
+        let dot_y = y + (height - dot) / 2.0;
+        let mut dot_x = x + pad;
+        for index in plan.dots {
+            let tab_id = card.tabs[index].tab_id;
+            let previewed = tab_id == card.tab_id;
+            let activity = self.tab_activity(tab_id, previewed, now);
+            let hovered = self.interaction.hovered == Some(OverviewAction::SelectTab(tab_id));
+            let (fill, border) = match (previewed, activity) {
+                (true, _) => (palette.text, palette.text),
+                (false, TabActivity::Running) => (palette.accent, palette.accent),
+                (false, TabActivity::Fresh) => (palette.secondary_text, palette.secondary_text),
+                (false, TabActivity::Idle) => (
+                    LinearRgba::TRANSPARENT,
+                    if hovered {
+                        palette.text
+                    } else {
+                        palette.muted_text
+                    },
+                ),
+            };
+            ctx.draw_rounded_frame(layers, 0, dot_x, dot_y, dot, dot, fill, border, dot / 2.0)?;
+            // The target is the pill's full height and reaches halfway to the
+            // neighbouring dots: an 8px disc is not something to aim at.
+            hits.push((
+                euclid::rect(dot_x - gap / 2.0, y, dot + gap, height),
+                tab_id,
+            ));
+            dot_x += dot + gap;
+        }
+        if let Some(text) = count_text.as_deref() {
+            // Centred even when the line box is taller than the pill: the
+            // glyphs sit in the middle of their box, so clamping to the pill's
+            // top pushed them down past its bottom edge.
+            let line_height = count_font.metrics().cell_height.get() as f32;
+            let text_y = y + (height - line_height) / 2.0;
+            ctx.draw_text(
+                layers,
+                count_font,
+                dot_x,
+                text_y,
+                text,
+                palette.muted_text,
+                count_width + gap,
+            )?;
+        }
+        Ok((pill, hits))
+    }
+
+    /// A pill dot was clicked: the card shows that tab from now on, and the
+    /// click opens it like a click on the card would.
+    fn select_tab(&mut self, tab_id: TabId) -> ContentViewResponse {
+        let Some(key) = self.tab_keys.get(&tab_id).cloned() else {
+            return ContentViewResponse::Redraw;
+        };
+        self.selected_tabs.insert(key.clone(), tab_id);
+        open_thread_response(key, tab_id, self.owner_id)
+    }
+
     fn request_close_tab(&mut self, tab_id: TabId) -> ContentViewResponse {
         let Some(tab) = Mux::get().get_tab(tab_id) else {
             return ContentViewResponse::Redraw;
@@ -1496,11 +1764,12 @@ impl LiveOverviewView {
                     match hit.expect("checked as some") {
                         OverviewAction::CloseOverview => ContentViewResponse::Close,
                         OverviewAction::OpenThread(tab_id) => self
-                            .card_keys
+                            .tab_keys
                             .get(&tab_id)
                             .cloned()
-                            .map(|key| open_thread_response(key, self.owner_id))
+                            .map(|key| open_thread_response(key, tab_id, self.owner_id))
                             .unwrap_or(ContentViewResponse::Redraw),
+                        OverviewAction::SelectTab(tab_id) => self.select_tab(tab_id),
                         OverviewAction::CloseTab(tab_id) => self.request_close_tab(tab_id),
                         OverviewAction::ConfirmCloseTab => self.confirm_close_tab(),
                         OverviewAction::CancelCloseTab => self.cancel_close_tab(),
@@ -1805,18 +2074,89 @@ fn draw_surface_gradient_slice(
     )
 }
 
-fn live_tab_for_workspace(workspace: &str) -> Option<TabId> {
+/// Every tab of a thread's workspace, and the one its first window is showing
+/// -- what the card previews until a dot is hovered or picked. Windows are
+/// visited in id order and tabs in their window order, so the pill keeps a
+/// stable order from frame to frame. Tabs with no panes are mid-close and
+/// have nothing to show.
+fn live_tabs_for_workspace(workspace: &str) -> Option<(Vec<CardTab>, TabId)> {
     let mux = Mux::get();
+    let mut tabs = Vec::new();
+    let mut shown = None;
     for window_id in mux.iter_windows_in_workspace(workspace) {
-        let Some(tab) = mux.get_active_tab_for_window(window_id) else {
+        let Some(window) = mux.get_window(window_id) else {
             continue;
         };
-        if tab.iter_panes().is_empty() {
-            continue;
+        let active = window.get_active().map(|tab| tab.tab_id());
+        for tab in window.iter() {
+            if tab.iter_panes().is_empty() {
+                continue;
+            }
+            let tab_id = tab.tab_id();
+            if shown.is_none() && active == Some(tab_id) {
+                shown = Some(tab_id);
+            }
+            tabs.push(CardTab {
+                tab_id,
+                title: tab.get_title(),
+            });
         }
-        return Some(tab.tab_id());
     }
-    None
+    let shown = shown.or_else(|| tabs.first().map(|tab| tab.tab_id))?;
+    Some((tabs, shown))
+}
+
+fn live_tab_for_workspace(workspace: &str) -> Option<TabId> {
+    live_tabs_for_workspace(workspace).map(|(_, shown)| shown)
+}
+
+/// Which tabs get a dot. Under the limit, all of them. Over it, the first
+/// few and a count -- with the previewed tab's dot always among them, in the
+/// last place, so the pill never shows a card without the tab it is showing.
+fn tab_pill_plan(tab_count: usize, previewed: usize) -> TabPillPlan {
+    if tab_count <= TAB_PILL_MAX_DOTS {
+        return TabPillPlan {
+            dots: (0..tab_count).collect(),
+            folded: 0,
+        };
+    }
+    let mut dots: Vec<usize> = (0..TAB_PILL_FOLDED_DOTS).collect();
+    if previewed >= TAB_PILL_FOLDED_DOTS {
+        dots[TAB_PILL_FOLDED_DOTS - 1] = previewed;
+    }
+    TabPillPlan {
+        folded: tab_count - dots.len(),
+        dots,
+    }
+}
+
+/// How much output a tab has ever produced, across its panes. Only compared
+/// with an earlier reading of itself.
+fn tab_output_generation(tab_id: TabId) -> u64 {
+    let mux = Mux::get();
+    let Some(tab) = mux.get_tab(tab_id) else {
+        return 0;
+    };
+    tab.iter_panes()
+        .iter()
+        .map(|pos| mux.pane_output_generation(pos.pane.pane_id()))
+        .sum()
+}
+
+/// Which of a card's tabs the preview shows: the dot under the pointer wins,
+/// then the user's pick for as long as that tab exists, then what the
+/// thread's window is showing.
+fn previewed_tab(
+    tabs: &[CardTab],
+    shown: TabId,
+    selected: Option<TabId>,
+    hovered: Option<TabId>,
+) -> TabId {
+    let listed = |tab_id: TabId| tabs.iter().any(|tab| tab.tab_id == tab_id);
+    hovered
+        .filter(|tab_id| listed(*tab_id))
+        .or(selected.filter(|tab_id| listed(*tab_id)))
+        .unwrap_or(shown)
 }
 
 fn terminal_preview_fingerprint(tab_id: TabId) -> Option<TerminalPreviewFingerprint> {
@@ -1874,9 +2214,13 @@ fn retain_running_labels(
     labels: &mut HashMap<TabId, (Instant, Option<String>)>,
     groups: &[LiveGroup],
 ) {
+    // Every tab of every card, not just the previewed ones: the pill asks
+    // for all of them, and a label dropped here would be looked up afresh
+    // on the next frame.
     let live_tabs: HashSet<TabId> = groups
         .iter()
-        .flat_map(|group| group.cards.iter().map(|card| card.tab_id))
+        .flat_map(|group| group.cards.iter())
+        .flat_map(|card| card.tabs.iter().map(|tab| tab.tab_id))
         .collect();
     labels.retain(|tab_id, _| live_tabs.contains(tab_id));
 }
@@ -1949,9 +2293,9 @@ fn capture_terminal_snapshot(tab_id: TabId) -> Option<TerminalPreviewSnapshot> {
     }
 }
 
-fn resolve_snapshot<T, F>(
-    cache: &mut HashMap<LiveThreadKey, CachedPreview<T>>,
-    key: &LiveThreadKey,
+fn resolve_snapshot<K, T, F>(
+    cache: &mut HashMap<K, CachedPreview<T>>,
+    key: &K,
     fingerprint: Option<TerminalPreviewFingerprint>,
     now: Instant,
     refresh_interval: Option<Duration>,
@@ -1959,6 +2303,7 @@ fn resolve_snapshot<T, F>(
     capture: F,
 ) -> (Option<Arc<T>>, Option<Instant>)
 where
+    K: Clone + Eq + Hash,
     F: FnOnce() -> Option<T>,
 {
     let Some(fingerprint) = fingerprint else {
@@ -2066,7 +2411,40 @@ fn live_tab_for_key(key: &LiveThreadKey) -> Option<TabId> {
     live_tab_for_workspace(&state.workspace_name)
 }
 
-fn open_thread_response(key: LiveThreadKey, source_owner_id: u64) -> ContentViewResponse {
+/// Make `tab_id` its mux window's active tab, so that the thread switch that
+/// follows adopts the window already showing it. Returns that window.
+fn bring_tab_forward(tab_id: TabId) -> Option<mux::window::WindowId> {
+    let mux = Mux::get();
+    let pane_id = mux.get_tab(tab_id)?.get_active_pane()?.pane_id();
+    let (_, window_id, _) = mux.resolve_pane_id(pane_id)?;
+    let mut window = mux.get_window_mut(window_id)?;
+    let idx = window.idx_by_id(tab_id)?;
+    if window.get_active_idx() != idx {
+        window.save_and_then_set_active(idx);
+    }
+    Some(window_id)
+}
+
+/// Once the thread is on screen, give its chosen tab the switch a discrete
+/// tab change gets (focus, geometry sync, layout persistence) -- when the
+/// window now shown is the one holding it. A tab in another window of the
+/// workspace was already made that window's active tab.
+fn sync_shown_tab(term_window: &mut TermWindow, tab_id: TabId) {
+    let idx = Mux::get()
+        .get_window(term_window.mux_window_id)
+        .and_then(|window| window.idx_by_id(tab_id));
+    if let Some(idx) = idx {
+        if let Err(err) = term_window.activate_tab(idx as isize) {
+            log::warn!("live overview: activating tab {tab_id}: {err:#}");
+        }
+    }
+}
+
+fn open_thread_response(
+    key: LiveThreadKey,
+    tab_id: TabId,
+    source_owner_id: u64,
+) -> ContentViewResponse {
     ContentViewResponse::Run(Box::new(move |term_window: &mut TermWindow| {
         if live_tab_for_key(&key).is_none() {
             term_window.invalidate_window();
@@ -2076,6 +2454,7 @@ fn open_thread_response(key: LiveThreadKey, source_owner_id: u64) -> ContentView
         let Some(source_window) = term_window.window.clone() else {
             return;
         };
+        bring_tab_forward(tab_id);
 
         if let Some(target_owner_id) = workspace_threads::window_owner_for_space(&key.space_id) {
             if target_owner_id != source_owner_id {
@@ -2103,6 +2482,7 @@ fn open_thread_response(key: LiveThreadKey, source_owner_id: u64) -> ContentView
 
                         target_term_window
                             .activate_workspace_thread(key.thread_id.clone(), &target_window);
+                        sync_shown_tab(target_term_window, tab_id);
                         target_window.focus();
                         source_window.notify(TermWindowNotif::Apply(Box::new(
                             |source_term_window| {
@@ -2120,6 +2500,7 @@ fn open_thread_response(key: LiveThreadKey, source_owner_id: u64) -> ContentView
         }
 
         if term_window.switch_space_to_thread(key.space_id, Some(key.thread_id), &source_window) {
+            sync_shown_tab(term_window, tab_id);
             // `switch_space_to_thread` deactivates content views as part of a
             // successful navigation. Remove this singleton so its next entry
             // captures a fresh host aspect and live snapshot set.
@@ -2481,6 +2862,10 @@ mod tests {
                     title: format!("thread {index}"),
                     running: None,
                     tab_id: index as TabId,
+                    tabs: vec![CardTab {
+                        tab_id: index as TabId,
+                        title: String::new(),
+                    }],
                     active: index == active,
                 })
                 .collect(),
@@ -3044,6 +3429,86 @@ mod tests {
             }],
             splits: Vec::new(),
         }
+    }
+
+    fn tabs(ids: &[TabId]) -> Vec<CardTab> {
+        ids.iter()
+            .map(|tab_id| CardTab {
+                tab_id: *tab_id,
+                title: format!("tab {tab_id}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_small_pill_shows_every_tab_and_a_large_one_folds_but_keeps_the_shown_tab() {
+        assert_eq!(
+            tab_pill_plan(4, 2),
+            TabPillPlan {
+                dots: vec![0, 1, 2, 3],
+                folded: 0
+            }
+        );
+        assert_eq!(
+            tab_pill_plan(9, 1),
+            TabPillPlan {
+                dots: vec![0, 1, 2],
+                folded: 6
+            }
+        );
+        assert_eq!(
+            tab_pill_plan(9, 7),
+            TabPillPlan {
+                dots: vec![0, 1, 7],
+                folded: 6
+            }
+        );
+    }
+
+    #[test]
+    fn a_pill_dot_wins_the_hit_test_over_the_card_under_it() {
+        let card = euclid::rect(10.0, 20.0, 320.0, 180.0);
+        let dot = euclid::rect(250.0, 26.0, 15.0, 22.0);
+        let mut widgets = UiContext::default();
+        widgets.push(card, WidgetKind::SidebarRow, OverviewAction::OpenThread(42));
+        widgets.push(dot, WidgetKind::Button, OverviewAction::SelectTab(43));
+        let hit = widgets
+            .hit_test(dot.center().x, dot.center().y)
+            .expect("dot should hit");
+        assert_eq!(hit.action, OverviewAction::SelectTab(43));
+    }
+
+    #[test]
+    fn running_labels_of_a_cards_other_tabs_survive_the_frame() {
+        let mut labels = HashMap::new();
+        let now = Instant::now();
+        labels.insert(7, (now, Some("vim".to_string())));
+        labels.insert(8, (now, None));
+        labels.insert(9, (now, None));
+        let mut group = live_group_with_active(1, 0);
+        group.cards[0].tab_id = 7;
+        group.cards[0].tabs = tabs(&[7, 8]);
+        retain_running_labels(&mut labels, &[group]);
+        assert!(labels.contains_key(&7));
+        assert!(labels.contains_key(&8));
+        assert!(!labels.contains_key(&9));
+    }
+
+    #[test]
+    fn a_card_previews_the_hovered_dot_over_the_pick_over_the_shown_tab() {
+        let tabs = tabs(&[10, 11, 12]);
+        assert_eq!(previewed_tab(&tabs, 10, None, None), 10);
+        assert_eq!(previewed_tab(&tabs, 10, Some(11), None), 11);
+        assert_eq!(previewed_tab(&tabs, 10, Some(11), Some(12)), 12);
+    }
+
+    #[test]
+    fn a_pick_or_hover_for_a_tab_that_left_the_card_is_ignored() {
+        let tabs = tabs(&[10, 11]);
+        // The pick's tab closed: back to what the window shows.
+        assert_eq!(previewed_tab(&tabs, 10, Some(99), None), 10);
+        // A dot of some other card is hovered: this card keeps its pick.
+        assert_eq!(previewed_tab(&tabs, 10, Some(11), Some(99)), 11);
     }
 
     #[test]
