@@ -1127,9 +1127,14 @@ impl ImportFieldId {
             Self::WindowBackgroundOpacity => format!("{:.2}", config.window_background_opacity),
             Self::MacosWindowBackgroundBlur => config.macos_window_background_blur.to_string(),
             Self::InactivePaneHsb => {
-                let palette: wezterm_term::color::ColorPalette =
-                    config.resolved_palette.clone().into();
-                let hsb = config.inactive_pane_hsb_for_background(palette.background);
+                // The list only carries this field when the config sets it
+                // explicitly, so the background-derived default is never
+                // what shows; build the palette only if it ever is.
+                let hsb = config.inactive_pane_hsb.unwrap_or_else(|| {
+                    let palette: wezterm_term::color::ColorPalette =
+                        config.resolved_palette.clone().into();
+                    config.inactive_pane_hsb_for_background(palette.background)
+                });
                 format!(
                     "h {:.2}, s {:.2}, b {:.2}",
                     hsb.hue, hsb.saturation, hsb.brightness

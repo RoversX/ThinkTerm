@@ -723,7 +723,16 @@ impl crate::TermWindow {
         layers: &mut TripleLayerQuadAllocator<'_>,
     ) -> anyhow::Result<()> {
         let gate = self.frontend_terminal_gate();
-        if !gate.is_claimable() {
+        // A terminal another device holds wears the badge until it is
+        // taken. So does one just taken with its picture kept: a click on a
+        // remote tab keeps the old grid on screen while input waits for the
+        // resized one to be confirmed, and without the badge those seconds
+        // read as a terminal ignoring the keyboard.
+        let syncing_in_view = matches!(
+            gate,
+            wezterm_client::domain::RemoteFrontendGate::Syncing
+        ) && !self.frontend_surface_blocked();
+        if !gate.is_claimable() && !syncing_in_view {
             return Ok(());
         }
         let Some((title, hint)) = gate.overlay_message() else {
@@ -1674,12 +1683,13 @@ impl crate::TermWindow {
         // them back -- is what makes an arrival look like several things
         // happening near each other rather than one thing happening.
         let composites_before = self.card_composites.borrow().len();
-        // Record into last frame's buffers. A settled view records the same
-        // surface every frame; dropping that heap to allocate its twin was
-        // one large free and one large malloc per frame for the life of
-        // the view. Nothing reads the previous recording once this frame's
-        // begins: the closing ghost is taken before any frame is painted.
-        let mut heap = self.content_view_last_frame.take().unwrap_or_default();
+        // Record into the scratch heap, not the last frame's: a settled view
+        // records the same surface every frame, and the two swap below so
+        // neither is ever reallocated. The last frame stays in place while
+        // this one records -- an error on the way out leaves it whole for a
+        // closing ghost, and `dedicated_image_textures_allowed` keeps
+        // reading it as "a heap is being recorded", as it must.
+        let mut heap = std::mem::take(&mut self.content_view_frame_scratch);
         heap.recycle();
         {
             let mut recorded = TripleLayerQuadAllocator::Heap(&mut heap);
@@ -1707,7 +1717,9 @@ impl crate::TermWindow {
             // Settled: nothing else is on screen to be ordered against.
             None => heap.apply_to_clipped(layers, self.surface_clip(), 1.0)?,
         }
-        self.content_view_last_frame = Some(heap);
+        if let Some(previous) = self.content_view_last_frame.replace(heap) {
+            self.content_view_frame_scratch = previous;
+        }
         // The heap holds no thumbnail quads on the texture path, so a closing
         // ghost needs this frame's composites to fade the pictures out.
         *self.content_view_last_composites.borrow_mut() =
