@@ -1871,7 +1871,14 @@ impl LiveOverviewView {
 
         let icon_width = pad * 2.0 + icon;
         let title_pad = ctx.px(CAPSULE_TITLE_PAD);
-        let title_text_width = title_ctx.measure_text_width(title_font, &card.title);
+        // A long thread name is shortened with an ellipsis to what the
+        // capsule can hold once the other sections have their room; the
+        // subtitle follows the same limit.
+        let title_room = (max_width * 0.6).max(ctx.px(80.0));
+        let title_text = title_ctx.text_with_ellipsis(title_font, &card.title, title_room);
+        let subtitle =
+            subtitle.map(|text| sub_ctx.text_with_ellipsis(sub_font, &text, title_room));
+        let title_text_width = title_ctx.measure_text_width(title_font, &title_text);
         let sub_text_width = subtitle
             .as_deref()
             .map_or(0.0, |text| sub_ctx.measure_text_width(sub_font, text));
@@ -2031,7 +2038,7 @@ impl LiveOverviewView {
                     title_font,
                     cursor + title_pad + (inner - shown) / 2.0,
                     title_y,
-                    &card.title,
+                    &title_text,
                     colors.capsule_text.mul_alpha(alpha),
                     inner,
                 )?;

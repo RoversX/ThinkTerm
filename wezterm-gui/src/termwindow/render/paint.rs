@@ -1784,11 +1784,13 @@ impl crate::TermWindow {
                 // A card names a thread in a capsule the size of a control,
                 // not a heading: a shade under the pane header size, and a
                 // caption a step below that in the same family.
-                self.fonts.title_font_with_size(
-                    (crate::native_settings::pane_header_font_size() * 0.66).max(8.0),
+                self.fonts.title_font_with_size_and_weight(
+                    (crate::native_settings::pane_header_font_size() * 0.58).max(8.0),
+                    600,
                 )?,
-                self.fonts.title_font_with_size(
-                    (crate::native_settings::pane_header_font_size() * 0.56).max(7.5),
+                self.fonts.title_font_with_size_and_weight(
+                    (crate::native_settings::pane_header_font_size() * 0.5).max(7.5),
+                    500,
                 )?,
             ),
         };
