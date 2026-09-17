@@ -812,15 +812,17 @@ fn compute_tree_size_from_panes(node: &mut Tree, tab_cell: &TerminalSize) -> Opt
             // Fall back to the pane's own counts when it cannot describe
             // itself in pixels; that is the pre-conversion behaviour and is
             // still correct for a pane whose cells match the tab's.
+            // Never below one cell either way: the split record built from
+            // these is later measured by dividing by them.
             let cols = if cell_width > 0 && dims.pixel_width > 0 {
                 (dims.pixel_width / cell_width).max(1)
             } else {
-                dims.cols
+                dims.cols.max(1)
             };
             let rows = if cell_height > 0 && dims.pixel_height > 0 {
                 (dims.pixel_height / cell_height).max(1)
             } else {
-                dims.rows
+                dims.rows.max(1)
             };
             let size = TerminalSize {
                 cols,
@@ -1510,9 +1512,12 @@ impl TabInner {
                 // 87-column pane into 43/43 measured 43+1+87, and the resize
                 // below took the excess off both sides, landing the divider
                 // at 21/65 while the server kept 43/43.
+                // A record whose first branch has no cells cannot be
+                // measured (`size()` divides by them); such a split falls
+                // through to being measured from its panes instead.
                 Some(Tree::Node {
                     data: Some(data), ..
-                }) => {
+                }) if data.first.cols > 0 && data.first.rows > 0 => {
                     self.size = data.size();
                 }
                 // A lone leaf has no split record. Measure that pane against
@@ -5834,6 +5839,42 @@ mod test {
         assert_eq!(widths, vec![(1, 40), (0, 39)]);
         // The surviving pane was dealt its branch, not left at 80 columns.
         assert_eq!(existing.get_dimensions().cols, 39);
+        assert_eq!(tab.get_size().cols, size.cols);
+    }
+
+    /// A wire split whose first branch has no cells must not be measured
+    /// through its record: `size()` divides by those cells.
+    #[test]
+    fn sync_with_pane_tree_survives_a_split_record_with_no_cells() {
+        let size = test_size();
+        let tab = Tab::new(&size);
+        let existing = FakePane::new(0, size);
+        tab.sync_with_pane_tree(size, PaneNode::Leaf(pane_entry(0, size, true)), |_| {
+            Arc::clone(&existing)
+        });
+        let mut first = size;
+        first.cols = 0;
+        first.pixel_width = 0;
+        let mut second = size;
+        second.cols = size.cols - 1;
+        second.pixel_width = second.cols * (size.pixel_width / size.cols);
+        let root = PaneNode::Split {
+            left: Box::new(PaneNode::Leaf(pane_entry(1, first, true))),
+            right: Box::new(PaneNode::Leaf(pane_entry(0, second, false))),
+            node: SplitDirectionAndSize {
+                direction: SplitDirection::Horizontal,
+                first,
+                second,
+            },
+        };
+        tab.sync_with_pane_tree(size, root, |entry| {
+            if entry.pane_id == 0 {
+                Arc::clone(&existing)
+            } else {
+                FakePane::new(entry.pane_id, entry.size)
+            }
+        });
+        assert_eq!(tab.iter_panes().len(), 2);
         assert_eq!(tab.get_size().cols, size.cols);
     }
 
