@@ -641,6 +641,9 @@ pub struct GlyphCache {
     pub cursor_glyphs: HashMap<(Option<CursorShape>, u8), Sprite>,
     pub color: HashMap<(RgbColor, NotNan<f32>), Sprite>,
     pub rotated_svg_icons: HashMap<SizedRotatedSvgIconKey, Sprite>,
+    /// Blurred rounded-rectangle silhouettes, one per corner radius and
+    /// blur, drawn as nine slices under elevated surfaces.
+    pub shadows: HashMap<crate::ui::shadow::ShadowKey, Sprite>,
     min_frame_duration: Duration,
 }
 
@@ -717,6 +720,7 @@ impl GlyphCache {
             app_icons: HashMap::new(),
             material_icons: HashMap::new(),
             rotated_svg_icons: HashMap::new(),
+            shadows: HashMap::new(),
             cursor_glyphs: HashMap::new(),
             color: HashMap::new(),
             min_frame_duration: Duration::from_millis(1000 / fonts.config().max_fps as u64),
@@ -753,6 +757,7 @@ impl GlyphCache {
             app_icons: HashMap::new(),
             material_icons: HashMap::new(),
             rotated_svg_icons: HashMap::new(),
+            shadows: HashMap::new(),
             cursor_glyphs: HashMap::new(),
             color: HashMap::new(),
             min_frame_duration: Duration::from_millis(1000 / fonts.config().max_fps as u64),
@@ -1411,6 +1416,19 @@ impl GlyphCache {
         let image = icon.rasterize(size)?;
         let sprite = self.atlas.allocate(&image)?;
         self.svg_icons.insert(key, sprite.clone());
+        Ok(sprite)
+    }
+
+    pub fn cached_shadow(
+        &mut self,
+        key: crate::ui::shadow::ShadowKey,
+    ) -> anyhow::Result<Sprite> {
+        if let Some(sprite) = self.shadows.get(&key) {
+            return Ok(sprite.clone());
+        }
+        let image = crate::ui::shadow::rasterize_shadow(key);
+        let sprite = self.atlas.allocate(&image)?;
+        self.shadows.insert(key, sprite.clone());
         Ok(sprite)
     }
 

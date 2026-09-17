@@ -178,6 +178,79 @@ impl<'a> DrawContext<'a> {
 
     /// Standard elevated surface used by overview cards. Two restrained
     /// layers provide depth without a hard concentric halo.
+    /// A soft shadow under a rounded rectangle: the blurred silhouette from
+    /// the atlas, drawn as nine slices. `sigma` is the blur's standard
+    /// deviation and `offset_y` how far the shadow is dropped, both in
+    /// pixels; the colour's alpha is the shadow's peak opacity.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draw_shadow(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        rect: RectF,
+        radius: f32,
+        sigma: f32,
+        offset_y: f32,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let Some(snapped) = pixel_snap_rounded_rect(
+            rect.origin.x,
+            rect.origin.y + offset_y,
+            rect.size.width,
+            rect.size.height,
+            radius,
+        ) else {
+            return Ok(());
+        };
+        let sigma = sigma.round().clamp(0.0, 64.0);
+        if color.3 <= 0.0 || (sigma <= 0.0 && snapped.radius <= 0.0) {
+            return Ok(());
+        }
+        let key = crate::ui::shadow::ShadowKey {
+            radius: snapped.radius.round().clamp(0.0, 128.0) as u16,
+            sigma: sigma as u16,
+        };
+        let layout = key.layout();
+        let coords = self
+            .render_state
+            .glyph_cache
+            .borrow_mut()
+            .cached_shadow(key)?
+            .texture_coords();
+        let side = layout.side as f32;
+        let u = |px: f32| coords.min_x() + coords.size.width * (px / side);
+        let v = |px: f32| coords.min_y() + coords.size.height * (px / side);
+        let left_offset = self.dimensions.pixel_width as f32 / 2.0;
+        let top_offset = self.dimensions.pixel_height as f32 / 2.0;
+        for slice in crate::ui::shadow::shadow_slices(
+            snapped.x,
+            snapped.y,
+            snapped.width,
+            snapped.height,
+            layout,
+        ) {
+            let mut quad = layers.allocate(layer_num)?;
+            quad.set_position(
+                slice.screen_x.0 - left_offset,
+                slice.screen_y.0 - top_offset,
+                slice.screen_x.1 - left_offset,
+                slice.screen_y.1 - top_offset,
+            );
+            quad.set_texture_discrete(
+                u(slice.sprite_x.0),
+                u(slice.sprite_x.1),
+                v(slice.sprite_y.0),
+                v(slice.sprite_y.1),
+            );
+            quad.set_fg_color(color);
+            quad.set_alt_color_and_mix_value(color, 0.0);
+            quad.set_hsv(None);
+            quad.set_has_color(false);
+            quad.set_grayscale();
+        }
+        Ok(())
+    }
+
     pub(crate) fn draw_elevated_surface(
         &self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -188,21 +261,26 @@ impl<'a> DrawContext<'a> {
         shadow: LinearRgba,
         radius: f32,
     ) -> anyhow::Result<()> {
-        for (spread, offset_y, alpha) in [
-            (self.px(6.0), self.px(5.0), 0.14),
-            (self.px(2.0), self.px(3.0), 0.24),
-        ] {
-            self.draw_rounded_rect(
-                layers,
-                layer_num,
-                rect.origin.x - spread,
-                rect.origin.y - spread + offset_y,
-                rect.size.width + spread * 2.0,
-                rect.size.height + spread * 2.0,
-                color_with_alpha(shadow, shadow.3 * alpha),
-                radius + spread,
-            )?;
-        }
+        // Two shadows, as a lit surface casts: a wide, faint ambient one
+        // and a tight, darker one close under the edge.
+        self.draw_shadow(
+            layers,
+            layer_num,
+            rect,
+            radius,
+            self.px(9.0),
+            self.px(6.0),
+            color_with_alpha(shadow, shadow.3 * 0.42),
+        )?;
+        self.draw_shadow(
+            layers,
+            layer_num,
+            rect,
+            radius,
+            self.px(2.0),
+            self.px(1.5),
+            color_with_alpha(shadow, shadow.3 * 0.28),
+        )?;
         self.draw_rounded_frame(
             layers,
             layer_num,
