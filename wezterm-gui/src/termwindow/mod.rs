@@ -2182,6 +2182,12 @@ pub(crate) enum FrontendGeometryPhase {
 pub(crate) struct RemoteOpenIntent {
     domain_id: DomainId,
     ready: bool,
+    /// When the intent was armed. One that is never made ready -- an
+    /// activation that returned early, a landing on a pane that was not yet
+    /// a client pane -- has nothing else to release it, and while it stands
+    /// the window shows "Connecting" over a live terminal and swallows the
+    /// keyboard; `advance_remote_open` drops it after `REMOTE_OPEN_ARM_TIMEOUT`.
+    armed: Instant,
 }
 
 impl FrontendGeometryPhase {
@@ -2609,6 +2615,10 @@ pub struct TermWindow {
     /// The most recent full-window view frame, recorded so that closing one
     /// has a picture to take away after the view itself is gone.
     content_view_last_frame: Option<crate::quad::HeapQuadAllocator>,
+    /// The heap the next view frame records into; it and `content_view_last_frame`
+    /// swap every frame so neither is reallocated, and the last frame stays
+    /// whole until the new recording has succeeded.
+    content_view_frame_scratch: crate::quad::HeapQuadAllocator,
     next_content_view_id: ContentViewId,
     registered_content_view_surfaces: HashMap<ContentViewId, MuxWindowId>,
     /// Tracks SSH connections kicked off by `RemoteThreadView`s.
@@ -3980,6 +3990,7 @@ impl TermWindow {
                 .map(|domain_id| RemoteOpenIntent {
                     domain_id,
                     ready: false,
+                    armed: Instant::now(),
                 }),
             frontend_geometry_confirmations: HashMap::new(),
             frontend_geometry_resized: std::collections::HashSet::new(),
@@ -4172,6 +4183,7 @@ impl TermWindow {
             content_view_deferred_mux_resize: false,
             content_view_fade: None,
             content_view_last_frame: None,
+            content_view_frame_scratch: Default::default(),
             next_content_view_id: 1,
             registered_content_view_surfaces: HashMap::new(),
             remote_connects: HashMap::new(),
@@ -5366,9 +5378,10 @@ impl TermWindow {
                     // driving the ptys at the split it dealt while we draw
                     // ours. Offer the viewport the way a divider release
                     // would. Only the tab on screen has frames worth sending,
-                    // and only while this client holds its lease; the
-                    // debounce and the unchanged-viewport check keep an
-                    // ordinary window resize from paying twice.
+                    // and only while this client holds its lease. This is the
+                    // same single-flight debounce the window-resize path
+                    // uses, so a drag that fires both collapses into the one
+                    // publish it already paid for.
                     if self.active_tab_is(tab_id) {
                         if let Some(tab) = Mux::get().get_tab(tab_id) {
                             let is_mirror = tab

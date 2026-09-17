@@ -696,10 +696,16 @@ pub(crate) async fn connect_domain_into_space(
     .await?;
     // Keep the native handle: adopting the restored workspace can replace
     // its mux-window id while this explicit connection is in progress.
+    let window = crate::frontend::front_end()
+        .gui_window_for_mux_window(window_id)
+        .map(|gui| gui.window);
+    if window.is_none() {
+        // The window was recorded under this id with no await since; a
+        // miss here means the intent armed inside it can never be released.
+        log::warn!("remote open: no GUI window for mux window {window_id}; intent unreleased");
+    }
     let remote_open = RemoteOpenRequest {
-        window: crate::frontend::front_end()
-            .gui_window_for_mux_window(window_id)
-            .map(|gui| gui.window),
+        window,
         domain_id: domain.domain_id(),
     };
 

@@ -51,17 +51,22 @@ fn frontend_gate_with_geometry(
     }
 }
 
+/// How long an armed, not-yet-ready remote open intent may stand. An
+/// on-demand attach retries for up to a minute before it can land, so the
+/// net must outlast that; past it, the one-shot claim is simply forgone and
+/// the terminal is taken by a click like any other.
+const REMOTE_OPEN_ARM_TIMEOUT: Duration = Duration::from_secs(75);
+
+fn remote_open_intent_expired(intent: &super::RemoteOpenIntent, now: std::time::Instant) -> bool {
+    !intent.ready && now.saturating_duration_since(intent.armed) > REMOTE_OPEN_ARM_TIMEOUT
+}
+
 fn take_ready_remote_open(
     pending: &mut Option<super::RemoteOpenIntent>,
-    enabled: bool,
     domain_id: mux::domain::DomainId,
     gate: &RemoteFrontendGate,
     geometry_in_flight: bool,
 ) -> bool {
-    if !enabled {
-        *pending = None;
-        return false;
-    }
     if pending.is_some_and(|intent| intent.ready && intent.domain_id == domain_id)
         && !geometry_in_flight
         && matches!(
@@ -1249,6 +1254,7 @@ impl super::TermWindow {
         self.remote_open_intent = Some(super::RemoteOpenIntent {
             domain_id,
             ready: false,
+            armed: std::time::Instant::now(),
         });
     }
 
@@ -1299,6 +1305,19 @@ impl super::TermWindow {
             self.remote_open_intent = None;
             return;
         }
+        // The safety net for an intent nothing will ever make ready: the
+        // activation returned early, or landed on a pane that was not yet
+        // a client pane. Without it the window sat behind "Connecting" with
+        // a dead keyboard until the user navigated away.
+        if self
+            .remote_open_intent
+            .is_some_and(|intent| remote_open_intent_expired(&intent, std::time::Instant::now()))
+        {
+            log::warn!("dropping a remote open intent that was never made ready");
+            self.remote_open_intent = None;
+            self.invalidate_window();
+            return;
+        }
         if !self.remote_open_intent.is_some_and(|intent| intent.ready) {
             return;
         }
@@ -1317,7 +1336,6 @@ impl super::TermWindow {
             .is_some_and(|phase| phase.is_in_flight());
         if take_ready_remote_open(
             &mut self.remote_open_intent,
-            self.config.remote_mux_auto_claim_on_open,
             client.domain_id(),
             &client.remote_frontend_gate(),
             in_flight,
@@ -3196,8 +3214,9 @@ mod frontend_geometry_tests {
         geometry_confirmation_settled, local_viewport_publish_is_worthwhile,
         remote_divider_can_pump, remote_divider_target_is_owed, take_ready_remote_open,
         visible_geometry_targets,
-        FrontendGeometryAction, LocalTabShape, RejectedClientViewport, RejectedLocalViewport,
-        FRONTEND_GEOMETRY_SETTLE, REJECTED_CLIENT_VIEWPORT_HOLD,
+        remote_open_intent_expired, FrontendGeometryAction, LocalTabShape,
+        RejectedClientViewport, RejectedLocalViewport, FRONTEND_GEOMETRY_SETTLE,
+        REJECTED_CLIENT_VIEWPORT_HOLD, REMOTE_OPEN_ARM_TIMEOUT,
     };
     use crate::termwindow::{FrontendGeometryPhase, RemoteDividerResizeStrategy, RemoteOpenIntent};
     use std::collections::HashSet;
@@ -3210,13 +3229,14 @@ mod frontend_geometry_tests {
         let mut pending = Some(RemoteOpenIntent {
             domain_id: 7,
             ready: false,
+            armed: std::time::Instant::now(),
         });
         let gate = RemoteFrontendGate::Claimable { owner: None };
-        assert!(!take_ready_remote_open(&mut pending, true, 7, &gate, false));
+        assert!(!take_ready_remote_open(&mut pending, 7, &gate, false));
         pending.as_mut().unwrap().ready = true;
-        assert!(!take_ready_remote_open(&mut pending, true, 8, &gate, false));
-        assert!(!take_ready_remote_open(&mut pending, true, 7, &gate, true));
-        assert!(take_ready_remote_open(&mut pending, true, 7, &gate, false));
+        assert!(!take_ready_remote_open(&mut pending, 8, &gate, false));
+        assert!(!take_ready_remote_open(&mut pending, 7, &gate, true));
+        assert!(take_ready_remote_open(&mut pending, 7, &gate, false));
         assert!(pending.is_none());
         // Neither repainting nor returning from a later disconnect may claim again.
         for gate in [
@@ -3224,21 +3244,29 @@ mod frontend_geometry_tests {
             gate,
             RemoteFrontendGate::Visible,
         ] {
-            assert!(!take_ready_remote_open(&mut pending, true, 7, &gate, false));
+            assert!(!take_ready_remote_open(&mut pending, 7, &gate, false));
         }
     }
 
     #[test]
-    fn disabling_auto_claim_drops_the_pending_intent_and_keeps_manual_takeover() {
-        let mut pending = Some(RemoteOpenIntent {
+    fn a_remote_open_intent_that_is_never_made_ready_expires() {
+        let armed = std::time::Instant::now();
+        let intent = RemoteOpenIntent {
             domain_id: 7,
-            ready: true,
-        });
-        let gate = RemoteFrontendGate::Claimable { owner: None };
-        assert!(!take_ready_remote_open(&mut pending, false, 7, &gate, false));
-        assert!(pending.is_none());
-        assert!(!take_ready_remote_open(&mut pending, true, 7, &gate, false));
-        assert!(frontend_gate_with_geometry(gate, None, true).is_claimable());
+            ready: false,
+            armed,
+        };
+        assert!(!remote_open_intent_expired(&intent, armed + Duration::from_secs(30)));
+        assert!(remote_open_intent_expired(
+            &intent,
+            armed + REMOTE_OPEN_ARM_TIMEOUT + Duration::from_secs(1)
+        ));
+        // A ready intent is consumed by the claim, never by the clock.
+        let ready = RemoteOpenIntent { ready: true, ..intent };
+        assert!(!remote_open_intent_expired(
+            &ready,
+            armed + REMOTE_OPEN_ARM_TIMEOUT + Duration::from_secs(1)
+        ));
     }
 
     #[test]
@@ -3246,6 +3274,7 @@ mod frontend_geometry_tests {
         let mut pending = Some(RemoteOpenIntent {
             domain_id: 7,
             ready: true,
+            armed: std::time::Instant::now(),
         });
         for gate in [
             RemoteFrontendGate::Connecting,
@@ -3253,7 +3282,7 @@ mod frontend_geometry_tests {
             RemoteFrontendGate::Reconnecting,
             RemoteFrontendGate::Offline,
         ] {
-            assert!(!take_ready_remote_open(&mut pending, true, 7, &gate, false));
+            assert!(!take_ready_remote_open(&mut pending, 7, &gate, false));
             assert!(pending.is_some());
         }
     }
