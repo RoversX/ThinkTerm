@@ -359,6 +359,10 @@ jobs:
     env:
       RUSTUP_WINDOWS_PATH_ADD_BIN: '1'
       TAG_NAME: ${{ needs.prepare.outputs.version }}
+      # dist's concurrent fat-LTO builds exhausted the Windows runner's memory.
+      # Keep the previous release profile until dist is validated here again.
+      # Build, packaging, cache selection and symbol upload share this value.
+      CARGO_PROFILE: release
 
     steps:
       - name: Checkout
@@ -387,7 +391,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: windows-x86_64-dist
+          key: windows-x86_64-${{ env.CARGO_PROFILE }}
           cache-on-failure: true
           save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
@@ -410,7 +414,7 @@ jobs:
         shell: cmd
         run: |
           PATH C:\Strawberry\perl\bin;%PATH%
-          cargo build --profile dist -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
+          cargo build --profile %CARGO_PROFILE% -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
 
       - name: Fetch the browser bundle
         uses: actions/download-artifact@v8
@@ -420,8 +424,6 @@ jobs:
 
       - name: Package
         shell: bash
-        env:
-          CARGO_PROFILE: dist
         run: bash ci/deploy.sh
 
       - name: Upload
@@ -435,6 +437,8 @@ jobs:
           if-no-files-found: error
 
       - name: Upload symbols
+        # The ordinary release profile does not produce a separate PDB bundle.
+        if: env.CARGO_PROFILE == 'dist'
         uses: actions/upload-artifact@v7
         with:
           name: windows-x86_64-symbols
@@ -457,6 +461,10 @@ jobs:
 
     env:
       TAG_NAME: ${{ needs.prepare.outputs.version }}
+      # Restore Ubuntu's previous release profile while the heavier dist
+      # build is being revalidated. Fedora keeps dist. Packaging and AppImage
+      # must read the same profile directory as the build and cache steps.
+      CARGO_PROFILE: ${{ startsWith(matrix.name, 'ubuntu') && 'release' || 'dist' }}
       # Job-wide, not per-step: ./get-deps pulls in tzdata and friends, and a
       # debconf prompt there would hang until timeout-minutes with no output.
       DEBIAN_FRONTEND: noninteractive
@@ -513,7 +521,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.name }}-${{ matrix.arch }}-dist
+          key: ${{ matrix.name }}-${{ matrix.arch }}-${{ env.CARGO_PROFILE }}
           cache-on-failure: true
           save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
@@ -522,7 +530,7 @@ jobs:
 
       - name: Build
         run: |
-          cargo build --profile dist \
+          cargo build --profile "$CARGO_PROFILE" \
             -p wezterm \
             -p wezterm-gui \
             -p wezterm-mux-server \
@@ -535,8 +543,6 @@ jobs:
           path: thinkterm-web/www
 
       - name: Package
-        env:
-          CARGO_PROFILE: dist
         run: bash ci/deploy.sh
 
       - name: Collect RPMs
@@ -545,8 +551,6 @@ jobs:
 
       - name: Build AppImage
         if: matrix.appimage
-        env:
-          CARGO_PROFILE: dist
         run: |
           set -eu
           apt-get install -y --no-install-recommends file zsync

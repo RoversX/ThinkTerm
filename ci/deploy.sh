@@ -21,8 +21,8 @@ set -e
 
 TARGET_DIR=${1:-${CARGO_TARGET_DIR:-target}}
 # The cargo profile the binaries were built with: `release` (target/release)
-# unless the caller built with `--profile dist` (target/dist), which is what
-# the release workflow and `ci/macos-package.sh --profile dist` do.
+# unless the caller built with `--profile dist` (target/dist). Release jobs
+# pass their selected profile; `ci/macos-package.sh --profile dist` does too.
 PROFILE=${CARGO_PROFILE:-release}
 
 TAG_NAME=${TAG_NAME:-$(git -c "core.abbrev=8" show -s "--format=%cd-%h" "--date=format:%Y%m%d-%H%M%S")}
