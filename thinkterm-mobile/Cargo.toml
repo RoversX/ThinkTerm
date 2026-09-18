@@ -1,0 +1,38 @@
+[package]
+name = "thinkterm-mobile"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The native-shell side of the mobile client: a core thread that owns the
+# GPU state, the session and (later) the App; a Send handle the shells call
+# through UniFFI; and the platform seams -- a surface from a CAMetalLayer or
+# an ANativeWindow, ssh as the transport, the shell's fonts for the glyphs
+# the bundled faces lack. S0/S0.5 scope: the thread model, the surface
+# lifecycle, and one real pane over ssh.
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+codec.workspace = true
+futures.workspace = true
+log.workspace = true
+russh = { version = "0.63.3", default-features = false, features = ["ring"] }
+termwiz = { workspace = true, features = ["use_serde"] }
+thinkterm-font-web.workspace = true
+thinkterm-proto.workspace = true
+thinkterm-render = { workspace = true, features = ["wgpu"] }
+thinkterm-session.workspace = true
+thinkterm-web.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "net", "io-util"] }
+uniffi = { workspace = true, features = ["cli"] }
+wezterm-color-types.workspace = true
+wezterm-term = { workspace = true, features = ["use_serde"] }
+wgpu.workspace = true
