@@ -1,9 +1,10 @@
-//! The core thread's end of the PDU stream, whatever carries it.
+//! The core thread's end of the PDU stream over ssh, as the App's [`Link`].
 //!
 //! The network thread hands in bytes and takes out bytes; this side does
 //! the framing, matches answers to requests by serial, hands pushes to the
-//! App and keeps the lease. It is the transport-neutral 450 lines of the
-//! browser's `link.rs`, minus the WebSocket.
+//! App and keeps the lease. It is the transport-neutral part of the
+//! browser's `link.rs`, with the ssh session's life (dial, redial, hang
+//! up) in place of the WebSocket's.
 //!
 //! Sending is ordered by construction: `request` encodes and queues the
 //! bytes on the spot, in the order it was called, and the network thread
@@ -11,31 +12,35 @@
 //! wire now, behind everything sent before it"); the plan's saturation
 //! rules for a bounded queue come with the real Transport, not this probe.
 
-use crate::ssh::Out;
+use crate::ssh::{self, Net, Out, SshParams};
 use anyhow::{anyhow, Result};
 use codec::Pdu;
 use futures::channel::oneshot;
 use std::cell::{Cell, RefCell};
-use std::future::Future;
-use std::pin::Pin;
 use std::rc::Rc;
 use thinkterm_proto::TabId;
 use thinkterm_session::connection::{Answer, SerialTable};
 use thinkterm_session::host::{LinkError, PduLink};
 use thinkterm_session::input::PaneLink;
 use thinkterm_web::lease::Lease;
+use thinkterm_web::platform::{Link, LocalFuture};
 use tokio::sync::mpsc::UnboundedSender;
-
-pub type LocalFuture<T> = Pin<Box<dyn Future<Output = T> + 'static>>;
 
 #[derive(Clone)]
 pub struct SshLink(Rc<Inner>);
 
 struct Inner {
+    params: SshParams,
+    /// How the network thread reaches the core thread with what arrives.
+    deliver: Box<dyn Fn() -> Box<dyn Fn(Net) + Send>>,
     out: RefCell<Option<UnboundedSender<Out>>>,
     serials: RefCell<SerialTable<oneshot::Sender<Pdu>>>,
     pushes: RefCell<Option<Box<dyn FnMut(Pdu)>>>,
     pending_pushes: RefCell<Vec<Pdu>>,
+    on_close: RefCell<Option<Box<dyn FnMut(String)>>>,
+    closed_early: RefCell<Option<String>>,
+    /// A dial in progress: answered by `opened` or by a close.
+    connecting: RefCell<Option<oneshot::Sender<Result<()>>>>,
     lease: RefCell<Lease>,
     inbound: RefCell<Vec<u8>>,
     open: Cell<bool>,
@@ -43,12 +48,18 @@ struct Inner {
 }
 
 impl SshLink {
-    pub fn new() -> Self {
+    /// `deliver` makes the callback each dial hands the network thread.
+    pub fn new(params: SshParams, deliver: Box<dyn Fn() -> Box<dyn Fn(Net) + Send>>) -> Self {
         Self(Rc::new(Inner {
+            params,
+            deliver,
             out: RefCell::new(None),
             serials: RefCell::new(SerialTable::new()),
             pushes: RefCell::new(None),
             pending_pushes: RefCell::new(Vec::new()),
+            on_close: RefCell::new(None),
+            closed_early: RefCell::new(None),
+            connecting: RefCell::new(None),
             lease: RefCell::new(Lease::default()),
             inbound: RefCell::new(Vec::new()),
             open: Cell::new(false),
@@ -56,21 +67,51 @@ impl SshLink {
         }))
     }
 
-    /// A transport came up: everything sent from now on goes to `out`.
-    pub fn opened(&self, out: UnboundedSender<Out>) {
-        self.0.inbound.borrow_mut().clear();
-        self.0.serials.borrow_mut().drain();
+    /// Dial. The future resolves when the exec channel is up (or the dial
+    /// failed); the core thread feeds the outcome through `opened` and
+    /// `closed`.
+    pub fn connect(&self) -> LocalFuture<Result<()>> {
+        let (tx, rx) = oneshot::channel();
+        *self.0.connecting.borrow_mut() = Some(tx);
+        let deliver = (self.0.deliver)();
+        let out = ssh::spawn(self.0.params.clone(), deliver);
         *self.0.out.borrow_mut() = Some(out);
-        self.0.open.set(true);
-        self.0.generation.set(self.0.generation.get() + 1);
+        Box::pin(async move { rx.await.map_err(|_| anyhow!("the dial was abandoned"))? })
     }
 
-    /// The transport went away. Every request still waiting is answered
-    /// with an error by its sender being dropped.
-    pub fn closed(&self) {
+    /// The transport came up.
+    pub fn opened(&self) {
+        self.0.inbound.borrow_mut().clear();
+        self.0.serials.borrow_mut().drain();
+        self.0.open.set(true);
+        self.0.generation.set(self.0.generation.get() + 1);
+        if let Some(tx) = self.0.connecting.borrow_mut().take() {
+            let _ = tx.send(Ok(()));
+        }
+    }
+
+    /// The transport went away, and why. A dial still waiting learns it
+    /// failed; an open connection's close handler is told.
+    pub fn closed(&self, reason: String) {
+        let was_open = self.0.open.get();
         self.0.open.set(false);
         *self.0.out.borrow_mut() = None;
         self.0.serials.borrow_mut().drain();
+        if let Some(tx) = self.0.connecting.borrow_mut().take() {
+            let _ = tx.send(Err(anyhow!("{reason}")));
+            return;
+        }
+        if !was_open {
+            return;
+        }
+        let taken = self.0.on_close.borrow_mut().take();
+        match taken {
+            Some(mut handler) => {
+                handler(reason);
+                *self.0.on_close.borrow_mut() = Some(handler);
+            }
+            None => *self.0.closed_early.borrow_mut() = Some(reason),
+        }
     }
 
     pub fn is_open(&self) -> bool {
@@ -87,10 +128,7 @@ impl SshLink {
                 match Pdu::stream_decode(&mut inbound) {
                     Ok(Some(decoded)) => decoded,
                     Ok(None) => return Ok(()),
-                    Err(err) => {
-                        self.closed();
-                        return Err(anyhow!("decoding the stream: {err:#}"));
-                    }
+                    Err(err) => return Err(anyhow!("decoding the stream: {err:#}")),
                 }
             };
             let (serial, pdu) = (decoded.serial, decoded.pdu);
@@ -119,30 +157,6 @@ impl SshLink {
             if answer == Answer::Unmatched {
                 log::error!("the server answered serial {serial}, which nothing asked for");
             }
-        }
-    }
-
-    pub fn lease(&self) -> std::cell::Ref<'_, Lease> {
-        self.0.lease.borrow()
-    }
-
-    pub fn lease_mut(&self) -> std::cell::RefMut<'_, Lease> {
-        self.0.lease.borrow_mut()
-    }
-
-    /// The pushes that arrived since the last call, in order. The core
-    /// loop drains these after every `feed` rather than installing a
-    /// handler, so nothing re-enters the App from inside the decoder.
-    pub fn take_pushes(&self) -> Vec<Pdu> {
-        std::mem::take(&mut *self.0.pending_pushes.borrow_mut())
-    }
-
-    #[allow(dead_code)]
-    pub fn set_push_handler(&self, handler: impl FnMut(Pdu) + 'static) {
-        *self.0.pushes.borrow_mut() = Some(Box::new(handler));
-        let pending = std::mem::take(&mut *self.0.pending_pushes.borrow_mut());
-        for pdu in pending {
-            self.push(pdu);
         }
     }
 
@@ -184,7 +198,7 @@ impl SshLink {
         })
     }
 
-    pub async fn ensure_owner(&self, tab_id: TabId) -> Result<bool> {
+    async fn ensure_owner_now(&self, tab_id: TabId) -> Result<bool> {
         {
             let mut lease = self.0.lease.borrow_mut();
             if lease.owns_viewport() {
@@ -195,17 +209,28 @@ impl SshLink {
             }
             lease.fit = true;
         }
-        self.claim(tab_id).await
+        self.claim_now(tab_id).await
     }
 
-    pub async fn claim(&self, tab_id: TabId) -> Result<bool> {
+    async fn claim_now(&self, tab_id: TabId) -> Result<bool> {
         let viewport = self
             .0
             .lease
             .borrow()
             .claim_viewport()
             .ok_or_else(|| anyhow!("no viewport has been reported yet"))?;
-        let state = self.claim_with(tab_id, viewport.clone()).await?;
+        let (viewport, state) = match self.claim_with(tab_id, viewport.clone()).await {
+            Ok(state) => (viewport, state),
+            Err(err) if matches!(viewport, codec::ClientViewport::Native { .. }) => {
+                log::warn!("pane-by-pane claim refused, claiming the grid: {err:#}");
+                let grid = codec::ClientViewport::CellGrid {
+                    size: viewport.size(),
+                };
+                let state = self.claim_with(tab_id, grid.clone()).await?;
+                (grid, state)
+            }
+            Err(err) => return Err(err),
+        };
         let mut lease = self.0.lease.borrow_mut();
         lease.reported_viewport = Some(viewport);
         lease.apply_viewport(&state);
@@ -228,7 +253,7 @@ impl SshLink {
         .await
     }
 
-    pub async fn report_viewport(&self, tab_id: TabId) -> Result<()> {
+    async fn report_viewport_now(&self, tab_id: TabId) -> Result<()> {
         let viewport = {
             let lease = self.0.lease.borrow();
             match lease.claim_viewport() {
@@ -291,6 +316,59 @@ impl PaneLink for SshLink {
 
     fn prepare(&self, remote_tab_id: TabId) -> Self::Prepare {
         let link = self.clone();
-        Box::pin(async move { link.ensure_owner(remote_tab_id).await })
+        Box::pin(async move { link.ensure_owner_now(remote_tab_id).await })
+    }
+}
+
+impl Link for SshLink {
+    fn reconnect(&self) -> LocalFuture<Result<()>> {
+        self.connect()
+    }
+
+    fn shutdown(&self) {
+        if let Some(out) = self.0.out.borrow_mut().take() {
+            let _ = out.send(Out::Close);
+        }
+        self.0.open.set(false);
+        self.0.serials.borrow_mut().drain();
+    }
+
+    fn lease(&self) -> std::cell::Ref<'_, Lease> {
+        self.0.lease.borrow()
+    }
+
+    fn lease_mut(&self) -> std::cell::RefMut<'_, Lease> {
+        self.0.lease.borrow_mut()
+    }
+
+    fn set_push_handler(&self, handler: Box<dyn FnMut(Pdu)>) {
+        *self.0.pushes.borrow_mut() = Some(handler);
+        let pending = std::mem::take(&mut *self.0.pending_pushes.borrow_mut());
+        for pdu in pending {
+            self.push(pdu);
+        }
+    }
+
+    fn set_close_handler(&self, handler: Box<dyn FnMut(String)>) {
+        let mut handler = handler;
+        if let Some(reason) = self.0.closed_early.borrow_mut().take() {
+            handler(reason);
+        }
+        *self.0.on_close.borrow_mut() = Some(handler);
+    }
+
+    fn ensure_owner(&self, tab_id: TabId) -> LocalFuture<Result<bool>> {
+        let link = self.clone();
+        Box::pin(async move { link.ensure_owner_now(tab_id).await })
+    }
+
+    fn claim(&self, tab_id: TabId) -> LocalFuture<Result<bool>> {
+        let link = self.clone();
+        Box::pin(async move { link.claim_now(tab_id).await })
+    }
+
+    fn report_viewport(&self, tab_id: TabId) -> LocalFuture<Result<()>> {
+        let link = self.clone();
+        Box::pin(async move { link.report_viewport_now(tab_id).await })
     }
 }

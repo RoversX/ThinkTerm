@@ -14,11 +14,10 @@
 //! shell must treat as coming from a background thread.
 
 mod core;
-mod host;
 mod link;
 pub mod painter;
+mod platform;
 mod ssh;
-mod terminal;
 
 use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;
@@ -38,6 +37,17 @@ pub trait Notify: Send + Sync {
     fn on_status(&self, status: String);
     /// A line for the shell's log view.
     fn on_log(&self, line: String);
+    /// The focused pane's title.
+    fn on_title(&self, title: String);
+    /// Something the App shows changed (tabs, the tree, the status); the
+    /// shell reads the views it wants.
+    fn on_change(&self);
+    /// Text the App wants on the clipboard.
+    fn on_clipboard(&self, text: String);
+    /// The App wants the keyboard.
+    fn on_focus_input(&self);
+    /// Where the cursor cell is, in points, in the terminal view.
+    fn on_ime_anchor(&self, left: f64, top: f64, width: f64, height: f64);
 }
 
 /// Rust's `log` output goes to stdout, which the simulator's console shows;

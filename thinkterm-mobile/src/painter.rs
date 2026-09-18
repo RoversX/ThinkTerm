@@ -2,9 +2,9 @@
 //! (CJK, emoji) with the platform's own fonts -- CoreText on iOS -- and the
 //! shared procedure in `thinkterm_web::raster` does the rest.
 
-use crate::host::MobileClock;
 use anyhow::{ensure, Result};
 use std::sync::Arc;
+use std::time::Instant;
 use thinkterm_web::raster::{GlyphPlatform, ScratchGeometry, TextPainter};
 
 /// Implemented by the shell. Called on the core thread, synchronously,
@@ -32,23 +32,23 @@ pub trait GlyphPainter: Send + Sync {
     ) -> Vec<u8>;
 }
 
-pub struct MobilePlatform {
+pub struct GlyphSeams {
     painter: Arc<dyn GlyphPainter>,
-    clock: MobileClock,
+    start: Instant,
 }
 
-impl MobilePlatform {
-    pub fn new(painter: Box<dyn GlyphPainter>, clock: MobileClock) -> Self {
+impl GlyphSeams {
+    pub fn new(painter: Box<dyn GlyphPainter>) -> Self {
         Self {
             painter: Arc::from(painter),
-            clock,
+            start: Instant::now(),
         }
     }
 }
 
-impl GlyphPlatform for MobilePlatform {
+impl GlyphPlatform for GlyphSeams {
     fn now_ms(&self) -> f64 {
-        self.clock.now_ms()
+        self.start.elapsed().as_secs_f64() * 1000.0
     }
 
     fn painter(&self, geometry: &ScratchGeometry, _families: &str) -> Result<Box<dyn TextPainter>> {

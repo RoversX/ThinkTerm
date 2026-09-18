@@ -1,36 +1,40 @@
-//! The core thread: owns the wgpu device, the current surface, the link to
-//! the server and the one pane the S0.5 slice shows. The shape is the one
-//! the plan fixes: device and pipeline outlive any surface; the surface is
-//! optional and carries a generation; drawing is a request the shell
-//! fulfils from its display callback; content changes -- the server's
-//! output, or the demo's clock -- only *ask* for a frame.
+//! The core thread: owns the wgpu device, the surface the shell lends it,
+//! the link to the server and the App -- the same App the browser runs,
+//! over the phone's [`MobilePlatform`] and [`SshLink`].
 //!
-//! The thread drives a `LocalPool` for the session's futures (the request
-//! answers, the input drain, the render-delta drain) and runs it after
-//! every event it handles. Nothing here waits on the shell.
+//! The shape is the one the plan fixes: device and pipeline outlive any
+//! surface; the surface is optional and carries a generation; drawing is a
+//! request the shell fulfils from its display callback; content changes
+//! only *ask* for a frame. The thread drives a `LocalPool` for the App's
+//! futures and fires the App's timers itself. Nothing here waits on the
+//! shell.
 
-use crate::host::{Config, Events, MobileClock, MobileHost, Spawn};
 use crate::link::SshLink;
-use crate::painter::{GlyphPainter, MobilePlatform};
-use crate::ssh::{self, Net, Out, SshParams};
-use crate::terminal::{self, Attached, Terminal};
+use crate::painter::{GlyphPainter, GlyphSeams};
+use crate::platform::MobilePlatform;
+use crate::ssh::{Net, SshParams};
 use crate::Notify;
 use anyhow::{anyhow, Context, Result};
-use futures::executor::{LocalPool, LocalSpawner};
+use futures::executor::LocalPool;
 use futures::task::LocalSpawnExt;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use thinkterm_font_core::FontShaper as _;
 use thinkterm_font_web::{Face, FontSet};
-use thinkterm_render::pipeline::{
-    centred_projection, quad_indices, srgb_format, view_as, AtlasBindGroups, GpuTexture, Pipeline,
-    ShaderUniform,
-};
+use thinkterm_render::pipeline::GpuTexture;
 use thinkterm_render::vertex::{Vertex, IS_SOLID_COLOR};
-use thinkterm_web::fallback::FallbackBudget;
+use thinkterm_web::app::{build_session, grid_for, App, PaneCell, Setup};
+use thinkterm_web::attach::{attach, Attached};
 use thinkterm_web::glyphs::GlyphCache;
-use tokio::sync::mpsc::UnboundedSender;
+use thinkterm_web::gpu::Gpu;
+use thinkterm_web::host::AppHost;
+use thinkterm_web::keymap::{map_key, DomKey};
+use thinkterm_web::platform::{Link, Platform, WheelDelta, WheelInput};
+use wezterm_term::KeyModifiers;
+
+pub type MobileApp = App<MobilePlatform, SshLink>;
 
 pub struct ConnectParams {
     pub ssh: SshParams,
@@ -69,10 +73,10 @@ pub enum Cmd {
     Disconnect,
     /// From the network thread.
     Net(Net),
-    /// The attach handshake finished (posted by its own future).
+    /// The first dial finished.
+    Dialed(Result<(), String>),
+    /// The attach handshake finished.
     Attached(Result<Attached, String>),
-    /// The reattach handshake finished; `Err(true)` is permanent.
-    Reattached(Result<(), (String, bool)>),
     Key {
         name: String,
         ctrl: bool,
@@ -85,30 +89,11 @@ pub enum Cmd {
     Composing(bool),
 }
 
-/// Device-level state: survives surfaces coming and going.
-struct Gpu {
-    adapter: wgpu::Adapter,
-    device: wgpu::Device,
-    queue: Arc<wgpu::Queue>,
-    pipeline: Option<(wgpu::TextureFormat, Pipeline)>,
-    uniform_buffer: wgpu::Buffer,
-    vertex_buffer: wgpu::Buffer,
-    vertex_capacity: usize,
-    index_buffer: wgpu::Buffer,
-    index_quads: usize,
-    /// One white texel for solid quads drawn without an atlas.
-    white: Rc<GpuTexture>,
-    atlas_groups: Vec<(usize, AtlasBindGroups)>,
-    uniform_bind_group: Option<wgpu::BindGroup>,
-    adapter_name: String,
-}
-
-/// The surface currently attached, if any.
+/// The surface currently lent, if any.
 struct Target {
-    surface: wgpu::Surface<'static>,
-    config: wgpu::SurfaceConfiguration,
-    view_format: wgpu::TextureFormat,
     generation: u64,
+    width: u32,
+    height: u32,
     scale: f64,
 }
 
@@ -128,54 +113,40 @@ struct Stats {
     height: u32,
     scale: f64,
     bytes_in: u64,
-    pushes: u64,
+    inputs_sent: u64,
 }
 
-/// The connection, from the shell's point of view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Conn {
     Idle,
     Connecting,
     Attaching,
     Ready,
-    /// Lost after being ready: trying to come back.
-    Reconnecting,
     Disconnected(String),
 }
-
-const RECONNECT_MIN: Duration = Duration::from_millis(500);
-const RECONNECT_MAX: Duration = Duration::from_secs(10);
-const RECONNECT_GIVE_UP: u32 = 30;
 
 struct State {
     cmd_tx: Sender<Cmd>,
     instance: wgpu::Instance,
+    adapter: Option<wgpu::Adapter>,
+    /// The GPU state until the App takes it over.
     gpu: Option<Gpu>,
+    white: Option<Rc<GpuTexture>>,
+    app: Option<Rc<MobileApp>>,
     target: Option<Target>,
     next_generation: u64,
     animating: bool,
     stats: Stats,
     notify: Arc<dyn Notify>,
     pool: LocalPool,
-    spawner: LocalSpawner,
-    clock: MobileClock,
-    link: SshLink,
-    host: Option<Arc<MobileHost>>,
-    net_out: Option<UnboundedSender<Out>>,
+    platform: Rc<MobilePlatform>,
+    link: Option<SshLink>,
     fonts: Option<Rc<FontSet>>,
-    platform: Option<Rc<MobilePlatform>>,
+    glyph_platform: Option<thinkterm_web::raster::Platform>,
     size_pt: f64,
-    /// The glyph cache built for the handshake, handed to the terminal
-    /// once the pane is known.
-    pending_glyphs: Option<GlyphCache>,
-    terminal: Option<Terminal>,
     conn: Conn,
     status: String,
-    /// What to dial again when the transport drops.
-    ssh_params: Option<SshParams>,
-    reconnect_at: Option<Instant>,
-    reconnect_delay: Duration,
-    reconnect_attempts: u32,
+    composing: bool,
 }
 
 pub fn run(cmd_tx: Sender<Cmd>, rx: Receiver<Cmd>, notify: Box<dyn Notify>) {
@@ -187,68 +158,57 @@ pub fn run(cmd_tx: Sender<Cmd>, rx: Receiver<Cmd>, notify: Box<dyn Notify>) {
         ..Default::default()
     });
     let pool = LocalPool::new();
-    let spawner = pool.spawner();
     let notify: Arc<dyn Notify> = Arc::from(notify);
+    let platform = Rc::new(MobilePlatform::new(pool.spawner(), Arc::clone(&notify)));
     let mut state = State {
         cmd_tx,
         instance,
+        adapter: None,
         gpu: None,
+        white: None,
+        app: None,
         target: None,
         next_generation: 1,
         animating: false,
         stats: Stats::default(),
         notify,
         pool,
-        spawner,
-        clock: MobileClock::new(),
-        link: SshLink::new(),
-        host: None,
-        net_out: None,
+        platform,
+        link: None,
         fonts: None,
-        platform: None,
+        glyph_platform: None,
         size_pt: 11.0,
-        pending_glyphs: None,
-        terminal: None,
         conn: Conn::Idle,
         status: String::new(),
-        ssh_params: None,
-        reconnect_at: None,
-        reconnect_delay: RECONNECT_MIN,
-        reconnect_attempts: 0,
+        composing: false,
     };
     state.notify.on_log("core thread up".into());
     state.set_status("idle");
 
     loop {
-        // While animating with a surface and no pane, the demo changes its
-        // scene every 100 ms and asks for a frame. Otherwise sleep until
-        // told; the session's futures are all woken through commands.
-        let mut wait = if state.animating && state.target.is_some() && state.terminal.is_none() {
-            Duration::from_millis(100)
-        } else {
-            Duration::from_secs(3600)
-        };
-        if let Some(at) = state.reconnect_at {
-            wait = wait.min(at.saturating_duration_since(Instant::now()));
+        let now = Instant::now();
+        let mut wait = Duration::from_secs(3600);
+        if state.animating && state.target.is_some() && state.app.is_none() {
+            wait = Duration::from_millis(100);
+        }
+        if let Some(due) = state.platform.next_deadline() {
+            wait = wait.min(due.saturating_duration_since(now));
         }
         match rx.recv_timeout(wait) {
             Ok(Cmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
             Ok(cmd) => state.handle(cmd),
             Err(RecvTimeoutError::Timeout) => {
-                if state.reconnect_at.is_some_and(|at| Instant::now() >= at) {
-                    state.reconnect_at = None;
-                    state.try_reconnect();
-                } else if state.terminal.is_none() {
+                if state.app.is_none() && state.animating {
                     state.stats.phase = state.stats.phase.wrapping_add(1);
                     state.request_frame();
                 }
             }
         }
         state.pool.run_until_stalled();
-        state.after_run();
+        state.platform.fire_due();
+        state.pool.run_until_stalled();
     }
     state.disconnect();
-    state.target = None;
     state.notify.on_log("core thread down".into());
 }
 
@@ -270,27 +230,18 @@ impl State {
                     }
                 };
                 let _ = reply.send(generation);
-                self.fit_terminal();
-                self.try_attach_pane();
             }
             Cmd::Resize {
                 generation,
                 width,
                 height,
                 scale,
-            } => {
-                self.resize(generation, width, height, scale);
-                self.fit_terminal();
-            }
+            } => self.resize(generation, width, height, scale),
             Cmd::Detach { generation, reply } => {
                 self.detach(generation);
                 let _ = reply.send(());
             }
-            Cmd::Render => {
-                if let Err(err) = self.render() {
-                    self.fail(format!("render: {err:#}"));
-                }
-            }
+            Cmd::Render => self.render(),
             Cmd::Animate(on) => {
                 self.animating = on;
                 if on {
@@ -313,69 +264,68 @@ impl State {
                 self.set_status("disconnected");
             }
             Cmd::Net(net) => self.on_net(net),
+            Cmd::Dialed(outcome) => self.on_dialed(outcome),
             Cmd::Attached(outcome) => self.on_attached(outcome),
-            Cmd::Reattached(outcome) => self.on_reattached(outcome),
             Cmd::Key {
                 name,
                 ctrl,
                 alt,
                 shift,
             } => {
-                if let Some(terminal) = self.terminal.as_mut() {
-                    if !terminal.key(&name, ctrl, alt, shift) {
-                        self.notify.on_log(format!("key {name:?} has no mapping"));
+                let Some(app) = self.app.clone() else {
+                    return;
+                };
+                let dom = DomKey {
+                    key: &name,
+                    code: "",
+                    ctrl,
+                    alt,
+                    shift,
+                    meta: false,
+                    composing: false,
+                };
+                match map_key(&dom) {
+                    Some((key, mods)) => {
+                        self.stats.inputs_sent += 1;
+                        app.key_down(key, mods, shift);
                     }
-                    self.request_frame();
+                    None => self.notify.on_log(format!("key {name:?} has no mapping")),
                 }
             }
             Cmd::Text(text) => {
-                if let Some(terminal) = self.terminal.as_mut() {
-                    terminal.text(&text);
-                    self.request_frame();
-                }
-            }
-            Cmd::Composing(on) => {
-                if let Some(terminal) = self.terminal.as_mut() {
-                    terminal.composing = on;
+                if let Some(app) = &self.app {
+                    if !text.is_empty() {
+                        self.stats.inputs_sent += 1;
+                        app.text(&text);
+                    }
                 }
             }
             Cmd::Paste(text) => {
-                if let Some(terminal) = self.terminal.as_mut() {
-                    terminal.paste(&text);
-                    self.request_frame();
+                if let Some(app) = &self.app {
+                    self.stats.inputs_sent += 1;
+                    app.paste(&text);
                 }
             }
             Cmd::Scroll(lines) => {
-                if let Some(terminal) = self.terminal.as_mut() {
-                    terminal.scroll_lines(lines);
-                    self.request_frame();
+                if let Some(app) = self.app.clone() {
+                    let vp = self.platform.viewport();
+                    app.wheel(&WheelInput {
+                        x: vp.width / 2.0,
+                        y: vp.height / 2.0,
+                        // The shell counts lines back into history; the
+                        // App counts down the page.
+                        delta: WheelDelta::Lines(-(lines as f64)),
+                        mods: KeyModifiers::NONE,
+                        ctrl: false,
+                        trusted: true,
+                    });
                 }
             }
-        }
-    }
-
-    /// After the executor ran: pushes the link collected while futures
-    /// were answering, and dirty panes.
-    fn after_run(&mut self) {
-        let pushes = self.link.take_pushes();
-        if !pushes.is_empty() {
-            self.stats.pushes += pushes.len() as u64;
-            let mut repaint = false;
-            for pdu in pushes {
-                if let Some(terminal) = self.terminal.as_mut() {
-                    repaint |= terminal.on_push(pdu);
+            Cmd::Composing(on) => {
+                self.composing = on;
+                if let Some(app) = &self.app {
+                    app.composing(on);
                 }
-            }
-            // A push may have queued futures (render deltas): run them now
-            // so the frame that follows sees their lines.
-            self.pool.run_until_stalled();
-            if repaint {
-                self.request_frame();
-            }
-        }
-        if let Some(host) = &self.host {
-            if !host.events.take_dirty().is_empty() {
-                self.request_frame();
             }
         }
     }
@@ -395,7 +345,7 @@ impl State {
 
     fn request_frame(&mut self) {
         self.stats.frames_requested += 1;
-        self.notify.on_frame_needed();
+        self.platform.request_frame();
     }
 
     // ----- connection -----
@@ -415,176 +365,83 @@ impl State {
         anyhow::ensure!(!faces.is_empty(), "no fonts given");
         self.fonts = Some(Rc::new(FontSet::new(faces)?));
         self.size_pt = params.size_pt;
-        self.platform = Some(Rc::new(MobilePlatform::new(painter, self.clock)));
-
-        let host = Arc::new(MobileHost {
-            clock: self.clock,
-            spawner: Spawn(self.spawner.clone()),
-            events: Events::default(),
-            link: self.link.clone(),
-            config: Config::default(),
-        });
-        let notify = Arc::clone(&self.notify);
-        host.events
-            .set_wake(Rc::new(move || notify.on_frame_needed()));
-        self.host = Some(host);
+        self.glyph_platform = Some(Rc::new(GlyphSeams::new(painter)));
 
         let tx = self.cmd_tx.clone();
-        let deliver: Box<dyn Fn(Net) + Send> = Box::new(move |net| {
-            let _ = tx.send(Cmd::Net(net));
+        let deliver: Box<dyn Fn() -> Box<dyn Fn(Net) + Send>> = Box::new(move || {
+            let tx = tx.clone();
+            Box::new(move |net| {
+                let _ = tx.send(Cmd::Net(net));
+            })
         });
-        self.net_out = Some(ssh::spawn(params.ssh.clone(), deliver));
-        self.ssh_params = Some(params.ssh.clone());
-        self.reconnect_attempts = 0;
-        self.reconnect_delay = RECONNECT_MIN;
-        self.reconnect_at = None;
+        let link = SshLink::new(params.ssh.clone(), deliver);
+        let dial = link.connect();
+        self.link = Some(link);
         self.conn = Conn::Connecting;
         self.set_status(&format!(
             "connecting to {}@{}:{}",
             params.ssh.user, params.ssh.host, params.ssh.port
         ));
+        let tx = self.cmd_tx.clone();
+        self.pool
+            .spawner()
+            .spawn_local(async move {
+                let outcome = dial.await.map_err(|e| format!("{e:#}"));
+                let _ = tx.send(Cmd::Dialed(outcome));
+            })
+            .map_err(|e| anyhow!("spawning the dial: {e}"))?;
         Ok(())
     }
 
+    /// End the connection. The App goes with it; its GPU state comes back
+    /// to the core so the next connection (or the demo) can draw. The
+    /// surface, if lent, is dropped: the shell re-attaches it by calling
+    /// `attach_surface` again, which is what it does on any change anyway.
     fn disconnect(&mut self) {
-        if let Some(out) = self.net_out.take() {
-            let _ = out.send(Out::Close);
+        if let Some(link) = self.link.take() {
+            link.shutdown();
         }
-        self.link.closed();
-        self.terminal = None;
-        self.pending_glyphs = None;
-        self.ssh_params = None;
-        self.reconnect_at = None;
+        if let Some(app) = self.app.take() {
+            // The App's GPU state cannot be moved out of it; a connection
+            // that ends takes the device with it and the next one makes a
+            // fresh one from the surface the shell lends again.
+            drop(app);
+            self.gpu = None;
+            self.white = None;
+            self.target = None;
+            self.notify
+                .on_log("the App and its GPU state are gone; attach the surface again".into());
+        }
         self.conn = Conn::Idle;
     }
 
-    // ----- reconnecting -----
-
-    /// The transport dropped under a live pane: keep the pane, dial again.
-    fn lost(&mut self, reason: &str) {
-        if let Some(terminal) = &self.terminal {
-            terminal.session.set_dead(true);
-        }
-        self.conn = Conn::Reconnecting;
-        self.schedule_reconnect(Duration::ZERO);
-        self.set_status(&format!("connection lost ({reason}); reconnecting"));
-        self.request_frame();
-    }
-
-    fn schedule_reconnect(&mut self, delay: Duration) {
-        if self.reconnect_at.is_none() {
-            self.reconnect_at = Some(Instant::now() + delay);
-        }
-    }
-
-    fn try_reconnect(&mut self) {
-        if self.conn != Conn::Reconnecting {
-            return;
-        }
-        let Some(params) = self.ssh_params.clone() else {
-            return;
-        };
-        if self.reconnect_attempts >= RECONNECT_GIVE_UP {
-            self.conn = Conn::Disconnected("gave up reconnecting".into());
-            self.set_status(&format!(
-                "still disconnected after {} attempts; reconnect by hand",
-                self.reconnect_attempts
-            ));
-            return;
-        }
-        self.reconnect_attempts += 1;
-        self.notify
-            .on_log(format!("reconnect attempt {}", self.reconnect_attempts));
-        let tx = self.cmd_tx.clone();
-        let deliver: Box<dyn Fn(Net) + Send> = Box::new(move |net| {
-            let _ = tx.send(Cmd::Net(net));
-        });
-        self.net_out = Some(ssh::spawn(params, deliver));
-    }
-
-    fn reconnect_failed(&mut self, reason: &str, permanent: bool) {
-        if permanent {
-            self.conn = Conn::Disconnected(reason.to_string());
-            self.set_status(&format!("not reconnecting: {reason}"));
-            if let Some(out) = self.net_out.take() {
-                let _ = out.send(Out::Close);
-            }
-            return;
-        }
-        self.reconnect_delay = (self.reconnect_delay * 2).clamp(RECONNECT_MIN, RECONNECT_MAX);
-        let delay = self.reconnect_delay;
-        self.notify.on_log(format!(
-            "reconnect failed ({reason}); retrying in {delay:?}"
-        ));
-        self.conn = Conn::Reconnecting;
-        self.schedule_reconnect(delay);
-    }
-
-    /// The transport is up again: run the reattach handshake on it.
-    fn start_reattach(&mut self) {
-        let Some(terminal) = self.terminal.as_ref() else {
-            return;
-        };
-        let size = self.target.as_ref().map(|_| terminal.size());
-        let (tab_id, pane_id) = (terminal.tab_id, terminal.pane_id);
-        let link = self.link.clone();
-        let tx = self.cmd_tx.clone();
-        let spawned = self.spawner.spawn_local(async move {
-            let outcome = terminal::reattach(&link, tab_id, pane_id, size)
-                .await
-                .map(|_| ())
-                .map_err(|err| {
-                    let permanent = err.downcast_ref::<terminal::NoPanes>().is_some()
-                        || err.to_string().contains("update the server or the app");
-                    (format!("{err:#}"), permanent)
-                });
-            let _ = tx.send(Cmd::Reattached(outcome));
-        });
-        if let Err(err) = spawned {
-            self.fail(format!("spawning the reattach: {err}"));
-        }
-    }
-
-    fn on_reattached(&mut self, outcome: Result<(), (String, bool)>) {
+    fn on_dialed(&mut self, outcome: Result<(), String>) {
         match outcome {
             Ok(()) => {
-                self.reconnect_attempts = 0;
-                self.reconnect_delay = RECONNECT_MIN;
-                let pane = self.terminal.as_mut().map(|terminal| {
-                    terminal.reconnected();
-                    terminal.pane_id
-                });
-                if let Some(pane) = pane {
-                    self.conn = Conn::Ready;
-                    self.set_status(&format!("pane {pane} · reconnected"));
-                }
-                self.request_frame();
+                self.conn = Conn::Attaching;
+                self.set_status("connected; attaching");
+                self.start_attach();
             }
-            Err((reason, permanent)) => self.reconnect_failed(&reason, permanent),
+            Err(err) => {
+                self.fail(format!("dial: {err}"));
+                self.conn = Conn::Disconnected(err.clone());
+                self.set_status(&format!("failed: {err}"));
+                self.link = None;
+            }
         }
     }
 
     fn on_net(&mut self, net: Net) {
+        let Some(link) = self.link.clone() else {
+            return;
+        };
         match net {
-            Net::Connected => {
-                if let Some(out) = self.net_out.clone() {
-                    self.link.opened(out);
-                }
-                if self.conn == Conn::Reconnecting && self.terminal.is_some() {
-                    self.set_status("reconnected; reattaching");
-                    self.start_reattach();
-                } else {
-                    self.conn = Conn::Attaching;
-                    self.set_status("connected; attaching");
-                    self.try_attach_pane();
-                }
-            }
+            Net::Connected => link.opened(),
             Net::Data(bytes) => {
                 self.stats.bytes_in += bytes.len() as u64;
-                if let Err(err) = self.link.feed(&bytes) {
+                if let Err(err) = link.feed(&bytes) {
                     self.fail(format!("link: {err:#}"));
-                    self.conn = Conn::Disconnected(format!("{err:#}"));
-                    self.set_status(&format!("disconnected: {err:#}"));
+                    link.closed(format!("{err:#}"));
                 }
             }
             Net::Stderr(text) => self.notify.on_log(format!("remote: {}", text.trim_end())),
@@ -592,69 +449,42 @@ impl State {
                 .notify
                 .on_log(format!("remote command exited with {code}")),
             Net::Closed(reason) => {
-                self.link.closed();
-                self.net_out = None;
-                self.pending_glyphs = None;
-                match self.conn {
-                    Conn::Ready => self.lost(&reason),
-                    Conn::Reconnecting => self.reconnect_failed(&reason, false),
-                    _ => {
-                        self.conn = Conn::Disconnected(reason.clone());
-                        self.set_status(&format!("disconnected: {reason}"));
-                        self.request_frame();
-                    }
+                if self.app.is_none() {
+                    self.conn = Conn::Disconnected(reason.clone());
+                    self.set_status(&format!("disconnected: {reason}"));
                 }
+                // With an App up, its close handler takes it from here:
+                // it schedules the redial and reattaches on the same pane.
+                link.closed(reason);
             }
         }
     }
 
-    /// Start the handshake once the link is open and the GPU and fonts
-    /// exist (the glyph metrics decide the grid to report).
-    fn try_attach_pane(&mut self) {
-        if self.conn != Conn::Attaching || self.pending_glyphs.is_some() || self.terminal.is_some()
-        {
-            return;
-        }
-        if !self.link.is_open() {
-            return;
-        }
-        let (Some(gpu), Some(fonts), Some(platform)) = (&self.gpu, &self.fonts, &self.platform)
-        else {
+    /// The link is up: attach to the server's active pane at the grid the
+    /// surface holds (measured with the glyph metrics for this screen).
+    fn start_attach(&mut self) {
+        let (Some(link), Some(fonts)) = (self.link.clone(), self.fonts.clone()) else {
             return;
         };
+        if self.gpu.is_none() {
+            self.fail("attach a surface before connecting".into());
+            return;
+        }
         let scale = self.target.as_ref().map(|t| t.scale).unwrap_or(1.0);
-        // `size_pt` is in the platform's points (1/72 in on iOS), so the
-        // dpi is 72 per unit of scale -- not the browser's 96, which would
-        // make 11 pt a 44 px face on a 3x screen.
-        let dpi = (72.0 * scale) as u32;
-        let side = 1024u32.min(gpu.device.limits().max_texture_dimension_2d);
-        let texture = match GpuTexture::new(&gpu.device, Arc::clone(&gpu.queue), side, side) {
-            Ok(t) => Rc::new(t),
+        let dpi = (self.platform.units_per_inch() * scale) as u32;
+        let metrics = match fonts.metrics(self.size_pt, dpi) {
+            Ok(m) => thinkterm_web::glyphs::RenderMetrics::with_font_metrics(&m),
             Err(err) => {
-                self.fail(format!("atlas: {err:#}"));
-                return;
-            }
-        };
-        let glyphs = match GlyphCache::new(
-            Rc::clone(fonts),
-            self.size_pt,
-            dpi,
-            texture,
-            Rc::from(""),
-            Rc::clone(platform) as thinkterm_web::raster::Platform,
-        ) {
-            Ok(g) => g,
-            Err(err) => {
-                self.fail(format!("glyph cache: {err:#}"));
+                self.fail(format!("font metrics: {err:#}"));
                 return;
             }
         };
         let (cw, ch) = (
-            glyphs.metrics.cell_size.width as u32,
-            glyphs.metrics.cell_size.height as u32,
+            metrics.cell_size.width as u32,
+            metrics.cell_size.height as u32,
         );
         let size = self.target.as_ref().and_then(|t| {
-            terminal::grid_for(t.config.width, t.config.height, cw, ch).map(|(cols, rows)| {
+            grid_for(t.width.saturating_sub(2 * cw), t.height, cw, ch).map(|(cols, rows)| {
                 wezterm_term::TerminalSize {
                     rows,
                     cols,
@@ -664,17 +494,22 @@ impl State {
                 }
             })
         });
-        self.pending_glyphs = Some(glyphs);
         self.notify.on_log(format!(
             "cell {cw}x{ch} px at {} pt, {dpi} dpi; reporting {:?}",
             self.size_pt,
             size.map(|s| (s.cols, s.rows))
         ));
-        let link = self.link.clone();
+        let me = thinkterm_proto::ClientId {
+            hostname: "ios".into(),
+            username: "mobile".into(),
+            pid: std::process::id(),
+            epoch: self.platform.wall_ms() as u64,
+            id: self.platform.random_u32() as usize,
+            ssh_auth_sock: None,
+        };
         let tx = self.cmd_tx.clone();
-        let wall = thinkterm_session::clock::Clock::wall_millis(&self.clock);
-        let spawned = self.spawner.spawn_local(async move {
-            let outcome = terminal::attach(&link, size, wall)
+        let spawned = self.pool.spawner().spawn_local(async move {
+            let outcome = attach(&link, size, 0, me)
                 .await
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Cmd::Attached(outcome));
@@ -685,59 +520,121 @@ impl State {
     }
 
     fn on_attached(&mut self, outcome: Result<Attached, String>) {
-        let Some(glyphs) = self.pending_glyphs.take() else {
-            return;
-        };
-        match outcome {
-            Ok(attached) => {
-                let Some(host) = self.host.clone() else {
-                    return;
-                };
-                let (cw, ch) = (
-                    glyphs.metrics.cell_size.width as u32,
-                    glyphs.metrics.cell_size.height as u32,
-                );
-                let (cols, rows) = self
-                    .target
-                    .as_ref()
-                    .and_then(|t| terminal::grid_for(t.config.width, t.config.height, cw, ch))
-                    .unwrap_or((attached.dims.cols, attached.dims.viewport_rows));
-                let dpi = glyphs.dpi;
-                self.notify.on_log(format!(
-                    "attached to pane {} in tab {} on {} ({cols}x{rows}), server {}",
-                    attached.pane_id, attached.tab_id, attached.server_version, attached.server_id
-                ));
-                self.terminal = Some(Terminal::new(host, glyphs, &attached, cols, rows, dpi));
-                self.conn = Conn::Ready;
-                self.set_status(&format!("pane {} · {}", attached.pane_id, attached.title));
-                self.request_frame();
-            }
+        let attached = match outcome {
+            Ok(attached) => attached,
             Err(err) => {
                 self.fail(format!("attach: {err}"));
                 self.conn = Conn::Disconnected(err.clone());
                 self.set_status(&format!("attach failed: {err}"));
-                if let Some(out) = self.net_out.take() {
-                    let _ = out.send(Out::Close);
+                if let Some(link) = self.link.take() {
+                    link.shutdown();
                 }
+                return;
             }
-        }
-    }
+        };
+        let (Some(link), Some(fonts), Some(glyph_platform), Some(gpu)) = (
+            self.link.clone(),
+            self.fonts.clone(),
+            self.glyph_platform.clone(),
+            self.gpu.take(),
+        ) else {
+            self.fail("attached without a link, fonts or a GPU".into());
+            return;
+        };
+        let scale = self.target.as_ref().map(|t| t.scale).unwrap_or(1.0);
+        let dpi = (self.platform.units_per_inch() * scale) as u32;
+        let side = 1024u32.min(gpu.max_texture_dimension());
+        let glyphs = GpuTexture::new(&gpu.device, Arc::clone(&gpu.queue), side, side)
+            .map(Rc::new)
+            .and_then(|texture| {
+                GlyphCache::new(
+                    Rc::clone(&fonts),
+                    self.size_pt,
+                    dpi,
+                    texture,
+                    Rc::from(""),
+                    glyph_platform,
+                )
+            });
+        let glyphs = match glyphs {
+            Ok(g) => g,
+            Err(err) => {
+                self.fail(format!("glyph cache: {err:#}"));
+                self.gpu = Some(gpu);
+                return;
+            }
+        };
+        let (cw, ch) = (
+            glyphs.metrics.cell_size.width as u32,
+            glyphs.metrics.cell_size.height as u32,
+        );
+        let (cols, rows) = self
+            .target
+            .as_ref()
+            .and_then(|t| grid_for(t.width.saturating_sub(2 * cw), t.height, cw, ch))
+            .unwrap_or((attached.dims.cols, attached.dims.viewport_rows));
 
-    /// The grid follows the surface.
-    fn fit_terminal(&mut self) {
-        let Some(target) = self.target.as_ref() else {
-            return;
-        };
-        let (w, h) = (target.config.width, target.config.height);
-        let Some(terminal) = self.terminal.as_mut() else {
-            return;
-        };
-        let (cw, ch) = terminal.cell_size();
-        if let Some((cols, rows)) = terminal::grid_for(w, h, cw, ch) {
-            if terminal.resize(cols, rows) {
-                self.request_frame();
-            }
+        let host = Arc::new(AppHost::new(Rc::clone(&self.platform), link.clone()));
+        let images = Arc::new(thinkterm_session::Lock::new(
+            thinkterm_session::images::ImageStore::default(),
+        ));
+        let remote_tab_id = Arc::new(std::sync::atomic::AtomicUsize::new(attached.tab_id));
+        let session = build_session(
+            &host,
+            &images,
+            &remote_tab_id,
+            attached.pane_id,
+            attached.dims,
+            &attached.title,
+            attached.alt_screen,
+        );
+        let app = App::new(Setup {
+            platform: Rc::clone(&self.platform),
+            link: link.clone(),
+            host: Arc::clone(&host),
+            images,
+            remote_tab_id,
+            pane: PaneCell::new(session, &attached.title),
+            gpu,
+            glyphs,
+            fonts,
+            pane_id: attached.pane_id,
+            tab_id: attached.tab_id,
+            window_id: attached.window_id,
+            workspace: attached.workspace.clone(),
+            dpr: scale,
+            cols,
+            rows,
+            font_pinned: true,
+            languages: vec![],
+        });
+        host.events.set_wake(app.wake());
+        {
+            let app = Rc::clone(&app);
+            link.set_push_handler(Box::new(move |pdu| app.on_push(pdu)));
         }
+        {
+            let app = Rc::clone(&app);
+            link.set_close_handler(Box::new(move |reason| app.on_close(reason)));
+        }
+        {
+            let notify = Arc::clone(&self.notify);
+            app.set_on_change(Rc::new(move || notify.on_change()));
+        }
+        app.composing(self.composing);
+        app.fetch_tree();
+        app.hide_status();
+        app.refresh_layout();
+        app.poll_layout(5_000);
+        app.resize();
+        app.request_frame();
+        self.notify.on_log(format!(
+            "attached to pane {} in tab {} on {} ({cols}x{rows}), server {}",
+            attached.pane_id, attached.tab_id, attached.server_version, attached.server_id
+        ));
+        self.app = Some(app);
+        self.conn = Conn::Ready;
+        self.set_status(&format!("pane {} · {}", attached.pane_id, attached.title));
     }
 
     // ----- surface -----
@@ -747,41 +644,43 @@ impl State {
             anyhow::bail!("a surface is already attached; detach it first");
         }
         let surface = self.surface_from_layer(layer)?;
-        if self.gpu.is_none() {
-            self.gpu = Some(Self::make_gpu(&self.instance, &surface)?);
-            let name = self.gpu.as_ref().unwrap().adapter_name.clone();
-            self.notify.on_log(format!("gpu ready: {name}"));
+        if self.adapter.is_none() {
+            let adapter = futures::executor::block_on(self.instance.request_adapter(
+                &wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: Some(&surface),
+                    force_fallback_adapter: false,
+                },
+            ))
+            .context("requesting a GPU adapter")?;
+            self.adapter = Some(adapter);
         }
-        let gpu = self.gpu.as_mut().unwrap();
-        let caps = surface.get_capabilities(&gpu.adapter);
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| matches!(f, wgpu::TextureFormat::Bgra8Unorm))
-            .or_else(|| caps.formats.first().copied())
-            .ok_or_else(|| anyhow!("the surface offers no texture format"))?;
-        let view_format = srgb_format(format);
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: width.max(1),
-            height: height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
-            view_formats: vec![view_format],
-            desired_maximum_frame_latency: 2,
-        };
-        surface.configure(&gpu.device, &config);
-        gpu.ensure_pipeline(view_format);
-
+        let adapter = self.adapter.as_ref().expect("adapter just made");
+        match (&self.app, &mut self.gpu) {
+            (Some(app), _) => {
+                app.with_gpu(|g| g.attach_surface(adapter, surface, width, height))?
+            }
+            (None, Some(gpu)) => gpu.attach_surface(adapter, surface, width, height)?,
+            (None, None) => {
+                let gpu = futures::executor::block_on(Gpu::from_surface(
+                    &self.instance,
+                    surface,
+                    width,
+                    height,
+                ))?;
+                let info = gpu.adapter_info.name.clone();
+                self.white = Some(Rc::new(white_texture(&gpu)?));
+                self.gpu = Some(gpu);
+                self.notify.on_log(format!("gpu ready: {info}"));
+            }
+        }
+        self.platform.set_viewport(width, height, scale);
         let generation = self.next_generation;
         self.next_generation += 1;
         self.target = Some(Target {
-            surface,
-            config,
-            view_format,
             generation,
+            width,
+            height,
             scale,
         });
         self.stats.attaches += 1;
@@ -790,9 +689,14 @@ impl State {
         self.stats.height = height;
         self.stats.scale = scale;
         self.notify.on_log(format!(
-            "attached generation {generation}: {width}x{height} @{scale} {format:?}"
+            "attached generation {generation}: {width}x{height} @{scale}"
         ));
-        self.request_frame();
+        if let Some(app) = self.app.clone() {
+            app.resize();
+            app.request_frame();
+        } else {
+            self.request_frame();
+        }
         Ok(generation)
     }
 
@@ -819,97 +723,6 @@ impl State {
         anyhow::bail!("no surface source on this platform yet")
     }
 
-    fn make_gpu(instance: &wgpu::Instance, surface: &wgpu::Surface<'static>) -> Result<Gpu> {
-        let adapter =
-            futures::executor::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(surface),
-                force_fallback_adapter: false,
-            }))
-            .context("requesting a GPU adapter")?;
-        let (device, queue) =
-            futures::executor::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("thinkterm-mobile"),
-                required_features: wgpu::Features::empty(),
-                required_limits:
-                    wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
-                memory_hints: wgpu::MemoryHints::Performance,
-                trace: wgpu::Trace::Off,
-            }))
-            .context("requesting the GPU device")?;
-        let queue = Arc::new(queue);
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ShaderUniform"),
-            size: std::mem::size_of::<ShaderUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let vertex_capacity = 4096;
-        let vertex_buffer = Self::make_vertex_buffer(&device, vertex_capacity);
-        let index_quads = 1024;
-        let index_buffer = Self::make_index_buffer(&device, &queue, index_quads);
-        let white = GpuTexture::new(&device, Arc::clone(&queue), 1, 1)?;
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: white.texture(),
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &[255, 255, 255, 255],
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4),
-                rows_per_image: Some(1),
-            },
-            wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-        );
-        let adapter_name = {
-            let info = adapter.get_info();
-            format!("{} ({:?})", info.name, info.backend)
-        };
-        Ok(Gpu {
-            adapter,
-            device,
-            queue,
-            pipeline: None,
-            uniform_buffer,
-            vertex_buffer,
-            vertex_capacity,
-            index_buffer,
-            index_quads,
-            white: Rc::new(white),
-            atlas_groups: Vec::new(),
-            uniform_bind_group: None,
-            adapter_name,
-        })
-    }
-
-    fn make_vertex_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
-        device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("vertices"),
-            size: (capacity * std::mem::size_of::<Vertex>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })
-    }
-
-    fn make_index_buffer(device: &wgpu::Device, queue: &wgpu::Queue, quads: usize) -> wgpu::Buffer {
-        let indices = quad_indices(quads);
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("indices"),
-            size: (indices.len() * std::mem::size_of::<u32>()) as u64,
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&indices));
-        buffer
-    }
-
     fn resize(&mut self, generation: u64, width: u32, height: u32, scale: f64) {
         let Some(target) = self.target.as_mut() else {
             return;
@@ -922,25 +735,33 @@ impl State {
             return;
         }
         let (width, height) = (width.max(1), height.max(1));
-        target.scale = scale;
-        self.stats.scale = scale;
-        if (width, height) == (target.config.width, target.config.height) {
+        if (width, height, scale) == (target.width, target.height, target.scale) {
             return;
         }
-        target.config.width = width;
-        target.config.height = height;
-        let gpu = self.gpu.as_ref().expect("gpu exists while a target does");
-        target.surface.configure(&gpu.device, &target.config);
+        target.width = width;
+        target.height = height;
+        target.scale = scale;
+        self.platform.set_viewport(width, height, scale);
         self.stats.resizes += 1;
         self.stats.width = width;
         self.stats.height = height;
-        self.request_frame();
+        self.stats.scale = scale;
+        if let Some(app) = self.app.clone() {
+            app.resize();
+        } else if let Some(gpu) = self.gpu.as_mut() {
+            gpu.resize(width, height);
+            self.request_frame();
+        }
     }
 
     fn detach(&mut self, generation: u64) {
         match self.target.take() {
             Some(target) if target.generation == generation => {
-                drop(target);
+                if let Some(app) = &self.app {
+                    app.with_gpu(|g| g.detach_surface());
+                } else if let Some(gpu) = self.gpu.as_mut() {
+                    gpu.detach_surface();
+                }
                 self.stats.detaches += 1;
                 self.notify
                     .on_log(format!("detached generation {generation}"));
@@ -960,140 +781,52 @@ impl State {
 
     // ----- frames -----
 
-    fn render(&mut self) -> Result<()> {
-        let Some(target) = self.target.as_mut() else {
-            // A frame requested before the surface came, or after it went:
-            // nothing to draw on, and nothing to do.
-            return Ok(());
-        };
-        let gpu = self.gpu.as_mut().expect("gpu exists while a target does");
+    fn render(&mut self) {
         let started = Instant::now();
-        let (w, h) = (target.config.width, target.config.height);
-
-        let (vertices, texture, background): (Vec<Vertex>, Rc<GpuTexture>, [f32; 4]) =
-            match (self.terminal.as_mut(), self.platform.as_ref()) {
-                (Some(terminal), Some(platform)) => {
-                    let mut budget = FallbackBudget::new(
-                        thinkterm_web::raster::GlyphPlatform::now_ms(&**platform),
-                    );
-                    let (vertices, bg) = {
-                        let (vertices, _, bg) = terminal.paint((w, h), &mut budget)?;
-                        (vertices.to_vec(), bg.tuple())
-                    };
-                    // Glyphs the budget put off are owed to the next frame.
-                    let owed = budget.deferred() + terminal.glyphs.declined();
-                    if owed > 0 {
-                        self.stats.frames_requested += 1;
-                        self.notify.on_frame_needed();
-                    }
-                    (
-                        vertices,
-                        terminal.glyphs.texture_rc(),
-                        [bg.0, bg.1, bg.2, bg.3],
-                    )
-                }
-                _ => (
-                    demo_scene(w as f32, h as f32, target.scale as f32, self.stats.phase),
-                    Rc::clone(&gpu.white),
-                    [0.07, 0.07, 0.09, 1.0],
-                ),
-            };
-
-        let uniforms = ShaderUniform {
-            foreground_text_hsb: [1.0, 1.0, 1.0],
-            milliseconds: (started.elapsed().as_millis() % u32::MAX as u128) as u32,
-            viewport_and_corner: [w as f32, h as f32, 0.0, 0.0],
-            window_border: [0.0; 4],
-            projection: centred_projection(w as f32, h as f32),
-        };
-        gpu.queue
-            .write_buffer(&gpu.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
-        let quads = gpu.upload_vertices(&vertices);
-        let group = gpu.atlas_groups(&texture);
-
-        let frame = match target.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(wgpu::SurfaceError::Lost) | Err(wgpu::SurfaceError::Outdated) => {
-                target.surface.configure(&gpu.device, &target.config);
-                target
-                    .surface
-                    .get_current_texture()
-                    .context("acquiring the frame after reconfiguring")?
+        if self.app.is_some() {
+            if self.platform.run_frame() {
+                self.stats.frames += 1;
+                self.stats.last_frame_us = started.elapsed().as_micros();
             }
-            Err(wgpu::SurfaceError::Timeout) => {
-                self.notify.on_log("frame skipped: surface timeout".into());
-                return Ok(());
-            }
-            Err(err) => return Err(anyhow!("acquiring the frame: {err}")),
-        };
-        let view = view_as(&frame.texture, target.view_format);
-        let pipeline = &gpu.pipeline.as_ref().expect("pipeline built at attach").1;
-        let groups = &gpu.atlas_groups[group].1;
-        let uniform_group = gpu
-            .uniform_bind_group
-            .as_ref()
-            .expect("uniform group built at attach");
-        let mut encoder = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("frame"),
-            });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("pane"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: background[0] as f64,
-                            g: background[1] as f64,
-                            b: background[2] as f64,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            if quads > 0 {
-                pass.set_pipeline(&pipeline.render_pipeline);
-                pass.set_bind_group(0, uniform_group, &[]);
-                pass.set_bind_group(1, &groups.linear, &[]);
-                pass.set_bind_group(2, &groups.nearest, &[]);
-                pass.set_vertex_buffer(0, gpu.vertex_buffer.slice(..));
-                pass.set_index_buffer(gpu.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..(quads * 6) as u32, 0, 0..1);
-            }
+            return;
         }
-        gpu.queue.submit(Some(encoder.finish()));
-        frame.present();
+        // No App yet: the demo, so the surface path can be seen working.
+        self.platform.run_frame();
+        let (Some(target), Some(gpu), Some(white)) =
+            (self.target.as_ref(), self.gpu.as_mut(), self.white.as_ref())
+        else {
+            return;
+        };
+        let vertices = demo_scene(
+            target.width as f32,
+            target.height as f32,
+            target.scale as f32,
+            self.stats.phase,
+        );
+        if let Err(err) = gpu.draw_batches(&[(&vertices, white)], [0.07, 0.07, 0.09, 1.0], 0) {
+            self.fail(format!("render: {err:#}"));
+            return;
+        }
         self.stats.frames += 1;
         self.stats.last_frame_us = started.elapsed().as_micros();
-        Ok(())
     }
 
     fn stats_json(&self) -> String {
         let s = &self.stats;
-        let adapter = self
-            .gpu
+        let layout = self
+            .app
             .as_ref()
-            .map(|g| g.adapter_name.clone())
+            .map(|a| a.layout_view())
+            .unwrap_or_else(|| "null".into());
+        // The App's own grid is in its layout JSON as "canvas":[cols,rows].
+        let grid = layout
+            .split("\"canvas\":[")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .map(|cr| cr.replace(',', "x"))
             .unwrap_or_default();
-        let grid = self
-            .terminal
-            .as_ref()
-            .map(|t| format!("{}x{}", t.cols, t.rows))
-            .unwrap_or_default();
-        let (inputs, composing) = self
-            .terminal
-            .as_ref()
-            .map(|t| (t.inputs_sent, t.composing))
-            .unwrap_or((0, false));
         format!(
-            "{{\"attached\":{},\"generation\":{},\"size\":\"{}x{}@{}\",\"attaches\":{},\"detaches\":{},\"resizes\":{},\"frames\":{},\"frames_requested\":{},\"last_frame_us\":{},\"phase\":{},\"animating\":{},\"errors\":{},\"last_error\":{:?},\"adapter\":{:?},\"conn\":{:?},\"grid\":{:?},\"bytes_in\":{},\"pushes\":{},\"inputs_sent\":{},\"composing\":{}}}",
+            "{{\"attached\":{},\"generation\":{},\"size\":\"{}x{}@{}\",\"attaches\":{},\"detaches\":{},\"resizes\":{},\"frames\":{},\"frames_requested\":{},\"last_frame_us\":{},\"phase\":{},\"animating\":{},\"errors\":{},\"last_error\":{:?},\"conn\":{:?},\"grid\":{:?},\"bytes_in\":{},\"inputs_sent\":{},\"composing\":{},\"layout\":{}}}",
             self.target.is_some(),
             s.generation,
             s.width,
@@ -1109,65 +842,38 @@ impl State {
             self.animating,
             s.errors,
             s.last_error,
-            adapter,
             format!("{:?}", self.conn),
             grid,
             s.bytes_in,
-            s.pushes,
-            inputs,
-            composing,
+            s.inputs_sent,
+            self.composing,
+            layout,
         )
     }
 }
 
-impl Gpu {
-    fn ensure_pipeline(&mut self, view_format: wgpu::TextureFormat) {
-        let stale = self
-            .pipeline
-            .as_ref()
-            .map(|(format, _)| *format != view_format)
-            .unwrap_or(true);
-        if stale {
-            let pipeline = Pipeline::new(&self.device, view_format);
-            self.uniform_bind_group =
-                Some(pipeline.uniform_bind_group(&self.device, &self.uniform_buffer));
-            self.pipeline = Some((view_format, pipeline));
-            self.atlas_groups.clear();
-        }
-    }
-
-    /// Bind groups for `atlas`, made on first sight and kept for a few.
-    fn atlas_groups(&mut self, atlas: &GpuTexture) -> usize {
-        let identity = atlas.id();
-        if let Some(i) = self.atlas_groups.iter().position(|(id, _)| *id == identity) {
-            return i;
-        }
-        if self.atlas_groups.len() >= 8 {
-            self.atlas_groups.remove(0);
-        }
-        let pipeline = &self.pipeline.as_ref().expect("pipeline built at attach").1;
-        let groups = pipeline.atlas_bind_groups(&self.device, &atlas.view());
-        self.atlas_groups.push((identity, groups));
-        self.atlas_groups.len() - 1
-    }
-
-    fn upload_vertices(&mut self, vertices: &[Vertex]) -> usize {
-        let quads = vertices.len() / 4;
-        if vertices.len() > self.vertex_capacity {
-            self.vertex_capacity = vertices.len().next_power_of_two();
-            self.vertex_buffer = State::make_vertex_buffer(&self.device, self.vertex_capacity);
-        }
-        if quads > self.index_quads {
-            self.index_quads = quads.next_power_of_two();
-            self.index_buffer =
-                State::make_index_buffer(&self.device, &self.queue, self.index_quads);
-        }
-        if !vertices.is_empty() {
-            self.queue
-                .write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(vertices));
-        }
-        quads
-    }
+fn white_texture(gpu: &Gpu) -> Result<GpuTexture> {
+    let white = GpuTexture::new(&gpu.device, Arc::clone(&gpu.queue), 1, 1)?;
+    gpu.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: white.texture(),
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &[255, 255, 255, 255],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    Ok(white)
 }
 
 /// A grid of coloured cells the size a terminal's would be, one of them

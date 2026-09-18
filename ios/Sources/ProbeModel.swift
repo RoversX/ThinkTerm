@@ -400,6 +400,19 @@ private final class NotifySink: Notify, @unchecked Sendable {
     func onFrameNeeded() { model?.coreWantsFrame() }
     func onStatus(status: String) { model?.coreStatus(status) }
     func onLog(line: String) { model?.coreLogged(line) }
+    func onTitle(title: String) { model?.coreLogged("title: " + title) }
+    func onChange() {}
+    func onClipboard(text: String) {
+        DispatchQueue.main.async { UIPasteboard.general.string = text }
+    }
+    func onFocusInput() {
+        DispatchQueue.main.async { self.model?.focusKeyboard() }
+    }
+    func onImeAnchor(left: Double, top: Double, width: Double, height: Double) {
+        DispatchQueue.main.async {
+            self.model?.cursorRect = CGRect(x: left, y: top, width: width, height: height)
+        }
+    }
 }
 
 /// Paints the graphemes the bundled faces lack with CoreText, which falls
