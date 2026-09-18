@@ -350,6 +350,15 @@ struct PreviewSwitch {
     fade: Timeline,
 }
 
+/// How long a card keeps showing the tab it was previewing while the tab
+/// it should now preview has no picture yet. Captures are one per frame
+/// and a remote tab's rows take a round trip, so the first frames after a
+/// hover would otherwise crossfade to a blank panel and then pop. A tab
+/// that never yields a picture -- a remote gone quiet -- is switched to
+/// anyway once this runs out, so the panel cannot stay on a tab its dot
+/// no longer names.
+const PREVIEW_SWITCH_WAIT: Duration = Duration::from_secs(1);
+
 /// What a tab is up to, as its dot tells it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TabActivity {
@@ -511,6 +520,9 @@ pub(crate) struct LiveOverviewView {
     dot_selection: HashMap<TabId, Timeline>,
     /// Cards whose preview is crossfading from one tab to another.
     preview_switches: HashMap<LiveThreadKey, PreviewSwitch>,
+    /// Cards holding their old picture while the new tab's is captured:
+    /// which tab they are waiting on, and since when.
+    preview_switch_waits: HashMap<LiveThreadKey, (TabId, Instant)>,
     /// Which tab each card previewed last frame; a change starts a switch.
     last_previewed: HashMap<LiveThreadKey, TabId>,
     /// Whether any capsule animation (dot selection, preview switch) is
@@ -602,6 +614,7 @@ impl LiveOverviewView {
             pill_expansion: None,
             dot_selection: HashMap::new(),
             preview_switches: HashMap::new(),
+            preview_switch_waits: HashMap::new(),
             last_previewed: HashMap::new(),
             capsule_motion_running: false,
             last_ui_scale: 1.0,
@@ -759,6 +772,7 @@ impl LiveOverviewView {
         self.dot_selection
             .retain(|tab_id, _| tab_keys.contains_key(tab_id));
         self.preview_switches.retain(|key, _| live_keys.contains(key));
+        self.preview_switch_waits.retain(|key, _| live_keys.contains(key));
         self.last_previewed.retain(|key, _| live_keys.contains(key));
 
         groups
@@ -1195,8 +1209,14 @@ impl LiveOverviewView {
                                 // picture out under the new one. The old
                                 // tab's snapshot is kept warm for the length
                                 // of the fade.
+                                // A picture worth switching to: the rows
+                                // are all there, or enough of them to show
+                                // something.
+                                let ready = snapshot
+                                    .as_ref()
+                                    .is_some_and(|snapshot| snapshot.complete || snapshot.has_content());
                                 let (from, arrived) =
-                                    self.preview_switch_for(&card.key, tab_id, now);
+                                    self.preview_switch_for(&card.key, tab_id, ready, now);
                                 if let Some(from) = from {
                                     if let Some(cached) = self.snapshot_cache.get(&from) {
                                         warm_tabs.insert(from);
@@ -1211,14 +1231,21 @@ impl LiveOverviewView {
                                     }
                                 }
                                 if let Some(snapshot) = snapshot.as_ref() {
-                                    self.previews.push(TerminalPreviewRequest {
-                                        tab_id,
-                                        snapshot: Arc::clone(snapshot),
-                                        area: preview,
-                                        clip,
-                                        hold_scale: self.live_resizing,
-                                        opacity: arrived,
-                                    });
+                                    // A held-back picture is not drawn --
+                                    // it would spend the frame's one quad
+                                    // rebuild on something invisible -- but
+                                    // its panes are wanted, so their rows
+                                    // arriving repaints the card.
+                                    if arrived > 0.0 || from.is_none() {
+                                        self.previews.push(TerminalPreviewRequest {
+                                            tab_id,
+                                            snapshot: Arc::clone(snapshot),
+                                            area: preview,
+                                            clip,
+                                            hold_scale: self.live_resizing,
+                                            opacity: arrived,
+                                        });
+                                    }
                                     self.visible_panes
                                         .extend(snapshot.panes.iter().map(|pane| pane.pane_id));
                                 }
@@ -1820,8 +1847,42 @@ impl LiveOverviewView {
     }
 
     /// The old picture a card is fading out, and how far in the new one is.
-    /// Starts a crossfade the frame a card's previewed tab changes.
-    fn preview_switch_for(&mut self, key: &LiveThreadKey, tab_id: TabId, now: Instant) -> (Option<TabId>, f32) {
+    /// Starts a crossfade the frame a card's previewed tab changes and has
+    /// a picture (`ready`); until it has one the old tab's picture stands
+    /// in whole, for at most `PREVIEW_SWITCH_WAIT`.
+    fn preview_switch_for(
+        &mut self,
+        key: &LiveThreadKey,
+        tab_id: TabId,
+        ready: bool,
+        now: Instant,
+    ) -> (Option<TabId>, f32) {
+        if let Some(previous) = self.last_previewed.get(key).copied() {
+            // A fade already running is left to run: freezing it under a
+            // hold and restarting it later would jump the picture.
+            let fading = self.preview_switches.contains_key(key);
+            if previous != tab_id && !ready && !fading {
+                let since = match self.preview_switch_waits.get(key) {
+                    Some((waiting_on, since)) if *waiting_on == tab_id => *since,
+                    _ => {
+                        self.preview_switch_waits.insert(key.clone(), (tab_id, now));
+                        now
+                    }
+                };
+                let give_up = since + PREVIEW_SWITCH_WAIT;
+                if now < give_up {
+                    // The picture's arrival repaints through the new tab's
+                    // panes being wanted; this is for the case it never
+                    // comes.
+                    self.next_preview_refresh = Some(
+                        self.next_preview_refresh
+                            .map_or(give_up, |current| current.min(give_up)),
+                    );
+                    return (Some(previous), 0.0);
+                }
+            }
+        }
+        self.preview_switch_waits.remove(key);
         if let Some(previous) = self.last_previewed.insert(key.clone(), tab_id) {
             if previous != tab_id {
                 self.preview_switches.insert(
@@ -4425,19 +4486,94 @@ mod tests {
         let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
         let key = card_key();
         let start = Instant::now();
-        assert_eq!(view.preview_switch_for(&key, 7, start), (None, 1.0));
+        assert_eq!(view.preview_switch_for(&key, 7, true, start), (None, 1.0));
         // Same tab again: nothing to fade.
-        assert_eq!(view.preview_switch_for(&key, 7, start), (None, 1.0));
-        let (from, arrived) = view.preview_switch_for(&key, 8, start);
+        assert_eq!(view.preview_switch_for(&key, 7, true, start), (None, 1.0));
+        let (from, arrived) = view.preview_switch_for(&key, 8, true, start);
         assert_eq!(from, Some(7));
         assert!(arrived < 1.0);
         assert!(view.capsule_motion_running);
         // The clock starts on the frame after the first sample, as every
         // Timeline's does; then the fade runs its course.
-        let (from, _) = view.preview_switch_for(&key, 8, start + Duration::from_millis(16));
+        let (from, _) = view.preview_switch_for(&key, 8, true, start + Duration::from_millis(16));
         assert_eq!(from, Some(7));
-        let (from, arrived) = view.preview_switch_for(&key, 8, start + Duration::from_secs(2));
+        let (from, arrived) =
+            view.preview_switch_for(&key, 8, true, start + Duration::from_secs(2));
         assert_eq!((from, arrived), (None, 1.0));
+    }
+
+    /// The new tab has no picture on the frame the pointer reaches its dot:
+    /// captures are one per frame, and a remote tab's rows take a round
+    /// trip. The old picture stands whole until one arrives, and the
+    /// crossfade starts then; a tab that never yields one is switched to
+    /// after a bound, so the panel cannot stay on a tab its dot no longer
+    /// names.
+    #[test]
+    fn a_card_holds_its_old_picture_until_the_new_tab_has_one() {
+        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
+        let key = card_key();
+        let start = Instant::now();
+        assert_eq!(view.preview_switch_for(&key, 7, true, start), (None, 1.0));
+        // No picture yet: the old one, whole, and no fade running.
+        assert_eq!(view.preview_switch_for(&key, 8, false, start), (Some(7), 0.0));
+        assert!(!view.capsule_motion_running);
+        assert_eq!(view.next_preview_refresh, Some(start + PREVIEW_SWITCH_WAIT));
+        let later = start + Duration::from_millis(200);
+        assert_eq!(view.preview_switch_for(&key, 8, false, later), (Some(7), 0.0));
+        // The picture arrives: the crossfade begins from the old tab.
+        let (from, arrived) = view.preview_switch_for(&key, 8, true, later);
+        assert_eq!(from, Some(7));
+        assert!(arrived < 1.0);
+        assert!(view.capsule_motion_running);
+        assert!(view.preview_switch_waits.is_empty());
+
+        // A tab that never yields a picture is switched to regardless once
+        // the wait runs out.
+        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
+        assert_eq!(view.preview_switch_for(&key, 7, true, start), (None, 1.0));
+        assert_eq!(view.preview_switch_for(&key, 8, false, start), (Some(7), 0.0));
+        let (from, arrived) =
+            view.preview_switch_for(&key, 8, false, start + PREVIEW_SWITCH_WAIT);
+        assert_eq!(from, Some(7));
+        assert!(arrived < 1.0, "the fade to the (blank) new tab has begun");
+        assert!(view.preview_switch_waits.is_empty());
+
+        // The wait is per target: moving on to a third tab before the
+        // first wait ran out starts that tab's own wait.
+        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
+        assert_eq!(view.preview_switch_for(&key, 7, true, start), (None, 1.0));
+        assert_eq!(view.preview_switch_for(&key, 8, false, start), (Some(7), 0.0));
+        let third = start + Duration::from_millis(900);
+        assert_eq!(view.preview_switch_for(&key, 9, false, third), (Some(7), 0.0));
+        assert_eq!(
+            view.preview_switch_for(&key, 9, false, start + PREVIEW_SWITCH_WAIT),
+            (Some(7), 0.0),
+            "tab 9's wait began at 900ms, not at 0"
+        );
+        let (from, arrived) =
+            view.preview_switch_for(&key, 9, false, third + PREVIEW_SWITCH_WAIT);
+        assert_eq!(from, Some(7));
+        assert!(arrived < 1.0);
+    }
+
+    /// A fade that is already running is not frozen by a hold: the pointer
+    /// moving on to a tab without a picture lets the running fade finish
+    /// rather than snapping the half-blended picture back.
+    #[test]
+    fn a_running_crossfade_is_not_frozen_by_a_hold() {
+        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
+        let key = card_key();
+        let start = Instant::now();
+        assert_eq!(view.preview_switch_for(&key, 7, true, start), (None, 1.0));
+        let (from, _) = view.preview_switch_for(&key, 8, true, start);
+        assert_eq!(from, Some(7));
+        // On to 9, which has no picture, mid-fade: a new fade from 8
+        // starts rather than a hold on the frozen 7->8 one.
+        let (from, arrived) =
+            view.preview_switch_for(&key, 9, false, start + Duration::from_millis(50));
+        assert_eq!(from, Some(8));
+        assert!(arrived < 1.0);
+        assert!(view.preview_switch_waits.is_empty());
     }
 
     #[test]
