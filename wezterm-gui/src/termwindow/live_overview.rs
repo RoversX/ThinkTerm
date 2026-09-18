@@ -3118,13 +3118,20 @@ where
 
     let mut retry = None;
     if let Some((snapshot, complete)) = capture() {
-        // An incomplete picture never displaces a whole one: the rows it
-        // lacks are blank, and the held picture's rows were at least real.
-        // It does replace nothing, or another incomplete one -- possibly
-        // with fewer real rows, which is still the current state of the
-        // terminal rather than a stale one.
+        // An incomplete picture never displaces a whole one of the same
+        // shape: the rows it lacks are blank, and the held picture's rows
+        // were at least real. A whole picture of another shape -- the
+        // terminal resized under it, a pane split -- is a stale picture,
+        // and blank rows at the right size beat real rows at the wrong
+        // one; it is displaced. So is nothing, or another incomplete
+        // picture, possibly with fewer real rows, which is still the
+        // current state of the terminal rather than an old one.
         let (snapshot, incomplete_captures) = match cache.remove(key) {
-            Some(previous) if !complete && previous.incomplete_captures == 0 => {
+            Some(previous)
+                if !complete
+                    && previous.incomplete_captures == 0
+                    && same_geometry(&previous.fingerprint, &fingerprint) =>
+            {
                 (previous.snapshot, 1)
             }
             Some(previous) if !complete && previous.fingerprint == fingerprint => {
@@ -3153,6 +3160,36 @@ where
         cache.get(key).map(|cached| Arc::clone(&cached.snapshot)),
         retry,
     )
+}
+
+/// Whether two fingerprints describe the same shape of picture: the same
+/// panes in the same places at the same sizes. Output, cursor, palette and
+/// rows arriving are not shape.
+fn same_geometry(a: &TerminalPreviewFingerprint, b: &TerminalPreviewFingerprint) -> bool {
+    let shape = |fingerprint: &TerminalPreviewFingerprint| {
+        (
+            fingerprint.tab_size,
+            fingerprint.splits.clone(),
+            fingerprint
+                .panes
+                .iter()
+                .map(|pane| {
+                    (
+                        pane.pane_id,
+                        pane.index,
+                        pane.is_zoomed,
+                        pane.left,
+                        pane.top,
+                        pane.width,
+                        pane.height,
+                        pane.dimensions.cols,
+                        pane.dimensions.viewport_rows,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    shape(a) == shape(b)
 }
 
 /// Whether `later` differs from `earlier` by rows having arrived for some
@@ -4219,6 +4256,72 @@ mod tests {
             || Some((9_u8, true)),
         );
         assert_eq!((*snapshot.unwrap(), due), (9, None));
+    }
+
+    /// The terminal resized under a whole picture: the next capture comes
+    /// back incomplete because the resize flushed the rows, and it must
+    /// still displace the whole picture, whose shape is now wrong.
+    #[test]
+    fn a_resized_terminal_takes_the_incomplete_picture_over_the_stale_one() {
+        let key = LiveThreadKey {
+            space_id: "local".to_string(),
+            thread_id: "thread".to_string(),
+        };
+        let mut cache = HashMap::new();
+        let now = Instant::now();
+        let mut budget = usize::MAX;
+        let interval = Duration::from_millis(300);
+        let fingerprint = test_fingerprint(1);
+        let (snapshot, _) = resolve_snapshot(
+            &mut cache,
+            &key,
+            Some(fingerprint.clone()),
+            now,
+            Some(interval),
+            &mut budget,
+            || Some((7_u8, true)),
+        );
+        assert_eq!(*snapshot.unwrap(), 7);
+
+        let mut wider = fingerprint.clone();
+        wider.panes[0].dimensions.cols = 200;
+        wider.panes[0].width = 200;
+        wider.panes[0].seqno = 2;
+        let (snapshot, due) = resolve_snapshot(
+            &mut cache,
+            &key,
+            Some(wider.clone()),
+            now + interval,
+            Some(interval),
+            &mut budget,
+            || Some((8_u8, false)),
+        );
+        assert_eq!(*snapshot.unwrap(), 8, "the wrong shape is not kept");
+        assert_eq!(due, Some(now + interval * 2));
+
+        // Same shape, output only: the whole picture is kept as before.
+        let (snapshot, _) = resolve_snapshot(
+            &mut cache,
+            &key,
+            Some(wider.clone()),
+            now + interval * 2,
+            Some(interval),
+            &mut budget,
+            || Some((9_u8, true)),
+        );
+        assert_eq!(*snapshot.unwrap(), 9);
+        let mut output = wider.clone();
+        output.panes[0].seqno = 3;
+        let (snapshot, _) = resolve_snapshot(
+            &mut cache,
+            &key,
+            Some(output),
+            now + interval * 3,
+            Some(interval),
+            &mut budget,
+            || Some((10_u8, false)),
+        );
+        assert_eq!(*snapshot.unwrap(), 9);
     }
 
     #[test]
