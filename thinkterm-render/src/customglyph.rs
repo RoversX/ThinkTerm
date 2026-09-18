@@ -647,6 +647,18 @@ pub enum PolyStyle {
     Fill,
     OutlineAlpha,
     OutlineThin,
+    /// Exactly one pixel wide, for a path already inset by half a pixel so
+    /// that the stroke lands just inside the shape's edge.
+    ///
+    /// This is the corner arc of a rounded outline, whose straight strips
+    /// are one-pixel rects drawn inside the shape. OutlineThin's 1.2 is
+    /// both wider than those strips and centred on the shape's edge, which
+    /// puts half of it outside: where the arc runs diagonally the whole
+    /// 1.2 lands, so the corner reads heavier and spills a fringe beyond
+    /// the fill, and where the arc turns tangent to the cell edge -- the
+    /// join -- the outer half is clipped away and the arc arrives 31%
+    /// dimmer than the strip it meets.
+    OutlineEdge,
     // A line with the thickness as underlines
     Outline,
     // A line with twice the thickness of underlines
@@ -661,6 +673,7 @@ impl PolyStyle {
             }
 
             PolyStyle::OutlineThin
+            | PolyStyle::OutlineEdge
             | PolyStyle::Outline
             | PolyStyle::OutlineHeavy
             | PolyStyle::OutlineAlpha => {
@@ -670,6 +683,10 @@ impl PolyStyle {
                     stroke.width *= 3.01; // NOTE: Changing this makes block cursor disproportionate at different font sizes and resolutions
                 } else if self == PolyStyle::OutlineThin {
                     stroke.width = 1.2;
+                } else if self == PolyStyle::OutlineEdge {
+                    // The same one pixel the straight strips of the outline
+                    // are; the path carries the half-pixel inset.
+                    stroke.width = 1.0;
                 } else if self == PolyStyle::OutlineAlpha {
                     stroke.width = 0.25; // NOTE: This is for filling antialiased border between triangles when using the alpha style
                 }

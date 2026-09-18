@@ -174,40 +174,57 @@ pub const BOTTOM_RIGHT_ROUNDED_CORNER_MASK: &[Poly] = &[Poly {
 // Sharing one primitive is what makes them agree by construction rather
 // than by two curves happening to be close.
 
+// The border stroke of a rounded corner: the arc of the fill above, pulled
+// half a pixel inwards so that a one-pixel stroke centred on it covers the
+// fill's outermost pixel and nothing beyond. `Frac(1, 1)` is that inset --
+// `to_pixel` nudges any coordinate landing on a whole pixel down by half a
+// pixel, and a corner cell is always a whole number of pixels across, so the
+// radius comes out at R - 0.5. `Circle` rather than `Oval` because
+// `Oval` derives its bounding box from the centre and the *cell* size,
+// so insetting the radius there walks the centre inwards with it and
+// the arc stops being tangent to the cell edge at the join.
+//
+// Stroking the arc on the edge itself (radius R, `OutlineThin`'s 1.2) put
+// half the stroke outside the fill: the corners read heavier than the
+// straight strips they join and carried a fringe past the silhouette, while
+// at the joins, where the arc turns tangent to the cell edge, that outer
+// half was clipped away instead and the arc met the strip at alpha 176
+// against its 255 -- a notch at each of the outline's four joins.
+
 pub const TOP_LEFT_ROUNDED_CORNER_OUTLINE: &[Poly] = &[Poly {
-    path: &[PolyCommand::Oval {
+    path: &[PolyCommand::Circle {
         center: (BlockCoord::One, BlockCoord::One),
-        radiuses: (BlockCoord::One, BlockCoord::One),
+        radius: BlockCoord::Frac(1, 1),
     }],
     intensity: BlockAlpha::Full,
-    style: PolyStyle::OutlineThin,
+    style: PolyStyle::OutlineEdge,
 }];
 
 pub const TOP_RIGHT_ROUNDED_CORNER_OUTLINE: &[Poly] = &[Poly {
-    path: &[PolyCommand::Oval {
+    path: &[PolyCommand::Circle {
         center: (BlockCoord::Zero, BlockCoord::One),
-        radiuses: (BlockCoord::One, BlockCoord::One),
+        radius: BlockCoord::Frac(1, 1),
     }],
     intensity: BlockAlpha::Full,
-    style: PolyStyle::OutlineThin,
+    style: PolyStyle::OutlineEdge,
 }];
 
 pub const BOTTOM_LEFT_ROUNDED_CORNER_OUTLINE: &[Poly] = &[Poly {
-    path: &[PolyCommand::Oval {
+    path: &[PolyCommand::Circle {
         center: (BlockCoord::One, BlockCoord::Zero),
-        radiuses: (BlockCoord::One, BlockCoord::One),
+        radius: BlockCoord::Frac(1, 1),
     }],
     intensity: BlockAlpha::Full,
-    style: PolyStyle::OutlineThin,
+    style: PolyStyle::OutlineEdge,
 }];
 
 pub const BOTTOM_RIGHT_ROUNDED_CORNER_OUTLINE: &[Poly] = &[Poly {
-    path: &[PolyCommand::Oval {
+    path: &[PolyCommand::Circle {
         center: (BlockCoord::Zero, BlockCoord::Zero),
-        radiuses: (BlockCoord::One, BlockCoord::One),
+        radius: BlockCoord::Frac(1, 1),
     }],
     intensity: BlockAlpha::Full,
-    style: PolyStyle::OutlineThin,
+    style: PolyStyle::OutlineEdge,
 }];
 
 // Quarter-annulus ring corners: the border stroke of a rounded corner,
@@ -407,6 +424,65 @@ mod tests {
             .chunks_exact(4)
             .map(|p| p[3])
             .collect()
+    }
+
+    /// Where a corner's arc meets the straight strip that continues it, the
+    /// two are the same one-pixel line and must arrive at the same alpha.
+    /// Stroked on the shape's edge rather than inside it, the arc turns
+    /// tangent to the cell edge at the join and half the stroke is clipped
+    /// away: it met the strip at alpha 160 against the strip's 255, and
+    /// every rounded outline showed a notch at each of its four joins.
+    ///
+    /// The residual shortfall is the circle falling away from its tangent
+    /// within that one pixel, a fraction of a level once the border colour
+    /// is applied; 160 was a quarter of the border's whole contrast.
+    #[test]
+    fn a_corner_outline_meets_its_straight_edge_at_full_alpha() {
+        let last = SIDE - 1;
+        let mut joins = vec![];
+        for (name, polys, at) in [
+            ("top-left", TOP_LEFT_ROUNDED_CORNER_OUTLINE, [(last, 0), (0, last)]),
+            ("top-right", TOP_RIGHT_ROUNDED_CORNER_OUTLINE, [(0, 0), (last, last)]),
+            ("bottom-left", BOTTOM_LEFT_ROUNDED_CORNER_OUTLINE, [(last, last), (0, 0)]),
+            ("bottom-right", BOTTOM_RIGHT_ROUNDED_CORNER_OUTLINE, [(0, last), (last, 0)]),
+        ] {
+            let alpha = raster(polys);
+            for (x, y) in at {
+                joins.push((name, x, y, alpha[y * SIDE + x]));
+            }
+        }
+        let worst = joins.iter().map(|j| j.3).min().unwrap();
+        assert!(
+            worst >= 235,
+            "an arc meets its strip below full alpha: {joins:?}"
+        );
+    }
+
+    /// The outline is the fill's outermost pixel, not a ring around it.
+    /// Centred on the shape's edge instead, the stroke put half its width
+    /// outside the silhouette: the corners carried a fringe over whatever
+    /// was behind them, which on a translucent border reads as a glow that
+    /// the straight strips -- drawn inside the shape -- do not have.
+    #[test]
+    fn a_corner_outline_stays_within_its_filled_corner() {
+        for (name, fill, outline) in [
+            ("top-left", TOP_LEFT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER_OUTLINE),
+            ("top-right", TOP_RIGHT_ROUNDED_CORNER, TOP_RIGHT_ROUNDED_CORNER_OUTLINE),
+            ("bottom-left", BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_LEFT_ROUNDED_CORNER_OUTLINE),
+            ("bottom-right", BOTTOM_RIGHT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER_OUTLINE),
+        ] {
+            let (fill, outline) = (raster(fill), raster(outline));
+            for (i, (f, o)) in fill.iter().zip(outline.iter()).enumerate() {
+                // Where the fill is absent the outline must be too, give or
+                // take the anti-aliased pixel they share on the silhouette.
+                assert!(
+                    *o as i32 <= *f as i32 + 16,
+                    "{name}: outline {o} outside fill {f} at ({}, {})",
+                    i % SIDE,
+                    i / SIDE
+                );
+            }
+        }
     }
 
     /// The mask is everything the filled corner is not. A one-quad mask
