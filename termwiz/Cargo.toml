@@ -62,11 +62,13 @@ k9.workspace = true
 
 # Only the terminal:: implementations need this, and those are already gated on
 # unix/windows. Keeping it off other targets is what lets the escape parsing,
-# cell model and surface layers build for wasm32.
-[target."cfg(any(unix, windows))".dependencies]
+# cell model and surface layers build for wasm32. iOS is unix by family but
+# has no tty to drive, and the termios crate does not build there, so it is
+# excluded along with the implementations.
+[target.'cfg(any(all(unix, not(target_os = "ios")), windows))'.dependencies]
 filedescriptor.workspace = true
 
-[target."cfg(unix)".dependencies]
+[target.'cfg(all(unix, not(target_os = "ios")))'.dependencies]
 signal-hook.workspace = true
 termios.workspace = true
 nix = {workspace=true, features=["mman", "fs"]}
