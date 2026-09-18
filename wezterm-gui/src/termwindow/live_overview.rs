@@ -17,7 +17,7 @@ use crate::ui::{
 use crate::workspace_threads;
 use fluent_bundle::FluentArgs;
 use mux::domain::DomainState;
-use mux::pane::{CachePolicy, CloseReason, Pane, PaneId};
+use mux::pane::{CachePolicy, CloseReason, PaneId};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::{PositionedSplit, TabId};
 use mux::Mux;
@@ -165,16 +165,6 @@ const MAX_PREVIEW_CAPTURES_PER_FRAME: usize = 1;
 /// open transition is still running) in exchange for the overview arriving
 /// mostly populated instead of popping thumbnails in one per frame.
 const FIRST_FRAME_CAPTURE_BUDGET: usize = 4;
-/// How often a pane's palette is re-read for the preview fingerprint.
-///
-/// `Pane::palette` takes the pane's lock and clones all 256 colours, and the
-/// fingerprint asked for it on every frame of every warm card only to hash
-/// it. A palette changes with a theme switch or an OSC from the program,
-/// both rare; a thumbnail that notices a second late is not a difference
-/// anyone sees. The pills ask for a frame at `RUNNING_LABEL_REFRESH`
-/// whenever cards are drawn, which is what makes "a second late" a bound
-/// rather than "the next time something else repaints".
-const PALETTE_IDENTITY_REFRESH: Duration = Duration::from_secs(1);
 /// How often a card re-asks what its terminal is running.
 ///
 /// `CachePolicy::AllowStale` is not the cheap read its name suggests: it takes
@@ -216,9 +206,6 @@ struct TerminalPreviewPaneFingerprint {
     height: usize,
     dimensions: RenderableDimensions,
     seqno: usize,
-    /// Rows fetched on demand arrive without moving the seqno; this moves
-    /// instead. See `Pane::line_fetch_generation`.
-    fetch_generation: u64,
     palette_identity: u64,
     cursor: StableCursorPosition,
 }
@@ -226,26 +213,9 @@ struct TerminalPreviewPaneFingerprint {
 #[derive(Clone, Debug)]
 struct CachedPreview<T> {
     fingerprint: TerminalPreviewFingerprint,
-    /// How many captures in a row came back with placeholder rows, for
-    /// as long as the fingerprint stood still; zero when the last capture
-    /// was whole. The picture held may be older and whole -- an incomplete
-    /// capture never displaces one -- so this describes the capturing, not
-    /// the snapshot. While non-zero the entry is captured again at the
-    /// refresh cadence even though its fingerprint has not moved, since a
-    /// fetch that failed moves nothing; `INCOMPLETE_CAPTURE_RETRIES` bounds
-    /// that for a pane whose rows never come.
-    incomplete_captures: u32,
     snapshot: Arc<T>,
     captured_at: Instant,
 }
-
-/// How many times a picture with placeholder rows is re-captured at the
-/// refresh cadence before the card settles for what it has. A fetch that
-/// lands moves the fingerprint and captures regardless of this; the bound
-/// is for a pane whose rows never come -- a dead mirror, a server that
-/// no longer has them -- which would otherwise wake the overview at the
-/// cadence for as long as it stayed open.
-const INCOMPLETE_CAPTURE_RETRIES: u32 = 10;
 
 /// One tab of a thread's workspace, as the card's tab pill lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -358,23 +328,6 @@ struct CapsulePaint {
 struct PreviewSwitch {
     from: TabId,
     fade: Timeline,
-}
-
-/// How long a card keeps showing the tab it was previewing while the tab
-/// it should now preview has no picture yet. Captures are one per frame
-/// and a remote tab's rows take a round trip, so the first frames after a
-/// hover would otherwise crossfade to a blank panel and then pop. A tab
-/// that never yields a picture -- a remote gone quiet -- is switched to
-/// anyway once this runs out, so the panel cannot stay on a tab its dot
-/// no longer names.
-const PREVIEW_SWITCH_WAIT: Duration = Duration::from_secs(1);
-
-#[derive(Clone, Copy, Debug)]
-struct PaletteIdentity {
-    hash: u64,
-    read_at: Instant,
-    /// The last frame that asked; an entry nobody asks for is dropped.
-    used_at: Instant,
 }
 
 /// What a tab is up to, as its dot tells it.
@@ -538,12 +491,6 @@ pub(crate) struct LiveOverviewView {
     dot_selection: HashMap<TabId, Timeline>,
     /// Cards whose preview is crossfading from one tab to another.
     preview_switches: HashMap<LiveThreadKey, PreviewSwitch>,
-    /// Cards holding their old picture while the new tab's is captured:
-    /// which tab they are waiting on, and since when.
-    preview_switch_waits: HashMap<LiveThreadKey, (TabId, Instant)>,
-    /// Each warm pane's palette hash and when it was read; see
-    /// `PALETTE_IDENTITY_REFRESH`.
-    palette_identities: HashMap<PaneId, PaletteIdentity>,
     /// Which tab each card previewed last frame; a change starts a switch.
     last_previewed: HashMap<LiveThreadKey, TabId>,
     /// Whether any capsule animation (dot selection, preview switch) is
@@ -635,8 +582,6 @@ impl LiveOverviewView {
             pill_expansion: None,
             dot_selection: HashMap::new(),
             preview_switches: HashMap::new(),
-            preview_switch_waits: HashMap::new(),
-            palette_identities: HashMap::new(),
             last_previewed: HashMap::new(),
             capsule_motion_running: false,
             last_ui_scale: 1.0,
@@ -794,7 +739,6 @@ impl LiveOverviewView {
         self.dot_selection
             .retain(|tab_id, _| tab_keys.contains_key(tab_id));
         self.preview_switches.retain(|key, _| live_keys.contains(key));
-        self.preview_switch_waits.retain(|key, _| live_keys.contains(key));
         self.last_previewed.retain(|key, _| live_keys.contains(key));
 
         groups
@@ -1077,11 +1021,7 @@ impl LiveOverviewView {
                                 .get(&card.tab_id)
                                 .map(|cached| Arc::clone(&cached.snapshot))
                         } else {
-                            let fingerprint = terminal_preview_fingerprint(
-                                card.tab_id,
-                                &mut self.palette_identities,
-                                now,
-                            );
+                            let fingerprint = terminal_preview_fingerprint(card.tab_id);
                             let (snapshot, refresh_due) = resolve_snapshot(
                                 &mut self.snapshot_cache,
                                 &card.tab_id,
@@ -1089,11 +1029,7 @@ impl LiveOverviewView {
                                 now,
                                 refresh_interval,
                                 &mut capture_budget,
-                                || {
-                                    let snapshot = capture_terminal_snapshot(card.tab_id)?;
-                                    let complete = snapshot.complete;
-                                    Some((snapshot, complete))
-                                },
+                                || capture_terminal_snapshot(card.tab_id),
                             );
                             if let Some(refresh_due) = refresh_due {
                                 // A `Some` here means the card's fingerprint no
@@ -1230,41 +1166,13 @@ impl LiveOverviewView {
                                 preview_fill,
                                 ctx.px(PREVIEW_RADIUS),
                             )?;
-                            if in_flight {
-                                // Built, not shown. The thumbnail's quads
-                                // take several frames to record, and the
-                                // dissolve that lands the travelling
-                                // terminal on this card began on the frame
-                                // the card was handed its picture back --
-                                // which left the panel showing through for
-                                // as long as the recording took. Asking for
-                                // the picture at zero opacity during the
-                                // flight has it recorded by the time the
-                                // terminal arrives, and the landing waits
-                                // for it (see `paint_content_view_flight`).
-                                if let Some(snapshot) = snapshot.as_ref() {
-                                    self.previews.push(TerminalPreviewRequest {
-                                        tab_id,
-                                        snapshot: Arc::clone(snapshot),
-                                        area: preview,
-                                        clip,
-                                        hold_scale: self.live_resizing,
-                                        opacity: 0.0,
-                                    });
-                                }
-                            } else {
+                            if !in_flight {
                                 // A card that changed tab fades the old
                                 // picture out under the new one. The old
                                 // tab's snapshot is kept warm for the length
                                 // of the fade.
-                                // A picture worth switching to: the rows
-                                // are all there, or enough of them to show
-                                // something.
-                                let ready = snapshot
-                                    .as_ref()
-                                    .is_some_and(|snapshot| snapshot.complete || snapshot.has_content());
                                 let (from, arrived) =
-                                    self.preview_switch_for(&card.key, tab_id, ready, now);
+                                    self.preview_switch_for(&card.key, tab_id, now);
                                 if let Some(from) = from {
                                     if let Some(cached) = self.snapshot_cache.get(&from) {
                                         warm_tabs.insert(from);
@@ -1279,21 +1187,14 @@ impl LiveOverviewView {
                                     }
                                 }
                                 if let Some(snapshot) = snapshot.as_ref() {
-                                    // A held-back picture is not drawn --
-                                    // it would spend the frame's one quad
-                                    // rebuild on something invisible -- but
-                                    // its panes are wanted, so their rows
-                                    // arriving repaints the card.
-                                    if arrived > 0.0 || from.is_none() {
-                                        self.previews.push(TerminalPreviewRequest {
-                                            tab_id,
-                                            snapshot: Arc::clone(snapshot),
-                                            area: preview,
-                                            clip,
-                                            hold_scale: self.live_resizing,
-                                            opacity: arrived,
-                                        });
-                                    }
+                                    self.previews.push(TerminalPreviewRequest {
+                                        tab_id,
+                                        snapshot: Arc::clone(snapshot),
+                                        area: preview,
+                                        clip,
+                                        hold_scale: self.live_resizing,
+                                        opacity: arrived,
+                                    });
                                     self.visible_panes
                                         .extend(snapshot.panes.iter().map(|pane| pane.pane_id));
                                 }
@@ -1355,11 +1256,6 @@ impl LiveOverviewView {
             self.scrollbar_visible_until = None;
         }
         self.snapshot_cache.retain(|tab_id, _| warm_tabs.contains(tab_id));
-        // Palette hashes belong to warm panes; one not asked for in a while
-        // is a pane that scrolled away or closed.
-        let palette_stale = PALETTE_IDENTITY_REFRESH * 10;
-        self.palette_identities
-            .retain(|_, identity| now.saturating_duration_since(identity.used_at) < palette_stale);
         // The running-label cache is pruned in `collect_groups`, against every
         // live tab rather than against the cards that happened to be drawn.
         // A card that is gone has nowhere left to travel to; keeping its
@@ -1900,42 +1796,8 @@ impl LiveOverviewView {
     }
 
     /// The old picture a card is fading out, and how far in the new one is.
-    /// Starts a crossfade the frame a card's previewed tab changes and has
-    /// a picture (`ready`); until it has one the old tab's picture stands
-    /// in whole, for at most `PREVIEW_SWITCH_WAIT`.
-    fn preview_switch_for(
-        &mut self,
-        key: &LiveThreadKey,
-        tab_id: TabId,
-        ready: bool,
-        now: Instant,
-    ) -> (Option<TabId>, f32) {
-        if let Some(previous) = self.last_previewed.get(key).copied() {
-            // A fade already running is left to run: freezing it under a
-            // hold and restarting it later would jump the picture.
-            let fading = self.preview_switches.contains_key(key);
-            if previous != tab_id && !ready && !fading {
-                let since = match self.preview_switch_waits.get(key) {
-                    Some((waiting_on, since)) if *waiting_on == tab_id => *since,
-                    _ => {
-                        self.preview_switch_waits.insert(key.clone(), (tab_id, now));
-                        now
-                    }
-                };
-                let give_up = since + PREVIEW_SWITCH_WAIT;
-                if now < give_up {
-                    // The picture's arrival repaints through the new tab's
-                    // panes being wanted; this is for the case it never
-                    // comes.
-                    self.next_preview_refresh = Some(
-                        self.next_preview_refresh
-                            .map_or(give_up, |current| current.min(give_up)),
-                    );
-                    return (Some(previous), 0.0);
-                }
-            }
-        }
-        self.preview_switch_waits.remove(key);
+    /// Starts a crossfade the frame a card's previewed tab changes.
+    fn preview_switch_for(&mut self, key: &LiveThreadKey, tab_id: TabId, now: Instant) -> (Option<TabId>, f32) {
         if let Some(previous) = self.last_previewed.insert(key.clone(), tab_id) {
             if previous != tab_id {
                 self.preview_switches.insert(
@@ -2880,11 +2742,7 @@ fn previewed_tab(
         .unwrap_or(shown)
 }
 
-fn terminal_preview_fingerprint(
-    tab_id: TabId,
-    palette_identities: &mut HashMap<PaneId, PaletteIdentity>,
-    now: Instant,
-) -> Option<TerminalPreviewFingerprint> {
+fn terminal_preview_fingerprint(tab_id: TabId) -> Option<TerminalPreviewFingerprint> {
     let tab = Mux::get().get_tab(tab_id)?;
     let tab_size = tab.get_size();
     if tab_size.cols == 0 || tab_size.rows == 0 {
@@ -2897,7 +2755,7 @@ fn terminal_preview_fingerprint(
         .into_iter()
         .map(|positioned| {
             let pane = positioned.pane;
-            let palette_identity = palette_identity_for(pane.as_ref(), palette_identities, now);
+            let palette = pane.palette_override().unwrap_or_else(|| pane.palette());
             TerminalPreviewPaneFingerprint {
                 pane_id: pane.pane_id(),
                 index: positioned.index,
@@ -2909,8 +2767,7 @@ fn terminal_preview_fingerprint(
                 height: positioned.height,
                 dimensions: pane.get_dimensions(),
                 seqno: pane.get_current_seqno(),
-                fetch_generation: pane.line_fetch_generation(),
-                palette_identity,
+                palette_identity: palette_identity(&palette),
                 cursor: pane.get_cursor_position(),
             }
         })
@@ -2951,50 +2808,6 @@ fn retain_running_labels(
     labels.retain(|tab_id, _| live_tabs.contains(tab_id));
 }
 
-/// The pane's palette hash, re-read at `PALETTE_IDENTITY_REFRESH`.
-fn palette_identity_for(
-    pane: &dyn Pane,
-    identities: &mut HashMap<PaneId, PaletteIdentity>,
-    now: Instant,
-) -> u64 {
-    cached_palette_identity(pane.pane_id(), identities, now, || {
-        let palette = pane.palette_override().unwrap_or_else(|| pane.palette());
-        palette_identity(&palette)
-    })
-}
-
-/// `read` is called for a pane not seen before and again once the cadence
-/// has passed since it was last read; otherwise the held hash is answered.
-fn cached_palette_identity(
-    pane_id: PaneId,
-    identities: &mut HashMap<PaneId, PaletteIdentity>,
-    now: Instant,
-    read: impl FnOnce() -> u64,
-) -> u64 {
-    match identities.get_mut(&pane_id) {
-        Some(identity) => {
-            if now.saturating_duration_since(identity.read_at) >= PALETTE_IDENTITY_REFRESH {
-                identity.hash = read();
-                identity.read_at = now;
-            }
-            identity.used_at = now;
-            identity.hash
-        }
-        None => {
-            let hash = read();
-            identities.insert(
-                pane_id,
-                PaletteIdentity {
-                    hash,
-                    read_at: now,
-                    used_at: now,
-                },
-            );
-            hash
-        }
-    }
-}
-
 fn palette_identity(palette: &wezterm_term::color::ColorPalette) -> u64 {
     let mut hasher = DefaultHasher::new();
     palette.colors.0.hash(&mut hasher);
@@ -3019,7 +2832,6 @@ fn capture_terminal_snapshot(tab_id: TabId) -> Option<TerminalPreviewSnapshot> {
 
     let splits = tab.iter_splits();
     let mut snapshots = Vec::new();
-    let mut complete = true;
     for positioned in tab.iter_panes() {
         let pane = positioned.pane;
         let dimensions = pane.get_dimensions();
@@ -3034,19 +2846,7 @@ fn capture_terminal_snapshot(tab_id: TabId) -> Option<TerminalPreviewSnapshot> {
         let (resolved_top, lines) = if rows == 0 || cols == 0 {
             (first_row, Vec::new())
         } else {
-            let (resolved_top, lines) =
-                pane.get_lines(first_row..first_row.saturating_add(rows as isize));
-            // Asked after the copy, over the rows the copy holds: `get_lines`
-            // is what requests the rows it did not have, and a row it has
-            // just asked for is a placeholder in the copy. Nothing fills a
-            // row between the two calls -- fetches land on the thread that
-            // paints. A dead pane's rows are never coming, and its picture
-            // is as whole as it will get.
-            if !pane.is_dead() {
-                let copied = resolved_top..resolved_top.saturating_add(lines.len() as isize);
-                complete &= pane.unfetched_lines(copied).is_empty();
-            }
-            (resolved_top, lines)
+            pane.get_lines(first_row..first_row.saturating_add(rows as isize))
         };
         snapshots.push(TerminalPreviewPaneSnapshot {
             pane_id: pane.pane_id(),
@@ -3072,15 +2872,10 @@ fn capture_terminal_snapshot(tab_id: TabId) -> Option<TerminalPreviewSnapshot> {
             tab_size,
             panes: snapshots,
             splits,
-            complete,
         })
     }
 }
 
-/// `capture` returns the picture and whether it is complete: a picture with
-/// placeholder rows in it does not replace a complete one already held,
-/// and is looked at again at the refresh cadence until a complete one
-/// arrives, whether or not the fingerprint moves in between.
 fn resolve_snapshot<K, T, F>(
     cache: &mut HashMap<K, CachedPreview<T>>,
     key: &K,
@@ -3092,7 +2887,7 @@ fn resolve_snapshot<K, T, F>(
 ) -> (Option<Arc<T>>, Option<Instant>)
 where
     K: Clone + Eq + Hash,
-    F: FnOnce() -> Option<(T, bool)>,
+    F: FnOnce() -> Option<T>,
 {
     let Some(fingerprint) = fingerprint else {
         return (
@@ -3102,17 +2897,10 @@ where
     };
 
     if let Some(cached) = cache.get(key) {
-        let incomplete = cached.incomplete_captures > 0;
-        let settled = cached.incomplete_captures >= INCOMPLETE_CAPTURE_RETRIES;
-        if cached.fingerprint == fingerprint && (!incomplete || settled) {
+        if cached.fingerprint == fingerprint {
             return (Some(Arc::clone(&cached.snapshot)), None);
         }
-        // The cadence paces a busy terminal's refreshes. Rows arriving for
-        // an incomplete picture are what the card has been waiting to show,
-        // and only that movement skips the pacing: anything else moving the
-        // fingerprint -- output, the cursor -- is the busy terminal.
-        let rows_arrived = incomplete && rows_arrived(&cached.fingerprint, &fingerprint);
-        if let (Some(refresh_interval), false) = (refresh_interval, rows_arrived) {
+        if let Some(refresh_interval) = refresh_interval {
             let refresh_due = cached.captured_at + refresh_interval;
             if now < refresh_due {
                 return (Some(Arc::clone(&cached.snapshot)), Some(refresh_due));
@@ -3138,92 +2926,20 @@ where
     }
     *capture_budget -= 1;
 
-    let mut retry = None;
-    if let Some((snapshot, complete)) = capture() {
-        // An incomplete picture never displaces a whole one of the same
-        // shape: the rows it lacks are blank, and the held picture's rows
-        // were at least real. A whole picture of another shape -- the
-        // terminal resized under it, a pane split -- is a stale picture,
-        // and blank rows at the right size beat real rows at the wrong
-        // one; it is displaced. So is nothing, or another incomplete
-        // picture, possibly with fewer real rows, which is still the
-        // current state of the terminal rather than an old one.
-        let (snapshot, incomplete_captures) = match cache.remove(key) {
-            Some(previous)
-                if !complete
-                    && previous.incomplete_captures == 0
-                    && same_geometry(&previous.fingerprint, &fingerprint) =>
-            {
-                (previous.snapshot, 1)
-            }
-            Some(previous) if !complete && previous.fingerprint == fingerprint => {
-                (Arc::new(snapshot), previous.incomplete_captures + 1)
-            }
-            _ if !complete => (Arc::new(snapshot), 1),
-            _ => (Arc::new(snapshot), 0),
-        };
+    if let Some(snapshot) = capture() {
         cache.insert(
             key.clone(),
             CachedPreview {
                 fingerprint,
-                incomplete_captures,
-                snapshot,
+                snapshot: Arc::new(snapshot),
                 captured_at: now,
             },
         );
-        if incomplete_captures > 0 && incomplete_captures < INCOMPLETE_CAPTURE_RETRIES {
-            // The rows arriving moves the fingerprint; the fetch failing
-            // moves nothing, and only a look at the refresh cadence would
-            // ask for them again.
-            retry = refresh_interval.map(|interval| now + interval);
-        }
     }
     (
         cache.get(key).map(|cached| Arc::clone(&cached.snapshot)),
-        retry,
+        None,
     )
-}
-
-/// Whether two fingerprints describe the same shape of picture: the same
-/// panes in the same places at the same sizes. Output, cursor, palette and
-/// rows arriving are not shape.
-fn same_geometry(a: &TerminalPreviewFingerprint, b: &TerminalPreviewFingerprint) -> bool {
-    let shape = |fingerprint: &TerminalPreviewFingerprint| {
-        (
-            fingerprint.tab_size,
-            fingerprint.splits.clone(),
-            fingerprint
-                .panes
-                .iter()
-                .map(|pane| {
-                    (
-                        pane.pane_id,
-                        pane.index,
-                        pane.is_zoomed,
-                        pane.left,
-                        pane.top,
-                        pane.width,
-                        pane.height,
-                        pane.dimensions.cols,
-                        pane.dimensions.viewport_rows,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
-    };
-    shape(a) == shape(b)
-}
-
-/// Whether `later` differs from `earlier` by rows having arrived for some
-/// pane, whatever else moved with them.
-fn rows_arrived(earlier: &TerminalPreviewFingerprint, later: &TerminalPreviewFingerprint) -> bool {
-    later.panes.iter().any(|pane| {
-        earlier
-            .panes
-            .iter()
-            .find(|previous| previous.pane_id == pane.pane_id)
-            .is_some_and(|previous| previous.fetch_generation != pane.fetch_generation)
-    })
 }
 
 /// The command in the foreground of a tab's active pane, basename only, or
@@ -4014,7 +3730,7 @@ mod tests {
             now,
             None,
             &mut budget,
-            || Some((7_u8, true)),
+            || Some(7_u8),
         );
         assert_eq!(*snapshot.unwrap(), 7);
         assert!(due.is_none());
@@ -4051,7 +3767,7 @@ mod tests {
             now + Duration::from_millis(34),
             Some(LIVE_RESIZE_PREVIEW_INTERVAL),
             &mut budget,
-            || Some((8_u8, true)),
+            || Some(8_u8),
         );
         assert_eq!(*snapshot.unwrap(), 8);
         assert!(due.is_none());
@@ -4069,301 +3785,6 @@ mod tests {
         let live = HashSet::<LiveThreadKey>::new();
         cache.retain(|cached, _| live.contains(cached));
         assert!(cache.is_empty());
-    }
-
-    /// A tab whose rows are fetched on demand hands the first capture blank
-    /// placeholders. That picture must not outlive the rows' arrival, and
-    /// once a real picture is held no later placeholder-ridden one may
-    /// replace it.
-    #[test]
-    fn an_incomplete_picture_is_retried_and_never_replaces_a_complete_one() {
-        let key = LiveThreadKey {
-            space_id: "local".to_string(),
-            thread_id: "thread".to_string(),
-        };
-        let mut cache = HashMap::new();
-        let now = Instant::now();
-        let mut budget = usize::MAX;
-        let interval = Duration::from_millis(300);
-        let fingerprint = test_fingerprint(1);
-
-        // Nothing held: the blank picture is shown, and a look is booked
-        // for the refresh cadence even though the fingerprint may not move.
-        let (snapshot, due) = resolve_snapshot(
-            &mut cache,
-            &key,
-            Some(fingerprint.clone()),
-            now,
-            Some(interval),
-            &mut budget,
-            || Some((0_u8, false)),
-        );
-        assert_eq!(*snapshot.unwrap(), 0);
-        assert_eq!(due, Some(now + interval));
-
-        // Before the cadence, the same fingerprint is not recaptured.
-        let (snapshot, due) = resolve_snapshot(
-            &mut cache,
-            &key,
-            Some(fingerprint.clone()),
-            now + Duration::from_millis(100),
-            Some(interval),
-            &mut budget,
-            || panic!("an incomplete picture is not re-read before the cadence"),
-        );
-        assert_eq!(*snapshot.unwrap(), 0);
-        assert_eq!(due, Some(now + interval));
-
-        // At the cadence it is, fingerprint unchanged; a second blank
-        // replaces the first and books another look.
-        let (snapshot, due) = resolve_snapshot(
-            &mut cache,
-            &key,
-            Some(fingerprint.clone()),
-            now + interval,
-            Some(interval),
-            &mut budget,
-            || Some((1_u8, false)),
-        );
-        assert_eq!(*snapshot.unwrap(), 1);
-        assert_eq!(due, Some(now + interval * 2));
-
-        // The rows arrive: the fingerprint moves, the picture completes.
-        let mut arrived = fingerprint.clone();
-        arrived.panes[0].fetch_generation = 1;
-        let (snapshot, due) = resolve_snapshot(
-            &mut cache,
-            &key,
-            Some(arrived.clone()),
-            now + interval + Duration::from_millis(50),
-            Some(interval),
-            &mut budget,
-            || Some((7_u8, true)),
-        );
-        assert_eq!(*snapshot.unwrap(), 7);
-        assert!(due.is_none());
-
-        // Output lands while its rows are in flight: the capture is
-        // incomplete again, and the complete picture is kept in its place.
-        let mut later = arrived.clone();
-        later.panes[0].seqno = 2;
-        let output_at = now + interval * 2 + Duration::from_millis(50);
-        let (snapshot, due) = resolve_snapshot(
-            &mut cache,
-            &key,
-            Some(later.clone()),
-            output_at,
-            Some(interval),
-            &mut budget,
-            || Some((8_u8, false)),
-        );
-        assert_eq!(*snapshot.unwrap(), 7, "blank rows do not replace real ones");
-        assert_eq!(due, Some(output_at + interval));
-
-        // Same fingerprint, and the held picture is complete: nothing to do
-        // before the cadence -- but at it, the incomplete entry is re-read.
-        let (snapshot, due) = resolve_snapshot(
-            &mut cache,
-            &key,
-            Some(later.clone()),
-            output_at + interval,
-            Some(interval),
-            &mut budget,
-            || Some((9_u8, true)),
-        );
-        assert_eq!(*snapshot.unwrap(), 9);
-        assert!(due.is_none());
-    }
-
-    /// A card whose captures keep coming back incomplete while its
-    /// terminal is busy: the fingerprint moves every frame, but not by
-    /// rows arriving. That is the busy terminal the cadence exists for,
-    /// and it must not be captured more often for being incomplete --
-    /// nor may it ever chain an immediate frame.
-    #[test]
-    fn an_incomplete_card_with_a_moving_fingerprint_still_keeps_the_cadence() {
-        let key = LiveThreadKey {
-            space_id: "local".to_string(),
-            thread_id: "thread".to_string(),
-        };
-        let mut cache = HashMap::new();
-        let now = Instant::now();
-        let mut budget = usize::MAX;
-        let interval = Duration::from_millis(300);
-        let mut fingerprint = test_fingerprint(1);
-        let (_, due) = resolve_snapshot(
-            &mut cache,
-            &key,
-            Some(fingerprint.clone()),
-            now,
-            Some(interval),
-            &mut budget,
-            || Some((0_u8, false)),
-        );
-        assert_eq!(due, Some(now + interval));
-        for frame in 1..10 {
-            fingerprint.panes[0].seqno += 1;
-            let at = now + Duration::from_millis(16 * frame);
-            let (_, due) = resolve_snapshot(
-                &mut cache,
-                &key,
-                Some(fingerprint.clone()),
-                at,
-                Some(interval),
-                &mut budget,
-                || panic!("output alone does not skip the cadence"),
-            );
-            assert_eq!(due, Some(now + interval), "frame {frame}");
-        }
-        // Rows arriving does skip it.
-        fingerprint.panes[0].fetch_generation += 1;
-        let (snapshot, due) = resolve_snapshot(
-            &mut cache,
-            &key,
-            Some(fingerprint.clone()),
-            now + Duration::from_millis(200),
-            Some(interval),
-            &mut budget,
-            || Some((5_u8, true)),
-        );
-        assert_eq!((*snapshot.unwrap(), due), (5, None));
-    }
-
-    /// A pane whose rows never come -- a dead mirror, a server that no
-    /// longer has them -- is not re-read at the cadence forever. After the
-    /// bound the card settles for what it has, and a later fetch that does
-    /// land captures it again.
-    #[test]
-    fn retries_for_rows_that_never_come_are_bounded() {
-        let key = LiveThreadKey {
-            space_id: "local".to_string(),
-            thread_id: "thread".to_string(),
-        };
-        let mut cache = HashMap::new();
-        let now = Instant::now();
-        let mut budget = usize::MAX;
-        let interval = Duration::from_millis(300);
-        let fingerprint = test_fingerprint(1);
-        let mut captures = 0;
-        let mut at = now;
-        let mut last_due = Some(now);
-        for _ in 0..(INCOMPLETE_CAPTURE_RETRIES + 5) {
-            let (_, due) = resolve_snapshot(
-                &mut cache,
-                &key,
-                Some(fingerprint.clone()),
-                at,
-                Some(interval),
-                &mut budget,
-                || {
-                    captures += 1;
-                    Some((0_u8, false))
-                },
-            );
-            last_due = due;
-            at += interval;
-        }
-        assert_eq!(captures, INCOMPLETE_CAPTURE_RETRIES);
-        assert_eq!(last_due, None, "settled: no further look is booked");
-
-        let mut arrived = fingerprint.clone();
-        arrived.panes[0].fetch_generation = 1;
-        let (snapshot, due) = resolve_snapshot(
-            &mut cache,
-            &key,
-            Some(arrived),
-            at,
-            Some(interval),
-            &mut budget,
-            || Some((9_u8, true)),
-        );
-        assert_eq!((*snapshot.unwrap(), due), (9, None));
-    }
-
-    /// The terminal resized under a whole picture: the next capture comes
-    /// back incomplete because the resize flushed the rows, and it must
-    /// still displace the whole picture, whose shape is now wrong.
-    #[test]
-    fn a_resized_terminal_takes_the_incomplete_picture_over_the_stale_one() {
-        let key = LiveThreadKey {
-            space_id: "local".to_string(),
-            thread_id: "thread".to_string(),
-        };
-        let mut cache = HashMap::new();
-        let now = Instant::now();
-        let mut budget = usize::MAX;
-        let interval = Duration::from_millis(300);
-        let fingerprint = test_fingerprint(1);
-        let (snapshot, _) = resolve_snapshot(
-            &mut cache,
-            &key,
-            Some(fingerprint.clone()),
-            now,
-            Some(interval),
-            &mut budget,
-            || Some((7_u8, true)),
-        );
-        assert_eq!(*snapshot.unwrap(), 7);
-
-        let mut wider = fingerprint.clone();
-        wider.panes[0].dimensions.cols = 200;
-        wider.panes[0].width = 200;
-        wider.panes[0].seqno = 2;
-        let (snapshot, due) = resolve_snapshot(
-            &mut cache,
-            &key,
-            Some(wider.clone()),
-            now + interval,
-            Some(interval),
-            &mut budget,
-            || Some((8_u8, false)),
-        );
-        assert_eq!(*snapshot.unwrap(), 8, "the wrong shape is not kept");
-        assert_eq!(due, Some(now + interval * 2));
-
-        // Same shape, output only: the whole picture is kept as before.
-        let (snapshot, _) = resolve_snapshot(
-            &mut cache,
-            &key,
-            Some(wider.clone()),
-            now + interval * 2,
-            Some(interval),
-            &mut budget,
-            || Some((9_u8, true)),
-        );
-        assert_eq!(*snapshot.unwrap(), 9);
-        let mut output = wider.clone();
-        output.panes[0].seqno = 3;
-        let (snapshot, _) = resolve_snapshot(
-            &mut cache,
-            &key,
-            Some(output),
-            now + interval * 3,
-            Some(interval),
-            &mut budget,
-            || Some((10_u8, false)),
-        );
-        assert_eq!(*snapshot.unwrap(), 9);
-    }
-
-    #[test]
-    fn only_a_fetch_generation_counts_as_rows_arriving() {
-        let earlier = test_fingerprint(1);
-        let mut output = earlier.clone();
-        output.panes[0].seqno = 2;
-        output.panes[0].cursor.y = 3;
-        assert!(!rows_arrived(&earlier, &output));
-        let mut fetched = earlier.clone();
-        fetched.panes[0].fetch_generation = 1;
-        assert!(rows_arrived(&earlier, &fetched));
-        // A pane that was not in the earlier picture says nothing.
-        let mut split = earlier.clone();
-        split.panes.push(TerminalPreviewPaneFingerprint {
-            pane_id: 2,
-            fetch_generation: 7,
-            ..earlier.panes[0].clone()
-        });
-        assert!(!rows_arrived(&earlier, &split));
     }
 
     /// A busy terminal changes its fingerprint on every frame. Without an
@@ -4390,7 +3811,7 @@ mod tests {
                     budget,
                     || {
                         captures += 1;
-                        Some((seq as u8, true))
+                        Some(seq as u8)
                     },
                 )
             };
@@ -4443,7 +3864,7 @@ mod tests {
                 &mut budget,
                 || {
                     captured += 1;
-                    Some((1_u8, true))
+                    Some(1_u8)
                 },
             );
             if snapshot.is_none() {
@@ -4466,7 +3887,7 @@ mod tests {
             &mut budget,
             || {
                 captured += 1;
-                Some((1_u8, true))
+                Some(1_u8)
             },
         );
         assert_eq!(captured, 2 * MAX_PREVIEW_CAPTURES_PER_FRAME);
@@ -4495,7 +3916,7 @@ mod tests {
                 now,
                 Some(preview_refresh_interval()),
                 &mut budget,
-                || Some((1_u8, true)),
+                || Some(1_u8),
             );
         }
 
@@ -4514,7 +3935,7 @@ mod tests {
                 &mut budget,
                 || {
                     captured += 1;
-                    Some((2_u8, true))
+                    Some(2_u8)
                 },
             );
             if *snapshot.unwrap() == 1 {
@@ -4587,7 +4008,6 @@ mod tests {
                 height: 24,
                 dimensions: RenderableDimensions::default(),
                 seqno,
-                fetch_generation: 0,
                 palette_identity: 1,
                 cursor: StableCursorPosition::default(),
             }],
@@ -4690,119 +4110,19 @@ mod tests {
         let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
         let key = card_key();
         let start = Instant::now();
-        assert_eq!(view.preview_switch_for(&key, 7, true, start), (None, 1.0));
+        assert_eq!(view.preview_switch_for(&key, 7, start), (None, 1.0));
         // Same tab again: nothing to fade.
-        assert_eq!(view.preview_switch_for(&key, 7, true, start), (None, 1.0));
-        let (from, arrived) = view.preview_switch_for(&key, 8, true, start);
+        assert_eq!(view.preview_switch_for(&key, 7, start), (None, 1.0));
+        let (from, arrived) = view.preview_switch_for(&key, 8, start);
         assert_eq!(from, Some(7));
         assert!(arrived < 1.0);
         assert!(view.capsule_motion_running);
         // The clock starts on the frame after the first sample, as every
         // Timeline's does; then the fade runs its course.
-        let (from, _) = view.preview_switch_for(&key, 8, true, start + Duration::from_millis(16));
+        let (from, _) = view.preview_switch_for(&key, 8, start + Duration::from_millis(16));
         assert_eq!(from, Some(7));
-        let (from, arrived) =
-            view.preview_switch_for(&key, 8, true, start + Duration::from_secs(2));
+        let (from, arrived) = view.preview_switch_for(&key, 8, start + Duration::from_secs(2));
         assert_eq!((from, arrived), (None, 1.0));
-    }
-
-    /// The new tab has no picture on the frame the pointer reaches its dot:
-    /// captures are one per frame, and a remote tab's rows take a round
-    /// trip. The old picture stands whole until one arrives, and the
-    /// crossfade starts then; a tab that never yields one is switched to
-    /// after a bound, so the panel cannot stay on a tab its dot no longer
-    /// names.
-    #[test]
-    fn a_card_holds_its_old_picture_until_the_new_tab_has_one() {
-        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
-        let key = card_key();
-        let start = Instant::now();
-        assert_eq!(view.preview_switch_for(&key, 7, true, start), (None, 1.0));
-        // No picture yet: the old one, whole, and no fade running.
-        assert_eq!(view.preview_switch_for(&key, 8, false, start), (Some(7), 0.0));
-        assert!(!view.capsule_motion_running);
-        assert_eq!(view.next_preview_refresh, Some(start + PREVIEW_SWITCH_WAIT));
-        let later = start + Duration::from_millis(200);
-        assert_eq!(view.preview_switch_for(&key, 8, false, later), (Some(7), 0.0));
-        // The picture arrives: the crossfade begins from the old tab.
-        let (from, arrived) = view.preview_switch_for(&key, 8, true, later);
-        assert_eq!(from, Some(7));
-        assert!(arrived < 1.0);
-        assert!(view.capsule_motion_running);
-        assert!(view.preview_switch_waits.is_empty());
-
-        // A tab that never yields a picture is switched to regardless once
-        // the wait runs out.
-        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
-        assert_eq!(view.preview_switch_for(&key, 7, true, start), (None, 1.0));
-        assert_eq!(view.preview_switch_for(&key, 8, false, start), (Some(7), 0.0));
-        let (from, arrived) =
-            view.preview_switch_for(&key, 8, false, start + PREVIEW_SWITCH_WAIT);
-        assert_eq!(from, Some(7));
-        assert!(arrived < 1.0, "the fade to the (blank) new tab has begun");
-        assert!(view.preview_switch_waits.is_empty());
-
-        // The wait is per target: moving on to a third tab before the
-        // first wait ran out starts that tab's own wait.
-        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
-        assert_eq!(view.preview_switch_for(&key, 7, true, start), (None, 1.0));
-        assert_eq!(view.preview_switch_for(&key, 8, false, start), (Some(7), 0.0));
-        let third = start + Duration::from_millis(900);
-        assert_eq!(view.preview_switch_for(&key, 9, false, third), (Some(7), 0.0));
-        assert_eq!(
-            view.preview_switch_for(&key, 9, false, start + PREVIEW_SWITCH_WAIT),
-            (Some(7), 0.0),
-            "tab 9's wait began at 900ms, not at 0"
-        );
-        let (from, arrived) =
-            view.preview_switch_for(&key, 9, false, third + PREVIEW_SWITCH_WAIT);
-        assert_eq!(from, Some(7));
-        assert!(arrived < 1.0);
-    }
-
-    /// A fade that is already running is not frozen by a hold: the pointer
-    /// moving on to a tab without a picture lets the running fade finish
-    /// rather than snapping the half-blended picture back.
-    #[test]
-    fn a_running_crossfade_is_not_frozen_by_a_hold() {
-        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
-        let key = card_key();
-        let start = Instant::now();
-        assert_eq!(view.preview_switch_for(&key, 7, true, start), (None, 1.0));
-        let (from, _) = view.preview_switch_for(&key, 8, true, start);
-        assert_eq!(from, Some(7));
-        // On to 9, which has no picture, mid-fade: a new fade from 8
-        // starts rather than a hold on the frozen 7->8 one.
-        let (from, arrived) =
-            view.preview_switch_for(&key, 9, false, start + Duration::from_millis(50));
-        assert_eq!(from, Some(8));
-        assert!(arrived < 1.0);
-        assert!(view.preview_switch_waits.is_empty());
-    }
-
-    /// The fingerprint hashes each pane's palette, and reading a palette
-    /// clones all of it under the pane's lock. Once a second is as often as
-    /// a thumbnail needs to notice a theme change.
-    #[test]
-    fn a_palette_is_read_once_per_refresh() {
-        let reads = std::cell::Cell::new(0);
-        let read = || {
-            reads.set(reads.get() + 1);
-            42
-        };
-        let mut identities = HashMap::new();
-        let start = Instant::now();
-        assert_eq!(cached_palette_identity(1, &mut identities, start, read), 42);
-        assert_eq!(reads.get(), 1);
-        let within = start + Duration::from_millis(500);
-        assert_eq!(cached_palette_identity(1, &mut identities, within, read), 42);
-        assert_eq!(reads.get(), 1, "within the cadence: the held hash");
-        let at = start + PALETTE_IDENTITY_REFRESH;
-        assert_eq!(cached_palette_identity(1, &mut identities, at, read), 42);
-        assert_eq!(reads.get(), 2, "at the cadence: re-read");
-        // Another pane is its own entry.
-        assert_eq!(cached_palette_identity(2, &mut identities, at, read), 42);
-        assert_eq!(reads.get(), 3);
     }
 
     #[test]

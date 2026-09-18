@@ -467,24 +467,18 @@ const CONTENT_VIEW_FADE: Duration = Duration::from_millis(140);
 /// registers as a jump rather than as travel.
 const CONTENT_VIEW_TRAVEL: Duration = Duration::from_millis(260);
 
-/// How long the travelling terminal takes to give way to the card's own
+/// How long the travelling terminal takes to dissolve into the card's own
 /// thumbnail of it, once the two are close enough in size to overlap.
 ///
-/// A cut, on purpose. This was a 140ms dissolve on the belief that the two
-/// pictures align exactly once the terminal has settled into the card. They
-/// do not: the travelling picture is the terminal as the window drew it,
-/// tab strip and all, and the thumbnail is the same rows laid out again at
-/// the card's scale, so no glyph lands where its counterpart was. Dissolving
-/// two different pictures of dense text shows both at half strength for the
-/// length of the dissolve, which on a dark full-screen program reads as the
-/// card washing out grey and coming back -- a flash on every open. A cut
-/// between two near pictures is a small shift the eye forgives.
+/// Long enough to be seen, which is a lower bound with real teeth: a timeline
+/// does not start its clock until the frame after it is armed, so a dissolve
+/// budgeted at 45ms spent one frame arming and left two usable ones. That is a
+/// cut with extra steps, and it is what the first version of this shipped as.
 ///
-/// One frame: a timeline does not start its clock until the frame after it
-/// is armed, so this spends that frame opaque over the thumbnail that has
-/// just been handed back (see the landing in `advance_content_view_fade`,
-/// which waits for the thumbnail to be recorded), and is gone the next.
-const CONTENT_VIEW_LANDING_FADE: Duration = Duration::from_millis(1);
+/// Deliberately outlasts the travel. The last stretch of it therefore runs
+/// after the terminal has settled into the card, where the two pictures are
+/// aligned exactly and the dissolve costs nothing at all.
+const CONTENT_VIEW_LANDING_FADE: Duration = Duration::from_millis(140);
 
 /// How long the window frame takes to clear its own edges. Shorter than the
 /// terminal's journey: it only has to get out of the way, and the eye should

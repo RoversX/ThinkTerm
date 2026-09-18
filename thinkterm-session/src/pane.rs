@@ -117,29 +117,6 @@ impl<H: SessionHost> PaneSession<H> {
         self.state().seqno
     }
 
-    /// How many row fetches have completed. Moves when rows that were
-    /// placeholders become content, which the seqno does not record.
-    pub fn fetch_generation(&self) -> u64 {
-        self.state().fetch_generation
-    }
-
-    /// The rows of `lines` that are still placeholders: never received, or
-    /// requested and not yet answered. A row with any content, even one the
-    /// server has since changed, is not among them.
-    pub fn unfetched_lines(&self, lines: Range<StableRowIndex>) -> RangeSet<StableRowIndex> {
-        let st = self.state();
-        let mut set = RangeSet::new();
-        for idx in lines {
-            match st.lines.peek(&idx) {
-                None | Some(LineEntry::Fetching(_)) => set.add(idx),
-                Some(LineEntry::Line(_))
-                | Some(LineEntry::LineAndFetching(_, _))
-                | Some(LineEntry::Stale(_)) => {}
-            }
-        }
-        set
-    }
-
     pub fn title(&self) -> String {
         self.state().title.clone()
     }
@@ -1054,16 +1031,9 @@ impl<H: SessionHost> PaneSession<H> {
                     let mut returned = RangeSet::new();
 
                     log::trace!("fetch complete for {:?} with {:?}", to_fetch, fetch_token);
-                    let mut landed = false;
                     for (stable_row, line) in lines.into_iter() {
                         returned.add(stable_row);
-                        landed |= st.put_line(stable_row, line, &rules, Some(fetch_token));
-                    }
-                    // Only rows that became content count: a reply that
-                    // returned nothing, or nothing still wanted, changed no
-                    // picture.
-                    if landed {
-                        st.fetch_generation += 1;
+                        st.put_line(stable_row, line, &rules, Some(fetch_token));
                     }
                     // The terminal can scroll or resize while GetLines is in
                     // flight, so a successful response is allowed to omit a
@@ -1563,46 +1533,6 @@ mod tests {
             session.prime_frontend_geometry(size()),
             "every visible row is a Line now"
         );
-    }
-
-    /// Rows fetched on demand are stamped with the seqno the pane already
-    /// has, so the seqno never says they arrived. The fetch generation
-    /// does, and the placeholder rows are named until then.
-    #[test]
-    fn a_completed_fetch_moves_the_generation_not_the_seqno() {
-        let (host, session) = session(&(0..24).map(|r| (r, "row")).collect::<Vec<_>>());
-        session.queue_render_delta(delta(1, false, false));
-        host.spawner.run_all();
-        assert_eq!(session.fetch_generation(), 0);
-        assert_eq!(session.current_seqno(), 1);
-
-        let (_, lines) = session.get_lines(0..24);
-        assert!(lines.iter().all(|line| line.is_whitespace()), "placeholders");
-        let pending: usize = session.unfetched_lines(0..24).iter().map(|r| r.len()).sum();
-        assert_eq!(pending, 24, "every painted row is in flight");
-        assert_eq!(session.fetch_generation(), 0, "asking is not arriving");
-
-        host.spawner.run_all();
-        assert_eq!(session.fetch_generation(), 1);
-        assert!(session.unfetched_lines(0..24).is_empty());
-        assert_eq!(session.current_seqno(), 1, "arrival leaves the seqno alone");
-        let (_, lines) = session.get_lines(0..24);
-        assert!(lines.iter().all(|line| !line.is_whitespace()));
-    }
-
-    /// A reply that brings no row -- the server no longer has them -- is
-    /// not an arrival: the generation stays, and the rows stay wanted.
-    #[test]
-    fn an_empty_fetch_reply_moves_no_generation() {
-        let (host, session) = session(&[]);
-        session.queue_render_delta(delta(1, false, false));
-        host.spawner.run_all();
-        let _ = session.get_lines(0..8);
-        host.spawner.run_all();
-        assert!(host.link.asked.borrow().contains(&"GetLines"));
-        assert_eq!(session.fetch_generation(), 0);
-        let pending: usize = session.unfetched_lines(0..8).iter().map(|r| r.len()).sum();
-        assert_eq!(pending, 8, "unanswered rows are still placeholders");
     }
 
     /// R5: a poll completing after the pane is gone still clears the

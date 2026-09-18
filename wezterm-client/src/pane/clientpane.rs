@@ -686,14 +686,6 @@ impl Pane for ClientPane {
         self.session.current_seqno()
     }
 
-    fn line_fetch_generation(&self) -> u64 {
-        self.session.fetch_generation()
-    }
-
-    fn unfetched_lines(&self, lines: Range<StableRowIndex>) -> RangeSet<StableRowIndex> {
-        self.session.unfetched_lines(lines)
-    }
-
     fn get_changed_since(
         &self,
         lines: Range<StableRowIndex>,
