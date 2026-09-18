@@ -1689,8 +1689,17 @@ impl LiveOverviewView {
         }
     }
 
+    /// Whether `key`'s pill is folding any tab away. One already showing a
+    /// dot per tab has nothing to reveal, and opening it only trades its
+    /// title for empty room: the capsule is centred on its card, so losing
+    /// the title walks both its ends inwards and takes the dots out from
+    /// under the pointer that was reaching for them.
+    fn pill_can_reveal(&self, key: &LiveThreadKey) -> bool {
+        self.tab_keys.values().filter(|k| *k == key).count() > TAB_PILL_MAX_DOTS
+    }
+
     fn update_pill_expansion(&mut self, now: Instant) {
-        let over = self.pill_hover_key();
+        let over = self.pill_hover_key().filter(|key| self.pill_can_reveal(key));
         match self.pill_expansion.as_mut() {
             Some(expansion) => {
                 let on_this = over.as_ref() == Some(&expansion.key);
@@ -1726,6 +1735,9 @@ impl LiveOverviewView {
         let Some(key) = self.tab_keys.get(&tab_id).cloned() else {
             return ContentViewResponse::Redraw;
         };
+        if !self.pill_can_reveal(&key) {
+            return ContentViewResponse::Redraw;
+        }
         let now = Instant::now();
         match self.pill_expansion.as_mut() {
             Some(expansion) if expansion.key == key && expansion.is_open() => {
