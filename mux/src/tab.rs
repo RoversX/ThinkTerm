@@ -1540,7 +1540,9 @@ impl TabInner {
             }
         }
         let resized = self.resize(size);
-        if keep_local_geometry && !geometry_preserved && !resized {
+        // A zoomed no-op deliberately leaves split sizes unapplied. This
+        // also matters for handoff restoration, whose panes are local PTYs.
+        if keep_local_geometry && !geometry_preserved && !resized && self.zoomed.is_none() {
             // The wire tree already composes to the local root, so the
             // resize had nothing to redistribute; the surviving panes still
             // hold the sizes they had before the topology changed. Deal the
@@ -5840,6 +5842,43 @@ mod test {
         // The surviving pane was dealt its branch, not left at 80 columns.
         assert_eq!(existing.get_dimensions().cols, 39);
         assert_eq!(tab.get_size().cols, size.cols);
+    }
+
+    /// Handoff restores local PTYs through sync, including a zoomed pane
+    /// already sized to the full tab. The split tree must not shrink it.
+    #[test]
+    fn sync_with_pane_tree_preserves_zoomed_local_pane_size() {
+        let size = test_size();
+        let tab = Tab::new(&size);
+        let zoomed = FakePane::new(0, size);
+        let mut first = size;
+        first.cols = 40;
+        first.pixel_width = 40 * (size.pixel_width / size.cols);
+        let mut second = size;
+        second.cols = size.cols - first.cols - 1;
+        second.pixel_width = second.cols * (size.pixel_width / size.cols);
+        let mut entry = pane_entry(0, size, true);
+        entry.is_zoomed_pane = true;
+        let root = PaneNode::Split {
+            left: Box::new(PaneNode::Leaf(entry)),
+            right: Box::new(PaneNode::Leaf(pane_entry(1, second, false))),
+            node: SplitDirectionAndSize {
+                direction: SplitDirection::Horizontal,
+                first,
+                second,
+            },
+        };
+        tab.sync_with_pane_tree(size, root, |entry| {
+            if entry.pane_id == 0 {
+                Arc::clone(&zoomed)
+            } else {
+                FakePane::new(entry.pane_id, entry.size)
+            }
+        });
+        assert_eq!(tab.get_zoomed_pane().unwrap().pane_id(), 0);
+        assert_eq!(zoomed.get_dimensions().cols, size.cols);
+        assert_eq!(zoomed.get_dimensions().viewport_rows, size.rows);
+        assert_eq!(tab.get_size(), size);
     }
 
     /// A wire split whose first branch has no cells must not be measured
