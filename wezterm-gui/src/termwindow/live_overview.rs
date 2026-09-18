@@ -7,10 +7,11 @@ use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::{TermWindow, TermWindowNotif};
 use crate::ui::anim::{self, Easing, Timeline};
 use crate::ui::{
-    draw_button_on_layer, draw_icon_button, draw_icon_button_on_layer, draw_scrollbar_on_layer,
+    draw_button_on_layer, draw_icon_button, draw_scrollbar_on_layer,
+    draw_styled_icon_button_on_layer,
     card_is_warm, card_rect, grid_card_width, precise_wheel_delta_pixels, row_fully_visible,
     row_visible, shared_grid_columns, wheel_delta_pixels, ButtonSpec, ButtonVariant, CardGrid,
-    ControlState, DrawContext, RowAlign,
+    ControlState, DrawContext, IconButtonStyle, RowAlign,
     InteractionState, ScrollState, UiContext, UiPalette, UiTokens, WidgetKind,
 };
 use crate::workspace_threads;
@@ -83,7 +84,18 @@ const TAB_PILL_FOLDED_DOTS: usize = 3;
 const TAB_PILL_OPEN_DELAY: Duration = Duration::from_millis(150);
 const TAB_PILL_CLOSE_DELAY: Duration = Duration::from_millis(200);
 const PREVIEW_RADIUS: f32 = 12.0;
-const CLOSE_BUTTON_SIZE: f32 = 44.0;
+/// The button that closes the overview: a 28pt circle whose right edge lands
+/// on the page's right margin, so it shares a column edge with everything in
+/// the list rather than hanging off the window corner.
+const CLOSE_BUTTON_SIZE: f32 = 56.0;
+/// It rides much nearer the top than the margin it keeps at the side. The
+/// content area begins below the row the platform keeps for its window
+/// controls, and the button cannot cross into that row -- a press there
+/// resolves to the chrome's own hit target and never reaches this view -- so
+/// this is as high as it goes. The gap that is left keeps it clear of the
+/// integrated title buttons that occupy the right-hand end of that row on
+/// Windows and Linux.
+const CLOSE_BUTTON_TOP_INSET: f32 = 8.0;
 const CONFIRM_MIN_WIDTH: f32 = 640.0;
 const CONFIRM_MAX_WIDTH: f32 = 880.0;
 const CONFIRM_SIDE_MARGIN: f32 = 64.0;
@@ -939,6 +951,9 @@ impl LiveOverviewView {
                 if row_visible(heading_y, group_header_height, self.viewport) {
                     let heading_text_y =
                         heading_y + (group_header_height - group_line_height).max(0.0) / 2.0;
+                    // The close button ends the first title's line: it sits
+                    // on the same right margin and overlaps the band the title
+                    // is drawn in, so that title alone is measured short.
                     let title_width = if layout.header_y == 0.0 {
                         (content_width - ctx.px(CLOSE_BUTTON_SIZE + 20.0)).max(1.0)
                     } else {
@@ -1366,18 +1381,20 @@ impl LiveOverviewView {
         // button visible without hand-authoring a second control style.
         let pad = horizontal_page_pad(ctx, area);
         let close_size = ctx.px(CLOSE_BUTTON_SIZE);
-        draw_icon_button_on_layer(
+        let top_inset = ctx.px(CLOSE_BUTTON_TOP_INSET);
+        draw_styled_icon_button_on_layer(
             ctx,
             layers,
             &mut self.widgets,
             &self.interaction,
             palette,
             area.max_x() - pad - close_size,
-            area.origin.y + ctx.px(14.0),
+            area.origin.y + top_inset,
             close_size,
             SvgIcon::X,
             OverviewAction::CloseOverview,
             2,
+            IconButtonStyle::Floating,
         )
     }
 

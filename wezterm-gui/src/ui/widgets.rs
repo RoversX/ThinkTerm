@@ -28,6 +28,10 @@ use window::RectF;
 /// house size and leaves 16 design px of slack.
 const BUTTON_TEXT_PAD: f32 = 20.0;
 const ICON_BUTTON_RADIUS: f32 = 8.0;
+/// Side of the glyph inside a floating icon button, as a fraction of the
+/// button. The cell-derived size below is tied to the terminal font, which
+/// has nothing to say about a control that floats on a page of its own.
+const FLOATING_ICON_RATIO: f32 = 0.5;
 /// Icon side length is derived from the (already DPI-aware) cell height, so
 /// only the padding and the clamp bounds are design pixels.
 const ICON_CELL_PADDING: f32 = 4.0;
@@ -131,6 +135,19 @@ fn draw_button_with_layers<A: Copy + PartialEq>(
     Ok(())
 }
 
+/// How an icon button paints when the pointer is nowhere near it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IconButtonStyle {
+    /// Icon alone until hovered, then a rounded-square surface. What a button
+    /// in a row, a header or a toolbar wants: a standing fill on each of them
+    /// would tile the strip with chips.
+    Flat,
+    /// A circle with a standing fill that brightens on hover. For a control
+    /// floating alone on an open page, where a bare glyph has no edge, no
+    /// neighbours and nothing about it that says it can be pressed.
+    Floating,
+}
+
 /// A transparent square button containing a tinted SVG icon; background fades
 /// in on hover/press.
 pub(crate) fn draw_icon_button<A: Copy + PartialEq>(
@@ -178,6 +195,39 @@ pub(crate) fn draw_icon_button_on_layer<A: Copy + PartialEq>(
     action: A,
     background_layer: usize,
 ) -> anyhow::Result<()> {
+    draw_styled_icon_button_on_layer(
+        ctx,
+        layers,
+        widgets,
+        interaction,
+        palette,
+        x,
+        y,
+        size,
+        icon,
+        action,
+        background_layer,
+        IconButtonStyle::Flat,
+    )
+}
+
+/// [`draw_icon_button_on_layer`] with the resting appearance chosen by the
+/// caller. See [`IconButtonStyle`] for which one a given button wants.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_styled_icon_button_on_layer<A: Copy + PartialEq>(
+    ctx: &DrawContext,
+    layers: &mut TripleLayerQuadAllocator<'_>,
+    widgets: &mut UiContext<A>,
+    interaction: &InteractionState<A>,
+    palette: UiPalette,
+    x: f32,
+    y: f32,
+    size: f32,
+    icon: SvgIcon,
+    action: A,
+    background_layer: usize,
+    style: IconButtonStyle,
+) -> anyhow::Result<()> {
     let rect = RectF::new(euclid::point2(x, y), euclid::size2(size, size));
     widgets.push(rect, WidgetKind::Button, action);
     let hovered = interaction.hovered == Some(action);
@@ -187,24 +237,33 @@ pub(crate) fn draw_icon_button_on_layer<A: Copy + PartialEq>(
     } else if hovered {
         palette.control_hover_bg
     } else {
-        LinearRgba::TRANSPARENT
+        match style {
+            IconButtonStyle::Flat => LinearRgba::TRANSPARENT,
+            IconButtonStyle::Floating => palette.control_bg,
+        }
     };
     if bg.3 > 0.0 {
-        ctx.draw_rounded_rect(
-            layers,
-            background_layer,
-            x,
-            y,
-            size,
-            size,
-            bg,
-            ctx.px(ICON_BUTTON_RADIUS),
-        )?;
+        let radius = match style {
+            IconButtonStyle::Flat => ctx.px(ICON_BUTTON_RADIUS),
+            IconButtonStyle::Floating => size / 2.0,
+        };
+        ctx.draw_rounded_rect(layers, background_layer, x, y, size, size, bg, radius)?;
     }
-    // cell_size already tracks the window DPI, so only the padding and the
-    // clamp bounds need converting from design pixels.
-    let icon_size = (ctx.metrics.cell_size.height as f32 + ctx.px(ICON_CELL_PADDING))
-        .clamp(ctx.px(ICON_MIN_SIZE), ctx.px(ICON_MAX_SIZE));
+    let icon_size = match style {
+        // cell_size already tracks the window DPI, so only the padding and the
+        // clamp bounds need converting from design pixels.
+        IconButtonStyle::Flat => (ctx.metrics.cell_size.height as f32
+            + ctx.px(ICON_CELL_PADDING))
+        .clamp(ctx.px(ICON_MIN_SIZE), ctx.px(ICON_MAX_SIZE)),
+        IconButtonStyle::Floating => size * FLOATING_ICON_RATIO,
+    };
+    let resting_icon = match style {
+        IconButtonStyle::Flat => palette.muted_text,
+        // A step brighter than flat: the standing surface already carries some
+        // of the contrast the glyph alone used to need, but muted on top of it
+        // reads as a disabled control rather than a quiet one.
+        IconButtonStyle::Floating => palette.secondary_text,
+    };
     ctx.draw_svg_icon(
         layers,
         icon,
@@ -214,7 +273,7 @@ pub(crate) fn draw_icon_button_on_layer<A: Copy + PartialEq>(
         if hovered || pressed {
             palette.text
         } else {
-            palette.muted_text
+            resting_icon
         },
     )
 }
