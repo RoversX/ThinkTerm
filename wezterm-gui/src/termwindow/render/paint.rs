@@ -94,15 +94,6 @@ pub(crate) enum PreviewContentFade {
     ContentSince(Instant),
 }
 
-fn snapshot_has_content(
-    snapshot: &crate::termwindow::content_view::TerminalPreviewSnapshot,
-) -> bool {
-    snapshot
-        .panes
-        .iter()
-        .any(|pane| pane.lines.iter().any(|line| !line.is_whitespace()))
-}
-
 /// Everything a card's recorded quads depend on.
 ///
 /// Equal keys mean the recorded heap still draws the right picture and can be
@@ -1983,7 +1974,7 @@ impl crate::TermWindow {
         let snapshot_ptr = Arc::as_ptr(&preview.snapshot) as usize;
         let mut fades = self.preview_content_fade.borrow_mut();
         let entry = fades.entry(preview.tab_id).or_insert_with(|| {
-            if snapshot_has_content(&preview.snapshot) {
+            if preview.snapshot.has_content() {
                 PreviewContentFade::ContentSince(now)
             } else {
                 PreviewContentFade::Blank {
@@ -1993,7 +1984,7 @@ impl crate::TermWindow {
         });
         if let PreviewContentFade::Blank { snapshot } = entry {
             if *snapshot != snapshot_ptr {
-                if snapshot_has_content(&preview.snapshot) {
+                if preview.snapshot.has_content() {
                     *entry = PreviewContentFade::ContentSince(now);
                 } else {
                     *snapshot = snapshot_ptr;
@@ -4388,6 +4379,7 @@ mod tests {
                 tab_size: TerminalSize::default(),
                 panes: vec![],
                 splits: vec![],
+                complete: true,
             }),
             area,
             clip: area,

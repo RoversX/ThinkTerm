@@ -206,6 +206,9 @@ struct TerminalPreviewPaneFingerprint {
     height: usize,
     dimensions: RenderableDimensions,
     seqno: usize,
+    /// Rows fetched on demand arrive without moving the seqno; this moves
+    /// instead. See `Pane::line_fetch_generation`.
+    fetch_generation: u64,
     palette_identity: u64,
     cursor: StableCursorPosition,
 }
@@ -213,9 +216,26 @@ struct TerminalPreviewPaneFingerprint {
 #[derive(Clone, Debug)]
 struct CachedPreview<T> {
     fingerprint: TerminalPreviewFingerprint,
+    /// How many captures in a row came back with placeholder rows, for
+    /// as long as the fingerprint stood still; zero when the last capture
+    /// was whole. The picture held may be older and whole -- an incomplete
+    /// capture never displaces one -- so this describes the capturing, not
+    /// the snapshot. While non-zero the entry is captured again at the
+    /// refresh cadence even though its fingerprint has not moved, since a
+    /// fetch that failed moves nothing; `INCOMPLETE_CAPTURE_RETRIES` bounds
+    /// that for a pane whose rows never come.
+    incomplete_captures: u32,
     snapshot: Arc<T>,
     captured_at: Instant,
 }
+
+/// How many times a picture with placeholder rows is re-captured at the
+/// refresh cadence before the card settles for what it has. A fetch that
+/// lands moves the fingerprint and captures regardless of this; the bound
+/// is for a pane whose rows never come -- a dead mirror, a server that
+/// no longer has them -- which would otherwise wake the overview at the
+/// cadence for as long as it stayed open.
+const INCOMPLETE_CAPTURE_RETRIES: u32 = 10;
 
 /// One tab of a thread's workspace, as the card's tab pill lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1029,7 +1049,11 @@ impl LiveOverviewView {
                                 now,
                                 refresh_interval,
                                 &mut capture_budget,
-                                || capture_terminal_snapshot(card.tab_id),
+                                || {
+                                    let snapshot = capture_terminal_snapshot(card.tab_id)?;
+                                    let complete = snapshot.complete;
+                                    Some((snapshot, complete))
+                                },
                             );
                             if let Some(refresh_due) = refresh_due {
                                 // A `Some` here means the card's fingerprint no
@@ -2767,6 +2791,7 @@ fn terminal_preview_fingerprint(tab_id: TabId) -> Option<TerminalPreviewFingerpr
                 height: positioned.height,
                 dimensions: pane.get_dimensions(),
                 seqno: pane.get_current_seqno(),
+                fetch_generation: pane.line_fetch_generation(),
                 palette_identity: palette_identity(&palette),
                 cursor: pane.get_cursor_position(),
             }
@@ -2832,6 +2857,7 @@ fn capture_terminal_snapshot(tab_id: TabId) -> Option<TerminalPreviewSnapshot> {
 
     let splits = tab.iter_splits();
     let mut snapshots = Vec::new();
+    let mut complete = true;
     for positioned in tab.iter_panes() {
         let pane = positioned.pane;
         let dimensions = pane.get_dimensions();
@@ -2846,7 +2872,19 @@ fn capture_terminal_snapshot(tab_id: TabId) -> Option<TerminalPreviewSnapshot> {
         let (resolved_top, lines) = if rows == 0 || cols == 0 {
             (first_row, Vec::new())
         } else {
-            pane.get_lines(first_row..first_row.saturating_add(rows as isize))
+            let (resolved_top, lines) =
+                pane.get_lines(first_row..first_row.saturating_add(rows as isize));
+            // Asked after the copy, over the rows the copy holds: `get_lines`
+            // is what requests the rows it did not have, and a row it has
+            // just asked for is a placeholder in the copy. Nothing fills a
+            // row between the two calls -- fetches land on the thread that
+            // paints. A dead pane's rows are never coming, and its picture
+            // is as whole as it will get.
+            if !pane.is_dead() {
+                let copied = resolved_top..resolved_top.saturating_add(lines.len() as isize);
+                complete &= pane.unfetched_lines(copied).is_empty();
+            }
+            (resolved_top, lines)
         };
         snapshots.push(TerminalPreviewPaneSnapshot {
             pane_id: pane.pane_id(),
@@ -2872,10 +2910,15 @@ fn capture_terminal_snapshot(tab_id: TabId) -> Option<TerminalPreviewSnapshot> {
             tab_size,
             panes: snapshots,
             splits,
+            complete,
         })
     }
 }
 
+/// `capture` returns the picture and whether it is complete: a picture with
+/// placeholder rows in it does not replace a complete one already held,
+/// and is looked at again at the refresh cadence until a complete one
+/// arrives, whether or not the fingerprint moves in between.
 fn resolve_snapshot<K, T, F>(
     cache: &mut HashMap<K, CachedPreview<T>>,
     key: &K,
@@ -2887,7 +2930,7 @@ fn resolve_snapshot<K, T, F>(
 ) -> (Option<Arc<T>>, Option<Instant>)
 where
     K: Clone + Eq + Hash,
-    F: FnOnce() -> Option<T>,
+    F: FnOnce() -> Option<(T, bool)>,
 {
     let Some(fingerprint) = fingerprint else {
         return (
@@ -2897,10 +2940,17 @@ where
     };
 
     if let Some(cached) = cache.get(key) {
-        if cached.fingerprint == fingerprint {
+        let incomplete = cached.incomplete_captures > 0;
+        let settled = cached.incomplete_captures >= INCOMPLETE_CAPTURE_RETRIES;
+        if cached.fingerprint == fingerprint && (!incomplete || settled) {
             return (Some(Arc::clone(&cached.snapshot)), None);
         }
-        if let Some(refresh_interval) = refresh_interval {
+        // The cadence paces a busy terminal's refreshes. Rows arriving for
+        // an incomplete picture are what the card has been waiting to show,
+        // and only that movement skips the pacing: anything else moving the
+        // fingerprint -- output, the cursor -- is the busy terminal.
+        let rows_arrived = incomplete && rows_arrived(&cached.fingerprint, &fingerprint);
+        if let (Some(refresh_interval), false) = (refresh_interval, rows_arrived) {
             let refresh_due = cached.captured_at + refresh_interval;
             if now < refresh_due {
                 return (Some(Arc::clone(&cached.snapshot)), Some(refresh_due));
@@ -2926,20 +2976,55 @@ where
     }
     *capture_budget -= 1;
 
-    if let Some(snapshot) = capture() {
+    let mut retry = None;
+    if let Some((snapshot, complete)) = capture() {
+        // An incomplete picture never displaces a whole one: the rows it
+        // lacks are blank, and the held picture's rows were at least real.
+        // It does replace nothing, or another incomplete one -- possibly
+        // with fewer real rows, which is still the current state of the
+        // terminal rather than a stale one.
+        let (snapshot, incomplete_captures) = match cache.remove(key) {
+            Some(previous) if !complete && previous.incomplete_captures == 0 => {
+                (previous.snapshot, 1)
+            }
+            Some(previous) if !complete && previous.fingerprint == fingerprint => {
+                (Arc::new(snapshot), previous.incomplete_captures + 1)
+            }
+            _ if !complete => (Arc::new(snapshot), 1),
+            _ => (Arc::new(snapshot), 0),
+        };
         cache.insert(
             key.clone(),
             CachedPreview {
                 fingerprint,
-                snapshot: Arc::new(snapshot),
+                incomplete_captures,
+                snapshot,
                 captured_at: now,
             },
         );
+        if incomplete_captures > 0 && incomplete_captures < INCOMPLETE_CAPTURE_RETRIES {
+            // The rows arriving moves the fingerprint; the fetch failing
+            // moves nothing, and only a look at the refresh cadence would
+            // ask for them again.
+            retry = refresh_interval.map(|interval| now + interval);
+        }
     }
     (
         cache.get(key).map(|cached| Arc::clone(&cached.snapshot)),
-        None,
+        retry,
     )
+}
+
+/// Whether `later` differs from `earlier` by rows having arrived for some
+/// pane, whatever else moved with them.
+fn rows_arrived(earlier: &TerminalPreviewFingerprint, later: &TerminalPreviewFingerprint) -> bool {
+    later.panes.iter().any(|pane| {
+        earlier
+            .panes
+            .iter()
+            .find(|previous| previous.pane_id == pane.pane_id)
+            .is_some_and(|previous| previous.fetch_generation != pane.fetch_generation)
+    })
 }
 
 /// The command in the foreground of a tab's active pane, basename only, or
@@ -3730,7 +3815,7 @@ mod tests {
             now,
             None,
             &mut budget,
-            || Some(7_u8),
+            || Some((7_u8, true)),
         );
         assert_eq!(*snapshot.unwrap(), 7);
         assert!(due.is_none());
@@ -3767,7 +3852,7 @@ mod tests {
             now + Duration::from_millis(34),
             Some(LIVE_RESIZE_PREVIEW_INTERVAL),
             &mut budget,
-            || Some(8_u8),
+            || Some((8_u8, true)),
         );
         assert_eq!(*snapshot.unwrap(), 8);
         assert!(due.is_none());
@@ -3785,6 +3870,235 @@ mod tests {
         let live = HashSet::<LiveThreadKey>::new();
         cache.retain(|cached, _| live.contains(cached));
         assert!(cache.is_empty());
+    }
+
+    /// A tab whose rows are fetched on demand hands the first capture blank
+    /// placeholders. That picture must not outlive the rows' arrival, and
+    /// once a real picture is held no later placeholder-ridden one may
+    /// replace it.
+    #[test]
+    fn an_incomplete_picture_is_retried_and_never_replaces_a_complete_one() {
+        let key = LiveThreadKey {
+            space_id: "local".to_string(),
+            thread_id: "thread".to_string(),
+        };
+        let mut cache = HashMap::new();
+        let now = Instant::now();
+        let mut budget = usize::MAX;
+        let interval = Duration::from_millis(300);
+        let fingerprint = test_fingerprint(1);
+
+        // Nothing held: the blank picture is shown, and a look is booked
+        // for the refresh cadence even though the fingerprint may not move.
+        let (snapshot, due) = resolve_snapshot(
+            &mut cache,
+            &key,
+            Some(fingerprint.clone()),
+            now,
+            Some(interval),
+            &mut budget,
+            || Some((0_u8, false)),
+        );
+        assert_eq!(*snapshot.unwrap(), 0);
+        assert_eq!(due, Some(now + interval));
+
+        // Before the cadence, the same fingerprint is not recaptured.
+        let (snapshot, due) = resolve_snapshot(
+            &mut cache,
+            &key,
+            Some(fingerprint.clone()),
+            now + Duration::from_millis(100),
+            Some(interval),
+            &mut budget,
+            || panic!("an incomplete picture is not re-read before the cadence"),
+        );
+        assert_eq!(*snapshot.unwrap(), 0);
+        assert_eq!(due, Some(now + interval));
+
+        // At the cadence it is, fingerprint unchanged; a second blank
+        // replaces the first and books another look.
+        let (snapshot, due) = resolve_snapshot(
+            &mut cache,
+            &key,
+            Some(fingerprint.clone()),
+            now + interval,
+            Some(interval),
+            &mut budget,
+            || Some((1_u8, false)),
+        );
+        assert_eq!(*snapshot.unwrap(), 1);
+        assert_eq!(due, Some(now + interval * 2));
+
+        // The rows arrive: the fingerprint moves, the picture completes.
+        let mut arrived = fingerprint.clone();
+        arrived.panes[0].fetch_generation = 1;
+        let (snapshot, due) = resolve_snapshot(
+            &mut cache,
+            &key,
+            Some(arrived.clone()),
+            now + interval + Duration::from_millis(50),
+            Some(interval),
+            &mut budget,
+            || Some((7_u8, true)),
+        );
+        assert_eq!(*snapshot.unwrap(), 7);
+        assert!(due.is_none());
+
+        // Output lands while its rows are in flight: the capture is
+        // incomplete again, and the complete picture is kept in its place.
+        let mut later = arrived.clone();
+        later.panes[0].seqno = 2;
+        let output_at = now + interval * 2 + Duration::from_millis(50);
+        let (snapshot, due) = resolve_snapshot(
+            &mut cache,
+            &key,
+            Some(later.clone()),
+            output_at,
+            Some(interval),
+            &mut budget,
+            || Some((8_u8, false)),
+        );
+        assert_eq!(*snapshot.unwrap(), 7, "blank rows do not replace real ones");
+        assert_eq!(due, Some(output_at + interval));
+
+        // Same fingerprint, and the held picture is complete: nothing to do
+        // before the cadence -- but at it, the incomplete entry is re-read.
+        let (snapshot, due) = resolve_snapshot(
+            &mut cache,
+            &key,
+            Some(later.clone()),
+            output_at + interval,
+            Some(interval),
+            &mut budget,
+            || Some((9_u8, true)),
+        );
+        assert_eq!(*snapshot.unwrap(), 9);
+        assert!(due.is_none());
+    }
+
+    /// A card whose captures keep coming back incomplete while its
+    /// terminal is busy: the fingerprint moves every frame, but not by
+    /// rows arriving. That is the busy terminal the cadence exists for,
+    /// and it must not be captured more often for being incomplete --
+    /// nor may it ever chain an immediate frame.
+    #[test]
+    fn an_incomplete_card_with_a_moving_fingerprint_still_keeps_the_cadence() {
+        let key = LiveThreadKey {
+            space_id: "local".to_string(),
+            thread_id: "thread".to_string(),
+        };
+        let mut cache = HashMap::new();
+        let now = Instant::now();
+        let mut budget = usize::MAX;
+        let interval = Duration::from_millis(300);
+        let mut fingerprint = test_fingerprint(1);
+        let (_, due) = resolve_snapshot(
+            &mut cache,
+            &key,
+            Some(fingerprint.clone()),
+            now,
+            Some(interval),
+            &mut budget,
+            || Some((0_u8, false)),
+        );
+        assert_eq!(due, Some(now + interval));
+        for frame in 1..10 {
+            fingerprint.panes[0].seqno += 1;
+            let at = now + Duration::from_millis(16 * frame);
+            let (_, due) = resolve_snapshot(
+                &mut cache,
+                &key,
+                Some(fingerprint.clone()),
+                at,
+                Some(interval),
+                &mut budget,
+                || panic!("output alone does not skip the cadence"),
+            );
+            assert_eq!(due, Some(now + interval), "frame {frame}");
+        }
+        // Rows arriving does skip it.
+        fingerprint.panes[0].fetch_generation += 1;
+        let (snapshot, due) = resolve_snapshot(
+            &mut cache,
+            &key,
+            Some(fingerprint.clone()),
+            now + Duration::from_millis(200),
+            Some(interval),
+            &mut budget,
+            || Some((5_u8, true)),
+        );
+        assert_eq!((*snapshot.unwrap(), due), (5, None));
+    }
+
+    /// A pane whose rows never come -- a dead mirror, a server that no
+    /// longer has them -- is not re-read at the cadence forever. After the
+    /// bound the card settles for what it has, and a later fetch that does
+    /// land captures it again.
+    #[test]
+    fn retries_for_rows_that_never_come_are_bounded() {
+        let key = LiveThreadKey {
+            space_id: "local".to_string(),
+            thread_id: "thread".to_string(),
+        };
+        let mut cache = HashMap::new();
+        let now = Instant::now();
+        let mut budget = usize::MAX;
+        let interval = Duration::from_millis(300);
+        let fingerprint = test_fingerprint(1);
+        let mut captures = 0;
+        let mut at = now;
+        let mut last_due = Some(now);
+        for _ in 0..(INCOMPLETE_CAPTURE_RETRIES + 5) {
+            let (_, due) = resolve_snapshot(
+                &mut cache,
+                &key,
+                Some(fingerprint.clone()),
+                at,
+                Some(interval),
+                &mut budget,
+                || {
+                    captures += 1;
+                    Some((0_u8, false))
+                },
+            );
+            last_due = due;
+            at += interval;
+        }
+        assert_eq!(captures, INCOMPLETE_CAPTURE_RETRIES);
+        assert_eq!(last_due, None, "settled: no further look is booked");
+
+        let mut arrived = fingerprint.clone();
+        arrived.panes[0].fetch_generation = 1;
+        let (snapshot, due) = resolve_snapshot(
+            &mut cache,
+            &key,
+            Some(arrived),
+            at,
+            Some(interval),
+            &mut budget,
+            || Some((9_u8, true)),
+        );
+        assert_eq!((*snapshot.unwrap(), due), (9, None));
+    }
+
+    #[test]
+    fn only_a_fetch_generation_counts_as_rows_arriving() {
+        let earlier = test_fingerprint(1);
+        let mut output = earlier.clone();
+        output.panes[0].seqno = 2;
+        output.panes[0].cursor.y = 3;
+        assert!(!rows_arrived(&earlier, &output));
+        let mut fetched = earlier.clone();
+        fetched.panes[0].fetch_generation = 1;
+        assert!(rows_arrived(&earlier, &fetched));
+        // A pane that was not in the earlier picture says nothing.
+        let mut split = earlier.clone();
+        split.panes.push(TerminalPreviewPaneFingerprint {
+            pane_id: 2,
+            fetch_generation: 7,
+            ..earlier.panes[0].clone()
+        });
+        assert!(!rows_arrived(&earlier, &split));
     }
 
     /// A busy terminal changes its fingerprint on every frame. Without an
@@ -3811,7 +4125,7 @@ mod tests {
                     budget,
                     || {
                         captures += 1;
-                        Some(seq as u8)
+                        Some((seq as u8, true))
                     },
                 )
             };
@@ -3864,7 +4178,7 @@ mod tests {
                 &mut budget,
                 || {
                     captured += 1;
-                    Some(1_u8)
+                    Some((1_u8, true))
                 },
             );
             if snapshot.is_none() {
@@ -3887,7 +4201,7 @@ mod tests {
             &mut budget,
             || {
                 captured += 1;
-                Some(1_u8)
+                Some((1_u8, true))
             },
         );
         assert_eq!(captured, 2 * MAX_PREVIEW_CAPTURES_PER_FRAME);
@@ -3916,7 +4230,7 @@ mod tests {
                 now,
                 Some(preview_refresh_interval()),
                 &mut budget,
-                || Some(1_u8),
+                || Some((1_u8, true)),
             );
         }
 
@@ -3935,7 +4249,7 @@ mod tests {
                 &mut budget,
                 || {
                     captured += 1;
-                    Some(2_u8)
+                    Some((2_u8, true))
                 },
             );
             if *snapshot.unwrap() == 1 {
@@ -4008,6 +4322,7 @@ mod tests {
                 height: 24,
                 dimensions: RenderableDimensions::default(),
                 seqno,
+                fetch_generation: 0,
                 palette_identity: 1,
                 cursor: StableCursorPosition::default(),
             }],

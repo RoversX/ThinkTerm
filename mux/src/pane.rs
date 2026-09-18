@@ -269,6 +269,23 @@ pub trait Pane: Downcast + Send + Sync {
 
     fn get_current_seqno(&self) -> SequenceNo;
 
+    /// How many times rows this pane lacked have arrived from wherever it
+    /// gets them. A pane that holds its own screen never lacks a row and
+    /// stays at zero. A pane fetching rows on demand stamps each arrival
+    /// with the seqno it already has, so a consumer keyed on the seqno
+    /// alone would keep whatever placeholder it copied before the rows
+    /// came; this moves when they do.
+    fn line_fetch_generation(&self) -> u64 {
+        0
+    }
+
+    /// The rows of `lines` that `get_lines` would answer with a blank
+    /// placeholder: not yet received, or asked for and not yet answered.
+    /// Empty for a pane that holds its own screen.
+    fn unfetched_lines(&self, _lines: Range<StableRowIndex>) -> RangeSet<StableRowIndex> {
+        RangeSet::new()
+    }
+
     /// Returns misc metadata that is pane-specific
     fn get_metadata(&self) -> Value {
         Value::Null

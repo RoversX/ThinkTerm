@@ -294,6 +294,21 @@ pub(crate) struct TerminalPreviewSnapshot {
     pub tab_size: TerminalSize,
     pub panes: Vec<TerminalPreviewPaneSnapshot>,
     pub splits: Vec<PositionedSplit>,
+    /// Whether every row copied was a row the pane had. A pane that fetches
+    /// its rows on demand hands out blank placeholders for the ones still
+    /// in flight, and a picture holding any of those is not the terminal
+    /// yet: it is kept only until one that is can be taken.
+    pub complete: bool,
+}
+
+impl TerminalPreviewSnapshot {
+    /// Whether anything in the picture would be visible: at least one row
+    /// with more than whitespace on it.
+    pub fn has_content(&self) -> bool {
+        self.panes
+            .iter()
+            .any(|pane| pane.lines.iter().any(|line| !line.is_whitespace()))
+    }
 }
 
 #[derive(Clone, Debug)]

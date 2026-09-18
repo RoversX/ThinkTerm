@@ -68,6 +68,11 @@ pub struct PaneState {
     /// discard several in-flight fetches, and one repaint per epoch is
     /// enough to re-issue them.
     pub(crate) epoch_discard_notified: u64,
+    /// Counts completed row fetches. A fetched row is stamped with the
+    /// pane's current seqno, so nothing keyed on seqno alone can tell that
+    /// it arrived; a consumer that captured placeholder rows watches this
+    /// to know when to look again.
+    pub(crate) fetch_generation: u64,
     pub(crate) title: String,
     pub(crate) working_dir: Option<Url>,
     pub(crate) seqno: SequenceNo,
@@ -115,6 +120,7 @@ impl PaneState {
             warmed_epoch: None,
             warmed_top: 0,
             epoch_discard_notified: 0,
+            fetch_generation: 0,
             title: title.to_string(),
             working_dir: None,
             fetch_limiter: RateLimiter::new(fetch_rate_per_second, now),
@@ -447,13 +453,15 @@ impl PaneState {
         }
     }
 
+    /// Returns whether the row was stored; a fetched row is left alone
+    /// when something changed the entry after the fetch began.
     pub(crate) fn put_line(
         &mut self,
         stable_row: StableRowIndex,
         mut line: Line,
         rules: &[termwiz::hyperlink::Rule],
         fetch_token: Option<FetchToken>,
-    ) {
+    ) -> bool {
         line.scan_and_create_hyperlinks(rules);
 
         let entry = if let Some(fetch_token) = fetch_token {
@@ -484,13 +492,14 @@ impl PaneState {
                         fetch_token
                     );
                     self.lines.put(stable_row, e);
-                    return;
+                    return false;
                 }
-                None => return,
+                None => return false,
             }
         } else {
             LineEntry::Line(line)
         };
         self.lines.put(stable_row, entry);
+        true
     }
 }
