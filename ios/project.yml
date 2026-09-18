@@ -1,0 +1,46 @@
+# xcodegen spec for the S0 iOS probe: a SwiftUI shell around the Rust core
+# (thinkterm-mobile, linked as a static library) that drives a CAMetalLayer
+# through the UniFFI bindings in Generated/. `ios/build.sh` regenerates the
+# bindings and the project and builds for the simulator.
+name: ThinkTermProbe
+options:
+  bundleIdPrefix: com.roversx.thinkterm
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+targets:
+  ThinkTermProbe:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: Generated
+        excludes:
+          - "*.h"
+          - "*.modulemap"
+      # Listed file by file: an iOS bundle is flat, and a folder reference
+      # would nest a Resources/ directory the installer rejects.
+      - path: Resources
+        buildPhase: resources
+        excludes:
+          - ".gitignore"
+    dependencies:
+      - sdk: Metal.framework
+      - sdk: QuartzCore.framework
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
+        SWIFT_VERSION: "5.9"
+        SWIFT_INCLUDE_PATHS: $(SRCROOT)/Generated
+        # The crate also emits a cdylib (for Android later); naming the .a by
+        # path keeps the linker from preferring the .dylib next to it.
+        "OTHER_LDFLAGS[sdk=iphonesimulator*]": $(SRCROOT)/../target/aarch64-apple-ios-sim/release/libthinkterm_mobile.a
+        "OTHER_LDFLAGS[sdk=iphoneos*]": $(SRCROOT)/../target/aarch64-apple-ios/release/libthinkterm_mobile.a
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+      configs:
+        Debug:
+          "CODE_SIGNING_ALLOWED[sdk=iphonesimulator*]": NO
