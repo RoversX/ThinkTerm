@@ -1230,7 +1230,29 @@ impl LiveOverviewView {
                                 preview_fill,
                                 ctx.px(PREVIEW_RADIUS),
                             )?;
-                            if !in_flight {
+                            if in_flight {
+                                // Built, not shown. The thumbnail's quads
+                                // take several frames to record, and the
+                                // dissolve that lands the travelling
+                                // terminal on this card began on the frame
+                                // the card was handed its picture back --
+                                // which left the panel showing through for
+                                // as long as the recording took. Asking for
+                                // the picture at zero opacity during the
+                                // flight has it recorded by the time the
+                                // terminal arrives, and the landing waits
+                                // for it (see `paint_content_view_flight`).
+                                if let Some(snapshot) = snapshot.as_ref() {
+                                    self.previews.push(TerminalPreviewRequest {
+                                        tab_id,
+                                        snapshot: Arc::clone(snapshot),
+                                        area: preview,
+                                        clip,
+                                        hold_scale: self.live_resizing,
+                                        opacity: 0.0,
+                                    });
+                                }
+                            } else {
                                 // A card that changed tab fades the old
                                 // picture out under the new one. The old
                                 // tab's snapshot is kept warm for the length

@@ -91,6 +91,8 @@ pub(crate) enum PreviewContentFade {
     Blank {
         snapshot: usize,
     },
+    /// Showing content since this instant; the ramp runs from it, so a card
+    /// that was never blank is entered with an instant already a ramp ago.
     ContentSince(Instant),
 }
 
@@ -1365,22 +1367,39 @@ impl crate::TermWindow {
     /// sidebar, below the tab bar).
     /// Advance a full-window view's arrival or departure.
     fn advance_content_view_fade(&mut self, now: Instant) {
+        // Read before the fade is borrowed for advancing; see the landing
+        // below for what it gates.
+        let flight_thumbnail_recorded = self
+            .content_view_fade
+            .as_ref()
+            .and_then(|fade| fade.flight.as_ref())
+            .and_then(|flight| flight.tab_id)
+            .map_or(true, |tab_id| self.preview_thumbnail_recorded(tab_id));
         let Some(fade) = self.content_view_fade.as_mut() else {
             return;
         };
         // Once the travelling terminal has closed to within touching distance
-        // of its card, hand the card back its own thumbnail and dissolve the
-        // recording into it. Both pictures are then on screen at the same
-        // rectangle, which is the only arrangement in which a dissolve reads as
-        // one thing settling rather than as two things overlapping.
+        // of its card, hand the card back its own thumbnail and cut from the
+        // recording to it (`CONTENT_VIEW_LANDING_FADE` says why a cut). Both
+        // pictures are on screen at the same rectangle for the one frame the
+        // cut takes, the recording on top.
         let mut landed = false;
         if fade.landing.is_none() && fade.travel.target() >= 0.5 {
             if let Some(flight) = fade.flight.as_ref() {
-                if crate::termwindow::content_view::flight_is_landing(
-                    flight.source,
-                    flight.destination,
-                    fade.travel.value(now),
-                ) {
+                // The dissolve needs a thumbnail under it. The card asks for
+                // its picture at zero opacity while the terminal is in
+                // flight so that it is recorded by now; if it is not -- a
+                // slow recording, or a tab with nothing to show -- the
+                // terminal holds at the card, opaque, until it is, and no
+                // longer than the travel itself once that has ended.
+                let thumbnail_ready = flight_thumbnail_recorded || !fade.travel.is_running();
+                if thumbnail_ready
+                    && crate::termwindow::content_view::flight_is_landing(
+                        flight.source,
+                        flight.destination,
+                        fade.travel.value(now),
+                    )
+                {
                     fade.landing = Some(crate::ui::anim::Timeline::new(
                         now,
                         1.0,
@@ -1965,6 +1984,18 @@ impl crate::TermWindow {
         Ok(())
     }
 
+    /// Whether `tab_id`'s thumbnail has a complete recording to replay: an
+    /// entry in the quad cache, and no rebuild of it sliced across frames
+    /// still under way.
+    fn preview_thumbnail_recorded(&self, tab_id: TabId) -> bool {
+        self.preview_quad_cache.borrow().contains_key(&tab_id)
+            && !self
+                .preview_rebuild_partial
+                .borrow()
+                .as_ref()
+                .is_some_and(|partial| partial.tab_id == tab_id)
+    }
+
     /// The opacity a card's picture should draw at this frame: 1.0 for a
     /// settled card, ramping 0->1 across [`PREVIEW_CONTENT_FADE`] from the
     /// moment its terminal first shows visible content. Requests further
@@ -1975,7 +2006,18 @@ impl crate::TermWindow {
         let mut fades = self.preview_content_fade.borrow_mut();
         let entry = fades.entry(preview.tab_id).or_insert_with(|| {
             if preview.snapshot.has_content() {
-                PreviewContentFade::ContentSince(now)
+                // A card first seen with its picture already there is
+                // settled from the start. Fading it in ran against the
+                // landing dissolve of the overview's open: the terminal
+                // flying into its card is handed back to the thumbnail on
+                // the frame the dissolve begins, and a thumbnail rising
+                // from zero under a picture sinking to zero left the panel
+                // showing through at the crossing -- a washed-out flash on
+                // every open. The ramp is for a blank card whose rows
+                // arrive later, which is the edge below.
+                PreviewContentFade::ContentSince(
+                    now.checked_sub(PREVIEW_CONTENT_FADE).unwrap_or(now),
+                )
             } else {
                 PreviewContentFade::Blank {
                     snapshot: snapshot_ptr,
