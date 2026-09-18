@@ -239,7 +239,8 @@ struct TabPillPlan {
 /// A folded pill in the middle of opening or closing.
 ///
 /// Opens only once the pointer has rested on the pill, closes only once it
-/// has been gone for a moment, and a click pins it open until the next.
+/// has been gone for a moment, and a click pins it open until the next
+/// click or a hover over another expandable pill.
 #[derive(Clone, Debug)]
 struct PillExpansion {
     key: LiveThreadKey,
@@ -1716,13 +1717,22 @@ impl LiveOverviewView {
     }
 
     fn update_pill_expansion(&mut self, now: Instant) {
+        // collect_groups rebuilt tab_keys for the live cards. A removed
+        // card (or one with no folded tabs left) must not keep a pinned slot.
+        if self
+            .pill_expansion
+            .as_ref()
+            .is_some_and(|expansion| !self.pill_can_reveal(&expansion.key))
+        {
+            self.pill_expansion = None;
+        }
         let over = self.pill_hover_key().filter(|key| self.pill_can_reveal(key));
         match self.pill_expansion.as_mut() {
             Some(expansion) => {
                 let on_this = over.as_ref() == Some(&expansion.key);
-                if !on_this && over.is_some() && !expansion.pinned && !expansion.is_open() {
-                    // Straight from one folded pill onto another: arm the
-                    // new one instead of waiting the old one out.
+                if !on_this && over.is_some() && (expansion.pinned || !expansion.is_open()) {
+                    // Another pill can take over a pinned expansion. Merely
+                    // leaving for empty space still keeps the pin open.
                     self.pill_expansion =
                         Some(PillExpansion::armed(over.expect("checked"), now));
                     return;
@@ -4085,6 +4095,52 @@ mod tests {
         pill.set_open(true, start);
         assert!(pill.step(false, start + Duration::from_secs(5)));
         assert!(pill.is_open());
+    }
+
+    #[test]
+    fn hovering_another_pill_takes_over_a_pin_after_the_hover_delay() {
+        let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
+        let first = card_key();
+        let second = LiveThreadKey {
+            thread_id: "second".into(),
+            ..first.clone()
+        };
+        let second_tab = TAB_PILL_MAX_DOTS + 1;
+        for tab in 0..=TAB_PILL_MAX_DOTS {
+            view.tab_keys.insert(tab, first.clone());
+            view.tab_keys.insert(second_tab + tab, second.clone());
+        }
+        view.toggle_pill(0);
+        let now = Instant::now();
+        // Empty space does not unpin the first card.
+        view.update_pill_expansion(now);
+        assert!(view.pill_expansion.as_ref().unwrap().pinned);
+
+        view.interaction.hovered = Some(OverviewAction::ExpandTabs(second_tab));
+        view.update_pill_expansion(now);
+        let expansion = view.pill_expansion.as_ref().unwrap();
+        assert_eq!(expansion.key, second);
+        assert!(!expansion.pinned);
+        assert!(!expansion.is_open(), "the new pill still waits for a hover");
+        view.update_pill_expansion(now + TAB_PILL_OPEN_DELAY);
+        assert!(view.pill_expansion.as_ref().unwrap().is_open());
+    }
+
+    #[test]
+    fn a_pin_is_cleared_when_its_card_disappears_or_no_longer_folds_tabs() {
+        for remaining_tabs in [0, TAB_PILL_MAX_DOTS] {
+            let mut view = LiveOverviewView::new(0, "space", "workspace", 1.8);
+            let key = card_key();
+            for tab in 0..=TAB_PILL_MAX_DOTS {
+                view.tab_keys.insert(tab, key.clone());
+            }
+            view.toggle_pill(0);
+            assert!(view.pill_expansion.as_ref().unwrap().pinned);
+            // The live-card collection replaces this mapping on every frame.
+            view.tab_keys.retain(|tab, _| *tab < remaining_tabs);
+            view.update_pill_expansion(Instant::now());
+            assert!(view.pill_expansion.is_none());
+        }
     }
 
     #[test]
