@@ -1,10 +1,9 @@
-//! What the session takes from the page: a clock, a spawner, an event
-//! sink and its settings.
+//! The session layer's view of the App's platform: a clock, a spawner and
+//! an event sink over a [`Platform`], and the link. One type for every
+//! client; only `P` and `L` differ.
 
-use crate::link::WsLink;
+use crate::platform::{Link, Platform};
 use std::cell::RefCell;
-use std::future::Future;
-use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use thinkterm_session::clock::{Clock, Timestamp};
@@ -12,51 +11,35 @@ use thinkterm_session::host::{
     DetachedFuture, HostConfig, HostPaneId, ImageDomainKey, SessionEvents, SessionHost, Spawner,
 };
 
-pub type LocalFuture<T> = Pin<Box<dyn Future<Output = T> + 'static>>;
+pub struct PlatformClock<P: Platform>(Rc<P>);
 
-pub struct WebClock {
-    performance: web_sys::Performance,
-}
-
-impl WebClock {
-    pub fn new() -> Self {
-        let performance = web_sys::window()
-            .and_then(|w| w.performance())
-            .expect("performance.now is a web standard");
-        Self { performance }
-    }
-}
-
-impl Clock for WebClock {
+impl<P: Platform> Clock for PlatformClock<P> {
     fn now(&self) -> Timestamp {
-        Timestamp::from_micros((self.performance.now() * 1000.0) as u64)
+        Timestamp::from_micros((self.0.monotonic_ms() * 1000.0) as u64)
     }
+
     fn wall_millis(&self) -> u64 {
-        js_sys::Date::now() as u64
+        self.0.wall_ms() as u64
     }
 }
 
-pub struct LocalSpawner;
+pub struct PlatformSpawner<P: Platform>(Rc<P>);
 
-impl Spawner for LocalSpawner {
+impl<P: Platform> Spawner for PlatformSpawner<P> {
     fn spawn_detached(&self, fut: DetachedFuture) {
-        wasm_bindgen_futures::spawn_local(fut);
+        self.0.spawn(fut);
     }
 }
 
-/// The session's notifications, folded into "the page needs a paint" plus
-/// the few facts the page shows.
+/// Which panes had output since the last frame, and a wake to ask for
+/// one when the first arrives.
 #[derive(Default)]
-pub struct WebEvents {
-    /// The panes with news since the last frame, by the id the page
-    /// keys them on (the server's pane id).
+pub struct Events {
     dirty: RefCell<std::collections::HashSet<HostPaneId>>,
     wake: RefCell<Option<Rc<dyn Fn()>>>,
 }
 
-impl WebEvents {
-    /// `wake` runs on every event that changes what the page should show;
-    /// it schedules a frame.
+impl Events {
     pub fn set_wake(&self, wake: Rc<dyn Fn()>) {
         *self.wake.borrow_mut() = Some(wake);
     }
@@ -73,7 +56,7 @@ impl WebEvents {
     }
 }
 
-impl SessionEvents for WebEvents {
+impl SessionEvents for Events {
     fn pane_output(&self, pane: HostPaneId) {
         self.mark(pane);
     }
@@ -86,11 +69,11 @@ impl SessionEvents for WebEvents {
     fn input_recorded(&self) {}
 }
 
-pub struct WebConfig {
+pub struct Config {
     rules: Arc<Vec<termwiz::hyperlink::Rule>>,
 }
 
-impl Default for WebConfig {
+impl Default for Config {
     fn default() -> Self {
         Self {
             rules: Arc::new(Vec::new()),
@@ -98,13 +81,11 @@ impl Default for WebConfig {
     }
 }
 
-impl HostConfig for WebConfig {
+impl HostConfig for Config {
     fn hyperlink_rules(&self) -> Arc<Vec<termwiz::hyperlink::Rule>> {
         Arc::clone(&self.rules)
     }
     fn fetch_rate_per_second(&self) -> u32 {
-        // The desktop's default mux_output_parser... no: its default
-        // ratelimit for line fetches is 10 per second per pane.
         10
     }
     fn scrollback_lookahead_screens(&self) -> usize {
@@ -115,34 +96,46 @@ impl HostConfig for WebConfig {
     }
 }
 
-pub struct WebHost {
-    pub clock: WebClock,
-    pub spawner: LocalSpawner,
-    pub events: WebEvents,
-    pub link: WsLink,
-    pub config: WebConfig,
+pub struct AppHost<P: Platform, L: Link> {
+    pub clock: PlatformClock<P>,
+    pub spawner: PlatformSpawner<P>,
+    pub events: Events,
+    pub link: L,
+    pub config: Config,
 }
 
-impl SessionHost for WebHost {
-    type Clock = WebClock;
-    type Spawner = LocalSpawner;
-    type Events = WebEvents;
-    type Link = WsLink;
-    type Config = WebConfig;
+impl<P: Platform, L: Link> AppHost<P, L> {
+    pub fn new(platform: Rc<P>, link: L) -> Self {
+        Self {
+            clock: PlatformClock(Rc::clone(&platform)),
+            spawner: PlatformSpawner(platform),
+            events: Events::default(),
+            link,
+            config: Config::default(),
+        }
+    }
+}
 
-    fn clock(&self) -> &WebClock {
+impl<P: Platform, L: Link> SessionHost for AppHost<P, L> {
+    type Clock = PlatformClock<P>;
+    type Spawner = PlatformSpawner<P>;
+    type Events = Events;
+    type Link = L;
+    type Config = Config;
+
+    fn clock(&self) -> &PlatformClock<P> {
         &self.clock
     }
-    fn spawner(&self) -> &LocalSpawner {
+    fn spawner(&self) -> &PlatformSpawner<P> {
         &self.spawner
     }
-    fn events(&self) -> &WebEvents {
+    fn events(&self) -> &Events {
         &self.events
     }
-    fn link(&self) -> &WsLink {
+    fn link(&self) -> &L {
         &self.link
     }
-    fn config(&self) -> &WebConfig {
+    fn config(&self) -> &Config {
         &self.config
     }
     fn image_domain(&self) -> ImageDomainKey {

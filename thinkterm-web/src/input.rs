@@ -2,8 +2,10 @@
 //! IME composes into it; keys the IME is not handling go to the pane as
 //! key events, composed text goes as bytes, and paste arrives as paste.
 
-use crate::app::App;
 use crate::keymap::{map_key, DomKey};
+use crate::page::WebApp;
+use crate::platform::{PointerInput, WheelDelta, WheelInput};
+use wezterm_term::KeyModifiers;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -30,7 +32,50 @@ pub(crate) fn listen<E: JsCast + 'static>(
     closure.forget();
 }
 
-pub fn install(app: Rc<App>, canvas: &HtmlCanvasElement, textarea: &HtmlTextAreaElement) {
+fn mouse_modifiers(ev: &web_sys::MouseEvent) -> KeyModifiers {
+    let mut m = KeyModifiers::NONE;
+    if ev.shift_key() {
+        m |= KeyModifiers::SHIFT;
+    }
+    if ev.ctrl_key() {
+        m |= KeyModifiers::CTRL;
+    }
+    if ev.alt_key() {
+        m |= KeyModifiers::ALT;
+    }
+    if ev.meta_key() {
+        m |= KeyModifiers::SUPER;
+    }
+    m
+}
+
+fn pointer_input(ev: &PointerEvent) -> PointerInput {
+    PointerInput {
+        x: ev.client_x() as f64,
+        y: ev.client_y() as f64,
+        button: ev.button().clamp(0, 255) as u8,
+        buttons_down: ev.buttons() != 0,
+        mods: mouse_modifiers(ev),
+    }
+}
+
+fn wheel_input(ev: &WheelEvent) -> WheelInput {
+    let delta = match ev.delta_mode() {
+        WheelEvent::DOM_DELTA_LINE => WheelDelta::Lines(ev.delta_y()),
+        WheelEvent::DOM_DELTA_PAGE => WheelDelta::Pages(ev.delta_y()),
+        _ => WheelDelta::Pixels(ev.delta_y()),
+    };
+    WheelInput {
+        x: ev.client_x() as f64,
+        y: ev.client_y() as f64,
+        delta,
+        mods: mouse_modifiers(ev),
+        ctrl: ev.ctrl_key(),
+        trusted: ev.is_trusted(),
+    }
+}
+
+pub fn install(app: Rc<WebApp>, canvas: &HtmlCanvasElement, textarea: &HtmlTextAreaElement) {
     let window = web_sys::window().expect("window");
 
     {
@@ -112,33 +157,35 @@ pub fn install(app: Rc<App>, canvas: &HtmlCanvasElement, textarea: &HtmlTextArea
     }
     {
         let app = app.clone();
-        listen::<PointerEvent>(canvas, "pointerdown", move |ev| {
-            app.pointer(&ev, crate::app::Pointer::Down);
+        let canvas = canvas.clone();
+        listen::<PointerEvent>(&canvas.clone(), "pointerdown", move |ev| {
+            let _ = canvas.set_pointer_capture(ev.pointer_id());
+            app.pointer(&pointer_input(&ev), crate::app::Pointer::Down);
             ev.prevent_default();
         });
     }
     {
         let app = app.clone();
         listen::<PointerEvent>(canvas, "pointermove", move |ev| {
-            app.pointer(&ev, crate::app::Pointer::Move);
+            app.pointer(&pointer_input(&ev), crate::app::Pointer::Move);
         });
     }
     {
         let app = app.clone();
         listen::<PointerEvent>(canvas, "pointerup", move |ev| {
-            app.pointer(&ev, crate::app::Pointer::Up);
+            app.pointer(&pointer_input(&ev), crate::app::Pointer::Up);
         });
     }
     {
         let app = app.clone();
         listen::<PointerEvent>(canvas, "pointercancel", move |ev| {
-            app.pointer(&ev, crate::app::Pointer::Up);
+            app.pointer(&pointer_input(&ev), crate::app::Pointer::Up);
         });
     }
     {
         let app = app.clone();
         listen::<WheelEvent>(canvas, "wheel", move |ev| {
-            if app.wheel(&ev) {
+            if app.wheel(&wheel_input(&ev)) {
                 ev.prevent_default();
             }
         });

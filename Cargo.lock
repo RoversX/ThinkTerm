@@ -7796,6 +7796,7 @@ dependencies = [
  "log",
  "russh",
  "termwiz 0.24.0",
+ "thinkterm-font-core",
  "thinkterm-font-web",
  "thinkterm-proto",
  "thinkterm-render",

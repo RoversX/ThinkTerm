@@ -5,8 +5,13 @@ use crate::app::{App, Setup};
 use crate::attach::attach;
 use crate::glyphs::GlyphCache;
 use crate::gpu::Gpu;
-use crate::host::{LocalSpawner, WebClock, WebConfig, WebEvents, WebHost};
+use crate::host::AppHost;
 use crate::link::WsLink;
+use crate::platform::Platform;
+use crate::web_platform::WebPlatform;
+
+/// The App as the page runs it.
+pub type WebApp = App<WebPlatform, WsLink>;
 use anyhow::{anyhow, Context, Result};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -105,7 +110,7 @@ async fn run(
     glyph_font: String,
     font_pinned: bool,
     languages: Vec<String>,
-) -> Result<Rc<crate::app::App>> {
+) -> Result<Rc<WebApp>> {
     let canvas: web_sys::HtmlCanvasElement = element(&canvas_id)?;
     let textarea: web_sys::HtmlTextAreaElement = element(&textarea_id)?;
     // The page draws its own status; the boot's progress is logged.
@@ -135,9 +140,10 @@ async fn run(
     // From here on a failure must hand the socket back: without this the
     // server keeps a registered client and a TCP session for a page that
     // gave up, and the reader keeps answering its pings.
+    let platform = Rc::new(WebPlatform::new(canvas.clone(), textarea.clone()));
     let outcome = start_attached(
-        &link, &canvas, &textarea, &url, &token, fonts, size_pt, &glyph_font, dpr,
-        dpi, font_pinned, languages,
+        &link, platform, &canvas, &textarea, fonts, size_pt, &glyph_font, dpr, dpi, font_pinned,
+        languages,
     )
     .await;
     if outcome.is_err() {
@@ -148,10 +154,9 @@ async fn run(
 
 async fn start_attached(
     link: &WsLink,
+    platform: Rc<WebPlatform>,
     canvas: &web_sys::HtmlCanvasElement,
     textarea: &web_sys::HtmlTextAreaElement,
-    url: &str,
-    token: &str,
     fonts: Rc<FontSet>,
     size_pt: f64,
     glyph_font: &str,
@@ -159,7 +164,7 @@ async fn start_attached(
     dpi: u32,
     font_pinned: bool,
     languages: Vec<String>,
-) -> Result<Rc<crate::app::App>> {
+) -> Result<Rc<WebApp>> {
     let set_status = |text: &str| log::info!("{text}");
     set_status("starting WebGPU…");
     let rect = canvas.get_bounding_client_rect();
@@ -192,7 +197,15 @@ async fn start_attached(
     set_status("attaching…");
     // Rows the bar above each pane takes, for the first report.
     let nav_rows = crate::navbar::nav_rows(crate::navbar::nav_css(ch as f64 / dpr, None) * dpr, ch as f64);
-    let attached = attach(&link, size, nav_rows).await?;
+    let me = thinkterm_proto::ClientId {
+        hostname: "web".into(),
+        username: "web".into(),
+        pid: 0,
+        epoch: platform.wall_ms() as u64,
+        id: platform.random_u32() as usize,
+        ssh_auth_sock: None,
+    };
+    let attached = attach(link, size, nav_rows, me).await?;
     let (cols, rows) = match size {
         Some(size) => (size.cols, size.rows),
         None => (attached.dims.cols, attached.dims.viewport_rows),
@@ -206,13 +219,7 @@ async fn start_attached(
         rows
     );
 
-    let host = Arc::new(WebHost {
-        clock: WebClock::new(),
-        spawner: LocalSpawner,
-        events: WebEvents::default(),
-        link: link.clone(),
-        config: WebConfig::default(),
-    });
+    let host = Arc::new(AppHost::new(Rc::clone(&platform), link.clone()));
     let images = Arc::new(thinkterm_session::Lock::new(
         thinkterm_session::images::ImageStore::default(),
     ));
@@ -228,6 +235,7 @@ async fn start_attached(
     );
 
     let app = App::new(Setup {
+        platform: Rc::clone(&platform),
         link: link.clone(),
         host: Arc::clone(&host),
         images,
@@ -236,10 +244,6 @@ async fn start_attached(
         gpu,
         glyphs,
         fonts,
-        canvas: canvas.clone(),
-        textarea: textarea.clone(),
-        url: url.to_string(),
-        token: token.to_string(),
         pane_id: attached.pane_id,
         tab_id: attached.tab_id,
         window_id: attached.window_id,
@@ -253,11 +257,11 @@ async fn start_attached(
     host.events.set_wake(app.wake());
     {
         let app = Rc::clone(&app);
-        link.set_push_handler(move |pdu| app.on_push(pdu));
+        link.set_push_handler(Box::new(move |pdu| app.on_push(pdu)));
     }
     {
         let app = Rc::clone(&app);
-        link.set_close_handler(move |reason| app.on_close(reason));
+        link.set_close_handler(Box::new(move |reason| app.on_close(reason)));
     }
     crate::input::install(Rc::clone(&app), canvas, textarea);
     app.fetch_tree();

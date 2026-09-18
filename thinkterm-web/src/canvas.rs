@@ -25,7 +25,7 @@ pub struct WebPlatform;
 
 impl GlyphPlatform for WebPlatform {
     fn now_ms(&self) -> f64 {
-        crate::app::monotonic_ms()
+        crate::web_platform::WebPlatform::now_ms()
     }
 
     fn painter(&self, geometry: &ScratchGeometry, families: &str) -> Result<Box<dyn TextPainter>> {

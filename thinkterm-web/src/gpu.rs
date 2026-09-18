@@ -14,7 +14,10 @@ use thinkterm_render::vertex::Vertex;
 pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: Arc<wgpu::Queue>,
-    surface: wgpu::Surface<'static>,
+    /// The surface drawn on, when there is one: a phone takes it away in
+    /// the background and hands a new one back, and the device, the
+    /// pipeline and every atlas outlive that.
+    surface: Option<wgpu::Surface<'static>>,
     config: wgpu::SurfaceConfiguration,
     view_format: wgpu::TextureFormat,
     pub pipeline: Pipeline,
@@ -32,6 +35,7 @@ pub struct Gpu {
 }
 
 impl Gpu {
+    #[cfg(target_arch = "wasm32")]
     pub async fn new(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32) -> Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::BROWSER_WEBGPU,
@@ -40,6 +44,16 @@ impl Gpu {
         let surface = instance
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
             .map_err(|e| anyhow!("creating the canvas surface: {e}"))?;
+        Self::from_surface(&instance, surface, width, height).await
+    }
+
+    /// A device for `surface` and the pipeline for its format.
+    pub async fn from_surface(
+        instance: &wgpu::Instance,
+        surface: wgpu::Surface<'static>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -98,7 +112,7 @@ impl Gpu {
         Ok(Self {
             device,
             queue,
-            surface,
+            surface: Some(surface),
             config,
             view_format,
             pipeline,
@@ -164,7 +178,51 @@ impl Gpu {
         }
         self.config.width = width;
         self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
+        if let Some(surface) = &self.surface {
+            surface.configure(&self.device, &self.config);
+        }
+    }
+
+    pub fn has_surface(&self) -> bool {
+        self.surface.is_some()
+    }
+
+    /// Let go of the surface: nothing is drawn until another is attached.
+    /// The device, the pipeline and every atlas stay.
+    pub fn detach_surface(&mut self) {
+        self.surface = None;
+    }
+
+    /// Draw on `surface` from now on. Its format may differ from the last
+    /// one's, in which case the pipeline is rebuilt for it; the atlases
+    /// are unaffected, and their bind groups are made again on first use.
+    pub fn attach_surface(
+        &mut self,
+        adapter: &wgpu::Adapter,
+        surface: wgpu::Surface<'static>,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let caps = surface.get_capabilities(adapter);
+        let format = caps
+            .formats
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow!("the surface offers no texture format"))?;
+        let view_format = srgb_format(format);
+        self.config.format = format;
+        self.config.width = width.max(1);
+        self.config.height = height.max(1);
+        self.config.view_formats = if view_format != format { vec![view_format] } else { vec![] };
+        surface.configure(&self.device, &self.config);
+        if view_format != self.view_format {
+            self.view_format = view_format;
+            self.pipeline = Pipeline::new(&self.device, view_format);
+            self.uniform_bind_group = self.pipeline.uniform_bind_group(&self.device, &self.uniform_buffer);
+            self.atlas_bind_groups.clear();
+        }
+        self.surface = Some(surface);
+        Ok(())
     }
 
     pub fn max_texture_dimension(&self) -> u32 {
@@ -219,10 +277,21 @@ impl Gpu {
         self.upload_vertices(&scratch);
         self.scratch = scratch;
 
-        let frame = self
-            .surface
-            .get_current_texture()
-            .map_err(|e| anyhow!("acquiring the canvas frame: {e}"))?;
+        let Some(surface) = &self.surface else {
+            // Nothing to draw on: the quads were built for nothing, which
+            // is cheap, and the next attached surface asks for a frame.
+            return Ok(());
+        };
+        let frame = match surface.get_current_texture() {
+            Ok(frame) => frame,
+            Err(wgpu::SurfaceError::Lost) | Err(wgpu::SurfaceError::Outdated) => {
+                surface.configure(&self.device, &self.config);
+                surface
+                    .get_current_texture()
+                    .map_err(|e| anyhow!("acquiring the frame after reconfiguring: {e}"))?
+            }
+            Err(err) => return Err(anyhow!("acquiring the frame: {err}")),
+        };
         let view = view_as(&frame.texture, self.view_format);
         let mut encoder = self
             .device
@@ -288,8 +357,8 @@ impl Gpu {
         let quads = self.upload_vertices(vertices);
         let group = self.atlas_groups(atlas);
 
-        let frame = self
-            .surface
+        let surface = self.surface.as_ref().ok_or_else(|| anyhow!("no surface"))?;
+        let frame = surface
             .get_current_texture()
             .map_err(|e| anyhow!("acquiring the canvas frame: {e}"))?;
         let view = view_as(&frame.texture, self.view_format);

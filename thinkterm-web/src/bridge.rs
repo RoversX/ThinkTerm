@@ -2,17 +2,17 @@
 //! and the few things it can ask for. The display layer is not told what
 //! changed, only that something did; it reads the views it draws.
 
-use crate::app::App;
+use crate::page::WebApp;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
 pub struct Client {
-    app: Rc<App>,
+    app: Rc<WebApp>,
 }
 
 impl Client {
-    pub(crate) fn new(app: Rc<App>) -> Self {
+    pub(crate) fn new(app: Rc<WebApp>) -> Self {
         Self { app }
     }
 }
@@ -26,7 +26,11 @@ impl Client {
     /// Called once right away, then once per task in which any view
     /// changed.
     pub fn on_change(&self, callback: js_sys::Function) {
-        self.app.set_on_change(callback);
+        self.app.set_on_change(Rc::new(move || {
+            if let Err(err) = callback.call0(&JsValue::NULL) {
+                log::warn!("the page's change handler failed: {err:?}");
+            }
+        }));
     }
 
     pub fn sidebar(&self) -> String {

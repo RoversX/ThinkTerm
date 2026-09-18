@@ -2,7 +2,7 @@
 //! takes: version, identity, the pane list, a viewport report, and the
 //! render subscription.
 
-use crate::link::WsLink;
+use crate::platform::Link;
 use anyhow::{anyhow, bail, Result};
 use codec::Pdu;
 use crate::chrome::active_pane;
@@ -20,12 +20,22 @@ pub struct Attached {
     pub dims: RenderableDimensions,
     pub alt_screen: bool,
     pub server_version: String,
+    /// The server's identity for this run: a cold start that comes back
+    /// to a different one must not trust the ids it remembers.
+    pub server_id: String,
 }
 
 /// `size` is the grid this page can show, or `None` when it cannot show
 /// one yet; only a real size is reported, so a later claim never carries
 /// a made-up one.
-pub async fn attach(link: &WsLink, size: Option<TerminalSize>, nav_rows: usize) -> Result<Attached> {
+/// `me` is this client's identity for the server: the platform makes it
+/// (it needs a clock and a random number).
+pub async fn attach<L: Link>(
+    link: &L,
+    size: Option<TerminalSize>,
+    nav_rows: usize,
+    me: ClientId,
+) -> Result<Attached> {
     let version = request(
         link,
         Pdu::GetCodecVersion(codec::GetCodecVersion {}),
@@ -43,14 +53,6 @@ pub async fn attach(link: &WsLink, size: Option<TerminalSize>, nav_rows: usize) 
         );
     }
 
-    let me = ClientId {
-        hostname: "web".into(),
-        username: "web".into(),
-        pid: 0,
-        epoch: js_sys::Date::now() as u64,
-        id: (js_sys::Math::random() * u32::MAX as f64) as usize,
-        ssh_auth_sock: None,
-    };
     link.lease_mut().me = Some(me.clone());
     request(
         link,
@@ -129,6 +131,7 @@ pub async fn attach(link: &WsLink, size: Option<TerminalSize>, nav_rows: usize) 
         },
         alt_screen: entry.alt_screen,
         server_version: version.version_string,
+        server_id: version.server_id,
     })
 }
 
@@ -160,8 +163,8 @@ impl std::error::Error for NoPanes {}
 /// The identity is the one from the first connection. The server tracks the
 /// frontend lease by `ClientId`, so coming back under a new one would hand
 /// this page a different seat than the one it left.
-pub async fn reattach(
-    link: &WsLink,
+pub async fn reattach<L: Link>(
+    link: &L,
     tab_id: TabId,
     focused: PaneId,
     size: Option<TerminalSize>,

@@ -2,7 +2,7 @@
 //! matched to answers by serial, server pushes handed to the app, and the
 //! lease bookkeeping that decides whether this browser may type.
 
-use crate::host::LocalFuture;
+use crate::platform::{Link, LocalFuture};
 use thinkterm_proto::TabId;
 use anyhow::{anyhow, Result};
 use codec::{DecodedPdu, Pdu};
@@ -134,6 +134,8 @@ struct Inner {
     /// The close that happened before a handler was installed.
     closed_early: RefCell<Option<String>>,
     pub lease: RefCell<Lease>,
+    url: String,
+    token: String,
 }
 
 /// A handle on the connection; clone freely.
@@ -153,6 +155,8 @@ impl WsLink {
             on_close: RefCell::new(None),
             closed_early: RefCell::new(None),
             lease: RefCell::new(Lease::default()),
+            url: url.to_string(),
+            token: token.to_string(),
         }));
         link.spawn_reader();
         Ok(link)
@@ -275,8 +279,8 @@ impl WsLink {
     /// that the session, the host and the app all hold clones of this one:
     /// swapping the socket underneath them is what makes a reconnect
     /// invisible to everything above.
-    pub async fn reconnect(&self, url: &str, token: &str) -> Result<()> {
-        let socket = Self::open(url, token).await?;
+    pub async fn reconnect_to(&self) -> Result<()> {
+        let socket = Self::open(&self.0.url, &self.0.token).await?;
         // Anything still waiting was waiting on the old socket and will
         // never be answered; the new server has never heard of those
         // serials.
@@ -595,3 +599,44 @@ impl PaneLink for WsLink {
     }
 }
 
+impl Link for WsLink {
+    fn reconnect(&self) -> LocalFuture<Result<()>> {
+        let link = self.clone();
+        Box::pin(async move { link.reconnect_to().await })
+    }
+
+    fn shutdown(&self) {
+        WsLink::shutdown(self)
+    }
+
+    fn lease(&self) -> std::cell::Ref<'_, Lease> {
+        WsLink::lease(self)
+    }
+
+    fn lease_mut(&self) -> std::cell::RefMut<'_, Lease> {
+        WsLink::lease_mut(self)
+    }
+
+    fn set_push_handler(&self, handler: Box<dyn FnMut(Pdu)>) {
+        WsLink::set_push_handler(self, handler)
+    }
+
+    fn set_close_handler(&self, handler: Box<dyn FnMut(String)>) {
+        WsLink::set_close_handler(self, handler)
+    }
+
+    fn ensure_owner(&self, tab_id: TabId) -> LocalFuture<Result<bool>> {
+        let link = self.clone();
+        Box::pin(async move { WsLink::ensure_owner(&link, tab_id).await })
+    }
+
+    fn claim(&self, tab_id: TabId) -> LocalFuture<Result<bool>> {
+        let link = self.clone();
+        Box::pin(async move { WsLink::claim(&link, tab_id).await })
+    }
+
+    fn report_viewport(&self, tab_id: TabId) -> LocalFuture<Result<()>> {
+        let link = self.clone();
+        Box::pin(async move { WsLink::report_viewport(&link, tab_id).await })
+    }
+}
