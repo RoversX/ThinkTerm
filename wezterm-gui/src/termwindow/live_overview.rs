@@ -50,16 +50,17 @@ const CARD_MAX_WIDTH: f32 = 640.0;
 /// The band above a card's panel: the floating capsule that names the thread
 /// and lists its tabs, plus the gap that keeps it floating. Like every other
 /// figure in this file these are design pixels (2x backing), so the capsule
-/// stands 46pt tall on a Retina display, as the design has it.
-const CAPSULE_HEIGHT: f32 = 92.0;
-const CAPSULE_GAP: f32 = 20.0;
+/// stands 36pt tall on a Retina display: one line of text with the room a
+/// control has around it, not a band.
+const CAPSULE_HEIGHT: f32 = 72.0;
+const CAPSULE_GAP: f32 = 16.0;
 const CARD_HEADER_HEIGHT: f32 = CAPSULE_HEIGHT + CAPSULE_GAP;
 const CAPSULE_ICON: f32 = 26.0;
 /// Padding either side of a capsule section's contents.
 const CAPSULE_SECTION_PAD: f32 = 18.0;
 const CAPSULE_TITLE_PAD: f32 = 20.0;
 /// Vertical inset of the hairlines between sections.
-const CAPSULE_DIVIDER_INSET: f32 = 26.0;
+const CAPSULE_DIVIDER_INSET: f32 = 20.0;
 const CAPSULE_DOT: f32 = 14.0;
 const CAPSULE_DOT_GAP: f32 = 16.0;
 /// Room either side of the hairline between two windows' dots.
@@ -1858,26 +1859,21 @@ impl LiveOverviewView {
         let title_line = title_metrics.cell_size.height as f32;
         let sub_line = sub_metrics.cell_size.height as f32;
 
-        // What goes under the thread name: which tab is showing, and what
-        // it is running. A one-tab card has only the latter to say.
-        let previewed = card.tabs.iter().find(|tab| tab.tab_id == card.tab_id);
-        let tab_title = previewed
-            .map(|tab| tab.title.as_str())
-            .filter(|title| multi && !title.is_empty() && *title != card.title);
-        let subtitle = match (tab_title, card.running.as_deref()) {
-            (Some(title), Some(running)) => Some(format!("{title} · {running}")),
-            (Some(title), None) => Some(title.to_string()),
-            (None, Some(running)) => Some(running.to_string()),
-            (None, None) => None,
-        };
-
+        // One line: the thread's name, and after it what its previewed tab
+        // is running, if anything. The tab's own title is not shown -- the
+        // dot says which tab, and naming it made the capsule two lines tall
+        // and rewrote itself as the pointer crossed the dots.
         let icon_width = pad * 2.0 + icon;
         let title_pad = ctx.px(CAPSULE_TITLE_PAD);
         let title_text_width = title_ctx.measure_text_width(title_font, &card.title);
-        let sub_text_width = subtitle
+        let running_gap = ctx.px(10.0);
+        let running_width = card
+            .running
             .as_deref()
-            .map_or(0.0, |text| sub_ctx.measure_text_width(sub_font, text));
-        let title_natural = title_text_width.max(sub_text_width) + title_pad * 2.0;
+            .map_or(0.0, |text| running_gap + sub_ctx.measure_text_width(sub_font, text));
+        // Sized by the thread's name and what it runs; both are stable across
+        // hover, so the centred capsule holds still under the pointer.
+        let title_natural = title_text_width + running_width + title_pad * 2.0;
 
         let count_text = |folded: usize| format!("+{folded}");
         let count_width = |folded: usize| -> f32 {
@@ -1941,13 +1937,16 @@ impl LiveOverviewView {
             .min(max_width - icon_width - dots_folded - count_folded - dividers_folded)
             .max(0.0);
         // A thread name longer than the room left once the other sections
-        // have theirs is shortened with an ellipsis; the subtitle follows.
+        // have theirs is shortened with an ellipsis; the running label goes
+        // first when there is not room for both.
         let title_inner = (title_folded - title_pad * 2.0).max(1.0);
+        let running = card
+            .running
+            .as_deref()
+            .filter(|_| title_text_width + running_width <= title_inner);
         let title_text = title_ctx.text_with_ellipsis(title_font, &card.title, title_inner);
-        let subtitle =
-            subtitle.map(|text| sub_ctx.text_with_ellipsis(sub_font, &text, title_inner));
         let title_text_width = title_text_width.min(title_inner);
-        let sub_text_width = sub_text_width.min(title_inner);
+        let line_width = title_text_width + if running.is_some() { running_width } else { 0.0 };
         let title_width = lerp(title_folded, 0.0);
         let dots_section = lerp(dots_folded, dots_open);
         let count_section = lerp(count_folded, count_open);
@@ -2014,47 +2013,38 @@ impl LiveOverviewView {
         )?;
         cursor += icon_width;
 
-        // Title and subtitle, centred in their section; they fade out in
-        // the first part of the opening so the section can shrink under
-        // text that is already gone.
+        // The name line, centred in its section; it fades out in the first
+        // part of the opening so the section can shrink under text that is
+        // already gone.
         if title_width > 0.5 {
             draw_divider(layers, cursor)?;
             cursor += hairline;
             let alpha = (1.0 - t * 2.0).clamp(0.0, 1.0);
             let inner = (title_width - title_pad * 2.0).max(1.0);
             if alpha > 0.0 {
-                // Line boxes carry their leading; stacked as they are, two
-                // lines would not fit the capsule. Overlapping them by a
-                // third of the smaller box sets the lines the way a caption
-                // sits under a heading, and the pair rides a little high
-                // because caps have no descenders to balance the caption's.
-                let overlap = sub_line * 0.35;
-                let block = if subtitle.is_some() {
-                    title_line + sub_line - overlap
-                } else {
-                    title_line
-                };
-                let title_y = y + (height - block) / 2.0 - ctx.px(4.0);
-                let shown = title_text_width.min(inner);
+                let title_y = y + (height - title_line) / 2.0;
+                let shown = line_width.min(inner);
+                let text_x = cursor + title_pad + (inner - shown) / 2.0;
                 title_ctx.draw_text(
                     layers,
                     title_font,
-                    cursor + title_pad + (inner - shown) / 2.0,
+                    text_x,
                     title_y,
                     &title_text,
                     colors.capsule_text.mul_alpha(alpha),
                     inner,
                 )?;
-                if let Some(text) = subtitle.as_deref() {
-                    let shown = sub_text_width.min(inner);
+                if let Some(text) = running {
+                    // Same baseline as the name: the caption's smaller line
+                    // box is centred on the name's.
                     sub_ctx.draw_text(
                         layers,
                         sub_font,
-                        cursor + title_pad + (inner - shown) / 2.0,
-                        title_y + title_line - overlap,
+                        text_x + title_text_width + running_gap,
+                        title_y + (title_line - sub_line) / 2.0,
                         text,
                         colors.capsule_subtext.mul_alpha(alpha),
-                        inner,
+                        (inner - title_text_width - running_gap).max(1.0),
                     )?;
                 }
             }
