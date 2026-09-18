@@ -720,18 +720,11 @@ impl Pdu {
         match Self::decode(&mut cursor) {
             Ok(decoded) => {
                 let consumed = cursor.position() as usize;
-                let remain = buffer.len() - consumed;
-                // Remove `consumed` bytes from the start of the vec.
-                // This is safe because the vec is just bytes and we are
-                // constrained the offsets accordingly.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        buffer.as_ptr().add(consumed),
-                        buffer.as_mut_ptr(),
-                        remain,
-                    );
-                }
-                buffer.truncate(remain);
+                // Remove the decoded PDU while preserving the remaining bytes.
+                // Moving them to the front overlaps the source range when
+                // more bytes remain than were consumed, so using
+                // `copy_nonoverlapping` here would violate its contract.
+                buffer.drain(..consumed);
                 Ok(Some(decoded))
             }
             Err(err) => {
@@ -1892,6 +1885,37 @@ mod golden {
     use thinkterm_proto::{
         PaneEntry, PaneStackEntry, Pattern, SplitDirection, SplitDirectionAndSize, SplitSize,
     };
+
+    #[test]
+    fn stream_decode_preserves_overlapping_buffered_pdus() {
+        // Three small PDUs leave more bytes than the first decode consumes,
+        // so moving the remainder to the front requires an overlapping copy.
+        let mut buffer = Vec::new();
+        Pdu::Ping(Ping {}).encode(&mut buffer, 1).unwrap();
+        let first_len = buffer.len();
+        Pdu::GetCodecVersion(GetCodecVersion {})
+            .encode(&mut buffer, 2)
+            .unwrap();
+        Pdu::Pong(Pong {}).encode(&mut buffer, 3).unwrap();
+        let remaining = buffer[first_len..].to_vec();
+        assert!(
+            remaining.len() > first_len,
+            "fixture must require an overlapping copy"
+        );
+
+        let first = Pdu::stream_decode(&mut buffer).unwrap().unwrap();
+        assert_eq!(first.serial, 1);
+        assert!(matches!(first.pdu, Pdu::Ping(_)));
+        assert_eq!(buffer, remaining);
+        let second = Pdu::stream_decode(&mut buffer).unwrap().unwrap();
+        assert_eq!(second.serial, 2);
+        assert!(matches!(second.pdu, Pdu::GetCodecVersion(_)));
+        let third = Pdu::stream_decode(&mut buffer).unwrap().unwrap();
+        assert_eq!(third.serial, 3);
+        assert!(matches!(third.pdu, Pdu::Pong(_)));
+        assert!(buffer.is_empty());
+        assert!(Pdu::stream_decode(&mut buffer).unwrap().is_none());
+    }
 
     fn varbincode_bytes<T: serde::Serialize>(t: &T) -> Vec<u8> {
         let mut buf = Vec::new();
