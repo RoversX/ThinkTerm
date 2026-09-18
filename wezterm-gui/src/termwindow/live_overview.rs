@@ -17,7 +17,7 @@ use crate::ui::{
 use crate::workspace_threads;
 use fluent_bundle::FluentArgs;
 use mux::domain::DomainState;
-use mux::pane::{CachePolicy, CloseReason, PaneId};
+use mux::pane::{CachePolicy, CloseReason, Pane, PaneId};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::{PositionedSplit, TabId};
 use mux::Mux;
@@ -165,6 +165,16 @@ const MAX_PREVIEW_CAPTURES_PER_FRAME: usize = 1;
 /// open transition is still running) in exchange for the overview arriving
 /// mostly populated instead of popping thumbnails in one per frame.
 const FIRST_FRAME_CAPTURE_BUDGET: usize = 4;
+/// How often a pane's palette is re-read for the preview fingerprint.
+///
+/// `Pane::palette` takes the pane's lock and clones all 256 colours, and the
+/// fingerprint asked for it on every frame of every warm card only to hash
+/// it. A palette changes with a theme switch or an OSC from the program,
+/// both rare; a thumbnail that notices a second late is not a difference
+/// anyone sees. The pills ask for a frame at `RUNNING_LABEL_REFRESH`
+/// whenever cards are drawn, which is what makes "a second late" a bound
+/// rather than "the next time something else repaints".
+const PALETTE_IDENTITY_REFRESH: Duration = Duration::from_secs(1);
 /// How often a card re-asks what its terminal is running.
 ///
 /// `CachePolicy::AllowStale` is not the cheap read its name suggests: it takes
@@ -359,6 +369,14 @@ struct PreviewSwitch {
 /// no longer names.
 const PREVIEW_SWITCH_WAIT: Duration = Duration::from_secs(1);
 
+#[derive(Clone, Copy, Debug)]
+struct PaletteIdentity {
+    hash: u64,
+    read_at: Instant,
+    /// The last frame that asked; an entry nobody asks for is dropped.
+    used_at: Instant,
+}
+
 /// What a tab is up to, as its dot tells it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TabActivity {
@@ -523,6 +541,9 @@ pub(crate) struct LiveOverviewView {
     /// Cards holding their old picture while the new tab's is captured:
     /// which tab they are waiting on, and since when.
     preview_switch_waits: HashMap<LiveThreadKey, (TabId, Instant)>,
+    /// Each warm pane's palette hash and when it was read; see
+    /// `PALETTE_IDENTITY_REFRESH`.
+    palette_identities: HashMap<PaneId, PaletteIdentity>,
     /// Which tab each card previewed last frame; a change starts a switch.
     last_previewed: HashMap<LiveThreadKey, TabId>,
     /// Whether any capsule animation (dot selection, preview switch) is
@@ -615,6 +636,7 @@ impl LiveOverviewView {
             dot_selection: HashMap::new(),
             preview_switches: HashMap::new(),
             preview_switch_waits: HashMap::new(),
+            palette_identities: HashMap::new(),
             last_previewed: HashMap::new(),
             capsule_motion_running: false,
             last_ui_scale: 1.0,
@@ -1055,7 +1077,11 @@ impl LiveOverviewView {
                                 .get(&card.tab_id)
                                 .map(|cached| Arc::clone(&cached.snapshot))
                         } else {
-                            let fingerprint = terminal_preview_fingerprint(card.tab_id);
+                            let fingerprint = terminal_preview_fingerprint(
+                                card.tab_id,
+                                &mut self.palette_identities,
+                                now,
+                            );
                             let (snapshot, refresh_due) = resolve_snapshot(
                                 &mut self.snapshot_cache,
                                 &card.tab_id,
@@ -1307,6 +1333,11 @@ impl LiveOverviewView {
             self.scrollbar_visible_until = None;
         }
         self.snapshot_cache.retain(|tab_id, _| warm_tabs.contains(tab_id));
+        // Palette hashes belong to warm panes; one not asked for in a while
+        // is a pane that scrolled away or closed.
+        let palette_stale = PALETTE_IDENTITY_REFRESH * 10;
+        self.palette_identities
+            .retain(|_, identity| now.saturating_duration_since(identity.used_at) < palette_stale);
         // The running-label cache is pruned in `collect_groups`, against every
         // live tab rather than against the cards that happened to be drawn.
         // A card that is gone has nowhere left to travel to; keeping its
@@ -2827,7 +2858,11 @@ fn previewed_tab(
         .unwrap_or(shown)
 }
 
-fn terminal_preview_fingerprint(tab_id: TabId) -> Option<TerminalPreviewFingerprint> {
+fn terminal_preview_fingerprint(
+    tab_id: TabId,
+    palette_identities: &mut HashMap<PaneId, PaletteIdentity>,
+    now: Instant,
+) -> Option<TerminalPreviewFingerprint> {
     let tab = Mux::get().get_tab(tab_id)?;
     let tab_size = tab.get_size();
     if tab_size.cols == 0 || tab_size.rows == 0 {
@@ -2840,7 +2875,7 @@ fn terminal_preview_fingerprint(tab_id: TabId) -> Option<TerminalPreviewFingerpr
         .into_iter()
         .map(|positioned| {
             let pane = positioned.pane;
-            let palette = pane.palette_override().unwrap_or_else(|| pane.palette());
+            let palette_identity = palette_identity_for(pane.as_ref(), palette_identities, now);
             TerminalPreviewPaneFingerprint {
                 pane_id: pane.pane_id(),
                 index: positioned.index,
@@ -2853,7 +2888,7 @@ fn terminal_preview_fingerprint(tab_id: TabId) -> Option<TerminalPreviewFingerpr
                 dimensions: pane.get_dimensions(),
                 seqno: pane.get_current_seqno(),
                 fetch_generation: pane.line_fetch_generation(),
-                palette_identity: palette_identity(&palette),
+                palette_identity,
                 cursor: pane.get_cursor_position(),
             }
         })
@@ -2892,6 +2927,50 @@ fn retain_running_labels(
         .flat_map(|card| card.tabs.iter().map(|tab| tab.tab_id))
         .collect();
     labels.retain(|tab_id, _| live_tabs.contains(tab_id));
+}
+
+/// The pane's palette hash, re-read at `PALETTE_IDENTITY_REFRESH`.
+fn palette_identity_for(
+    pane: &dyn Pane,
+    identities: &mut HashMap<PaneId, PaletteIdentity>,
+    now: Instant,
+) -> u64 {
+    cached_palette_identity(pane.pane_id(), identities, now, || {
+        let palette = pane.palette_override().unwrap_or_else(|| pane.palette());
+        palette_identity(&palette)
+    })
+}
+
+/// `read` is called for a pane not seen before and again once the cadence
+/// has passed since it was last read; otherwise the held hash is answered.
+fn cached_palette_identity(
+    pane_id: PaneId,
+    identities: &mut HashMap<PaneId, PaletteIdentity>,
+    now: Instant,
+    read: impl FnOnce() -> u64,
+) -> u64 {
+    match identities.get_mut(&pane_id) {
+        Some(identity) => {
+            if now.saturating_duration_since(identity.read_at) >= PALETTE_IDENTITY_REFRESH {
+                identity.hash = read();
+                identity.read_at = now;
+            }
+            identity.used_at = now;
+            identity.hash
+        }
+        None => {
+            let hash = read();
+            identities.insert(
+                pane_id,
+                PaletteIdentity {
+                    hash,
+                    read_at: now,
+                    used_at: now,
+                },
+            );
+            hash
+        }
+    }
 }
 
 fn palette_identity(palette: &wezterm_term::color::ColorPalette) -> u64 {
@@ -4574,6 +4653,31 @@ mod tests {
         assert_eq!(from, Some(8));
         assert!(arrived < 1.0);
         assert!(view.preview_switch_waits.is_empty());
+    }
+
+    /// The fingerprint hashes each pane's palette, and reading a palette
+    /// clones all of it under the pane's lock. Once a second is as often as
+    /// a thumbnail needs to notice a theme change.
+    #[test]
+    fn a_palette_is_read_once_per_refresh() {
+        let reads = std::cell::Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            42
+        };
+        let mut identities = HashMap::new();
+        let start = Instant::now();
+        assert_eq!(cached_palette_identity(1, &mut identities, start, read), 42);
+        assert_eq!(reads.get(), 1);
+        let within = start + Duration::from_millis(500);
+        assert_eq!(cached_palette_identity(1, &mut identities, within, read), 42);
+        assert_eq!(reads.get(), 1, "within the cadence: the held hash");
+        let at = start + PALETTE_IDENTITY_REFRESH;
+        assert_eq!(cached_palette_identity(1, &mut identities, at, read), 42);
+        assert_eq!(reads.get(), 2, "at the cadence: re-read");
+        // Another pane is its own entry.
+        assert_eq!(cached_palette_identity(2, &mut identities, at, read), 42);
+        assert_eq!(reads.get(), 3);
     }
 
     #[test]
