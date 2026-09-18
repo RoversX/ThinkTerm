@@ -170,7 +170,7 @@ async fn start_attached(
     let gpu = Gpu::new(canvas.clone(), dev_w, dev_h).await?;
     let atlas_side = 1024u32.min(gpu.max_texture_dimension());
     let texture = Rc::new(GpuTexture::new(&gpu.device, Arc::clone(&gpu.queue), atlas_side, atlas_side)?);
-    let glyphs = GlyphCache::new(Rc::clone(&fonts), size_pt, dpi, texture, families(glyph_font))?;
+    let glyphs = GlyphCache::new(Rc::clone(&fonts), size_pt, dpi, texture, families(glyph_font), crate::canvas::platform())?;
     let (cw, ch) = (
         glyphs.metrics.cell_size.width as u32,
         glyphs.metrics.cell_size.height as u32,
@@ -406,9 +406,16 @@ pub fn fallback_check(
         let metrics = crate::glyphs::RenderMetrics::with_font_metrics(&set.metrics(size_pt, dpi)?);
         let stack = families(&glyph_font);
         let px = size_pt * dpi as f64 / 72.0;
-        let scratch =
-            crate::canvas::Scratch::new(metrics.cell_size, metrics.descender.get(), px, &stack)?;
-        let (canvas_w, canvas_h, pen_x, baseline) = scratch.geometry();
+        let scratch = crate::raster::Scratch::new(
+            &crate::canvas::WebPlatform,
+            metrics.cell_size,
+            metrics.descender.get(),
+            px,
+            &stack,
+        )?;
+        let geometry = scratch.geometry();
+        let (canvas_w, canvas_h, pen_x, baseline) =
+            (geometry.width, geometry.height, geometry.pen_x, geometry.baseline);
 
         let mut rows = Vec::new();
         let (mut drawn, mut wrong_colour, mut clipped, mut blank) = (0, 0, 0, 0);

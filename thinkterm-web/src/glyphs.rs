@@ -155,6 +155,8 @@ pub struct GlyphCache {
     scratch: Renderer,
     /// The CSS font stack the fallback draws with.
     pub families: Rc<str>,
+    /// The clock and the painter for glyphs the faces lack.
+    pub platform: crate::raster::Platform,
     /// Handed back wherever a glyph cannot be made right now. Shared, so
     /// the frozen path allocates nothing at all.
     blank: Rc<CachedGlyph>,
@@ -170,7 +172,7 @@ pub struct GlyphCache {
 /// give us a 2D context is asked exactly once.
 enum Renderer {
     Untried,
-    Ready(crate::canvas::Scratch),
+    Ready(crate::raster::Scratch),
     Unavailable,
 }
 
@@ -198,6 +200,7 @@ impl GlyphCache {
         dpi: u32,
         texture: Rc<GpuTexture>,
         families: Rc<str>,
+        platform: crate::raster::Platform,
     ) -> Result<Self> {
         let base_metrics = fonts.metrics(size_pt, dpi)?;
         let metrics = RenderMetrics::with_font_metrics(&base_metrics);
@@ -231,6 +234,7 @@ impl GlyphCache {
             failed: HashMap::new(),
             scratch: Renderer::Untried,
             families,
+            platform,
             blank: Rc::new(blank_glyph()),
             frozen: false,
             declined: 0,
@@ -336,10 +340,11 @@ impl GlyphCache {
     /// asked once per cache -- this is a field, so an atlas growth or clear
     /// rebuilds it along with everything else, which is what keeps it in
     /// step with the cell size.
-    fn scratch(&mut self) -> Option<&crate::canvas::Scratch> {
+    fn scratch(&mut self) -> Option<&crate::raster::Scratch> {
         if matches!(self.scratch, Renderer::Untried) {
             let px = self.size_pt * self.dpi as f64 / 72.0;
-            self.scratch = match crate::canvas::Scratch::new(
+            self.scratch = match crate::raster::Scratch::new(
+                &*self.platform,
                 self.metrics.cell_size,
                 self.metrics.descender.get(),
                 px,
@@ -433,7 +438,7 @@ impl GlyphCache {
         // so the box is the honest answer. Nothing in a terminal is this
         // wide -- the widest cluster the shaper produces is two columns --
         // but `cells` comes from the row, and the row is data.
-        if cells > crate::canvas::MAX_FALLBACK_CELLS {
+        if cells > crate::raster::MAX_FALLBACK_CELLS {
             return Ok(self.remember(gap, cells, None));
         }
         if let Some(known) = self
@@ -447,7 +452,7 @@ impl GlyphCache {
             self.declined += 1;
             return Ok(None);
         }
-        let now = crate::app::monotonic_ms();
+        let now = self.platform.now_ms();
         if let Some((retry_at, _)) = self.failed.get(&(cells, gap.text.clone())) {
             if now < *retry_at {
                 return Ok(None);
@@ -467,7 +472,7 @@ impl GlyphCache {
         let drawn = match self.scratch() {
             None => return Ok(None),
             Some(scratch) => {
-                if !budget.take(crate::app::monotonic_ms()) {
+                if !budget.take(now) {
                     return Ok(None);
                 }
                 scratch.glyph(&gap.text, cells)

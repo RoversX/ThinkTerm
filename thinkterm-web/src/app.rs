@@ -4132,6 +4132,7 @@ impl App {
                     dpi,
                     Rc::new(t),
                     Rc::clone(&inner.glyphs.families),
+                    Rc::clone(&inner.glyphs.platform),
                 )
             },
         ) {
@@ -4157,6 +4158,7 @@ impl App {
                     dpi,
                     Rc::new(t),
                     Rc::clone(&inner.glyphs.families),
+                    Rc::clone(&inner.glyphs.platform),
                 )
             });
             match built {
@@ -4266,7 +4268,7 @@ impl App {
                 let side = inner.glyphs.atlas.size() as u32;
                 let (size_pt, dpi) = (inner.glyphs.size_pt, inner.glyphs.dpi);
                 let built = GpuTexture::new(&inner.gpu.device, Arc::clone(&inner.gpu.queue), side, side).and_then(|t| {
-                    GlyphCache::new(Rc::clone(&inner.fonts), size_pt * scale, dpi, Rc::new(t), Rc::clone(&inner.glyphs.families))
+                    GlyphCache::new(Rc::clone(&inner.fonts), size_pt * scale, dpi, Rc::new(t), Rc::clone(&inner.glyphs.families), Rc::clone(&inner.glyphs.platform))
                 });
                 match built {
                     Ok(glyphs) => {
@@ -4683,6 +4685,7 @@ impl App {
             inner.glyphs.dpi,
             texture,
             Rc::clone(&inner.glyphs.families),
+            Rc::clone(&inner.glyphs.platform),
         )?;
         Ok(())
     }

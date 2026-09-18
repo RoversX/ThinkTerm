@@ -57,6 +57,7 @@ async fn run(names: Vec<String>, fonts: Vec<js_sys::Uint8Array>, size: f64) -> R
         (96.0 * dpr) as u32,
         texture,
         crate::canvas::DEFAULT_FAMILIES.into(),
+        crate::canvas::platform(),
     )?;
     let (cw, ch) = (
         cache.metrics.cell_size.width as u32,
