@@ -69,13 +69,6 @@ const RECONNECT_DOUBT_AFTER: u32 = 6;
 const RECONNECT_STABLE_MS: f64 = 5_000.0;
 /// How long the close button waits for its second press.
 const CLOSE_CONFIRM_MS: f64 = 3_000.0;
-/// The desktop's `inactive_pane_hsb` default: panes without the focus are
-/// a little darker and a little greyer.
-const INACTIVE_PANE_HSB: wezterm_color_types::HsbTransform = wezterm_color_types::HsbTransform {
-    hue: 1.0,
-    saturation: 0.9,
-    brightness: 0.8,
-};
 
 pub struct Setup {
     pub link: WsLink,
@@ -4784,7 +4777,11 @@ impl App {
             let palette = cell.palette.clone();
             let selection = cell.selection;
             let is_focused = place.pane_id == inner.focused_pane;
-            let hsv = if is_focused { None } else { Some(INACTIVE_PANE_HSB) };
+            let hsv = if is_focused {
+                None
+            } else {
+                Some(wezterm_color_types::HsbTransform::for_inactive_pane(palette.background))
+            };
             // A pane with its own font draws from its own cache, into its
             // own batch.
             let own_font = Self::pane_font_shown(inner, place);

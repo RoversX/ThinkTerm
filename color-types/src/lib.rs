@@ -30,6 +30,26 @@ pub struct HsbTransform {
     pub brightness: f32,
 }
 
+/// Classify the terminal palette itself, independently of the OS appearance.
+pub fn is_light_terminal_background(background: SrgbaTuple) -> bool {
+    0.2126 * background.0 + 0.7152 * background.1 + 0.0722 * background.2 > 0.5
+}
+
+impl HsbTransform {
+    /// The shared desktop and browser default for an unfocused terminal pane.
+    pub fn for_inactive_pane(background: SrgbaTuple) -> Self {
+        Self {
+            hue: 1.0,
+            saturation: 0.9,
+            brightness: if is_light_terminal_background(background) {
+                0.95
+            } else {
+                0.8
+            },
+        }
+    }
+}
+
 fn default_one_point_oh() -> f32 {
     1.0
 }

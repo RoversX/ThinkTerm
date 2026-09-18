@@ -1042,15 +1042,8 @@ impl Default for Config {
 
 impl Config {
     pub fn inactive_pane_hsb_for_background(&self, background: SrgbaTuple) -> HsbTransform {
-        self.inactive_pane_hsb.unwrap_or_else(|| HsbTransform {
-            brightness: if crate::color::is_light_terminal_background(background) {
-                0.95
-            } else {
-                0.8
-            },
-            saturation: 0.9,
-            hue: 1.0,
-        })
+        self.inactive_pane_hsb
+            .unwrap_or_else(|| HsbTransform::for_inactive_pane(background))
     }
 
     pub fn load() -> LoadedConfig {

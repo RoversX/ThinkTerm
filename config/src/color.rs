@@ -8,12 +8,7 @@ pub use termwiz::color::{AnsiColor, ColorAttribute, RgbColor, SrgbaTuple};
 use wezterm_dynamic::{FromDynamic, ToDynamic};
 use wezterm_term::color::ColorPalette;
 
-pub use wezterm_color_types::HsbTransform;
-
-/// Classify the terminal palette itself, independently of the OS appearance.
-pub fn is_light_terminal_background(background: SrgbaTuple) -> bool {
-    0.2126 * background.0 + 0.7152 * background.1 + 0.0722 * background.2 > 0.5
-}
+pub use wezterm_color_types::{is_light_terminal_background, HsbTransform};
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
 #[dynamic(try_from = "String", into = "String")]
