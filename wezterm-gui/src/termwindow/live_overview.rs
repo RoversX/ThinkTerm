@@ -2626,9 +2626,24 @@ fn draw_surface_gradient_slice(
 /// have nothing to show.
 fn live_tabs_for_workspace(workspace: &str) -> Option<(Vec<CardTab>, TabId)> {
     let mux = Mux::get();
+    let windows = mux.iter_windows_in_workspace(workspace);
+    // The tab the user would see on opening the thread: the active tab of
+    // the mux window a GUI window is showing, else of the window a thread
+    // activation would adopt. The lowest window id is neither -- a
+    // workspace can hold a window that nothing shows, and its active tab
+    // is not what the card is a picture of.
+    let shown_window = windows
+        .iter()
+        .copied()
+        .find(|window_id| {
+            crate::frontend::front_end()
+                .gui_window_for_mux_window(*window_id)
+                .is_some()
+        })
+        .or_else(|| workspace_threads::window_to_show_in_workspace(workspace));
     let mut tabs = Vec::new();
     let mut shown = None;
-    for window_id in mux.iter_windows_in_workspace(workspace) {
+    for window_id in windows {
         let Some(window) = mux.get_window(window_id) else {
             continue;
         };
@@ -2638,7 +2653,7 @@ fn live_tabs_for_workspace(workspace: &str) -> Option<(Vec<CardTab>, TabId)> {
                 continue;
             }
             let tab_id = tab.tab_id();
-            if shown.is_none() && active == Some(tab_id) {
+            if Some(window_id) == shown_window && active == Some(tab_id) {
                 shown = Some(tab_id);
             }
             tabs.push(CardTab {
