@@ -77,6 +77,10 @@ impl Gpu {
             .await
             .map_err(|e| anyhow!("requesting the device: {e}"))?;
         let queue = Arc::new(queue);
+        // A device error is fatal by default -- a panic on the core's
+        // thread, and no word of why. Logged instead; the frame that hit
+        // it is lost, the next one is tried.
+        device.on_uncaptured_error(Box::new(|err| log::error!("wgpu: {err}")));
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -86,12 +90,12 @@ impl Gpu {
             .ok_or_else(|| anyhow!("the canvas offers no texture format"))?;
         let view_format = srgb_format(format);
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            usage: Self::surface_usage(&caps),
             format,
             width: width.max(1),
             height: height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            alpha_mode: Self::alpha_mode(&caps),
             view_formats: if view_format != format { vec![view_format] } else { vec![] },
             desired_maximum_frame_latency: 2,
         };
@@ -193,6 +197,27 @@ impl Gpu {
         self.surface = None;
     }
 
+    /// Reading the frame back (the smoke tests' snapshots) needs the
+    /// swapchain to allow it; an Android swapchain often does not, and
+    /// asking anyway is a device error.
+    fn surface_usage(caps: &wgpu::SurfaceCapabilities) -> wgpu::TextureUsages {
+        let mut usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+            usage |= wgpu::TextureUsages::COPY_SRC;
+        }
+        usage
+    }
+
+    /// Opaque where offered; else whatever the surface has (Android
+    /// offers only Inherit on some drivers).
+    fn alpha_mode(caps: &wgpu::SurfaceCapabilities) -> wgpu::CompositeAlphaMode {
+        if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            wgpu::CompositeAlphaMode::Opaque
+        } else {
+            caps.alpha_modes.first().copied().unwrap_or(wgpu::CompositeAlphaMode::Auto)
+        }
+    }
+
     /// Draw on `surface` from now on. Its format may differ from the last
     /// one's, in which case the pipeline is rebuilt for it; the atlases
     /// are unaffected, and their bind groups are made again on first use.
@@ -211,6 +236,8 @@ impl Gpu {
             .ok_or_else(|| anyhow!("the surface offers no texture format"))?;
         let view_format = srgb_format(format);
         self.config.format = format;
+        self.config.usage = Self::surface_usage(&caps);
+        self.config.alpha_mode = Self::alpha_mode(&caps);
         self.config.width = width.max(1);
         self.config.height = height.max(1);
         self.config.view_formats = if view_format != format { vec![view_format] } else { vec![] };

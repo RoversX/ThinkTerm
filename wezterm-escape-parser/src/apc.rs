@@ -331,13 +331,14 @@ impl KittyImageData {
             Self::File { .. } => {}
             Self::TemporaryFile { path, .. } => remove_temporary_file(path),
             Self::SharedMem { name, .. } => {
-                #[cfg(unix)]
+                // nix has no shm on Android; there is nothing to unlink.
+                #[cfg(all(unix, not(target_os = "android")))]
                 {
                     if let Err(err) = nix::sys::mman::shm_unlink(name.as_str()) {
                         log::warn!("shm_unlink {name} while discarding a stale frame: {err:#}");
                     }
                 }
-                #[cfg(not(unix))]
+                #[cfg(not(all(unix, not(target_os = "android"))))]
                 {
                     let _ = name;
                 }
