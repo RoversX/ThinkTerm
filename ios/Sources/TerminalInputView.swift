@@ -5,8 +5,10 @@ import UIKit
 /// view over the Metal layer that adopts `UITextInput` so the soft
 /// keyboard, its IMEs (Pinyin, Kana...) and a hardware keyboard all talk
 /// to it, and whose gestures are the terminal's -- a tap focuses the pane
-/// under it, a drag scrolls, a long press opens the pane's menu, a pinch
-/// changes the font.
+/// under it and raises the keyboard, a one-finger drag scrolls, a
+/// two-finger swipe down puts the keyboard away, a long press opens the
+/// pane's menu, a pinch changes the font. A phone can tell a tap from a
+/// drag, so there is no keyboard button.
 ///
 /// It holds no text of its own beyond the IME's marked (composing)
 /// string: committed text goes straight to the core, keys go as key
@@ -15,29 +17,99 @@ import UIKit
 /// composing; cancelling sends nothing; a candidate commits once
 /// (insertText clears the marked text before unmarkText can commit it
 /// again); backspace inside a composition edits the marked text only.
-final class TerminalInputView: UIView, UITextInput, UIGestureRecognizerDelegate {
+final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDelegate, UIScrollViewDelegate {
     weak var model: TerminalModel?
     var onMenu: ((CGPoint) -> Void)?
 
     private(set) var marked: String?
     private var markedSelection = NSRange(location: 0, length: 0)
-    private var panRemainder: CGFloat = 0
     private var pinchStart: CGFloat = 1
+    /// The scroll view is the drag surface: its content is a tall nothing,
+    /// the offset's travel is what the terminal scrolls by, in points, and
+    /// the view brings iOS's own inertia and deceleration with it. The
+    /// offset is parked mid-way and put back there whenever a scroll ends.
+    private let runway: CGFloat = 200_000
+    private var lastOffset: CGFloat = 0
+    private var recentring = false
+    /// Stepped mode: finger travel not yet a whole row.
+    private var rowRemainder: CGFloat = 0
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         isUserInteractionEnabled = true
         backgroundColor = .clear
+        showsVerticalScrollIndicator = false
+        showsHorizontalScrollIndicator = false
+        bounces = false
+        alwaysBounceVertical = false
+        isDirectionalLockEnabled = true
+        delaysContentTouches = false
+        panGestureRecognizer.maximumNumberOfTouches = 1
+        delegate = self
         let tap = UITapGestureRecognizer(target: self, action: #selector(tapped(_:)))
-        let pan = UIPanGestureRecognizer(target: self, action: #selector(panned(_:)))
         let press = UILongPressGestureRecognizer(target: self, action: #selector(pressed(_:)))
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:)))
-        pan.maximumNumberOfTouches = 1
+        let hide = UISwipeGestureRecognizer(target: self, action: #selector(swipedDown(_:)))
         press.minimumPressDuration = 0.45
-        for g in [tap, pan, press, pinch] as [UIGestureRecognizer] {
+        hide.direction = .down
+        hide.numberOfTouchesRequired = 2
+        for g in [tap, press, pinch, hide] as [UIGestureRecognizer] {
             g.delegate = self
             addGestureRecognizer(g)
         }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let size = CGSize(width: bounds.width, height: runway)
+        if contentSize != size {
+            contentSize = size
+            recentre()
+        }
+    }
+
+    private func recentre() {
+        recentring = true
+        contentOffset = CGPoint(x: 0, y: runway / 2)
+        lastOffset = contentOffset.y
+        recentring = false
+    }
+
+    // MARK: UIScrollViewDelegate: the drag, with inertia
+
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        if recentring { return }
+        let y = contentOffset.y
+        let delta = y - lastOffset
+        lastOffset = y
+        guard delta != 0, let model else { return }
+        // The bounds' origin is the content offset; the App wants a point
+        // in the view, so the centre is measured from the top-left corner.
+        let centre = CGPoint(x: bounds.width / 2, y: bounds.height / 2)
+        if model.smoothScroll {
+            model.wheelPx(at: centre, px: Double(delta))
+        } else {
+            // Whole rows, at the App's own row height.
+            let row = CGFloat(max(model.cellHeight, 1))
+            rowRemainder += delta
+            let rows = (rowRemainder / row).rounded(.towardZero)
+            if rows != 0 {
+                rowRemainder -= rows * row
+                // The App's stepped mode counts a wheel event as one notch
+                // per line asked; the shell scrolls history up by asking
+                // for negative lines.
+                model.wheel(at: centre, lines: Double(-rows))
+            }
+        }
+    }
+
+    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        if !decelerate { recentre() }
+        if !(model?.smoothScroll ?? true) { rowRemainder = 0 }
+    }
+
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        recentre()
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -54,23 +126,9 @@ final class TerminalInputView: UIView, UITextInput, UIGestureRecognizerDelegate 
         }
     }
 
-    @objc private func panned(_ g: UIPanGestureRecognizer) {
-        let p = g.location(in: self)
-        switch g.state {
-        case .began:
-            panRemainder = 0
-        case .changed:
-            // Points to rows: the App's own cell height is unknown here;
-            // a row is taken as 20 pt, which is what 11 pt Menlo is.
-            let dy = g.translation(in: self).y + panRemainder
-            let rows = (dy / 20).rounded(.towardZero)
-            panRemainder = dy - rows * 20
-            g.setTranslation(.zero, in: self)
-            if rows != 0 {
-                model?.wheel(at: p, lines: Double(rows))
-            }
-        default:
-            break
+    @objc private func swipedDown(_ g: UISwipeGestureRecognizer) {
+        if isFirstResponder {
+            resignFirstResponder()
         }
     }
 

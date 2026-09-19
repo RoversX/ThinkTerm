@@ -28,6 +28,15 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     @Published var stats = ""
     @Published var inset: CGFloat = 0
     @Published var animating = false
+    /// Smooth (by the pixel, with inertia) or stepped (whole rows).
+    @Published var smoothScroll: Bool = UserDefaults.standard.object(forKey: "scroll.smooth") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(smoothScroll, forKey: "scroll.smooth")
+            applyScrollMode()
+        }
+    }
+    /// The App's cell height in points, from its layout view.
+    private(set) var cellHeight: Double = 20
 
     let core: Core
     let host: Host?
@@ -51,7 +60,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     // a wrapper that points the remote proxy at an isolated HOME.
     private var probeKeyPath = "/tmp/ttp-ssh/userkey"
     private var probeRemoteCommand = "/tmp/ttp-ssh/thinkterm-remote cli --prefer-mux proxy"
-    private var probeUser = NSUserName()
+    private var probeUser = probeUserName()
 
     init(host: Host?, store: HostStore?) {
         self.host = host
@@ -76,6 +85,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             guard let self else { return }
             self.stats = self.core.stats()
         }
+        applyScrollMode()
         if args.contains("--autotest") { scheduleAutotest() }
         if args.contains("--autoconnect") { scheduleAutoconnect() }
         if args.contains("--imetest") { scheduleImeTest() }
@@ -174,6 +184,14 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         core.wheel(x: point.x, y: point.y, lines: lines)
     }
 
+    func wheelPx(at point: CGPoint, px: Double) {
+        core.wheelPx(x: point.x, y: point.y, px: px)
+    }
+
+    private func applyScrollMode() {
+        core.setSetting(key: "scroll-mode", value: smoothScroll ? "\"smooth\"" : "\"stepped\"")
+    }
+
     func stepFont(_ by: Double) { core.stepFont(by: by) }
 
     // MARK: the App's chrome
@@ -214,6 +232,12 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         sidebar = ViewJSON.decode(SidebarView.self, core.view(name: "sidebar"))
         navs = ViewJSON.decode([NavView].self, core.view(name: "navs")) ?? []
         status = ViewJSON.decode(StatusView.self, core.view(name: "status"))
+        let layout = core.view(name: "layout")
+        if let r = layout.range(of: "\"cell\":["),
+           let end = layout[r.upperBound...].firstIndex(of: "]") {
+            let parts = layout[r.upperBound..<end].split(separator: ",")
+            if parts.count == 2, let h = Double(parts[1]), h > 0 { cellHeight = h }
+        }
     }
 
     // MARK: surface lifecycle, all on the main thread
@@ -514,6 +538,19 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     private func inputsSent() -> Int64 { Int64(statsField("inputs_sent")) ?? -1 }
     private func composingFlag() -> String { statsField("composing") }
     private func sizeString() -> String { statsField("size") }
+}
+
+/// The Mac user the probe's key belongs to: the `user@host` comment
+/// ssh-keygen wrote at the end of the public key. The simulator gives an
+/// app neither USER nor a real NSUserName.
+func probeUserName() -> String {
+    if let pub = try? String(contentsOfFile: "/tmp/ttp-ssh/userkey.pub", encoding: .utf8),
+       let comment = pub.split(separator: " ").dropFirst(2).first,
+       let user = comment.split(separator: "@").first, !user.isEmpty {
+        return String(user)
+    }
+    let env = ProcessInfo.processInfo.environment["USER"] ?? ""
+    return env.isEmpty ? NSUserName() : env
 }
 
 /// UniFFI hands the callback object to the core thread; it forwards to the

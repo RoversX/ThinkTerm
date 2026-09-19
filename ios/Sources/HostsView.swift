@@ -38,7 +38,7 @@ struct HostsView: View {
                 }
             }
             Section("Development") {
-                NavigationLink("This Mac (probe sshd on :2299)", value: Host(name: "probe", hostname: "127.0.0.1", port: 2299, user: NSUserName()))
+                NavigationLink("This Mac (probe sshd on :2299)", value: Host(name: "probe", hostname: "127.0.0.1", port: 2299, user: probeUserName()))
             }
         }
         .navigationTitle("ThinkTerm")

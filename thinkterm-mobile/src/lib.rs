@@ -286,6 +286,19 @@ impl Core {
         let _ = self.tx.send(core::Cmd::Wheel { x, y, lines });
     }
 
+    /// Scroll at a point by `px` points of finger travel; positive is down
+    /// the page, towards the newest row. The App keeps the fraction of a
+    /// row, so this is what a drag with inertia sends.
+    pub fn wheel_px(&self, x: f64, y: f64, px: f64) {
+        let _ = self.tx.send(core::Cmd::WheelPx { x, y, px });
+    }
+
+    /// One of the App's preferences, as JSON: `set_setting("scroll-mode",
+    /// "\"stepped\"")`. Kept by the core and applied to every App it makes.
+    pub fn set_setting(&self, key: String, value: String) {
+        let _ = self.tx.send(core::Cmd::SetSetting { key, value });
+    }
+
     /// Scale the focused pane's font by a tenth per step; 0 resets.
     pub fn step_font(&self, by: f64) {
         let _ = self.tx.send(core::Cmd::StepFont(by));

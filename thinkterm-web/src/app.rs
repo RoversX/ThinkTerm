@@ -2155,6 +2155,9 @@ impl<P: Platform, L: Link> App<P, L> {
 
     /// The bar above each pane, in CSS px.
     fn nav_css(inner: &Inner<P, L>) -> f64 {
+        if inner.platform.is_mobile() {
+            return crate::navbar::MOBILE_NAV_CSS;
+        }
         let cell_css = inner.glyphs.metrics.cell_size.height as f64 / inner.dpr.max(0.1);
         crate::navbar::nav_css(cell_css, Self::desktop_cell_css(inner))
     }

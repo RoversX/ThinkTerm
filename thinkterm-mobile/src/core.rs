@@ -24,7 +24,6 @@ use std::time::{Duration, Instant};
 use thinkterm_font_core::FontShaper as _;
 use thinkterm_font_web::{Face, FontSet};
 use thinkterm_render::pipeline::GpuTexture;
-use thinkterm_render::vertex::{Vertex, IS_SOLID_COLOR};
 use thinkterm_web::app::{build_session, grid_for, App, PaneCell, Setup};
 use thinkterm_web::attach::{attach, Attached};
 use thinkterm_web::glyphs::GlyphCache;
@@ -126,7 +125,16 @@ pub enum Cmd {
         y: f64,
         lines: f64,
     },
+    WheelPx {
+        x: f64,
+        y: f64,
+        px: f64,
+    },
     StepFont(f64),
+    SetSetting {
+        key: String,
+        value: String,
+    },
 }
 
 /// The surface currently lent, if any.
@@ -171,7 +179,6 @@ struct State {
     adapter: Option<wgpu::Adapter>,
     /// The GPU state until the App takes it over.
     gpu: Option<Gpu>,
-    white: Option<Rc<GpuTexture>>,
     app: Option<Rc<MobileApp>>,
     target: Option<Target>,
     next_generation: u64,
@@ -187,6 +194,8 @@ struct State {
     conn: Conn,
     status: String,
     composing: bool,
+    /// The shell's preferences, applied to each App as it is made.
+    settings: Vec<(String, String)>,
 }
 
 pub fn run(cmd_tx: Sender<Cmd>, rx: Receiver<Cmd>, notify: Box<dyn Notify>) {
@@ -205,7 +214,6 @@ pub fn run(cmd_tx: Sender<Cmd>, rx: Receiver<Cmd>, notify: Box<dyn Notify>) {
         instance,
         adapter: None,
         gpu: None,
-        white: None,
         app: None,
         target: None,
         next_generation: 1,
@@ -221,6 +229,7 @@ pub fn run(cmd_tx: Sender<Cmd>, rx: Receiver<Cmd>, notify: Box<dyn Notify>) {
         conn: Conn::Idle,
         status: String::new(),
         composing: false,
+        settings: Vec::new(),
     };
     state.notify.on_log("core thread up".into());
     state.set_status("idle");
@@ -457,9 +466,30 @@ impl State {
                     });
                 }
             }
+            Cmd::WheelPx { x, y, px } => {
+                if let Some(app) = self.app.clone() {
+                    app.wheel(&WheelInput {
+                        x,
+                        y,
+                        delta: WheelDelta::Pixels(px),
+                        mods: KeyModifiers::NONE,
+                        ctrl: false,
+                        trusted: true,
+                    });
+                }
+            }
             Cmd::StepFont(by) => {
                 if let Some(app) = self.app.clone() {
                     app.step_font(by);
+                }
+            }
+            Cmd::SetSetting { key, value } => {
+                self.settings.retain(|(k, _)| k != &key);
+                self.settings.push((key.clone(), value.clone()));
+                if let Some(app) = self.app.clone() {
+                    if let Err(err) = app.set_setting(&key, &value) {
+                        self.notify.on_log(format!("setting {key}: {err}"));
+                    }
                 }
             }
         }
@@ -561,7 +591,6 @@ impl State {
                     // state; the shell's next attach makes a fresh one.
                     drop(app);
                     self.gpu = None;
-                    self.white = None;
                     self.target = None;
                     self.notify.on_log(
                         "the App was still in use; its GPU state went with it -- attach the surface again".into(),
@@ -780,6 +809,11 @@ impl State {
             app.set_on_change(Rc::new(move || notify.on_change()));
         }
         app.composing(self.composing);
+        for (key, value) in &self.settings {
+            if let Err(err) = app.set_setting(key, value) {
+                self.notify.on_log(format!("setting {key}: {err}"));
+            }
+        }
         app.fetch_tree();
         app.hide_status();
         app.refresh_layout();
@@ -827,7 +861,6 @@ impl State {
                     height,
                 ))?;
                 let info = gpu.adapter_info.name.clone();
-                self.white = Some(Rc::new(white_texture(&gpu)?));
                 self.gpu = Some(gpu);
                 self.notify.on_log(format!("gpu ready: {info}"));
             }
@@ -948,20 +981,13 @@ impl State {
             }
             return;
         }
-        // No App yet: the demo, so the surface path can be seen working.
+        // No App yet: a bare ground, so the surface path can be seen
+        // working without drawing anything that looks like content.
         self.platform.run_frame();
-        let (Some(target), Some(gpu), Some(white)) =
-            (self.target.as_ref(), self.gpu.as_mut(), self.white.as_ref())
-        else {
+        let (Some(_), Some(gpu)) = (self.target.as_ref(), self.gpu.as_mut()) else {
             return;
         };
-        let vertices = demo_scene(
-            target.width as f32,
-            target.height as f32,
-            target.scale as f32,
-            self.stats.phase,
-        );
-        if let Err(err) = gpu.draw_batches(&[(&vertices, white)], [0.07, 0.07, 0.09, 1.0], 0) {
+        if let Err(err) = gpu.draw_batches(&[], [0.07, 0.07, 0.09, 1.0], 0) {
             self.fail(format!("render: {err:#}"));
             return;
         }
@@ -1015,133 +1041,3 @@ fn json<T: serde::Serialize>(value: &T) -> String {
         .unwrap_or_else(|err| format!("{{\"error\":{:?}}}", err.to_string()))
 }
 
-fn white_texture(gpu: &Gpu) -> Result<GpuTexture> {
-    let white = GpuTexture::new(&gpu.device, Arc::clone(&gpu.queue), 1, 1)?;
-    gpu.queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: white.texture(),
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &[255, 255, 255, 255],
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(4),
-            rows_per_image: Some(1),
-        },
-        wgpu::Extent3d {
-            width: 1,
-            height: 1,
-            depth_or_array_layers: 1,
-        },
-    );
-    Ok(white)
-}
-
-/// A grid of coloured cells the size a terminal's would be, one of them
-/// walking across with the phase, and a bar along the bottom whose length
-/// follows the width. Enough to see, in a screenshot, that the projection,
-/// the scale and a resize all land where they should.
-fn demo_scene(width: f32, height: f32, scale: f32, phase: u64) -> Vec<Vertex> {
-    let mut out = Vec::new();
-    let cell_w = 9.0 * scale;
-    let cell_h = 20.0 * scale;
-    let cols = ((width - 2.0 * cell_w) / cell_w).floor().max(1.0) as u64;
-    let rows = ((height - 4.0 * cell_h) / cell_h).floor().max(1.0) as u64;
-    let x0 = cell_w;
-    let y0 = cell_h * 2.0;
-    for row in 0..rows {
-        for col in 0..cols {
-            let i = row * cols + col;
-            let lit = (i + phase) % 7 == 0;
-            let color = if lit {
-                let hue = ((i * 37 + phase * 5) % 360) as f32;
-                hsl(hue, 0.7, 0.55)
-            } else {
-                [0.16, 0.16, 0.20, 1.0]
-            };
-            push_rect(
-                &mut out,
-                width,
-                height,
-                x0 + col as f32 * cell_w,
-                y0 + row as f32 * cell_h,
-                cell_w - 1.0 * scale,
-                cell_h - 1.0 * scale,
-                color,
-            );
-        }
-    }
-    let walker = (phase % cols.max(1)) as f32;
-    push_rect(
-        &mut out,
-        width,
-        height,
-        x0 + walker * cell_w,
-        cell_h * 0.5,
-        cell_w,
-        cell_h,
-        [1.0, 0.85, 0.2, 1.0],
-    );
-    push_rect(
-        &mut out,
-        width,
-        height,
-        x0,
-        height - cell_h * 1.5,
-        width - 2.0 * x0,
-        cell_h * 0.5,
-        [0.3, 0.7, 1.0, 1.0],
-    );
-    out
-}
-
-#[allow(clippy::too_many_arguments)]
-fn push_rect(
-    out: &mut Vec<Vertex>,
-    width: f32,
-    height: f32,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    color: [f32; 4],
-) {
-    // The projection is centred: pixel (0,0) is at (-width/2, -height/2).
-    let left = x - width / 2.0;
-    let top = y - height / 2.0;
-    let right = left + w;
-    let bottom = top + h;
-    let vertex = |px: f32, py: f32| Vertex {
-        position: [px, py],
-        tex: [0.0, 0.0],
-        fg_color: color,
-        alt_color: color,
-        hsv: [1.0, 1.0, 1.0],
-        has_color: IS_SOLID_COLOR,
-        mix_value: 0.0,
-    };
-    // Order matches thinkterm_render::vertex::{V_TOP_LEFT, V_TOP_RIGHT,
-    // V_BOT_LEFT, V_BOT_RIGHT}, which quad_indices assumes.
-    out.push(vertex(left, top));
-    out.push(vertex(right, top));
-    out.push(vertex(left, bottom));
-    out.push(vertex(right, bottom));
-}
-
-fn hsl(h: f32, s: f32, l: f32) -> [f32; 4] {
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let hp = h / 60.0;
-    let x = c * (1.0 - ((hp % 2.0) - 1.0).abs());
-    let (r, g, b) = match hp as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    let m = l - c / 2.0;
-    [r + m, g + m, b + m, 1.0]
-}

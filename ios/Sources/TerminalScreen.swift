@@ -39,6 +39,7 @@ struct TerminalScreen: View {
                     Button("Zoom pane") { model.chromeClick("zoom") }
                     Button("Close pane", role: .destructive) { model.chromeClick("close") }
                     Divider()
+                    Toggle("Smooth scrolling", isOn: $model.smoothScroll)
                     Button("Paste") { model.pasteFromClipboard() }
                     Button(model.connection.hasPrefix("disconnected") || model.connection.hasPrefix("failed") ? "Reconnect" : "Disconnect") {
                         if model.connection.hasPrefix("disconnected") || model.connection.hasPrefix("failed") {
@@ -110,47 +111,57 @@ struct TerminalScreen: View {
     /// The App leaves rows above each pane for its bar; these draw it,
     /// where the App says (points, from the terminal's origin).
     private var navBars: some View {
-        ForEach(model.navs) { nav in
-            HStack(spacing: 6) {
-                ForEach(nav.members) { member in
-                    Button {
-                        model.chromeClick("pane", pane: member.pane)
-                    } label: {
-                        HStack(spacing: 4) {
-                            if member.busy {
-                                ProgressView().controlSize(.mini)
-                            }
-                            Text(member.title.isEmpty ? "shell" : member.title)
-                                .lineLimit(1)
-                                .font(.system(size: 11, weight: member.current ? .semibold : .regular))
-                        }
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(member.current ? Color.white.opacity(nav.focused ? 0.22 : 0.12) : Color.clear)
-                        .clipShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
-                }
-                Spacer(minLength: 0)
-                Button { model.chromeClick("new-pane", pane: nav.rect.pane) } label: {
-                    Image(systemName: "plus").font(.system(size: 11))
-                }
-                .buttonStyle(.plain)
-                Button { model.chromeClick("close-pane", pane: nav.rect.pane) } label: {
-                    Image(systemName: "xmark").font(.system(size: 11))
-                }
-                .buttonStyle(.plain)
+        // A GeometryReader takes the terminal's box and never grows with
+        // its children: a bar the App sizes to a wider tab (the server's,
+        // until this phone's claim lands) must not widen the surface, or
+        // the surface, the grid and the bars chase each other forever.
+        GeometryReader { geo in
+            ForEach(model.navs) { nav in
+                navBar(nav, maxWidth: max(geo.size.width - nav.rect.left, 0))
             }
-            .foregroundColor(nav.focused ? .white : .gray)
-            .padding(.horizontal, 6)
-            .frame(width: nav.rect.width, height: nav.rect.height, alignment: .leading)
-            .background(Color(white: nav.focused ? 0.16 : 0.1))
-            .contentShape(Rectangle())
-            .onLongPressGesture {
-                menu = MenuSheet(kind: "pane", id: String(nav.rect.pane), title: "Pane")
-            }
-            .offset(x: nav.rect.left, y: nav.rect.top)
         }
+    }
+
+    private func navBar(_ nav: NavView, maxWidth: CGFloat) -> some View {
+        HStack(spacing: 6) {
+            ForEach(nav.members) { member in
+                Button {
+                    model.chromeClick("pane", pane: member.pane)
+                } label: {
+                    HStack(spacing: 4) {
+                        if member.busy {
+                            ProgressView().controlSize(.mini)
+                        }
+                        Text(member.title.isEmpty ? "shell" : member.title)
+                            .lineLimit(1)
+                            .font(.system(size: 11, weight: member.current ? .semibold : .regular))
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(member.current ? Color.white.opacity(nav.focused ? 0.22 : 0.12) : Color.clear)
+                    .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer(minLength: 0)
+            Button { model.chromeClick("new-pane", pane: nav.rect.pane) } label: {
+                Image(systemName: "plus").font(.system(size: 11))
+            }
+            .buttonStyle(.plain)
+            Button { model.chromeClick("close-pane", pane: nav.rect.pane) } label: {
+                Image(systemName: "xmark").font(.system(size: 11))
+            }
+            .buttonStyle(.plain)
+        }
+        .foregroundColor(nav.focused ? .white : .gray)
+        .padding(.horizontal, 6)
+        .frame(width: min(nav.rect.width, maxWidth), height: nav.rect.height, alignment: .leading)
+        .background(Color(white: nav.focused ? 0.16 : 0.1))
+        .contentShape(Rectangle())
+        .onLongPressGesture {
+            menu = MenuSheet(kind: "pane", id: String(nav.rect.pane), title: "Pane")
+        }
+        .offset(x: nav.rect.left, y: nav.rect.top)
     }
 
     private func paneUnder(_ point: CGPoint) -> Int? {
@@ -339,8 +350,6 @@ struct KeyBar: View {
                 key("^L") { model.key("l", ctrl: true) }
                 key("^Z") { model.key("z", ctrl: true) }
                 key("⌫") { model.key("Backspace") }
-                key("⌨︎") { model.focusKeyboard() }
-                key("⌨︎✕") { model.dismissKeyboard() }
             }
             .padding(.horizontal, 6)
         }

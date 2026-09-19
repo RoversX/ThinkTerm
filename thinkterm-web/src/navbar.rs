@@ -11,6 +11,12 @@ use crate::layout::{PanePlacement, TabLayout};
 /// a 46.67 px cell, the smallest count a 94 px bar needs).
 pub const DESKTOP_NAV_CSS: f64 = 47.0;
 
+/// The bar on a phone, in points: room for one row of 11 pt capsules.
+/// The desktop's 47 is a third of a phone's terminal at a large font,
+/// and the grid pays for it in whole rows, so it came to four rows
+/// (65 pt) at 11 pt -- a bar taller than the tab strip above it.
+pub const MOBILE_NAV_CSS: f64 = 28.0;
+
 /// The bar's height on this page. The desktop's, scaled by how far the
 /// page's cell is from the desktop's: with the font matched the ratio
 /// is one and the bar is the desktop's to the pixel.
