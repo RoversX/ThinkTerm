@@ -48,6 +48,9 @@ pub trait Notify: Send + Sync {
     fn on_focus_input(&self);
     /// Where the cursor cell is, in points, in the terminal view.
     fn on_ime_anchor(&self, left: f64, top: f64, width: f64, height: f64);
+    /// The host's key fingerprint, seen before authentication: the shell
+    /// remembers it and passes it back as `known_host` next time.
+    fn on_host_key(&self, fingerprint: String);
 }
 
 /// Rust's `log` output goes to stdout, which the simulator's console shows;
@@ -166,25 +169,41 @@ impl Core {
     /// Connect over ssh, exec the proxy on the host and attach to its
     /// active pane. `font_paths` are the TTF files to shape with (base face
     /// first); `painter` draws what they lack.
+    /// `auth_kind` is "key-path" (the secret is a file path), "key" (the
+    /// secret is the private key's text, `passphrase` its passphrase) or
+    /// "password". `known_host` is the fingerprint remembered from an
+    /// earlier connection, if any.
     #[allow(clippy::too_many_arguments)]
     pub fn connect(
         &self,
         host: String,
         port: u16,
         user: String,
-        key_path: String,
+        auth_kind: String,
+        secret: String,
+        passphrase: Option<String>,
+        known_host: Option<String>,
         remote_command: String,
         font_paths: Vec<String>,
         size_pt: f64,
         painter: Box<dyn painter::GlyphPainter>,
     ) {
+        let auth = match auth_kind.as_str() {
+            "password" => ssh::Auth::Password(secret),
+            "key" => ssh::Auth::KeyPem {
+                pem: secret,
+                passphrase: passphrase.filter(|p| !p.is_empty()),
+            },
+            _ => ssh::Auth::KeyPath(secret),
+        };
         let _ = self.tx.send(core::Cmd::Connect {
             params: core::ConnectParams {
                 ssh: ssh::SshParams {
                     host,
                     port,
                     user,
-                    key_path,
+                    auth,
+                    known_host: known_host.filter(|k| !k.is_empty()),
                     remote_command,
                 },
                 font_paths,
@@ -192,6 +211,84 @@ impl Core {
             },
             painter,
         });
+    }
+
+    // ----- the App's views and commands, for the shell's own interface -----
+
+    /// One of the App's views as JSON: "tabs", "sidebar", "navs",
+    /// "status", "layout" or "strings". "null" while there is no App.
+    pub fn view(&self, name: String) -> String {
+        let (reply, ack) = mpsc::channel();
+        if self.tx.send(core::Cmd::View { name, reply }).is_err() {
+            return "null".into();
+        }
+        ack.recv().unwrap_or_else(|_| "null".into())
+    }
+
+    /// A click on the tab strip or a pane's bar: "pane", "new-tab",
+    /// "new-pane", "split-right", "split-below", "zoom", "close",
+    /// "close-pane", "close-tab", "follow".
+    pub fn chrome_click(&self, action: String, pane: Option<u32>, tab: Option<u32>) {
+        let _ = self.tx.send(core::Cmd::ChromeClick { action, pane, tab });
+    }
+
+    /// A click in the sidebar: "thread", "window", "toggle-project",
+    /// "new-thread", "pin", "delete", "archive", "unarchive"...
+    pub fn side_click(&self, kind: String, id: Option<String>, flag: Option<bool>) {
+        let _ = self.tx.send(core::Cmd::SideClick { kind, id, flag });
+    }
+
+    /// A key in the sidebar's text field ("Enter" commits, "Escape"
+    /// cancels) with the field's text.
+    pub fn side_key(&self, key: String, value: String) {
+        let _ = self.tx.send(core::Cmd::SideKey { key, value });
+    }
+
+    /// The context menu for `kind` ("pane", "tab", "thread", "project",
+    /// "space"...) and `id`, as JSON.
+    pub fn context_menu(&self, kind: String, id: String) -> String {
+        let (reply, ack) = mpsc::channel();
+        if self
+            .tx
+            .send(core::Cmd::ContextMenu { kind, id, reply })
+            .is_err()
+        {
+            return "[]".into();
+        }
+        ack.recv().unwrap_or_else(|_| "[]".into())
+    }
+
+    /// Do what a menu row asks; the outcome says whether it was handled
+    /// and whether the shell should copy or paste.
+    pub fn menu_action(&self, id: String) -> String {
+        let (reply, ack) = mpsc::channel();
+        if self.tx.send(core::Cmd::MenuAction { id, reply }).is_err() {
+            return "{\"handled\":false,\"copy\":null,\"paste\":false}".into();
+        }
+        ack.recv().unwrap_or_default()
+    }
+
+    pub fn set_space(&self, id: String) {
+        let _ = self.tx.send(core::Cmd::SetSpace(id));
+    }
+
+    pub fn take_over(&self) {
+        let _ = self.tx.send(core::Cmd::TakeOver);
+    }
+
+    /// A touch on the terminal, in points: "down", "move" or "up".
+    pub fn pointer(&self, kind: String, x: f64, y: f64) {
+        let _ = self.tx.send(core::Cmd::Pointer { kind, x, y });
+    }
+
+    /// Scroll at a point by `lines`; positive is back into history.
+    pub fn wheel(&self, x: f64, y: f64, lines: f64) {
+        let _ = self.tx.send(core::Cmd::Wheel { x, y, lines });
+    }
+
+    /// Scale the focused pane's font by a tenth per step; 0 resets.
+    pub fn step_font(&self, by: f64) {
+        let _ = self.tx.send(core::Cmd::StepFont(by));
     }
 
     pub fn disconnect(&self) {

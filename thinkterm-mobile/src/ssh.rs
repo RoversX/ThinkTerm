@@ -5,22 +5,39 @@
 //! channel and are written in order; everything that comes back -- data,
 //! stderr, the exit status, the close -- is delivered to the core thread
 //! through the callback it gave us, which must not block.
+//!
+//! The host key is trusted on first use: its fingerprint is reported so
+//! the shell can remember it, and a remembered one that no longer matches
+//! ends the dial before any authentication.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use russh::client::{self, Handler};
-use russh::keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate};
+use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::ChannelMsg;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+#[derive(Debug, Clone)]
+pub enum Auth {
+    /// An OpenSSH private key file on disk (the probe's throwaway key).
+    KeyPath(String),
+    /// A private key in OpenSSH or PEM text, with its passphrase if any.
+    KeyPem {
+        pem: String,
+        passphrase: Option<String>,
+    },
+    Password(String),
+}
 
 #[derive(Debug, Clone)]
 pub struct SshParams {
     pub host: String,
     pub port: u16,
     pub user: String,
-    /// Path to an OpenSSH private key file (unencrypted for the probe).
-    pub key_path: String,
+    pub auth: Auth,
+    /// The host key fingerprint seen last time (`SHA256:...`), if any.
+    pub known_host: Option<String>,
     /// The command to exec; empty means the default proxy invocation.
     pub remote_command: String,
 }
@@ -32,6 +49,8 @@ pub enum Out {
 
 #[derive(Debug)]
 pub enum Net {
+    /// The host's key fingerprint, before authentication.
+    HostKey(String),
     Connected,
     Data(Vec<u8>),
     Stderr(String),
@@ -39,14 +58,29 @@ pub enum Net {
     Closed(String),
 }
 
-struct Trusting;
+struct HostKeyCheck {
+    known: Option<String>,
+    seen: Arc<Mutex<Option<String>>>,
+}
 
-impl Handler for Trusting {
+impl Handler for HostKeyCheck {
     type Error = anyhow::Error;
-    async fn check_server_key(&mut self, _key: &PublicKeyOrCertificate) -> Result<bool> {
-        // The probe trusts any host key; the real client pins it on first
-        // use and refuses a change.
-        Ok(true)
+    async fn check_server_key(&mut self, key: &PublicKeyOrCertificate) -> Result<bool> {
+        let fingerprint = match key {
+            PublicKeyOrCertificate::PublicKey { key, .. } => {
+                key.fingerprint(HashAlg::Sha256).to_string()
+            }
+            PublicKeyOrCertificate::Certificate(cert) => {
+                cert.public_key().fingerprint(HashAlg::Sha256).to_string()
+            }
+        };
+        *self.seen.lock().unwrap() = Some(fingerprint.clone());
+        match &self.known {
+            Some(known) if known != &fingerprint => Err(anyhow!(
+                "the host's key changed: expected {known}, got {fingerprint}. If the host was reinstalled, forget it and add it again"
+            )),
+            _ => Ok(true),
+        }
     }
 }
 
@@ -94,25 +128,52 @@ async fn run(
         keepalive_max: 3,
         ..Default::default()
     });
-    let mut session = tokio::time::timeout(
+    let seen = Arc::new(Mutex::new(None));
+    let handler = HostKeyCheck {
+        known: params.known_host.clone(),
+        seen: Arc::clone(&seen),
+    };
+    let dial = tokio::time::timeout(
         Duration::from_secs(15),
-        client::connect(config, (params.host.as_str(), params.port), Trusting),
+        client::connect(config, (params.host.as_str(), params.port), handler),
     )
     .await
-    .context("connecting timed out")?
-    .context("ssh transport")?;
+    .context("connecting timed out")?;
+    if let Some(fingerprint) = seen.lock().unwrap().clone() {
+        deliver(Net::HostKey(fingerprint));
+    }
+    let mut session = dial.context("ssh transport")?;
 
-    let key = russh::keys::load_secret_key(&params.key_path, None)
-        .with_context(|| format!("loading the key {}", params.key_path))?;
-    let auth = session
-        .authenticate_publickey(
-            &params.user,
-            PrivateKeyWithHashAlg::new(Arc::new(key), None),
-        )
-        .await
-        .context("publickey auth")?;
+    let auth = match &params.auth {
+        Auth::KeyPath(path) => {
+            let key = russh::keys::load_secret_key(path, None)
+                .with_context(|| format!("loading the key {path}"))?;
+            session
+                .authenticate_publickey(
+                    &params.user,
+                    PrivateKeyWithHashAlg::new(Arc::new(key), None),
+                )
+                .await
+                .context("publickey auth")?
+        }
+        Auth::KeyPem { pem, passphrase } => {
+            let key = russh::keys::decode_secret_key(pem, passphrase.as_deref())
+                .context("reading the private key")?;
+            session
+                .authenticate_publickey(
+                    &params.user,
+                    PrivateKeyWithHashAlg::new(Arc::new(key), None),
+                )
+                .await
+                .context("publickey auth")?
+        }
+        Auth::Password(password) => session
+            .authenticate_password(&params.user, password.as_str())
+            .await
+            .context("password auth")?,
+    };
     if !auth.success() {
-        anyhow::bail!("the host refused the key for {}", params.user);
+        anyhow::bail!("the host refused the login for {}", params.user);
     }
 
     let mut channel = session

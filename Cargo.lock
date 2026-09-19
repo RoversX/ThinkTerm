@@ -7795,6 +7795,8 @@ dependencies = [
  "futures",
  "log",
  "russh",
+ "serde",
+ "serde_json",
  "termwiz 0.24.0",
  "thinkterm-font-core",
  "thinkterm-font-web",

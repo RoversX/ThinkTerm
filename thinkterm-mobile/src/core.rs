@@ -31,7 +31,7 @@ use thinkterm_web::glyphs::GlyphCache;
 use thinkterm_web::gpu::Gpu;
 use thinkterm_web::host::AppHost;
 use thinkterm_web::keymap::{map_key, DomKey};
-use thinkterm_web::platform::{Link, Platform, WheelDelta, WheelInput};
+use thinkterm_web::platform::{Link, Platform, PointerInput, WheelDelta, WheelInput};
 use wezterm_term::KeyModifiers;
 
 pub type MobileApp = App<MobilePlatform, SshLink>;
@@ -87,6 +87,46 @@ pub enum Cmd {
     Paste(String),
     Scroll(i32),
     Composing(bool),
+    View {
+        name: String,
+        reply: Sender<String>,
+    },
+    ChromeClick {
+        action: String,
+        pane: Option<u32>,
+        tab: Option<u32>,
+    },
+    SideClick {
+        kind: String,
+        id: Option<String>,
+        flag: Option<bool>,
+    },
+    SideKey {
+        key: String,
+        value: String,
+    },
+    ContextMenu {
+        kind: String,
+        id: String,
+        reply: Sender<String>,
+    },
+    MenuAction {
+        id: String,
+        reply: Sender<String>,
+    },
+    SetSpace(String),
+    TakeOver,
+    Pointer {
+        kind: String,
+        x: f64,
+        y: f64,
+    },
+    Wheel {
+        x: f64,
+        y: f64,
+        lines: f64,
+    },
+    StepFont(f64),
 }
 
 /// The surface currently lent, if any.
@@ -327,6 +367,116 @@ impl State {
                     app.composing(on);
                 }
             }
+            Cmd::View { name, reply } => {
+                let _ = reply.send(self.view(&name));
+            }
+            Cmd::ChromeClick { action, pane, tab } => {
+                if let Some(app) = self.app.clone() {
+                    let click = thinkterm_web::commands::chrome_click(
+                        &action,
+                        pane.map(|p| p as usize),
+                        tab.map(|t| t as usize),
+                    );
+                    match click {
+                        Some(click) => app.on_chrome_click(click),
+                        None => self
+                            .notify
+                            .on_log(format!("chrome click {action:?} is not a thing")),
+                    }
+                }
+            }
+            Cmd::SideClick { kind, id, flag } => {
+                if let Some(app) = self.app.clone() {
+                    match thinkterm_web::commands::side_click(&kind, id, flag) {
+                        Some(click) => app.on_side_click(click),
+                        None => self
+                            .notify
+                            .on_log(format!("side click {kind:?} is not a thing")),
+                    }
+                }
+            }
+            Cmd::SideKey { key, value } => {
+                if let Some(app) = self.app.clone() {
+                    app.on_side_key(&key, value);
+                }
+            }
+            Cmd::ContextMenu { kind, id, reply } => {
+                let json = self
+                    .app
+                    .as_ref()
+                    .map(|app| json(&app.context_menu(&kind, &id)))
+                    .unwrap_or_else(|| "[]".into());
+                let _ = reply.send(json);
+            }
+            Cmd::MenuAction { id, reply } => {
+                let json = self
+                    .app
+                    .clone()
+                    .map(|app| json(&app.menu_action(&id)))
+                    .unwrap_or_else(|| "{\"handled\":false,\"copy\":null,\"paste\":false}".into());
+                let _ = reply.send(json);
+            }
+            Cmd::SetSpace(id) => {
+                if let Some(app) = &self.app {
+                    app.set_space(&id);
+                }
+            }
+            Cmd::TakeOver => {
+                if let Some(app) = self.app.clone() {
+                    app.take_over();
+                }
+            }
+            Cmd::Pointer { kind, x, y } => {
+                if let Some(app) = self.app.clone() {
+                    let what = match kind.as_str() {
+                        "down" => thinkterm_web::app::Pointer::Down,
+                        "move" => thinkterm_web::app::Pointer::Move,
+                        _ => thinkterm_web::app::Pointer::Up,
+                    };
+                    app.pointer(
+                        &PointerInput {
+                            x,
+                            y,
+                            button: 0,
+                            buttons_down: what != thinkterm_web::app::Pointer::Up,
+                            mods: KeyModifiers::NONE,
+                        },
+                        what,
+                    );
+                }
+            }
+            Cmd::Wheel { x, y, lines } => {
+                if let Some(app) = self.app.clone() {
+                    app.wheel(&WheelInput {
+                        x,
+                        y,
+                        delta: WheelDelta::Lines(-lines),
+                        mods: KeyModifiers::NONE,
+                        ctrl: false,
+                        trusted: true,
+                    });
+                }
+            }
+            Cmd::StepFont(by) => {
+                if let Some(app) = self.app.clone() {
+                    app.step_font(by);
+                }
+            }
+        }
+    }
+
+    fn view(&self, name: &str) -> String {
+        let Some(app) = &self.app else {
+            return "null".into();
+        };
+        match name {
+            "tabs" => json(&app.tabs_view()),
+            "sidebar" => json(&app.sidebar_view()),
+            "navs" => json(&app.navs_view()),
+            "status" => json(&app.status_view()),
+            "layout" => app.layout_view(),
+            "strings" => json(&thinkterm_web::views::strings()),
+            _ => "null".into(),
         }
     }
 
@@ -402,15 +552,22 @@ impl State {
             link.shutdown();
         }
         if let Some(app) = self.app.take() {
-            // The App's GPU state cannot be moved out of it; a connection
-            // that ends takes the device with it and the next one makes a
-            // fresh one from the surface the shell lends again.
-            drop(app);
-            self.gpu = None;
-            self.white = None;
-            self.target = None;
-            self.notify
-                .on_log("the App and its GPU state are gone; attach the surface again".into());
+            // The device, the pipeline and the surface come back to the
+            // core for the next connection (or the demo).
+            match App::into_gpu(app) {
+                Ok(gpu) => self.gpu = Some(gpu),
+                Err(app) => {
+                    // A task still holds the App: let it go with its GPU
+                    // state; the shell's next attach makes a fresh one.
+                    drop(app);
+                    self.gpu = None;
+                    self.white = None;
+                    self.target = None;
+                    self.notify.on_log(
+                        "the App was still in use; its GPU state went with it -- attach the surface again".into(),
+                    );
+                }
+            }
         }
         self.conn = Conn::Idle;
     }
@@ -444,6 +601,7 @@ impl State {
                     link.closed(format!("{err:#}"));
                 }
             }
+            Net::HostKey(fingerprint) => self.notify.on_host_key(fingerprint),
             Net::Stderr(text) => self.notify.on_log(format!("remote: {}", text.trim_end())),
             Net::Exit(code) => self
                 .notify
@@ -850,6 +1008,11 @@ impl State {
             layout,
         )
     }
+}
+
+fn json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|err| format!("{{\"error\":{:?}}}", err.to_string()))
 }
 
 fn white_texture(gpu: &Gpu) -> Result<GpuTexture> {

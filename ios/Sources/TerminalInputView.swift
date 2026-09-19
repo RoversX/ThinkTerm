@@ -1,40 +1,106 @@
 import SwiftUI
 import UIKit
 
-/// The keyboard's target: an invisible view over the terminal that adopts
-/// `UITextInput` so the soft keyboard, its IMEs (Pinyin, Kana...) and a
-/// hardware keyboard all talk to it. It holds no text of its own beyond
-/// the IME's marked (composing) string: committed text goes straight to
-/// the core, keys go as key events, and while a composition is open the
-/// core is told to leave the keyboard to the IME.
+/// The keyboard's target and the terminal's touch surface: an invisible
+/// view over the Metal layer that adopts `UITextInput` so the soft
+/// keyboard, its IMEs (Pinyin, Kana...) and a hardware keyboard all talk
+/// to it, and whose gestures are the terminal's -- a tap focuses the pane
+/// under it, a drag scrolls, a long press opens the pane's menu, a pinch
+/// changes the font.
 ///
-/// The rules this enforces (plan §2.6):
-/// - nothing is sent while composing; the marked text is the IME's;
-/// - cancelling a composition sends nothing;
-/// - picking a candidate commits once (insertText clears the marked text
-///   before unmarkText can commit it again);
-/// - backspace inside a composition edits the marked text only.
-final class TerminalInputView: UIView, UITextInput {
-    weak var model: ProbeModel?
+/// It holds no text of its own beyond the IME's marked (composing)
+/// string: committed text goes straight to the core, keys go as key
+/// events, and while a composition is open the core is told to leave the
+/// keyboard to the IME. The rules (plan §2.6): nothing is sent while
+/// composing; cancelling sends nothing; a candidate commits once
+/// (insertText clears the marked text before unmarkText can commit it
+/// again); backspace inside a composition edits the marked text only.
+final class TerminalInputView: UIView, UITextInput, UIGestureRecognizerDelegate {
+    weak var model: TerminalModel?
+    var onMenu: ((CGPoint) -> Void)?
 
-    /// The IME's composing text, `nil` when none is open.
     private(set) var marked: String?
-    /// Selection inside the marked text, for the IME's own bookkeeping.
     private var markedSelection = NSRange(location: 0, length: 0)
+    private var panRemainder: CGFloat = 0
+    private var pinchStart: CGFloat = 1
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         isUserInteractionEnabled = true
         backgroundColor = .clear
-        addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped)))
+        let tap = UITapGestureRecognizer(target: self, action: #selector(tapped(_:)))
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(panned(_:)))
+        let press = UILongPressGestureRecognizer(target: self, action: #selector(pressed(_:)))
+        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:)))
+        pan.maximumNumberOfTouches = 1
+        press.minimumPressDuration = 0.45
+        for g in [tap, pan, press, pinch] as [UIGestureRecognizer] {
+            g.delegate = self
+            addGestureRecognizer(g)
+        }
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
-    @objc private func tapped() {
+    // MARK: gestures
+
+    @objc private func tapped(_ g: UITapGestureRecognizer) {
+        let p = g.location(in: self)
+        // A press and release at the point: the App focuses the pane.
+        model?.pointer("down", at: p)
+        model?.pointer("up", at: p)
         if !isFirstResponder {
             becomeFirstResponder()
         }
+    }
+
+    @objc private func panned(_ g: UIPanGestureRecognizer) {
+        let p = g.location(in: self)
+        switch g.state {
+        case .began:
+            panRemainder = 0
+        case .changed:
+            // Points to rows: the App's own cell height is unknown here;
+            // a row is taken as 20 pt, which is what 11 pt Menlo is.
+            let dy = g.translation(in: self).y + panRemainder
+            let rows = (dy / 20).rounded(.towardZero)
+            panRemainder = dy - rows * 20
+            g.setTranslation(.zero, in: self)
+            if rows != 0 {
+                model?.wheel(at: p, lines: Double(rows))
+            }
+        default:
+            break
+        }
+    }
+
+    @objc private func pressed(_ g: UILongPressGestureRecognizer) {
+        guard g.state == .began else { return }
+        let p = g.location(in: self)
+        model?.pointer("down", at: p)
+        model?.pointer("up", at: p)
+        onMenu?(p)
+    }
+
+    @objc private func pinched(_ g: UIPinchGestureRecognizer) {
+        switch g.state {
+        case .began: pinchStart = 1
+        case .changed:
+            // One font step per 15% of scale, either way.
+            while g.scale > pinchStart * 1.15 {
+                pinchStart *= 1.15
+                model?.stepFont(1)
+            }
+            while g.scale < pinchStart / 1.15 {
+                pinchStart /= 1.15
+                model?.stepFont(-1)
+            }
+        default: break
+        }
+    }
+
+    func gestureRecognizer(_ a: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith b: UIGestureRecognizer) -> Bool {
+        true
     }
 
     override var canBecomeFirstResponder: Bool { true }
@@ -56,8 +122,8 @@ final class TerminalInputView: UIView, UITextInput {
         model?.compositionChanged(nil)
     }
 
-    /// Called by the shell when the pane goes away or the connection
-    /// changes: an open composition must not land in whatever comes next.
+    /// The pane went away or the connection changed: an open composition
+    /// must not land in whatever comes next.
     func dropComposition() {
         endComposing()
     }
@@ -67,19 +133,15 @@ final class TerminalInputView: UIView, UITextInput {
     var hasText: Bool { marked?.isEmpty == false }
 
     func insertText(_ text: String) {
-        // A candidate was chosen (or plain text typed with no IME): the
-        // marked text is replaced by this, and this alone is sent.
         endComposing()
         if text == "\n" {
             model?.key("Enter")
         } else {
-            model?.core.text(text: text)
+            model?.text(text)
         }
     }
 
     func deleteBackward() {
-        // Inside a composition the IME edits its own buffer through
-        // setMarkedText; this only fires for a real backspace.
         if marked != nil { return }
         model?.key("Backspace")
     }
@@ -99,7 +161,6 @@ final class TerminalInputView: UIView, UITextInput {
     func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
         let text = markedText ?? ""
         if text.isEmpty {
-            // The IME cleared its buffer without committing: a cancel.
             endComposing()
             return
         }
@@ -110,23 +171,17 @@ final class TerminalInputView: UIView, UITextInput {
     }
 
     func unmarkText() {
-        // The composition ended with text still marked (the IME committed
-        // the raw buffer, or the keyboard went away): commit it once.
         if let marked, !marked.isEmpty {
             self.marked = nil
             model?.core.setComposing(on: false)
             model?.compositionChanged(nil)
-            model?.core.text(text: marked)
+            model?.text(marked)
             return
         }
         endComposing()
     }
 
     // MARK: UITextInput -- the (empty) document
-
-    // The view's "text" is only ever the marked string; everything else
-    // has been handed to the terminal. Positions are UTF-16 offsets into
-    // the marked text, and the document is otherwise empty.
 
     var selectedTextRange: UITextRange? {
         get {
@@ -149,8 +204,6 @@ final class TerminalInputView: UIView, UITextInput {
     }
 
     func replace(_ range: UITextRange, withText text: String) {
-        // Replacing inside the marked text is the IME's business and comes
-        // through setMarkedText; anything else is a commit.
         insertText(text)
     }
 
@@ -210,9 +263,6 @@ final class TerminalInputView: UIView, UITextInput {
 
     func setBaseWritingDirection(_ writingDirection: NSWritingDirection, for range: UITextRange) {}
 
-    // The candidate bar and the magnifier ask where the text is; the
-    // terminal's cursor rectangle is what they should get. The model keeps
-    // it from the last frame (in points, in this view's coordinates).
     func firstRect(for range: UITextRange) -> CGRect { model?.cursorRect ?? CGRect(x: 0, y: 0, width: 1, height: 20) }
     func caretRect(for position: UITextPosition) -> CGRect { model?.cursorRect ?? CGRect(x: 0, y: 0, width: 1, height: 20) }
     func selectionRects(for range: UITextRange) -> [UITextSelectionRect] { [] }
@@ -236,12 +286,12 @@ final class TerminalInputView: UIView, UITextInput {
 
     override var keyCommands: [UIKeyCommand]? {
         var cmds: [UIKeyCommand] = []
-        let arrows: [(String, String)] = [
-            (UIKeyCommand.inputUpArrow, "ArrowUp"), (UIKeyCommand.inputDownArrow, "ArrowDown"),
-            (UIKeyCommand.inputLeftArrow, "ArrowLeft"), (UIKeyCommand.inputRightArrow, "ArrowRight"),
-            (UIKeyCommand.inputEscape, "Escape"), ("\t", "Tab"),
+        let specials: [String] = [
+            UIKeyCommand.inputUpArrow, UIKeyCommand.inputDownArrow,
+            UIKeyCommand.inputLeftArrow, UIKeyCommand.inputRightArrow,
+            UIKeyCommand.inputEscape, "\t",
         ]
-        for (input, _) in arrows {
+        for input in specials {
             let c = UIKeyCommand(input: input, modifierFlags: [], action: #selector(hardwareKey(_:)))
             c.wantsPriorityOverSystemBehavior = true
             cmds.append(c)
@@ -286,14 +336,18 @@ final class TerminalInputView: UIView, UITextInput {
 }
 
 struct TerminalInput: UIViewRepresentable {
-    @EnvironmentObject var model: ProbeModel
+    @EnvironmentObject var model: TerminalModel
+    var onMenu: (CGPoint) -> Void
 
     func makeUIView(context: Context) -> TerminalInputView {
         let view = TerminalInputView()
         view.model = model
+        view.onMenu = onMenu
         model.inputView = view
         return view
     }
 
-    func updateUIView(_ uiView: TerminalInputView, context: Context) {}
+    func updateUIView(_ uiView: TerminalInputView, context: Context) {
+        uiView.onMenu = onMenu
+    }
 }

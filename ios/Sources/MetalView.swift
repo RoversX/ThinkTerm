@@ -7,7 +7,7 @@ import QuartzCore
 /// and takes the surface back before the layer is torn down.
 final class MetalLayerView: UIView {
     override class var layerClass: AnyClass { CAMetalLayer.self }
-    weak var model: ProbeModel?
+    weak var model: TerminalModel?
 
     var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
 
@@ -40,7 +40,7 @@ final class MetalLayerView: UIView {
 }
 
 struct MetalView: UIViewRepresentable {
-    @EnvironmentObject var model: ProbeModel
+    @EnvironmentObject var model: TerminalModel
 
     func makeUIView(context: Context) -> MetalLayerView {
         let view = MetalLayerView()

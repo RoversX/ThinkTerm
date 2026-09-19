@@ -89,25 +89,8 @@ impl Client {
     /// thread, project or window it is about, `flag` the pin state.
     /// Returns false for a kind the model does not know.
     pub fn side_click(&self, kind: String, id: Option<String>, flag: Option<bool>) -> bool {
-        use crate::sidebar::SideClick;
-        let click = match (kind.as_str(), id) {
-            ("thread", Some(id)) => SideClick::Thread(id),
-            ("window", Some(id)) => match id.parse() {
-                Ok(w) => SideClick::Window(w),
-                Err(_) => return false,
-            },
-            ("toggle-project", Some(id)) => SideClick::ToggleProject(id),
-            ("toggle-archived", _) => SideClick::ToggleArchived,
-            ("new-thread", project) => SideClick::NewThread(project),
-            ("new-project", _) => SideClick::NewProject,
-            ("pin", Some(id)) => SideClick::Pin(id, flag.unwrap_or(true)),
-            ("delete", Some(id)) => SideClick::Delete(id),
-            ("rename-thread", Some(id)) => SideClick::RenameThread(id),
-            ("rename-project", Some(id)) => SideClick::RenameProject(id),
-            ("archive", Some(id)) => SideClick::Archive(id),
-            ("unarchive", Some(id)) => SideClick::Unarchive(id),
-            ("space-menu", _) => SideClick::SpaceMenu,
-            _ => return false,
+        let Some(click) = crate::commands::side_click(&kind, id, flag) else {
+            return false;
         };
         self.app.on_side_click(click);
         true
@@ -227,7 +210,6 @@ impl Client {
     /// False when the model refuses; the listing or tree that follows
     /// redraws the page.
     pub fn drop(&self, kind: String, id: String, target: Option<String>, edge: Option<String>, at: Option<u32>) -> bool {
-        use thinkterm_proto::SplitDirection;
         match kind.as_str() {
             "tab" => match (id.parse(), at) {
                 (Ok(tab), Some(at)) => self.app.move_tab(tab, at as usize),
@@ -237,12 +219,8 @@ impl Client {
                 let (Ok(pane), Some(Ok(target))) = (id.parse(), target.map(|t| t.parse())) else {
                     return false;
                 };
-                let (direction, second) = match edge.as_deref() {
-                    Some("left") => (SplitDirection::Horizontal, false),
-                    Some("right") => (SplitDirection::Horizontal, true),
-                    Some("top") => (SplitDirection::Vertical, false),
-                    Some("bottom") => (SplitDirection::Vertical, true),
-                    _ => return false,
+                let Some((direction, second)) = edge.as_deref().and_then(crate::commands::drop_edge) else {
+                    return false;
                 };
                 self.app.move_pane(pane, target, direction, second)
             }
@@ -253,20 +231,9 @@ impl Client {
     }
 
     pub fn chrome_click(&self, action: String, pane: Option<u32>, tab: Option<u32>) -> bool {
-        use crate::chrome::Click;
         let pane = pane.map(|p| p as usize);
-        let click = match (action.as_str(), pane, tab) {
-            ("pane", Some(p), _) => Click::Pane(p),
-            ("follow", _, _) => Click::Follow,
-            ("new-tab", _, _) => Click::NewTab,
-            ("new-pane", Some(p), _) => Click::NewInStack(p),
-            ("split-right", p, _) => Click::SplitRight(p),
-            ("split-below", p, _) => Click::SplitBelow(p),
-            ("zoom", p, _) => Click::Zoom(p),
-            ("close", _, _) => Click::Close,
-            ("close-pane", Some(p), _) => Click::ClosePane(p),
-            ("close-tab", _, Some(t)) => Click::CloseTab(t as usize),
-            _ => return false,
+        let Some(click) = crate::commands::chrome_click(&action, pane, tab.map(|t| t as usize)) else {
+            return false;
         };
         self.app.on_chrome_click(click);
         true

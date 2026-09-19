@@ -1,15 +1,15 @@
-# xcodegen spec for the S0 iOS probe: a SwiftUI shell around the Rust core
+# xcodegen spec for the iOS app: a SwiftUI shell around the Rust core
 # (thinkterm-mobile, linked as a static library) that drives a CAMetalLayer
 # through the UniFFI bindings in Generated/. `ios/build.sh` regenerates the
 # bindings and the project and builds for the simulator.
-name: ThinkTermProbe
+name: ThinkTerm
 options:
   bundleIdPrefix: com.roversx.thinkterm
   deploymentTarget:
     iOS: "17.0"
   createIntermediateGroups: true
 targets:
-  ThinkTermProbe:
+  ThinkTerm:
     type: application
     platform: iOS
     sources:
@@ -31,6 +31,8 @@ targets:
       base:
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_CFBundleDisplayName: ThinkTerm
+        PRODUCT_BUNDLE_IDENTIFIER: com.roversx.thinkterm.ios
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
         SWIFT_VERSION: "5.9"
         SWIFT_INCLUDE_PATHS: $(SRCROOT)/Generated

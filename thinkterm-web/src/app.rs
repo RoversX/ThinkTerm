@@ -4010,6 +4010,20 @@ impl<P: Platform, L: Link> App<P, L> {
         f(&mut self.inner.borrow_mut().gpu)
     }
 
+    /// Let the link go and take the GPU state back, for a platform that
+    /// keeps its device across connections. Fails (handing the App back)
+    /// while something else still holds it -- a task on the wire, say.
+    pub fn into_gpu(app: Rc<Self>) -> std::result::Result<Gpu, Rc<Self>> {
+        {
+            // The link's handlers hold the App; the App holds the link.
+            let inner = app.inner.borrow();
+            inner.link.set_push_handler(Box::new(|_| {}));
+            inner.link.set_close_handler(Box::new(|_| {}));
+            inner.link.shutdown();
+        }
+        Rc::try_unwrap(app).map(|app| app.inner.into_inner().gpu)
+    }
+
     /// See `GlyphCache::warm`. Called once, after the first frame.
     pub fn warm_glyph_canvas(&self) {
         self.inner.borrow_mut().glyphs.warm();

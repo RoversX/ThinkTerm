@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build the S0 iOS probe for the simulator and, optionally, run it.
+# Build the iOS app for the simulator and, optionally, run it.
 #
 #   ios/build.sh            build the Rust library, bindings, project and app
 #   ios/build.sh run        ...and boot a simulator, install, launch
@@ -12,7 +12,7 @@ ROOT=$PWD
 SIM_TARGET=aarch64-apple-ios-sim
 SIM_NAME=${SIM_NAME:-iPhone 17}
 DERIVED=${DERIVED:-$ROOT/target/xcode}
-BUNDLE=com.roversx.thinkterm.ThinkTermProbe
+BUNDLE=com.roversx.thinkterm.ios
 
 echo "== rust ($SIM_TARGET, release)"
 cargo build -p thinkterm-mobile --release --target $SIM_TARGET
@@ -33,11 +33,11 @@ echo "== project"
 (cd ios && xcodegen generate --quiet)
 
 echo "== xcodebuild"
-xcodebuild -project ios/ThinkTermProbe.xcodeproj -scheme ThinkTermProbe \
+xcodebuild -project ios/ThinkTerm.xcodeproj -scheme ThinkTerm \
   -configuration Debug -sdk iphonesimulator \
   -destination "platform=iOS Simulator,name=$SIM_NAME" \
   -derivedDataPath "$DERIVED" build 2>&1 | grep -E "error:|warning: .*Sources/|BUILD (SUCCEEDED|FAILED)" || true
-APP="$DERIVED/Build/Products/Debug-iphonesimulator/ThinkTermProbe.app"
+APP="$DERIVED/Build/Products/Debug-iphonesimulator/ThinkTerm.app"
 test -d "$APP" || { echo "no app bundle at $APP" >&2; exit 1; }
 
 [ "${1:-}" = run ] || [ "${1:-}" = shot ] || exit 0

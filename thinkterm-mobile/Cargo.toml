@@ -25,6 +25,8 @@ codec.workspace = true
 futures.workspace = true
 log.workspace = true
 russh = { version = "0.63.3", default-features = false, features = ["ring"] }
+serde.workspace = true
+serde_json.workspace = true
 termwiz = { workspace = true, features = ["use_serde"] }
 thinkterm-font-core.workspace = true
 thinkterm-font-web.workspace = true

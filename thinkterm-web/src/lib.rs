@@ -10,6 +10,7 @@ pub mod app;
 pub mod attach;
 pub mod braille;
 pub mod chrome;
+pub mod commands;
 pub mod emit;
 pub mod fallback;
 pub mod glyphs;
