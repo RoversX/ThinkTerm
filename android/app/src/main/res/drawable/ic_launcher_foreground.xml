@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <!-- The chevron, as on the Mac and the iPhone. -->
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M44,30 L66,54 L44,78 L38.5,72.5 L55,54 L38.5,35.5 Z" />
+</vector>
