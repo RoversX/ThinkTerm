@@ -9,7 +9,7 @@ struct PaneView: Decodable, Hashable {
     var current: Bool
 }
 
-struct TabView: Decodable, Hashable, Identifiable {
+struct TabEntry: Decodable, Hashable, Identifiable {
     var tab: Int
     var window: Int
     var title: String
@@ -28,7 +28,7 @@ struct Controls: Decodable, Hashable {
 }
 
 struct TabsView: Decodable, Hashable {
-    var tabs: [TabView]
+    var tabs: [TabEntry]
     var controls: Controls
 }
 

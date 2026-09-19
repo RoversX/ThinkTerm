@@ -22,9 +22,49 @@ struct Host: Codable, Identifiable, Hashable {
     /// Set when the remote runs the probe's wrapper rather than an
     /// installed `thinkterm`; empty means the default proxy command.
     var remoteCommand: String = ""
+    /// A label the list groups by; empty is no group.
+    var group: String = ""
+    /// The public half of a key the app generated or could read, so it
+    /// can be shown and copied to the host's authorized_keys.
+    var publicKey: String?
+    var lastConnected: Date?
 
     var display: String {
         name.isEmpty ? "\(user)@\(hostname):\(port)" : name
+    }
+
+    var address: String { "\(user)@\(hostname)" + (port == 22 ? "" : ":\(port)") }
+
+    init() {}
+
+    // Fields added later are absent from hosts saved before them.
+    private enum Keys: String, CodingKey {
+        case id, name, hostname, port, user, auth, knownHost, remoteCommand, group, publicKey, lastConnected
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        hostname = try c.decodeIfPresent(String.self, forKey: .hostname) ?? ""
+        port = try c.decodeIfPresent(Int.self, forKey: .port) ?? 22
+        user = try c.decodeIfPresent(String.self, forKey: .user) ?? ""
+        auth = try c.decodeIfPresent(AuthKind.self, forKey: .auth) ?? .key
+        knownHost = try c.decodeIfPresent(String.self, forKey: .knownHost)
+        remoteCommand = try c.decodeIfPresent(String.self, forKey: .remoteCommand) ?? ""
+        group = try c.decodeIfPresent(String.self, forKey: .group) ?? ""
+        publicKey = try c.decodeIfPresent(String.self, forKey: .publicKey)
+        lastConnected = try c.decodeIfPresent(Date.self, forKey: .lastConnected)
+    }
+}
+
+extension Host {
+    init(name: String, hostname: String, port: Int, user: String) {
+        self.init()
+        self.name = name
+        self.hostname = hostname
+        self.port = port
+        self.user = user
     }
 }
 
@@ -64,6 +104,18 @@ final class HostStore: ObservableObject {
         }
     }
 
+    /// A connection reached the terminal: the list shows when.
+    func touchConnected(_ id: UUID) {
+        guard let i = hosts.firstIndex(where: { $0.id == id }) else { return }
+        hosts[i].lastConnected = Date()
+        save()
+    }
+
+    /// The groups in use, for the editor's suggestions.
+    var groups: [String] {
+        Array(Set(hosts.map(\.group).filter { !$0.isEmpty })).sorted()
+    }
+
     func forgetHostKey(for id: UUID) {
         guard let i = hosts.firstIndex(where: { $0.id == id }) else { return }
         hosts[i].knownHost = nil
@@ -93,11 +145,15 @@ enum Keychain {
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
         ]
-        let status = SecItemUpdate(query as CFDictionary, attrs as CFDictionary)
+        var status = SecItemUpdate(query as CFDictionary, attrs as CFDictionary)
         if status == errSecItemNotFound {
             var add = query
             add.merge(attrs) { $1 }
-            SecItemAdd(add as CFDictionary, nil)
+            status = SecItemAdd(add as CFDictionary, nil)
+        }
+        if status != errSecSuccess {
+            // -34018 is a missing entitlement: an unsigned simulator build.
+            NSLog("keychain: saving %@ failed with %d", account, status)
         }
     }
 

@@ -6,9 +6,13 @@ import UIKit
 /// keyboard, its IMEs (Pinyin, Kana...) and a hardware keyboard all talk
 /// to it, and whose gestures are the terminal's -- a tap focuses the pane
 /// under it and raises the keyboard, a one-finger drag scrolls, a
-/// two-finger swipe down puts the keyboard away, a long press opens the
-/// pane's menu, a pinch changes the font. A phone can tell a tap from a
-/// drag, so there is no keyboard button.
+/// two-finger swipe down puts the keyboard away, and a pinch changes the
+/// font. Selecting text is the system's own: a UITextInteraction over
+/// this view brings the native handles, magnifier and Copy menu, and
+/// reads the terminal through UITextInput -- the focused pane's visible
+/// rows are the document (`App::screen_text`), with the IME's marked
+/// text appended after them. A phone can tell a tap from a drag, so
+/// there is no keyboard button.
 ///
 /// It holds no text of its own beyond the IME's marked (composing)
 /// string: committed text goes straight to the core, keys go as key
@@ -19,7 +23,6 @@ import UIKit
 /// again); backspace inside a composition edits the marked text only.
 final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDelegate, UIScrollViewDelegate {
     weak var model: TerminalModel?
-    var onMenu: ((CGPoint) -> Void)?
 
     private(set) var marked: String?
     private var markedSelection = NSRange(location: 0, length: 0)
@@ -33,6 +36,10 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
     private var recentring = false
     /// Stepped mode: finger travel not yet a whole row.
     private var rowRemainder: CGFloat = 0
+    /// The document the text system reads: the pane's visible rows, as
+    /// the core last gave them. Fetched when a selection interaction asks
+    /// and dropped when the core reports a change.
+    private var screen: ScreenText?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -47,16 +54,20 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
         panGestureRecognizer.maximumNumberOfTouches = 1
         delegate = self
         let tap = UITapGestureRecognizer(target: self, action: #selector(tapped(_:)))
-        let press = UILongPressGestureRecognizer(target: self, action: #selector(pressed(_:)))
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:)))
         let hide = UISwipeGestureRecognizer(target: self, action: #selector(swipedDown(_:)))
-        press.minimumPressDuration = 0.45
         hide.direction = .down
         hide.numberOfTouchesRequired = 2
-        for g in [tap, press, pinch, hide] as [UIGestureRecognizer] {
+        for g in [tap, pinch, hide] as [UIGestureRecognizer] {
             g.delegate = self
             addGestureRecognizer(g)
         }
+        // The system's selection: a long press selects a word and shows
+        // the handles, a tap elsewhere clears it. Non-editable, so a tap
+        // does not place a caret -- the terminal's cursor is its own.
+        let selection = UITextInteraction(for: .nonEditable)
+        selection.textInput = self
+        addInteraction(selection)
     }
 
     override func layoutSubviews() {
@@ -116,8 +127,15 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
 
     // MARK: gestures
 
-    @objc private func tapped(_ g: UITapGestureRecognizer) {
+    /// A gesture's point in the view's own box. The scroll view's
+    /// coordinates start at the content offset, half-way down the runway.
+    private func point(of g: UIGestureRecognizer) -> CGPoint {
         let p = g.location(in: self)
+        return CGPoint(x: p.x - contentOffset.x, y: p.y - contentOffset.y)
+    }
+
+    @objc private func tapped(_ g: UITapGestureRecognizer) {
+        let p = point(of: g)
         // A press and release at the point: the App focuses the pane.
         model?.pointer("down", at: p)
         model?.pointer("up", at: p)
@@ -130,14 +148,6 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
         if isFirstResponder {
             resignFirstResponder()
         }
-    }
-
-    @objc private func pressed(_ g: UILongPressGestureRecognizer) {
-        guard g.state == .began else { return }
-        let p = g.location(in: self)
-        model?.pointer("down", at: p)
-        model?.pointer("up", at: p)
-        onMenu?(p)
     }
 
     @objc private func pinched(_ g: UIPinchGestureRecognizer) {
@@ -204,11 +214,64 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
         model?.key("Backspace")
     }
 
-    // MARK: UITextInput -- marked text
+    // MARK: the document
+
+    /// The core changed something on screen: the rows are read again
+    /// when next asked for.
+    func screenChanged() {
+        screen = nil
+    }
+
+    private func currentScreen() -> ScreenText? {
+        if let screen { return screen }
+        guard let model, let s = ViewJSON.decode(ScreenText.self, model.core.screenText()) else { return nil }
+        screen = s
+        return s
+    }
+
+    /// The rows' length in the document; marked text follows it.
+    private var screenLength: Int {
+        currentScreen().map { $0.rows * ($0.cols + 1) } ?? 0
+    }
+
+    private var markedLength: Int { marked?.utf16.count ?? 0 }
+    private var documentLength: Int { screenLength + markedLength }
+
+    private func cell(at index: Int) -> (row: Int, col: Int)? {
+        guard let s = currentScreen(), index >= 0, index < screenLength else { return nil }
+        let stride = s.cols + 1
+        return (index / stride, min(index % stride, s.cols - 1))
+    }
+
+    private func index(row: Int, col: Int) -> Int {
+        guard let s = currentScreen() else { return 0 }
+        return row * (s.cols + 1) + col
+    }
+
+    /// The cell under a point in the view, clamped into the pane.
+    private func cell(under point: CGPoint) -> (row: Int, col: Int)? {
+        guard let s = currentScreen(), s.cell[0] > 0, s.cell[1] > 0 else { return nil }
+        let col = Int(((point.x - s.origin[0]) / s.cell[0]).rounded(.down))
+        let row = Int(((point.y - s.origin[1]) / s.cell[1]).rounded(.down))
+        return (min(max(row, 0), s.rows - 1), min(max(col, 0), s.cols - 1))
+    }
+
+    private func rect(row: Int, col: Int, cols: Int = 1) -> CGRect {
+        guard let s = currentScreen() else { return .zero }
+        return CGRect(
+            x: s.origin[0] + Double(col) * s.cell[0],
+            y: s.origin[1] + Double(row) * s.cell[1],
+            width: Double(cols) * s.cell[0],
+            height: s.cell[1]
+        )
+    }
+
+    // MARK: UITextInput -- marked text (after the rows)
 
     var markedTextRange: UITextRange? {
         guard let marked, !marked.isEmpty else { return nil }
-        return Range(0, marked.utf16.count)
+        let n = screenLength
+        return Range(n, n + marked.utf16.count)
     }
 
     var markedTextStyle: [NSAttributedString.Key: Any]? {
@@ -239,26 +302,66 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
         endComposing()
     }
 
-    // MARK: UITextInput -- the (empty) document
+    // MARK: UITextInput -- the selection
 
+    /// The pane's selection while there is one, else the caret at the
+    /// end of the marked text (the keyboard's insertion point).
     var selectedTextRange: UITextRange? {
         get {
-            let n = marked?.utf16.count ?? 0
+            if marked == nil, let s = currentScreen(), let sel = s.selection {
+                return Range(index(row: sel[0][0], col: sel[0][1]), index(row: sel[1][0], col: sel[1][1]) + 1)
+            }
+            let n = documentLength
             return Range(n, n)
         }
-        set {}
+        set {
+            guard let r = newValue as? Range else {
+                model?.core.clearSelection()
+                screen = nil
+                return
+            }
+            // A non-empty range inside the rows is a selection; anything
+            // else (a caret) clears it. The end is exclusive here and
+            // inclusive in the core.
+            if r.b > r.a, let a = cell(at: r.a), let b = cell(at: r.b - 1) {
+                model?.core.setSelection(anchorRow: UInt32(a.row), anchorCol: UInt32(a.col), headRow: UInt32(b.row), headCol: UInt32(b.col))
+                if var s = screen {
+                    s.selection = [[a.row, a.col], [b.row, b.col]]
+                    screen = s
+                }
+            } else {
+                model?.core.clearSelection()
+                if var s = screen {
+                    s.selection = nil
+                    screen = s
+                }
+            }
+        }
     }
 
     var beginningOfDocument: UITextPosition { Pos(0) }
-    var endOfDocument: UITextPosition { Pos(marked?.utf16.count ?? 0) }
+    var endOfDocument: UITextPosition { Pos(documentLength) }
 
     func text(in range: UITextRange) -> String? {
-        guard let r = range as? Range, let marked else { return nil }
-        let s = marked.utf16
-        guard r.a <= s.count, r.b <= s.count, r.a <= r.b else { return nil }
-        let start = s.index(s.startIndex, offsetBy: r.a)
-        let end = s.index(s.startIndex, offsetBy: r.b)
-        return String(s[start..<end])
+        guard let r = range as? Range, r.a <= r.b else { return nil }
+        let n = screenLength
+        var out = ""
+        if r.a < n, let s = currentScreen() {
+            let u = s.text.utf16
+            let end = min(r.b, n)
+            if let a = u.index(u.startIndex, offsetBy: r.a, limitedBy: u.endIndex),
+               let b = u.index(u.startIndex, offsetBy: end, limitedBy: u.endIndex) {
+                out += String(u[a..<b]) ?? ""
+            }
+        }
+        if r.b > n, let marked {
+            let m = marked.utf16
+            let a = max(r.a - n, 0), b = min(r.b - n, m.count)
+            if a < b {
+                out += String(m[m.index(m.startIndex, offsetBy: a)..<m.index(m.startIndex, offsetBy: b)]) ?? ""
+            }
+        }
+        return out
     }
 
     func replace(_ range: UITextRange, withText text: String) {
@@ -273,14 +376,20 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
     func position(from position: UITextPosition, offset: Int) -> UITextPosition? {
         guard let p = position as? Pos else { return nil }
         let n = p.i + offset
-        let max = marked?.utf16.count ?? 0
-        return (0...max).contains(n) ? Pos(n) : nil
+        return (0...documentLength).contains(n) ? Pos(n) : nil
     }
 
     func position(from position: UITextPosition, in direction: UITextLayoutDirection, offset: Int) -> UITextPosition? {
+        guard let p = position as? Pos else { return nil }
         switch direction {
-        case .right, .down: return self.position(from: position, offset: offset)
-        case .left, .up: return self.position(from: position, offset: -offset)
+        case .right: return self.position(from: p, offset: offset)
+        case .left: return self.position(from: p, offset: -offset)
+        case .down, .up:
+            // A row at a time within the rows.
+            guard let s = currentScreen(), let c = cell(at: p.i) else { return nil }
+            let row = direction == .down ? c.row + offset : c.row - offset
+            guard (0..<s.rows).contains(row) else { return nil }
+            return Pos(index(row: row, col: c.col))
         @unknown default: return nil
         }
     }
@@ -312,7 +421,10 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
 
     func characterRange(byExtending position: UITextPosition, in direction: UITextLayoutDirection) -> UITextRange? {
         guard let p = position as? Pos else { return nil }
-        return Range(p.i, p.i)
+        switch direction {
+        case .right, .down: return Range(p.i, min(p.i + 1, documentLength))
+        default: return Range(max(p.i - 1, 0), p.i)
+        }
     }
 
     func baseWritingDirection(for position: UITextPosition, in direction: UITextStorageDirection) -> NSWritingDirection {
@@ -321,24 +433,98 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
 
     func setBaseWritingDirection(_ writingDirection: NSWritingDirection, for range: UITextRange) {}
 
-    func firstRect(for range: UITextRange) -> CGRect { model?.cursorRect ?? CGRect(x: 0, y: 0, width: 1, height: 20) }
-    func caretRect(for position: UITextPosition) -> CGRect { model?.cursorRect ?? CGRect(x: 0, y: 0, width: 1, height: 20) }
-    func selectionRects(for range: UITextRange) -> [UITextSelectionRect] { [] }
-    func closestPosition(to point: CGPoint) -> UITextPosition? { endOfDocument }
-    func closestPosition(to point: CGPoint, within range: UITextRange) -> UITextPosition? { endOfDocument }
-    func characterRange(at point: CGPoint) -> UITextRange? { nil }
+    // MARK: UITextInput -- geometry
+
+    func firstRect(for range: UITextRange) -> CGRect {
+        guard let r = range as? Range, let a = cell(at: r.a) else { return model?.cursorRect ?? .zero }
+        let last = cell(at: max(r.b - 1, r.a)) ?? a
+        let cols = last.row == a.row ? last.col - a.col + 1 : (currentScreen()?.cols ?? 1) - a.col
+        return rect(row: a.row, col: a.col, cols: max(cols, 1))
+    }
+
+    func caretRect(for position: UITextPosition) -> CGRect {
+        guard let p = position as? Pos, let c = cell(at: p.i) else { return model?.cursorRect ?? .zero }
+        var r = rect(row: c.row, col: c.col)
+        r.size.width = 2
+        return r
+    }
+
+    /// One rect per row the range touches, so the handles sit on the
+    /// first and last cells and the highlight follows the rows.
+    func selectionRects(for range: UITextRange) -> [UITextSelectionRect] {
+        guard let r = range as? Range, r.b > r.a, let s = currentScreen(),
+              let a = cell(at: r.a), let b = cell(at: r.b - 1) else { return [] }
+        var rects: [UITextSelectionRect] = []
+        for row in a.row...b.row {
+            let from = row == a.row ? a.col : 0
+            let to = row == b.row ? b.col : s.cols - 1
+            rects.append(SelectionRect(
+                rect: rect(row: row, col: from, cols: to - from + 1),
+                start: row == a.row, end: row == b.row
+            ))
+        }
+        return rects
+    }
+
+    func closestPosition(to point: CGPoint) -> UITextPosition? {
+        guard let c = cell(under: point) else { return endOfDocument }
+        return Pos(index(row: c.row, col: c.col))
+    }
+
+    func closestPosition(to point: CGPoint, within range: UITextRange) -> UITextPosition? {
+        guard let r = range as? Range, let p = closestPosition(to: point) as? Pos else { return nil }
+        return Pos(min(max(p.i, r.a), r.b))
+    }
+
+    func characterRange(at point: CGPoint) -> UITextRange? {
+        guard let p = closestPosition(to: point) as? Pos, p.i < screenLength else { return nil }
+        return Range(p.i, p.i + 1)
+    }
+
+    // MARK: the edit menu
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        switch action {
+        case #selector(copy(_:)): return currentScreen()?.selection != nil
+        case #selector(paste(_:)): return UIPasteboard.general.hasStrings
+        case #selector(selectAll(_:)): return currentScreen() != nil
+        default: return false
+        }
+    }
+
+    override func copy(_ sender: Any?) {
+        if let text = model?.core.selectedText(), !text.isEmpty {
+            UIPasteboard.general.string = text
+            model?.showCopied()
+        }
+        model?.core.clearSelection()
+        screen = nil
+    }
+
+    override func paste(_ sender: Any?) {
+        model?.pasteFromClipboard()
+    }
+
+    override func selectAll(_ sender: Any?) {
+        guard let s = currentScreen() else { return }
+        selectedTextRange = Range(0, index(row: s.rows - 1, col: s.cols - 1) + 1)
+    }
 
     // MARK: traits: a terminal wants raw keys, no autocorrect
 
-    var keyboardType: UIKeyboardType { .asciiCapable }
-    var autocorrectionType: UITextAutocorrectionType { .no }
-    var autocapitalizationType: UITextAutocapitalizationType { .none }
-    var spellCheckingType: UITextSpellCheckingType { .no }
-    var smartQuotesType: UITextSmartQuotesType { .no }
-    var smartDashesType: UITextSmartDashesType { .no }
-    var smartInsertDeleteType: UITextSmartInsertDeleteType { .no }
-    var returnKeyType: UIReturnKeyType { .default }
-    var enablesReturnKeyAutomatically: Bool { false }
+    // Stored, not computed: the traits protocol declares them settable,
+    // and UIKit reads them through the setter's counterpart. The inline
+    // prediction is the one that draws the suggestion bar on iOS 17+.
+    var keyboardType: UIKeyboardType = .asciiCapable
+    var autocorrectionType: UITextAutocorrectionType = .no
+    var autocapitalizationType: UITextAutocapitalizationType = .none
+    var spellCheckingType: UITextSpellCheckingType = .no
+    var smartQuotesType: UITextSmartQuotesType = .no
+    var smartDashesType: UITextSmartDashesType = .no
+    var smartInsertDeleteType: UITextSmartInsertDeleteType = .no
+    var inlinePredictionType: UITextInlinePredictionType = .no
+    var returnKeyType: UIReturnKeyType = .default
+    var enablesReturnKeyAutomatically: Bool = false
 
     // MARK: hardware keyboard
 
@@ -391,21 +577,39 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
         override var start: UITextPosition { Pos(a) }
         override var end: UITextPosition { Pos(b) }
     }
+
+    final class SelectionRect: UITextSelectionRect {
+        let r: CGRect
+        let first: Bool
+        let last: Bool
+        init(rect: CGRect, start: Bool, end: Bool) { r = rect; first = start; last = end }
+        override var rect: CGRect { r }
+        override var writingDirection: NSWritingDirection { .leftToRight }
+        override var containsStart: Bool { first }
+        override var containsEnd: Bool { last }
+        override var isVertical: Bool { false }
+    }
+}
+
+/// `App::screen_text`, as the core hands it over.
+struct ScreenText: Decodable {
+    var cols: Int
+    var rows: Int
+    var text: String
+    var origin: [Double]
+    var cell: [Double]
+    var selection: [[Int]]?
 }
 
 struct TerminalInput: UIViewRepresentable {
     @EnvironmentObject var model: TerminalModel
-    var onMenu: (CGPoint) -> Void
 
     func makeUIView(context: Context) -> TerminalInputView {
         let view = TerminalInputView()
         view.model = model
-        view.onMenu = onMenu
         model.inputView = view
         return view
     }
 
-    func updateUIView(_ uiView: TerminalInputView, context: Context) {
-        uiView.onMenu = onMenu
-    }
+    func updateUIView(_ uiView: TerminalInputView, context: Context) {}
 }

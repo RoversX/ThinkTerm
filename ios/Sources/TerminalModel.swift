@@ -2,6 +2,7 @@ import Foundation
 import UIKit
 import QuartzCore
 import Combine
+import SwiftUI
 import CoreText
 import CoreGraphics
 
@@ -27,19 +28,33 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     @Published var logText = ""
     @Published var stats = ""
     @Published var inset: CGFloat = 0
+    /// A selection was just copied; the status line says so for a moment.
+    @Published var copied = false
+    /// The App's remark for the status line: a passing one goes after a
+    /// few seconds, a sticky one (the connection is down) stays until the
+    /// App takes it back.
+    @Published private(set) var toastText: String?
+    /// The App says its connection is down and it is redialing.
+    @Published private(set) var reconnecting = false
+    private var toastTimer: Timer?
+    /// The terminal's background, as the App paints it: the chrome around
+    /// the terminal takes the same colour.
+    @Published var background = Color(white: 0.11)
+    /// The App's font size in points, from its layout view.
+    @Published private(set) var fontPt: Double = 11
     @Published var animating = false
-    /// Smooth (by the pixel, with inertia) or stepped (whole rows).
-    @Published var smoothScroll: Bool = UserDefaults.standard.object(forKey: "scroll.smooth") as? Bool ?? true {
-        didSet {
-            UserDefaults.standard.set(smoothScroll, forKey: "scroll.smooth")
-            applyScrollMode()
-        }
-    }
+    /// The log view is open: the stats are worth refreshing.
+    var wantsStats = false
+    /// The preferences, followed as they change.
+    let settings = AppSettings.shared
+    var smoothScroll: Bool { settings.smoothScroll }
+    private var subscriptions: [AnyCancellable] = []
     /// The App's cell height in points, from its layout view.
     private(set) var cellHeight: Double = 20
 
     let core: Core
-    let host: Host?
+    /// The host this screen shows; edited in place from the failure card.
+    @Published var host: Host?
     weak var store: HostStore?
     weak var inputView: TerminalInputView?
     var cursorRect = CGRect(x: 8, y: 8, width: 2, height: 20)
@@ -81,14 +96,22 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         let link = CADisplayLink(target: self, selector: #selector(tick))
         link.add(to: .main, forMode: .common)
         displayLink = link
+        // Every published change redraws the screen (and closes an open
+        // menu): the stats tick only while the log shows them.
         statsTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.stats = self.core.stats()
+            guard let self, self.wantsStats else { return }
+            let stats = self.core.stats()
+            if stats != self.stats { self.stats = stats }
         }
+        if let name = arg("--scheme") { settings.schemeName = name }
         applyScrollMode()
+        applyScheme()
+        settings.$schemeName.dropFirst().sink { [weak self] _ in self?.applyScheme() }.store(in: &subscriptions)
+        settings.$smoothScroll.dropFirst().sink { [weak self] _ in self?.applyScrollMode() }.store(in: &subscriptions)
         if args.contains("--autotest") { scheduleAutotest() }
         if args.contains("--autoconnect") { scheduleAutoconnect() }
         if args.contains("--imetest") { scheduleImeTest() }
+        if args.contains("--seltest") { scheduleSelectionTest() }
         if args.contains("--uitest") { scheduleUiTest() }
     }
 
@@ -108,6 +131,15 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// This install's name to the servers, made once: the tab this phone
+    /// holds stays its own across launches.
+    static let deviceId: String = {
+        if let id = UserDefaults.standard.string(forKey: "client.id") { return id }
+        let id = UUID().uuidString
+        UserDefaults.standard.set(id, forKey: "client.id")
+        return id
+    }()
+
     /// Connect to the model's host with the secret from the Keychain.
     func connect() {
         guard let host else {
@@ -117,6 +149,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         let account = host.id.uuidString
         let secret = Keychain.load(account: account) ?? ""
         let passphrase = Keychain.load(account: account + ".passphrase")
+        log("shell: \(host.auth == .password ? "password" : "key text") \(secret.count) chars from the Keychain" + (passphrase == nil ? "" : ", with a passphrase"))
         connect(
             hostname: host.hostname, port: host.port, user: host.user,
             authKind: host.auth == .password ? "password" : "key", secret: secret,
@@ -141,7 +174,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         core.connect(
             host: hostname, port: UInt16(clamping: port), user: user,
             authKind: authKind, secret: secret, passphrase: passphrase, knownHost: knownHost,
-            remoteCommand: remoteCommand, fontPaths: paths, sizePt: 11.0,
+            remoteCommand: remoteCommand, deviceId: Self.deviceId, fontPaths: paths, sizePt: settings.fontSize,
             painter: CoreTextPainter()
         )
     }
@@ -188,6 +221,41 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         core.wheelPx(x: point.x, y: point.y, px: px)
     }
 
+    private func showToast(_ toast: Toast?) {
+        toastTimer?.invalidate()
+        let sticky = toast?.sticky ?? false
+        if reconnecting != sticky { reconnecting = sticky }
+        guard let toast, !toast.text.isEmpty else {
+            if toastText != nil { toastText = nil }
+            return
+        }
+        toastText = toast.text
+        if !sticky {
+            toastTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: false) { [weak self] _ in
+                guard let self, self.toastText == toast.text else { return }
+                self.toastText = nil
+            }
+        }
+    }
+
+    private func applyScheme() {
+        let schemeName = settings.schemeName
+        if schemeName == Schemes.followDesktop || Schemes.json(named: schemeName) == nil {
+            core.setSetting(key: "terminal-scheme", value: "\"desktop\"")
+            core.setPalette(scheme: nil)
+        } else {
+            core.setSetting(key: "terminal-scheme", value: "\"" + schemeName.replacingOccurrences(of: "\"", with: "\\\"") + "\"")
+            core.setPalette(scheme: Schemes.json(named: schemeName))
+        }
+    }
+
+    fileprivate func corePublished(_ key: String, _ value: String) {
+        guard key == "bg", let color = Color(hex: value) else { return }
+        DispatchQueue.main.async {
+            if self.background != color { self.background = color }
+        }
+    }
+
     private func applyScrollMode() {
         core.setSetting(key: "scroll-mode", value: smoothScroll ? "\"smooth\"" : "\"stepped\"")
     }
@@ -228,15 +296,30 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     /// Pull every view the screen shows. Called on the main thread after
     /// the core said something changed; a burst of changes is one pull.
     func refreshViews() {
-        tabs = ViewJSON.decode(TabsView.self, core.view(name: "tabs"))
-        sidebar = ViewJSON.decode(SidebarView.self, core.view(name: "sidebar"))
-        navs = ViewJSON.decode([NavView].self, core.view(name: "navs")) ?? []
-        status = ViewJSON.decode(StatusView.self, core.view(name: "status"))
+        inputView?.screenChanged()
+        // Assigned only on a change: a published write redraws the whole
+        // screen, and the core reports changes as often as output comes.
+        let tabs = ViewJSON.decode(TabsView.self, core.view(name: "tabs"))
+        if tabs != self.tabs { self.tabs = tabs }
+        let sidebar = ViewJSON.decode(SidebarView.self, core.view(name: "sidebar"))
+        if sidebar != self.sidebar { self.sidebar = sidebar }
+        let navs = ViewJSON.decode([NavView].self, core.view(name: "navs")) ?? []
+        if navs != self.navs { self.navs = navs }
+        let status = ViewJSON.decode(StatusView.self, core.view(name: "status"))
+        if status != self.status {
+            self.status = status
+            showToast(status?.toast)
+        }
         let layout = core.view(name: "layout")
         if let r = layout.range(of: "\"cell\":["),
            let end = layout[r.upperBound...].firstIndex(of: "]") {
             let parts = layout[r.upperBound..<end].split(separator: ",")
             if parts.count == 2, let h = Double(parts[1]), h > 0 { cellHeight = h }
+        }
+        if let r = layout.range(of: "\"font_pt\":"),
+           let end = layout[r.upperBound...].firstIndex(where: { $0 == "," || $0 == "}" }),
+           let pt = Double(layout[r.upperBound..<end]), pt > 0, pt != fontPt {
+            fontPt = pt
         }
     }
 
@@ -249,6 +332,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             attach(layer, width: width, height: height, scale: scale)
         } else if lastSize != (width, height, scale) {
             lastSize = (width, height, scale)
+            log("shell: surface \(width)x\(height) @\(scale)")
             core.resize(generation: generation, width: UInt32(width), height: UInt32(height), scale: scale)
         }
     }
@@ -336,6 +420,10 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     func toggleInset() { inset = inset > 0 ? 0 : 60 }
 
     func focusKeyboard() { inputView?.becomeFirstResponder() }
+    func showCopied() {
+        copied = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { self.copied = false }
+    }
     func dismissKeyboard() { inputView?.resignFirstResponder() }
     func compositionChanged(_ text: String?) {
         DispatchQueue.main.async { self.composing = text }
@@ -350,6 +438,9 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         DispatchQueue.main.async {
             self.connection = status
             self.log("status: " + status)
+            if status.hasPrefix("pane "), let host = self.host {
+                self.store?.touchConnected(host.id)
+            }
             if status.hasPrefix("connecting") || status.contains("reconnect") || status.hasPrefix("disconnected") {
                 self.inputView?.dropComposition()
             }
@@ -358,7 +449,9 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     }
 
     fileprivate func coreTitle(_ title: String) {
-        DispatchQueue.main.async { self.title = title }
+        DispatchQueue.main.async {
+            if self.title != title { self.title = title }
+        }
     }
 
     fileprivate func coreHostKey(_ fingerprint: String) {
@@ -376,6 +469,9 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     }
 
     private func log(_ line: String) {
+        #if DEBUG
+        NSLog("%@", line)
+        #endif
         logLines.append(line)
         if logLines.count > 60 { logLines.removeFirst(logLines.count - 60) }
         logText = logLines.joined(separator: "\n")
@@ -471,6 +567,46 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// The native selection's document against the core: the rows read
+    /// back, a programmatic selection lands in the core and copies.
+    private func scheduleSelectionTest() {
+        let q = DispatchQueue.main
+        q.asyncAfter(deadline: .now() + 1.5) { self.connectProbe() }
+        q.asyncAfter(deadline: .now() + 4.0) { self.core.text(text: "echo SELECT-ME-PLEASE\n") }
+        q.asyncAfter(deadline: .now() + 6.0) {
+            guard let input = self.inputView else { return self.check("input view", false, "none") }
+            let json = self.core.screenText()
+            guard let screen = ViewJSON.decode(ScreenText.self, json) else {
+                return self.check("screen text", false, String(json.prefix(80)))
+            }
+            let stride = screen.cols + 1
+            self.check("screen text shape", screen.text.utf16.count == screen.rows * stride, "\(screen.rows)x\(screen.cols), \(screen.text.utf16.count) units")
+            // The echoed line: the last row holding it.
+            let rows = screen.text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            guard let row = rows.lastIndex(where: { $0.contains("SELECT-ME-PLEASE") }),
+                  let col = rows[row].range(of: "SELECT-ME-PLEASE")?.lowerBound.utf16Offset(in: rows[row]) else {
+                return self.check("echoed line on screen", false, "not found")
+            }
+            let a = row * stride + col
+            let range = TerminalInputView.Range(a, a + "SELECT-ME-PLEASE".count)
+            input.selectedTextRange = range
+            let read = input.text(in: range) ?? ""
+            self.check("document text", read == "SELECT-ME-PLEASE", read)
+            q.asyncAfter(deadline: .now() + 0.5) {
+                let copied = self.core.selectedText() ?? ""
+                self.check("core selection", copied == "SELECT-ME-PLEASE", copied)
+                let back = input.selectedTextRange as? TerminalInputView.Range
+                self.check("selection read back", back?.a == a && back?.b == a + "SELECT-ME-PLEASE".count, "\(back?.a ?? -1)..\(back?.b ?? -1)")
+                let rects = input.selectionRects(for: range)
+                self.check("selection rects", rects.count == 1 && rects[0].rect.width > 0, "\(rects.count) rects, first \(rects.first?.rect ?? .zero)")
+                let under = input.closestPosition(to: CGPoint(x: rects.first?.rect.midX ?? 0, y: rects.first?.rect.midY ?? 0)) as? TerminalInputView.Pos
+                self.check("point to cell", under.map { $0.i >= a && $0.i < a + 16 } ?? false, "\(under?.i ?? -1)")
+                self.report("selection done")
+                print("SELTEST DONE")
+            }
+        }
+    }
+
     private func scheduleImeTest() {
         let q = DispatchQueue.main
         var sent: Int { Int(inputsSent()) }
@@ -563,7 +699,10 @@ private final class NotifySink: Notify, @unchecked Sendable {
     func onTitle(title: String) { model?.coreTitle(title) }
     func onChange() { model?.coreChanged() }
     func onClipboard(text: String) {
-        DispatchQueue.main.async { UIPasteboard.general.string = text }
+        DispatchQueue.main.async {
+            UIPasteboard.general.string = text
+            self.model?.showCopied()
+        }
     }
     func onFocusInput() {
         DispatchQueue.main.async { self.model?.focusKeyboard() }
@@ -574,6 +713,7 @@ private final class NotifySink: Notify, @unchecked Sendable {
         }
     }
     func onHostKey(fingerprint: String) { model?.coreHostKey(fingerprint) }
+    func onPublished(key: String, value: String) { model?.corePublished(key, value) }
 }
 
 /// Paints the graphemes the bundled faces lack with CoreText, which falls
