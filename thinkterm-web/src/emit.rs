@@ -44,6 +44,13 @@ pub struct LineParams<'a> {
     pub hsv: Option<HsbTransform>,
     /// Only the focused pane shows its cursor.
     pub draw_cursor: bool,
+    /// A shape the page prefers over the program's.
+    pub cursor_shape: Option<CursorShape>,
+    /// The blink's off phase: the cursor is not drawn this frame.
+    pub cursor_hidden: bool,
+    /// A WCAG contrast ratio text is lifted to against its background;
+    /// under 1 is off.
+    pub min_contrast: f32,
 }
 
 /// A flat rectangle at `at` of `size`, both in device pixels from the
@@ -161,9 +168,12 @@ pub fn emit_line(
     } else {
         p.selection.start as f32 * cell_width..p.selection.end as f32 * cell_width
     };
-    let cursor_visible =
-        p.draw_cursor && cursor_on_row && p.cursor.visibility == CursorVisibility::Visible;
-    let filled_cursor = cursor_visible && p.focused && is_block(p.cursor.shape);
+    let cursor_visible = p.draw_cursor
+        && cursor_on_row
+        && !p.cursor_hidden
+        && p.cursor.visibility == CursorVisibility::Visible;
+    let cursor_shape = p.cursor_shape.unwrap_or(p.cursor.shape);
+    let filled_cursor = cursor_visible && p.focused && is_block(cursor_shape);
 
     let selection_fg = p.palette.selection_fg.to_linear();
     let selection_bg = p.palette.selection_bg.to_linear();
@@ -210,6 +220,15 @@ pub fn emit_line(
             (bg, fg, false)
         } else {
             (fg, bg, bg_is_default)
+        };
+        // The floor lifts dim text off its ground, as the desktop's
+        // minimum contrast does; the ground of a default cell is the
+        // palette's.
+        let fg = if p.min_contrast > 1.0 {
+            let ground = if bg_is_default { p.palette.background.to_linear() } else { bg };
+            fg.ensure_contrast_ratio(&ground, p.min_contrast).unwrap_or(fg)
+        } else {
+            fg
         };
         let underline = if attrs.underline() != Underline::None
             || attrs.strikethrough()
@@ -339,10 +358,10 @@ pub fn emit_line(
     if cursor_visible {
         let (shape, color) = if !p.focused {
             (CursorShape::SteadyBlock, cursor_border)
-        } else if is_block(p.cursor.shape) {
+        } else if is_block(cursor_shape) {
             (CursorShape::Default, cursor_bg)
         } else {
-            (p.cursor.shape, cursor_bg)
+            (cursor_shape, cursor_bg)
         };
         let layer = match shape {
             CursorShape::BlinkingBar | CursorShape::SteadyBar => 2,

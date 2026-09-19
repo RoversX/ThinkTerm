@@ -34,6 +34,97 @@ pub enum Pointer {
     Up,
 }
 
+/// A row of a thumbnail: runs of text with their foreground, as hex,
+/// trailing blanks dropped.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PreviewRow {
+    pub runs: Vec<PreviewRun>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PreviewRun {
+    pub text: String,
+    pub fg: String,
+}
+
+/// A line's cells as runs of one colour: a thumbnail keeps the terminal's
+/// colours, which is most of what makes it recognisable at that size.
+fn preview_row(line: &termwiz::surface::Line, palette: &ColorPalette) -> PreviewRow {
+    use wezterm_term::color::ColorAttribute;
+    let mut runs: Vec<PreviewRun> = Vec::new();
+    let mut at = 0usize;
+    for cell in line.visible_cells() {
+        let col = cell.cell_index();
+        let attrs = cell.attrs();
+        let fg = match attrs.foreground() {
+            ColorAttribute::Default => palette.foreground,
+            other => palette.resolve_fg(other),
+        };
+        let hex = fg.to_rgb_string();
+        let mut text = String::new();
+        while at < col {
+            text.push(' ');
+            at += 1;
+        }
+        text.push_str(cell.str());
+        at += cell.width().max(1);
+        match runs.last_mut() {
+            Some(last) if last.fg == hex => last.text.push_str(&text),
+            _ => runs.push(PreviewRun { text, fg: hex }),
+        }
+    }
+    // Trailing blanks go: a thumbnail's row ends where its text does.
+    while let Some(last) = runs.last_mut() {
+        let trimmed = last.text.trim_end().len();
+        if trimmed == 0 {
+            runs.pop();
+        } else {
+            last.text.truncate(trimmed);
+            break;
+        }
+    }
+    PreviewRow { runs }
+}
+
+/// See `App::threads_view`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ThreadsView {
+    pub space: String,
+    pub threads: Vec<ThreadView>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ThreadView {
+    pub id: String,
+    pub name: String,
+    pub project: String,
+    pub project_id: String,
+    pub status: crate::tree::Status,
+    pub dot: crate::tree::Dot,
+    pub live: bool,
+    pub pinned: bool,
+    pub unread: bool,
+    pub current: bool,
+    pub window: Option<thinkterm_proto::WindowId>,
+    pub tabs: Vec<ThreadTab>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ThreadTab {
+    pub tab: TabId,
+    pub title: String,
+    /// The pane a tap shows.
+    pub target: PaneId,
+    pub current: bool,
+    pub panes: Vec<PaneRef>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PaneRef {
+    pub pane: PaneId,
+    pub title: String,
+}
+
 /// See `App::screen_text`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ScreenText {
@@ -250,6 +341,10 @@ pub struct Inner<P: Platform, L: Link> {
     /// says after enough of them.
     reconnect_delay: f64,
     reconnect_pending: bool,
+    /// The cursor blink's phase, while `cursor_blink` is on: shown, or not.
+    blink_shown: bool,
+    /// The blink's tick runs once started; it does nothing while off.
+    blink_ticking: bool,
     reconnect_attempts: u32,
     /// When the current connection came up, until it has lasted long enough
     /// to be called good. `None` once the backoff has been forgiven.
@@ -340,7 +435,7 @@ enum AfterTakeOver {
 }
 
 pub struct App<P: Platform, L: Link> {
-    platform: Rc<P>,
+    pub platform: Rc<P>,
     inner: RefCell<Inner<P, L>>,
     frame_requested: Cell<bool>,
     /// The atlas backoff's own wake-up. Everything else here is driven by
@@ -493,6 +588,8 @@ impl<P: Platform, L: Link> App<P, L> {
             disconnected: None,
             reconnect_delay: RECONNECT_MIN_MS,
             reconnect_pending: false,
+            blink_shown: true,
+            blink_ticking: false,
             reconnect_attempts: 0,
             connected_since: None,
             capacity: Capacity::new(),
@@ -747,6 +844,76 @@ impl<P: Platform, L: Link> App<P, L> {
         ]
     }
 
+    /// The threads of the Space on show with their tabs, in the sidebar's
+    /// order (pinned first, then by project), for a phone that shows the
+    /// desktop's sidebar layer and its tab strip as two rows. The current
+    /// thread's tabs come from the strip (labels and panes as shown);
+    /// another thread's from the session state.
+    pub fn threads_view(&self) -> ThreadsView {
+        let inner = self.inner.borrow();
+        let space = inner
+            .tree
+            .current_space()
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "Default".to_string());
+        let strip = Self::strip_model(&inner).map(|(tabs, _)| tabs).unwrap_or_default();
+        let mut threads = Vec::new();
+        for row in Self::side_rows(&inner) {
+            let crate::tree::Row::Thread(t) = row else {
+                continue;
+            };
+            let Some(thread) = inner.tree.thread(&t.id) else {
+                continue;
+            };
+            let project = inner
+                .tree
+                .project_of(&t.id)
+                .map(|p| p.name.clone())
+                .unwrap_or_default();
+            let window = thread.tabs.first().map(|tab| tab.window_id);
+            let tabs = thread
+                .tabs
+                .iter()
+                .map(|tab| {
+                    let shown = strip.iter().find(|s| s.tab_id == tab.tab_id);
+                    let panes = match shown {
+                        Some(s) => s.panes.iter().map(|p| PaneRef { pane: p.pane_id, title: p.title.clone() }).collect(),
+                        None => tab
+                            .pane_ids
+                            .iter()
+                            .map(|p| PaneRef { pane: *p, title: String::new() })
+                            .collect(),
+                    };
+                    let target = shown.map(|s| s.target).or_else(|| tab.pane_ids.first().copied()).unwrap_or(0);
+                    ThreadTab {
+                        tab: tab.tab_id,
+                        title: shown
+                            .map(|s| s.label.clone())
+                            .unwrap_or_else(|| crate::navbar::display_title(&tab.title).0.to_string()),
+                        target,
+                        current: t.selected && tab.tab_id == inner.tab_id,
+                        panes,
+                    }
+                })
+                .collect();
+            threads.push(ThreadView {
+                id: t.id.clone(),
+                name: t.name.clone(),
+                project,
+                project_id: t.project_id.clone(),
+                status: t.status,
+                dot: t.dot,
+                live: t.live,
+                pinned: t.pinned,
+                unread: t.unread,
+                current: t.selected,
+                window,
+                tabs,
+            });
+        }
+        ThreadsView { space, threads }
+    }
+
     pub fn tabs_view(&self) -> crate::views::TabsView {
         let inner = self.inner.borrow();
         let (tabs, controls) = Self::strip_model(&inner).unwrap_or_default();
@@ -882,6 +1049,49 @@ impl<P: Platform, L: Link> App<P, L> {
     }
 
     /// What is selected in the focused pane, for the platform's clipboard.
+    /// The `rows` rows of any pane on the server ending at its cursor's
+    /// row, as text, for a thumbnail of a tab this page is not showing: a
+    /// fresh shell's prompt sits at the top of a tall pane, and the rows
+    /// under it are nothing to look at. Two round trips: the pane's
+    /// dimensions, then its lines.
+    pub fn preview_lines(self: &Rc<Self>, pane_id: PaneId, rows: usize) -> crate::platform::LocalFuture<Result<Vec<PreviewRow>>> {
+        let link = self.inner.borrow().link.clone();
+        // The pane's own colours if it is drawn here, else the scheme's.
+        let palette = {
+            let inner = self.inner.borrow();
+            inner.panes.get(&pane_id).map(|c| c.palette.clone()).unwrap_or_else(|| inner.configured())
+        };
+        Box::pin(async move {
+            let (dims, cursor) = thinkterm_session::host::request(
+                &link,
+                Pdu::GetPaneRenderableDimensions(codec::GetPaneRenderableDimensions { pane_id }),
+                |pdu| match pdu {
+                    Pdu::GetPaneRenderableDimensionsResponse(r) => Ok((r.dimensions, r.cursor_position)),
+                    other => Err(other),
+                },
+            )
+            .await?;
+            let bottom = (cursor.y + 1).min(dims.physical_top + dims.viewport_rows as StableRowIndex);
+            let top = (bottom - rows as StableRowIndex).max(dims.scrollback_top);
+            let response = thinkterm_session::host::request(
+                &link,
+                Pdu::GetLines(codec::GetLines { pane_id, lines: vec![top..bottom] }),
+                |pdu| match pdu {
+                    Pdu::GetLinesResponse(r) => Ok(r),
+                    other => Err(other),
+                },
+            )
+            .await?;
+            let (lines, _) = response.lines.extract_data();
+            let mut out: Vec<(StableRowIndex, PreviewRow)> = lines
+                .into_iter()
+                .map(|(row, line)| (row, preview_row(&line, &palette)))
+                .collect();
+            out.sort_by_key(|(row, _)| *row);
+            Ok(out.into_iter().map(|(_, row)| row).collect())
+        })
+    }
+
     pub fn selected_text(&self) -> Option<String> {
         Self::selection_text(&self.inner.borrow())
     }
@@ -1068,6 +1278,13 @@ impl<P: Platform, L: Link> App<P, L> {
         {
             let mut inner = self.inner.borrow_mut();
             if inner.reconnect_pending || inner.disconnected.is_none() {
+                return;
+            }
+            if !inner.settings.auto_reconnect {
+                // Asked not to: the remark stays, sticky, until a reconnect
+                // is asked for.
+                let reason = inner.disconnected.clone().unwrap_or_default();
+                Self::set_status(&inner, &format!("connection lost ({reason})"));
                 return;
             }
             inner.reconnect_pending = true;
@@ -1673,6 +1890,10 @@ impl<P: Platform, L: Link> App<P, L> {
                 inner.divider_claim_next = Some((idx, cells));
                 return;
             }
+            if inner.settings.resize_mode == crate::settings::ResizeMode::Release {
+                // The picture moves; the server hears when the finger lifts.
+                return;
+            }
             inner.divider_claim_busy = true;
             (link, tab_id)
         };
@@ -2201,6 +2422,8 @@ impl<P: Platform, L: Link> App<P, L> {
             };
             cell.scroll_px = 0.0;
         }
+        // The scroll position is in the layout view: a scrollbar reads it.
+        Self::notify(&inner);
         drop(inner);
         self.request_frame();
         true
@@ -2245,6 +2468,12 @@ impl<P: Platform, L: Link> App<P, L> {
             lease.fit,
             inner.following,
         );
+        // Where the focused pane is in its scrollback: rows above the
+        // bottom, and rows there are to scroll through.
+        if let Some(cell) = inner.panes.get(&inner.focused_pane) {
+            let max = max_scroll(&cell.session.dimensions());
+            json.push_str(&format!(",\"scroll\":[{},{}]", cell.scroll_from_bottom, max));
+        }
         match &inner.tab_layout {
             Some(layout) => {
                 json.push_str(&format!(",\"cols\":{},\"rows\":{},\"zoomed\":", layout.cols, layout.rows));
@@ -2355,7 +2584,7 @@ impl<P: Platform, L: Link> App<P, L> {
     /// pane bare, as its terminal apps do; the bar appears with a split,
     /// when there is something to tell apart.
     fn nav_rows_for(inner: &Inner<P, L>, panes: usize) -> usize {
-        if inner.platform.is_mobile() && panes <= 1 {
+        if inner.platform.is_mobile() && (panes <= 1 || !inner.settings.pane_bars) {
             return 0;
         }
         crate::navbar::nav_rows(Self::nav_css(inner) * inner.dpr, inner.glyphs.metrics.cell_size.height as f64)
@@ -3675,9 +3904,48 @@ impl<P: Platform, L: Link> App<P, L> {
                 Self::notify(&self.inner.borrow());
                 self.request_frame();
             }
+            "cursor-blink" => {
+                // Read first: `set_blinking` borrows mutably.
+                let on = self.inner.borrow().settings.cursor_blink;
+                self.set_blinking(on);
+            }
+            "cursor-style" | "min-contrast" | "pane-bars" => {
+                if key == "pane-bars" {
+                    // The rows the bars take changed: the grid is laid out again.
+                    self.inner.borrow_mut().cols = 0;
+                    self.resize();
+                }
+                self.request_frame();
+            }
             _ => Self::notify(&self.inner.borrow()),
         }
         Ok(())
+    }
+
+    /// Blink the cursor: a half-second tick that hides it every other
+    /// beat. Intervals cannot be cancelled, so the tick starts once and
+    /// idles while blinking is off.
+    fn set_blinking(self: &Rc<Self>, on: bool) {
+        let mut inner = self.inner.borrow_mut();
+        inner.blink_shown = true;
+        if on && !inner.blink_ticking {
+            inner.blink_ticking = true;
+            let app = Rc::clone(self);
+            inner.platform.set_interval(
+                530.0,
+                Box::new(move || {
+                    let mut inner = app.inner.borrow_mut();
+                    if !inner.settings.cursor_blink || inner.panes.is_empty() {
+                        return;
+                    }
+                    inner.blink_shown = !inner.blink_shown;
+                    drop(inner);
+                    app.request_frame();
+                }),
+            );
+        }
+        drop(inner);
+        self.request_frame();
     }
 
     fn apply_language(&self, preference: &str) {
@@ -4958,6 +5226,14 @@ impl<P: Platform, L: Link> App<P, L> {
                     clip,
                     hsv,
                     draw_cursor: is_focused,
+                    cursor_shape: match inner.settings.cursor_style {
+                        crate::settings::CursorStyle::Auto => None,
+                        crate::settings::CursorStyle::Block => Some(termwiz::surface::CursorShape::SteadyBlock),
+                        crate::settings::CursorStyle::Bar => Some(termwiz::surface::CursorShape::SteadyBar),
+                        crate::settings::CursorStyle::Underline => Some(termwiz::surface::CursorShape::SteadyUnderline),
+                    },
+                    cursor_hidden: inner.settings.cursor_blink && !inner.blink_shown,
+                    min_contrast: inner.settings.min_contrast,
                 };
                 if px > 0.0 && (i == 0 || i == last) {
                     // Only the two rows that hang over the content box are

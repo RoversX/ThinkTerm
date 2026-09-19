@@ -123,6 +123,9 @@ pub trait Platform: 'static {
     fn focus_input(&self);
     /// The pointer's shape over the terminal (`text`, `col-resize`...).
     fn set_cursor(&self, cursor: &str);
+    /// A pane rang its bell. Nothing, unless the platform has a sound
+    /// or a buzz for it.
+    fn bell(&self) {}
     /// Where the cursor cell is, in the viewport's units, so the IME's
     /// candidate window can sit by it.
     fn set_ime_anchor(&self, anchor: crate::ime::Anchor);

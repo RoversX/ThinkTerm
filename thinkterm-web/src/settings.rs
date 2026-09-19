@@ -47,6 +47,19 @@ pub struct WebSettings {
     /// `"desktop"` follows the server's configured scheme; anything else
     /// names a scheme this browser picked.
     pub terminal_scheme: String,
+    /// The cursor's shape, over what the program asked for.
+    pub cursor_style: CursorStyle,
+    /// Whether the cursor blinks (the page keeps it steady otherwise).
+    pub cursor_blink: bool,
+    /// A floor for text against its background, as a WCAG ratio; 0 is off.
+    pub min_contrast: f32,
+    /// Whether a divider drag reshapes the server's panes as it goes, or
+    /// once, when the finger lifts.
+    pub resize_mode: ResizeMode,
+    /// Redial on a lost connection, or wait to be asked.
+    pub auto_reconnect: bool,
+    /// The bars over the panes; a phone can do without them.
+    pub pane_bars: bool,
 }
 
 /// A colour scheme as the page hands it over, straight out of
@@ -107,8 +120,30 @@ impl Default for WebSettings {
             sidebar_width: 220.0,
             scroll_mode: ScrollMode::Smooth,
             terminal_scheme: FOLLOW_DESKTOP.to_string(),
+            cursor_style: CursorStyle::Auto,
+            cursor_blink: false,
+            min_contrast: 0.0,
+            resize_mode: ResizeMode::Live,
+            auto_reconnect: true,
+            pane_bars: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CursorStyle {
+    Auto,
+    Block,
+    Bar,
+    Underline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResizeMode {
+    Live,
+    Release,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

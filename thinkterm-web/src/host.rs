@@ -37,11 +37,17 @@ impl<P: Platform> Spawner for PlatformSpawner<P> {
 pub struct Events {
     dirty: RefCell<std::collections::HashSet<HostPaneId>>,
     wake: RefCell<Option<Rc<dyn Fn()>>>,
+    /// A pane rang its bell; the platform decides what that sounds like.
+    bell: RefCell<Option<Rc<dyn Fn(HostPaneId)>>>,
 }
 
 impl Events {
     pub fn set_wake(&self, wake: Rc<dyn Fn()>) {
         *self.wake.borrow_mut() = Some(wake);
+    }
+
+    pub fn set_bell(&self, bell: Rc<dyn Fn(HostPaneId)>) {
+        *self.bell.borrow_mut() = Some(bell);
     }
 
     pub fn take_dirty(&self) -> std::collections::HashSet<HostPaneId> {
@@ -60,7 +66,13 @@ impl SessionEvents for Events {
     fn pane_output(&self, pane: HostPaneId) {
         self.mark(pane);
     }
-    fn alert(&self, _pane: HostPaneId, _alert: wezterm_term::Alert) {}
+    fn alert(&self, pane: HostPaneId, alert: wezterm_term::Alert) {
+        if matches!(alert, wezterm_term::Alert::Bell) {
+            if let Some(bell) = self.bell.borrow().clone() {
+                bell(pane);
+            }
+        }
+    }
     fn agent_status_changed(&self, _pane: HostPaneId) {}
     fn pane_removed(&self, pane: HostPaneId) {
         self.mark(pane);
