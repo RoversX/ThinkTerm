@@ -222,5 +222,7 @@ impl Platform for MobilePlatform {
             .on_ime_anchor(anchor.left, anchor.top, anchor.width, anchor.height);
     }
 
-    fn publish(&self, _key: &str, _value: &str) {}
+    fn publish(&self, key: &str, value: &str) {
+        self.notify.on_published(key.to_string(), value.to_string());
+    }
 }

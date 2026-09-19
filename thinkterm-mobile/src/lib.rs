@@ -51,6 +51,9 @@ pub trait Notify: Send + Sync {
     /// The host's key fingerprint, seen before authentication: the shell
     /// remembers it and passes it back as `known_host` next time.
     fn on_host_key(&self, fingerprint: String);
+    /// Something the App publishes for the display layer, keyed: "bg" is
+    /// the terminal's background as a hex colour, for the chrome around it.
+    fn on_published(&self, key: String, value: String);
 }
 
 /// Rust's `log` output goes to stdout, which the simulator's console shows;
@@ -172,7 +175,9 @@ impl Core {
     /// `auth_kind` is "key-path" (the secret is a file path), "key" (the
     /// secret is the private key's text, `passphrase` its passphrase) or
     /// "password". `known_host` is the fingerprint remembered from an
-    /// earlier connection, if any.
+    /// earlier connection, if any. `device_id` names this install to the
+    /// server, the same every launch: a tab this phone held is still its
+    /// own after a relaunch, rather than "another device's".
     #[allow(clippy::too_many_arguments)]
     pub fn connect(
         &self,
@@ -184,6 +189,7 @@ impl Core {
         passphrase: Option<String>,
         known_host: Option<String>,
         remote_command: String,
+        device_id: String,
         font_paths: Vec<String>,
         size_pt: f64,
         painter: Box<dyn painter::GlyphPainter>,
@@ -208,6 +214,7 @@ impl Core {
                 },
                 font_paths,
                 size_pt,
+                device_id,
             },
             painter,
         });
@@ -299,9 +306,47 @@ impl Core {
         let _ = self.tx.send(core::Cmd::SetSetting { key, value });
     }
 
+    /// The terminal's colour scheme: one entry of `schemes.json` as JSON
+    /// (`{"foreground":"#...","background":"#...","ansi":[...],...}`), or
+    /// none to follow the host's own scheme. Kept like a setting.
+    pub fn set_palette(&self, scheme: Option<String>) {
+        let _ = self.tx.send(core::Cmd::SetPalette(scheme));
+    }
+
     /// Scale the focused pane's font by a tenth per step; 0 resets.
     pub fn step_font(&self, by: f64) {
         let _ = self.tx.send(core::Cmd::StepFont(by));
+    }
+
+    /// The focused pane's visible rows as a document for the platform's
+    /// text system, as JSON (`App::screen_text`); "null" without a pane.
+    pub fn screen_text(&self) -> String {
+        let (reply, ack) = mpsc::channel();
+        if self.tx.send(core::Cmd::ScreenText { reply }).is_err() {
+            return "null".into();
+        }
+        ack.recv().unwrap_or_else(|_| "null".into())
+    }
+
+    /// Select between two visible cells (row, col) of the focused pane.
+    pub fn set_selection(&self, anchor_row: u32, anchor_col: u32, head_row: u32, head_col: u32) {
+        let _ = self.tx.send(core::Cmd::SetSelection {
+            anchor: (anchor_row as usize, anchor_col as usize),
+            head: (head_row as usize, head_col as usize),
+        });
+    }
+
+    pub fn clear_selection(&self) {
+        let _ = self.tx.send(core::Cmd::ClearSelection);
+    }
+
+    /// The selected text of the focused pane, for the clipboard.
+    pub fn selected_text(&self) -> Option<String> {
+        let (reply, ack) = mpsc::channel();
+        if self.tx.send(core::Cmd::SelectedText { reply }).is_err() {
+            return None;
+        }
+        ack.recv().unwrap_or(None)
     }
 
     pub fn disconnect(&self) {

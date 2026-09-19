@@ -39,6 +39,7 @@ pub struct ConnectParams {
     pub ssh: SshParams,
     pub font_paths: Vec<String>,
     pub size_pt: f64,
+    pub device_id: String,
 }
 
 pub enum Cmd {
@@ -131,10 +132,22 @@ pub enum Cmd {
         px: f64,
     },
     StepFont(f64),
+    ScreenText {
+        reply: Sender<String>,
+    },
+    SetSelection {
+        anchor: (usize, usize),
+        head: (usize, usize),
+    },
+    ClearSelection,
+    SelectedText {
+        reply: Sender<Option<String>>,
+    },
     SetSetting {
         key: String,
         value: String,
     },
+    SetPalette(Option<String>),
 }
 
 /// The surface currently lent, if any.
@@ -191,11 +204,14 @@ struct State {
     fonts: Option<Rc<FontSet>>,
     glyph_platform: Option<thinkterm_web::raster::Platform>,
     size_pt: f64,
+    device_id: String,
     conn: Conn,
     status: String,
     composing: bool,
     /// The shell's preferences, applied to each App as it is made.
     settings: Vec<(String, String)>,
+    /// The chosen scheme's colours as JSON, applied to every App made.
+    palette: Option<String>,
 }
 
 pub fn run(cmd_tx: Sender<Cmd>, rx: Receiver<Cmd>, notify: Box<dyn Notify>) {
@@ -226,10 +242,12 @@ pub fn run(cmd_tx: Sender<Cmd>, rx: Receiver<Cmd>, notify: Box<dyn Notify>) {
         fonts: None,
         glyph_platform: None,
         size_pt: 11.0,
+        device_id: String::new(),
         conn: Conn::Idle,
         status: String::new(),
         composing: false,
         settings: Vec::new(),
+        palette: None,
     };
     state.notify.on_log("core thread up".into());
     state.set_status("idle");
@@ -478,6 +496,28 @@ impl State {
                     });
                 }
             }
+            Cmd::ScreenText { reply } => {
+                let json = self
+                    .app
+                    .as_ref()
+                    .and_then(|app| app.screen_text())
+                    .map(|t| json(&t))
+                    .unwrap_or_else(|| "null".into());
+                let _ = reply.send(json);
+            }
+            Cmd::SetSelection { anchor, head } => {
+                if let Some(app) = self.app.clone() {
+                    app.set_selection(anchor, head);
+                }
+            }
+            Cmd::ClearSelection => {
+                if let Some(app) = self.app.clone() {
+                    app.clear_selection();
+                }
+            }
+            Cmd::SelectedText { reply } => {
+                let _ = reply.send(self.app.as_ref().and_then(|app| app.selected_text()));
+            }
             Cmd::StepFont(by) => {
                 if let Some(app) = self.app.clone() {
                     app.step_font(by);
@@ -492,7 +532,27 @@ impl State {
                     }
                 }
             }
+            Cmd::SetPalette(scheme) => {
+                self.palette = scheme.clone();
+                if let Some(app) = self.app.clone() {
+                    Self::apply_palette(&app, &self.notify, scheme.as_deref());
+                }
+            }
         }
+    }
+
+    fn apply_palette(app: &Rc<App<MobilePlatform, SshLink>>, notify: &Arc<dyn Notify>, scheme: Option<&str>) {
+        let palette = match scheme {
+            None => None,
+            Some(json) => match thinkterm_web::settings::SchemeColors::parse(json).and_then(|c| c.to_palette()) {
+                Ok(palette) => Some(palette),
+                Err(err) => {
+                    notify.on_log(format!("scheme: {err}"));
+                    return;
+                }
+            },
+        };
+        app.set_terminal_palette(palette);
     }
 
     fn view(&self, name: &str) -> String {
@@ -532,6 +592,7 @@ impl State {
 
     fn connect(&mut self, params: ConnectParams, painter: Box<dyn GlyphPainter>) -> Result<()> {
         self.disconnect();
+        self.device_id = params.device_id.clone();
         let mut faces = Vec::new();
         for path in &params.font_paths {
             let bytes = std::fs::read(path).with_context(|| format!("reading the font {path}"))?;
@@ -654,7 +715,8 @@ impl State {
             return;
         };
         if self.gpu.is_none() {
-            self.fail("attach a surface before connecting".into());
+            // Not a failure: the surface's arrival attaches.
+            self.notify.on_log("connected before the surface; attaching when it comes".into());
             return;
         }
         let scale = self.target.as_ref().map(|t| t.scale).unwrap_or(1.0);
@@ -686,12 +748,15 @@ impl State {
             self.size_pt,
             size.map(|s| (s.cols, s.rows))
         ));
+        // The identity the server compares leases against, derived from
+        // the install's id so it survives a relaunch.
+        let (epoch, id) = stable_identity(&self.device_id);
         let me = thinkterm_proto::ClientId {
             hostname: "ios".into(),
             username: "mobile".into(),
-            pid: std::process::id(),
-            epoch: self.platform.wall_ms() as u64,
-            id: self.platform.random_u32() as usize,
+            pid: 0,
+            epoch,
+            id,
             ssh_auth_sock: None,
         };
         let tx = self.cmd_tx.clone();
@@ -814,6 +879,9 @@ impl State {
                 self.notify.on_log(format!("setting {key}: {err}"));
             }
         }
+        if let Some(scheme) = self.palette.clone() {
+            Self::apply_palette(&app, &self.notify, Some(&scheme));
+        }
         app.fetch_tree();
         app.hide_status();
         app.refresh_layout();
@@ -885,6 +953,10 @@ impl State {
         if let Some(app) = self.app.clone() {
             app.resize();
             app.request_frame();
+        } else if matches!(self.conn, Conn::Attaching) && self.link.is_some() {
+            // The transport was up before the surface: a fast loopback
+            // dial beats the first layout. The attach waited for this.
+            self.start_attach();
         } else {
             self.request_frame();
         }
@@ -1041,3 +1113,19 @@ fn json<T: serde::Serialize>(value: &T) -> String {
         .unwrap_or_else(|err| format!("{{\"error\":{:?}}}", err.to_string()))
 }
 
+
+/// Two numbers from the install's id (FNV-1a over it, twice), for the
+/// client identity's epoch and id fields.
+fn stable_identity(device_id: &str) -> (u64, usize) {
+    fn fnv(bytes: &[u8], seed: u64) -> u64 {
+        let mut h = seed ^ 0xcbf2_9ce4_8422_2325;
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        h
+    }
+    let epoch = fnv(device_id.as_bytes(), 0) & 0xffff_ffff;
+    let id = (fnv(device_id.as_bytes(), 0x9e37_79b9_7f4a_7c15) & 0x7fff_ffff) as usize;
+    (epoch, id)
+}
