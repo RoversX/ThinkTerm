@@ -39,3 +39,10 @@ uniffi = { workspace = true, features = ["cli"] }
 wezterm-color-types.workspace = true
 wezterm-term = { workspace = true, features = ["use_serde"] }
 wgpu.workspace = true
+
+# The Android shell hands over a java.lang.Surface; the native window
+# behind it, and logcat, are NDK calls.
+[target.'cfg(target_os = "android")'.dependencies]
+jni-sys = "0.3"
+ndk-sys = "0.5"
+raw-window-handle.workspace = true

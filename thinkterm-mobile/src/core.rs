@@ -1002,7 +1002,27 @@ impl State {
         .context("creating the Metal surface")
     }
 
-    #[cfg(not(target_vendor = "apple"))]
+    /// `layer` is an `ANativeWindow*` the shell took from its Surface
+    /// (`NativeWindow.fromSurface`), which it keeps alive until after
+    /// `detach_surface`.
+    #[cfg(target_os = "android")]
+    fn surface_from_layer(&self, layer: usize) -> Result<wgpu::Surface<'static>> {
+        use raw_window_handle::{AndroidDisplayHandle, AndroidNdkWindowHandle, RawDisplayHandle, RawWindowHandle};
+        let Some(window) = std::ptr::NonNull::new(layer as *mut std::ffi::c_void) else {
+            anyhow::bail!("null window");
+        };
+        // SAFETY: the shell guarantees the window outlives the surface,
+        // dropping it only after `detach_surface` returned.
+        unsafe {
+            self.instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: RawDisplayHandle::Android(AndroidDisplayHandle::new()),
+                raw_window_handle: RawWindowHandle::AndroidNdk(AndroidNdkWindowHandle::new(window)),
+            })
+        }
+        .context("creating the Vulkan surface")
+    }
+
+    #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
     fn surface_from_layer(&self, _layer: usize) -> Result<wgpu::Surface<'static>> {
         anyhow::bail!("no surface source on this platform yet")
     }

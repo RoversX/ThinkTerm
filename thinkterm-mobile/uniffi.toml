@@ -1,0 +1,4 @@
+# The Kotlin bindings' package; the library is loaded by JNA under this name.
+[bindings.kotlin]
+package_name = "com.roversx.thinkterm.core"
+cdylib_name = "thinkterm_mobile"

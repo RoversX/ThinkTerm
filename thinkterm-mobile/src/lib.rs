@@ -61,8 +61,9 @@ pub trait Notify: Send + Sync {
     fn on_preview(&self, pane: u32, rows: String);
 }
 
-/// Rust's `log` output goes to stdout, which the simulator's console shows;
-/// a device build will want os_log instead.
+/// Rust's `log` output goes to stdout, which the simulator's console shows
+/// (a device build will want os_log instead); on Android, to logcat under
+/// the tag "thinkterm".
 struct StdoutLogger;
 
 impl log::Log for StdoutLogger {
@@ -70,16 +71,57 @@ impl log::Log for StdoutLogger {
         metadata.level() <= log::Level::Info
     }
     fn log(&self, record: &log::Record) {
-        if self.enabled(record.metadata()) {
-            println!(
-                "rust {} {}: {}",
-                record.level(),
-                record.target(),
-                record.args()
-            );
+        if !self.enabled(record.metadata()) {
+            return;
         }
+        let line = format!("rust {} {}: {}", record.level(), record.target(), record.args());
+        #[cfg(target_os = "android")]
+        {
+            if let Ok(c) = std::ffi::CString::new(line) {
+                let prio = match record.level() {
+                    log::Level::Error => ndk_sys::android_LogPriority::ANDROID_LOG_ERROR,
+                    log::Level::Warn => ndk_sys::android_LogPriority::ANDROID_LOG_WARN,
+                    _ => ndk_sys::android_LogPriority::ANDROID_LOG_INFO,
+                };
+                // SAFETY: both strings are NUL-terminated and outlive the call.
+                unsafe {
+                    ndk_sys::__android_log_write(prio.0 as std::ffi::c_int, c"thinkterm".as_ptr(), c.as_ptr());
+                }
+            }
+            return;
+        }
+        #[allow(unreachable_code)]
+        println!("{line}");
     }
     fn flush(&self) {}
+}
+
+/// The Android shell cannot reach an `ANativeWindow*` from Kotlin: these
+/// two JNI entry points do it for `com.roversx.thinkterm.NativeWindow`.
+/// `fromSurface` acquires a reference the shell releases with `release`
+/// after `detach_surface`.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "C" fn Java_com_roversx_thinkterm_NativeWindow_fromSurface(
+    env: *mut jni_sys::JNIEnv,
+    _class: jni_sys::jclass,
+    surface: jni_sys::jobject,
+) -> jni_sys::jlong {
+    // SAFETY: the JVM hands over a live env and a Surface object.
+    unsafe { ndk_sys::ANativeWindow_fromSurface(env as *mut _, surface as *mut _) as jni_sys::jlong }
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "C" fn Java_com_roversx_thinkterm_NativeWindow_release(
+    _env: *mut jni_sys::JNIEnv,
+    _class: jni_sys::jclass,
+    window: jni_sys::jlong,
+) {
+    if window != 0 {
+        // SAFETY: a pointer `fromSurface` returned, released once.
+        unsafe { ndk_sys::ANativeWindow_release(window as *mut _) }
+    }
 }
 
 fn install_logger() {
@@ -88,6 +130,9 @@ fn install_logger() {
         static LOGGER: StdoutLogger = StdoutLogger;
         let _ = log::set_logger(&LOGGER);
         log::set_max_level(log::LevelFilter::Info);
+        // A panic on the core thread ends it silently otherwise: stderr
+        // goes nowhere on a phone.
+        std::panic::set_hook(Box::new(|info| log::error!("panic: {info}")));
     });
 }
 
