@@ -57,6 +57,52 @@ struct NavView: Decodable, Hashable, Identifiable {
     var id: Int { rect.pane }
 }
 
+/// The desktop's sidebar layer with its tabs: `App::threads_view`.
+struct ThreadsView: Decodable, Hashable {
+    var space: String
+    var threads: [ThreadView]
+}
+
+struct ThreadView: Decodable, Hashable, Identifiable {
+    var id: String
+    var name: String
+    var project: String
+    var project_id: String
+    var status: String
+    var dot: String
+    var live: Bool
+    var pinned: Bool
+    var unread: Bool
+    var current: Bool
+    var window: Int?
+    var tabs: [ThreadTab]
+}
+
+struct ThreadTab: Decodable, Hashable, Identifiable {
+    var tab: Int
+    var title: String
+    var target: Int
+    var current: Bool
+    var panes: [PaneRef]
+    var id: Int { tab }
+}
+
+struct PaneRef: Decodable, Hashable, Identifiable {
+    var pane: Int
+    var title: String
+    var id: Int { pane }
+}
+
+/// A thumbnail row: `App::PreviewRow`.
+struct PreviewRow: Decodable, Hashable {
+    var runs: [PreviewRun]
+}
+
+struct PreviewRun: Decodable, Hashable {
+    var text: String
+    var fg: String
+}
+
 struct Toast: Decodable, Hashable {
     var text: String
     var sticky: Bool

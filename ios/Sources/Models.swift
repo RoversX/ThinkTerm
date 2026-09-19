@@ -8,7 +8,7 @@ struct Host: Codable, Identifiable, Hashable {
         case key
         case password
         var id: String { rawValue }
-        var label: String { self == .key ? "Private key" : "Password" }
+        var label: String { self == .key ? tr("f.key") : tr("f.password") }
     }
 
     var id: UUID = UUID()

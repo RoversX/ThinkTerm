@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 import UIKit
 
@@ -40,6 +41,13 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
     /// the core last gave them. Fetched when a selection interaction asks
     /// and dropped when the core reports a change.
     private var screen: ScreenText?
+    /// The system's selection, held so the gesture setting can take it
+    /// away and put it back while the terminal stays open.
+    private let selection = UITextInteraction(for: .editable)
+    /// A caret the system placed with a tap: not drawn, but kept, so the
+    /// loupe and the handles that follow have a position to start from.
+    private var caret: Int?
+    private var selectionWatch: AnyCancellable?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -58,16 +66,35 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
         let hide = UISwipeGestureRecognizer(target: self, action: #selector(swipedDown(_:)))
         hide.direction = .down
         hide.numberOfTouchesRequired = 2
-        for g in [tap, pinch, hide] as [UIGestureRecognizer] {
+        // Ours never hold the system's back: the touches go on to the text
+        // interaction's recognizers whatever ours decide.
+        tap.cancelsTouchesInView = false
+        tap.delaysTouchesEnded = false
+        // A sideways flick goes to the next or previous tab. The scroll
+        // view only moves vertically, so a horizontal pan is nobody's.
+        let flick = UIPanGestureRecognizer(target: self, action: #selector(flicked(_:)))
+        flick.maximumNumberOfTouches = 1
+        flick.cancelsTouchesInView = false
+        for g in [tap, pinch, hide, flick] as [UIGestureRecognizer] {
             g.delegate = self
             addGestureRecognizer(g)
         }
-        // The system's selection: a long press selects a word and shows
-        // the handles, a tap elsewhere clears it. Non-editable, so a tap
-        // does not place a caret -- the terminal's cursor is its own.
-        let selection = UITextInteraction(for: .nonEditable)
+        // The system's text editing over the rows, the way every editable
+        // text view has it: a tap raises the keyboard, a double tap selects
+        // a word and shows the handles, a long press the loupe. The caret
+        // it places is kept but not drawn; the terminal's cursor is its own.
         selection.textInput = self
-        addInteraction(selection)
+        // The setting decides whether it is attached at all; the publisher
+        // hands over the value it holds now, so this also starts it right.
+        selectionWatch = AppSettings.shared.$longPressSelects.sink { [weak self] on in
+            guard let self else { return }
+            let attached = self.interactions.contains { $0 === self.selection }
+            if on, !attached {
+                self.addInteraction(self.selection)
+            } else if !on, attached {
+                self.removeInteraction(self.selection)
+            }
+        }
     }
 
     override func layoutSubviews() {
@@ -144,13 +171,27 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
         }
     }
 
+    @objc private func flicked(_ g: UIPanGestureRecognizer) {
+        guard g.state == .ended else { return }
+        let t = g.translation(in: self)
+        let v = g.velocity(in: self)
+        guard abs(t.x) > 70, abs(t.y) < 50, abs(v.x) > 400, abs(v.x) > abs(v.y) * 2 else { return }
+        model?.switchTab(by: t.x < 0 ? 1 : -1)
+    }
+
     @objc private func swipedDown(_ g: UISwipeGestureRecognizer) {
+        // Read the setting as the gesture fires, so turning it off in
+        // Settings takes hold without rebuilding the view.
+        guard AppSettings.shared.twoFingerHidesKeyboard else { return }
         if isFirstResponder {
             resignFirstResponder()
         }
     }
 
     @objc private func pinched(_ g: UIPinchGestureRecognizer) {
+        // Same as the swipe: the recognizer stays, the setting decides
+        // here, so a change applies to the very next pinch.
+        guard AppSettings.shared.pinchZoom else { return }
         switch g.state {
         case .began: pinchStart = 1
         case .changed:
@@ -169,6 +210,14 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
 
     func gestureRecognizer(_ a: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith b: UIGestureRecognizer) -> Bool {
         true
+    }
+
+    func gestureRecognizer(_ a: UIGestureRecognizer, shouldRequireFailureOf b: UIGestureRecognizer) -> Bool {
+        false
+    }
+
+    func gestureRecognizer(_ a: UIGestureRecognizer, shouldBeRequiredToFailBy b: UIGestureRecognizer) -> Bool {
+        false
     }
 
     override var canBecomeFirstResponder: Bool { true }
@@ -311,25 +360,31 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
             if marked == nil, let s = currentScreen(), let sel = s.selection {
                 return Range(index(row: sel[0][0], col: sel[0][1]), index(row: sel[1][0], col: sel[1][1]) + 1)
             }
+            if marked == nil, let caret, caret <= screenLength {
+                return Range(caret, caret)
+            }
             let n = documentLength
             return Range(n, n)
         }
         set {
             guard let r = newValue as? Range else {
+                caret = nil
                 model?.core.clearSelection()
                 screen = nil
                 return
             }
-            // A non-empty range inside the rows is a selection; anything
-            // else (a caret) clears it. The end is exclusive here and
-            // inclusive in the core.
+            // A non-empty range inside the rows is a selection; a caret
+            // inside them is remembered and clears it. The end is
+            // exclusive here and inclusive in the core.
             if r.b > r.a, let a = cell(at: r.a), let b = cell(at: r.b - 1) {
+                caret = nil
                 model?.core.setSelection(anchorRow: UInt32(a.row), anchorCol: UInt32(a.col), headRow: UInt32(b.row), headCol: UInt32(b.col))
                 if var s = screen {
                     s.selection = [[a.row, a.col], [b.row, b.col]]
                     screen = s
                 }
             } else {
+                caret = r.a < screenLength ? r.a : nil
                 model?.core.clearSelection()
                 if var s = screen {
                     s.selection = nil
@@ -442,10 +497,17 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
         return rect(row: a.row, col: a.col, cols: max(cols, 1))
     }
 
+    /// Where the caret would be: the cell, but nothing wide enough to
+    /// see -- the terminal draws its own cursor, and a second one over a
+    /// tapped cell would only mislead.
     func caretRect(for position: UITextPosition) -> CGRect {
-        guard let p = position as? Pos, let c = cell(at: p.i) else { return model?.cursorRect ?? .zero }
+        guard let p = position as? Pos, let c = cell(at: p.i) else {
+            var r = model?.cursorRect ?? .zero
+            r.size.width = 0
+            return r
+        }
         var r = rect(row: c.row, col: c.col)
-        r.size.width = 2
+        r.size.width = 0
         return r
     }
 

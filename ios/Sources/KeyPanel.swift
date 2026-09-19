@@ -129,10 +129,10 @@ enum KeyPanelTab: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .keys: return "Keys"
-        case .snippets: return "Snippets"
-        case .history: return "History"
-        case .colors: return "Colors"
+        case .keys: return tr("p.keys")
+        case .snippets: return tr("p.snippets")
+        case .history: return tr("p.history")
+        case .colors: return tr("p.colors")
         }
     }
 }
@@ -142,6 +142,7 @@ enum KeyPanelTab: String, CaseIterable, Identifiable {
 /// the prototype's `.kpanel`, on the terminal's own background.
 struct KeyPanel: View {
     @ObservedObject var model: TerminalModel
+    @ObservedObject private var lang = AppLanguage.shared
     @Binding var tab: KeyPanelTab
     @ObservedObject private var snippets = SnippetStore.shared
     @ObservedObject private var history = KeyHistory.shared
@@ -156,8 +157,8 @@ struct KeyPanel: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                chip("gearshape", "Customize") { showSettings = true }
-                chip("doc.on.clipboard", "Paste") { model.pasteFromClipboard() }
+                chip("gearshape", tr("p.customize")) { showSettings = true }
+                chip("doc.on.clipboard", tr("paste")) { model.pasteFromClipboard() }
             }
             .padding(.horizontal, 10)
             .padding(.top, 8)
@@ -168,7 +169,7 @@ struct KeyPanel: View {
 
             Rectangle().fill(Color.white.opacity(0.08)).frame(height: 0.5)
 
-            Picker("Panel", selection: $tab) {
+            Picker(tr("p.panel"), selection: $tab) {
                 ForEach(KeyPanelTab.allCases) { Text($0.title).tag($0) }
             }
             .pickerStyle(.segmented)
@@ -190,7 +191,7 @@ struct KeyPanel: View {
                 SettingsView(model: model, showLog: nil)
                     .toolbar {
                         ToolbarItem(placement: .confirmationAction) {
-                            Button("Done") { showSettings = false }
+                            Button(tr("done")) { showSettings = false }
                         }
                     }
             }
@@ -212,10 +213,10 @@ struct KeyPanel: View {
     private var keysGrid: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 10) {
-                block("Function", KeyCaps.functions)
-                block("Navigation", KeyCaps.navigation)
-                block("Symbols", KeyCaps.symbols)
-                block("Control", KeyCaps.chords)
+                block(tr("k.function"), KeyCaps.functions)
+                block(tr("k.navigation"), KeyCaps.navigation)
+                block(tr("k.symbols"), KeyCaps.symbols)
+                block(tr("k.control"), KeyCaps.chords)
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
@@ -262,7 +263,7 @@ struct KeyPanel: View {
                                     .truncationMode(.middle)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                 if snippet.runs {
-                                    Text("Run")
+                                    Text(tr("p.run"))
                                         .font(.system(size: 12))
                                         .foregroundColor(.accentColor)
                                 }
@@ -287,7 +288,7 @@ struct KeyPanel: View {
                 Button {
                     draft = SnippetDraft(snippet: Snippet(text: ""), isNew: true)
                 } label: {
-                    Label("New snippet", systemImage: "plus")
+                    Label(tr("snip.new"), systemImage: "plus")
                         .font(.system(size: 14))
                         .frame(maxWidth: .infinity)
                         .frame(height: 42)
@@ -314,7 +315,7 @@ struct KeyPanel: View {
     private var historyList: some View {
         ScrollView {
             if history.lines.isEmpty {
-                Text("Nothing sent from here yet")
+                Text(tr("hist.empty"))
                     .font(.system(size: 13))
                     .foregroundColor(.white.opacity(0.45))
                     .frame(maxWidth: .infinity)
@@ -351,7 +352,7 @@ struct KeyPanel: View {
     private var colorRow: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             LazyHGrid(rows: [GridItem(.fixed(62)), GridItem(.fixed(62))], spacing: 10) {
-                swatch(Schemes.followDesktop, label: "Follow host")
+                swatch(Schemes.followDesktop, label: tr("followhost"))
                 ForEach(Schemes.names, id: \.self) { name in
                     swatch(name, label: name)
                 }
@@ -432,6 +433,7 @@ struct SnippetDraft: Identifiable {
 /// One snippet's text and whether it runs itself; Delete throws it away.
 struct SnippetEditor: View {
     let draft: SnippetDraft
+    @ObservedObject private var lang = AppLanguage.shared
     @Environment(\.dismiss) private var dismiss
     @State private var text: String
     @State private var runs: Bool
@@ -446,30 +448,30 @@ struct SnippetEditor: View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("Command", text: $text, axis: .vertical)
+                    TextField(tr("snip.command"), text: $text, axis: .vertical)
                         .font(.system(size: 14, design: .monospaced))
                         .lineLimit(1...6)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
-                    Toggle("Press Enter after sending", isOn: $runs)
+                    Toggle(tr("snip.enter"), isOn: $runs)
                 }
                 if !draft.isNew {
                     Section {
-                        Button("Delete", role: .destructive) {
+                        Button(tr("delete"), role: .destructive) {
                             SnippetStore.shared.remove(draft.snippet)
                             dismiss()
                         }
                     }
                 }
             }
-            .navigationTitle(draft.isNew ? "New snippet" : "Snippet")
+            .navigationTitle(draft.isNew ? tr("snip.new") : tr("snip.title"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
+                    Button(tr("cancel")) { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") { save() }
+                    Button(tr("save")) { save() }
                         .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }

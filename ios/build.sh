@@ -53,7 +53,7 @@ mv ios/Generated/thinkterm_mobileFFI.modulemap ios/Generated/module.modulemap
 
 echo "== fonts"
 mkdir -p ios/Resources
-cp assets/fonts/JetBrainsMono-Regular.ttf assets/fonts/SymbolsNerdFontMono-Regular.ttf ios/Resources/
+cp assets/fonts/JetBrainsMono-Regular.ttf assets/fonts/FiraCode-Regular.ttf assets/fonts/SymbolsNerdFontMono-Regular.ttf ios/Resources/
 # The colour schemes the theme picker offers: the web page's list.
 cp thinkterm-web/www/schemes.json ios/Resources/
 

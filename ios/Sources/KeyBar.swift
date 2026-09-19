@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// The keys a soft keyboard has not got, with sticky Ctrl and Alt, and at
 /// the row's right end — fixed, never scrolling away — the button that
@@ -11,6 +12,7 @@ struct KeyBar: View {
     /// simulator cannot be tapped, and a screenshot needs it showing.
     @State private var panelOpen = ProcessInfo.processInfo.arguments.contains("--keypanel")
     @State private var tab: KeyPanelTab = KeyBar.debugTab
+    @ObservedObject private var settings = AppSettings.shared
 
     /// `--keypanel snippets` also picks the face it opens on.
     private static var debugTab: KeyPanelTab {
@@ -39,6 +41,18 @@ struct KeyBar: View {
             }
         }
         .background(model.background)
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { note in
+            guard settings.autoKeyPanel else { return }
+            // A hardware keyboard (the simulator's) posts a zero-height
+            // frame: no keys on screen, so nothing for the panel to join.
+            let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect
+            guard (frame?.height ?? 0) > 0 else { return }
+            withAnimation(.easeOut(duration: 0.16)) { panelOpen = true }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            guard settings.autoKeyPanel else { return }
+            withAnimation(.easeOut(duration: 0.16)) { panelOpen = false }
+        }
     }
 
     private func key(_ cap: KeyCap) -> some View {

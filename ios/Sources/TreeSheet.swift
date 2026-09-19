@@ -7,6 +7,7 @@ import SwiftUI
 /// desktop names it: thread, tab, pane.
 struct TreeSheet: View {
     @ObservedObject var model: TerminalModel
+    @ObservedObject private var lang = AppLanguage.shared
     @Binding var isPresented: Bool
     @Binding var menu: MenuSheet?
     @State private var openThreads: Set<String> = []
@@ -28,11 +29,11 @@ struct TreeSheet: View {
                 }
             }
             .listStyle(.plain)
-            .navigationTitle("Threads")
+            .navigationTitle(tr("threads"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { isPresented = false }
+                    Button(tr("done")) { isPresented = false }
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Menu {
@@ -50,13 +51,13 @@ struct TreeSheet: View {
                     Button { model.chromeClick("new-tab") } label: { Image(systemName: "plus") }
                 }
             }
-            .alert("Rename", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
-                TextField("Name", text: $renameText)
-                Button("Save") {
+            .alert(tr("rename"), isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
+                TextField(tr("f.name"), text: $renameText)
+                Button(tr("save")) {
                     model.sideKey("Enter", value: renameText)
                     renaming = nil
                 }
-                Button("Cancel", role: .cancel) {
+                Button(tr("cancel"), role: .cancel) {
                     model.sideKey("Escape", value: "")
                     renaming = nil
                 }
@@ -90,12 +91,12 @@ struct TreeSheet: View {
             Text(name).font(.headline)
         case .newThread:
             Button { model.sideClick("new-thread") } label: {
-                Label("New thread", systemImage: "plus").foregroundColor(.accentColor)
+                Label(tr("thread.new"), systemImage: "plus").foregroundColor(.accentColor)
             }
         case .pinned:
-            caption("Pinned")
+            caption(tr("pinned"))
         case .workspaces:
-            caption("Workspaces")
+            caption(tr("workspaces"))
         case .project(let id, let name, let path, let collapsed, let archived):
             HStack {
                 Button { model.sideClick("toggle-project", id: id) } label: {
@@ -117,7 +118,7 @@ struct TreeSheet: View {
                 }
             }
             .contextMenu {
-                Button("More…") { menu = MenuSheet(kind: archived ? "archived-project" : "project", id: id, title: name) }
+                AppMenuItems(model: model, kind: archived ? "archived-project" : "project", id: id)
             }
         case .thread(let t):
             if let thread = threads.first(where: { $0.id == t.id }) {
@@ -135,12 +136,12 @@ struct TreeSheet: View {
                 .foregroundColor(.secondary)
             }
         case .others:
-            caption("Other windows")
+            caption(tr("otherwindows"))
         case .window(let id, let title, let selected):
             Button { model.sideClick("window", id: String(id)) } label: {
                 HStack {
                     Image(systemName: "macwindow").foregroundColor(.secondary)
-                    Text(title.isEmpty ? "Window \(id)" : title)
+                    Text(title.isEmpty ? tr("window.n", id) : title)
                 }
             }
             .listRowBackground(selected ? Color.accentColor.opacity(0.2) : nil)
@@ -169,7 +170,7 @@ struct TreeSheet: View {
             if thread.pinned {
                 Image(systemName: "pin").font(.caption).foregroundColor(.secondary)
             }
-            Text(thread.live ? "\(thread.tabs.count) tab\(thread.tabs.count == 1 ? "" : "s")" : "off")
+            Text(thread.live ? tr(thread.tabs.count == 1 ? "tab.one" : "tab.n", thread.tabs.count) : tr("thread.off"))
                 .font(.caption2).foregroundColor(.secondary)
             if !thread.tabs.isEmpty {
                 Button {
@@ -187,7 +188,7 @@ struct TreeSheet: View {
         .padding(.leading, indent)
         .listRowBackground(thread.current ? Color.accentColor.opacity(0.18) : nil)
         .contextMenu {
-            Button("More…") { menu = MenuSheet(kind: "thread", id: thread.id, title: thread.name) }
+            AppMenuItems(model: model, kind: "thread", id: thread.id)
         }
         if open {
             ForEach(thread.tabs) { tab in
@@ -209,7 +210,7 @@ struct TreeSheet: View {
                 isPresented = false
             } label: {
                 HStack(spacing: 6) {
-                    Text(tab.title.isEmpty ? "Tab \(tab.tab)" : tab.title)
+                    Text(tab.title.isEmpty ? tr("tab.num", tab.tab) : tab.title)
                     if let first = tab.panes.first, !first.title.isEmpty, first.title != tab.title {
                         Text(first.title).font(.caption).foregroundColor(.secondary)
                     }
@@ -221,7 +222,7 @@ struct TreeSheet: View {
                 Image(systemName: "checkmark").foregroundColor(.accentColor)
             }
             if tab.panes.count > 1 {
-                Text("\(tab.panes.count) panes").font(.caption2).foregroundColor(.secondary)
+                Text(tr("panes.n", tab.panes.count)).font(.caption2).foregroundColor(.secondary)
                 Button {
                     if open { openTabs.remove(key) } else { openTabs.insert(key) }
                 } label: {
@@ -236,8 +237,7 @@ struct TreeSheet: View {
         }
         .padding(.leading, indent)
         .contextMenu {
-            Button("Close tab", role: .destructive) { model.chromeClick("close-tab", tab: tab.tab) }
-            Button("More…") { menu = MenuSheet(kind: "tab", id: String(tab.tab), title: tab.title) }
+            AppMenuItems(model: model, kind: "tab", id: String(tab.tab))
         }
         if open {
             ForEach(tab.panes) { pane in
@@ -261,13 +261,24 @@ struct TreeSheet: View {
     }
 }
 
-/// The desktop's Live Overview, one column of cards: a card per thread,
-/// grouped by project, with its tabs as dots (the rest folded into +N),
-/// an offline badge, and the last rows of its terminal as a preview.
+/// The desktop's Live Overview as an overlay under the terminal: a card
+/// per thread, grouped by project, two to a row. Each card is the
+/// thread's name and state, its tabs as dots (the rest folded into +N),
+/// an offline badge, and a thumbnail of its terminal in its colours: the
+/// last rows of its current tab's pane, fetched from the server and
+/// refreshed while the overview is up. The thread on show leaves its
+/// thumbnail empty and reports the box's frame: the live terminal is
+/// zoomed into it by the screen above.
 struct OverviewScreen: View {
     @ObservedObject var model: TerminalModel
+    @ObservedObject private var lang = AppLanguage.shared
     @Binding var isPresented: Bool
+    /// The thumbnail box of the thread on show, in the screen's space.
+    @Binding var cardFrame: CGRect?
+    var liveThread: String?
     private let dots = 4
+    private let rows = 9
+    private let columns = [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)]
 
     private var threads: [ThreadView] { model.threads?.threads ?? [] }
 
@@ -282,104 +293,155 @@ struct OverviewScreen: View {
     }
 
     var body: some View {
-        NavigationStack {
+        VStack(spacing: 0) {
             ScrollView {
                 if threads.isEmpty {
-                    Text("No threads on this server.")
+                    Text(tr("overview.none"))
                         .foregroundColor(.secondary)
                         .padding(.top, 60)
                 } else {
-                    LazyVStack(alignment: .leading, spacing: 10) {
+                    LazyVStack(alignment: .leading, spacing: 8) {
                         ForEach(groups, id: \.project) { group in
                             HStack(spacing: 6) {
                                 Text(model.threads?.space ?? "")
                                 Text("·").foregroundColor(.secondary)
                                 Text(group.project)
-                                Rectangle().fill(Color.secondary.opacity(0.3)).frame(height: 1)
+                                Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
                                 Text("\(group.threads.count)").foregroundColor(.secondary)
                             }
                             .font(.caption)
-                            .padding(.horizontal, 12)
-                            .padding(.top, 8)
-                            ForEach(group.threads) { thread in
-                                card(thread)
-                                    .padding(.horizontal, 12)
+                            .padding(.top, 10)
+                            LazyVGrid(columns: columns, spacing: 10) {
+                                ForEach(group.threads) { thread in
+                                    card(thread)
+                                }
                             }
                         }
                     }
+                    .padding(.horizontal, 12)
                     .padding(.vertical, 8)
                 }
             }
-            .background(Color(white: 0.06))
-            .navigationTitle("Overview")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Done") { isPresented = false } }
+            // Pinching back in returns to the terminal.
+            .gesture(MagnifyGesture().onEnded { value in
+                if value.magnification > 1.25 { isPresented = false }
+            })
+        }
+        .foregroundColor(.white)
+        .background(Color(white: 0.06))
+        .onAppear {
+            model.refreshViews()
+            refreshPreviews()
+        }
+        .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
+            refreshPreviews()
+        }
+    }
+
+    /// Every live thread's current tab, asked for its last rows.
+    private func refreshPreviews() {
+        for thread in threads where thread.live && thread.id != liveThread {
+            if let pane = previewPane(thread) {
+                model.requestPreview(pane: pane, rows: rows)
             }
         }
-        .onAppear { model.refreshViews() }
+    }
+
+    private func previewPane(_ thread: ThreadView) -> Int? {
+        (thread.tabs.first(where: { $0.current }) ?? thread.tabs.first)?.target
     }
 
     private func card(_ thread: ThreadView) -> some View {
         let shown = Array(thread.tabs.prefix(dots))
         let folded = thread.tabs.count - shown.count
         let currentTab = thread.tabs.first(where: { $0.current }) ?? thread.tabs.first
+        let live = thread.id == liveThread
         return Button {
-            model.sideClick("thread", id: thread.id)
+            if !live { model.sideClick("thread", id: thread.id) }
             isPresented = false
         } label: {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
-                    Circle().fill(TerminalScreen.threadColor(status: thread.status, live: thread.live)).frame(width: 8, height: 8)
-                    Text(thread.name).font(.subheadline.weight(.semibold)).lineLimit(1)
-                    Spacer()
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(spacing: 7) {
+                    Circle().fill(TerminalScreen.threadColor(status: thread.status, live: thread.live)).frame(width: 7, height: 7)
+                    Text(thread.name).font(.system(size: 13.5, weight: .semibold)).lineLimit(1)
+                    Spacer(minLength: 0)
                 }
+                .padding(.horizontal, 10)
+                .padding(.top, 10)
+                .padding(.bottom, 6)
                 HStack(spacing: 4) {
                     ForEach(shown) { tab in
                         Circle()
-                            .fill(thread.current && tab.current ? Color.white : Color.white.opacity(0.3))
-                            .frame(width: 7, height: 7)
+                            .fill(thread.current && tab.current ? Color.accentColor : Color.white.opacity(0.28))
+                            .frame(width: 6, height: 6)
                     }
                     if folded > 0 {
-                        Text("+\(folded)").font(.caption2).foregroundColor(.secondary)
+                        Text("+\(folded)").font(.system(size: 9.5)).foregroundColor(.secondary)
                     }
-                    Text(currentTab?.title ?? "").font(.caption).foregroundColor(.secondary).lineLimit(1)
-                    Spacer()
+                    Text(currentTab?.title ?? "")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .padding(.leading, 3)
+                    Spacer(minLength: 0)
                     if !thread.live {
-                        Text("offline")
-                            .font(.caption2)
+                        Text(tr("offline"))
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(.secondary)
                             .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(Color.white.opacity(0.1))
+                            .background(Color.gray.opacity(0.22))
                             .clipShape(Capsule())
                     }
                 }
-                Text(preview(thread))
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundColor(.secondary)
-                    .lineLimit(7)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(8)
-                    .background(model.background)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                .padding(.horizontal, 10)
+                .padding(.bottom, 7)
+                Group {
+                    if live {
+                        // The terminal itself lands here; the frame is reported.
+                        Color.clear
+                            .background(GeometryReader { geo in
+                                Color.clear
+                                    .onAppear { cardFrame = geo.frame(in: .named("screen")) }
+                                    .onChange(of: geo.frame(in: .named("screen"))) { _, f in cardFrame = f }
+                            })
+                    } else {
+                        Text(preview(thread))
+                            .font(.system(size: 7, design: .monospaced))
+                            .lineSpacing(1)
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 7)
+                    }
+                }
+                .frame(height: 92, alignment: .topLeading)
+                .background(thread.live ? model.background : Color.black.opacity(0.4))
+                .clipped()
             }
-            .padding(10)
-            .background(Color.white.opacity(thread.current ? 0.12 : 0.06))
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).stroke(thread.current ? Color.accentColor : Color.clear, lineWidth: 1))
+            .background(Color(red: 0.10, green: 0.11, blue: 0.13))
+            .clipShape(RoundedRectangle(cornerRadius: 13))
+            .overlay(RoundedRectangle(cornerRadius: 13).stroke(live ? Color.accentColor : Color.white.opacity(0.07), lineWidth: live ? 2 : 1))
         }
         .buttonStyle(.plain)
-        .foregroundColor(.white)
     }
 
-    /// The current thread's terminal, its last rows; another thread's is
-    /// not on this phone, and shows what it holds.
-    private func preview(_ thread: ThreadView) -> String {
-        if thread.current, let screen = ViewJSON.decode(ScreenText.self, model.core.screenText()) {
-            let rows = screen.text.split(separator: "\n", omittingEmptySubsequences: false)
-                .map { $0.replacingOccurrences(of: "\u{2060}", with: "").trimmingCharacters(in: .whitespaces) }
-            let kept = rows.reversed().drop(while: { $0.isEmpty }).reversed().suffix(7)
-            return kept.joined(separator: "\n")
+    /// The rows fetched for the thread's pane in their colours, trailing
+    /// blank rows dropped, each cut at about a half-width card's worth.
+    private func preview(_ thread: ThreadView) -> AttributedString {
+        guard let pane = previewPane(thread), let fetched = model.previews[pane] else { return AttributedString("") }
+        let kept = Array(fetched.reversed().drop(while: { $0.runs.isEmpty }).reversed().suffix(rows))
+        var out = AttributedString()
+        for (i, row) in kept.enumerated() {
+            var used = 0
+            for run in row.runs {
+                let room = 38 - used
+                if room <= 0 { break }
+                var piece = AttributedString(String(run.text.prefix(room)))
+                piece.foregroundColor = Color(hex: run.fg) ?? .white
+                out += piece
+                used += min(run.text.count, room)
+            }
+            if i < kept.count - 1 { out += AttributedString("\n") }
         }
-        return thread.tabs.map { "· " + ($0.title.isEmpty ? "Tab \($0.tab)" : $0.title) }.joined(separator: "\n")
+        return out
     }
 }

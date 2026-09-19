@@ -8,6 +8,7 @@ struct HostEditView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject var store: HostStore
     @State var host: Host
+    @ObservedObject private var lang = AppLanguage.shared
     @State private var secret = ""
     @State private var passphrase = ""
     @State private var hasStoredSecret = false
@@ -28,12 +29,12 @@ struct HostEditView: View {
             }
             .scrollContentBackground(.hidden)
             .background(Color.black.ignoresSafeArea())
-            .navigationTitle(host.hostname.isEmpty ? "New host" : host.display)
+            .navigationTitle(host.hostname.isEmpty ? tr("newhost") : host.display)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) { Button(tr("cancel")) { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") {
+                    Button(tr("save")) {
                         save(host, secret, passphrase.isEmpty ? nil : passphrase)
                         dismiss()
                     }
@@ -46,10 +47,10 @@ struct HostEditView: View {
                 importKey(result)
             }
             .alert(
-                "Import failed",
+                tr("key.importfailed"),
                 isPresented: Binding(get: { importError != nil }, set: { if !$0 { importError = nil } })
             ) {
-                Button("OK", role: .cancel) { importError = nil }
+                Button(tr("ok"), role: .cancel) { importError = nil }
             } message: {
                 Text(importError ?? "")
             }
@@ -57,21 +58,21 @@ struct HostEditView: View {
     }
 
     private var hostSection: some View {
-        Section("Host") {
-            labelled("Name") {
-                TextField("Optional", text: $host.name)
+        Section(tr("f.host")) {
+            labelled(tr("f.name")) {
+                TextField(tr("optional"), text: $host.name)
             }
-            labelled("Hostname") {
+            labelled(tr("f.hostname")) {
                 TextField("example.com or 10.0.0.4", text: $host.hostname)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .keyboardType(.URL)
             }
-            labelled("Port") {
+            labelled(tr("f.port")) {
                 TextField("22", value: $host.port, format: .number)
                     .keyboardType(.numberPad)
             }
-            labelled("User") {
+            labelled(tr("f.user")) {
                 TextField("root", text: $host.user)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -81,8 +82,8 @@ struct HostEditView: View {
 
     private var groupSection: some View {
         Section {
-            labelled("Group") {
-                TextField("None", text: $host.group)
+            labelled(tr("f.group")) {
+                TextField(tr("none"), text: $host.group)
                     .autocorrectionDisabled()
             }
             if !store.groups.isEmpty {
@@ -113,15 +114,15 @@ struct HostEditView: View {
                 .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
             }
         } header: {
-            Text("Group")
+            Text(tr("f.group"))
         } footer: {
-            Text("Groups become sections in the host list.")
+            Text(tr("f.groupfoot"))
         }
     }
 
     private var authSection: some View {
-        Section("Authentication") {
-            Picker("Method", selection: $host.auth) {
+        Section(tr("f.auth")) {
+            Picker(tr("f.method"), selection: $host.auth) {
                 ForEach(Host.AuthKind.allCases) { kind in Text(kind.label).tag(kind) }
             }
             .pickerStyle(.segmented)
@@ -130,13 +131,13 @@ struct HostEditView: View {
 
             if host.auth == .key {
                 keyStatusRow
-                Button { pasteKey() } label: { Label("Paste from clipboard", systemImage: "doc.on.clipboard") }
-                Button { importing = true } label: { Label("Import file…", systemImage: "folder") }
-                Button { generateKey() } label: { Label("Generate new key", systemImage: "key.fill") }
+                Button { pasteKey() } label: { Label(tr("key.paste"), systemImage: "doc.on.clipboard") }
+                Button { importing = true } label: { Label(tr("key.import"), systemImage: "folder") }
+                Button { generateKey() } label: { Label(tr("key.generate"), systemImage: "key.fill") }
                 if let publicKey = host.publicKey, !publicKey.isEmpty {
                     publicKeyRow(publicKey)
                 }
-                DisclosureGroup("Paste key text", isExpanded: $showKeyText) {
+                DisclosureGroup(tr("key.pastetext"), isExpanded: $showKeyText) {
                     TextEditor(text: $secret)
                         .font(.system(size: 11, design: .monospaced))
                         .frame(minHeight: 120)
@@ -145,9 +146,9 @@ struct HostEditView: View {
                         .scrollContentBackground(.hidden)
                         .onChange(of: secret) { _, _ in refreshPublicKey() }
                 }
-                SecureField("Key passphrase (if any)", text: $passphrase)
+                SecureField(tr("key.passphrase"), text: $passphrase)
             } else {
-                SecureField("Password", text: $secret)
+                SecureField(tr("f.password"), text: $secret)
             }
         }
     }
@@ -176,13 +177,13 @@ struct HostEditView: View {
                 copiedPublicKey = true
             } label: {
                 Label(
-                    copiedPublicKey ? "Copied" : "Copy public key",
+                    copiedPublicKey ? tr("copied") : tr("key.copypub"),
                     systemImage: copiedPublicKey ? "checkmark" : "doc.on.doc"
                 )
                 .font(.subheadline)
             }
             .buttonStyle(.bordered)
-            Text("Add this line to ~/.ssh/authorized_keys on the host.")
+            Text(tr("key.authorized"))
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -191,20 +192,20 @@ struct HostEditView: View {
 
     private var advancedSection: some View {
         Section {
-            DisclosureGroup("Advanced", isExpanded: $showAdvanced) {
+            DisclosureGroup(tr("f.advanced"), isExpanded: $showAdvanced) {
                 VStack(alignment: .leading, spacing: 6) {
-                    TextField("Remote command", text: $host.remoteCommand)
+                    TextField(tr("f.remotecmd"), text: $host.remoteCommand)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .font(.system(size: 13, design: .monospaced))
-                    Text("Blank runs `thinkterm cli --prefer-mux proxy` on the host.")
+                    Text(tr("f.remotecmd.foot"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 .padding(.vertical, 4)
                 if let known = host.knownHost {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Host key")
+                        Text(tr("f.hostkey"))
                             .font(.subheadline)
                         Text(known)
                             .font(.system(size: 11, design: .monospaced))
@@ -216,7 +217,7 @@ struct HostEditView: View {
                     Button(role: .destructive) {
                         host.knownHost = nil
                     } label: {
-                        Label("Forget host key", systemImage: "xmark.shield")
+                        Label(tr("forgetkey"), systemImage: "xmark.shield")
                     }
                 }
             }
@@ -244,11 +245,11 @@ struct HostEditView: View {
     private var keyStatus: (text: String, symbol: String, tint: Color) {
         if !secret.isEmpty {
             return host.publicKey == nil
-                ? ("Key loaded", "checkmark.seal.fill", .green)
-                : ("ed25519 key loaded", "checkmark.seal.fill", .green)
+                ? (tr("key.loaded"), "checkmark.seal.fill", .green)
+                : (tr("key.loaded.ed25519"), "checkmark.seal.fill", .green)
         }
-        if hasStoredSecret { return ("Key stored", "lock.fill", .green) }
-        return ("No key yet", "exclamationmark.triangle.fill", .orange)
+        if hasStoredSecret { return (tr("key.stored"), "lock.fill", .green) }
+        return (tr("key.none"), "exclamationmark.triangle.fill", .orange)
     }
 
     private var keyComment: String { "\(host.user)@thinkterm-ios" }
@@ -273,7 +274,7 @@ struct HostEditView: View {
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             guard let text = try? String(contentsOf: url, encoding: .utf8) else {
-                importError = "That file is not readable as text."
+                importError = tr("key.notext")
                 return
             }
             secret = text

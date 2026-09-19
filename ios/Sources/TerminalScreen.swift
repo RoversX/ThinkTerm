@@ -4,16 +4,31 @@ import SwiftUI
 /// key bar, and the sidebar and menus as sheets.
 struct TerminalScreen: View {
     @StateObject private var model: TerminalModel
+    @ObservedObject private var settings = AppSettings.shared
+    @ObservedObject private var lang = AppLanguage.shared
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.dismiss) private var dismiss
-    @State private var showSidebar = false
-    @State private var showSessions = false
+    @State private var showTree = false
     @State private var showLog = false
     @State private var showSettings = false
     @State private var menu: MenuSheet?
     @State private var editingHost: Host?
     /// A bar being dragged moves the divider it hangs from.
     @State private var barDrag: CGPoint?
+    /// The bar's width, for the strip in its middle: a principal item is
+    /// centred and clipped when wider than its slot, so it is sized.
+    @State private var barWidth: CGFloat = 402
+    /// The software keyboard is up: the key bar shows with it.
+    @State private var keyboardUp = false
+    /// The overview: the terminal shrinks into its thread's card and the
+    /// cards fade in around it, as the desktop's Live Overview zooms out.
+    @State private var overviewOpen = false
+    @State private var overviewShown = false
+    @State private var terminalFrame: CGRect = .zero
+    @State private var cardFrame: CGRect?
+    @State private var zoomScale: CGFloat = 1
+    @State private var zoomOffset: CGSize = .zero
+    @State private var zoomClip: CGFloat?
 
     init(host: Host?, store: HostStore?) {
         _model = StateObject(wrappedValue: TerminalModel(host: host, store: store))
@@ -23,33 +38,80 @@ struct TerminalScreen: View {
     /// button and the menu; the keys sit below the terminal, and nothing
     /// else. Every piece of chrome takes the terminal's own background.
     var body: some View {
-        VStack(spacing: 0) {
-            terminal
-            statusLine
-            KeyBar(model: model)
+        ZStack(alignment: .topLeading) {
+            if overviewShown {
+                OverviewScreen(model: model, isPresented: $overviewShown, cardFrame: $cardFrame, liveThread: currentThreadId)
+                    .opacity(overviewOpen ? 1 : 0)
+                    .onChange(of: overviewShown) { _, shown in if !shown { closeOverview() } }
+            }
+            // Above the cards, so the shrunken terminal shows in its card;
+            // untouchable meanwhile, so the cards get the taps.
+            VStack(spacing: 0) {
+                if twoLevel {
+                    tabSubstrip.opacity(overviewOpen ? 0 : 1)
+                }
+                terminal
+                    .background(GeometryReader { geo in
+                        Color.clear
+                            .onAppear { terminalFrame = geo.frame(in: .named("screen")) }
+                            .onChange(of: geo.frame(in: .named("screen"))) { _, f in terminalFrame = f }
+                    })
+                    .mask(alignment: .top) {
+                        Rectangle().frame(height: zoomClip)
+                    }
+                    .scaleEffect(zoomScale, anchor: .topLeading)
+                    .offset(zoomOffset)
+                    .zIndex(2)
+                    .allowsHitTesting(!overviewOpen)
+                statusLine.opacity(overviewOpen ? 0 : 1)
+                if keyboardUp && !overviewOpen {
+                    KeyBar(model: model)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
+            .animation(.easeOut(duration: 0.2), value: keyboardUp)
+            .zIndex(1)
+            .allowsHitTesting(!overviewOpen)
         }
-        .background(model.background)
+        .coordinateSpace(name: "screen")
+        .background(overviewOpen ? Color(white: 0.06) : model.background)
+        .background(GeometryReader { geo in
+            Color.clear.onAppear { barWidth = geo.size.width }
+                .onChange(of: geo.size.width) { _, w in barWidth = w }
+        })
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { note in
+            let frame = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect) ?? .zero
+            keyboardUp = frame.height > 0
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            keyboardUp = false
+        }
+        .onChange(of: cardFrame) { _, frame in
+            // The card's thumbnail is laid out: the terminal goes there.
+            if overviewShown, let frame, !overviewOpen { zoom(into: frame) }
+        }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .tabBar)
         .toolbarBackground(model.background, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbar {
-            ToolbarItem(placement: .principal) { tabStrip }
-            ToolbarItem(placement: .topBarTrailing) { moreMenu }
+            ToolbarItem(placement: .principal) { tabStrip.frame(width: max(barWidth - 190, 120)) }
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button { if overviewShown { overviewShown = false } else { openOverview() } } label: {
+                    Image(systemName: "square.grid.2x2")
+                }
+                moreMenu
+            }
         }
         .ignoresSafeArea(.container, edges: .bottom)
-        .sheet(isPresented: $showSidebar) {
-            SidebarSheet(model: model, isPresented: $showSidebar)
-        }
-        .sheet(isPresented: $showSessions) {
-            SessionsSheet(model: model, isPresented: $showSessions, menu: $menu, showSidebar: $showSidebar)
-                .presentationDetents([.medium, .large])
+        .sheet(isPresented: $showTree) {
+            TreeSheet(model: model, isPresented: $showTree, menu: $menu)
         }
         .sheet(isPresented: $showSettings) {
             NavigationStack {
                 SettingsView(model: model, showLog: $showLog)
                     .toolbar {
-                        ToolbarItem(placement: .confirmationAction) { Button("Done") { showSettings = false } }
+                        ToolbarItem(placement: .confirmationAction) { Button(tr("done")) { showSettings = false } }
                     }
             }
         }
@@ -69,9 +131,19 @@ struct TerminalScreen: View {
         }
         .onAppear {
             // The automated flows connect on their own schedule.
-            if !ProcessInfo.processInfo.arguments.contains(where: { $0.hasSuffix("test") || $0 == "--autoconnect" }) {
+            let args = ProcessInfo.processInfo.arguments
+            if !args.contains(where: { $0.hasSuffix("test") || $0 == "--autoconnect" }) {
                 model.connect()
             }
+            #if DEBUG
+            // Screenshots of the sheets, which no script can tap open.
+            if args.contains("--open-tree") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 14) { showTree = true }
+            }
+            if args.contains("--open-overview") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 14) { openOverview() }
+            }
+            #endif
         }
         .onDisappear {
             model.shutdown()
@@ -92,7 +164,7 @@ struct TerminalScreen: View {
     }
 
     private var hostName: String {
-        model.host?.display ?? "This Mac"
+        model.host?.display ?? tr("thismac")
     }
 
     private var statusColor: Color {
@@ -102,61 +174,190 @@ struct TerminalScreen: View {
         return .red
     }
 
-    /// The connection's state and the tabs, in the bar's middle.
+    /// The desktop's two layers, as two rows: threads (the sidebar's
+    /// layer, one per workspace) in the navigation bar, the current
+    /// thread's tabs in a strip under it. A server without threads (no
+    /// session state) shows its tabs in the bar instead.
+    private var twoLevel: Bool { settings.tabBarLevels == "two" && !(model.threads?.threads.isEmpty ?? true) }
+
     private var tabStrip: some View {
         HStack(spacing: 6) {
             Circle().fill(statusColor).frame(width: 7, height: 7)
+            ScrollViewReader { reader in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 4) {
-                    ForEach(model.tabs?.tabs ?? []) { tab in
-                        Button {
-                            model.chromeClick("pane", pane: tab.target)
-                        } label: {
-                            Text(tab.label.isEmpty ? "Tab \(tab.tab)" : tab.label)
-                                .font(.system(size: 12, weight: tab.current ? .semibold : .regular))
-                                .lineLimit(1)
+                    if twoLevel {
+                        ForEach(model.threads?.threads ?? []) { thread in
+                            Button {
+                                // The one on show opens the tree; another is shown.
+                                if thread.current { showTree = true } else { model.sideClick("thread", id: thread.id) }
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Circle().fill(threadColor(thread)).frame(width: 6, height: 6)
+                                    Text(thread.name)
+                                        .font(.system(size: 12, weight: thread.current ? .semibold : .regular))
+                                        .lineLimit(1)
+                                }
                                 .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(tab.current ? Color.white.opacity(0.18) : Color.white.opacity(0.06))
+                                .frame(minWidth: 64, minHeight: 26)
+                                .background(thread.current ? Color.white.opacity(0.18) : Color.white.opacity(0.06))
                                 .clipShape(Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu {
+                                AppMenuItems(model: model, kind: "thread", id: thread.id)
+                            }
+                            .id("thread:" + thread.id)
+                        }
+                        Button { model.sideClick("new-thread") } label: {
+                            Image(systemName: "plus").font(.system(size: 13, weight: .semibold)).padding(6)
+                                .foregroundColor(Color.white.opacity(0.62))
                         }
                         .buttonStyle(.plain)
-                        .contextMenu {
-                            Button("Close tab", role: .destructive) { model.chromeClick("close-tab", tab: tab.tab) }
-                            Button("More…") { menu = MenuSheet(kind: "tab", id: String(tab.tab), title: "Tab") }
-                        }
+                    } else {
+                        tabPills(size: 12, height: 26)
+                        newTabButton
                     }
-                    Button { model.chromeClick("new-tab") } label: {
-                        Image(systemName: "plus").font(.system(size: 13, weight: .semibold)).padding(6)
-                    }
-                    .buttonStyle(.plain)
                 }
+            }
+            .onChange(of: model.threads?.threads.first(where: { $0.current })?.id) { _, id in
+                if let id { reader.scrollTo("thread:" + id, anchor: .center) }
+            }
+            .onChange(of: model.tabs?.tabs.first(where: { $0.current })?.tab) { _, tab in
+                if let tab, !twoLevel { reader.scrollTo("tab:\(tab)", anchor: .center) }
+            }
             }
         }
         .foregroundColor(.white)
     }
 
+    /// The current thread's tabs, under the bar.
+    private var tabSubstrip: some View {
+        HStack(spacing: 4) {
+            ScrollViewReader { reader in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 4) {
+                        tabPills(size: 11.5, height: 22)
+                    }
+                }
+                .onChange(of: model.tabs?.tabs.first(where: { $0.current })?.tab) { _, tab in
+                    if let tab { reader.scrollTo("tab:\(tab)", anchor: .center) }
+                }
+            }
+            newTabButton
+        }
+        .foregroundColor(.white)
+        .padding(.horizontal, 8)
+        .frame(height: 32)
+        .contentShape(Rectangle())
+        // Pinching the strip zooms out to the overview.
+        .gesture(MagnifyGesture().onEnded { value in
+            if value.magnification < 0.8 { openOverview() }
+        })
+        .background(model.background)
+    }
+
+    private func tabPills(size: CGFloat, height: CGFloat) -> some View {
+        ForEach(model.tabs?.tabs ?? []) { tab in
+            Button {
+                model.chromeClick("pane", pane: tab.target)
+            } label: {
+                Text(tab.label.isEmpty ? tr("tab.num", tab.tab) : tab.label)
+                    .font(.system(size: size, weight: tab.current ? .semibold : .regular))
+                    .lineLimit(1)
+                    .padding(.horizontal, 10)
+                    .frame(minWidth: 76, maxWidth: 140, minHeight: height)
+                    .foregroundColor(tab.current ? .white : Color.white.opacity(0.62))
+                    .background(tab.current ? Color.white.opacity(0.18) : Color.white.opacity(0.06))
+                    .clipShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .contextMenu {
+                AppMenuItems(model: model, kind: "tab", id: String(tab.tab))
+            }
+            .id("tab:\(tab.tab)")
+        }
+    }
+
+    private var newTabButton: some View {
+        Button { model.chromeClick("new-tab") } label: {
+            Image(systemName: "plus").font(.system(size: 13, weight: .semibold)).padding(6)
+                .foregroundColor(Color.white.opacity(0.62))
+        }
+        .buttonStyle(.plain)
+    }
+
+    static func threadColor(status: String, live: Bool) -> Color {
+        switch status {
+        case "Running": return .green
+        case "NeedsAttention": return .orange
+        case "Done": return .blue
+        default: return live ? .gray : .gray.opacity(0.4)
+        }
+    }
+
+    private func threadColor(_ t: ThreadView) -> Color { Self.threadColor(status: t.status, live: t.live) }
+
     private var moreMenu: some View {
         Menu {
             Section(hostName) {
-                Button(connected ? "Disconnect" : "Reconnect") {
+                Button(connected ? tr("disconnect") : tr("reconnect")) {
                     if connected { model.disconnect() } else { model.connect() }
                 }
             }
-            Button("Split right") { model.chromeClick("split-right") }
-            Button("Split below") { model.chromeClick("split-below") }
-            Button("Zoom pane") { model.chromeClick("zoom") }
-            Button("Pane…") { menu = MenuSheet(kind: "pane", id: String(model.tabs?.tabs.first(where: { $0.current })?.target ?? 0), title: "Pane") }
+            Button(tr("split.right")) { model.chromeClick("split-right") }
+            Button(tr("split.below")) { model.chromeClick("split-below") }
+            Button(tr("zoom")) { model.chromeClick("zoom") }
+            Button(tr("pane")) { menu = MenuSheet(kind: "pane", id: String(model.tabs?.tabs.first(where: { $0.current })?.target ?? 0), title: tr("pane.title")) }
             Divider()
-            Button("Sessions…") { showSessions = true }
-            Button("Threads…") { showSidebar = true }
-            Button("Paste") { model.pasteFromClipboard() }
+            Button(tr("m.threadstabs")) { showTree = true }
+            Button(tr("m.overview")) { openOverview() }
+            Button(tr("paste")) { model.pasteFromClipboard() }
             Divider()
-            Button("Settings…") { showSettings = true }
-            Button("Close pane", role: .destructive) { model.chromeClick("close") }
+            Button(tr("m.settings")) { showSettings = true }
+            Button(tr("closepane"), role: .destructive) { model.chromeClick("close") }
         } label: {
             Image(systemName: "ellipsis")
         }
+    }
+
+    // MARK: the overview's zoom
+
+    private var currentThreadId: String? { model.threads?.threads.first(where: { $0.current })?.id }
+
+    private func openOverview() {
+        guard !overviewShown else { return }
+        model.refreshViews()
+        cardFrame = nil
+        overviewShown = true
+        // Without a card of its own (no threads, or none current) the
+        // terminal only fades.
+        if currentThreadId == nil {
+            withAnimation(.easeOut(duration: 0.25)) { overviewOpen = true }
+        }
+    }
+
+    /// Shrink the terminal into the card's thumbnail: scaled to its
+    /// width, moved to its corner, and masked to its height.
+    private func zoom(into frame: CGRect) {
+        guard terminalFrame.width > 0 else { return }
+        let scale = frame.width / terminalFrame.width
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
+            overviewOpen = true
+            zoomScale = scale
+            zoomOffset = CGSize(width: frame.minX - terminalFrame.minX, height: frame.minY - terminalFrame.minY)
+            zoomClip = frame.height / scale
+        }
+    }
+
+    private func closeOverview() {
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.9)) {
+            overviewOpen = false
+            zoomScale = 1
+            zoomOffset = .zero
+            zoomClip = nil
+        }
+        cardFrame = nil
     }
 
     // MARK: the terminal with its overlays
@@ -165,8 +366,20 @@ struct TerminalScreen: View {
         ZStack(alignment: .topLeading) {
             MetalView()
             TerminalInput()
-            if model.navs.count > 1 {
+            if model.navs.count > 1 && settings.paneBars {
                 navBars
+            }
+            if settings.scrollbar && model.scroll.1 > 0 && model.scrollShown {
+                scrollbar
+            }
+            if settings.devMode {
+                Text(model.stats)
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.7))
+                    .padding(4)
+                    .background(Color.black.opacity(0.5))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                    .allowsHitTesting(false)
             }
             if let composing = model.composing {
                 Text(composing)
@@ -181,6 +394,15 @@ struct TerminalScreen: View {
             }
             if showLog {
                 logView
+            }
+            if model.reconnecting && !settings.autoReconnect && ConnectionPhase(status: model.connection) == nil {
+                // Asked not to redial: the card offers it instead.
+                ConnectionCard(phase: .disconnected, hostName: hostName, canEdit: model.host != nil) { action in
+                    switch action {
+                    case .back: dismiss()
+                    default: model.connect()
+                    }
+                }
             }
             if let phase = ConnectionPhase(status: model.connection) {
                 ConnectionCard(phase: phase, hostName: hostName, canEdit: model.host != nil) { action in
@@ -202,6 +424,24 @@ struct TerminalScreen: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(model.inset)
         .background(model.background)
+    }
+
+    /// A thin bar at the right: where the view is in the scrollback.
+    private var scrollbar: some View {
+        GeometryReader { geo in
+            let (above, max) = model.scroll
+            let total = CGFloat(max) + geo.size.height / Swift.max(model.cellHeight, 1)
+            let visible = geo.size.height / Swift.max(model.cellHeight, 1)
+            let thumb = Swift.max(geo.size.height * visible / Swift.max(total, 1), 24)
+            let track = geo.size.height - thumb
+            let y = track * (1 - CGFloat(above) / CGFloat(Swift.max(max, 1)))
+            RoundedRectangle(cornerRadius: 2)
+                .fill(Color.white.opacity(0.35))
+                .frame(width: 3, height: thumb)
+                .offset(x: geo.size.width - 6, y: y)
+        }
+        .allowsHitTesting(false)
+        .transition(.opacity)
     }
 
     /// The App leaves rows above each pane for its bar; these draw it,
@@ -255,8 +495,8 @@ struct TerminalScreen: View {
         .background(model.background)
         .background(Color.white.opacity(nav.focused ? 0.1 : 0.04))
         .contentShape(Rectangle())
-        .onLongPressGesture {
-            menu = MenuSheet(kind: "pane", id: String(nav.rect.pane), title: "Pane")
+        .contextMenu {
+            AppMenuItems(model: model, kind: "pane", id: String(nav.rect.pane))
         }
         .gesture(barDragGesture(nav))
         .offset(x: nav.rect.left, y: nav.rect.top)
@@ -322,7 +562,7 @@ struct TerminalScreen: View {
 
     @ViewBuilder
     private var statusLine: some View {
-        let text = model.copied ? "Copied" : (model.toastText ?? "")
+        let text = model.copied ? tr("copied") : (model.toastText ?? "")
         let showing = !text.isEmpty || model.connection.hasPrefix("connecting") || model.connection.hasPrefix("disconnected") || model.connection.hasPrefix("failed") || model.connection.contains("reconnect")
         if showing {
             Text(text.isEmpty ? model.connection : text)
@@ -345,8 +585,53 @@ struct MenuSheet: Identifiable {
     var key: String { kind + ":" + id }
 }
 
+/// The App's context menu for something, as the system menu that a long
+/// press opens: its items, checks, separators and submenus, built when
+/// the menu shows.
+struct AppMenuItems: View {
+    @ObservedObject var model: TerminalModel
+    var kind: String
+    var id: String
+
+    var body: some View {
+        let items = model.contextMenu(kind, id: id)
+        ForEach(items, id: \.rowId) { item in
+            Self.row(item, model: model)
+        }
+    }
+
+    static func row(_ item: MenuItem, model: TerminalModel) -> AnyView {
+        switch item.kind {
+        case "separator":
+            return AnyView(Divider())
+        case "header":
+            return AnyView(Text(item.label))
+        default:
+            if !item.submenu.isEmpty {
+                let subs = item.submenu
+                return AnyView(Menu(item.label) {
+                    ForEach(subs, id: \.rowId) { sub in row(sub, model: model) }
+                })
+            }
+            return AnyView(
+                Button {
+                    model.menuAction(item.id)
+                } label: {
+                    if item.checked {
+                        Label(item.label, systemImage: "checkmark")
+                    } else {
+                        Text(item.label)
+                    }
+                }
+                .disabled(!item.enabled)
+            )
+        }
+    }
+}
+
 struct MenuList: View {
     @ObservedObject var model: TerminalModel
+    @ObservedObject private var lang = AppLanguage.shared
     var sheet: MenuSheet
     var dismiss: () -> Void
     @State private var items: [MenuItem] = []
@@ -361,7 +646,7 @@ struct MenuList: View {
             .navigationTitle(sheet.title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Done", action: dismiss) }
+                ToolbarItem(placement: .cancellationAction) { Button(tr("done"), action: dismiss) }
             }
         }
         .onAppear { items = model.contextMenu(sheet.kind, id: sheet.id) }
@@ -404,133 +689,9 @@ struct MenuList: View {
     }
 }
 
-/// The keys a soft keyboard has not got, with sticky Ctrl and Alt.
-struct KeyBar: View {
-    @ObservedObject var model: TerminalModel
-
-    var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                key("esc") { model.key("Escape") }
-                key("tab") { model.key("Tab") }
-                toggle("ctrl", $model.ctrlSticky)
-                toggle("alt", $model.altSticky)
-                key("↑") { model.key("ArrowUp") }
-                key("↓") { model.key("ArrowDown") }
-                key("←") { model.key("ArrowLeft") }
-                key("→") { model.key("ArrowRight") }
-                key("home") { model.key("Home") }
-                key("end") { model.key("End") }
-                key("pgup") { model.key("PageUp") }
-                key("pgdn") { model.key("PageDown") }
-                key("-") { model.text("-") }
-                key("/") { model.text("/") }
-                key("|") { model.text("|") }
-                key("~") { model.text("~") }
-                key("^C") { model.key("c", ctrl: true) }
-                key("^D") { model.key("d", ctrl: true) }
-                key("^L") { model.key("l", ctrl: true) }
-                key("^Z") { model.key("z", ctrl: true) }
-                key("⌫") { model.key("Backspace") }
-            }
-            .padding(.horizontal, 6)
-        }
-        .frame(height: 38)
-        .background(model.background)
-    }
-
-    private func key(_ label: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(label)
-                .font(.system(size: 13, design: .monospaced))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(Color.white.opacity(0.08))
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-        }
-        .buttonStyle(.plain)
-        .foregroundColor(.white)
-    }
-
-    private func toggle(_ label: String, _ on: Binding<Bool>) -> some View {
-        Button { on.wrappedValue.toggle() } label: {
-            Text(label)
-                .font(.system(size: 13, design: .monospaced))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .background(on.wrappedValue ? Color.accentColor : Color.white.opacity(0.08))
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-        }
-        .buttonStyle(.plain)
-        .foregroundColor(.white)
-    }
-}
-
-/// The tabs and their panes, as a list: a tap shows one, a swipe closes
-/// a tab. This is where the strip and the pane menu went.
-struct SessionsSheet: View {
-    @ObservedObject var model: TerminalModel
-    @Binding var isPresented: Bool
-    @Binding var menu: MenuSheet?
-    @Binding var showSidebar: Bool
-
-    var body: some View {
-        NavigationStack {
-            List {
-                ForEach(model.tabs?.tabs ?? []) { tab in
-                    Section {
-                        ForEach(tab.panes, id: \.pane) { pane in
-                            Button {
-                                model.chromeClick("pane", pane: pane.pane)
-                                isPresented = false
-                            } label: {
-                                HStack {
-                                    Image(systemName: "terminal")
-                                        .foregroundColor(pane.current && tab.current ? .accentColor : .secondary)
-                                    Text(pane.title.isEmpty ? "shell" : pane.title)
-                                        .fontWeight(pane.current && tab.current ? .semibold : .regular)
-                                    Spacer()
-                                    if pane.current && tab.current {
-                                        Image(systemName: "checkmark").foregroundColor(.accentColor)
-                                    }
-                                }
-                            }
-                            .foregroundColor(.primary)
-                        }
-                    } header: {
-                        HStack {
-                            Text(tab.label.isEmpty ? "Tab \(tab.tab)" : tab.label)
-                            Spacer()
-                            Button("More…") {
-                                menu = MenuSheet(kind: "tab", id: String(tab.tab), title: "Tab")
-                                isPresented = false
-                            }
-                            .font(.caption)
-                        }
-                    }
-                    .swipeActions(edge: .trailing) {
-                        Button(role: .destructive) { model.chromeClick("close-tab", tab: tab.tab) } label: {
-                            Label("Close tab", systemImage: "xmark")
-                        }
-                    }
-                }
-            }
-            .navigationTitle("Sessions")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Done") { isPresented = false } }
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button { showSidebar = true; isPresented = false } label: { Image(systemName: "sidebar.left") }
-                    Button { model.chromeClick("new-tab") } label: { Image(systemName: "plus") }
-                }
-            }
-        }
-        .onAppear { model.refreshViews() }
-    }
-}
 
 /// Where a connection is, read off the core's status line.
-enum ConnectionPhase {
+enum ConnectionPhase: Equatable {
     case connecting(String)
     case attaching
     case reconnecting
@@ -565,6 +726,8 @@ enum ConnectionPhase {
 struct ConnectionCard: View {
     enum Action { case retry, forgetKeyAndRetry, edit, back }
 
+    @ObservedObject private var lang = AppLanguage.shared
+
     var phase: ConnectionPhase
     var hostName: String
     var canEdit: Bool
@@ -575,28 +738,28 @@ struct ConnectionCard: View {
             switch phase {
             case .connecting(let target):
                 ProgressView().controlSize(.large)
-                Text("Connecting to \(hostName)").font(.headline)
+                Text(tr("card.connecting", hostName)).font(.headline)
                 if !target.isEmpty {
                     Text(target).font(.caption.monospaced()).foregroundColor(.secondary)
                 }
                 steps(done: 0)
             case .attaching:
                 ProgressView().controlSize(.large)
-                Text("Starting ThinkTerm on \(hostName)").font(.headline)
+                Text(tr("card.attaching", hostName)).font(.headline)
                 steps(done: 1)
             case .reconnecting:
                 ProgressView().controlSize(.large)
-                Text("Reconnecting to \(hostName)…").font(.headline)
+                Text(tr("card.reconnecting", hostName)).font(.headline)
             case .disconnected:
                 Image(systemName: "bolt.slash").font(.system(size: 34)).foregroundColor(.secondary)
-                Text("Disconnected").font(.headline)
+                Text(tr("conn.disconnected")).font(.headline)
                 HStack {
-                    Button("Back") { act(.back) }.buttonStyle(.bordered)
-                    Button("Reconnect") { act(.retry) }.buttonStyle(.borderedProminent)
+                    Button(tr("back")) { act(.back) }.buttonStyle(.bordered)
+                    Button(tr("reconnect")) { act(.retry) }.buttonStyle(.borderedProminent)
                 }
             case .failed(let reason):
                 Image(systemName: "exclamationmark.triangle").font(.system(size: 34)).foregroundColor(.orange)
-                Text("Couldn't connect to \(hostName)").font(.headline).multilineTextAlignment(.center)
+                Text(tr("card.failed", hostName)).font(.headline).multilineTextAlignment(.center)
                 Text(reason)
                     .font(.caption.monospaced())
                     .foregroundColor(.secondary)
@@ -606,14 +769,14 @@ struct ConnectionCard: View {
                     Text(hint).font(.footnote).multilineTextAlignment(.center)
                 }
                 HStack {
-                    Button("Back") { act(.back) }.buttonStyle(.bordered)
+                    Button(tr("back")) { act(.back) }.buttonStyle(.bordered)
                     if canEdit {
-                        Button("Edit host") { act(.edit) }.buttonStyle(.bordered)
+                        Button(tr("edithost")) { act(.edit) }.buttonStyle(.bordered)
                     }
                     if reason.contains("key changed") && canEdit {
-                        Button("Forget key & retry") { act(.forgetKeyAndRetry) }.buttonStyle(.borderedProminent)
+                        Button(tr("forgetretry")) { act(.forgetKeyAndRetry) }.buttonStyle(.borderedProminent)
                     } else {
-                        Button("Retry") { act(.retry) }.buttonStyle(.borderedProminent)
+                        Button(tr("retry")) { act(.retry) }.buttonStyle(.borderedProminent)
                     }
                 }
             }
@@ -628,8 +791,8 @@ struct ConnectionCard: View {
 
     private func steps(done: Int) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            step("Secure connection", state: done > 0 ? 2 : 1)
-            step("ThinkTerm on the host", state: done > 1 ? 2 : (done == 1 ? 1 : 0))
+            step(tr("conn.step1"), state: done > 0 ? 2 : 1)
+            step(tr("conn.step2"), state: done > 1 ? 2 : (done == 1 ? 1 : 0))
         }
         .font(.footnote)
         .padding(.top, 4)
@@ -647,19 +810,19 @@ struct ConnectionCard: View {
     static func hint(for reason: String) -> String? {
         let r = reason.lowercased()
         if r.contains("refused the login") || r.contains("auth") {
-            return "The host did not accept the user name with this key or password."
+            return tr("hint.auth")
         }
         if r.contains("key changed") {
-            return "The host's key is not the one seen before. If the host was reinstalled, forget the old key."
+            return tr("hint.keychanged")
         }
         if r.contains("timed out") || r.contains("connection refused") || r.contains("unreachable") || r.contains("no route") {
-            return "The host did not answer on this address and port. Check the network, or a VPN such as Tailscale."
+            return tr("hint.unreachable")
         }
         if r.contains("not found") || r.contains("exit 127") || r.contains("no such file") {
-            return "ThinkTerm is not installed on the host, or not on its PATH."
+            return tr("hint.notfound")
         }
         if r.contains("codec") || r.contains("version") {
-            return "The host runs another version of ThinkTerm. Update one of the two."
+            return tr("hint.version")
         }
         return nil
     }

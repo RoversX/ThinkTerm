@@ -16,6 +16,9 @@ import CoreGraphics
 final class TerminalModel: ObservableObject, @unchecked Sendable {
     // The App's views, refreshed when the core says something changed.
     @Published var tabs: TabsView?
+    @Published var threads: ThreadsView?
+    /// The last rows of panes the overview asked about, by pane.
+    @Published var previews: [Int: [PreviewRow]] = [:]
     @Published var sidebar: SidebarView?
     @Published var navs: [NavView] = []
     @Published var status: StatusView?
@@ -42,6 +45,14 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     @Published var background = Color(white: 0.11)
     /// The App's font size in points, from its layout view.
     @Published private(set) var fontPt: Double = 11
+    /// The focused pane's place in its scrollback: rows above the bottom,
+    /// and rows there are; changes for a moment show the scrollbar.
+    @Published private(set) var scroll: (Int, Int) = (0, 0)
+    @Published private(set) var scrollShown = false
+    private var scrollTimer: Timer?
+    /// The background task that holds the connection after the app leaves
+    /// the screen, for as long as iOS allows.
+    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     @Published var animating = false
     /// The log view is open: the stats are worth refreshing.
     var wantsStats = false
@@ -108,10 +119,25 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         applyScheme()
         settings.$schemeName.dropFirst().sink { [weak self] _ in self?.applyScheme() }.store(in: &subscriptions)
         settings.$smoothScroll.dropFirst().sink { [weak self] _ in self?.applyScrollMode() }.store(in: &subscriptions)
+        applyTerminalPrefs()
+        settings.$cursorStyle.dropFirst().sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
+        settings.$cursorBlink.dropFirst().sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
+        settings.$contrast.dropFirst().sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
+        settings.$resizeMode.dropFirst().sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
+        settings.$autoReconnect.dropFirst().sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
+        settings.$paneBars.dropFirst().sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
+        // A face is shaped at connect time: the connection is made again.
+        settings.$fontFamily.dropFirst().removeDuplicates().sink { [weak self] _ in
+            guard let self, self.connection.hasPrefix("pane ") else { return }
+            self.disconnect()
+            self.connect()
+        }.store(in: &subscriptions)
+        settings.$devMode.sink { [weak self] on in self?.wantsStats = on || (self?.wantsStats ?? false) }.store(in: &subscriptions)
         if args.contains("--autotest") { scheduleAutotest() }
         if args.contains("--autoconnect") { scheduleAutoconnect() }
         if args.contains("--imetest") { scheduleImeTest() }
         if args.contains("--seltest") { scheduleSelectionTest() }
+        if args.contains("--treetest") { scheduleTreeTest() }
         if args.contains("--uitest") { scheduleUiTest() }
     }
 
@@ -125,8 +151,10 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
 
     // MARK: connection
 
+    /// The chosen face first, the symbols fallback after it.
     var fontPaths: [String] {
-        ["JetBrainsMono-Regular", "SymbolsNerdFontMono-Regular"].compactMap {
+        let face = settings.fontFamily == "Fira Code" ? "FiraCode-Regular" : "JetBrainsMono-Regular"
+        return [face, "SymbolsNerdFontMono-Regular"].compactMap {
             Bundle.main.path(forResource: $0, ofType: "ttf")
         }
     }
@@ -174,7 +202,8 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         core.connect(
             host: hostname, port: UInt16(clamping: port), user: user,
             authKind: authKind, secret: secret, passphrase: passphrase, knownHost: knownHost,
-            remoteCommand: remoteCommand, deviceId: Self.deviceId, fontPaths: paths, sizePt: settings.fontSize,
+            remoteCommand: remoteCommand, deviceId: Self.deviceId, keepaliveSecs: UInt32(max(settings.keepAliveSeconds, 0)),
+            fontPaths: paths, sizePt: settings.fontSize,
             painter: CoreTextPainter()
         )
     }
@@ -260,6 +289,40 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         core.setSetting(key: "scroll-mode", value: smoothScroll ? "\"smooth\"" : "\"stepped\"")
     }
 
+    /// The preferences the shared App honours, as its JSON values.
+    private func applyTerminalPrefs() {
+        let style = ["auto", "block", "bar", "underline"].contains(settings.cursorStyle) ? settings.cursorStyle : "auto"
+        core.setSetting(key: "cursor-style", value: "\"\(style)\"")
+        core.setSetting(key: "cursor-blink", value: settings.cursorBlink ? "true" : "false")
+        let contrast: Double = ["3": 3, "45": 4.5, "7": 7][settings.contrast] ?? 0
+        core.setSetting(key: "min-contrast", value: String(contrast))
+        core.setSetting(key: "resize-mode", value: settings.resizeMode == "release" ? "\"release\"" : "\"live\"")
+        core.setSetting(key: "auto-reconnect", value: settings.autoReconnect ? "true" : "false")
+        core.setSetting(key: "pane-bars", value: settings.paneBars ? "true" : "false")
+    }
+
+    /// The tab `by` places along the strip from the current one, shown.
+    func switchTab(by: Int) {
+        guard let tabs = tabs?.tabs, !tabs.isEmpty,
+              let at = tabs.firstIndex(where: { $0.current }) else { return }
+        let next = at + by
+        guard tabs.indices.contains(next) else { return }
+        chromeClick("pane", pane: tabs[next].target)
+    }
+
+    /// The last rows of a pane, for a thumbnail; `previews` fills in.
+    func requestPreview(pane: Int, rows: Int = 8) {
+        core.requestPreview(pane: UInt32(pane), rows: UInt32(rows))
+    }
+
+    /// A pane rang its bell: a buzz, if the setting says so.
+    fileprivate func coreBell() {
+        DispatchQueue.main.async {
+            guard self.settings.bell else { return }
+            UINotificationFeedbackGenerator().notificationOccurred(.warning)
+        }
+    }
+
     func stepFont(_ by: Double) { core.stepFont(by: by) }
 
     // MARK: the App's chrome
@@ -303,6 +366,8 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         if tabs != self.tabs { self.tabs = tabs }
         let sidebar = ViewJSON.decode(SidebarView.self, core.view(name: "sidebar"))
         if sidebar != self.sidebar { self.sidebar = sidebar }
+        let threads = ViewJSON.decode(ThreadsView.self, core.view(name: "threads"))
+        if threads != self.threads { self.threads = threads }
         let navs = ViewJSON.decode([NavView].self, core.view(name: "navs")) ?? []
         if navs != self.navs { self.navs = navs }
         let status = ViewJSON.decode(StatusView.self, core.view(name: "status"))
@@ -315,6 +380,18 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
            let end = layout[r.upperBound...].firstIndex(of: "]") {
             let parts = layout[r.upperBound..<end].split(separator: ",")
             if parts.count == 2, let h = Double(parts[1]), h > 0 { cellHeight = h }
+        }
+        if let r = layout.range(of: "\"scroll\":["),
+           let end = layout[r.upperBound...].firstIndex(of: "]") {
+            let parts = layout[r.upperBound..<end].split(separator: ",")
+            if parts.count == 2, let a = Int(parts[0]), let b = Int(parts[1]), (a, b) != scroll {
+                scroll = (a, b)
+                scrollShown = true
+                scrollTimer?.invalidate()
+                scrollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self] _ in
+                    self?.scrollShown = false
+                }
+            }
         }
         if let r = layout.range(of: "\"font_pt\":"),
            let end = layout[r.upperBound...].firstIndex(where: { $0 == "," || $0 == "}" }),
@@ -372,9 +449,28 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     func detachForBackground() {
         detach()
         report("background")
+        if settings.keepSessionInBackground {
+            // iOS grants about half a minute; the socket lives that long.
+            backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "thinkterm-connection") { [weak self] in
+                self?.endBackgroundTask()
+            }
+        } else if connection.hasPrefix("pane ") {
+            disconnect()
+        }
+    }
+
+    private func endBackgroundTask() {
+        if backgroundTask != .invalid {
+            UIApplication.shared.endBackgroundTask(backgroundTask)
+            backgroundTask = .invalid
+        }
     }
 
     func reattachAfterBackground() {
+        endBackgroundTask()
+        if !settings.keepSessionInBackground, connection.hasPrefix("disconnected") {
+            connect()
+        }
         guard wantsSurface, generation == 0, let layer, let size = drawableSize(of: layer) else { return }
         attach(layer, width: size.0, height: size.1, scale: size.2)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self.report("foreground") }
@@ -569,6 +665,40 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
 
     /// The native selection's document against the core: the rows read
     /// back, a programmatic selection lands in the core and copies.
+    /// Threads on a bare server: a project, two threads in it, and the
+    /// two-level strip that follows.
+    private func scheduleTreeTest() {
+        let q = DispatchQueue.main
+        var project: String?
+        q.asyncAfter(deadline: .now() + 1.5) { self.connectProbe() }
+        q.asyncAfter(deadline: .now() + 4.0) { self.sideClick("new-project") }
+        q.asyncAfter(deadline: .now() + 4.6) { self.sideKey("Enter", value: "/tmp/ttp-srv") }
+        q.asyncAfter(deadline: .now() + 6.5) {
+            self.refreshViews()
+            project = self.sidebar?.rows.compactMap { row -> String? in
+                if case .project(let id, _, _, _, false) = row { return id }
+                return nil
+            }.first
+            self.check("project made", project != nil, self.sidebar?.new_project_error ?? "\(self.sidebar?.rows.count ?? -1) rows")
+            if let project { self.sideClick("new-thread", id: project) }
+        }
+        q.asyncAfter(deadline: .now() + 9.5) {
+            self.refreshViews()
+            let threads = self.threads?.threads ?? []
+            self.check("thread listed", threads.count >= 1, "\(threads.count) threads")
+            self.check("thread current with a tab", threads.contains { $0.current && !$0.tabs.isEmpty }, threads.map { "\($0.name):\($0.tabs.count):\($0.current)" }.joined(separator: " "))
+            if let project { self.sideClick("new-thread", id: project) }
+        }
+        q.asyncAfter(deadline: .now() + 12.5) {
+            self.refreshViews()
+            let threads = self.threads?.threads ?? []
+            self.check("second thread", threads.count >= 2, "\(threads.count) threads")
+            self.check("one current", threads.filter(\.current).count == 1, threads.map { "\($0.name):\($0.current)" }.joined(separator: " "))
+            self.report("tree done")
+            print("TREETEST DONE")
+        }
+    }
+
     private func scheduleSelectionTest() {
         let q = DispatchQueue.main
         q.asyncAfter(deadline: .now() + 1.5) { self.connectProbe() }
@@ -714,6 +844,11 @@ private final class NotifySink: Notify, @unchecked Sendable {
     }
     func onHostKey(fingerprint: String) { model?.coreHostKey(fingerprint) }
     func onPublished(key: String, value: String) { model?.corePublished(key, value) }
+    func onBell() { model?.coreBell() }
+    func onPreview(pane: UInt32, rows: String) {
+        let decoded = ViewJSON.decode([PreviewRow].self, rows) ?? []
+        DispatchQueue.main.async { self.model?.previews[Int(pane)] = decoded }
+    }
 }
 
 /// Paints the graphemes the bundled faces lack with CoreText, which falls

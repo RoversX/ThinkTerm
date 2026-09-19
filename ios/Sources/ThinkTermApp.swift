@@ -3,7 +3,6 @@ import SwiftUI
 @main
 struct ThinkTermApp: App {
     @StateObject private var store = HostStore()
-    @State private var path = NavigationPath()
 
     var body: some Scene {
         WindowGroup {
@@ -12,24 +11,7 @@ struct ThinkTermApp: App {
                     // The automated flows go straight to the probe's host.
                     NavigationStack { TerminalScreen(host: nil, store: store) }
                 } else {
-                    TabView {
-                        NavigationStack(path: $path) {
-                            HostsView()
-                                .onAppear {
-                                    // A saved host for the probe, with its key
-                                    // in the Keychain, opened over the list: the
-                                    // same path a real host takes, back included.
-                                    if path.isEmpty, let seeded = Self.seededHost(into: store) {
-                                        path.append(seeded)
-                                    }
-                                }
-                        }
-                        .tabItem { Label("Hosts", systemImage: "server.rack") }
-                        NavigationStack {
-                            SettingsView(model: nil, showLog: nil)
-                        }
-                        .tabItem { Label("Settings", systemImage: "gearshape") }
-                    }
+                    RootTabs(store: store)
                 }
             }
             .environmentObject(store)
@@ -58,5 +40,34 @@ struct ThinkTermApp: App {
         #else
         return nil
         #endif
+    }
+}
+
+/// The two tabs. Its own view so the language switch relabels the tab bar
+/// with the rest of the app.
+private struct RootTabs: View {
+    let store: HostStore
+    @State private var path = NavigationPath()
+    @ObservedObject private var lang = AppLanguage.shared
+
+    var body: some View {
+        TabView {
+            NavigationStack(path: $path) {
+                HostsView()
+                    .onAppear {
+                        // A saved host for the probe, with its key in the
+                        // Keychain, opened over the list: the same path a
+                        // real host takes, back included.
+                        if path.isEmpty, let seeded = ThinkTermApp.seededHost(into: store) {
+                            path.append(seeded)
+                        }
+                    }
+            }
+            .tabItem { Label(tr("hosts"), systemImage: "server.rack") }
+            NavigationStack {
+                SettingsView(model: nil, showLog: nil)
+            }
+            .tabItem { Label(tr("settings"), systemImage: "gearshape") }
+        }
     }
 }

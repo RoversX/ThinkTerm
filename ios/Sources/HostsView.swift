@@ -4,6 +4,7 @@ import SwiftUI
 /// its own so the automated flows and a quick check need no setup.
 struct HostsView: View {
     @EnvironmentObject var store: HostStore
+    @ObservedObject private var lang = AppLanguage.shared
     @State private var editing: Host?
     @State private var adding = false
     @State private var search = ""
@@ -25,7 +26,7 @@ struct HostsView: View {
                 .listRowSeparator(.hidden)
             } else if matches.isEmpty {
                 Section {
-                    Text("No hosts match “\(search)”.")
+                    Text(tr("hosts.nomatch.q", search))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .center)
@@ -39,19 +40,19 @@ struct HostsView: View {
                 }
             } else {
                 ForEach(sections) { group in
-                    Section(group.title ?? "Other") {
+                    Section(group.title ?? tr("hosts.other")) {
                         ForEach(group.hosts) { row($0) }
                     }
                 }
             }
 
             #if DEBUG
-            Section("Development") {
+            Section(tr("dev")) {
                 NavigationLink(value: probe) {
                     HostRowLayout(
                         symbol: "hammer",
                         tint: .gray,
-                        title: "This Mac",
+                        title: tr("thismac"),
                         subtitle: "probe sshd on 127.0.0.1:2299"
                     )
                 }
@@ -61,9 +62,9 @@ struct HostsView: View {
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
         .background(Color.black.ignoresSafeArea())
-        .navigationTitle("Hosts")
+        .navigationTitle(tr("hosts"))
         .navigationBarTitleDisplayMode(.large)
-        .searchable(text: $search, placement: .navigationBarDrawer, prompt: "Search hosts")
+        .searchable(text: $search, placement: .navigationBarDrawer, prompt: tr("hosts.search"))
         .navigationDestination(for: Host.self) { host in
             if host.name == "probe" {
                 TerminalScreen(host: nil, store: store)
@@ -79,7 +80,7 @@ struct HostsView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button { adding = true } label: { Image(systemName: "plus") }
-                    .accessibilityLabel("Add host")
+                    .accessibilityLabel(tr("hosts.add"))
             }
         }
         .sheet(isPresented: $adding) {
@@ -99,15 +100,15 @@ struct HostsView: View {
             .environmentObject(store)
         }
         .confirmationDialog(
-            "Delete this host?",
+            tr("host.delete.title"),
             isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
             titleVisibility: .visible,
             presenting: pendingDelete
         ) { host in
-            Button("Delete \(host.display)", role: .destructive) { store.remove(host) }
-            Button("Cancel", role: .cancel) {}
+            Button(tr("host.delete.confirm", host.display), role: .destructive) { store.remove(host) }
+            Button(tr("cancel"), role: .cancel) {}
         } message: { _ in
-            Text("Its saved key or password is removed from the Keychain too.")
+            Text(tr("host.delete.body"))
         }
     }
 
@@ -117,19 +118,19 @@ struct HostsView: View {
             HostRow(host: host)
         }
         .swipeActions(edge: .trailing) {
-            Button(role: .destructive) { pendingDelete = host } label: { Label("Delete", systemImage: "trash") }
-            Button { editing = host } label: { Label("Edit", systemImage: "pencil") }
+            Button(role: .destructive) { pendingDelete = host } label: { Label(tr("delete"), systemImage: "trash") }
+            Button { editing = host } label: { Label(tr("edit"), systemImage: "pencil") }
                 .tint(.indigo)
         }
         .contextMenu {
-            Button { connecting = ConnectTarget(host: host) } label: { Label("Connect", systemImage: "bolt.horizontal") }
-            Button { editing = host } label: { Label("Edit", systemImage: "pencil") }
-            Button { duplicate(host) } label: { Label("Duplicate", systemImage: "plus.square.on.square") }
+            Button { connecting = ConnectTarget(host: host) } label: { Label(tr("connect"), systemImage: "bolt.horizontal") }
+            Button { editing = host } label: { Label(tr("edit"), systemImage: "pencil") }
+            Button { duplicate(host) } label: { Label(tr("duplicate"), systemImage: "plus.square.on.square") }
             if host.knownHost != nil {
-                Button { store.forgetHostKey(for: host.id) } label: { Label("Forget host key", systemImage: "xmark.shield") }
+                Button { store.forgetHostKey(for: host.id) } label: { Label(tr("forgetkey"), systemImage: "xmark.shield") }
             }
             Divider()
-            Button(role: .destructive) { pendingDelete = host } label: { Label("Delete", systemImage: "trash") }
+            Button(role: .destructive) { pendingDelete = host } label: { Label(tr("delete"), systemImage: "trash") }
         }
     }
 
@@ -138,7 +139,7 @@ struct HostsView: View {
     private func duplicate(_ host: Host) {
         var copy = host
         copy.id = UUID()
-        copy.name = (host.name.isEmpty ? host.display : host.name) + " copy"
+        copy.name = (host.name.isEmpty ? host.display : host.name) + tr("host.copysuffix")
         copy.lastConnected = nil
         if let secret = Keychain.load(account: host.id.uuidString) {
             Keychain.save(secret, account: copy.id.uuidString)
@@ -190,6 +191,7 @@ private struct ConnectTarget: Hashable {
 
 struct HostRow: View {
     let host: Host
+    @ObservedObject private var lang = AppLanguage.shared
 
     var body: some View {
         HostRowLayout(
@@ -202,7 +204,7 @@ struct HostRow: View {
                 Text(host.lastConnectedText)
                     .font(.caption)
                     .foregroundStyle(.tertiary)
-                Text(host.auth == .key ? "key" : "password")
+                Text(host.auth == .key ? tr("badge.key") : tr("badge.password"))
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 7)
@@ -253,6 +255,7 @@ extension HostRowLayout where Detail == EmptyView {
 
 struct HostsEmptyState: View {
     var add: () -> Void
+    @ObservedObject private var lang = AppLanguage.shared
 
     var body: some View {
         VStack(spacing: 10) {
@@ -260,15 +263,15 @@ struct HostsEmptyState: View {
                 .font(.system(size: 46, weight: .light))
                 .foregroundStyle(.secondary)
                 .padding(.bottom, 4)
-            Text("No hosts yet")
+            Text(tr("hosts.empty"))
                 .font(.title3.weight(.semibold))
-            Text("Add a machine that has ThinkTerm installed. The app connects over ssh and attaches to its sessions.")
+            Text(tr("hosts.empty.body"))
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
             Button(action: add) {
-                Label("Add host", systemImage: "plus")
+                Label(tr("hosts.add"), systemImage: "plus")
                     .font(.headline)
                     .frame(maxWidth: .infinity)
             }
@@ -303,7 +306,9 @@ extension Host {
     }
 
     var lastConnectedText: String {
-        guard let last = lastConnected else { return "Never connected" }
+        guard let last = lastConnected else { return tr("hosts.never") }
+        // "13m ago" follows the app's language, not the phone's.
+        hostRelativeFormatter.locale = Locale(identifier: L10n.currentTag)
         return hostRelativeFormatter.localizedString(for: last, relativeTo: Date())
     }
 }
