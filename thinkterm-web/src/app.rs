@@ -34,6 +34,20 @@ pub enum Pointer {
     Up,
 }
 
+/// See `App::screen_text`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScreenText {
+    pub cols: usize,
+    pub rows: usize,
+    pub text: String,
+    /// The pane's content origin, in the viewport's units.
+    pub origin: [f64; 2],
+    /// One cell, in the viewport's units.
+    pub cell: [f64; 2],
+    /// The selection as two visible (row, col) cells, ordered, inclusive.
+    pub selection: Option<[[usize; 2]; 2]>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Selection {
     anchor: (StableRowIndex, usize),
@@ -750,6 +764,128 @@ impl<P: Platform, L: Link> App<P, L> {
         crate::views::StatusView { toast, card: Self::card(&inner), summary }
     }
 
+    /// The focused pane's visible rows as a document for a platform's text
+    /// system (the phone's native selection): every row exactly `cols`
+    /// UTF-16 units wide -- a wide glyph is followed by a word joiner for
+    /// its second cell, an empty cell is a space, a glyph outside the BMP
+    /// is a replacement character -- and rows joined by newlines, so a
+    /// position is `row * (cols + 1) + col`. The text copied comes from
+    /// `selection_text`, not from here.
+    pub fn screen_text(&self) -> Option<ScreenText> {
+        let inner = self.inner.borrow();
+        let place = Self::focused_placement(&inner)?;
+        let cell = inner.panes.get(&place.pane_id)?;
+        let (cols, rows) = Self::shown_in(&inner, &place);
+        if cols == 0 || rows == 0 {
+            return None;
+        }
+        let dims = cell.session.dimensions();
+        let visible = visible_rows(&dims, rows, cell.scroll_from_bottom);
+        let (first, lines) = cell.session.get_lines(visible.clone());
+        let mut text = String::with_capacity(rows * (cols + 1));
+        for i in 0..rows {
+            let row = visible.start + i as StableRowIndex;
+            let mut at = 0usize;
+            if row >= first {
+                if let Some(line) = lines.get((row - first) as usize) {
+                    for c in line.visible_cells() {
+                        let col = c.cell_index();
+                        if col >= cols {
+                            break;
+                        }
+                        while at < col {
+                            text.push(' ');
+                            at += 1;
+                        }
+                        let s = c.str();
+                        let ch = s.chars().next().unwrap_or(' ');
+                        text.push(if (ch as u32) > 0xffff { '\u{fffd}' } else { ch });
+                        at += 1;
+                        for _ in 1..c.width().max(1) {
+                            if at < cols {
+                                text.push('\u{2060}');
+                                at += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            while at < cols {
+                text.push(' ');
+                at += 1;
+            }
+            text.push('\n');
+        }
+        let (cw, ch) = Self::pane_cell(&inner, &place);
+        let root = inner.glyphs.metrics.cell_size;
+        let pad = Self::pad(&inner);
+        let nav = Self::content_offset(&inner, &place) as f64;
+        let [left, top, _, _] = inner.canvas_rect;
+        let dpr = inner.dpr.max(0.1);
+        let origin = [
+            left + (pad.0 as f64 + place.frame.left as f64 * root.width as f64) / dpr,
+            top + (pad.1 as f64 + place.frame.top as f64 * root.height as f64 + nav - cell.scroll_px as f64) / dpr,
+        ];
+        let selection = cell.selection.map(|sel| {
+            let ((r0, c0), (r1, c1)) = sel.ordered();
+            let clamp = |r: StableRowIndex, c: usize| {
+                let r = (r - visible.start).clamp(0, rows as StableRowIndex - 1) as usize;
+                [r, c.min(cols.saturating_sub(1))]
+            };
+            [clamp(r0, c0), clamp(r1, c1)]
+        });
+        Some(ScreenText {
+            cols,
+            rows,
+            text,
+            origin,
+            cell: [cw / dpr, ch / dpr],
+            selection,
+        })
+    }
+
+    /// Select from one visible cell to another in the focused pane, as a
+    /// platform's own selection handles ask; both ends inclusive.
+    pub fn set_selection(self: &Rc<Self>, anchor: (usize, usize), head: (usize, usize)) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            let Some(place) = Self::focused_placement(&inner) else {
+                return;
+            };
+            let (_, rows) = Self::shown_in(&inner, &place);
+            let Some(cell) = inner.panes.get_mut(&place.pane_id) else {
+                return;
+            };
+            let dims = cell.session.dimensions();
+            let visible = visible_rows(&dims, rows, cell.scroll_from_bottom);
+            cell.selection = Some(Selection {
+                anchor: (visible.start + anchor.0 as StableRowIndex, anchor.1),
+                head: (visible.start + head.0 as StableRowIndex, head.1),
+                mode: 1,
+            });
+            inner.selecting = false;
+        }
+        self.request_frame();
+    }
+
+    pub fn clear_selection(self: &Rc<Self>) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            let focused = inner.focused_pane;
+            if let Some(cell) = inner.panes.get_mut(&focused) {
+                if cell.selection.take().is_none() {
+                    return;
+                }
+            }
+        }
+        self.request_frame();
+    }
+
+    /// What is selected in the focused pane, for the platform's clipboard.
+    pub fn selected_text(&self) -> Option<String> {
+        Self::selection_text(&self.inner.borrow())
+    }
+
     pub fn layout_view(&self) -> String {
         Self::layout_json(&self.inner.borrow())
     }
@@ -1036,6 +1172,13 @@ impl<P: Platform, L: Link> App<P, L> {
                 cell.reconnect_stale = true;
             }
             log::info!("reconnected to pane {}", inner.focused_pane);
+            // The outage's remark ("connection lost; reconnecting") was
+            // sticky for as long as it was true; it is not any more.
+            *inner.toast.borrow_mut() = None;
+            // The server let the lease go with the socket. The listing
+            // that follows is a fresh showing: it claims the tab again,
+            // silently, unless another device took it meanwhile.
+            inner.auto_claimed = None;
         }
         self.refresh_status();
         self.request_frame();
@@ -2205,6 +2348,16 @@ impl<P: Platform, L: Link> App<P, L> {
 
     /// Rows of a frame the bar takes from the pane.
     fn nav_rows(inner: &Inner<P, L>) -> usize {
+        Self::nav_rows_for(inner, inner.tab_layout.as_ref().map_or(1, |l| l.panes.len()))
+    }
+
+    /// The bar's rows for a tab of `panes` panes. A phone shows a lone
+    /// pane bare, as its terminal apps do; the bar appears with a split,
+    /// when there is something to tell apart.
+    fn nav_rows_for(inner: &Inner<P, L>, panes: usize) -> usize {
+        if inner.platform.is_mobile() && panes <= 1 {
+            return 0;
+        }
         crate::navbar::nav_rows(Self::nav_css(inner) * inner.dpr, inner.glyphs.metrics.cell_size.height as f64)
     }
 
@@ -2817,9 +2970,11 @@ impl<P: Platform, L: Link> App<P, L> {
     /// a fresh listing. The same tab is reconciled in place; another tab
     /// is reported to the server first, since the lease is per tab.
     async fn show(self: &Rc<Self>, list: codec::ListPanesResponse, want: PaneId) {
-        let nav_rows = Self::nav_rows(&self.inner.borrow());
         let node = crate::layout::tab_containing(&list, want)
             .or_else(|| list.tabs.iter().find(|t| crate::layout::layout(t).is_some()));
+        // The rows the bars take depend on the tab about to be shown, not
+        // the one on screen: a split's second pane brings the bars with it.
+        let nav_rows = Self::nav_rows_for(&self.inner.borrow(), node.map_or(1, |n| crate::layout::leaves(n).len()));
         let lay = |node: &thinkterm_proto::layout::PaneNode| {
             let tab_size = node
                 .window_and_tab_ids()
