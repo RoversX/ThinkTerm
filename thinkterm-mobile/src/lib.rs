@@ -54,6 +54,11 @@ pub trait Notify: Send + Sync {
     /// Something the App publishes for the display layer, keyed: "bg" is
     /// the terminal's background as a hex colour, for the chrome around it.
     fn on_published(&self, key: String, value: String);
+    /// A pane rang its bell.
+    fn on_bell(&self);
+    /// The last rows of a pane, answering `request_preview`: JSON, a list
+    /// of rows, each a list of `{"text","fg"}` runs (`App::PreviewRow`).
+    fn on_preview(&self, pane: u32, rows: String);
 }
 
 /// Rust's `log` output goes to stdout, which the simulator's console shows;
@@ -190,6 +195,7 @@ impl Core {
         known_host: Option<String>,
         remote_command: String,
         device_id: String,
+        keepalive_secs: u32,
         font_paths: Vec<String>,
         size_pt: f64,
         painter: Box<dyn painter::GlyphPainter>,
@@ -211,6 +217,7 @@ impl Core {
                     auth,
                     known_host: known_host.filter(|k| !k.is_empty()),
                     remote_command,
+                    keepalive_secs: keepalive_secs as u64,
                 },
                 font_paths,
                 size_pt,
@@ -341,6 +348,11 @@ impl Core {
     }
 
     /// The selected text of the focused pane, for the clipboard.
+    /// Ask for the last `rows` rows of any pane; `on_preview` answers.
+    pub fn request_preview(&self, pane: u32, rows: u32) {
+        let _ = self.tx.send(core::Cmd::Preview { pane: pane as usize, rows: rows as usize });
+    }
+
     pub fn selected_text(&self) -> Option<String> {
         let (reply, ack) = mpsc::channel();
         if self.tx.send(core::Cmd::SelectedText { reply }).is_err() {

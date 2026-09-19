@@ -40,6 +40,8 @@ pub struct SshParams {
     pub known_host: Option<String>,
     /// The command to exec; empty means the default proxy invocation.
     pub remote_command: String,
+    /// Seconds between keep-alives; 0 sends none.
+    pub keepalive_secs: u64,
 }
 
 pub enum Out {
@@ -124,7 +126,7 @@ async fn run(
 ) -> Result<String> {
     let config = Arc::new(client::Config {
         inactivity_timeout: None,
-        keepalive_interval: Some(Duration::from_secs(15)),
+        keepalive_interval: (params.keepalive_secs > 0).then(|| Duration::from_secs(params.keepalive_secs)),
         keepalive_max: 3,
         ..Default::default()
     });

@@ -217,6 +217,10 @@ impl Platform for MobilePlatform {
 
     fn set_cursor(&self, _cursor: &str) {}
 
+    fn bell(&self) {
+        self.notify.on_bell();
+    }
+
     fn set_ime_anchor(&self, anchor: thinkterm_web::ime::Anchor) {
         self.notify
             .on_ime_anchor(anchor.left, anchor.top, anchor.width, anchor.height);

@@ -140,6 +140,10 @@ pub enum Cmd {
         head: (usize, usize),
     },
     ClearSelection,
+    Preview {
+        pane: usize,
+        rows: usize,
+    },
     SelectedText {
         reply: Sender<Option<String>>,
     },
@@ -515,6 +519,18 @@ impl State {
                     app.clear_selection();
                 }
             }
+            Cmd::Preview { pane, rows } => {
+                if let Some(app) = self.app.clone() {
+                    let notify = Arc::clone(&self.notify);
+                    let task = app.preview_lines(pane, rows);
+                    let _ = self.pool.spawner().spawn_local(async move {
+                        match task.await {
+                            Ok(rows) => notify.on_preview(pane as u32, json(&rows)),
+                            Err(err) => notify.on_log(format!("preview of pane {pane}: {err:#}")),
+                        }
+                    });
+                }
+            }
             Cmd::SelectedText { reply } => {
                 let _ = reply.send(self.app.as_ref().and_then(|app| app.selected_text()));
             }
@@ -561,6 +577,7 @@ impl State {
         };
         match name {
             "tabs" => json(&app.tabs_view()),
+            "threads" => json(&app.threads_view()),
             "sidebar" => json(&app.sidebar_view()),
             "navs" => json(&app.navs_view()),
             "status" => json(&app.status_view()),
@@ -861,6 +878,10 @@ impl State {
             languages: vec![],
         });
         host.events.set_wake(app.wake());
+        {
+            let platform = Rc::clone(&app.platform);
+            host.events.set_bell(Rc::new(move |_| platform.bell()));
+        }
         {
             let app = Rc::clone(&app);
             link.set_push_handler(Box::new(move |pdu| app.on_push(pdu)));
