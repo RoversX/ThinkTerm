@@ -28,6 +28,8 @@ EXTRA = {
     "ok": ["OK", "好", "OK", "OK", "OK"],
     "copy": ["Copy", "复制", "コピー", "Copier", "Kopieren"],
     "p.layout": ["Layout", "布局", "レイアウト", "Disposition", "Layout"],
+    "project.new": ["New project", "新建项目", "新規プロジェクト", "Nouveau projet", "Neues Projekt"],
+    "sidebar": ["Sidebar", "侧栏", "サイドバー", "Barre latérale", "Seitenleiste"],
     "thread.delete.title": ["Delete “%@”?", "删除“%@”？", "「%@」を削除しますか？", "Supprimer « %@ » ?", "„%@“ löschen?"],
     "thread.delete.body": [
         "Its tabs close and the programs in them end.",

@@ -20,6 +20,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     /// The last rows of panes the overview asked about, by pane.
     @Published var previews: [Int: [PreviewRow]] = [:]
     @Published var sidebar: SidebarView?
+    @Published var tree: TreeView?
     @Published var navs: [NavView] = []
     @Published var status: StatusView?
     @Published var title = ""
@@ -339,6 +340,15 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         core.sideKey(key: key, value: value)
     }
 
+    /// Show a thread, switching the Space on show to its own first when
+    /// it is in another one, so the strips follow.
+    func openThread(_ id: String, space: String?) {
+        if let space, tree?.spaces.first(where: { $0.current })?.id != space { core.setSpace(id: space) }
+        sideClick("thread", id: id)
+    }
+
+    func setSpace(_ id: String) { core.setSpace(id: id) }
+
     func contextMenu(_ kind: String, id: String) -> [MenuItem] {
         ViewJSON.decode([MenuItem].self, core.contextMenu(kind: kind, id: id)) ?? []
     }
@@ -368,6 +378,8 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         if sidebar != self.sidebar { self.sidebar = sidebar }
         let threads = ViewJSON.decode(ThreadsView.self, core.view(name: "threads"))
         if threads != self.threads { self.threads = threads }
+        let tree = ViewJSON.decode(TreeView.self, core.view(name: "tree"))
+        if tree != self.tree { self.tree = tree }
         let navs = ViewJSON.decode([NavView].self, core.view(name: "navs")) ?? []
         if navs != self.navs { self.navs = navs }
         let status = ViewJSON.decode(StatusView.self, core.view(name: "status"))

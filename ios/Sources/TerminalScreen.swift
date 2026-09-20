@@ -125,6 +125,16 @@ struct TerminalScreen: View {
             .zIndex(1)
             .allowsHitTesting(!overviewOpen)
         }
+        .overlay {
+            SidebarPanel(
+                model: model,
+                isPresented: $showTree,
+                hostName: hostName,
+                connected: connected,
+                onEditHost: { showTree = false; editingHost = model.host },
+                onSettings: { showTree = false; showSettings = true }
+            )
+        }
         .coordinateSpace(name: "screen")
         .background(overviewOpen ? Color(white: 0.06) : model.background)
         .background(GeometryReader { geo in
@@ -159,12 +169,6 @@ struct TerminalScreen: View {
             }
         }
         .ignoresSafeArea(.container, edges: .bottom)
-        .sheet(isPresented: $showTree) {
-            TreeSheet(model: model, isPresented: $showTree, menu: $menu, hostName: hostName, connected: connected, onEditHost: {
-                showTree = false
-                editingHost = model.host
-            })
-        }
         .sheet(isPresented: $showSettings) {
             NavigationStack {
                 SettingsView(model: model, showLog: $showLog)

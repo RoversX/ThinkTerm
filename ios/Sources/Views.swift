@@ -93,6 +93,25 @@ struct PaneRef: Decodable, Hashable, Identifiable {
     var id: Int { pane }
 }
 
+/// The tree whole, every Space with its projects and threads: `App::tree_view`.
+struct TreeView: Decodable, Hashable {
+    var spaces: [TreeSpace]
+}
+
+struct TreeSpace: Decodable, Hashable, Identifiable {
+    var id: String
+    var name: String
+    var current: Bool
+    var projects: [TreeProject]
+}
+
+struct TreeProject: Decodable, Hashable, Identifiable {
+    var id: String
+    var name: String
+    var path: String
+    var threads: [ThreadRow]
+}
+
 /// A thumbnail row: `App::PreviewRow`.
 struct PreviewRow: Decodable, Hashable {
     var runs: [PreviewRun]
@@ -188,7 +207,7 @@ enum SideRow: Decodable, Hashable, Identifiable {
     }
 }
 
-struct ThreadRow: Decodable, Hashable {
+struct ThreadRow: Decodable, Hashable, Identifiable {
     var id: String
     var project: String
     var name: String

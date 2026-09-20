@@ -2645,12 +2645,21 @@ impl<P: Platform, L: Link> App<P, L> {
 
     /// The sidebar's rows from the model, with the pending delete shown.
     fn side_rows(inner: &Inner<P, L>) -> Vec<crate::tree::Row> {
-        let deleting = inner
+        inner.tree.rows_with(inner.tab_id, &inner.workspace, inner.window_id, Self::deleting(inner))
+    }
+
+    fn deleting(inner: &Inner<P, L>) -> Option<&str> {
+        inner
             .deleting
             .as_ref()
             .filter(|(_, since)| inner.platform.monotonic_ms() - since < CLOSE_CONFIRM_MS)
-            .map(|(id, _)| id.as_str());
-        inner.tree.rows_with(inner.tab_id, &inner.workspace, inner.window_id, deleting)
+            .map(|(id, _)| id.as_str())
+    }
+
+    /// Every Space with its projects and threads: the TUI's sidebar tree.
+    pub fn tree_view(&self) -> crate::tree::TreeView {
+        let inner = self.inner.borrow();
+        inner.tree.tree(inner.tab_id, &inner.workspace, Self::deleting(&inner))
     }
 
     /// Ask the server for its tree, its session view and the agents in

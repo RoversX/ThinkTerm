@@ -45,6 +45,8 @@ class TerminalModel(
         private set
     var sidebar by mutableStateOf<SidebarView?>(null)
         private set
+    var tree by mutableStateOf<TreeView?>(null)
+        private set
     var navs by mutableStateOf<List<NavView>>(emptyList())
         private set
     var status by mutableStateOf<StatusView?>(null)
@@ -308,6 +310,15 @@ class TerminalModel(
 
     fun sideKey(key: String, value: String) = core.sideKey(key, value)
 
+    /// Show a thread, switching the Space on show to its own first when
+    /// it is in another one, so the strips follow.
+    fun openThread(id: String, spaceId: String?) {
+        if (spaceId != null && tree?.spaces?.firstOrNull { it.current }?.id != spaceId) core.setSpace(spaceId)
+        sideClick("thread", id)
+    }
+
+    fun setSpace(id: String) = core.setSpace(id)
+
     fun contextMenu(kind: String, id: String): List<MenuItem> = Views.menu(core.contextMenu(kind, id))
 
     /// Run a menu row. Copy and paste are the shell's to do.
@@ -349,6 +360,8 @@ class TerminalModel(
         if (sidebar != this.sidebar) this.sidebar = sidebar
         val threads = Views.threads(core.view("threads"))
         if (threads != this.threads) this.threads = threads
+        val tree = Views.tree(core.view("tree"))
+        if (tree != this.tree) this.tree = tree
         val navs = Views.navs(core.view("navs"))
         if (navs != this.navs) this.navs = navs
         val status = Views.status(core.view("status"))

@@ -68,6 +68,13 @@ data class ThreadTab(
 
 data class PaneRef(val pane: Int, val title: String)
 
+/// The tree whole, every Space with its projects and threads: `App::tree_view`.
+data class TreeView(val spaces: List<TreeSpace>)
+
+data class TreeSpace(val id: String, val name: String, val current: Boolean, val projects: List<TreeProject>)
+
+data class TreeProject(val id: String, val name: String, val path: String, val threads: List<ThreadRow>)
+
 /// A thumbnail row: `App::PreviewRow`.
 data class PreviewRow(val runs: List<PreviewRun>)
 
@@ -252,6 +259,40 @@ object Views {
             },
         )
     }
+
+    fun tree(json: String): TreeView? {
+        val root = obj(json) ?: return null
+        return TreeView(
+            root.optJSONArray("spaces").map { sp ->
+                TreeSpace(
+                    id = sp.optString("id"),
+                    name = sp.optString("name"),
+                    current = sp.optBoolean("current"),
+                    projects = sp.optJSONArray("projects").map { pr ->
+                        TreeProject(
+                            id = pr.optString("id"),
+                            name = pr.optString("name"),
+                            path = pr.optString("path"),
+                            threads = pr.optJSONArray("threads").map { threadRow(it) },
+                        )
+                    },
+                )
+            }
+        )
+    }
+
+    private fun threadRow(r: JSONObject) = ThreadRow(
+        id = r.optString("id"),
+        project = r.optString("project"),
+        name = r.optString("name"),
+        status = r.optString("status"),
+        dot = r.optString("dot"),
+        pinned = r.optBoolean("pinned"),
+        unread = r.optBoolean("unread"),
+        live = r.optBoolean("live"),
+        selected = r.optBoolean("selected"),
+        deleting = r.optBoolean("deleting"),
+    )
 
     fun previewRows(json: String): List<PreviewRow> {
         val arr = array(json) ?: return emptyList()

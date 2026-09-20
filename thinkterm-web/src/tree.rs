@@ -67,6 +67,28 @@ pub struct ThreadRow {
     pub deleting: bool,
 }
 
+/// The tree whole: `TreeModel::tree`.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+pub struct TreeView {
+    pub spaces: Vec<TreeSpace>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct TreeSpace {
+    pub id: String,
+    pub name: String,
+    pub current: bool,
+    pub projects: Vec<TreeProject>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct TreeProject {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub threads: Vec<ThreadRow>,
+}
+
 /// A Space as the Space menu lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpaceEntry {
@@ -229,6 +251,72 @@ impl TreeModel {
             .or(thread.planned_workspace_name.as_deref())
     }
 
+    fn thread_row(
+        &self,
+        t: &ThinkTermSessionThread,
+        project_id: &str,
+        selected: Option<&str>,
+        deleting: Option<&str>,
+    ) -> ThreadRow {
+        let live = !t.tabs.is_empty();
+        let is_selected = selected == Some(t.id.as_str());
+        let dot = if is_selected {
+            Dot::Active
+        } else if t.is_unread {
+            Dot::Unread
+        } else if t.is_pinned {
+            Dot::Pinned
+        } else if live {
+            Dot::Open
+        } else {
+            Dot::Quiet
+        };
+        ThreadRow {
+            id: t.id.clone(),
+            project_id: project_id.to_string(),
+            name: t.name.clone(),
+            status: self.status_of(t),
+            dot,
+            pinned: t.is_pinned,
+            unread: t.is_unread,
+            live,
+            selected: is_selected,
+            deleting: deleting == Some(t.id.as_str()),
+        }
+    }
+
+    /// The whole tree, every Space with its projects and their threads,
+    /// as the TUI's sidebar shows it; `rows` is one Space of it flattened
+    /// the desktop's way.
+    pub fn tree(&self, current_tab: TabId, current_workspace: &str, deleting: Option<&str>) -> TreeView {
+        let Some(session) = &self.session else {
+            return TreeView::default();
+        };
+        let selected = self.selected_thread(current_tab, current_workspace);
+        let current = self.current_space().map(|s| s.id.clone()).unwrap_or_default();
+        let spaces = session
+            .spaces
+            .iter()
+            .map(|space| TreeSpace {
+                id: space.id.clone(),
+                name: space.name.clone(),
+                current: space.id == current,
+                projects: session
+                    .projects
+                    .iter()
+                    .filter(|p| p.space_id == space.id)
+                    .map(|p| TreeProject {
+                        id: p.id.clone(),
+                        name: p.name.clone(),
+                        path: p.path.clone(),
+                        threads: p.threads.iter().map(|t| self.thread_row(t, &p.id, selected, deleting)).collect(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        TreeView { spaces }
+    }
+
     /// The worst of what the thread's panes are doing, the desktop's way:
     /// an agent waiting on someone, or a program that failed, outranks
     /// one still working, which outranks having finished unseen.
@@ -344,33 +432,7 @@ impl TreeModel {
         });
         rows.push(Row::NewThread);
         let in_space = |p: &&codec::ThinkTermSessionProject| p.space_id == space_id;
-        let thread_row = |t: &ThinkTermSessionThread, project_id: &str| {
-            let live = !t.tabs.is_empty();
-            let is_selected = selected == Some(t.id.as_str());
-            let dot = if is_selected {
-                Dot::Active
-            } else if t.is_unread {
-                Dot::Unread
-            } else if t.is_pinned {
-                Dot::Pinned
-            } else if live {
-                Dot::Open
-            } else {
-                Dot::Quiet
-            };
-            Row::Thread(ThreadRow {
-                id: t.id.clone(),
-                project_id: project_id.to_string(),
-                name: t.name.clone(),
-                status: self.status_of(t),
-                dot,
-                pinned: t.is_pinned,
-                unread: t.is_unread,
-                live,
-                selected: is_selected,
-                deleting: deleting == Some(t.id.as_str()),
-            })
-        };
+        let thread_row = |t: &ThinkTermSessionThread, project_id: &str| Row::Thread(self.thread_row(t, project_id, selected, deleting));
         let pinned: Vec<Row> = session
             .projects
             .iter()

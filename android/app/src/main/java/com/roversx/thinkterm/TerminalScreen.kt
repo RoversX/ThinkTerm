@@ -417,8 +417,14 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
             )
         }
 
-        if (showTree) {
-            TreeSheet(model = model, onDismiss = { showTree = false }, onEditHost = { showTree = false; editingHost = model.host })
+        Box(Modifier.fillMaxSize().zIndex(2.8f)) {
+            SidebarDrawer(
+                model = model,
+                visible = showTree,
+                onDismiss = { showTree = false },
+                onEditHost = { showTree = false; editingHost = model.host },
+                onSettings = { showSettings = true },
+            )
         }
         if (showSettings) {
             Box(Modifier.fillMaxSize().zIndex(3f).background(MaterialTheme.colorScheme.background)) {

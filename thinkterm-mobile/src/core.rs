@@ -578,6 +578,7 @@ impl State {
         match name {
             "tabs" => json(&app.tabs_view()),
             "threads" => json(&app.threads_view()),
+            "tree" => json(&app.tree_view()),
             "sidebar" => json(&app.sidebar_view()),
             "navs" => json(&app.navs_view()),
             "status" => json(&app.status_view()),
