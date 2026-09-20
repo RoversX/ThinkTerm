@@ -248,7 +248,8 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
             .onGloballyPositioned { boxOrigin = it.positionInRoot() }
     ) {
         if (overviewShown) {
-            Box(Modifier.fillMaxSize().graphicsLayer { alpha = zoom.value }) {
+            // Under the bar, which stays: the threads and the way back.
+            Box(Modifier.fillMaxSize().padding(top = 48.dp).graphicsLayer { alpha = zoom.value }) {
                 OverviewScreen(
                     model = model,
                     liveThread = currentThread?.id,
@@ -263,23 +264,27 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
         // strips and bars leave while the overview is up, so the cards get
         // the taps; the terminal's own touches close it.
         Column(Modifier.fillMaxSize().zIndex(1f).imePadding()) {
-            // The strips fade with the zoom and stop taking touches; their
-            // room stays, so the terminal's own place does not move under
-            // the zoom that was measured from it.
-            Column(
-                Modifier
-                    .graphicsLayer { alpha = 1f - zoom.value }
-                    .then(if (overviewOpen) Modifier.pointerInput(Unit) { awaitPointerEventScope { while (true) awaitPointerEvent().changes.forEach { it.consume() } } } else Modifier)
-            ) {
-                TopBar(
-                    model = model,
-                    twoLevel = twoLevel,
-                    onBack = { model.disconnect(); onBack() },
-                    onTree = { showTree = true },
-                    onOverview = { openOverview() },
-                    onEditHost = { editingHost = model.host },
-                )
-                if (twoLevel) TabSubstrip(model, onPinchOut = { openOverview() })
+            // The bar stays through the overview, as the iOS navigation bar
+            // does: the threads switch there and its grid button comes back.
+            TopBar(
+                model = model,
+                twoLevel = twoLevel,
+                onBack = { model.disconnect(); onBack() },
+                onTree = { showTree = true },
+                onOverview = { if (overviewShown) closeOverview() else openOverview() },
+                onEditHost = { editingHost = model.host },
+            )
+            // The tab strip fades with the zoom and stops taking touches;
+            // its room stays, so the terminal's own place does not move
+            // under the zoom that was measured from it.
+            if (twoLevel) {
+                Box(
+                    Modifier
+                        .graphicsLayer { alpha = 1f - zoom.value }
+                        .then(if (overviewOpen) Modifier.pointerInput(Unit) { awaitPointerEventScope { while (true) awaitPointerEvent().changes.forEach { it.consume() } } } else Modifier)
+                ) {
+                    TabSubstrip(model, onPinchOut = { openOverview() })
+                }
             }
 
             // The terminal, scaled to the card's width and moved into it as
