@@ -68,7 +68,11 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.platform.InterceptPlatformTextInput
+import androidx.compose.ui.platform.PlatformTextInputMethodRequest
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import android.view.inputmethod.EditorInfo
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -261,25 +265,29 @@ fun HostEditScreen(
                             modifier = Modifier.fillMaxWidth(),
                         )
                     }
-                    OutlinedTextField(
-                        value = passphrase,
-                        onValueChange = { passphrase = it },
-                        label = { Text(tr("key.passphrase")) },
-                        singleLine = true,
-                        visualTransformation = PasswordVisualTransformation(),
-                        keyboardOptions = plainKeyboard(KeyboardType.Password),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
+                    IncognitoKeyboard {
+                        OutlinedTextField(
+                            value = passphrase,
+                            onValueChange = { passphrase = it },
+                            label = { Text(tr("key.passphrase")) },
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            keyboardOptions = plainKeyboard(KeyboardType.Password),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 } else {
-                    OutlinedTextField(
-                        value = secret,
-                        onValueChange = { secret = it },
-                        label = { Text(tr("f.password")) },
-                        singleLine = true,
-                        visualTransformation = PasswordVisualTransformation(),
-                        keyboardOptions = plainKeyboard(KeyboardType.Password),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
+                    IncognitoKeyboard {
+                        OutlinedTextField(
+                            value = secret,
+                            onValueChange = { secret = it },
+                            label = { Text(tr("f.password")) },
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            keyboardOptions = plainKeyboard(KeyboardType.Password),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 }
             }
 
@@ -381,6 +389,27 @@ private fun EditField(
 }
 
 /// Nothing here is prose: no capitals of its own, no autocorrect.
+/// A secret is typed with the keyboard asked not to learn from it
+/// (`IME_FLAG_NO_PERSONALIZED_LEARNING`; Gboard shows its incognito
+/// look). Compose has no option for the flag, so it is set on the
+/// editor info as the field's input session starts.
+@OptIn(ExperimentalComposeUiApi::class)
+@Composable
+private fun IncognitoKeyboard(content: @Composable () -> Unit) {
+    InterceptPlatformTextInput(
+        interceptor = { request, next ->
+            next.startInputMethod(
+                PlatformTextInputMethodRequest { attrs ->
+                    request.createInputConnection(attrs).also {
+                        attrs.imeOptions = attrs.imeOptions or EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+                    }
+                }
+            )
+        },
+        content = content,
+    )
+}
+
 private fun plainKeyboard(keyboard: KeyboardType) = KeyboardOptions(
     keyboardType = keyboard,
     capitalization = KeyboardCapitalization.None,

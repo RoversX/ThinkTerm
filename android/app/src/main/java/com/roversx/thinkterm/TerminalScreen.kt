@@ -157,6 +157,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
             listOf(
                 settings.schemeName, settings.smoothScroll, settings.cursorStyle, settings.cursorBlink,
                 settings.contrast, settings.resizeMode, settings.autoReconnect, settings.paneBars, settings.fontFamily,
+                settings.incognitoKeyboard,
             )
         }.drop(1).collect { model.settingsChanged() }
     }

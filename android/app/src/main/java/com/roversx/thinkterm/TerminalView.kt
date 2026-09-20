@@ -192,6 +192,10 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
         isClickable = true
         model.onScreenChanged = { if (anchor != null) screen = null }
         model.onDropComposition = { dropComposition() }
+        model.onImeOptionsChanged = {
+            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.restartInput(this)
+        }
     }
 
     fun keyboardShown(): Boolean =
@@ -521,6 +525,11 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
             EditorInfo.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
             EditorInfo.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
         outAttrs.imeOptions = EditorInfo.IME_ACTION_NONE or EditorInfo.IME_FLAG_NO_EXTRACT_UI
+        if (settings.incognitoKeyboard) {
+            // What is typed into a shell is not the keyboard's to learn;
+            // Gboard shows its incognito look for this flag.
+            outAttrs.imeOptions = outAttrs.imeOptions or EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+        }
         return Connection(this)
     }
 

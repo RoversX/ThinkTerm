@@ -128,6 +128,7 @@ private fun SettingsList(
             PushRow(tr("cursor"), label(cursors(), settings.cursorStyle)) { onPush("cursor") }
             SwitchRow(tr("cursor.blink"), settings.cursorBlink) { settings.cursorBlink = it }
             SwitchRow(tr("bell"), settings.bell) { settings.bell = it }
+            SwitchRow(tr("keyboard.incognito"), settings.incognitoKeyboard) { settings.incognitoKeyboard = it }
             PushRow(tr("resize.mode"), label(resizes(), settings.resizeMode)) { onPush("resize.mode") }
 
             Section(tr("sec.interface"))

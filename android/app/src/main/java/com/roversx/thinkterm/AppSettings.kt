@@ -54,6 +54,9 @@ class AppSettings private constructor(private val prefs: SharedPreferences) {
     var cursorBlink by pref("cursor.blink", true)
     /// A pane's bell buzzes the phone.
     var bell by pref("bell", false)
+    /// The terminal's keyboard is asked not to learn from what is typed
+    /// (Gboard shows its incognito look). Password fields always are.
+    var incognitoKeyboard by pref("keyboard.incognito", true)
     /// "auto" or "live": the server's panes follow a divider drag as it
     /// goes; "release": once, when the finger lifts.
     var resizeMode by pref("resize.mode", "auto")

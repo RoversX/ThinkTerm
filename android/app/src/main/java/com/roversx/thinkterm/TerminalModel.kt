@@ -116,6 +116,10 @@ class TerminalModel(
     /// The connection changed under an open IME composition: the view
     /// lets it go, so it does not land in whatever comes next.
     var onDropComposition: (() -> Unit)? = null
+    /// The keyboard's options changed: the view starts its input over so
+    /// the IME reads them again.
+    var onImeOptionsChanged: (() -> Unit)? = null
+    private var appliedIncognito = settings.incognitoKeyboard
     var onScreenChanged: (() -> Unit)? = null
     var onHideKeyboard: (() -> Unit)? = null
     /// A selection stands: where its copy chip goes, in dp from the
@@ -170,6 +174,10 @@ class TerminalModel(
         applyScheme()
         applyScrollMode()
         applyTerminalPrefs()
+        if (settings.incognitoKeyboard != appliedIncognito) {
+            appliedIncognito = settings.incognitoKeyboard
+            onImeOptionsChanged?.invoke()
+        }
         // A face is shaped at connect time: the connection is made again.
         if (settings.fontFamily != appliedFamily) {
             appliedFamily = settings.fontFamily
