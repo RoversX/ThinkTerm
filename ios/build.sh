@@ -66,10 +66,20 @@ if [ "${1:-}" = xcode ]; then
 fi
 
 echo "== xcodebuild"
+build_log=$(mktemp "${TMPDIR:-/tmp}/thinkterm-ios-build.XXXXXX")
+trap 'rm -f "$build_log"' EXIT
+build_status=0
 xcodebuild -project ios/ThinkTerm.xcodeproj -scheme ThinkTerm \
   -configuration Debug -sdk iphonesimulator \
   -destination "platform=iOS Simulator,name=$SIM_NAME" \
-  -derivedDataPath "$DERIVED" build 2>&1 | grep -E "error:|warning: .*Sources/|BUILD (SUCCEEDED|FAILED)" || true
+  -derivedDataPath "$DERIVED" build >"$build_log" 2>&1 || build_status=$?
+if [ "$build_status" -ne 0 ]; then
+  cat "$build_log"
+  exit "$build_status"
+fi
+grep -E "error:|warning: .*Sources/|BUILD (SUCCEEDED|FAILED)" "$build_log" || true
+rm -f "$build_log"
+trap - EXIT
 APP="$DERIVED/Build/Products/Debug-iphonesimulator/ThinkTerm.app"
 test -d "$APP" || { echo "no app bundle at $APP" >&2; exit 1; }
 

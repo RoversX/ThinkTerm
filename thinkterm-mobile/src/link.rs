@@ -29,6 +29,22 @@ use tokio::sync::mpsc::UnboundedSender;
 #[derive(Clone)]
 pub struct SshLink(Rc<Inner>);
 
+#[cfg(test)]
+pub(crate) fn test_link() -> SshLink {
+    SshLink::new(
+        SshParams {
+            host: "unused".into(),
+            port: 22,
+            user: "test".into(),
+            auth: ssh::Auth::Password(String::new()),
+            known_host: None,
+            remote_command: String::new(),
+            keepalive_secs: 0,
+        },
+        Box::new(|| panic!("this test must not open a network connection")),
+    )
+}
+
 struct Inner {
     params: SshParams,
     /// How the network thread reaches the core thread with what arrives.
@@ -331,6 +347,9 @@ impl Link for SshLink {
         }
         self.0.open.set(false);
         self.0.serials.borrow_mut().drain();
+        // A reconnect task can still hold this link alive. Its dial must
+        // finish without waiting for network events the core now discards.
+        self.0.connecting.borrow_mut().take();
     }
 
     fn lease(&self) -> std::cell::Ref<'_, Lease> {
@@ -370,5 +389,38 @@ impl Link for SshLink {
     fn report_viewport(&self, tab_id: TabId) -> LocalFuture<Result<()>> {
         let link = self.clone();
         Box::pin(async move { link.report_viewport_now(tab_id).await })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::executor::LocalPool;
+    use futures::task::LocalSpawnExt;
+
+    #[test]
+    fn shutdown_releases_a_dial_waiter_that_still_holds_the_link() {
+        let link = test_link();
+        let weak = Rc::downgrade(&link.0);
+        // The pending response installed by connect, without a network thread.
+        let (tx, rx) = oneshot::channel();
+        *link.0.connecting.borrow_mut() = Some(tx);
+        let finished = Rc::new(Cell::new(false));
+        let mut pool = LocalPool::new();
+        let retained = link.clone();
+        let done = Rc::clone(&finished);
+        pool.spawner().spawn_local(async move {
+            assert!(rx.await.is_err());
+            drop(retained);
+            done.set(true);
+        }).unwrap();
+        pool.run_until_stalled();
+        assert!(!finished.get());
+
+        link.shutdown();
+        drop(link);
+        pool.run_until_stalled();
+        assert!(finished.get());
+        assert!(weak.upgrade().is_none());
     }
 }

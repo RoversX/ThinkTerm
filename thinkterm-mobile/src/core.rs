@@ -75,9 +75,9 @@ pub enum Cmd {
     /// so a retiring thread's last words never reach its successor.
     Net { serial: u64, net: Net },
     /// The first dial finished.
-    Dialed(Result<(), String>),
+    Dialed { serial: u64, outcome: Result<(), String> },
     /// The attach handshake finished.
-    Attached(Result<Attached, String>),
+    Attached { serial: u64, outcome: Result<Attached, String> },
     Key {
         name: String,
         ctrl: bool,
@@ -228,42 +228,7 @@ struct State {
 }
 
 pub fn run(cmd_tx: Sender<Cmd>, rx: Receiver<Cmd>, notify: Box<dyn Notify>) {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        #[cfg(target_vendor = "apple")]
-        backends: wgpu::Backends::METAL,
-        #[cfg(not(target_vendor = "apple"))]
-        backends: wgpu::Backends::PRIMARY,
-        ..Default::default()
-    });
-    let pool = LocalPool::new();
-    let notify: Arc<dyn Notify> = Arc::from(notify);
-    let platform = Rc::new(MobilePlatform::new(pool.spawner(), Arc::clone(&notify)));
-    let mut state = State {
-        cmd_tx,
-        instance,
-        adapter: None,
-        gpu: None,
-        app: None,
-        target: None,
-        next_generation: 1,
-        link_serial: 0,
-        attaching: false,
-        animating: false,
-        stats: Stats::default(),
-        notify,
-        pool,
-        platform,
-        link: None,
-        fonts: None,
-        glyph_platform: None,
-        size_pt: 11.0,
-        device_id: String::new(),
-        conn: Conn::Idle,
-        status: String::new(),
-        composing: false,
-        settings: Vec::new(),
-        palette: None,
-    };
+    let mut state = State::new(cmd_tx, notify);
     state.notify.on_log("core thread up".into());
     state.set_status("idle");
 
@@ -295,6 +260,45 @@ pub fn run(cmd_tx: Sender<Cmd>, rx: Receiver<Cmd>, notify: Box<dyn Notify>) {
 }
 
 impl State {
+    fn new(cmd_tx: Sender<Cmd>, notify: Box<dyn Notify>) -> Self {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            #[cfg(target_vendor = "apple")]
+            backends: wgpu::Backends::METAL,
+            #[cfg(not(target_vendor = "apple"))]
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
+        let pool = LocalPool::new();
+        let notify: Arc<dyn Notify> = Arc::from(notify);
+        let platform = Rc::new(MobilePlatform::new(pool.spawner(), Arc::clone(&notify)));
+        Self {
+            cmd_tx,
+            instance,
+            adapter: None,
+            gpu: None,
+            app: None,
+            target: None,
+            next_generation: 1,
+            link_serial: 0,
+            attaching: false,
+            animating: false,
+            stats: Stats::default(),
+            notify,
+            pool,
+            platform,
+            link: None,
+            fonts: None,
+            glyph_platform: None,
+            size_pt: 11.0,
+            device_id: String::new(),
+            conn: Conn::Idle,
+            status: String::new(),
+            composing: false,
+            settings: Vec::new(),
+            palette: None,
+        }
+    }
+
     fn handle(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Attach {
@@ -346,8 +350,8 @@ impl State {
                 self.set_status("disconnected");
             }
             Cmd::Net { serial, net } => self.on_net(serial, net),
-            Cmd::Dialed(outcome) => self.on_dialed(outcome),
-            Cmd::Attached(outcome) => self.on_attached(outcome),
+            Cmd::Dialed { serial, outcome } => self.on_dialed(serial, outcome),
+            Cmd::Attached { serial, outcome } => self.on_attached(serial, outcome),
             Cmd::Key {
                 name,
                 ctrl,
@@ -638,7 +642,6 @@ impl State {
         self.glyph_platform = Some(Rc::new(GlyphSeams::new(painter)));
 
         let tx = self.cmd_tx.clone();
-        self.link_serial += 1;
         let serial = self.link_serial;
         let deliver: Box<dyn Fn() -> Box<dyn Fn(Net) + Send>> = Box::new(move || {
             let tx = tx.clone();
@@ -659,7 +662,7 @@ impl State {
             .spawner()
             .spawn_local(async move {
                 let outcome = dial.await.map_err(|e| format!("{e:#}"));
-                let _ = tx.send(Cmd::Dialed(outcome));
+                let _ = tx.send(Cmd::Dialed { serial, outcome });
             })
             .map_err(|e| anyhow!("spawning the dial: {e}"))?;
         Ok(())
@@ -670,6 +673,9 @@ impl State {
     /// surface, if lent, is dropped: the shell re-attaches it by calling
     /// `attach_surface` again, which is what it does on any change anyway.
     fn disconnect(&mut self) {
+        // Invalidate queued completions even if no new connection follows,
+        // or the next connect fails before it can create its link.
+        self.link_serial += 1;
         self.attaching = false;
         if let Some(link) = self.link.take() {
             link.shutdown();
@@ -729,7 +735,10 @@ impl State {
         }
     }
 
-    fn on_dialed(&mut self, outcome: Result<(), String>) {
+    fn on_dialed(&mut self, serial: u64, outcome: Result<(), String>) {
+        if serial != self.link_serial {
+            return;
+        }
         match outcome {
             Ok(()) => {
                 self.conn = Conn::Attaching;
@@ -842,12 +851,13 @@ impl State {
             ssh_auth_sock: None,
         };
         let tx = self.cmd_tx.clone();
+        let serial = self.link_serial;
         self.attaching = true;
         let spawned = self.pool.spawner().spawn_local(async move {
             let outcome = attach(&link, size, 0, me)
                 .await
                 .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(Cmd::Attached(outcome));
+            let _ = tx.send(Cmd::Attached { serial, outcome });
         });
         if let Err(err) = spawned {
             self.attaching = false;
@@ -855,7 +865,10 @@ impl State {
         }
     }
 
-    fn on_attached(&mut self, outcome: Result<Attached, String>) {
+    fn on_attached(&mut self, serial: u64, outcome: Result<Attached, String>) {
+        if serial != self.link_serial {
+            return;
+        }
         self.attaching = false;
         let attached = match outcome {
             Ok(attached) => attached,
@@ -1249,4 +1262,101 @@ fn stable_identity(device_id: &str) -> (u64, usize) {
     let epoch = fnv(device_id.as_bytes(), 0) & 0xffff_ffff;
     let id = (fnv(device_id.as_bytes(), 0x9e37_79b9_7f4a_7c15) & 0x7fff_ffff) as usize;
     (epoch, id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct QuietNotify;
+
+    impl Notify for QuietNotify {
+        fn on_frame_needed(&self) {}
+        fn on_status(&self, _: String) {}
+        fn on_log(&self, _: String) {}
+        fn on_title(&self, _: String) {}
+        fn on_change(&self) {}
+        fn on_clipboard(&self, _: String) {}
+        fn on_focus_input(&self) {}
+        fn on_ime_anchor(&self, _: f64, _: f64, _: f64, _: f64) {}
+        fn on_host_key(&self, _: String) {}
+        fn on_published(&self, _: String, _: String) {}
+        fn on_bell(&self) {}
+        fn on_preview(&self, _: u32, _: String) {}
+    }
+
+    fn state() -> State {
+        let (tx, _) = std::sync::mpsc::channel();
+        State::new(tx, Box::new(QuietNotify))
+    }
+
+    fn attached() -> Attached {
+        Attached {
+            pane_id: 1,
+            tab_id: 2,
+            window_id: 3,
+            workspace: String::new(),
+            title: String::new(),
+            dims: Default::default(),
+            alt_screen: false,
+            server_version: String::new(),
+            server_id: String::new(),
+        }
+    }
+
+    fn old_completions(serial: u64) -> Vec<Cmd> {
+        vec![
+            Cmd::Dialed { serial, outcome: Ok(()) },
+            Cmd::Dialed { serial, outcome: Err("old dial".into()) },
+            Cmd::Attached { serial, outcome: Ok(attached()) },
+            Cmd::Attached { serial, outcome: Err("old handshake".into()) },
+        ]
+    }
+
+    #[test]
+    fn disconnect_ignores_queued_completions_without_a_successor() {
+        let mut state = state();
+        let old = state.link_serial;
+        state.handle(Cmd::Disconnect);
+        for cmd in old_completions(old) {
+            state.handle(cmd);
+            assert_eq!(state.conn, Conn::Idle);
+            assert_eq!(state.status, "disconnected");
+            assert_eq!(state.stats.errors, 0);
+            assert!(!state.attaching);
+            assert!(state.link.is_none());
+        }
+    }
+
+    #[test]
+    fn old_completions_cannot_change_a_successor_or_clear_its_handshake() {
+        let mut state = state();
+        let old = state.link_serial;
+        state.handle(Cmd::Disconnect);
+        // Install a successor without opening a real SSH connection or GPU.
+        let link = crate::link::test_link();
+        link.opened();
+        state.link = Some(link.clone());
+        state.conn = Conn::Connecting;
+        state.set_status("new connection");
+        state.attaching = true;
+        for cmd in old_completions(old) {
+            state.handle(cmd);
+            assert_eq!(state.conn, Conn::Connecting);
+            assert_eq!(state.status, "new connection");
+            assert_eq!(state.stats.errors, 0);
+            assert!(state.attaching);
+            assert!(state.link.is_some());
+            assert!(link.is_open());
+        }
+        // The current generation must still deliver failures normally.
+        state.handle(Cmd::Attached {
+            serial: state.link_serial,
+            outcome: Err("current handshake".into()),
+        });
+        assert_eq!(state.conn, Conn::Disconnected("current handshake".into()));
+        assert!(!state.attaching);
+        assert!(state.link.is_none());
+        assert!(!link.is_open());
+    }
 }

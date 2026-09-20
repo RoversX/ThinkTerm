@@ -40,7 +40,17 @@ mkdir -p android/app/src/debug/assets
 [ -f /tmp/ttp-ssh/userkey ] && cp /tmp/ttp-ssh/userkey android/app/src/debug/assets/probe_key || true
 
 echo "== gradle"
-(cd android && "$GRADLE" --quiet assembleDebug 2>&1 | grep -E "error|warning: unused|BUILD|FAIL" || true)
+build_log=$(mktemp "${TMPDIR:-/tmp}/thinkterm-android-build.XXXXXX")
+trap 'rm -f "$build_log"' EXIT
+build_status=0
+(cd android && "$GRADLE" --quiet assembleDebug) >"$build_log" 2>&1 || build_status=$?
+if [ "$build_status" -ne 0 ]; then
+  cat "$build_log"
+  exit "$build_status"
+fi
+grep -E "error|warning: unused|BUILD|FAIL" "$build_log" || true
+rm -f "$build_log"
+trap - EXIT
 APK="android/app/build/outputs/apk/debug/app-debug.apk"
 test -f "$APK" || { echo "no APK at $APK" >&2; exit 1; }
 
