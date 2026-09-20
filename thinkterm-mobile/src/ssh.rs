@@ -119,6 +119,25 @@ pub fn spawn(params: SshParams, deliver: Box<dyn Fn(Net) + Send>) -> UnboundedSe
     out_tx
 }
 
+/// How long any one step of the handshake may take. The transport's
+/// own keepalive only starts once the login is through, so until then
+/// this is the only thing that ends a server that stops answering.
+const STEP: Duration = Duration::from_secs(15);
+
+async fn bounded<T, E>(
+    what: &'static str,
+    fut: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> Result<T>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match tokio::time::timeout(STEP, fut).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(anyhow::Error::new(err).context(what)),
+        Err(_) => Err(anyhow!("{what} timed out")),
+    }
+}
+
 async fn run(
     params: SshParams,
     mut out_rx: UnboundedReceiver<Out>,
@@ -136,7 +155,7 @@ async fn run(
         seen: Arc::clone(&seen),
     };
     let dial = tokio::time::timeout(
-        Duration::from_secs(15),
+        STEP,
         client::connect(config, (params.host.as_str(), params.port), handler),
     )
     .await
@@ -152,44 +171,44 @@ async fn run(
         Auth::KeyPath(path) => {
             let key = russh::keys::load_secret_key(path, None)
                 .with_context(|| format!("loading the key {path}"))?;
-            session
-                .authenticate_publickey(
+            bounded(
+                "publickey auth",
+                session.authenticate_publickey(
                     &params.user,
                     PrivateKeyWithHashAlg::new(Arc::new(key), None),
-                )
-                .await
-                .context("publickey auth")?
+                ),
+            )
+            .await?
         }
         Auth::KeyPem { pem, passphrase } => {
             let key = russh::keys::decode_secret_key(pem, passphrase.as_deref())
                 .context("reading the private key")?;
-            session
-                .authenticate_publickey(
+            bounded(
+                "publickey auth",
+                session.authenticate_publickey(
                     &params.user,
                     PrivateKeyWithHashAlg::new(Arc::new(key), None),
-                )
-                .await
-                .context("publickey auth")?
+                ),
+            )
+            .await?
         }
-        Auth::Password(password) => session
-            .authenticate_password(&params.user, password.as_str())
-            .await
-            .context("password auth")?,
+        Auth::Password(password) => bounded(
+            "password auth",
+            session.authenticate_password(&params.user, password.as_str()),
+        )
+        .await?,
     };
     if !auth.success() {
         anyhow::bail!("the host refused the login for {}", params.user);
     }
 
-    let mut channel = session
-        .channel_open_session()
-        .await
-        .context("opening a session channel")?;
+    let mut channel = bounded("opening a session channel", session.channel_open_session()).await?;
     let command = if params.remote_command.trim().is_empty() {
         DEFAULT_COMMAND
     } else {
         params.remote_command.as_str()
     };
-    channel.exec(true, command).await.context("exec")?;
+    bounded("exec", channel.exec(true, command)).await?;
     deliver(Net::Connected);
 
     // A write waits for the remote's window, and the window only grows

@@ -850,9 +850,12 @@ private final class NotifySink: Notify, @unchecked Sendable {
             self.model?.showCopied()
         }
     }
-    func onFocusInput() {
-        DispatchQueue.main.async { self.model?.focusKeyboard() }
-    }
+    /// The App asks for the input's focus after a press, a finished
+    /// rename and every answered request. On a phone that would raise
+    /// the keyboard over half the screen at each of them, so the ask is
+    /// honoured only while the keyboard is already up -- and then the
+    /// input is already first responder. A tap raises it on its own.
+    func onFocusInput() {}
     func onImeAnchor(left: Double, top: Double, width: Double, height: Double) {
         DispatchQueue.main.async {
             self.model?.cursorRect = CGRect(x: left, y: top, width: width, height: height)

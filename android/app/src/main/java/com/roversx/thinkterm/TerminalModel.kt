@@ -113,6 +113,9 @@ class TerminalModel(
     /// The view sets these so the core can ask for the keyboard and the
     /// selection can be redrawn when the screen changes.
     var onFocusRequested: (() -> Unit)? = null
+    /// The connection changed under an open IME composition: the view
+    /// lets it go, so it does not land in whatever comes next.
+    var onDropComposition: (() -> Unit)? = null
     var onScreenChanged: (() -> Unit)? = null
     var onHideKeyboard: (() -> Unit)? = null
     /// A selection stands: where its copy chip goes, in dp from the
@@ -459,6 +462,7 @@ class TerminalModel(
                 }
                 if (status.startsWith("connecting") || status.contains("reconnect") || status.startsWith("disconnected")) {
                     composing = null
+                    onDropComposition?.invoke()
                 }
                 changePending.set(true)
             }

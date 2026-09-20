@@ -4,7 +4,6 @@
 
 use anyhow::{ensure, Result};
 use std::sync::Arc;
-use std::time::Instant;
 use thinkterm_web::raster::{GlyphPlatform, ScratchGeometry, TextPainter};
 
 /// Implemented by the shell. Called on the core thread, synchronously,
@@ -34,21 +33,20 @@ pub trait GlyphPainter: Send + Sync {
 
 pub struct GlyphSeams {
     painter: Arc<dyn GlyphPainter>,
-    start: Instant,
 }
 
 impl GlyphSeams {
     pub fn new(painter: Box<dyn GlyphPainter>) -> Self {
         Self {
             painter: Arc::from(painter),
-            start: Instant::now(),
         }
     }
 }
 
 impl GlyphPlatform for GlyphSeams {
+    /// The platform's clock: the frame budget's deadline is set on it.
     fn now_ms(&self) -> f64 {
-        self.start.elapsed().as_secs_f64() * 1000.0
+        crate::platform::monotonic_ms()
     }
 
     fn painter(&self, geometry: &ScratchGeometry, _families: &str) -> Result<Box<dyn TextPainter>> {

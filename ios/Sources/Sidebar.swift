@@ -48,13 +48,18 @@ struct SidebarPanel: View {
             }
         }
         .onChange(of: model.sidebar?.editing) { _, editing in
-            guard let editing, editing.kind != "none", let id = editing.id else { return }
+            // A new project has no id yet: the same field, asking for the
+            // name of what is about to exist.
+            guard let editing, editing.kind != "none" else { return }
             if renaming == nil {
                 renameText = ""
-                renaming = (editing.kind, id)
+                renaming = (editing.kind, editing.id ?? "")
             }
         }
-        .alert(tr("rename"), isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
+        .alert(
+            renaming?.kind == "new-project" ? tr("project.new") : tr("rename"),
+            isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })
+        ) {
             TextField(tr("f.name"), text: $renameText)
             Button(tr("save")) {
                 model.sideKey("Enter", value: renameText)

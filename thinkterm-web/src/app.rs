@@ -4604,7 +4604,9 @@ impl<P: Platform, L: Link> App<P, L> {
     /// The panes as this page would claim them: the desktop's rule for
     /// each, at its own cell where it has its own font.
     fn native_panes(inner: &Inner<P, L>, layout: &crate::layout::TabLayout) -> Vec<codec::ClientPaneViewport> {
-        let nav_rows = Self::nav_rows(inner);
+        // The bar's rows for *this* layout: on a switch the one on show is
+        // still the outgoing tab's, and a phone shows a lone pane bare.
+        let nav_rows = Self::nav_rows_for(inner, layout.panes.len());
         let mut panes = layout.viewport(nav_rows);
         let root = inner.glyphs.metrics.cell_size;
         let nav = Self::nav_dev(inner) as f64;

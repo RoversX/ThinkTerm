@@ -108,10 +108,11 @@ private fun SidebarTree(model: TerminalModel, onDismiss: () -> Unit, onEditHost:
 
     LaunchedEffect(Unit) { model.refreshViews() }
     LaunchedEffect(editing) {
-        val id = editing?.id
-        if (editing == null || editing.kind == "none" || id == null || renaming != null) return@LaunchedEffect
+        // A new project has no id yet: the same field, asking for the
+        // name of what is about to exist.
+        if (editing == null || editing.kind == "none" || renaming != null) return@LaunchedEffect
         renameText = ""
-        renaming = editing.kind to id
+        renaming = editing.kind to (editing.id ?: "")
     }
 
     Column(Modifier.fillMaxSize()) {
@@ -302,7 +303,7 @@ private fun SidebarTree(model: TerminalModel, onDismiss: () -> Unit, onEditHost:
     if (renaming != null) {
         AlertDialog(
             onDismissRequest = { model.sideKey("Escape", ""); renaming = null },
-            title = { Text(tr("rename")) },
+            title = { Text(tr(if (renaming?.first == "new-project") "project.new" else "rename")) },
             text = { OutlinedTextField(value = renameText, onValueChange = { renameText = it }, label = { Text(tr("f.name")) }, singleLine = true) },
             confirmButton = { TextButton(onClick = { model.sideKey("Enter", renameText); renaming = null }) { Text(tr("save")) } },
             dismissButton = { TextButton(onClick = { model.sideKey("Escape", ""); renaming = null }) { Text(tr("cancel")) } },

@@ -22,8 +22,15 @@ struct Interval {
     cb: Box<dyn FnMut()>,
 }
 
+/// Milliseconds since the process's first look at the clock. The App's
+/// frame budget takes its deadline from the platform and checks it in
+/// the glyph cache, so both must read this one clock.
+pub fn monotonic_ms() -> f64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+}
+
 pub struct MobilePlatform {
-    start: Instant,
     spawner: LocalSpawner,
     notify: Arc<dyn Notify>,
     timers: RefCell<Vec<Timer>>,
@@ -45,7 +52,6 @@ impl MobilePlatform {
             .unwrap_or(0x9E37_79B9_7F4A_7C15)
             | 1;
         Self {
-            start: Instant::now(),
             spawner,
             notify,
             timers: RefCell::new(Vec::new()),
@@ -137,7 +143,7 @@ impl MobilePlatform {
 
 impl Platform for MobilePlatform {
     fn monotonic_ms(&self) -> f64 {
-        self.start.elapsed().as_secs_f64() * 1000.0
+        monotonic_ms()
     }
 
     fn wall_ms(&self) -> f64 {

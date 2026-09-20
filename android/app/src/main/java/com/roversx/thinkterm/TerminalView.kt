@@ -44,7 +44,10 @@ class TerminalHostView(context: Context, private val model: TerminalModel) : Fra
         texture.isOpaque = false
         addView(texture, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         addView(input, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
-        model.onFocusRequested = { input.focusAndShowKeyboard() }
+        // The App asks for focus after a press, a finished rename and
+        // every answered request; on a phone that must not raise the
+        // keyboard (a tap does that itself), only keep it where it is.
+        model.onFocusRequested = { if (input.keyboardShown()) input.requestFocus() }
         model.onHideKeyboard = { input.hideKeyboard() }
         texture.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
@@ -114,17 +117,18 @@ class TerminalHostView(context: Context, private val model: TerminalModel) : Fra
 class TerminalInputView(context: Context, private val model: TerminalModel) : View(context) {
     private val settings get() = model.settings
     private val slop = ViewConfiguration.get(context).scaledTouchSlop
-    private val tapTimeout = ViewConfiguration.getTapTimeout().toLong() * 2
     private val longPressTimeout = ViewConfiguration.getLongPressTimeout().toLong()
     private val minFling = ViewConfiguration.get(context).scaledMinimumFlingVelocity * 4
     private val main = Handler(Looper.getMainLooper())
     private var downX = 0f
     private var downY = 0f
     private var lastY = 0f
-    private var downAt = 0L
     private var dragging = false
     private var pinching = false
     private var pinchStart = 1f
+    /// The fingers' distance when the pinch began: the scale is measured
+    /// from there, not from one event to the next.
+    private var pinchSpan = 0f
     private var rowRemainder = 0f
     private var velocity: VelocityTracker? = null
     private val scroller = OverScroller(context)
@@ -156,6 +160,7 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
         override fun onScaleBegin(d: ScaleGestureDetector): Boolean {
             if (!settings.pinchZoom) return false
             pinchStart = 1f
+            pinchSpan = d.currentSpan
             pinching = true
             dropLongPress()
             return true
@@ -163,11 +168,13 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
 
         override fun onScale(d: ScaleGestureDetector): Boolean {
             // One font step per 15% of scale, either way, as on iOS.
-            while (d.scaleFactor > pinchStart * 1.15f) {
+            if (pinchSpan <= 0f) return true
+            val scale = d.currentSpan / pinchSpan
+            while (scale > pinchStart * 1.15f) {
                 pinchStart *= 1.15f
                 model.stepFont(1.0)
             }
-            while (d.scaleFactor < pinchStart / 1.15f) {
+            while (scale < pinchStart / 1.15f) {
                 pinchStart /= 1.15f
                 model.stepFont(-1.0)
             }
@@ -184,6 +191,24 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
         isFocusableInTouchMode = true
         isClickable = true
         model.onScreenChanged = { if (anchor != null) screen = null }
+        model.onDropComposition = { dropComposition() }
+    }
+
+    fun keyboardShown(): Boolean =
+        rootWindowInsets?.isVisible(android.view.WindowInsets.Type.ime()) == true
+
+    /// The connection changed: an open composition is let go here and in
+    /// the core, whose latch would otherwise swallow every key of the
+    /// next connection, and the IME starts over.
+    private fun dropComposition() {
+        val open = composing != null
+        composing = null
+        model.composing = null
+        model.core.setComposing(false)
+        if (open) {
+            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.restartInput(this)
+        }
     }
 
     fun focusAndShowKeyboard() {
@@ -214,7 +239,6 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
                 downX = event.x
                 downY = event.y
                 lastY = event.y
-                downAt = event.eventTime
                 dragging = false
                 selecting = false
                 twoFingerStartY = null
@@ -231,6 +255,20 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
                 dropLongPress()
                 if (event.pointerCount == 2 && !selecting) {
                     twoFingerStartY = (event.getY(0) + event.getY(1)) / 2
+                }
+            }
+
+            MotionEvent.ACTION_POINTER_UP -> {
+                // The finger that stays is the one the scroll follows
+                // from here, or the rows between the two would go past
+                // in one jump. Its lift is no tap: the two-finger mark
+                // stays set.
+                if (event.pointerCount == 2) {
+                    val staying = if (event.actionIndex == 0) 1 else 0
+                    downX = event.getX(staying)
+                    downY = event.getY(staying)
+                    lastY = downY
+                    dragging = false
                 }
             }
 
@@ -274,7 +312,9 @@ class TerminalInputView(context: Context, private val model: TerminalModel) : Vi
                     } else if (settings.smoothScroll) {
                         fling()
                     }
-                } else if (!pinching && twoFingerStartY == null && event.eventTime - downAt < tapTimeout) {
+                } else if (!pinching && twoFingerStartY == null) {
+                    // Any press that neither dragged nor turned into a
+                    // long press is a tap, however long it was held.
                     tap()
                 }
                 velocity?.recycle()

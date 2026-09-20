@@ -171,10 +171,10 @@ class HostStore(context: Context) {
                     port = o.optInt("port", 22),
                     user = o.optString("user"),
                     auth = o.optString("auth", "key"),
-                    knownHost = o.optString("knownHost").ifEmpty { null },
+                    knownHost = o.stringOrNull("knownHost"),
                     remoteCommand = o.optString("remoteCommand"),
                     group = o.optString("group"),
-                    publicKey = o.optString("publicKey").ifEmpty { null },
+                    publicKey = o.stringOrNull("publicKey"),
                     lastConnected = if (o.isNull("lastConnected")) null else o.optLong("lastConnected"),
                 )
             }
@@ -186,6 +186,11 @@ class HostStore(context: Context) {
 
     private companion object {
         const val KEY = "hosts.v1"
+
+        /// A string field, or null for one absent, null or empty --
+        /// `optString` would read a JSON null as the word "null".
+        fun JSONObject.stringOrNull(key: String): String? =
+            if (!has(key) || isNull(key)) null else optString(key).ifEmpty { null }
 
         const val SECRETS = "thinkterm-secrets"
 
