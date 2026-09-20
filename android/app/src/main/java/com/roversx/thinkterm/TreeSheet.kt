@@ -539,7 +539,7 @@ fun OverviewScreen(
         model.refreshViews()
         while (true) {
             for (thread in model.threads?.threads ?: emptyList()) {
-                if (!thread.live || thread.id == liveThread) continue
+                if (!thread.live) continue
                 previewPane(thread)?.let { model.requestPreview(it, OVERVIEW_ROWS) }
             }
             delay(2000)
@@ -690,18 +690,18 @@ private fun ThreadCard(
                 .background(if (thread.live) model.background else Color.Black.copy(alpha = 0.4f))
                 .clipToBounds()
         ) {
+            Text(
+                previewText(model, thread),
+                fontSize = 7.sp,
+                lineHeight = 8.5.sp,
+                fontFamily = FontFamily.Monospace,
+                color = Color.White,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 7.dp),
+            )
             if (live) {
-                // The terminal itself lands here; the box reports where.
+                // The terminal itself lands over this, then fades into the
+                // same preview as every other card; the box reports where.
                 Box(Modifier.fillMaxSize().onGloballyPositioned { onCardBounds(it.boundsInRoot()) })
-            } else {
-                Text(
-                    previewText(model, thread),
-                    fontSize = 7.sp,
-                    lineHeight = 8.5.sp,
-                    fontFamily = FontFamily.Monospace,
-                    color = Color.White,
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 7.dp),
-                )
             }
         }
     }

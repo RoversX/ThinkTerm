@@ -122,6 +122,9 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
     var terminalBounds by remember { mutableStateOf(Rect.Zero) }
     var cardBounds by remember { mutableStateOf<Rect?>(null) }
     val zoom = remember { Animatable(0f) }
+    // Once in the card the terminal fades into the card's own preview,
+    // so the live card looks like every other one.
+    val fade = remember { Animatable(0f) }
     val overviewOpen = overviewShown && zoom.value > 0f
     var zoomTarget by remember { mutableStateOf<Rect?>(null) }
 
@@ -163,6 +166,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
     fun closeOverview() {
         if (!overviewShown) return
         scope.launch {
+            fade.animateTo(0f, tween(150))
             zoom.animateTo(0f, spring(dampingRatio = 0.9f, stiffness = 400f))
             overviewShown = false
             zoomTarget = null
@@ -192,7 +196,10 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
         cardBounds = frame
         if (frame == null || !overviewShown || zoomTarget != null || terminalBounds.width <= 0f) return
         zoomTarget = frame
-        scope.launch { zoom.animateTo(1f, spring(dampingRatio = 0.85f, stiffness = 300f)) }
+        scope.launch {
+            zoom.animateTo(1f, spring(dampingRatio = 0.85f, stiffness = 300f))
+            if (overviewShown) fade.animateTo(1f, tween(250))
+        }
     }
 
     BackHandler {
@@ -264,6 +271,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                             // The card's own corners, once the terminal is in it.
                             val r = 13.dp.toPx() / scale * t
                             shape = RoundedCornerShape(bottomStart = r, bottomEnd = r)
+                            alpha = 1f - fade.value
                         } else {
                             scaleX = 1f
                             scaleY = 1f

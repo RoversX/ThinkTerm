@@ -340,7 +340,7 @@ struct OverviewScreen: View {
 
     /// Every live thread's current tab, asked for its last rows.
     private func refreshPreviews() {
-        for thread in threads where thread.live && thread.id != liveThread {
+        for thread in threads where thread.live {
             if let pane = previewPane(thread) {
                 model.requestPreview(pane: pane, rows: rows)
             }
@@ -395,22 +395,23 @@ struct OverviewScreen: View {
                 }
                 .padding(.horizontal, 10)
                 .padding(.bottom, 7)
-                Group {
+                ZStack(alignment: .topLeading) {
+                    Text(preview(thread))
+                        .font(.system(size: 7, design: .monospaced))
+                        .lineSpacing(1)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 7)
                     if live {
-                        // The terminal itself lands here; the frame is reported.
+                        // The terminal itself lands over this, then fades into
+                        // the same preview as every other card; the frame is
+                        // reported so the screen above knows where.
                         Color.clear
                             .background(GeometryReader { geo in
                                 Color.clear
                                     .onAppear { cardFrame = geo.frame(in: .named("screen")) }
                                     .onChange(of: geo.frame(in: .named("screen"))) { _, f in cardFrame = f }
                             })
-                    } else {
-                        Text(preview(thread))
-                            .font(.system(size: 7, design: .monospaced))
-                            .lineSpacing(1)
-                            .frame(maxWidth: .infinity, alignment: .topLeading)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 7)
                     }
                 }
                 .frame(height: 92, alignment: .topLeading)

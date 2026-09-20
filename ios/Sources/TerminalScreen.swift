@@ -24,11 +24,15 @@ struct TerminalScreen: View {
     /// cards fade in around it, as the desktop's Live Overview zooms out.
     @State private var overviewOpen = false
     @State private var overviewShown = false
+    /// The cards stay while the terminal comes back out of its card.
+    @State private var overviewVisible = false
     @State private var terminalFrame: CGRect = .zero
     @State private var cardFrame: CGRect?
     @State private var zoomScale: CGFloat = 1
     @State private var zoomOffset: CGSize = .zero
     @State private var zoomClip: CGFloat?
+    /// Once in the card the terminal fades into the card's own preview.
+    @State private var zoomFade: Double = 1
 
     init(host: Host?, store: HostStore?) {
         _model = StateObject(wrappedValue: TerminalModel(host: host, store: store))
@@ -39,7 +43,7 @@ struct TerminalScreen: View {
     /// else. Every piece of chrome takes the terminal's own background.
     var body: some View {
         ZStack(alignment: .topLeading) {
-            if overviewShown {
+            if overviewVisible {
                 OverviewScreen(model: model, isPresented: $overviewShown, cardFrame: $cardFrame, liveThread: currentThreadId)
                     .opacity(overviewOpen ? 1 : 0)
                     .onChange(of: overviewShown) { _, shown in if !shown { closeOverview() } }
@@ -63,6 +67,7 @@ struct TerminalScreen: View {
                     }
                     .scaleEffect(zoomScale, anchor: .topLeading)
                     .offset(zoomOffset)
+                    .opacity(zoomFade)
                     .zIndex(2)
                     .allowsHitTesting(!overviewOpen)
                 statusLine.opacity(overviewOpen ? 0 : 1)
@@ -333,6 +338,7 @@ struct TerminalScreen: View {
         model.refreshViews()
         cardFrame = nil
         overviewShown = true
+        overviewVisible = true
         // Without a card of its own (no threads, or none current) the
         // terminal only fades.
         if currentThreadId == nil {
@@ -356,14 +362,24 @@ struct TerminalScreen: View {
             )
             zoomClip = clip
         }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            guard overviewOpen else { return }
+            withAnimation(.easeOut(duration: 0.25)) { zoomFade = 0 }
+        }
     }
 
     private func closeOverview() {
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.9)) {
-            overviewOpen = false
-            zoomScale = 1
-            zoomOffset = .zero
-            zoomClip = nil
+        withAnimation(.easeOut(duration: 0.15)) { zoomFade = 1 }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.9)) {
+                overviewOpen = false
+                zoomScale = 1
+                zoomOffset = .zero
+                zoomClip = nil
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            if !overviewShown { overviewVisible = false }
         }
         cardFrame = nil
     }
