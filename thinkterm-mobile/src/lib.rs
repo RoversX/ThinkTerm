@@ -136,6 +136,60 @@ fn install_logger() {
     });
 }
 
+/// A key pair the shell asked for: the private half in the unencrypted
+/// openssh-key-v1 container, the public half as one authorized_keys line.
+#[derive(uniffi::Record)]
+pub struct SshKeyPair {
+    pub private_pem: String,
+    pub public_line: String,
+}
+
+/// The system's randomness, as ssh-key's generator wants it.
+struct SysRng(ring::rand::SystemRandom);
+
+impl rand_core::TryRng for SysRng {
+    type Error = std::convert::Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut b = [0u8; 4];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let mut b = [0u8; 8];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u64::from_le_bytes(b))
+    }
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        use ring::rand::SecureRandom;
+        self.0.fill(dst).expect("the system's randomness is available");
+        Ok(())
+    }
+}
+
+impl rand_core::TryCryptoRng for SysRng {}
+
+/// A fresh ed25519 key pair, with `comment` on both halves.
+#[uniffi::export]
+pub fn generate_ssh_key(comment: String) -> Option<SshKeyPair> {
+    use russh::keys::ssh_key::{Algorithm, LineEnding, PrivateKey};
+    let mut key = PrivateKey::random(&mut SysRng(ring::rand::SystemRandom::new()), Algorithm::Ed25519).ok()?;
+    key.set_comment(comment.as_str());
+    let pem = key.to_openssh(LineEnding::LF).ok()?;
+    let public_line = key.public_key().to_openssh().ok()?;
+    Some(SshKeyPair { private_pem: pem.to_string(), public_line })
+}
+
+/// The public line of a private key the user pasted or imported, with
+/// `comment` on it; none when the text is not a key (or the passphrase
+/// is wrong).
+#[uniffi::export]
+pub fn ssh_public_line(pem: String, passphrase: Option<String>, comment: String) -> Option<String> {
+    let key = russh::keys::decode_secret_key(&pem, passphrase.as_deref().filter(|p| !p.is_empty())).ok()?;
+    let mut public = key.public_key().clone();
+    public.set_comment(comment.as_str());
+    public.to_openssh().ok()
+}
+
 #[derive(uniffi::Object)]
 pub struct Core {
     tx: Sender<core::Cmd>,

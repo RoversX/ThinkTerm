@@ -25,6 +25,9 @@ codec.workspace = true
 futures.workspace = true
 log.workspace = true
 russh = { version = "0.63.3", default-features = false, features = ["ring"] }
+# For making keys: ssh-key's generator wants a rand_core 0.10 RNG.
+rand_core = "0.10"
+ring = "0.17"
 serde.workspace = true
 serde_json.workspace = true
 termwiz = { workspace = true, features = ["use_serde"] }
