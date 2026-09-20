@@ -26,6 +26,7 @@ LANGS = ["en-US", "zh-CN", "ja-JP", "fr-FR", "de-DE"]
 EXTRA = {
     # common
     "ok": ["OK", "好", "OK", "OK", "OK"],
+    "copy": ["Copy", "复制", "コピー", "Copier", "Kopieren"],
     "more": ["More…", "更多…", "その他…", "Plus…", "Mehr…"],
     "rename": ["Rename", "重命名", "名前を変更", "Renommer", "Umbenennen"],
     "none": ["None", "无", "なし", "Aucun", "Keine"],
