@@ -147,7 +147,11 @@ struct TerminalScreen: View {
         .toolbarBackground(model.background, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbar {
-            ToolbarItem(placement: .principal) { tabStrip.frame(width: max(barWidth - 150, 120)) }
+            ToolbarItem(placement: .principal) { tabStrip.frame(width: max(barWidth - 190, 120)) }
+            ToolbarItem(placement: .topBarLeading) {
+                // The desktop's sidebar: the projects and threads, as a sheet.
+                Button { showTree = true } label: { Image(systemName: "sidebar.left") }
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 Button { if overviewShown { overviewShown = false } else { openOverview() } } label: {
                     Image(systemName: "square.grid.2x2")

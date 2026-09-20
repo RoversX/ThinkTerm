@@ -41,6 +41,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.outlined.ViewSidebar
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.outlined.Circle
@@ -480,6 +481,10 @@ private fun TopBar(
                     .background(statusColor(model))
             )
             ConnectionMenu(model, expanded = connectionMenu, onDismiss = { connectionMenu = false }, onEditHost = onEditHost)
+        }
+        // The desktop's sidebar: the projects and threads, as a sheet.
+        IconButton(onClick = onTree, modifier = Modifier.size(36.dp)) {
+            Icon(Icons.Outlined.ViewSidebar, contentDescription = tr("threads"), tint = Color.White, modifier = Modifier.size(20.dp))
         }
         val scroll = rememberScrollState()
         val positions = remember { mutableStateMapOf<String, Int>() }
