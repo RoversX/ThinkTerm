@@ -160,7 +160,9 @@ struct TerminalScreen: View {
         .toolbarBackground(model.background, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbar {
-            ToolbarItem(placement: .principal) { tabStrip.frame(width: max(barWidth - 190, 120)) }
+            // The strip takes the bar from the two leading buttons to the
+            // trailing margin: nothing sits at the right any more.
+            ToolbarItem(placement: .principal) { tabStrip.frame(width: max(barWidth - 140, 120)) }
             ToolbarItem(placement: .topBarLeading) {
                 // The desktop's sidebar: the projects and threads, as a
                 // panel; the keyboard goes first, or the panel sits on it.
