@@ -861,8 +861,14 @@ impl State {
             Ok(attached) => attached,
             Err(err) => {
                 self.fail(format!("attach: {err}"));
-                self.conn = Conn::Disconnected(err.clone());
-                self.set_status(&format!("attach failed: {err}"));
+                // A link that closed under the handshake already said why;
+                // that reason beats "closed before the server answered".
+                let reason = match &self.conn {
+                    Conn::Disconnected(reason) => reason.clone(),
+                    _ => err.clone(),
+                };
+                self.conn = Conn::Disconnected(reason.clone());
+                self.set_status(&format!("failed: {reason}"));
                 if let Some(link) = self.link.take() {
                     link.shutdown();
                 }
