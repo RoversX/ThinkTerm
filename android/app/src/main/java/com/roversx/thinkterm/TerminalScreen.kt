@@ -273,7 +273,6 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                 onBack = { model.disconnect(); onBack() },
                 onTree = { showTree = true },
                 onOverview = { if (overviewShown) closeOverview() else openOverview() },
-                onEditHost = { editingHost = model.host },
             )
             // The tab strip fades with the zoom and stops taking touches;
             // its room stays, so the terminal's own place does not move
@@ -419,7 +418,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
         }
 
         if (showTree) {
-            TreeSheet(model = model, onDismiss = { showTree = false })
+            TreeSheet(model = model, onDismiss = { showTree = false }, onEditHost = { showTree = false; editingHost = model.host })
         }
         if (showSettings) {
             Box(Modifier.fillMaxSize().zIndex(3f).background(MaterialTheme.colorScheme.background)) {
@@ -459,28 +458,13 @@ private fun TopBar(
     onBack: () -> Unit,
     onTree: () -> Unit,
     onOverview: () -> Unit,
-    onEditHost: () -> Unit,
 ) {
-    var connectionMenu by remember { mutableStateOf(false) }
     Row(
         Modifier.fillMaxWidth().height(48.dp).padding(start = 2.dp, end = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         IconButton(onClick = onBack) {
             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = tr("back"), tint = Color.White)
-        }
-        // The dot is the connection: a tap opens what can be done with it.
-        Box {
-            Box(
-                Modifier
-                    .size(28.dp)
-                    .clip(CircleShape)
-                    .clickable { connectionMenu = true }
-                    .padding(10.dp)
-                    .clip(CircleShape)
-                    .background(statusColor(model))
-            )
-            ConnectionMenu(model, expanded = connectionMenu, onDismiss = { connectionMenu = false }, onEditHost = onEditHost)
         }
         // The desktop's sidebar: the projects and threads, as a sheet.
         IconButton(onClick = onTree, modifier = Modifier.size(36.dp)) {
@@ -516,7 +500,7 @@ private fun TopBar(
 /// What the ⋯ menu used to hold about the host: reconnect or disconnect,
 /// and the host's editor.
 @Composable
-private fun ConnectionMenu(model: TerminalModel, expanded: Boolean, onDismiss: () -> Unit, onEditHost: () -> Unit) {
+fun ConnectionMenu(model: TerminalModel, expanded: Boolean, onDismiss: () -> Unit, onEditHost: () -> Unit) {
     DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
         val connected = model.isConnected
         Text(
@@ -718,7 +702,7 @@ private fun TabSubstrip(model: TerminalModel, onPinchOut: () -> Unit) {
     }
 }
 
-private fun statusColor(model: TerminalModel): Color = when {
+fun statusColor(model: TerminalModel): Color = when {
     model.reconnecting -> Color(0xFFFF9F0A)
     model.isConnected -> Color(0xFF34C759)
     model.connection.startsWith("connecting") || model.connection.contains("reconnect") -> Color(0xFFFF9F0A)

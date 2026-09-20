@@ -87,13 +87,14 @@ import kotlinx.coroutines.delay
 /// threads under them, as far as the desktop's sidebar goes.
 /// Everything is named as the desktop names it: thread, tab, pane.
 @Composable
-fun TreeSheet(model: TerminalModel, onDismiss: () -> Unit) {
+fun TreeSheet(model: TerminalModel, onDismiss: () -> Unit, onEditHost: () -> Unit) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val open = remember { TreeOpen() }
     var spaceMenu by remember { mutableStateOf<List<MenuItem>>(emptyList()) }
     var spacesShown by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf<Pair<String, String>?>(null) }
     var renameText by remember { mutableStateOf("") }
+    var connectionMenu by remember { mutableStateOf(false) }
     val threads = model.threads?.threads ?: emptyList()
     val rows = model.sidebar?.rows ?: emptyList()
     val error = model.sidebar?.newProjectError
@@ -151,6 +152,27 @@ fun TreeSheet(model: TerminalModel, onDismiss: () -> Unit) {
             IconButton(onClick = { model.chromeClick("new-tab") }) {
                 Icon(Icons.Default.Add, contentDescription = tr("thread.new"))
             }
+        }
+        // The host this sheet belongs to: its state, and what can be done
+        // with the connection (this used to be a dot in the bar).
+        Box {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable { connectionMenu = true }
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Box(Modifier.size(8.dp).background(statusColor(model), CircleShape))
+                Text(model.host.display, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                Text(
+                    if (model.isConnected) tr("disconnect") else tr("reconnect"),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+            ConnectionMenu(model, expanded = connectionMenu, onDismiss = { connectionMenu = false }, onEditHost = onEditHost)
         }
         LazyColumn(Modifier.fillMaxWidth().weight(1f)) {
             items(rows) { row -> SideRowView(model, row, threads, open, onDismiss) }

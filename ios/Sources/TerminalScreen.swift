@@ -160,7 +160,10 @@ struct TerminalScreen: View {
         }
         .ignoresSafeArea(.container, edges: .bottom)
         .sheet(isPresented: $showTree) {
-            TreeSheet(model: model, isPresented: $showTree, menu: $menu)
+            TreeSheet(model: model, isPresented: $showTree, menu: $menu, hostName: hostName, connected: connected, onEditHost: {
+                showTree = false
+                editingHost = model.host
+            })
         }
         .sheet(isPresented: $showSettings) {
             NavigationStack {
@@ -234,7 +237,7 @@ struct TerminalScreen: View {
         model.host?.display ?? tr("thismac")
     }
 
-    private var statusColor: Color {
+    var statusColor: Color {
         if model.reconnecting { return .orange }
         if connected { return .green }
         if model.connection.hasPrefix("connecting") || model.connection.contains("reconnect") { return .orange }
@@ -247,28 +250,8 @@ struct TerminalScreen: View {
     /// session state) shows its tabs in the bar instead.
     private var twoLevel: Bool { settings.tabBarLevels == "two" && !(model.threads?.threads.isEmpty ?? true) }
 
-    /// The dot is the connection: a tap opens what can be done with it.
-    private var connectionDot: some View {
-        Menu {
-            Section(hostName) {
-                Button(connected ? tr("disconnect") : tr("reconnect")) {
-                    if connected { model.disconnect() } else { model.connect() }
-                }
-                if model.host != nil {
-                    Button(tr("edithost")) { editingHost = model.host }
-                }
-            }
-        } label: {
-            Circle().fill(statusColor).frame(width: 7, height: 7)
-                .frame(width: 24, height: 24)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-
     private var tabStrip: some View {
         HStack(spacing: 2) {
-            connectionDot
             ScrollViewReader { reader in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 4) {

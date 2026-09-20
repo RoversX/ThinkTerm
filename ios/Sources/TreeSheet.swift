@@ -10,15 +10,44 @@ struct TreeSheet: View {
     @ObservedObject private var lang = AppLanguage.shared
     @Binding var isPresented: Bool
     @Binding var menu: MenuSheet?
+    /// The host this sheet belongs to, and what can be done with its
+    /// connection (this used to be a dot in the bar).
+    var hostName: String = ""
+    var connected: Bool = true
+    var onEditHost: () -> Void = {}
     @State private var spaceMenu: [MenuItem] = []
     @State private var renaming: (kind: String, id: String)?
     @State private var renameText = ""
 
     private var threads: [ThreadView] { model.threads?.threads ?? [] }
 
+    private var connectionColor: Color {
+        if model.reconnecting { return .orange }
+        if connected { return .green }
+        if model.connection.hasPrefix("connecting") || model.connection.contains("reconnect") { return .orange }
+        return .red
+    }
+
     var body: some View {
         NavigationStack {
             List {
+                Section {
+                    Menu {
+                        Button(connected ? tr("disconnect") : tr("reconnect")) {
+                            if connected { model.disconnect() } else { model.connect() }
+                        }
+                        if model.host != nil {
+                            Button(tr("edithost")) { onEditHost() }
+                        }
+                    } label: {
+                        HStack(spacing: 8) {
+                            Circle().fill(connectionColor).frame(width: 8, height: 8)
+                            Text(hostName).lineLimit(1)
+                            Spacer()
+                            Text(connected ? tr("disconnect") : tr("reconnect")).font(.subheadline).foregroundColor(.accentColor)
+                        }
+                    }
+                }
                 ForEach(model.sidebar?.rows ?? []) { row in
                     rowView(row)
                 }
