@@ -89,8 +89,14 @@ struct OverviewScreen: View {
             model.refreshViews()
             refreshPreviews()
         }
-        .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
-            refreshPreviews()
+        .task {
+            // One ticker for the grid's life: a publisher made in `body`
+            // would be made again on every render, and its subscription
+            // with it.
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if !Task.isCancelled { refreshPreviews() }
+            }
         }
     }
 

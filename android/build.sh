@@ -34,8 +34,10 @@ echo "== assets"
 mkdir -p android/app/src/main/assets
 cp assets/fonts/JetBrainsMono-Regular.ttf assets/fonts/FiraCode-Regular.ttf assets/fonts/SymbolsNerdFontMono-Regular.ttf android/app/src/main/assets/
 cp thinkterm-web/www/schemes.json ios/Resources/strings.json android/app/src/main/assets/
-# The probe sshd's throwaway key, for the emulator's "This Mac" entry.
-[ -f /tmp/ttp-ssh/userkey ] && cp /tmp/ttp-ssh/userkey android/app/src/main/assets/probe_key || true
+# The probe sshd's throwaway key, for the emulator's "This Mac" entry:
+# a debug asset, so no release build carries it.
+mkdir -p android/app/src/debug/assets
+[ -f /tmp/ttp-ssh/userkey ] && cp /tmp/ttp-ssh/userkey android/app/src/debug/assets/probe_key || true
 
 echo "== gradle"
 (cd android && "$GRADLE" --quiet assembleDebug 2>&1 | grep -E "error|warning: unused|BUILD|FAIL" || true)

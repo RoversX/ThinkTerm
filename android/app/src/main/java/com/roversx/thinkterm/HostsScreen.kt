@@ -85,6 +85,9 @@ fun HostsScreen(store: HostStore, showProbe: Boolean, onOpen: (Host) -> Unit) {
                 // secret; an empty field on an edit keeps the stored one.
                 if (secret.isNotEmpty() || store.secret(host.id).isEmpty()) {
                     store.putSecret(host.id, secret, passphrase)
+                } else if (passphrase != store.passphrase(host.id)) {
+                    // Only the passphrase changed: kept with the key it unlocks.
+                    store.putSecret(host.id, store.secret(host.id), passphrase)
                 }
                 store.upsert(host)
                 editing = null

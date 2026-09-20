@@ -205,6 +205,9 @@ struct State {
     next_generation: u64,
     /// One per link made; a network event from an older one is dropped.
     link_serial: u64,
+    /// A handshake is on the wire: a surface that comes and goes
+    /// meanwhile must not start a second one over the same lease.
+    attaching: bool,
     animating: bool,
     stats: Stats,
     notify: Arc<dyn Notify>,
@@ -244,6 +247,7 @@ pub fn run(cmd_tx: Sender<Cmd>, rx: Receiver<Cmd>, notify: Box<dyn Notify>) {
         target: None,
         next_generation: 1,
         link_serial: 0,
+        attaching: false,
         animating: false,
         stats: Stats::default(),
         notify,
@@ -666,6 +670,7 @@ impl State {
     /// surface, if lent, is dropped: the shell re-attaches it by calling
     /// `attach_surface` again, which is what it does on any change anyway.
     fn disconnect(&mut self) {
+        self.attaching = false;
         if let Some(link) = self.link.take() {
             link.shutdown();
         }
@@ -786,6 +791,11 @@ impl State {
         let (Some(link), Some(fonts)) = (self.link.clone(), self.fonts.clone()) else {
             return;
         };
+        if self.attaching {
+            // The one in flight attaches to whatever surface is there
+            // when it lands; the App resizes to it then.
+            return;
+        }
         if self.gpu.is_none() {
             // Not a failure: the surface's arrival attaches.
             self.notify.on_log("connected before the surface; attaching when it comes".into());
@@ -832,6 +842,7 @@ impl State {
             ssh_auth_sock: None,
         };
         let tx = self.cmd_tx.clone();
+        self.attaching = true;
         let spawned = self.pool.spawner().spawn_local(async move {
             let outcome = attach(&link, size, 0, me)
                 .await
@@ -839,11 +850,13 @@ impl State {
             let _ = tx.send(Cmd::Attached(outcome));
         });
         if let Err(err) = spawned {
+            self.attaching = false;
             self.fail(format!("spawning the handshake: {err}"));
         }
     }
 
     fn on_attached(&mut self, outcome: Result<Attached, String>) {
+        self.attaching = false;
         let attached = match outcome {
             Ok(attached) => attached,
             Err(err) => {

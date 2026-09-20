@@ -127,6 +127,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         settings.$resizeMode.dropFirst().sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
         settings.$autoReconnect.dropFirst().sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
         settings.$paneBars.dropFirst().sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
+        settings.$language.dropFirst().sink { [weak self] _ in self?.applyTerminalPrefs() }.store(in: &subscriptions)
         // A face is shaped at connect time: the connection is made again.
         settings.$fontFamily.dropFirst().removeDuplicates().sink { [weak self] _ in
             guard let self, self.connection.hasPrefix("pane ") else { return }
@@ -304,6 +305,8 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         core.setSetting(key: "resize-mode", value: settings.resizeMode == "release" ? "\"release\"" : "\"live\"")
         core.setSetting(key: "auto-reconnect", value: settings.autoReconnect ? "true" : "false")
         core.setSetting(key: "pane-bars", value: settings.paneBars ? "true" : "false")
+        // The core's own menus and messages follow the app's language.
+        core.setSetting(key: "language", value: "\"\(L10n.currentTag)\"")
     }
 
     /// The tab `by` places along the strip from the current one, shown.
@@ -462,6 +465,9 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// The background took the connection down; the foreground brings it back.
+    private var pausedForBackground = false
+
     func detachForBackground() {
         detach()
         report("background")
@@ -470,7 +476,11 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "thinkterm-connection") { [weak self] in
                 self?.endBackgroundTask()
             }
-        } else if connection.hasPrefix("pane ") {
+        } else if !connection.hasPrefix("idle"), !connection.hasPrefix("disconnected"), !connection.hasPrefix("failed") {
+            // Attached or still on the way: torn down for the background,
+            // and dialled again on the way back -- whatever the status
+            // reads by then.
+            pausedForBackground = true
             disconnect()
         }
     }
@@ -484,7 +494,8 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
 
     func reattachAfterBackground() {
         endBackgroundTask()
-        if !settings.keepSessionInBackground, connection.hasPrefix("disconnected") {
+        if pausedForBackground {
+            pausedForBackground = false
             connect()
         }
         guard wantsSurface, generation == 0, let layer, let size = drawableSize(of: layer) else { return }

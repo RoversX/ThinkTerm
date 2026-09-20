@@ -53,7 +53,9 @@ fn pointer_input(ev: &PointerEvent) -> PointerInput {
     PointerInput {
         x: ev.client_x() as f64,
         y: ev.client_y() as f64,
-        button: ev.button().clamp(0, 255) as u8,
+        // Pointer Events give -1 on a move or a cancel: no button of its
+        // own. 255 says so; the App fills in the one held.
+        button: if ev.button() < 0 { 255 } else { ev.button().min(255) as u8 },
         buttons_down: ev.buttons() != 0,
         mods: mouse_modifiers(ev),
     }

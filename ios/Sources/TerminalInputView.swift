@@ -268,7 +268,9 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
     /// The core changed something on screen: the rows are read again
     /// when next asked for.
     func screenChanged() {
+        inputDelegate?.textWillChange(self)
         screen = nil
+        inputDelegate?.textDidChange(self)
     }
 
     private func currentScreen() -> ScreenText? {
@@ -469,10 +471,9 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
         return b.i - a.i
     }
 
-    var inputDelegate: UITextInputDelegate? {
-        get { nil }
-        set {}
-    }
+    /// UIKit's own listener for the text changing under it: the native
+    /// selection redraws its handles and highlight when told.
+    weak var inputDelegate: UITextInputDelegate?
 
     var tokenizer: UITextInputTokenizer { UITextInputStringTokenizer(textInput: self) }
 

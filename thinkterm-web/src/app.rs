@@ -326,6 +326,9 @@ pub struct Inner<P: Platform, L: Link> {
     /// a tab switch takes its colours from here.
     overrides: std::collections::HashMap<PaneId, Option<ColorPalette>>,
     click_count: u8,
+    /// The button a press put down, for the moves and the cancel that
+    /// carry no button of their own.
+    held_button: MouseButton,
     last_click_ms: f64,
     focused: bool,
     composing: bool,
@@ -583,6 +586,7 @@ impl<P: Platform, L: Link> App<P, L> {
             panel_drag: false,
             overrides: std::collections::HashMap::new(),
             click_count: 0,
+            held_button: MouseButton::None,
             last_click_ms: 0.0,
             focused: true,
             composing: false,
@@ -1693,13 +1697,26 @@ impl<P: Platform, L: Link> App<P, L> {
                 // as the divider moves; a page that does not hold the tab
                 // can only ask the server to grow a pane.
                 if self.inner.borrow().link.lease().owns_viewport() {
-                    self.drag_divider_to(step.0, step.2);
+                    self.drag_divider_to(step.0, step.2, false);
                 } else {
                     self.adjust_divider(step.0, step.1);
                 }
             }
             Pointer::Up => {
                 let was = self.inner.borrow_mut().drag_divider.take();
+                if let Some((idx, _, cells)) = was {
+                    // Release mode held every step back: the lift is when
+                    // the server hears where the divider ended up.
+                    let settle = {
+                        let inner = self.inner.borrow();
+                        cells != 0
+                            && inner.settings.resize_mode == crate::settings::ResizeMode::Release
+                            && inner.link.lease().owns_viewport()
+                    };
+                    if settle {
+                        self.drag_divider_to(idx, cells, true);
+                    }
+                }
                 self.inner.borrow_mut().drag_layout = None;
                 if was.is_some() {
                     // The held-back report goes out with a fresh listing,
@@ -1869,7 +1886,9 @@ impl<P: Platform, L: Link> App<P, L> {
     /// Claim the tab with divider `idx` moved `cells` from where the drag
     /// began (right/down positive): every pane touching the divider along
     /// its extent gives or takes the cells, none below one content row.
-    fn drag_divider_to(self: &Rc<Self>, idx: usize, cells: isize) {
+    /// `settle` is the lift of the finger: in Release mode the only step
+    /// the server hears.
+    fn drag_divider_to(self: &Rc<Self>, idx: usize, cells: isize, settle: bool) {
         let (link, tab_id) = {
             let inner = self.inner.borrow();
             let Some(layout) = inner.drag_layout.as_ref() else {
@@ -1895,7 +1914,7 @@ impl<P: Platform, L: Link> App<P, L> {
                 inner.divider_claim_next = Some((idx, cells));
                 return;
             }
-            if inner.settings.resize_mode == crate::settings::ResizeMode::Release {
+            if inner.settings.resize_mode == crate::settings::ResizeMode::Release && !settle {
                 // The picture moves; the server hears when the finger lifts.
                 return;
             }
@@ -1913,7 +1932,7 @@ impl<P: Platform, L: Link> App<P, L> {
                 inner.divider_claim_next.take().filter(|_| inner.drag_divider.is_some())
             };
             match next {
-                Some((idx, cells)) => app.drag_divider_to(idx, cells),
+                Some((idx, cells)) => app.drag_divider_to(idx, cells, false),
                 None => app.refresh_layout(),
             }
         });
@@ -2196,8 +2215,14 @@ impl<P: Platform, L: Link> App<P, L> {
             0 => MouseButton::Left,
             1 => MouseButton::Middle,
             2 => MouseButton::Right,
+            255 => inner.held_button,
             _ => MouseButton::None,
         };
+        match what {
+            Pointer::Down => inner.held_button = button,
+            Pointer::Up => inner.held_button = MouseButton::None,
+            Pointer::Move => {}
+        }
 
         // A program that asked for the mouse gets it, unless Shift holds
         // the event back for the page's own selection.
@@ -3787,7 +3812,15 @@ impl<P: Platform, L: Link> App<P, L> {
                 crate::tree::Row::Thread(t) if t.id == id => Some(menu::for_thread(&t)),
                 _ => None,
             }),
-            "project" => Some(menu::for_project(id, inner.tree.live_panes_of_project(id).len())),
+            "project" => Some(menu::for_project(id, inner.tree.live_panes_of_project(id).len())).map(|items| {
+                if inner.platform.is_mobile() {
+                    // The phone's sidebar folds on its own; the core's
+                    // fold would only hide the threads from the overview.
+                    items.into_iter().filter(|item| !item.id.starts_with("collapse")).collect()
+                } else {
+                    items
+                }
+            }),
             "archived-project" => Some(menu::for_archived_project(id, inner.tree.thread_count_of_project(id))),
             "sidebar-options" => Some(menu::for_sidebar_options(inner.tree.archived_open, inner.tree.archived_count())),
             "space" => Some(menu::for_space(&inner.tree.spaces())),

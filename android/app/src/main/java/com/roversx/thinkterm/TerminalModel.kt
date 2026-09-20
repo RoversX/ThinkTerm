@@ -442,6 +442,8 @@ class TerminalModel(
         core.setSetting("resize-mode", if (settings.resizeMode == "release") "\"release\"" else "\"live\"")
         core.setSetting("auto-reconnect", settings.autoReconnect.toString())
         core.setSetting("pane-bars", settings.paneBars.toString())
+        // The core's own menus and messages follow the app's language.
+        core.setSetting("language", "\"${L10n.currentTag(settings.language)}\"")
     }
 
     // MARK: the log

@@ -406,13 +406,27 @@ struct TerminalScreen: View {
     private func openOverview() {
         guard !overviewShown else { return }
         model.refreshViews()
-        cardFrame = nil
         overviewShown = true
+        if overviewVisible, let frames = cardFrame {
+            // The cards are still up from a close a moment ago and will
+            // not lay out again: the frames they last reported serve.
+            zoom(into: frames)
+        } else {
+            cardFrame = nil
+        }
         overviewVisible = true
         // Without a card of its own (no threads, or none current) the
         // terminal only fades.
         if currentThreadId == nil {
             withAnimation(.easeOut(duration: 0.25)) { overviewOpen = true }
+        }
+        // A card the lazy grid never realises reports nothing; the
+        // overview must not stay invisible for it. After a moment, the
+        // terminal only fades.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            if overviewShown && !overviewOpen {
+                withAnimation(.easeOut(duration: 0.25)) { overviewOpen = true }
+            }
         }
     }
 
@@ -482,6 +496,8 @@ struct TerminalScreen: View {
         withAnimation(.easeOut(duration: 0.1)) { livePreview = false }
         withAnimation(.easeOut(duration: 0.15)) { zoomFade = 1 }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            // Opened again already: the zoom in progress is the new one's.
+            guard !overviewShown else { return }
             withAnimation(.spring(response: 0.35, dampingFraction: 0.9)) {
                 overviewOpen = false
                 zoomScale = 1
@@ -501,9 +517,11 @@ struct TerminalScreen: View {
             if !overviewShown {
                 overviewVisible = false
                 heroFrames = nil
+                // The cards go with the grid; the next open lays them out
+                // again and hears their frames afresh.
+                cardFrame = nil
             }
         }
-        cardFrame = nil
     }
 
     // MARK: the terminal with its overlays

@@ -119,6 +119,9 @@ async fn run(names: Vec<String>, fonts: Vec<js_sys::Uint8Array>, size: f64) -> R
                     clip: (w as f32, h as f32),
                     hsv: None,
                     draw_cursor: true,
+                    cursor_shape: None,
+                    cursor_hidden: false,
+                    min_contrast: 0.0,
                 },
             )?;
         }

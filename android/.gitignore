@@ -2,7 +2,7 @@
 app/src/main/java/com/roversx/thinkterm/core/
 app/src/main/jniLibs/
 app/src/main/assets/*.ttf
-app/src/main/assets/probe_key
+app/src/debug/assets/probe_key
 app/src/main/assets/schemes.json
 app/src/main/assets/strings.json
 .gradle/
