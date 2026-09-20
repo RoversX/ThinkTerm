@@ -238,6 +238,7 @@ struct HostEditView: View {
     private var canSave: Bool {
         guard !host.hostname.trimmingCharacters(in: .whitespaces).isEmpty,
               !host.user.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
+        guard (1...65535).contains(host.port) else { return false }
         // A new host has nothing in the Keychain yet, so it needs a secret now.
         return isExisting || hasStoredSecret || !secret.isEmpty
     }

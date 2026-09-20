@@ -856,15 +856,20 @@ impl State {
                 return;
             }
         };
-        let (Some(link), Some(fonts), Some(glyph_platform), Some(gpu)) = (
+        // The GPU state is taken only once the rest is known to be there:
+        // taken inside a pattern that then fails to match, it would be
+        // dropped with the match, and the target left over it would draw
+        // on nothing.
+        let (Some(link), Some(fonts), Some(glyph_platform), true) = (
             self.link.clone(),
             self.fonts.clone(),
             self.glyph_platform.clone(),
-            self.gpu.take(),
+            self.gpu.is_some(),
         ) else {
             self.fail("attached without a link, fonts or a GPU".into());
             return;
         };
+        let gpu = self.gpu.take().expect("checked just above");
         let scale = self.target.as_ref().map(|t| t.scale).unwrap_or(1.0);
         let dpi = (self.platform.units_per_inch() * scale) as u32;
         let side = 1024u32.min(gpu.max_texture_dimension());

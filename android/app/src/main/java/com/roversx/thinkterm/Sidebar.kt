@@ -97,7 +97,9 @@ private class Folded(model: TerminalModel) {
 private fun SidebarTree(model: TerminalModel, onDismiss: () -> Unit, onEditHost: () -> Unit, onSettings: () -> Unit) {
     val folded = remember(model) { Folded(model) }
     var connectionMenu by remember { mutableStateOf(false) }
-    var spaceMenu by remember { mutableStateOf(false) }
+    /// The Space whose menu is up, if any: one flag for all of them
+    /// would open every Space's menu at once.
+    var spaceMenuFor by remember { mutableStateOf<String?>(null) }
     var renaming by remember { mutableStateOf<Pair<String, String>?>(null) }
     var renameText by remember { mutableStateOf("") }
     val tree = model.tree
@@ -174,7 +176,7 @@ private fun SidebarTree(model: TerminalModel, onDismiss: () -> Unit, onEditHost:
                                     if (!space.current) model.setSpace(space.id)
                                     if (spaceKey in folded) folded.toggle(spaceKey)
                                 },
-                                onLongClick = { spaceMenu = true },
+                                onLongClick = { spaceMenuFor = space.id },
                                 trailing = {
                                     IconButton(onClick = { model.setSpace(space.id); model.sideClick("new-project") }, modifier = Modifier.size(32.dp)) {
                                         Icon(Icons.Default.Add, contentDescription = tr("project.new"), tint = secondary, modifier = Modifier.size(16.dp))
@@ -183,7 +185,7 @@ private fun SidebarTree(model: TerminalModel, onDismiss: () -> Unit, onEditHost:
                             ) {
                                 Text(space.name, fontWeight = if (space.current) FontWeight.SemiBold else FontWeight.Normal, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
                             }
-                            AppContextMenu(model, "space", "", expanded = spaceMenu, onDismiss = { spaceMenu = false })
+                            AppContextMenu(model, "space", "", expanded = spaceMenuFor == space.id, onDismiss = { spaceMenuFor = null })
                         }
                     }
                     if (spaceKey in folded) continue

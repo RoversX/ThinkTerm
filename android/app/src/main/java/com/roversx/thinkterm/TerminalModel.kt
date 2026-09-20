@@ -197,7 +197,7 @@ class TerminalModel(
         log("shell: connecting ${h.address}, ${secret.length} chars of secret")
         core.connect(
             host = h.hostname,
-            port = h.port.toUShort(),
+            port = h.port.coerceIn(1, 65535).toUShort(),
             user = h.user,
             authKind = h.auth,
             secret = secret,

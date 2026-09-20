@@ -81,7 +81,13 @@ final class HostStore: ObservableObject {
     }
 
     func upsert(_ host: Host) {
+        var host = host
         if let i = hosts.firstIndex(where: { $0.id == host.id }) {
+            // Another address is another machine as far as its key goes:
+            // the pin stays only while the host is where it was pinned.
+            if hosts[i].hostname != host.hostname || hosts[i].port != host.port {
+                host.knownHost = nil
+            }
             hosts[i] = host
         } else {
             hosts.append(host)

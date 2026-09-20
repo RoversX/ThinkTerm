@@ -80,7 +80,11 @@ class HostStore(context: Context) {
 
     fun upsert(host: Host) {
         val at = hosts.indexOfFirst { it.id == host.id }
-        hosts = if (at >= 0) hosts.toMutableList().also { it[at] = host } else hosts + host
+        // Another address is another machine as far as its key goes: the
+        // pin stays only while the host is where it was pinned.
+        val moved = at >= 0 && (hosts[at].hostname != host.hostname || hosts[at].port != host.port)
+        val next = if (moved) host.copy(knownHost = null) else host
+        hosts = if (at >= 0) hosts.toMutableList().also { it[at] = next } else hosts + next
         save()
     }
 

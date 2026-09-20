@@ -137,7 +137,8 @@ fun HostEditScreen(
         }
     }
 
-    val canSave = draft.hostname.isNotBlank() && draft.user.isNotBlank() &&
+    val portOk = portText.isEmpty() || portText.toIntOrNull()?.let { it in 1..65535 } == true
+    val canSave = draft.hostname.isNotBlank() && draft.user.isNotBlank() && portOk &&
         (isExisting || hasStoredSecret || secret.isNotEmpty())
 
     Scaffold(
@@ -181,7 +182,9 @@ fun HostEditScreen(
                 ) { draft = draft.copy(hostname = it.trim()) }
                 EditField(tr("f.port"), portText, placeholder = "22", keyboard = KeyboardType.Number) { typed ->
                     portText = typed.filter { it.isDigit() }.take(5)
-                    draft = draft.copy(port = portText.toIntOrNull() ?: 22)
+                    // Out of range is kept in the field (and blocks Save)
+                    // rather than silently becoming another port.
+                    draft = draft.copy(port = portText.toIntOrNull()?.takeIf { it in 1..65535 } ?: 22)
                 }
                 EditField(tr("f.user"), draft.user, placeholder = "root") { draft = draft.copy(user = it.trim()) }
             }
