@@ -444,6 +444,9 @@ pub struct App<P: Platform, L: Link> {
     retry_pending: Cell<bool>,
     /// When the pending timer is due, so a nearer one can replace it.
     retry_due: Cell<f64>,
+    /// Set once the App is let go: a tick that still finds it (an
+    /// interval cannot be cancelled) does nothing more.
+    retired: Cell<bool>,
 }
 
 /// How large the glyph atlas is allowed to get.
@@ -631,6 +634,7 @@ impl<P: Platform, L: Link> App<P, L> {
             frame_requested: Cell::new(false),
             retry_pending: Cell::new(false),
             retry_due: Cell::new(0.0),
+            retired: Cell::new(false),
         });
         let weak = Rc::downgrade(&app);
         app.platform.set_frame_handler(Box::new(move || {
@@ -1289,10 +1293,11 @@ impl<P: Platform, L: Link> App<P, L> {
             }
             inner.reconnect_pending = true;
         }
-        let app = Rc::clone(self);
+        let weak = Rc::downgrade(self);
         self.platform.set_timeout(
             delay_ms.max(0.0),
             Box::new(move || {
+                let Some(app) = weak.upgrade() else { return };
                 app.inner.borrow_mut().reconnect_pending = false;
                 let task = Rc::clone(&app).try_reconnect();
                 app.spawn(task);
@@ -2724,10 +2729,11 @@ impl<P: Platform, L: Link> App<P, L> {
             }
             inner.session_refresh_pending = true;
         }
-        let app = Rc::clone(self);
+        let weak = Rc::downgrade(self);
         self.platform.set_timeout(
             150.0,
             Box::new(move || {
+                let Some(app) = weak.upgrade() else { return };
                 app.inner.borrow_mut().session_refresh_pending = false;
                 let task = {
                     let app = Rc::clone(&app);
@@ -3453,9 +3459,15 @@ impl<P: Platform, L: Link> App<P, L> {
     /// `refresh_layout`, a moment from now, so a burst of pushes is one
     /// listing.
     fn refresh_layout_soon(self: &Rc<Self>) {
-        let app = Rc::clone(self);
-        self.platform
-            .set_timeout(150.0, Box::new(move || app.refresh_layout()));
+        let weak = Rc::downgrade(self);
+        self.platform.set_timeout(
+            150.0,
+            Box::new(move || {
+                if let Some(app) = weak.upgrade() {
+                    app.refresh_layout();
+                }
+            }),
+        );
     }
 
     /// Ask the server again every so often, whatever the pushes said:
@@ -3466,7 +3478,9 @@ impl<P: Platform, L: Link> App<P, L> {
             every_ms as f64,
             Box::new(move || {
                 if let Some(app) = weak.upgrade() {
-                    app.refresh_layout();
+                    if !app.retired.get() {
+                        app.refresh_layout();
+                    }
                 }
             }),
         );
@@ -3560,12 +3574,14 @@ impl<P: Platform, L: Link> App<P, L> {
                     self.close_pane();
                 } else {
                     // Back to a plain × when the moment passes.
-                    let app = Rc::clone(self);
+                    let weak = Rc::downgrade(self);
                     self.platform.set_timeout(
                         CLOSE_CONFIRM_MS + 50.0,
                         Box::new(move || {
-                            let inner = app.inner.borrow();
-                            Self::render_strip(&inner);
+                            if let Some(app) = weak.upgrade() {
+                                let inner = app.inner.borrow();
+                                Self::render_strip(&inner);
+                            }
                         }),
                     );
                 }
@@ -3933,16 +3949,22 @@ impl<P: Platform, L: Link> App<P, L> {
 
     /// Blink the cursor: a half-second tick that hides it every other
     /// beat. Intervals cannot be cancelled, so the tick starts once and
-    /// idles while blinking is off.
+    /// idles while blinking is off. It holds the App weakly: a strong
+    /// reference here would keep a retired App (and its GPU state)
+    /// alive for the life of the platform.
     fn set_blinking(self: &Rc<Self>, on: bool) {
         let mut inner = self.inner.borrow_mut();
         inner.blink_shown = true;
         if on && !inner.blink_ticking {
             inner.blink_ticking = true;
-            let app = Rc::clone(self);
+            let weak = Rc::downgrade(self);
             inner.platform.set_interval(
                 530.0,
                 Box::new(move || {
+                    let Some(app) = weak.upgrade() else { return };
+                    if app.retired.get() {
+                        return;
+                    }
                     let mut inner = app.inner.borrow_mut();
                     if !inner.settings.cursor_blink || inner.panes.is_empty() {
                         return;
@@ -4445,17 +4467,25 @@ impl<P: Platform, L: Link> App<P, L> {
         f(&mut self.inner.borrow_mut().gpu)
     }
 
-    /// Let the link go and take the GPU state back, for a platform that
-    /// keeps its device across connections. Fails (handing the App back)
-    /// while something else still holds it -- a task on the wire, say.
+    /// Let the link go, ahead of `into_gpu`. The link's handlers hold the
+    /// App and the App holds the link; cutting that, and telling the
+    /// link's pending requests they will not be answered, lets every task
+    /// on the wire finish once the executor runs again. Ticks that still
+    /// reach the App afterwards do nothing.
+    pub fn retire(&self) {
+        self.retired.set(true);
+        let inner = self.inner.borrow();
+        inner.link.set_push_handler(Box::new(|_| {}));
+        inner.link.set_close_handler(Box::new(|_| {}));
+        inner.link.shutdown();
+    }
+
+    /// Take the GPU state back, for a platform that keeps its device
+    /// across connections. Fails (handing the App back) while something
+    /// else still holds it -- a task on the wire, say; `retire` first and
+    /// run the executor to give those a chance to finish.
     pub fn into_gpu(app: Rc<Self>) -> std::result::Result<Gpu, Rc<Self>> {
-        {
-            // The link's handlers hold the App; the App holds the link.
-            let inner = app.inner.borrow();
-            inner.link.set_push_handler(Box::new(|_| {}));
-            inner.link.set_close_handler(Box::new(|_| {}));
-            inner.link.shutdown();
-        }
+        app.retire();
         Rc::try_unwrap(app).map(|app| app.inner.into_inner().gpu)
     }
 

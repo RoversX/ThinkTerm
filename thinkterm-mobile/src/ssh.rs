@@ -141,10 +141,12 @@ async fn run(
     )
     .await
     .context("connecting timed out")?;
+    let mut session = dial.context("ssh transport")?;
+    // Only a key the check let through is worth remembering: the shells
+    // pin whatever arrives here, and a mismatch must not replace the pin.
     if let Some(fingerprint) = seen.lock().unwrap().clone() {
         deliver(Net::HostKey(fingerprint));
     }
-    let mut session = dial.context("ssh transport")?;
 
     let auth = match &params.auth {
         Auth::KeyPath(path) => {
@@ -190,29 +192,48 @@ async fn run(
     channel.exec(true, command).await.context("exec")?;
     deliver(Net::Connected);
 
+    // A write waits for the remote's window, and the window only grows
+    // through messages the reader takes in; russh parks its session loop
+    // on a full inbound queue. So the writer runs apart from the reader,
+    // and a stalled write never stops the reading.
+    let (mut reader, writer) = channel.split();
+    let mut sender = tokio::spawn(async move {
+        while let Some(out) = out_rx.recv().await {
+            match out {
+                Out::Bytes(bytes) => writer
+                    .data(&bytes[..])
+                    .await
+                    .context("writing to the channel")?,
+                Out::Close => break,
+            }
+        }
+        let _ = writer.eof().await;
+        let _ = writer.close().await;
+        Ok::<(), anyhow::Error>(())
+    });
     loop {
         tokio::select! {
-            out = out_rx.recv() => match out {
-                Some(Out::Bytes(bytes)) => {
-                    channel.data(&bytes[..]).await.context("writing to the channel")?;
-                }
-                Some(Out::Close) | None => {
-                    let _ = channel.eof().await;
-                    let _ = channel.close().await;
-                    let _ = session
-                        .disconnect(russh::Disconnect::ByApplication, "closed", "")
-                        .await;
-                    return Ok("closed by the client".into());
-                }
-            },
-            msg = channel.wait() => match msg {
+            sent = &mut sender => {
+                let _ = session
+                    .disconnect(russh::Disconnect::ByApplication, "closed", "")
+                    .await;
+                return match sent {
+                    Ok(Ok(())) => Ok("closed by the client".into()),
+                    Ok(Err(err)) => Err(err),
+                    Err(err) => Err(anyhow!("the writer ended: {err}")),
+                };
+            }
+            msg = reader.wait() => match msg {
                 Some(ChannelMsg::Data { data }) => deliver(Net::Data(data.to_vec())),
                 Some(ChannelMsg::ExtendedData { data, .. }) => {
                     deliver(Net::Stderr(String::from_utf8_lossy(&data).to_string()))
                 }
                 Some(ChannelMsg::ExitStatus { exit_status }) => deliver(Net::Exit(exit_status)),
                 Some(ChannelMsg::Eof) => {}
-                Some(ChannelMsg::Close) | None => return Ok("the remote command ended".into()),
+                Some(ChannelMsg::Close) | None => {
+                    sender.abort();
+                    return Ok("the remote command ended".into());
+                }
                 Some(_) => {}
             },
         }

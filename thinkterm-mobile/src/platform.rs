@@ -127,6 +127,12 @@ impl MobilePlatform {
     pub fn frame_pending(&self) -> bool {
         self.frame_requested.get()
     }
+
+    /// Drop every timer and interval: they were an App's, and it is gone.
+    pub fn clear_timers(&self) {
+        self.timers.borrow_mut().clear();
+        self.intervals.borrow_mut().clear();
+    }
 }
 
 impl Platform for MobilePlatform {

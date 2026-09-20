@@ -297,22 +297,32 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
         return row * (s.cols + 1) + col
     }
 
-    /// The cell under a point in the view, clamped into the pane.
+    /// The cell under a point UIKit hands the text input, clamped into
+    /// the pane. Those points are in the scroll view's coordinates, which
+    /// start at the content offset, half-way down the runway.
     private func cell(under point: CGPoint) -> (row: Int, col: Int)? {
         guard let s = currentScreen(), s.cell[0] > 0, s.cell[1] > 0 else { return nil }
-        let col = Int(((point.x - s.origin[0]) / s.cell[0]).rounded(.down))
-        let row = Int(((point.y - s.origin[1]) / s.cell[1]).rounded(.down))
+        let x = point.x - contentOffset.x
+        let y = point.y - contentOffset.y
+        let col = Int(((x - s.origin[0]) / s.cell[0]).rounded(.down))
+        let row = Int(((y - s.origin[1]) / s.cell[1]).rounded(.down))
         return (min(max(row, 0), s.rows - 1), min(max(col, 0), s.cols - 1))
     }
 
+    /// A cell's rect for UIKit, in the scroll view's coordinates.
     private func rect(row: Int, col: Int, cols: Int = 1) -> CGRect {
         guard let s = currentScreen() else { return .zero }
         return CGRect(
-            x: s.origin[0] + Double(col) * s.cell[0],
-            y: s.origin[1] + Double(row) * s.cell[1],
+            x: contentOffset.x + s.origin[0] + Double(col) * s.cell[0],
+            y: contentOffset.y + s.origin[1] + Double(row) * s.cell[1],
             width: Double(cols) * s.cell[0],
             height: s.cell[1]
         )
+    }
+
+    /// The App's cursor rect, in the scroll view's coordinates.
+    private var cursorRectForText: CGRect {
+        (model?.cursorRect ?? .zero).offsetBy(dx: contentOffset.x, dy: contentOffset.y)
     }
 
     // MARK: UITextInput -- marked text (after the rows)
@@ -491,7 +501,7 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
     // MARK: UITextInput -- geometry
 
     func firstRect(for range: UITextRange) -> CGRect {
-        guard let r = range as? Range, let a = cell(at: r.a) else { return model?.cursorRect ?? .zero }
+        guard let r = range as? Range, let a = cell(at: r.a) else { return cursorRectForText }
         let last = cell(at: max(r.b - 1, r.a)) ?? a
         let cols = last.row == a.row ? last.col - a.col + 1 : (currentScreen()?.cols ?? 1) - a.col
         return rect(row: a.row, col: a.col, cols: max(cols, 1))
@@ -502,7 +512,7 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
     /// tapped cell would only mislead.
     func caretRect(for position: UITextPosition) -> CGRect {
         guard let p = position as? Pos, let c = cell(at: p.i) else {
-            var r = model?.cursorRect ?? .zero
+            var r = cursorRectForText
             r.size.width = 0
             return r
         }

@@ -214,7 +214,11 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     // MARK: input
 
     func key(_ name: String, ctrl: Bool = false, alt: Bool = false, shift: Bool = false) {
-        core.key(name: name, ctrl: ctrl || takeSticky(\.ctrlSticky), alt: alt || takeSticky(\.altSticky), shift: shift)
+        // A sticky modifier is spent by the next key whether or not that
+        // key brought the modifier itself, so it never lingers past it.
+        let stickyCtrl = takeSticky(\.ctrlSticky)
+        let stickyAlt = takeSticky(\.altSticky)
+        core.key(name: name, ctrl: ctrl || stickyCtrl, alt: alt || stickyAlt, shift: shift)
     }
 
     /// Text from the keyboard. A sticky Ctrl or Alt turns a single

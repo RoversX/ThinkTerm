@@ -187,20 +187,81 @@ class HostStore(context: Context) {
     private companion object {
         const val KEY = "hosts.v1"
 
-        /// Keystore-backed preferences. If the device refuses (a broken
-        /// keystore on an emulator), plain preferences keep the app usable.
-        fun openSecrets(app: Context): SharedPreferences = try {
+        const val SECRETS = "thinkterm-secrets"
+
+        /// Keystore-backed preferences. A file whose keyset the keystore
+        /// can no longer open (a restore onto another device) is thrown
+        /// away and made afresh: its secrets were lost with the key. If
+        /// the keystore refuses altogether, the secrets live in memory
+        /// for this run -- never in a file in the clear.
+        fun openSecrets(app: Context): SharedPreferences {
+            try {
+                return openEncrypted(app)
+            } catch (e: Throwable) {
+                Log.w("thinkterm", "encrypted preferences unreadable, starting them over: $e")
+            }
+            try {
+                app.deleteSharedPreferences(SECRETS)
+                return openEncrypted(app)
+            } catch (e: Throwable) {
+                Log.w("thinkterm", "encrypted preferences unavailable: $e")
+            }
+            return MemoryPreferences()
+        }
+
+        private fun openEncrypted(app: Context): SharedPreferences {
             val key = MasterKey.Builder(app).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build()
-            EncryptedSharedPreferences.create(
+            return EncryptedSharedPreferences.create(
                 app,
-                "thinkterm-secrets",
+                SECRETS,
                 key,
                 EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
                 EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
             )
-        } catch (e: Throwable) {
-            Log.w("thinkterm", "encrypted preferences unavailable: $e")
-            app.getSharedPreferences("thinkterm-secrets-plain", Context.MODE_PRIVATE)
+        }
+    }
+}
+
+/// Preferences that last for the run only: the stand-in for the
+/// encrypted store when the keystore is out of order.
+private class MemoryPreferences : SharedPreferences {
+    private val values = HashMap<String, Any?>()
+    private val listeners = HashSet<SharedPreferences.OnSharedPreferenceChangeListener>()
+
+    override fun getAll(): MutableMap<String, *> = HashMap(values)
+    override fun getString(key: String?, defValue: String?): String? = values[key] as? String ?: defValue
+    @Suppress("UNCHECKED_CAST")
+    override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? =
+        (values[key] as? Set<String>)?.toMutableSet() ?: defValues
+    override fun getInt(key: String?, defValue: Int): Int = values[key] as? Int ?: defValue
+    override fun getLong(key: String?, defValue: Long): Long = values[key] as? Long ?: defValue
+    override fun getFloat(key: String?, defValue: Float): Float = values[key] as? Float ?: defValue
+    override fun getBoolean(key: String?, defValue: Boolean): Boolean = values[key] as? Boolean ?: defValue
+    override fun contains(key: String?): Boolean = values.containsKey(key)
+    override fun edit(): SharedPreferences.Editor = Editor()
+    override fun registerOnSharedPreferenceChangeListener(l: SharedPreferences.OnSharedPreferenceChangeListener) { listeners.add(l) }
+    override fun unregisterOnSharedPreferenceChangeListener(l: SharedPreferences.OnSharedPreferenceChangeListener) { listeners.remove(l) }
+
+    private inner class Editor : SharedPreferences.Editor {
+        private val puts = HashMap<String, Any?>()
+        private val removes = HashSet<String>()
+        private var clear = false
+
+        override fun putString(key: String?, value: String?) = also { if (key != null) puts[key] = value }
+        override fun putStringSet(key: String?, values: MutableSet<String>?) = also { if (key != null) puts[key] = values?.toSet() }
+        override fun putInt(key: String?, value: Int) = also { if (key != null) puts[key] = value }
+        override fun putLong(key: String?, value: Long) = also { if (key != null) puts[key] = value }
+        override fun putFloat(key: String?, value: Float) = also { if (key != null) puts[key] = value }
+        override fun putBoolean(key: String?, value: Boolean) = also { if (key != null) puts[key] = value }
+        override fun remove(key: String?) = also { if (key != null) removes.add(key) }
+        override fun clear() = also { clear = true }
+        override fun commit(): Boolean { apply(); return true }
+        override fun apply() {
+            if (clear) values.clear()
+            for (k in removes) values.remove(k)
+            for ((k, v) in puts) if (v == null) values.remove(k) else values[k] = v
+            val changed = removes + puts.keys
+            for (l in listeners.toList()) for (k in changed) l.onSharedPreferenceChanged(this@MemoryPreferences, k)
         }
     }
 }

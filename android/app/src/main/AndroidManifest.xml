@@ -2,11 +2,16 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Nothing here is backed up or moved to another device: the
+         private keys and passwords are bound to this device's keystore,
+         and a copy of their file elsewhere would be unreadable at best. -->
     <application
         android:label="ThinkTerm"
         android:icon="@mipmap/ic_launcher"
         android:theme="@style/Theme.ThinkTerm"
-        android:supportsRtl="true">
+        android:supportsRtl="true"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules">
         <activity
             android:name=".MainActivity"
             android:exported="true"

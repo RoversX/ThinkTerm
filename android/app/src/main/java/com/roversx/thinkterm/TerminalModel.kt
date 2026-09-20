@@ -251,7 +251,11 @@ class TerminalModel(
     // MARK: input
 
     fun key(name: String, ctrl: Boolean = false, alt: Boolean = false, shift: Boolean = false) {
-        core.key(name, ctrl || takeCtrl(), alt || takeAlt(), shift)
+        // A sticky modifier is spent by the next key whether or not that
+        // key brought the modifier itself, so it never lingers past it.
+        val stickyCtrl = takeCtrl()
+        val stickyAlt = takeAlt()
+        core.key(name, ctrl || stickyCtrl, alt || stickyAlt, shift)
     }
 
     /// Text from the keyboard. A sticky Ctrl or Alt turns a single
@@ -535,10 +539,24 @@ object Assets {
     fun install(context: Context) {
         for (name in faces) {
             val out = java.io.File(context.filesDir, name)
-            if (out.exists() && out.length() > 0) continue
-            try {
-                context.assets.open(name).use { input -> out.outputStream().use { input.copyTo(it) } }
+            // The APK's copy is the truth: a file of another size is a
+            // copy that was cut short (or a font that changed) and is
+            // made again. An unknown size settles for a file that exists.
+            val wanted = try {
+                context.assets.openFd(name).use { it.length }
             } catch (e: Throwable) {
+                -1L
+            }
+            if (out.exists() && out.length() > 0 && (wanted < 0 || out.length() == wanted)) continue
+            // Written beside its name and renamed into place, so a copy
+            // interrupted half-way never passes for a font.
+            val part = java.io.File(context.filesDir, "$name.part")
+            try {
+                context.assets.open(name).use { input -> part.outputStream().use { input.copyTo(it) } }
+                if (wanted >= 0 && part.length() != wanted) throw java.io.IOException("short copy")
+                if (!part.renameTo(out)) throw java.io.IOException("rename failed")
+            } catch (e: Throwable) {
+                part.delete()
                 Log.w("thinkterm", "font $name not installed: $e")
             }
         }

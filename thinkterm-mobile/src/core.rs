@@ -71,8 +71,9 @@ pub enum Cmd {
         painter: Box<dyn GlyphPainter>,
     },
     Disconnect,
-    /// From the network thread.
-    Net(Net),
+    /// From the network thread; `serial` names the link it belongs to,
+    /// so a retiring thread's last words never reach its successor.
+    Net { serial: u64, net: Net },
     /// The first dial finished.
     Dialed(Result<(), String>),
     /// The attach handshake finished.
@@ -157,6 +158,9 @@ pub enum Cmd {
 /// The surface currently lent, if any.
 struct Target {
     generation: u64,
+    /// The shell's native layer or window, kept so the GPU state can be
+    /// remade on it without a fresh attach.
+    layer: usize,
     width: u32,
     height: u32,
     scale: f64,
@@ -199,6 +203,8 @@ struct State {
     app: Option<Rc<MobileApp>>,
     target: Option<Target>,
     next_generation: u64,
+    /// One per link made; a network event from an older one is dropped.
+    link_serial: u64,
     animating: bool,
     stats: Stats,
     notify: Arc<dyn Notify>,
@@ -237,6 +243,7 @@ pub fn run(cmd_tx: Sender<Cmd>, rx: Receiver<Cmd>, notify: Box<dyn Notify>) {
         app: None,
         target: None,
         next_generation: 1,
+        link_serial: 0,
         animating: false,
         stats: Stats::default(),
         notify,
@@ -334,7 +341,7 @@ impl State {
                 self.disconnect();
                 self.set_status("disconnected");
             }
-            Cmd::Net(net) => self.on_net(net),
+            Cmd::Net { serial, net } => self.on_net(serial, net),
             Cmd::Dialed(outcome) => self.on_dialed(outcome),
             Cmd::Attached(outcome) => self.on_attached(outcome),
             Cmd::Key {
@@ -627,10 +634,12 @@ impl State {
         self.glyph_platform = Some(Rc::new(GlyphSeams::new(painter)));
 
         let tx = self.cmd_tx.clone();
+        self.link_serial += 1;
+        let serial = self.link_serial;
         let deliver: Box<dyn Fn() -> Box<dyn Fn(Net) + Send>> = Box::new(move || {
             let tx = tx.clone();
             Box::new(move |net| {
-                let _ = tx.send(Cmd::Net(net));
+                let _ = tx.send(Cmd::Net { serial, net });
             })
         });
         let link = SshLink::new(params.ssh.clone(), deliver);
@@ -661,23 +670,58 @@ impl State {
             link.shutdown();
         }
         if let Some(app) = self.app.take() {
+            // Cut the link's hold on the App, then let every task on the
+            // wire see the link gone and finish, so nothing but this
+            // handle is left holding it.
+            app.retire();
+            self.pool.run_until_stalled();
             // The device, the pipeline and the surface come back to the
             // core for the next connection (or the demo).
             match App::into_gpu(app) {
                 Ok(gpu) => self.gpu = Some(gpu),
                 Err(app) => {
-                    // A task still holds the App: let it go with its GPU
-                    // state; the shell's next attach makes a fresh one.
+                    // Something still holds the App. It must never draw
+                    // again on a window the shell may release: take the
+                    // surface from it and unhook its frame handler, then
+                    // remake the GPU state on the target still attached.
+                    app.with_gpu(|gpu| gpu.detach_surface());
+                    self.platform.set_frame_handler(Box::new(|| {}));
                     drop(app);
                     self.gpu = None;
-                    self.target = None;
-                    self.notify.on_log(
-                        "the App was still in use; its GPU state went with it -- attach the surface again".into(),
-                    );
+                    self.notify
+                        .on_log("the App was still in use; remaking the GPU state".into());
+                    self.remake_gpu();
                 }
             }
+            // Every timer and interval belonged to that App.
+            self.platform.clear_timers();
         }
         self.conn = Conn::Idle;
+    }
+
+    /// A fresh device and swapchain on the surface the shell still lends,
+    /// for when the old ones went away with a retired App.
+    fn remake_gpu(&mut self) {
+        let Some(target) = self.target.as_ref() else {
+            return;
+        };
+        let (layer, width, height) = (target.layer, target.width, target.height);
+        let made = self.surface_from_layer(layer).and_then(|surface| {
+            futures::executor::block_on(Gpu::from_surface(&self.instance, surface, width, height))
+        });
+        match made {
+            Ok(gpu) => {
+                let info = gpu.adapter_info.name.clone();
+                self.gpu = Some(gpu);
+                self.notify.on_log(format!("gpu ready again: {info}"));
+            }
+            Err(err) => {
+                self.target = None;
+                self.notify.on_log(format!(
+                    "remaking the GPU state failed: {err:#} -- attach the surface again"
+                ));
+            }
+        }
     }
 
     fn on_dialed(&mut self, outcome: Result<(), String>) {
@@ -696,7 +740,17 @@ impl State {
         }
     }
 
-    fn on_net(&mut self, net: Net) {
+    fn on_net(&mut self, serial: u64, net: Net) {
+        if serial != self.link_serial {
+            // A thread of an earlier link, saying its goodbyes: the link
+            // it speaks for is gone, and the current one must not hear
+            // them as its own.
+            if let Net::Closed(reason) = net {
+                self.notify
+                    .on_log(format!("an earlier connection ended: {reason}"));
+            }
+            return;
+        }
         let Some(link) = self.link.clone() else {
             return;
         };
@@ -960,6 +1014,7 @@ impl State {
         self.next_generation += 1;
         self.target = Some(Target {
             generation,
+            layer,
             width,
             height,
             scale,
