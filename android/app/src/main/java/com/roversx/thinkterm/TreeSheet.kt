@@ -518,7 +518,6 @@ private fun TabRows(
     }
 }
 
-private const val OVERVIEW_DOTS = 4
 private const val OVERVIEW_ROWS = 9
 private const val OVERVIEW_COLS = 38
 
@@ -623,62 +622,43 @@ data class CardFrames(val card: Rect, val thumb: Rect)
 /// which carries the same header while the terminal shrinks.
 @Composable
 fun ThreadCardHeader(thread: ThreadView, accent: Color, modifier: Modifier = Modifier) {
-    val shown = thread.tabs.take(OVERVIEW_DOTS)
-    val folded = thread.tabs.size - shown.size
     val currentTab = thread.tabs.firstOrNull { it.current } ?: thread.tabs.firstOrNull()
-    Column(modifier) {
-        Row(
-            Modifier.fillMaxWidth().padding(start = 10.dp, end = 10.dp, top = 10.dp, bottom = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(7.dp),
-        ) {
-            Box(Modifier.size(7.dp).background(threadColor(thread.status, thread.live), CircleShape))
+    // One line: the dot and name, the current tab's title after them, and
+    // an offline badge at the end; the tabs as dots took a row of their own.
+    Row(
+        modifier.fillMaxWidth().padding(start = 10.dp, end = 10.dp, top = 9.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(7.dp),
+    ) {
+        Box(Modifier.size(7.dp).background(threadColor(thread.status, thread.live), CircleShape))
+        Text(
+            thread.name,
+            fontSize = 13.5.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = Color.White,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            currentTab?.title ?: "",
+            fontSize = 10.sp,
+            fontFamily = FontFamily.Monospace,
+            color = overviewSecondary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        if (!thread.live) {
             Text(
-                thread.name,
-                fontSize = 13.5.sp,
+                tr("offline"),
+                fontSize = 9.sp,
                 fontWeight = FontWeight.SemiBold,
-                color = Color.White,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+                color = overviewSecondary,
+                modifier = Modifier
+                    .background(Color.Gray.copy(alpha = 0.22f), CircleShape)
+                    .padding(horizontal = 6.dp, vertical = 2.dp),
             )
         }
-        Row(
-                Modifier.fillMaxWidth().padding(start = 10.dp, end = 10.dp, bottom = 7.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                for (tab in shown) {
-                    Box(
-                        Modifier
-                            .size(6.dp)
-                            .background(
-                                if (thread.current && tab.current) accent else Color.White.copy(alpha = 0.28f),
-                                CircleShape,
-                            )
-                    )
-                }
-                if (folded > 0) Text("+$folded", fontSize = 9.5.sp, color = overviewSecondary)
-                Text(
-                    currentTab?.title ?: "",
-                    fontSize = 10.sp,
-                    fontFamily = FontFamily.Monospace,
-                    color = overviewSecondary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f).padding(start = 3.dp),
-                )
-                if (!thread.live) {
-                    Text(
-                        tr("offline"),
-                        fontSize = 9.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = overviewSecondary,
-                        modifier = Modifier
-                            .background(Color.Gray.copy(alpha = 0.22f), CircleShape)
-                            .padding(horizontal = 6.dp, vertical = 2.dp),
-                    )
-                }
-            }
     }
 }
 

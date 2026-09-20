@@ -263,7 +263,7 @@ struct TreeSheet: View {
 
 /// The desktop's Live Overview as an overlay under the terminal: a card
 /// per thread, grouped by project, two to a row. Each card is the
-/// thread's name and state, its tabs as dots (the rest folded into +N),
+/// thread's name and state with its current tab's title,
 /// an offline badge, and a thumbnail of its terminal in its colours: the
 /// last rows of its current tab's pane, fetched from the server and
 /// refreshed while the overview is up. The thread on show leaves its
@@ -280,7 +280,6 @@ struct OverviewScreen: View {
     var livePreview: Bool = true
     /// A tapped card, with its frames: the terminal grows back out of it.
     var onPick: (ThreadView, CardFrames?) -> Void = { _, _ in }
-    private let dots = 4
     private let rows = 9
     private let columns = [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)]
 
@@ -370,9 +369,6 @@ struct OverviewScreen: View {
     }
 
     private func card(_ thread: ThreadView) -> some View {
-        let shown = Array(thread.tabs.prefix(dots))
-        let folded = thread.tabs.count - shown.count
-        let currentTab = thread.tabs.first(where: { $0.current }) ?? thread.tabs.first
         let live = thread.id == liveThread
         return Button {
             if !live { model.sideClick("thread", id: thread.id) }
@@ -453,48 +449,31 @@ struct CardFrames: Equatable {
 struct ThreadCardHeader: View {
     let thread: ThreadView
     @ObservedObject private var lang = AppLanguage.shared
-    private let dots = 4
 
+    /// One line: the dot and name, the current tab's title after them, and
+    /// an offline badge at the end; the tabs as dots took a row of their own.
     var body: some View {
-        let shown = Array(thread.tabs.prefix(dots))
-        let folded = thread.tabs.count - shown.count
         let currentTab = thread.tabs.first(where: { $0.current }) ?? thread.tabs.first
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 7) {
-                Circle().fill(TerminalScreen.threadColor(status: thread.status, live: thread.live)).frame(width: 7, height: 7)
-                Text(thread.name).font(.system(size: 13.5, weight: .semibold)).lineLimit(1)
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 10)
-            .padding(.top, 10)
-            .padding(.bottom, 6)
-            HStack(spacing: 4) {
-                ForEach(shown) { tab in
-                    Circle()
-                        .fill(thread.current && tab.current ? Color.accentColor : Color.white.opacity(0.28))
-                        .frame(width: 6, height: 6)
-                }
-                if folded > 0 {
-                    Text("+\(folded)").font(.system(size: 9.5)).foregroundColor(.secondary)
-                }
-                Text(currentTab?.title ?? "")
-                    .font(.system(size: 10, design: .monospaced))
+        HStack(spacing: 7) {
+            Circle().fill(TerminalScreen.threadColor(status: thread.status, live: thread.live)).frame(width: 7, height: 7)
+            Text(thread.name).font(.system(size: 13.5, weight: .semibold)).lineLimit(1)
+            Text(currentTab?.title ?? "")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+            if !thread.live {
+                Text(tr("offline"))
+                    .font(.system(size: 9, weight: .semibold))
                     .foregroundColor(.secondary)
-                    .lineLimit(1)
-                    .padding(.leading, 3)
-                Spacer(minLength: 0)
-                if !thread.live {
-                    Text(tr("offline"))
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundColor(.secondary)
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(Color.gray.opacity(0.22))
-                        .clipShape(Capsule())
-                }
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Color.gray.opacity(0.22))
+                    .clipShape(Capsule())
             }
-            .padding(.horizontal, 10)
-            .padding(.bottom, 7)
         }
+        .padding(.horizontal, 10)
+        .padding(.top, 9)
+        .padding(.bottom, 8)
         .foregroundColor(.white)
     }
 }
