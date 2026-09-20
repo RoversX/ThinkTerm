@@ -398,9 +398,12 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                         val top = (terminalBounds.height - hero.thumb.height / sEnd) * t
                         val left = terminalBounds.left + (hero.thumb.left - terminalBounds.left) * t - boxOrigin.x
                         val thumbTop = terminalBounds.top + (hero.thumb.top - terminalBounds.top) * t - boxOrigin.y
-                        val frameTop = thumbTop - headerPx * scale
+                        // The header is laid out at the card's size and blown
+                        // up by 1/sEnd before the zoom scales it.
+                        val headerH = headerPx * scale / sEnd
+                        val frameTop = thumbTop - headerH
                         val w = terminalBounds.width * scale
-                        val h = headerPx * scale + (terminalBounds.height - top) * scale
+                        val h = headerH + (terminalBounds.height - top) * scale
                         val r = 13.dp.toPx() * t
                         val stroke = 2.dp.toPx()
                         drawRoundRect(
