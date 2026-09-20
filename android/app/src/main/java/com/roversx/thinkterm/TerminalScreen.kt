@@ -87,7 +87,6 @@ import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -96,8 +95,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.launch
 import kotlin.math.max
@@ -111,7 +108,9 @@ import kotlin.math.min
 @Composable
 fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
     val context = LocalContext.current
-    val model = remember(host.id) { TerminalModel(context, store, host) }
+    // The connection is the host's, not the screen's: it lives in
+    // `Sessions` and is picked up again on the way back.
+    val model = remember(host.id) { Sessions.get(context, store, host) }
     val settings = model.settings
     val density = LocalDensity.current
     val scope = rememberCoroutineScope()
@@ -148,8 +147,13 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
 
     // The connection does not wait for the surface: the core attaches to
     // a pane when both have arrived, in whichever order they come.
-    LaunchedEffect(model) { model.connect() }
-    DisposableEffect(model) { onDispose { model.shutdown() } }
+    LaunchedEffect(model) {
+        model.enterScreen()
+        if (!model.isConnected) model.connect()
+    }
+    // Leaving takes the picture, not the connection: the frame loop
+    // rests, the surface goes with the view, the socket stays.
+    DisposableEffect(model) { onDispose { model.leaveScreen() } }
 
     // The open terminal follows the preferences as they change.
     LaunchedEffect(model) {
@@ -163,20 +167,6 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
     }
     LaunchedEffect(showLog.value, settings.devMode) { model.wantsStats = showLog.value || settings.devMode }
 
-    // Leaving the screen (Home, another app) with the setting off drops
-    // the connection; coming back redials.
-    val lifecycle = LocalLifecycleOwner.current.lifecycle
-    DisposableEffect(lifecycle, model) {
-        val observer = LifecycleEventObserver { _, event ->
-            when (event) {
-                Lifecycle.Event.ON_STOP -> model.enteredBackground()
-                Lifecycle.Event.ON_START -> model.enteredForeground()
-                else -> {}
-            }
-        }
-        lifecycle.addObserver(observer)
-        onDispose { lifecycle.removeObserver(observer) }
-    }
 
     /// Back to the terminal. A tapped card hands over its thread and its
     /// frames: the terminal grows out of that card, not the one it came
@@ -272,9 +262,9 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
             TopBar(
                 model = model,
                 twoLevel = twoLevel,
-                onBack = { model.disconnect(); onBack() },
-                onTree = { showTree = true },
-                onOverview = { if (overviewShown) closeOverview() else openOverview() },
+                onBack = onBack,
+                // The keyboard goes first, or the panel sits on it.
+                onTree = { model.onHideKeyboard?.invoke(); showTree = true },
             )
             // The tab strip fades with the zoom and stops taking touches;
             // its room stays, so the terminal's own place does not move
@@ -346,7 +336,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
 
             if (!overviewOpen) {
                 StatusLine(model)
-                if (keyboardUp) {
+                if (keyboardUp || model.panelOpen) {
                     KeyBar(model = model, keyboardUp = keyboardUp, onOpenSettings = { showSettings = true })
                 }
             }
@@ -426,6 +416,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                 onDismiss = { showTree = false },
                 onEditHost = { showTree = false; editingHost = model.host },
                 onSettings = { showSettings = true },
+                onOverview = { if (overviewShown) closeOverview() else openOverview() },
             )
         }
         if (showSettings) {
@@ -465,7 +456,6 @@ private fun TopBar(
     twoLevel: Boolean,
     onBack: () -> Unit,
     onTree: () -> Unit,
-    onOverview: () -> Unit,
 ) {
     Row(
         Modifier.fillMaxWidth().height(48.dp).padding(start = 2.dp, end = 2.dp),
@@ -498,9 +488,6 @@ private fun TopBar(
                 TabPills(model, size = 12.sp, height = 26.dp, positions = positions)
                 NewTabButton(model)
             }
-        }
-        IconButton(onClick = onOverview) {
-            Icon(Icons.Default.GridView, contentDescription = tr("overview"), tint = Color.White)
         }
     }
 }

@@ -4,6 +4,7 @@ import SwiftUI
 /// its own so the automated flows and a quick check need no setup.
 struct HostsView: View {
     @EnvironmentObject var store: HostStore
+    @EnvironmentObject var sessions: Sessions
     @ObservedObject private var lang = AppLanguage.shared
     @State private var editing: Host?
     @State private var adding = false
@@ -67,15 +68,15 @@ struct HostsView: View {
         .searchable(text: $search, placement: .navigationBarDrawer, prompt: tr("hosts.search"))
         .navigationDestination(for: Host.self) { host in
             if host.name == "probe" {
-                TerminalScreen(host: nil, store: store)
+                TerminalScreen(model: sessions.model(for: nil, store: store))
             } else {
-                TerminalScreen(host: host, store: store)
+                TerminalScreen(model: sessions.model(for: host, store: store))
             }
         }
         // A separate destination type so the context menu's Connect can push
         // without fighting the value-based destination above.
         .navigationDestination(item: $connecting) { target in
-            TerminalScreen(host: target.host, store: store)
+            TerminalScreen(model: sessions.model(for: target.host, store: store))
         }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -105,7 +106,7 @@ struct HostsView: View {
             titleVisibility: .visible,
             presenting: pendingDelete
         ) { host in
-            Button(tr("host.delete.confirm", host.display), role: .destructive) { store.remove(host) }
+            Button(tr("host.delete.confirm", host.display), role: .destructive) { sessions.close(host.id); store.remove(host) }
             Button(tr("cancel"), role: .cancel) {}
         } message: { _ in
             Text(tr("host.delete.body"))
@@ -115,7 +116,7 @@ struct HostsView: View {
     @ViewBuilder
     private func row(_ host: Host) -> some View {
         NavigationLink(value: host) {
-            HostRow(host: host)
+            HostRow(host: host, session: sessions.existing(host.id))
         }
         .swipeActions(edge: .trailing) {
             Button(role: .destructive) { pendingDelete = host } label: { Label(tr("delete"), systemImage: "trash") }
@@ -124,6 +125,9 @@ struct HostsView: View {
         }
         .contextMenu {
             Button { connecting = ConnectTarget(host: host) } label: { Label(tr("connect"), systemImage: "bolt.horizontal") }
+            if let session = sessions.existing(host.id), session.isConnected {
+                Button { sessions.close(host.id) } label: { Label(tr("disconnect"), systemImage: "power") }
+            }
             Button { editing = host } label: { Label(tr("edit"), systemImage: "pencil") }
             Button { duplicate(host) } label: { Label(tr("duplicate"), systemImage: "plus.square.on.square") }
             if host.knownHost != nil {
@@ -191,6 +195,8 @@ private struct ConnectTarget: Hashable {
 
 struct HostRow: View {
     let host: Host
+    /// The host's open session, if any: a dot says so.
+    var session: TerminalModel? = nil
     @ObservedObject private var lang = AppLanguage.shared
 
     var body: some View {
@@ -201,6 +207,7 @@ struct HostRow: View {
             subtitle: host.address
         ) {
             HStack(spacing: 6) {
+                if let session { ConnectionDot(model: session) }
                 Text(host.lastConnectedText)
                     .font(.caption)
                     .foregroundStyle(.tertiary)

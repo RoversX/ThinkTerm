@@ -182,8 +182,9 @@ data class LayoutView(
     val cellW: Double,
     val cellH: Double,
     val fontPt: Double,
-    /// Rows above the bottom, and rows there are to scroll through.
-    val scrollAbove: Int,
+    /// Rows above the bottom (with the fraction a smooth scroll is part
+    /// way through), and rows there are to scroll through.
+    val scrollAbove: Double,
     val scrollMax: Int,
     val focused: Int,
 )
@@ -403,7 +404,7 @@ object Views {
             cellW = cell?.optDouble(0) ?: 0.0,
             cellH = cell?.optDouble(1) ?: 0.0,
             fontPt = root.optDouble("font_pt"),
-            scrollAbove = scroll?.optInt(0) ?: 0,
+            scrollAbove = scroll?.optDouble(0) ?: 0.0,
             scrollMax = scroll?.optInt(1) ?: 0,
             focused = root.optInt("focused"),
         )

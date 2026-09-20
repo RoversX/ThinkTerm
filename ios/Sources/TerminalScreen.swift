@@ -3,10 +3,11 @@ import SwiftUI
 /// One host: its terminal, the tab strip, the bars over the panes, the
 /// key bar, and the sidebar and menus as sheets.
 struct TerminalScreen: View {
-    @StateObject private var model: TerminalModel
+    /// The host's session, from `Sessions`: the screen shows it and
+    /// gives it back on the way out, connection and all.
+    @ObservedObject var model: TerminalModel
     @ObservedObject private var settings = AppSettings.shared
     @ObservedObject private var lang = AppLanguage.shared
-    @Environment(\.scenePhase) private var scenePhase
     @Environment(\.dismiss) private var dismiss
     @State private var showTree = false
     @State private var showLog = false
@@ -48,10 +49,6 @@ struct TerminalScreen: View {
     @State private var livePreview = false
     @State private var deletingThread: ThreadView?
 
-    init(host: Host?, store: HostStore?) {
-        _model = StateObject(wrappedValue: TerminalModel(host: host, store: store))
-    }
-
     /// The tabs live in the navigation bar, between the system's own back
     /// button and the menu; the keys sit below the terminal, and nothing
     /// else. Every piece of chrome takes the terminal's own background.
@@ -63,7 +60,7 @@ struct TerminalScreen: View {
                     liveThread: currentThreadId, livePreview: livePreview,
                     onPick: { thread, frames in if let frames { picked = (thread, frames) } }
                 )
-                    .opacity(overviewOpen ? 1 : 0)
+                    .opacity(gridOpacity)
                     .onChange(of: overviewShown) { _, shown in if !shown { closeOverview() } }
             }
             // The card's own header rides along with the terminal: laid out at
@@ -116,12 +113,16 @@ struct TerminalScreen: View {
                     .zIndex(2)
                     .allowsHitTesting(!overviewOpen)
                 statusLine.opacity(overviewOpen ? 0 : 1)
-                if keyboardUp && !overviewOpen {
+                if (keyboardUp || model.panelOpen) && !overviewOpen {
+                    // With the keyboard down the bar sits on the home
+                    // indicator's inset; with it up, on the keyboard.
                     KeyBar(model: model)
+                        .padding(.bottom, keyboardUp ? 0 : Self.bottomInset)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
             .animation(.easeOut(duration: 0.2), value: keyboardUp)
+            .animation(.easeOut(duration: 0.2), value: model.panelOpen)
             .zIndex(1)
             .allowsHitTesting(!overviewOpen)
         }
@@ -132,7 +133,8 @@ struct TerminalScreen: View {
                 hostName: hostName,
                 connected: connected,
                 onEditHost: { showTree = false; editingHost = model.host },
-                onSettings: { showTree = false; showSettings = true }
+                onSettings: { showTree = false; showSettings = true },
+                onOverview: { showTree = false; openOverview() }
             )
         }
         .coordinateSpace(name: "screen")
@@ -149,8 +151,9 @@ struct TerminalScreen: View {
             keyboardUp = false
         }
         .onChange(of: cardFrame) { _, frames in
-            // The card's thumbnail is laid out: the terminal goes there.
-            if overviewShown, let frames, !overviewOpen { zoom(into: frames) }
+            // The card's thumbnail is laid out: the terminal goes there --
+            // even when it came late and the overview opened without it.
+            if overviewShown, let frames, heroFrames == nil { zoom(into: frames) }
         }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .tabBar)
@@ -159,13 +162,9 @@ struct TerminalScreen: View {
         .toolbar {
             ToolbarItem(placement: .principal) { tabStrip.frame(width: max(barWidth - 190, 120)) }
             ToolbarItem(placement: .topBarLeading) {
-                // The desktop's sidebar: the projects and threads, as a sheet.
-                Button { showTree = true } label: { Image(systemName: "sidebar.left") }
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                Button { if overviewShown { overviewShown = false } else { openOverview() } } label: {
-                    Image(systemName: "square.grid.2x2")
-                }
+                // The desktop's sidebar: the projects and threads, as a
+                // panel; the keyboard goes first, or the panel sits on it.
+                Button { model.dismissKeyboard(); showTree = true } label: { Image(systemName: "sidebar.left") }
             }
         }
         .ignoresSafeArea(.container, edges: .bottom)
@@ -204,9 +203,11 @@ struct TerminalScreen: View {
             }
         }
         .onAppear {
-            // The automated flows connect on their own schedule.
+            model.enterScreen()
+            // The automated flows connect on their own schedule; a session
+            // found open is simply shown.
             let args = ProcessInfo.processInfo.arguments
-            if !args.contains(where: { $0.hasSuffix("test") || $0 == "--autoconnect" }) {
+            if !args.contains(where: { $0.hasSuffix("test") || $0 == "--autoconnect" }), !model.isConnected {
                 model.connect()
             }
             #if DEBUG
@@ -220,14 +221,8 @@ struct TerminalScreen: View {
             #endif
         }
         .onDisappear {
-            model.shutdown()
-        }
-        .onChange(of: scenePhase) { _, phase in
-            switch phase {
-            case .background: model.detachForBackground()
-            case .active: model.reattachAfterBackground()
-            default: break
-            }
+            // The picture goes, the connection stays (see Sessions).
+            model.leaveScreen()
         }
     }
 
@@ -403,6 +398,25 @@ struct TerminalScreen: View {
 
     private var currentThreadId: String? { model.threads?.threads.first(where: { $0.current })?.id }
 
+    /// The cards' opacity follows the zoom itself, so no frame shows the
+    /// cards before the terminal has begun to shrink (or after it has
+    /// begun to grow back): one curve for both.
+    private var gridOpacity: Double {
+        guard overviewOpen else { return 0 }
+        guard let hero = heroFrames, terminalFrame.width > 0 else { return 1 }
+        let end = hero.thumb.width / terminalFrame.width
+        guard end < 0.999 else { return 1 }
+        return min(max((1 - zoomScale) / (1 - end), 0), 1)
+    }
+
+    /// The home indicator's inset, for a bar that sits at the bottom
+    /// while the keyboard is down.
+    private static var bottomInset: CGFloat {
+        UIApplication.shared.connectedScenes
+            .compactMap { ($0 as? UIWindowScene)?.keyWindow }
+            .first?.safeAreaInsets.bottom ?? 0
+    }
+
     private func openOverview() {
         guard !overviewShown else { return }
         model.refreshViews()
@@ -423,7 +437,7 @@ struct TerminalScreen: View {
         // A card the lazy grid never realises reports nothing; the
         // overview must not stay invisible for it. After a moment, the
         // terminal only fades.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             if overviewShown && !overviewOpen {
                 withAnimation(.easeOut(duration: 0.25)) { overviewOpen = true }
             }

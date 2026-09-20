@@ -27,6 +27,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.MoreHoriz
+import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Window
@@ -66,6 +67,7 @@ fun SidebarDrawer(
     onDismiss: () -> Unit,
     onEditHost: () -> Unit,
     onSettings: () -> Unit,
+    onOverview: () -> Unit,
 ) {
     BackHandler(enabled = visible) { onDismiss() }
     Box(Modifier.fillMaxSize()) {
@@ -76,7 +78,7 @@ fun SidebarDrawer(
             // A Surface, not a Box: it sets the content colour, so text with
             // no colour of its own is readable on every theme.
             Surface(Modifier.fillMaxHeight().width(300.dp), color = MaterialTheme.colorScheme.surface) {
-                SidebarTree(model, onDismiss, onEditHost, onSettings)
+                SidebarTree(model, onDismiss, onEditHost, onSettings, onOverview)
             }
         }
     }
@@ -94,7 +96,7 @@ private class Folded(model: TerminalModel) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun SidebarTree(model: TerminalModel, onDismiss: () -> Unit, onEditHost: () -> Unit, onSettings: () -> Unit) {
+private fun SidebarTree(model: TerminalModel, onDismiss: () -> Unit, onEditHost: () -> Unit, onSettings: () -> Unit, onOverview: () -> Unit) {
     val folded = remember(model) { Folded(model) }
     var connectionMenu by remember { mutableStateOf(false) }
     /// The Space whose menu is up, if any: one flag for all of them
@@ -292,6 +294,15 @@ private fun SidebarTree(model: TerminalModel, onDismiss: () -> Unit, onEditHost:
             }
         }
         HorizontalDivider()
+        // The desktop's footer actions: the overview, then settings.
+        Row(
+            Modifier.fillMaxWidth().clickable { onDismiss(); onOverview() }.padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Icon(Icons.Default.GridView, contentDescription = null, tint = secondary, modifier = Modifier.size(18.dp))
+            Text(tr("overview"), color = secondary)
+        }
         Row(
             Modifier.fillMaxWidth().clickable { onDismiss(); onSettings() }.padding(horizontal = 16.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,

@@ -25,6 +25,16 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     @Published var status: StatusView?
     @Published var title = ""
     @Published var connection = ""
+    /// The key panel is up in the keyboard's place.
+    @Published var panelOpen = ProcessInfo.processInfo.arguments.contains("--keypanel")
+    /// A thread this phone was on last time it was in this host, put
+    /// back once the threads are listed after a connect.
+    private var restoredThread = false
+    private var lastThreadKey: String? { host.map { "thread.last." + $0.id.uuidString } }
+
+    var isConnected: Bool {
+        !connection.isEmpty && !connection.hasPrefix("disconnected") && !connection.hasPrefix("failed") && !connection.hasPrefix("idle")
+    }
     @Published var attached = false
     @Published var composing: String?
     @Published var ctrlSticky = false
@@ -48,7 +58,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     @Published private(set) var fontPt: Double = 11
     /// The focused pane's place in its scrollback: rows above the bottom,
     /// and rows there are; changes for a moment show the scrollbar.
-    @Published private(set) var scroll: (Int, Int) = (0, 0)
+    @Published private(set) var scroll: (Double, Int) = (0, 0)
     @Published private(set) var scrollShown = false
     private var scrollTimer: Timer?
     /// The background task that holds the connection after the app leaves
@@ -143,6 +153,11 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         if args.contains("--uitest") { scheduleUiTest() }
     }
 
+    /// The screen went away but the connection stays: the frame loop
+    /// rests until the screen is back. The surface goes with the view.
+    func leaveScreen() { displayLink?.isPaused = true }
+    func enterScreen() { displayLink?.isPaused = false }
+
     func shutdown() {
         displayLink?.invalidate()
         statsTimer?.invalidate()
@@ -172,6 +187,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
 
     /// Connect to the model's host with the secret from the Keychain.
     func connect() {
+        restoredThread = false
         guard let host else {
             connectProbe()
             return
@@ -349,6 +365,22 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
 
     /// Show a thread, switching the Space on show to its own first when
     /// it is in another one, so the strips follow.
+    /// The thread on show is written down for the next connect; the first
+    /// listing after a connect puts the phone back on the one it left.
+    private func rememberThread(_ threads: ThreadsView?) {
+        guard let key = lastThreadKey, let list = threads?.threads,
+              let current = list.first(where: { $0.current })?.id else { return }
+        if !restoredThread {
+            restoredThread = true
+            if let saved = UserDefaults.standard.string(forKey: key), saved != current,
+               list.contains(where: { $0.id == saved }) {
+                openThread(saved, space: nil)
+                return
+            }
+        }
+        UserDefaults.standard.set(current, forKey: key)
+    }
+
     func openThread(_ id: String, space: String?) {
         if let space, tree?.spaces.first(where: { $0.current })?.id != space { core.setSpace(id: space) }
         sideClick("thread", id: id)
@@ -385,6 +417,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         if sidebar != self.sidebar { self.sidebar = sidebar }
         let threads = ViewJSON.decode(ThreadsView.self, core.view(name: "threads"))
         if threads != self.threads { self.threads = threads }
+        rememberThread(threads)
         let tree = ViewJSON.decode(TreeView.self, core.view(name: "tree"))
         if tree != self.tree { self.tree = tree }
         let navs = ViewJSON.decode([NavView].self, core.view(name: "navs")) ?? []
@@ -403,7 +436,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         if let r = layout.range(of: "\"scroll\":["),
            let end = layout[r.upperBound...].firstIndex(of: "]") {
             let parts = layout[r.upperBound..<end].split(separator: ",")
-            if parts.count == 2, let a = Int(parts[0]), let b = Int(parts[1]), (a, b) != scroll {
+            if parts.count == 2, let a = Double(parts[0]), let b = Int(parts[1]), (a, b) != scroll {
                 scroll = (a, b)
                 scrollShown = true
                 scrollTimer?.invalidate()
@@ -750,8 +783,8 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             let read = input.text(in: range) ?? ""
             self.check("document text", read == "SELECT-ME-PLEASE", read)
             q.asyncAfter(deadline: .now() + 0.5) {
-                let copied = self.core.selectedText() ?? ""
-                self.check("core selection", copied == "SELECT-ME-PLEASE", copied)
+                let copied = input.selectedText() ?? ""
+                self.check("shell selection", copied == "SELECT-ME-PLEASE", copied)
                 let back = input.selectedTextRange as? TerminalInputView.Range
                 self.check("selection read back", back?.a == a && back?.b == a + "SELECT-ME-PLEASE".count, "\(back?.a ?? -1)..\(back?.b ?? -1)")
                 let rects = input.selectionRects(for: range)

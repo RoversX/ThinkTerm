@@ -71,7 +71,6 @@ struct SettingsView: View {
                     }
                 }
                 Toggle(tr("k.haptics"), isOn: $settings.hapticKeys)
-                Toggle(tr("k.autopanel"), isOn: $settings.autoKeyPanel)
             }
 
             Section(tr("sec.gestures")) {

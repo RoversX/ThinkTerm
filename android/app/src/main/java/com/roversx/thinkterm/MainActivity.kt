@@ -53,6 +53,20 @@ class MainActivity : ComponentActivity() {
 private fun Root(store: HostStore, debuggable: Boolean) {
     // Reading the tag here relabels the tabs with the rest of the app.
     AppLanguage.tag
+    // Leaving the app (Home, another app) with the setting off drops
+    // every connection; coming back redials them.
+    val lifecycle = androidx.compose.ui.platform.LocalLifecycleOwner.current.lifecycle
+    androidx.compose.runtime.DisposableEffect(lifecycle) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_STOP -> Sessions.enteredBackground()
+                androidx.lifecycle.Lifecycle.Event.ON_START -> Sessions.enteredForeground()
+                else -> {}
+            }
+        }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer) }
+    }
     var open by remember { mutableStateOf<Host?>(null) }
     var tab by remember { mutableIntStateOf(0) }
 

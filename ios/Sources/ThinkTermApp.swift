@@ -3,18 +3,20 @@ import SwiftUI
 @main
 struct ThinkTermApp: App {
     @StateObject private var store = HostStore()
+    @StateObject private var sessions = Sessions()
 
     var body: some Scene {
         WindowGroup {
             Group {
                 if ProcessInfo.processInfo.arguments.contains(where: { $0.hasPrefix("--auto") || $0.hasSuffix("test") }) {
                     // The automated flows go straight to the probe's host.
-                    NavigationStack { TerminalScreen(host: nil, store: store) }
+                    NavigationStack { TerminalScreen(model: sessions.model(for: nil, store: store)) }
                 } else {
                     RootTabs(store: store)
                 }
             }
             .environmentObject(store)
+            .environmentObject(sessions)
             .preferredColorScheme(.dark)
         }
     }
@@ -47,6 +49,8 @@ struct ThinkTermApp: App {
 /// with the rest of the app.
 private struct RootTabs: View {
     let store: HostStore
+    @EnvironmentObject private var sessions: Sessions
+    @Environment(\.scenePhase) private var scenePhase
     @State private var path = NavigationPath()
     @ObservedObject private var lang = AppLanguage.shared
 
@@ -68,6 +72,14 @@ private struct RootTabs: View {
                 SettingsView(model: nil, showLog: nil)
             }
             .tabItem { Label(tr("settings"), systemImage: "gearshape") }
+        }
+        // Every open connection hears about the background, on screen or not.
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .background: sessions.detachForBackground()
+            case .active: sessions.reattachAfterBackground()
+            default: break
+            }
         }
     }
 }

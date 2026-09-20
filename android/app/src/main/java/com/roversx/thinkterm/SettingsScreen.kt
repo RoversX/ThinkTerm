@@ -142,7 +142,6 @@ private fun SettingsList(
             Section(tr("sec.keyboard"))
             PushRow(tr("k.keybar"), keyCaps.size.toString()) { onPush("k.keybar") }
             SwitchRow(tr("k.haptics"), settings.hapticKeys) { settings.hapticKeys = it }
-            SwitchRow(tr("k.autopanel"), settings.autoKeyPanel) { settings.autoKeyPanel = it }
 
             Section(tr("sec.gestures"))
             SwitchRow(tr("g.pinch"), settings.pinchZoom) { settings.pinchZoom = it }

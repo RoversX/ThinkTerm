@@ -2502,7 +2502,17 @@ impl<P: Platform, L: Link> App<P, L> {
         // bottom, and rows there are to scroll through.
         if let Some(cell) = inner.panes.get(&inner.focused_pane) {
             let max = max_scroll(&cell.session.dimensions());
-            json.push_str(&format!(",\"scroll\":[{},{}]", cell.scroll_from_bottom, max));
+            // With the fraction of a row a smooth scroll is part way
+            // through, so a bar following it moves as the rows do rather
+            // than a row at a time.
+            let cell_h = inner
+                .pane_fonts
+                .get(&inner.focused_pane)
+                .map(|f| f.glyphs.metrics.cell_size.height as f32)
+                .unwrap_or(inner.glyphs.metrics.cell_size.height as f32)
+                .max(1.0);
+            let above = cell.scroll_from_bottom as f32 + cell.scroll_px / cell_h;
+            json.push_str(&format!(",\"scroll\":[{above:.3},{max}]"));
         }
         match &inner.tab_layout {
             Some(layout) => {

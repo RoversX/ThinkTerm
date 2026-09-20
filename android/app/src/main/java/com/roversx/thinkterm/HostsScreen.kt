@@ -24,6 +24,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.PowerSettingsNew
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
@@ -143,6 +145,8 @@ fun HostsScreen(store: HostStore, showProbe: Boolean, onOpen: (Host) -> Unit) {
                     items(section.hosts, key = { it.id }) { host ->
                         HostListRow(
                             host = host,
+                            connected = Sessions.isConnected(host.id),
+                            onDisconnect = { Sessions.close(host.id) },
                             onOpen = { onOpen(host) },
                             onEdit = { editing = host },
                             onDuplicate = { store.duplicate(host, tr("host.copysuffix")) },
@@ -160,7 +164,14 @@ fun HostsScreen(store: HostStore, showProbe: Boolean, onOpen: (Host) -> Unit) {
                         modifier = Modifier.clickable { onOpen(Host.probe) },
                         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                         leadingContent = { HostDisc(Icons.Filled.Hardware, Color(0xFF8E8E93)) },
-                        headlineContent = { Text(tr("thismac"), fontWeight = FontWeight.SemiBold) },
+                        headlineContent = {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                if (Sessions.isConnected(Host.PROBE_ID)) {
+                                    Box(Modifier.size(8.dp).background(Color(0xFF4CAF50), CircleShape))
+                                }
+                                Text(tr("thismac"), fontWeight = FontWeight.SemiBold)
+                            }
+                        },
                         supportingContent = {
                             Text("probe sshd on ${Host.probe.hostname}:${Host.probe.port}")
                         },
@@ -176,7 +187,7 @@ fun HostsScreen(store: HostStore, showProbe: Boolean, onOpen: (Host) -> Unit) {
             title = { Text(tr("host.delete.title")) },
             text = { Text(tr("host.delete.body")) },
             confirmButton = {
-                TextButton(onClick = { store.remove(host); pendingDelete = null }) {
+                TextButton(onClick = { Sessions.close(host.id); store.remove(host); pendingDelete = null }) {
                     Text(tr("host.delete.confirm", host.display), color = MaterialTheme.colorScheme.error)
                 }
             },
@@ -222,6 +233,8 @@ private fun HostGroupHeader(title: String) {
 @Composable
 private fun HostListRow(
     host: Host,
+    connected: Boolean,
+    onDisconnect: () -> Unit,
     onOpen: () -> Unit,
     onEdit: () -> Unit,
     onDuplicate: () -> Unit,
@@ -235,7 +248,13 @@ private fun HostListRow(
             colors = ListItemDefaults.colors(containerColor = Color.Transparent),
             leadingContent = { HostDisc(Icons.Filled.Dns, host.tint) },
             headlineContent = {
-                Text(host.title, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (connected) {
+                        // Connected: the session is open behind the list.
+                        Box(Modifier.size(8.dp).background(Color(0xFF4CAF50), CircleShape))
+                    }
+                    Text(host.title, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
+                }
             },
             supportingContent = {
                 Column {
@@ -266,6 +285,13 @@ private fun HostListRow(
                 leadingIcon = { Icon(Icons.Filled.Bolt, contentDescription = null) },
                 onClick = { menu = false; onOpen() },
             )
+            if (connected) {
+                DropdownMenuItem(
+                    text = { Text(tr("disconnect")) },
+                    leadingIcon = { Icon(Icons.Filled.PowerSettingsNew, contentDescription = null) },
+                    onClick = { menu = false; onDisconnect() },
+                )
+            }
             DropdownMenuItem(
                 text = { Text(tr("edit")) },
                 leadingIcon = { Icon(Icons.Filled.Edit, contentDescription = null) },

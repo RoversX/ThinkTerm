@@ -43,7 +43,9 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
     private var screen: ScreenText?
     /// The system's selection, held so the gesture setting can take it
     /// away and put it back while the terminal stays open.
-    private let selection = UITextInteraction(for: .editable)
+    /// Non-editable: the system draws handles and a loupe for a selection
+    /// but never a caret -- the terminal's cursor is the only one.
+    private let selection = UITextInteraction(for: .nonEditable)
     /// A caret the system placed with a tap: not drawn, but kept, so the
     /// loupe and the handles that follow have a position to start from.
     private var caret: Int?
@@ -367,10 +369,15 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
 
     /// The pane's selection while there is one, else the caret at the
     /// end of the marked text (the keyboard's insertion point).
+    /// The system's selection over the rows, as document offsets. It is
+    /// the shell's alone: the core is not told, so it draws no highlight
+    /// of its own under the system's, and the copy reads the rows here.
+    private var selected: (a: Int, b: Int)?
+
     var selectedTextRange: UITextRange? {
         get {
-            if marked == nil, let s = currentScreen(), let sel = s.selection {
-                return Range(index(row: sel[0][0], col: sel[0][1]), index(row: sel[1][0], col: sel[1][1]) + 1)
+            if marked == nil, let selected {
+                return Range(selected.a, selected.b)
             }
             if marked == nil, let caret, caret <= screenLength {
                 return Range(caret, caret)
@@ -381,27 +388,17 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
         set {
             guard let r = newValue as? Range else {
                 caret = nil
-                model?.core.clearSelection()
-                screen = nil
+                selected = nil
                 return
             }
             // A non-empty range inside the rows is a selection; a caret
-            // inside them is remembered and clears it. The end is
-            // exclusive here and inclusive in the core.
-            if r.b > r.a, let a = cell(at: r.a), let b = cell(at: r.b - 1) {
+            // inside them is remembered and clears it.
+            if r.b > r.a, r.a < screenLength {
                 caret = nil
-                model?.core.setSelection(anchorRow: UInt32(a.row), anchorCol: UInt32(a.col), headRow: UInt32(b.row), headCol: UInt32(b.col))
-                if var s = screen {
-                    s.selection = [[a.row, a.col], [b.row, b.col]]
-                    screen = s
-                }
+                selected = (r.a, min(r.b, screenLength))
             } else {
                 caret = r.a < screenLength ? r.a : nil
-                model?.core.clearSelection()
-                if var s = screen {
-                    s.selection = nil
-                    screen = s
-                }
+                selected = nil
             }
         }
     }
@@ -558,20 +555,33 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         switch action {
-        case #selector(copy(_:)): return currentScreen()?.selection != nil
+        case #selector(copy(_:)): return selected != nil
         case #selector(paste(_:)): return UIPasteboard.general.hasStrings
         case #selector(selectAll(_:)): return currentScreen() != nil
         default: return false
         }
     }
 
+    /// The selected rows' text, each row's trailing blanks dropped, as
+    /// a terminal copies: the rows are fixed-width, the words are not.
+    func selectedText() -> String? {
+        guard let selected, let raw = text(in: Range(selected.a, selected.b)) else { return nil }
+        let lines = raw.split(separator: "\n", omittingEmptySubsequences: false).map { line -> String in
+            var s = String(line)
+            while s.last == " " { s.removeLast() }
+            return s
+        }
+        let joined = lines.joined(separator: "\n")
+        return joined.isEmpty ? nil : joined
+    }
+
     override func copy(_ sender: Any?) {
-        if let text = model?.core.selectedText(), !text.isEmpty {
+        if let text = selectedText() {
             UIPasteboard.general.string = text
             model?.showCopied()
         }
-        model?.core.clearSelection()
-        screen = nil
+        selected = nil
+        inputDelegate?.selectionDidChange(self)
     }
 
     override func paste(_ sender: Any?) {

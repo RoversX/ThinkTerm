@@ -48,12 +48,11 @@ fun KeyBar(
     val context = LocalContext.current
     val history = remember(context) { KeyHistory.get(context) }
     val tap = rememberKeyTap(model)
-    var panelOpen by remember { mutableStateOf(false) }
     var tab by remember { mutableStateOf(KeyPanelTab.KEYS) }
 
-    // The panel joins the soft keyboard when the setting asks it to.
+    // The keyboard coming up takes the panel's place: the two never stack.
     LaunchedEffect(keyboardUp) {
-        if (model.settings.autoKeyPanel) panelOpen = keyboardUp
+        if (keyboardUp) model.panelOpen = false
     }
 
     Column(modifier.fillMaxWidth().background(model.background)) {
@@ -75,12 +74,15 @@ fun KeyBar(
                     }
                 }
             }
-            MoreButton(open = panelOpen) {
-                panelOpen = !panelOpen
+            MoreButton(open = model.panelOpen) {
+                // Opening the panel puts the keyboard away: the panel is
+                // its stand-in, not a shelf on top of it.
+                if (!model.panelOpen) model.onHideKeyboard?.invoke()
+                model.panelOpen = !model.panelOpen
                 tap()
             }
         }
-        if (panelOpen) {
+        if (model.panelOpen) {
             KeyPanel(model, tab, { tab = it }, onOpenSettings)
         }
     }

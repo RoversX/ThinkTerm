@@ -12,6 +12,7 @@ struct SidebarPanel: View {
     var connected: Bool
     var onEditHost: () -> Void
     var onSettings: () -> Void
+    var onOverview: () -> Void
     /// Folded nodes; every Space but the one on show starts folded.
     @State private var folded: Set<String>?
     @State private var renaming: (kind: String, id: String)?
@@ -137,6 +138,14 @@ struct SidebarPanel: View {
                 .padding(.top, 8)
             }
             Divider()
+            Button(action: onOverview) {
+                Label(tr("overview"), systemImage: "square.grid.2x2")
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+            }
+            .buttonStyle(.plain)
             Button(action: onSettings) {
                 Label(tr("settings"), systemImage: "gearshape")
                     .foregroundColor(.secondary)

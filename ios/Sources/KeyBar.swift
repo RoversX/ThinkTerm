@@ -8,9 +8,6 @@ import UIKit
 /// sent, and the colours, as the prototype's `.keybar` + `.kpanel`.
 struct KeyBar: View {
     @ObservedObject var model: TerminalModel
-    /// `--keypanel` on the command line starts with the panel open: the
-    /// simulator cannot be tapped, and a screenshot needs it showing.
-    @State private var panelOpen = ProcessInfo.processInfo.arguments.contains("--keypanel")
     @State private var tab: KeyPanelTab = KeyBar.debugTab
     @ObservedObject private var settings = AppSettings.shared
 
@@ -36,22 +33,18 @@ struct KeyBar: View {
                 more
             }
             .frame(height: 38)
-            if panelOpen {
+            if model.panelOpen {
                 KeyPanel(model: model, tab: $tab)
             }
         }
         .background(model.background)
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { note in
-            guard settings.autoKeyPanel else { return }
-            // A hardware keyboard (the simulator's) posts a zero-height
-            // frame: no keys on screen, so nothing for the panel to join.
+            // The keyboard coming up takes the panel's place: the two
+            // never stack. A hardware keyboard (the simulator's) posts a
+            // zero-height frame and takes nothing.
             let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect
             guard (frame?.height ?? 0) > 0 else { return }
-            withAnimation(.easeOut(duration: 0.16)) { panelOpen = true }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
-            guard settings.autoKeyPanel else { return }
-            withAnimation(.easeOut(duration: 0.16)) { panelOpen = false }
+            withAnimation(.easeOut(duration: 0.16)) { model.panelOpen = false }
         }
     }
 
@@ -79,13 +72,16 @@ struct KeyBar: View {
 
     private var more: some View {
         Button {
-            withAnimation(.easeOut(duration: 0.16)) { panelOpen.toggle() }
+            // Opening the panel puts the keyboard away: the panel is its
+            // stand-in, not a shelf on top of it.
+            if !model.panelOpen { model.dismissKeyboard() }
+            withAnimation(.easeOut(duration: 0.16)) { model.panelOpen.toggle() }
             KeyCaps.tap()
         } label: {
-            Image(systemName: panelOpen ? "chevron.down" : "square.grid.2x2")
+            Image(systemName: model.panelOpen ? "chevron.down" : "square.grid.2x2")
                 .font(.system(size: 14, weight: .semibold))
                 .frame(width: 40, height: 28)
-                .background(panelOpen ? Color.accentColor : Color.white.opacity(0.14))
+                .background(model.panelOpen ? Color.accentColor : Color.white.opacity(0.14))
                 .clipShape(RoundedRectangle(cornerRadius: 7))
         }
         .buttonStyle(.plain)

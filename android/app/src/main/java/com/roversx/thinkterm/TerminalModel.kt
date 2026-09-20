@@ -86,7 +86,7 @@ class TerminalModel(
         private set
     /// The focused pane's place in its scrollback: rows above the bottom,
     /// and rows there are; changes for a moment show the scrollbar.
-    var scrollAbove by mutableStateOf(0)
+    var scrollAbove by mutableStateOf(0.0)
         private set
     var scrollMax by mutableStateOf(0)
         private set
@@ -119,6 +119,12 @@ class TerminalModel(
     /// The keyboard's options changed: the view starts its input over so
     /// the IME reads them again.
     var onImeOptionsChanged: (() -> Unit)? = null
+    /// The key panel is up in the keyboard's place.
+    var panelOpen by mutableStateOf(false)
+    /// A thread this phone was on last time it was in this host, put
+    /// back once the threads are listed after a connect.
+    private var restoredThread = false
+    private val lastThreads = context.getSharedPreferences("thinkterm.threads", Context.MODE_PRIVATE)
     private var appliedIncognito = settings.incognitoKeyboard
     var onScreenChanged: (() -> Unit)? = null
     var onHideKeyboard: (() -> Unit)? = null
@@ -197,7 +203,41 @@ class TerminalModel(
     }
 
     /// Connect to the model's host with the secret from the store.
+    /// The thread on show is written down for the next connect; the first
+    /// listing after a connect puts the phone back on the one it left.
+    private fun rememberThread(threads: ThreadsView?) {
+        val list = threads?.threads ?: return
+        val current = list.firstOrNull { it.current }?.id ?: return
+        val key = "last." + host.id
+        if (!restoredThread) {
+            restoredThread = true
+            val saved = lastThreads.getString(key, null)
+            if (saved != null && saved != current && list.any { it.id == saved }) {
+                openThread(saved, null)
+                return
+            }
+        }
+        if (lastThreads.getString(key, null) != current) lastThreads.edit().putString(key, current).apply()
+    }
+
+    /// The screen went away but the connection stays: the frame loop
+    /// rests until the screen is back, and the views catch up then.
+    fun leaveScreen() {
+        running = false
+        choreographer.removeFrameCallback(tick)
+        main.removeCallbacks(statsTick)
+    }
+
+    fun enterScreen() {
+        if (running) return
+        running = true
+        choreographer.postFrameCallback(tick)
+        main.postDelayed(statsTick, 500)
+        changePending.set(true)
+    }
+
     fun connect() {
+        restoredThread = false
         connected = true
         val h = host
         val secret = if (h.id == Host.PROBE_ID) probeKey() else store.secret(h.id)
@@ -375,6 +415,7 @@ class TerminalModel(
         if (sidebar != this.sidebar) this.sidebar = sidebar
         val threads = Views.threads(core.view("threads"))
         if (threads != this.threads) this.threads = threads
+        rememberThread(threads)
         val tree = Views.tree(core.view("tree"))
         if (tree != this.tree) this.tree = tree
         val navs = Views.navs(core.view("navs"))
