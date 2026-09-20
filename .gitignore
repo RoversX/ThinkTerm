@@ -107,3 +107,21 @@ __pycache__/
 /thinkterm-web/www/schemes.json
 /thinkterm-web/www/*.gz
 /thinkterm-web/ui/node_modules/
+
+# Local credentials and native release output. The privacy hook also rejects
+# these if they are force-added; ignore rules do not protect tracked files.
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.p12
+*.pfx
+*.keystore
+*.jks
+*.apk
+*.aab
+*.ipa
+*.dmg
+
+!/ci/PRIVACY.md
