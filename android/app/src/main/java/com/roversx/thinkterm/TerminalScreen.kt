@@ -10,7 +10,6 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -138,6 +137,8 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
     var livePreview by remember { mutableStateOf(false) }
     val overviewOpen = overviewShown && zoom.value > 0f
     var zoomTarget by remember { mutableStateOf<CardFrames?>(null) }
+    /// The thread whose card the terminal is moving into or out of.
+    var heroThread by remember { mutableStateOf<ThreadView?>(null) }
 
     val keyboardUp = WindowInsets.ime.getBottom(density) > 0
     val twoLevel = settings.tabBarLevels == "two" && !(model.threads?.threads.isNullOrEmpty())
@@ -174,11 +175,18 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
         onDispose { lifecycle.removeObserver(observer) }
     }
 
-    fun closeOverview() {
+    /// Back to the terminal. A tapped card hands over its thread and its
+    /// frames: the terminal grows out of that card, not the one it came
+    /// from.
+    fun closeOverview(picked: ThreadView? = null, frames: CardFrames? = null) {
         if (!overviewShown) return
+        if (picked != null && frames != null) {
+            heroThread = picked
+            zoomTarget = frames
+        }
         scope.launch {
             livePreview = false
-            hostView?.visibility = android.view.View.VISIBLE
+            hostView?.showPicture(true)
             fade.animateTo(0f, tween(150))
             zoom.animateTo(0f, spring(dampingRatio = 0.9f, stiffness = 400f))
             overviewShown = false
@@ -194,6 +202,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
         model.onHideKeyboard?.invoke()
         cardBounds = null
         zoomTarget = null
+        heroThread = currentThread
         overviewShown = true
         hostView?.input?.touchOverride = { closeOverview() }
         // Without a card of its own (no threads, or none current) the
@@ -216,7 +225,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                 // A faded layer is not enough: the texture repaints itself on
                 // every new frame (the cursor's blink) and can show through
                 // for one; hidden outright, it cannot.
-                hostView?.visibility = android.view.View.INVISIBLE
+                hostView?.showPicture(false)
                 livePreview = overviewShown
             }
         }
@@ -245,7 +254,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                     liveThread = currentThread?.id,
                     livePreview = livePreview,
                     onCardBounds = { cardLaidOut(it) },
-                    onDismiss = { closeOverview() },
+                    onDismiss = { picked, frames -> closeOverview(picked, frames) },
                 )
             }
         }
@@ -281,9 +290,6 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                     .fillMaxWidth()
                     .weight(1f)
                     .onGloballyPositioned { if (!overviewShown) terminalBounds = it.boundsInRoot() }
-                    // In the overview the shrunken terminal is the live card:
-                    // a tap on it (the hidden view lets it through) closes.
-                    .then(if (overviewOpen) Modifier.pointerInput(Unit) { detectTapGestures { closeOverview() } } else Modifier)
                     .graphicsLayer {
                         val t = zoom.value
                         val target = zoomTarget
@@ -343,7 +349,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
         // the card's size, blown up to the terminal's width, and shrunk with
         // the same zoom, so the whole card closes in, not just its bottom.
         val hero = zoomTarget
-        val heroThread = currentThread
+        val heroThread = heroThread
         if (hero != null && heroThread != null && terminalBounds.width > 0) {
             val sEnd = hero.thumb.width / terminalBounds.width
             val headerPx = hero.thumb.top - hero.card.top
@@ -372,6 +378,35 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
             ) {
                 ThreadCardHeader(heroThread, MaterialTheme.colorScheme.primary, Modifier.fillMaxWidth())
             }
+            // The moving card's border, around header and terminal slice
+            // together; the card's own border waits until it has landed.
+            val accent = MaterialTheme.colorScheme.primary
+            Spacer(
+                Modifier
+                    .fillMaxSize()
+                    .zIndex(2.5f)
+                    .drawWithContent {
+                        val t = zoom.value
+                        val a = t * (1f - fade.value)
+                        if (a <= 0f) return@drawWithContent
+                        val scale = 1f + (sEnd - 1f) * t
+                        val top = (terminalBounds.height - hero.thumb.height / sEnd) * t
+                        val left = terminalBounds.left + (hero.thumb.left - terminalBounds.left) * t - boxOrigin.x
+                        val thumbTop = terminalBounds.top + (hero.thumb.top - terminalBounds.top) * t - boxOrigin.y
+                        val frameTop = thumbTop - headerPx * scale
+                        val w = terminalBounds.width * scale
+                        val h = headerPx * scale + (terminalBounds.height - top) * scale
+                        val r = 13.dp.toPx() * t
+                        val stroke = 2.dp.toPx()
+                        drawRoundRect(
+                            color = accent.copy(alpha = accent.alpha * a),
+                            topLeft = Offset(left + stroke / 2, frameTop + stroke / 2),
+                            size = androidx.compose.ui.geometry.Size(w - stroke, h - stroke),
+                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(r, r),
+                            style = androidx.compose.ui.graphics.drawscope.Stroke(stroke),
+                        )
+                    }
+            )
         }
 
         if (showTree) {

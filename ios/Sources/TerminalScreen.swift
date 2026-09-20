@@ -33,6 +33,12 @@ struct TerminalScreen: View {
     @State private var heroScale: CGFloat = 1
     @State private var heroOffset: CGSize = .zero
     @State private var heroAlpha: Double = 0
+    /// The moving card's border: its natural height follows the zoom.
+    @State private var heroFrameHeight: CGFloat = 0
+    /// The thread whose card the terminal is moving into or out of, and
+    /// the card a tap picked on the way back.
+    @State private var heroThread: ThreadView?
+    @State private var picked: (thread: ThreadView, frames: CardFrames)?
     @State private var zoomScale: CGFloat = 1
     @State private var zoomOffset: CGSize = .zero
     @State private var zoomClip: CGFloat?
@@ -52,19 +58,34 @@ struct TerminalScreen: View {
     var body: some View {
         ZStack(alignment: .topLeading) {
             if overviewVisible {
-                OverviewScreen(model: model, isPresented: $overviewShown, cardFrame: $cardFrame, liveThread: currentThreadId, livePreview: livePreview)
+                OverviewScreen(
+                    model: model, isPresented: $overviewShown, cardFrame: $cardFrame,
+                    liveThread: currentThreadId, livePreview: livePreview,
+                    onPick: { thread, frames in if let frames { picked = (thread, frames) } }
+                )
                     .opacity(overviewOpen ? 1 : 0)
                     .onChange(of: overviewShown) { _, shown in if !shown { closeOverview() } }
             }
             // The card's own header rides along with the terminal: laid out at
             // the card's size, blown up to the terminal's width, and shrunk
             // with the same zoom, so the whole card closes in.
-            if let hero = heroFrames, let thread = model.threads?.threads.first(where: { $0.id == currentThreadId }) {
+            if let hero = heroFrames, let thread = heroThread {
                 let sEnd = hero.thumb.width / max(terminalFrame.width, 1)
                 ThreadCardHeader(thread: thread)
                     .frame(width: hero.card.width, height: hero.thumb.minY - hero.card.minY, alignment: .top)
                     .background(Color(red: 0.10, green: 0.11, blue: 0.13))
                     .clipShape(UnevenRoundedRectangle(topLeadingRadius: 13, topTrailingRadius: 13))
+                    .scaleEffect(1 / sEnd, anchor: .topLeading)
+                    .scaleEffect(heroScale, anchor: .topLeading)
+                    .offset(heroOffset)
+                    .opacity(heroAlpha * zoomFade)
+                    .zIndex(3)
+                    .allowsHitTesting(false)
+                // The moving card's border, around header and terminal slice
+                // together; the card's own border waits until it has landed.
+                RoundedRectangle(cornerRadius: 13)
+                    .stroke(Color.accentColor, lineWidth: 2)
+                    .frame(width: hero.card.width, height: heroFrameHeight)
                     .scaleEffect(1 / sEnd, anchor: .topLeading)
                     .scaleEffect(heroScale, anchor: .topLeading)
                     .offset(heroOffset)
@@ -414,9 +435,12 @@ struct TerminalScreen: View {
         let clip = frame.height / scale
         // The header starts above the terminal, at the terminal's width,
         // and lands on the card's own header.
+        let headerH = frame.minY - frames.card.minY
         heroFrames = frames
+        heroThread = model.threads?.threads.first(where: { $0.id == currentThreadId })
         heroScale = 1
-        heroOffset = CGSize(width: terminalFrame.minX, height: terminalFrame.minY - (frame.minY - frames.card.minY) / scale)
+        heroOffset = CGSize(width: terminalFrame.minX, height: terminalFrame.minY - headerH / scale)
+        heroFrameHeight = headerH + terminalFrame.height * scale
         heroAlpha = 0
         withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
             overviewOpen = true
@@ -428,6 +452,7 @@ struct TerminalScreen: View {
             zoomClip = clip
             heroScale = scale
             heroOffset = CGSize(width: frames.card.minX, height: frames.card.minY)
+            heroFrameHeight = frames.card.height
             heroAlpha = 1
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
@@ -439,7 +464,30 @@ struct TerminalScreen: View {
         }
     }
 
+    /// Back to the terminal. A tapped card was kept by onPick: the
+    /// terminal grows out of that card, not the one it came from.
     private func closeOverview() {
+        if let pick = picked, terminalFrame.width > 0 {
+            picked = nil
+            let frame = pick.frames.thumb
+            let scale = frame.width / terminalFrame.width
+            let clip = frame.height / scale
+            // Placed in the new card without animation: nothing shows yet.
+            var t = Transaction(); t.disablesAnimations = true
+            withTransaction(t) {
+                heroFrames = pick.frames
+                heroThread = pick.thread
+                zoomScale = scale
+                zoomOffset = CGSize(
+                    width: frame.minX - terminalFrame.minX,
+                    height: frame.minY - terminalFrame.minY - (terminalFrame.height - clip) * scale
+                )
+                zoomClip = clip
+                heroScale = scale
+                heroOffset = CGSize(width: pick.frames.card.minX, height: pick.frames.card.minY)
+                heroFrameHeight = pick.frames.card.height
+            }
+        }
         withAnimation(.easeOut(duration: 0.1)) { livePreview = false }
         withAnimation(.easeOut(duration: 0.15)) { zoomFade = 1 }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
@@ -452,7 +500,9 @@ struct TerminalScreen: View {
                 heroAlpha = 0
                 if let hero = heroFrames {
                     let sEnd = hero.thumb.width / max(terminalFrame.width, 1)
-                    heroOffset = CGSize(width: terminalFrame.minX, height: terminalFrame.minY - (hero.thumb.minY - hero.card.minY) / sEnd)
+                    let headerH = hero.thumb.minY - hero.card.minY
+                    heroOffset = CGSize(width: terminalFrame.minX, height: terminalFrame.minY - headerH / sEnd)
+                    heroFrameHeight = headerH + terminalFrame.height * sEnd
                 }
             }
         }

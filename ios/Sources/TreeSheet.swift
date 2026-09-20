@@ -278,17 +278,23 @@ struct OverviewScreen: View {
     var liveThread: String?
     /// The live card's rows wait until the terminal has faded out of it.
     var livePreview: Bool = true
+    /// A tapped card, with its frames: the terminal grows back out of it.
+    var onPick: (ThreadView, CardFrames?) -> Void = { _, _ in }
     private let dots = 4
     private let rows = 9
     private let columns = [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)]
 
-    /// The live card's two frames, reported together once both are known.
-    @State private var liveCardFrame: CGRect?
-    @State private var thumbFrame: CGRect?
+    /// Every card's two frames, by thread; the live card's are reported.
+    @State private var cardFrames: [String: CGRect] = [:]
+    @State private var thumbFrames: [String: CGRect] = [:]
+
+    private func frames(of id: String) -> CardFrames? {
+        guard let card = cardFrames[id], let thumb = thumbFrames[id] else { return nil }
+        return CardFrames(card: card, thumb: thumb)
+    }
 
     private func report() {
-        guard let card = liveCardFrame, let thumb = thumbFrame else { return }
-        let frames = CardFrames(card: card, thumb: thumb)
+        guard let live = liveThread, let frames = frames(of: live) else { return }
         if cardFrame != frames { cardFrame = frames }
     }
 
@@ -370,6 +376,7 @@ struct OverviewScreen: View {
         let live = thread.id == liveThread
         return Button {
             if !live { model.sideClick("thread", id: thread.id) }
+            onPick(thread, frames(of: thread.id))
             isPresented = false
         } label: {
             VStack(alignment: .leading, spacing: 0) {
@@ -382,30 +389,32 @@ struct OverviewScreen: View {
                         .padding(.horizontal, 8)
                         .padding(.vertical, 7)
                         .opacity(!live || livePreview ? 1 : 0)
-                    if live {
-                        // The terminal itself lands over this, then fades into
-                        // the same preview as every other card; the frame is
-                        // reported so the screen above knows where.
-                        Color.clear
-                            .background(GeometryReader { geo in
-                                Color.clear
-                                    .onAppear { thumbFrame = geo.frame(in: .named("screen")); report() }
-                                    .onChange(of: geo.frame(in: .named("screen"))) { _, f in thumbFrame = f; report() }
-                            })
-                    }
+                    // The terminal itself lands over this, then fades into the
+                    // same preview as every other card; the frame is kept so
+                    // the screen above knows where.
+                    Color.clear
+                        .background(GeometryReader { geo in
+                            Color.clear
+                                .onAppear { thumbFrames[thread.id] = geo.frame(in: .named("screen")); report() }
+                                .onChange(of: geo.frame(in: .named("screen"))) { _, f in thumbFrames[thread.id] = f; report() }
+                        })
                 }
                 .frame(height: 92, alignment: .topLeading)
                 .background(thread.live ? model.background : Color.black.opacity(0.4))
                 .clipped()
             }
-            .background(live ? GeometryReader { geo in
+            .background(GeometryReader { geo in
                 Color.clear
-                    .onAppear { liveCardFrame = geo.frame(in: .named("screen")); report() }
-                    .onChange(of: geo.frame(in: .named("screen"))) { _, f in liveCardFrame = f; report() }
-            } : nil)
+                    .onAppear { cardFrames[thread.id] = geo.frame(in: .named("screen")); report() }
+                    .onChange(of: geo.frame(in: .named("screen"))) { _, f in cardFrames[thread.id] = f; report() }
+            })
             .background(Color(red: 0.10, green: 0.11, blue: 0.13))
             .clipShape(RoundedRectangle(cornerRadius: 13))
-            .overlay(RoundedRectangle(cornerRadius: 13).stroke(live ? Color.accentColor : Color.white.opacity(0.07), lineWidth: live ? 2 : 1))
+            // The moving card draws its own border until it has landed.
+            .overlay(RoundedRectangle(cornerRadius: 13).stroke(
+                live ? (livePreview ? Color.accentColor : Color.clear) : Color.white.opacity(0.07),
+                lineWidth: live ? 2 : 1
+            ))
         }
         .buttonStyle(.plain)
     }

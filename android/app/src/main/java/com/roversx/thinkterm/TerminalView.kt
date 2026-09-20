@@ -80,6 +80,12 @@ class TerminalHostView(context: Context, private val model: TerminalModel) : Fra
         }
     }
 
+    /// The picture hidden or shown; touches keep arriving either way,
+    /// which the overview relies on while the terminal sits in its card.
+    fun showPicture(shown: Boolean) {
+        texture.visibility = if (shown) View.VISIBLE else View.INVISIBLE
+    }
+
     private fun attachOrResize(width: Int, height: Int) {
         if (window == 0L || width <= 0 || height <= 0) return
         val density = resources.displayMetrics.density.toDouble()

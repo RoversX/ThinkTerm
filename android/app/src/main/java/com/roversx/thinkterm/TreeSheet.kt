@@ -532,7 +532,9 @@ fun OverviewScreen(
     liveThread: String?,
     livePreview: Boolean,
     onCardBounds: (CardFrames?) -> Unit,
-    onDismiss: () -> Unit,
+    /// A tap on a card, with the card's frames, so the terminal can grow
+    /// back out of that card; a pinch passes nothing.
+    onDismiss: (ThreadView?, CardFrames?) -> Unit,
 ) {
     val threads = model.threads?.threads ?: emptyList()
     val groups = threads.groupBy { it.project }.toList()
@@ -555,7 +557,7 @@ fun OverviewScreen(
             .fillMaxSize()
             .background(Color(0xFF0F0F0F))
             // Pinching out returns to the terminal.
-            .pointerInput(Unit) { awaitPinchOut { onDismiss() } }
+            .pointerInput(Unit) { awaitPinchOut { onDismiss(null, null) } }
     ) {
         Column(
             Modifier
@@ -687,29 +689,39 @@ private fun ThreadCard(
     live: Boolean,
     livePreview: Boolean,
     onCardBounds: (CardFrames?) -> Unit,
-    onDismiss: () -> Unit,
+    onDismiss: (ThreadView?, CardFrames?) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val accent = MaterialTheme.colorScheme.primary
     val shape = RoundedCornerShape(13.dp)
-    // The live card reports where it is and where its thumbnail is, so
-    // the screen can shrink the terminal, header and all, into it.
+    // Every card knows where it is and where its thumbnail is: the live
+    // one reports it so the terminal can shrink into it, and any card
+    // hands it over when tapped so the terminal can grow back out of it.
     var cardRect by remember { mutableStateOf<Rect?>(null) }
     var thumbRect by remember { mutableStateOf<Rect?>(null) }
+    fun frames(): CardFrames? {
+        val c = cardRect ?: return null
+        val t = thumbRect ?: return null
+        return CardFrames(c, t)
+    }
     fun report() {
-        val c = cardRect ?: return
-        val t = thumbRect ?: return
-        onCardBounds(CardFrames(c, t))
+        if (live) frames()?.let(onCardBounds)
+    }
+    // The moving card draws its own border until it has landed.
+    val border = when {
+        !live -> Color.White.copy(alpha = 0.07f)
+        livePreview -> accent
+        else -> Color.Transparent
     }
     Column(
         modifier
-            .onGloballyPositioned { if (live) { cardRect = it.boundsInRoot(); report() } }
+            .onGloballyPositioned { cardRect = it.boundsInRoot(); report() }
             .clip(shape)
             .background(Color(0xFF1A1C21))
-            .border(if (live) 2.dp else 1.dp, if (live) accent else Color.White.copy(alpha = 0.07f), shape)
+            .border(if (live) 2.dp else 1.dp, border, shape)
             .clickable {
                 if (!live) model.sideClick("thread", thread.id)
-                onDismiss()
+                onDismiss(thread, frames())
             }
     ) {
         ThreadCardHeader(thread, accent)
@@ -731,11 +743,9 @@ private fun ThreadCard(
                 color = Color.White,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 7.dp).graphicsLayer { alpha = rowsAlpha },
             )
-            if (live) {
-                // The terminal itself lands over this, then fades into the
-                // same preview as every other card; the box reports where.
-                Box(Modifier.fillMaxSize().onGloballyPositioned { thumbRect = it.boundsInRoot(); report() })
-            }
+            // The terminal itself lands over this, then fades into the same
+            // preview as every other card; the box reports where.
+            Box(Modifier.fillMaxSize().onGloballyPositioned { thumbRect = it.boundsInRoot(); report() })
         }
     }
 }
