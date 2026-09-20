@@ -84,7 +84,7 @@ import kotlinx.coroutines.delay
 
 /// The desktop's sidebar and tab strip in one sheet, the way both are on
 /// screen at once there: the Space, its threads by project, under an
-/// opened thread its tabs, and under a tab with several panes, its panes.
+/// threads under them, as far as the desktop's sidebar goes.
 /// Everything is named as the desktop names it: thread, tab, pane.
 @Composable
 fun TreeSheet(model: TerminalModel, onDismiss: () -> Unit) {
@@ -358,7 +358,6 @@ private fun ThreadRows(
 ) {
     val accent = MaterialTheme.colorScheme.primary
     val secondary = MaterialTheme.colorScheme.onSurfaceVariant
-    val opened = open.threads.contains(thread.id)
     var menu by remember { mutableStateOf(false) }
     Column {
         Box {
@@ -388,132 +387,11 @@ private fun ThreadRows(
                 if (thread.pinned) {
                     Icon(Icons.Default.PushPin, contentDescription = null, tint = secondary, modifier = Modifier.size(14.dp))
                 }
-                Text(
-                    if (thread.live) tr(if (thread.tabs.size == 1) "tab.one" else "tab.n", thread.tabs.size) else tr("thread.off"),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = secondary,
-                )
-                if (thread.tabs.isNotEmpty()) {
-                    IconButton(onClick = { open.toggleThread(thread.id) }, modifier = Modifier.size(28.dp)) {
-                        Icon(
-                            Icons.Default.KeyboardArrowDown,
-                            contentDescription = null,
-                            tint = secondary,
-                            modifier = Modifier.size(18.dp).rotate(if (opened) 0f else -90f),
-                        )
-                    }
+                if (!thread.live) {
+                    Text(tr("thread.off"), style = MaterialTheme.typography.labelSmall, color = secondary)
                 }
             }
             AppContextMenu(model = model, kind = "thread", id = thread.id, expanded = menu, onDismiss = { menu = false })
-        }
-        if (opened) {
-            for (tab in thread.tabs) TabRows(model, thread, tab, indent + 20.dp, open, onDismiss)
-        }
-    }
-}
-
-/// A tab, and when open, its panes.
-@Composable
-private fun TabRows(
-    model: TerminalModel,
-    thread: ThreadView,
-    tab: ThreadTab,
-    indent: Dp,
-    open: TreeOpen,
-    onDismiss: () -> Unit,
-) {
-    val accent = MaterialTheme.colorScheme.primary
-    val secondary = MaterialTheme.colorScheme.onSurfaceVariant
-    val key = thread.id + ":" + tab.tab
-    val opened = open.tabs.contains(key)
-    val current = thread.current && tab.current
-    var menu by remember { mutableStateOf(false) }
-    Box {
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .combinedClickable(
-                    onClick = {
-                        model.chromeClick("pane", pane = tab.target)
-                        onDismiss()
-                    },
-                    onLongClick = { menu = true },
-                )
-                .padding(start = 16.dp + indent, end = 8.dp, top = 5.dp, bottom = 5.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Icon(
-                Icons.Default.Terminal,
-                contentDescription = null,
-                tint = if (current) accent else secondary,
-                modifier = Modifier.size(16.dp),
-            )
-            Row(
-                Modifier.weight(1f),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                Text(
-                    tab.title.ifEmpty { tr("tab.num", tab.tab) },
-                    style = MaterialTheme.typography.bodyMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                val first = tab.panes.firstOrNull()
-                if (first != null && first.title.isNotEmpty() && first.title != tab.title) {
-                    Text(
-                        first.title,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = secondary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-            }
-            if (current) {
-                Icon(Icons.Default.Check, contentDescription = null, tint = accent, modifier = Modifier.size(16.dp))
-            }
-            if (tab.panes.size > 1) {
-                Text(tr("panes.n", tab.panes.size), style = MaterialTheme.typography.labelSmall, color = secondary)
-                IconButton(onClick = { open.toggleTab(key) }, modifier = Modifier.size(28.dp)) {
-                    Icon(
-                        Icons.Default.KeyboardArrowDown,
-                        contentDescription = null,
-                        tint = secondary,
-                        modifier = Modifier.size(18.dp).rotate(if (opened) 0f else -90f),
-                    )
-                }
-            }
-        }
-        AppContextMenu(model = model, kind = "tab", id = tab.tab.toString(), expanded = menu, onDismiss = { menu = false })
-    }
-    if (opened) {
-        val focused = model.tabs?.current?.panes?.firstOrNull { it.current }?.pane
-        for (pane in tab.panes) {
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        model.chromeClick("pane", pane = pane.pane)
-                        onDismiss()
-                    }
-                    .padding(start = 16.dp + indent + 22.dp, end = 16.dp, top = 5.dp, bottom = 5.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Box(Modifier.size(6.dp).background(secondary, RoundedCornerShape(1.dp)))
-                Text(
-                    pane.title.ifEmpty { "shell" },
-                    style = MaterialTheme.typography.bodyMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-                if (thread.current && focused == pane.pane) {
-                    Icon(Icons.Default.Check, contentDescription = null, tint = accent, modifier = Modifier.size(16.dp))
-                }
-            }
         }
     }
 }

@@ -2,7 +2,7 @@ import SwiftUI
 
 /// The desktop's sidebar and tab strip in one list, the way both are on
 /// screen at once on the desktop: the Space, its pinned threads, its
-/// projects with their threads, and under an opened thread its tabs, and
+/// projects with their threads, as far as the desktop's sidebar goes;
 /// under a tab with several panes, its panes. Everything is named as the
 /// desktop names it: thread, tab, pane.
 struct TreeSheet: View {
@@ -10,8 +10,6 @@ struct TreeSheet: View {
     @ObservedObject private var lang = AppLanguage.shared
     @Binding var isPresented: Bool
     @Binding var menu: MenuSheet?
-    @State private var openThreads: Set<String> = []
-    @State private var openTabs: Set<String> = []
     @State private var spaceMenu: [MenuItem] = []
     @State private var renaming: (kind: String, id: String)?
     @State private var renameText = ""
@@ -66,10 +64,6 @@ struct TreeSheet: View {
         .onAppear {
             model.refreshViews()
             reloadSpaces()
-            // The current thread starts open: its tabs are what the strip shows.
-            if let current = threads.first(where: { $0.current }) {
-                openThreads.insert(current.id)
-            }
         }
         .onChange(of: model.sidebar?.editing) { _, editing in
             guard let editing, editing.kind != "none", let id = editing.id else { return }
@@ -155,7 +149,6 @@ struct TreeSheet: View {
     /// A thread, and when open, its tabs under it.
     @ViewBuilder
     private func threadRows(_ thread: ThreadView, indent: CGFloat) -> some View {
-        let open = openThreads.contains(thread.id)
         HStack(spacing: 8) {
             Circle().fill(TerminalScreen.threadColor(status: thread.status, live: thread.live)).frame(width: 8, height: 8)
             Button {
@@ -170,19 +163,8 @@ struct TreeSheet: View {
             if thread.pinned {
                 Image(systemName: "pin").font(.caption).foregroundColor(.secondary)
             }
-            Text(thread.live ? tr(thread.tabs.count == 1 ? "tab.one" : "tab.n", thread.tabs.count) : tr("thread.off"))
-                .font(.caption2).foregroundColor(.secondary)
-            if !thread.tabs.isEmpty {
-                Button {
-                    if open { openThreads.remove(thread.id) } else { openThreads.insert(thread.id) }
-                } label: {
-                    Image(systemName: "chevron.down")
-                        .rotationEffect(.degrees(open ? 0 : -90))
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .frame(width: 24, height: 24)
-                }
-                .buttonStyle(.plain)
+            if !thread.live {
+                Text(tr("thread.off")).font(.caption2).foregroundColor(.secondary)
             }
         }
         .padding(.leading, indent)
@@ -190,75 +172,8 @@ struct TreeSheet: View {
         .contextMenu {
             AppMenuItems(model: model, kind: "thread", id: thread.id)
         }
-        if open {
-            ForEach(thread.tabs) { tab in
-                tabRows(thread, tab, indent: indent + 20)
-            }
-        }
     }
 
-    /// A tab, and when open, its panes.
-    @ViewBuilder
-    private func tabRows(_ thread: ThreadView, _ tab: ThreadTab, indent: CGFloat) -> some View {
-        let key = thread.id + ":" + String(tab.tab)
-        let open = openTabs.contains(key)
-        let current = thread.current && tab.current
-        HStack(spacing: 8) {
-            Image(systemName: "terminal").foregroundColor(current ? .accentColor : .secondary)
-            Button {
-                model.chromeClick("pane", pane: tab.target)
-                isPresented = false
-            } label: {
-                HStack(spacing: 6) {
-                    Text(tab.title.isEmpty ? tr("tab.num", tab.tab) : tab.title)
-                    if let first = tab.panes.first, !first.title.isEmpty, first.title != tab.title {
-                        Text(first.title).font(.caption).foregroundColor(.secondary)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.plain)
-            if current {
-                Image(systemName: "checkmark").foregroundColor(.accentColor)
-            }
-            if tab.panes.count > 1 {
-                Text(tr("panes.n", tab.panes.count)).font(.caption2).foregroundColor(.secondary)
-                Button {
-                    if open { openTabs.remove(key) } else { openTabs.insert(key) }
-                } label: {
-                    Image(systemName: "chevron.down")
-                        .rotationEffect(.degrees(open ? 0 : -90))
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .frame(width: 24, height: 24)
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .padding(.leading, indent)
-        .contextMenu {
-            AppMenuItems(model: model, kind: "tab", id: String(tab.tab))
-        }
-        if open {
-            ForEach(tab.panes) { pane in
-                Button {
-                    model.chromeClick("pane", pane: pane.pane)
-                    isPresented = false
-                } label: {
-                    HStack(spacing: 8) {
-                        RoundedRectangle(cornerRadius: 1).fill(Color.secondary).frame(width: 6, height: 6)
-                        Text(pane.title.isEmpty ? "shell" : pane.title).font(.subheadline)
-                        Spacer()
-                        if thread.current, model.tabs?.tabs.first(where: { $0.current })?.panes.first(where: { $0.current })?.pane == pane.pane {
-                            Image(systemName: "checkmark").foregroundColor(.accentColor)
-                        }
-                    }
-                }
-                .buttonStyle(.plain)
-                .padding(.leading, indent + 22)
-            }
-        }
-    }
 }
 
 /// The desktop's Live Overview as an overlay under the terminal: a card
