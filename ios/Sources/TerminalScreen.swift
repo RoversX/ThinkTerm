@@ -33,6 +33,9 @@ struct TerminalScreen: View {
     @State private var zoomClip: CGFloat?
     /// Once in the card the terminal fades into the card's own preview.
     @State private var zoomFade: Double = 1
+    /// Once the terminal has faded, the live card shows its preview rows.
+    @State private var livePreview = false
+    @State private var deletingThread: ThreadView?
 
     init(host: Host?, store: HostStore?) {
         _model = StateObject(wrappedValue: TerminalModel(host: host, store: store))
@@ -44,7 +47,7 @@ struct TerminalScreen: View {
     var body: some View {
         ZStack(alignment: .topLeading) {
             if overviewVisible {
-                OverviewScreen(model: model, isPresented: $overviewShown, cardFrame: $cardFrame, liveThread: currentThreadId)
+                OverviewScreen(model: model, isPresented: $overviewShown, cardFrame: $cardFrame, liveThread: currentThreadId, livePreview: livePreview)
                     .opacity(overviewOpen ? 1 : 0)
                     .onChange(of: overviewShown) { _, shown in if !shown { closeOverview() } }
             }
@@ -125,6 +128,18 @@ struct TerminalScreen: View {
         .sheet(item: $menu) { sheet in
             MenuList(model: model, sheet: sheet) { menu = nil }
                 .presentationDetents([.medium, .large])
+        }
+        .confirmationDialog(
+            tr("thread.delete.title", deletingThread?.name ?? ""),
+            isPresented: Binding(get: { deletingThread != nil }, set: { if !$0 { deletingThread = nil } }),
+            titleVisibility: .visible,
+            presenting: deletingThread
+        ) { thread in
+            // Deleting ends every program in the thread: it is asked first.
+            Button(tr("delete"), role: .destructive) { model.sideClick("delete", id: thread.id) }
+            Button(tr("cancel"), role: .cancel) {}
+        } message: { _ in
+            Text(tr("thread.delete.body"))
         }
         .sheet(item: $editingHost) { host in
             HostEditView(host: host) { edited, secret, passphrase in
@@ -222,8 +237,12 @@ struct TerminalScreen: View {
                                     Text(thread.name)
                                         .font(.system(size: 12, weight: thread.current ? .semibold : .regular))
                                         .lineLimit(1)
+                                    if thread.current {
+                                        closeX { deletingThread = thread }
+                                    }
                                 }
-                                .padding(.horizontal, 10)
+                                .padding(.leading, 10)
+                                .padding(.trailing, thread.current ? 4 : 10)
                                 .frame(minWidth: 64, minHeight: 26)
                                 .background(thread.current ? Color.white.opacity(0.18) : Color.white.opacity(0.06))
                                 .clipShape(Capsule())
@@ -287,14 +306,20 @@ struct TerminalScreen: View {
             Button {
                 model.chromeClick("pane", pane: tab.target)
             } label: {
-                Text(tab.label.isEmpty ? tr("tab.num", tab.tab) : tab.label)
-                    .font(.system(size: size, weight: tab.current ? .semibold : .regular))
-                    .lineLimit(1)
-                    .padding(.horizontal, 10)
-                    .frame(minWidth: 76, maxWidth: 140, minHeight: height)
-                    .foregroundColor(tab.current ? .white : Color.white.opacity(0.62))
-                    .background(tab.current ? Color.white.opacity(0.18) : Color.white.opacity(0.06))
-                    .clipShape(Capsule())
+                HStack(spacing: 4) {
+                    Text(tab.label.isEmpty ? tr("tab.num", tab.tab) : tab.label)
+                        .font(.system(size: size, weight: tab.current ? .semibold : .regular))
+                        .lineLimit(1)
+                    if tab.current {
+                        closeX { model.chromeClick("close-tab", tab: tab.tab) }
+                    }
+                }
+                .padding(.leading, 10)
+                .padding(.trailing, tab.current ? 4 : 10)
+                .frame(minWidth: 76, maxWidth: 160, minHeight: height)
+                .foregroundColor(tab.current ? .white : Color.white.opacity(0.62))
+                .background(tab.current ? Color.white.opacity(0.18) : Color.white.opacity(0.06))
+                .clipShape(Capsule())
             }
             .buttonStyle(.plain)
             .contextMenu {
@@ -302,6 +327,18 @@ struct TerminalScreen: View {
             }
             .id("tab:\(tab.tab)")
         }
+    }
+
+    /// The × at the end of the current pill: what the desktop's tabs carry.
+    private func closeX(_ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: "xmark")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundColor(Color.white.opacity(0.7))
+                .frame(width: 18, height: 18)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
     }
 
     /// "+" opens a tab; held, it offers the splits too.
@@ -364,11 +401,15 @@ struct TerminalScreen: View {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
             guard overviewOpen else { return }
-            withAnimation(.easeOut(duration: 0.25)) { zoomFade = 0 }
+            withAnimation(.easeOut(duration: 0.18)) { zoomFade = 0 }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+                if overviewOpen { withAnimation(.easeOut(duration: 0.15)) { livePreview = true } }
+            }
         }
     }
 
     private func closeOverview() {
+        withAnimation(.easeOut(duration: 0.1)) { livePreview = false }
         withAnimation(.easeOut(duration: 0.15)) { zoomFade = 1 }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
             withAnimation(.spring(response: 0.35, dampingFraction: 0.9)) {

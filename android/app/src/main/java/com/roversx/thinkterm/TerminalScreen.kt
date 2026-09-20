@@ -44,7 +44,9 @@ import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.outlined.Circle
 import androidx.compose.material.icons.outlined.PowerOff
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -74,6 +76,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -125,6 +128,8 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
     // Once in the card the terminal fades into the card's own preview,
     // so the live card looks like every other one.
     val fade = remember { Animatable(0f) }
+    // Once the terminal has faded, the live card shows its preview rows.
+    var livePreview by remember { mutableStateOf(false) }
     val overviewOpen = overviewShown && zoom.value > 0f
     var zoomTarget by remember { mutableStateOf<Rect?>(null) }
 
@@ -166,6 +171,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
     fun closeOverview() {
         if (!overviewShown) return
         scope.launch {
+            livePreview = false
             fade.animateTo(0f, tween(150))
             zoom.animateTo(0f, spring(dampingRatio = 0.9f, stiffness = 400f))
             overviewShown = false
@@ -198,7 +204,10 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
         zoomTarget = frame
         scope.launch {
             zoom.animateTo(1f, spring(dampingRatio = 0.85f, stiffness = 300f))
-            if (overviewShown) fade.animateTo(1f, tween(250))
+            if (overviewShown) {
+                fade.animateTo(1f, tween(180))
+                livePreview = overviewShown
+            }
         }
     }
 
@@ -214,7 +223,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
     Box(
         Modifier
             .fillMaxSize()
-            .background(if (overviewOpen) Color(0xFF0F0F0F) else model.background)
+            .background(lerp(model.background, Color(0xFF0F0F0F), zoom.value))
             .safeDrawingPadding()
     ) {
         if (overviewShown) {
@@ -222,6 +231,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                 OverviewScreen(
                     model = model,
                     liveThread = currentThread?.id,
+                    livePreview = livePreview,
                     onCardBounds = { cardLaidOut(it) },
                     onDismiss = { closeOverview() },
                 )
@@ -232,7 +242,14 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
         // strips and bars leave while the overview is up, so the cards get
         // the taps; the terminal's own touches close it.
         Column(Modifier.fillMaxSize().zIndex(1f).imePadding()) {
-            if (!overviewOpen) {
+            // The strips fade with the zoom and stop taking touches; their
+            // room stays, so the terminal's own place does not move under
+            // the zoom that was measured from it.
+            Column(
+                Modifier
+                    .graphicsLayer { alpha = 1f - zoom.value }
+                    .then(if (overviewOpen) Modifier.pointerInput(Unit) { awaitPointerEventScope { while (true) awaitPointerEvent().changes.forEach { it.consume() } } } else Modifier)
+            ) {
                 TopBar(
                     model = model,
                     twoLevel = twoLevel,
@@ -242,10 +259,6 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                     onEditHost = { editingHost = model.host },
                 )
                 if (twoLevel) TabSubstrip(model, onPinchOut = { openOverview() })
-            } else {
-                // Their room stays, so the terminal's own place does not
-                // move under the zoom that was measured from it.
-                Spacer(Modifier.height(if (twoLevel) 80.dp else 48.dp))
             }
 
             // The terminal, scaled to the card's width and moved into it as
@@ -442,6 +455,21 @@ private fun NewTabButton(model: TerminalModel) {
 @Composable
 private fun ThreadPill(model: TerminalModel, thread: ThreadView, onTree: () -> Unit) {
     var menu by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
+    if (confirmDelete) {
+        // Deleting ends every program in the thread: it is asked first.
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = { Text(tr("thread.delete.title", thread.name)) },
+            text = { Text(tr("thread.delete.body")) },
+            confirmButton = {
+                TextButton(onClick = { confirmDelete = false; model.sideClick("delete", thread.id) }) {
+                    Text(tr("delete"), color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = { TextButton(onClick = { confirmDelete = false }) { Text(tr("cancel")) } },
+        )
+    }
     Box {
         Row(
             Modifier
@@ -454,7 +482,7 @@ private fun ThreadPill(model: TerminalModel, thread: ThreadView, onTree: () -> U
                 )
                 .widthIn(min = 64.dp)
                 .height(26.dp)
-                .padding(horizontal = 10.dp),
+                .padding(start = 10.dp, end = if (thread.current) 4.dp else 10.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(5.dp),
         ) {
@@ -467,6 +495,7 @@ private fun ThreadPill(model: TerminalModel, thread: ThreadView, onTree: () -> U
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+            if (thread.current) CloseX { confirmDelete = true }
         }
         AppContextMenu(model, "thread", thread.id, expanded = menu, onDismiss = { menu = false })
     }
@@ -493,28 +522,50 @@ private fun TabPills(
     for (tab in model.tabs?.tabs ?: emptyList()) {
         var menu by remember(tab.tab) { mutableStateOf(false) }
         Box(Modifier.onGloballyPositioned { positions["tab:" + tab.tab] = it.positionInParent().x.toInt() }) {
-            Text(
-                text = tab.label.ifEmpty { tr("tab.num", tab.tab) },
-                color = if (tab.current) Color.White else Color.White.copy(alpha = 0.62f),
-                fontSize = size,
-                fontWeight = if (tab.current) FontWeight.SemiBold else FontWeight.Normal,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                textAlign = TextAlign.Center,
-                modifier = Modifier
+            Row(
+                Modifier
                     .clip(RoundedCornerShape(50))
                     .background(Color.White.copy(alpha = if (tab.current) 0.18f else 0.06f))
                     .combinedClickable(
                         onClick = { model.chromeClick("pane", pane = tab.target) },
                         onLongClick = { menu = true },
                     )
-                    .widthIn(min = 76.dp, max = 140.dp)
+                    .widthIn(min = 76.dp, max = 160.dp)
                     .heightIn(min = height)
-                    .padding(horizontal = 10.dp, vertical = 4.dp),
-            )
+                    .padding(start = 10.dp, end = if (tab.current) 4.dp else 10.dp, top = 4.dp, bottom = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(
+                    text = tab.label.ifEmpty { tr("tab.num", tab.tab) },
+                    color = if (tab.current) Color.White else Color.White.copy(alpha = 0.62f),
+                    fontSize = size,
+                    fontWeight = if (tab.current) FontWeight.SemiBold else FontWeight.Normal,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                if (tab.current) CloseX { model.chromeClick("close-tab", tab = tab.tab) }
+            }
             AppContextMenu(model, "tab", tab.tab.toString(), expanded = menu, onDismiss = { menu = false })
         }
     }
+}
+
+/// The × at the end of the current pill: what the desktop's tabs carry.
+@Composable
+private fun CloseX(onClick: () -> Unit) {
+    Icon(
+        Icons.Default.Close,
+        contentDescription = tr("closetab"),
+        tint = Color.White.copy(alpha = 0.7f),
+        modifier = Modifier
+            .size(18.dp)
+            .clip(CircleShape)
+            .clickable(onClick = onClick)
+            .padding(3.dp),
+    )
 }
 
 @OptIn(ExperimentalFoundationApi::class)

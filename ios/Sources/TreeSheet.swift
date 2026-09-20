@@ -276,6 +276,8 @@ struct OverviewScreen: View {
     /// The thumbnail box of the thread on show, in the screen's space.
     @Binding var cardFrame: CGRect?
     var liveThread: String?
+    /// The live card's rows wait until the terminal has faded out of it.
+    var livePreview: Bool = true
     private let dots = 4
     private let rows = 9
     private let columns = [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)]
@@ -402,6 +404,7 @@ struct OverviewScreen: View {
                         .frame(maxWidth: .infinity, alignment: .topLeading)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 7)
+                        .opacity(!live || livePreview ? 1 : 0)
                     if live {
                         // The terminal itself lands over this, then fades into
                         // the same preview as every other card; the frame is

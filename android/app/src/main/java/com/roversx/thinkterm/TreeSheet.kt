@@ -66,6 +66,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -527,6 +530,7 @@ private const val OVERVIEW_COLS = 38
 fun OverviewScreen(
     model: TerminalModel,
     liveThread: String?,
+    livePreview: Boolean,
     onCardBounds: (Rect?) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -576,6 +580,7 @@ fun OverviewScreen(
                                     model = model,
                                     thread = thread,
                                     live = thread.id == liveThread,
+                                    livePreview = livePreview,
                                     onCardBounds = onCardBounds,
                                     onDismiss = onDismiss,
                                     modifier = Modifier.weight(1f),
@@ -612,6 +617,7 @@ private fun ThreadCard(
     model: TerminalModel,
     thread: ThreadView,
     live: Boolean,
+    livePreview: Boolean,
     onCardBounds: (Rect?) -> Unit,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
@@ -690,13 +696,16 @@ private fun ThreadCard(
                 .background(if (thread.live) model.background else Color.Black.copy(alpha = 0.4f))
                 .clipToBounds()
         ) {
+            // The live card's rows wait until the terminal has faded out of
+            // it, so the two never show at once.
+            val rowsAlpha by animateFloatAsState(if (!live || livePreview) 1f else 0f, tween(150), label = "rows")
             Text(
                 previewText(model, thread),
                 fontSize = 7.sp,
                 lineHeight = 8.5.sp,
                 fontFamily = FontFamily.Monospace,
                 color = Color.White,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 7.dp),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 7.dp).graphicsLayer { alpha = rowsAlpha },
             )
             if (live) {
                 // The terminal itself lands over this, then fades into the
