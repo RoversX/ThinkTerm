@@ -36,6 +36,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -72,12 +73,9 @@ fun SidebarDrawer(
             Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)).clickable(onClick = onDismiss))
         }
         AnimatedVisibility(visible, enter = slideInHorizontally { -it }, exit = slideOutHorizontally { -it }) {
-            Box(
-                Modifier
-                    .fillMaxHeight()
-                    .width(300.dp)
-                    .background(MaterialTheme.colorScheme.surface)
-            ) {
+            // A Surface, not a Box: it sets the content colour, so text with
+            // no colour of its own is readable on every theme.
+            Surface(Modifier.fillMaxHeight().width(300.dp), color = MaterialTheme.colorScheme.surface) {
                 SidebarTree(model, onDismiss, onEditHost, onSettings)
             }
         }

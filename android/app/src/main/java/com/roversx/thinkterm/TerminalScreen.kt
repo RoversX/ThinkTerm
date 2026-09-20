@@ -57,6 +57,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -427,12 +428,12 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
             )
         }
         if (showSettings) {
-            Box(Modifier.fillMaxSize().zIndex(3f).background(MaterialTheme.colorScheme.background)) {
+            Surface(Modifier.fillMaxSize().zIndex(3f), color = MaterialTheme.colorScheme.background) {
                 SettingsScreen(model = model, showLog = showLog, onDone = { showSettings = false })
             }
         }
         editingHost?.let { h ->
-            Box(Modifier.fillMaxSize().zIndex(3f).background(MaterialTheme.colorScheme.background)) {
+            Surface(Modifier.fillMaxSize().zIndex(3f), color = MaterialTheme.colorScheme.background) {
                 HostEditScreen(
                     store = store,
                     host = h,
