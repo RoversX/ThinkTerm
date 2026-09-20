@@ -38,6 +38,9 @@ cp thinkterm-web/www/schemes.json ios/Resources/strings.json android/app/src/mai
 # a debug asset, so no release build carries it.
 mkdir -p android/app/src/debug/assets
 [ -f /tmp/ttp-ssh/userkey ] && cp /tmp/ttp-ssh/userkey android/app/src/debug/assets/probe_key || true
+# The app reads the probe's login at runtime. Override it when the SSH
+# account differs from the local account; this asset is debug-only.
+printf '%s\n' "${THINKTERM_PROBE_USER:-$(id -un)}" > android/app/src/debug/assets/probe_user
 
 echo "== gradle"
 build_log=$(mktemp "${TMPDIR:-/tmp}/thinkterm-android-build.XXXXXX")

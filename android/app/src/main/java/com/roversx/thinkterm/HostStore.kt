@@ -45,12 +45,15 @@ data class Host(
     companion object {
         const val PROBE_ID = "probe"
 
-        val probe = Host(
+        fun probe(context: Context) = Host(
             id = PROBE_ID,
             name = "This Mac (probe)",
             hostname = "10.0.2.2",
             port = 2299,
-            user = "",
+            // Generated locally for debug builds; no account name lives in Git.
+            user = runCatching {
+                context.assets.open("probe_user").bufferedReader().use { it.readText().trim() }
+            }.getOrDefault(""),
             auth = "key",
             remoteCommand = "/tmp/ttp-ssh/thinkterm-remote cli --prefer-mux proxy",
         )

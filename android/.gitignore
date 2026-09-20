@@ -3,6 +3,7 @@ app/src/main/java/com/roversx/thinkterm/core/
 app/src/main/jniLibs/
 app/src/main/assets/*.ttf
 app/src/debug/assets/probe_key
+app/src/debug/assets/probe_user
 app/src/main/assets/schemes.json
 app/src/main/assets/strings.json
 .gradle/

@@ -60,6 +60,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -72,6 +73,10 @@ import androidx.compose.ui.unit.dp
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HostsScreen(store: HostStore, showProbe: Boolean, onOpen: (Host) -> Unit) {
+    val context = LocalContext.current
+    val probe = remember(context, showProbe) {
+        if (showProbe) Host.probe(context).takeIf { it.user.isNotEmpty() } else null
+    }
     var editing by remember { mutableStateOf<Host?>(null) }
     var search by remember { mutableStateOf("") }
     var pendingDelete by remember { mutableStateOf<Host?>(null) }
@@ -157,11 +162,11 @@ fun HostsScreen(store: HostStore, showProbe: Boolean, onOpen: (Host) -> Unit) {
                 }
             }
 
-            if (showProbe) {
+            if (probe != null) {
                 item(key = "dev-header") { HostGroupHeader(tr("dev")) }
                 item(key = Host.PROBE_ID) {
                     ListItem(
-                        modifier = Modifier.clickable { onOpen(Host.probe) },
+                        modifier = Modifier.clickable { onOpen(probe) },
                         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                         leadingContent = { HostDisc(Icons.Filled.Hardware, Color(0xFF8E8E93)) },
                         headlineContent = {
@@ -173,7 +178,7 @@ fun HostsScreen(store: HostStore, showProbe: Boolean, onOpen: (Host) -> Unit) {
                             }
                         },
                         supportingContent = {
-                            Text("probe sshd on ${Host.probe.hostname}:${Host.probe.port}")
+                            Text("probe sshd on ${probe.hostname}:${probe.port}")
                         },
                     )
                 }
