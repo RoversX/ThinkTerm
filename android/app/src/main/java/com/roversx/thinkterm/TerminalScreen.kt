@@ -241,8 +241,9 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                 Spacer(Modifier.height(if (twoLevel) 80.dp else 48.dp))
             }
 
-            // The terminal, scaled and moved into the card and clipped to
-            // its height as the zoom goes from 0 to 1.
+            // The terminal, scaled to the card's width and moved into it as
+            // the zoom goes from 0 to 1; the card keeps the bottom of it,
+            // the newest rows, as the other cards' previews do.
             Box(
                 Modifier
                     .fillMaxWidth()
@@ -255,10 +256,14 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                         if (target != null && terminalBounds.width > 0) {
                             val s = target.width / terminalBounds.width
                             val scale = 1f + (s - 1f) * t
+                            val top = (terminalBounds.height - target.height / s) * t
                             scaleX = scale
                             scaleY = scale
                             translationX = (target.left - terminalBounds.left) * t
-                            translationY = (target.top - terminalBounds.top) * t
+                            translationY = (target.top - terminalBounds.top) * t - top * scale
+                            // The card's own corners, once the terminal is in it.
+                            val r = 13.dp.toPx() / scale * t
+                            shape = RoundedCornerShape(bottomStart = r, bottomEnd = r)
                         } else {
                             scaleX = 1f
                             scaleY = 1f
@@ -272,10 +277,8 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                         val target = zoomTarget
                         if (target != null && terminalBounds.width > 0) {
                             val s = target.width / terminalBounds.width
-                            val full = size.height
-                            val clipped = target.height / s
-                            val h = full + (clipped - full) * zoom.value
-                            clipRect(bottom = h) { this@drawWithContent.drawContent() }
+                            val top = (size.height - target.height / s) * zoom.value
+                            clipRect(top = top) { this@drawWithContent.drawContent() }
                         } else {
                             drawContent()
                         }

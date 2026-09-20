@@ -56,8 +56,10 @@ struct TerminalScreen: View {
                             .onAppear { terminalFrame = geo.frame(in: .named("screen")) }
                             .onChange(of: geo.frame(in: .named("screen"))) { _, f in terminalFrame = f }
                     })
-                    .mask(alignment: .top) {
-                        Rectangle().frame(height: zoomClip)
+                    .mask(alignment: .bottom) {
+                        // The card's own corners, once the terminal is in it.
+                        UnevenRoundedRectangle(bottomLeadingRadius: 13 / zoomScale, bottomTrailingRadius: 13 / zoomScale)
+                            .frame(height: zoomClip)
                     }
                     .scaleEffect(zoomScale, anchor: .topLeading)
                     .offset(zoomOffset)
@@ -339,15 +341,20 @@ struct TerminalScreen: View {
     }
 
     /// Shrink the terminal into the card's thumbnail: scaled to its
-    /// width, moved to its corner, and masked to its height.
+    /// width, moved into it, and masked to its height from the bottom,
+    /// so the card keeps the newest rows as the other cards' previews do.
     private func zoom(into frame: CGRect) {
         guard terminalFrame.width > 0 else { return }
         let scale = frame.width / terminalFrame.width
+        let clip = frame.height / scale
         withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
             overviewOpen = true
             zoomScale = scale
-            zoomOffset = CGSize(width: frame.minX - terminalFrame.minX, height: frame.minY - terminalFrame.minY)
-            zoomClip = frame.height / scale
+            zoomOffset = CGSize(
+                width: frame.minX - terminalFrame.minX,
+                height: frame.minY - terminalFrame.minY - (terminalFrame.height - clip) * scale
+            )
+            zoomClip = clip
         }
     }
 
