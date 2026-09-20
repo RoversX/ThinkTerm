@@ -33,7 +33,7 @@ cargo run -q -p thinkterm-mobile --bin uniffi-bindgen -- generate \
 echo "== assets"
 mkdir -p android/app/src/main/assets
 cp assets/fonts/JetBrainsMono-Regular.ttf assets/fonts/FiraCode-Regular.ttf assets/fonts/SymbolsNerdFontMono-Regular.ttf android/app/src/main/assets/
-cp thinkterm-web/www/schemes.json android/app/src/main/assets/
+cp thinkterm-web/www/schemes.json ios/Resources/strings.json android/app/src/main/assets/
 # The probe sshd's throwaway key, for the emulator's "This Mac" entry.
 [ -f /tmp/ttp-ssh/userkey ] && cp /tmp/ttp-ssh/userkey android/app/src/main/assets/probe_key || true
 

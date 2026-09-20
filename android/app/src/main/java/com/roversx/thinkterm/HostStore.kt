@@ -26,8 +26,18 @@ data class Host(
     val knownHost: String? = null,
     /// Empty means the default proxy command on the host.
     val remoteCommand: String = "",
+    /// A label the list groups by; empty is no group.
+    val group: String = "",
+    /// The public half of a key the app generated or could read, so it
+    /// can be shown and copied to the host's authorized_keys.
+    val publicKey: String? = null,
+    /// Unix milliseconds of the last connection that reached a pane.
+    val lastConnected: Long? = null,
 ) {
     val display: String get() = if (name.isNotEmpty()) name else "$user@$hostname:$port"
+    /// The headline of a row: `display` would repeat the address below it
+    /// when the host has no name.
+    val title: String get() = name.ifEmpty { hostname }
     val address: String get() = "$user@$hostname" + if (port == 22) "" else ":$port"
 
     /// The dev-only entry that reaches the Mac's probe sshd. 10.0.2.2 is
@@ -80,6 +90,36 @@ class HostStore(context: Context) {
         save()
     }
 
+    /// A connection reached the terminal: the list shows when.
+    fun touchConnected(id: String) {
+        val at = hosts.indexOfFirst { it.id == id }
+        if (at < 0) return
+        hosts = hosts.toMutableList().also { it[at] = it[at].copy(lastConnected = System.currentTimeMillis()) }
+        save()
+    }
+
+    fun forgetHostKey(id: String) {
+        val at = hosts.indexOfFirst { it.id == id }
+        if (at < 0 || hosts[at].knownHost == null) return
+        hosts = hosts.toMutableList().also { it[at] = it[at].copy(knownHost = null) }
+        save()
+    }
+
+    /// The groups in use, for the editor's suggestions.
+    val groups: List<String> get() = hosts.map { it.group }.filter { it.isNotEmpty() }.distinct().sorted()
+
+    /// A copy under a new id, with the secret copied across so the
+    /// duplicate connects without being re-keyed.
+    fun duplicate(host: Host, nameSuffix: String) {
+        val copy = host.copy(
+            id = UUID.randomUUID().toString(),
+            name = host.name.ifEmpty { host.display } + nameSuffix,
+            lastConnected = null,
+        )
+        putSecret(copy.id, secret(host.id), passphrase(host.id))
+        upsert(copy)
+    }
+
     fun rememberHostKey(id: String, fingerprint: String) {
         val at = hosts.indexOfFirst { it.id == id }
         if (at < 0 || hosts[at].knownHost == fingerprint) return
@@ -110,6 +150,9 @@ class HostStore(context: Context) {
                     .put("auth", h.auth)
                     .put("knownHost", h.knownHost ?: JSONObject.NULL)
                     .put("remoteCommand", h.remoteCommand)
+                    .put("group", h.group)
+                    .put("publicKey", h.publicKey ?: JSONObject.NULL)
+                    .put("lastConnected", h.lastConnected ?: JSONObject.NULL)
             )
         }
         prefs.edit().putString(KEY, arr.toString()).apply()
@@ -130,6 +173,9 @@ class HostStore(context: Context) {
                     auth = o.optString("auth", "key"),
                     knownHost = o.optString("knownHost").ifEmpty { null },
                     remoteCommand = o.optString("remoteCommand"),
+                    group = o.optString("group"),
+                    publicKey = o.optString("publicKey").ifEmpty { null },
+                    lastConnected = if (o.isNull("lastConnected")) null else o.optLong("lastConnected"),
                 )
             }
         } catch (e: Throwable) {
