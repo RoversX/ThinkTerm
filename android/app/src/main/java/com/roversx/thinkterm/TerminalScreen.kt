@@ -10,6 +10,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -177,6 +178,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
         if (!overviewShown) return
         scope.launch {
             livePreview = false
+            hostView?.visibility = android.view.View.VISIBLE
             fade.animateTo(0f, tween(150))
             zoom.animateTo(0f, spring(dampingRatio = 0.9f, stiffness = 400f))
             overviewShown = false
@@ -211,6 +213,10 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
             zoom.animateTo(1f, spring(dampingRatio = 0.85f, stiffness = 300f))
             if (overviewShown) {
                 fade.animateTo(1f, tween(180))
+                // A faded layer is not enough: the texture repaints itself on
+                // every new frame (the cursor's blink) and can show through
+                // for one; hidden outright, it cannot.
+                hostView?.visibility = android.view.View.INVISIBLE
                 livePreview = overviewShown
             }
         }
@@ -275,6 +281,9 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                     .fillMaxWidth()
                     .weight(1f)
                     .onGloballyPositioned { if (!overviewShown) terminalBounds = it.boundsInRoot() }
+                    // In the overview the shrunken terminal is the live card:
+                    // a tap on it (the hidden view lets it through) closes.
+                    .then(if (overviewOpen) Modifier.pointerInput(Unit) { detectTapGestures { closeOverview() } } else Modifier)
                     .graphicsLayer {
                         val t = zoom.value
                         val target = zoomTarget

@@ -39,7 +39,9 @@ class TerminalHostView(context: Context, private val model: TerminalModel) : Fra
     private var lastSize = Triple(0, 0, 0.0)
 
     init {
-        texture.isOpaque = true
+        // Not opaque: the overview fades the terminal, and an opaque texture
+        // ignores its layer's alpha when it repaints itself.
+        texture.isOpaque = false
         addView(texture, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         addView(input, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         model.onFocusRequested = { input.focusAndShowKeyboard() }
