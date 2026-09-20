@@ -14,6 +14,10 @@ struct KeyCap: Identifiable {
         case text(String)
         /// Ctrl or Alt held for the next key only.
         case sticky(Sticky)
+        /// The clipboard, typed into the pane.
+        case paste
+        /// One of the App's chrome actions (a split, a zoom, a new tab).
+        case chrome(String)
     }
 
     enum Sticky {
@@ -27,13 +31,17 @@ struct KeyCap: Identifiable {
     static func text(_ label: String) -> KeyCap {
         KeyCap(label: label, action: .text(label))
     }
+
+    static func chrome(_ label: String, _ action: String) -> KeyCap {
+        KeyCap(label: label, action: .chrome(action))
+    }
 }
 
 /// The key bar's row and the panel's grid, and the one place a cap turns
 /// into input.
 enum KeyCaps {
     /// The bar under the terminal: the keys a soft keyboard has not got.
-    static let bar: [KeyCap] = [
+    static var bar: [KeyCap] { [
         .dom("esc", "Escape"),
         .dom("tab", "Tab"),
         KeyCap(label: "ctrl", action: .sticky(.ctrl)),
@@ -55,7 +63,18 @@ enum KeyCaps {
         .dom("^L", "l", ctrl: true),
         .dom("^Z", "z", ctrl: true),
         .dom("⌫", "Backspace"),
-    ]
+        KeyCap(label: tr("paste"), action: .paste),
+    ] }
+
+    /// The panes and tabs: what the desktop keeps in its menus, as keys.
+    static var layout: [KeyCap] { [
+        .chrome(tr("split.right"), "split-right"),
+        .chrome(tr("split.below"), "split-below"),
+        .chrome(tr("zoom"), "zoom"),
+        .chrome(tr("closepane"), "close"),
+        .chrome(tr("newtab"), "new-tab"),
+        .chrome(tr("closetab"), "close-tab"),
+    ] }
 
     static let functions: [KeyCap] = (1...12).map { .dom("F\($0)", "F\($0)") }
 
@@ -110,6 +129,14 @@ enum KeyCaps {
             model.ctrlSticky.toggle()
         case .sticky(.alt):
             model.altSticky.toggle()
+        case .paste:
+            model.pasteFromClipboard()
+        case .chrome(let action):
+            if action == "close-tab" {
+                if let tab = model.tabs?.tabs.first(where: { $0.current })?.tab { model.chromeClick("close-tab", tab: tab) }
+            } else {
+                model.chromeClick(action)
+            }
         }
         tap()
     }
@@ -123,13 +150,14 @@ enum KeyCaps {
 
 /// The four faces of the extension panel.
 enum KeyPanelTab: String, CaseIterable, Identifiable {
-    case keys, snippets, history, colors
+    case keys, layout, snippets, history, colors
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .keys: return tr("p.keys")
+        case .layout: return tr("p.layout")
         case .snippets: return tr("p.snippets")
         case .history: return tr("p.history")
         case .colors: return tr("p.colors")
@@ -202,6 +230,7 @@ struct KeyPanel: View {
     private func body(for tab: KeyPanelTab) -> some View {
         switch tab {
         case .keys: keysGrid
+        case .layout: layoutGrid
         case .snippets: snippetList
         case .history: historyList
         case .colors: colorRow
@@ -217,6 +246,30 @@ struct KeyPanel: View {
                 block(tr("k.navigation"), KeyCaps.navigation)
                 block(tr("k.symbols"), KeyCaps.symbols)
                 block(tr("k.control"), KeyCaps.chords)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+        }
+    }
+
+    /// Two to a row, wide enough for their words.
+    private var layoutGrid: some View {
+        ScrollView {
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)], spacing: 8) {
+                ForEach(KeyCaps.layout) { cap in
+                    Button { KeyCaps.send(cap, to: model) } label: {
+                        Text(cap.label)
+                            .font(.system(size: 14))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 42)
+                            .background(Color.white.opacity(0.07))
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(.white)
+                }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)

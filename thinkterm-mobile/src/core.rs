@@ -769,7 +769,7 @@ impl State {
         // the install's id so it survives a relaunch.
         let (epoch, id) = stable_identity(&self.device_id);
         let me = thinkterm_proto::ClientId {
-            hostname: "ios".into(),
+            hostname: if cfg!(target_os = "android") { "android" } else { "ios" }.into(),
             username: "mobile".into(),
             pid: 0,
             epoch,

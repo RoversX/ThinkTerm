@@ -40,7 +40,6 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.GridView
-import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.outlined.Circle
@@ -115,8 +114,6 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
     var showSettings by remember { mutableStateOf(false) }
     val showLog = remember { mutableStateOf(false) }
     var editingHost by remember { mutableStateOf<Host?>(null) }
-    var moreOpen by remember { mutableStateOf(false) }
-    var paneMenuOpen by remember { mutableStateOf(false) }
     var hostView by remember { mutableStateOf<TerminalHostView?>(null) }
 
     // The overview: the terminal shrinks into its thread's card and the
@@ -235,25 +232,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                     onBack = { model.disconnect(); onBack() },
                     onTree = { showTree = true },
                     onOverview = { openOverview() },
-                    onMore = { moreOpen = true },
-                    moreMenu = {
-                        MoreMenu(
-                            model = model,
-                            expanded = moreOpen,
-                            onDismiss = { moreOpen = false },
-                            onTree = { showTree = true },
-                            onOverview = { openOverview() },
-                            onSettings = { showSettings = true },
-                            onPaneMenu = { paneMenuOpen = true },
-                        )
-                        AppContextMenu(
-                            model = model,
-                            kind = "pane",
-                            id = (model.tabs?.current?.target ?: 0).toString(),
-                            expanded = paneMenuOpen,
-                            onDismiss = { paneMenuOpen = false },
-                        )
-                    },
+                    onEditHost = { editingHost = model.host },
                 )
                 if (twoLevel) TabSubstrip(model, onPinchOut = { openOverview() })
             } else {
@@ -361,9 +340,9 @@ private fun TopBar(
     onBack: () -> Unit,
     onTree: () -> Unit,
     onOverview: () -> Unit,
-    onMore: () -> Unit,
-    moreMenu: @Composable () -> Unit,
+    onEditHost: () -> Unit,
 ) {
+    var connectionMenu by remember { mutableStateOf(false) }
     Row(
         Modifier.fillMaxWidth().height(48.dp).padding(start = 2.dp, end = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -371,8 +350,19 @@ private fun TopBar(
         IconButton(onClick = onBack) {
             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = tr("back"), tint = Color.White)
         }
-        Box(Modifier.size(7.dp).clip(CircleShape).background(statusColor(model)))
-        Spacer(Modifier.width(6.dp))
+        // The dot is the connection: a tap opens what can be done with it.
+        Box {
+            Box(
+                Modifier
+                    .size(28.dp)
+                    .clip(CircleShape)
+                    .clickable { connectionMenu = true }
+                    .padding(10.dp)
+                    .clip(CircleShape)
+                    .background(statusColor(model))
+            )
+            ConnectionMenu(model, expanded = connectionMenu, onDismiss = { connectionMenu = false }, onEditHost = onEditHost)
+        }
         val scroll = rememberScrollState()
         val positions = remember { mutableStateMapOf<String, Int>() }
         val currentKey = if (twoLevel) model.threads?.current?.id?.let { "thread:$it" } else model.tabs?.current?.tab?.let { "tab:$it" }
@@ -388,20 +378,51 @@ private fun TopBar(
                         ThreadPill(model, thread, onTree)
                     }
                 }
-                PlusButton { model.sideClick("new-thread") }
+                PlusButton(onClick = { model.sideClick("new-thread") })
             } else {
                 TabPills(model, size = 12.sp, height = 26.dp, positions = positions)
-                PlusButton { model.chromeClick("new-tab") }
+                NewTabButton(model)
             }
         }
         IconButton(onClick = onOverview) {
             Icon(Icons.Default.GridView, contentDescription = tr("overview"), tint = Color.White)
         }
-        Box {
-            IconButton(onClick = onMore) {
-                Icon(Icons.Default.MoreVert, contentDescription = tr("more"), tint = Color.White)
-            }
-            moreMenu()
+    }
+}
+
+/// What the ⋯ menu used to hold about the host: reconnect or disconnect,
+/// and the host's editor.
+@Composable
+private fun ConnectionMenu(model: TerminalModel, expanded: Boolean, onDismiss: () -> Unit, onEditHost: () -> Unit) {
+    DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
+        val connected = model.isConnected
+        Text(
+            model.host.display,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+        )
+        DropdownMenuItem(
+            text = { Text(if (connected) tr("disconnect") else tr("reconnect")) },
+            onClick = { if (connected) model.disconnect() else model.connect(); onDismiss() },
+        )
+        if (model.host.id != Host.PROBE_ID) {
+            DropdownMenuItem(text = { Text(tr("edithost")) }, onClick = { onDismiss(); onEditHost() })
+        }
+    }
+}
+
+/// "+" opens a tab; held, it offers the splits too.
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun NewTabButton(model: TerminalModel) {
+    var menu by remember { mutableStateOf(false) }
+    Box {
+        PlusButton(onClick = { model.chromeClick("new-tab") }, onLongClick = { menu = true })
+        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            DropdownMenuItem(text = { Text(tr("newtab")) }, onClick = { model.chromeClick("new-tab"); menu = false })
+            DropdownMenuItem(text = { Text(tr("split.right")) }, onClick = { model.chromeClick("split-right"); menu = false })
+            DropdownMenuItem(text = { Text(tr("split.below")) }, onClick = { model.chromeClick("split-below"); menu = false })
         }
     }
 }
@@ -485,13 +506,18 @@ private fun TabPills(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun PlusButton(onClick: () -> Unit) {
+private fun PlusButton(onClick: () -> Unit, onLongClick: (() -> Unit)? = null) {
     Icon(
         Icons.Default.Add,
         contentDescription = tr("newtab"),
         tint = Color.White.copy(alpha = 0.62f),
-        modifier = Modifier.size(28.dp).clip(CircleShape).clickable(onClick = onClick).padding(5.dp),
+        modifier = Modifier
+            .size(28.dp)
+            .clip(CircleShape)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+            .padding(5.dp),
     )
 }
 
@@ -527,7 +553,7 @@ private fun TabSubstrip(model: TerminalModel, onPinchOut: () -> Unit) {
         ) {
             TabPills(model, size = 11.5.sp, height = 22.dp, positions = positions)
         }
-        PlusButton { model.chromeClick("new-tab") }
+        NewTabButton(model)
     }
 }
 
@@ -536,48 +562,6 @@ private fun statusColor(model: TerminalModel): Color = when {
     model.isConnected -> Color(0xFF34C759)
     model.connection.startsWith("connecting") || model.connection.contains("reconnect") -> Color(0xFFFF9F0A)
     else -> Color(0xFFFF453A)
-}
-
-/// The ⋯ menu: the host's connection, the splits, the pane's own menu,
-/// the tree and the overview, paste, settings, and closing the pane.
-@Composable
-private fun MoreMenu(
-    model: TerminalModel,
-    expanded: Boolean,
-    onDismiss: () -> Unit,
-    onTree: () -> Unit,
-    onOverview: () -> Unit,
-    onSettings: () -> Unit,
-    onPaneMenu: () -> Unit,
-) {
-    DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
-        val connected = model.isConnected
-        Text(
-            model.host.display,
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
-        )
-        DropdownMenuItem(
-            text = { Text(if (connected) tr("disconnect") else tr("reconnect")) },
-            onClick = { if (connected) model.disconnect() else model.connect(); onDismiss() },
-        )
-        HorizontalDivider()
-        DropdownMenuItem(text = { Text(tr("split.right")) }, onClick = { model.chromeClick("split-right"); onDismiss() })
-        DropdownMenuItem(text = { Text(tr("split.below")) }, onClick = { model.chromeClick("split-below"); onDismiss() })
-        DropdownMenuItem(text = { Text(tr("zoom")) }, onClick = { model.chromeClick("zoom"); onDismiss() })
-        DropdownMenuItem(text = { Text(tr("pane")) }, onClick = { onDismiss(); onPaneMenu() })
-        HorizontalDivider()
-        DropdownMenuItem(text = { Text(tr("m.threadstabs")) }, onClick = { onDismiss(); onTree() })
-        DropdownMenuItem(text = { Text(tr("m.overview")) }, onClick = { onDismiss(); onOverview() })
-        DropdownMenuItem(text = { Text(tr("paste")) }, onClick = { model.pasteFromClipboard(); onDismiss() })
-        HorizontalDivider()
-        DropdownMenuItem(text = { Text(tr("m.settings")) }, onClick = { onDismiss(); onSettings() })
-        DropdownMenuItem(
-            text = { Text(tr("closepane"), color = MaterialTheme.colorScheme.error) },
-            onClick = { model.chromeClick("close"); onDismiss() },
-        )
-    }
 }
 
 // MARK: over the terminal

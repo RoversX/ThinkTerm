@@ -95,12 +95,11 @@ struct TerminalScreen: View {
         .toolbarBackground(model.background, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbar {
-            ToolbarItem(placement: .principal) { tabStrip.frame(width: max(barWidth - 190, 120)) }
-            ToolbarItemGroup(placement: .topBarTrailing) {
+            ToolbarItem(placement: .principal) { tabStrip.frame(width: max(barWidth - 150, 120)) }
+            ToolbarItem(placement: .topBarTrailing) {
                 Button { if overviewShown { overviewShown = false } else { openOverview() } } label: {
                     Image(systemName: "square.grid.2x2")
                 }
-                moreMenu
             }
         }
         .ignoresSafeArea(.container, edges: .bottom)
@@ -180,9 +179,28 @@ struct TerminalScreen: View {
     /// session state) shows its tabs in the bar instead.
     private var twoLevel: Bool { settings.tabBarLevels == "two" && !(model.threads?.threads.isEmpty ?? true) }
 
-    private var tabStrip: some View {
-        HStack(spacing: 6) {
+    /// The dot is the connection: a tap opens what can be done with it.
+    private var connectionDot: some View {
+        Menu {
+            Section(hostName) {
+                Button(connected ? tr("disconnect") : tr("reconnect")) {
+                    if connected { model.disconnect() } else { model.connect() }
+                }
+                if model.host != nil {
+                    Button(tr("edithost")) { editingHost = model.host }
+                }
+            }
+        } label: {
             Circle().fill(statusColor).frame(width: 7, height: 7)
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var tabStrip: some View {
+        HStack(spacing: 2) {
+            connectionDot
             ScrollViewReader { reader in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 4) {
@@ -279,12 +297,18 @@ struct TerminalScreen: View {
         }
     }
 
+    /// "+" opens a tab; held, it offers the splits too.
     private var newTabButton: some View {
         Button { model.chromeClick("new-tab") } label: {
             Image(systemName: "plus").font(.system(size: 13, weight: .semibold)).padding(6)
                 .foregroundColor(Color.white.opacity(0.62))
         }
         .buttonStyle(.plain)
+        .contextMenu {
+            Button(tr("newtab")) { model.chromeClick("new-tab") }
+            Button(tr("split.right")) { model.chromeClick("split-right") }
+            Button(tr("split.below")) { model.chromeClick("split-below") }
+        }
     }
 
     static func threadColor(status: String, live: Bool) -> Color {
@@ -297,29 +321,6 @@ struct TerminalScreen: View {
     }
 
     private func threadColor(_ t: ThreadView) -> Color { Self.threadColor(status: t.status, live: t.live) }
-
-    private var moreMenu: some View {
-        Menu {
-            Section(hostName) {
-                Button(connected ? tr("disconnect") : tr("reconnect")) {
-                    if connected { model.disconnect() } else { model.connect() }
-                }
-            }
-            Button(tr("split.right")) { model.chromeClick("split-right") }
-            Button(tr("split.below")) { model.chromeClick("split-below") }
-            Button(tr("zoom")) { model.chromeClick("zoom") }
-            Button(tr("pane")) { menu = MenuSheet(kind: "pane", id: String(model.tabs?.tabs.first(where: { $0.current })?.target ?? 0), title: tr("pane.title")) }
-            Divider()
-            Button(tr("m.threadstabs")) { showTree = true }
-            Button(tr("m.overview")) { openOverview() }
-            Button(tr("paste")) { model.pasteFromClipboard() }
-            Divider()
-            Button(tr("m.settings")) { showSettings = true }
-            Button(tr("closepane"), role: .destructive) { model.chromeClick("close") }
-        } label: {
-            Image(systemName: "ellipsis")
-        }
-    }
 
     // MARK: the overview's zoom
 

@@ -77,6 +77,12 @@ sealed interface KeyCap {
     /// Ctrl or Alt held for the next key only.
     data class Sticky(override val label: String, val mod: Mod) : KeyCap
 
+    /// The clipboard, typed into the pane.
+    data class Paste(override val label: String) : KeyCap
+
+    /// One of the App's chrome actions (a split, a zoom, a new tab).
+    data class Chrome(override val label: String, val action: String) : KeyCap
+
     enum class Mod { CTRL, ALT }
 }
 
@@ -87,7 +93,7 @@ object KeyCaps {
         KeyCap.Dom(label, name, ctrl, shift)
 
     /// The bar under the terminal: the keys a soft keyboard has not got.
-    val bar: List<KeyCap> = listOf(
+    val bar: List<KeyCap> get() = listOf(
         dom("esc", "Escape"),
         dom("tab", "Tab"),
         KeyCap.Sticky("ctrl", KeyCap.Mod.CTRL),
@@ -109,6 +115,7 @@ object KeyCaps {
         dom("^L", "l", ctrl = true),
         dom("^Z", "z", ctrl = true),
         dom("⌫", "Backspace"),
+        KeyCap.Paste(tr("paste")),
     )
 
     val functions: List<KeyCap> = (1..12).map { dom("F$it", "F$it") }
@@ -152,6 +159,11 @@ object KeyCaps {
                 KeyCap.Mod.CTRL -> model.ctrlSticky = !model.ctrlSticky
                 KeyCap.Mod.ALT -> model.altSticky = !model.altSticky
             }
+            is KeyCap.Paste -> model.pasteFromClipboard()
+            is KeyCap.Chrome -> when (cap.action) {
+                "close-tab" -> model.tabs?.current?.tab?.let { model.chromeClick("close-tab", tab = it) }
+                else -> model.chromeClick(cap.action)
+            }
         }
         tap()
     }
@@ -172,11 +184,12 @@ fun rememberKeyTap(model: TerminalModel): () -> Unit {
 
 /// The four faces of the extension panel.
 enum class KeyPanelTab {
-    KEYS, SNIPPETS, HISTORY, COLORS;
+    KEYS, LAYOUT, SNIPPETS, HISTORY, COLORS;
 
     val title: String
         get() = when (this) {
             KEYS -> tr("p.keys")
+            LAYOUT -> tr("p.layout")
             SNIPPETS -> tr("p.snippets")
             HISTORY -> tr("p.history")
             COLORS -> tr("p.colors")
@@ -220,6 +233,7 @@ fun KeyPanel(
         Box(Modifier.fillMaxWidth().weight(1f)) {
             when (tab) {
                 KeyPanelTab.KEYS -> KeysFace(model, history, tap)
+                KeyPanelTab.LAYOUT -> LayoutFace(model, history, tap)
                 KeyPanelTab.SNIPPETS -> SnippetsFace(model, store, history, tap)
                 KeyPanelTab.HISTORY -> HistoryFace(model, history, tap)
                 KeyPanelTab.COLORS -> ColorsFace(model, tap)
@@ -262,6 +276,46 @@ private fun KeysFace(model: TerminalModel, history: KeyHistory, tap: () -> Unit)
         KeyBlock(tr("k.navigation"), KeyCaps.navigation, model, history, tap)
         KeyBlock(tr("k.symbols"), KeyCaps.symbols, model, history, tap)
         KeyBlock(tr("k.control"), KeyCaps.chords, model, history, tap)
+    }
+}
+
+/// The panes and tabs: what the desktop keeps in its menus, as keys.
+@Composable
+private fun LayoutFace(model: TerminalModel, history: KeyHistory, tap: () -> Unit) {
+    val caps = listOf(
+        KeyCap.Chrome(tr("split.right"), "split-right"),
+        KeyCap.Chrome(tr("split.below"), "split-below"),
+        KeyCap.Chrome(tr("zoom"), "zoom"),
+        KeyCap.Chrome(tr("closepane"), "close"),
+        KeyCap.Chrome(tr("newtab"), "new-tab"),
+        KeyCap.Chrome(tr("closetab"), "close-tab"),
+    )
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        for (row in caps.chunked(2)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                for (cap in row) {
+                    Text(
+                        cap.label,
+                        color = Color.White,
+                        fontSize = 14.sp,
+                        maxLines = 1,
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color.White.copy(alpha = 0.07f))
+                            .clickable { KeyCaps.send(cap, model, history, tap) }
+                            .padding(vertical = 12.dp),
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    )
+                }
+            }
+        }
     }
 }
 
