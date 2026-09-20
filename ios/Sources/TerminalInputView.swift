@@ -43,9 +43,10 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
     private var screen: ScreenText?
     /// The system's selection, held so the gesture setting can take it
     /// away and put it back while the terminal stays open.
-    /// Non-editable: the system draws handles and a loupe for a selection
-    /// but never a caret -- the terminal's cursor is the only one.
-    private let selection = UITextInteraction(for: .nonEditable)
+    /// Editable, or the keyboard stays down (and UIKit logs "cannot add
+    /// handler" for every gesture). The caret it draws takes the view's
+    /// tint, which is clear until a selection needs its handles seen.
+    private let selection = UITextInteraction(for: .editable)
     /// A caret the system placed with a tap: not drawn, but kept, so the
     /// loupe and the handles that follow have a position to start from.
     private var caret: Int?
@@ -86,6 +87,9 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
         // a word and shows the handles, a long press the loupe. The caret
         // it places is kept but not drawn; the terminal's cursor is its own.
         selection.textInput = self
+        // No caret over the terminal's own cursor: the tint that draws it
+        // is clear until a selection puts handles up.
+        tintColor = .clear
         // The setting decides whether it is attached at all; the publisher
         // hands over the value it holds now, so this also starts it right.
         selectionWatch = AppSettings.shared.$longPressSelects.sink { [weak self] on in
@@ -386,6 +390,7 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
             return Range(n, n)
         }
         set {
+            defer { tintColor = selected == nil ? .clear : .systemBlue }
             guard let r = newValue as? Range else {
                 caret = nil
                 selected = nil
@@ -581,6 +586,7 @@ final class TerminalInputView: UIScrollView, UITextInput, UIGestureRecognizerDel
             model?.showCopied()
         }
         selected = nil
+        tintColor = .clear
         inputDelegate?.selectionDidChange(self)
     }
 
