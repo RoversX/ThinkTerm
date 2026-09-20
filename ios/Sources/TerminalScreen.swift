@@ -27,7 +27,12 @@ struct TerminalScreen: View {
     /// The cards stay while the terminal comes back out of its card.
     @State private var overviewVisible = false
     @State private var terminalFrame: CGRect = .zero
-    @State private var cardFrame: CGRect?
+    @State private var cardFrame: CardFrames?
+    /// The card's header, carried along with the terminal by the zoom.
+    @State private var heroFrames: CardFrames?
+    @State private var heroScale: CGFloat = 1
+    @State private var heroOffset: CGSize = .zero
+    @State private var heroAlpha: Double = 0
     @State private var zoomScale: CGFloat = 1
     @State private var zoomOffset: CGSize = .zero
     @State private var zoomClip: CGFloat?
@@ -50,6 +55,22 @@ struct TerminalScreen: View {
                 OverviewScreen(model: model, isPresented: $overviewShown, cardFrame: $cardFrame, liveThread: currentThreadId, livePreview: livePreview)
                     .opacity(overviewOpen ? 1 : 0)
                     .onChange(of: overviewShown) { _, shown in if !shown { closeOverview() } }
+            }
+            // The card's own header rides along with the terminal: laid out at
+            // the card's size, blown up to the terminal's width, and shrunk
+            // with the same zoom, so the whole card closes in.
+            if let hero = heroFrames, let thread = model.threads?.threads.first(where: { $0.id == currentThreadId }) {
+                let sEnd = hero.thumb.width / max(terminalFrame.width, 1)
+                ThreadCardHeader(thread: thread)
+                    .frame(width: hero.card.width, height: hero.thumb.minY - hero.card.minY, alignment: .top)
+                    .background(Color(red: 0.10, green: 0.11, blue: 0.13))
+                    .clipShape(UnevenRoundedRectangle(topLeadingRadius: 13, topTrailingRadius: 13))
+                    .scaleEffect(1 / sEnd, anchor: .topLeading)
+                    .scaleEffect(heroScale, anchor: .topLeading)
+                    .offset(heroOffset)
+                    .opacity(heroAlpha * zoomFade)
+                    .zIndex(3)
+                    .allowsHitTesting(false)
             }
             // Above the cards, so the shrunken terminal shows in its card;
             // untouchable meanwhile, so the cards get the taps.
@@ -96,9 +117,9 @@ struct TerminalScreen: View {
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
             keyboardUp = false
         }
-        .onChange(of: cardFrame) { _, frame in
+        .onChange(of: cardFrame) { _, frames in
             // The card's thumbnail is laid out: the terminal goes there.
-            if overviewShown, let frame, !overviewOpen { zoom(into: frame) }
+            if overviewShown, let frames, !overviewOpen { zoom(into: frames) }
         }
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .tabBar)
@@ -386,10 +407,17 @@ struct TerminalScreen: View {
     /// Shrink the terminal into the card's thumbnail: scaled to its
     /// width, moved into it, and masked to its height from the bottom,
     /// so the card keeps the newest rows as the other cards' previews do.
-    private func zoom(into frame: CGRect) {
+    private func zoom(into frames: CardFrames) {
         guard terminalFrame.width > 0 else { return }
+        let frame = frames.thumb
         let scale = frame.width / terminalFrame.width
         let clip = frame.height / scale
+        // The header starts above the terminal, at the terminal's width,
+        // and lands on the card's own header.
+        heroFrames = frames
+        heroScale = 1
+        heroOffset = CGSize(width: terminalFrame.minX, height: terminalFrame.minY - (frame.minY - frames.card.minY) / scale)
+        heroAlpha = 0
         withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
             overviewOpen = true
             zoomScale = scale
@@ -398,6 +426,9 @@ struct TerminalScreen: View {
                 height: frame.minY - terminalFrame.minY - (terminalFrame.height - clip) * scale
             )
             zoomClip = clip
+            heroScale = scale
+            heroOffset = CGSize(width: frames.card.minX, height: frames.card.minY)
+            heroAlpha = 1
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
             guard overviewOpen else { return }
@@ -417,10 +448,19 @@ struct TerminalScreen: View {
                 zoomScale = 1
                 zoomOffset = .zero
                 zoomClip = nil
+                heroScale = 1
+                heroAlpha = 0
+                if let hero = heroFrames {
+                    let sEnd = hero.thumb.width / max(terminalFrame.width, 1)
+                    heroOffset = CGSize(width: terminalFrame.minX, height: terminalFrame.minY - (hero.thumb.minY - hero.card.minY) / sEnd)
+                }
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            if !overviewShown { overviewVisible = false }
+            if !overviewShown {
+                overviewVisible = false
+                heroFrames = nil
+            }
         }
         cardFrame = nil
     }

@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -81,6 +82,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInParent
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLifecycleOwner
@@ -123,7 +125,10 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
     // cards fade in around it, as the desktop's Live Overview zooms out.
     var overviewShown by remember { mutableStateOf(false) }
     var terminalBounds by remember { mutableStateOf(Rect.Zero) }
-    var cardBounds by remember { mutableStateOf<Rect?>(null) }
+    // Where the screen's padded box starts, in root pixels: the frames
+    // the cards report are root pixels too.
+    var boxOrigin by remember { mutableStateOf(Offset.Zero) }
+    var cardBounds by remember { mutableStateOf<CardFrames?>(null) }
     val zoom = remember { Animatable(0f) }
     // Once in the card the terminal fades into the card's own preview,
     // so the live card looks like every other one.
@@ -131,7 +136,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
     // Once the terminal has faded, the live card shows its preview rows.
     var livePreview by remember { mutableStateOf(false) }
     val overviewOpen = overviewShown && zoom.value > 0f
-    var zoomTarget by remember { mutableStateOf<Rect?>(null) }
+    var zoomTarget by remember { mutableStateOf<CardFrames?>(null) }
 
     val keyboardUp = WindowInsets.ime.getBottom(density) > 0
     val twoLevel = settings.tabBarLevels == "two" && !(model.threads?.threads.isNullOrEmpty())
@@ -198,7 +203,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
 
     // The card's thumbnail is laid out: the terminal goes there. Only the
     // first report counts; later ones must not restart the animation.
-    fun cardLaidOut(frame: Rect?) {
+    fun cardLaidOut(frame: CardFrames?) {
         cardBounds = frame
         if (frame == null || !overviewShown || zoomTarget != null || terminalBounds.width <= 0f) return
         zoomTarget = frame
@@ -225,6 +230,7 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
             .fillMaxSize()
             .background(lerp(model.background, Color(0xFF0F0F0F), zoom.value))
             .safeDrawingPadding()
+            .onGloballyPositioned { boxOrigin = it.positionInRoot() }
     ) {
         if (overviewShown) {
             Box(Modifier.fillMaxSize().graphicsLayer { alpha = zoom.value }) {
@@ -274,13 +280,14 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                         val target = zoomTarget
                         transformOrigin = TransformOrigin(0f, 0f)
                         if (target != null && terminalBounds.width > 0) {
-                            val s = target.width / terminalBounds.width
+                            val thumb = target.thumb
+                            val s = thumb.width / terminalBounds.width
                             val scale = 1f + (s - 1f) * t
-                            val top = (terminalBounds.height - target.height / s) * t
+                            val top = (terminalBounds.height - thumb.height / s) * t
                             scaleX = scale
                             scaleY = scale
-                            translationX = (target.left - terminalBounds.left) * t
-                            translationY = (target.top - terminalBounds.top) * t - top * scale
+                            translationX = (thumb.left - terminalBounds.left) * t
+                            translationY = (thumb.top - terminalBounds.top) * t - top * scale
                             // The card's own corners, once the terminal is in it.
                             val r = 13.dp.toPx() / scale * t
                             shape = RoundedCornerShape(bottomStart = r, bottomEnd = r)
@@ -297,8 +304,8 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                     .drawWithContent {
                         val target = zoomTarget
                         if (target != null && terminalBounds.width > 0) {
-                            val s = target.width / terminalBounds.width
-                            val top = (size.height - target.height / s) * zoom.value
+                            val s = target.thumb.width / terminalBounds.width
+                            val top = (size.height - target.thumb.height / s) * zoom.value
                             clipRect(top = top) { this@drawWithContent.drawContent() }
                         } else {
                             drawContent()
@@ -320,6 +327,41 @@ fun TerminalScreen(host: Host, store: HostStore, onBack: () -> Unit) {
                 if (keyboardUp) {
                     KeyBar(model = model, keyboardUp = keyboardUp, onOpenSettings = { showSettings = true })
                 }
+            }
+        }
+
+        // The card's own header rides along with the terminal: laid out at
+        // the card's size, blown up to the terminal's width, and shrunk with
+        // the same zoom, so the whole card closes in, not just its bottom.
+        val hero = zoomTarget
+        val heroThread = currentThread
+        if (hero != null && heroThread != null && terminalBounds.width > 0) {
+            val sEnd = hero.thumb.width / terminalBounds.width
+            val headerPx = hero.thumb.top - hero.card.top
+            val cardW = with(density) { hero.card.width.toDp() }
+            val headerH = with(density) { headerPx.toDp() }
+            Box(
+                Modifier
+                    .zIndex(2f)
+                    .requiredSize(cardW, headerH)
+                    .graphicsLayer {
+                        val t = zoom.value
+                        val scale = (1f + (sEnd - 1f) * t) / sEnd
+                        transformOrigin = TransformOrigin(0f, 0f)
+                        scaleX = scale
+                        scaleY = scale
+                        // Its bottom sits on the slice of terminal the card keeps.
+                        val thumbTop = terminalBounds.top + (hero.thumb.top - terminalBounds.top) * t
+                        translationX = terminalBounds.left + (hero.thumb.left - terminalBounds.left) * t - boxOrigin.x
+                        translationY = thumbTop - headerPx * scale - boxOrigin.y
+                        alpha = t * (1f - fade.value)
+                        val r = 13.dp.toPx() * t
+                        shape = RoundedCornerShape(topStart = r, topEnd = r)
+                        clip = true
+                    }
+                    .background(Color(0xFF1A1C21))
+            ) {
+                ThreadCardHeader(heroThread, MaterialTheme.colorScheme.primary, Modifier.fillMaxWidth())
             }
         }
 

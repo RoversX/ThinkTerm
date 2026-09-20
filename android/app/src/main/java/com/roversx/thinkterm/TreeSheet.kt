@@ -531,7 +531,7 @@ fun OverviewScreen(
     model: TerminalModel,
     liveThread: String?,
     livePreview: Boolean,
-    onCardBounds: (Rect?) -> Unit,
+    onCardBounds: (CardFrames?) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val threads = model.threads?.threads ?: emptyList()
@@ -612,31 +612,19 @@ private fun GroupHeader(space: String, project: String, count: Int) {
     }
 }
 
+
+/// Where the live card is and where its thumbnail is, in root pixels.
+data class CardFrames(val card: Rect, val thumb: Rect)
+
+/// A card's top: the thread's dot and name, its tabs as dots, the current
+/// tab's title, and an offline badge. Shared with the screen's zoom,
+/// which carries the same header while the terminal shrinks.
 @Composable
-private fun ThreadCard(
-    model: TerminalModel,
-    thread: ThreadView,
-    live: Boolean,
-    livePreview: Boolean,
-    onCardBounds: (Rect?) -> Unit,
-    onDismiss: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val accent = MaterialTheme.colorScheme.primary
+fun ThreadCardHeader(thread: ThreadView, accent: Color, modifier: Modifier = Modifier) {
     val shown = thread.tabs.take(OVERVIEW_DOTS)
     val folded = thread.tabs.size - shown.size
     val currentTab = thread.tabs.firstOrNull { it.current } ?: thread.tabs.firstOrNull()
-    val shape = RoundedCornerShape(13.dp)
-    Column(
-        modifier
-            .clip(shape)
-            .background(Color(0xFF1A1C21))
-            .border(if (live) 2.dp else 1.dp, if (live) accent else Color.White.copy(alpha = 0.07f), shape)
-            .clickable {
-                if (!live) model.sideClick("thread", thread.id)
-                onDismiss()
-            }
-    ) {
+    Column(modifier) {
         Row(
             Modifier.fillMaxWidth().padding(start = 10.dp, end = 10.dp, top = 10.dp, bottom = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -653,42 +641,78 @@ private fun ThreadCard(
             )
         }
         Row(
-            Modifier.fillMaxWidth().padding(start = 10.dp, end = 10.dp, bottom = 7.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            for (tab in shown) {
-                Box(
-                    Modifier
-                        .size(6.dp)
-                        .background(
-                            if (thread.current && tab.current) accent else Color.White.copy(alpha = 0.28f),
-                            CircleShape,
-                        )
-                )
-            }
-            if (folded > 0) Text("+$folded", fontSize = 9.5.sp, color = overviewSecondary)
-            Text(
-                currentTab?.title ?: "",
-                fontSize = 10.sp,
-                fontFamily = FontFamily.Monospace,
-                color = overviewSecondary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f).padding(start = 3.dp),
-            )
-            if (!thread.live) {
+                Modifier.fillMaxWidth().padding(start = 10.dp, end = 10.dp, bottom = 7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                for (tab in shown) {
+                    Box(
+                        Modifier
+                            .size(6.dp)
+                            .background(
+                                if (thread.current && tab.current) accent else Color.White.copy(alpha = 0.28f),
+                                CircleShape,
+                            )
+                    )
+                }
+                if (folded > 0) Text("+$folded", fontSize = 9.5.sp, color = overviewSecondary)
                 Text(
-                    tr("offline"),
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.SemiBold,
+                    currentTab?.title ?: "",
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
                     color = overviewSecondary,
-                    modifier = Modifier
-                        .background(Color.Gray.copy(alpha = 0.22f), CircleShape)
-                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f).padding(start = 3.dp),
                 )
+                if (!thread.live) {
+                    Text(
+                        tr("offline"),
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = overviewSecondary,
+                        modifier = Modifier
+                            .background(Color.Gray.copy(alpha = 0.22f), CircleShape)
+                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                    )
+                }
             }
-        }
+    }
+}
+
+@Composable
+private fun ThreadCard(
+    model: TerminalModel,
+    thread: ThreadView,
+    live: Boolean,
+    livePreview: Boolean,
+    onCardBounds: (CardFrames?) -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val accent = MaterialTheme.colorScheme.primary
+    val shape = RoundedCornerShape(13.dp)
+    // The live card reports where it is and where its thumbnail is, so
+    // the screen can shrink the terminal, header and all, into it.
+    var cardRect by remember { mutableStateOf<Rect?>(null) }
+    var thumbRect by remember { mutableStateOf<Rect?>(null) }
+    fun report() {
+        val c = cardRect ?: return
+        val t = thumbRect ?: return
+        onCardBounds(CardFrames(c, t))
+    }
+    Column(
+        modifier
+            .onGloballyPositioned { if (live) { cardRect = it.boundsInRoot(); report() } }
+            .clip(shape)
+            .background(Color(0xFF1A1C21))
+            .border(if (live) 2.dp else 1.dp, if (live) accent else Color.White.copy(alpha = 0.07f), shape)
+            .clickable {
+                if (!live) model.sideClick("thread", thread.id)
+                onDismiss()
+            }
+    ) {
+        ThreadCardHeader(thread, accent)
         Box(
             Modifier
                 .fillMaxWidth()
@@ -710,7 +734,7 @@ private fun ThreadCard(
             if (live) {
                 // The terminal itself lands over this, then fades into the
                 // same preview as every other card; the box reports where.
-                Box(Modifier.fillMaxSize().onGloballyPositioned { onCardBounds(it.boundsInRoot()) })
+                Box(Modifier.fillMaxSize().onGloballyPositioned { thumbRect = it.boundsInRoot(); report() })
             }
         }
     }

@@ -273,14 +273,24 @@ struct OverviewScreen: View {
     @ObservedObject var model: TerminalModel
     @ObservedObject private var lang = AppLanguage.shared
     @Binding var isPresented: Bool
-    /// The thumbnail box of the thread on show, in the screen's space.
-    @Binding var cardFrame: CGRect?
+    /// The thread on show's card and its thumbnail box, in the screen's space.
+    @Binding var cardFrame: CardFrames?
     var liveThread: String?
     /// The live card's rows wait until the terminal has faded out of it.
     var livePreview: Bool = true
     private let dots = 4
     private let rows = 9
     private let columns = [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)]
+
+    /// The live card's two frames, reported together once both are known.
+    @State private var liveCardFrame: CGRect?
+    @State private var thumbFrame: CGRect?
+
+    private func report() {
+        guard let card = liveCardFrame, let thumb = thumbFrame else { return }
+        let frames = CardFrames(card: card, thumb: thumb)
+        if cardFrame != frames { cardFrame = frames }
+    }
 
     private var threads: [ThreadView] { model.threads?.threads ?? [] }
 
@@ -363,40 +373,7 @@ struct OverviewScreen: View {
             isPresented = false
         } label: {
             VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 7) {
-                    Circle().fill(TerminalScreen.threadColor(status: thread.status, live: thread.live)).frame(width: 7, height: 7)
-                    Text(thread.name).font(.system(size: 13.5, weight: .semibold)).lineLimit(1)
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, 10)
-                .padding(.top, 10)
-                .padding(.bottom, 6)
-                HStack(spacing: 4) {
-                    ForEach(shown) { tab in
-                        Circle()
-                            .fill(thread.current && tab.current ? Color.accentColor : Color.white.opacity(0.28))
-                            .frame(width: 6, height: 6)
-                    }
-                    if folded > 0 {
-                        Text("+\(folded)").font(.system(size: 9.5)).foregroundColor(.secondary)
-                    }
-                    Text(currentTab?.title ?? "")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-                        .padding(.leading, 3)
-                    Spacer(minLength: 0)
-                    if !thread.live {
-                        Text(tr("offline"))
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundColor(.secondary)
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(Color.gray.opacity(0.22))
-                            .clipShape(Capsule())
-                    }
-                }
-                .padding(.horizontal, 10)
-                .padding(.bottom, 7)
+                ThreadCardHeader(thread: thread)
                 ZStack(alignment: .topLeading) {
                     Text(preview(thread))
                         .font(.system(size: 7, design: .monospaced))
@@ -412,8 +389,8 @@ struct OverviewScreen: View {
                         Color.clear
                             .background(GeometryReader { geo in
                                 Color.clear
-                                    .onAppear { cardFrame = geo.frame(in: .named("screen")) }
-                                    .onChange(of: geo.frame(in: .named("screen"))) { _, f in cardFrame = f }
+                                    .onAppear { thumbFrame = geo.frame(in: .named("screen")); report() }
+                                    .onChange(of: geo.frame(in: .named("screen"))) { _, f in thumbFrame = f; report() }
                             })
                     }
                 }
@@ -421,6 +398,11 @@ struct OverviewScreen: View {
                 .background(thread.live ? model.background : Color.black.opacity(0.4))
                 .clipped()
             }
+            .background(live ? GeometryReader { geo in
+                Color.clear
+                    .onAppear { liveCardFrame = geo.frame(in: .named("screen")); report() }
+                    .onChange(of: geo.frame(in: .named("screen"))) { _, f in liveCardFrame = f; report() }
+            } : nil)
             .background(Color(red: 0.10, green: 0.11, blue: 0.13))
             .clipShape(RoundedRectangle(cornerRadius: 13))
             .overlay(RoundedRectangle(cornerRadius: 13).stroke(live ? Color.accentColor : Color.white.opacity(0.07), lineWidth: live ? 2 : 1))
@@ -447,5 +429,63 @@ struct OverviewScreen: View {
             if i < kept.count - 1 { out += AttributedString("\n") }
         }
         return out
+    }
+}
+
+/// Where the live card is and where its thumbnail is, in the screen's space.
+struct CardFrames: Equatable {
+    var card: CGRect
+    var thumb: CGRect
+}
+
+/// A card's top: the thread's dot and name, its tabs as dots, the current
+/// tab's title, and an offline badge. Shared with the screen's zoom, which
+/// carries the same header while the terminal shrinks.
+struct ThreadCardHeader: View {
+    let thread: ThreadView
+    @ObservedObject private var lang = AppLanguage.shared
+    private let dots = 4
+
+    var body: some View {
+        let shown = Array(thread.tabs.prefix(dots))
+        let folded = thread.tabs.count - shown.count
+        let currentTab = thread.tabs.first(where: { $0.current }) ?? thread.tabs.first
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 7) {
+                Circle().fill(TerminalScreen.threadColor(status: thread.status, live: thread.live)).frame(width: 7, height: 7)
+                Text(thread.name).font(.system(size: 13.5, weight: .semibold)).lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.top, 10)
+            .padding(.bottom, 6)
+            HStack(spacing: 4) {
+                ForEach(shown) { tab in
+                    Circle()
+                        .fill(thread.current && tab.current ? Color.accentColor : Color.white.opacity(0.28))
+                        .frame(width: 6, height: 6)
+                }
+                if folded > 0 {
+                    Text("+\(folded)").font(.system(size: 9.5)).foregroundColor(.secondary)
+                }
+                Text(currentTab?.title ?? "")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .padding(.leading, 3)
+                Spacer(minLength: 0)
+                if !thread.live {
+                    Text(tr("offline"))
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color.gray.opacity(0.22))
+                        .clipShape(Capsule())
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.bottom, 7)
+        }
+        .foregroundColor(.white)
     }
 }
