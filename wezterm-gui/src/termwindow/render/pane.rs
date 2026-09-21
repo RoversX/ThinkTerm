@@ -1718,7 +1718,7 @@ impl crate::TermWindow {
             // too, and the two edge rows are cropped to the pane. The clamp
             // in set_viewport_px keeps the extra row inside the terminal.
             let scroll_px = match current_viewport {
-                Some(_) => self.get_viewport_px(pane_id),
+                Some(_) => self.drawn_viewport_px(&pos.pane),
                 None => 0.0,
             };
             let extra_row = if scroll_px > 0.0 { 1 } else { 0 };

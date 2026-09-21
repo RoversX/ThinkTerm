@@ -10718,6 +10718,21 @@ impl TermWindow {
         self.pane_state(pane_id).viewport_px
     }
 
+    /// The remainder as it is drawn. A copy or quick-select overlay pins
+    /// its search bar to the bottom row of the viewport and hands it over
+    /// as a terminal line, so shifting the rows by the remainder dragged
+    /// the bar up a few pixels and snapped it back at every row. Those
+    /// overlays move a whole row at a time on screen; the remainder keeps
+    /// accumulating underneath so no wheel travel is lost.
+    pub fn drawn_viewport_px(&self, pane: &Arc<dyn Pane>) -> f32 {
+        if pane.downcast_ref::<CopyOverlay>().is_some()
+            || pane.downcast_ref::<QuickSelectOverlay>().is_some()
+        {
+            return 0.0;
+        }
+        self.get_viewport_px(pane.pane_id())
+    }
+
     /// The one place the viewport is written. `px` is how far `position`
     /// is cut off at its top; it only survives when `position` was taken
     /// as given -- a clamp at either end of the scrollback, or following

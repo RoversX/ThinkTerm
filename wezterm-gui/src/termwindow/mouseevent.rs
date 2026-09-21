@@ -1765,7 +1765,7 @@ impl super::TermWindow {
         let local_x = event.coords.x.sub(pane_left);
         // A smooth scroll draws the top row cut off by `viewport_px`, so
         // the row under the pointer is that much further down the grid.
-        let scroll_px = self.get_viewport_px(pane.pane_id()).round() as isize;
+        let scroll_px = self.drawn_viewport_px(pane).round() as isize;
         let local_y = event.coords.y.sub(pane_top + pane_nav_height) + scroll_px;
 
         let x = (local_x.max(0) as f32) / pane_cell_size.width.max(1) as f32;
