@@ -6628,49 +6628,32 @@ impl WorkspaceThreadStore {
             .and_then(|layout| pane_font_scales_for_window(layout, window_id))
     }
 
-    /// Store remote-pane-id-keyed font scales for the active thread of the
-    /// given mux-domain Space. Counterpart of snapshot_active_space_thread_layout
-    /// for the one piece of state that IS client-owned on remote threads.
+    /// Store remote-pane-id-keyed font scales for the thread that `workspace`
+    /// materializes in the given mux-domain Space. Counterpart of
+    /// snapshot_active_space_thread_layout for the one piece of state that IS
+    /// client-owned on remote threads.
+    ///
+    /// The thread is found by its workspace name, the same key the restore
+    /// side (`remote_thread_font_scales`) uses. Resolving it through the
+    /// Space's active project and that project's active thread instead used
+    /// to drop the write silently whenever the window on screen was not the
+    /// bookkept active thread (a second window into the same project, a
+    /// thread reference, a server-side workspace switch the view state had
+    /// not caught up with): the scale then lived only in the pane state, and
+    /// the next resync restored the stale stored map over it.
     fn snapshot_remote_thread_font_scales(
         &mut self,
         space_id: &str,
         workspace: &str,
         scales: HashMap<PaneId, f64>,
     ) -> bool {
-        let Some(project_id) = self.active_project_id_for_space(space_id) else {
+        let Some(session) = self.remote_thread_for_workspace_mut(space_id, workspace) else {
+            log::warn!(
+                "remote font scale for workspace {workspace} not stored: \
+                 no thread of Space {space_id} materializes it"
+            );
             return false;
         };
-        let Some(project) = self
-            .projects
-            .iter_mut()
-            .find(|project| project.space_id == space_id && project.id == project_id)
-        else {
-            return false;
-        };
-        let project_id = project.id.clone();
-        let active_thread_id = project
-            .active_thread_id
-            .clone()
-            .or_else(|| project.threads.first().map(|session| session.id.clone()));
-        let Some(active_thread_id) = active_thread_id else {
-            return false;
-        };
-        let Some(session) = project
-            .threads
-            .iter_mut()
-            .find(|session| session.id == active_thread_id)
-        else {
-            return false;
-        };
-
-        let expected_workspace = session
-            .materialized_workspace_name
-            .clone()
-            .unwrap_or_else(|| workspace_name_for_thread(&project_id, &session.id));
-        if expected_workspace != workspace {
-            return false;
-        }
-
         if session.remote_font_scales == scales {
             return false;
         }
@@ -6678,11 +6661,42 @@ impl WorkspaceThreadStore {
         true
     }
 
+    fn remote_thread_for_workspace_mut(
+        &mut self,
+        space_id: &str,
+        workspace: &str,
+    ) -> Option<&mut WorkspaceThread> {
+        // Prefer the Space the window resolved; a thread reference shows a
+        // workspace whose thread lives in another Space, so fall back to any.
+        let position = |projects: &[Project], same_space: bool| {
+            projects.iter().enumerate().find_map(|(project_index, project)| {
+                if same_space && project.space_id != space_id {
+                    return None;
+                }
+                project
+                    .threads
+                    .iter()
+                    .position(|session| thread_materializes_workspace(project, session, workspace))
+                    .map(|thread_index| (project_index, thread_index))
+            })
+        };
+        let (project_index, thread_index) =
+            position(&self.projects, true).or_else(|| position(&self.projects, false))?;
+        self.projects
+            .get_mut(project_index)?
+            .threads
+            .get_mut(thread_index)
+    }
+
     fn remote_thread_font_scales(&self, workspace: &str) -> Option<HashMap<PaneId, f64>> {
         self.projects
             .iter()
-            .flat_map(|project| project.threads.iter())
-            .find(|session| session.materialized_workspace_name.as_deref() == Some(workspace))
+            .find_map(|project| {
+                project
+                    .threads
+                    .iter()
+                    .find(|session| thread_materializes_workspace(project, session, workspace))
+            })
             .map(|session| session.remote_font_scales.clone())
             .filter(|scales| !scales.is_empty())
     }
@@ -9081,6 +9095,21 @@ fn strip_windows_verbatim_prefix_text(path: &str) -> Option<String> {
 
 fn workspace_name_for_thread(project_id: &str, thread_id: &str) -> String {
     format!("thinkterm:{project_id}:{thread_id}")
+}
+
+/// Whether `workspace` is the mux workspace this thread runs in: its
+/// materialized name once the server has reported one, else the name the
+/// thread is planned under. Both the writer and the reader of remote font
+/// scales key on this, so a scale saved under one name is found again.
+fn thread_materializes_workspace(
+    project: &Project,
+    session: &WorkspaceThread,
+    workspace: &str,
+) -> bool {
+    match session.materialized_workspace_name.as_deref() {
+        Some(name) => name == workspace,
+        None => workspace_name_for_thread(&project.id, &session.id) == workspace,
+    }
 }
 
 fn workspace_name_for_remote_default(project_id: &str, thread_id: &str, workspace: &str) -> String {
@@ -14420,5 +14449,60 @@ mod tests {
             1,
             "unarchiving brings the ref row back verbatim"
         );
+    }
+
+    /// Cmd+= on a remote thread saves the scale under the workspace the
+    /// window shows, whatever the Space's active project and the project's
+    /// active thread say, and the restore side finds it under that same key.
+    #[test]
+    fn remote_font_scales_are_keyed_by_the_workspace_on_screen() {
+        let mut store = remote_test_store("syd");
+        assert!(store.ingest_remote_tree("syd", &sample_tree()));
+        // The Space has no active project and the project points at rt2,
+        // while the window on screen shows rt1.
+        assert_eq!(store.active_project_id_for_space("space-remote"), None);
+        let project = store
+            .projects
+            .iter_mut()
+            .find(|project| project.id == "rp1")
+            .unwrap();
+        project.active_thread_id = Some("rt2".to_string());
+        let workspace = project.threads[0]
+            .materialized_workspace_name
+            .clone()
+            .unwrap();
+
+        let scales: HashMap<PaneId, f64> = HashMap::from([(7, 1.5)]);
+        assert!(store.snapshot_remote_thread_font_scales("space-remote", &workspace, scales.clone()));
+        assert_eq!(store.remote_thread_font_scales(&workspace), Some(scales.clone()));
+        // Same content again is a no-op write.
+        assert!(!store.snapshot_remote_thread_font_scales("space-remote", &workspace, scales));
+        assert_eq!(
+            store.remote_thread_font_scales("thinkterm:rp1:rt2"),
+            None,
+            "the other thread is untouched"
+        );
+
+        // A thread the server has not materialized yet is found under the
+        // name it is planned as.
+        let project = store
+            .projects
+            .iter_mut()
+            .find(|project| project.id == "rp1")
+            .unwrap();
+        project.threads[1].materialized_workspace_name = None;
+        let planned = workspace_name_for_thread("rp1", "rt2");
+        let scales: HashMap<PaneId, f64> = HashMap::from([(9, 0.8)]);
+        assert!(store.snapshot_remote_thread_font_scales("space-remote", &planned, scales.clone()));
+        assert_eq!(store.remote_thread_font_scales(&planned), Some(scales));
+
+        // A workspace no thread runs in is refused rather than written to
+        // whichever thread happens to be active.
+        assert!(!store.snapshot_remote_thread_font_scales(
+            "space-remote",
+            "thinkterm:rp1:nobody",
+            HashMap::from([(1, 2.0)])
+        ));
+        assert_eq!(store.remote_thread_font_scales("thinkterm:rp1:nobody"), None);
     }
 }
