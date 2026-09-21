@@ -5373,25 +5373,8 @@ impl TermWindow {
                     self.persist_workspace_layout_if_structure_changed();
                     // A server-side split (`thinkterm cli split-pane`) reaches
                     // this window only as that resync: the tree now carries
-                    // the peer's split, but no gesture of ours follows it, so
-                    // nothing re-publishes the frames and the server keeps
-                    // driving the ptys at the split it dealt while we draw
-                    // ours. Offer the viewport the way a divider release
-                    // would. Only the tab on screen has frames worth sending,
-                    // and only while this client holds its lease. This is the
-                    // same single-flight debounce the window-resize path
-                    // uses, so a drag that fires both collapses into the one
-                    // publish it already paid for.
-                    if self.active_tab_is(tab_id) {
-                        if let Some(tab) = Mux::get().get_tab(tab_id) {
-                            let is_mirror = tab
-                                .get_active_pane()
-                                .is_some_and(|pane| pane.downcast_ref::<wezterm_client::pane::ClientPane>().is_some());
-                            if is_mirror && self.tab_owns_frontend_viewport(&tab) {
-                                self.report_frontend_viewport();
-                            }
-                        }
-                    }
+                    // the peer's split, but no gesture of ours follows it.
+                    self.offer_viewport_for_mirror_tab(tab_id);
                 }
                 MuxNotification::TabTitleChanged { .. } => {
                     self.update_title_post_status();
@@ -5404,6 +5387,19 @@ impl TermWindow {
                 MuxNotification::PaneRemoved(_) => {
                     self.refresh_all_thread_work();
                     self.persist_workspace_layout_after_mutation("pane removed");
+                    // A pane leaving a mirror tab (its process exited, a peer
+                    // closed it) is pruned locally first, which hands the
+                    // freed space to its sibling without a TabResized, and
+                    // the resync that follows finds a tree that already
+                    // matches and keeps the local geometry. So no TabResized
+                    // ever offers the frames, while the server dealt that
+                    // same space at its own row count: the survivor's pty
+                    // stays the pane-chrome rows taller than what this GUI
+                    // draws (a TUI there paints past the bottom, or
+                    // flickers) until a Space switch publishes again.
+                    if let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) {
+                        self.offer_viewport_for_mirror_tab(tab.tab_id());
+                    }
                 }
                 MuxNotification::WorkspaceRenamed { .. }
                 | MuxNotification::WindowWorkspaceChanged(_)
@@ -5578,6 +5574,30 @@ impl TermWindow {
 
     pub(crate) fn active_space_id(&self) -> &str {
         &self.active_space_id
+    }
+
+    /// A mirror tab's topology changed under this window with no gesture of
+    /// ours behind it (a peer's split, a pane that exited), so nothing
+    /// re-publishes the frames and the server keeps driving the ptys at the
+    /// layout it dealt while we draw ours. Offer the viewport the way a
+    /// divider release would. Only the tab on screen has frames worth
+    /// sending, and only while this client holds its lease. This is the same
+    /// single-flight debounce the window-resize path uses, so a drag that
+    /// fires both collapses into the one publish it already paid for.
+    fn offer_viewport_for_mirror_tab(&mut self, tab_id: TabId) {
+        if !self.active_tab_is(tab_id) {
+            return;
+        }
+        let Some(tab) = Mux::get().get_tab(tab_id) else {
+            return;
+        };
+        let is_mirror = tab.get_active_pane().is_some_and(|pane| {
+            pane.downcast_ref::<wezterm_client::pane::ClientPane>()
+                .is_some()
+        });
+        if is_mirror && self.tab_owns_frontend_viewport(&tab) {
+            self.report_frontend_viewport();
+        }
     }
 
 
