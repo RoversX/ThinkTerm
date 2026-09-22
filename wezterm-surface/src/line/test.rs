@@ -8,6 +8,153 @@ use alloc::sync::Arc;
 use k9::assert_equal as assert_eq;
 use wezterm_cell::{Cell, CellAttributes};
 
+// Keep a scalar reference so the fast path is checked against the old behavior,
+// including less visible state such as hyperlinks, sequence numbers and zones.
+fn scalar_range(line: &mut Line, range: core::ops::Range<usize>, cell: &Cell, clear: bool) {
+    if clear && line.len() == 0 && *cell == Cell::blank() {
+        return;
+    }
+    for x in range {
+        if clear {
+            line.set_cell_clearing_image_placements(x, cell.clone(), 42);
+        } else {
+            line.set_cell(x, cell.clone(), 42);
+        }
+    }
+    if clear {
+        line.prune_trailing_blanks(42);
+    }
+}
+
+fn check_range_against_scalar(
+    base: &Line,
+    range: core::ops::Range<usize>,
+    cell: &Cell,
+    clear: bool,
+) {
+    let mut expected = base.clone();
+    scalar_range(&mut expected, range.clone(), cell, clear);
+    let mut actual = base.clone();
+    if clear {
+        actual.fill_range(range.clone(), cell, 42);
+    } else {
+        actual.set_cell_range(range.clone(), cell, 42);
+    }
+    assert_eq!(
+        actual, expected,
+        "range={range:?}, cell={cell:?}, clear={clear}"
+    );
+    assert_eq!(
+        actual.semantic_zone_ranges(),
+        expected.semantic_zone_ranges()
+    );
+    assert_eq!(actual.compute_shape_hash(), expected.compute_shape_hash());
+}
+
+#[test]
+fn cell_ranges_match_scalar_writes_at_wide_boundaries_and_beyond_end() {
+    let mut colored = CellAttributes::default();
+    colored.set_background(wezterm_cell::color::ColorAttribute::PaletteIndex(4));
+    let cells = [
+        Cell::blank(),
+        Cell::blank_with_attrs(colored.clone()),
+        Cell::new('x', colored),
+        Cell::new_grapheme("界", CellAttributes::default(), None),
+        Cell::new_grapheme("e\u{301}", CellAttributes::default(), None),
+    ];
+    for text in ["", "abc   ", "a界b🙂c", "界界", "e\u{301}x", "    "] {
+        for compressed in [false, true] {
+            let mut base: Line = text.into();
+            if compressed {
+                base.compress_for_scrollback();
+            } else {
+                base.coerce_vec_storage();
+            }
+            for start in 0..base.len() + 3 {
+                for end in start..base.len() + 5 {
+                    for cell in &cells {
+                        for clear in [false, true] {
+                            check_range_against_scalar(&base, start..end, cell, clear);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cell_ranges_invalidate_implicit_links_and_preserve_explicit_links() {
+    let mut base: Line = "https://example.com abc".into();
+    base.scan_and_create_hyperlinks(&[Rule::new(r"https://\S+", "$0").unwrap()]);
+    let mut attrs = CellAttributes::default();
+    attrs.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.org"))));
+    attrs.set_semantic_type(wezterm_cell::SemanticType::Prompt);
+    base.semantic_zone_ranges();
+    for cell in [Cell::blank(), Cell::new('x', attrs)] {
+        for clear in [false, true] {
+            check_range_against_scalar(&base, 2..15, &cell, clear);
+            check_range_against_scalar(&base, 2..2, &cell, clear);
+        }
+    }
+}
+
+#[test]
+fn appending_ranges_keeps_compact_storage() {
+    let mut line = Line::new(0);
+    line.set_cell_range(0..4096, &Cell::new('x', CellAttributes::default()), 1);
+    assert!(line.is_compressed_for_scrollback());
+    assert_eq!(line.len(), 4096);
+    let mut empty = Line::new(0);
+    empty.fill_range(0..usize::MAX, &Cell::blank(), 1);
+    assert_eq!(empty.len(), 0);
+    assert!(empty.is_compressed_for_scrollback());
+}
+
+#[cfg(feature = "use_image")]
+#[test]
+fn cell_ranges_preserve_or_clear_image_placements_like_scalar_writes() {
+    use wezterm_cell::image::{ImageCell, ImageData, ImageDataType, TextureCoordinate};
+    let data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+        1,
+        1,
+        vec![255; 4],
+    )));
+    let mut base: Line = "a界b cdef".into();
+    for x in 0..base.len() {
+        for placement in [None, Some(7)] {
+            base.cells_mut()[x]
+                .attrs_mut()
+                .attach_image(Box::new(ImageCell::with_z_index(
+                    TextureCoordinate::new_f32(0.0, 0.0),
+                    TextureCoordinate::new_f32(1.0, 1.0),
+                    Arc::clone(&data),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(3),
+                    placement,
+                )));
+        }
+    }
+    let image_cell = base.cells_mut()[4].clone();
+    for cell in [
+        Cell::blank(),
+        Cell::new('x', CellAttributes::default()),
+        image_cell,
+    ] {
+        for start in 0..base.len() {
+            for end in start..base.len() + 2 {
+                for clear in [false, true] {
+                    check_range_against_scalar(&base, start..end, &cell, clear);
+                }
+            }
+        }
+    }
+}
+
 /// There are 4 double-wide graphemes that occupy 2 cells each.
 /// When we join the lines, we must preserve the invisible blank
 /// that is part of the grapheme otherwise our metrics will be

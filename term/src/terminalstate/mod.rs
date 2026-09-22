@@ -32,6 +32,8 @@ mod keyboard;
 pub(crate) mod kitty;
 mod mouse;
 pub(crate) mod performer;
+#[cfg(all(test, feature = "use_serde"))]
+mod repeat_tests;
 mod sixel;
 #[cfg(feature = "use_serde")]
 mod snapshot;
@@ -2479,15 +2481,24 @@ impl TerminalState {
                     n
                 };
 
-                for _ in 0..n {
+                let mut remaining = n;
+                while remaining > 0 {
+                    // Batch only within a row. Wrapping and scrolling must
+                    // still happen at precisely the same cell as scalar REP.
+                    let count = if cell.width() == 1 && left_and_right_margins.contains(&x) {
+                        remaining.min(left_and_right_margins.end - x)
+                    } else {
+                        1
+                    };
                     {
                         let screen = self.screen_mut();
                         let line_idx = screen.phys_row(y);
                         let line = screen.line_mut(line_idx);
 
-                        line.set_cell(x, cell.clone(), seqno);
+                        line.set_cell_range(x..x + count, &cell, seqno);
                     }
-                    x += 1;
+                    remaining -= count;
+                    x += count;
                     if x > left_and_right_margins.end - 1 {
                         x = left_and_right_margins.start;
                         if y == top_and_bottom_margins.end - 1 {

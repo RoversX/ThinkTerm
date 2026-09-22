@@ -1002,11 +1002,51 @@ impl Line {
             // them all away again before we return; NOP
             return;
         }
-        for x in cols {
-            // FIXME: we can skip the look-back for second and subsequent iterations
-            self.set_cell_impl(x, cell.clone(), true, seqno);
-        }
+        self.set_cell_range_impl(cols, cell, true, seqno);
         self.prune_trailing_blanks(seqno);
+    }
+
+    /// Equivalent to calling `set_cell` at each column, including preservation
+    /// of Kitty image placements. Unlike `fill_range`, this does not prune
+    /// trailing blanks or erase image placements.
+    pub fn set_cell_range(&mut self, cols: Range<usize>, cell: &Cell, seqno: SequenceNo) {
+        self.set_cell_range_impl(cols, cell, false, seqno);
+    }
+
+    fn set_cell_range_impl(
+        &mut self,
+        mut cols: Range<usize>,
+        cell: &Cell,
+        clear_image_placements: bool,
+        seqno: SequenceNo,
+    ) {
+        let Some(first) = cols.next() else {
+            return;
+        };
+        // The first write handles an overlapping wide cell, invalidates links
+        // and zones, and updates the sequence number exactly as a scalar write.
+        self.set_cell_impl(first, cell.clone(), clear_image_placements, seqno);
+
+        if cell.width() == 1 && !cols.is_empty() {
+            if let CellStorage::V(cells) = &mut self.cells {
+                if cols.end > cells.len() {
+                    cells.resize_with(cols.end, Cell::blank);
+                }
+                // Every preceding cell in this run has just been written with
+                // width one, so subsequent writes cannot overlap a wide cell
+                // on their left. Keep VecStorage's image-placement semantics.
+                for x in cols {
+                    cells.set_cell(x, cell.clone(), clear_image_placements);
+                }
+                return;
+            }
+        }
+
+        // Preserve compact append storage and the scalar semantics of wide or
+        // zero-width cells. Never expand a compact line just for this fast path.
+        for x in cols {
+            self.set_cell_impl(x, cell.clone(), clear_image_placements, seqno);
+        }
     }
 
     pub fn len(&self) -> usize {
