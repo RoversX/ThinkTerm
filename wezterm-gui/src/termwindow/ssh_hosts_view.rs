@@ -311,6 +311,7 @@ impl SshHostsView {
     }
 
     fn open_new_form(&mut self) {
+        self.password_visible = false;
         let mut form = HostForm::default();
         form.fields[FIELD_PORT].set_text_end("22".to_string());
         form.fields[FIELD_MOSH_SERVER]
@@ -2812,7 +2813,12 @@ mod tests {
             spec: spec("prod-1", "10.0.0.7"),
         }];
 
+        view.password_visible = true;
         let response = view.run_host_command("ssh-original", RemoteHostCommand::Duplicate);
+        assert!(
+            !view.password_visible,
+            "a duplicate must mask its stored password"
+        );
         assert!(matches!(response, ContentViewResponse::Redraw));
 
         let form = view
