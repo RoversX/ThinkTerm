@@ -786,6 +786,23 @@ private fun BoxScope.TerminalOverlays(model: TerminalModel, showLog: Boolean, on
                 .padding(6.dp),
         )
     }
+    model.pendingHostKey?.let { challenge ->
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { model.disconnect() },
+            title = { Text(tr("hostkey.approve.title")) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(16.dp), modifier = Modifier.verticalScroll(rememberScrollState())) {
+                    Text("${challenge.endpoint.hostname}:${challenge.endpoint.port}")
+                    androidx.compose.foundation.text.selection.SelectionContainer {
+                        Text(challenge.fingerprint, fontFamily = FontFamily.Monospace)
+                    }
+                    Text(tr("hostkey.approve.body"))
+                }
+            },
+            confirmButton = { TextButton(onClick = { model.approveHostKey(challenge) }) { Text(tr("hostkey.approve.accept")) } },
+            dismissButton = { TextButton(onClick = { model.disconnect() }) { Text(tr("cancel")) } },
+        )
+    }
     val phase = ConnectionPhase.of(model.connection)
     if (model.reconnecting && !settings.autoReconnect && phase == null) {
         // Asked not to redial: the card offers it instead.

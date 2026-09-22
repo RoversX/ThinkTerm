@@ -77,6 +77,17 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     let core: Core
     /// The host this screen shows; edited in place from the failure card.
     @Published var host: Host?
+    struct HostKeyChallenge: Identifiable {
+        let id: String
+        let hostname: String
+        let port: Int
+        let hostID: UUID?
+        let fingerprint: String
+    }
+    @Published var pendingHostKey: HostKeyChallenge?
+    private var activeRequestID: String?
+    private var requestedEndpoint: (hostname: String, port: Int, hostID: UUID?)?
+
     weak var store: HostStore?
     weak var inputView: TerminalInputView?
     var cursorRect = CGRect(x: 8, y: 8, width: 2, height: 20)
@@ -159,6 +170,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     func enterScreen() { displayLink?.isPaused = false }
 
     func shutdown() {
+        clearHostKeyRequest()
         displayLink?.invalidate()
         statsTimer?.invalidate()
         detach()
@@ -207,17 +219,22 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     func connectProbe() {
         connect(
             hostname: "127.0.0.1", port: 2299, user: probeUser, authKind: "key-path",
-            secret: probeKeyPath, passphrase: nil, knownHost: nil, remoteCommand: probeRemoteCommand
+            secret: probeKeyPath, passphrase: nil, knownHost: hostKeyToRemember, remoteCommand: probeRemoteCommand
         )
     }
 
     private func connect(hostname: String, port: Int, user: String, authKind: String, secret: String, passphrase: String?, knownHost: String?, remoteCommand: String) {
+        clearHostKeyRequest()
+        let requestID = UUID().uuidString
+        activeRequestID = requestID
+        requestedEndpoint = (hostname, port, host?.id)
         let paths = fontPaths
         guard paths.count == 2 else {
             log("shell: fonts missing from the bundle (\(paths))")
             return
         }
         core.connect(
+            requestId: requestID,
             host: hostname, port: UInt16(clamping: port), user: user,
             authKind: authKind, secret: secret, passphrase: passphrase, knownHost: knownHost,
             remoteCommand: remoteCommand, deviceId: Self.deviceId, keepaliveSecs: UInt32(max(settings.keepAliveSeconds, 0)),
@@ -226,7 +243,31 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         )
     }
 
-    func disconnect() { core.disconnect() }
+    private func clearHostKeyRequest() {
+        activeRequestID = nil
+        requestedEndpoint = nil
+        pendingHostKey = nil
+    }
+
+    func disconnect() { clearHostKeyRequest(); core.disconnect() }
+
+    func approveHostKey(_ challenge: HostKeyChallenge) {
+        guard activeRequestID == challenge.id,
+              requestedEndpoint?.hostname == challenge.hostname,
+              requestedEndpoint?.port == challenge.port,
+              host?.id == challenge.hostID else { return }
+        if var host = host {
+            guard host.hostname == challenge.hostname, host.port == challenge.port,
+                  host.knownHost == nil else { return }
+            host.knownHost = challenge.fingerprint
+            store?.rememberHostKey(challenge.fingerprint, for: host.id)
+            self.host = host
+        } else {
+            hostKeyToRemember = challenge.fingerprint
+        }
+        connect()
+    }
+
 
     // MARK: input
 
@@ -610,12 +651,16 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         }
     }
 
-    fileprivate func coreHostKey(_ fingerprint: String) {
+    fileprivate func coreHostKeyRequired(_ requestID: String, _ fingerprint: String) {
         DispatchQueue.main.async {
-            self.log("host key " + fingerprint)
+            guard self.activeRequestID == requestID, let endpoint = self.requestedEndpoint,
+                  self.host?.id == endpoint.hostID else { return }
             if let host = self.host {
-                self.store?.rememberHostKey(fingerprint, for: host.id)
+                guard host.hostname == endpoint.hostname, host.port == endpoint.port,
+                      host.knownHost == nil else { return }
             }
+            self.pendingHostKey = HostKeyChallenge(id: requestID, hostname: endpoint.hostname,
+                port: endpoint.port, hostID: endpoint.hostID, fingerprint: fingerprint)
         }
     }
 
@@ -905,7 +950,7 @@ private final class NotifySink: Notify, @unchecked Sendable {
             self.model?.cursorRect = CGRect(x: left, y: top, width: width, height: height)
         }
     }
-    func onHostKey(fingerprint: String) { model?.coreHostKey(fingerprint) }
+    func onHostKeyRequired(requestId: String, fingerprint: String) { model?.coreHostKeyRequired(requestId, fingerprint) }
     func onPublished(key: String, value: String) { model?.corePublished(key, value) }
     func onBell() { model?.coreBell() }
     func onPreview(pane: UInt32, rows: String) {

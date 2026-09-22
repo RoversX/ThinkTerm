@@ -147,6 +147,27 @@ EXTRA = {
         "Leer führt auf dem Host `thinkterm cli --prefer-mux proxy` aus.",
     ],
     "f.hostkey": ["Host key", "主机密钥", "ホスト鍵", "Clé de l’hôte", "Hostschlüssel"],
+    "hostkey.approve.title": [
+        "Trust this SSH host key?",
+        "信任这个 SSH 主机密钥？",
+        "この SSH ホスト鍵を信頼しますか？",
+        "Faire confiance à cette clé d’hôte SSH ?",
+        "Diesem SSH-Hostschlüssel vertrauen?",
+    ],
+    "hostkey.approve.body": [
+        "Before sending a password or authenticating with a key, verify this SHA-256 fingerprint with the server administrator over a trusted channel. Cancel if it differs.",
+        "发送密码或进行密钥认证前，请通过可信渠道与服务器管理员核对以上 SHA-256 指纹。不一致请取消。",
+        "パスワードを送信したり鍵で認証したりする前に、信頼できる通信手段でサーバー管理者にこの SHA-256 フィンガープリントを確認してください。一致しない場合はキャンセルしてください。",
+        "Avant d’envoyer un mot de passe ou de vous authentifier avec une clé, vérifiez cette empreinte SHA-256 auprès de l’administrateur du serveur via un canal de confiance. Annulez si elle ne correspond pas.",
+        "Bevor Sie ein Passwort senden oder sich mit einem Schlüssel authentifizieren, gleichen Sie diesen SHA-256-Fingerabdruck über einen vertrauenswürdigen Kanal mit dem Serveradministrator ab. Brechen Sie bei einer Abweichung ab.",
+    ],
+    "hostkey.approve.accept": [
+        "Trust and connect",
+        "信任并连接",
+        "信頼して接続",
+        "Faire confiance et se connecter",
+        "Vertrauen und verbinden",
+    ],
     # settings
     "cursor.auto": [
         "As the program sets",

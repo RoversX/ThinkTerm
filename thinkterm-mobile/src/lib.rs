@@ -48,9 +48,8 @@ pub trait Notify: Send + Sync {
     fn on_focus_input(&self);
     /// Where the cursor cell is, in points, in the terminal view.
     fn on_ime_anchor(&self, left: f64, top: f64, width: f64, height: f64);
-    /// The host's key fingerprint, seen before authentication: the shell
-    /// remembers it and passes it back as `known_host` next time.
-    fn on_host_key(&self, fingerprint: String);
+    /// Authentication is blocked until the user approves this request's key.
+    fn on_host_key_required(&self, request_id: String, fingerprint: String);
     /// Something the App publishes for the display layer, keyed: "bg" is
     /// the terminal's background as a hex colour, for the chrome around it.
     fn on_published(&self, key: String, value: String);
@@ -285,6 +284,7 @@ impl Core {
     #[allow(clippy::too_many_arguments)]
     pub fn connect(
         &self,
+        request_id: String,
         host: String,
         port: u16,
         user: String,
@@ -310,6 +310,7 @@ impl Core {
         let _ = self.tx.send(core::Cmd::Connect {
             params: core::ConnectParams {
                 ssh: ssh::SshParams {
+                    request_id,
                     host,
                     port,
                     user,

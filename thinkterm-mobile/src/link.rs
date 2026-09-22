@@ -33,6 +33,7 @@ pub struct SshLink(Rc<Inner>);
 pub(crate) fn test_link() -> SshLink {
     SshLink::new(
         SshParams {
+            request_id: "test".into(),
             host: "unused".into(),
             port: 22,
             user: "test".into(),

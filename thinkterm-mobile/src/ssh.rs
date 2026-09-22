@@ -6,9 +6,9 @@
 //! stderr, the exit status, the close -- is delivered to the core thread
 //! through the callback it gave us, which must not block.
 //!
-//! The host key is trusted on first use: its fingerprint is reported so
-//! the shell can remember it, and a remembered one that no longer matches
-//! ends the dial before any authentication.
+//! An unknown host key ends the transport before authentication. The shell
+//! asks for explicit approval and retries with that exact fingerprint pinned.
+//! A remembered key that changes is always rejected.
 
 use anyhow::{anyhow, Context, Result};
 use russh::client::{self, Handler};
@@ -32,6 +32,7 @@ pub enum Auth {
 
 #[derive(Debug, Clone)]
 pub struct SshParams {
+    pub request_id: String,
     pub host: String,
     pub port: u16,
     pub user: String,
@@ -51,8 +52,11 @@ pub enum Out {
 
 #[derive(Debug)]
 pub enum Net {
-    /// The host's key fingerprint, before authentication.
-    HostKey(String),
+    /// Transport stopped before authentication; only explicit approval may retry.
+    HostKeyRequired {
+        request_id: String,
+        fingerprint: String,
+    },
     Connected,
     Data(Vec<u8>),
     Stderr(String),
@@ -81,7 +85,8 @@ impl Handler for HostKeyCheck {
             Some(known) if known != &fingerprint => Err(anyhow!(
                 "the host's key changed: expected {known}, got {fingerprint}. If the host was reinstalled, forget it and add it again"
             )),
-            _ => Ok(true),
+            Some(_) => Ok(true),
+            None => Err(anyhow!("host key approval required before authentication")),
         }
     }
 }
@@ -217,12 +222,15 @@ async fn run(
     )
     .await
     .context("connecting timed out")?;
-    let mut session = dial.context("ssh transport")?;
-    // Only a key the check let through is worth remembering: the shells
-    // pin whatever arrives here, and a mismatch must not replace the pin.
-    if let Some(fingerprint) = seen.lock().unwrap().clone() {
-        deliver(Net::HostKey(fingerprint));
+    if dial.is_err() && params.known_host.is_none() {
+        if let Some(fingerprint) = seen.lock().unwrap().clone() {
+            deliver(Net::HostKeyRequired {
+                request_id: params.request_id.clone(),
+                fingerprint,
+            });
+        }
     }
+    let mut session = dial.context("ssh transport")?;
 
     let auth = match &params.auth {
         Auth::KeyPath(path) => {
@@ -331,6 +339,103 @@ async fn run(
                 }
                 Some(_) => {}
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod host_key_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct PasswordServer(Arc<AtomicUsize>);
+    impl russh::server::Handler for PasswordServer {
+        type Error = anyhow::Error;
+        async fn auth_password(&mut self, _: &str, password: &str) -> Result<russh::server::Auth> {
+            assert_eq!(password, "test-secret");
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(russh::server::Auth::Accept)
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_and_changed_keys_never_receive_credentials() {
+        let key = russh::keys::PrivateKey::random(
+            &mut crate::SysRng(ring::rand::SystemRandom::new()),
+            russh::keys::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let fingerprint = key.public_key().fingerprint(HashAlg::Sha256).to_string();
+        let config = Arc::new(russh::server::Config {
+            keys: vec![key],
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            ..Default::default()
+        });
+        // The same real SSH transport is exercised with no pin, a mismatched
+        // pin and the explicitly approved pin. No UI or transport mock.
+        for (known_host, expected_auth, expected_challenge) in [
+            (None, 0, true),
+            (Some("SHA256:wrong".to_string()), 0, false),
+            (Some(fingerprint.clone()), 1, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let count = Arc::new(AtomicUsize::new(0));
+            let server_count = count.clone();
+            let server_config = config.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                if let Ok(session) =
+                    russh::server::run_stream(server_config, stream, PasswordServer(server_count))
+                        .await
+                {
+                    let _ = session.await;
+                }
+            });
+            let (_sender, receiver) = unbounded_channel();
+            let events = std::cell::RefCell::new(Vec::new());
+            let params = SshParams {
+                request_id: "attempt-42".into(),
+                host: "127.0.0.1".into(),
+                port,
+                user: "test".into(),
+                auth: Auth::Password("test-secret".into()),
+                known_host,
+                remote_command: "test".into(),
+                keepalive_secs: 0,
+            };
+            // The server intentionally refuses opening a session after auth.
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                run(params, receiver, &|event| events.borrow_mut().push(event)),
+            )
+            .await;
+            assert!(result
+                .expect("transport completes within the test deadline")
+                .is_err());
+            assert_eq!(count.load(Ordering::SeqCst), expected_auth);
+            let challenges: Vec<_> = events
+                .borrow()
+                .iter()
+                .filter_map(|event| match event {
+                    Net::HostKeyRequired {
+                        request_id,
+                        fingerprint,
+                    } => Some((request_id.clone(), fingerprint.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                challenges,
+                if expected_challenge {
+                    vec![("attempt-42".into(), fingerprint.clone())]
+                } else {
+                    vec![]
+                }
+            );
+            server.abort();
+            let _ = server.await;
         }
     }
 }

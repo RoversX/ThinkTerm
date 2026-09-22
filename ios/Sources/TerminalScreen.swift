@@ -170,6 +170,22 @@ struct TerminalScreen: View {
             }
         }
         .ignoresSafeArea(.container, edges: .bottom)
+        .sheet(item: $model.pendingHostKey) { challenge in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    Text(tr("hostkey.approve.title")).font(.headline)
+                    Text("\(challenge.hostname):\(challenge.port)")
+                    Text(challenge.fingerprint).font(.system(.body, design: .monospaced))
+                        .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    Text(tr("hostkey.approve.body"))
+                    HStack {
+                        Button(tr("cancel"), role: .cancel) { model.disconnect() }
+                        Spacer()
+                        Button(tr("hostkey.approve.accept")) { model.approveHostKey(challenge) }
+                    }
+                }.padding(24)
+            }.presentationDetents([.medium, .large])
+        }
         .sheet(isPresented: $showSettings) {
             NavigationStack {
                 SettingsView(model: model, showLog: $showLog)

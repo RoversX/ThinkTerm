@@ -19,6 +19,7 @@ import androidx.compose.ui.graphics.Color
 import com.roversx.thinkterm.core.Core
 import com.roversx.thinkterm.core.Notify
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.UUID
 
 /// The shell's side of the thread contract. `Notify` calls arrive on the
 /// core thread; nothing here blocks them and nothing here calls back into
@@ -37,6 +38,12 @@ class TerminalModel(
 
     /// The host this screen shows; edited in place from the failure card.
     var host by mutableStateOf(host)
+    data class HostKeyChallenge(val requestId: String, val endpoint: Host, val fingerprint: String)
+    var pendingHostKey by mutableStateOf<HostKeyChallenge?>(null)
+        private set
+    private var activeRequestId: String? = null
+    private var requestedHost: Host? = null
+
 
     // The App's views, refreshed when the core says something changed.
     var tabs by mutableStateOf<TabsView?>(null)
@@ -237,6 +244,10 @@ class TerminalModel(
     }
 
     fun connect() {
+        clearHostKeyRequest()
+        val requestId = UUID.randomUUID().toString()
+        activeRequestId = requestId
+        requestedHost = host
         restoredThread = false
         connected = true
         val h = host
@@ -244,6 +255,7 @@ class TerminalModel(
         val passphrase = if (h.id == Host.PROBE_ID) null else store.passphrase(h.id)
         log("shell: connecting ${h.address}, ${secret.length} chars of secret")
         core.connect(
+            requestId = requestId,
             host = h.hostname,
             port = h.port.coerceIn(1, 65535).toUShort(),
             user = h.user,
@@ -269,8 +281,23 @@ class TerminalModel(
     }
 
     fun disconnect() {
+        clearHostKeyRequest()
         connected = false
         core.disconnect()
+    }
+
+    private fun clearHostKeyRequest() {
+        activeRequestId = null
+        requestedHost = null
+        pendingHostKey = null
+    }
+
+    fun approveHostKey(challenge: HostKeyChallenge) {
+        if (activeRequestId != challenge.requestId || requestedHost != challenge.endpoint ||
+            host != challenge.endpoint || host.knownHost != null) return
+        if (host.id != Host.PROBE_ID) store.rememberHostKey(host.id, challenge.fingerprint)
+        host = host.copy(knownHost = challenge.fingerprint)
+        connect()
     }
 
     val isConnected: Boolean
@@ -278,6 +305,7 @@ class TerminalModel(
 
     /// Leaving the screen for good: the frame loop stops, then the core.
     fun shutdown() {
+        clearHostKeyRequest()
         running = false
         choreographer.removeFrameCallback(tick)
         main.removeCallbacks(statsTick)
@@ -555,10 +583,12 @@ class TerminalModel(
             }
         }
 
-        override fun onHostKey(fingerprint: String) {
+        override fun onHostKeyRequired(requestId: String, fingerprint: String) {
             main.post {
-                log("host key $fingerprint")
-                if (host.id != Host.PROBE_ID) store.rememberHostKey(host.id, fingerprint)
+                val endpoint = requestedHost
+                if (requestId == activeRequestId && endpoint != null && host == endpoint && host.knownHost == null) {
+                    pendingHostKey = HostKeyChallenge(requestId, endpoint, fingerprint)
+                }
             }
         }
 

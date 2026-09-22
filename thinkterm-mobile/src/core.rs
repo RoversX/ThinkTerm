@@ -777,7 +777,10 @@ impl State {
                     link.closed(format!("{err:#}"));
                 }
             }
-            Net::HostKey(fingerprint) => self.notify.on_host_key(fingerprint),
+            Net::HostKeyRequired {
+                request_id,
+                fingerprint,
+            } => self.notify.on_host_key_required(request_id, fingerprint),
             Net::Stderr(text) => self.notify.on_log(format!("remote: {}", text.trim_end())),
             Net::Exit(code) => self
                 .notify
@@ -1279,7 +1282,7 @@ mod tests {
         fn on_clipboard(&self, _: String) {}
         fn on_focus_input(&self) {}
         fn on_ime_anchor(&self, _: f64, _: f64, _: f64, _: f64) {}
-        fn on_host_key(&self, _: String) {}
+        fn on_host_key_required(&self, _: String, _: String) {}
         fn on_published(&self, _: String, _: String) {}
         fn on_bell(&self) {}
         fn on_preview(&self, _: u32, _: String) {}

@@ -206,7 +206,10 @@
     "version": "Version",
     "window.n": "Fenster %d",
     "workspaces": "Workspaces",
-    "zoom": "Bereich zoomen"
+    "zoom": "Bereich zoomen",
+    "hostkey.approve.title": "Diesem SSH-Hostschlüssel vertrauen?",
+    "hostkey.approve.body": "Bevor Sie ein Passwort senden oder sich mit einem Schlüssel authentifizieren, gleichen Sie diesen SHA-256-Fingerabdruck über einen vertrauenswürdigen Kanal mit dem Serveradministrator ab. Brechen Sie bei einer Abweichung ab.",
+    "hostkey.approve.accept": "Vertrauen und verbinden"
   },
   "en-US": {
     "archived": "Archived",
@@ -415,7 +418,10 @@
     "version": "Version",
     "window.n": "Window %d",
     "workspaces": "Workspaces",
-    "zoom": "Zoom pane"
+    "zoom": "Zoom pane",
+    "hostkey.approve.title": "Trust this SSH host key?",
+    "hostkey.approve.body": "Before sending a password or authenticating with a key, verify this SHA-256 fingerprint with the server administrator over a trusted channel. Cancel if it differs.",
+    "hostkey.approve.accept": "Trust and connect"
   },
   "fr-FR": {
     "archived": "Archivés",
@@ -624,7 +630,10 @@
     "version": "Version",
     "window.n": "Fenêtre %d",
     "workspaces": "Espaces de travail",
-    "zoom": "Zoomer le volet"
+    "zoom": "Zoomer le volet",
+    "hostkey.approve.title": "Faire confiance à cette clé d’hôte SSH ?",
+    "hostkey.approve.body": "Avant d’envoyer un mot de passe ou de vous authentifier avec une clé, vérifiez cette empreinte SHA-256 auprès de l’administrateur du serveur via un canal de confiance. Annulez si elle ne correspond pas.",
+    "hostkey.approve.accept": "Faire confiance et se connecter"
   },
   "ja-JP": {
     "archived": "アーカイブ済み",
@@ -833,7 +842,10 @@
     "version": "バージョン",
     "window.n": "ウインドウ %d",
     "workspaces": "ワークスペース",
-    "zoom": "ペインをズーム"
+    "zoom": "ペインをズーム",
+    "hostkey.approve.title": "この SSH ホスト鍵を信頼しますか？",
+    "hostkey.approve.body": "パスワードを送信したり鍵で認証したりする前に、信頼できる通信手段でサーバー管理者にこの SHA-256 フィンガープリントを確認してください。一致しない場合はキャンセルしてください。",
+    "hostkey.approve.accept": "信頼して接続"
   },
   "zh-CN": {
     "archived": "已归档",
@@ -1042,6 +1054,9 @@
     "version": "版本",
     "window.n": "窗口 %d",
     "workspaces": "工作区",
-    "zoom": "缩放 pane"
+    "zoom": "缩放 pane",
+    "hostkey.approve.title": "信任这个 SSH 主机密钥？",
+    "hostkey.approve.body": "发送密码或进行密钥认证前，请通过可信渠道与服务器管理员核对以上 SHA-256 指纹。不一致请取消。",
+    "hostkey.approve.accept": "信任并连接"
   }
 }
