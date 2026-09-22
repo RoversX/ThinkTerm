@@ -147,6 +147,7 @@ pub(crate) enum ProjectedObject {
         resolved_path: Option<String>,
         ambiguous_paths: Vec<String>,
         rendered_lines: Vec<String>,
+        embed_truncation: Option<EmbedTruncation>,
     },
     Callout {
         source: Range<usize>,
@@ -557,6 +558,7 @@ impl MarkdownProjection {
                 resolved_path: None,
                 ambiguous_paths: vec![],
                 rendered_lines: vec![],
+                embed_truncation: None,
             });
         }
         for (range, kind, title, body) in parse_callouts(source, &self.syntax) {
@@ -582,6 +584,13 @@ impl MarkdownProjection {
         self.text = project_tags(project_plain_urls(std::mem::take(&mut self.text)));
     }
 
+    pub(super) fn link_targets(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.objects.iter().filter_map(|object| match object {
+            ProjectedObject::WikiLink { target, embed, .. } => Some((target.as_str(), *embed)),
+            _ => None,
+        })
+    }
+
     pub(crate) fn resolve_vault_links(&mut self, vault_root: &Path, current_note: &str) {
         if !self
             .objects
@@ -598,6 +607,7 @@ impl MarkdownProjection {
             }
         };
         let index = VaultLinkIndex::new(paths);
+        let mut embed_budget = EmbedBudget::default();
         let current_directory = Path::new(current_note)
             .parent()
             .unwrap_or_else(|| Path::new(""));
@@ -608,6 +618,7 @@ impl MarkdownProjection {
                 resolved_path,
                 ambiguous_paths,
                 rendered_lines,
+                embed_truncation,
                 ..
             } = object
             else {
@@ -617,11 +628,20 @@ impl MarkdownProjection {
             *resolved_path = resolution.path;
             *ambiguous_paths = resolution.ambiguous_paths;
             rendered_lines.clear();
+            *embed_truncation = None;
             if *embed {
                 if let Some(path) = resolved_path.as_deref() {
                     let mut visiting = HashSet::new();
-                    *rendered_lines =
-                        render_embedded_note(vault_root, path, &index, 0, &mut visiting);
+                    let preview = render_embedded_note(
+                        vault_root,
+                        path,
+                        &index,
+                        0,
+                        &mut visiting,
+                        &mut embed_budget,
+                    );
+                    *rendered_lines = preview.lines;
+                    *embed_truncation = preview.truncation;
                 }
             }
         }
@@ -1212,84 +1232,233 @@ impl VaultLinkIndex {
     }
 }
 
+const EMBED_BUDGET_NOTICE: &str = "… (embed budget reached)";
+const MAX_EMBED_CONTENT_LINES: usize = 200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmbedTruncation {
+    Lines,
+    Bytes,
+    Visits,
+}
+
+#[derive(Default)]
+pub(super) struct EmbedPreview {
+    pub(super) lines: Vec<String>,
+    pub(super) truncation: Option<EmbedTruncation>,
+}
+impl EmbedPreview {
+    fn truncate(&mut self, reason: EmbedTruncation) {
+        self.truncation.get_or_insert(reason);
+    }
+
+    fn finish(mut self) -> Self {
+        // A notice is presentation, not one of the 200 admitted content rows.
+        // Its presence is recorded separately; literal note text is never a flag.
+        if self.truncation.is_some() {
+            self.lines.push(EMBED_BUDGET_NOTICE.into());
+        }
+        self
+    }
+}
+
+/// Payload and file-visit budgets are shared by the whole projection pass.
+/// Each top-level embed separately admits 200 content rows, including children.
+pub(super) struct EmbedBudget {
+    bytes: usize,
+    visits: usize,
+}
+impl Default for EmbedBudget {
+    fn default() -> Self {
+        Self {
+            bytes: 4 * 1024 * 1024,
+            visits: 256,
+        }
+    }
+}
+impl EmbedBudget {
+    /// Admit payload bytes before cloning, including when many embeds share a
+    /// cached target. This runs only on projection changes, not unchanged paints.
+    pub(super) fn copy_cached(
+        &mut self,
+        cached: &[String],
+        truncation: Option<EmbedTruncation>,
+    ) -> EmbedPreview {
+        let mut preview = EmbedPreview::default();
+        if self.visits == 0 {
+            preview.truncate(EmbedTruncation::Visits);
+            return preview.finish();
+        }
+        if self.bytes == 0 {
+            preview.truncate(EmbedTruncation::Bytes);
+            return preview.finish();
+        }
+        self.visits -= 1;
+        // The final generated notice is excluded using metadata, not its text.
+        let content_len = cached
+            .len()
+            .saturating_sub(usize::from(truncation.is_some()));
+        for text in &cached[..content_len] {
+            if preview.lines.len() == MAX_EMBED_CONTENT_LINES {
+                preview.truncate(EmbedTruncation::Lines);
+                break;
+            }
+            if text.len() > self.bytes {
+                preview.truncate(EmbedTruncation::Bytes);
+                break;
+            }
+            self.bytes -= text.len();
+            preview.lines.push(text.clone());
+        }
+        if preview.truncation.is_none() {
+            preview.truncation = truncation;
+        }
+        preview.finish()
+    }
+}
+
 fn render_embedded_note(
     vault_root: &Path,
     relative_path: &str,
     index: &VaultLinkIndex,
     depth: usize,
     visiting: &mut HashSet<String>,
-) -> Vec<String> {
+    budget: &mut EmbedBudget,
+) -> EmbedPreview {
+    let mut preview = EmbedPreview::default();
+    render_embedded_note_into(
+        vault_root,
+        relative_path,
+        index,
+        depth,
+        visiting,
+        budget,
+        &mut preview,
+    );
+    preview.finish()
+}
+
+fn render_embedded_note_into(
+    vault_root: &Path,
+    relative_path: &str,
+    index: &VaultLinkIndex,
+    depth: usize,
+    visiting: &mut HashSet<String>,
+    budget: &mut EmbedBudget,
+    preview: &mut EmbedPreview,
+) {
+    if preview.lines.len() == MAX_EMBED_CONTENT_LINES {
+        preview.truncate(EmbedTruncation::Lines);
+        return;
+    }
+    if budget.visits == 0 {
+        preview.truncate(EmbedTruncation::Visits);
+        return;
+    }
+    if budget.bytes == 0 {
+        preview.truncate(EmbedTruncation::Bytes);
+        return;
+    }
+    budget.visits -= 1;
     if Path::new(relative_path)
         .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| !extension.eq_ignore_ascii_case("md"))
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| !e.eq_ignore_ascii_case("md"))
     {
-        return vec![format!("Attachment: {relative_path}")];
+        preview.lines.push(format!("Attachment: {relative_path}"));
+        return;
     }
     if depth >= 3 {
-        return vec!["…".to_string()];
+        preview.lines.push("…".into());
+        return;
     }
-    if !visiting.insert(relative_path.to_ascii_lowercase()) {
-        return vec![format!("↻ {relative_path} (cycle)")];
+    let key = relative_path.to_ascii_lowercase();
+    if !visiting.insert(key.clone()) {
+        preview.lines.push(format!("↻ {relative_path} (cycle)"));
+        return;
     }
-    let result = std::fs::read_to_string(vault_root.join(relative_path))
-        .map(|source| {
-            let frontmatter = parse_frontmatter(&source).map(|(range, _)| range);
-            let current_directory = Path::new(relative_path)
-                .parent()
-                .unwrap_or_else(|| Path::new(""));
-            let mut lines = Vec::new();
-            let mut source_offset = 0usize;
-            let mut in_fence = false;
-            for line in source.split_inclusive('\n') {
-                if lines.len() >= 200 {
-                    lines.push("…".to_string());
-                    break;
-                }
-                let line_end = source_offset + line.len();
-                if frontmatter
-                    .as_ref()
-                    .is_some_and(|range| source_offset < range.end && range.start < line_end)
-                {
-                    source_offset = line_end;
-                    continue;
-                }
-                let trimmed = line.trim_end_matches(['\r', '\n']).trim();
-                if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-                    in_fence = !in_fence;
-                    source_offset = line_end;
-                    continue;
-                }
-                if let Some(target) = trimmed
-                    .strip_prefix("![[")
-                    .and_then(|value| value.strip_suffix("]]"))
-                {
-                    if let Some(path) = index.resolve(current_directory, target).path {
-                        lines.extend(render_embedded_note(
-                            vault_root,
-                            &path,
-                            index,
-                            depth + 1,
-                            visiting,
-                        ));
-                    } else {
-                        lines.push(format!("▧ {target}"));
-                    }
-                } else if in_fence {
-                    lines.push(line.trim_end_matches(['\r', '\n']).to_string());
-                } else {
-                    lines.push(clean_embedded_markdown_line(trimmed));
-                }
+    let allowance = budget.bytes.min(1024 * 1024);
+    let mut consumed = 0;
+    let bytes = crate::bounded_file::read_in_root(
+        vault_root,
+        Path::new(relative_path),
+        allowance,
+        &mut consumed,
+    );
+    budget.bytes = budget.bytes.saturating_sub(consumed);
+    let source = match bytes {
+        Ok(bytes) => String::from_utf8(bytes).ok(),
+        Err(error) if error.is::<crate::bounded_file::ByteBudgetExceeded>() => {
+            visiting.remove(&key);
+            preview.truncate(EmbedTruncation::Bytes);
+            return;
+        }
+        Err(_) => None,
+    };
+    if let Some(source) = source {
+        let frontmatter = parse_frontmatter(&source).map(|(range, _)| range);
+        let current_directory = Path::new(relative_path)
+            .parent()
+            .unwrap_or_else(|| Path::new(""));
+        let first_line = preview.lines.len();
+        let mut source_offset = 0usize;
+        let mut in_fence = false;
+        for line in source.split_inclusive('\n') {
+            let line_end = source_offset + line.len();
+            if frontmatter
+                .as_ref()
+                .is_some_and(|range| source_offset < range.end && range.start < line_end)
+            {
                 source_offset = line_end;
+                continue;
             }
-            while lines.last().is_some_and(|line| line.is_empty()) {
-                lines.pop();
+            let trimmed = line.trim_end_matches(['\r', '\n']).trim();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                in_fence = !in_fence;
+                source_offset = line_end;
+                continue;
             }
-            lines
-        })
-        .unwrap_or_else(|_| vec![format!("Missing embed: {relative_path}")]);
-    visiting.remove(&relative_path.to_ascii_lowercase());
-    result
+            if preview.lines.len() == MAX_EMBED_CONTENT_LINES {
+                preview.truncate(EmbedTruncation::Lines);
+                break;
+            }
+            if let Some(target) = trimmed
+                .strip_prefix("![[")
+                .and_then(|v| v.strip_suffix("]]"))
+            {
+                if let Some(path) = index.resolve(current_directory, target).path {
+                    render_embedded_note_into(
+                        vault_root,
+                        &path,
+                        index,
+                        depth + 1,
+                        visiting,
+                        budget,
+                        preview,
+                    );
+                } else {
+                    preview.lines.push(format!("▧ {target}"));
+                }
+            } else if in_fence {
+                preview
+                    .lines
+                    .push(line.trim_end_matches(['\r', '\n']).to_string());
+            } else {
+                preview.lines.push(clean_embedded_markdown_line(trimmed));
+            }
+            source_offset = line_end;
+        }
+        while preview.lines.len() > first_line
+            && preview.lines.last().is_some_and(|line| line.is_empty())
+        {
+            preview.lines.pop();
+        }
+    } else {
+        preview
+            .lines
+            .push(format!("Unable to read embed: {relative_path}"));
+    }
+    visiting.remove(&key);
 }
 
 fn clean_embedded_markdown_line(line: &str) -> String {
@@ -1739,5 +1908,224 @@ mod tests {
             ambiguous,
             &vec!["A/Plan.md".to_string(), "B/Plan.md".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod embed_budget_tests {
+    use super::*;
+    #[test]
+    fn repeated_empty_children_and_multiple_roots_share_a_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("leaf.md"), "").unwrap();
+        std::fs::write(dir.path().join("middle.md"), "![[leaf]]\n".repeat(100)).unwrap();
+        std::fs::write(dir.path().join("root.md"), "![[middle]]\n".repeat(100)).unwrap();
+        let index =
+            VaultLinkIndex::new(vec!["leaf.md".into(), "middle.md".into(), "root.md".into()]);
+        let mut budget = EmbedBudget::default();
+        let mut visiting = HashSet::new();
+        let _ = render_embedded_note(dir.path(), "root.md", &index, 0, &mut visiting, &mut budget);
+        assert_eq!(budget.visits, 0);
+        let bytes = budget.bytes;
+        let _ = render_embedded_note(dir.path(), "root.md", &index, 0, &mut visiting, &mut budget);
+        assert_eq!(budget.bytes, bytes);
+        assert!(visiting.is_empty());
+    }
+    #[test]
+    fn each_top_level_embed_keeps_200_content_lines_and_its_own_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("first.md"), "line\n".repeat(201)).unwrap();
+        std::fs::write(dir.path().join("second.md"), "Hello\n").unwrap();
+        let mut projection = MarkdownProjection::parse("![[first]]\n![[second]]\n");
+        projection.resolve_vault_links(dir.path(), "Home.md");
+        let rows: Vec<_> = projection
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                ProjectedObject::WikiLink { rendered_lines, .. } => Some(rendered_lines),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows[0].len(), 201);
+        assert!(rows[0][..200].iter().all(|line| line == "line"));
+        assert_eq!(rows[0].last().unwrap(), EMBED_BUDGET_NOTICE);
+        assert_eq!(rows[1], &vec!["Hello".to_string()]);
+    }
+
+    #[test]
+    fn byte_cap_notices_preserve_unread_budget_for_smaller_embeds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("large.md"), "Hello\n").unwrap();
+        std::fs::write(dir.path().join("small.md"), "x\n").unwrap();
+        let index = VaultLinkIndex::new(vec!["large.md".into(), "small.md".into()]);
+        let mut budget = EmbedBudget {
+            bytes: 5,
+            ..Default::default()
+        };
+        let mut visiting = HashSet::new();
+        let too_large = render_embedded_note(
+            dir.path(),
+            "large.md",
+            &index,
+            0,
+            &mut visiting,
+            &mut budget,
+        );
+        assert_eq!(too_large.lines, vec![EMBED_BUDGET_NOTICE]);
+        assert_eq!(too_large.truncation, Some(EmbedTruncation::Bytes));
+        assert_eq!(budget.bytes, 5);
+        assert!(visiting.is_empty());
+        assert_eq!(
+            render_embedded_note(
+                dir.path(),
+                "small.md",
+                &index,
+                0,
+                &mut visiting,
+                &mut budget
+            )
+            .lines,
+            vec!["x"]
+        );
+        assert_eq!(budget.bytes, 3);
+        assert_eq!(budget.visits, 254);
+        // Cache reuse must charge the same content before cloning and must not
+        // reserve a whole file's allowance on rejection.
+        let copied = budget.copy_cached(&["abc".into()], None);
+        assert_eq!(copied.lines, vec!["abc"]);
+        assert_eq!(budget.bytes, 0);
+        let exhausted = budget.copy_cached(&["x".into()], None);
+        assert_eq!(exhausted.truncation, Some(EmbedTruncation::Bytes));
+    }
+
+    #[test]
+    fn missing_embeds_spend_visits_but_not_unread_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("good.md"), "Hello\n").unwrap();
+        std::fs::write(dir.path().join("invalid.md"), [0xff, 0xfe]).unwrap();
+        let index = VaultLinkIndex::new(vec!["good.md".into(), "invalid.md".into()]);
+        let mut budget = EmbedBudget::default();
+        let bytes = budget.bytes;
+        for _ in 0..4 {
+            let missing = render_embedded_note(
+                dir.path(),
+                "missing.md",
+                &index,
+                0,
+                &mut HashSet::new(),
+                &mut budget,
+            );
+            assert_eq!(missing.truncation, None);
+            assert_eq!(missing.lines, vec!["Unable to read embed: missing.md"]);
+        }
+        assert_eq!(budget.bytes, bytes);
+        assert_eq!(budget.visits, 252);
+        assert_eq!(
+            render_embedded_note(
+                dir.path(),
+                "good.md",
+                &index,
+                0,
+                &mut HashSet::new(),
+                &mut budget
+            )
+            .lines,
+            vec!["Hello"]
+        );
+        assert_eq!(budget.bytes, bytes - 6);
+        render_embedded_note(
+            dir.path(),
+            "invalid.md",
+            &index,
+            0,
+            &mut HashSet::new(),
+            &mut budget,
+        );
+        assert_eq!(
+            budget.bytes,
+            bytes - 8,
+            "invalid UTF-8 still consumed payload"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backslash_filename_cannot_turn_a_vault_embed_into_an_absolute_read() {
+        let vault = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("outside.md");
+        std::fs::write(&secret, "PRIVATE_TEST_MARKER").unwrap();
+        let alias = secret.to_string_lossy().replace('/', "\\");
+        std::fs::write(vault.path().join(alias), "decoy").unwrap();
+        let mut projection = MarkdownProjection::parse("![[outside]]");
+        projection.resolve_vault_links(vault.path(), "Home.md");
+        let rendered: Vec<_> = projection
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                ProjectedObject::WikiLink { rendered_lines, .. } => Some(rendered_lines),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("Unable to read embed")));
+        assert!(!rendered
+            .iter()
+            .any(|line| line.contains("PRIVATE_TEST_MARKER")));
+    }
+
+    #[test]
+    fn normal_nested_notes_render_but_absolute_aliases_cannot_read_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("child.md"), "# Hello\n").unwrap();
+        std::fs::write(dir.path().join("root.md"), "![[child]]\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("outside.md");
+        std::fs::write(&secret, "PRIVATE_TEST_MARKER").unwrap();
+        let index = VaultLinkIndex::new(vec![
+            "child.md".into(),
+            "root.md".into(),
+            secret.to_string_lossy().into_owned(),
+        ]);
+        let mut budget = EmbedBudget::default();
+        assert_eq!(
+            render_embedded_note(
+                dir.path(),
+                "root.md",
+                &index,
+                0,
+                &mut HashSet::new(),
+                &mut budget
+            )
+            .lines,
+            vec!["Hello"]
+        );
+        std::fs::write(dir.path().join("child.md"), "nested\n".repeat(201)).unwrap();
+        let nested = render_embedded_note(
+            dir.path(),
+            "root.md",
+            &index,
+            0,
+            &mut HashSet::new(),
+            &mut budget,
+        );
+        assert_eq!(nested.lines.len(), 201);
+        assert!(nested.lines[..200].iter().all(|line| line == "nested"));
+        assert_eq!(nested.truncation, Some(EmbedTruncation::Lines));
+        let path = index.resolve(Path::new(""), "outside").path.unwrap();
+        let result = render_embedded_note(
+            dir.path(),
+            &path,
+            &index,
+            0,
+            &mut HashSet::new(),
+            &mut budget,
+        );
+        assert!(!result
+            .lines
+            .iter()
+            .any(|s| s.contains("PRIVATE_TEST_MARKER")));
     }
 }

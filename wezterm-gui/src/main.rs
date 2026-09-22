@@ -37,6 +37,7 @@ use wezterm_toast_notification::*;
 
 mod agent_status;
 mod bottom_quotes;
+mod bounded_file;
 mod colorease;
 mod commands;
 mod customglyph;

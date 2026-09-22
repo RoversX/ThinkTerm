@@ -400,30 +400,34 @@ impl NoteHostState {
             projection_stage = Some(crate::input_diagnostics::StageTimer::begin(
                 "note_projection",
             ));
-            let cached_links = self
-                .projection
-                .objects
-                .iter()
-                .filter_map(|object| match object {
-                    ProjectedObject::WikiLink {
-                        target,
-                        embed,
+            // Borrow the old cache instead of deep-cloning all payloads before
+            // admission. Keep the first occurrence: a later duplicate may be
+            // only an exhaustion placeholder from the previous shared budget.
+            let mut cached_links = HashMap::new();
+            for object in &self.projection.objects {
+                if let ProjectedObject::WikiLink {
+                    target,
+                    embed,
+                    resolved_path,
+                    ambiguous_paths,
+                    rendered_lines,
+                    embed_truncation,
+                    ..
+                } = object
+                {
+                    cached_links.entry((target.as_str(), *embed)).or_insert((
                         resolved_path,
                         ambiguous_paths,
                         rendered_lines,
-                        ..
-                    } => Some((
-                        (target.clone(), *embed),
-                        (
-                            resolved_path.clone(),
-                            ambiguous_paths.clone(),
-                            rendered_lines.clone(),
-                        ),
-                    )),
-                    _ => None,
-                })
-                .collect::<HashMap<_, _>>();
+                        embed_truncation,
+                    ));
+                }
+            }
+            let mut embed_budget = super::projection::EmbedBudget::default();
             let mut projection = MarkdownProjection::parse(source);
+            // Reallocate shared budgets only when link targets/order/count change.
+            // Plain edits must not make a deterministic truncation rescan the vault.
+            let links_changed = !self.projection.link_targets().eq(projection.link_targets());
             // Never walk the vault (or read embedded notes) on the UI thread:
             // reuse the previous projection's resolutions for immediate paint
             // and let the background parse worker do the authoritative lookup.
@@ -436,18 +440,27 @@ impl NoteHostState {
                     resolved_path,
                     ambiguous_paths,
                     rendered_lines,
+                    embed_truncation,
                     ..
                 } = object
                 else {
                     continue;
                 };
                 any_links = true;
-                if let Some((cached_path, cached_ambiguous_paths, cached_lines)) =
-                    cached_links.get(&(target.clone(), *embed))
+                if let Some((
+                    cached_path,
+                    cached_ambiguous_paths,
+                    cached_lines,
+                    cached_truncation,
+                )) = cached_links.get(&(target.as_str(), *embed))
                 {
-                    *resolved_path = cached_path.clone();
-                    *ambiguous_paths = cached_ambiguous_paths.clone();
-                    *rendered_lines = cached_lines.clone();
+                    *resolved_path = (*cached_path).clone();
+                    *ambiguous_paths = (*cached_ambiguous_paths).clone();
+                    if *embed {
+                        let preview = embed_budget.copy_cached(cached_lines, **cached_truncation);
+                        *rendered_lines = preview.lines;
+                        *embed_truncation = preview.truncation;
+                    }
                 } else {
                     links_missing_resolution = true;
                 }
@@ -455,9 +468,11 @@ impl NoteHostState {
             // Published projections used to re-resolve on every reparse, which
             // is what picks up created/renamed targets and edited embeds; keep
             // that freshness, just on the worker instead of the UI thread.
-            // Live/Frozen keep the old cache-authoritative behavior and only
-            // owe a round trip for links the cache has never seen.
-            self.links_resolution_pending = links_missing_resolution
+            // Live/Frozen re-resolve on structural edits, not truncation markers.
+            // Preserve outstanding work across edits while an old worker runs.
+            self.links_resolution_pending = self.links_resolution_pending
+                || links_changed
+                || links_missing_resolution
                 || (any_links && matches!(self.display_source, NoteDisplaySource::Published));
             self.projection = projection;
             self.reveal_key_cache = None;
@@ -1210,6 +1225,195 @@ mod state_tests {
         let visual = build_visual_document(source, &resolved, mode, caret);
         assert!(host.apply_background_parse(revision, mode, caret, resolved, visual));
         assert!(!host.background_parse_pending());
+        assert!(host.background_parse_request().is_none());
+    }
+
+    #[test]
+    fn edited_duplicate_embeds_cannot_amplify_cached_payload_or_lose_first_content() {
+        for payload_bytes in [16, 128 * 1024] {
+            let vault = tempfile::tempdir().unwrap();
+            std::fs::write(vault.path().join("big.md"), "x".repeat(payload_bytes)).unwrap();
+            let mut host = host_with_source("![[big]]\n");
+            host.display_source = NoteDisplaySource::Live;
+            host.projection
+                .resolve_vault_links(vault.path(), "Inbox.md");
+            let session = host.session.as_ref().unwrap().clone();
+            let mut view = EditorViewState::default();
+            let end = session.lock().source().len();
+            session.lock().set_caret(&mut view, end, false);
+            assert!(session
+                .lock()
+                .insert_text(&mut view, &"![[big]]\n".repeat(299)));
+            host.refresh_projection();
+            let embedded: Vec<_> = host
+                .projection
+                .objects
+                .iter()
+                .filter_map(|object| match object {
+                    ProjectedObject::WikiLink {
+                        rendered_lines,
+                        embed_truncation,
+                        ..
+                    } => {
+                        let end = rendered_lines.len() - usize::from(embed_truncation.is_some());
+                        Some(&rendered_lines[..end])
+                    }
+                    _ => None,
+                })
+                .collect();
+            let content: Vec<_> = embedded.iter().flat_map(|lines| lines.iter()).collect();
+            assert!(content.len() <= 256 * 200);
+            assert!(content.iter().map(|line| line.len()).sum::<usize>() <= 4 * 1024 * 1024);
+            assert_eq!(embedded[0][0].len(), payload_bytes);
+            assert!(host.links_resolution_pending);
+            // A second edit must not let a later placeholder overwrite the
+            // first occurrence's real cache value for this same target.
+            assert!(session.lock().insert_text(&mut view, "\n"));
+            host.refresh_projection();
+            let first = host
+                .projection
+                .objects
+                .iter()
+                .find_map(|object| match object {
+                    ProjectedObject::WikiLink { rendered_lines, .. } => Some(rendered_lines),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(first[0].len(), payload_bytes);
+        }
+    }
+
+    fn resolve_requested_links(host: &mut NoteHostState, vault: &std::path::Path) {
+        let (revision, source, mode, caret, _) = host
+            .background_parse_request()
+            .expect("one resolution request");
+        let mut projection = MarkdownProjection::parse(&source);
+        projection.resolve_vault_links(vault, "Inbox.md");
+        let visual = build_visual_document(&source, &projection, mode, caret);
+        assert!(host.apply_background_parse(revision, mode, caret, projection, visual));
+        assert!(host.background_parse_request().is_none());
+    }
+
+    #[test]
+    fn ordinary_edits_do_not_reindex_truncated_or_literal_notice_embeds() {
+        for contents in [
+            "line\n".repeat(201),
+            "… (embed budget reached)\n".into(),
+            "x".repeat(1024 * 1024 + 1),
+        ] {
+            let vault = tempfile::tempdir().unwrap();
+            std::fs::write(vault.path().join("note.md"), &contents).unwrap();
+            let mut host = host_with_source("![[note]]\n");
+            host.display_source = NoteDisplaySource::Live;
+            resolve_requested_links(&mut host, vault.path());
+            let original: Vec<_> = host
+                .projection
+                .objects
+                .iter()
+                .filter_map(|object| match object {
+                    ProjectedObject::WikiLink {
+                        rendered_lines,
+                        embed_truncation,
+                        ..
+                    } => Some((rendered_lines.clone(), *embed_truncation)),
+                    _ => None,
+                })
+                .collect();
+            if contents.starts_with('…') {
+                assert_eq!(
+                    original[0].1, None,
+                    "literal text is not truncation metadata"
+                );
+            } else {
+                assert!(original[0].1.is_some());
+            }
+            let session = host.session.as_ref().unwrap().clone();
+            let mut view = EditorViewState::default();
+            for text in ["a", "b", "c"] {
+                let end = session.lock().source().len();
+                session.lock().set_caret(&mut view, end, false);
+                assert!(session.lock().insert_text(&mut view, text));
+                host.refresh_projection();
+                assert!(!host.links_resolution_pending);
+                assert!(
+                    host.background_parse_request().is_none(),
+                    "plain typing must not schedule vault indexing"
+                );
+                let current: Vec<_> = host
+                    .projection
+                    .objects
+                    .iter()
+                    .filter_map(|object| match object {
+                        ProjectedObject::WikiLink {
+                            rendered_lines,
+                            embed_truncation,
+                            ..
+                        } => Some((rendered_lines.clone(), *embed_truncation)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(current, original);
+            }
+        }
+    }
+
+    #[test]
+    fn removing_embeds_restores_budgeted_content_despite_an_inflight_edit() {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("big.md"), "x".repeat(1024 * 1024)).unwrap();
+        std::fs::write(vault.path().join("tail.md"), "Hello\n").unwrap();
+        let mut host = host_with_source(&("![[big]]\n".repeat(4) + "![[tail]]\n"));
+        host.display_source = NoteDisplaySource::Live;
+        resolve_requested_links(&mut host, vault.path());
+        let tail = host
+            .projection
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                ProjectedObject::WikiLink {
+                    target,
+                    embed_truncation,
+                    ..
+                } if target == "tail" => Some(*embed_truncation),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(tail, Some(super::super::projection::EmbedTruncation::Bytes));
+        let session = host.session.as_ref().unwrap().clone();
+        let mut view = EditorViewState::default();
+        session.lock().select_all(&mut view);
+        assert!(session.lock().insert_text(&mut view, "![[tail]]\n"));
+        host.refresh_projection();
+        let (revision, source, mode, caret, _) =
+            host.background_parse_request().expect("structure changed");
+        assert!(session.lock().insert_text(&mut view, "plain edit"));
+        host.refresh_projection();
+        assert!(
+            host.links_resolution_pending,
+            "the outstanding resolution must survive another edit"
+        );
+        let projection = MarkdownProjection::parse(&source);
+        let visual = build_visual_document(&source, &projection, mode, caret);
+        assert!(!host.apply_background_parse(revision, mode, caret, projection, visual));
+        resolve_requested_links(&mut host, vault.path());
+        let tail = host
+            .projection
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                ProjectedObject::WikiLink {
+                    target,
+                    rendered_lines,
+                    embed_truncation,
+                    ..
+                } if target == "tail" => Some((rendered_lines, embed_truncation)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(tail.0, &vec!["Hello".to_string()]);
+        assert_eq!(*tail.1, None);
+        assert!(session.lock().insert_text(&mut view, " more text"));
+        host.refresh_projection();
         assert!(host.background_parse_request().is_none());
     }
 

@@ -18622,15 +18622,8 @@ fn remote_preview_from_bytes(
 }
 
 fn load_file_preview_image(path: &Path) -> anyhow::Result<RightSidebarFilePreviewImage> {
-    let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    if metadata.len() > FILE_PREVIEW_IMAGE_MAX_BYTES as u64 {
-        anyhow::bail!(
-            "image is larger than {} MiB",
-            FILE_PREVIEW_IMAGE_MAX_BYTES / 1024 / 1024
-        );
-    }
-
-    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let bytes = crate::bounded_file::read_regular(path, FILE_PREVIEW_IMAGE_MAX_BYTES)?;
+    let encoded_bytes = bytes.len();
     let image_data = ImageDataType::EncodedFile(bytes);
     // `dimensions()` only reads the header, so this is cheap and lets us reject
     // decompression bombs *before* `cached_image` decodes the full RGBA bitmap.
@@ -18645,7 +18638,7 @@ fn load_file_preview_image(path: &Path) -> anyhow::Result<RightSidebarFilePrevie
         data: Arc::new(ImageData::with_data(image_data)),
         width,
         height,
-        encoded_bytes: metadata.len() as usize,
+        encoded_bytes,
     })
 }
 
