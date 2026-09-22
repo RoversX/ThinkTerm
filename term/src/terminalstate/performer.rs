@@ -33,6 +33,8 @@ use wezterm_escape_parser::{
 pub(crate) struct Performer<'a> {
     pub state: &'a mut TerminalState,
     print: String,
+    #[cfg(test)]
+    disable_ascii_batch: bool,
 }
 
 impl<'a> Deref for Performer<'a> {
@@ -60,6 +62,8 @@ impl<'a> Performer<'a> {
         Self {
             state,
             print: String::new(),
+            #[cfg(test)]
+            disable_ascii_batch: false,
         }
     }
 
@@ -131,108 +135,159 @@ impl<'a> Performer<'a> {
             p.as_str()
         };
 
-        for g in Graphemes::new(text) {
-            let g = self.remap_grapheme(g);
+        // Mixed Unicode must still be segmented as a whole: an ASCII base may
+        // belong to a combining sequence or emoji. Special character sets and
+        // insert mode retain the existing grapheme path as well.
+        let charset = if self.shift_out {
+            self.g1_charset
+        } else {
+            self.g0_charset
+        };
+        let ascii_batch = !self.insert
+            && charset == CharSet::Ascii
+            && self.unicode_version.cell_widths.is_none()
+            && text.bytes().all(|b| (b' '..=b'~').contains(&b));
+        #[cfg(test)]
+        let ascii_batch = ascii_batch && !self.disable_ascii_batch;
+        if ascii_batch {
+            self.flush_ascii(text);
+        } else {
+            for g in Graphemes::new(text) {
+                let g = self.remap_grapheme(g);
 
-            let mut print_width = grapheme_column_width(g, Some(&self.unicode_version));
-            if print_width == 0 {
-                // We got a zero-width grapheme.
+                let mut print_width = grapheme_column_width(g, Some(&self.unicode_version));
+                if print_width == 0 {
+                    // We got a zero-width grapheme.
 
-                // Relevant reading:
-                // <https://github.com/wezterm/wezterm/issues/1422>
-                // <https://github.com/wezterm/wezterm/issues/6637>
-                // <https://github.com/harfbuzz/harfbuzz/issues/4279>
-                // <https://www.unicode.org/faq/unsup_char.html#2>
-                //
-                // For White_Space we want to ensure that we display as a space.
-                // Other non-printing, zero-width characters can be elided
-                // to avoid presentation problems, but may introduce potential
-                // weirdness elsewhere. For example, U+2068 is a BIDI control
-                // character and will be elided by this logic. A consequence
-                // of that is that when the user copies the surrounding text
-                // from the terminal, that BIDI control will not be present.
-                // We do not currently have a solution for that.
-                if is_white_space_grapheme(g) {
-                    // Ensure that White_Space shows as a space
-                    print_width = 1;
-                } else {
-                    log::trace!("Eliding zero-width grapheme {:?}", g);
-                    continue;
+                    // Relevant reading:
+                    // <https://github.com/wezterm/wezterm/issues/1422>
+                    // <https://github.com/wezterm/wezterm/issues/6637>
+                    // <https://github.com/harfbuzz/harfbuzz/issues/4279>
+                    // <https://www.unicode.org/faq/unsup_char.html#2>
+                    //
+                    // For White_Space we want to ensure that we display as a space.
+                    // Other non-printing, zero-width characters can be elided
+                    // to avoid presentation problems, but may introduce potential
+                    // weirdness elsewhere. For example, U+2068 is a BIDI control
+                    // character and will be elided by this logic. A consequence
+                    // of that is that when the user copies the surrounding text
+                    // from the terminal, that BIDI control will not be present.
+                    // We do not currently have a solution for that.
+                    if is_white_space_grapheme(g) {
+                        // Ensure that White_Space shows as a space
+                        print_width = 1;
+                    } else {
+                        log::trace!("Eliding zero-width grapheme {:?}", g);
+                        continue;
+                    }
                 }
-            }
 
-            if self.wrap_next {
-                // Since we're implicitly moving the cursor to the next
-                // line, we need to tag the current position as wrapped
-                // so that we can correctly reflow it if the window is
-                // resized.
-                {
-                    let y = self.cursor.y;
-                    let is_conpty = self.state.enable_conpty_quirks;
+                self.wrap_if_needed();
+
+                let x = self.cursor.x;
+                let y = self.cursor.y;
+                let width = self.left_and_right_margins.end;
+
+                let pen = self.pen.clone();
+
+                let wrappable = x + print_width >= width;
+
+                if self.insert {
+                    let margin = self.left_and_right_margins.end;
                     let screen = self.screen_mut();
-                    let y = screen.phys_row(y);
-
-                    fn makes_sense_to_wrap(s: &str) -> bool {
-                        let len = s.len();
-                        match (len, s.chars().next()) {
-                            (1, Some(c)) => c.is_alphanumeric() || c.is_ascii_punctuation(),
-                            _ => true,
-                        }
-                    }
-
-                    let should_mark_wrapped = !is_conpty
-                        || screen
-                            .line_mut(y)
-                            .visible_cells()
-                            .last()
-                            .map(|cell| makes_sense_to_wrap(cell.str()))
-                            .unwrap_or(false);
-                    if should_mark_wrapped {
-                        screen.line_mut(y).set_last_cell_was_wrapped(true, seqno);
+                    for _ in x..x + print_width as usize {
+                        screen.insert_cell(x, y, margin, seqno);
                     }
                 }
-                self.new_line(true);
+
+                // Assign the cell
+                log::trace!(
+                    "print x={} y={} print_width={} width={} cell={} {:?}",
+                    x,
+                    y,
+                    print_width,
+                    width,
+                    g,
+                    self.pen
+                );
+                self.screen_mut()
+                    .set_cell_grapheme(x, y, g, print_width, pen, seqno);
+
+                if !wrappable {
+                    self.cursor.x += print_width;
+                    self.wrap_next = false;
+                } else {
+                    self.wrap_next = self.dec_auto_wrap;
+                }
             }
+        }
+        std::mem::swap(&mut self.print, &mut p);
+        self.print.clear();
+    }
+
+    fn wrap_if_needed(&mut self) {
+        let seqno = self.seqno;
+        if self.wrap_next {
+            // Since we're implicitly moving the cursor to the next
+            // line, we need to tag the current position as wrapped
+            // so that we can correctly reflow it if the window is
+            // resized.
+            {
+                let y = self.cursor.y;
+                let is_conpty = self.state.enable_conpty_quirks;
+                let screen = self.screen_mut();
+                let y = screen.phys_row(y);
+
+                fn makes_sense_to_wrap(s: &str) -> bool {
+                    let len = s.len();
+                    match (len, s.chars().next()) {
+                        (1, Some(c)) => c.is_alphanumeric() || c.is_ascii_punctuation(),
+                        _ => true,
+                    }
+                }
+
+                let should_mark_wrapped = !is_conpty
+                    || screen
+                        .line_mut(y)
+                        .visible_cells()
+                        .last()
+                        .map(|cell| makes_sense_to_wrap(cell.str()))
+                        .unwrap_or(false);
+                if should_mark_wrapped {
+                    screen.line_mut(y).set_last_cell_was_wrapped(true, seqno);
+                }
+            }
+            self.new_line(true);
+        }
+    }
+
+    fn flush_ascii(&mut self, mut text: &str) {
+        let seqno = self.seqno;
+        while !text.is_empty() {
+            self.wrap_if_needed();
 
             let x = self.cursor.x;
             let y = self.cursor.y;
             let width = self.left_and_right_margins.end;
-
+            let count = text.len().min(width.saturating_sub(x).max(1));
             let pen = self.pen.clone();
-
-            let wrappable = x + print_width >= width;
-
-            if self.insert {
-                let margin = self.left_and_right_margins.end;
-                let screen = self.screen_mut();
-                for _ in x..x + print_width as usize {
-                    screen.insert_cell(x, y, margin, seqno);
-                }
-            }
-
-            // Assign the cell
-            log::trace!(
-                "print x={} y={} print_width={} width={} cell={} {:?}",
-                x,
-                y,
-                print_width,
-                width,
-                g,
-                self.pen
-            );
-            self.screen_mut()
-                .set_cell_grapheme(x, y, g, print_width, pen, seqno);
-
-            if !wrappable {
-                self.cursor.x += print_width;
+            let screen = self.screen_mut();
+            let row = screen.phys_row(y);
+            let written = screen
+                .line_mut(row)
+                .set_ascii_cells(x, &text[..count], &pen, seqno);
+            debug_assert!(written);
+            if x + count < width {
+                self.cursor.x += count;
                 self.wrap_next = false;
             } else {
+                // The scalar path leaves the cursor on the final cell, even
+                // when wrapping is disabled or the cursor is past the margin.
+                self.cursor.x += count - 1;
                 self.wrap_next = self.dec_auto_wrap;
             }
+            text = &text[count..];
         }
-
-        std::mem::swap(&mut self.print, &mut p);
-        self.print.clear();
     }
 
     /// ConPTY, at the time of writing, does something horrible to rewrite
@@ -267,8 +322,10 @@ impl<'a> Performer<'a> {
         match action {
             Action::Print(c) => self.print(c),
             Action::PrintString(s) => {
-                for c in s.chars() {
-                    self.print(c)
+                if let Some(title) = self.accumulating_title.as_mut() {
+                    title.push_str(&s);
+                } else {
+                    self.print.push_str(&s);
                 }
             }
             Action::Control(code) => self.control(code),
@@ -1153,5 +1210,120 @@ fn selection_to_selection(sel: Selection) -> ClipboardSelection {
         // also use the same fallback configuration as NONE,
         // if/when we add it
         _ => ClipboardSelection::Clipboard,
+    }
+}
+
+#[cfg(all(test, feature = "use_serde"))]
+mod ascii_tests {
+    use super::*;
+    use crate::{TerminalConfiguration, TerminalSize};
+    use std::sync::Arc;
+    use wezterm_cell::UnicodeVersion;
+    use wezterm_escape_parser::parser::Parser;
+
+    #[derive(Debug)]
+    struct TestConfig {
+        normalize: bool,
+        custom_widths: bool,
+    }
+    impl TerminalConfiguration for TestConfig {
+        fn scrollback_size(&self) -> usize {
+            4
+        }
+        fn color_palette(&self) -> crate::color::ColorPalette {
+            Default::default()
+        }
+        fn normalize_output_to_unicode_nfc(&self) -> bool {
+            self.normalize
+        }
+        fn unicode_version(&self) -> UnicodeVersion {
+            let mut version = UnicodeVersion::new(9);
+            if self.custom_widths {
+                version.cell_widths = Some(Arc::new(
+                    [('a' as u32, 2), ('z' as u32, 0)].iter().copied().collect(),
+                ));
+            }
+            version
+        }
+    }
+
+    #[test]
+    fn ascii_batch_matches_grapheme_path_across_modes_and_chunk_boundaries() {
+        for (rows, cols) in [(1, 1), (1, 7), (3, 7)] {
+            for setup in [
+                "",
+                "a界",
+                "\x1b[?7l",
+                "\x1b[4h",
+                "\x1b(0",
+                "\x1b(A",
+                "\x1b)0\x0e",
+                "\x1b)A\x0e",
+                "\x1b[?1049h",
+                "\x1b[44m",
+                "\x1b[2;3r\x1b[3;6H",
+                "\x1b[?69h\x1b[2;6s\x1b[3;7H",
+                "\x1b]8;;https://example.com\x1b\\",
+                "\x1b]133;A\x07",
+            ] {
+                for (normalize, custom_widths, conpty) in [
+                    (false, false, false),
+                    (true, false, false),
+                    (false, true, false),
+                    (false, false, true),
+                ] {
+                    for chunk_size in [1, 3, 17, 4096] {
+                        let make = || {
+                            let mut state = TerminalState::new(
+                                TerminalSize {
+                                    rows,
+                                    cols,
+                                    pixel_width: cols * 8,
+                                    pixel_height: rows * 16,
+                                    dpi: 96,
+                                },
+                                Arc::new(TestConfig {
+                                    normalize,
+                                    custom_widths,
+                                }),
+                                "test",
+                                "test",
+                                Box::new(Vec::new()),
+                            );
+                            state.enable_conpty_quirks = conpty;
+                            state
+                        };
+                        let mut expected = make();
+                        let mut actual = make();
+                        let mut parser = Parser::new();
+                        let input = format!("{setup}abc #q~0123456789az      next\rOVERWRITE\nmore\te\u{301}1\u{fe0f}\u{20e3}界\x1b[0m\x1bkASCII title界\x1b\\end");
+                        for chunk in input.as_bytes().chunks(chunk_size) {
+                            let mut actions = Vec::new();
+                            parser.parse(chunk, |action| action.append_to(&mut actions));
+                            actual.increment_seqno();
+                            expected.increment_seqno();
+                            {
+                                let mut scalar = Performer::new(&mut expected);
+                                scalar.disable_ascii_batch = true;
+                                let mut batched = Performer::new(&mut actual);
+                                for action in actions {
+                                    batched.perform(action.clone());
+                                    match action {
+                                        Action::PrintString(text) => {
+                                            for c in text.chars() {
+                                                scalar.perform(Action::Print(c));
+                                            }
+                                        }
+                                        other => scalar.perform(other),
+                                    }
+                                }
+                            }
+                            assert_eq!(actual.snapshot(), expected.snapshot(),
+                                "rows={rows}, cols={cols}, setup={setup:?}, normalize={normalize}, custom_widths={custom_widths}, conpty={conpty}, chunk_size={chunk_size}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

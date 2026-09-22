@@ -792,6 +792,55 @@ impl Line {
         self.set_cell(idx, Cell::new_grapheme_with_width(text, width, attr), seqno);
     }
 
+    /// Write a run of printable ASCII with the same semantics as individual
+    /// `set_cell_grapheme` calls. Invalid input returns false without mutation.
+    /// Appending keeps compact storage; overwriting preserves image placements.
+    pub fn set_ascii_cells(
+        &mut self,
+        idx: usize,
+        text: &str,
+        attr: &CellAttributes,
+        seqno: SequenceNo,
+    ) -> bool {
+        if !text.bytes().all(|b| (b' '..=b'~').contains(&b)) {
+            return false;
+        }
+        if text.is_empty() {
+            return true;
+        }
+        // Establish the same wide-cell boundary and line metadata as a scalar
+        // write before taking either storage-specific path.
+        self.set_cell_grapheme(idx, &text[..1], 1, attr.clone(), seqno);
+        match &mut self.cells {
+            CellStorage::C(cl) if cl.len() == idx + 1 => {
+                cl.append_ascii(&text[1..], attr);
+            }
+            CellStorage::V(cells) => {
+                let end = idx + text.len();
+                if end > cells.len() {
+                    cells.resize_with(end, Cell::blank);
+                }
+                for (offset, byte) in text.bytes().enumerate().skip(1) {
+                    cells.set_cell(idx + offset, Cell::new(byte as char, attr.clone()), false);
+                }
+            }
+            _ => {
+                // A default blank beyond the end of compact storage is elided.
+                // Retain that behavior if the first write did not append.
+                for offset in 1..text.len() {
+                    self.set_cell_grapheme(
+                        idx + offset,
+                        &text[offset..offset + 1],
+                        1,
+                        attr.clone(),
+                        seqno,
+                    );
+                }
+            }
+        }
+        true
+    }
+
     pub fn set_cell_clearing_image_placements(
         &mut self,
         idx: usize,

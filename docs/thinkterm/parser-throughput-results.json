@@ -1,0 +1,97 @@
+{
+  "baseline_commit": "06bdaa4",
+  "platform": "macOS, Apple M1 Pro, 16 GiB RAM",
+  "kitten": "0.49.0",
+  "size": [
+    120,
+    32
+  ],
+  "scrollback_lines": 3500,
+  "repetitions": 100,
+  "renderer": "none (isolated mux server)",
+  "runs": {
+    "baseline": [
+      {
+        "rates_mib_per_second": {
+          "Only ASCII chars": 24.4,
+          "Unicode chars": 46.9,
+          "Unique multi-codepoint Unicode cells": 63.1,
+          "CSI codes with few chars": 15.6,
+          "Long escape codes": 202.1,
+          "Images": 280.4
+        },
+        "peak_rss_bytes": 463372288
+      },
+      {
+        "rates_mib_per_second": {
+          "Only ASCII chars": 24.4,
+          "Unicode chars": 46.4,
+          "Unique multi-codepoint Unicode cells": 61.9,
+          "CSI codes with few chars": 15.6,
+          "Long escape codes": 201.6,
+          "Images": 274.2
+        },
+        "peak_rss_bytes": 465534976
+      },
+      {
+        "rates_mib_per_second": {
+          "Only ASCII chars": 24.5,
+          "Unicode chars": 46.9,
+          "Unique multi-codepoint Unicode cells": 63.2,
+          "CSI codes with few chars": 15.7,
+          "Long escape codes": 201.0,
+          "Images": 277.8
+        },
+        "peak_rss_bytes": 464502784
+      }
+    ],
+    "candidate": [
+      {
+        "rates_mib_per_second": {
+          "Only ASCII chars": 43.3,
+          "Unicode chars": 48.0,
+          "Unique multi-codepoint Unicode cells": 69.7,
+          "CSI codes with few chars": 20.3,
+          "Long escape codes": 200.7,
+          "Images": 278.4
+        },
+        "peak_rss_bytes": 461225984
+      },
+      {
+        "rates_mib_per_second": {
+          "Only ASCII chars": 43.4,
+          "Unicode chars": 48.0,
+          "Unique multi-codepoint Unicode cells": 69.5,
+          "CSI codes with few chars": 20.0,
+          "Long escape codes": 198.6,
+          "Images": 281.4
+        },
+        "peak_rss_bytes": 462503936
+      },
+      {
+        "rates_mib_per_second": {
+          "Only ASCII chars": 43.4,
+          "Unicode chars": 48.0,
+          "Unique multi-codepoint Unicode cells": 69.7,
+          "CSI codes with few chars": 20.3,
+          "Long escape codes": 214.8,
+          "Images": 278.7
+        },
+        "peak_rss_bytes": 462192640
+      }
+    ]
+  },
+  "baseline_sha256": "67bf4f4be556eec5c4ffa568c894af8aa046917c21c430e8244fc2c1265d3dae",
+  "candidate_sha256": "98d5209cd4a41b4a1f9cf78f48d9b88592811f35c49ddaeaf0f0307e8f61d186",
+  "scrollback_check": {
+    "baseline": {
+      "repetitions": 200,
+      "peak_rss_bytes": 447905792
+    },
+    "candidate": {
+      "repetitions": 200,
+      "peak_rss_bytes": 448315392
+    }
+  },
+  "invalid_workload": "Images: both builds reported Invalid padding; rates measure a rejected transfer and are not successful image throughput."
+}

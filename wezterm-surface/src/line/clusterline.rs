@@ -216,6 +216,33 @@ impl ClusteredLine {
         }
     }
 
+    /// Append printable ASCII that has already been validated by Line.
+    pub fn append_ascii(&mut self, text: &str, attrs: &CellAttributes) {
+        debug_assert!(text.bytes().all(|b| (b' '..=b'~').contains(&b)));
+        if text.is_empty() {
+            return;
+        }
+        let mut remaining = text.len();
+        if let Some(cluster) = self.clusters.last_mut() {
+            if cluster.attrs == *attrs {
+                let count = remaining.min((u16::MAX - cluster.cell_width) as usize);
+                cluster.cell_width += count as u16;
+                remaining -= count;
+            }
+        }
+        while remaining > 0 {
+            let count = remaining.min(u16::MAX as usize);
+            self.clusters.push(Cluster {
+                attrs: attrs.clone(),
+                cell_width: count as u16,
+            });
+            remaining -= count;
+        }
+        self.text.push_str(text);
+        self.len += text.len() as u32;
+        self.last_cell_width = NonZeroU8::new(1);
+    }
+
     pub fn append_grapheme(&mut self, text: &str, cell_width: usize, attrs: CellAttributes) {
         let cell_width = cell_width as u16;
         let new_cluster = match self.clusters.last() {

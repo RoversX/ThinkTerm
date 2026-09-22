@@ -759,3 +759,118 @@ Line {
 "#
     );
 }
+
+fn check_ascii_against_scalar(base: &Line, start: usize, text: &str, attrs: &CellAttributes) {
+    let mut expected = base.clone();
+    for offset in 0..text.len() {
+        expected.set_cell_grapheme(
+            start + offset,
+            &text[offset..offset + 1],
+            1,
+            attrs.clone(),
+            42,
+        );
+    }
+    let mut actual = base.clone();
+    assert!(actual.set_ascii_cells(start, text, attrs, 42));
+    assert_eq!(actual, expected, "start={start}, text={text:?}");
+    assert_eq!(
+        actual.semantic_zone_ranges(),
+        expected.semantic_zone_ranges()
+    );
+    assert_eq!(actual.compute_shape_hash(), expected.compute_shape_hash());
+}
+
+#[test]
+fn ascii_runs_match_scalar_storage_links_and_wide_boundaries() {
+    let mut linked = CellAttributes::default();
+    linked.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.org"))));
+    linked.set_semantic_type(wezterm_cell::SemanticType::Prompt);
+    for text in [
+        "",
+        "abc   ",
+        "a界b🙂c",
+        "界界",
+        "e\u{301}x",
+        "https://example.com",
+    ] {
+        for compressed in [false, true] {
+            let mut base: Line = text.into();
+            base.scan_and_create_hyperlinks(&[Rule::new(r"https://\S+", "$0").unwrap()]);
+            if compressed {
+                base.compress_for_scrollback();
+            } else {
+                base.coerce_vec_storage();
+            }
+            base.semantic_zone_ranges();
+            for start in 0..base.len() + 3 {
+                for replacement in [
+                    "",
+                    "x",
+                    "   ",
+                    " ab ~",
+                    "0123456789abcdefghijklmnopqrstuvwxyz",
+                ] {
+                    for attrs in [CellAttributes::default(), linked.clone()] {
+                        check_ascii_against_scalar(&base, start, replacement, &attrs);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ascii_append_keeps_compact_storage_and_splits_full_attribute_clusters() {
+    let mut base = Line::new(0);
+    let attrs = CellAttributes::default();
+    for len in [65534, 65535, 65536, 131073] {
+        let text = "x".repeat(len);
+        check_ascii_against_scalar(&base, base.len(), &text, &attrs);
+        assert!(base.set_ascii_cells(base.len(), &text, &attrs, 42));
+        assert!(base.is_compressed_for_scrollback());
+    }
+}
+
+#[test]
+fn invalid_ascii_input_is_rejected_without_mutating_the_line() {
+    for text in ["a\nb", "a\0b", "a\x7fb", "a界", "e\u{301}"] {
+        let mut line: Line = "original".into();
+        let original = line.clone();
+        assert!(!line.set_ascii_cells(3, text, &CellAttributes::default(), 42));
+        assert_eq!(line, original);
+    }
+}
+
+#[cfg(feature = "use_image")]
+#[test]
+fn ascii_overwrite_preserves_image_placements() {
+    use wezterm_cell::image::{ImageCell, ImageData, ImageDataType, TextureCoordinate};
+    let data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+        1,
+        1,
+        vec![255; 4],
+    )));
+    let mut base: Line = "a界b cdef".into();
+    for x in 0..base.len() {
+        for placement in [None, Some(7)] {
+            base.cells_mut()[x]
+                .attrs_mut()
+                .attach_image(Box::new(ImageCell::with_z_index(
+                    TextureCoordinate::new_f32(0.0, 0.0),
+                    TextureCoordinate::new_f32(1.0, 1.0),
+                    Arc::clone(&data),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(3),
+                    placement,
+                )));
+        }
+    }
+    for start in 0..base.len() + 2 {
+        check_ascii_against_scalar(&base, start, "0123456789", &CellAttributes::default());
+    }
+}
