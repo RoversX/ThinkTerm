@@ -467,10 +467,15 @@ jobs:
 
     env:
       TAG_NAME: ${{ needs.prepare.outputs.version }}
-      # Restore Ubuntu's previous release profile while the heavier dist
-      # build is being revalidated. Fedora keeps dist. Packaging and AppImage
-      # must read the same profile directory as the build and cache steps.
-      CARGO_PROFILE: ${{ startsWith(matrix.name, 'ubuntu') && 'release' || 'dist' }}
+      # Every Linux leg builds with the release profile. Fedora kept dist
+      # so that CI could revalidate it, and that is now answered: fat LTO
+      # with a single codegen unit links wezterm-gui in one process too
+      # large for a standard runner, and the job was killed at 78 minutes
+      # -- inside the 90 minute limit, and with no log uploaded -- while
+      # the release leg finished in 28. dist is still what the macOS
+      # packaging builds with. Packaging and AppImage must read the same
+      # profile directory as the build and cache steps.
+      CARGO_PROFILE: release
       # Job-wide, not per-step: ./get-deps pulls in tzdata and friends, and a
       # debconf prompt there would hang until timeout-minutes with no output.
       DEBIAN_FRONTEND: noninteractive
