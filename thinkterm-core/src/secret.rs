@@ -12,12 +12,12 @@ const MARKER: &str = "enc:v1:";
 const IV_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 
-fn key_path() -> std::path::PathBuf {
-    crate::frontend_data_dir().join("secret.key")
+fn key_path() -> Result<std::path::PathBuf> {
+    Ok(crate::credential_data_dir()?.join("secret.key"))
 }
 
 fn load_or_create_key() -> Result<[u8; 32]> {
-    load_or_create_key_at(&key_path())
+    load_or_create_key_at(&key_path()?)
 }
 
 fn load_or_create_key_at(path: &Path) -> Result<[u8; 32]> {

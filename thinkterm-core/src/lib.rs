@@ -15,6 +15,24 @@ pub fn frontend_data_dir() -> std::path::PathBuf {
         .join("ThinkTerm")
 }
 
+/// Keep credentials local without moving unrelated workspace/snippet state.
+/// Publish the key and catalog together; a migration error must not create a
+/// replacement key or an empty catalog in a different location.
+pub fn credential_data_dir() -> anyhow::Result<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        let local = dirs_next::data_local_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot locate local application data"))?
+            .join("ThinkTerm").join("ssh");
+        config::migrate_private_files(
+            &frontend_data_dir(), &local, &["secret.key", "ssh_hosts.json"],
+        )?;
+        return Ok(local);
+    }
+    #[cfg(not(windows))]
+    Ok(frontend_data_dir())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

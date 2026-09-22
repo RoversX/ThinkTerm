@@ -74,12 +74,12 @@ struct SshHostStore {
     hosts: Vec<SshHostRecord>,
 }
 
-pub fn saved_hosts_path() -> std::path::PathBuf {
-    crate::frontend_data_dir().join("ssh_hosts.json")
+pub fn saved_hosts_path() -> Result<std::path::PathBuf> {
+    Ok(crate::credential_data_dir()?.join("ssh_hosts.json"))
 }
 
 pub fn list_saved_hosts() -> Result<Vec<SshHostEntry>> {
-    list_saved_hosts_from_path(&saved_hosts_path())
+    list_saved_hosts_from_path(&saved_hosts_path()?)
 }
 
 pub fn list_saved_hosts_from_path(path: &Path) -> Result<Vec<SshHostEntry>> {

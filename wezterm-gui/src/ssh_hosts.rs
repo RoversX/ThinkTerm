@@ -54,19 +54,34 @@ fn store_version() -> u32 {
 }
 
 lazy_static::lazy_static! {
-    static ref SSH_HOST_STORE: Mutex<SshHostStore> =
-        Mutex::new(load_ssh_host_store().unwrap_or_else(|err| {
-            log::warn!("failed to load ThinkTerm SSH host store: {err:#}");
-            SshHostStore::default()
-        }));
+    static ref SSH_HOST_STORE: Mutex<Option<SshHostStore>> = Mutex::new(None);
 }
 
-pub fn ssh_hosts_store_path() -> PathBuf {
-    crate::native_paths::data_file("ssh_hosts.json")
+fn ensure_store_loaded(
+    cached: &mut Option<SshHostStore>,
+    load: impl FnOnce() -> Result<SshHostStore>,
+) -> Result<()> {
+    if cached.is_none() {
+        *cached = Some(load()?);
+    }
+    Ok(())
+}
+
+fn host_store() -> Result<parking_lot::MappedMutexGuard<'static, SshHostStore>> {
+    let mut store = SSH_HOST_STORE.lock();
+    ensure_store_loaded(&mut store, load_ssh_host_store).map_err(|err| {
+        log::warn!("failed to load ThinkTerm SSH host store: {err:#}");
+        err
+    })?;
+    Ok(parking_lot::MutexGuard::map(store, |store| store.as_mut().unwrap()))
+}
+
+pub fn ssh_hosts_store_path() -> Result<PathBuf> {
+    thinkterm_core::ssh_hosts::saved_hosts_path()
 }
 
 fn load_ssh_host_store() -> Result<SshHostStore> {
-    load_ssh_host_store_from_path(&ssh_hosts_store_path())
+    load_ssh_host_store_from_path(&ssh_hosts_store_path()?)
 }
 
 fn load_ssh_host_store_from_path(path: &Path) -> Result<SshHostStore> {
@@ -78,7 +93,7 @@ fn load_ssh_host_store_from_path(path: &Path) -> Result<SshHostStore> {
 }
 
 fn save_ssh_host_store(store: &SshHostStore) -> Result<()> {
-    save_ssh_host_store_to_path(&ssh_hosts_store_path(), store)
+    save_ssh_host_store_to_path(&ssh_hosts_store_path()?, store)
 }
 
 fn save_ssh_host_store_to_path(path: &Path, store: &SshHostStore) -> Result<()> {
@@ -108,7 +123,7 @@ fn save_ssh_host_store_to_path(path: &Path, store: &SshHostStore) -> Result<()> 
 }
 
 pub fn list_hosts() -> Vec<(SshHostId, SshHostSpec)> {
-    let store = SSH_HOST_STORE.lock();
+    let Ok(store) = host_store() else { return vec![]; };
     store
         .hosts
         .iter()
@@ -130,8 +145,7 @@ pub fn list_all_hosts() -> Vec<SshHostEntry> {
 }
 
 pub fn host_spec(host_id: &str) -> Option<SshHostSpec> {
-    {
-        let store = SSH_HOST_STORE.lock();
+    if let Ok(store) = host_store() {
         if let Some(record) = store.hosts.iter().find(|record| record.id == host_id) {
             return Some(record.spec.clone());
         }
@@ -143,11 +157,7 @@ pub fn host_spec(host_id: &str) -> Option<SshHostSpec> {
 }
 
 pub fn host_exists(host_id: &str) -> bool {
-    SSH_HOST_STORE
-        .lock()
-        .hosts
-        .iter()
-        .any(|record| record.id == host_id)
+    host_store().map(|store| store.hosts.iter().any(|record| record.id == host_id)).unwrap_or(false)
 }
 
 pub fn try_create_host(spec: SshHostSpec) -> Result<SshHostId> {
@@ -156,7 +166,7 @@ pub fn try_create_host(spec: SshHostSpec) -> Result<SshHostId> {
     // host already uses used to overwrite that host's whole record -- its
     // saved password included -- and leave one card behind wearing the new
     // name.
-    if host_exists(&host_id_for_host(&spec)) {
+    if host_store()?.hosts.iter().any(|record| record.id == host_id_for_host(&spec)) {
         bail!("a saved host already uses {}", endpoint(&spec));
     }
     let (host_id, spec) = upsert_host(spec)?;
@@ -165,7 +175,7 @@ pub fn try_create_host(spec: SshHostSpec) -> Result<SshHostId> {
 }
 
 pub fn try_import_legacy_host(spec: SshHostSpec) -> Result<SshHostId> {
-    let mut store = SSH_HOST_STORE.lock();
+    let mut store = host_store()?;
     let host_id = host_id_for_host(&spec);
     if store.hosts.iter().any(|record| record.id == host_id) {
         return Ok(host_id);
@@ -179,7 +189,7 @@ pub fn try_import_legacy_host(spec: SshHostSpec) -> Result<SshHostId> {
 }
 
 fn upsert_host(spec: SshHostSpec) -> Result<(SshHostId, SshHostSpec)> {
-    let mut store = SSH_HOST_STORE.lock();
+    let mut store = host_store()?;
     let host_id = host_id_for_host(&spec);
     if let Some(record) = store.hosts.iter_mut().find(|record| record.id == host_id) {
         record.spec = spec;
@@ -208,7 +218,7 @@ pub fn try_update_host(host_id: &str, spec: SshHostSpec) -> Result<Option<SshHos
     if is_system_host_id(host_id) {
         return Ok(None);
     }
-    let mut store = SSH_HOST_STORE.lock();
+    let mut store = host_store()?;
     // The same invariant `try_create_host` enforces, and for the same reason:
     // one record per endpoint. Editing a host onto an endpoint another record
     // already owns would leave two records dialing it, both registering a
@@ -239,7 +249,7 @@ pub fn try_remove_host(host_id: &str) -> Result<bool> {
     if is_system_host_id(host_id) {
         return Ok(false);
     }
-    let mut store = SSH_HOST_STORE.lock();
+    let mut store = host_store()?;
     let before = store.hosts.len();
     store.hosts.retain(|record| record.id != host_id);
     if store.hosts.len() == before {
@@ -253,7 +263,7 @@ pub fn set_host_distro(host_id: &str, distro_id: &str) -> bool {
     if is_system_host_id(host_id) {
         return false;
     }
-    let mut store = SSH_HOST_STORE.lock();
+    let Ok(mut store) = host_store() else { return false; };
     let Some(record) = store.hosts.iter_mut().find(|record| record.id == host_id) else {
         return false;
     };
@@ -745,6 +755,24 @@ fn system_host_id(alias: &str) -> SshHostId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_catalog_load_is_retried_before_editing() {
+        let mut cached = None;
+        assert!(ensure_store_loaded(&mut cached, || anyhow::bail!("migration cleanup temporarily failed")).is_err());
+        assert!(cached.is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ssh_hosts.json");
+        let original = SshHostRecord { id: "original".into(), spec: spec_with_options(HashMap::new()) };
+        save_ssh_host_store_to_path(&path, &SshHostStore { version: 1, hosts: vec![original.clone()] }).unwrap();
+        ensure_store_loaded(&mut cached, || load_ssh_host_store_from_path(&path)).unwrap();
+        let store = cached.as_mut().unwrap();
+        store.hosts.push(SshHostRecord { id: "new".into(), ..original });
+        save_ssh_host_store_to_path(&path, store).unwrap();
+        let saved = load_ssh_host_store_from_path(&path).unwrap();
+        assert_eq!(saved.hosts.len(), 2);
+        assert_eq!(saved.hosts[0].id, "original");
+    }
 
     #[test]
     fn system_hosts_preserve_ssh_config_alias_as_remote_address() {

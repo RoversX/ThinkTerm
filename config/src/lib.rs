@@ -33,6 +33,8 @@ pub mod keyassignment;
 mod keys;
 pub mod lua;
 pub mod meta;
+mod private_data;
+pub use private_data::migrate_private_files;
 pub mod scheme_data;
 mod thinkterm_schemes;
 mod serial;

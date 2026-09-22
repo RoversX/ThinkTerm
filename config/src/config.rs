@@ -1989,6 +1989,23 @@ pub(crate) fn compute_data_dir() -> anyhow::Result<PathBuf> {
     Ok(data_dir)
 }
 
+/// Resolve the web listener's private files outside a Windows roaming profile.
+/// Failure is propagated so callers cannot silently generate a new identity.
+pub fn local_data_path(item: &str) -> anyhow::Result<PathBuf> {
+    #[cfg(windows)]
+    {
+        let local = dirs_next::data_local_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot locate local application data"))?
+            .join(PRODUCT_DIR_NAME).join(item);
+        crate::migrate_private_files(
+            &crate::DATA_DIR.join(item), &local, &["cert.pem", "key.pem", "sans.txt"],
+        )?;
+        return Ok(local);
+    }
+    #[cfg(not(windows))]
+    Ok(crate::DATA_DIR.join(item))
+}
+
 pub(crate) fn compute_runtime_dir() -> anyhow::Result<PathBuf> {
     if let Some(runtime) = dirs_next::runtime_dir() {
         return Ok(runtime.join(PRODUCT_DIR_NAME));

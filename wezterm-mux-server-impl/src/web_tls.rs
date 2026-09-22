@@ -19,8 +19,9 @@ pub struct WebTls {
     pub generated: bool,
 }
 
-fn dir() -> PathBuf {
-    config::DATA_DIR.join("web-tls")
+fn dir() -> anyhow::Result<PathBuf> {
+    // The private key must not leave this machine with a roaming profile.
+    config::local_data_path("web-tls")
 }
 
 fn names(addresses: &[IpAddr]) -> (Vec<String>, Vec<IpAddr>) {
@@ -62,7 +63,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 /// The listener's certificate: the stored one when it still names every
 /// address the machine has, else a fresh one.
 pub fn ensure(addresses: &[IpAddr]) -> anyhow::Result<WebTls> {
-    let dir = dir();
+    let dir = dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
