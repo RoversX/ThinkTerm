@@ -21,6 +21,7 @@ pub struct WebControl {
     /// defaults, plus whatever the listener filled in itself (a generated
     /// certificate) -- so URLs and origins are told the scheme in use.
     pub effective: fn(&str) -> Option<config::WebServer>,
+    pub certificates: fn() -> Vec<(String, String)>,
 }
 
 static CONTROL: OnceLock<WebControl> = OnceLock::new();
@@ -46,4 +47,9 @@ pub fn listening() -> Vec<String> {
 /// The entry a live listener runs with, when it is up.
 pub fn effective(bind_address: &str) -> Option<config::WebServer> {
     get().and_then(|c| (c.effective)(bind_address))
+}
+
+/// Bind address and SHA-256 for each live TLS listener; HTTP has no entry.
+pub fn certificates() -> Vec<(String, String)> {
+    get().map(|c| (c.certificates)()).unwrap_or_default()
 }

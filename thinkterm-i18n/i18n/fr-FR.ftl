@@ -866,3 +866,5 @@ web-scheme-preview = Aperçu
 web-settings-hover-reveal-description = Barre latérale rangée, poser le pointeur sur le bord gauche la fait apparaître jusqu’à ce qu’il s’éloigne.
 web-settings-agents-panel-description = Un panneau à droite qui liste chaque volet où tourne un agent.
 web-settings-sidebar-reset-description = Remettre la barre latérale à sa largeur par défaut.
+
+settings-web-verify-certificate = Comparez cette empreinte SHA-256 à celle du certificat du navigateur avant de lui faire confiance.

@@ -95,8 +95,10 @@ machine's hostname and every address it has, kept under
 `~/.local/share/thinkterm/web-tls/` and remade only when an address it
 does not name appears. `mint` then prints one URL per address, Tailscale
 ones first, and `--url-only` picks the first that another device can use.
-The browser warns once about the certificate; continuing puts the page in
-a secure context. Two things to know: a name or address the machine gains
+Before accepting a self-signed certificate warning, compare the browser certificate’s
+SHA-256 fingerprint with Settings → Web or the full `web-token mint` output.
+Do not continue if it differs. `--url-only` deliberately omits this information;
+use the full output when establishing trust. Two things to know: a name or address the machine gains
 later is not in the certificate until the server restarts, and iOS Safari
 has been known to refuse the WebSocket behind a certificate it was told to
 continue past -- if the page attaches on a laptop but not on the phone,

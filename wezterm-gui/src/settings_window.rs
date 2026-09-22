@@ -6163,9 +6163,32 @@ impl SettingsWindow {
         let qr_modules = state.qr.as_ref().map(|q| q.len()).unwrap_or(0);
         let qr_scale = self.ui_px(4.0);
         let qr_side = qr_modules as f32 * qr_scale;
-        let qr_extra = if qr_modules > 0 { qr_side + self.ui_px(24.0) } else { 0.0 };
+        let qr_extra = if qr_modules > 0 {
+            qr_side + self.ui_px(24.0)
+        } else {
+            0.0
+        };
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, 5);
-        let card_height = self.settings_card_height(5) + qr_extra;
+        let certificates = state.displayed_certificates();
+        let mut certificate_lines = Vec::new();
+        if !certificates.is_empty() {
+            certificate_lines.push(crate::i18n::tr("settings-web-verify-certificate"));
+            for certificate in certificates {
+                certificate_lines.push(certificate.urls.join(" · "));
+                certificate_lines.push("SHA-256:".to_string());
+                let groups: Vec<_> = certificate.sha256.split(':').collect();
+                for chunk in groups.chunks(8) {
+                    certificate_lines.push(chunk.join(":"));
+                }
+            }
+        }
+        let certificate_step = self.ui_px(24.0);
+        let certificate_extra = if certificate_lines.is_empty() {
+            0.0
+        } else {
+            certificate_step * certificate_lines.len() as f32 + self.ui_px(24.0)
+        };
+        let card_height = self.settings_card_height(5) + qr_extra + certificate_extra;
         self.paint_group_card(layers, x, card_y, max_width, card_height)?;
 
         // The error takes the description slot rather than a line of its
@@ -6323,6 +6346,19 @@ impl SettingsWindow {
                     }
                 }
             }
+        }
+
+        let certificate_y = self.settings_row_description_y(qr_y) + self.ui_px(30.0) + qr_extra;
+        for (index, line) in certificate_lines.iter().enumerate() {
+            self.draw_text(
+                layers,
+                &body_font,
+                row_x,
+                certificate_y + index as f32 * certificate_step,
+                line,
+                palette.text,
+                row_width,
+            )?;
         }
 
         // --- the links --------------------------------------------------

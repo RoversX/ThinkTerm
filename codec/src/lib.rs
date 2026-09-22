@@ -576,7 +576,8 @@ macro_rules! pdu {
 /// 67: Web tokens: the credential a browser presents at the server's web
 ///     port is minted, listed and revoked over the mux connection
 ///     (WebTokenMint/List/Revoke), the way TLS credentials are obtained.
-pub const CODEC_VERSION: usize = 71;
+/// 72: Web status and minted links carry the live TLS certificate identity.
+pub const CODEC_VERSION: usize = 72;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -873,6 +874,7 @@ pub struct WebTokenMintResponse {
     /// the token in the URL fragment for the page to pick up (never sent
     /// to the server, never in a Referer).
     pub urls: Vec<String>,
+    pub certificates: Vec<WebCertificate>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -916,6 +918,14 @@ pub struct SetWebServer {
 
 /// The answer to both of the above, so a client that changes the state and
 /// a client that only asks read the same shape.
+/// Certificate identity captured from a live TLS listener, keyed by its URLs.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct WebCertificate {
+    pub urls: Vec<String>,
+    /// Colon-separated SHA-256 of the installed leaf certificate.
+    pub sha256: String,
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct WebServerStatus {
     /// Accepting right now. Empty means no browser can reach this server.
@@ -926,6 +936,7 @@ pub struct WebServerStatus {
     /// What `web_servers` names in the configuration, up or not. A client
     /// offering to start one uses this rather than inventing an address.
     pub configured: Vec<String>,
+    pub certificates: Vec<WebCertificate>,
 }
 
 /// Revoke one token by id, or every token when `id` is None. Connections
@@ -2549,7 +2560,7 @@ mod test {
         // The exact assertion is the tripwire: whoever bumps the codec must
         // come here, confirm the round-trips still cover the new version,
         // and advance it deliberately.
-        assert_eq!(CODEC_VERSION, 71);
+        assert_eq!(CODEC_VERSION, 72);
         use thinkterm_proto::{AgentEvidence, AgentState, AgentStatus};
 
         fn round_trip(pdu: Pdu) {
@@ -2974,6 +2985,39 @@ mod image_payload_tests {
             let back = Pdu::decode(wire.as_slice()).unwrap();
             assert_eq!(back.serial, 9);
             assert_eq!(back.pdu, pdu);
+        }
+    }
+}
+
+#[cfg(test)]
+mod web_certificate_tests {
+    use super::*;
+    #[test]
+    fn status_and_minted_links_carry_certificate_identity() {
+        let certificates = vec![WebCertificate {
+            urls: vec!["https://example.test/".into()],
+            sha256: "ab:".repeat(31) + "ab",
+        }];
+        let messages = [
+            Pdu::WebServerStatus(WebServerStatus {
+                listening: vec![],
+                urls: vec![],
+                configured: vec![],
+                certificates: certificates.clone(),
+            }),
+            Pdu::WebTokenMintResponse(WebTokenMintResponse {
+                id: "test".into(),
+                label: None,
+                token: "test".into(),
+                expires_at: None,
+                urls: vec![],
+                certificates,
+            }),
+        ];
+        for message in messages {
+            let mut bytes = Vec::new();
+            message.encode(&mut bytes, 1).unwrap();
+            assert_eq!(Pdu::decode(bytes.as_slice()).unwrap().pdu, message);
         }
     }
 }

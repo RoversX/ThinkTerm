@@ -847,3 +847,5 @@ web-scheme-preview = 预览
 web-settings-hover-reveal-description = 侧栏收起时,鼠标停在左边缘会临时展开它,离开后收回。
 web-settings-agents-panel-description = 右侧的面板,列出每个运行着 Agent 的窗格。
 web-settings-sidebar-reset-description = 把侧栏恢复到默认宽度。
+
+settings-web-verify-certificate = 信任前，请核对浏览器证书的 SHA-256；不一致就停止连接。

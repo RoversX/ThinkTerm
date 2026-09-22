@@ -2371,6 +2371,7 @@ impl SessionHandler {
                             label: minted.label,
                             token: minted.token,
                             expires_at: minted.expires_at,
+                            certificates: web_certificates(),
                             urls,
                         }))
                     },
@@ -3216,6 +3217,16 @@ mod tests {
 /// `urls` names only the listeners that are actually up: a URL for a port
 /// nobody is accepting on is worse than no URL, because it looks like the
 /// feature is on.
+fn web_certificates() -> Vec<WebCertificate> {
+    crate::web_control::certificates()
+        .into_iter()
+        .map(|(bind, sha256)| WebCertificate {
+            urls: web_urls(&[bind]),
+            sha256,
+        })
+        .collect()
+}
+
 fn web_server_status() -> WebServerStatus {
     let listening = crate::web_control::listening();
     let configured = config::configuration()
@@ -3225,6 +3236,7 @@ fn web_server_status() -> WebServerStatus {
         .collect();
     WebServerStatus {
         urls: web_urls(&listening),
+        certificates: web_certificates(),
         listening,
         configured,
     }

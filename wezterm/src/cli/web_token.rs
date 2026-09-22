@@ -152,6 +152,14 @@ impl MintCommand {
             None => println!("Does not expire; revoke it with `thinkterm cli web-token revoke {}`.", minted.id),
         }
         println!();
+        for certificate in &minted.certificates {
+            println!("Certificate for {}", certificate.urls.join(", "));
+            println!("SHA-256: {}", certificate.sha256);
+        }
+        if !minted.certificates.is_empty() {
+            println!("Compare this fingerprint with the browser's certificate before trusting it. If it differs, stop.");
+            println!();
+        }
         println!("This token is a login as your user on this machine. Anyone holding it can");
         println!("open a shell and read every pane. Treat it like an ssh key.");
         println!();

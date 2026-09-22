@@ -869,3 +869,5 @@ web-scheme-preview = Vorschau
 web-settings-hover-reveal-description = Bei eingeklappter Seitenleiste zeigt ein Zeiger am linken Rand sie an, bis er sich entfernt.
 web-settings-agents-panel-description = Ein Panel rechts, das jedes Pane auflistet, in dem ein Agent läuft.
 web-settings-sidebar-reset-description = Setzt die Seitenleiste auf ihre Standardbreite zurück.
+
+settings-web-verify-certificate = Vergleiche diesen SHA-256-Fingerabdruck mit dem Browserzertifikat, bevor du ihm vertraust.

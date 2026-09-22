@@ -850,7 +850,7 @@ settings-web-reachable = Reachable from other devices
 settings-web-reachable-description = Listens on every network address with a certificate of its own; a phone on the same network or tailnet can open the link. Off, only the machine it runs on can.
 settings-web-reachable-restart = Turned browser access off and on again at the new address.
 settings-web-qr = Scan on your phone
-settings-web-qr-description = Makes a link and shows it as a code; the browser warns about the certificate once, then continues.
+settings-web-qr-description = Makes a link and shows it as a code; compare the certificate fingerprint before continuing.
 settings-web-qr-show = Show code
 settings-web-qr-hide = Hide code
 settings-web-qr-loopback = Only the machine it runs on can reach the listener; turn on "Reachable from other devices" for a code a phone can use.
@@ -869,3 +869,5 @@ web-scheme-preview = Preview
 web-settings-hover-reveal-description = With the sidebar put away, resting on the left edge shows it until the pointer leaves.
 web-settings-agents-panel-description = A panel on the right listing every pane an agent runs in.
 web-settings-sidebar-reset-description = Put the sidebar back to its default width.
+
+settings-web-verify-certificate = Compare this SHA-256 with the browser certificate before trusting it.

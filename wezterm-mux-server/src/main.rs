@@ -369,6 +369,7 @@ fn run() -> anyhow::Result<()> {
             stop: web::stop_web_listener,
             listening: web::listening,
             effective: web::effective,
+            certificates: web::certificates,
         },
     );
 

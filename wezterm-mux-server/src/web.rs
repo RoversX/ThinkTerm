@@ -33,6 +33,7 @@ struct Listening {
     /// What the listener runs with: the entry as given, plus the
     /// certificate it made for itself when the entry named none.
     effective: WebServer,
+    fingerprint: Option<String>,
     stop: Arc<AtomicBool>,
     /// The address `accept()` actually returned, not the configured
     /// string: an unspecified bind has to be woken through a real address.
@@ -53,6 +54,33 @@ pub fn effective(bind_address: &str) -> Option<WebServer> {
         .map_or_else(|e| e.into_inner(), |g| g)
         .get(bind_address)
         .map(|l| l.effective.clone())
+}
+
+/// Captured from the loaded SSL context; disk rotation cannot change a live
+/// listener's identity until that listener is restarted.
+pub fn certificates() -> Vec<(String, String)> {
+    LISTENERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|(bind, live)| {
+            live.fingerprint
+                .as_ref()
+                .map(|fp| (bind.clone(), fp.clone()))
+        })
+        .collect()
+}
+fn certificate_fingerprint(acceptor: &SslAcceptor) -> anyhow::Result<String> {
+    let certificate = acceptor
+        .context()
+        .certificate()
+        .context("TLS listener has no certificate")?;
+    let digest = certificate.digest(openssl::hash::MessageDigest::sha256())?;
+    Ok(digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(":"))
 }
 
 pub fn is_listening(bind_address: &str) -> bool {
@@ -207,9 +235,11 @@ pub fn spawn_web_listener(server: &WebServer) -> anyhow::Result<()> {
     let mut effective = server.clone();
     if !server.is_loopback() && !server.uses_tls() && server.require_tls_off_loopback {
         let tls = wezterm_mux_server_impl::web_tls::ensure(&config::local_addresses())
-            .with_context(|| format!("web server {}: making its certificate", server.bind_address))?;
+            .with_context(|| {
+                format!("web server {}: making its certificate", server.bind_address)
+            })?;
         log::error!(
-            "web server {}: {} self-signed certificate {} (SHA-256 {}); browsers warn once, then continue",
+            "web server {}: {} self-signed certificate {} (SHA-256 {}); compare this fingerprint with the browser certificate before trusting",
             server.bind_address,
             if tls.generated { "made a" } else { "using the" },
             tls.cert.display(),
@@ -224,6 +254,7 @@ pub fn spawn_web_listener(server: &WebServer) -> anyhow::Result<()> {
     } else {
         None
     };
+    let fingerprint = acceptor.as_ref().map(certificate_fingerprint).transpose()?;
     let static_dir = resolve_static_dir(server);
     match &static_dir {
         Some(dir) => log::info!("web bundle for {} at {}", server.bind_address, dir.display()),
@@ -252,15 +283,19 @@ pub fn spawn_web_listener(server: &WebServer) -> anyhow::Result<()> {
     let done = Arc::new(AtomicBool::new(false));
     // Registered before the thread starts, so a stop that arrives in the
     // same breath as the start still finds it.
-    LISTENERS.lock().map_or_else(|e| e.into_inner(), |g| g).insert(
-        server.bind_address.clone(),
-        Listening {
-            effective: effective.clone(),
-            stop: Arc::clone(&stop),
-            local,
-            done: Some(Arc::clone(&done)),
-        },
-    );
+    LISTENERS
+        .lock()
+        .map_or_else(|e| e.into_inner(), |g| g)
+        .insert(
+            server.bind_address.clone(),
+            Listening {
+                effective: effective.clone(),
+                fingerprint,
+                stop: Arc::clone(&stop),
+                local,
+                done: Some(Arc::clone(&done)),
+            },
+        );
     let bind_address = server.bind_address.clone();
     match std::thread::Builder::new()
         .name(format!("web-accept-{}", server.bind_address))
@@ -420,5 +455,51 @@ fn accept_loop(
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod certificate_tests {
+    use super::*;
+    #[test]
+    fn identities_follow_live_listeners_and_ignore_plain_http() {
+        let first = crate::ossl::deadline_tests::test_acceptor();
+        let second = crate::ossl::deadline_tests::test_acceptor();
+        let first_fp = certificate_fingerprint(&first).unwrap();
+        let second_fp = certificate_fingerprint(&second).unwrap();
+        assert_ne!(first_fp, second_fp);
+        assert_eq!(first_fp.split(':').count(), 32);
+        let binds = ["127.0.0.1:0", "127.0.0.2:0", "127.0.0.3:0"];
+        for (bind, fingerprint) in
+            binds
+                .iter()
+                .zip([Some(first_fp.clone()), Some(second_fp.clone()), None])
+        {
+            LISTENERS.lock().unwrap().insert(
+                (*bind).into(),
+                Listening {
+                    effective: WebServer {
+                        bind_address: (*bind).into(),
+                        ..Default::default()
+                    },
+                    fingerprint,
+                    stop: Arc::new(AtomicBool::new(false)),
+                    local: bind.parse().unwrap(),
+                    done: None,
+                },
+            );
+        }
+        let fingerprints = certificates();
+        assert!(fingerprints.contains(&(binds[0].into(), first_fp.clone())));
+        assert!(fingerprints.contains(&(binds[1].into(), second_fp)));
+        assert!(!fingerprints.iter().any(|(bind, _)| bind == binds[2]));
+        // Building a replacement context did not change the old listener.
+        assert_eq!(certificate_fingerprint(&first).unwrap(), first_fp);
+        for bind in binds {
+            assert!(stop_web_listener(bind));
+        }
+        assert!(!certificates()
+            .iter()
+            .any(|(bind, _)| binds.contains(&bind.as_str())));
     }
 }

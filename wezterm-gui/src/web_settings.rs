@@ -40,6 +40,8 @@ pub struct WebState {
     /// A minted link as a QR code (rows of dark modules), shown until the
     /// section is left. The code carries the token, as a copied link does.
     pub qr: Option<Vec<Vec<bool>>>,
+    /// Public page URL only, without the token fragment. Certificates come from status.
+    pub qr_url: Option<String>,
     /// Whether anything has been asked yet, so the first paint of the
     /// section can ask without a button.
     pub loaded: bool,
@@ -52,6 +54,26 @@ pub struct WebState {
     /// flight when it did carries a picture from before the click, and is
     /// thrown away rather than painted over the result.
     pub generation: u64,
+}
+
+impl WebState {
+    /// Always borrow the latest listener identities, including while a QR stays visible.
+    pub fn displayed_certificates(&self) -> &[codec::WebCertificate] {
+        let certificates = self
+            .status
+            .as_ref()
+            .map(|status| status.certificates.as_slice())
+            .unwrap_or_default();
+        if let (Some(_), Some(url)) = (&self.qr, &self.qr_url) {
+            if let Some(certificate) = certificates
+                .iter()
+                .find(|cert| cert.urls.iter().any(|u| u == url))
+            {
+                return std::slice::from_ref(certificate);
+            }
+        }
+        certificates
+    }
 }
 
 /// How often the open page re-reads the server.
@@ -336,6 +358,7 @@ pub fn restart(window: Window, bind_address: String) {
                 with_state(|s| {
                     s.status = Some(status);
                     s.qr = None;
+                    s.qr_url = None;
                 });
                 finish(&window, None, Gate::Action);
                 refresh(window);
@@ -392,8 +415,14 @@ pub fn show_qr(window: Window, ttl_secs: Option<u64>) {
                                 let rows: Vec<Vec<bool>> = (0..width)
                                     .map(|y| (0..width).map(|x| colors[y * width + x] == qrcode::Color::Dark).collect())
                                     .collect();
-                                let remark = reachable.is_none().then(|| crate::i18n::tr("settings-web-qr-loopback"));
-                                with_state(|s| s.qr = Some(rows));
+                                let remark = reachable
+                                    .is_none()
+                                    .then(|| crate::i18n::tr("settings-web-qr-loopback"));
+                                with_state(|s| {
+                                    s.qr = Some(rows);
+                                    let page = url.split('#').next().unwrap_or(url);
+                                    s.qr_url = Some(page.to_string());
+                                });
                                 finish(&window, remark, Gate::Action);
                                 refresh(window);
                             }
@@ -415,7 +444,10 @@ pub fn show_qr(window: Window, ttl_secs: Option<u64>) {
 }
 
 pub fn hide_qr() {
-    with_state(|s| s.qr = None);
+    with_state(|s| {
+        s.qr = None;
+        s.qr_url = None;
+    });
 }
 
 /// Mint a link and put it on the clipboard.
@@ -515,4 +547,45 @@ fn clear_copied_soon(window: Window) {
         window.invalidate();
     })
     .detach();
+}
+
+#[cfg(test)]
+mod certificate_display_tests {
+    use super::*;
+
+    #[test]
+    fn visible_qr_uses_current_identity_and_falls_back_without_a_match() {
+        let certificate = |url: &str, sha256: &str| codec::WebCertificate {
+            urls: vec![url.into()],
+            sha256: sha256.into(),
+        };
+        let mut state = WebState {
+            qr: Some(vec![vec![true]]),
+            qr_url: Some("https://example.test/".into()),
+            status: Some(WebServerStatus {
+                listening: vec![],
+                urls: vec![],
+                configured: vec![],
+                certificates: vec![
+                    certificate("https://other.test/", "other"),
+                    certificate("https://example.test/", "old"),
+                ],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(state.displayed_certificates().len(), 1);
+        assert_eq!(state.displayed_certificates()[0].sha256, "old");
+        state.status.as_mut().unwrap().certificates[1].sha256 = "rotated".into();
+        assert_eq!(state.displayed_certificates()[0].sha256, "rotated");
+        assert!(
+            state.qr.is_some(),
+            "a status refresh must not hide or recreate the QR"
+        );
+        state.status.as_mut().unwrap().certificates.pop();
+        assert_eq!(state.displayed_certificates()[0].sha256, "other");
+        state.qr_url = None;
+        assert_eq!(state.displayed_certificates().len(), 1);
+        state.status = None;
+        assert!(state.displayed_certificates().is_empty());
+    }
 }

@@ -847,3 +847,5 @@ web-scheme-preview = プレビュー
 web-settings-hover-reveal-description = サイドバーを閉じているとき、左端にポインターを置くと表示され、離れると戻ります。
 web-settings-agents-panel-description = エージェントが動いているペインを一覧する右側のパネル。
 web-settings-sidebar-reset-description = サイドバーを既定の幅に戻します。
+
+settings-web-verify-certificate = 信頼する前に、この SHA-256 指紋をブラウザーの証明書と照合してください。
