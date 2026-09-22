@@ -1553,16 +1553,45 @@ fn draw_text(frame: &mut Frame<'_>, area: Rect, text: &str, style: Style) {
 }
 
 fn fit_text(text: &str, width: usize) -> String {
-    let mut result = String::new();
-    for ch in text.chars() {
-        let mut candidate = result.clone();
-        candidate.push(ch);
-        if unicode_column_width(&candidate, None) > width {
+    use finl_unicode::grapheme_clusters::Graphemes;
+    use termwiz::cell::grapheme_column_width;
+    // Bound even a single enormous combining cluster before segmentation.
+    const MAX_BYTES: usize = 16 * 1024;
+    let mut limit = text.len().min(MAX_BYTES);
+    while !text.is_char_boundary(limit) {
+        limit -= 1;
+    }
+    let truncated = limit < text.len();
+    let mut end = 0;
+    let mut columns = 0usize;
+    for grapheme in Graphemes::new(&text[..limit]) {
+        let next = end + grapheme.len();
+        // The final cluster may have been cut by the byte budget.
+        if truncated && next == limit {
             break;
         }
-        result.push(ch);
+        let next_columns = columns.saturating_add(grapheme_column_width(grapheme, None));
+        if next_columns > width {
+            break;
+        }
+        columns = next_columns;
+        end = next;
     }
-    result
+    text[..end].to_string()
+}
+
+#[cfg(test)]
+mod text_budget_tests {
+    use super::fit_text;
+    #[test]
+    fn fitting_keeps_graphemes_and_bounds_zero_width_titles() {
+        assert_eq!(fit_text("abc", 2), "ab");
+        assert_eq!(fit_text("中文x", 3), "中");
+        assert_eq!(fit_text("e\u{301}x", 1), "e\u{301}");
+        assert_eq!(fit_text("👩‍💻x", 2), "👩‍💻");
+        assert!(fit_text(&"\u{200b}".repeat(100_000), 16).len() <= 16 * 1024);
+        assert!(fit_text(&format!("e{}", "\u{301}".repeat(100_000)), 16).is_empty());
+    }
 }
 
 fn chrome() -> Style {

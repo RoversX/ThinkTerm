@@ -4,6 +4,7 @@ use codec::{
 };
 use mux::tab::TabId;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 /// A thread is only unique inside one running server.  Keep both the configured
 /// transport name and the server runtime id in every UI key so that a restart
@@ -33,7 +34,7 @@ pub enum TreeNodeKey {
 pub struct ThreadRow {
     pub key: ThreadKey,
     pub space: ThinkTermSessionSpace,
-    pub project: ThinkTermSessionProject,
+    pub project: Arc<ThinkTermSessionProject>,
     pub thread: ThinkTermSessionThread,
 }
 
@@ -161,6 +162,8 @@ impl AppModel {
                 let Some(space) = spaces.get(project.space_id.as_str()) else {
                     continue;
                 };
+                // One shared project per rebuild, not one full thread list per row.
+                let project = Arc::new(project.clone());
                 for thread in &project.threads {
                     self.rows.push(ThreadRow {
                         key: ThreadKey {
@@ -169,7 +172,7 @@ impl AppModel {
                             thread_id: thread.id.clone(),
                         },
                         space: (*space).clone(),
-                        project: project.clone(),
+                        project: Arc::clone(&project),
                         thread: thread.clone(),
                     });
                 }
@@ -461,5 +464,46 @@ mod tests {
         model.apply_snapshot("a", snapshot);
         assert_eq!(model.selected_tab().map(|tab| tab.tab_id), Some(7));
         assert_eq!(model.selected_tab().map(|tab| tab.tab_id), Some(7));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn rows_share_projects_and_replace_them_on_new_snapshots() {
+        let mut model = AppModel::default();
+        let mut state = ThinkTermSessionState {
+            server_id: "server".into(),
+            generation: 1,
+            spaces: vec![ThinkTermSessionSpace {
+                id: "space".into(),
+                ..Default::default()
+            }],
+            projects: vec![ThinkTermSessionProject {
+                id: "project".into(),
+                space_id: "space".into(),
+                threads: (0..40)
+                    .map(|i| ThinkTermSessionThread {
+                        id: format!("thread-{i}"),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(model.apply_snapshot("remote", state.clone()));
+        assert_eq!(model.rows().len(), 40);
+        let old = model.rows()[0].project.clone();
+        assert!(model
+            .rows()
+            .iter()
+            .all(|row| Arc::ptr_eq(&old, &row.project)));
+        state.generation += 1;
+        state.projects[0].path = "/new".into();
+        assert!(model.apply_snapshot("remote", state));
+        assert_eq!(model.rows()[0].project.path, "/new");
+        assert!(!Arc::ptr_eq(&old, &model.rows()[0].project));
     }
 }

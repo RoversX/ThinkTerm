@@ -11,6 +11,7 @@ base64.workspace = true
 codec.workspace = true
 config.workspace = true
 filedescriptor.workspace = true
+finl_unicode.workspace = true
 log.workspace = true
 mux.workspace = true
 promise.workspace = true
