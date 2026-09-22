@@ -193,12 +193,13 @@ jobs:
         run: bash ci/check-submodules.sh
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, pinned
         with:
+          toolchain: stable
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: web
           cache-on-failure: true
@@ -286,15 +287,16 @@ jobs:
         run: echo "$RELEASE_TAG" > .tag
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, pinned
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       # Caches are ref-scoped and a tag run can only read its own ref plus the
       # default branch, so writing from tags would produce entries nothing ever
       # restores. Save from main, restore everywhere.
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: macos-${{ matrix.arch }}-dist
           cache-on-failure: true
@@ -384,12 +386,13 @@ jobs:
         run: echo "$RELEASE_TAG" > .tag
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, pinned
         with:
+          toolchain: stable
           targets: x86_64-pc-windows-msvc
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: windows-x86_64-${{ env.CARGO_PROFILE }}
           cache-on-failure: true
@@ -512,14 +515,16 @@ jobs:
         run: echo "$RELEASE_TAG" > .tag
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, pinned
+        with:
+          toolchain: stable
 
       # rust-cache keys on the job id, which is just "linux" for all six legs.
       # Without an explicit key a fedora job would happily restore a target dir
       # built inside ubuntu, and whichever leg finishes first wins the write
       # while the others burn minutes compressing an entry they cannot save.
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.name }}-${{ matrix.arch }}-${{ env.CARGO_PROFILE }}
           cache-on-failure: true
