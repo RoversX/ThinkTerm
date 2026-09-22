@@ -1826,6 +1826,9 @@ impl super::TermWindow {
 
     pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         log::trace!("{:?}", event);
+        if self.recording_overlay_mouse(&event, context) {
+            return;
+        }
         // See `key_event_impl`: nothing on screen during a transition is live,
         // including the card layout a click would be aiming at, which is still
         // moving.
@@ -8141,6 +8144,18 @@ impl super::TermWindow {
                 ContextMenuIcon::Paste,
                 KeyAssignment::PasteFrom(ClipboardPasteSource::Clipboard),
             ),
+            self.context_menu_application_item_with_icon(
+                crate::i18n::tr("menu-edit-recording-overlay"),
+                ContextMenuIcon::Terminal,
+                crate::termwindow::ContextMenuApplicationAction::EditRecordingOverlay,
+                true,
+            ),
+            self.context_menu_application_item_with_icon(
+                crate::i18n::tr("menu-clear-recording-overlay"),
+                ContextMenuIcon::Refresh,
+                crate::termwindow::ContextMenuApplicationAction::ClearRecordingOverlay,
+                !self.recording_overlay.is_empty(),
+            ),
             ContextMenuItem::Separator,
             split_item(
                 crate::i18n::tr("menu-split-right"),
@@ -8692,11 +8707,16 @@ impl super::TermWindow {
         }
 
         if allow_action
-            && matches!(event.kind, WMEK::Release(MousePress::Right))
-            && !pane.is_mouse_grabbed()
+            && matches!(event.kind, WMEK::Press(MousePress::Right) | WMEK::Release(MousePress::Right))
+            && (!pane.is_mouse_grabbed()
+                || event.modifiers.contains(self.config.bypass_mouse_reporting_modifiers))
         {
-            let items = self.terminal_context_menu_items();
-            self.show_term_context_menu(context, event.coords, items);
+            // Own both halves of the click so the terminal application never
+            // receives a press whose release opens our menu instead.
+            if matches!(event.kind, WMEK::Release(MousePress::Right)) {
+                let items = self.terminal_context_menu_items();
+                self.show_term_context_menu(context, event.coords, items);
+            }
             return;
         }
 

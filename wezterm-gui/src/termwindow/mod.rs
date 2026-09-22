@@ -626,6 +626,8 @@ pub(crate) enum NoteEditorCommand {
 #[derive(Clone, Debug)]
 pub(crate) enum ContextMenuApplicationAction {
     Note(NoteEditorCommand),
+    EditRecordingOverlay,
+    ClearRecordingOverlay,
     /// One entry of the Remote Hosts page's card menu, carrying the host it
     /// was raised on. An owned id rather than a list index: the page's
     /// filtered list can change between building the menu and choosing from
@@ -2568,6 +2570,7 @@ pub struct TermWindow {
 
     ui_items: Vec<UIItem>,
     context_menu: Option<ui::context_menu::ContextMenuState>,
+    recording_overlay: ui::recording_overlay::RecordingOverlay,
     command_palette: Option<ui::command_palette::CommandPaletteState>,
     /// The contrast floor text is held to, or `None` to leave the
     /// application's colours alone. Resolved from the settings window's
@@ -3710,6 +3713,7 @@ impl TermWindow {
         }
 
         if self.focused.is_none() {
+            self.recording_overlay.cancel_interaction();
             self.workspace_sidebar_swipe.cancel_immediately();
             self.workspace_sidebar_hover.cancel_immediately();
             self.clear_workspace_space_swipe_frame_transition();
@@ -4164,6 +4168,7 @@ impl TermWindow {
             semantic_zones: HashMap::new(),
             ui_items: vec![],
             context_menu: None,
+            recording_overlay: Default::default(),
             command_palette: None,
             text_min_contrast: crate::native_settings::text_min_contrast_ratio(&config),
             min_contrast_memo: RefCell::new(HashMap::new()),

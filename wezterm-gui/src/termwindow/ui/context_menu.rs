@@ -224,6 +224,15 @@ impl crate::TermWindow {
             return;
         };
         match action {
+            crate::termwindow::ContextMenuApplicationAction::EditRecordingOverlay => {
+                self.start_recording_overlay_edit();
+            }
+            crate::termwindow::ContextMenuApplicationAction::ClearRecordingOverlay => {
+                self.recording_overlay.clear();
+                if let Some(window) = &self.window {
+                    window.invalidate();
+                }
+            }
             crate::termwindow::ContextMenuApplicationAction::Note(command) => {
                 self.perform_right_sidebar_note_command(command);
             }

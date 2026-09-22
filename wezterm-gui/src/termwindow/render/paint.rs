@@ -4373,6 +4373,11 @@ impl crate::TermWindow {
         // Last, so the tag sits above every chrome surface it might overhang.
         self.paint_hover_tooltip().context("paint_hover_tooltip")?;
 
+        // Window-space masks are composited last and never baked into a
+        // terminal/overview capture, so content transitions cannot move them.
+        self.paint_recording_overlay()
+            .context("paint_recording_overlay")?;
+
         Ok(())
     }
 }

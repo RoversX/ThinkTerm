@@ -830,7 +830,7 @@ impl super::TermWindow {
         // behind it. Placed after the modifier/LED bookkeeping so status-line
         // state stays current; not marking the event handled lets the cooked
         // KeyEvent still arrive, where the palette's dispatch consumes it.
-        if self.command_palette.is_some() {
+        if self.command_palette.is_some() || self.recording_overlay.owns_keyboard() {
             return;
         }
         // The Settings-picked palette hotkey must also beat the RAW binding
@@ -1029,6 +1029,9 @@ impl super::TermWindow {
     }
 
     pub fn key_event_impl(&mut self, window_key: KeyEvent, context: &dyn WindowOps) {
+        if self.recording_overlay_key(&window_key, context) {
+            return;
+        }
         // A transition owns the window: what is on screen is a recording, not
         // anything that can answer. Swallowing here rather than routing to the
         // terminal is the difference between a keystroke landing in a pane the

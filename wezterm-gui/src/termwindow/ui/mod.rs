@@ -5,6 +5,7 @@ pub mod folder_problem;
 pub mod icons;
 pub mod platform_chrome;
 pub mod right_sidebar;
+pub mod recording_overlay;
 pub mod sidebar;
 pub mod status_icon;
 pub mod tokens;
