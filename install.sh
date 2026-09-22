@@ -25,7 +25,9 @@
 # GITHUB_TOKEN in the environment is sent with every request. It is what lets
 # the script work against a private repository -- the API and the release
 # assets both refuse anonymous access there -- and lifts the anonymous API
-# rate limit on a public one.
+# rate limit on a public one. This script is something you run yourself; the
+# app's own background update check deliberately does not read GITHUB_TOKEN
+# and takes THINKTERM_UPDATE_TOKEN instead (see PRIVACY.md).
 #
 # Windows has an installer on the releases page; this script stops there.
 #

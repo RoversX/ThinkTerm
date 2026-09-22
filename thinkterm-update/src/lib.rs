@@ -180,9 +180,11 @@ pub fn http_get(uri: &str) -> anyhow::Result<Vec<u8>> {
     request
         .version(HttpVersion::Http10)
         .header("User-Agent", &format!("thinkterm/{}", config::wezterm_version()));
-    // The same convention as install.sh: a token lifts the anonymous API
-    // rate limit and is what makes a private repository reachable at all.
-    let auth = std::env::var("GITHUB_TOKEN")
+    // A token lifts the anonymous API rate limit and is what makes a
+    // private repository reachable at all. It has to be one meant for
+    // this: the GUI runs this check on its own, and a GITHUB_TOKEN the
+    // user exported for other tools must not be sent anywhere by it.
+    let auth = std::env::var("THINKTERM_UPDATE_TOKEN")
         .ok()
         .filter(|t| !t.trim().is_empty())
         .map(|t| format!("Bearer {}", t.trim()));

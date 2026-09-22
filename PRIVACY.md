@@ -42,7 +42,11 @@ notify you if that is the case.
 
 The content of that request is private between your machine and GitHub. The
 contributors to ThinkTerm cannot see inside that request and therefore cannot
-infer any information from it.
+infer any information from it. The request is anonymous: it carries no
+credentials unless you set `THINKTERM_UPDATE_TOKEN` yourself, which is only
+useful for reaching a private fork. (The `install.sh` script, which you run
+by hand, honours `GITHUB_TOKEN` for the same purpose; the app never reads
+that variable.)
 
 If you wish, you can disable update checking by setting
 `check_for_updates = false`.

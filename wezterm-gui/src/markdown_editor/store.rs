@@ -342,7 +342,12 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(unix)]
 fn set_user_document_permissions(path: &Path, permissions: Option<fs::Permissions>) {
     use std::os::unix::fs::PermissionsExt;
-    let permissions = permissions.unwrap_or_else(|| fs::Permissions::from_mode(0o644));
+    // A Note without a mode to inherit is the user's own document: 0600,
+    // the same as the temporary it was written through, and never wider
+    // than the umask this process runs under. Vault folders are the
+    // user's and are not tightened, so 0644 here read to every other
+    // account on a shared machine.
+    let permissions = permissions.unwrap_or_else(|| fs::Permissions::from_mode(0o600));
     if let Err(err) = fs::set_permissions(path, permissions) {
         log::warn!(
             "failed to preserve Note permissions on {}: {err:#}",
@@ -357,6 +362,19 @@ fn set_user_document_permissions(_path: &Path, _permissions: Option<fs::Permissi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn new_notes_are_private_and_existing_permissions_are_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        write_bytes_atomic(&path, b"private note").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        write_bytes_atomic(&path, b"updated note").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o640);
+    }
 
     #[test]
     fn creates_and_reuses_a_vault_document_session() {

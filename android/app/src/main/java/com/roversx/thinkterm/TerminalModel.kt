@@ -489,8 +489,15 @@ class TerminalModel(
 
     // MARK: the log
 
+    // Pane titles, remote stderr and user@host pass through here; logcat
+    // is readable by other apps with the right permission and by anyone
+    // with adb, so only a debuggable build writes it there. The in-app
+    // log view keeps the lines either way.
+    private val debuggable =
+        (context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+
     fun log(line: String) {
-        Log.i("thinkterm", line)
+        if (debuggable) Log.i("thinkterm", line)
         logLines.addLast(line)
         while (logLines.size > 60) logLines.removeFirst()
         logText = logLines.joinToString("\n")
