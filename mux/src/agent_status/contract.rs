@@ -46,6 +46,9 @@ pub struct AgentContract {
 }
 
 pub fn parse(value: &str) -> Option<AgentContract> {
+    if !wezterm_term::agent_contract::agent_contract_within_budget(value) {
+        return None;
+    }
     let mut fields = value.split(';');
     let version = fields.next()?.trim();
     // "v1" or a future minor like "v1.1" stays parseable; any other major
@@ -117,6 +120,16 @@ pub fn state_is_fresh(contract: &AgentContract, now_unix: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_identity_or_session_is_rejected() {
+        assert!(parse(&format!("v1;agent={};state=idle", "a".repeat(129))).is_none());
+        assert!(parse(&format!(
+            "v1;agent=claude;state=idle;session={}",
+            "s".repeat(513)
+        ))
+        .is_none());
+    }
 
     #[test]
     fn full_value_parses() {

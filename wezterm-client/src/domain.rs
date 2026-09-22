@@ -1120,7 +1120,7 @@ impl ClientInner {
         status: Option<thinkterm_proto::AgentStatus>,
     ) {
         let mut map = self.remote_agent_statuses.lock().unwrap();
-        match status {
+        match status.filter(|s| s.within_budget()) {
             Some(status) => {
                 map.insert(remote_pane_id, status);
             }

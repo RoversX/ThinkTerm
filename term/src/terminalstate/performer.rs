@@ -862,7 +862,8 @@ impl<'a> Performer<'a> {
                     self.writer.flush().ok();
                 }
                 ITermProprietary::File(image) => self.set_image(*image),
-                ITermProprietary::SetUserVar { name, value } => {
+                ITermProprietary::SetUserVar { name, mut value } => {
+                    crate::agent_contract::sanitize_agent_user_var(&name, &mut value);
                     self.user_vars.insert(name.clone(), value.clone());
                     if let Some(handler) = self.alert_handler.as_mut() {
                         handler.alert(Alert::SetUserVar { name, value });

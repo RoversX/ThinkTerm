@@ -85,7 +85,7 @@ impl ClientPane {
     /// cold-start fetch on attach/resync). Quiet: the caller decides
     /// whether a repaint is warranted.
     pub fn set_agent_status(&self, status: Option<thinkterm_proto::AgentStatus>) {
-        *self.agent_status.lock() = status;
+        *self.agent_status.lock() = status.filter(|s| s.within_budget());
     }
 
     /// Ask the (single) sender worker to bring the server to `palette`.
@@ -326,7 +326,10 @@ impl ClientPane {
                         .alert(self.local_pane_id, Alert::PaletteChanged);
                 }
             }
-            Pdu::NotifyAlert(NotifyAlert { alert, .. }) => {
+            Pdu::NotifyAlert(NotifyAlert { mut alert, .. }) => {
+                if let Alert::SetUserVar { name, value } = &mut alert {
+                    wezterm_term::agent_contract::sanitize_agent_user_var(name, value);
+                }
                 match &alert {
                     Alert::SetUserVar { name, value } => {
                         self.user_vars.lock().insert(name.clone(), value.clone());
@@ -348,6 +351,7 @@ impl ClientPane {
                 self.host.events().alert(self.local_pane_id, alert);
             }
             Pdu::AgentStatusChanged(codec::AgentStatusChanged { status, .. }) => {
+                let status = status.filter(|s| s.within_budget());
                 // Read-at-send-time coalescing means a backlog of queued
                 // notifications all carry the same current value; only a
                 // real change is worth a re-notify (each one repaints and

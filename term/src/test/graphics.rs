@@ -1067,7 +1067,7 @@ fn appended_animation_frames_stay_within_the_image_budget() {
 }
 
 /// Standard base64 for test payloads; the crate has no encoder of its own.
-fn base64_of(bytes: &[u8]) -> String {
+pub(super) fn base64_of(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in bytes.chunks(3) {

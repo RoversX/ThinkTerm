@@ -1569,3 +1569,29 @@ fn the_writer_handle_keeps_the_terminals_order() {
     }
     assert_eq!(sink.0.lock().unwrap().clone(), expected);
 }
+
+#[test]
+fn oversized_agent_updates_clear_retained_identity_but_normal_updates_survive() {
+    let mut term = TestTerm::new(3, 20, 10);
+    let normal = "v1;agent=soul;state=working;session=test";
+    for value in [
+        normal.to_string(),
+        format!("v1;agent={}", "x".repeat(129)),
+        normal.into(),
+        format!("v1;session={}", "x".repeat(513)),
+    ] {
+        let encoded = graphics::base64_of(value.as_bytes());
+        term.print(format!(
+            "\x1b]1337;SetUserVar=THINKTERM_AGENT={encoded}\x07"
+        ));
+        let expected = if crate::agent_contract::agent_contract_within_budget(&value) {
+            value.as_str()
+        } else {
+            ""
+        };
+        assert_eq!(
+            term.user_vars().get("THINKTERM_AGENT").map(String::as_str),
+            Some(expected)
+        );
+    }
+}

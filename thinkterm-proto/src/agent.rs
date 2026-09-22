@@ -47,3 +47,14 @@ pub struct AgentStatus {
     /// should not rely on ever observing it.
     pub ended: bool,
 }
+
+impl AgentStatus {
+    /// Metadata budgets do not change identity bytes or the wire layout.
+    pub fn within_budget(&self) -> bool {
+        self.agent_id.len() <= wezterm_term::agent_contract::MAX_AGENT_ID_BYTES
+            && self
+                .session_id
+                .as_ref()
+                .is_none_or(|id| id.len() <= wezterm_term::agent_contract::MAX_AGENT_SESSION_BYTES)
+    }
+}

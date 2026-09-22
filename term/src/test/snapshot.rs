@@ -379,3 +379,40 @@ fn a_snapshot_needs_a_terminal_of_its_size() {
     let err = small.restore(snapshot).expect_err("refused");
     assert!(format!("{err:#}").contains("80x24"), "{err:#}");
 }
+
+#[test]
+fn restore_applies_agent_budgets_without_changing_other_user_variables() {
+    for contract in [
+        format!("v1;agent={}", "x".repeat(129)),
+        format!("v1;session={}", "s".repeat(513)),
+        "x".repeat(1024 * 1024),
+    ] {
+        let mut snapshot = terminal(10).snapshot();
+        snapshot
+            .identity
+            .user_vars
+            .insert("THINKTERM_AGENT".into(), contract);
+        snapshot
+            .identity
+            .user_vars
+            .insert("ordinary".into(), "kept".into());
+        let restored = restored(snapshot, 10);
+        let cleared = restored.user_vars().get("THINKTERM_AGENT").unwrap();
+        assert!(cleared.is_empty());
+        assert_eq!(cleared.capacity(), 0);
+        assert_eq!(restored.user_vars().get("ordinary").unwrap(), "kept");
+    }
+    let mut snapshot = terminal(10).snapshot();
+    let normal = "v1;agent=claude;state=idle;session=abc";
+    snapshot
+        .identity
+        .user_vars
+        .insert("THINKTERM_AGENT".into(), normal.into());
+    assert_eq!(
+        restored(snapshot, 10)
+            .user_vars()
+            .get("THINKTERM_AGENT")
+            .unwrap(),
+        normal
+    );
+}

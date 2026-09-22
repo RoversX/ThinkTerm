@@ -474,7 +474,7 @@ macro_rules! pdu {
                             metrics::histogram!("pdu.size.rate", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
                             Ok(DecodedPdu {
                                 serial: decoded.serial,
-                                pdu: Pdu::$name(deserialize(decoded.data.as_slice(), decoded.is_compressed)?)
+                                pdu: Pdu::$name(deserialize(decoded.data.as_slice(), decoded.is_compressed)?).sanitize_agent_status()
                             })
                         }
                     ,)*
@@ -507,7 +507,7 @@ macro_rules! pdu {
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
                             #[cfg(not(target_family = "wasm"))]
                             let deserialize_started = std::time::Instant::now();
-                            let pdu = Pdu::$name(deserialize(decoded.data.as_slice(), decoded.is_compressed)?);
+                            let pdu = Pdu::$name(deserialize(decoded.data.as_slice(), decoded.is_compressed)?).sanitize_agent_status();
                             #[cfg(not(target_family = "wasm"))]
                             if decoded.data.len() > 64 * 1024 {
                                 log::debug!(
@@ -1250,6 +1250,32 @@ pub enum ThinkTermSessionWorkStatus {
     Running,
     NeedsAttention,
     FinishedUnseen,
+}
+
+impl Pdu {
+    /// Discard invalid metadata after consuming its complete frame, so a
+    /// malformed identity cannot terminate unrelated terminal traffic. Actual
+    /// framing/deserialization errors and the decoder allocation limit remain fatal.
+    fn sanitize_agent_status(mut self) -> Self {
+        match &mut self {
+            Self::AgentStatusChanged(update) => {
+                if update
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| !status.within_budget())
+                {
+                    update.status = None;
+                }
+            }
+            Self::GetAgentStatusesResponse(response) => {
+                response
+                    .statuses
+                    .retain(|entry| entry.status.within_budget());
+            }
+            _ => {}
+        }
+        self
+    }
 }
 
 /// Ask a mux server for its authoritative ThinkTerm session view.
@@ -2949,5 +2975,85 @@ mod image_payload_tests {
             assert_eq!(back.serial, 9);
             assert_eq!(back.pdu, pdu);
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_budget_tests {
+    use super::*;
+    use thinkterm_proto::{AgentEvidence, AgentState, AgentStatus};
+
+    fn status(agent_id: String, session_id: Option<String>) -> AgentStatus {
+        AgentStatus {
+            agent_id,
+            session_id,
+            state: AgentState::Idle,
+            evidence: AgentEvidence::Contract,
+            since_unix: 42,
+            ended: false,
+        }
+    }
+    fn assert_stream_survives(message: Pdu, expected: Pdu) {
+        let mut bytes = Vec::new();
+        message.encode(&mut bytes, 1).unwrap();
+        Pdu::Ping(Ping {}).encode(&mut bytes, 2).unwrap();
+        let mut sync = std::io::Cursor::new(&bytes);
+        assert_eq!(Pdu::decode(&mut sync).unwrap().pdu, expected);
+        assert_eq!(Pdu::decode(&mut sync).unwrap().pdu, Pdu::Ping(Ping {}));
+        futures_lite::future::block_on(async {
+            let mut reader = futures_lite::io::Cursor::new(bytes);
+            assert_eq!(
+                Pdu::decode_async(&mut reader, None).await.unwrap().pdu,
+                expected
+            );
+            assert_eq!(
+                Pdu::decode_async(&mut reader, None).await.unwrap().pdu,
+                Pdu::Ping(Ping {})
+            );
+        });
+    }
+    #[test]
+    fn oversized_pushes_clear_status_without_closing_or_corrupting_the_stream() {
+        for (agent, session, accepted) in [
+            ("x".repeat(128), Some("s".repeat(512)), true),
+            ("x".repeat(129), Some("s".into()), false),
+            ("ok".into(), Some("s".repeat(513)), false),
+            ("界".repeat(43), None, false),
+            ("界".repeat(42), None, true),
+            ("ok".into(), Some("界".repeat(171)), false),
+        ] {
+            let value = status(agent, session);
+            let expected = Pdu::AgentStatusChanged(AgentStatusChanged {
+                pane_id: 1,
+                status: accepted.then(|| value.clone()),
+            });
+            assert_stream_survives(
+                Pdu::AgentStatusChanged(AgentStatusChanged {
+                    pane_id: 1,
+                    status: Some(value),
+                }),
+                expected,
+            );
+        }
+    }
+    #[test]
+    fn mixed_status_snapshots_keep_valid_siblings_unchanged() {
+        let valid = AgentStatusEntry {
+            pane_id: 1,
+            status: status("claude".into(), Some("session".into())),
+            title: "title".into(),
+            workspace: "workspace".into(),
+        };
+        let mut invalid = valid.clone();
+        invalid.pane_id = 2;
+        invalid.status.agent_id = "x".repeat(129);
+        assert_stream_survives(
+            Pdu::GetAgentStatusesResponse(GetAgentStatusesResponse {
+                statuses: vec![invalid.clone(), valid.clone(), invalid],
+            }),
+            Pdu::GetAgentStatusesResponse(GetAgentStatusesResponse {
+                statuses: vec![valid],
+            }),
+        );
     }
 }

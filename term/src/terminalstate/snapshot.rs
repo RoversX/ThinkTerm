@@ -492,7 +492,12 @@ impl TerminalState {
             Some(url) => Some(Url::parse(&url)?),
             None => None,
         };
-        self.user_vars = identity.user_vars.into_iter().collect();
+        self.user_vars = identity.user_vars.into_iter()
+            .map(|(name, mut value)| {
+                crate::agent_contract::sanitize_agent_user_var(&name, &mut value);
+                (name, value)
+            })
+            .collect();
         self.progress = identity.progress;
         self.agent_osc_title = identity.agent_osc_title;
         self.agent_osc_progress = identity.agent_osc_progress;

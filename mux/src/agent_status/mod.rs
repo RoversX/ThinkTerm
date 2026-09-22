@@ -440,7 +440,10 @@ fn evaluate_pane(pane: &dyn Pane) -> bool {
     let pane_id = pane.pane_id();
 
     let user_vars = pane.copy_user_vars();
-    let contract_raw = user_vars.get(contract::USER_VAR_NAME).cloned();
+    let contract_raw = user_vars
+        .get(contract::USER_VAR_NAME)
+        .filter(|value| wezterm_term::agent_contract::agent_contract_within_budget(value))
+        .cloned();
     let parsed_contract = contract_raw.as_deref().and_then(contract::parse);
 
     let now_unix = SystemTime::now()
@@ -727,7 +730,9 @@ fn evaluate_pane(pane: &dyn Pane) -> bool {
             // was premature or belongs to a finished sub-session.
             record.ended = c.ended && !process_backed;
         }
-        _ => {}
+        _ => {
+            record.session_id = None;
+        }
     }
     // Guarded transitions keep publishing the held state until the raw
     // observation proves stable; the first classification is never held.
@@ -1106,6 +1111,31 @@ mod tests {
         assert_eq!(status.state, AgentState::Working);
         assert_eq!(status.evidence, AgentEvidence::Contract);
         assert_eq!(status.session_id.as_deref(), Some("s-1"));
+        evict_pane(pane.pane_id());
+    }
+
+    #[test]
+    fn an_oversized_contract_clears_a_previously_retained_session() {
+        let pane = FakeAgentPane::new(Some("/usr/local/bin/claude"));
+        pane.set_contract(&format!(
+            "v1;agent=claude;state=working;session=before;ts={}",
+            now_unix()
+        ));
+        evaluate_pane(pane.as_ref() as &dyn Pane);
+        assert_eq!(
+            status_for_pane(pane.pane_id())
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("before")
+        );
+        pane.set_contract(&format!(
+            "v1;agent=claude;state=working;session={};ts={}",
+            "x".repeat(513),
+            now_unix()
+        ));
+        evaluate_pane(pane.as_ref() as &dyn Pane);
+        assert_eq!(status_for_pane(pane.pane_id()).unwrap().session_id, None);
         evict_pane(pane.pane_id());
     }
 
