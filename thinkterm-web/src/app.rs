@@ -1214,7 +1214,13 @@ impl<P: Platform, L: Link> App<P, L> {
                 self.request_frame();
             }
             Pdu::SetClipboard(clip) => {
-                if let Some(text) = clip.clipboard {
+                // Every pane on the server pushes to every client. Only a
+                // pane this page shows may write the device's clipboard,
+                // the same gate the render deltas above pass through: a
+                // pane nobody is looking at is a program nobody chose.
+                let shown = inner.panes.contains_key(&clip.pane_id)
+                    || inner.parked.contains_key(&clip.pane_id);
+                if let (true, Some(text)) = (shown, clip.clipboard) {
                     inner.platform.clipboard_write(&text);
                 }
             }

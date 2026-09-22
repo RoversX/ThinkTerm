@@ -6182,26 +6182,28 @@ impl WorkspaceThreadStore {
     fn ensure_unique_thread_names(&mut self) -> bool {
         let mut changed = false;
         for project in &mut self.projects {
-            let mut used = Vec::<String>::new();
+            // A set, not a scan: the thread count comes off the wire with
+            // no cap, and this runs on every load and on sidebar clicks.
+            let mut used = std::collections::HashSet::<String>::new();
             let mut next_index = project.threads.len().saturating_add(1).max(1);
 
             for session in &mut project.threads {
                 let trimmed = session.name.trim();
-                if !trimmed.is_empty() && !used.iter().any(|name| name == trimmed) {
+                if !trimmed.is_empty() && !used.contains(trimmed) {
                     if session.name != trimmed {
                         session.name = trimmed.to_string();
                         changed = true;
                     }
-                    used.push(session.name.clone());
+                    used.insert(session.name.clone());
                     continue;
                 }
 
                 loop {
                     let candidate = format!("Thread {next_index}");
                     next_index += 1;
-                    if !used.iter().any(|name| name == &candidate) {
+                    if !used.contains(&candidate) {
                         session.name = candidate.clone();
-                        used.push(candidate);
+                        used.insert(candidate);
                         changed = true;
                         break;
                     }
@@ -6951,12 +6953,59 @@ impl WorkspaceThreadStore {
     /// a cache: it lets the sidebar draw something before the attach finishes,
     /// and this function overwrites it wholesale when the truth arrives.
     fn ingest_remote_tree(&mut self, domain_name: &str, tree: &codec::ThinkTermTree) -> bool {
+        // The tree is the server's word and nothing more. A Space whose id
+        // is already one of ours from elsewhere (the local default Space,
+        // another domain's) would have every local project under that id
+        // treated as this domain's and replaced, layouts included; and a
+        // project naming a Space the tree does not carry would be re-homed
+        // into the local default Space by normalize_after_load and read as
+        // local from then on. Neither row is taken.
+        let foreign_space_ids: std::collections::HashSet<&str> = self
+            .spaces
+            .iter()
+            .filter(|space| space.client_domain.as_deref() != Some(domain_name))
+            .map(|space| space.id.as_str())
+            .collect();
+        let tree_spaces: Vec<&codec::TtSpace> = tree
+            .spaces
+            .iter()
+            .filter(|space| {
+                let ok = !space.id.is_empty() && !foreign_space_ids.contains(space.id.as_str());
+                if !ok {
+                    log::warn!(
+                        "ignoring Space {:?} from {domain_name}: the id is empty or belongs \
+                         to a Space that is not this server's",
+                        space.id
+                    );
+                }
+                ok
+            })
+            .collect();
+        let tree_space_ids: std::collections::HashSet<&str> =
+            tree_spaces.iter().map(|space| space.id.as_str()).collect();
+        let tree_projects: Vec<&codec::TtProject> = tree
+            .projects
+            .iter()
+            .filter(|project| {
+                let ok = tree_space_ids.contains(project.space_id.as_str());
+                if !ok {
+                    log::warn!(
+                        "ignoring project {:?} from {domain_name}: its Space {:?} is not in \
+                         the tree",
+                        project.id,
+                        project.space_id
+                    );
+                }
+                ok
+            })
+            .collect();
+
         let owned_space_ids: std::collections::HashSet<SpaceId> = self
             .spaces
             .iter()
             .filter(|space| space.client_domain.as_deref() == Some(domain_name))
             .map(|space| space.id.clone())
-            .chain(tree.spaces.iter().map(|space| space.id.clone()))
+            .chain(tree_spaces.iter().map(|space| space.id.clone()))
             .collect();
 
         let mut space_state: HashMap<SpaceId, (Option<ProjectId>, Option<SpaceVaultBinding>)> =
@@ -7013,8 +7062,7 @@ impl WorkspaceThreadStore {
             }
         }
 
-        let new_spaces: Vec<Space> = tree
-            .spaces
+        let new_spaces: Vec<Space> = tree_spaces
             .iter()
             .map(|space| {
                 let (active_project_id, note_vault) =
@@ -7035,8 +7083,7 @@ impl WorkspaceThreadStore {
             })
             .collect();
 
-        let new_projects: Vec<Project> = tree
-            .projects
+        let new_projects: Vec<Project> = tree_projects
             .iter()
             .map(|project| {
                 let view = project_state.get(&project.id);
@@ -14504,5 +14551,86 @@ mod tests {
             HashMap::from([(1, 2.0)])
         ));
         assert_eq!(store.remote_thread_font_scales("thinkterm:rp1:nobody"), None);
+    }
+
+    /// A server cannot name a Space after one that is not its own, nor
+    /// hand over a project whose Space it does not carry: the first would
+    /// replace the local rows under that id, the second would be re-homed
+    /// into the local default Space and read as local from then on.
+    #[test]
+    fn ingesting_drops_spaces_that_collide_and_projects_without_a_space() {
+        let mut store = remote_test_store("syd");
+        let local_before = store.projects.clone();
+        let default_space = store.spaces[0].id.clone();
+
+        let mut tree = sample_tree();
+        tree.spaces.push(codec::TtSpace {
+            id: String::new(),
+            name: "empty-id".to_string(),
+        });
+        tree.projects.push(codec::TtProject {
+            id: "empty-space-project".to_string(),
+            space_id: String::new(),
+            name: "empty-space".to_string(),
+            path: "/home/x/.ssh".to_string(),
+            threads: vec![],
+            archived_at: None,
+        });
+        tree.spaces.push(codec::TtSpace {
+            id: default_space.clone(),
+            name: "impostor".to_string(),
+        });
+        tree.projects.push(codec::TtProject {
+            id: "planted-in-default".to_string(),
+            space_id: default_space.clone(),
+            name: "planted".to_string(),
+            path: "/home/x/.ssh".to_string(),
+            threads: vec![tree_thread("pt1", "planted-in-default", "main")],
+            archived_at: None,
+        });
+        tree.projects.push(codec::TtProject {
+            id: "orphan".to_string(),
+            space_id: "space-nowhere".to_string(),
+            name: "orphan".to_string(),
+            path: "/home/x/.ssh".to_string(),
+            threads: vec![tree_thread("ot1", "orphan", "main")],
+            archived_at: None,
+        });
+
+        assert!(store.ingest_remote_tree("syd", &tree));
+
+        // The local rows are exactly as they were.
+        let local_after: Vec<&Project> = store
+            .projects
+            .iter()
+            .filter(|project| project.space_id == default_space)
+            .collect();
+        assert_eq!(local_after.len(), local_before.len());
+        assert!(local_after
+            .iter()
+            .zip(local_before.iter())
+            .all(|(after, before)| *after == before));
+        assert!(!store.projects.iter().any(|project| project.id == "planted-in-default"));
+        assert!(!store.projects.iter().any(|project| project.id == "orphan"));
+        // Only the server's own Space came in, and the local default Space
+        // is still the local one.
+        let default_spaces: Vec<&Space> = store
+            .spaces
+            .iter()
+            .filter(|space| space.id == default_space)
+            .collect();
+        assert_eq!(default_spaces.len(), 1);
+        assert_eq!(default_spaces[0].client_domain, None);
+        assert!(store.projects.iter().any(|project| project.id == "rp1"));
+        // And normalize re-homes nothing into the default Space.
+        store.normalize_after_load();
+        let ids: Vec<&str> = store
+            .projects
+            .iter()
+            .filter(|project| project.space_id == default_space)
+            .map(|project| project.id.as_str())
+            .collect();
+        let before_ids: Vec<&str> = local_before.iter().map(|project| project.id.as_str()).collect();
+        assert_eq!(ids, before_ids);
     }
 }
