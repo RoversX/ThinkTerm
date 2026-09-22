@@ -204,17 +204,41 @@ fn build_acceptor(server: &WebServer) -> anyhow::Result<SslAcceptor> {
         );
     };
     let mut acceptor = SslAcceptor::mozilla_modern(SslMethod::tls())?;
+    let leaf_pem = std::fs::read(cert)
+        .with_context(|| format!("read leaf certificate {}", cert.display()))?;
+    let leaf = openssl::x509::X509::from_pem(&leaf_pem)
+        .with_context(|| format!("parse leaf certificate {}", cert.display()))?;
     acceptor
-        .set_certificate_file(cert, SslFiletype::PEM)
-        .with_context(|| format!("set_certificate_file {}", cert.display()))?;
+        .set_certificate(&leaf)
+        .with_context(|| format!("set leaf certificate {}", cert.display()))?;
     acceptor
         .set_private_key_file(key, SslFiletype::PEM)
         .with_context(|| format!("set_private_key_file {}", key.display()))?;
     if let Some(chain) = &server.pem_ca {
-        acceptor
-            .set_certificate_chain_file(chain)
-            .with_context(|| format!("set_certificate_chain_file {}", chain.display()))?;
+        // A chain file may contain just the issuers or start with the leaf.
+        // set_certificate_chain_file would replace the configured leaf.
+        let leaf_der = leaf.to_der()?;
+        let pem = std::fs::read(chain)
+            .with_context(|| format!("read certificate chain {}", chain.display()))?;
+        let certificates = openssl::x509::X509::stack_from_pem(&pem)
+            .with_context(|| format!("parse certificate chain {}", chain.display()))?;
+        if certificates.is_empty() {
+            bail!(
+                "certificate chain {} contains no certificates",
+                chain.display()
+            );
+        }
+        for certificate in certificates {
+            if certificate.to_der()? != leaf_der {
+                acceptor
+                    .add_extra_chain_cert(certificate)
+                    .with_context(|| format!("append certificate chain {}", chain.display()))?;
+            }
+        }
     }
+    acceptor
+        .check_private_key()
+        .context("Web TLS certificate and private key do not match")?;
     // No client certificate: a browser has none. The token is the
     // credential; TLS is here for the secure context and the wire.
     Ok(acceptor.build())
@@ -461,6 +485,126 @@ fn accept_loop(
 #[cfg(test)]
 mod certificate_tests {
     use super::*;
+    #[test]
+    fn ca_only_and_full_chain_preserve_the_leaf_and_reject_wrong_keys() {
+        use openssl::ssl::{SslConnector, SslVerifyMode};
+        use std::io::{Read, Write};
+        struct FixtureDir(PathBuf);
+        impl Drop for FixtureDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = FixtureDir(std::env::temp_dir().join(format!(
+            "thinkterm-web-chain-{}-{nonce}",
+            std::process::id()
+        )));
+        std::fs::create_dir(&dir.0).unwrap();
+        let original = crate::ossl::deadline_tests::test_acceptor();
+        let issuer = crate::ossl::deadline_tests::test_acceptor();
+        let leaf = original.context().certificate().unwrap();
+        let ca = issuer.context().certificate().unwrap();
+        let expected = certificate_fingerprint(&original).unwrap();
+        let cert_path = dir.0.join("leaf.pem");
+        let key_path = dir.0.join("key.pem");
+        let chain_path = dir.0.join("chain.pem");
+        std::fs::write(&cert_path, leaf.to_pem().unwrap()).unwrap();
+        std::fs::write(
+            &key_path,
+            original
+                .context()
+                .private_key()
+                .unwrap()
+                .private_key_to_pem_pkcs8()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut server = WebServer {
+            pem_cert: Some(cert_path),
+            pem_private_key: Some(key_path.clone()),
+            ..Default::default()
+        };
+        for chain in [
+            None,
+            Some(ca.to_pem().unwrap()),
+            Some([leaf.to_pem().unwrap(), ca.to_pem().unwrap()].concat()),
+        ] {
+            server.pem_ca = chain.as_ref().map(|pem| {
+                std::fs::write(&chain_path, pem).unwrap();
+                chain_path.clone()
+            });
+            let acceptor = build_acceptor(&server).unwrap();
+            assert_eq!(certificate_fingerprint(&acceptor).unwrap(), expected);
+            if chain.is_some() {
+                assert_eq!(acceptor.context().extra_chain_certs().len(), 1);
+                assert_eq!(
+                    acceptor.context().extra_chain_certs()[0].to_der().unwrap(),
+                    ca.to_der().unwrap()
+                );
+            }
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = std::thread::spawn(move || {
+                let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+                // These generated self-signed fixtures test the sent identity,
+                // not browser trust policy. Production TLS settings are unchanged.
+                connector.set_verify(SslVerifyMode::NONE);
+                let socket = TcpStream::connect(address).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut tls = connector.build().connect("localhost", socket).unwrap();
+                let certificate = tls.ssl().peer_certificate().unwrap().to_der().unwrap();
+                let chain_len = tls.ssl().peer_cert_chain().unwrap().len();
+                tls.write_all(b"ok").unwrap();
+                (certificate, chain_len)
+            });
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut tls = acceptor.accept(socket).unwrap();
+            tls.read_exact(&mut [0; 2]).unwrap();
+            let (peer, chain_len) = client.join().unwrap();
+            assert_eq!(peer, leaf.to_der().unwrap());
+            assert_eq!(
+                chain_len,
+                1 + usize::from(chain.is_some()),
+                "the leaf must not be duplicated in the sent chain"
+            );
+        }
+        std::fs::write(&chain_path, b"").unwrap();
+        assert!(
+            build_acceptor(&server).is_err(),
+            "an empty chain remains a configuration error"
+        );
+        server.pem_ca = None;
+        std::fs::write(
+            &key_path,
+            issuer
+                .context()
+                .private_key()
+                .unwrap()
+                .private_key_to_pem_pkcs8()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            build_acceptor(&server).is_err(),
+            "a wrong key must be rejected before opening a listener"
+        );
+    }
+
     #[test]
     fn identities_follow_live_listeners_and_ignore_plain_http() {
         let first = crate::ossl::deadline_tests::test_acceptor();
