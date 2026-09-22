@@ -601,6 +601,8 @@ impl Default for NativeWorkspaceSettings {
             remote_drop_destination: String::new(),
             notification_sounds_enabled: true,
             remote_update_keeps_sessions: true,
+            // Preserve the behavior of older settings files without this field.
+            // Fresh installs enable it in ThinkTermNativeSettings::for_new_install.
             local_sessions_via_mux: false,
         }
     }
@@ -729,6 +731,14 @@ impl Default for ThinkTermNativeSettings {
     }
 }
 
+impl ThinkTermNativeSettings {
+    fn for_new_install() -> Self {
+        let mut settings = Self::default();
+        settings.workspaces.local_sessions_via_mux = true;
+        settings
+    }
+}
+
 pub(crate) fn remote_sftp_idle_minutes() -> u32 {
     load().workspaces.remote_sftp_idle_minutes.clamp(1, 120)
 }
@@ -826,7 +836,7 @@ fn load_from_disk() -> ThinkTermNativeSettings {
                 ThinkTermNativeSettings::default()
             }
         },
-        Err(err) if err.kind() == io::ErrorKind::NotFound => ThinkTermNativeSettings::default(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => ThinkTermNativeSettings::for_new_install(),
         Err(err) => {
             log::warn!(
                 "Unable to read ThinkTerm native settings {}: {err:#}",
@@ -1805,6 +1815,29 @@ mod tests {
         mark_onboarding_seen(&mut settings);
 
         assert_eq!(settings.onboarding.seen_version, ONBOARDING_VERSION);
+    }
+
+    #[test]
+    fn local_mux_is_enabled_for_new_installs_and_survives_saving() {
+        let settings = ThinkTermNativeSettings::for_new_install();
+        assert!(settings.workspaces.local_sessions_via_mux);
+
+        let encoded = serde_json::to_string(&settings).unwrap();
+        let decoded: ThinkTermNativeSettings = serde_json::from_str(&encoded).unwrap();
+        assert!(decoded.workspaces.local_sessions_via_mux);
+    }
+
+    #[test]
+    fn local_mux_preserves_existing_settings() {
+        for (json, expected) in [
+            (r#"{"version":1}"#, false),
+            (r#"{"workspaces":{}}"#, false),
+            (r#"{"workspaces":{"local_sessions_via_mux":false}}"#, false),
+            (r#"{"workspaces":{"local_sessions_via_mux":true}}"#, true),
+        ] {
+            let settings: ThinkTermNativeSettings = serde_json::from_str(json).unwrap();
+            assert_eq!(settings.workspaces.local_sessions_via_mux, expected, "{json}");
+        }
     }
 
     #[test]
