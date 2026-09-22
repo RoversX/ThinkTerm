@@ -48,7 +48,7 @@ mod tests {
     fn proxied_identity_matches_its_originating_client() {
         let local = client_id("myhost.local", 7, Some("/local/agent"));
         let proxied = client_id(
-            "myhost.local (via proxy pid 190892)",
+            "myhost.local (via proxy pid 4242)",
             7,
             Some("/remote/agent"),
         );
@@ -60,7 +60,7 @@ mod tests {
     #[test]
     fn proxy_decoration_does_not_merge_distinct_clients() {
         let local = client_id("myhost.local", 7, None);
-        let other = client_id("myhost.local (via proxy pid 190892)", 8, None);
+        let other = client_id("myhost.local (via proxy pid 4242)", 8, None);
 
         assert!(!local.same_logical_client(&other));
     }

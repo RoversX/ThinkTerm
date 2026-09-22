@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 CI = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("privacy_guard", CI / "check-privacy.py")
@@ -20,6 +21,32 @@ def personal_path():
 
 
 class Rules(unittest.TestCase):
+    def test_hostname_literals_and_source_expressions(self):
+        private = b"synthetic-private-machine"
+        for suffix in (b".local", b".LAN", b".home.arpa"):
+            for prefix in (b'"', b"'", b"`", b"user@", b"https://"):
+                self.assertTrue(GUARD.content_issues("test.rs", prefix + private + suffix + b'"'))
+        for data in (b'"myhost.local"', b'"example.lan"', b"entry" + b".local", b'"entry.local_name"'):
+            self.assertFalse(GUARD.content_issues("test.rs", data))
+        label = b'"Dockerfile' + b'.local"'
+        self.assertFalse(GUARD.content_issues("third_party/material-icon-theme/icons.json", label))
+        self.assertTrue(GUARD.content_issues("test.rs", label))
+
+    def test_personal_names_are_literal_bounded_and_independent_of_exemptions(self):
+        name = b"synthetic-private-machine"
+        pattern = GUARD.personal_pattern([name, b"test[42]"])
+        self.assertTrue(GUARD.content_issues("test.rs", name.upper(), pattern))
+        self.assertTrue(GUARD.content_issues("test.rs", b"test[42]", pattern))
+        self.assertFalse(GUARD.content_issues("test.rs", b"test4", pattern))
+        self.assertFalse(GUARD.content_issues("test.rs", b"prefix-" + name, pattern))
+        self.assertTrue(GUARD.content_issues("test.rs", b'"myhost.local"', GUARD.personal_pattern([b"myhost"])))
+
+    def test_ci_does_not_read_machine_names_or_local_list(self):
+        with mock.patch.dict(os.environ, {"CI": "true"}), mock.patch.object(GUARD.socket, "gethostname") as hostname, mock.patch("builtins.open") as opened:
+            self.assertEqual(GUARD.local_names(), ())
+            hostname.assert_not_called()
+            opened.assert_not_called()
+
     def test_native_and_escaped_windows_paths(self):
         for data in (personal_path(), b"C:\\Users\\" + b"synthetic-person\\work", b"C:\\\\Users\\\\" + b"synthetic-person\\\\work"):
             self.assertTrue(GUARD.content_issues("example.rs", data))
@@ -84,6 +111,36 @@ class GitIntegration(unittest.TestCase):
 
     def scan(self, *args):
         return self.run_command([sys.executable, str(CI / "check-privacy.py"), *args])
+
+    def test_local_list_is_used_without_disclosing_or_staging_it(self):
+        self.env.pop("CI", None)
+        local = self.repo / GUARD.LOCAL_LIST
+        local.parent.mkdir()
+        name = b"synthetic-private-machine"
+        local.write_bytes(name + b" # fixture\n")
+        (self.repo / "test.txt").write_bytes(name.upper())
+        self.git("add", "test.txt")
+        result = self.scan()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b"personal-machine", result.stderr)
+        self.assertNotIn(name.lower(), (result.stdout + result.stderr).lower())
+        self.env["CI"] = "true"
+        self.assertEqual(self.scan().returncode, 0)
+        self.git("add", GUARD.LOCAL_LIST)
+        self.assertIn(b"personal-host-list", self.scan().stderr)
+
+    def test_hostname_check_reads_index_and_redacts_matches(self):
+        self.env["CI"] = "true"
+        name = b"synthetic-private-machine" + b".local"
+        path = self.repo / "test.txt"
+        path.write_bytes(b'"' + name + b'"')
+        self.git("add", "test.txt")
+        path.write_text('"myhost.local"')
+        result = self.scan()
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(name, result.stdout + result.stderr)
+        self.git("add", "test.txt")
+        self.assertEqual(self.scan().returncode, 0)
 
     def test_scans_staged_bytes_and_redacts_values(self):
         path = self.repo / "settings.txt"

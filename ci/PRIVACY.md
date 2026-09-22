@@ -29,6 +29,16 @@ for fixtures. Existing public upstream examples and specific packaging template
 files have narrow exceptions in the scanner; do not add blanket exclusions for
 tests or source folders.
 
+Quoted hostnames and hosts in URLs or after `@` ending in `.local`, `.lan`, or
+`.home.arpa` are checked too; use `myhost.local` or `example.local` for fixtures.
+Bare source expressions such as entry.local are not treated as hostnames.
+Outside CI, the guard also reads this computer's names from the OS and an optional
+ignored `ci/privacy-local.txt` (one name per line, `#` starts a comment). Those
+names of at least four characters are checked case-insensitively at word boundaries without printing them.
+Do not commit personal names or their hashes as a denylist. The guard rejects the
+local list itself even if force-added. CI uses the structural rule only; it
+cannot know a developer's private machine names.
+
 The `privacy` Actions workflow checks the committed snapshot on pushes and pull
 requests without running a Rust/mobile build. Once installed on GitHub, its
 `check` job can be required in repository branch rules. CI is **after upload**;

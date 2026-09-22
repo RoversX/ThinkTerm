@@ -110,6 +110,7 @@ __pycache__/
 
 # Local credentials and native release output. The privacy hook also rejects
 # these if they are force-added; ignore rules do not protect tracked files.
+/ci/privacy-local.txt
 .env
 .env.*
 !.env.example
