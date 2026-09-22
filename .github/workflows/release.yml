@@ -247,6 +247,7 @@ jobs:
           name: web-bundle
           path: thinkterm-web/www
           if-no-files-found: error
+          retention-days: 7
 
   macos:
     name: macos ${{ matrix.arch }}
@@ -340,6 +341,7 @@ jobs:
             ThinkTerm-macos-*.zip
             !ThinkTerm-macos-*-dSYM.zip
           if-no-files-found: error
+          retention-days: 7
 
       # The symbols stay a workflow artifact (kept 90 days), not a release
       # asset: nobody but us reads a crash report against them, and on the
@@ -438,6 +440,7 @@ jobs:
             !ThinkTerm-*-pdb.zip
             ThinkTerm-*.exe
           if-no-files-found: error
+          retention-days: 7
 
       - name: Upload symbols
         # The ordinary release profile does not produce a separate PDB bundle.
@@ -577,6 +580,7 @@ jobs:
             ThinkTerm-*.AppImage
             ThinkTerm-*.AppImage.zsync
           if-no-files-found: error
+          retention-days: 7
 
   publish:
     name: publish
