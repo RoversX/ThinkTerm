@@ -15,18 +15,58 @@ remains under its original MIT license, preserved in
 [LICENSE-MIT](LICENSE-MIT); other third-party components are listed in
 [licenses/README.md](licenses/README.md).
 
-By opening a pull request you agree to two things:
+### Contributor agreement (version 1.0)
 
-1. Your contribution is licensed under GPL-3.0-only.
-2. You grant the ThinkTerm project a perpetual, worldwide, non-exclusive,
-   royalty-free and irrevocable right to relicense your contribution under
-   different terms, including a more permissive license such as MIT.
+ThinkTerm may move to the MIT License in the future. To make that possible,
+we ask contributors to explicitly accept the following terms for each pull
+request before it is merged. A contribution means the code, documentation,
+or other material you intentionally submit for inclusion in that pull request,
+including your subsequent updates to it.
 
-The second point is not boilerplate. ThinkTerm expects to move to MIT once the
-project is more established, and without that grant the change would require
-tracking down every past contributor for consent. If you are not comfortable
-granting it, say so in the pull request rather than staying quiet — that is a
-conversation worth having before the code is written, not after.
+1. **You retain your copyright.** This agreement does not transfer ownership
+   of your contribution to ThinkTerm.
+2. **Current license.** You license your contribution under GPL-3.0-only,
+   subject to the third-party exclusions below.
+3. **Permission for a future MIT release.** For the copyright you own or are
+   authorized to license, you additionally grant RoversX and the ThinkTerm
+   project maintainers a perpetual, worldwide, non-exclusive, no-charge,
+   royalty-free, irrevocable copyright license to use, reproduce, modify,
+   prepare derivative works of, publish, distribute, and sublicense your
+   contribution and those derivative works under the MIT License. This permits
+   a future MIT release without asking you for further consent. Applicable
+   copyright and license notices must be preserved. This permission does not
+   require ThinkTerm to change its license or set a date for doing so.
+4. **Authority to contribute.** You confirm that you have the right to make
+   these grants. If your employer or another party owns rights in your work,
+   you must obtain the necessary authorization before agreeing.
+5. **Third-party material.** Identify any material you did not create, its
+   source, and its license in the pull request, and preserve its notices.
+   This agreement does not relicense third-party material or grant rights you
+   do not control. Maintainers must review any such material separately for
+   compatibility with both the current license and a possible MIT release.
+
+This agreement does not revoke GPL rights already granted for released copies.
+It does not automatically cover earlier contributions: any missing permission
+for those must be obtained separately from the relevant copyright holders.
+Changes to this agreement do not expand an earlier grant without new consent.
+
+### Recording your agreement
+
+Check the contributor-agreement box in the pull request template, or post this
+statement from your own account in the pull request:
+
+> I have read and agree to the ThinkTerm Contributor Agreement version 1.0 in
+> CONTRIBUTING.md for my contributions in this pull request, including the
+> permission for a future MIT release. I confirm that I am authorized to make
+> these grants and have identified any third-party material.
+
+If a pull request includes work by multiple contributors, each must provide
+their own confirmation, unless an authorized rights holder explicitly grants
+permission for all of the identified contributions. Maintainers should verify
+and retain the agreement record before merging; an unchecked box or silence
+is not confirmation. This is a manual review requirement, not an automated
+merge check. If you cannot agree, explain that in the pull request so the
+licensing issue can be resolved before merging.
 
 ## Getting set up
 

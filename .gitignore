@@ -86,6 +86,9 @@ __pycache__/
 
 *.md
 
+# Keep the contributor agreement visible in new pull requests.
+!/.github/pull_request_template.md
+
 # Keep ThinkTerm-specific design documentation under version control.
 !/docs/
 /docs/*
