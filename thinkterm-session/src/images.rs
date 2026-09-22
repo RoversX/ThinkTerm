@@ -21,6 +21,14 @@ pub fn frame_count(data: &ImageDataType) -> u32 {
     }
 }
 
+fn image_size(data: &ImageDataType) -> Option<(u32, u32)> {
+    match data {
+        ImageDataType::Rgba8 { width, height, .. }
+        | ImageDataType::AnimRgba8 { width, height, .. } => Some((*width, *height)),
+        _ => None,
+    }
+}
+
 /// Bring `held` up to date from `fetched`, in place. `frames_from` is 0
 /// when `fetched` is the whole image, otherwise the index its frames start
 /// at, in which case its durations and hashes cover every frame and the
@@ -41,6 +49,9 @@ pub fn merge_into(
     // order cannot cross anyone else's.
     let mut mine = held.data();
     let mut theirs = fetched.data();
+    if !mine.is_well_formed() || !theirs.is_well_formed_tail(frames_from) {
+        return false;
+    }
 
     let merged = if frames_from == 0 {
         if frame_count(&theirs) < frame_count(&mine) {
@@ -75,7 +86,10 @@ pub fn merge_into(
             ) => from == 1 && hashes.len() == 1 + tail.len() && hashes[0] == *hash,
             _ => false,
         };
-        if !matches {
+        // The tail's frames are appended to the held ones and drawn at
+        // the held size; a tail of another size would be frames of the
+        // wrong length under it.
+        if !matches || image_size(&theirs) != image_size(&mine) {
             return false;
         }
         // `theirs` is taken apart first; `mine` is emptied last and for

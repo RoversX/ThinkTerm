@@ -505,6 +505,12 @@ impl TerminalState {
         // once and re-placed on every redraw must outlive frames streamed
         // after it, or the client's next `a=p` fails on a missing id.
         self.kitty_img.mark_newest(image_id);
+        // A placement spanning more cells than the grid has is clamped to
+        // the grid: cells are assigned one column at a time below, and a
+        // count near u32::MAX would allocate them until the process died,
+        // holding the terminal lock the whole way.
+        let grid_cols = self.screen().physical_cols.max(1);
+        let grid_rows = self.screen().physical_rows.max(1);
         let info = self.assign_image_to_cells(ImageAttachParams {
             image_width,
             image_height,
@@ -517,8 +523,8 @@ impl TerminalState {
             data: img,
             style: ImageAttachStyle::Kitty,
             z_index: placement.z_index.unwrap_or(0),
-            columns: placement.columns.map(|x| x as usize),
-            rows: placement.rows.map(|x| x as usize),
+            columns: placement.columns.map(|x| (x as usize).min(grid_cols)),
+            rows: placement.rows.map(|x| (x as usize).min(grid_rows)),
             image_id: Some(image_id),
             placement_id: placement.placement_id,
             do_not_move_cursor: placement.do_not_move_cursor,
@@ -995,6 +1001,15 @@ impl TerminalState {
         }
 
         log::trace!("Query Response: {}", message);
+        // The message can carry text the application chose (a shm name, a
+        // file path in an error), and this reply is written to the pty as
+        // if typed. A control byte in it would be a keystroke in the user's
+        // shell, so only printable ASCII goes out, and not much of it.
+        let message: String = message
+            .chars()
+            .filter(|c| (' '..='~').contains(c))
+            .take(256)
+            .collect();
 
         match (image_id, image_no) {
             (Some(id), Some(no)) => {

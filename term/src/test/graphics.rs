@@ -1256,3 +1256,45 @@ fn a_frame_for_a_placement_on_the_other_screen_dirties_that_screen() {
         "the primary-screen row holding the placement must be marked changed"
     );
 }
+
+#[test]
+fn security_sixel_repeat_is_bounded_by_the_declared_image() {
+    let mut terminal = term(640, 384, false);
+    for repeat in ["!4294967295?", "!?"] {
+        terminal.advance_bytes(format!("\x1bPq\"1;1;1;1{repeat}\x1b\\"));
+    }
+    terminal.advance_bytes("still alive");
+}
+
+#[test]
+fn security_kitty_reply_filters_control_bytes_for_all_transmits() {
+    use wezterm_escape_parser::apc::{KittyImage, KittyImageData};
+    use wezterm_escape_parser::Action;
+    let (mut terminal, tap) = term_with_tap(640, 384);
+    for action in ["q", "t", "T"] {
+        let mut image = KittyImage::parse_apc(format!("Ga={action},i=42,f=32,s=1,v=1;AAAAAA==").as_bytes()).unwrap();
+        let data = KittyImageData::MaterializedError {
+            kind: std::io::ErrorKind::InvalidInput,
+            message: format!("bad\n\r\x1b[31m\x07\x7f非ASCII{}", "x".repeat(400)),
+        };
+        match &mut image {
+            KittyImage::Query { transmit, .. }
+            | KittyImage::TransmitData { transmit, .. }
+            | KittyImage::TransmitDataAndDisplay { transmit, .. } => transmit.data = data,
+            _ => unreachable!(),
+        }
+        terminal.perform_actions(vec![Action::KittyImage(Box::new(image))]);
+    }
+    let replies = drain(&mut terminal, &tap);
+    assert_eq!(replies.matches("\x1b_Gi=42;").count(), 3);
+    for reply in replies.split("\x1b_Gi=42;").skip(1) {
+        let text = reply.strip_suffix("\x1b\\").unwrap();
+        assert!(text.len() <= 256);
+        assert!(text.bytes().all(|b| (b' '..=b'~').contains(&b)));
+    }
+}
+
+#[test]
+fn security_kitty_placement_caps_wire_cell_counts() {
+    kitty(640, 384, "\x1b_Ga=p,i=1,c=4294967295,r=4294967295\x1b\\");
+}

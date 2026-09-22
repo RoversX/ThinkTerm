@@ -151,7 +151,7 @@ async fn get_image_cell<H: SessionHost>(
 /// second Arc under the same hash would leave the painter on the old one
 /// for good. A whole image the copy still will not take (it would shrink
 /// under a painter) leaves the copy as it is.
-async fn fetch_image<H: SessionHost>(
+pub(crate) async fn fetch_image<H: SessionHost>(
     host: &H,
     held: Option<Arc<ImageData>>,
     request: GetImageCell,
@@ -185,6 +185,15 @@ async fn fetch_image<H: SessionHost>(
                 frames_from,
                 ..
             }) => {
+                // The wire built this field by field; nothing between it
+                // and the GPU checks the buffer against the size it claims.
+                if !fresh.data().is_well_formed_tail(frames_from) {
+                    log::warn!(
+                        "the server sent an image whose pixel data does not match its \
+                         declared size; ignoring it"
+                    );
+                    return None;
+                }
                 if fresh.hash() != whole.data_hash {
                     // Not the picture asked for but the one now in the cell:
                     // a newer frame. Its own copy, never merged into the

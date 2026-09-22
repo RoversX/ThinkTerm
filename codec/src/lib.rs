@@ -1692,7 +1692,7 @@ impl SerializedLines {
     /// Reconsitute hyperlinks or other attributes that were decomposed for
     /// serialization, and return the line data.
     pub fn extract_data(self) -> (Vec<(StableRowIndex, Line)>, Vec<SerializedImageCell>) {
-        let lines = if self.hyperlinks.is_empty() {
+        let mut lines = if self.hyperlinks.is_empty() {
             self.lines
         } else {
             let mut lines = self.lines;
@@ -1715,6 +1715,17 @@ impl SerializedLines {
 
             lines
         };
+        // Normal wire lines carry image references in `images`, never pixel
+        // buffers in cell attributes. A hostile encoder can bypass From<Vec>
+        // and inject such buffers directly; discard them before any frontend
+        // can see them. Referenced images are fetched and validated separately.
+        for (_, line) in &mut lines {
+            if line.has_hyperlinks_or_images() {
+                for cell in line.cells_mut_for_attr_changes_only() {
+                    cell.attrs_mut().clear_images();
+                }
+            }
+        }
         (lines, self.images)
     }
 }
@@ -2168,6 +2179,53 @@ mod golden {
 mod test {
     use super::*;
     use termwiz::cell::CellAttributes;
+
+    #[test]
+    fn recursive_wire_layout_is_rejected_on_a_reader_sized_stack() {
+        std::thread::Builder::new().stack_size(2 * 1024 * 1024).spawn(|| {
+            // Vec length 1, then an endless chain of PaneNode::Split.left.
+            let bytes = vec![1u8; 10_000];
+            let error = varbincode::deserialize::<ListPanesResponse, _>(&bytes[..]).unwrap_err();
+            assert!(error.to_string().contains("nests deeper"));
+        }).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn compressed_line_wide_indices_are_bounded_by_actual_text() {
+        let mut line = Line::from_text("a好", &CellAttributes::default(), 1, None);
+        line.compress_for_scrollback();
+        let bytes = varbincode::serialize(&line).unwrap();
+        let normal: Line = varbincode::deserialize(&bytes[..]).unwrap();
+        assert_eq!(normal.as_str(), line.as_str());
+        let mut wire = serde_json::to_value(&line).unwrap();
+        assert!(wire["cells"]["C"]["is_double_wide"].is_array());
+        for index in [1_000_000_000usize, usize::MAX] {
+            wire["cells"]["C"]["is_double_wide"] = serde_json::json!([index]);
+            let error = serde_json::from_value::<Line>(wire.clone()).unwrap_err();
+            assert!(error.to_string().contains("wide-cell index exceeds line text"));
+        }
+    }
+
+    #[test]
+    fn inline_image_buffers_cannot_bypass_remote_image_validation() {
+        use termwiz::image::{ImageCell, ImageDataType, TextureCoordinate};
+        let bad = Arc::new(ImageData::with_data(ImageDataType::Rgba8 {
+            width: 512, height: 511, data: vec![0; 4], hash: ImageDataType::content_key(&[0; 4]),
+        }));
+        let mut attrs = CellAttributes::default();
+        attrs.attach_image(Box::new(ImageCell::new(
+            TextureCoordinate::new_f32(0.0, 0.0),
+            TextureCoordinate::new_f32(1.0, 1.0), bad,
+        )));
+        let line = Line::from_text("x", &attrs, 1, None);
+        let wire = SerializedLines { lines: vec![(0, line)], hyperlinks: vec![], images: vec![] };
+        let encoded = varbincode::serialize(&wire).unwrap();
+        let decoded: SerializedLines = varbincode::deserialize(&encoded[..]).unwrap();
+        let (lines, refs) = decoded.extract_data();
+        assert!(refs.is_empty());
+        assert!(lines[0].1.visible_cells().all(|cell| cell.attrs().images().is_none()));
+        assert_eq!(lines[0].1.as_str(), "x");
+    }
 
     #[test]
     fn serializing_lines_keeps_plain_lines_compressed() {

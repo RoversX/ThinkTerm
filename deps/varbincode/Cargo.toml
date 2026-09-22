@@ -1,7 +1,9 @@
-# Vendored from crates.io varbincode 0.1.0 (Wez Furlong, MIT) with one
-# change: a declared byte/string length no longer allocates up front, so a
+# Vendored from crates.io varbincode 0.1.0 (Wez Furlong, MIT) with bounded
+# decoding: a declared byte/string length no longer allocates up front, so a
 # corrupt or hostile length costs only the bytes actually present in the
-# stream instead of aborting the process on allocation failure.
+# stream instead of aborting the process on allocation failure; and values
+# may nest only so deep, so a stream of nested tags cannot run the decoder
+# off its stack; aggregate decoded allocation is also bounded.
 [package]
 name = "varbincode"
 version = "0.1.0"

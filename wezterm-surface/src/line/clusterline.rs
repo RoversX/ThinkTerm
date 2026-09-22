@@ -23,14 +23,13 @@ struct Cluster {
 /// Stores line data as a contiguous string and a series of
 /// clusters of attribute data describing attributed ranges
 /// within the line
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "use_serde", derive(Serialize))]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ClusteredLine {
     pub text: String,
     #[cfg_attr(
         feature = "use_serde",
         serde(
-            deserialize_with = "deserialize_bitset",
             serialize_with = "serialize_bitset"
         )
     )]
@@ -42,20 +41,36 @@ pub(crate) struct ClusteredLine {
 }
 
 #[cfg(feature = "use_serde")]
-fn deserialize_bitset<'de, D>(deserializer: D) -> Result<Option<Box<FixedBitSet>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let wide_indices = <Vec<usize>>::deserialize(deserializer)?;
-    if wide_indices.is_empty() {
-        Ok(None)
-    } else {
-        let max_idx = wide_indices.iter().max().unwrap_or(&1);
-        let mut bitset = FixedBitSet::with_capacity(max_idx + 1);
-        for idx in wide_indices {
-            bitset.set(idx, true);
+impl<'de> Deserialize<'de> for ClusteredLine {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Keep the existing field order and wire representation, but defer
+        // sparse-bitset expansion until its indices can be checked against
+        // the text. Each UTF-8 byte can contribute at most two cell columns.
+        #[derive(Deserialize)]
+        struct Wire {
+            text: String,
+            is_double_wide: Vec<usize>,
+            clusters: Vec<Cluster>,
+            len: u32,
+            last_cell_width: Option<NonZeroU8>,
         }
-        Ok(Some(Box::new(bitset)))
+        let wire = Wire::deserialize(deserializer)?;
+        let is_double_wide = if let Some(&max_idx) = wire.is_double_wide.iter().max() {
+            if max_idx >= wire.text.len().saturating_mul(2) {
+                return Err(serde::de::Error::custom("wide-cell index exceeds line text"));
+            }
+            let mut bits = FixedBitSet::with_capacity(max_idx + 1);
+            for idx in wire.is_double_wide {
+                bits.set(idx, true);
+            }
+            Some(Box::new(bits))
+        } else {
+            None
+        };
+        Ok(Self {
+            text: wire.text, is_double_wide, clusters: wire.clusters,
+            len: wire.len, last_cell_width: wire.last_cell_width,
+        })
     }
 }
 
@@ -101,7 +116,9 @@ impl ClusteredLine {
         // would keep up to 60% slack alive in scrollback. len() is a width
         // sum, which zero-width cells can overshoot; the shrink is a no-op
         // in the exact case and trims the rare doubled buffer otherwise.
-        let mut cells = Vec::with_capacity(self.len());
+        // len() is a sum of widths that arrive off the wire; reserve for a
+        // plausible line, and let a wider one grow as it is filled.
+        let mut cells = Vec::with_capacity(self.len().min(4096));
 
         for c in self.iter() {
             cells.push(c.as_cell());

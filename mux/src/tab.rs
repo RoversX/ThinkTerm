@@ -946,8 +946,8 @@ fn cell_dimensions(size: &TerminalSize) -> TerminalSize {
     TerminalSize {
         rows: 1,
         cols: 1,
-        pixel_width: size.pixel_width / size.cols,
-        pixel_height: size.pixel_height / size.rows,
+        pixel_width: size.pixel_width / size.cols.max(1),
+        pixel_height: size.pixel_height / size.rows.max(1),
         dpi: size.dpi,
     }
 }

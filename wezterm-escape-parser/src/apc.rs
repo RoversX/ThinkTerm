@@ -211,6 +211,11 @@ impl KittyImageData {
     /// chunk accumulation rules.
     #[cfg(feature = "kitty-shm")]
     pub fn materialize_external_source(&mut self) {
+        self.materialize_external_source_capped(MAX_IMAGE_DATA_BYTES);
+    }
+
+    #[cfg(feature = "kitty-shm")]
+    fn materialize_external_source_capped(&mut self, cap: u64) {
         if !matches!(
             self,
             Self::File { .. } | Self::TemporaryFile { .. } | Self::SharedMem { .. }
@@ -219,7 +224,7 @@ impl KittyImageData {
         }
 
         let source = core::mem::replace(self, Self::DirectBin(Vec::new()));
-        *self = match source.load_data() {
+        *self = match source.load_data_capped(cap) {
             Ok(data) => Self::DirectBin(data),
             Err(err) => Self::MaterializedError {
                 kind: err.kind(),
@@ -234,6 +239,11 @@ impl KittyImageData {
     /// of the read operaiton.
     #[cfg(feature = "kitty-shm")]
     pub fn load_data(self) -> std::io::Result<Vec<u8>> {
+        self.load_data_capped(MAX_IMAGE_DATA_BYTES)
+    }
+
+    #[cfg(feature = "kitty-shm")]
+    fn load_data_capped(self, cap: u64) -> std::io::Result<Vec<u8>> {
         match self {
             Self::Direct(data) => base64_decode(data).or_else(|err| {
                 Err(std::io::Error::new(
@@ -246,7 +256,7 @@ impl KittyImageData {
                 path,
                 data_offset,
                 data_size,
-            } => read_from_file(&path, data_offset, data_size),
+            } => read_from_file_capped(&path, data_offset, data_size, cap),
             Self::TemporaryFile {
                 path,
                 data_offset,
@@ -255,7 +265,7 @@ impl KittyImageData {
                 // Read first, but clean up no matter how the read went: an
                 // early error return here (a refused oversized file included)
                 // would leave the temporary file behind on disk.
-                let result = read_from_file(&path, data_offset, data_size);
+                let result = read_from_file_capped(&path, data_offset, data_size, cap);
                 remove_temporary_file(&path);
                 result
             }
@@ -263,7 +273,7 @@ impl KittyImageData {
                 name,
                 data_offset,
                 data_size,
-            } => read_shared_memory_data(&name, data_offset, data_size),
+            } => read_shared_memory_data(&name, data_offset, data_size, cap),
             Self::MaterializedError { kind, message } => Err(std::io::Error::new(kind, message)),
         }
     }
@@ -361,18 +371,20 @@ impl KittyImageData {
 }
 
 /// Materialize the external kitty payloads of one flush, newest first.
-/// Once `budget` bytes have been read, an older payload is discarded unread
-/// if -- and only if -- a newer transmit in the same flush carries the same
-/// image id (`i=`): that older picture is replaced before anything can be
-/// drawn from it. A parser that fell behind a frame stream can find
-/// hundreds of frame escapes in a single read; reading all of them holds
-/// gigabytes for pictures the next frame overwrites, and the frames a
-/// viewer will actually see are the last ones in the batch.
+/// Once `budget` bytes have been read, every older payload is discarded
+/// unread. A parser that fell behind a frame stream can find hundreds of
+/// frame escapes in a single read; reading all of them holds gigabytes for
+/// pictures the next frame overwrites, and the frames a viewer will
+/// actually see are the last ones in the batch. Newest first is what keeps
+/// those.
 ///
-/// Anything not superseded that way -- distinct ids, id-less transmits, a
-/// gallery of separate pictures, queries, animation frames -- is read even
-/// past the budget: the budget bounds the waste, never the protocol.
-/// Returns (bytes materialized, actions discarded).
+/// The budget is a ceiling on what one flush can hold, not only a filter
+/// for superseded frames: a batch of distinct pictures past it is also cut,
+/// because the process hosting the pane has to survive whatever a program
+/// prints, and 60 bytes of escapes can name gigabytes of shared memory. A
+/// discarded transmit is answered with an error, so a client counting
+/// replies is not left waiting. Returns (bytes materialized, actions
+/// discarded).
 #[cfg(feature = "kitty-shm")]
 pub fn materialize_kitty_actions_newest_first(
     actions: &mut [crate::Action],
@@ -389,11 +401,17 @@ pub fn materialize_kitty_actions_newest_first(
         let replaces_id = image.replacing_transmit_image_id();
         if image.has_external_data_source() {
             let superseded = replaces_id.map_or(false, |id| newer_ids.contains(&id));
-            if remaining == 0 && superseded {
-                image.discard_data_sources("superseded by a newer frame in the same batch");
+            if remaining == 0 {
+                image.discard_data_sources(if superseded {
+                    "superseded by a newer frame in the same batch"
+                } else {
+                    "over the budget for external payloads in one flush"
+                });
                 discarded += 1;
             } else {
-                image.materialize_data_sources();
+                if !image.materialize_data_sources_capped(remaining as u64) {
+                    discarded += 1;
+                }
                 let len = image.materialized_len();
                 materialized += len;
                 remaining = remaining.saturating_sub(len);
@@ -460,15 +478,6 @@ fn open_regular_file(path: &str) -> std::io::Result<(std::fs::File, u64)> {
         ));
     }
     Ok((f, metadata.len()))
-}
-
-#[cfg(feature = "kitty-shm")]
-fn read_from_file(
-    path: &str,
-    data_offset: Option<u32>,
-    data_size: Option<u32>,
-) -> std::io::Result<Vec<u8>> {
-    read_from_file_capped(path, data_offset, data_size, MAX_IMAGE_DATA_BYTES)
 }
 
 /// The cap is a parameter so the tests can exercise it without a
@@ -563,6 +572,7 @@ fn read_shared_memory_data(
     name: &str,
     data_offset: Option<u32>,
     data_size: Option<u32>,
+    cap: u64,
 ) -> std::result::Result<std::vec::Vec<u8>, std::io::Error> {
     use nix::sys::mman::{shm_open, shm_unlink};
     use std::fs::File;
@@ -605,11 +615,11 @@ fn read_shared_memory_data(
         read_exactly(
             &mut f,
             len,
-            MAX_IMAGE_DATA_BYTES,
+            cap,
             available.map(|available| available.min(u64::from(len))),
         )?
     } else {
-        read_to_end_capped(&mut f, MAX_IMAGE_DATA_BYTES, available)?
+        read_to_end_capped(&mut f, cap, available)?
     };
 
     Ok(data)
@@ -628,6 +638,7 @@ fn read_shared_memory_data(
     _name: &str,
     _data_offset: Option<u32>,
     _data_size: Option<u32>,
+    _cap: u64,
 ) -> std::result::Result<std::vec::Vec<u8>, std::io::Error> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
@@ -678,6 +689,7 @@ mod win {
         name: &str,
         data_offset: Option<u32>,
         data_size: Option<u32>,
+        cap: u64,
     ) -> std::result::Result<std::vec::Vec<u8>, std::io::Error> {
         let wide_name = wide_string(&name);
 
@@ -737,6 +749,9 @@ mod win {
         size = size.saturating_sub(offset);
         if let Some(val) = data_size {
             size = size.min(val as usize);
+        }
+        if size as u64 > cap {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "shared memory image exceeds the byte limit"));
         }
         let buf_slice = unsafe { std::slice::from_raw_parts(shm.buf.add(offset), size) };
         let data = buf_slice.to_vec();
@@ -1480,6 +1495,20 @@ impl KittyImage {
         }
     }
 
+    #[cfg(feature = "kitty-shm")]
+    fn materialize_data_sources_capped(&mut self, cap: u64) -> bool {
+        match self {
+            Self::TransmitData { transmit, .. }
+            | Self::TransmitDataAndDisplay { transmit, .. }
+            | Self::Query { transmit, .. }
+            | Self::TransmitFrame { transmit, .. } => {
+                transmit.data.materialize_external_source_capped(cap.min(MAX_IMAGE_DATA_BYTES));
+                !matches!(transmit.data, KittyImageData::MaterializedError { .. })
+            }
+            _ => true,
+        }
+    }
+
     pub fn verbosity(&self) -> KittyImageVerbosity {
         match self {
             Self::TransmitData { verbosity, .. } => *verbosity,
@@ -2009,9 +2038,9 @@ mod temp_file_test {
             actions.push(temp_file_transmit(&file, Some(1)));
         }
 
-        // 150 bytes: the newest two frames (100 each) are read, the oldest
+        // 200 bytes: the newest two frames (100 each) are read, the oldest
         // is discarded without a read -- but its temporary file still goes.
-        let (bytes, discarded) = materialize_kitty_actions_newest_first(&mut actions, 150);
+        let (bytes, discarded) = materialize_kitty_actions_newest_first(&mut actions, 200);
         assert_eq!((bytes, discarded), (200, 1));
         for file in &files {
             assert!(!file.exists(), "every temporary file is unlinked");
@@ -2053,10 +2082,9 @@ mod temp_file_test {
     }
 
     #[test]
-    fn a_gallery_of_distinct_pictures_is_read_past_the_budget() {
+    fn a_gallery_of_distinct_pictures_is_cut_at_the_budget_newest_first() {
         // Three separate pictures -- two ids and one id-less -- coalesced
-        // into one flush. None replaces another, so the budget must not
-        // cost the viewer any of them.
+        // into one flush. Within the budget every one of them is read.
         let dir = ScratchDir::in_temp("gallery");
         let files: Vec<_> = (0..3)
             .map(|i| dir.file(&format!("pic-{i}.rgba"), &[i as u8; 100]))
@@ -2066,17 +2094,37 @@ mod temp_file_test {
             temp_file_transmit(&files[1], Some(2)),
             temp_file_transmit(&files[2], None),
         ];
-        let (bytes, discarded) = materialize_kitty_actions_newest_first(&mut actions, 150);
+        let (bytes, discarded) = materialize_kitty_actions_newest_first(&mut actions, 300);
         assert_eq!((bytes, discarded), (300, 0));
         for (i, action) in actions.iter().enumerate() {
             assert_eq!(transmit_payload(action).unwrap(), vec![i as u8; 100]);
         }
+
+        // Past it the oldest are cut, distinct or not: the budget is the
+        // ceiling on what one flush may hold, and a cut transmit answers
+        // with an error rather than silence.
+        let files: Vec<_> = (0..3)
+            .map(|i| dir.file(&format!("big-{i}.rgba"), &[i as u8; 100]))
+            .collect();
+        let mut actions = vec![
+            temp_file_transmit(&files[0], Some(1)),
+            temp_file_transmit(&files[1], Some(2)),
+            temp_file_transmit(&files[2], None),
+        ];
+        let (bytes, discarded) = materialize_kitty_actions_newest_first(&mut actions, 150);
+        assert_eq!((bytes, discarded), (100, 2));
+        assert_eq!(transmit_payload(&actions[2]).unwrap(), vec![2u8; 100]);
+        assert_eq!(transmit_payload(&actions[1]).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            transmit_payload(&actions[0]).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
     fn only_a_newer_transmit_of_the_same_id_supersedes() {
-        // id 1 twice with id 2 in between: over budget, the old id-1 frame
-        // goes and the id-2 picture stays, whichever order they arrived in.
+        // id 1 twice with id 2 in between: the budget runs out after the
+        // two newest, and the old id-1 frame is the one that goes.
         let dir = ScratchDir::in_temp("mixed-ids");
         let files: Vec<_> = (0..3)
             .map(|i| dir.file(&format!("pic-{i}.rgba"), &[i as u8; 100]))
@@ -2086,7 +2134,7 @@ mod temp_file_test {
             temp_file_transmit(&files[1], Some(2)),
             temp_file_transmit(&files[2], Some(1)),
         ];
-        let (bytes, discarded) = materialize_kitty_actions_newest_first(&mut actions, 100);
+        let (bytes, discarded) = materialize_kitty_actions_newest_first(&mut actions, 200);
         assert_eq!((bytes, discarded), (200, 1));
         assert_eq!(transmit_payload(&actions[2]).unwrap(), vec![2u8; 100]);
         assert_eq!(transmit_payload(&actions[1]).unwrap(), vec![1u8; 100]);

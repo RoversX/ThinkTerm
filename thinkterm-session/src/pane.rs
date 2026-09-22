@@ -725,6 +725,15 @@ impl<H: SessionHost> PaneSession<H> {
         delta: GetPaneRenderChangesResponse,
         bonus_lines: Vec<(StableRowIndex, Line)>,
     ) {
+        // Reject impossible geometry before it reaches cache seeding or any
+        // frontend. Clamping only dirty ranges leaves those other walks open.
+        if delta.dimensions.viewport_rows > 10_000
+            || delta.dimensions.cols > 10_000
+            || delta.dimensions.physical_top.checked_add(delta.dimensions.viewport_rows as StableRowIndex).is_none()
+        {
+            log::warn!("ignoring render update with invalid pane dimensions");
+            return;
+        }
         log::trace!(
             "apply_changes_to_surface local={} remote={}",
             self.host_pane_id,
@@ -751,9 +760,40 @@ impl<H: SessionHost> PaneSession<H> {
                 || render_dimensions_match_terminal_size(delta.dimensions, preview.size)
         });
 
+        // Every row of every dirty range is walked below under the lock,
+        // and the ranges come off the wire, so the walk has to be bounded
+        // by something the wire does not set. Below the viewport's top the
+        // bound is a viewport taller than any screen; above it, the walk
+        // only marks cached rows stale, and past as many rows as the cache
+        // holds that is the same work as marking the whole cache stale, so
+        // the walk stops there and the one sweep takes over.
+        const MAX_VIEWPORT_ROWS: usize = 10_000;
+        let physical_top = delta.dimensions.physical_top;
+        let row_end = physical_top.saturating_add(
+            delta.dimensions.viewport_rows.min(MAX_VIEWPORT_ROWS) as StableRowIndex,
+        );
+        let cache_rows = st.lines.cap().get() as StableRowIndex;
+        let walk_start = physical_top
+            .saturating_sub(cache_rows)
+            .max(delta.dimensions.scrollback_top);
         let mut dirty = RangeSet::new();
+        let mut sweep_cache = false;
         for r in delta.dirty_lines {
-            dirty.add_range(r.clone());
+            let lo = r.start.max(delta.dimensions.scrollback_top);
+            let hi = r.end.min(row_end);
+            if lo >= hi {
+                continue;
+            }
+            if lo < walk_start {
+                sweep_cache = true;
+            }
+            let lo = lo.max(walk_start);
+            if lo < hi {
+                dirty.add_range(lo..hi);
+            }
+        }
+        if sweep_cache {
+            invalidate_line_entries(&mut st.lines, true);
         }
         if delta.cursor_position != st.cursor_position {
             dirty.add(st.cursor_position.y);
@@ -1312,6 +1352,7 @@ mod tests {
         asked: RefCell<Vec<&'static str>>,
         rows_asked: Cell<usize>,
         image: RefCell<Option<Arc<ImageData>>>,
+        image_frames_from: Cell<u32>,
         line_reply_ready: RefCell<Option<Rc<Cell<bool>>>>,
         image_reply_ready: RefCell<Option<Rc<Cell<bool>>>>,
     }
@@ -1372,7 +1413,7 @@ mod tests {
                     pane_id: req.pane_id,
                     data: self.image.borrow().clone(),
                     data_generation: req.data_generation,
-                    frames_from: 0,
+                    frames_from: self.image_frames_from.get(),
                 }),
                 _ => Pdu::UnitResponse(UnitResponse {}),
             };
@@ -1510,6 +1551,61 @@ mod tests {
             input_serial: None,
             seqno,
         }
+    }
+
+    #[test]
+    fn render_updates_reject_unbounded_geometry_and_bound_dirty_ranges() {
+        let (host, session) = session(&[]);
+        let mut huge = delta(1, false, false);
+        huge.dimensions.physical_top = 1;
+        huge.dimensions.viewport_rows = usize::MAX;
+        session.queue_render_delta(huge);
+        host.spawner.run_all();
+        assert_eq!(session.state().dimensions, dims());
+        let mut dirty = delta(2, false, false);
+        dirty.dirty_lines = vec![0..isize::MAX];
+        session.queue_render_delta(dirty);
+        host.spawner.run_all();
+        assert_eq!(session.state().seqno, 2);
+        assert!(session.state().lines.len() <= 256);
+    }
+
+    #[test]
+    fn image_hydration_accepts_animation_tails_and_rejects_bad_pixels() {
+        use termwiz::image::ImageDataType;
+        let (host, _) = session(&[]);
+        let held = Arc::new(ImageData::with_data(
+            ImageDataType::new_single_frame_content_hashed(1, 1, vec![1; 4]),
+        ));
+        let first_hash = match &*held.data() {
+            ImageDataType::Rgba8 { hash, .. } => *hash,
+            _ => unreachable!(),
+        };
+        let request = codec::GetImageCell {
+            pane_id: 9, line_idx: 0, cell_idx: 0, data_hash: held.hash(),
+            data_generation: 7, have_frames: 1,
+        };
+        for (from, frames) in [(1, vec![vec![2; 4]]), (2, vec![])] {
+            *host.link.image.borrow_mut() = Some(Arc::new(ImageData::with_data_and_hash(
+                ImageDataType::AnimRgba8 {
+                    width: 1, height: 1,
+                    durations: vec![std::time::Duration::from_millis(40); 2],
+                    frames, hashes: vec![first_hash, [2; 32]],
+                }, held.hash(),
+            )));
+            host.link.image_frames_from.set(from);
+            let fetched = spin_on(crate::hydrate::fetch_image(&*host, Some(held.clone()), request.clone())).unwrap();
+            assert!(Arc::ptr_eq(&held, &fetched));
+            assert_eq!(crate::images::frame_count(&held.data()), 2);
+        }
+        let bad = Arc::new(ImageData::with_data_and_hash(
+            ImageDataType::Rgba8 { width: 512, height: 511, data: vec![0; 4], hash: [0; 32] },
+            held.hash(),
+        ));
+        *host.link.image.borrow_mut() = Some(bad);
+        host.link.image_frames_from.set(0);
+        assert!(spin_on(crate::hydrate::fetch_image(&*host, Some(held.clone()), request)).is_none());
+        assert!(held.data().is_well_formed());
     }
 
     /// R1: `prime_frontend_geometry` fetches through the same lock it

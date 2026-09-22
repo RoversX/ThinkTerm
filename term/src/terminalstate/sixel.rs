@@ -62,7 +62,11 @@ impl TerminalState {
                 }
 
                 SixelData::Repeat { repeat_count, data } => {
-                    for _ in 0..*repeat_count {
+                    // Past the right edge every repeat is a no-op, and a
+                    // count near u32::MAX would spin here for seconds
+                    // holding the terminal lock. Emit only what fits.
+                    let repeat = (*repeat_count).min(width.saturating_sub(x));
+                    for _ in 0..repeat {
                         emit_sixel(data, &foreground_color, x, y);
                         x += 1;
                     }

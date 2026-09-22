@@ -1,4 +1,4 @@
-// Vendored: see Cargo.toml. Kept as upstream wrote it apart from `read_vec`.
+// Vendored: see Cargo.toml for decoder resource limits.
 #![allow(bare_trait_objects, deprecated, unused_attributes, unused_mut, dropping_references)]
 //! varbincode is a binary serialization format that uses variable
 //! length encoding for integer values, which typically results in

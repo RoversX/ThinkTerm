@@ -306,6 +306,54 @@ pub const CONTENT_HASH_MAX: usize = 1024 * 1024;
 const NONCE_KEY_MARKER: [u8; 8] = [0x54, 0x54, 0x4e, 0x43, 0x9d, 0x1b, 0x7a, 0xe4];
 
 impl ImageDataType {
+    /// Whether the pixel buffers match the dimensions they claim. A value
+    /// built by this crate always does; one that arrived over a wire was
+    /// built field by field, so `width * height * 4` is a claim until it
+    /// is checked, and a renderer that takes it as a buffer length reads
+    /// past the buffer.
+    pub fn is_well_formed(&self) -> bool {
+        self.is_well_formed_tail(0)
+    }
+
+    /// Wire animation deltas carry only frames from `frames_from` onward,
+    /// but retain the durations and hashes for the entire animation.
+    pub fn is_well_formed_tail(&self, frames_from: u32) -> bool {
+        fn frame_len(width: u32, height: u32) -> Option<usize> {
+            if width == 0 || height == 0 {
+                return None;
+            }
+            (width as usize)
+                .checked_mul(height as usize)?
+                .checked_mul(4)
+        }
+        match self {
+            Self::EncodedFile(_) => frames_from == 0,
+            #[cfg(feature = "std")]
+            Self::EncodedLease(_) => frames_from == 0,
+            Self::Rgba8 {
+                data,
+                width,
+                height,
+                ..
+            } => frames_from == 0 && frame_len(*width, *height) == Some(data.len()),
+            Self::AnimRgba8 {
+                width,
+                height,
+                durations,
+                frames,
+                hashes,
+            } => {
+                !hashes.is_empty()
+                    && frames.len().checked_add(frames_from as usize) == Some(hashes.len())
+                    && hashes.len() == durations.len()
+                    && match frame_len(*width, *height) {
+                        Some(len) => frames.iter().all(|frame| frame.len() == len),
+                        None => false,
+                    }
+            }
+        }
+    }
+
     pub fn new_single_frame(width: u32, height: u32, data: Vec<u8>) -> Self {
         let hash = Self::content_key(&data);
         Self::new_single_frame_with_hash(width, height, data, hash)
