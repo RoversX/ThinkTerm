@@ -52,7 +52,7 @@ impl Into<ColorAttribute> for SmallColor {
 /// The setter methods return a mutable self reference so that they can
 /// be chained together.
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct CellAttributes {
     attributes: u32,
     /// The foreground color
@@ -63,6 +63,29 @@ pub struct CellAttributes {
     /// allocated struct in order to keep CellAttributes
     /// smaller in the common case.
     fat: Option<Box<FatAttributes>>,
+}
+
+impl Clone for CellAttributes {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            attributes: self.attributes,
+            foreground: self.foreground,
+            background: self.background,
+            fat: self.fat.clone(),
+        }
+    }
+
+    #[inline]
+    fn clone_from(&mut self, source: &Self) {
+        self.attributes = source.attributes;
+        self.foreground = source.foreground;
+        self.background = source.background;
+        // Box::clone_from reuses the destination allocation when both cells
+        // have extended attributes. Keep independent ownership and the same
+        // per-cell footprint, including cells with images and hyperlinks.
+        self.fat.clone_from(&source.fat);
+    }
 }
 
 impl core::fmt::Debug for CellAttributes {
@@ -477,6 +500,12 @@ impl CellAttributes {
         Some(fat.image.iter().map(|im| im.as_ref().clone()).collect())
     }
 
+    /// Test for image attachments without cloning the attachment list.
+    #[cfg(feature = "use_image")]
+    pub fn has_images(&self) -> bool {
+        self.fat.as_ref().is_some_and(|fat| !fat.image.is_empty())
+    }
+
     pub fn underline_color(&self) -> ColorAttribute {
         self.fat
             .as_ref()
@@ -711,7 +740,7 @@ impl core::cmp::Eq for TeenyString {}
 
 /// Models the contents of a cell on the terminal display
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct Cell {
     #[cfg_attr(
         feature = "use_serde",
@@ -722,6 +751,22 @@ pub struct Cell {
     )]
     text: TeenyString,
     attrs: CellAttributes,
+}
+
+impl Clone for Cell {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            text: self.text.clone(),
+            attrs: self.attrs.clone(),
+        }
+    }
+
+    #[inline]
+    fn clone_from(&mut self, source: &Self) {
+        self.text.clone_from(&source.text);
+        self.attrs.clone_from(&source.attrs);
+    }
 }
 
 impl core::fmt::Debug for Cell {
@@ -1000,6 +1045,55 @@ pub enum AttributeChange {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn rgb_attrs(red: f32) -> CellAttributes {
+        let mut attrs = CellAttributes::blank();
+        attrs.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(
+            (red, 0.25, 0.5, 1.0).into(),
+        ));
+        attrs
+    }
+
+    #[test]
+    fn clone_from_reuses_extended_attributes_without_sharing_them() {
+        let mut dest = rgb_attrs(0.1);
+        let allocation = dest.fat.as_deref().unwrap() as *const FatAttributes;
+        let mut source = rgb_attrs(0.7);
+        source.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.com"))));
+        dest.clone_from(&source);
+        assert_eq!(dest, source);
+        assert_eq!(
+            allocation,
+            dest.fat.as_deref().unwrap() as *const FatAttributes
+        );
+        dest.set_hyperlink(None);
+        dest.set_foreground(ColorAttribute::Default);
+        assert!(dest.fat.is_none());
+        assert!(source.hyperlink().is_some());
+        assert_eq!(source.foreground(), rgb_attrs(0.7).foreground());
+        dest.clone_from(&source);
+        assert_eq!(dest, source);
+        dest.clone_from(&CellAttributes::blank());
+        assert!(dest.fat.is_none());
+    }
+
+    #[test]
+    fn cell_clone_from_matches_replacement_across_text_and_style_changes() {
+        let cells = [
+            Cell::blank(),
+            Cell::new('a', rgb_attrs(0.3)),
+            Cell::new_grapheme("界", CellAttributes::blank(), None),
+            Cell::new_grapheme("👩🏿‍🤝‍👩🏿", rgb_attrs(0.7), None),
+        ];
+        for initial in &cells {
+            let mut dest = initial.clone();
+            for source in &cells {
+                dest.clone_from(source);
+                assert_eq!(dest, source.clone());
+                assert_eq!(dest.width(), source.clone().width());
+            }
+        }
+    }
 
     #[test]
     fn teeny_string() {
