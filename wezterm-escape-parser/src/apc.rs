@@ -2,6 +2,28 @@ use crate::allocate::*;
 use crate::osc::{base64_decode, base64_encode};
 use core::fmt::{Display, Error as FmtError, Formatter};
 
+/// Kitty's Go clients omit Base64 padding for both pixels and external-source
+/// names. Choose the decoder before allocating: don't copy/add padding or
+/// retry a failed decode. Explicit padding must still be canonical.
+fn kitty_base64_decode(data: &[u8]) -> crate::Result<Vec<u8>> {
+    use base64::Engine;
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+
+    if data.last() == Some(&b'=') {
+        return base64_decode(data);
+    }
+
+    const UNPADDED: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_decode_allow_trailing_bits(true)
+            .with_decode_padding_mode(DecodePaddingMode::RequireNone),
+    );
+    UNPADDED
+        .decode(data)
+        .map_err(|err| crate::format_err!("base64_decode: {:#}", err))
+}
+
 fn get<'a>(keys: &BTreeMap<&str, &'a str>, k: &str) -> Option<&'a str> {
     keys.get(k).map(|&s| s)
 }
@@ -125,17 +147,17 @@ impl KittyImageData {
         match t {
             "d" => Some(Self::Direct(String::from_utf8(payload.to_vec()).ok()?)),
             "f" => Some(Self::File {
-                path: String::from_utf8(base64_decode(payload.to_vec()).ok()?).ok()?,
+                path: String::from_utf8(kitty_base64_decode(payload).ok()?).ok()?,
                 data_size: geti(keys, "S"),
                 data_offset: geti(keys, "O"),
             }),
             "t" => Some(Self::TemporaryFile {
-                path: String::from_utf8(base64_decode(payload.to_vec()).ok()?).ok()?,
+                path: String::from_utf8(kitty_base64_decode(payload).ok()?).ok()?,
                 data_size: geti(keys, "S"),
                 data_offset: geti(keys, "O"),
             }),
             "s" => Some(Self::SharedMem {
-                name: String::from_utf8(base64_decode(payload.to_vec()).ok()?).ok()?,
+                name: String::from_utf8(kitty_base64_decode(payload).ok()?).ok()?,
                 data_size: geti(keys, "S"),
                 data_offset: geti(keys, "O"),
             }),
@@ -245,7 +267,7 @@ impl KittyImageData {
     #[cfg(feature = "kitty-shm")]
     fn load_data_capped(self, cap: u64) -> std::io::Result<Vec<u8>> {
         match self {
-            Self::Direct(data) => base64_decode(data).or_else(|err| {
+            Self::Direct(data) => kitty_base64_decode(data.as_bytes()).or_else(|err| {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!("base64 decode: {err:#}"),
@@ -1677,6 +1699,109 @@ impl Display for KittyImage {
 mod test {
     use super::*;
     use k9::assert_equal as assert_eq;
+
+    #[cfg(feature = "kitty-shm")]
+    #[test]
+    fn kitty_payload_accepts_optional_base64_padding() {
+        for len in 0..65 {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 37) as u8).collect();
+            let padded = base64_encode(&bytes);
+            for encoded in [padded.as_str(), padded.trim_end_matches('=')] {
+                assert_eq!(
+                    KittyImageData::Direct(encoded.to_string())
+                        .load_data()
+                        .unwrap(),
+                    bytes
+                );
+            }
+        }
+        // Preserve the existing tolerance for unused low bits in the last
+        // symbol; this change only makes trailing '=' optional for Kitty.
+        for encoded in ["Zh==", "Zh"] {
+            assert_eq!(
+                KittyImageData::Direct(encoded.to_string())
+                    .load_data()
+                    .unwrap(),
+                b"f".to_vec()
+            );
+        }
+        // OSC clipboard/user-variable/iTerm decoding keeps its own policy.
+        assert!(crate::osc::base64_decode("Zg").is_err());
+    }
+
+    #[cfg(feature = "kitty-shm")]
+    #[test]
+    fn kitty_payload_rejects_malformed_base64() {
+        for encoded in [
+            "A",
+            "YWJjA",
+            "YQ=",
+            "YQ===",
+            "YQ====",
+            "=YQ=",
+            "Y=Q=",
+            "YQ==Yg==",
+            "YQ$=",
+            "YQ\n",
+            "YQ ",
+            "YQ-_",
+            "YQ\u{00ff}",
+        ] {
+            let err = KittyImageData::Direct(encoded.to_string())
+                .load_data()
+                .expect_err(encoded);
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn kitty_external_names_accept_optional_base64_padding() {
+        // File paths and shared-memory names use the same Kitty wire
+        // encoding. Parsing these commands must not open/delete anything.
+        for name in ["/x", "/xy", "/xyz"] {
+            let padded = base64_encode(name);
+            for encoded in [padded.as_str(), padded.trim_end_matches('=')] {
+                for transport in ["f", "t", "s"] {
+                    let command = format!("Ga=t,t={transport},S=4,O=1;{encoded}");
+                    let Some(KittyImage::TransmitData { transmit, .. }) =
+                        KittyImage::parse_apc(command.as_bytes())
+                    else {
+                        panic!("failed to parse {command}");
+                    };
+                    match transmit.data {
+                        KittyImageData::File {
+                            path,
+                            data_size,
+                            data_offset,
+                        }
+                        | KittyImageData::TemporaryFile {
+                            path,
+                            data_size,
+                            data_offset,
+                        }
+                        | KittyImageData::SharedMem {
+                            name: path,
+                            data_size,
+                            data_offset,
+                        } => {
+                            assert_eq!(path, name);
+                            assert_eq!(data_size, Some(4));
+                            assert_eq!(data_offset, Some(1));
+                        }
+                        other => panic!("unexpected transport {other:?}"),
+                    }
+                }
+            }
+        }
+        for transport in ["f", "t", "s"] {
+            for invalid in ["Lw=", "L3g$", "L3g==="] {
+                assert!(
+                    KittyImage::parse_apc(format!("Ga=t,t={transport};{invalid}").as_bytes())
+                        .is_none()
+                );
+            }
+        }
+    }
 
     #[test]
     fn kitty_payload() {

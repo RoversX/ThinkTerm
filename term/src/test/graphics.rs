@@ -227,6 +227,119 @@ fn sixel_still_works_on_a_normal_pane() {
 const HALF_2X2: &str = "AAAAAAAAAAA=";
 
 #[test]
+fn an_unpadded_kitty_image_is_decoded_and_placed() {
+    use wezterm_cell::image::ImageDataType;
+
+    let (mut term, tap) = term_with_tap(640, 384);
+    let pixels = [
+        255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+    ];
+    let encoded = base64_of(&pixels);
+    term.advance_bytes(format!(
+        "\x1b_Ga=T,i=9,f=32,s=2,v=2,c=1,r=1;{}\x1b\\",
+        encoded.trim_end_matches('=')
+    ));
+    assert_eq!(drain(&mut term, &tap), "\x1b_Gi=9;OK\x1b\\");
+    let image = term.kitty_image_data_for_id(9).expect("decoded image");
+    match &*image.data() {
+        ImageDataType::Rgba8 {
+            data,
+            width,
+            height,
+            ..
+        } => {
+            assert_eq!((*width, *height), (2, 2));
+            assert_eq!(data.as_slice(), pixels.as_slice());
+        }
+        other => panic!("unexpected image data {:?}", other),
+    }
+    assert!(term
+        .screen_mut()
+        .line_mut(0)
+        .get_cell(0)
+        .unwrap()
+        .attrs()
+        .images()
+        .unwrap()
+        .iter()
+        .any(|im| im.image_id() == Some(9)));
+    assert_eq!(term.kitty_used_memory(), pixels.len());
+    drop(image);
+    term.advance_bytes("\x1b_Ga=d,d=I,i=9\x1b\\");
+    assert!(term.kitty_image_data_for_id(9).is_none());
+    assert_eq!(term.kitty_used_memory(), 0);
+}
+
+#[test]
+fn benchmark_sized_kitty_images_decode_with_optional_padding() {
+    use wezterm_cell::image::ImageDataType;
+
+    let (mut term, tap) = term_with_tap(640, 384);
+    let pixels: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let padded = base64_of(&pixels);
+    // kitten __benchmark__ sends a 1024x1024 RGBA image in 128 KiB
+    // Base64 chunks, with no '=' in the final chunk. Check the old padded
+    // form too, including deleting the stored image after each transfer.
+    for encoded in [padded.as_str(), padded.trim_end_matches('=')] {
+        let mut chunks = encoded.as_bytes().chunks(128 * 1024).peekable();
+        let mut first = true;
+        while let Some(chunk) = chunks.next() {
+            let more = u8::from(chunks.peek().is_some());
+            let header = if first {
+                first = false;
+                format!("\x1b_Ga=t,i=12345,f=32,s=1024,v=1024,m={more};")
+            } else {
+                format!("\x1b_Gm={more};")
+            };
+            term.advance_bytes(header);
+            // Also split PTY reads inside the APC payload.
+            for bytes in chunk.chunks(8191) {
+                term.advance_bytes(bytes);
+            }
+            term.advance_bytes("\x1b\\");
+        }
+        assert_eq!(drain(&mut term, &tap), "\x1b_Gi=12345;OK\x1b\\");
+        // Tap retains replies, including the sentinel. Start the next
+        // transfer with an empty buffer so drain waits for its own reply.
+        tap.0.lock().unwrap().clear();
+        let image = term.kitty_image_data_for_id(12345).expect("complete image");
+        match &*image.data() {
+            ImageDataType::Rgba8 {
+                data,
+                width,
+                height,
+                ..
+            } => {
+                assert_eq!((*width, *height), (1024, 1024));
+                assert_eq!(data, &pixels);
+            }
+            other => panic!("unexpected image data {:?}", other),
+        }
+        assert_eq!(term.kitty_used_memory(), pixels.len());
+        drop(image);
+        term.advance_bytes("\x1b_Ga=d,d=I,i=12345\x1b\\");
+        assert!(term.kitty_image_data_for_id(12345).is_none());
+        assert_eq!(term.kitty_used_memory(), 0);
+    }
+}
+
+#[test]
+fn a_malformed_kitty_tail_does_not_poison_the_next_image() {
+    let (mut term, tap) = term_with_tap(640, 384);
+    term.advance_bytes("\x1b_Ga=t,i=9,f=32,s=2,v=2,m=1;AAAAAAAAAAAAAAAA\x1b\\");
+    // Four more bytes need either no padding or two '=' characters.
+    term.advance_bytes("\x1b_Gm=0;AAAAAA=\x1b\\");
+    assert!(term.kitty_image_data_for_id(9).is_none());
+    assert_eq!(term.kitty_used_memory(), 0);
+    term.advance_bytes("\x1b_Ga=t,i=10,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA\x1b\\");
+    let reply = drain(&mut term, &tap);
+    assert!(reply.contains("i=10;OK"), "{:?}", reply);
+    assert!(!reply.contains("i=9;OK"), "{:?}", reply);
+    assert!(term.kitty_image_data_for_id(10).is_some());
+    assert_eq!(term.kitty_used_memory(), 16);
+}
+
+#[test]
 fn a_chunked_transfer_reassembles() {
     let (mut term, _tap) = term_with_tap(640, 384);
     term.advance_bytes(format!("\x1b_Ga=t,i=9,f=32,s=2,v=2,m=1;{HALF_2X2}\x1b\\"));

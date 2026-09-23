@@ -50,7 +50,9 @@ in these workloads; they are not a long-duration leak test or GUI/GPU memory mea
 optimized binaries both logged `Invalid padding` while decoding the benchmark
 images. Their roughly 278 MiB/s scores measure a rejected transfer, not successful
 image processing. This pre-existing compatibility issue is separate from the
-text/CSI changes and remains unresolved.
+text/CSI changes. A subsequent [Kitty Base64 fix](kitty-base64-compatibility.md)
+accepts unpadded payloads; the historical rejected-transfer scores above remain
+excluded.
 
 The benchmark waits for terminal status replies after parsing. These results do
 not establish foreground frame rate, input latency, or the cost of synchronizing

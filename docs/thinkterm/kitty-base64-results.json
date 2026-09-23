@@ -1,0 +1,253 @@
+{
+  "date": "2026-09-23",
+  "platform": "macOS, Apple M1 Pro, 16 GiB RAM",
+  "kitten": "0.49.0",
+  "source_base": "1f3b385",
+  "baseline_binary": "pre-fix parser-optimized binary recorded in parser-throughput-results.json",
+  "baseline_sha256": "98d5209cd4a41b4a1f9cf78f48d9b88592811f35c49ddaeaf0f0307e8f61d186",
+  "candidate_mux_sha256": "73a5230c893e32d1266a5fa6ddafb0c59440ae02c867656ec7edc81fbe5bede7",
+  "acknowledged_image_runs": {
+    "baseline-padded": {
+      "runs": [
+        {
+          "mode": "padded",
+          "images": 100,
+          "acknowledged": 100,
+          "elapsed_seconds": 5.8570589589944575,
+          "raw_MB_s": 71.61109405530178,
+          "wire_MB_s": 95.4886409571021,
+          "peak_rss_bytes": 44744704,
+          "image_decode_errors": 0
+        },
+        {
+          "mode": "padded",
+          "images": 100,
+          "acknowledged": 100,
+          "elapsed_seconds": 5.878601208009059,
+          "raw_MB_s": 71.3486738016119,
+          "wire_MB_s": 95.13872096614215,
+          "peak_rss_bytes": 43073536,
+          "image_decode_errors": 0
+        },
+        {
+          "mode": "padded",
+          "images": 100,
+          "acknowledged": 100,
+          "elapsed_seconds": 5.846534666023217,
+          "raw_MB_s": 71.74000052330048,
+          "wire_MB_s": 95.6605291764089,
+          "peak_rss_bytes": 43106304,
+          "image_decode_errors": 0
+        }
+      ],
+      "median_raw_MB_s": 71.61109405530178,
+      "median_wire_MB_s": 95.4886409571021,
+      "median_peak_rss_MiB": 41.109375
+    },
+    "candidate-padded": {
+      "runs": [
+        {
+          "mode": "padded",
+          "images": 100,
+          "acknowledged": 100,
+          "elapsed_seconds": 5.857583500008332,
+          "raw_MB_s": 71.60468135015121,
+          "wire_MB_s": 95.48009004040736,
+          "peak_rss_bytes": 46350336,
+          "image_decode_errors": 0
+        },
+        {
+          "mode": "padded",
+          "images": 100,
+          "acknowledged": 100,
+          "elapsed_seconds": 5.905526874994393,
+          "raw_MB_s": 71.02336656462988,
+          "wire_MB_s": 94.7049453568918,
+          "peak_rss_bytes": 41500672,
+          "image_decode_errors": 0
+        },
+        {
+          "mode": "padded",
+          "images": 100,
+          "acknowledged": 100,
+          "elapsed_seconds": 5.8320097499818075,
+          "raw_MB_s": 71.91867263275894,
+          "wire_MB_s": 95.89877657556121,
+          "peak_rss_bytes": 43122688,
+          "image_decode_errors": 0
+        }
+      ],
+      "median_raw_MB_s": 71.60468135015121,
+      "median_wire_MB_s": 95.48009004040736,
+      "median_peak_rss_MiB": 41.125
+    },
+    "candidate-unpadded": {
+      "runs": [
+        {
+          "mode": "unpadded",
+          "images": 100,
+          "acknowledged": 100,
+          "elapsed_seconds": 5.933669000020018,
+          "raw_MB_s": 70.68651790293409,
+          "wire_MB_s": 94.25574631785379,
+          "peak_rss_bytes": 43548672,
+          "image_decode_errors": 0
+        },
+        {
+          "mode": "unpadded",
+          "images": 100,
+          "acknowledged": 100,
+          "elapsed_seconds": 5.709387707989663,
+          "raw_MB_s": 73.4632891392282,
+          "wire_MB_s": 97.95838513775224,
+          "peak_rss_bytes": 46284800,
+          "image_decode_errors": 0
+        },
+        {
+          "mode": "unpadded",
+          "images": 100,
+          "acknowledged": 100,
+          "elapsed_seconds": 5.702241332997801,
+          "raw_MB_s": 73.55535753508624,
+          "wire_MB_s": 98.08115218897133,
+          "peak_rss_bytes": 44679168,
+          "image_decode_errors": 0
+        }
+      ],
+      "median_raw_MB_s": 73.4632891392282,
+      "median_wire_MB_s": 97.95838513775224,
+      "median_peak_rss_MiB": 42.609375
+    }
+  },
+  "codec_allocations": [
+    {
+      "case": "old_padded_16",
+      "allocations": 1,
+      "reallocations": 0,
+      "peak_bytes": 18,
+      "remaining_bytes": 0
+    },
+    {
+      "case": "fixed_padded_16",
+      "allocations": 1,
+      "reallocations": 0,
+      "peak_bytes": 18,
+      "remaining_bytes": 0
+    },
+    {
+      "case": "fixed_unpadded_16",
+      "allocations": 1,
+      "reallocations": 0,
+      "peak_bytes": 18,
+      "remaining_bytes": 0
+    },
+    {
+      "case": "old_padded_4096",
+      "allocations": 1,
+      "reallocations": 0,
+      "peak_bytes": 4098,
+      "remaining_bytes": 0
+    },
+    {
+      "case": "fixed_padded_4096",
+      "allocations": 1,
+      "reallocations": 0,
+      "peak_bytes": 4098,
+      "remaining_bytes": 0
+    },
+    {
+      "case": "fixed_unpadded_4096",
+      "allocations": 1,
+      "reallocations": 0,
+      "peak_bytes": 4098,
+      "remaining_bytes": 0
+    },
+    {
+      "case": "old_padded_98304",
+      "allocations": 1,
+      "reallocations": 0,
+      "peak_bytes": 98304,
+      "remaining_bytes": 0
+    },
+    {
+      "case": "fixed_padded_98304",
+      "allocations": 1,
+      "reallocations": 0,
+      "peak_bytes": 98304,
+      "remaining_bytes": 0
+    },
+    {
+      "case": "fixed_unpadded_98304",
+      "allocations": 1,
+      "reallocations": 0,
+      "peak_bytes": 98304,
+      "remaining_bytes": 0
+    },
+    {
+      "case": "old_padded_4194304",
+      "allocations": 1,
+      "reallocations": 0,
+      "peak_bytes": 4194306,
+      "remaining_bytes": 0
+    },
+    {
+      "case": "fixed_padded_4194304",
+      "allocations": 1,
+      "reallocations": 0,
+      "peak_bytes": 4194306,
+      "remaining_bytes": 0
+    },
+    {
+      "case": "fixed_unpadded_4194304",
+      "allocations": 1,
+      "reallocations": 0,
+      "peak_bytes": 4194306,
+      "remaining_bytes": 0
+    },
+    {
+      "case": "old_path",
+      "allocations": 2,
+      "reallocations": 0,
+      "peak_bytes": 56,
+      "remaining_bytes": 0
+    },
+    {
+      "case": "fixed_path",
+      "allocations": 1,
+      "reallocations": 0,
+      "peak_bytes": 24,
+      "remaining_bytes": 0
+    }
+  ],
+  "codec_seven_round_median_time_ratios": [
+    {
+      "raw_bytes": 16,
+      "fixed_padded_time_ratio": 0.9888426213213785,
+      "fixed_unpadded_time_ratio": 0.6090928996777142
+    },
+    {
+      "raw_bytes": 4096,
+      "fixed_padded_time_ratio": 1.0007646867774511,
+      "fixed_unpadded_time_ratio": 0.988075121460067
+    },
+    {
+      "raw_bytes": 98304,
+      "fixed_padded_time_ratio": 0.9914003790859816,
+      "fixed_unpadded_time_ratio": 0.9950064843654742
+    },
+    {
+      "raw_bytes": 4194304,
+      "fixed_padded_time_ratio": 0.997513726108968,
+      "fixed_unpadded_time_ratio": 1.0009278024195318
+    }
+  ],
+  "kitten_images_smoke": {
+    "repetitions": 100,
+    "elapsed_seconds_reported": 2.08,
+    "reported_MiB_s": 256.9,
+    "peak_rss_bytes": 49659904,
+    "image_errors": 0,
+    "padding_errors": 0,
+    "exit_code": 0
+  }
+}
