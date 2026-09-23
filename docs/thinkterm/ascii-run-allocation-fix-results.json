@@ -1,0 +1,2073 @@
+{
+  "baseline_commit": "e791e31",
+  "before_commit": "23b052a",
+  "production_patch_sha256": "d880e7ba41cc32c4ea8cc3c9e2dfd15972d4437d273a93cb67ddad3c7391e242",
+  "binary_sha256": {
+    "baseline": "654e2917ad8e23951c7bacd0b66ea0bd23f9f203d7f78393f2fdb465aff05ac2",
+    "before": "bd654e038fe43f2d55d834bbc56154316eca7cc81f913ba36d3a486339703936",
+    "fixed": "693f6fd04c2d2c4b50dc1c878aac78fb677ff7a5841dd19e96ec1a3a4a5d344d"
+  },
+  "summary": {
+    "short": [
+      {
+        "case": "sgr-2",
+        "baseline": 29.44311789835752,
+        "before": 31.560435949372575,
+        "fixed": 31.917414598086378,
+        "fixed_vs_before_percent": 1.1310954300075116,
+        "fixed_vs_baseline_percent": 8.403650415932628
+      },
+      {
+        "case": "unicode-2",
+        "baseline": 38.89148074414547,
+        "before": 34.13146242336605,
+        "fixed": 40.88939632495905,
+        "fixed_vs_before_percent": 19.799719735907328,
+        "fixed_vs_baseline_percent": 5.137154828218615
+      },
+      {
+        "case": "sgr-4",
+        "baseline": 26.633463593574817,
+        "before": 28.412485445581563,
+        "fixed": 29.118816689686412,
+        "fixed_vs_before_percent": 2.4859889341876995,
+        "fixed_vs_baseline_percent": 9.33169314377562
+      },
+      {
+        "case": "unicode-4",
+        "baseline": 33.266773017748285,
+        "before": 33.26025361771143,
+        "fixed": 37.93895298898254,
+        "fixed_vs_before_percent": 14.066938349440793,
+        "fixed_vs_baseline_percent": 14.044584272546023
+      },
+      {
+        "case": "sgr-8",
+        "baseline": 23.545836723725895,
+        "before": 25.751953707675785,
+        "fixed": 26.25128338871441,
+        "fixed_vs_before_percent": 1.9389972765048613,
+        "fixed_vs_baseline_percent": 11.490127519071681
+      },
+      {
+        "case": "unicode-8",
+        "baseline": 32.506204806975695,
+        "before": 35.25752600119481,
+        "fixed": 39.16460676155422,
+        "fixed_vs_before_percent": 11.081551099833264,
+        "fixed_vs_baseline_percent": 20.48347998210378
+      },
+      {
+        "case": "sgr-16",
+        "baseline": 20.96906643320366,
+        "before": 24.708913909100325,
+        "fixed": 24.8078729823832,
+        "fixed_vs_before_percent": 0.40049948632678856,
+        "fixed_vs_baseline_percent": 18.306997888570486
+      },
+      {
+        "case": "unicode-16",
+        "baseline": 32.54059606092343,
+        "before": 37.14511107356387,
+        "fixed": 38.4871340542788,
+        "fixed_vs_before_percent": 3.6129195523392665,
+        "fixed_vs_baseline_percent": 18.27421348466418
+      },
+      {
+        "case": "sgr-64",
+        "baseline": 19.60826276182843,
+        "before": 24.300278004734263,
+        "fixed": 24.006945992151202,
+        "fixed_vs_before_percent": -1.2071138137839998,
+        "fixed_vs_baseline_percent": 22.432804393491313
+      },
+      {
+        "case": "unicode-64",
+        "baseline": 32.162721148114635,
+        "before": 39.801202691555005,
+        "fixed": 40.34635131535992,
+        "fixed_vs_before_percent": 1.3696787708392,
+        "fixed_vs_baseline_percent": 25.444458289329177
+      }
+    ],
+    "kitten": [
+      {
+        "case": "Only ASCII chars",
+        "baseline": 42.6,
+        "before": 68.9,
+        "fixed": 68.6,
+        "fixed_vs_before_percent": -0.43541364296082463,
+        "fixed_vs_baseline_percent": 61.03286384976523
+      },
+      {
+        "case": "Unicode chars",
+        "baseline": 47.0,
+        "before": 45.9,
+        "fixed": 47.6,
+        "fixed_vs_before_percent": 3.70370370370372,
+        "fixed_vs_baseline_percent": 1.276595744680864
+      },
+      {
+        "case": "Unique multi-codepoint Unicode cells",
+        "baseline": 66.0,
+        "before": 66.2,
+        "fixed": 68.4,
+        "fixed_vs_before_percent": 3.3232628398791597,
+        "fixed_vs_baseline_percent": 3.6363636363636376
+      },
+      {
+        "case": "CSI codes with few chars",
+        "baseline": 20.0,
+        "before": 23.2,
+        "fixed": 24.9,
+        "fixed_vs_before_percent": 7.3275862068965525,
+        "fixed_vs_baseline_percent": 24.49999999999999
+      },
+      {
+        "case": "Long escape codes",
+        "baseline": 188.9,
+        "before": 195.8,
+        "fixed": 206.7,
+        "fixed_vs_before_percent": 5.566905005107237,
+        "fixed_vs_baseline_percent": 9.422975119110632
+      },
+      {
+        "case": "Images",
+        "baseline": 260.1,
+        "before": 258.4,
+        "fixed": 269.8,
+        "fixed_vs_before_percent": 4.4117647058823595,
+        "fixed_vs_baseline_percent": 3.7293348712033714
+      }
+    ],
+    "kitten_peak_rss_mib": {
+      "baseline": 442.265625,
+      "before": 440.375,
+      "fixed": 442.546875
+    }
+  },
+  "runs": {
+    "short-1-baseline": {
+      "result": {
+        "mib": 32,
+        "results": [
+          {
+            "case": "sgr-2",
+            "bytes": 33553408,
+            "seconds": 1.0868082499946468,
+            "mib_s": 29.44311789835752
+          },
+          {
+            "case": "unicode-2",
+            "bytes": 33553920,
+            "seconds": 0.8205144169915002,
+            "mib_s": 38.99932902590484
+          },
+          {
+            "case": "sgr-4",
+            "bytes": 33546240,
+            "seconds": 1.1964292079792358,
+            "mib_s": 26.739724579304344
+          },
+          {
+            "case": "unicode-4",
+            "bytes": 33553408,
+            "seconds": 0.9618914170132484,
+            "mib_s": 33.266773017748285
+          },
+          {
+            "case": "sgr-8",
+            "bytes": 33546240,
+            "seconds": 1.3587194999854546,
+            "mib_s": 23.545836723725895
+          },
+          {
+            "case": "unicode-8",
+            "bytes": 33549824,
+            "seconds": 1.0075980420224369,
+            "mib_s": 31.754334699310117
+          },
+          {
+            "case": "sgr-16",
+            "bytes": 33546240,
+            "seconds": 1.5256848749995697,
+            "mib_s": 20.96906643320366
+          },
+          {
+            "case": "unicode-16",
+            "bytes": 33551872,
+            "seconds": 0.9758146659878548,
+            "mib_s": 32.790610460191886
+          },
+          {
+            "case": "sgr-64",
+            "bytes": 33490944,
+            "seconds": 1.5971209589915816,
+            "mib_s": 19.998142874016565
+          },
+          {
+            "case": "unicode-64",
+            "bytes": 33549312,
+            "seconds": 0.9807138750038575,
+            "mib_s": 32.62431378099362
+          }
+        ]
+      },
+      "resources": {
+        "max_rss_bytes": 44793856,
+        "user_seconds": 11.382314,
+        "system_seconds": 2.431579,
+        "server_exit": 0
+      },
+      "mib_s": {
+        "sgr-2": 29.44311789835752,
+        "unicode-2": 38.99932902590484,
+        "sgr-4": 26.739724579304344,
+        "unicode-4": 33.266773017748285,
+        "sgr-8": 23.545836723725895,
+        "unicode-8": 31.754334699310117,
+        "sgr-16": 20.96906643320366,
+        "unicode-16": 32.790610460191886,
+        "sgr-64": 19.998142874016565,
+        "unicode-64": 32.62431378099362
+      }
+    },
+    "short-1-before": {
+      "result": {
+        "mib": 32,
+        "results": [
+          {
+            "case": "sgr-2",
+            "bytes": 33553408,
+            "seconds": 1.0050073330057785,
+            "mib_s": 31.839591997599896
+          },
+          {
+            "case": "unicode-2",
+            "bytes": 33553920,
+            "seconds": 0.9375370829948224,
+            "mib_s": 34.13146242336605
+          },
+          {
+            "case": "sgr-4",
+            "bytes": 33546240,
+            "seconds": 1.1259904580074362,
+            "mib_s": 28.412485445581563
+          },
+          {
+            "case": "unicode-4",
+            "bytes": 33553408,
+            "seconds": 0.9585808340052608,
+            "mib_s": 33.3816641250772
+          },
+          {
+            "case": "sgr-8",
+            "bytes": 33546240,
+            "seconds": 1.332053124991944,
+            "mib_s": 24.01720089068781
+          },
+          {
+            "case": "unicode-8",
+            "bytes": 33549824,
+            "seconds": 0.9106350840011146,
+            "mib_s": 35.135485147539995
+          },
+          {
+            "case": "sgr-16",
+            "bytes": 33546240,
+            "seconds": 1.2954363750177436,
+            "mib_s": 24.696070078749955
+          },
+          {
+            "case": "unicode-16",
+            "bytes": 33551872,
+            "seconds": 0.8610144999984186,
+            "mib_s": 37.162624547912685
+          },
+          {
+            "case": "sgr-64",
+            "bytes": 33490944,
+            "seconds": 1.3143657500040717,
+            "mib_s": 24.300278004734263
+          },
+          {
+            "case": "unicode-64",
+            "bytes": 33549312,
+            "seconds": 0.8038731250271667,
+            "mib_s": 39.801202691555005
+          }
+        ]
+      },
+      "resources": {
+        "max_rss_bytes": 44793856,
+        "user_seconds": 10.41278,
+        "system_seconds": 2.67286,
+        "server_exit": 0
+      },
+      "mib_s": {
+        "sgr-2": 31.839591997599896,
+        "unicode-2": 34.13146242336605,
+        "sgr-4": 28.412485445581563,
+        "unicode-4": 33.3816641250772,
+        "sgr-8": 24.01720089068781,
+        "unicode-8": 35.135485147539995,
+        "sgr-16": 24.696070078749955,
+        "unicode-16": 37.162624547912685,
+        "sgr-64": 24.300278004734263,
+        "unicode-64": 39.801202691555005
+      }
+    },
+    "short-1-fixed": {
+      "result": {
+        "mib": 32,
+        "results": [
+          {
+            "case": "sgr-2",
+            "bytes": 33553408,
+            "seconds": 1.0025568749988452,
+            "mib_s": 31.917414598086378
+          },
+          {
+            "case": "unicode-2",
+            "bytes": 33553920,
+            "seconds": 0.7817815839953255,
+            "mib_s": 40.93152406483565
+          },
+          {
+            "case": "sgr-4",
+            "bytes": 33546240,
+            "seconds": 1.0950301660050172,
+            "mib_s": 29.215804726838382
+          },
+          {
+            "case": "unicode-4",
+            "bytes": 33553408,
+            "seconds": 0.8384731250116602,
+            "mib_s": 38.163445533278136
+          },
+          {
+            "case": "sgr-8",
+            "bytes": 33546240,
+            "seconds": 1.2169706659915391,
+            "mib_s": 26.288380150834648
+          },
+          {
+            "case": "unicode-8",
+            "bytes": 33549824,
+            "seconds": 0.8131790829938836,
+            "mib_s": 39.346321293646284
+          },
+          {
+            "case": "sgr-16",
+            "bytes": 33546240,
+            "seconds": 1.2761092500004452,
+            "mib_s": 25.07010077702112
+          },
+          {
+            "case": "unicode-16",
+            "bytes": 33551872,
+            "seconds": 0.817729500005953,
+            "mib_s": 39.12975940517868
+          },
+          {
+            "case": "sgr-64",
+            "bytes": 33490944,
+            "seconds": 1.330425499996636,
+            "mib_s": 24.006945992151202
+          },
+          {
+            "case": "unicode-64",
+            "bytes": 33549312,
+            "seconds": 0.7930114160117228,
+            "mib_s": 40.34635131535992
+          }
+        ]
+      },
+      "resources": {
+        "max_rss_bytes": 44318720,
+        "user_seconds": 9.987381,
+        "system_seconds": 2.362106,
+        "server_exit": 0
+      },
+      "mib_s": {
+        "sgr-2": 31.917414598086378,
+        "unicode-2": 40.93152406483565,
+        "sgr-4": 29.215804726838382,
+        "unicode-4": 38.163445533278136,
+        "sgr-8": 26.288380150834648,
+        "unicode-8": 39.346321293646284,
+        "sgr-16": 25.07010077702112,
+        "unicode-16": 39.12975940517868,
+        "sgr-64": 24.006945992151202,
+        "unicode-64": 40.34635131535992
+      }
+    },
+    "short-2-baseline": {
+      "result": {
+        "mib": 32,
+        "results": [
+          {
+            "case": "sgr-2",
+            "bytes": 33553408,
+            "seconds": 1.125242290989263,
+            "mib_s": 28.437451821480938
+          },
+          {
+            "case": "unicode-2",
+            "bytes": 33553920,
+            "seconds": 0.8227897500037216,
+            "mib_s": 38.89148074414547
+          },
+          {
+            "case": "sgr-4",
+            "bytes": 33546240,
+            "seconds": 1.2012026669981424,
+            "mib_s": 26.633463593574817
+          },
+          {
+            "case": "unicode-4",
+            "bytes": 33553408,
+            "seconds": 0.9167574580060318,
+            "mib_s": 34.90456844179768
+          },
+          {
+            "case": "sgr-8",
+            "bytes": 33546240,
+            "seconds": 1.3532035830139648,
+            "mib_s": 23.641814063737847
+          },
+          {
+            "case": "unicode-8",
+            "bytes": 33549824,
+            "seconds": 0.9620750829926692,
+            "mib_s": 33.25686948384859
+          },
+          {
+            "case": "sgr-16",
+            "bytes": 33546240,
+            "seconds": 1.5111142079986166,
+            "mib_s": 21.171257162866468
+          },
+          {
+            "case": "unicode-16",
+            "bytes": 33551872,
+            "seconds": 0.9833119999966584,
+            "mib_s": 32.54059606092343
+          },
+          {
+            "case": "sgr-64",
+            "bytes": 33490944,
+            "seconds": 1.6288772500120103,
+            "mib_s": 19.60826276182843
+          },
+          {
+            "case": "unicode-64",
+            "bytes": 33549312,
+            "seconds": 1.2122024160053115,
+            "mib_s": 26.394203447421447
+          }
+        ]
+      },
+      "resources": {
+        "max_rss_bytes": 46448640,
+        "user_seconds": 11.479439,
+        "system_seconds": 2.329421,
+        "server_exit": 0
+      },
+      "mib_s": {
+        "sgr-2": 28.437451821480938,
+        "unicode-2": 38.89148074414547,
+        "sgr-4": 26.633463593574817,
+        "unicode-4": 34.90456844179768,
+        "sgr-8": 23.641814063737847,
+        "unicode-8": 33.25686948384859,
+        "sgr-16": 21.171257162866468,
+        "unicode-16": 32.54059606092343,
+        "sgr-64": 19.60826276182843,
+        "unicode-64": 26.394203447421447
+      }
+    },
+    "short-2-before": {
+      "result": {
+        "mib": 32,
+        "results": [
+          {
+            "case": "sgr-2",
+            "bytes": 33553408,
+            "seconds": 1.0232137499842793,
+            "mib_s": 31.273058476776367
+          },
+          {
+            "case": "unicode-2",
+            "bytes": 33553920,
+            "seconds": 1.0275527919875458,
+            "mib_s": 31.141477078617914
+          },
+          {
+            "case": "sgr-4",
+            "bytes": 33546240,
+            "seconds": 1.156119082996156,
+            "mib_s": 27.67205210132006
+          },
+          {
+            "case": "unicode-4",
+            "bytes": 33553408,
+            "seconds": 1.0840000410098583,
+            "mib_s": 29.519393198260026
+          },
+          {
+            "case": "sgr-8",
+            "bytes": 33546240,
+            "seconds": 1.2423207910032943,
+            "mib_s": 25.751953707675785
+          },
+          {
+            "case": "unicode-8",
+            "bytes": 33549824,
+            "seconds": 0.9074830000172369,
+            "mib_s": 35.25752600119481
+          },
+          {
+            "case": "sgr-16",
+            "bytes": 33546240,
+            "seconds": 1.2947630000126082,
+            "mib_s": 24.708913909100325
+          },
+          {
+            "case": "unicode-16",
+            "bytes": 33551872,
+            "seconds": 0.8671650420001242,
+            "mib_s": 36.89904117899787
+          },
+          {
+            "case": "sgr-64",
+            "bytes": 33490944,
+            "seconds": 1.3769135000184178,
+            "mib_s": 23.196412210769065
+          },
+          {
+            "case": "unicode-64",
+            "bytes": 33549312,
+            "seconds": 0.8144149580039084,
+            "mib_s": 39.286013687565955
+          }
+        ]
+      },
+      "resources": {
+        "max_rss_bytes": 44630016,
+        "user_seconds": 10.458748,
+        "system_seconds": 2.7954529999999997,
+        "server_exit": 0
+      },
+      "mib_s": {
+        "sgr-2": 31.273058476776367,
+        "unicode-2": 31.141477078617914,
+        "sgr-4": 27.67205210132006,
+        "unicode-4": 29.519393198260026,
+        "sgr-8": 25.751953707675785,
+        "unicode-8": 35.25752600119481,
+        "sgr-16": 24.708913909100325,
+        "unicode-16": 36.89904117899787,
+        "sgr-64": 23.196412210769065,
+        "unicode-64": 39.286013687565955
+      }
+    },
+    "short-2-fixed": {
+      "result": {
+        "mib": 32,
+        "results": [
+          {
+            "case": "sgr-2",
+            "bytes": 33553408,
+            "seconds": 1.0311774160072673,
+            "mib_s": 31.031540199358364
+          },
+          {
+            "case": "unicode-2",
+            "bytes": 33553920,
+            "seconds": 0.8284275000041816,
+            "mib_s": 38.62681009332558
+          },
+          {
+            "case": "sgr-4",
+            "bytes": 33546240,
+            "seconds": 1.1094104580115527,
+            "mib_s": 28.837106473055126
+          },
+          {
+            "case": "unicode-4",
+            "bytes": 33553408,
+            "seconds": 0.8436972500057891,
+            "mib_s": 37.92713966684191
+          },
+          {
+            "case": "sgr-8",
+            "bytes": 33546240,
+            "seconds": 1.2278411659935955,
+            "mib_s": 26.055640082820673
+          },
+          {
+            "case": "unicode-8",
+            "bytes": 33549824,
+            "seconds": 0.8169520420196932,
+            "mib_s": 39.16460676155422
+          },
+          {
+            "case": "sgr-16",
+            "bytes": 33546240,
+            "seconds": 1.298935541009996,
+            "mib_s": 24.629542028794024
+          },
+          {
+            "case": "unicode-16",
+            "bytes": 33551872,
+            "seconds": 0.8322721250005998,
+            "mib_s": 38.44602940862274
+          },
+          {
+            "case": "sgr-64",
+            "bytes": 33490944,
+            "seconds": 1.3500566669972613,
+            "mib_s": 23.65786111485111
+          },
+          {
+            "case": "unicode-64",
+            "bytes": 33549312,
+            "seconds": 0.8040580420056358,
+            "mib_s": 39.792049225316674
+          }
+        ]
+      },
+      "resources": {
+        "max_rss_bytes": 44974080,
+        "user_seconds": 10.034687,
+        "system_seconds": 2.4815869999999998,
+        "server_exit": 0
+      },
+      "mib_s": {
+        "sgr-2": 31.031540199358364,
+        "unicode-2": 38.62681009332558,
+        "sgr-4": 28.837106473055126,
+        "unicode-4": 37.92713966684191,
+        "sgr-8": 26.055640082820673,
+        "unicode-8": 39.16460676155422,
+        "sgr-16": 24.629542028794024,
+        "unicode-16": 38.44602940862274,
+        "sgr-64": 23.65786111485111,
+        "unicode-64": 39.792049225316674
+      }
+    },
+    "short-3-baseline": {
+      "result": {
+        "mib": 32,
+        "results": [
+          {
+            "case": "sgr-2",
+            "bytes": 33553408,
+            "seconds": 1.0676159160211682,
+            "mib_s": 29.97241138625507
+          },
+          {
+            "case": "unicode-2",
+            "bytes": 33553920,
+            "seconds": 0.8423566670098808,
+            "mib_s": 37.98807912607718
+          },
+          {
+            "case": "sgr-4",
+            "bytes": 33546240,
+            "seconds": 1.2276441669964697,
+            "mib_s": 26.0598212088373
+          },
+          {
+            "case": "unicode-4",
+            "bytes": 33553408,
+            "seconds": 0.9718025000183843,
+            "mib_s": 32.927496520017854
+          },
+          {
+            "case": "sgr-8",
+            "bytes": 33546240,
+            "seconds": 1.399124625022523,
+            "mib_s": 22.865859786782746
+          },
+          {
+            "case": "unicode-8",
+            "bytes": 33549824,
+            "seconds": 0.9842922500101849,
+            "mib_s": 32.506204806975695
+          },
+          {
+            "case": "sgr-16",
+            "bytes": 33546240,
+            "seconds": 1.5330740000063088,
+            "mib_s": 20.867999522442066
+          },
+          {
+            "case": "unicode-16",
+            "bytes": 33551872,
+            "seconds": 1.0049592909927014,
+            "mib_s": 31.839656472196726
+          },
+          {
+            "case": "sgr-64",
+            "bytes": 33490944,
+            "seconds": 1.633092417003354,
+            "mib_s": 19.557651969021666
+          },
+          {
+            "case": "unicode-64",
+            "bytes": 33549312,
+            "seconds": 0.9947888749884441,
+            "mib_s": 32.162721148114635
+          }
+        ]
+      },
+      "resources": {
+        "max_rss_bytes": 46153728,
+        "user_seconds": 11.486567,
+        "system_seconds": 2.563813,
+        "server_exit": 0
+      },
+      "mib_s": {
+        "sgr-2": 29.97241138625507,
+        "unicode-2": 37.98807912607718,
+        "sgr-4": 26.0598212088373,
+        "unicode-4": 32.927496520017854,
+        "sgr-8": 22.865859786782746,
+        "unicode-8": 32.506204806975695,
+        "sgr-16": 20.867999522442066,
+        "unicode-16": 31.839656472196726,
+        "sgr-64": 19.557651969021666,
+        "unicode-64": 32.162721148114635
+      }
+    },
+    "short-3-before": {
+      "result": {
+        "mib": 32,
+        "results": [
+          {
+            "case": "sgr-2",
+            "bytes": 33553408,
+            "seconds": 1.0138967499951832,
+            "mib_s": 31.560435949372575
+          },
+          {
+            "case": "unicode-2",
+            "bytes": 33553920,
+            "seconds": 0.9345732500078157,
+            "mib_s": 34.23970429121783
+          },
+          {
+            "case": "sgr-4",
+            "bytes": 33546240,
+            "seconds": 1.10831374998088,
+            "mib_s": 28.86564161145877
+          },
+          {
+            "case": "unicode-4",
+            "bytes": 33553408,
+            "seconds": 0.9620799590193201,
+            "mib_s": 33.26025361771143
+          },
+          {
+            "case": "sgr-8",
+            "bytes": 33546240,
+            "seconds": 1.220621000014944,
+            "mib_s": 26.209763308683304
+          },
+          {
+            "case": "unicode-8",
+            "bytes": 33549824,
+            "seconds": 0.9017083749931771,
+            "mib_s": 35.483318505267405
+          },
+          {
+            "case": "sgr-16",
+            "bytes": 33546240,
+            "seconds": 1.2708727499993984,
+            "mib_s": 25.173399539816355
+          },
+          {
+            "case": "unicode-16",
+            "bytes": 33551872,
+            "seconds": 0.8614204580080695,
+            "mib_s": 37.14511107356387
+          },
+          {
+            "case": "sgr-64",
+            "bytes": 33490944,
+            "seconds": 1.3081792080192827,
+            "mib_s": 24.415197038148623
+          },
+          {
+            "case": "unicode-64",
+            "bytes": 33549312,
+            "seconds": 0.8035955000086688,
+            "mib_s": 39.814953153862675
+          }
+        ]
+      },
+      "resources": {
+        "max_rss_bytes": 46727168,
+        "user_seconds": 10.305292,
+        "system_seconds": 2.39583,
+        "server_exit": 0
+      },
+      "mib_s": {
+        "sgr-2": 31.560435949372575,
+        "unicode-2": 34.23970429121783,
+        "sgr-4": 28.86564161145877,
+        "unicode-4": 33.26025361771143,
+        "sgr-8": 26.209763308683304,
+        "unicode-8": 35.483318505267405,
+        "sgr-16": 25.173399539816355,
+        "unicode-16": 37.14511107356387,
+        "sgr-64": 24.415197038148623,
+        "unicode-64": 39.814953153862675
+      }
+    },
+    "short-3-fixed": {
+      "result": {
+        "mib": 32,
+        "results": [
+          {
+            "case": "sgr-2",
+            "bytes": 33553408,
+            "seconds": 1.0020740829932038,
+            "mib_s": 31.93279217632158
+          },
+          {
+            "case": "unicode-2",
+            "bytes": 33553920,
+            "seconds": 0.7825870419910643,
+            "mib_s": 40.88939632495905
+          },
+          {
+            "case": "sgr-4",
+            "bytes": 33546240,
+            "seconds": 1.0986774579796474,
+            "mib_s": 29.118816689686412
+          },
+          {
+            "case": "unicode-4",
+            "bytes": 33553408,
+            "seconds": 0.8434345419809688,
+            "mib_s": 37.93895298898254
+          },
+          {
+            "case": "sgr-8",
+            "bytes": 33546240,
+            "seconds": 1.2186904170084745,
+            "mib_s": 26.25128338871441
+          },
+          {
+            "case": "unicode-8",
+            "bytes": 33549824,
+            "seconds": 0.8886264169996139,
+            "mib_s": 36.0056879434003
+          },
+          {
+            "case": "sgr-16",
+            "bytes": 33546240,
+            "seconds": 1.28959816598217,
+            "mib_s": 24.8078729823832
+          },
+          {
+            "case": "unicode-16",
+            "bytes": 33551872,
+            "seconds": 0.8313832500134595,
+            "mib_s": 38.4871340542788
+          },
+          {
+            "case": "sgr-64",
+            "bytes": 33490944,
+            "seconds": 1.2634953749948181,
+            "mib_s": 25.278646647306477
+          },
+          {
+            "case": "unicode-64",
+            "bytes": 33549312,
+            "seconds": 0.7847830840037204,
+            "mib_s": 40.76937671014876
+          }
+        ]
+      },
+      "resources": {
+        "max_rss_bytes": 45760512,
+        "user_seconds": 9.941294,
+        "system_seconds": 2.260465,
+        "server_exit": 0
+      },
+      "mib_s": {
+        "sgr-2": 31.93279217632158,
+        "unicode-2": 40.88939632495905,
+        "sgr-4": 29.118816689686412,
+        "unicode-4": 37.93895298898254,
+        "sgr-8": 26.25128338871441,
+        "unicode-8": 36.0056879434003,
+        "sgr-16": 24.8078729823832,
+        "unicode-16": 38.4871340542788,
+        "sgr-64": 25.278646647306477,
+        "unicode-64": 40.76937671014876
+      }
+    },
+    "kitten-1-baseline": {
+      "result": {
+        "cmd": [
+          "/opt/homebrew/bin/kitten",
+          "__benchmark__",
+          "--repetitions",
+          "100"
+        ],
+        "cols": 120,
+        "rows": 32,
+        "elapsed": 23.20131866700831,
+        "rc": 0,
+        "stdout": "\u001b]\u001b\\\u001bcThese results measure the time it takes the terminal to fully parse all the data sent to it.\nNote that \u001b[31mrendering is suppressed\u001b[m (if the terminal supports the synchronized output escape code) to better benchmark parser performance. Use the --render flag to enable rendering.\n\nResults:\n  Only ASCII chars                     : 4.64s      @ \u001b[32m43.1   \u001b[m MB/s\n  Unicode chars                        : 3.83s      @ \u001b[32m47.0   \u001b[m MB/s\n  Unique multi-codepoint Unicode cells : 2.85s      @ \u001b[32m61.4   \u001b[m MB/s\n  CSI codes with few chars             : 5.03s      @ \u001b[32m19.9   \u001b[m MB/s\n  Long escape codes                    : 4.18s      @ \u001b[32m187.8  \u001b[m MB/s\n  Images                               : 2.07s      @ \u001b[32m257.2  \u001b[m MB/s\n",
+        "stderr": ""
+      },
+      "resources": {
+        "max_rss_bytes": 463749120,
+        "user_seconds": 24.510937,
+        "system_seconds": 27.99166,
+        "server_exit": 0
+      },
+      "mib_s": {
+        "Only ASCII chars": 43.1,
+        "Unicode chars": 47.0,
+        "Unique multi-codepoint Unicode cells": 61.4,
+        "CSI codes with few chars": 19.9,
+        "Long escape codes": 187.8,
+        "Images": 257.2
+      }
+    },
+    "kitten-1-before": {
+      "result": {
+        "cmd": [
+          "/opt/homebrew/bin/kitten",
+          "__benchmark__",
+          "--repetitions",
+          "100"
+        ],
+        "cols": 120,
+        "rows": 32,
+        "elapsed": 20.951551041012863,
+        "rc": 0,
+        "stdout": "\u001b]\u001b\\\u001bcThese results measure the time it takes the terminal to fully parse all the data sent to it.\nNote that \u001b[31mrendering is suppressed\u001b[m (if the terminal supports the synchronized output escape code) to better benchmark parser performance. Use the --render flag to enable rendering.\n\nResults:\n  Only ASCII chars                     : 2.89s      @ \u001b[32m69.1   \u001b[m MB/s\n  Unicode chars                        : 3.86s      @ \u001b[32m46.6   \u001b[m MB/s\n  Unique multi-codepoint Unicode cells : 2.63s      @ \u001b[32m66.6   \u001b[m MB/s\n  CSI codes with few chars             : 4.13s      @ \u001b[32m24.2   \u001b[m MB/s\n  Long escape codes                    : 4.61s      @ \u001b[32m169.9  \u001b[m MB/s\n  Images                               : 2.27s      @ \u001b[32m234.8  \u001b[m MB/s\n",
+        "stderr": ""
+      },
+      "resources": {
+        "max_rss_bytes": 461012992,
+        "user_seconds": 21.446383,
+        "system_seconds": 26.192962,
+        "server_exit": 0
+      },
+      "mib_s": {
+        "Only ASCII chars": 69.1,
+        "Unicode chars": 46.6,
+        "Unique multi-codepoint Unicode cells": 66.6,
+        "CSI codes with few chars": 24.2,
+        "Long escape codes": 169.9,
+        "Images": 234.8
+      }
+    },
+    "kitten-1-fixed": {
+      "result": {
+        "cmd": [
+          "/opt/homebrew/bin/kitten",
+          "__benchmark__",
+          "--repetitions",
+          "100"
+        ],
+        "cols": 120,
+        "rows": 32,
+        "elapsed": 20.53726920898771,
+        "rc": 0,
+        "stdout": "\u001b]\u001b\\\u001bcThese results measure the time it takes the terminal to fully parse all the data sent to it.\nNote that \u001b[31mrendering is suppressed\u001b[m (if the terminal supports the synchronized output escape code) to better benchmark parser performance. Use the --render flag to enable rendering.\n\nResults:\n  Only ASCII chars                     : 2.98s      @ \u001b[32m67.2   \u001b[m MB/s\n  Unicode chars                        : 3.91s      @ \u001b[32m46.0   \u001b[m MB/s\n  Unique multi-codepoint Unicode cells : 2.86s      @ \u001b[32m61.2   \u001b[m MB/s\n  CSI codes with few chars             : 4.45s      @ \u001b[32m22.5   \u001b[m MB/s\n  Long escape codes                    : 3.79s      @ \u001b[32m207.0  \u001b[m MB/s\n  Images                               : 1.98s      @ \u001b[32m269.8  \u001b[m MB/s\n",
+        "stderr": ""
+      },
+      "resources": {
+        "max_rss_bytes": 464044032,
+        "user_seconds": 21.454723,
+        "system_seconds": 25.122359,
+        "server_exit": 0
+      },
+      "mib_s": {
+        "Only ASCII chars": 67.2,
+        "Unicode chars": 46.0,
+        "Unique multi-codepoint Unicode cells": 61.2,
+        "CSI codes with few chars": 22.5,
+        "Long escape codes": 207.0,
+        "Images": 269.8
+      }
+    },
+    "kitten-2-baseline": {
+      "result": {
+        "cmd": [
+          "/opt/homebrew/bin/kitten",
+          "__benchmark__",
+          "--repetitions",
+          "100"
+        ],
+        "cols": 120,
+        "rows": 32,
+        "elapsed": 22.87488495899015,
+        "rc": 0,
+        "stdout": "\u001b]\u001b\\\u001bcThese results measure the time it takes the terminal to fully parse all the data sent to it.\nNote that \u001b[31mrendering is suppressed\u001b[m (if the terminal supports the synchronized output escape code) to better benchmark parser performance. Use the --render flag to enable rendering.\n\nResults:\n  Only ASCII chars                     : 4.69s      @ \u001b[32m42.6   \u001b[m MB/s\n  Unicode chars                        : 3.79s      @ \u001b[32m47.4   \u001b[m MB/s\n  Unique multi-codepoint Unicode cells : 2.65s      @ \u001b[32m66.0   \u001b[m MB/s\n  CSI codes with few chars             : 5.01s      @ \u001b[32m20.0   \u001b[m MB/s\n  Long escape codes                    : 4.11s      @ \u001b[32m190.7  \u001b[m MB/s\n  Images                               : 2.05s      @ \u001b[32m260.1  \u001b[m MB/s\n",
+        "stderr": ""
+      },
+      "resources": {
+        "max_rss_bytes": 461651968,
+        "user_seconds": 24.726789,
+        "system_seconds": 27.696376,
+        "server_exit": 0
+      },
+      "mib_s": {
+        "Only ASCII chars": 42.6,
+        "Unicode chars": 47.4,
+        "Unique multi-codepoint Unicode cells": 66.0,
+        "CSI codes with few chars": 20.0,
+        "Long escape codes": 190.7,
+        "Images": 260.1
+      }
+    },
+    "kitten-2-before": {
+      "result": {
+        "cmd": [
+          "/opt/homebrew/bin/kitten",
+          "__benchmark__",
+          "--repetitions",
+          "100"
+        ],
+        "cols": 120,
+        "rows": 32,
+        "elapsed": 20.52771937500802,
+        "rc": 0,
+        "stdout": "\u001b]\u001b\\\u001bcThese results measure the time it takes the terminal to fully parse all the data sent to it.\nNote that \u001b[31mrendering is suppressed\u001b[m (if the terminal supports the synchronized output escape code) to better benchmark parser performance. Use the --render flag to enable rendering.\n\nResults:\n  Only ASCII chars                     : 3.02s      @ \u001b[32m66.2   \u001b[m MB/s\n  Unicode chars                        : 3.92s      @ \u001b[32m45.9   \u001b[m MB/s\n  Unique multi-codepoint Unicode cells : 2.65s      @ \u001b[32m66.1   \u001b[m MB/s\n  CSI codes with few chars             : 4.34s      @ \u001b[32m23.1   \u001b[m MB/s\n  Long escape codes                    : 3.98s      @ \u001b[32m197.2  \u001b[m MB/s\n  Images                               : 2.06s      @ \u001b[32m258.4  \u001b[m MB/s\n",
+        "stderr": ""
+      },
+      "resources": {
+        "max_rss_bytes": 463831040,
+        "user_seconds": 21.478484,
+        "system_seconds": 25.930654,
+        "server_exit": 0
+      },
+      "mib_s": {
+        "Only ASCII chars": 66.2,
+        "Unicode chars": 45.9,
+        "Unique multi-codepoint Unicode cells": 66.1,
+        "CSI codes with few chars": 23.1,
+        "Long escape codes": 197.2,
+        "Images": 258.4
+      }
+    },
+    "kitten-2-fixed": {
+      "result": {
+        "cmd": [
+          "/opt/homebrew/bin/kitten",
+          "__benchmark__",
+          "--repetitions",
+          "100"
+        ],
+        "cols": 120,
+        "rows": 32,
+        "elapsed": 19.720567582990043,
+        "rc": 0,
+        "stdout": "\u001b]\u001b\\\u001bcThese results measure the time it takes the terminal to fully parse all the data sent to it.\nNote that \u001b[31mrendering is suppressed\u001b[m (if the terminal supports the synchronized output escape code) to better benchmark parser performance. Use the --render flag to enable rendering.\n\nResults:\n  Only ASCII chars                     : 2.92s      @ \u001b[32m68.6   \u001b[m MB/s\n  Unicode chars                        : 3.77s      @ \u001b[32m47.6   \u001b[m MB/s\n  Unique multi-codepoint Unicode cells : 2.56s      @ \u001b[32m68.4   \u001b[m MB/s\n  CSI codes with few chars             : 3.98s      @ \u001b[32m25.1   \u001b[m MB/s\n  Long escape codes                    : 3.97s      @ \u001b[32m197.7  \u001b[m MB/s\n  Images                               : 1.96s      @ \u001b[32m272.6  \u001b[m MB/s\n",
+        "stderr": ""
+      },
+      "resources": {
+        "max_rss_bytes": 464896000,
+        "user_seconds": 21.184692,
+        "system_seconds": 24.839705,
+        "server_exit": 0
+      },
+      "mib_s": {
+        "Only ASCII chars": 68.6,
+        "Unicode chars": 47.6,
+        "Unique multi-codepoint Unicode cells": 68.4,
+        "CSI codes with few chars": 25.1,
+        "Long escape codes": 197.7,
+        "Images": 272.6
+      }
+    },
+    "kitten-3-baseline": {
+      "result": {
+        "cmd": [
+          "/opt/homebrew/bin/kitten",
+          "__benchmark__",
+          "--repetitions",
+          "100"
+        ],
+        "cols": 120,
+        "rows": 32,
+        "elapsed": 22.82878495901241,
+        "rc": 0,
+        "stdout": "\u001b]\u001b\\\u001bcThese results measure the time it takes the terminal to fully parse all the data sent to it.\nNote that \u001b[31mrendering is suppressed\u001b[m (if the terminal supports the synchronized output escape code) to better benchmark parser performance. Use the --render flag to enable rendering.\n\nResults:\n  Only ASCII chars                     : 4.7s       @ \u001b[32m42.5   \u001b[m MB/s\n  Unicode chars                        : 3.83s      @ \u001b[32m47.0   \u001b[m MB/s\n  Unique multi-codepoint Unicode cells : 2.58s      @ \u001b[32m67.8   \u001b[m MB/s\n  CSI codes with few chars             : 4.96s      @ \u001b[32m20.2   \u001b[m MB/s\n  Long escape codes                    : 4.15s      @ \u001b[32m188.9  \u001b[m MB/s\n  Images                               : 2.03s      @ \u001b[32m262.4  \u001b[m MB/s\n",
+        "stderr": ""
+      },
+      "resources": {
+        "max_rss_bytes": 464044032,
+        "user_seconds": 24.643215,
+        "system_seconds": 27.822443,
+        "server_exit": 0
+      },
+      "mib_s": {
+        "Only ASCII chars": 42.5,
+        "Unicode chars": 47.0,
+        "Unique multi-codepoint Unicode cells": 67.8,
+        "CSI codes with few chars": 20.2,
+        "Long escape codes": 188.9,
+        "Images": 262.4
+      }
+    },
+    "kitten-3-before": {
+      "result": {
+        "cmd": [
+          "/opt/homebrew/bin/kitten",
+          "__benchmark__",
+          "--repetitions",
+          "100"
+        ],
+        "cols": 120,
+        "rows": 32,
+        "elapsed": 20.30206074999296,
+        "rc": 0,
+        "stdout": "\u001b]\u001b\\\u001bcThese results measure the time it takes the terminal to fully parse all the data sent to it.\nNote that \u001b[31mrendering is suppressed\u001b[m (if the terminal supports the synchronized output escape code) to better benchmark parser performance. Use the --render flag to enable rendering.\n\nResults:\n  Only ASCII chars                     : 2.9s       @ \u001b[32m68.9   \u001b[m MB/s\n  Unicode chars                        : 3.93s      @ \u001b[32m45.7   \u001b[m MB/s\n  Unique multi-codepoint Unicode cells : 2.64s      @ \u001b[32m66.2   \u001b[m MB/s\n  CSI codes with few chars             : 4.31s      @ \u001b[32m23.2   \u001b[m MB/s\n  Long escape codes                    : 4s         @ \u001b[32m195.8  \u001b[m MB/s\n  Images                               : 1.94s      @ \u001b[32m275.5  \u001b[m MB/s\n",
+        "stderr": ""
+      },
+      "resources": {
+        "max_rss_bytes": 461766656,
+        "user_seconds": 21.494031,
+        "system_seconds": 25.296062,
+        "server_exit": 0
+      },
+      "mib_s": {
+        "Only ASCII chars": 68.9,
+        "Unicode chars": 45.7,
+        "Unique multi-codepoint Unicode cells": 66.2,
+        "CSI codes with few chars": 23.2,
+        "Long escape codes": 195.8,
+        "Images": 275.5
+      }
+    },
+    "kitten-3-fixed": {
+      "result": {
+        "cmd": [
+          "/opt/homebrew/bin/kitten",
+          "__benchmark__",
+          "--repetitions",
+          "100"
+        ],
+        "cols": 120,
+        "rows": 32,
+        "elapsed": 19.657567417016253,
+        "rc": 0,
+        "stdout": "\u001b]\u001b\\\u001bcThese results measure the time it takes the terminal to fully parse all the data sent to it.\nNote that \u001b[31mrendering is suppressed\u001b[m (if the terminal supports the synchronized output escape code) to better benchmark parser performance. Use the --render flag to enable rendering.\n\nResults:\n  Only ASCII chars                     : 2.9s       @ \u001b[32m68.9   \u001b[m MB/s\n  Unicode chars                        : 3.78s      @ \u001b[32m47.6   \u001b[m MB/s\n  Unique multi-codepoint Unicode cells : 2.54s      @ \u001b[32m69.0   \u001b[m MB/s\n  CSI codes with few chars             : 4.01s      @ \u001b[32m24.9   \u001b[m MB/s\n  Long escape codes                    : 3.79s      @ \u001b[32m206.7  \u001b[m MB/s\n  Images                               : 2.07s      @ \u001b[32m257.9  \u001b[m MB/s\n",
+        "stderr": ""
+      },
+      "resources": {
+        "max_rss_bytes": 461684736,
+        "user_seconds": 20.90886,
+        "system_seconds": 25.148935,
+        "server_exit": 0
+      },
+      "mib_s": {
+        "Only ASCII chars": 68.9,
+        "Unicode chars": 47.6,
+        "Unique multi-codepoint Unicode cells": 69.0,
+        "CSI codes with few chars": 24.9,
+        "Long escape codes": 206.7,
+        "Images": 257.9
+      }
+    }
+  },
+  "allocations": [
+    {
+      "case": "sgr-2",
+      "path": "print-buffer",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65534",
+      "ns": "1525500",
+      "alloc": "1",
+      "realloc": "0"
+    },
+    {
+      "case": "sgr-2",
+      "path": "print-buffer",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65534",
+      "ns": "2006541",
+      "alloc": "9363",
+      "realloc": "0"
+    },
+    {
+      "case": "sgr-2",
+      "path": "print-buffer",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65534",
+      "ns": "1317458",
+      "alloc": "1",
+      "realloc": "0"
+    },
+    {
+      "case": "sgr-2",
+      "path": "mux-coalesce",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65534",
+      "ns": "1898041",
+      "alloc": "9363",
+      "realloc": "13"
+    },
+    {
+      "case": "sgr-2",
+      "path": "mux-coalesce",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65534",
+      "ns": "1502917",
+      "alloc": "9363",
+      "realloc": "13"
+    },
+    {
+      "case": "sgr-2",
+      "path": "mux-coalesce",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65534",
+      "ns": "1424875",
+      "alloc": "9363",
+      "realloc": "13"
+    },
+    {
+      "case": "unicode-2",
+      "path": "print-buffer",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65535",
+      "ns": "816667",
+      "alloc": "1",
+      "realloc": "13"
+    },
+    {
+      "case": "unicode-2",
+      "path": "print-buffer",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65535",
+      "ns": "1235166",
+      "alloc": "13108",
+      "realloc": "13"
+    },
+    {
+      "case": "unicode-2",
+      "path": "print-buffer",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65535",
+      "ns": "676250",
+      "alloc": "1",
+      "realloc": "13"
+    },
+    {
+      "case": "unicode-2",
+      "path": "mux-coalesce",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65535",
+      "ns": "757750",
+      "alloc": "2",
+      "realloc": "13"
+    },
+    {
+      "case": "unicode-2",
+      "path": "mux-coalesce",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65535",
+      "ns": "1149125",
+      "alloc": "13108",
+      "realloc": "14"
+    },
+    {
+      "case": "unicode-2",
+      "path": "mux-coalesce",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65535",
+      "ns": "718250",
+      "alloc": "2",
+      "realloc": "14"
+    },
+    {
+      "case": "sgr-4",
+      "path": "print-buffer",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65520",
+      "ns": "905042",
+      "alloc": "1",
+      "realloc": "0"
+    },
+    {
+      "case": "sgr-4",
+      "path": "print-buffer",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65520",
+      "ns": "1056708",
+      "alloc": "7281",
+      "realloc": "0"
+    },
+    {
+      "case": "sgr-4",
+      "path": "print-buffer",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65520",
+      "ns": "721375",
+      "alloc": "1",
+      "realloc": "0"
+    },
+    {
+      "case": "sgr-4",
+      "path": "mux-coalesce",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65520",
+      "ns": "1177416",
+      "alloc": "7281",
+      "realloc": "12"
+    },
+    {
+      "case": "sgr-4",
+      "path": "mux-coalesce",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65520",
+      "ns": "936708",
+      "alloc": "7281",
+      "realloc": "12"
+    },
+    {
+      "case": "sgr-4",
+      "path": "mux-coalesce",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65520",
+      "ns": "904750",
+      "alloc": "7281",
+      "realloc": "12"
+    },
+    {
+      "case": "unicode-4",
+      "path": "print-buffer",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65534",
+      "ns": "552709",
+      "alloc": "1",
+      "realloc": "13"
+    },
+    {
+      "case": "unicode-4",
+      "path": "print-buffer",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65534",
+      "ns": "721042",
+      "alloc": "9363",
+      "realloc": "13"
+    },
+    {
+      "case": "unicode-4",
+      "path": "print-buffer",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65534",
+      "ns": "382708",
+      "alloc": "1",
+      "realloc": "13"
+    },
+    {
+      "case": "unicode-4",
+      "path": "mux-coalesce",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65534",
+      "ns": "557667",
+      "alloc": "2",
+      "realloc": "13"
+    },
+    {
+      "case": "unicode-4",
+      "path": "mux-coalesce",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65534",
+      "ns": "802500",
+      "alloc": "9363",
+      "realloc": "14"
+    },
+    {
+      "case": "unicode-4",
+      "path": "mux-coalesce",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65534",
+      "ns": "441167",
+      "alloc": "2",
+      "realloc": "14"
+    },
+    {
+      "case": "sgr-8",
+      "path": "print-buffer",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65520",
+      "ns": "636708",
+      "alloc": "1",
+      "realloc": "0"
+    },
+    {
+      "case": "sgr-8",
+      "path": "print-buffer",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65520",
+      "ns": "604709",
+      "alloc": "5041",
+      "realloc": "0"
+    },
+    {
+      "case": "sgr-8",
+      "path": "print-buffer",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65520",
+      "ns": "442167",
+      "alloc": "1",
+      "realloc": "0"
+    },
+    {
+      "case": "sgr-8",
+      "path": "mux-coalesce",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65520",
+      "ns": "815333",
+      "alloc": "5041",
+      "realloc": "12"
+    },
+    {
+      "case": "sgr-8",
+      "path": "mux-coalesce",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65520",
+      "ns": "597541",
+      "alloc": "5041",
+      "realloc": "12"
+    },
+    {
+      "case": "sgr-8",
+      "path": "mux-coalesce",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65520",
+      "ns": "563584",
+      "alloc": "5041",
+      "realloc": "12"
+    },
+    {
+      "case": "unicode-8",
+      "path": "print-buffer",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65527",
+      "ns": "441459",
+      "alloc": "1",
+      "realloc": "13"
+    },
+    {
+      "case": "unicode-8",
+      "path": "print-buffer",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65527",
+      "ns": "437292",
+      "alloc": "5958",
+      "realloc": "13"
+    },
+    {
+      "case": "unicode-8",
+      "path": "print-buffer",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65527",
+      "ns": "241083",
+      "alloc": "1",
+      "realloc": "13"
+    },
+    {
+      "case": "unicode-8",
+      "path": "mux-coalesce",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65527",
+      "ns": "487833",
+      "alloc": "2",
+      "realloc": "13"
+    },
+    {
+      "case": "unicode-8",
+      "path": "mux-coalesce",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65527",
+      "ns": "465125",
+      "alloc": "5958",
+      "realloc": "13"
+    },
+    {
+      "case": "unicode-8",
+      "path": "mux-coalesce",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65527",
+      "ns": "254834",
+      "alloc": "2",
+      "realloc": "13"
+    },
+    {
+      "case": "sgr-16",
+      "path": "print-buffer",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65520",
+      "ns": "502375",
+      "alloc": "1",
+      "realloc": "1"
+    },
+    {
+      "case": "sgr-16",
+      "path": "print-buffer",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65520",
+      "ns": "365708",
+      "alloc": "3121",
+      "realloc": "0"
+    },
+    {
+      "case": "sgr-16",
+      "path": "print-buffer",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65520",
+      "ns": "300083",
+      "alloc": "1",
+      "realloc": "0"
+    },
+    {
+      "case": "sgr-16",
+      "path": "mux-coalesce",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65520",
+      "ns": "664500",
+      "alloc": "3121",
+      "realloc": "3131"
+    },
+    {
+      "case": "sgr-16",
+      "path": "mux-coalesce",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65520",
+      "ns": "368083",
+      "alloc": "3121",
+      "realloc": "11"
+    },
+    {
+      "case": "sgr-16",
+      "path": "mux-coalesce",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65520",
+      "ns": "361417",
+      "alloc": "3121",
+      "realloc": "11"
+    },
+    {
+      "case": "unicode-16",
+      "path": "print-buffer",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65531",
+      "ns": "387750",
+      "alloc": "1",
+      "realloc": "13"
+    },
+    {
+      "case": "unicode-16",
+      "path": "print-buffer",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65531",
+      "ns": "294375",
+      "alloc": "3450",
+      "realloc": "12"
+    },
+    {
+      "case": "unicode-16",
+      "path": "print-buffer",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65531",
+      "ns": "158208",
+      "alloc": "1",
+      "realloc": "12"
+    },
+    {
+      "case": "unicode-16",
+      "path": "mux-coalesce",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65531",
+      "ns": "418459",
+      "alloc": "2",
+      "realloc": "13"
+    },
+    {
+      "case": "unicode-16",
+      "path": "mux-coalesce",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65531",
+      "ns": "276583",
+      "alloc": "3450",
+      "realloc": "12"
+    },
+    {
+      "case": "unicode-16",
+      "path": "mux-coalesce",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65531",
+      "ns": "160500",
+      "alloc": "2",
+      "realloc": "12"
+    },
+    {
+      "case": "sgr-64",
+      "path": "print-buffer",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65412",
+      "ns": "315541",
+      "alloc": "1",
+      "realloc": "3"
+    },
+    {
+      "case": "sgr-64",
+      "path": "print-buffer",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65412",
+      "ns": "153167",
+      "alloc": "949",
+      "realloc": "0"
+    },
+    {
+      "case": "sgr-64",
+      "path": "print-buffer",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65412",
+      "ns": "95125",
+      "alloc": "1",
+      "realloc": "0"
+    },
+    {
+      "case": "sgr-64",
+      "path": "mux-coalesce",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65412",
+      "ns": "535459",
+      "alloc": "949",
+      "realloc": "2853"
+    },
+    {
+      "case": "sgr-64",
+      "path": "mux-coalesce",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65412",
+      "ns": "128208",
+      "alloc": "949",
+      "realloc": "9"
+    },
+    {
+      "case": "sgr-64",
+      "path": "mux-coalesce",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65412",
+      "ns": "123875",
+      "alloc": "949",
+      "realloc": "9"
+    },
+    {
+      "case": "unicode-64",
+      "path": "print-buffer",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65526",
+      "ns": "292375",
+      "alloc": "1",
+      "realloc": "13"
+    },
+    {
+      "case": "unicode-64",
+      "path": "print-buffer",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65526",
+      "ns": "95291",
+      "alloc": "979",
+      "realloc": "10"
+    },
+    {
+      "case": "unicode-64",
+      "path": "print-buffer",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65526",
+      "ns": "65666",
+      "alloc": "1",
+      "realloc": "10"
+    },
+    {
+      "case": "unicode-64",
+      "path": "mux-coalesce",
+      "mode": "scalar",
+      "rep": "0",
+      "bytes": "65526",
+      "ns": "308375",
+      "alloc": "2",
+      "realloc": "13"
+    },
+    {
+      "case": "unicode-64",
+      "path": "mux-coalesce",
+      "mode": "owned",
+      "rep": "0",
+      "bytes": "65526",
+      "ns": "97375",
+      "alloc": "979",
+      "realloc": "10"
+    },
+    {
+      "case": "unicode-64",
+      "path": "mux-coalesce",
+      "mode": "borrowed",
+      "rep": "0",
+      "bytes": "65526",
+      "ns": "68917",
+      "alloc": "2",
+      "realloc": "10"
+    }
+  ],
+  "soaks": {
+    "before": {
+      "result": {
+        "mib": 60,
+        "results": [
+          {
+            "case": "mixed-soak",
+            "bytes": 1265380176,
+            "seconds": 60.039060667011654,
+            "rounds": 1207
+          }
+        ]
+      },
+      "samples": [
+        {
+          "elapsed": 0.0011541249987203628,
+          "rss_bytes": 3899392
+        },
+        {
+          "elapsed": 2.048579458001768,
+          "rss_bytes": 34390016
+        },
+        {
+          "elapsed": 4.097076208010549,
+          "rss_bytes": 34406400
+        },
+        {
+          "elapsed": 6.140316625009291,
+          "rss_bytes": 34406400
+        },
+        {
+          "elapsed": 8.186507040983997,
+          "rss_bytes": 35651584
+        },
+        {
+          "elapsed": 10.233617582998704,
+          "rss_bytes": 35651584
+        },
+        {
+          "elapsed": 12.276634125009878,
+          "rss_bytes": 35667968
+        },
+        {
+          "elapsed": 14.358578749990556,
+          "rss_bytes": 35651584
+        },
+        {
+          "elapsed": 16.407988916005706,
+          "rss_bytes": 35651584
+        },
+        {
+          "elapsed": 18.456786249997094,
+          "rss_bytes": 35651584
+        },
+        {
+          "elapsed": 20.50251033299719,
+          "rss_bytes": 35651584
+        },
+        {
+          "elapsed": 22.55571320798481,
+          "rss_bytes": 35667968
+        },
+        {
+          "elapsed": 24.601115458004642,
+          "rss_bytes": 35667968
+        },
+        {
+          "elapsed": 26.641772500006482,
+          "rss_bytes": 35667968
+        },
+        {
+          "elapsed": 28.685069665982155,
+          "rss_bytes": 35667968
+        },
+        {
+          "elapsed": 30.726364000001922,
+          "rss_bytes": 35667968
+        },
+        {
+          "elapsed": 32.76676554098958,
+          "rss_bytes": 35667968
+        },
+        {
+          "elapsed": 34.80642633300158,
+          "rss_bytes": 35667968
+        },
+        {
+          "elapsed": 36.84818541599088,
+          "rss_bytes": 35667968
+        },
+        {
+          "elapsed": 38.89200858300319,
+          "rss_bytes": 35667968
+        },
+        {
+          "elapsed": 40.941773333004676,
+          "rss_bytes": 35667968
+        },
+        {
+          "elapsed": 42.98160512500908,
+          "rss_bytes": 35667968
+        },
+        {
+          "elapsed": 45.016362875001505,
+          "rss_bytes": 35667968
+        },
+        {
+          "elapsed": 47.0586309999926,
+          "rss_bytes": 35667968
+        },
+        {
+          "elapsed": 49.101665249996586,
+          "rss_bytes": 35667968
+        },
+        {
+          "elapsed": 51.139619624998886,
+          "rss_bytes": 35684352
+        },
+        {
+          "elapsed": 53.18394370799069,
+          "rss_bytes": 35684352
+        },
+        {
+          "elapsed": 55.2238555829972,
+          "rss_bytes": 35684352
+        },
+        {
+          "elapsed": 57.26717320800526,
+          "rss_bytes": 35684352
+        },
+        {
+          "elapsed": 59.31773208300001,
+          "rss_bytes": 35684352
+        }
+      ],
+      "resources": {
+        "max_rss_bytes": 36339712,
+        "user_seconds": 53.928251,
+        "system_seconds": 9.386206,
+        "server_exit": 0
+      }
+    },
+    "fixed": {
+      "result": {
+        "mib": 60,
+        "results": [
+          {
+            "case": "mixed-soak",
+            "bytes": 1320943680,
+            "seconds": 60.037250332999974,
+            "rounds": 1260
+          }
+        ]
+      },
+      "samples": [
+        {
+          "elapsed": 0.0008937499951571226,
+          "rss_bytes": 3964928
+        },
+        {
+          "elapsed": 2.0362528749974445,
+          "rss_bytes": 34160640
+        },
+        {
+          "elapsed": 4.081354916997952,
+          "rss_bytes": 35389440
+        },
+        {
+          "elapsed": 6.128167499991832,
+          "rss_bytes": 35373056
+        },
+        {
+          "elapsed": 8.166472749988316,
+          "rss_bytes": 35405824
+        },
+        {
+          "elapsed": 10.205093291995581,
+          "rss_bytes": 35405824
+        },
+        {
+          "elapsed": 12.255061625008238,
+          "rss_bytes": 35422208
+        },
+        {
+          "elapsed": 14.30518304198631,
+          "rss_bytes": 35405824
+        },
+        {
+          "elapsed": 16.354732457984937,
+          "rss_bytes": 35405824
+        },
+        {
+          "elapsed": 18.39393716698396,
+          "rss_bytes": 35405824
+        },
+        {
+          "elapsed": 20.444873832981102,
+          "rss_bytes": 35422208
+        },
+        {
+          "elapsed": 22.480574457993498,
+          "rss_bytes": 35438592
+        },
+        {
+          "elapsed": 24.514188750006724,
+          "rss_bytes": 35422208
+        },
+        {
+          "elapsed": 26.561025542003335,
+          "rss_bytes": 35422208
+        },
+        {
+          "elapsed": 28.60279870798695,
+          "rss_bytes": 35422208
+        },
+        {
+          "elapsed": 30.646770916995592,
+          "rss_bytes": 35454976
+        },
+        {
+          "elapsed": 32.68916466698283,
+          "rss_bytes": 35454976
+        },
+        {
+          "elapsed": 34.73257433300023,
+          "rss_bytes": 35454976
+        },
+        {
+          "elapsed": 36.78261091699824,
+          "rss_bytes": 35454976
+        },
+        {
+          "elapsed": 38.828797166992445,
+          "rss_bytes": 35454976
+        },
+        {
+          "elapsed": 40.88110949998372,
+          "rss_bytes": 35454976
+        },
+        {
+          "elapsed": 42.9307419169927,
+          "rss_bytes": 35454976
+        },
+        {
+          "elapsed": 44.97676737498841,
+          "rss_bytes": 35454976
+        },
+        {
+          "elapsed": 47.024209041992435,
+          "rss_bytes": 35487744
+        },
+        {
+          "elapsed": 49.06769999998505,
+          "rss_bytes": 35520512
+        },
+        {
+          "elapsed": 51.11613379200571,
+          "rss_bytes": 35520512
+        },
+        {
+          "elapsed": 53.15707395799109,
+          "rss_bytes": 35536896
+        },
+        {
+          "elapsed": 55.20457004199852,
+          "rss_bytes": 35536896
+        },
+        {
+          "elapsed": 57.24837820799439,
+          "rss_bytes": 35553280
+        },
+        {
+          "elapsed": 59.28815741700237,
+          "rss_bytes": 35536896
+        }
+      ],
+      "resources": {
+        "max_rss_bytes": 36110336,
+        "user_seconds": 54.123548,
+        "system_seconds": 9.538035,
+        "server_exit": 0
+      }
+    }
+  },
+  "fixed_commit": "96dc67cf7f27cce34c6a0fe9c00316ff7b981355"
+}

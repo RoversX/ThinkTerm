@@ -1,5 +1,9 @@
 # Parser throughput follow-up
 
+A later [borrowed-run correction](ascii-run-allocation-fix.md) removes the
+short ASCII/Unicode mixture allocation regression discovered after this series.
+The measurements below describe the original owned-run implementation.
+
 This follow-up starts at `e791e31`, after the earlier screen-write batching and
 Kitty Base64 compatibility fixes. It evaluates the parser boundary, CSI row
 updates, and repeated extended-attribute allocation separately from rendering.
