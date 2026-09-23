@@ -2618,6 +2618,7 @@ pub struct TermWindow {
     /// The most recent full-window view frame, recorded so that closing one
     /// has a picture to take away after the view itself is gone.
     content_view_last_frame: Option<crate::quad::HeapQuadAllocator>,
+    content_view_last_recording_revision: u64,
     /// The heap the next view frame records into; it and `content_view_last_frame`
     /// swap every frame so neither is reallocated, and the last frame stays
     /// whole until the new recording has succeeded.
@@ -4188,6 +4189,7 @@ impl TermWindow {
             content_view_deferred_mux_resize: false,
             content_view_fade: None,
             content_view_last_frame: None,
+            content_view_last_recording_revision: 0,
             content_view_frame_scratch: Default::default(),
             next_content_view_id: 1,
             registered_content_view_surfaces: HashMap::new(),

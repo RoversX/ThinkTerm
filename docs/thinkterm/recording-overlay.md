@@ -26,3 +26,17 @@ closes or the GUI process exits. They are not synchronized to other GUI clients.
 This is a visual cover for screen recording. Terminal contents, clipboard copies,
 logs, and remote clients retain the original text. Check the recording preview
 after changing the window layout or scrolling sensitive content.
+
+## Rendering and validation
+
+Recorded previews and transition captures remove the covered source quads before
+adding the black masks. This keeps text, images, and emoji hidden when the entire
+picture fades or scales. A mask edit invalidates the affected thumbnail and any
+partial rebuild; the card may briefly show its background while rebuilding.
+Snapshots retain their pane's mask layer even after the pane closes. The preview
+mapping uses the terminal renderer's actual text-grid geometry, including padding,
+the navigation bar, split boundaries, and per-pane font metrics.
+
+Regression tests cover partial-opacity/scaled quad replay, texture and gradient
+coordinates, overlapping masks, geometry mapping, and snapshot/cache lifetime.
+These checks do not replace a GUI screen-recording check on the target backend.

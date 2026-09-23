@@ -194,6 +194,7 @@ pub(crate) struct ContentViewChrome {
 /// below the size they were rasterised at, so the text softens as it shrinks
 /// -- which is what a window pulling away from you looks like anyway.
 pub(crate) struct ContentViewFlight {
+    pub(crate) recording_revision: u64,
     pub(crate) surface: crate::quad::HeapQuadAllocator,
     /// Where the terminal was when `surface` was recorded.
     ///
@@ -296,9 +297,24 @@ pub(crate) struct TerminalPreviewSnapshot {
     pub splits: Vec<PositionedSplit>,
 }
 
+impl TerminalPreviewSnapshot {
+    pub(crate) fn recording_revision(&self) -> u64 {
+        // Revisions are assigned from one monotonic counter: an edit to any
+        // pane exceeds the previous maximum, without hashes or collisions.
+        self.panes
+            .iter()
+            .map(|pane| pane.recording_layer.revision())
+            .max()
+            .unwrap_or(0)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct TerminalPreviewPaneSnapshot {
     pub pane_id: PaneId,
+    // Retained with the pixels, including after PaneRemoved and during a
+    // sliced rebuild that has not reached this pane yet.
+    pub recording_layer: crate::termwindow::ui::recording_overlay::PaneRecordingLayer,
     pub is_active: bool,
     pub left: usize,
     pub top: usize,

@@ -5,6 +5,7 @@ use crate::ui::{DrawContext, SvgIcon};
 use crate::utilsprites::RenderMetrics;
 use mux::pane::PaneId;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use window::color::LinearRgba;
 use window::{KeyCode, KeyEvent, MouseCursor, MouseEvent, MouseEventKind, MousePress, WindowOps};
@@ -25,12 +26,82 @@ struct Rect {
 
 // GUI-local state follows a pane between windows; no terminal or mux data changes.
 // Rectangles are normalized to the pane frame, so previews reuse the same geometry.
-#[derive(Clone, Default)]
-pub(crate) struct PaneRecordingLayer(Arc<Mutex<Vec<Rect>>>);
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PaneRecordingLayer(Arc<Mutex<PaneRecordingState>>);
+
+#[derive(Debug, Default)]
+struct PaneRecordingState {
+    masks: Vec<Rect>,
+    // The actual text grid, relative to the editable pane frame. This includes
+    // the renderer's padding, nav bar and effective per-pane font metrics.
+    grid: Option<Rect>,
+    revision: u64,
+}
+
+static MASK_REVISION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn recording_mask_revision() -> u64 {
+    MASK_REVISION.load(Ordering::Relaxed)
+}
+
+fn next_revision() -> u64 {
+    MASK_REVISION.fetch_add(1, Ordering::Relaxed) + 1
+}
 
 impl PaneRecordingLayer {
+    pub(crate) fn revision(&self) -> u64 {
+        self.0.lock().unwrap().revision
+    }
+
+    pub(crate) fn preview_rects(
+        &self,
+        target_grid: window::RectF,
+        clip: window::RectF,
+    ) -> Vec<window::RectF> {
+        let state = self.0.lock().unwrap();
+        if state.masks.is_empty() {
+            return Vec::new();
+        }
+        let Some(grid) = state.grid.filter(|grid| grid.w > 0.0 && grid.h > 0.0) else {
+            // A source pane that has not painted since its masks were created
+            // has no trustworthy grid mapping yet. Keep its preview covered.
+            return vec![clip];
+        };
+        state
+            .masks
+            .iter()
+            .filter_map(|mask| {
+                Rect {
+                    x: (mask.x - grid.x) / grid.w,
+                    y: (mask.y - grid.y) / grid.h,
+                    w: mask.w / grid.w,
+                    h: mask.h / grid.h,
+                }
+                .in_frame(target_grid)
+                .intersection(&clip)
+            })
+            .collect()
+    }
+
+    fn set_grid(&self, frame: window::RectF, grid: window::RectF) -> bool {
+        let grid = Rect {
+            x: (grid.min_x() - frame.min_x()) / frame.width().max(1.0),
+            y: (grid.min_y() - frame.min_y()) / frame.height().max(1.0),
+            w: grid.width() / frame.width().max(1.0),
+            h: grid.height() / frame.height().max(1.0),
+        };
+        let mut state = self.0.lock().unwrap();
+        if state.grid != Some(grid) {
+            state.grid = Some(grid);
+            if !state.masks.is_empty() {
+                state.revision = next_revision();
+                return true;
+            }
+        }
+        false
+    }
     fn is_empty(&self) -> bool {
-        self.0.lock().unwrap().is_empty()
+        self.0.lock().unwrap().masks.is_empty()
     }
 }
 
@@ -55,7 +126,12 @@ pub(crate) fn pane_layer(pane_id: PaneId) -> PaneRecordingLayer {
 }
 
 fn save_pane_masks(pane_id: PaneId, masks: Vec<Rect>) {
-    *pane_layer(pane_id).0.lock().unwrap() = masks;
+    let layer = pane_layer(pane_id);
+    let mut state = layer.0.lock().unwrap();
+    if state.masks != masks {
+        state.masks = masks;
+        state.revision = next_revision();
+    }
 }
 
 impl Rect {
@@ -165,6 +241,7 @@ impl RecordingOverlay {
                     .0
                     .lock()
                     .unwrap()
+                    .masks
                     .iter()
                     .map(|r| Rect {
                         x: r.x * size.0,
@@ -365,6 +442,49 @@ impl crate::TermWindow {
         }
     }
 
+    pub(crate) fn update_recording_mask_grid(
+        &self,
+        pane_id: PaneId,
+        frame: window::RectF,
+        grid: window::RectF,
+    ) {
+        if let Some(masks) = pane_masks(pane_id) {
+            if masks.set_grid(frame, grid) {
+                crate::frontend::front_end().invalidate_all_windows();
+            }
+        }
+    }
+
+    pub(crate) fn occlude_recording_masks(
+        &self,
+        heap: &mut crate::quad::HeapQuadAllocator,
+        rects: &[window::RectF],
+    ) -> anyhow::Result<()> {
+        let clips: Vec<_> = rects
+            .iter()
+            .map(|rect| {
+                crate::quad::QuadClipRect::from_top_left_pixels(
+                    rect.min_x(),
+                    rect.min_y(),
+                    rect.max_x(),
+                    rect.max_y(),
+                    &self.dimensions,
+                )
+            })
+            .collect();
+        heap.occlude(&clips);
+        let mut layers = TripleLayerQuadAllocator::Heap(heap);
+        for rect in rects {
+            self.filled_rectangle(
+                &mut layers,
+                2,
+                *rect,
+                LinearRgba::with_components(0.0, 0.0, 0.0, 1.0),
+            )?;
+        }
+        Ok(())
+    }
+
     // This runs inside the terminal world, so a recorded transition includes it.
     pub(crate) fn paint_pane_recording_masks(
         &self,
@@ -373,6 +493,22 @@ impl crate::TermWindow {
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<()> {
         let black = LinearRgba::with_components(0.0, 0.0, 0.0, 1.0);
+        if let TripleLayerQuadAllocator::Heap(heap) = layers {
+            let rects = pane_masks(pane_id)
+                .map(|masks| {
+                    masks
+                        .0
+                        .lock()
+                        .unwrap()
+                        .masks
+                        .iter()
+                        .filter_map(|mask| mask.in_frame(frame).intersection(&frame))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            self.occlude_recording_masks(heap, &rects)?;
+            return Ok(());
+        }
         let editing =
             self.recording_overlay.editing && self.recording_overlay.pane_id == Some(pane_id);
         if !editing {
@@ -444,7 +580,7 @@ impl crate::TermWindow {
         layers: &mut TripleLayerQuadAllocator,
         opacity: f32,
     ) -> anyhow::Result<()> {
-        for rect in masks.0.lock().unwrap().iter() {
+        for rect in masks.0.lock().unwrap().masks.iter() {
             if let Some(rect) = rect.in_frame(frame).intersection(&clip) {
                 self.filled_rectangle(
                     layers,
@@ -959,13 +1095,13 @@ mod tests {
             h: 0.1,
         };
         save_pane_masks(id, vec![rect]);
-        assert_eq!(*cached.0.lock().unwrap(), vec![rect]);
+        assert_eq!(cached.0.lock().unwrap().masks, vec![rect]);
         save_pane_masks(id, vec![]);
         assert!(cached.is_empty());
         save_pane_masks(id, vec![rect]);
         forget_pane(id);
         assert!(pane_masks(id).is_none());
-        assert_eq!(*cached.0.lock().unwrap(), vec![rect]);
+        assert_eq!(cached.0.lock().unwrap().masks, vec![rect]);
     }
 
     #[test]
@@ -1019,5 +1155,157 @@ mod tests {
         assert!(state.drag.is_none());
         assert!(state.pressed_button.is_none());
         assert!(state.finish_key.is_none());
+    }
+    #[test]
+    fn preview_masks_follow_text_grid_padding_splits_and_pane_font_metrics() {
+        for (frame, grid, cell) in [
+            // Default horizontal one-cell and vertical half-cell padding plus nav.
+            (
+                euclid::rect(280.0, 40.0, 900.0, 600.0),
+                euclid::rect(294.0, 84.0, 868.0, 532.0),
+                (14.0, 28.0),
+            ),
+            // Split pane begins half a root cell before its own content grid.
+            (
+                euclid::rect(701.0, 40.0, 479.0, 600.0),
+                euclid::rect(708.0, 84.0, 448.0, 532.0),
+                (14.0, 28.0),
+            ),
+            // Independent pane zoom and a different window/sidebar origin.
+            (
+                euclid::rect(61.0, 200.0, 1200.0, 900.0),
+                euclid::rect(82.0, 260.0, 1155.0, 798.0),
+                (21.0, 42.0),
+            ),
+        ] {
+            let layer = PaneRecordingLayer::default();
+            let mask = Rect {
+                x: grid.min_x() - frame.min_x(),
+                y: grid.min_y() - frame.min_y(),
+                w: cell.0 * 4.0,
+                h: cell.1,
+            }
+            .normalized((frame.width(), frame.height()));
+            layer.0.lock().unwrap().masks = vec![mask];
+            layer.set_grid(frame, grid);
+            let target = euclid::rect(25.0, 80.0, grid.width() / 4.0, grid.height() / 4.0);
+            let result = layer.preview_rects(target, euclid::rect(0.0, 0.0, 1000.0, 1000.0));
+            assert_eq!(result.len(), 1);
+            for (got, wanted) in [
+                (result[0].min_x(), target.min_x()),
+                (result[0].min_y(), target.min_y()),
+                (result[0].width(), cell.0),
+                (result[0].height(), cell.1 / 4.0),
+            ] {
+                assert!((got - wanted).abs() < 0.0001, "{} != {}", got, wanted);
+            }
+        }
+    }
+
+    #[test]
+    fn missing_grid_only_covers_masked_panes_and_geometry_changes_invalidate() {
+        let layer = PaneRecordingLayer::default();
+        let frame = euclid::rect(0.0, 0.0, 100.0, 100.0);
+        assert!(layer.preview_rects(frame, frame).is_empty());
+        layer.0.lock().unwrap().masks.push(Rect {
+            x: 0.1,
+            y: 0.1,
+            w: 0.2,
+            h: 0.2,
+        });
+        assert_eq!(layer.preview_rects(frame, frame), vec![frame]);
+        layer.set_grid(frame, euclid::rect(10.0, 10.0, 80.0, 80.0));
+        let first = layer.revision();
+        layer.set_grid(frame, euclid::rect(10.0, 10.0, 80.0, 80.0));
+        assert_eq!(layer.revision(), first);
+        layer.set_grid(frame, euclid::rect(20.0, 10.0, 70.0, 80.0));
+        assert!(layer.revision() > first);
+    }
+
+    #[test]
+    fn snapshot_keeps_masks_for_unrendered_or_removed_panes() {
+        use crate::termwindow::content_view::{
+            TerminalPreviewPaneSnapshot, TerminalPreviewSnapshot,
+        };
+        let id = usize::MAX - 111;
+        let mask = Rect {
+            x: 0.1,
+            y: 0.1,
+            w: 0.2,
+            h: 0.2,
+        };
+        save_pane_masks(id, vec![mask]);
+        let snapshot = TerminalPreviewSnapshot {
+            tab_size: Default::default(),
+            splits: Vec::new(),
+            panes: vec![TerminalPreviewPaneSnapshot {
+                pane_id: id,
+                recording_layer: pane_layer(id),
+                is_active: true,
+                left: 0,
+                top: 0,
+                width: 0,
+                height: 0,
+                cols: 0,
+                rows: 0,
+                resolved_top: 0,
+                lines: Vec::new(),
+                box_pixel_height: 0,
+                dimensions: Default::default(),
+                palette: Default::default(),
+                cursor: Default::default(),
+            }],
+        };
+        let first = snapshot.recording_revision();
+        assert!(first > 0); // zero-sized/off-card panes participate in both key checks
+        save_pane_masks(id, vec![mask, mask]);
+        let edited = snapshot.recording_revision();
+        assert!(edited > first); // retires both a cached picture and its old partial
+        forget_pane(id);
+        assert_eq!(snapshot.recording_revision(), edited);
+        assert_eq!(
+            snapshot.panes[0]
+                .recording_layer
+                .0
+                .lock()
+                .unwrap()
+                .masks
+                .len(),
+            2
+        );
+        let frame = euclid::rect(0.0, 0.0, 100.0, 100.0);
+        assert_eq!(
+            snapshot.panes[0]
+                .recording_layer
+                .preview_rects(frame, frame),
+            vec![frame]
+        );
+    }
+    #[test]
+    fn preview_uses_full_source_grid_when_the_window_clips_rows_or_columns() {
+        let layer = PaneRecordingLayer::default();
+        let frame = euclid::rect(100.0, 20.0, 800.0, 600.0);
+        let grid = euclid::rect(112.0, 60.0, 1200.0, 960.0);
+        // A visible cell near the right edge; the snapshot also contains
+        // source columns/rows outside the current window's clipped viewport.
+        layer.0.lock().unwrap().masks = vec![Rect {
+            x: 12.0 + 60.0 * 12.0,
+            y: 40.0 + 20.0 * 24.0,
+            w: 12.0,
+            h: 24.0,
+        }
+        .normalized((frame.width(), frame.height()))];
+        layer.set_grid(frame, grid);
+        let preview_grid = euclid::rect(20.0, 30.0, 300.0, 240.0);
+        let result = layer.preview_rects(preview_grid, preview_grid);
+        assert_eq!(result.len(), 1);
+        for (got, wanted) in [
+            (result[0].min_x(), 200.0),
+            (result[0].min_y(), 150.0),
+            (result[0].width(), 3.0),
+            (result[0].height(), 6.0),
+        ] {
+            assert!((got - wanted).abs() < 0.0001, "{} != {}", got, wanted);
+        }
     }
 }

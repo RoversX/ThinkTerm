@@ -134,6 +134,7 @@ pub(crate) struct PreviewQuadKey {
     /// captures (`discard_content_view_captures_after_atlas_recreation`), so
     /// nothing here has to stand in for it.
     shape_generation: usize,
+    recording_revision: u64,
     geometry: PreviewGeometryKey,
 }
 
@@ -162,6 +163,13 @@ pub(crate) struct PreviewGeometryKey {
     dpi: usize,
 }
 
+type PreviewRecordingRegion = (
+    mux::pane::PaneId,
+    RectF,
+    RectF,
+    crate::termwindow::ui::recording_overlay::PaneRecordingLayer,
+);
+
 /// One card's thumbnail, kept between frames.
 pub(crate) struct CachedPreviewQuads {
     key: PreviewQuadKey,
@@ -173,11 +181,21 @@ pub(crate) struct CachedPreviewQuads {
     /// The card rectangle these quads were laid out in.
     area: RectF,
     heap: HeapQuadAllocator,
-    mask_regions: Vec<(mux::pane::PaneId, RectF, crate::termwindow::ui::recording_overlay::PaneRecordingLayer)>,
     /// The card's picture as a texture (WebGpu only). Rendered from `heap`
     /// when content changes; composited as a single quad on every other
     /// frame, which is what makes an unchanged card nearly free.
     texture: Option<Rc<crate::termwindow::webgpu::CardRenderTexture>>,
+}
+
+impl CachedPreviewQuads {
+    fn invalidate_recording_masks(&mut self, revision: u64) {
+        if self.key.recording_revision != revision {
+            self.heap.recycle();
+            self.texture = None;
+            self.key.snapshot = 0;
+            self.key.recording_revision = revision;
+        }
+    }
 }
 
 /// What the card preview caches hold, for accounting.
@@ -225,7 +243,7 @@ pub(crate) struct PreviewRebuildPartial {
     #[allow(dead_code)]
     snapshot: Arc<crate::termwindow::content_view::TerminalPreviewSnapshot>,
     heap: HeapQuadAllocator,
-    mask_regions: Vec<(mux::pane::PaneId, RectF, crate::termwindow::ui::recording_overlay::PaneRecordingLayer)>,
+    mask_regions: Vec<PreviewRecordingRegion>,
     /// Resume point: the next pane and the next line within it.
     pane_idx: usize,
     line_idx: usize,
@@ -337,6 +355,7 @@ fn preview_quad_key(
     PreviewQuadKey {
         snapshot: Arc::as_ptr(&preview.snapshot) as usize,
         shape_generation,
+        recording_revision: preview.snapshot.recording_revision(),
         geometry: PreviewGeometryKey {
             // The font scale is chosen from the card's size, so a resized card
             // is a different picture even from the same snapshot. Position is
@@ -1475,6 +1494,11 @@ impl crate::TermWindow {
         let Some(flight) = fade.flight.as_ref() else {
             return Ok(());
         };
+        if flight.recording_revision
+            != crate::termwindow::ui::recording_overlay::recording_mask_revision()
+        {
+            return Ok(());
+        }
         // The terminal grid is what travels, and the card's own thumbnail is
         // what it lands on, so both ends of the journey are the same picture.
         //
@@ -1631,6 +1655,8 @@ impl crate::TermWindow {
                 source,
                 destination,
                 tab_id,
+                recording_revision:
+                    crate::termwindow::ui::recording_overlay::recording_mask_revision(),
             });
         }
     }
@@ -1719,6 +1745,8 @@ impl crate::TermWindow {
             // Settled: nothing else is on screen to be ordered against.
             None => heap.apply_to_clipped(layers, self.surface_clip(), 1.0)?,
         }
+        self.content_view_last_recording_revision =
+            crate::termwindow::ui::recording_overlay::recording_mask_revision();
         if let Some(previous) = self.content_view_last_frame.replace(heap) {
             self.content_view_frame_scratch = previous;
         }
@@ -1731,6 +1759,11 @@ impl crate::TermWindow {
 
     /// Composite the recorded frame of a view that has already been closed.
     fn paint_departing_content_view(&mut self) -> anyhow::Result<()> {
+        if self.content_view_last_recording_revision
+            != crate::termwindow::ui::recording_overlay::recording_mask_revision()
+        {
+            return Ok(());
+        }
         let opacity = self
             .content_view_fade_opacity(Instant::now())
             .unwrap_or(0.0);
@@ -1949,24 +1982,6 @@ impl crate::TermWindow {
             if self.paint_terminal_preview(layers, preview, &mut budget)? {
                 rebuilt += 1;
             }
-            // Masks stay live above cached textures, including during sliced rebuilds.
-            // Use the geometry of the picture actually being replayed, not a newer snapshot.
-            let cache = self.preview_quad_cache.borrow();
-            if let Some(cached) = cache.get(&preview.tab_id) {
-                let sx = preview.area.width() / cached.area.width().max(1.0);
-                let sy = preview.area.height() / cached.area.height().max(1.0);
-                let alpha = self.preview_content_alpha(preview) * preview.opacity.clamp(0.0, 1.0);
-                for (_, rect, masks) in &cached.mask_regions {
-                    let frame = euclid::rect(
-                        preview.area.min_x() + (rect.min_x() - cached.area.min_x()) * sx,
-                        preview.area.min_y() + (rect.min_y() - cached.area.min_y()) * sy,
-                        rect.width() * sx, rect.height() * sy,
-                    );
-                    if let Some(clip) = preview.clip.intersection(&preview.area) {
-                        self.paint_recording_mask_layer(masks, frame, clip, layers, alpha)?;
-                    }
-                }
-            }
         }
         // What a frame spent on thumbnails, and how much of that was a card
         // whose quads could not be replayed. Without the split, a slow frame
@@ -2063,6 +2078,16 @@ impl crate::TermWindow {
             self.shape_generation,
             self.preview_scale_estimate(preview),
         );
+        // A newly added or moved mask makes the old picture unsafe, even when
+        // the sliced rebuild has no budget. Keep only reusable allocation;
+        // display the card background until the rebuild completes.
+        if let Some(cached) = self
+            .preview_quad_cache
+            .borrow_mut()
+            .get_mut(&preview.tab_id)
+        {
+            cached.invalidate_recording_masks(key.recording_revision);
+        }
         let clip = quad_clip_rect(preview.clip, &self.dimensions);
         let content_alpha = self.preview_content_alpha(preview) * preview.opacity.clamp(0.0, 1.0);
 
@@ -2144,7 +2169,7 @@ impl crate::TermWindow {
                     .preview_quad_cache
                     .borrow_mut()
                     .get_mut(&preview.tab_id)
-                    .filter(|cached| cached.texture.is_some())
+                    .filter(|cached| cached.texture.is_some() || cached.heap.quad_count() == 0)
                 {
                     heap = std::mem::take(&mut cached.heap);
                     heap.recycle();
@@ -2201,7 +2226,21 @@ impl crate::TermWindow {
             self.update_next_frame_time(Some(Instant::now()));
             return Ok(true);
         }
-        let PreviewRebuildPartial { heap, mask_regions, .. } = partial;
+        let PreviewRebuildPartial {
+            mut heap,
+            mask_regions,
+            ..
+        } = partial;
+        for (_, grid, clip, masks) in &mask_regions {
+            let rects = masks.preview_rects(*grid, *clip);
+            self.occlude_recording_masks(&mut heap, &rects)?;
+        }
+        // Each rebuild slice reads the live layer. Never publish a recording
+        // whose masks changed while the earlier slices were being authored.
+        if preview.snapshot.recording_revision() != key.recording_revision {
+            self.update_next_frame_time(Some(Instant::now()));
+            return Ok(true);
+        }
         let prior_texture = self
             .preview_quad_cache
             .borrow_mut()
@@ -2263,7 +2302,6 @@ impl crate::TermWindow {
                 snapshot: Arc::clone(&preview.snapshot),
                 area: preview.area,
                 heap,
-                mask_regions,
                 texture,
             },
         );
@@ -2422,7 +2460,7 @@ impl crate::TermWindow {
         preview: &TerminalPreviewRequest,
         resume_pane: &mut usize,
         resume_line: &mut usize,
-        mask_regions: &mut Vec<(mux::pane::PaneId, RectF, crate::termwindow::ui::recording_overlay::PaneRecordingLayer)>,
+        mask_regions: &mut Vec<PreviewRecordingRegion>,
         deadline: Instant,
     ) -> anyhow::Result<bool> {
         let snapshot = &preview.snapshot;
@@ -2581,9 +2619,6 @@ impl crate::TermWindow {
             let pane_width = pane.width as f32 * cell_width;
             let pane_height = pane.height as f32 * cell_height;
             let pane_rect = euclid::rect(pane_x, pane_y, pane_width, pane_height);
-            if mask_regions.last().is_none_or(|(id, _, _)| *id != pane.pane_id) {
-                mask_regions.push((pane.pane_id, pane_rect, crate::termwindow::ui::recording_overlay::pane_layer(pane.pane_id)));
-            }
             let Some(pane_bounds) = pane_rect.intersection(&preview.area) else {
                 continue;
             };
@@ -2627,6 +2662,18 @@ impl crate::TermWindow {
             };
             let grid_top = pane_rect.min_y() + pane_height * nav_fraction;
             let grid_height = pane_height * (1.0 - nav_fraction);
+            if mask_regions
+                .last()
+                .is_none_or(|(id, _, _, _)| *id != pane.pane_id)
+            {
+                let masks = pane.recording_layer.clone();
+                mask_regions.push((
+                    pane.pane_id,
+                    euclid::rect(pane_rect.min_x(), grid_top, pane_width, grid_height),
+                    pane_bounds,
+                    masks,
+                ));
+            }
 
             // Pane placement remains in the root grid so every split keeps
             // the same outer frame. Content inside that frame uses the pane's
@@ -4414,6 +4461,7 @@ impl crate::TermWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quad::TripleLayerQuadAllocatorTrait;
 
     fn test_preview(area: RectF) -> TerminalPreviewRequest {
         TerminalPreviewRequest {
@@ -4436,6 +4484,32 @@ mod tests {
             pixel_height: 1000,
             dpi: 144,
         }
+    }
+
+    #[test]
+    fn changed_recording_masks_retire_cached_source_quads_before_rebuild() {
+        let preview = test_preview(euclid::rect(10.0, 20.0, 400.0, 260.0));
+        let mut heap = HeapQuadAllocator::default();
+        heap.allocate(1)
+            .unwrap()
+            .set_position(0.0, 0.0, 100.0, 100.0);
+        let mut cached = CachedPreviewQuads {
+            key: preview_quad_key(&preview, &test_dimensions(), 3, 1.0),
+            snapshot: Arc::clone(&preview.snapshot),
+            area: preview.area,
+            heap,
+            texture: None,
+        };
+        cached.invalidate_recording_masks(0);
+        assert_eq!(cached.heap.quad_count(), 1);
+        let partial_key = cached.key;
+        cached.invalidate_recording_masks(7);
+        assert_eq!(cached.heap.quad_count(), 0);
+        assert_eq!(cached.key.snapshot, 0); // no real snapshot can hit this placeholder
+        assert_ne!(partial_key, cached.key); // an in-flight old rebuild is retired too
+        let mut fresh_key = preview_quad_key(&preview, &test_dimensions(), 3, 1.0);
+        fresh_key.recording_revision = 7;
+        assert_ne!(cached.key, fresh_key);
     }
 
     /// The whole point of the cache: an unchanged snapshot in an unchanged card

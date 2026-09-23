@@ -2860,6 +2860,7 @@ fn capture_terminal_snapshot(tab_id: TabId) -> Option<TerminalPreviewSnapshot> {
         };
         snapshots.push(TerminalPreviewPaneSnapshot {
             pane_id: pane.pane_id(),
+            recording_layer: crate::termwindow::ui::recording_overlay::pane_layer(pane.pane_id()),
             is_active: positioned.is_active,
             left: positioned.left,
             top: positioned.top,

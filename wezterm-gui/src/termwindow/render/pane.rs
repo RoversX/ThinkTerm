@@ -1795,6 +1795,21 @@ impl crate::TermWindow {
                 + (pos.top as f32 * global_render_metrics.cell_size.height as f32)
                 + pane_nav_height as f32;
 
+            if let Ok(frame) = self.pane_frame_rect(pos) {
+                self.update_recording_mask_grid(
+                    pane_id,
+                    frame,
+                    euclid::rect(
+                        left_pixel_x,
+                        pane_top_pixel_y,
+                        // Preview snapshots contain the full logical grid,
+                        // including columns/rows clipped by this window.
+                        dims.cols as f32 * pane_render_metrics.cell_size.width as f32,
+                        dims.viewport_rows as f32 * pane_render_metrics.cell_size.height as f32,
+                    ),
+                );
+            }
+
             if pos.is_active {
                 self.update_text_cursor(
                     &cursor,
