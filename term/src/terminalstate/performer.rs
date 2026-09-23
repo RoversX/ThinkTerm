@@ -304,6 +304,14 @@ impl<'a> Performer<'a> {
         }
     }
 
+    pub fn print_text(&mut self, text: &str) {
+        if let Some(title) = self.accumulating_title.as_mut() {
+            title.push_str(text);
+        } else {
+            self.print.push_str(text);
+        }
+    }
+
     pub fn perform(&mut self, action: Action) {
         debug!("perform {:?}", action);
         if self.suppress_initial_title_change {
@@ -321,13 +329,7 @@ impl<'a> Performer<'a> {
         }
         match action {
             Action::Print(c) => self.print(c),
-            Action::PrintString(s) => {
-                if let Some(title) = self.accumulating_title.as_mut() {
-                    title.push_str(&s);
-                } else {
-                    self.print.push_str(&s);
-                }
-            }
+            Action::PrintString(s) => self.print_text(&s),
             Action::Control(code) => self.control(code),
             Action::DeviceControl(ctrl) => self.device_control(ctrl),
             Action::OperatingSystemCommand(osc) => self.osc_dispatch(*osc),
@@ -1295,16 +1297,31 @@ mod ascii_tests {
                         };
                         let mut expected = make();
                         let mut actual = make();
+                        let mut direct = make();
                         let mut parser = Parser::new();
+                        let mut direct_parser = Parser::new();
                         let input = format!("{setup}abc #q~0123456789az      next\rOVERWRITE\nmore\te\u{301}1\u{fe0f}\u{20e3}界\x1b[0m\x1bkASCII title界\x1b\\end");
                         for chunk in input.as_bytes().chunks(chunk_size) {
                             let mut actions = Vec::new();
-                            parser.parse_print_runs(chunk, |action| {
+                            parser.parse_with_borrowed_text(chunk, |action| {
                                 action.append_to(&mut actions)
                             });
                             actual.increment_seqno();
                             expected.increment_seqno();
+                            direct.increment_seqno();
                             {
+                                let mut direct_performer = Performer::new(&mut direct);
+                                direct_parser.parse_with_borrowed_text(
+                                    chunk,
+                                    |event| match event {
+                                        wezterm_escape_parser::parser::ParsedAction::Action(
+                                            action,
+                                        ) => direct_performer.perform(action),
+                                        wezterm_escape_parser::parser::ParsedAction::Print(
+                                            text,
+                                        ) => direct_performer.print_text(text),
+                                    },
+                                );
                                 let mut scalar = Performer::new(&mut expected);
                                 scalar.disable_ascii_batch = true;
                                 let mut batched = Performer::new(&mut actual);
@@ -1322,6 +1339,8 @@ mod ascii_tests {
                             }
                             assert_eq!(actual.snapshot(), expected.snapshot(),
                                 "rows={rows}, cols={cols}, setup={setup:?}, normalize={normalize}, custom_widths={custom_widths}, conpty={conpty}, chunk_size={chunk_size}");
+                            assert_eq!(direct.snapshot(), expected.snapshot(),
+                                "direct: rows={rows}, cols={cols}, setup={setup:?}, normalize={normalize}, custom_widths={custom_widths}, conpty={conpty}, chunk_size={chunk_size}");
                         }
                     }
                 }

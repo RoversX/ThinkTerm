@@ -55,6 +55,50 @@ struct ParseState {
     tmux_state: Option<RefCell<crate::tmux_cc::Parser>>,
 }
 
+/// A synchronous parser event. Printable runs borrow the input only for the
+/// callback; queued consumers must copy them into their owned action buffer.
+#[derive(Debug, PartialEq)]
+pub enum ParsedAction<'a> {
+    Action(Action),
+    Print(&'a str),
+}
+
+impl ParsedAction<'_> {
+    /// Convert to the owned representation, preserving single-character actions.
+    pub fn into_owned(self) -> Action {
+        match self {
+            Self::Action(action) => action,
+            Self::Print(text) => {
+                let mut chars = text.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => Action::Print(c),
+                    _ => Action::PrintString(text.to_string()),
+                }
+            }
+        }
+    }
+
+    /// Coalesce text directly into the queue's owned string, without allocating
+    /// a temporary string for every borrowed run. This also keeps Unicode
+    /// grapheme sequences together when an ASCII base precedes a combining mark.
+    pub fn append_to(self, dest: &mut Vec<Action>) {
+        match self {
+            Self::Action(action) => action.append_to(dest),
+            Self::Print("") => {}
+            Self::Print(text) => match dest.last_mut() {
+                Some(Action::PrintString(prior)) => prior.push_str(text),
+                Some(Action::Print(prior)) => {
+                    let mut combined = String::with_capacity(prior.len_utf8() + text.len());
+                    combined.push(*prior);
+                    combined.push_str(text);
+                    *dest.last_mut().unwrap() = Action::PrintString(combined);
+                }
+                _ => dest.push(Self::Print(text).into_owned()),
+            },
+        }
+    }
+}
+
 /// The `Parser` struct holds the state machine that is used to decode
 /// a sequence of bytes.  The byte sequence can be streaming into the
 /// state machine.
@@ -90,25 +134,52 @@ impl Parser {
     }
 
     pub fn parse<F: FnMut(Action)>(&mut self, bytes: &[u8], callback: F) {
-        self.parse_impl(bytes, callback, false);
+        let mut callback = callback;
+        self.parse_with_borrowed_text(bytes, |event| match event {
+            ParsedAction::Action(action) => callback(action),
+            ParsedAction::Print(text) => {
+                for byte in text.bytes() {
+                    callback(Action::Print(byte as char));
+                }
+            }
+        });
     }
 
     /// Like `parse`, but emits contiguous printable ASCII as `PrintString`.
     /// Run boundaries have no semantic meaning: consumers must still combine
     /// adjacent print actions before Unicode grapheme segmentation.
     pub fn parse_print_runs<F: FnMut(Action)>(&mut self, bytes: &[u8], callback: F) {
-        self.parse_impl(bytes, callback, true);
+        let mut callback = callback;
+        self.parse_with_borrowed_text(bytes, |event| callback(event.into_owned()));
     }
 
-    fn parse_impl<F: FnMut(Action)>(&mut self, bytes: &[u8], mut callback: F, print_runs: bool) {
+    /// Parse with borrowed printable ASCII runs, valid only during each callback.
+    /// Run boundaries are not grapheme boundaries: append adjacent print events
+    /// before segmenting Unicode text. Use `ParsedAction::append_to` for queues.
+    ///
+    /// The callback cannot retain a borrowed run after it returns:
+    /// ```compile_fail
+    /// use wezterm_escape_parser::parser::{ParsedAction, Parser};
+    /// let mut retained = Vec::new();
+    /// Parser::new().parse_with_borrowed_text(b"text", |event| {
+    ///     if let ParsedAction::Print(text) = event {
+    ///         retained.push(text);
+    ///     }
+    /// });
+    /// ```
+    pub fn parse_with_borrowed_text<F: FnMut(ParsedAction<'_>)>(
+        &mut self,
+        bytes: &[u8],
+        mut callback: F,
+    ) {
         #[cfg(feature = "tmux_cc")]
         let is_tmux_mode: bool = self.state.borrow().tmux_state.is_some();
         #[cfg(feature = "tmux_cc")]
         if is_tmux_mode {
             match self.advance_tmux_bytes(bytes) {
                 Ok(tmux_events) => {
-                    callback(Action::DeviceControl(DeviceControlMode::TmuxEvents(
-                        Box::new(tmux_events),
+                    callback(ParsedAction::Action(Action::DeviceControl(
+                        DeviceControlMode::TmuxEvents(Box::new(tmux_events)),
                     )));
                 }
                 Err(err_buf) => {
@@ -119,7 +190,6 @@ impl Parser {
                     let mut perform = Performer {
                         callback: &mut callback,
                         state: &mut parser_state,
-                        print_runs,
                     };
                     self.state_machine
                         .parse(unparsed_str.as_bytes(), &mut perform);
@@ -131,7 +201,6 @@ impl Parser {
         let mut perform = Performer {
             callback: &mut callback,
             state: &mut self.state.borrow_mut(),
-            print_runs,
         };
         self.state_machine.parse(bytes, &mut perform);
     }
@@ -148,16 +217,15 @@ impl Parser {
         let mut first_idx = None;
         {
             let mut perform = Performer {
-                callback: &mut |action| {
+                callback: &mut |event: ParsedAction<'_>| {
                     // capture the action, but only if it is the first one
                     // we've seen.  Preserve an existing one if any.
                     if first.borrow().is_some() {
                         return;
                     }
-                    *first.borrow_mut() = Some(action);
+                    *first.borrow_mut() = Some(event.into_owned());
                 },
                 state: &mut self.state.borrow_mut(),
-                print_runs: false,
             };
             for (idx, b) in bytes.iter().enumerate() {
                 self.state_machine.parse_byte(*b, &mut perform);
@@ -193,9 +261,8 @@ impl Parser {
             self.state_machine.parse_byte(
                 *b,
                 &mut Performer {
-                    callback: &mut |action| actions.push(action),
+                    callback: &mut |event: ParsedAction<'_>| actions.push(event.into_owned()),
                     state: &mut self.state.borrow_mut(),
-                    print_runs: false,
                 },
             );
             if !actions.is_empty() && self.state_machine.is_ground() {
@@ -208,10 +275,9 @@ impl Parser {
     }
 }
 
-struct Performer<'a, F: FnMut(Action) + 'a> {
+struct Performer<'a, F: FnMut(ParsedAction<'_>) + 'a> {
     callback: &'a mut F,
     state: &'a mut ParseState,
-    print_runs: bool,
 }
 
 fn is_short_dcs(intermediates: &[u8], byte: u8) -> bool {
@@ -223,24 +289,28 @@ fn is_short_dcs(intermediates: &[u8], byte: u8) -> bool {
     }
 }
 
-impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
+impl<F: FnMut(ParsedAction<'_>)> Performer<'_, F> {
+    fn emit(&mut self, action: Action) {
+        (self.callback)(ParsedAction::Action(action));
+    }
+}
+
+impl<'a, F: FnMut(ParsedAction<'_>)> VTActor for Performer<'a, F> {
     fn print(&mut self, c: char) {
-        (self.callback)(Action::Print(c));
+        self.emit(Action::Print(c));
     }
 
     fn print_ascii(&mut self, text: &str) {
-        if self.print_runs && text.len() > 1 {
-            (self.callback)(Action::PrintString(text.to_string()));
+        if text.len() == 1 {
+            self.print(text.as_bytes()[0] as char);
         } else {
-            for byte in text.bytes() {
-                self.print(byte as char);
-            }
+            (self.callback)(ParsedAction::Print(text));
         }
     }
 
     fn execute_c0_or_c1(&mut self, byte: u8) {
         match FromPrimitive::from_u8(byte) {
-            Some(code) => (self.callback)(Action::Control(code)),
+            Some(code) => self.emit(Action::Control(code)),
             None => error!(
                 "impossible C0/C1 control code {:?} 0x{:x} was dropped",
                 byte as char, byte
@@ -250,7 +320,7 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
 
     fn apc_dispatch(&mut self, data: Vec<u8>) {
         if let Some(img) = super::KittyImage::parse_apc(&data) {
-            (self.callback)(Action::KittyImage(Box::new(img)))
+            self.emit(Action::KittyImage(Box::new(img)))
         } else {
             log::trace!("Ignoring APC data: {:?}", String::from_utf8_lossy(&data));
         }
@@ -284,7 +354,7 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
                 self.state.borrow_mut().tmux_state =
                     Some(RefCell::new(crate::tmux_cc::Parser::new()));
             }
-            (self.callback)(Action::DeviceControl(DeviceControlMode::Enter(Box::new(
+            self.emit(Action::DeviceControl(DeviceControlMode::Enter(Box::new(
                 EnterDeviceControlMode {
                     byte,
                     params: params.to_vec(),
@@ -309,8 +379,8 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
                 match tmux_parser.advance_byte(data) {
                     Ok(optional_events) => {
                         if let Some(tmux_event) = optional_events {
-                            (self.callback)(Action::DeviceControl(DeviceControlMode::TmuxEvents(
-                                Box::new(vec![tmux_event]),
+                            (self.callback)(ParsedAction::Action(Action::DeviceControl(
+                                DeviceControlMode::TmuxEvents(Box::new(vec![tmux_event])),
                             )));
                         }
                     }
@@ -321,33 +391,33 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
                 }
                 return;
             }
-            (self.callback)(Action::DeviceControl(DeviceControlMode::Data(data)));
+            self.emit(Action::DeviceControl(DeviceControlMode::Data(data)));
         }
     }
 
     fn dcs_unhook(&mut self) {
         if let Some(dcs) = self.state.dcs.take() {
-            (self.callback)(Action::DeviceControl(
+            self.emit(Action::DeviceControl(
                 DeviceControlMode::ShortDeviceControl(Box::new(dcs)),
             ));
         } else if let Some(mut sixel) = self.state.sixel.take() {
             sixel.finish();
-            (self.callback)(Action::Sixel(Box::new(sixel.sixel)));
+            self.emit(Action::Sixel(Box::new(sixel.sixel)));
         } else if let Some(tcap) = self.state.get_tcap.take() {
-            (self.callback)(Action::XtGetTcap(tcap.finish()));
+            self.emit(Action::XtGetTcap(tcap.finish()));
         } else {
-            (self.callback)(Action::DeviceControl(DeviceControlMode::Exit));
+            self.emit(Action::DeviceControl(DeviceControlMode::Exit));
         }
     }
 
     fn osc_dispatch(&mut self, osc: &[&[u8]]) {
         let osc = OperatingSystemCommand::parse(osc);
-        (self.callback)(Action::OperatingSystemCommand(Box::new(osc)));
+        self.emit(Action::OperatingSystemCommand(Box::new(osc)));
     }
 
     fn csi_dispatch(&mut self, params: &[CsiParam], parameters_truncated: bool, control: u8) {
         for action in CSI::parse(params, parameters_truncated, control as char) {
-            (self.callback)(Action::CSI(action));
+            self.emit(Action::CSI(action));
         }
     }
 
@@ -361,7 +431,7 @@ impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
         // It doesn't appear to be possible for params.len() > 1 due to the way
         // that the state machine in vte functions.  As such, it also seems to
         // be impossible for ignored_extra_intermediates to be true too.
-        (self.callback)(Action::Esc(Esc::parse(
+        self.emit(Action::Esc(Esc::parse(
             if intermediates.len() == 1 {
                 Some(intermediates[0])
             } else {
@@ -788,10 +858,16 @@ mod test {
             for size in 1..=input.len() {
                 let mut batched = Parser::new();
                 let mut actual = vec![];
+                let mut borrowed = Parser::new();
+                let mut borrowed_actions = vec![];
                 for chunk in input.chunks(size) {
                     batched.parse_print_runs(chunk, |action| action.append_to(&mut actual));
+                    borrowed.parse_with_borrowed_text(chunk, |event| {
+                        event.append_to(&mut borrowed_actions)
+                    });
                 }
                 assert_eq!(actual, expected, "input={input:?}, chunk={size}");
+                assert_eq!(borrowed_actions, expected, "input={input:?}, chunk={size}");
             }
         }
         let mut actions = vec![];
@@ -800,6 +876,56 @@ mod test {
             actions,
             vec![Action::PrintString("a long ASCII run".into())]
         );
+    }
+
+    #[test]
+    fn borrowed_runs_reference_input_but_queued_actions_own_their_text() {
+        let mut input = b"ab\x1b[31mcd".to_vec();
+        let mut actions = vec![];
+        let mut offsets = vec![];
+        Parser::new().parse_with_borrowed_text(&input, |event| {
+            if let ParsedAction::Print(text) = &event {
+                offsets.push(text.as_ptr() as usize - input.as_ptr() as usize);
+            }
+            event.append_to(&mut actions);
+        });
+        assert_eq!(offsets, [0, 7]);
+        input.fill(b'x');
+        assert_eq!(encode(&actions), "ab\x1b[31mcd");
+    }
+
+    #[test]
+    fn borrowed_runs_preserve_parser_states_for_every_byte() {
+        for prefix in [
+            &b""[..],
+            &b"\x1b"[..],
+            &b"\x1b["[..],
+            &b"\x1b]0;"[..],
+            &b"\x1bP"[..],
+            &b"\x1b_"[..],
+            &b"\xc3"[..],
+            &b"\xf0\x9f"[..],
+        ] {
+            for byte in 0..=255 {
+                let mut input = prefix.to_vec();
+                input.push(byte);
+                input.extend_from_slice(b"ab\x1b\\tail\x1b[0m");
+                let mut expected = vec![];
+                Parser::new().parse(&input, |action| action.append_to(&mut expected));
+                for size in [1, 2, 7, 64] {
+                    let mut actual = vec![];
+                    let mut parser = Parser::new();
+                    for chunk in input.chunks(size) {
+                        parser
+                            .parse_with_borrowed_text(chunk, |event| event.append_to(&mut actual));
+                    }
+                    assert_eq!(
+                        actual, expected,
+                        "prefix={prefix:?}, byte={byte}, chunk={size}"
+                    );
+                }
+            }
+        }
     }
 
     fn parse_as(s: &str, expected: &str) -> Vec<Action> {

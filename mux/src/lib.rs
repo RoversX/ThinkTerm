@@ -27,6 +27,7 @@ use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
+use termwiz::escape::parser::ParsedAction;
 use termwiz::escape::{Action, CSI};
 use thiserror::*;
 use wezterm_term::color::ColorPalette;
@@ -669,7 +670,14 @@ fn parse_buffered_data(
             Ok(size) => {
                 unapplied += size;
                 let work_started = Instant::now();
-                parser.parse_print_runs(&buf[0..size], |action| {
+                parser.parse_with_borrowed_text(&buf[0..size], |event| {
+                    let action = match event {
+                        ParsedAction::Action(action) => action,
+                        text @ ParsedAction::Print(_) => {
+                            text.append_to(&mut actions);
+                            return;
+                        }
+                    };
                     let mut flush = false;
                     match &action {
                         Action::CSI(CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
@@ -3719,7 +3727,9 @@ pub fn spawn_idle_image_sweeper() {
         log::warn!("idle image sweeper not started: no scheduler configured");
         return;
     }
-    log::debug!("idle image sweeper started: every {IDLE_IMAGE_SWEEP:?}, {IDLE_IMAGE_TICKS} quiet sweeps");
+    log::debug!(
+        "idle image sweeper started: every {IDLE_IMAGE_SWEEP:?}, {IDLE_IMAGE_TICKS} quiet sweeps"
+    );
     promise::spawn::spawn_into_main_thread(async {
         loop {
             smol::Timer::after(IDLE_IMAGE_SWEEP).await;

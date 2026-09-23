@@ -1,7 +1,7 @@
 use super::*;
 use crate::terminalstate::performer::Performer;
 use std::sync::Arc;
-use wezterm_escape_parser::parser::Parser;
+use wezterm_escape_parser::parser::{ParsedAction, Parser};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
@@ -169,7 +169,10 @@ impl Terminal {
             let mut performer = Performer::new(&mut self.state);
 
             self.parser
-                .parse_print_runs(bytes, |action| performer.perform(action));
+                .parse_with_borrowed_text(bytes, |event| match event {
+                    ParsedAction::Action(action) => performer.perform(action),
+                    ParsedAction::Print(text) => performer.print_text(text),
+                });
         }
         self.trigger_unseen_output_notif();
     }
