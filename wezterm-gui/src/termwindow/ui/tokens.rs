@@ -57,14 +57,14 @@ pub const WINDOW_TAB_ACTION_RESERVED_WIDTH: usize = 60;
 pub const WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X: usize = 16;
 pub const WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET: usize = 4;
 pub const WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_SIZE: usize = 52;
-pub const WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE: usize = 46;
+pub const WINDOW_TAB_FULLSCREEN_SIDEBAR_ICON_SIZE: usize = TAB_ICON_SIZE;
 pub const WINDOW_TAB_FULLSCREEN_NEW_SESSION_Y_OFFSET: usize = 6;
 pub const WINDOW_TAB_FULLSCREEN_NEW_SESSION_EXTRA_HEIGHT: usize = 6;
 pub const WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE: usize = 34;
 pub const WINDOW_TAB_LEADING_ACTION_GAP: usize = 8;
 /// Matches `TAB_ICON_SIZE`: the leading action sits in the same row as the
 /// tabs and the trailing actions, which both already draw at that size.
-pub const WINDOW_TAB_LEADING_ACTION_ICON_SIZE: usize = 32;
+pub const WINDOW_TAB_LEADING_ACTION_ICON_SIZE: usize = TAB_ICON_SIZE;
 pub const WINDOW_TAB_GAP: usize = 18;
 /// How far a tab row dissolves into the bar at an edge the viewport cut.
 /// Matches `ssh_hosts_view`'s list fades, which solve the same problem
