@@ -42,8 +42,11 @@ fn resize_and_clear_produces_blank_rows_across_storage_styles_and_sizes() {
             for initial_attrs in &styles {
                 for width in [0, 1, 2, 12, 116] {
                     let mut actual = Line::from_text(text, initial_attrs, 7, None);
-                    if vector {
-                        actual.cells_mut();
+                    if !vector {
+                        actual.compress_for_scrollback();
+                        assert!(matches!(actual.cells, CellStorage::C(_)));
+                    } else {
+                        assert!(matches!(actual.cells, CellStorage::V(_)));
                     }
                     actual.set_double_height_top(7);
                     actual.set_bidi_info(
@@ -63,6 +66,10 @@ fn resize_and_clear_produces_blank_rows_across_storage_styles_and_sizes() {
                     // also cover the multi-line paste-prediction call site.
                     for next_width in [width, width, width + 3, 1, 0, width] {
                         for (n, attrs) in styles.iter().enumerate() {
+                            if !vector {
+                                actual.compress_for_scrollback();
+                                assert!(matches!(actual.cells, CellStorage::C(_)));
+                            }
                             let seqno = [3, 9, 8, 10, 10, 3][n];
                             expected_seqno = expected_seqno.max(seqno);
                             let mut expected = Line::with_width_and_cell(
@@ -122,8 +129,11 @@ fn resize_and_clear_releases_replaced_images_and_links() {
                 )));
                 let mut actual = Line::from_text("abcd", &attrs, 1, None);
                 drop(attrs);
-                if vector {
-                    actual.cells_mut();
+                if !vector {
+                    actual.compress_for_scrollback();
+                    assert!(matches!(actual.cells, CellStorage::C(_)));
+                } else {
+                    assert!(matches!(actual.cells, CellStorage::V(_)));
                 }
                 let expected =
                     Line::with_width_and_cell(width, Cell::blank_with_attrs(blank.clone()), 2);
