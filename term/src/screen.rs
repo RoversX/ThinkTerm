@@ -712,6 +712,28 @@ impl Screen {
         blank_attr: CellAttributes,
         bidi_mode: BidiMode,
     ) {
+        // Specialize the loop so row recycling does not add work or keep
+        // extra temporaries live in full-screen or styled scrolling.
+        if (scroll_region.start != 0 || scroll_region.end as usize != self.physical_rows)
+            && blank_attr == CellAttributes::blank()
+        {
+            self.scroll_up_impl::<true>(scroll_region, num_rows, seqno, blank_attr, bidi_mode);
+        } else {
+            self.scroll_up_impl::<false>(scroll_region, num_rows, seqno, blank_attr, bidi_mode);
+        }
+    }
+
+    // Keep the two loops separate; inlining them into the dispatcher makes
+    // the ordinary path pay for the recycling path's stack/register usage.
+    #[inline(never)]
+    fn scroll_up_impl<const RECYCLE: bool>(
+        &mut self,
+        scroll_region: &Range<VisibleRowIndex>,
+        num_rows: usize,
+        seqno: SequenceNo,
+        blank_attr: CellAttributes,
+        bidi_mode: BidiMode,
+    ) {
         let phys_scroll = self.phys_range(scroll_region);
         let num_rows = num_rows.min(phys_scroll.end - phys_scroll.start);
         let scrollback_ok = scroll_region.start == 0 && self.allow_scrollback;
@@ -768,7 +790,14 @@ impl Screen {
             for _ in 0..to_move {
                 let mut line = self.lines.remove(remove_idx).unwrap();
                 let line = if default_blank == blank_attr {
-                    Line::new(seqno)
+                    // Keep full-screen output on its existing allocation path:
+                    // recycling there regresses sustained ASCII mux throughput.
+                    if RECYCLE && line.len() < self.physical_cols {
+                        line.reset_for_scrolling(seqno, self.physical_cols);
+                        line
+                    } else {
+                        Line::new(seqno)
+                    }
                 } else {
                     // Make the line like a new one of the appropriate width
                     line.resize_and_clear(self.physical_cols, seqno, blank_attr.clone());
@@ -1215,3 +1244,6 @@ fn phys_intersection(r1: &Range<PhysRowIndex>, r2: &Range<PhysRowIndex>) -> Rang
         0..0
     }
 }
+
+#[cfg(test)]
+mod scroll_tests;

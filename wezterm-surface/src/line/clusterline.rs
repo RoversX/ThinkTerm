@@ -93,6 +93,20 @@ where
 }
 
 impl ClusteredLine {
+    /// Reuse only small buffers when a discarded screen row becomes blank.
+    /// Drop all attributes and wide-cell metadata, including image/link refs.
+    pub(crate) fn clear_for_scrolling(&mut self, max_text_capacity: usize) -> bool {
+        if self.text.capacity() > max_text_capacity || self.clusters.capacity() > 4 {
+            return false;
+        }
+        self.text.clear();
+        self.clusters.clear();
+        self.is_double_wide = None;
+        self.len = 0;
+        self.last_cell_width = None;
+        true
+    }
+
     pub fn new() -> Self {
         Self {
             text: String::with_capacity(80),
@@ -434,6 +448,28 @@ impl<'a> Iterator for ClusterLineCellIter<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn scroll_reuse_keeps_small_buffers_but_rejects_large_ones() {
+        let mut line = ClusteredLine::new();
+        line.append_ascii("abc", &CellAttributes::default());
+        let text = line.text.as_ptr();
+        let clusters = line.clusters.as_ptr();
+        assert!(line.clear_for_scrolling(160));
+        assert_eq!(line, ClusteredLine::new());
+        assert_eq!(line.text.as_ptr(), text);
+        assert_eq!(line.clusters.as_ptr(), clusters);
+
+        line.text.reserve(4096);
+        assert!(!line.clear_for_scrolling(160));
+        let mut many_styles = ClusteredLine::new();
+        for n in 0..16 {
+            let mut attrs = CellAttributes::default();
+            attrs.set_foreground(wezterm_cell::color::ColorAttribute::PaletteIndex(n));
+            many_styles.append_ascii("x", &attrs);
+        }
+        assert!(!many_styles.clear_for_scrolling(160));
+    }
 
     #[test]
     #[cfg(target_pointer_width = "64")]

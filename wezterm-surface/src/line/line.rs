@@ -114,6 +114,25 @@ impl Line {
         }
     }
 
+    /// Replace a discarded row with the equivalent of `Line::new`, retaining
+    /// only bounded compact buffers. Never retain a vector of cells or a large
+    /// historical allocation merely because the row has scrolled off screen.
+    pub fn reset_for_scrolling(&mut self, seqno: SequenceNo, columns: usize) {
+        if let CellStorage::C(cl) = &mut self.cells {
+            if cl.clear_for_scrolling(columns.max(80).saturating_mul(2)) {
+                self.bits = LineBits::NONE;
+                self.seqno = seqno;
+                self.zones = Vec::new();
+                #[cfg(feature = "appdata")]
+                {
+                    self.appdata = Mutex::new(None);
+                }
+                return;
+            }
+        }
+        *self = Self::new(seqno);
+    }
+
     /// Computes a hash over the line that will change if the way that
     /// the line contents are shaped would change.
     /// This is independent of the seqno and is based purely on the

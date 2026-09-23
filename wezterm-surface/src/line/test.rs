@@ -8,6 +8,94 @@ use alloc::sync::Arc;
 use k9::assert_equal as assert_eq;
 use wezterm_cell::{Cell, CellAttributes};
 
+#[test]
+fn scroll_reset_discards_oversized_storage() {
+    let mut line = Line::new(1);
+    line.set_ascii_cells(0, &"x".repeat(8192), &CellAttributes::default(), 2);
+    line.reset_for_scrolling(3, 116);
+    assert_eq!(line, Line::new(3));
+    match &line.cells {
+        super::storage::CellStorage::C(cl) => assert!(cl.text.capacity() <= 232),
+        _ => panic!("reset row should use compact storage"),
+    }
+}
+
+#[cfg(feature = "use_image")]
+#[test]
+fn scroll_reset_releases_image_references() {
+    use wezterm_cell::image::{ImageCell, ImageData, ImageDataType, TextureCoordinate};
+    let data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+        1,
+        1,
+        vec![255; 4],
+    )));
+    for vector in [false, true] {
+        let mut attrs = CellAttributes::default();
+        attrs.attach_image(Box::new(ImageCell::with_z_index(
+            TextureCoordinate::new_f32(0.0, 0.0),
+            TextureCoordinate::new_f32(1.0, 1.0),
+            Arc::clone(&data),
+            0,
+            0,
+            0,
+            0,
+            0,
+            Some(3),
+            Some(7),
+        )));
+        let mut line = Line::new(1);
+        line.set_cell_grapheme(0, "x", 1, attrs, 1);
+        if vector {
+            line.cells_mut();
+        }
+        line.reset_for_scrolling(2, 116);
+        assert_eq!(Arc::strong_count(&data), 1);
+        assert_eq!(line, Line::new(2));
+    }
+}
+
+#[test]
+fn recycled_rows_match_new_rows_and_release_links_and_cached_data() {
+    for text in ["x", "界🙂e\u{301}", "https://example.com", ""] {
+        for vector in [false, true] {
+            let link = Arc::new(Hyperlink::new("https://example.org"));
+            let mut attrs = CellAttributes::default();
+            attrs.set_hyperlink(Some(Arc::clone(&link)));
+            attrs.set_semantic_type(wezterm_cell::SemanticType::Prompt);
+            let mut line = Line::new(7);
+            for g in finl_unicode::grapheme_clusters::Graphemes::new(text) {
+                let cell = Cell::new_grapheme(g, attrs.clone(), None);
+                line.set_cell(line.len(), cell, 7);
+            }
+            drop(attrs);
+            if vector {
+                line.cells_mut();
+            }
+            line.set_double_width(7);
+            line.set_bidi_info(true, wezterm_bidi::ParagraphDirectionHint::RightToLeft, 7);
+            line.semantic_zone_ranges();
+            #[cfg(feature = "appdata")]
+            let appdata = Arc::new(123u32);
+            #[cfg(feature = "appdata")]
+            line.set_appdata(Arc::clone(&appdata));
+            line.reset_for_scrolling(9, 116);
+            assert_eq!(line, Line::new(9));
+            assert!(line.semantic_zone_ranges().is_empty());
+            assert_eq!(Arc::strong_count(&link), 1);
+            #[cfg(feature = "appdata")]
+            {
+                assert!(line.get_appdata().is_none());
+                assert_eq!(Arc::weak_count(&appdata), 0);
+            }
+            // Previously-wide rows must also behave like fresh rows on reuse.
+            line.set_cell_grapheme(1, "y", 1, CellAttributes::default(), 10);
+            let mut expected = Line::new(9);
+            expected.set_cell_grapheme(1, "y", 1, CellAttributes::default(), 10);
+            assert_eq!(line, expected);
+        }
+    }
+}
+
 // Keep a scalar reference so the fast path is checked against the old behavior,
 // including less visible state such as hyperlinks, sequence numbers and zones.
 fn scalar_range(line: &mut Line, range: core::ops::Range<usize>, cell: &Cell, clear: bool) {
