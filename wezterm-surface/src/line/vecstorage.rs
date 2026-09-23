@@ -34,6 +34,17 @@ impl VecStorage {
         self.cells[idx] = cell;
     }
 
+    /// Repeated writes can reuse a cell's extended-attribute allocation. Keep
+    /// the existing merge path whenever the destination has image attachments.
+    pub(crate) fn set_cell_from(&mut self, idx: usize, cell: &Cell) {
+        #[cfg(feature = "use_image")]
+        if self.cells[idx].attrs().has_images() {
+            self.set_cell(idx, cell.clone(), false);
+            return;
+        }
+        self.cells[idx].clone_from(cell);
+    }
+
     pub(crate) fn scan_and_create_hyperlinks(
         &mut self,
         line: &str,

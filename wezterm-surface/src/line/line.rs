@@ -1045,11 +1045,35 @@ impl Line {
         }
     }
 
-    pub fn fill_range(&mut self, cols: Range<usize>, cell: &Cell, seqno: SequenceNo) {
+    pub fn fill_range(&mut self, mut cols: Range<usize>, cell: &Cell, seqno: SequenceNo) {
         if self.len() == 0 && *cell == Cell::blank() {
             // We would be filling it with blanks only to prune
             // them all away again before we return; NOP
             return;
+        }
+        if !cols.is_empty()
+            && cols.start < self.len()
+            && cols.end >= self.len()
+            && *cell == Cell::blank()
+            && matches!(&self.cells, CellStorage::V(_))
+        {
+            // Resolve a wide grapheme crossing the start and invalidate links
+            // before deciding which prefix can remain. The erased tail will
+            // be pruned, so don't first construct a blank Cell for every column.
+            let start = cols.start;
+            self.set_cell_impl(start, cell.clone(), true, seqno);
+            if let CellStorage::V(cells) = &mut self.cells {
+                if let Some(last) = cells[..start]
+                    .iter()
+                    .rposition(|c| c.str() != " " || c.attrs() != cell.attrs())
+                {
+                    cells.truncate(last + 1);
+                    return;
+                }
+            }
+            // Vec storage historically retains the length of all-blank lines.
+            // Preserve that behavior, including styled wide-cell padding.
+            cols.start += 1;
         }
         self.set_cell_range_impl(cols, cell, true, seqno);
         self.prune_trailing_blanks(seqno);
@@ -1084,8 +1108,12 @@ impl Line {
                 // Every preceding cell in this run has just been written with
                 // width one, so subsequent writes cannot overlap a wide cell
                 // on their left. Keep VecStorage's image-placement semantics.
-                for x in cols {
-                    cells.set_cell(x, cell.clone(), clear_image_placements);
+                if clear_image_placements {
+                    cells[cols].fill(cell.clone());
+                } else {
+                    for x in cols {
+                        cells.set_cell_from(x, cell);
+                    }
                 }
                 return;
             }

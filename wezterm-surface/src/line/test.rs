@@ -111,6 +111,17 @@ fn appending_ranges_keeps_compact_storage() {
     assert!(empty.is_compressed_for_scrollback());
 }
 
+#[test]
+fn erasing_a_default_tail_does_not_materialize_out_of_range_blanks() {
+    let mut line: Line = "prefix    tail".into();
+    line.coerce_vec_storage();
+    let mut expected = line.clone();
+    scalar_range(&mut expected, 6..100, &Cell::blank(), true);
+    line.fill_range(6..usize::MAX, &Cell::blank(), 42);
+    assert_eq!(line, expected);
+    assert_eq!(line.as_str(), "prefix");
+}
+
 #[cfg(feature = "use_image")]
 #[test]
 fn cell_ranges_preserve_or_clear_image_placements_like_scalar_writes() {

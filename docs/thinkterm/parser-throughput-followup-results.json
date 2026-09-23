@@ -1,0 +1,176 @@
+{
+  "baseline_commit": "e791e310a72915ed7f9a03208437ec34166263cb",
+  "candidate_code_patch_sha256": "098e81d761c98d597d4813e10c4d9dd6ab3bb6fecf8c534124ee39a4313238a7",
+  "binary_sha256": {
+    "baseline": "654e2917ad8e23951c7bacd0b66ea0bd23f9f203d7f78393f2fdb465aff05ac2",
+    "candidate": "bd654e038fe43f2d55d834bbc56154316eca7cc81f913ba36d3a486339703936"
+  },
+  "platform": "macOS arm64",
+  "date": "2026-09-23",
+  "kitten_version": "0.49.0",
+  "size": [
+    120,
+    32
+  ],
+  "scrollback_lines": 3500,
+  "repetitions": 100,
+  "renderer": "none (isolated PTY/mux server)",
+  "order": [
+    "baseline",
+    "candidate",
+    "candidate",
+    "baseline",
+    "baseline",
+    "candidate"
+  ],
+  "runs": {
+    "baseline": [
+      {
+        "rates_mib_per_second": {
+          "Only ASCII chars": 43.1,
+          "Unicode chars": 47.6,
+          "Unique multi-codepoint Unicode cells": 69.1,
+          "CSI codes with few chars": 20.2,
+          "Long escape codes": 200.0,
+          "Images": 261.9
+        },
+        "peak_rss_bytes": 459210752,
+        "elapsed_seconds": 22.483098708005855
+      },
+      {
+        "rates_mib_per_second": {
+          "Only ASCII chars": 43.2,
+          "Unicode chars": 47.3,
+          "Unique multi-codepoint Unicode cells": 69.0,
+          "CSI codes with few chars": 20.2,
+          "Long escape codes": 203.5,
+          "Images": 241.0
+        },
+        "peak_rss_bytes": 463077376,
+        "elapsed_seconds": 22.542637292004656
+      },
+      {
+        "rates_mib_per_second": {
+          "Only ASCII chars": 43.2,
+          "Unicode chars": 47.6,
+          "Unique multi-codepoint Unicode cells": 69.2,
+          "CSI codes with few chars": 20.2,
+          "Long escape codes": 203.2,
+          "Images": 239.2
+        },
+        "peak_rss_bytes": 459505664,
+        "elapsed_seconds": 22.539257084019482
+      }
+    ],
+    "candidate": [
+      {
+        "rates_mib_per_second": {
+          "Only ASCII chars": 69.3,
+          "Unicode chars": 47.1,
+          "Unique multi-codepoint Unicode cells": 68.5,
+          "CSI codes with few chars": 25.0,
+          "Long escape codes": 210.0,
+          "Images": 229.5
+        },
+        "peak_rss_bytes": 463405056,
+        "elapsed_seconds": 19.874922916002106
+      },
+      {
+        "rates_mib_per_second": {
+          "Only ASCII chars": 69.3,
+          "Unicode chars": 47.2,
+          "Unique multi-codepoint Unicode cells": 68.7,
+          "CSI codes with few chars": 25.0,
+          "Long escape codes": 209.3,
+          "Images": 244.1
+        },
+        "peak_rss_bytes": 461225984,
+        "elapsed_seconds": 19.736880499986
+      },
+      {
+        "rates_mib_per_second": {
+          "Only ASCII chars": 70.0,
+          "Unicode chars": 47.2,
+          "Unique multi-codepoint Unicode cells": 68.7,
+          "CSI codes with few chars": 25.2,
+          "Long escape codes": 203.0,
+          "Images": 239.7
+        },
+        "peak_rss_bytes": 461176832,
+        "elapsed_seconds": 19.82980612499523
+      }
+    ]
+  },
+  "median_rates_mib_per_second": {
+    "baseline": {
+      "Only ASCII chars": 43.2,
+      "Unicode chars": 47.6,
+      "Unique multi-codepoint Unicode cells": 69.1,
+      "CSI codes with few chars": 20.2,
+      "Long escape codes": 203.2,
+      "Images": 241.0
+    },
+    "candidate": {
+      "Only ASCII chars": 69.3,
+      "Unicode chars": 47.2,
+      "Unique multi-codepoint Unicode cells": 68.7,
+      "CSI codes with few chars": 25.0,
+      "Long escape codes": 209.3,
+      "Images": 239.7
+    }
+  },
+  "allocation_probe": {
+    "operation": "fill 100000 already styled RGB cells four times",
+    "baseline_allocations": 400000,
+    "candidate_allocations": 4,
+    "construction_live_bytes_unchanged": true,
+    "serialized_attribute_fixture_byte_identical": true
+  },
+  "rejected_cow_prototype": {
+    "reason": "Each independent extended attribute allocation gains a 16-byte reference-count header",
+    "independent_rgb_attribute_count": 100000,
+    "baseline_requested_live_bytes": 11200096,
+    "prototype_requested_live_bytes": 12800112
+  },
+  "validation": {
+    "vtparse_tests": 26,
+    "escape_parser_tests": 82,
+    "cell_tests": 14,
+    "surface_tests": 48,
+    "terminal_tests": 129,
+    "mux_tests": 202,
+    "gui_tests": 909,
+    "existing_ignored_gui_tests": 1,
+    "release_gui_and_mux_build": true,
+    "wasm_core_check": true,
+    "integration_note": "GUI and mux suites passed during integration; core suites reran after the final UTF-8 and inlining adjustments.",
+    "foreground_gui_qa": false,
+    "native_windows_qa": false,
+    "long_duration_leak_test": false
+  },
+  "notes": [
+    "Kitten randomizes input, so paired workloads are comparable but not byte-identical.",
+    "No build or tests ran during measured benchmark pairs.",
+    "No unexpected parser or image-decoding errors appeared in benchmark logs.",
+    "Expected sandbox SSH-agent and existing-daemon handoff refusal messages occurred at startup.",
+    "Peak RSS includes the mux process; this is not a GUI/GPU memory measurement."
+  ],
+  "scrollback_check": {
+    "baseline": {
+      "rates_mib_per_second": {
+        "Only ASCII chars": 43.3,
+        "CSI codes with few chars": 20.3
+      },
+      "peak_rss_bytes": 451461120,
+      "repetitions": 200
+    },
+    "candidate": {
+      "rates_mib_per_second": {
+        "Only ASCII chars": 69.7,
+        "CSI codes with few chars": 25.2
+      },
+      "peak_rss_bytes": 451674112,
+      "repetitions": 200
+    }
+  }
+}
