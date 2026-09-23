@@ -228,7 +228,7 @@ impl crate::TermWindow {
                 self.start_recording_overlay_edit();
             }
             crate::termwindow::ContextMenuApplicationAction::ClearRecordingOverlay => {
-                self.recording_overlay.clear();
+                self.clear_active_pane_recording_masks();
                 if let Some(window) = &self.window {
                     window.invalidate();
                 }

@@ -173,6 +173,7 @@ pub(crate) struct CachedPreviewQuads {
     /// The card rectangle these quads were laid out in.
     area: RectF,
     heap: HeapQuadAllocator,
+    mask_regions: Vec<(mux::pane::PaneId, RectF, crate::termwindow::ui::recording_overlay::PaneRecordingLayer)>,
     /// The card's picture as a texture (WebGpu only). Rendered from `heap`
     /// when content changes; composited as a single quad on every other
     /// frame, which is what makes an unchanged card nearly free.
@@ -224,6 +225,7 @@ pub(crate) struct PreviewRebuildPartial {
     #[allow(dead_code)]
     snapshot: Arc<crate::termwindow::content_view::TerminalPreviewSnapshot>,
     heap: HeapQuadAllocator,
+    mask_regions: Vec<(mux::pane::PaneId, RectF, crate::termwindow::ui::recording_overlay::PaneRecordingLayer)>,
     /// Resume point: the next pane and the next line within it.
     pane_idx: usize,
     line_idx: usize,
@@ -1947,6 +1949,24 @@ impl crate::TermWindow {
             if self.paint_terminal_preview(layers, preview, &mut budget)? {
                 rebuilt += 1;
             }
+            // Masks stay live above cached textures, including during sliced rebuilds.
+            // Use the geometry of the picture actually being replayed, not a newer snapshot.
+            let cache = self.preview_quad_cache.borrow();
+            if let Some(cached) = cache.get(&preview.tab_id) {
+                let sx = preview.area.width() / cached.area.width().max(1.0);
+                let sy = preview.area.height() / cached.area.height().max(1.0);
+                let alpha = self.preview_content_alpha(preview) * preview.opacity.clamp(0.0, 1.0);
+                for (_, rect, masks) in &cached.mask_regions {
+                    let frame = euclid::rect(
+                        preview.area.min_x() + (rect.min_x() - cached.area.min_x()) * sx,
+                        preview.area.min_y() + (rect.min_y() - cached.area.min_y()) * sy,
+                        rect.width() * sx, rect.height() * sy,
+                    );
+                    if let Some(clip) = preview.clip.intersection(&preview.area) {
+                        self.paint_recording_mask_layer(masks, frame, clip, layers, alpha)?;
+                    }
+                }
+            }
         }
         // What a frame spent on thumbnails, and how much of that was a card
         // whose quads could not be replayed. Without the split, a slow frame
@@ -2134,6 +2154,7 @@ impl crate::TermWindow {
                     key,
                     snapshot: Arc::clone(&preview.snapshot),
                     heap,
+                    mask_regions: Vec::new(),
                     pane_idx: 0,
                     line_idx: 0,
                 }
@@ -2148,6 +2169,7 @@ impl crate::TermWindow {
                 preview,
                 &mut partial.pane_idx,
                 &mut partial.line_idx,
+                &mut partial.mask_regions,
                 deadline,
             )?;
             crate::perf::log_duration("preview_rebuild_card", card_started);
@@ -2179,7 +2201,7 @@ impl crate::TermWindow {
             self.update_next_frame_time(Some(Instant::now()));
             return Ok(true);
         }
-        let PreviewRebuildPartial { heap, .. } = partial;
+        let PreviewRebuildPartial { heap, mask_regions, .. } = partial;
         let prior_texture = self
             .preview_quad_cache
             .borrow_mut()
@@ -2241,6 +2263,7 @@ impl crate::TermWindow {
                 snapshot: Arc::clone(&preview.snapshot),
                 area: preview.area,
                 heap,
+                mask_regions,
                 texture,
             },
         );
@@ -2399,6 +2422,7 @@ impl crate::TermWindow {
         preview: &TerminalPreviewRequest,
         resume_pane: &mut usize,
         resume_line: &mut usize,
+        mask_regions: &mut Vec<(mux::pane::PaneId, RectF, crate::termwindow::ui::recording_overlay::PaneRecordingLayer)>,
         deadline: Instant,
     ) -> anyhow::Result<bool> {
         let snapshot = &preview.snapshot;
@@ -2557,6 +2581,9 @@ impl crate::TermWindow {
             let pane_width = pane.width as f32 * cell_width;
             let pane_height = pane.height as f32 * cell_height;
             let pane_rect = euclid::rect(pane_x, pane_y, pane_width, pane_height);
+            if mask_regions.last().is_none_or(|(id, _, _)| *id != pane.pane_id) {
+                mask_regions.push((pane.pane_id, pane_rect, crate::termwindow::ui::recording_overlay::pane_layer(pane.pane_id)));
+            }
             let Some(pane_bounds) = pane_rect.intersection(&preview.area) else {
                 continue;
             };
@@ -4021,6 +4048,9 @@ impl crate::TermWindow {
                     }
                 }
                 self.paint_pane(&pos, &mut layers).context("paint_pane")?;
+                if let Ok(frame) = self.pane_frame_rect(&pos) {
+                    self.paint_pane_recording_masks(pos.pane.pane_id(), frame, &mut layers)?;
+                }
             }
 
             if let Some(pane) = self.get_active_pane_or_overlay() {
@@ -4373,8 +4403,7 @@ impl crate::TermWindow {
         // Last, so the tag sits above every chrome surface it might overhang.
         self.paint_hover_tooltip().context("paint_hover_tooltip")?;
 
-        // Window-space masks are composited last and never baked into a
-        // terminal/overview capture, so content transitions cannot move them.
+        // Only the floating editor is window-local; masks are painted with their panes.
         self.paint_recording_overlay()
             .context("paint_recording_overlay")?;
 

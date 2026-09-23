@@ -317,7 +317,9 @@ impl GuiFrontEnd {
                 MuxNotification::FrontendLeaseChanged(_) => {}
                 MuxNotification::FrontendAccessChanged(_) => {}
                 MuxNotification::TabAddedToWindow { .. } => {}
-                MuxNotification::PaneRemoved(_) => {}
+                MuxNotification::PaneRemoved(pane_id) => {
+                    crate::termwindow::ui::recording_overlay::forget_pane(pane_id);
+                }
                 MuxNotification::WindowInvalidated(_) => {}
                 MuxNotification::PaneOutput(_) => {}
                 MuxNotification::AgentStatusChanged(_) => {}

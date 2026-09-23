@@ -8154,7 +8154,7 @@ impl super::TermWindow {
                 crate::i18n::tr("menu-clear-recording-overlay"),
                 ContextMenuIcon::Refresh,
                 crate::termwindow::ContextMenuApplicationAction::ClearRecordingOverlay,
-                !self.recording_overlay.is_empty(),
+                !self.active_pane_recording_masks_empty(),
             ),
             ContextMenuItem::Separator,
             split_item(
