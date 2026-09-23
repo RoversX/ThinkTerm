@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
-use wezterm_cell::Cell;
+use wezterm_cell::{Cell, CellAttributes};
 
 extern crate alloc;
 use alloc::vec::Vec;
@@ -17,6 +17,36 @@ pub(crate) struct VecStorage {
 impl VecStorage {
     pub(crate) fn new(cells: Vec<Cell>) -> Self {
         Self { cells }
+    }
+
+    // Keep the clearing and allocation loops out of the line editing paths.
+    #[inline(never)]
+    pub(crate) fn resize_and_clear(&mut self, width: usize, attrs: CellAttributes) {
+        // Discard removed cells before clearing, rather than allocating new
+        // attributes for cells that will immediately be dropped.
+        self.cells.truncate(width);
+        let is_rgb = |color| {
+            !matches!(
+                color,
+                wezterm_cell::color::ColorAttribute::Default
+                    | wezterm_cell::color::ColorAttribute::PaletteIndex(_)
+            )
+        };
+        if is_rgb(attrs.background()) || is_rgb(attrs.foreground()) {
+            let blank = Cell::blank_with_attrs(attrs.clone());
+            for cell in &mut self.cells {
+                cell.clone_from(&blank);
+            }
+        } else {
+            // Replacing lightweight attributes is faster than clone_from;
+            // reserve allocation reuse for heap-backed RGB colors.
+            for cell in &mut self.cells {
+                *cell = Cell::blank_with_attrs(attrs.clone());
+            }
+        }
+        self.cells
+            .resize_with(width, || Cell::blank_with_attrs(attrs.clone()));
+        self.cells.shrink_to_fit();
     }
 
     #[cfg_attr(not(feature = "use_image"), allow(unused_mut, unused_variables))]

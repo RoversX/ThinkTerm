@@ -9,6 +9,47 @@ use k9::assert_equal as assert_eq;
 use wezterm_cell::{Cell, CellAttributes};
 
 #[test]
+fn grapheme_appends_preserve_gaps_and_wide_overwrites() {
+    let plain = CellAttributes::default();
+    let mut line = Line::new(1);
+    line.set_cell_grapheme(0, "界", 2, plain.clone(), 2);
+    line.set_cell_grapheme(2, "e\u{301}", 1, plain.clone(), 3);
+    assert_eq!(line.as_str(), "界e\u{301}");
+    assert_eq!(line.len(), 3);
+
+    // A default blank beyond the end remains implicit, including metadata.
+    let before = line.clone();
+    line.set_cell_grapheme(6, " ", 1, plain.clone(), 4);
+    assert_eq!(line, before);
+
+    line.set_cell_grapheme(5, "z", 1, plain.clone(), 5);
+    assert_eq!(line.as_str(), "界e\u{301}  z");
+    assert_eq!(line.len(), 6);
+    line.set_cell_grapheme(1, "x", 1, plain.clone(), 6);
+    assert_eq!(line.as_str(), " xe\u{301}  z");
+    assert_eq!(line.len(), 6);
+
+    // A colored blank must remain visible, including after a storage change.
+    for compact in [false, true] {
+        let mut line = line.clone();
+        if compact {
+            line.compress_for_scrollback();
+        }
+        let mut colored = plain.clone();
+        colored.set_background(wezterm_cell::color::ColorAttribute::PaletteIndex(4));
+        line.set_cell_grapheme(8, " ", 1, colored.clone(), 7);
+        assert_eq!(line.as_str(), " xe\u{301}  z   ");
+        assert_eq!(line.len(), 9);
+        assert_eq!(line.visible_cells().last().unwrap().attrs(), &colored);
+        assert_eq!(line.compute_shape_hash(), {
+            let mut expected = Line::from_text(" xe\u{301}  z   ", &plain, 7, None);
+            *expected.cells_mut()[8].attrs_mut() = colored;
+            expected.compute_shape_hash()
+        });
+    }
+}
+
+#[test]
 fn scroll_reset_discards_oversized_storage() {
     let mut line = Line::new(1);
     line.set_ascii_cells(0, &"x".repeat(8192), &CellAttributes::default(), 2);
@@ -913,6 +954,32 @@ fn ascii_runs_match_scalar_storage_links_and_wide_boundaries() {
                     for attrs in [CellAttributes::default(), linked.clone()] {
                         check_ascii_against_scalar(&base, start, replacement, &attrs);
                     }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ascii_append_matches_scalar_for_styled_compact_rows() {
+    let mut rgb = CellAttributes::default();
+    rgb.set_background(
+        wezterm_cell::color::ColorAttribute::TrueColorWithDefaultFallback(
+            (0.2, 0.4, 0.6, 1.0).into(),
+        ),
+    );
+    let mut linked = rgb.clone();
+    linked.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.org"))));
+    linked.set_semantic_type(wezterm_cell::SemanticType::Prompt);
+    let styles = [CellAttributes::default(), rgb, linked];
+    for prefix in ["", "hello", "界e\u{301}🙂"] {
+        for initial in &styles {
+            let mut base = Line::from_text(prefix, initial, 7, None);
+            base.compress_for_scrollback();
+            base.semantic_zone_ranges();
+            for attrs in &styles {
+                for text in [" ", "abc", "  styled text ~  "] {
+                    check_ascii_against_scalar(&base, base.len(), text, attrs);
                 }
             }
         }

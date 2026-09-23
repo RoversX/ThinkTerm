@@ -209,14 +209,8 @@ impl Line {
         seqno: SequenceNo,
         blank_attr: CellAttributes,
     ) {
-        {
-            let cells = self.coerce_vec_storage();
-            for c in cells.iter_mut() {
-                *c = Cell::blank_with_attrs(blank_attr.clone());
-            }
-            cells.resize_with(width, || Cell::blank_with_attrs(blank_attr.clone()));
-            cells.shrink_to_fit();
-        }
+        self.coerce_vec_storage()
+            .resize_and_clear(width, blank_attr);
         self.update_last_change_seqno(seqno);
         self.invalidate_zones();
         self.bits = LineBits::NONE;
@@ -789,15 +783,39 @@ impl Line {
         }
 
         if let CellStorage::C(cl) = &mut self.cells {
-            if idx > cl.len() && text == " " && attr == CellAttributes::blank() {
-                // Appending blank beyond end of line; is already
-                // implicitly blank
+            if idx == cl.len() {
+                cl.append_grapheme(text, width, attr);
+                self.invalidate_implicit_hyperlinks(seqno);
+                self.invalidate_zones();
+                self.update_last_change_seqno(seqno);
                 return;
             }
-            while cl.len() < idx {
-                // Fill out any implied blanks until we can append
-                // their intended cell content
-                cl.append_grapheme(" ", 1, CellAttributes::blank());
+        }
+        self.set_cell_grapheme_nonappend(idx, text, width, attr, seqno);
+    }
+
+    // Keep padding and overwrites out of the common sequential append path.
+    #[inline(never)]
+    fn set_cell_grapheme_nonappend(
+        &mut self,
+        idx: usize,
+        text: &str,
+        width: usize,
+        attr: CellAttributes,
+        seqno: SequenceNo,
+    ) {
+        if let CellStorage::C(cl) = &mut self.cells {
+            if idx > cl.len() {
+                if text == " " && attr == CellAttributes::blank() {
+                    // Appending blank beyond end of line; is already
+                    // implicitly blank
+                    return;
+                }
+                while cl.len() < idx {
+                    // Fill out any implied blanks until we can append
+                    // their intended cell content
+                    cl.append_grapheme(" ", 1, CellAttributes::blank());
+                }
             }
             if idx == cl.len() {
                 cl.append_grapheme(text, width, attr);
@@ -826,6 +844,27 @@ impl Line {
         }
         if text.is_empty() {
             return true;
+        }
+        // An append cannot overlap a wide cell. Write the whole run without
+        // allocating attributes for a scalar first cell, unless hyperlink
+        // invalidation can change the storage before the rest of the write.
+        // Single-character writes use the cheaper scalar append below.
+        if text.len() > 1
+            && (self.bits
+                & (LineBits::SCANNED_IMPLICIT_HYPERLINKS | LineBits::HAS_IMPLICIT_HYPERLINKS))
+                == LineBits::NONE
+        {
+            if let CellStorage::C(cl) = &mut self.cells {
+                if idx == cl.len() {
+                    cl.append_ascii(text, attr);
+                    if attr.hyperlink().is_some() {
+                        self.bits |= LineBits::HAS_HYPERLINK;
+                    }
+                    self.invalidate_zones();
+                    self.update_last_change_seqno(seqno);
+                    return true;
+                }
+            }
         }
         // Establish the same wide-cell boundary and line metadata as a scalar
         // write before taking either storage-specific path.
