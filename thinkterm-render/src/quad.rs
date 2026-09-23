@@ -874,6 +874,73 @@ impl HeapQuadAllocator {
         }
     }
 
+    /// Remove covered pixels before a recorded surface is faded. Merely fading
+    /// an opaque cover and the glyph beneath it separately reveals the glyph.
+    ///
+    /// The scratch rectangles are reused for all quads; unchanged quads move
+    /// without cloning. Axis-aligned mask edges partition a quad into at most
+    /// (2*n + 1)^2 cells, so overlapping masks cannot cause exponential growth.
+    /// Callers bound n (recording masks allow 64 per pane) and run this only
+    /// while rebuilding a cache or capturing a transition, never on replay.
+    pub fn occlude(&mut self, masks: &[QuadClipRect]) {
+        if masks.is_empty() {
+            return;
+        }
+        let mut visible = Vec::new();
+        let mut next = Vec::new();
+        for layer in [&mut self.layer0, &mut self.layer1, &mut self.layer2] {
+            let mut output = Vec::with_capacity(layer.len());
+            for quad in layer.drain(..) {
+                let (left, top, right, bottom) = quad.position;
+                let original = QuadClipRect {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                };
+                visible.clear();
+                visible.push(original);
+                for mask in masks {
+                    next.clear();
+                    for rect in visible.drain(..) {
+                        let x0 = rect.left.max(mask.left);
+                        let y0 = rect.top.max(mask.top);
+                        let x1 = rect.right.min(mask.right);
+                        let y1 = rect.bottom.min(mask.bottom);
+                        if x1 <= x0 || y1 <= y0 {
+                            next.push(rect);
+                            continue;
+                        }
+                        for piece in [
+                            rect.with_vertical(rect.top, y0),
+                            rect.with_vertical(y1, rect.bottom),
+                            rect.with_vertical(y0, y1).with_horizontal(rect.left, x0),
+                            rect.with_vertical(y0, y1).with_horizontal(x1, rect.right),
+                        ] {
+                            if piece.right > piece.left && piece.bottom > piece.top {
+                                next.push(piece);
+                            }
+                        }
+                    }
+                    std::mem::swap(&mut visible, &mut next);
+                    if visible.is_empty() {
+                        break;
+                    }
+                }
+                if visible.as_slice() == [original] {
+                    output.push(quad);
+                } else {
+                    for rect in &visible {
+                        if let Some(piece) = quad.translated_clipped(0.0, 0.0, *rect) {
+                            output.push(piece);
+                        }
+                    }
+                }
+            }
+            *layer = output;
+        }
+    }
+
     pub fn quad_count(&self) -> usize {
         self.layers().iter().map(|(_, quads)| quads.len()).sum()
     }
@@ -1596,5 +1663,108 @@ mod translated_clip_tests {
         let below = QuadClipRect::from_top_left_pixels(0.0, 20.0, 40.0, 30.0, &ORIGIN);
         assert!(quad.translated_clipped(-100.0, 0.0, full).is_none());
         assert!(quad.translated_clipped(0.0, 0.0, below).is_none());
+    }
+}
+
+#[cfg(test)]
+mod recording_occlusion_tests {
+    use super::*;
+
+    fn rect(left: f32, top: f32, right: f32, bottom: f32) -> QuadClipRect {
+        QuadClipRect::from_top_left_pixels(left, top, right, bottom, &TEST_ORIGIN)
+    }
+
+    #[test]
+    fn occlusion_preserves_texture_and_gradient_interpolation() {
+        let mut heap = HeapQuadAllocator::default();
+        let mut quad = heap.allocate(1).unwrap();
+        quad.set_position(0.0, 0.0, 100.0, 80.0);
+        quad.set_texture_discrete(0.0, 1.0, 0.0, 1.0);
+        quad.set_corner_gradient(
+            LinearRgba::with_components(0.0, 0.0, 0.0, 1.0),
+            LinearRgba::with_components(1.0, 0.0, 0.0, 1.0),
+            LinearRgba::with_components(0.0, 1.0, 0.0, 1.0),
+            LinearRgba::with_components(1.0, 1.0, 0.0, 1.0),
+        );
+        heap.occlude(&[rect(20.0, 10.0, 70.0, 65.0)]);
+        assert_eq!(heap.quad_count(), 4);
+        let area: f32 = heap
+            .layer1
+            .iter()
+            .map(|q| {
+                let (l, t, r, b) = q.position;
+                (r - l) * (b - t)
+            })
+            .sum();
+        assert_eq!(area, 8000.0 - 50.0 * 55.0);
+        for vertex in heap.layer1.iter().flat_map(|q| q.to_vertices()) {
+            let x = vertex.position[0] / 100.0;
+            let y = vertex.position[1] / 80.0;
+            assert!((vertex.tex[0] - x).abs() < 0.00001);
+            assert!((vertex.tex[1] - y).abs() < 0.00001);
+            assert!((vertex.fg_color[0] - x).abs() < 0.00001);
+            assert!((vertex.fg_color[1] - y).abs() < 0.00001);
+        }
+    }
+
+    #[test]
+    fn faded_and_scaled_recordings_contain_no_covered_source_pixels() {
+        let mut heap = HeapQuadAllocator::default();
+        for layer in 0..3 {
+            let mut quad = heap.allocate(layer).unwrap();
+            quad.set_position(0.0, 0.0, 100.0, 100.0);
+            quad.set_fg_color(LinearRgba::with_components(1.0, 1.0, 1.0, 1.0));
+            quad.set_has_color_impl([IS_GLYPH, IS_COLOR_EMOJI, IS_BG_IMAGE][layer]);
+        }
+        heap.occlude(&[rect(20.0, 20.0, 80.0, 80.0)]);
+        let mut cover = heap.allocate(2).unwrap();
+        cover.set_position(20.0, 20.0, 80.0, 80.0);
+        cover.set_fg_color(LinearRgba::with_components(0.0, 0.0, 0.0, 1.0));
+        cover.set_is_background();
+        for opacity in [0.01, 0.25, 0.5, 1.0] {
+            let mut replay = HeapQuadAllocator::default();
+            heap.apply_to_scaled(
+                &mut replay,
+                rect(0.0, 0.0, 100.0, 100.0),
+                rect(30.0, 40.0, 80.0, 90.0),
+                rect(30.0, 40.0, 80.0, 90.0),
+                opacity,
+            )
+            .unwrap();
+            let covering: Vec<_> = replay
+                .layers()
+                .into_iter()
+                .flat_map(|(_, quads)| quads)
+                .filter(|quad| {
+                    let (l, t, r, b) = quad.position;
+                    l < 55.0 && r > 55.0 && t < 65.0 && b > 65.0
+                })
+                .collect();
+            assert_eq!(covering.len(), 1);
+            assert_eq!(covering[0].fg_color, [0.0, 0.0, 0.0, opacity]);
+        }
+    }
+
+    #[test]
+    fn overlapping_masks_leave_exactly_the_uncovered_area() {
+        let mut heap = HeapQuadAllocator::default();
+        heap.allocate(0)
+            .unwrap()
+            .set_position(0.0, 0.0, 100.0, 100.0);
+        heap.occlude(&[
+            rect(20.0, 0.0, 40.0, 100.0),
+            rect(0.0, 30.0, 100.0, 70.0),
+            rect(20.0, 0.0, 40.0, 100.0),
+        ]);
+        let area: f32 = heap
+            .layer0
+            .iter()
+            .map(|q| {
+                let (l, t, r, b) = q.position;
+                (r - l) * (b - t)
+            })
+            .sum();
+        assert_eq!(area, 80.0 * 60.0);
+        assert_eq!(heap.quad_count(), 4);
     }
 }
