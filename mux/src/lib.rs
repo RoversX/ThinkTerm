@@ -669,7 +669,7 @@ fn parse_buffered_data(
             Ok(size) => {
                 unapplied += size;
                 let work_started = Instant::now();
-                parser.parse(&buf[0..size], |action| {
+                parser.parse_print_runs(&buf[0..size], |action| {
                     let mut flush = false;
                     match &action {
                         Action::CSI(CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(

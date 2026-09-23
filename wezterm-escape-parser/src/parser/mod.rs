@@ -89,7 +89,18 @@ impl Parser {
         return tmux_parser.advance_bytes(bytes);
     }
 
-    pub fn parse<F: FnMut(Action)>(&mut self, bytes: &[u8], mut callback: F) {
+    pub fn parse<F: FnMut(Action)>(&mut self, bytes: &[u8], callback: F) {
+        self.parse_impl(bytes, callback, false);
+    }
+
+    /// Like `parse`, but emits contiguous printable ASCII as `PrintString`.
+    /// Run boundaries have no semantic meaning: consumers must still combine
+    /// adjacent print actions before Unicode grapheme segmentation.
+    pub fn parse_print_runs<F: FnMut(Action)>(&mut self, bytes: &[u8], callback: F) {
+        self.parse_impl(bytes, callback, true);
+    }
+
+    fn parse_impl<F: FnMut(Action)>(&mut self, bytes: &[u8], mut callback: F, print_runs: bool) {
         #[cfg(feature = "tmux_cc")]
         let is_tmux_mode: bool = self.state.borrow().tmux_state.is_some();
         #[cfg(feature = "tmux_cc")]
@@ -108,6 +119,7 @@ impl Parser {
                     let mut perform = Performer {
                         callback: &mut callback,
                         state: &mut parser_state,
+                        print_runs,
                     };
                     self.state_machine
                         .parse(unparsed_str.as_bytes(), &mut perform);
@@ -119,6 +131,7 @@ impl Parser {
         let mut perform = Performer {
             callback: &mut callback,
             state: &mut self.state.borrow_mut(),
+            print_runs,
         };
         self.state_machine.parse(bytes, &mut perform);
     }
@@ -144,6 +157,7 @@ impl Parser {
                     *first.borrow_mut() = Some(action);
                 },
                 state: &mut self.state.borrow_mut(),
+                print_runs: false,
             };
             for (idx, b) in bytes.iter().enumerate() {
                 self.state_machine.parse_byte(*b, &mut perform);
@@ -181,6 +195,7 @@ impl Parser {
                 &mut Performer {
                     callback: &mut |action| actions.push(action),
                     state: &mut self.state.borrow_mut(),
+                    print_runs: false,
                 },
             );
             if !actions.is_empty() && self.state_machine.is_ground() {
@@ -196,6 +211,7 @@ impl Parser {
 struct Performer<'a, F: FnMut(Action) + 'a> {
     callback: &'a mut F,
     state: &'a mut ParseState,
+    print_runs: bool,
 }
 
 fn is_short_dcs(intermediates: &[u8], byte: u8) -> bool {
@@ -210,6 +226,16 @@ fn is_short_dcs(intermediates: &[u8], byte: u8) -> bool {
 impl<'a, F: FnMut(Action)> VTActor for Performer<'a, F> {
     fn print(&mut self, c: char) {
         (self.callback)(Action::Print(c));
+    }
+
+    fn print_ascii(&mut self, text: &str) {
+        if self.print_runs && text.len() > 1 {
+            (self.callback)(Action::PrintString(text.to_string()));
+        } else {
+            for byte in text.bytes() {
+                self.print(byte as char);
+            }
+        }
     }
 
     fn execute_c0_or_c1(&mut self, byte: u8) {
@@ -742,6 +768,38 @@ mod test {
         let actions = p.parse_as_vec(s.as_bytes());
         assert_eq!(s, encode(&actions), "actions: {actions:?}");
         actions
+    }
+
+    #[test]
+    fn print_runs_preserve_coalesced_actions_across_chunk_boundaries() {
+        let inputs: &[&[u8]] = &[
+            b"hello world",
+            "e\u{301}abc界1\u{fe0f}\u{20e3}xyz".as_bytes(),
+            b"abc\r\n\x1b[31mred\x1b[0m\x1b[5b\x7f\x00tail",
+            b"\x1b]0;title\x07text\x1bP+q544e\x1b\\next",
+            b"\x1b_Gi=1,s=1,v=1,f=24;YWJj\x1b\\end",
+            b"a\xf0\x9fASCII\xc3\x1b[0mb",
+            b"\x1b(0lqqk\x0eqx\x0f\x1b(Bnormal\x1bktitle\x1b\\end",
+        ];
+        for input in inputs {
+            let mut scalar = Parser::new();
+            let mut expected = vec![];
+            scalar.parse(input, |action| action.append_to(&mut expected));
+            for size in 1..=input.len() {
+                let mut batched = Parser::new();
+                let mut actual = vec![];
+                for chunk in input.chunks(size) {
+                    batched.parse_print_runs(chunk, |action| action.append_to(&mut actual));
+                }
+                assert_eq!(actual, expected, "input={input:?}, chunk={size}");
+            }
+        }
+        let mut actions = vec![];
+        Parser::new().parse_print_runs(b"a long ASCII run", |action| actions.push(action));
+        assert_eq!(
+            actions,
+            vec![Action::PrintString("a long ASCII run".into())]
+        );
     }
 
     fn parse_as(s: &str, expected: &str) -> Vec<Action> {

@@ -110,6 +110,14 @@ pub trait VTActor {
     /// character.
     fn print(&mut self, b: char);
 
+    /// Print a non-empty run of bytes in the range 0x20..=0x7e.
+    /// The default preserves the per-character callback for existing actors.
+    fn print_ascii(&mut self, text: &str) {
+        for byte in text.bytes() {
+            self.print(byte as char);
+        }
+    }
+
     /// The C0 or C1 control function should be executed, which may have any one of a variety of
     /// effects, including changing the cursor position, suspending or resuming communications or
     /// changing the shift states in effect.
@@ -770,6 +778,11 @@ impl VTParser {
             return;
         }
 
+        self.parse_non_utf8_byte(byte, actor);
+    }
+
+    #[inline(always)]
+    fn parse_non_utf8_byte(&mut self, byte: u8, actor: &mut dyn VTActor) {
         let (action, state) = lookup(self.state, byte);
 
         if state != self.state {
@@ -788,9 +801,46 @@ impl VTParser {
     /// Parse a sequence of bytes.  The sequence need not be complete.
     /// This may result in some number of calls to the methods on the
     /// provided `actor`.
-    pub fn parse(&mut self, bytes: &[u8], actor: &mut dyn VTActor) {
-        for b in bytes {
-            self.parse_byte(*b, actor);
+    pub fn parse(&mut self, mut bytes: &[u8], actor: &mut dyn VTActor) {
+        while !bytes.is_empty() {
+            // Continuation bytes cannot begin a printable run. Keep their
+            // original decoder path free of ASCII and payload-state checks.
+            if self.state == State::Utf8Sequence {
+                self.next_utf8(actor, bytes[0]);
+                bytes = &bytes[1..];
+                continue;
+            }
+            // Only Ground can bypass the state machine. In particular, ASCII
+            // following an incomplete UTF-8 sequence must reach next_utf8.
+            if self.is_ground() && (b' '..=b'~').contains(&bytes[0]) {
+                let end = bytes
+                    .iter()
+                    .position(|b| !(b' '..=b'~').contains(b))
+                    .unwrap_or(bytes.len());
+                actor.print_ascii(core::str::from_utf8(&bytes[..end]).unwrap());
+                bytes = &bytes[end..];
+            } else {
+                self.parse_non_utf8_byte(bytes[0], actor);
+                bytes = &bytes[1..];
+                if matches!(
+                    self.state,
+                    State::ApcString
+                        | State::OscString
+                        | State::DcsPassthrough
+                        | State::DcsIgnore
+                        | State::SosPmString
+                ) {
+                    // String payloads (notably images) need the byte parser,
+                    // so avoid an extra run-detection branch on every byte.
+                    // Finish this input chunk with the original loop. Any text
+                    // after the terminator still emits ordinary print actions;
+                    // batching can resume on the next input chunk.
+                    for &byte in bytes {
+                        self.parse_byte(byte, actor);
+                    }
+                    return;
+                }
+            }
         }
     }
 }
@@ -805,6 +855,48 @@ mod test {
         let mut actor = CollectingVTActor::default();
         parser.parse(bytes, &mut actor);
         actor.into_vec()
+    }
+
+    #[test]
+    fn ascii_runs_match_byte_parser_in_every_streaming_state() {
+        let prefixes: &[&[u8]] = &[
+            b"",
+            b"\x1b",
+            b"\x1b[",
+            b"\x1b[12;",
+            b"\x1b]0;",
+            b"\x1bP1;2q",
+            b"\x1b_",
+            b"\x1b^",
+            b"\xc3",
+            b"\xf0\x9f",
+        ];
+        for prefix in prefixes {
+            for byte in 0..=255 {
+                let mut input = prefix.to_vec();
+                input.push(byte);
+                input.extend_from_slice(b"abc ~\x7f\x00\x1b\\e\xcc\x81\r\nend");
+                let mut scalar = VTParser::new();
+                let mut expected = CollectingVTActor::default();
+                for &b in &input {
+                    scalar.parse_byte(b, &mut expected);
+                }
+                let expected = expected.into_vec();
+                for size in [1, 2, 7, 64] {
+                    let mut batched = VTParser::new();
+                    let mut actual = CollectingVTActor::default();
+                    for chunk in input.chunks(size) {
+                        batched.parse(chunk, &mut actual);
+                    }
+                    assert_eq!(
+                        actual.into_vec(),
+                        expected,
+                        "prefix={prefix:?}, byte={byte}, chunk={size}"
+                    );
+                    assert_eq!(batched.is_ground(), scalar.is_ground());
+                }
+            }
+        }
     }
 
     #[test]

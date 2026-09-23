@@ -1299,7 +1299,9 @@ mod ascii_tests {
                         let input = format!("{setup}abc #q~0123456789az      next\rOVERWRITE\nmore\te\u{301}1\u{fe0f}\u{20e3}界\x1b[0m\x1bkASCII title界\x1b\\end");
                         for chunk in input.as_bytes().chunks(chunk_size) {
                             let mut actions = Vec::new();
-                            parser.parse(chunk, |action| action.append_to(&mut actions));
+                            parser.parse_print_runs(chunk, |action| {
+                                action.append_to(&mut actions)
+                            });
                             actual.increment_seqno();
                             expected.increment_seqno();
                             {

@@ -63,7 +63,7 @@ pub enum Action {
 
 impl Action {
     /// Append this `Action` to a `Vec<Action>`.
-    /// If this `Action` is `Print` and the last element is `Print` or
+    /// If this `Action` is `Print` or `PrintString` and the last element is `Print` or
     /// `PrintString` then the elements are combined into `PrintString`
     /// to reduce heap utilization.
     pub fn append_to(self, dest: &mut Vec<Self>) {
@@ -78,6 +78,22 @@ impl Action {
                     dest.pop();
                     s.push(*c);
                     dest.push(Action::PrintString(s));
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if let Action::PrintString(text) = &self {
+            match dest.last_mut() {
+                Some(Action::PrintString(prior)) => {
+                    prior.push_str(text);
+                    return;
+                }
+                Some(Action::Print(prior)) => {
+                    let mut combined = String::with_capacity(prior.len_utf8() + text.len());
+                    combined.push(*prior);
+                    combined.push_str(text);
+                    *dest.last_mut().unwrap() = Action::PrintString(combined);
                     return;
                 }
                 _ => {}

@@ -168,7 +168,8 @@ impl Terminal {
 
             let mut performer = Performer::new(&mut self.state);
 
-            self.parser.parse(bytes, |action| performer.perform(action));
+            self.parser
+                .parse_print_runs(bytes, |action| performer.perform(action));
         }
         self.trigger_unseen_output_notif();
     }
