@@ -1379,3 +1379,7 @@ impl<'a> From<&'a str> for Line {
         Line::from_text(s, &CellAttributes::default(), SEQ_ZERO, None)
     }
 }
+
+#[cfg(test)]
+#[path = "resize_clear_tests.rs"]
+mod resize_clear_tests;
