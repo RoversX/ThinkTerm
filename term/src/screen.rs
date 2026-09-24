@@ -767,8 +767,10 @@ impl Screen {
         // of the screen based scrolling, the StableRowIndex does not change,
         // so we use the scroll region bounds to gate the invalidation.
         if !scrollback_ok {
-            for y in phys_scroll.clone() {
-                self.line_mut(y).update_last_change_seqno(seqno);
+            // Walk the deque's slices: indexing each row re-derives its slot
+            // from the deque header, which dominated region scrolling.
+            for line in self.lines.range_mut(phys_scroll.clone()) {
+                line.update_last_change_seqno(seqno);
             }
         }
 
@@ -864,8 +866,10 @@ impl Screen {
 
         // If we have invalidated the StableRowIndex, mark all subsequent lines as dirty
         if to_remove > 0 || (to_add > 0 && !insert_at_end) {
-            for y in self.phys_range(&(scroll_region.end..self.physical_rows as VisibleRowIndex)) {
-                self.line_mut(y).update_last_change_seqno(seqno);
+            let below =
+                self.phys_range(&(scroll_region.end..self.physical_rows as VisibleRowIndex));
+            for line in self.lines.range_mut(below) {
+                line.update_last_change_seqno(seqno);
             }
         }
     }
@@ -908,8 +912,8 @@ impl Screen {
         let middle = phys_scroll.end - num_rows;
 
         // dirty the rows in the region
-        for y in phys_scroll.start..middle {
-            self.line_mut(y).update_last_change_seqno(seqno);
+        for line in self.lines.range_mut(phys_scroll.start..middle) {
+            line.update_last_change_seqno(seqno);
         }
 
         for _ in 0..num_rows {

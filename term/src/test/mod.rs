@@ -1421,6 +1421,36 @@ fn test_alt_screen_region_scroll() {
 }
 
 #[test]
+fn region_scrolls_mark_the_region_wherever_the_row_ring_wraps() {
+    // Each pass rotates the row deque one more step, so the scroll region
+    // lands on every position relative to where its storage wraps around.
+    for alt in [false, true] {
+        let mut term = TestTerm::new(5, 4, 3);
+        if alt {
+            term.set_mode("?1049", true);
+        }
+        for pass in 0..24 {
+            term.set_scroll_region(0, 4);
+            term.cup(0, 4);
+            term.print(&format!("\n{}", pass));
+            let top = term.screen().scrollback_rows() - 5;
+            let region = [top + 1, top + 2, top + 3];
+
+            term.set_scroll_region(1, 3);
+            term.cup(0, 3);
+            let seqno = term.current_seqno();
+            term.print("\n");
+            term.assert_dirty_lines(seqno, &region, Some("scroll up"));
+
+            term.cup(0, 1);
+            let seqno = term.current_seqno();
+            term.print("\x1bM");
+            term.assert_dirty_lines(seqno, &region, Some("scroll down"));
+        }
+    }
+}
+
+#[test]
 fn test_region_scrollback_limit() {
     // Ensure scrollback is truncated properly, when it reaches the line limit
     let mut term = TestTerm::new(4, 1, 2);
