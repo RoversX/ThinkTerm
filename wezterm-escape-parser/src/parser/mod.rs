@@ -2,8 +2,8 @@
 #[cfg(feature = "tmux_cc")]
 use crate::tmux_cc::Event;
 use crate::{
-    Action, CSI, DeviceControlMode, EnterDeviceControlMode, Esc, OperatingSystemCommand,
-    ShortDeviceControl,
+    Action, DeviceControlMode, EnterDeviceControlMode, Esc, OperatingSystemCommand,
+    ShortDeviceControl, CSI,
 };
 #[cfg(feature = "tmux_cc")]
 use core::borrow::BorrowMut;
@@ -138,14 +138,14 @@ impl Parser {
         self.parse_with_borrowed_text(bytes, |event| match event {
             ParsedAction::Action(action) => callback(action),
             ParsedAction::Print(text) => {
-                for byte in text.bytes() {
-                    callback(Action::Print(byte as char));
+                for c in text.chars() {
+                    callback(Action::Print(c));
                 }
             }
         });
     }
 
-    /// Like `parse`, but emits contiguous printable ASCII as `PrintString`.
+    /// Like `parse`, but emits contiguous printable text as `PrintString`.
     /// Run boundaries have no semantic meaning: consumers must still combine
     /// adjacent print actions before Unicode grapheme segmentation.
     pub fn parse_print_runs<F: FnMut(Action)>(&mut self, bytes: &[u8], callback: F) {
@@ -153,7 +153,7 @@ impl Parser {
         self.parse_with_borrowed_text(bytes, |event| callback(event.into_owned()));
     }
 
-    /// Parse with borrowed printable ASCII runs, valid only during each callback.
+    /// Parse with borrowed printable text runs, valid only during each callback.
     /// Run boundaries are not grapheme boundaries: append adjacent print events
     /// before segmenting Unicode text. Use `ParsedAction::append_to` for queues.
     ///
@@ -306,6 +306,10 @@ impl<'a, F: FnMut(ParsedAction<'_>)> VTActor for Performer<'a, F> {
         } else {
             (self.callback)(ParsedAction::Print(text));
         }
+    }
+
+    fn print_utf8(&mut self, text: &str) {
+        (self.callback)(ParsedAction::Print(text));
     }
 
     fn execute_c0_or_c1(&mut self, byte: u8) {
@@ -892,6 +896,27 @@ mod test {
         assert_eq!(offsets, [0, 7]);
         input.fill(b'x');
         assert_eq!(encode(&actions), "ab\x1b[31mcd");
+    }
+
+    #[test]
+    fn borrowed_unicode_runs_preserve_scalar_api_and_queue_ownership() {
+        let text = "中e\u{301}🙂é";
+        let mut input = text.as_bytes().to_vec();
+        let expected: Vec<_> = text.chars().map(Action::Print).collect();
+        assert_eq!(Parser::new().parse_as_vec(&input), expected);
+        let mut owned = vec![];
+        let mut runs = 0;
+        Parser::new().parse_with_borrowed_text(&input, |event| {
+            if let ParsedAction::Print(run) = &event {
+                assert_eq!(run.as_ptr(), input['中'.len_utf8()..].as_ptr());
+                assert_eq!(*run, &text['中'.len_utf8()..]);
+                runs += 1;
+            }
+            event.append_to(&mut owned);
+        });
+        assert_eq!(runs, 1);
+        input.fill(b'x');
+        assert_eq!(owned, vec![Action::PrintString(text.to_string())]);
     }
 
     #[test]

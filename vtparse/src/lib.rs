@@ -118,6 +118,15 @@ pub trait VTActor {
         }
     }
 
+    /// Print a non-empty run of valid UTF-8 without C0, DEL or C1 controls.
+    /// Runs need not end at a grapheme boundary. The default retains the
+    /// per-character callback for actors that do not support borrowed text.
+    fn print_utf8(&mut self, text: &str) {
+        for c in text.chars() {
+            self.print(c);
+        }
+    }
+
     /// The C0 or C1 control function should be executed, which may have any one of a variety of
     /// effects, including changing the cursor position, suspending or resuming communications or
     /// changing the shift states in effect.
@@ -808,6 +817,16 @@ impl VTParser {
             if self.state == State::Utf8Sequence {
                 self.next_utf8(actor, bytes[0]);
                 bytes = &bytes[1..];
+                // Start a borrowed run only after the existing decoder has
+                // returned to Ground. ASCII and control-only input retain
+                // their original path without additional run-detection work.
+                if self.is_ground() {
+                    let text = printable_utf8_prefix(bytes);
+                    if !text.is_empty() {
+                        actor.print_utf8(text);
+                        bytes = &bytes[text.len()..];
+                    }
+                }
                 continue;
             }
             // Only Ground can bypass the state machine. In particular, ASCII
@@ -845,6 +864,54 @@ impl VTParser {
     }
 }
 
+/// Stop before controls, incomplete codepoints or invalid encodings so that
+/// the existing state machine retains all recovery and C1 dispatch behavior.
+/// Inspect each byte at most once, including on malformed input.
+#[inline(never)]
+fn printable_utf8_prefix(bytes: &[u8]) -> &str {
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let tail = &bytes[pos..];
+        let continuation = |b: u8| (0x80..=0xbf).contains(&b);
+        let len = match tail {
+            [0x20..=0x7e, ..] => 1,
+            // U+0080..U+009F are encoded C1 controls, not printable text.
+            [0xc2, 0xa0..=0xbf, ..] => 2,
+            [0xc3..=0xdf, b, ..] if continuation(*b) => 2,
+            [a @ 0xe0..=0xef, b, c, ..]
+                if continuation(*c)
+                    && match a {
+                        0xe0 => (0xa0..=0xbf).contains(b),
+                        0xed => (0x80..=0x9f).contains(b),
+                        _ => continuation(*b),
+                    } =>
+            {
+                3
+            }
+            [a @ 0xf0..=0xf4, b, c, d, ..]
+                if continuation(*c)
+                    && continuation(*d)
+                    && match a {
+                        0xf0 => (0x90..=0xbf).contains(b),
+                        0xf4 => (0x80..=0x8f).contains(b),
+                        _ => continuation(*b),
+                    } =>
+            {
+                4
+            }
+            _ => break,
+        };
+        pos += len;
+    }
+    let prefix = &bytes[..pos];
+    debug_assert!(core::str::from_utf8(prefix).is_ok());
+    // SAFETY: Each step above accepts a complete UTF-8 scalar, checking every
+    // continuation byte and excluding overlong encodings, surrogate values and
+    // values above U+10FFFF. `pos` only advances past such scalars; invalid or
+    // incomplete sequences stop the scan. The borrowed bytes remain unchanged.
+    unsafe { core::str::from_utf8_unchecked(prefix) }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -855,6 +922,139 @@ mod test {
         let mut actor = CollectingVTActor::default();
         parser.parse(bytes, &mut actor);
         actor.into_vec()
+    }
+
+    #[test]
+    fn printable_utf8_accepts_all_scalars_except_controls() {
+        for code in 0..=0x10ffff {
+            if let Some(c) = char::from_u32(code) {
+                let mut buffer = [0; 4];
+                let text = c.encode_utf8(&mut buffer);
+                let expected = if c.is_control() { 0 } else { text.len() };
+                assert_eq!(
+                    printable_utf8_prefix(text.as_bytes()).len(),
+                    expected,
+                    "{code:x}"
+                );
+                for end in 0..text.len() {
+                    assert!(printable_utf8_prefix(&text.as_bytes()[..end]).is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn printable_utf8_prefix_matches_standard_validator() {
+        fn check(bytes: &[u8]) {
+            let valid_len = match core::str::from_utf8(bytes) {
+                Ok(text) => text.len(),
+                Err(error) => error.valid_up_to(),
+            };
+            let valid = core::str::from_utf8(&bytes[..valid_len]).unwrap();
+            let end = valid
+                .char_indices()
+                .find(|(_, c)| c.is_control())
+                .map_or(valid.len(), |(index, _)| index);
+            assert_eq!(printable_utf8_prefix(bytes), &valid[..end], "{bytes:x?}");
+        }
+        // All byte pairs cover short malformed encodings and every C1 control.
+        for a in 0..=255u8 {
+            for b in 0..=255u8 {
+                check(&[a, b]);
+            }
+        }
+        // Mutate each byte around every encoding boundary. Include a valid
+        // leading run so the returned prefix must stop at the correct offset.
+        for c in [
+            '\u{80}', '\u{7ff}', '\u{800}', '\u{d7ff}', '\u{e000}',
+            '\u{ffff}', '\u{10000}', '\u{10ffff}', '🙂',
+        ] {
+            let mut encoded = [0; 4];
+            let text = c.encode_utf8(&mut encoded);
+            for index in 0..text.len() {
+                for byte in 0..=255u8 {
+                    let mut bytes = "é中".as_bytes().to_vec();
+                    let start = bytes.len();
+                    bytes.extend_from_slice(text.as_bytes());
+                    bytes[start + index] = byte;
+                    bytes.extend_from_slice("x🙂".as_bytes());
+                    for end in 0..=bytes.len() {
+                        check(&bytes[..end]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_runs_preserve_controls_invalid_input_and_streaming_states() {
+        let prefixes: &[&[u8]] = &[
+            b"",
+            b"\x1b",
+            b"\x1b[12;",
+            b"\x1b]0;",
+            b"\x1bP1;2q",
+            b"\x1b_",
+            b"\x1b^",
+            b"\xc3",
+            b"\xf0\x9f",
+        ];
+        let mut suffixes = vec![
+            "中e\u{301}🙂\u{a0}é\u{10ffff}text".as_bytes().to_vec(),
+            b"\xe0\x80\x80\xed\xa0\x80\xf0\x80\x80\x80\xf4\x90\x80\x80\xff".to_vec(),
+        ];
+        for c in 0x80..=0x9f {
+            let mut suffix = vec![0xc2, c];
+            suffix.extend_from_slice(b"31mtext\x1b\\\x07");
+            suffixes.push(suffix);
+        }
+        for prefix in prefixes {
+            for suffix in &suffixes {
+                let mut input = prefix.to_vec();
+                input.extend_from_slice("界🙂".as_bytes());
+                input.extend_from_slice(suffix);
+                input.extend_from_slice(b"\x1b\\\x1b[0mend");
+                let mut scalar = VTParser::new();
+                let mut expected = CollectingVTActor::default();
+                for &b in &input {
+                    scalar.parse_byte(b, &mut expected);
+                }
+                let expected = expected.into_vec();
+                for split in 0..=input.len() {
+                    let mut batched = VTParser::new();
+                    let mut actual = CollectingVTActor::default();
+                    batched.parse(&input[..split], &mut actual);
+                    batched.parse(&input[split..], &mut actual);
+                    assert_eq!(
+                        actual.into_vec(),
+                        expected,
+                        "input={input:?}, split={split}"
+                    );
+                    assert_eq!(batched.is_ground(), scalar.is_ground());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_runs_match_byte_parser_for_every_byte_pair() {
+        for a in 0..=255 {
+            for b in 0..=255 {
+                let mut input = "中🙂".as_bytes().to_vec();
+                input.extend_from_slice(&[a, b]);
+                input.extend_from_slice("é界\x1b\\tail".as_bytes());
+                let mut scalar = VTParser::new();
+                let mut expected = CollectingVTActor::default();
+                for &byte in &input {
+                    scalar.parse_byte(byte, &mut expected);
+                }
+                let mut batched = VTParser::new();
+                let mut actual = CollectingVTActor::default();
+                batched.parse(&input, &mut actual);
+                assert_eq!(actual.into_vec(), expected.into_vec(), "a={a}, b={b}");
+                assert_eq!(batched.is_ground(), scalar.is_ground());
+            }
+        }
     }
 
     #[test]
