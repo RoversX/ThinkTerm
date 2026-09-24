@@ -770,7 +770,10 @@ impl Screen {
             }
         };
 
-        if scroll_region.start == 0 {
+        // Only rows that may be retained in scrollback need compression.
+        // On the alternate screen these rows are immediately dropped or
+        // cleared, so compressing them first has no benefit.
+        if scrollback_ok {
             for y in self.phys_range(&(0..num_rows as VisibleRowIndex)) {
                 self.line_mut(y).compress_for_scrollback();
             }

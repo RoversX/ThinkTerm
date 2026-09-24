@@ -1436,6 +1436,45 @@ fn test_region_scrollback_limit() {
 }
 
 #[test]
+fn styled_alt_screen_scrolling_matches_retained_primary_rows() {
+    for region_end in [1, 3] {
+        let mut primary = TestTerm::new(4, 8, 10);
+        let mut alternate = TestTerm::new(4, 8, 10);
+        alternate.set_mode("?1049", true);
+        for term in [&mut primary, &mut alternate] {
+            term.print("outside\r\nrows\r\nstay\r\nhere");
+            term.set_scroll_region(0, region_end);
+            term.cup(0, 0);
+        }
+        // Recycle styled rows repeatedly, including wide characters, wrapping,
+        // hyperlinks and erasure. Primary history still uses compression and
+        // provides an independent reference for the visible alternate screen.
+        for i in 0..24 {
+            let input = format!(
+                "\x1b[48;2;12;34;56m\x1b]8;;https://example.com\x1b\\中e\u{301}🙂{i}\x1b]8;;\x1b\\\r\n\x1b[31mcolored text\x1b[0m\r\n\x1b[44m\x1b[2K"
+            );
+            primary.print(&input);
+            alternate.print(&input);
+            let expected = primary.screen().visible_lines();
+            let actual = alternate.screen().visible_lines();
+            assert_eq!(actual.len(), expected.len());
+            assert_lines_equal(
+                file!(),
+                line!(),
+                &actual,
+                &expected,
+                Compare::TEXT | Compare::ATTRS,
+            );
+            for (a, b) in actual.iter().zip(&expected) {
+                assert_eq!(a.last_cell_was_wrapped(), b.last_cell_was_wrapped());
+            }
+            assert_eq!(alternate.screen().all_lines().len(), 4);
+        }
+        assert!(primary.screen().all_lines().len() > 4);
+    }
+}
+
+#[test]
 fn test_hyperlinks() {
     let mut term = TestTerm::new(3, 5, 0);
     let link = Arc::new(Hyperlink::new("http://example.com"));
