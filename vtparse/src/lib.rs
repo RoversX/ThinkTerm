@@ -846,6 +846,64 @@ impl VTParser {
         }
     }
 
+    /// A complete `ESC [ params final` whose parameters are only digits, ';'
+    /// and ':' (not starting with ':'), such as SGR and cursor motion.
+    /// Applies what the state machine does for those bytes -- clearing on
+    /// entry, one Param per parameter byte, then CsiDispatch -- without
+    /// walking it byte by byte. Anything else, including a sequence that
+    /// continues past `bytes`, returns None and is left to the state machine.
+    /// Kept out of line so that the ASCII run loop in `parse` stays tight.
+    #[inline(never)]
+    fn parse_plain_csi(&mut self, bytes: &[u8], actor: &mut dyn VTActor) -> Option<usize> {
+        let params = bytes.strip_prefix(b"\x1b[")?;
+        let len = params
+            .iter()
+            .position(|b| !matches!(b, b'0'..=b'9' | b':' | b';'))?;
+        let final_byte = params[len];
+        // A leading ':' moves CsiEntry to CsiIgnore rather than dispatching.
+        if !(0x40..=0x7e).contains(&final_byte) || params[0] == b':' {
+            return None;
+        }
+        // Entering Escape and then CsiEntry clears twice; once is the same.
+        self.action(Action::Clear, 0, actor);
+        // Action::Param for each byte; after a clear there are no
+        // intermediates to promote.
+        let mut current: Option<i64> = None;
+        for &b in &params[..len] {
+            if self.params_full {
+                continue;
+            }
+            if b.is_ascii_digit() {
+                let digit = (b - b'0') as i64;
+                current = Some(match current {
+                    Some(value) => value.saturating_mul(10).saturating_add(digit),
+                    None => digit,
+                });
+            } else {
+                if let Some(value) = current.take() {
+                    if self.num_params < MAX_PARAMS {
+                        self.params[self.num_params] = CsiParam::Integer(value);
+                        self.num_params += 1;
+                    }
+                }
+                if self.num_params + 1 > MAX_PARAMS {
+                    self.params_full = true;
+                } else {
+                    self.params[self.num_params] = CsiParam::P(b);
+                    self.num_params += 1;
+                }
+            }
+        }
+        self.current_param = current.map(CsiParam::Integer);
+        self.action(Action::CsiDispatch, final_byte, actor);
+        self.utf8_return_state = if len > 0 {
+            State::CsiParam
+        } else {
+            State::CsiEntry
+        };
+        Some(2 + len + 1)
+    }
+
     /// Parse a sequence of bytes.  The sequence need not be complete.
     /// This may result in some number of calls to the methods on the
     /// provided `actor`.
@@ -883,6 +941,12 @@ impl VTParser {
                 let consumed = self.osc.put_ascii_run(bytes);
                 bytes = &bytes[consumed..];
             } else {
+                if bytes[0] == 0x1b && self.is_ground() {
+                    if let Some(consumed) = self.parse_plain_csi(bytes, actor) {
+                        bytes = &bytes[consumed..];
+                        continue;
+                    }
+                }
                 self.parse_non_utf8_byte(bytes[0], actor);
                 bytes = &bytes[1..];
                 if matches!(
@@ -1562,7 +1626,7 @@ mod test {
 
     /// Feed `input` to a parser in `chunks` and to another one byte at a
     /// time, checking actions and OSC state at every chunk boundary.
-    fn assert_osc_runs_match_byte_parser(input: &[u8], chunks: &[usize], what: &str) {
+    fn assert_runs_match_byte_parser(input: &[u8], chunks: &[usize], what: &str) {
         let mut scalar = VTParser::new();
         let mut expected = CollectingVTActor::default();
         let mut batched = VTParser::new();
@@ -1606,6 +1670,33 @@ mod test {
                 "{what}, offset={offset}"
             );
             core::assert_eq!(batched.osc.full, scalar.osc.full, "{what}, offset={offset}");
+            // CSI accumulation, including slots left over from earlier ones.
+            core::assert_eq!(batched.params, scalar.params, "{what}, offset={offset}");
+            core::assert_eq!(
+                batched.num_params,
+                scalar.num_params,
+                "{what}, offset={offset}"
+            );
+            core::assert_eq!(
+                batched.params_full,
+                scalar.params_full,
+                "{what}, offset={offset}"
+            );
+            core::assert_eq!(
+                batched.current_param,
+                scalar.current_param,
+                "{what}, offset={offset}"
+            );
+            core::assert_eq!(
+                (batched.intermediates, batched.num_intermediates),
+                (scalar.intermediates, scalar.num_intermediates),
+                "{what}, offset={offset}"
+            );
+            core::assert_eq!(
+                batched.ignored_excess_intermediates,
+                scalar.ignored_excess_intermediates,
+                "{what}, offset={offset}"
+            );
         }
     }
 
@@ -1629,13 +1720,9 @@ mod test {
         ];
         for (i, input) in inputs.iter().enumerate() {
             for size in [1, 2, 3, 5, 7, 64, 4096, usize::MAX] {
-                assert_osc_runs_match_byte_parser(
-                    input,
-                    &[size],
-                    &format!("input {i}, chunk {size}"),
-                );
+                assert_runs_match_byte_parser(input, &[size], &format!("input {i}, chunk {size}"));
             }
-            assert_osc_runs_match_byte_parser(input, &[1, 4, 2, 9, 3, 17], &format!("input {i}"));
+            assert_runs_match_byte_parser(input, &[1, 4, 2, 9, 3, 17], &format!("input {i}"));
         }
     }
 
@@ -1693,7 +1780,85 @@ mod test {
                 }
             }
             let chunks: Vec<usize> = (0..8).map(|_| 1 + (next() % 40) as usize).collect();
-            assert_osc_runs_match_byte_parser(&input, &chunks, &format!("round={round}"));
+            assert_runs_match_byte_parser(&input, &chunks, &format!("round={round}"));
+        }
+    }
+
+    #[test]
+    fn plain_csi_matches_byte_parser() {
+        let many = format!("\x1b[{}m", "1;".repeat(MAX_PARAMS + 5));
+        let many_colons = format!("\x1b[{}m", "2:".repeat(MAX_PARAMS + 5));
+        let huge = format!("\x1b[{}m", "9".repeat(40));
+        let inputs: &[&[u8]] = &[
+            b"\x1b[m\x1b[0m\x1b[;m\x1b[1;m\x1b[;1m",
+            b"\x1b[38;2;1;2;3mX\x1b[38:2::1:2:3mY\x1b[4:3m",
+            b"\x1b[12;34Hab\x1b[H\x1b[5A\x1b[2K\x1b[100b\x1b[@\x1b[~",
+            b"\x1b[:1m\x1b[1:m\x1b[1;:2m",
+            b"\x1b[?25h\x1b[>4;1m\x1b[=1c\x1b[<1;2;3M\x1b[1 q\x1b[1$p",
+            b"\x1b[1\x072H\x1b[1\x7f2H\x1b[1\x182H\x1b[1\x1a2H",
+            b"\x1b[1\x1b[2m\x1b[1;2\x1b]0;t\x07\x1b[3m",
+            b"\x1b[1;2\x9b3m\xc2\x9b4m\x9b5m",
+            b"\x1b[1;2\x80m\x1b[1;\xe4\xb8\xadm\x1b[1\x7e",
+            b"\x1bP1;2q#0\x1b\\\x1b[1m\x1b_Ga=q\x1b\\\x1b[2m",
+            b"\xe4\xb8\x1b[1mz\xc3\x1b[2m",
+            many.as_bytes(),
+            many_colons.as_bytes(),
+            huge.as_bytes(),
+        ];
+        for (i, input) in inputs.iter().enumerate() {
+            for size in [1, 2, 3, 5, 7, 64, usize::MAX] {
+                assert_runs_match_byte_parser(input, &[size], &format!("input {i}, chunk {size}"));
+            }
+            assert_runs_match_byte_parser(input, &[1, 4, 2, 9, 3, 17], &format!("input {i}"));
+        }
+    }
+
+    #[test]
+    fn plain_csi_matches_byte_parser_on_random_input() {
+        let mut seed = 0x0123_4567_89ab_cdefu64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alphabet: &[&[u8]] = &[
+            b"\x1b[",
+            b"\x1b[",
+            b"\x1b",
+            b"[",
+            b"0",
+            b"1",
+            b"9",
+            b"12",
+            b";",
+            b":",
+            b"?",
+            b">",
+            b" ",
+            b"$",
+            b"m",
+            b"H",
+            b"@",
+            b"~",
+            b"`",
+            b"\x7f",
+            b"\x07",
+            b"\x18",
+            b"\x1b]",
+            b"\x9b",
+            b"\xc2\x9b",
+            b"\xe4\xb8\xad",
+            b"a",
+            b"\n",
+        ];
+        for round in 0..3000 {
+            let mut input = vec![];
+            for _ in 0..(next() % 60) {
+                input.extend_from_slice(alphabet[(next() % alphabet.len() as u64) as usize]);
+            }
+            let chunks: Vec<usize> = (0..8).map(|_| 1 + (next() % 24) as usize).collect();
+            assert_runs_match_byte_parser(&input, &chunks, &format!("round={round}"));
         }
     }
 
