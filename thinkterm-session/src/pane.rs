@@ -3,7 +3,7 @@
 //! Detached tasks hold a `Weak` to it; a pane that is gone by the time an
 //! answer arrives is simply not updated.
 use crate::clock::Clock;
-use crate::delta_queue::{RenderDeltaQueue, RowsCarried};
+use crate::delta_queue::RenderDeltaQueue;
 use crate::host::{request, HostConfig, HostPaneId, PduLink, SessionEvents, SessionHost, Spawner};
 use crate::hydrate::hydrate_lines;
 use crate::images::ImageStore;
@@ -670,15 +670,15 @@ impl<H: SessionHost> PaneSession<H> {
             let Some(me) = weak.upgrade() else {
                 return;
             };
-            let Some((delta, carried)) = me.render_deltas.lock().take() else {
+            let Some((delta, has_newer)) = me.render_deltas.lock().take() else {
                 return;
             };
             // A push with a newer one already behind it is applied without
             // asking for pictures: the newer push names the current ones, and
             // rows whose pictures are missing keep showing the previous frame.
             let started = me.now();
-            let fetched_pictures = carried.is_none();
-            me.apply_render_delta(delta, carried).await;
+            let fetched_pictures = !has_newer;
+            me.apply_render_delta(delta, has_newer).await;
             log::debug!(
                 "render push for pane {} applied in {:?} (fetched pictures: {})",
                 me.host_pane_id,
@@ -688,7 +688,7 @@ impl<H: SessionHost> PaneSession<H> {
         }
     }
 
-    /// Apply one push. With `carried` given, newer pushes wait behind this
+    /// Apply one push. With `has_newer` set, newer pushes wait behind this
     /// one and it is applied without fetching pictures; a row it then has
     /// to leave out is marked dirty unless one of those pushes brings it,
     /// since the server sent it as a bonus row and nothing else would ever
@@ -696,7 +696,7 @@ impl<H: SessionHost> PaneSession<H> {
     async fn apply_render_delta(
         self: &Arc<Self>,
         mut delta: GetPaneRenderChangesResponse,
-        carried: Option<RowsCarried>,
+        has_newer: bool,
     ) {
         let bonus_lines = std::mem::take(&mut delta.bonus_lines);
         let (bonus_lines, left_out) = hydrate_lines(
@@ -704,10 +704,14 @@ impl<H: SessionHost> PaneSession<H> {
             &self.images,
             delta.pane_id,
             bonus_lines,
-            carried.is_none(),
+            !has_newer,
         )
         .await;
-        if let Some(carried) = carried {
+        // Rows are only left out when pictures were not fetched, which only
+        // happens with a newer push queued behind this one.
+        debug_assert!(has_newer || left_out.is_empty());
+        if !left_out.is_empty() {
+            let carried = self.render_deltas.lock().rows_carried();
             for row in left_out {
                 if !carried.contains(row) {
                     delta.dirty_lines.push(row..row + 1);
@@ -1568,6 +1572,85 @@ mod tests {
         host.spawner.run_all();
         assert_eq!(session.state().seqno, 2);
         assert!(session.state().lines.len() <= 256);
+    }
+
+    #[test]
+    fn skipped_image_rows_are_recovered_unless_a_later_push_carries_them() {
+        let (host, session) = session(&[(1, "recovered"), (2, "must not fetch")]);
+        let picture = Arc::new(ImageData::with_raw_data(vec![1, 2, 3]));
+        let image_line = || {
+            let mut line = Line::from_text("picture", &CellAttributes::default(), 1, None);
+            line.cells_mut()[0]
+                .attrs_mut()
+                .attach_image(Box::new(ImageCell::new(
+                    TextureCoordinate::new_f32(0., 0.),
+                    TextureCoordinate::new_f32(1., 1.),
+                    Arc::clone(&picture),
+                )));
+            line
+        };
+        let mut first = delta(1, false, false);
+        first.bonus_lines = vec![(1, image_line()), (2, image_line())].into();
+        let mut next = delta(2, false, false);
+        next.bonus_lines = vec![(
+            2,
+            Line::from_text("latest", &CellAttributes::default(), 2, None),
+        )]
+        .into();
+        session.queue_render_delta(first);
+        session.queue_render_delta(next);
+        host.spawner.run_all();
+        assert_eq!(*host.link.asked.borrow(), ["GetLines"]);
+        assert_eq!(
+            host.link.rows_asked.get(),
+            1,
+            "only the uncarried image row is fetched"
+        );
+        let st = session.state();
+        assert!(
+            matches!(st.lines.peek(&1), Some(LineEntry::Line(line)) if line.as_str() == "recovered")
+        );
+        assert!(
+            matches!(st.lines.peek(&2), Some(LineEntry::Line(line)) if line.as_str() == "latest")
+        );
+        assert_eq!(st.seqno, 2);
+    }
+
+    #[test]
+    fn queued_text_updates_keep_sparse_rows_and_apply_the_final_state() {
+        let (host, session) = session(&[]);
+        for seqno in 1..=100 {
+            let mut update = delta(seqno, false, seqno % 2 == 0);
+            let row = (seqno % 24) as StableRowIndex;
+            update.bonus_lines = vec![(
+                row,
+                Line::from_text(
+                    &format!("update {seqno}"),
+                    &CellAttributes::default(),
+                    seqno,
+                    None,
+                ),
+            )]
+            .into();
+            update.title = format!("title {seqno}");
+            session.queue_render_delta(update);
+        }
+        host.spawner.run_all();
+        let st = session.state();
+        assert_eq!(st.seqno, 100);
+        assert_eq!(st.title, "title 100");
+        assert!(st.mouse_grabbed);
+        for seqno in 77..=100 {
+            let row = (seqno % 24) as StableRowIndex;
+            assert!(
+                matches!(st.lines.peek(&row), Some(LineEntry::Line(line)) if line.as_str() == format!("update {seqno}"))
+            );
+        }
+        assert!(
+            host.link.asked.borrow().is_empty(),
+            "text needs no recovery fetch"
+        );
+        assert_eq!(host.events.outputs.get(), 100);
     }
 
     #[test]

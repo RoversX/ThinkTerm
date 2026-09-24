@@ -69,6 +69,12 @@ impl SentImages {
     /// Note every image attached to `lines`, which are about to be sent.
     pub fn remember(&mut self, lines: &[(StableRowIndex, Line)]) {
         for (_, line) in lines {
+            // Wire rows are compressed before reaching us. Checking their
+            // attribute runs avoids a grapheme walk of ordinary text. Keep
+            // vector rows on the single-pass path instead of scanning twice.
+            if line.is_compressed_for_scrollback() && !line.has_images() {
+                continue;
+            }
             for cell in line.visible_cells() {
                 let Some(images) = cell.attrs().images() else {
                     continue;
@@ -216,6 +222,41 @@ mod tests {
         let mut sent = SentImages::default();
         sent.remember(&[line_with(&image(b"one"))]);
         assert!(sent.get(&image(b"two").hash()).is_none());
+    }
+
+    #[test]
+    fn compact_rows_keep_images_after_text_and_link_only_rows() {
+        use termwiz::hyperlink::Hyperlink;
+        let picture = image(b"picture after text");
+        for compact in [false, true] {
+            let mut text = Line::from_text("plain text", &CellAttributes::default(), 1, None);
+            let mut attrs = CellAttributes::default();
+            attrs.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.org"))));
+            let mut linked = Line::from_text("a link without pictures", &attrs, 1, None);
+            let mut pictured =
+                Line::from_text("text then image", &CellAttributes::default(), 1, None);
+            pictured.cells_mut()[10]
+                .attrs_mut()
+                .attach_image(Box::new(ImageCell::new(
+                    TextureCoordinate::new_f32(0., 0.),
+                    TextureCoordinate::new_f32(1., 1.),
+                    Arc::clone(&picture),
+                )));
+            if compact {
+                text.compress_for_scrollback();
+                linked.compress_for_scrollback();
+                pictured.compress_for_scrollback();
+            }
+            assert!(!text.has_images());
+            assert!(!linked.has_images());
+            assert!(linked.has_hyperlinks_or_images());
+            assert!(pictured.has_images());
+            let mut sent = SentImages::default();
+            sent.remember(&[(0, text), (1, linked)]);
+            assert!(sent.get(&picture.hash()).is_none());
+            sent.remember(&[(2, pictured)]);
+            assert!(Arc::ptr_eq(&sent.get(&picture.hash()).unwrap(), &picture));
+        }
     }
 
     #[test]

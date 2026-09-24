@@ -31,9 +31,9 @@ impl RenderDeltaQueue {
         !std::mem::replace(&mut self.draining, true)
     }
 
-    /// The next push to apply, with the rows the pushes behind it carry
-    /// when there are any, or None once the drain is over.
-    pub fn take(&mut self) -> Option<(GetPaneRenderChangesResponse, Option<RowsCarried>)> {
+    /// The next push and whether a newer one waits. Taking an ordinary text
+    /// update must not scan every update behind it.
+    pub fn take(&mut self) -> Option<(GetPaneRenderChangesResponse, bool)> {
         let delta = match self.pending.pop_front() {
             Some(delta) => delta,
             None => {
@@ -41,15 +41,19 @@ impl RenderDeltaQueue {
                 return None;
             }
         };
-        if self.pending.is_empty() {
-            return Some((delta, None));
-        }
+        Some((delta, !self.pending.is_empty()))
+    }
+
+    /// Only needed when skipping an obsolete image actually omitted rows.
+    /// The single drain has not popped another push while hydrating this
+    /// one, so these are still the pushes that can recover those rows.
+    pub fn rows_carried(&self) -> RowsCarried {
         let mut carried = RowsCarried::default();
         for newer in &self.pending {
             carried.rows.extend(newer.bonus_lines.rows());
             carried.ranges.extend(newer.dirty_lines.iter().cloned());
         }
-        Some((delta, Some(carried)))
+        carried
     }
 
     /// The drain's task ended without reaching the end of the queue (it
@@ -80,15 +84,15 @@ mod render_delta_queue_tests {
         };
         assert!(queue.push(delta(1)), "the first push starts the drain");
         assert!(!queue.push(delta(2)), "the second rides along");
-        let (first, carried) = queue.take().unwrap();
+        let (first, has_newer) = queue.take().unwrap();
         assert_eq!(first.seqno, 1);
         assert!(
-            carried.is_some(),
+            has_newer,
             "so the first is applied without fetching pictures"
         );
-        let (second, carried) = queue.take().unwrap();
+        let (second, has_newer) = queue.take().unwrap();
         assert_eq!(second.seqno, 2);
-        assert!(carried.is_none(), "the latest one fetches");
+        assert!(!has_newer, "the latest one fetches");
         assert!(queue.take().is_none(), "and the drain ends");
     }
 
@@ -125,8 +129,9 @@ mod render_delta_queue_tests {
         queue.push(delta(2, vec![4], vec![10..12]));
 
         queue.push(delta(3, vec![7], vec![]));
-        let (_, carried) = queue.take().unwrap();
-        let carried = carried.expect("two pushes wait behind the first");
+        let (_, has_newer) = queue.take().unwrap();
+        assert!(has_newer, "two pushes wait behind the first");
+        let carried = queue.rows_carried();
         assert!(carried.contains(4), "a bonus row of a later push");
         assert!(carried.contains(7));
         assert!(carried.contains(11), "a dirty row of a later push");
@@ -135,5 +140,21 @@ mod render_delta_queue_tests {
             "row 3 is only in the push being applied: left out, it must be marked dirty"
         );
         assert!(!carried.contains(12), "ranges are half-open");
+
+        queue.take().unwrap();
+        let carried = queue.rows_carried();
+        assert!(
+            !carried.contains(4),
+            "an applied update no longer carries a row"
+        );
+        assert!(!carried.contains(11));
+        assert!(carried.contains(7));
+        queue.take().unwrap();
+        assert!(!queue.rows_carried().contains(7));
+        assert!(queue.take().is_none());
+        assert!(
+            queue.push(delta(4, vec![8], vec![])),
+            "a new drain starts after idle"
+        );
     }
 }

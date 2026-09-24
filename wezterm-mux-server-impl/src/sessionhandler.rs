@@ -318,6 +318,37 @@ struct PaneReading {
     input_serial: Option<InputSerial>,
 }
 
+/// Select from owned rows after the pane's terminal lock has been released.
+/// Keep dirty-set traversal, mutation and compression out of that lock:
+/// under full-screen output these do not save any row copies and would
+/// otherwise extend the time the parser has to wait for its terminal.
+fn select_dirty_lines(
+    first: StableRowIndex,
+    lines: Vec<wezterm_term::Line>,
+    dirty: &mut rangeset::RangeSet<StableRowIndex>,
+) -> Vec<(StableRowIndex, wezterm_term::Line)> {
+    let end = first + lines.len() as StableRowIndex;
+    let selected = lines
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, mut line)| {
+            let row = first + idx as StableRowIndex;
+            if dirty.contains(row) {
+                line.compress_for_scrollback();
+                Some((row, line))
+            } else {
+                None
+            }
+        })
+        .collect();
+    // All dirty rows in the actual returned range were copied. Remove
+    // the range once instead of allocating bookkeeping for each row.
+    if first < end {
+        dirty.remove_range(first..end);
+    }
+    selected
+}
+
 /// Read `pane` against what was `last` sent: None when nothing changed and
 /// nothing forces a push. Takes the pane's terminal lock, several times;
 /// no `PerPane` lock may be held by the caller.
@@ -380,20 +411,7 @@ fn read_pane_changes(
         dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex;
 
     let (first_line, lines) = pane.get_lines(viewport_range);
-    let mut bonus_lines = lines
-        .into_iter()
-        .enumerate()
-        .filter_map(|(idx, mut line)| {
-            let stable_row = first_line + idx as StableRowIndex;
-            if all_dirty_lines.contains(stable_row) {
-                all_dirty_lines.remove(stable_row);
-                line.compress_for_scrollback();
-                Some((stable_row, line))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
+    let mut bonus_lines = select_dirty_lines(first_line, lines, &mut all_dirty_lines);
 
     // Always send the cursor's row, as that tends to the busiest and we don't
     // have a sequencing concept for our idea of the remote state.
@@ -2973,6 +2991,56 @@ mod tests {
     use std::sync::Arc;
     use wezterm_term::color::ColorPalette;
     use wezterm_term::TerminalSize;
+
+    #[test]
+    fn selecting_dirty_lines_preserves_content_and_outside_invalidation() {
+        use rangeset::RangeSet;
+        use termwiz::cell::CellAttributes;
+        use wezterm_term::Line;
+
+        for changed in [
+            vec![],
+            vec![101],
+            vec![100, 102],
+            vec![100, 101, 102, 103],
+        ] {
+            let mut dirty = RangeSet::new();
+            dirty.add_range(10..20);
+            dirty.add(104);
+            for row in &changed {
+                dirty.add(*row);
+            }
+            let lines = (100..104)
+                .map(|row| {
+                    Line::from_text(&format!("row {row}"), &CellAttributes::default(), 7, None)
+                })
+                .collect();
+            // Use the actual first row returned by the pane, even if a
+            // concurrent scroll moved it since the viewport was requested.
+            let selected = super::select_dirty_lines(100, lines, &mut dirty);
+            assert_eq!(
+                selected.iter().map(|(row, _)| *row).collect::<Vec<_>>(),
+                changed
+            );
+            for (row, line) in selected {
+                assert_eq!(line.as_str(), format!("row {row}"));
+                assert_eq!(line.current_seqno(), 7);
+                assert!(line.is_compressed_for_scrollback());
+            }
+            assert_eq!(
+                dirty.iter().cloned().collect::<Vec<_>>(),
+                vec![10..20, 104..105]
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_line_read_keeps_dirty_rows_for_recovery() {
+        let mut dirty = rangeset::RangeSet::new();
+        dirty.add_range(100..104);
+        assert!(super::select_dirty_lines(100, vec![], &mut dirty).is_empty());
+        assert_eq!(dirty.iter().cloned().collect::<Vec<_>>(), vec![100..104]);
+    }
 
     #[test]
     fn cold_thread_materialization_does_not_require_an_existing_owner() {
