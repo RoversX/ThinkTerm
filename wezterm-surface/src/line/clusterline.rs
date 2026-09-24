@@ -107,9 +107,12 @@ impl ClusteredLine {
         true
     }
 
+    /// The text capacity a new row starts with.
+    pub(crate) const NEW_TEXT_CAPACITY: usize = 80;
+
     pub fn new() -> Self {
         Self {
-            text: String::with_capacity(80),
+            text: String::with_capacity(Self::NEW_TEXT_CAPACITY),
             is_double_wide: None,
             clusters: vec![],
             len: 0,

@@ -61,6 +61,8 @@ pub struct Screen {
 thread_local! {
     /// Lets tests compare against marking every row on every scroll.
     pub(crate) static ALWAYS_MARK_REGIONS: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    /// Lets tests compare against allocating new rows for full-screen scrolls.
+    pub(crate) static NEVER_RECYCLE_FULL_SCREEN: std::cell::Cell<bool> = std::cell::Cell::new(false);
 }
 
 /// How much of the scrollback allowance to pre-reserve at creation. Enough
@@ -747,10 +749,14 @@ impl Screen {
         bidi_mode: BidiMode,
     ) {
         // Specialize the loop so row recycling does not add work or keep
-        // extra temporaries live in full-screen or styled scrolling.
-        if (scroll_region.start != 0 || scroll_region.end as usize != self.physical_rows)
-            && blank_attr == CellAttributes::blank()
-        {
+        // extra temporaries live in styled scrolling.
+        let recycle = blank_attr == CellAttributes::blank();
+        #[cfg(test)]
+        let recycle = recycle
+            && !(NEVER_RECYCLE_FULL_SCREEN.with(|never| never.get())
+                && scroll_region.start == 0
+                && scroll_region.end as usize == self.physical_rows);
+        if recycle {
             self.scroll_up_impl::<true>(scroll_region, num_rows, seqno, blank_attr, bidi_mode);
         } else {
             self.scroll_up_impl::<false>(scroll_region, num_rows, seqno, blank_attr, bidi_mode);
@@ -841,10 +847,14 @@ impl Screen {
             for _ in 0..to_move {
                 let mut line = self.lines.remove(remove_idx).unwrap();
                 let line = if default_blank == blank_attr {
-                    // Keep full-screen output on its existing allocation path:
-                    // recycling there regresses sustained ASCII mux throughput.
                     if RECYCLE && line.len() < self.physical_cols {
-                        line.reset_for_scrolling(seqno, self.physical_cols);
+                        if scroll_region.start == 0 && insert_at_end {
+                            // Full-screen rows go on into the scrollback: keep
+                            // no more than a new row would have allocated.
+                            line.reset_for_scrolling_as_new(seqno);
+                        } else {
+                            line.reset_for_scrolling(seqno, self.physical_cols);
+                        }
                         line
                     } else {
                         Line::new(seqno)

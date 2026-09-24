@@ -118,14 +118,30 @@ impl Line {
     /// only bounded compact buffers. Never retain a vector of cells or a large
     /// historical allocation merely because the row has scrolled off screen.
     pub fn reset_for_scrolling(&mut self, seqno: SequenceNo, columns: usize) {
+        self.reset_for_scrolling_within(seqno, columns.max(80).saturating_mul(2));
+    }
+
+    /// `reset_for_scrolling`, keeping a text buffer no larger than a new
+    /// row's, for rows that may go on into the scrollback.
+    pub fn reset_for_scrolling_as_new(&mut self, seqno: SequenceNo) {
+        self.reset_for_scrolling_within(seqno, ClusteredLine::NEW_TEXT_CAPACITY);
+    }
+
+    fn reset_for_scrolling_within(&mut self, seqno: SequenceNo, max_text_capacity: usize) {
         if let CellStorage::C(cl) = &mut self.cells {
-            if cl.clear_for_scrolling(columns.max(80).saturating_mul(2)) {
+            if cl.clear_for_scrolling(max_text_capacity) {
                 self.bits = LineBits::NONE;
                 self.seqno = seqno;
                 self.zones = Vec::new();
                 #[cfg(feature = "appdata")]
                 {
-                    self.appdata = Mutex::new(None);
+                    // Keep the lock itself, which some platforms allocate on
+                    // first use; a poisoned one is replaced, as a new row's.
+                    if self.appdata.is_poisoned() {
+                        self.appdata = Mutex::new(None);
+                    } else if let Ok(appdata) = self.appdata.get_mut() {
+                        *appdata = None;
+                    }
                 }
                 return;
             }

@@ -1511,6 +1511,41 @@ fn skipped_region_marks_match_marking_every_scroll() {
 }
 
 #[test]
+fn recycled_full_screen_rows_match_new_rows() {
+    use crate::screen::NEVER_RECYCLE_FULL_SCREEN;
+    // Full-screen scrolls reuse the discarded row; compare with allocating
+    // a new one, on the primary screen (rows go into a full history) and the
+    // alternate one, with short, long, wide and styled rows.
+    let mut input = String::new();
+    for i in 0..40 {
+        match i % 5 {
+            0 => input.push_str("y\r\n"),
+            1 => input.push_str(&format!("{}\r\n", "long row ".repeat(3))),
+            2 => input.push_str("界🙂e\u{301}\r\n"),
+            3 => input.push_str("\x1b[44mstyled\x1b[0m\r\n"),
+            _ => input.push_str("\r\n"),
+        }
+    }
+    let input = format!("{input}\x1b[?1049h{input}\x1b[?1049l{input}");
+    for chunk in [1usize, 9, 64, 100_000] {
+        let mut recycling = TestTerm::new(5, 12, 7);
+        let mut allocating = TestTerm::new(5, 12, 7);
+        for (i, piece) in input.as_bytes().chunks(chunk).enumerate() {
+            NEVER_RECYCLE_FULL_SCREEN.with(|never| never.set(false));
+            recycling.print(piece);
+            NEVER_RECYCLE_FULL_SCREEN.with(|never| never.set(true));
+            allocating.print(piece);
+            NEVER_RECYCLE_FULL_SCREEN.with(|never| never.set(false));
+            assert_eq!(
+                recycling.screen().all_lines(),
+                allocating.screen().all_lines(),
+                "chunk={chunk}, batch={i}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_region_scrollback_limit() {
     // Ensure scrollback is truncated properly, when it reaches the line limit
     let mut term = TestTerm::new(4, 1, 2);
