@@ -209,6 +209,12 @@ impl Line {
         seqno: SequenceNo,
         blank_attr: CellAttributes,
     ) {
+        // All old cells are being discarded. Expanding a compact scrollback
+        // row first would decode its text and clone its styles only to erase
+        // them below. Drop that storage before allocating the replacement.
+        if matches!(&self.cells, CellStorage::C(_)) {
+            self.cells = CellStorage::V(VecStorage::new(Vec::new()));
+        }
         self.coerce_vec_storage()
             .resize_and_clear(width, blank_attr);
         self.update_last_change_seqno(seqno);
@@ -811,11 +817,7 @@ impl Line {
                     // implicitly blank
                     return;
                 }
-                while cl.len() < idx {
-                    // Fill out any implied blanks until we can append
-                    // their intended cell content
-                    cl.append_grapheme(" ", 1, CellAttributes::blank());
-                }
+                Self::pad_clustered_line(cl, idx);
             }
             if idx == cl.len() {
                 cl.append_grapheme(text, width, attr);
@@ -827,6 +829,23 @@ impl Line {
         }
 
         self.set_cell(idx, Cell::new_grapheme_with_width(text, width, attr), seqno);
+    }
+
+    // Keep gap filling off the overwrite path, which never needs padding.
+    #[inline(never)]
+    fn pad_clustered_line(cl: &mut ClusteredLine, idx: usize) {
+        // Tabs, cursor movement and LF without CR leave gaps. Their
+        // padding has one attribute run, so append it in chunks instead
+        // of repeating grapheme/attribute bookkeeping for every space.
+        const SPACES: &str = concat!(
+            "                                                                ",
+            "                                                                "
+        );
+        let blank = CellAttributes::blank();
+        while cl.len() < idx {
+            let count = (idx - cl.len()).min(SPACES.len());
+            cl.append_ascii(&SPACES[..count], &blank);
+        }
     }
 
     /// Write a run of printable ASCII with the same semantics as individual
@@ -1196,6 +1215,16 @@ impl Line {
         matches!(&self.cells, CellStorage::C(_))
     }
 
+    /// Check image attachments without walking the text or cloning image
+    /// references when the line is in compact cluster storage.
+    #[cfg(feature = "use_image")]
+    pub fn has_images(&self) -> bool {
+        match &self.cells {
+            CellStorage::V(cells) => cells.iter().any(|cell| cell.attrs().has_images()),
+            CellStorage::C(cl) => cl.any_cluster_attrs(CellAttributes::has_images),
+        }
+    }
+
     /// Whether any cell carries a hyperlink or attached image, answered
     /// without decompressing cluster storage. Serialization uses this to
     /// leave the great majority of lines, which carry neither, in their
@@ -1206,7 +1235,7 @@ impl Line {
                 return true;
             }
             #[cfg(feature = "use_image")]
-            if attrs.images().is_some() {
+            if attrs.has_images() {
                 return true;
             }
             false

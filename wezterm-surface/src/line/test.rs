@@ -50,6 +50,36 @@ fn grapheme_appends_preserve_gaps_and_wide_overwrites() {
 }
 
 #[test]
+fn compact_gap_padding_matches_individual_blank_cells() {
+    let mut linked = CellAttributes::default();
+    linked.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.org"))));
+    for prefix in ["", "ascii", "界🙂e\u{301}"] {
+        let mut base = Line::from_text(prefix, &linked, 1, None);
+        base.compress_for_scrollback();
+        for gap in [0, 1, 7, 63, 64, 127, 128, 129, 65535, 65536] {
+            for (text, width, attrs) in [
+                ("x", 1, CellAttributes::default()),
+                ("界", 2, linked.clone()),
+            ] {
+                let idx = base.len() + gap;
+                let mut expected = base.clone();
+                // Contiguous scalar appends do not use the gap-padding path.
+                while expected.len() < idx {
+                    expected.set_cell_grapheme(
+                        expected.len(), " ", 1, CellAttributes::blank(), 42,
+                    );
+                }
+                expected.set_cell_grapheme(idx, text, width, attrs.clone(), 42);
+                let mut actual = base.clone();
+                actual.set_cell_grapheme(idx, text, width, attrs, 42);
+                assert_eq!(actual, expected, "prefix={prefix:?}, gap={gap}");
+                assert_eq!(actual.compute_shape_hash(), expected.compute_shape_hash());
+            }
+        }
+    }
+}
+
+#[test]
 fn scroll_reset_discards_oversized_storage() {
     let mut line = Line::new(1);
     line.set_ascii_cells(0, &"x".repeat(8192), &CellAttributes::default(), 2);
