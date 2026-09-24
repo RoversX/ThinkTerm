@@ -24,6 +24,7 @@ use wezterm_cell::{Cell, CellAttributes, SemanticType, UnicodeVersion};
 
 extern crate alloc;
 use crate::alloc::string::ToString;
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -33,6 +34,48 @@ use alloc::vec::Vec;
 pub struct ZoneRange {
     pub semantic_type: SemanticType,
     pub range: Range<u16>,
+}
+
+/// Semantic zones, computed on demand: absent until then, after any change
+/// and whenever there are none, so that a row holds just a pointer. Shown
+/// and sent as the plain list they were before being boxed.
+#[derive(Clone, Default, PartialEq)]
+struct Zones(Option<Box<Vec<ZoneRange>>>);
+
+impl Zones {
+    fn as_slice(&self) -> &[ZoneRange] {
+        self.0.as_deref().map_or(&[], |zones| zones.as_slice())
+    }
+
+    fn set(&mut self, zones: Vec<ZoneRange>) {
+        self.0 = if zones.is_empty() {
+            None
+        } else {
+            Some(Box::new(zones))
+        };
+    }
+}
+
+impl core::fmt::Debug for Zones {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        fmt.debug_list().entries(self.as_slice()).finish()
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl Serialize for Zones {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.as_slice().serialize(serializer)
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl<'de> Deserialize<'de> for Zones {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut zones = Zones::default();
+        zones.set(Vec::deserialize(deserializer)?);
+        Ok(zones)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,7 +88,7 @@ pub enum DoubleClickRange {
 #[derive(Debug)]
 pub struct Line {
     pub(crate) cells: CellStorage,
-    zones: Vec<ZoneRange>,
+    zones: Zones,
     seqno: SequenceNo,
     bits: LineBits,
     #[cfg(feature = "appdata")]
@@ -81,7 +124,7 @@ impl Line {
             bits,
             cells: CellStorage::V(VecStorage::new(cells)),
             seqno,
-            zones: vec![],
+            zones: Zones::default(),
             #[cfg(feature = "appdata")]
             appdata: Mutex::new(None),
         }
@@ -93,7 +136,7 @@ impl Line {
             bits,
             cells: CellStorage::V(VecStorage::new(cells)),
             seqno,
-            zones: vec![],
+            zones: Zones::default(),
             #[cfg(feature = "appdata")]
             appdata: Mutex::new(None),
         }
@@ -108,7 +151,7 @@ impl Line {
             bits: LineBits::NONE,
             cells: CellStorage::C(ClusteredLine::new()),
             seqno,
-            zones: vec![],
+            zones: Zones::default(),
             #[cfg(feature = "appdata")]
             appdata: Mutex::new(None),
         }
@@ -132,7 +175,7 @@ impl Line {
             if cl.clear_for_scrolling(max_text_capacity) {
                 self.bits = LineBits::NONE;
                 self.seqno = seqno;
-                self.zones = Vec::new();
+                self.zones = Zones::default();
                 #[cfg(feature = "appdata")]
                 {
                     // Keep the lock itself, which some platforms allocate on
@@ -174,7 +217,7 @@ impl Line {
             bits,
             cells: CellStorage::V(VecStorage::new(cells)),
             seqno,
-            zones: vec![],
+            zones: Zones::default(),
             #[cfg(feature = "appdata")]
             appdata: Mutex::new(None),
         }
@@ -201,7 +244,7 @@ impl Line {
             cells: CellStorage::V(VecStorage::new(cells)),
             bits: LineBits::NONE,
             seqno,
-            zones: vec![],
+            zones: Zones::default(),
             #[cfg(feature = "appdata")]
             appdata: Mutex::new(None),
         }
@@ -455,7 +498,7 @@ impl Line {
     }
 
     fn invalidate_zones(&mut self) {
-        self.zones.clear();
+        self.zones = Zones::default();
     }
 
     fn compute_zones(&mut self) {
@@ -507,14 +550,14 @@ impl Line {
         if let Some(zone) = current_zone.take() {
             zones.push(zone);
         }
-        self.zones = zones;
+        self.zones.set(zones);
     }
 
     pub fn semantic_zone_ranges(&mut self) -> &[ZoneRange] {
-        if self.zones.is_empty() {
+        if self.zones.0.is_none() {
             self.compute_zones();
         }
-        &self.zones
+        self.zones.as_slice()
     }
 
     /// If we have any cells with an implicit hyperlink, remove the hyperlink
@@ -687,7 +730,7 @@ impl Line {
             bits: self.bits,
             cells: CellStorage::V(VecStorage::new(cells)),
             seqno,
-            zones: vec![],
+            zones: Zones::default(),
             #[cfg(feature = "appdata")]
             appdata: Mutex::new(None),
         }
@@ -772,7 +815,7 @@ impl Line {
             bits: LineBits::NONE,
             cells: CellStorage::V(VecStorage::new(cells)),
             seqno: self.current_seqno(),
-            zones: vec![],
+            zones: Zones::default(),
             #[cfg(feature = "appdata")]
             appdata: Mutex::new(None),
         }
