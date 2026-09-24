@@ -81,10 +81,13 @@ impl Clone for CellAttributes {
         self.attributes = source.attributes;
         self.foreground = source.foreground;
         self.background = source.background;
-        // Box::clone_from reuses the destination allocation when both cells
-        // have extended attributes. Keep independent ownership and the same
+        // Reuse the destination allocation when both cells have extended
+        // attributes. Keep independent ownership and the same
         // per-cell footprint, including cells with images and hyperlinks.
-        self.fat.clone_from(&source.fat);
+        match (&mut self.fat, &source.fat) {
+            (Some(dest), Some(source)) => dest.copy_contents_from(source),
+            _ => self.fat.clone_from(&source.fat),
+        }
     }
 }
 
@@ -125,6 +128,34 @@ struct FatAttributes {
 }
 
 impl FatAttributes {
+    // Keep extended-attribute copying out of the lightweight palette path.
+    #[inline(never)]
+    fn copy_contents_from(&mut self, source: &Self) {
+        // No `..`: a new field must fail to compile here instead of
+        // silently keeping the destination's old value.
+        let Self {
+            hyperlink,
+            #[cfg(feature = "use_image")]
+            image,
+            underline_color,
+            foreground,
+            background,
+        } = source;
+        self.hyperlink.clone_from(hyperlink);
+        #[cfg(feature = "use_image")]
+        {
+            // RGB-only cells have no images. Keep this common case out of
+            // the image cloning loop, and release any old image allocation.
+            self.image = if image.is_empty() {
+                Vec::new()
+            } else {
+                image.clone()
+            };
+        }
+        self.underline_color = *underline_color;
+        self.foreground = *foreground;
+        self.background = *background;
+    }
     pub fn compute_shape_hash<H: Hasher>(&self, hasher: &mut H) {
         if let Some(link) = &self.hyperlink {
             link.compute_shape_hash(hasher);
@@ -1075,6 +1106,46 @@ mod test {
         assert_eq!(dest, source);
         dest.clone_from(&CellAttributes::blank());
         assert!(dest.fat.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "use_image")]
+    fn extended_attribute_clones_release_images_and_empty_capacity() {
+        use crate::image::{ImageCell, ImageData, ImageDataType, TextureCoordinate};
+        let data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            1, 1, vec![255; 4],
+        )));
+        let mut source = rgb_attrs(0.7);
+        source.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.org"))));
+        source.attach_image(Box::new(ImageCell::with_z_index(
+            TextureCoordinate::new_f32(0.0, 0.0),
+            TextureCoordinate::new_f32(1.0, 1.0),
+            Arc::clone(&data),
+            0, 0, 0, 0, 0, Some(3), Some(7),
+        )));
+        let copied = source.clone();
+        let mut dest = rgb_attrs(0.1);
+        dest.clone_from(&source);
+        assert_eq!(dest, source);
+        assert_eq!(copied, source);
+        assert_eq!(Arc::strong_count(&data), 4);
+        assert!(!core::ptr::eq(
+            &*dest.fat.as_ref().unwrap().image[0],
+            &*source.fat.as_ref().unwrap().image[0],
+        ));
+        dest.clone_from(&rgb_attrs(0.2));
+        assert_eq!(Arc::strong_count(&data), 3);
+        assert_eq!(dest.fat.as_ref().unwrap().image.capacity(), 0);
+        source.fat.as_mut().unwrap().image.clear();
+        assert!(source.fat.as_ref().unwrap().image.capacity() > 0);
+        let empty_copy = source.clone();
+        assert_eq!(empty_copy.fat.as_ref().unwrap().image.capacity(), 0);
+        dest.fat.as_mut().unwrap().image.reserve(8);
+        dest.clone_from(&source);
+        assert_eq!(dest, source);
+        assert_eq!(dest.fat.as_ref().unwrap().image.capacity(), 0);
+        drop(copied);
+        assert_eq!(Arc::strong_count(&data), 1);
     }
 
     #[test]
