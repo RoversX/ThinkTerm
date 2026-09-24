@@ -3101,3 +3101,71 @@ mod agent_budget_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod fat_wire_golden {
+    // Guards the wire form of `CellAttributes` across the switch to shared
+    // extended attributes.
+    use super::*;
+    use termwiz::cell::{Cell, CellAttributes, Intensity};
+    use termwiz::color::{ColorAttribute, SrgbaTuple};
+
+    fn attrs_for_wire_golden() -> Vec<CellAttributes> {
+        let mut all = vec![CellAttributes::default()];
+        let mut a = CellAttributes::default();
+        a.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(
+            0.1, 0.2, 0.3, 1.0,
+        )));
+        all.push(a.clone());
+        a.set_background(ColorAttribute::TrueColorWithPaletteFallback(
+            SrgbaTuple(0.5, 0.25, 0.75, 1.0),
+            4,
+        ));
+        all.push(a.clone());
+        a.set_underline_color(ColorAttribute::PaletteIndex(9));
+        all.push(a.clone());
+        a.set_hyperlink(Some(Arc::new(Hyperlink::new_with_id(
+            "https://example.com/x",
+            "id1",
+        ))));
+        a.set_intensity(Intensity::Bold);
+        all.push(a.clone());
+        a.set_foreground(ColorAttribute::PaletteIndex(3));
+        all.push(a.clone());
+        a.set_hyperlink(None);
+        a.set_background(ColorAttribute::Default);
+        a.set_underline_color(ColorAttribute::Default);
+        all.push(a);
+        all
+    }
+
+    fn golden_hex() -> (String, String) {
+        let attrs = attrs_for_wire_golden();
+        let hex = |bytes: Vec<u8>| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let attr_bytes = varbincode::serialize(&attrs).unwrap();
+        let mut line = Line::new(1);
+        for (i, a) in attrs.iter().enumerate() {
+            line.set_cell(i, Cell::new('x', a.clone()), 1);
+        }
+        let line_bytes = varbincode::serialize(&line).unwrap();
+        (hex(attr_bytes), hex(line_bytes))
+    }
+
+    /// Written by the unshared `Box` layout (b431ab5): sharing the
+    /// extended attributes must not change a byte on the wire.
+    const GOLDEN_ATTRS: &str = "07000000000000000100000301cdcccc3dcdcc4c3e9a99993e0000803f030000000100000301cdcccc3dcdcc4c3e9a99993e0000803f000000003f0000803e0000403f0000803f04000000010000020901cdcccc3dcdcc4c3e9a99993e0000803f000000003f0000803e0000403f0000803f04010000010101026964036964311568747470733a2f2f6578616d706c652e636f6d2f780000020901cdcccc3dcdcc4c3e9a99993e0000803f000000003f0000803e0000403f0000803f0401010300010101026964036964311568747470733a2f2f6578616d706c652e636f6d2f780000020903000000003f0000803e0000403f0000803f040101030000";
+    const GOLDEN_LINE: &str = "01077878787878787800070100000000010000000100000301cdcccc3dcdcc4c3e9a99993e0000803f03010000000100000301cdcccc3dcdcc4c3e9a99993e0000803f000000003f0000803e0000403f0000803f0401000000010000020901cdcccc3dcdcc4c3e9a99993e0000803f000000003f0000803e0000403f0000803f0401010000010101026964036964311568747470733a2f2f6578616d706c652e636f6d2f780000020901cdcccc3dcdcc4c3e9a99993e0000803f000000003f0000803e0000403f0000803f040101010300010101026964036964311568747470733a2f2f6578616d706c652e636f6d2f780000020903000000003f0000803e0000403f0000803f04010101030000070101000102";
+
+    #[test]
+    fn extended_attributes_keep_their_wire_form() {
+        let (attrs, line) = golden_hex();
+        assert_eq!(attrs, GOLDEN_ATTRS);
+        assert_eq!(line, GOLDEN_LINE);
+        let bytes: Vec<u8> = (0..GOLDEN_ATTRS.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&GOLDEN_ATTRS[i..i + 2], 16).unwrap())
+            .collect();
+        let decoded: Vec<CellAttributes> = varbincode::deserialize(&bytes[..]).unwrap();
+        assert_eq!(decoded, attrs_for_wire_golden());
+    }
+}

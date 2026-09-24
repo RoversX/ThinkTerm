@@ -61,8 +61,30 @@ pub struct CellAttributes {
     background: SmallColor,
     /// Relatively rarely used attributes spill over to a heap
     /// allocated struct in order to keep CellAttributes
-    /// smaller in the common case.
-    fat: Option<Box<FatAttributes>>,
+    /// smaller in the common case. Cells copied from one another share
+    /// it; a change applies to a copy unless this cell holds it alone.
+    #[cfg_attr(feature = "use_serde", serde(with = "fat_wire"))]
+    fat: Option<Arc<FatAttributes>>,
+}
+
+/// The wire form is that of the unshared `Option<Box<FatAttributes>>`
+/// this replaced: an optional struct.
+#[cfg(feature = "use_serde")]
+mod fat_wire {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(
+        fat: &Option<Arc<FatAttributes>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        fat.as_deref().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Arc<FatAttributes>>, D::Error> {
+        Ok(Option::<FatAttributes>::deserialize(deserializer)?.map(Arc::new))
+    }
 }
 
 impl Clone for CellAttributes {
@@ -81,13 +103,7 @@ impl Clone for CellAttributes {
         self.attributes = source.attributes;
         self.foreground = source.foreground;
         self.background = source.background;
-        // Reuse the destination allocation when both cells have extended
-        // attributes. Keep independent ownership and the same
-        // per-cell footprint, including cells with images and hyperlinks.
-        match (&mut self.fat, &source.fat) {
-            (Some(dest), Some(source)) => dest.copy_contents_from(source),
-            _ => self.fat.clone_from(&source.fat),
-        }
+        self.fat.clone_from(&source.fat);
     }
 }
 
@@ -112,14 +128,16 @@ impl core::fmt::Debug for CellAttributes {
     }
 }
 
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-#[derive(Debug, Default, Clone, Eq, PartialEq)]
+/// With the image list kept aside, these fit in the allocation the
+/// unshared attributes had even with the reference counts added.
+#[derive(Default, Clone, Eq, PartialEq)]
 struct FatAttributes {
     /// The hyperlink content, if any
     hyperlink: Option<Arc<Hyperlink>>,
-    /// The image data, if any
+    /// The image data, if any: far fewer cells carry it than colors.
+    /// None whenever empty, so that equality holds by value.
     #[cfg(feature = "use_image")]
-    image: Vec<Box<ImageCell>>,
+    image: Option<Box<Vec<Box<ImageCell>>>>,
     /// The color of the underline.  If None, then
     /// the foreground color is to be used
     underline_color: ColorAttribute,
@@ -127,41 +145,121 @@ struct FatAttributes {
     background: ColorAttribute,
 }
 
-impl FatAttributes {
-    // Keep extended-attribute copying out of the lightweight palette path.
-    #[inline(never)]
-    fn copy_contents_from(&mut self, source: &Self) {
-        // No `..`: a new field must fail to compile here instead of
-        // silently keeping the destination's old value.
-        let Self {
-            hyperlink,
+impl core::fmt::Debug for FatAttributes {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter<'_>) -> Result<(), core::fmt::Error> {
+        let mut debug = fmt.debug_struct("FatAttributes");
+        debug.field("hyperlink", &self.hyperlink());
+        #[cfg(feature = "use_image")]
+        debug.field("image", &self.images());
+        debug
+            .field("underline_color", &self.underline_color)
+            .field("foreground", &self.foreground)
+            .field("background", &self.background)
+            .finish()
+    }
+}
+
+/// The wire form of the extended attributes as they were before the image
+/// list moved aside: the same fields, in the same order.
+#[cfg(feature = "use_serde")]
+#[derive(Serialize)]
+#[serde(rename = "FatAttributes")]
+struct FatAttributesWire<'a> {
+    hyperlink: Option<&'a Arc<Hyperlink>>,
+    #[cfg(feature = "use_image")]
+    image: &'a [Box<ImageCell>],
+    underline_color: &'a ColorAttribute,
+    foreground: &'a ColorAttribute,
+    background: &'a ColorAttribute,
+}
+
+#[cfg(feature = "use_serde")]
+#[derive(Deserialize)]
+#[serde(rename = "FatAttributes")]
+struct FatAttributesOwnedWire {
+    hyperlink: Option<Arc<Hyperlink>>,
+    #[cfg(feature = "use_image")]
+    image: Vec<Box<ImageCell>>,
+    underline_color: ColorAttribute,
+    foreground: ColorAttribute,
+    background: ColorAttribute,
+}
+
+#[cfg(feature = "use_serde")]
+impl Serialize for FatAttributes {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        FatAttributesWire {
+            hyperlink: self.hyperlink(),
             #[cfg(feature = "use_image")]
-            image,
-            underline_color,
-            foreground,
-            background,
-        } = source;
-        self.hyperlink.clone_from(hyperlink);
+            image: self.images(),
+            underline_color: &self.underline_color,
+            foreground: &self.foreground,
+            background: &self.background,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[cfg(feature = "use_serde")]
+impl<'de> Deserialize<'de> for FatAttributes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = FatAttributesOwnedWire::deserialize(deserializer)?;
+        #[allow(unused_mut)]
+        let mut fat = FatAttributes {
+            hyperlink: wire.hyperlink,
+            #[cfg(feature = "use_image")]
+            image: None,
+            underline_color: wire.underline_color,
+            foreground: wire.foreground,
+            background: wire.background,
+        };
+        #[cfg(feature = "use_image")]
+        fat.update_images(|images| *images = wire.image);
+        Ok(fat)
+    }
+}
+
+impl FatAttributes {
+    /// Whether every attribute has its default, so that none need be kept.
+    fn is_empty(&self) -> bool {
         #[cfg(feature = "use_image")]
         {
-            // RGB-only cells have no images. Keep this common case out of
-            // the image cloning loop, and release any old image allocation.
-            self.image = if image.is_empty() {
-                Vec::new()
-            } else {
-                image.clone()
-            };
+            if self.image.is_some() {
+                return false;
+            }
         }
-        self.underline_color = *underline_color;
-        self.foreground = *foreground;
-        self.background = *background;
+        self.hyperlink.is_none()
+            && self.underline_color == ColorAttribute::Default
+            && self.foreground == ColorAttribute::Default
+            && self.background == ColorAttribute::Default
     }
+
+    fn hyperlink(&self) -> Option<&Arc<Hyperlink>> {
+        self.hyperlink.as_ref()
+    }
+
+    #[cfg(feature = "use_image")]
+    fn images(&self) -> &[Box<ImageCell>] {
+        self.image
+            .as_deref()
+            .map_or(&[], |images| images.as_slice())
+    }
+
+    /// Change the image list, keeping it None when empty.
+    #[cfg(feature = "use_image")]
+    fn update_images(&mut self, change: impl FnOnce(&mut Vec<Box<ImageCell>>)) {
+        change(self.image.get_or_insert_with(Default::default));
+        if self.image.as_ref().is_some_and(|images| images.is_empty()) {
+            self.image = None;
+        }
+    }
+
     pub fn compute_shape_hash<H: Hasher>(&self, hasher: &mut H) {
-        if let Some(link) = &self.hyperlink {
+        if let Some(link) = self.hyperlink() {
             link.compute_shape_hash(hasher);
         }
         #[cfg(feature = "use_image")]
-        for cell in &self.image {
+        for cell in self.images() {
             cell.compute_shape_hash(hasher);
         }
         self.underline_color.hash(hasher);
@@ -293,29 +391,25 @@ impl CellAttributes {
     /// Set the foreground color for the cell to that specified
     pub fn set_foreground<C: Into<ColorAttribute>>(&mut self, foreground: C) -> &mut Self {
         let foreground: ColorAttribute = foreground.into();
-        match foreground {
-            ColorAttribute::Default => {
-                self.foreground = SmallColor::Default;
-                if let Some(fat) = self.fat.as_mut() {
-                    fat.foreground = ColorAttribute::Default;
-                }
-                self.deallocate_fat_attributes_if_none();
-            }
+        let (small, fat) = match foreground {
+            ColorAttribute::Default => (SmallColor::Default, ColorAttribute::Default),
             ColorAttribute::PaletteIndex(idx) => {
-                self.foreground = SmallColor::PaletteIndex(idx);
-                if let Some(fat) = self.fat.as_mut() {
-                    fat.foreground = ColorAttribute::Default;
-                }
-                self.deallocate_fat_attributes_if_none();
+                (SmallColor::PaletteIndex(idx), ColorAttribute::Default)
             }
-            foreground => {
-                self.foreground = SmallColor::Default;
-                self.allocate_fat_attributes();
-                self.fat.as_mut().unwrap().foreground = foreground;
-            }
+            foreground => (SmallColor::Default, foreground),
+        };
+        self.foreground = small;
+        if self.fat_foreground() != fat {
+            self.update_fat(|attrs| attrs.foreground = fat);
         }
-
+        self.deallocate_fat_attributes_if_none();
         self
+    }
+
+    fn fat_foreground(&self) -> ColorAttribute {
+        self.fat
+            .as_ref()
+            .map_or(ColorAttribute::Default, |fat| fat.foreground)
     }
 
     pub fn foreground(&self) -> ColorAttribute {
@@ -329,29 +423,25 @@ impl CellAttributes {
 
     pub fn set_background<C: Into<ColorAttribute>>(&mut self, background: C) -> &mut Self {
         let background: ColorAttribute = background.into();
-        match background {
-            ColorAttribute::Default => {
-                self.background = SmallColor::Default;
-                if let Some(fat) = self.fat.as_mut() {
-                    fat.background = ColorAttribute::Default;
-                }
-                self.deallocate_fat_attributes_if_none();
-            }
+        let (small, fat) = match background {
+            ColorAttribute::Default => (SmallColor::Default, ColorAttribute::Default),
             ColorAttribute::PaletteIndex(idx) => {
-                self.background = SmallColor::PaletteIndex(idx);
-                if let Some(fat) = self.fat.as_mut() {
-                    fat.background = ColorAttribute::Default;
-                }
-                self.deallocate_fat_attributes_if_none();
+                (SmallColor::PaletteIndex(idx), ColorAttribute::Default)
             }
-            background => {
-                self.background = SmallColor::Default;
-                self.allocate_fat_attributes();
-                self.fat.as_mut().unwrap().background = background;
-            }
+            background => (SmallColor::Default, background),
+        };
+        self.background = small;
+        if self.fat_background() != fat {
+            self.update_fat(|attrs| attrs.background = fat);
         }
-
+        self.deallocate_fat_attributes_if_none();
         self
+    }
+
+    fn fat_background(&self) -> ColorAttribute {
+        self.fat
+            .as_ref()
+            .map_or(ColorAttribute::Default, |fat| fat.background)
     }
 
     pub fn background(&self) -> ColorAttribute {
@@ -368,50 +458,45 @@ impl CellAttributes {
         *self = Self::blank();
     }
 
-    fn allocate_fat_attributes(&mut self) {
-        if self.fat.is_none() {
-            self.fat.replace(Box::new(FatAttributes {
-                hyperlink: None,
-                #[cfg(feature = "use_image")]
-                image: vec![],
-                underline_color: ColorAttribute::Default,
-                foreground: ColorAttribute::Default,
-                background: ColorAttribute::Default,
-            }));
+    /// Drop extended attributes that are all at their defaults, as every
+    /// change does; only ones received that way can be kept otherwise.
+    fn deallocate_fat_attributes_if_none(&mut self) {
+        if self.fat.as_ref().is_some_and(|fat| fat.is_empty()) {
+            self.fat = None;
         }
     }
 
-    fn deallocate_fat_attributes_if_none(&mut self) {
-        let deallocate = self
-            .fat
-            .as_ref()
-            .map(|fat| {
-                #[cfg(feature = "use_image")]
-                {
-                    if !fat.image.is_empty() {
-                        return false;
-                    }
-                }
-                fat.hyperlink.is_none()
-                    && fat.underline_color == ColorAttribute::Default
-                    && fat.foreground == ColorAttribute::Default
-                    && fat.background == ColorAttribute::Default
-            })
-            .unwrap_or(false);
-        if deallocate {
-            self.fat.take();
+    /// Apply `change` to the extended attributes: in place when this cell
+    /// alone holds them, otherwise to a copy, as other cells may share
+    /// them. None are kept once every one is back at its default.
+    fn update_fat(&mut self, change: impl FnOnce(&mut FatAttributes)) {
+        if let Some(fat) = self.fat.as_mut().and_then(Arc::get_mut) {
+            change(fat);
+            if fat.is_empty() {
+                self.fat = None;
+            }
+            return;
         }
+        let mut fat = self.fat.as_deref().cloned().unwrap_or_default();
+        change(&mut fat);
+        self.fat = if fat.is_empty() {
+            None
+        } else {
+            Some(Arc::new(fat))
+        };
     }
 
     pub fn set_hyperlink(&mut self, link: Option<Arc<Hyperlink>>) -> &mut Self {
-        if link.is_none() && self.fat.is_none() {
-            self
-        } else {
-            self.allocate_fat_attributes();
-            self.fat.as_mut().unwrap().hyperlink = link;
-            self.deallocate_fat_attributes_if_none();
-            self
+        let unchanged = match (self.hyperlink(), &link) {
+            (None, None) => true,
+            (Some(current), Some(link)) => Arc::ptr_eq(current, link),
+            _ => false,
+        };
+        if !unchanged {
+            self.update_fat(|fat| fat.hyperlink = link);
         }
+        self.deallocate_fat_attributes_if_none();
+        self
     }
 }
 
@@ -419,24 +504,31 @@ impl CellAttributes {
 impl CellAttributes {
     /// Assign a single image to a cell.
     pub fn set_image(&mut self, image: Box<ImageCell>) -> &mut Self {
-        self.allocate_fat_attributes();
-        self.fat.as_mut().unwrap().image = vec![image];
+        self.update_fat(|fat| fat.update_images(|images| *images = vec![image]));
         self
     }
 
     /// Clear all images from a cell
     pub fn clear_images(&mut self) -> &mut Self {
-        if let Some(fat) = self.fat.as_mut() {
-            fat.image.clear();
+        if self.has_images() {
+            self.update_fat(|fat| fat.update_images(|images| images.clear()));
         }
         self.deallocate_fat_attributes_if_none();
         self
     }
 
     pub fn detach_image_with_placement(&mut self, image_id: u32, placement_id: Option<u32>) {
-        if let Some(fat) = self.fat.as_mut() {
-            fat.image
-                .retain(|im| !im.matches_placement(image_id, placement_id));
+        let attached = self.fat.as_ref().is_some_and(|fat| {
+            fat.images()
+                .iter()
+                .any(|im| im.matches_placement(image_id, placement_id))
+        });
+        if attached {
+            self.update_fat(|fat| {
+                fat.update_images(|images| {
+                    images.retain(|im| !im.matches_placement(image_id, placement_id))
+                })
+            });
         }
         self.deallocate_fat_attributes_if_none();
     }
@@ -444,15 +536,14 @@ impl CellAttributes {
     /// Add an image attachement, preserving any existing attachments.
     /// The list of images is maintained in z-index order
     pub fn attach_image(&mut self, image: Box<ImageCell>) -> &mut Self {
-        self.allocate_fat_attributes();
-        let fat = self.fat.as_mut().unwrap();
-        let z_index = image.z_index();
-        match fat
-            .image
-            .binary_search_by(|probe| probe.z_index().cmp(&z_index))
-        {
-            Ok(idx) | Err(idx) => fat.image.insert(idx, image),
-        }
+        self.update_fat(|fat| {
+            fat.update_images(|images| {
+                let z_index = image.z_index();
+                match images.binary_search_by(|probe| probe.z_index().cmp(&z_index)) {
+                    Ok(idx) | Err(idx) => images.insert(idx, image),
+                }
+            })
+        });
         self
     }
 }
@@ -463,14 +554,11 @@ impl CellAttributes {
         underline_color: C,
     ) -> &mut Self {
         let underline_color = underline_color.into();
-        if underline_color == ColorAttribute::Default && self.fat.is_none() {
-            self
-        } else {
-            self.allocate_fat_attributes();
-            self.fat.as_mut().unwrap().underline_color = underline_color;
-            self.deallocate_fat_attributes_if_none();
-            self
+        if self.underline_color() != underline_color {
+            self.update_fat(|fat| fat.underline_color = underline_color);
         }
+        self.deallocate_fat_attributes_if_none();
+        self
     }
 
     /// Clone the attributes, but exclude fancy extras such
@@ -482,14 +570,24 @@ impl CellAttributes {
             background: self.background,
             fat: None,
         };
+        // Keep the colors, including the underline color, and leave
+        // hyperlinks and images behind. Without those the extended
+        // attributes are exactly the colors, so share them.
         if let Some(fat) = self.fat.as_ref() {
-            if fat.background != ColorAttribute::Default
-                || fat.foreground != ColorAttribute::Default
-            {
-                res.allocate_fat_attributes();
-                let new_fat = res.fat.as_mut().unwrap();
-                new_fat.foreground = fat.foreground;
-                new_fat.background = fat.background;
+            #[cfg(feature = "use_image")]
+            let images = fat.image.is_some();
+            #[cfg(not(feature = "use_image"))]
+            let images = false;
+            if fat.hyperlink.is_none() && !images {
+                if !fat.is_empty() {
+                    res.fat = Some(Arc::clone(fat));
+                }
+            } else {
+                res.update_fat(|colors| {
+                    colors.foreground = fat.foreground;
+                    colors.background = fat.background;
+                    colors.underline_color = fat.underline_color;
+                });
             }
         }
         // Reset the semantic type; clone_sgr_only is used primarily
@@ -497,7 +595,6 @@ impl CellAttributes {
         // be deterministically tagged as Output so that we have an
         // easier time in get_semantic_zones.
         res.set_semantic_type(SemanticType::default());
-        res.set_underline_color(self.underline_color());
 
         // Turn off underline because it can have surprising results
         // if underline is on, then we get CRLF and then SGR reset:
@@ -516,7 +613,7 @@ impl CellAttributes {
     }
 
     pub fn hyperlink(&self) -> Option<&Arc<Hyperlink>> {
-        self.fat.as_ref().and_then(|fat| fat.hyperlink.as_ref())
+        self.fat.as_ref().and_then(|fat| fat.hyperlink())
     }
 
     /// Returns the list of attached images in z-index order.
@@ -525,16 +622,18 @@ impl CellAttributes {
     #[cfg(feature = "use_image")]
     pub fn images(&self) -> Option<Vec<ImageCell>> {
         let fat = self.fat.as_ref()?;
-        if fat.image.is_empty() {
+        if fat.images().is_empty() {
             return None;
         }
-        Some(fat.image.iter().map(|im| im.as_ref().clone()).collect())
+        Some(fat.images().iter().map(|im| im.as_ref().clone()).collect())
     }
 
     /// Test for image attachments without cloning the attachment list.
     #[cfg(feature = "use_image")]
     pub fn has_images(&self) -> bool {
-        self.fat.as_ref().is_some_and(|fat| !fat.image.is_empty())
+        self.fat
+            .as_ref()
+            .is_some_and(|fat| !fat.images().is_empty())
     }
 
     pub fn underline_color(&self) -> ColorAttribute {
@@ -1085,66 +1184,157 @@ mod test {
         attrs
     }
 
+    fn shares(a: &CellAttributes, b: &CellAttributes) -> bool {
+        match (&a.fat, &b.fat) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
     #[test]
-    fn clone_from_reuses_extended_attributes_without_sharing_them() {
-        let mut dest = rgb_attrs(0.1);
-        let allocation = dest.fat.as_deref().unwrap() as *const FatAttributes;
+    fn copies_share_extended_attributes_until_one_changes() {
+        let link = Arc::new(Hyperlink::new("https://example.com"));
+        let other = Arc::new(Hyperlink::new("https://example.org"));
         let mut source = rgb_attrs(0.7);
-        source.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.com"))));
+        source.set_hyperlink(Some(Arc::clone(&link)));
+        source.set_underline_color(ColorAttribute::PaletteIndex(2));
+        let mut dest = rgb_attrs(0.1);
         dest.clone_from(&source);
         assert_eq!(dest, source);
-        assert_eq!(
-            allocation,
-            dest.fat.as_deref().unwrap() as *const FatAttributes
-        );
+        assert!(shares(&dest, &source));
+        assert!(shares(&source.clone(), &source));
+
+        // Every change leaves the other holders as they were.
+        let changes: [&dyn Fn(&mut CellAttributes); 9] = [
+            &|a| {
+                a.set_foreground(ColorAttribute::TrueColorWithDefaultFallback(
+                    (0.9, 0.1, 0.1, 1.0).into(),
+                ));
+            },
+            &|a| {
+                a.set_foreground(ColorAttribute::PaletteIndex(5));
+            },
+            &|a| {
+                a.set_foreground(ColorAttribute::Default);
+            },
+            &|a| {
+                a.set_background(ColorAttribute::TrueColorWithDefaultFallback(
+                    (0.2, 0.3, 0.4, 1.0).into(),
+                ));
+            },
+            &|a| {
+                a.set_underline_color(ColorAttribute::Default);
+            },
+            &|a| {
+                a.set_hyperlink(None);
+            },
+            &|a| {
+                a.set_hyperlink(Some(Arc::clone(&other)));
+            },
+            &|a| {
+                a.set_intensity(Intensity::Bold);
+            },
+            &|a| {
+                *a = a.clone_sgr_only();
+            },
+        ];
+        for change in changes.iter() {
+            let before = source.clone();
+            let mut changed = source.clone();
+            change(&mut changed);
+            let mut expected = rgb_attrs(0.7);
+            expected.set_hyperlink(Some(Arc::clone(&link)));
+            expected.set_underline_color(ColorAttribute::PaletteIndex(2));
+            assert_eq!(source, expected);
+            assert_eq!(before, expected);
+            // The same change on an unshared value gives the same result.
+            let mut alone = expected.clone();
+            alone.fat = alone.fat.as_deref().cloned().map(Arc::new);
+            change(&mut alone);
+            assert_eq!(alone, changed);
+        }
+
+        // Setting what is already there keeps sharing.
+        let mut same = source.clone();
+        same.set_foreground(source.foreground());
+        same.set_hyperlink(Some(Arc::clone(&link)));
+        same.set_underline_color(ColorAttribute::PaletteIndex(2));
+        assert!(shares(&same, &source));
+
+        // A sole holder changes in place.
+        let mut alone = rgb_attrs(0.3);
+        let at = Arc::as_ptr(alone.fat.as_ref().unwrap());
+        alone.set_background(ColorAttribute::TrueColorWithDefaultFallback(
+            (0.5, 0.5, 0.5, 1.0).into(),
+        ));
+        assert_eq!(at, Arc::as_ptr(alone.fat.as_ref().unwrap()));
+
+        // Back to defaults, no extended attributes are kept.
         dest.set_hyperlink(None);
+        dest.set_underline_color(ColorAttribute::Default);
         dest.set_foreground(ColorAttribute::Default);
         assert!(dest.fat.is_none());
-        assert!(source.hyperlink().is_some());
-        assert_eq!(source.foreground(), rgb_attrs(0.7).foreground());
-        dest.clone_from(&source);
-        assert_eq!(dest, source);
+        assert_eq!(source.hyperlink(), Some(&link));
         dest.clone_from(&CellAttributes::blank());
         assert!(dest.fat.is_none());
+        drop((source, dest, same));
+        assert_eq!(Arc::strong_count(&link), 1);
     }
 
     #[test]
     #[cfg(feature = "use_image")]
-    fn extended_attribute_clones_release_images_and_empty_capacity() {
+    fn shared_images_are_copied_on_change_and_released() {
         use crate::image::{ImageCell, ImageData, ImageDataType, TextureCoordinate};
         let data = Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
             1, 1, vec![255; 4],
         )));
+        let image = |id| {
+            Box::new(ImageCell::with_z_index(
+                TextureCoordinate::new_f32(0.0, 0.0),
+                TextureCoordinate::new_f32(1.0, 1.0),
+                Arc::clone(&data),
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some(id),
+                Some(7),
+            ))
+        };
         let mut source = rgb_attrs(0.7);
-        source.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.org"))));
-        source.attach_image(Box::new(ImageCell::with_z_index(
-            TextureCoordinate::new_f32(0.0, 0.0),
-            TextureCoordinate::new_f32(1.0, 1.0),
-            Arc::clone(&data),
-            0, 0, 0, 0, 0, Some(3), Some(7),
-        )));
+        source.attach_image(image(3));
         let copied = source.clone();
         let mut dest = rgb_attrs(0.1);
         dest.clone_from(&source);
-        assert_eq!(dest, source);
-        assert_eq!(copied, source);
+        assert!(shares(&dest, &source) && shares(&copied, &source));
+        assert_eq!(Arc::strong_count(&data), 2);
+
+        // Changing one holder's images copies the list for it alone.
+        dest.attach_image(image(4));
+        assert_eq!(dest.images().unwrap().len(), 2);
+        assert_eq!(source.images().unwrap().len(), 1);
         assert_eq!(Arc::strong_count(&data), 4);
-        assert!(!core::ptr::eq(
-            &*dest.fat.as_ref().unwrap().image[0],
-            &*source.fat.as_ref().unwrap().image[0],
-        ));
-        dest.clone_from(&rgb_attrs(0.2));
-        assert_eq!(Arc::strong_count(&data), 3);
-        assert_eq!(dest.fat.as_ref().unwrap().image.capacity(), 0);
-        source.fat.as_mut().unwrap().image.clear();
-        assert!(source.fat.as_ref().unwrap().image.capacity() > 0);
-        let empty_copy = source.clone();
-        assert_eq!(empty_copy.fat.as_ref().unwrap().image.capacity(), 0);
-        dest.fat.as_mut().unwrap().image.reserve(8);
-        dest.clone_from(&source);
+        dest.detach_image_with_placement(4, Some(7));
         assert_eq!(dest, source);
-        assert_eq!(dest.fat.as_ref().unwrap().image.capacity(), 0);
-        drop(copied);
+        assert_eq!(Arc::strong_count(&data), 3);
+        // Detaching nothing leaves the list shared.
+        let mut unmatched = source.clone();
+        unmatched.detach_image_with_placement(9, Some(7));
+        assert!(shares(&unmatched, &source));
+        drop(unmatched);
+
+        let mut cleared = source.clone();
+        cleared.clear_images();
+        assert!(!cleared.has_images() && source.has_images());
+        assert_eq!(cleared.foreground(), source.foreground());
+        let mut only_image = CellAttributes::blank();
+        only_image.set_image(image(5));
+        let mut emptied = only_image.clone();
+        emptied.clear_images();
+        assert!(emptied.fat.is_none() && only_image.has_images());
+
+        drop((source, copied, dest, cleared, only_image, emptied));
         assert_eq!(Arc::strong_count(&data), 1);
     }
 
