@@ -380,6 +380,45 @@ impl OscState {
             }
         }
     }
+
+    /// Consume the leading run of bytes in 0x20..=0x7f, which the state
+    /// table maps to OscPut without leaving OscString, with the same effect
+    /// as calling `put` once per byte. Returns the length of the run.
+    fn put_ascii_run(&mut self, bytes: &[u8]) -> usize {
+        let mut consumed = 0;
+        loop {
+            let rest = &bytes[consumed..];
+            let text = rest
+                .iter()
+                .position(|&b| b == b';' || !(0x20..=0x7f).contains(&b))
+                .unwrap_or(rest.len());
+            self.put_text(&rest[..text]);
+            consumed += text;
+            if rest.get(text) != Some(&b';') {
+                return consumed;
+            }
+            self.put(';');
+            consumed += 1;
+        }
+    }
+
+    #[cfg(any(feature = "std", feature = "alloc"))]
+    fn put_text(&mut self, text: &[u8]) {
+        // Appending to a Vec cannot fail, so `full` holds for the whole run.
+        if !text.is_empty() && !self.full {
+            self.buffer.extend_from_slice(text);
+            if self.num_params == 0 {
+                self.num_params = 1;
+            }
+        }
+    }
+
+    #[cfg(not(any(feature = "std", feature = "alloc")))]
+    fn put_text(&mut self, text: &[u8]) {
+        for &b in text {
+            self.put(b as char);
+        }
+    }
 }
 
 /// The virtual terminal parser.  It works together with an implementation of `VTActor`.
@@ -838,22 +877,26 @@ impl VTParser {
                     .unwrap_or(bytes.len());
                 actor.print_ascii(core::str::from_utf8(&bytes[..end]).unwrap());
                 bytes = &bytes[end..];
+            } else if self.state == State::OscString && (0x20..=0x7f).contains(&bytes[0]) {
+                // OSC text stays in OscString, so append it in runs. Other
+                // bytes, including UTF-8 and terminators, take the byte path.
+                let consumed = self.osc.put_ascii_run(bytes);
+                bytes = &bytes[consumed..];
             } else {
                 self.parse_non_utf8_byte(bytes[0], actor);
                 bytes = &bytes[1..];
                 if matches!(
                     self.state,
                     State::ApcString
-                        | State::OscString
                         | State::DcsPassthrough
                         | State::DcsIgnore
                         | State::SosPmString
                 ) {
-                    // String payloads (notably images) need the byte parser,
-                    // so avoid an extra run-detection branch on every byte.
-                    // Finish this input chunk with the original loop. Any text
-                    // after the terminator still emits ordinary print actions;
-                    // batching can resume on the next input chunk.
+                    // Other string payloads (notably images) need the byte
+                    // parser, so avoid an extra run-detection branch on every
+                    // byte. Finish this input chunk with the original loop.
+                    // Any text after the terminator still emits ordinary
+                    // print actions; batching can resume on the next chunk.
                     for &byte in bytes {
                         self.parse_byte(byte, actor);
                     }
@@ -1515,6 +1558,143 @@ mod test {
                 }
             ]
         );
+    }
+
+    /// Feed `input` to a parser in `chunks` and to another one byte at a
+    /// time, checking actions and OSC state at every chunk boundary.
+    fn assert_osc_runs_match_byte_parser(input: &[u8], chunks: &[usize], what: &str) {
+        let mut scalar = VTParser::new();
+        let mut expected = CollectingVTActor::default();
+        let mut batched = VTParser::new();
+        let mut actual = CollectingVTActor::default();
+        let mut offset = 0;
+        let mut sizes = chunks.iter().cycle();
+        while offset < input.len() {
+            let end = offset
+                .saturating_add(*sizes.next().unwrap())
+                .min(input.len());
+            batched.parse(&input[offset..end], &mut actual);
+            for &b in &input[offset..end] {
+                scalar.parse_byte(b, &mut expected);
+            }
+            offset = end;
+            // core's assert only formats the message on failure.
+            core::assert_eq!(actual.actions, expected.actions, "{what}, offset={offset}");
+            core::assert_eq!(batched.state, scalar.state, "{what}, offset={offset}");
+            // Only read inside a sequence and reset on entry; the ground UTF-8
+            // runs already leave a different stale value outside one.
+            if scalar.state == State::Utf8Sequence {
+                core::assert_eq!(
+                    batched.utf8_return_state,
+                    scalar.utf8_return_state,
+                    "{what}, offset={offset}"
+                );
+            }
+            core::assert_eq!(
+                batched.osc.buffer.as_slice(),
+                scalar.osc.buffer.as_slice(),
+                "{what}, offset={offset}"
+            );
+            core::assert_eq!(
+                batched.osc.param_indices,
+                scalar.osc.param_indices,
+                "{what}, offset={offset}"
+            );
+            core::assert_eq!(
+                batched.osc.num_params,
+                scalar.osc.num_params,
+                "{what}, offset={offset}"
+            );
+            core::assert_eq!(batched.osc.full, scalar.osc.full, "{what}, offset={offset}");
+        }
+    }
+
+    #[test]
+    fn osc_runs_match_byte_parser() {
+        let many_params = format!("\x1b]{}\x07", ";x".repeat(MAX_OSC + 3));
+        let long_payload = format!("\x1b]6;{}\x07after", "a1".repeat(9000));
+        let inputs: &[&[u8]] = &[
+            b"\x1b]0;title\x07tail",
+            b"\x1b];;a;;b;\x07",
+            b"\x1b];lead\x1b\\",
+            b"\x1b]8;id=1;http://x/\x1b\\link\x1b]8;;\x1b\\",
+            b"\x1b]2;a\x7fb ~c\x9cafter",
+            b"\x1b]2;\xe4\xb8\xad;\xc3\xa9x\xc2\x9cafter",
+            b"\x1b]2;ab\ncd\x00ef\x07",
+            b"\x9d0;c1 start\x07\xc2\x9d1;utf8 c1\x07",
+            b"\x1b]0;cancelled\x18then\x1b]1;sub\x1adone\x07",
+            b"\x1b]0;a\x1b[1mb\x1b]0;c\x1bP1q\x1b\\",
+            many_params.as_bytes(),
+            long_payload.as_bytes(),
+        ];
+        for (i, input) in inputs.iter().enumerate() {
+            for size in [1, 2, 3, 5, 7, 64, 4096, usize::MAX] {
+                assert_osc_runs_match_byte_parser(
+                    input,
+                    &[size],
+                    &format!("input {i}, chunk {size}"),
+                );
+            }
+            assert_osc_runs_match_byte_parser(input, &[1, 4, 2, 9, 3, 17], &format!("input {i}"));
+        }
+    }
+
+    #[test]
+    fn osc_runs_match_byte_parser_on_random_input() {
+        // Deterministic xorshift so failures reproduce.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let alphabet: &[&[u8]] = &[
+            b"a",
+            b"Z",
+            b"0",
+            b"9",
+            b" ",
+            b"~",
+            b";",
+            b";;",
+            b"\x7f",
+            b"\x07",
+            b"\x1b",
+            b"\\",
+            b"\x1b]",
+            b"\x1b]0;",
+            b"\x1b]8;;",
+            b"\x9d",
+            b"\x9c",
+            b"\xc2\x9c",
+            b"\xc2\x9d",
+            b"\xe4\xb8\xad",
+            b"\xf0\x9f\x99\x82",
+            b"\xc3",
+            b"\x80",
+            b"\xff",
+            b"\x00",
+            b"\n",
+            b"\x18",
+            b"\x1a",
+            b"\x1b[",
+            b"\x1bP",
+            b"\x1b_",
+            b"\x1b^",
+        ];
+        for round in 0..2000 {
+            let mut input = b"\x1b]".to_vec();
+            for _ in 0..(next() % 200) {
+                if next() % 4 == 0 {
+                    input.extend_from_slice(alphabet[(next() % alphabet.len() as u64) as usize]);
+                } else {
+                    input.push(0x20 + (next() % 0x60) as u8);
+                }
+            }
+            let chunks: Vec<usize> = (0..8).map(|_| 1 + (next() % 40) as usize).collect();
+            assert_osc_runs_match_byte_parser(&input, &chunks, &format!("round={round}"));
+        }
     }
 
     #[test]
