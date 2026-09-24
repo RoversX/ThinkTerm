@@ -1070,3 +1070,30 @@ fn ascii_overwrite_preserves_image_placements() {
         check_ascii_against_scalar(&base, start, "0123456789", &CellAttributes::default());
     }
 }
+
+#[test]
+fn blank_fill_to_the_end_matches_scalar_writes_then_prune() {
+    // fill_range's Vec fast path: a blank fill from inside the row to at
+    // least its end. Its result must equal per-column writes plus pruning.
+    let mut styled = CellAttributes::default();
+    styled.set_background(wezterm_cell::color::ColorAttribute::PaletteIndex(4));
+    for text in ["hello world", "界🙂x", "      ", "ab  cd  "] {
+        for attrs in [CellAttributes::default(), styled.clone()] {
+            let mut base = Line::from_text(text, &attrs, 1, None);
+            base.cells_mut();
+            let len = base.len();
+            for start in 0..len {
+                for end in [len, len + 1, 20] {
+                    let mut actual = base.clone();
+                    actual.fill_range(start..end, &Cell::blank(), 7);
+                    let mut expected = base.clone();
+                    for x in start..end {
+                        expected.set_cell(x, Cell::blank(), 7);
+                    }
+                    expected.prune_trailing_blanks(7);
+                    assert_eq!(actual, expected, "text={text:?} {start}..{end}");
+                }
+            }
+        }
+    }
+}

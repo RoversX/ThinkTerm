@@ -1147,6 +1147,12 @@ impl Line {
                     cells.truncate(last + 1);
                     return;
                 }
+                // The whole row ends up blank. Vec storage historically
+                // retains the length of all-blank lines, so write the tail
+                // in one go; the trailing-blank scan could prune nothing.
+                cells.truncate(start + 1);
+                cells.resize(cols.end, cell.clone());
+                return;
             }
             // Vec storage historically retains the length of all-blank lines.
             // Preserve that behavior, including styled wide-cell padding.
