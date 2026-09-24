@@ -659,7 +659,7 @@ impl ConfigInner {
                 self.config = Arc::new(config);
                 self.config_file = loaded_file_name;
                 self.error.take();
-                self.generation += 1;
+                self.bump_generation();
 
                 // If we loaded a user config, publish this latest version of
                 // the lua state to the LUA_PIPE.  This allows a subsequent
@@ -689,6 +689,14 @@ impl ConfigInner {
         }
     }
 
+    /// Count a change of the effective configuration and publish the new
+    /// generation for [`configuration_generation`] before the lock that
+    /// installed it is released.
+    fn bump_generation(&mut self) {
+        self.generation += 1;
+        CONFIG_GENERATION.store(self.generation, Ordering::Release);
+    }
+
     /// Discard the current configuration and any recorded
     /// error message; replace them with the default
     /// configuration
@@ -696,14 +704,14 @@ impl ConfigInner {
         self.config = Arc::new(Config::default_config());
         self.config_file = None;
         self.error.take();
-        self.generation += 1;
+        self.bump_generation();
     }
 
     fn use_this_config(&mut self, cfg: Config) {
         self.config = Arc::new(cfg);
         self.config_file = None;
         self.error.take();
-        self.generation += 1;
+        self.bump_generation();
     }
 
     fn overridden(&mut self, overrides: &wezterm_dynamic::Value) -> Result<ConfigHandle, Error> {
@@ -732,8 +740,18 @@ impl ConfigInner {
         config.dpi.replace(96.0);
         self.config = Arc::new(config);
         self.error.take();
-        self.generation += 1;
+        self.bump_generation();
     }
+}
+
+/// The global configuration's generation, readable without its lock.
+static CONFIG_GENERATION: AtomicUsize = AtomicUsize::new(0);
+
+/// The generation of the global configuration, read without taking its
+/// lock: every change to what [`configuration`] returns publishes a new
+/// value here before that change's lock is released.
+pub fn configuration_generation() -> usize {
+    CONFIG_GENERATION.load(Ordering::Acquire)
 }
 
 pub struct Configuration {

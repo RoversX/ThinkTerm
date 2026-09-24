@@ -1474,6 +1474,100 @@ fn styled_alt_screen_scrolling_matches_retained_primary_rows() {
     }
 }
 
+/// A configuration whose hot-path settings change between batches and which
+/// counts every read of them. With a `key` the terminal may cache them.
+#[derive(Debug, Default)]
+struct SwitchingConfig {
+    key: Mutex<Option<(usize, usize)>>,
+    nfc: std::sync::atomic::AtomicBool,
+    bidi: std::sync::atomic::AtomicBool,
+    scrollback: std::sync::atomic::AtomicUsize,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl TerminalConfiguration for SwitchingConfig {
+    fn change_key(&self) -> Option<(usize, usize)> {
+        *self.key.lock().unwrap()
+    }
+    fn scrollback_size(&self) -> usize {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.scrollback.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn normalize_output_to_unicode_nfc(&self) -> bool {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.nfc.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn bidi_mode(&self) -> crate::config::BidiMode {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::config::BidiMode {
+            enabled: self.bidi.load(std::sync::atomic::Ordering::SeqCst),
+            hint: wezterm_bidi::ParagraphDirectionHint::LeftToRight,
+        }
+    }
+    fn color_palette(&self) -> ColorPalette {
+        ColorPalette::default()
+    }
+}
+
+#[test]
+fn cached_hot_settings_follow_every_config_change() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let make = |cache: bool| {
+        let config = Arc::new(SwitchingConfig::default());
+        if cache {
+            *config.key.lock().unwrap() = Some((0, 0));
+        }
+        let term = Terminal::new(
+            TerminalSize {
+                rows: 4,
+                cols: 12,
+                pixel_width: 96,
+                pixel_height: 64,
+                dpi: 0,
+            },
+            Arc::clone(&config) as Arc<dyn TerminalConfiguration>,
+            "ThinkTerm",
+            "O_o",
+            Box::new(Vec::new()),
+        );
+        (config, term)
+    };
+    let (cached_config, mut cached) = make(true);
+    let (plain_config, mut plain) = make(false);
+    // Each step changes what the hot paths read: NFC for printed runs, bidi
+    // for line feeds and erases, the scrollback size for history and REP.
+    let steps = [
+        (false, false, 3),
+        (true, false, 3),
+        (true, true, 1),
+        (false, true, 5),
+        (false, false, 0),
+    ];
+    let chunk = "e\u{301}x\r\nab\u{5d0}\u{5d1}\r\n\x1b[2Kz\x1b[20b\r\n".repeat(6);
+    for (step, &(nfc, bidi, scrollback)) in steps.iter().enumerate() {
+        for config in [&cached_config, &plain_config] {
+            config.nfc.store(nfc, SeqCst);
+            config.bidi.store(bidi, SeqCst);
+            config.scrollback.store(scrollback, SeqCst);
+        }
+        *cached_config.key.lock().unwrap() = Some((step + 1, 0));
+        cached.advance_bytes(&chunk);
+        plain.advance_bytes(&chunk);
+        assert_eq!(
+            cached.screen().all_lines(),
+            plain.screen().all_lines(),
+            "step {step}"
+        );
+        assert_eq!(cached.cursor_pos(), plain.cursor_pos(), "step {step}");
+    }
+    let cached_reads = cached_config.reads.load(SeqCst);
+    let plain_reads = plain_config.reads.load(SeqCst);
+    assert!(
+        cached_reads * 4 < plain_reads,
+        "settings are reused while the key stays: {cached_reads} vs {plain_reads} reads"
+    );
+}
+
 #[test]
 fn perform_actions_in_place_matches_owned_batches() {
     use wezterm_escape_parser::parser::Parser;

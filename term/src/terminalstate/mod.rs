@@ -292,9 +292,21 @@ pub struct AgentOscEvidence {
     pub progress: Option<String>,
 }
 
+/// Settings read on hot paths (every flushed print run, line feed and
+/// erase), kept while the configuration's `change_key` stays the same.
+#[derive(Clone, Copy)]
+struct HotSettings {
+    key: (usize, usize),
+    normalize_output_to_unicode_nfc: bool,
+    bidi_mode: BidiMode,
+    scrollback_size: usize,
+}
+
 /// Manages the state for the terminal
 pub struct TerminalState {
     config: Arc<dyn TerminalConfiguration>,
+    /// See [`HotSettings`]; `None` until first read or after `set_config`.
+    hot_settings: std::cell::Cell<Option<HotSettings>>,
 
     screen: ScreenOrAlt,
     /// The current set of attributes in effect for the next
@@ -611,6 +623,7 @@ impl TerminalState {
 
         TerminalState {
             config,
+            hot_settings: std::cell::Cell::new(None),
             screen,
             pen: CellAttributes::default(),
             cursor: CursorPosition::default(),
@@ -698,6 +711,47 @@ impl TerminalState {
 
     pub fn set_config(&mut self, config: Arc<dyn TerminalConfiguration>) {
         self.config = config;
+        self.hot_settings.set(None);
+    }
+
+    /// The hot-path settings, read again only when the configuration's
+    /// `change_key` has moved; `None` for a configuration without one.
+    fn hot_settings(&self) -> Option<HotSettings> {
+        let key = self.config.change_key()?;
+        if let Some(hot) = self.hot_settings.get() {
+            if hot.key == key {
+                return Some(hot);
+            }
+        }
+        let hot = HotSettings {
+            key,
+            normalize_output_to_unicode_nfc: self.config.normalize_output_to_unicode_nfc(),
+            bidi_mode: self.config.bidi_mode(),
+            scrollback_size: self.config.scrollback_size(),
+        };
+        self.hot_settings.set(Some(hot));
+        Some(hot)
+    }
+
+    pub(crate) fn config_normalize_output_to_unicode_nfc(&self) -> bool {
+        match self.hot_settings() {
+            Some(hot) => hot.normalize_output_to_unicode_nfc,
+            None => self.config.normalize_output_to_unicode_nfc(),
+        }
+    }
+
+    fn config_bidi_mode(&self) -> BidiMode {
+        match self.hot_settings() {
+            Some(hot) => hot.bidi_mode,
+            None => self.config.bidi_mode(),
+        }
+    }
+
+    fn config_scrollback_size(&self) -> usize {
+        match self.hot_settings() {
+            Some(hot) => hot.scrollback_size,
+            None => self.config.scrollback_size(),
+        }
     }
 
     pub fn get_config(&self) -> Arc<dyn TerminalConfiguration> {
@@ -2299,7 +2353,7 @@ impl TerminalState {
     }
 
     fn get_bidi_mode(&self) -> BidiMode {
-        let mut mode = self.config.bidi_mode();
+        let mut mode = self.config_bidi_mode();
         if let Some(enabled) = &self.bidi_enabled {
             mode.enabled = *enabled;
         }
@@ -2473,7 +2527,7 @@ impl TerminalState {
                 // reaches u32::MAX and this loop runs for a minute.
                 let width = (left_and_right_margins.end - left_and_right_margins.start).max(1);
                 let saturated = width
-                    .saturating_mul(self.screen().physical_rows + self.config.scrollback_size());
+                    .saturating_mul(self.screen().physical_rows + self.config_scrollback_size());
                 let n = n as usize;
                 let n = if n > saturated {
                     saturated + (n % width)

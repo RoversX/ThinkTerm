@@ -31,6 +31,9 @@ pub struct Screen {
 
     /// config so we can access Maximum number of lines of scrollback
     config: Arc<dyn TerminalConfiguration>,
+    /// The scrollback size last read from `config`, with the `change_key`
+    /// it was read under: every line feed into the history consults it.
+    scrollback_size_cache: std::cell::Cell<Option<((usize, usize), usize)>>,
 
     /// Whether scrollback is allowed; this is another way of saying
     /// that we're the primary rather than the alternate screen.
@@ -86,6 +89,7 @@ impl Screen {
         Screen {
             lines,
             config: Arc::clone(config),
+            scrollback_size_cache: std::cell::Cell::new(None),
             allow_scrollback,
             physical_rows,
             physical_cols,
@@ -101,7 +105,20 @@ impl Screen {
     }
 
     fn scrollback_size(&self) -> usize {
-        scrollback_size(&self.config, self.allow_scrollback)
+        if !self.allow_scrollback {
+            return 0;
+        }
+        let Some(key) = self.config.change_key() else {
+            return self.config.scrollback_size();
+        };
+        match self.scrollback_size_cache.get() {
+            Some((cached, size)) if cached == key => size,
+            _ => {
+                let size = self.config.scrollback_size();
+                self.scrollback_size_cache.set(Some((key, size)));
+                size
+            }
+        }
     }
 
     /// Every line held, scrollback first, visible rows last.

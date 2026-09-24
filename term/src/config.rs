@@ -145,6 +145,14 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
         0
     }
 
+    /// A cheap value that changes whenever anything these settings are read
+    /// from changes. While it stays the same, the terminal may reuse settings
+    /// it has read on hot paths instead of asking again. `None`, the
+    /// default, means every setting is read afresh whenever it is needed.
+    fn change_key(&self) -> Option<(usize, usize)> {
+        None
+    }
+
     /// Returns the size of the scrollback in terms of the number of rows.
     fn scrollback_size(&self) -> usize {
         3500

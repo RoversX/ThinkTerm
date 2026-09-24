@@ -1,6 +1,7 @@
 //! Bridge our gui config into the terminal crate configuration
 
 use crate::{configuration, ConfigHandle, NewlineCanon};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use termwiz::cell::UnicodeVersion;
 use wezterm_term::color::ColorPalette;
@@ -9,6 +10,10 @@ use wezterm_term::config::BidiMode;
 #[derive(Debug)]
 pub struct TermConfig {
     config: Mutex<Option<ConfigHandle>>,
+    /// Bumped by every `set_config`. With the global configuration's
+    /// generation it forms `change_key`, so the terminal can tell cheaply
+    /// whether settings it already read are still current.
+    version: AtomicUsize,
     client_palette: Mutex<Option<ColorPalette>>,
     /// True while `client_palette` is a scheme being *shown* rather than
     /// chosen. See [`TermConfig::set_preview_palette`].
@@ -19,6 +24,7 @@ impl TermConfig {
     pub fn new() -> Self {
         Self {
             config: Mutex::new(None),
+            version: AtomicUsize::new(0),
             client_palette: Mutex::new(None),
             client_palette_is_preview: Mutex::new(false),
         }
@@ -27,13 +33,17 @@ impl TermConfig {
     pub fn with_config(config: ConfigHandle) -> Self {
         Self {
             config: Mutex::new(Some(config)),
+            version: AtomicUsize::new(0),
             client_palette: Mutex::new(None),
             client_palette_is_preview: Mutex::new(false),
         }
     }
 
     pub fn set_config(&self, config: ConfigHandle) {
-        self.config.lock().unwrap().replace(config);
+        let mut current = self.config.lock().unwrap();
+        current.replace(config);
+        // Published before the lock is released, like the global generation.
+        self.version.fetch_add(1, Ordering::Release);
     }
 
     pub fn set_client_palette(&self, palette: ColorPalette) {
@@ -73,6 +83,13 @@ impl TermConfig {
 impl wezterm_term::TerminalConfiguration for TermConfig {
     fn generation(&self) -> usize {
         self.configuration().generation()
+    }
+
+    fn change_key(&self) -> Option<(usize, usize)> {
+        Some((
+            self.version.load(Ordering::Acquire),
+            crate::configuration_generation(),
+        ))
     }
 
     fn scrollback_size(&self) -> usize {
@@ -163,5 +180,23 @@ impl wezterm_term::TerminalConfiguration for TermConfig {
             enabled: config.bidi_enabled,
             hint: config.bidi_direction,
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use wezterm_term::TerminalConfiguration;
+
+    #[test]
+    fn change_key_moves_with_every_set_config() {
+        let config = TermConfig::new();
+        let before = config.change_key();
+        assert!(before.is_some());
+        config.set_config(crate::configuration());
+        let after = config.change_key();
+        assert_ne!(after, before);
+        config.set_config(crate::configuration());
+        assert_ne!(config.change_key(), after);
     }
 }
