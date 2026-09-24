@@ -800,6 +800,53 @@ impl Line {
         self.set_cell_grapheme_nonappend(idx, text, width, attr, seqno);
     }
 
+    /// Whether `append_grapheme_run` can take graphemes starting at `idx`:
+    /// the end of clustered storage without implicit hyperlinks, which the
+    /// first write would otherwise expand to cells.
+    pub fn can_append_grapheme_run(&self, idx: usize) -> bool {
+        match &self.cells {
+            CellStorage::C(cl) => {
+                idx == cl.len() && (self.bits & LineBits::HAS_IMPLICIT_HYPERLINKS) == LineBits::NONE
+            }
+            _ => false,
+        }
+    }
+
+    /// `set_cell_grapheme` for each grapheme of a run written one after
+    /// another from `idx`, all with `attr`; see `ClusteredLine::append_run`
+    /// for the arguments. Returns false, changing nothing, unless
+    /// `can_append_grapheme_run(idx)` and `append_run` takes the run; the
+    /// caller then writes the graphemes one at a time.
+    pub fn append_grapheme_run(
+        &mut self,
+        idx: usize,
+        text: &str,
+        max_len: usize,
+        cells: usize,
+        wide: &[u16],
+        last_width: u8,
+        attr: &CellAttributes,
+        seqno: SequenceNo,
+    ) -> bool {
+        if !self.can_append_grapheme_run(idx) {
+            return false;
+        }
+        let CellStorage::C(cl) = &mut self.cells else {
+            return false;
+        };
+        if !cl.append_run(text, max_len, cells, wide, last_width, attr) {
+            return false;
+        }
+        // What each set_cell_grapheme would do; repeating it changes nothing.
+        if attr.hyperlink().is_some() {
+            self.bits |= LineBits::HAS_HYPERLINK;
+        }
+        self.invalidate_implicit_hyperlinks(seqno);
+        self.invalidate_zones();
+        self.update_last_change_seqno(seqno);
+        true
+    }
+
     // Keep padding and overwrites out of the common sequential append path.
     #[inline(never)]
     fn set_cell_grapheme_nonappend(

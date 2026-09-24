@@ -299,6 +299,75 @@ impl ClusteredLine {
         self.len += cell_width as u32;
     }
 
+    /// `append_grapheme` for each grapheme of a run in turn, all with
+    /// `attrs`: `text` is their concatenation, `max_len` the byte length of
+    /// the longest, `cells` the sum of their widths, `wide` the offsets from
+    /// the current end of those more than one cell wide, and `last_width`
+    /// the width of the final one. The text and the wide-cell set are left
+    /// with the capacities appending one at a time would give them. Returns
+    /// false, changing nothing, if the run would overflow a cluster's width,
+    /// where appending one at a time would start another cluster, or if the
+    /// text's capacity would depend on more than `max_len` and the total.
+    pub fn append_run(
+        &mut self,
+        text: &str,
+        max_len: usize,
+        cells: usize,
+        wide: &[u16],
+        last_width: u8,
+        attrs: &CellAttributes,
+    ) -> bool {
+        let extend = matches!(self.clusters.last(), Some(cluster) if cluster.attrs == *attrs);
+        let prior = if extend {
+            self.clusters
+                .last()
+                .map_or(0, |cluster| cluster.cell_width as usize)
+        } else {
+            0
+        };
+        if prior + cells > u16::MAX as usize {
+            return false;
+        }
+        let Some(capacity) =
+            grown_capacity(self.text.capacity(), self.text.len() + text.len(), max_len)
+        else {
+            return false;
+        };
+        match self.clusters.last_mut() {
+            Some(cluster) if extend => cluster.cell_width = (prior + cells) as u16,
+            _ => self.clusters.push(Cluster {
+                attrs: attrs.clone(),
+                cell_width: cells as u16,
+            }),
+        }
+        self.text.reserve_exact(capacity - self.text.len());
+        self.text.push_str(text);
+        if let (Some(&first), Some(&last)) = (wide.first(), wide.last()) {
+            let base = self.len as usize;
+            let bitset = self.is_double_wide.get_or_insert_with(|| {
+                Box::new(FixedBitSet::with_capacity(base + first as usize + 1))
+            });
+            // Grown wherever growing for each wide cell in turn would add a
+            // block (32 bits, or a multiple), so it reallocates to the same
+            // sizes.
+            let mut blocks = bitset.len().div_ceil(32);
+            for &offset in wide {
+                let bits = base + offset as usize + 1;
+                if bits.div_ceil(32) > blocks {
+                    bitset.grow(bits);
+                    blocks = bits.div_ceil(32);
+                }
+            }
+            bitset.grow(base + last as usize + 1);
+            for &offset in wide {
+                bitset.set(base + offset as usize, true);
+            }
+        }
+        self.last_cell_width = NonZeroU8::new(last_width);
+        self.len += cells as u32;
+        true
+    }
+
     pub fn append(&mut self, cell: Cell) {
         let cell_width = cell.width() as u16;
         let new_cluster = match self.clusters.last() {
@@ -443,6 +512,27 @@ impl<'a> Iterator for ClusterLineCellIter<'a> {
             attrs,
         })
     }
+}
+
+/// The capacity a String of `capacity` ends with when graphemes of at most
+/// `max_len` bytes are pushed one at a time until it holds `len` bytes, or
+/// None where that would depend on each one's length. A String grows to
+/// twice its capacity, or to what it needs if more, and to at least 8 bytes.
+fn grown_capacity(capacity: usize, len: usize, max_len: usize) -> Option<usize> {
+    if len <= capacity {
+        return Some(capacity);
+    }
+    let mut capacity = match capacity {
+        // The first push takes it to 8 bytes.
+        0 if max_len <= 8 => 8,
+        // No push then needs more than twice the capacity.
+        4.. if max_len <= capacity => capacity,
+        _ => return None,
+    };
+    while capacity < len {
+        capacity *= 2;
+    }
+    Some(capacity)
 }
 
 #[cfg(test)]

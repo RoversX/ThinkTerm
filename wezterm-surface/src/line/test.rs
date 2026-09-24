@@ -1097,3 +1097,166 @@ fn blank_fill_to_the_end_matches_scalar_writes_then_prune() {
         }
     }
 }
+
+#[test]
+fn grapheme_runs_match_one_grapheme_at_a_time() {
+    let plain = CellAttributes::default();
+    let bold = CellAttributes::default()
+        .set_intensity(wezterm_cell::Intensity::Bold)
+        .clone();
+    let mut linked = CellAttributes::default();
+    linked.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.org"))));
+    let long_wide = vec![("界", 2); 60];
+    let long_mixed: Vec<(&str, usize)> = (0..40)
+        .map(|i| {
+            if i % 3 == 0 {
+                ("e\u{301}", 1)
+            } else {
+                ("中", 2)
+            }
+        })
+        .collect();
+    // A grapheme longer than a new row's text capacity.
+    let marked = format!("e{}", "\u{301}".repeat(45));
+    let runs: &[&[(&str, usize)]] = &[
+        &[("界", 2)],
+        &[("x", 1)],
+        &[("中", 2), ("文", 2), ("字", 2)],
+        &[
+            ("a", 1),
+            ("é", 1),
+            ("界", 2),
+            ("e\u{301}", 1),
+            ("🙂", 2),
+            ("\u{3000}", 2),
+            ("\u{200b}", 1),
+        ],
+        &long_wide,
+        &long_mixed,
+        &[("界", 2), (&marked, 1), ("x", 1)],
+    ];
+    // Starting rows: empty, narrow or wide text in the same or other
+    // attributes, one scanned without finding a link (still clustered) and
+    // one with an implicit link (expanded to cells, so refused).
+    let prefixes: &[&[(&str, usize)]] = &[
+        &[],
+        &[("a", 1), ("b", 1)],
+        &[("界", 2), ("x", 1)],
+        &[
+            ("h", 1),
+            ("t", 1),
+            ("t", 1),
+            ("p", 1),
+            ("s", 1),
+            (":", 1),
+            ("/", 1),
+            ("/", 1),
+            ("e", 1),
+            (".", 1),
+            ("c", 1),
+            ("o", 1),
+        ],
+    ];
+    let rules = [Rule::new(r"https://\S+", "$0").unwrap()];
+    for prefix in prefixes {
+        for prefix_attrs in [&plain, &bold] {
+            for (scan, compress) in [(false, false), (true, false), (false, true)] {
+                let mut base = Line::new(1);
+                let mut end = 0;
+                for (g, w) in prefix.iter() {
+                    base.set_cell_grapheme(end, g, *w, prefix_attrs.clone(), 2);
+                    end += w;
+                }
+                if scan {
+                    base.scan_and_create_hyperlinks(&rules);
+                }
+                if compress {
+                    // Rebuilt compactly, with text capacity cut to its length.
+                    base.cells_mut();
+                    base.compress_for_scrollback();
+                }
+                // Text capacities: cut to the length (as cloning leaves it),
+                // a few bytes spare, and a new row's.
+                for spare in [0, 3, 80] {
+                    let copy = |line: &Line| {
+                        let mut line = line.clone();
+                        if let crate::line::storage::CellStorage::C(cl) = &mut line.cells {
+                            cl.text.reserve_exact(spare);
+                        }
+                        line
+                    };
+                    for attrs in [&plain, &bold, &linked] {
+                        for run in runs {
+                            for idx in [end, end + 1] {
+                                let mut expected = copy(&base);
+                                let mut x = idx;
+                                for (g, w) in run.iter() {
+                                    expected.set_cell_grapheme(x, g, *w, attrs.clone(), 5);
+                                    x += w;
+                                }
+                                let text: String = run.iter().map(|(g, _)| *g).collect();
+                                let cells = run.iter().map(|(_, w)| w).sum();
+                                let mut wide = vec![];
+                                let mut offset = 0;
+                                for (_, w) in run.iter() {
+                                    if *w > 1 {
+                                        wide.push(offset as u16);
+                                    }
+                                    offset += w;
+                                }
+                                let last = run.last().unwrap().1 as u8;
+                                let max_len = run.iter().map(|(g, _)| g.len()).max().unwrap();
+                                let mut actual = copy(&base);
+                                let (len, capacity) = match &actual.cells {
+                                    crate::line::storage::CellStorage::C(cl) => {
+                                        (cl.text.len(), cl.text.capacity())
+                                    }
+                                    _ => (0, 0),
+                                };
+                                let can = actual.can_append_grapheme_run(idx);
+                                let appended = actual.append_grapheme_run(
+                                    idx, &text, max_len, cells, &wide, last, attrs, 5,
+                                );
+                                // Refused where the text's growth would depend
+                                // on each grapheme's length: one longer than the
+                                // capacity, or a capacity under 4 bytes.
+                                let predictable = len + text.len() <= capacity
+                                    || if capacity == 0 {
+                                        max_len <= 8
+                                    } else {
+                                        capacity >= 4 && max_len <= capacity
+                                    };
+                                assert_eq!(appended, can && predictable);
+                                if appended {
+                                    assert_eq!(actual, expected);
+                                    assert_eq!(actual.as_str(), expected.as_str());
+                                    // The same text capacity is left behind.
+                                    match (&actual.cells, &expected.cells) {
+                                        (
+                                            crate::line::storage::CellStorage::C(a),
+                                            crate::line::storage::CellStorage::C(e),
+                                        ) => {
+                                            assert_eq!(a.text.capacity(), e.text.capacity());
+                                        }
+                                        _ => panic!("a run is only taken by clustered storage"),
+                                    }
+                                } else {
+                                    assert_eq!(actual, base);
+                                }
+                                // Only a row ending at `idx` in clustered storage takes a run.
+                                assert_eq!(
+                                    can,
+                                    idx == end
+                                        && matches!(
+                                            base.cells,
+                                            crate::line::storage::CellStorage::C(_)
+                                        )
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

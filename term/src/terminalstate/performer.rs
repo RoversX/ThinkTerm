@@ -35,6 +35,8 @@ pub(crate) struct Performer<'a> {
     print: String,
     #[cfg(test)]
     disable_ascii_batch: bool,
+    #[cfg(test)]
+    disable_grapheme_runs: bool,
 }
 
 impl<'a> Deref for Performer<'a> {
@@ -64,6 +66,8 @@ impl<'a> Performer<'a> {
             print: String::new(),
             #[cfg(test)]
             disable_ascii_batch: false,
+            #[cfg(test)]
+            disable_grapheme_runs: false,
         }
     }
 
@@ -152,7 +156,23 @@ impl<'a> Performer<'a> {
         if ascii_batch {
             self.flush_ascii(text);
         } else {
+            // Graphemes written one after another at the end of a clustered
+            // row are appended as one run (`Line::append_grapheme_run`). The
+            // writes are only deferred: nothing reads the row before the run
+            // is flushed. Remapped or custom-width text and insert mode keep
+            // writing one grapheme at a time.
+            let runs = !self.insert
+                && charset == CharSet::Ascii
+                && self.unicode_version.cell_widths.is_none();
+            #[cfg(test)]
+            let runs = runs && !self.disable_grapheme_runs;
+            let mut run = GraphemeRun::default();
+            // A row found unable to take a run, until the cursor next wraps.
+            let mut no_run_row = None;
+            let mut offset = 0;
             for g in Graphemes::new(text) {
+                let start = offset;
+                offset += g.len();
                 let g = self.remap_grapheme(g);
 
                 let mut print_width = grapheme_column_width(g, Some(&self.unicode_version));
@@ -182,13 +202,16 @@ impl<'a> Performer<'a> {
                     }
                 }
 
+                if self.wrap_next {
+                    // Wrapping marks the row and may scroll it away.
+                    self.flush_grapheme_run(&mut run, text, seqno);
+                    no_run_row = None;
+                }
                 self.wrap_if_needed();
 
                 let x = self.cursor.x;
                 let y = self.cursor.y;
                 let width = self.left_and_right_margins.end;
-
-                let pen = self.pen.clone();
 
                 let wrappable = x + print_width >= width;
 
@@ -210,8 +233,22 @@ impl<'a> Performer<'a> {
                     g,
                     self.pen
                 );
-                self.screen_mut()
-                    .set_cell_grapheme(x, y, g, print_width, pen, seqno);
+                let in_run = runs && no_run_row != Some(y) && {
+                    if !run.continues(x, y, start) {
+                        self.flush_grapheme_run(&mut run, text, seqno);
+                        if !self.can_start_grapheme_run(x, y) {
+                            no_run_row = Some(y);
+                        }
+                    }
+                    no_run_row != Some(y)
+                };
+                if in_run {
+                    run.push(x, y, start, offset, print_width);
+                } else {
+                    let pen = self.pen.clone();
+                    self.screen_mut()
+                        .set_cell_grapheme(x, y, g, print_width, pen, seqno);
+                }
 
                 if !wrappable {
                     self.cursor.x += print_width;
@@ -220,9 +257,58 @@ impl<'a> Performer<'a> {
                     self.wrap_next = self.dec_auto_wrap;
                 }
             }
+            self.flush_grapheme_run(&mut run, text, seqno);
         }
         std::mem::swap(&mut self.print, &mut p);
         self.print.clear();
+    }
+
+    fn can_start_grapheme_run(&mut self, x: usize, y: VisibleRowIndex) -> bool {
+        let screen = self.screen_mut();
+        let idx = screen.phys_row(y);
+        screen.line_mut(idx).can_append_grapheme_run(x)
+    }
+
+    /// Write the graphemes of `run`, which began where
+    /// `can_start_grapheme_run` held and has had nothing written since.
+    fn flush_grapheme_run(
+        &mut self,
+        run: &mut GraphemeRun,
+        text: &str,
+        seqno: wezterm_surface::SequenceNo,
+    ) {
+        if std::mem::take(&mut run.count) == 0 {
+            return;
+        }
+        let run_text = &text[run.start..run.end];
+        let pen = self.pen.clone();
+        let appended = {
+            let screen = self.screen_mut();
+            let idx = screen.phys_row(run.y);
+            screen.line_mut(idx).append_grapheme_run(
+                run.x,
+                run_text,
+                run.max_len,
+                run.cells,
+                &run.wide[..run.num_wide],
+                run.last_width,
+                &pen,
+                seqno,
+            )
+        };
+        if !appended {
+            // Refused for an overflowing cluster width, or a grapheme too
+            // long to tell how the row's text grows; write each grapheme
+            // instead. Zero-width ones in a run are white space, shown as
+            // one cell.
+            let mut x = run.x;
+            for g in Graphemes::new(run_text) {
+                let width = grapheme_column_width(g, Some(&self.unicode_version)).max(1);
+                self.screen_mut()
+                    .set_cell_grapheme(x, run.y, g, width, pen.clone(), seqno);
+                x += width;
+            }
+        }
     }
 
     fn wrap_if_needed(&mut self) {
@@ -1215,6 +1301,73 @@ fn selection_to_selection(sel: Selection) -> ClipboardSelection {
     }
 }
 
+/// Graphemes waiting to be appended to one row in a single write.
+struct GraphemeRun {
+    x: usize,
+    y: VisibleRowIndex,
+    /// Byte range of the run within the text being printed.
+    start: usize,
+    end: usize,
+    cells: usize,
+    count: usize,
+    /// Byte length of the longest grapheme.
+    max_len: usize,
+    /// Cell offsets from `x` of the graphemes wider than one cell.
+    wide: [u16; GraphemeRun::MAX],
+    num_wide: usize,
+    last_width: u8,
+}
+
+impl Default for GraphemeRun {
+    fn default() -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            start: 0,
+            end: 0,
+            cells: 0,
+            count: 0,
+            max_len: 0,
+            wide: [0; GraphemeRun::MAX],
+            num_wide: 0,
+            last_width: 0,
+        }
+    }
+}
+
+impl GraphemeRun {
+    const MAX: usize = 64;
+
+    /// Whether a grapheme at `x, y` starting at byte `start` extends the run.
+    fn continues(&self, x: usize, y: VisibleRowIndex, start: usize) -> bool {
+        self.count > 0
+            && self.count < Self::MAX
+            && self.y == y
+            && self.x + self.cells == x
+            && self.end == start
+    }
+
+    fn push(&mut self, x: usize, y: VisibleRowIndex, start: usize, end: usize, width: usize) {
+        if self.count == 0 {
+            self.x = x;
+            self.y = y;
+            self.start = start;
+            self.cells = 0;
+            self.max_len = 0;
+            self.num_wide = 0;
+        }
+        if width > 1 {
+            self.wide[self.num_wide] = self.cells as u16;
+            self.num_wide += 1;
+        }
+        self.max_len = self.max_len.max(end - start);
+        self.cells += width;
+        self.end = end;
+        self.count += 1;
+        self.last_width = width as u8;
+    }
+}
+
 #[cfg(all(test, feature = "use_serde"))]
 mod ascii_tests {
     use super::*;
@@ -1341,6 +1494,87 @@ mod ascii_tests {
                                 "rows={rows}, cols={cols}, setup={setup:?}, normalize={normalize}, custom_widths={custom_widths}, conpty={conpty}, chunk_size={chunk_size}");
                             assert_eq!(direct.snapshot(), expected.snapshot(),
                                 "direct: rows={rows}, cols={cols}, setup={setup:?}, normalize={normalize}, custom_widths={custom_widths}, conpty={conpty}, chunk_size={chunk_size}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grapheme_runs_match_one_grapheme_at_a_time() {
+        let long = format!("{}e\u{301}{}", "界".repeat(45), "字".repeat(40));
+        // Graphemes longer than a new row's text capacity: runs holding
+        // them are refused and written one at a time.
+        let marked = format!("ab界e{}界x{}y", "\u{301}".repeat(45), "\u{301}".repeat(150));
+        let texts = [
+            "中文，全角！ＡＢＣ测试".to_string(),
+            "ab界e\u{301}x\u{200b}y\u{2028}z\u{3000} 🙂👍🏽 1\u{fe0f}\u{20e3}é".to_string(),
+            long,
+            marked,
+        ];
+        for (rows, cols) in [(1, 1), (1, 2), (3, 7), (4, 23)] {
+            for setup in [
+                "",
+                "a界",
+                "\x1b[?7l",
+                "\x1b[4h",
+                "\x1b(0",
+                "\x1b)0\x0e",
+                "\x1b[?1049h",
+                "\x1b[44m",
+                "\x1b[2;3r\x1b[3;6H",
+                "\x1b[?69h\x1b[2;6s\x1b[3;7H",
+                "\x1b]8;;https://example.com\x1b\\",
+                "\x1b[3G",
+                "\x1b[1;2H界界",
+            ] {
+                for custom_widths in [false, true] {
+                    for text in &texts {
+                        for chunk_size in [1, 5, 4096] {
+                            let make = || {
+                                TerminalState::new(
+                                    TerminalSize {
+                                        rows,
+                                        cols,
+                                        pixel_width: cols * 8,
+                                        pixel_height: rows * 16,
+                                        dpi: 96,
+                                    },
+                                    Arc::new(TestConfig {
+                                        normalize: false,
+                                        custom_widths,
+                                    }),
+                                    "test",
+                                    "test",
+                                    Box::new(Vec::new()),
+                                )
+                            };
+                            let mut runs = make();
+                            let mut single = make();
+                            let mut parser = Parser::new();
+                            let input = format!("{setup}{text}\r\n{text}\x1b[A\x1b[3G{text}end");
+                            for chunk in input.as_bytes().chunks(chunk_size) {
+                                let mut actions = Vec::new();
+                                parser.parse_with_borrowed_text(chunk, |action| {
+                                    action.append_to(&mut actions)
+                                });
+                                runs.increment_seqno();
+                                single.increment_seqno();
+                                let mut batched = Performer::new(&mut runs);
+                                let mut scalar = Performer::new(&mut single);
+                                scalar.disable_grapheme_runs = true;
+                                for action in actions {
+                                    batched.perform(action.clone());
+                                    scalar.perform(action);
+                                }
+                                drop(batched);
+                                drop(scalar);
+                                assert_eq!(runs.snapshot(), single.snapshot(),
+                                    "rows={rows}, cols={cols}, setup={setup:?}, custom_widths={custom_widths}, text={text:?}, chunk_size={chunk_size}");
+                                assert_eq!(runs.screen().all_lines(), single.screen().all_lines(),
+                                    "rows={rows}, cols={cols}, setup={setup:?}, custom_widths={custom_widths}, text={text:?}, chunk_size={chunk_size}");
+                            }
                         }
                     }
                 }
