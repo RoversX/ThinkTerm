@@ -1475,6 +1475,47 @@ fn styled_alt_screen_scrolling_matches_retained_primary_rows() {
 }
 
 #[test]
+fn perform_actions_in_place_matches_owned_batches() {
+    use wezterm_escape_parser::parser::Parser;
+    let input = format!(
+        "plain ascii\r\n\x1b[1;31mred\x1b[0m wide 中文 e\u{301}\r\n{}\x1b[2;4r\x1b[4H\n\n\n\x1b[r\
+         \x1b]0;title\x07\x1b[38:5:24;48:2:125:136:147mx\x1b[100b\x1b[m\x1b[10A\x1b[3E\x1b[2Kend",
+        "a line long enough to wrap in a narrow terminal ".repeat(3)
+    );
+    for chunk_size in [1, 3, 7, 64, 4096] {
+        let mut owned = TestTerm::new(5, 20, 10);
+        let mut in_place = TestTerm::new(5, 20, 10);
+        let mut owned_parser = Parser::new();
+        let mut in_place_parser = Parser::new();
+        // One vector for every batch, as the mux parser thread keeps it.
+        let mut reused = Vec::new();
+        for chunk in input.as_bytes().chunks(chunk_size) {
+            owned.perform_actions(owned_parser.parse_as_vec(chunk));
+            in_place_parser.parse(chunk, |action| reused.push(action));
+            in_place.perform_actions_in_place(&mut reused);
+            assert!(reused.is_empty(), "every action is applied and removed");
+            // Line equality covers cells, attributes, bits and seqnos.
+            assert_eq!(
+                in_place.screen().all_lines(),
+                owned.screen().all_lines(),
+                "chunk_size={chunk_size}"
+            );
+            assert_eq!(in_place.cursor_pos(), owned.cursor_pos());
+            assert_eq!(in_place.current_seqno(), owned.current_seqno());
+            assert_eq!(in_place.get_title(), owned.get_title());
+            assert_eq!(
+                in_place.is_alt_screen_active(),
+                owned.is_alt_screen_active()
+            );
+        }
+        assert!(
+            reused.capacity() > 0,
+            "the allocation stays for the next batch"
+        );
+    }
+}
+
+#[test]
 fn test_hyperlinks() {
     let mut term = TestTerm::new(3, 5, 0);
     let link = Arc::new(Hyperlink::new("http://example.com"));

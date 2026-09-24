@@ -352,6 +352,18 @@ pub trait Pane: Downcast + Send + Sync {
     }
     fn mouse_event(&self, event: MouseEvent) -> anyhow::Result<()>;
     fn perform_actions(&self, _actions: Vec<termwiz::escape::Action>) {}
+    /// Apply every action in `actions` exactly like `perform_actions`,
+    /// leaving the vector empty. This default hands the allocation on with
+    /// the actions; implementations that keep it for reuse override it.
+    /// `may_hold_external_kitty` is false when the caller knows that no
+    /// action carries an external Kitty payload, so it need not be scanned.
+    fn perform_actions_in_place(
+        &self,
+        actions: &mut Vec<termwiz::escape::Action>,
+        _may_hold_external_kitty: bool,
+    ) {
+        self.perform_actions(std::mem::take(actions));
+    }
     fn is_dead(&self) -> bool;
     fn kill(&self) {}
 

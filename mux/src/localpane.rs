@@ -666,18 +666,26 @@ impl Pane for LocalPane {
     }
 
     fn perform_actions(&self, mut actions: Vec<termwiz::escape::Action>) {
-        if crate::has_external_kitty_image_data_source(&actions) {
+        self.perform_actions_in_place(&mut actions, true);
+    }
+
+    fn perform_actions_in_place(
+        &self,
+        actions: &mut Vec<termwiz::escape::Action>,
+        may_hold_external_kitty: bool,
+    ) {
+        if may_hold_external_kitty && crate::has_external_kitty_image_data_source(actions) {
             let kitty_graphics_enabled =
                 { self.terminal.lock().get_config().enable_kitty_graphics() };
             if kitty_graphics_enabled {
-                crate::materialize_kitty_image_data_sources(&mut actions);
+                crate::materialize_kitty_image_data_sources(actions);
             }
         }
         let mut term = self.terminal.lock();
         self.apply_pending_config(&mut term);
         self.apply_pending_resize(&mut term);
         self.apply_pending_focus(&mut term);
-        term.perform_actions(actions);
+        term.perform_actions_in_place(actions);
         self.apply_pending_and_store(&mut term);
         drop(term);
         // A resize that arrived after that last look, while the terminal

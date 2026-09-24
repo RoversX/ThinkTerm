@@ -177,11 +177,17 @@ impl Terminal {
         self.trigger_unseen_output_notif();
     }
 
-    pub fn perform_actions(&mut self, actions: Vec<wezterm_escape_parser::Action>) {
+    pub fn perform_actions(&mut self, mut actions: Vec<wezterm_escape_parser::Action>) {
+        self.perform_actions_in_place(&mut actions);
+    }
+
+    /// `perform_actions`, leaving `actions` empty with its allocation kept so
+    /// a caller that applies batch after batch does not regrow it each time.
+    pub fn perform_actions_in_place(&mut self, actions: &mut Vec<wezterm_escape_parser::Action>) {
         self.state.increment_seqno();
         {
             let mut performer = Performer::new(&mut self.state);
-            for action in actions {
+            for action in actions.drain(..) {
                 performer.perform(action);
             }
         }

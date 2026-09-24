@@ -573,11 +573,17 @@ pub(crate) fn materialize_kitty_image_data_sources(actions: &mut [Action]) {
     }
 }
 
-pub(crate) fn has_external_kitty_image_data_source(actions: &[Action]) -> bool {
-    actions.iter().any(|action| match action {
+/// Whether `action` carries a Kitty payload still to be read from a file or
+/// shared memory (see `materialize_kitty_image_data_sources`).
+pub(crate) fn is_external_kitty_image_data_source(action: &Action) -> bool {
+    match action {
         Action::KittyImage(image) => image.has_external_data_source(),
         _ => false,
-    })
+    }
+}
+
+pub(crate) fn has_external_kitty_image_data_source(actions: &[Action]) -> bool {
+    actions.iter().any(is_external_kitty_image_data_source)
 }
 
 /// A pane whose parser holds the terminal for a long time, on request:
@@ -611,24 +617,38 @@ fn wedge_for_the_test(pane: &Arc<dyn Pane>) {
 }
 
 /// This function applies parsed actions to the pane and notifies any
-/// mux subscribers about the output event
-fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut actions: Vec<Action>) {
+/// mux subscribers about the output event. `actions` is left empty with its
+/// allocation kept for the next batch. `external_kitty` says whether any of
+/// the actions carries an external Kitty payload; the parser tracks that as
+/// it appends, so a batch without one is not scanned here or by the pane.
+fn send_actions_to_mux(
+    pane: &Weak<dyn Pane>,
+    dead: &Arc<AtomicBool>,
+    actions: &mut Vec<Action>,
+    external_kitty: bool,
+) {
     let start = Instant::now();
+    debug_assert_eq!(
+        external_kitty,
+        has_external_kitty_image_data_source(actions)
+    );
     // External kitty payloads (a path or shm name) are read here, on the
     // parser thread and per flush, so the terminal lock never covers disk
     // IO and a backlog is trimmed to its newest frames before any of it is
     // read. Reading at parse time instead held every frame of the backlog.
-    if configuration().enable_kitty_graphics && has_external_kitty_image_data_source(&actions) {
-        materialize_kitty_image_data_sources(&mut actions);
+    if external_kitty && configuration().enable_kitty_graphics {
+        materialize_kitty_image_data_sources(actions);
     }
     match pane.upgrade() {
         Some(pane) => {
             wedge_for_the_test(&pane);
-            pane.perform_actions(actions);
+            pane.perform_actions_in_place(actions, external_kitty);
+            debug_assert!(actions.is_empty());
             histogram!("send_actions_to_mux.perform_actions.latency").record(start.elapsed());
             Mux::notify_from_any_thread(MuxNotification::PaneOutput(pane.pane_id()));
         }
         None => {
+            actions.clear();
             // Something else removed the pane from
             // the mux, so signal that we should stop
             // trying to process it in read_from_pane_pty.
@@ -636,6 +656,25 @@ fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut action
         }
     }
     histogram!("send_actions_to_mux.rate").record(1.);
+}
+
+/// Whether the parser should give its batch allocation back before waiting
+/// for more output. It is kept while output keeps arriving, so a busy pane
+/// does not regrow it for every batch; it is released once nothing is left
+/// to read, and whenever a batch grew past one action per byte of a full
+/// read, which only held synchronized output can reach.
+fn release_action_buffer(actions: &Vec<Action>, read_capacity: usize, more_to_read: bool) -> bool {
+    actions.capacity() > 0 && (!more_to_read || actions.capacity() > read_capacity)
+}
+
+/// Whether `fd` has data to read right now, without waiting for any.
+fn readable_now(fd: &FileDescriptor) -> bool {
+    let mut pfd = [pollfd {
+        fd: fd.as_socket_descriptor(),
+        events: POLLIN,
+        revents: 0,
+    }];
+    matches!(poll(&mut pfd, Some(Duration::ZERO)), Ok(1))
 }
 
 fn parse_buffered_data(
@@ -656,8 +695,15 @@ fn parse_buffered_data(
     let mut action_size = 0;
     let mut delay = Duration::from_millis(configuration().mux_output_parser_coalesce_delay_ms);
     let mut deadline = None;
+    let mut external_kitty = false;
 
     loop {
+        if actions.is_empty() && actions.capacity() > 0 {
+            let more_to_read = readable_now(&rx);
+            if release_action_buffer(&actions, buf.len(), more_to_read) {
+                actions = Vec::new();
+            }
+        }
         match rx.read(&mut buf) {
             Ok(size) if size == 0 => {
                 dead.store(true, Ordering::Relaxed);
@@ -687,7 +733,8 @@ fn parse_buffered_data(
 
                             // Flush prior actions
                             if !actions.is_empty() {
-                                send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
+                                send_actions_to_mux(&pane, &dead, &mut actions, external_kitty);
+                                external_kitty = false;
                                 action_size = 0;
                             }
                         }
@@ -703,10 +750,12 @@ fn parse_buffered_data(
                         }
                         _ => {}
                     };
+                    external_kitty |= is_external_kitty_image_data_source(&action);
                     action.append_to(&mut actions);
 
                     if flush && !actions.is_empty() {
-                        send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
+                        send_actions_to_mux(&pane, &dead, &mut actions, external_kitty);
+                        external_kitty = false;
                         action_size = 0;
                     }
                 });
@@ -746,7 +795,8 @@ fn parse_buffered_data(
                     }
 
                     let flush_started = Instant::now();
-                    send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
+                    send_actions_to_mux(&pane, &dead, &mut actions, external_kitty);
+                    external_kitty = false;
                     heartbeat.add(flush_started.elapsed(), 0);
                     deadline = None;
                     action_size = 0;
@@ -776,7 +826,7 @@ fn parse_buffered_data(
     // for very short lived commands so that we don't forget to
     // display what they displayed.
     if !actions.is_empty() {
-        send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
+        send_actions_to_mux(&pane, &dead, &mut actions, external_kitty);
     }
     if let Some(control) = &control {
         control.pending_bytes.fetch_sub(unapplied, Ordering::SeqCst);
@@ -3797,6 +3847,26 @@ mod tests {
         let mut state = PaneOutputGenerationState::default();
         state.generations.insert(9, u64::MAX);
         assert_eq!(state.note_output(9), 1);
+    }
+
+    #[test]
+    fn action_buffer_is_kept_only_while_output_is_waiting() {
+        let empty: Vec<Action> = Vec::new();
+        assert!(
+            !release_action_buffer(&empty, 128, false),
+            "nothing to release"
+        );
+        let mut kept: Vec<Action> = Vec::with_capacity(64);
+        assert!(
+            !release_action_buffer(&kept, 128, true),
+            "busy: kept for the next batch"
+        );
+        assert!(release_action_buffer(&kept, 128, false), "idle: given back");
+        kept.reserve(256);
+        assert!(
+            release_action_buffer(&kept, 128, true),
+            "grew past one action per byte of a full read: given back"
+        );
     }
 
     #[test]
