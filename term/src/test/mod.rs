@@ -1451,6 +1451,66 @@ fn region_scrolls_mark_the_region_wherever_the_row_ring_wraps() {
 }
 
 #[test]
+fn skipped_region_marks_match_marking_every_scroll() {
+    use crate::screen::ALWAYS_MARK_REGIONS;
+    // Region scrolls in one batch skip rows that an earlier scroll of the
+    // same region marked. Interleave everything else that moves, replaces
+    // or adds rows, in batches of every size, and compare with marking on
+    // every scroll.
+    let lf = |n: usize| "x\r\n".repeat(n);
+    let steps = [
+        format!("\x1b[2;4r\x1b[4;1H{}", lf(9)),
+        format!("\x1b[4;1H{}\x1b[2;1H\x1bM\x1bM{}", lf(3), lf(3)),
+        format!("\x1b[3;1H\x1b[2L{}\x1b[3;1H\x1b[M{}", lf(4), lf(4)),
+        format!("\x1b[2S{}\x1b[T{}", lf(2), lf(2)),
+        format!("\x1b[r\x1b[6;1H{}\x1b[2;4r\x1b[4;1H{}", lf(12), lf(5)),
+        format!("\x1b[?1049h\x1b[1;3r\x1b[3;1H{}\x1b[?1049l{}", lf(6), lf(6)),
+        format!("\x1b[3J\x1b[2;5r\x1b[5;1H{}\x1b#8{}", lf(7), lf(7)),
+        format!("\x1b[1;6r\x1b[6;1H{}\x1b[2;4r\x1b[4;1H{}", lf(5), lf(5)),
+        format!(
+            "\x1b[2;4r\x1b[4;1H\x1bD\x1bD\x1bE{}\x1b[4;1H\x1b[2J{}",
+            lf(2),
+            lf(3)
+        ),
+    ];
+    let input: String = steps.concat();
+    for chunk in [1usize, 5, 17, 64, 100_000] {
+        let mut skipping = TestTerm::new(6, 4, 3);
+        let mut marking = TestTerm::new(6, 4, 3);
+        for (i, piece) in input.as_bytes().chunks(chunk).enumerate() {
+            if i % 7 == 3 {
+                // A resize between batches moves every row.
+                let rows = 5 + i % 3;
+                for term in [&mut skipping, &mut marking] {
+                    term.resize(TerminalSize {
+                        rows,
+                        cols: 4,
+                        pixel_width: 32,
+                        pixel_height: rows * 16,
+                        dpi: 0,
+                    });
+                }
+            }
+            ALWAYS_MARK_REGIONS.with(|always| always.set(false));
+            skipping.print(piece);
+            ALWAYS_MARK_REGIONS.with(|always| always.set(true));
+            marking.print(piece);
+            ALWAYS_MARK_REGIONS.with(|always| always.set(false));
+            assert_eq!(
+                skipping.screen().all_lines(),
+                marking.screen().all_lines(),
+                "chunk={chunk}, batch={i}"
+            );
+            assert_eq!(
+                skipping.cursor_pos(),
+                marking.cursor_pos(),
+                "chunk={chunk}, batch={i}"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_region_scrollback_limit() {
     // Ensure scrollback is truncated properly, when it reaches the line limit
     let mut term = TestTerm::new(4, 1, 2);

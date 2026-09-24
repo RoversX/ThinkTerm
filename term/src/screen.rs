@@ -48,6 +48,19 @@ pub struct Screen {
     pub dpi: u32,
 
     pub(crate) saved_cursor: Option<SavedCursor>,
+
+    /// Physical rows that the last region scroll left with every line's
+    /// sequence number at least the one given, with no line moved into or
+    /// replaced within them since. A further scroll of that region in the
+    /// same batch then has no row left to mark. Every other change to the
+    /// arrangement of `lines` clears it.
+    region_marked: Option<(Range<PhysRowIndex>, SequenceNo)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Lets tests compare against marking every row on every scroll.
+    pub(crate) static ALWAYS_MARK_REGIONS: std::cell::Cell<bool> = std::cell::Cell::new(false);
 }
 
 /// How much of the scrollback allowance to pre-reserve at creation. Enough
@@ -97,6 +110,7 @@ impl Screen {
             dpi: size.dpi,
             keyboard_stack: vec![],
             saved_cursor: None,
+            region_marked: None,
         }
     }
 
@@ -143,6 +157,8 @@ impl Screen {
     pub(crate) fn replace_lines(&mut self, lines: VecDeque<Line>, stable_row_index_offset: usize) {
         debug_assert!(lines.len() >= self.physical_rows);
         debug_assert!(lines.len() <= self.line_capacity());
+        // Restored lines keep the sequence numbers they were saved with.
+        self.region_marked = None;
         self.lines = lines;
         self.stable_row_index_offset = stable_row_index_offset;
     }
@@ -247,6 +263,7 @@ impl Screen {
         seqno: SequenceNo,
         is_conpty: bool,
     ) -> CursorPosition {
+        self.region_marked = None;
         let physical_rows = size.rows.max(1);
         let physical_cols = size.cols.max(1);
 
@@ -767,10 +784,22 @@ impl Screen {
         // of the screen based scrolling, the StableRowIndex does not change,
         // so we use the scroll region bounds to gate the invalidation.
         if !scrollback_ok {
-            // Walk the deque's slices: indexing each row re-derives its slot
-            // from the deque header, which dominated region scrolling.
-            for line in self.lines.range_mut(phys_scroll.clone()) {
-                line.update_last_change_seqno(seqno);
+            let marked = self.region_marked.as_ref() == Some(&(phys_scroll.clone(), seqno));
+            #[cfg(test)]
+            let marked = marked && !ALWAYS_MARK_REGIONS.with(|always| always.get());
+            if marked {
+                // An earlier scroll of this region in this batch marked
+                // every row, and rows have only moved within it since.
+                debug_assert!(self
+                    .lines
+                    .range(phys_scroll.clone())
+                    .all(|line| line.current_seqno() >= seqno));
+            } else {
+                // Walk the deque's slices: indexing each row re-derives its
+                // slot from the deque header, which dominated region scrolling.
+                for line in self.lines.range_mut(phys_scroll.clone()) {
+                    line.update_last_change_seqno(seqno);
+                }
             }
         }
 
@@ -872,9 +901,19 @@ impl Screen {
                 line.update_last_change_seqno(seqno);
             }
         }
+
+        // Without history, the rows only rotated within the region: the one
+        // leaving it came back as the new bottom row, stamped with `seqno`.
+        // Moving rows into history shifts them unmarked, so forget any mark.
+        self.region_marked = if scrollback_ok {
+            None
+        } else {
+            Some((phys_scroll, seqno))
+        };
     }
 
     pub fn erase_scrollback(&mut self) {
+        self.region_marked = None;
         let len = self.lines.len();
         let to_clear = len - self.physical_rows;
         for _ in 0..to_clear {
@@ -906,6 +945,7 @@ impl Screen {
         bidi_mode: BidiMode,
     ) {
         debug!("scroll_down {:?} {}", scroll_region, num_rows);
+        self.region_marked = None;
         let phys_scroll = self.phys_range(scroll_region);
         let num_rows = num_rows.min(phys_scroll.end - phys_scroll.start);
 
