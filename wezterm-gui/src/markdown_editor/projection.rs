@@ -446,6 +446,11 @@ impl MarkdownProjection {
                     });
                 }
                 Event::Code(text) => {
+                    if let Some(table) = table.as_mut() {
+                        if table.current_cell_range.is_some() {
+                            table.current_cell_text.push_str(&text);
+                        }
+                    }
                     projection.syntax.push(MarkdownSyntaxNode {
                         kind: MarkdownSyntaxKind::InlineCode,
                         source: range.clone(),
@@ -1914,6 +1919,24 @@ mod tests {
 #[cfg(test)]
 mod embed_budget_tests {
     use super::*;
+
+    #[test]
+    fn table_cells_keep_inline_code_text() {
+        let source = "| Mods | Key |\n| - | - |\n| `CTRL` | a `b` c |\n";
+        let projection = MarkdownProjection::parse(source);
+        let table = projection
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                ProjectedObject::Table(table) => Some(table),
+                _ => None,
+            })
+            .expect("a table");
+        let body = &table.rows[1];
+        assert_eq!(body[0].text, "CTRL");
+        assert_eq!(&source[body[0].source.clone()], "CTRL");
+        assert_eq!(body[1].text, "a b c");
+    }
     #[test]
     fn repeated_empty_children_and_multiple_roots_share_a_budget() {
         let dir = tempfile::tempdir().unwrap();
