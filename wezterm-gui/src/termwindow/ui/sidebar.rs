@@ -300,12 +300,6 @@ impl crate::TermWindow {
 
     fn workspace_sidebar_rect_for_width(&self, width: usize) -> Option<WorkspaceSidebarRect> {
         let border = self.get_os_border();
-        let bottom_tab_bar_height = if self.config.tab_bar_at_bottom && self.show_tab_bar {
-            self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize
-        } else {
-            0
-        };
-
         let x = border.left.get() as usize;
         let y = border.top.get() as usize;
         let width = width.min(
@@ -316,7 +310,7 @@ impl crate::TermWindow {
         let height = self
             .dimensions
             .pixel_height
-            .saturating_sub(y + border.bottom.get() as usize + bottom_tab_bar_height);
+            .saturating_sub(y + border.bottom.get() as usize);
 
         if width == 0 || height == 0 {
             return None;
@@ -335,11 +329,7 @@ impl crate::TermWindow {
     /// the panel does not.
     pub(crate) fn workspace_sidebar_hover_hot_zone(&self) -> Option<(usize, usize, usize, usize)> {
         let rect = self.workspace_sidebar_rect_for_width(self.workspace_sidebar_docked_width())?;
-        let top_tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize
-        } else {
-            0
-        };
+        let top_tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize;
         crate::termwindow::sidebar_hover::hot_zone(
             rect.x,
             rect.y,
@@ -1214,13 +1204,7 @@ impl crate::TermWindow {
                     self.window_state,
                 )
         };
-        let top_fancy_row =
-            if self.show_tab_bar && self.config.use_fancy_tab_bar && !self.config.tab_bar_at_bottom
-            {
-                self.tab_bar_pixel_height().ok().map(|h| h.ceil() as usize)
-            } else {
-                None
-            };
+        let top_fancy_row = self.tab_bar_pixel_height().ok().map(|h| h.ceil() as usize);
         let sidebar_toggle_y = if sidebar_toolbar_uses_fullscreen_style {
             header_y + self.ui_px(WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET)
         } else if let Some(row_h) = top_fancy_row {

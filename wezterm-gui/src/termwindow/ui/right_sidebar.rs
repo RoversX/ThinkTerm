@@ -1725,11 +1725,7 @@ impl crate::TermWindow {
     /// the pointer is on its way to the tabs or the sidebar button.
     pub(crate) fn right_sidebar_hover_hot_zone(&self) -> Option<(usize, usize, usize, usize)> {
         let rect = self.right_sidebar_rect_for_width(self.right_sidebar_docked_width())?;
-        let top_tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize
-        } else {
-            0
-        };
+        let top_tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize;
         let width = self.ui_px(crate::termwindow::ui::tokens::SIDEBAR_HOVER_HOT_ZONE_WIDTH);
         let right_edge = rect.x.saturating_add(rect.width);
         crate::termwindow::sidebar_hover::hot_zone(
@@ -6325,11 +6321,7 @@ impl crate::TermWindow {
         // Off macOS the panel has no toggle of its own and the tab bar keeps
         // the window buttons at its right end; a hover-revealed panel stays
         // below the tab bar so both remain reachable.
-        if !cfg!(target_os = "macos")
-            && self.right_sidebar_collapsed
-            && self.show_tab_bar
-            && !self.config.tab_bar_at_bottom
-        {
+        if !cfg!(target_os = "macos") && self.right_sidebar_collapsed {
             let tab_bar = self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize;
             let top = tab_bar.max(rect.y);
             rect.height = rect.height.saturating_sub(top - rect.y);
@@ -6343,11 +6335,6 @@ impl crate::TermWindow {
 
     fn right_sidebar_rect_for_width(&self, width: usize) -> Option<RightSidebarRect> {
         let border = self.get_os_border();
-        let bottom_tab_bar_height = if self.config.tab_bar_at_bottom && self.show_tab_bar {
-            self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize
-        } else {
-            0
-        };
         let width = width.min(
             self.dimensions
                 .pixel_width
@@ -6357,7 +6344,7 @@ impl crate::TermWindow {
         let height = self
             .dimensions
             .pixel_height
-            .saturating_sub(y + border.bottom.get() as usize + bottom_tab_bar_height);
+            .saturating_sub(y + border.bottom.get() as usize);
         if width == 0 || height == 0 {
             return None;
         }
@@ -15298,21 +15285,16 @@ impl crate::TermWindow {
         };
         let viewport_bottom = strip_top.saturating_sub(bottom_reserve);
         // How far a row may hang below the list: into the mask band while a
-        // transfer strip is showing; otherwise as far as it likes -- unless
-        // a bottom tab bar sits under the panel, whose layer-0 background
-        // cannot cover these layer-2 glyphs, so the panel bottom must bound
-        // them instead.
+        // transfer strip is showing; otherwise as far as it likes.
         let row_overflow_bottom = if strip_rows > 0 {
             strip_top
-        } else if self.show_tab_bar && self.config.tab_bar_at_bottom {
-            content_bottom
         } else {
             usize::MAX
         };
         // Whether anything below the list needs protecting from overflow.
         // Decides both the bottom mask and how far row chrome may extend:
         // unprotected, rows run to the window edge and are cut there.
-        let masked_below = strip_rows > 0 || (self.show_tab_bar && self.config.tab_bar_at_bottom);
+        let masked_below = strip_rows > 0;
         let row_clip_bottom = if masked_below {
             viewport_bottom
         } else {
@@ -17212,22 +17194,11 @@ impl crate::TermWindow {
         let list_top_f = list_top as f32;
         let viewport_bottom = content_bottom.saturating_sub(bottom_reserve);
         let viewport_bottom_f = viewport_bottom as f32;
-        // Downward overflow past the panel is cut by the window edge --
-        // except with a bottom tab bar, whose background lives on layer 0
-        // under these layer-2 glyphs; then the panel bottom must bound it.
-        let masked_below = self.show_tab_bar && self.config.tab_bar_at_bottom;
-        let overflow_bottom = if masked_below {
-            content_bottom
-        } else {
-            usize::MAX
-        };
-        // Unmasked, cards run to the window edge and are cut there; their
-        // chrome must be allowed as far, or text outruns its card.
-        let card_clip_bottom = if masked_below {
-            viewport_bottom
-        } else {
-            content_bottom
-        };
+        // Downward overflow past the panel is cut by the window edge, so
+        // cards run to it; their chrome must be allowed as far, or text
+        // outruns its card.
+        let overflow_bottom = usize::MAX;
+        let card_clip_bottom = content_bottom;
         for (idx, snippet) in snippets.into_iter().enumerate() {
             let row_top = list_top_f + (idx * row_height) as f32 - scroll_offset;
             let row_bottom = row_top + self.ui_px(SNIPPET_CARD_HEIGHT) as f32;
@@ -17256,18 +17227,6 @@ impl crate::TermWindow {
             )?;
         }
 
-        // Only a bottom tab bar needs protecting from card overflow; with
-        // the window edge below, cards run to it and are cut there.
-        if max_scroll > 0.0 && masked_below {
-            self.paint_right_sidebar_file_mask(
-                layers,
-                chrome,
-                content_x,
-                viewport_bottom,
-                content_width,
-                bottom_reserve,
-            )?;
-        }
         // Erase the overflow the cards were allowed to paint above the list,
         // then put the toolbar back on top of that mask.
         if max_scroll > 0.0 && scroll_offset > 0.0 {

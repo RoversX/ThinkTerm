@@ -247,26 +247,12 @@ impl TermWindow {
         let metrics = right_sidebar_file_row_metrics(ui_metrics);
         // The panel's bottom padding, which doubles as the mask that keeps
         // rows out of it. Whatever overshoots it runs past the panel, where
-        // the window edge cuts it -- unless a tab bar sits at the bottom:
-        // its background is painted on layer 0 while these glyphs are on
-        // layer 2, and layer index beats paint order, so overflow would land
-        // *on top of* the bar. In that configuration the panel bottom
-        // (already the tab bar's top edge, see right_sidebar_rect) must
-        // bound the rows instead.
+        // the window edge cuts it: the panel runs the full window height.
         let viewport_bottom = content_bottom.saturating_sub(inset * 2);
-        let masked_below = self.show_tab_bar && self.config.tab_bar_at_bottom;
-        let overflow_bottom = if masked_below {
-            content_bottom
-        } else {
-            usize::MAX
-        };
-        // Unmasked, rows run to the window edge and are cut there; their
-        // hover chrome must reach as far, or glyphs outrun their tint.
-        let row_clip_bottom = if masked_below {
-            viewport_bottom
-        } else {
-            content_bottom
-        };
+        let overflow_bottom = usize::MAX;
+        // Rows run to the window edge and are cut there; their hover chrome
+        // must reach as far, or glyphs outrun their tint.
+        let row_clip_bottom = content_bottom;
         // An element is painted while it straddles an edge, because something
         // cuts it: the header mask above, the window edge below. That is the
         // whole difference between this and withholding it until it fits,
@@ -460,18 +446,6 @@ impl TermWindow {
         }
 
         let scrolled = max_scroll > 0.0 && scroll > 0.0;
-        // Only a bottom tab bar needs protecting from row overflow; with
-        // the window edge below, rows run to it and are cut there.
-        if max_scroll > 0.0 && masked_below {
-            self.paint_right_sidebar_file_mask(
-                layers,
-                chrome,
-                content_x,
-                viewport_bottom,
-                content_width,
-                content_bottom.saturating_sub(viewport_bottom),
-            )?;
-        }
         // Above the list sits the toolbar strip and nothing paints over it
         // afterwards: repaint it opaque, put the toolbar back on top, then
         // soften the cut.
