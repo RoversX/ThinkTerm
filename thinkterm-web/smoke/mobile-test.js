@@ -90,8 +90,9 @@ const BAR = 52;
   if (Math.abs(box.width - box.inner) > 1) fail("the canvas is " + box.width + " wide, not the window's " + box.inner);
   out.keybar = "ok";
 
-  // --- (b) a tap in the terminal: the wasm's own press takes it over, and
-  // the page asks for the soft keyboard.
+  // --- (b) a tap in the terminal: the wasm's own press takes it over, but a
+  // tap is only a tap -- the soft keyboard comes from the key bar's keyboard
+  // button, since it costs the lower half of a phone's screen.
   const l = await until("a laid-out tab", async () => { const v = await layout(); return v.panes && v.panes.length === 1 ? v : null; });
   const pane = l.panes[0].id;
   // The grid starts a cell in from the left and half a cell down (App::pad);
@@ -103,8 +104,12 @@ const BAR = 52;
   await tap(point[0], point[1]);
   await sleep(500);
   if (!/this browser has/.test(await summary())) fail("the tap did not take the terminal over: " + (await summary()));
-  if (!(await ev("document.activeElement?.id === 'kbd'"))) fail("the tap did not ask for the soft keyboard: " + (await ev("document.activeElement?.id || document.activeElement?.tagName")));
+  if (await ev("document.activeElement?.id === 'kbd'")) fail("the tap asked for the soft keyboard");
   out.tap = "ok";
+  await tapOn('#keybar .k[data-key="kbd"]');
+  await sleep(200);
+  if (!(await ev("document.activeElement?.id === 'kbd'"))) fail("the keyboard button did not ask for the soft keyboard: " + (await ev("document.activeElement?.id || document.activeElement?.tagName")));
+  out.keyboard = "ok";
 
   // --- (c) a key from the bar reaches the pane.
   const before = lastLine(pane);
