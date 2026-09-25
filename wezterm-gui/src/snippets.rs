@@ -81,6 +81,11 @@ fn load_snippet_store() -> Result<SnippetStore> {
     load_snippet_store_from_path(&snippets_store_path())
 }
 
+/// Whether `path` reads as a snippet store, as an imported backup must.
+pub(crate) fn check_snippet_store(path: &Path) -> Result<()> {
+    load_snippet_store_from_path(path).map(drop)
+}
+
 fn load_snippet_store_from_path(path: &Path) -> Result<SnippetStore> {
     if !path.exists() {
         return Ok(SnippetStore::default());

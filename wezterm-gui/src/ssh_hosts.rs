@@ -84,6 +84,11 @@ fn load_ssh_host_store() -> Result<SshHostStore> {
     load_ssh_host_store_from_path(&ssh_hosts_store_path()?)
 }
 
+/// Whether `path` reads as a host catalog, as an imported backup must.
+pub(crate) fn check_ssh_host_store(path: &Path) -> Result<()> {
+    load_ssh_host_store_from_path(path).map(drop)
+}
+
 fn load_ssh_host_store_from_path(path: &Path) -> Result<SshHostStore> {
     if !path.exists() {
         return Ok(SshHostStore::default());

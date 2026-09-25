@@ -769,6 +769,19 @@ pub fn workspace_thread_store_path() -> PathBuf {
     crate::native_paths::data_file("workspace_threads.json")
 }
 
+/// The store as the app holds it now, which a save may not have reached yet.
+pub fn workspace_thread_store_snapshot() -> WorkspaceThreadStore {
+    THREAD_STORE.lock().clone()
+}
+
+/// Whether the store on disk could not be read at start, so the one in
+/// memory is an empty stand-in (see `STORE_IS_UNREADABLE`).
+pub fn workspace_thread_store_is_unreadable() -> bool {
+    // Reading the store is what sets the flag.
+    drop(THREAD_STORE.lock());
+    STORE_IS_UNREADABLE.load(Ordering::Acquire)
+}
+
 pub fn load_workspace_thread_store() -> Result<WorkspaceThreadStore> {
     load_workspace_thread_store_from_path(&workspace_thread_store_path())
 }

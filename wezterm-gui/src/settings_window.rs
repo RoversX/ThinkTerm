@@ -343,6 +343,7 @@ enum SettingsSection {
     Developer,
     UiKit,
     Memory,
+    Backup,
     Update,
     About,
 }
@@ -360,6 +361,7 @@ const BASE_SECTIONS: &[SettingsSection] = &[
     SettingsSection::CommandPalette,
     SettingsSection::Compatibility,
     SettingsSection::Developer,
+    SettingsSection::Backup,
     SettingsSection::Update,
     SettingsSection::About,
 ];
@@ -425,6 +427,7 @@ fn initial_section() -> SettingsSection {
         "developer" => SettingsSection::Developer,
         "uikit" => SettingsSection::UiKit,
         "memory" => SettingsSection::Memory,
+        "backup" => SettingsSection::Backup,
         "update" => SettingsSection::Update,
         "about" => SettingsSection::About,
         _ => SettingsSection::Appearance,
@@ -452,6 +455,7 @@ impl SettingsSection {
             Self::Developer => crate::i18n::tr("settings-section-developer"),
             Self::UiKit => "UI Kit".to_string(),
             Self::Memory => "Memory".to_string(),
+            Self::Backup => crate::i18n::tr("settings-section-backup"),
             Self::Update => crate::i18n::tr("settings-section-update"),
             Self::About => crate::i18n::tr("settings-section-about"),
         }
@@ -473,6 +477,7 @@ impl SettingsSection {
             Self::Developer => SettingsIcon::Developer,
             Self::UiKit => SettingsIcon::UiKit,
             Self::Memory => SettingsIcon::Memory,
+            Self::Backup => SettingsIcon::Backup,
             Self::Update => SettingsIcon::Update,
             Self::About => SettingsIcon::About,
         }
@@ -647,6 +652,15 @@ impl SettingsSection {
                 "Agents",
                 "Agent Panel",
                 "Right Sidebar",
+            ],
+            Self::Backup => &[
+                "Backup",
+                "Export",
+                "Import",
+                "Restore",
+                "Spaces",
+                "SSH Hosts",
+                "Snippets",
             ],
             Self::Update => &[
                 "Update",
@@ -898,6 +912,8 @@ enum SettingsAction {
     OpenThirdPartyNotices,
     OpenPrivacyPolicy,
     OpenDataFolder,
+    ExportBackup,
+    ImportBackup,
     CopyVersionInfo,
     ToggleThemeModeMenu,
     SetThemeMode(NativeThemeMode),
@@ -3251,6 +3267,91 @@ impl SettingsWindow {
         }
     }
 
+    /// Pick where to export a backup to, or which backup to import.
+    fn choose_backup_folder(&mut self, import: bool) {
+        self.ui.open_dropdown = None;
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let instance_id = self.instance_id;
+        let notify = window.clone();
+        let title = if import {
+            "settings-backup-import-picker-title"
+        } else {
+            "settings-backup-export-picker-title"
+        };
+        window.pick_folder_async_with_options(
+            FolderPickerOptions {
+                title: crate::i18n::tr(title),
+                prompt: crate::i18n::tr("common-choose"),
+                ..Default::default()
+            },
+            Box::new(move |path| {
+                let Some(path) = path else {
+                    return;
+                };
+                promise::spawn::spawn_into_main_thread(async move {
+                    if let Some(settings) = settings_window_for_instance(instance_id) {
+                        settings.borrow_mut().finish_backup(import, path);
+                        notify.invalidate();
+                    }
+                })
+                .detach();
+            }),
+        );
+    }
+
+    /// Export to, or stage an import from, the folder picked. The copies can
+    /// be slow on a network or synced folder, so they run off the UI thread
+    /// and report back through the status line.
+    fn finish_backup(&mut self, import: bool, path: PathBuf) {
+        self.status = crate::i18n::tr(if import {
+            "settings-status-backup-checking"
+        } else {
+            "settings-status-backup-exporting"
+        });
+        let instance_id = self.instance_id;
+        let window = self.window.clone();
+        promise::spawn::spawn(async move {
+            let done = promise::spawn::spawn_into_new_thread(move || {
+                Ok::<_, anyhow::Error>(if import {
+                    crate::state_backup::stage_import(&path).map(|()| None)
+                } else {
+                    crate::state_backup::export(&path).map(Some)
+                })
+            })
+            .await
+            .and_then(|done| done);
+            let status = match (import, done) {
+                (true, Ok(_)) => crate::i18n::tr("settings-status-backup-import-staged"),
+                (true, Err(err)) => settings_tr(
+                    "settings-status-backup-import-error",
+                    &[("error", format!("{err:#}"))],
+                ),
+                (false, Ok(folder)) => settings_tr(
+                    "settings-status-backup-exported",
+                    &[(
+                        "path",
+                        folder
+                            .map(|folder| folder.display().to_string())
+                            .unwrap_or_default(),
+                    )],
+                ),
+                (false, Err(err)) => settings_tr(
+                    "settings-status-backup-export-error",
+                    &[("error", format!("{err:#}"))],
+                ),
+            };
+            if let Some(settings) = settings_window_for_instance(instance_id) {
+                settings.borrow_mut().status = status;
+            }
+            if let Some(window) = window {
+                window.invalidate();
+            }
+        })
+        .detach();
+    }
+
     fn choose_remote_download_directory(&mut self) {
         self.ui.open_dropdown = None;
         let Some(window) = self.window.clone() else {
@@ -4720,6 +4821,8 @@ impl SettingsWindow {
                 self.ui.open_dropdown = None;
                 Self::open_path(config::DATA_DIR.clone());
             }
+            SettingsAction::ExportBackup => self.choose_backup_folder(false),
+            SettingsAction::ImportBackup => self.choose_backup_folder(true),
             SettingsAction::CopyVersionInfo => {
                 self.ui.open_dropdown = None;
                 window.set_clipboard(Clipboard::Clipboard, self.version_info_for_clipboard());
@@ -5722,6 +5825,7 @@ impl SettingsWindow {
             SettingsSection::UiKit => self.paint_ui_kit(layers, x, max_width)?,
             SettingsSection::Memory => self.paint_memory_diagnostics(layers, x, max_width)?,
             SettingsSection::Sidebar => self.paint_sidebar_settings(layers, x, max_width)?,
+            SettingsSection::Backup => self.paint_backup(layers, x, max_width)?,
             SettingsSection::Update => self.paint_update(layers, x, max_width)?,
             SettingsSection::About => self.paint_about(layers, x, max_width)?,
         }
@@ -8457,6 +8561,91 @@ impl SettingsWindow {
             palette.text,
             (x + width - value_x).max(80.0),
         )?;
+        Ok(())
+    }
+
+    fn paint_backup(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let body_font = Rc::clone(&self.body_font);
+        let scroll = self.ui.content_scroll.offset;
+        let row_step = self.settings_row_step();
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
+        let staged = crate::state_backup::import_staged();
+        let failed = crate::state_backup::last_import_error();
+        let row_count = 2 + usize::from(staged) + usize::from(failed.is_some());
+        let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
+        let card_height = self.settings_card_height(row_count);
+        self.ui.content_scroll.set_extents(
+            self.content_viewport_extent(),
+            self.settings_content_extent(card_y + scroll + card_height),
+        );
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            section_y,
+            &crate::i18n::tr("settings-backup-description"),
+            palette.secondary_text,
+            max_width,
+        )?;
+        let card_padding = self.ui_px(36.0);
+        let row_x = x + card_padding;
+        let row_width = max_width - card_padding * 2.0;
+        self.paint_group_card(layers, x, card_y, max_width, card_height)?;
+        self.paint_action_setting_row(
+            layers,
+            row_x,
+            first_row_y,
+            row_width,
+            &crate::i18n::tr("settings-backup-export"),
+            &crate::i18n::tr("settings-backup-export-description"),
+            &crate::i18n::tr("settings-backup-export-button"),
+            SettingsAction::ExportBackup,
+            false,
+        )?;
+        self.paint_action_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step,
+            row_width,
+            &crate::i18n::tr("settings-backup-import"),
+            &crate::i18n::tr("settings-backup-import-description"),
+            &crate::i18n::tr("settings-backup-import-button"),
+            SettingsAction::ImportBackup,
+            true,
+        )?;
+        let mut next_row_y = first_row_y + row_step * 2.0;
+        if staged {
+            self.paint_action_setting_row(
+                layers,
+                row_x,
+                next_row_y,
+                row_width,
+                &crate::i18n::tr("settings-backup-import-ready"),
+                &crate::i18n::tr("settings-backup-import-ready-description"),
+                &crate::i18n::tr("settings-backup-quit-button"),
+                SettingsAction::QuitApplication,
+                true,
+            )?;
+            next_row_y += row_step;
+        }
+        if let Some(error) = failed {
+            self.paint_setting_row(
+                layers,
+                row_x,
+                next_row_y,
+                row_width,
+                &crate::i18n::tr("settings-backup-import-failed"),
+                &error,
+                "",
+                true,
+            )?;
+        }
         Ok(())
     }
 

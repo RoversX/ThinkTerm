@@ -69,6 +69,7 @@ mod shell_catalog;
 mod snippets;
 mod spawn;
 mod ssh_hosts;
+mod state_backup;
 mod stats;
 mod tabbar;
 mod termwindow;
@@ -201,6 +202,7 @@ async fn async_run_ssh(opts: SshCommand) -> anyhow::Result<()> {
 }
 
 fn run_ssh(opts: SshCommand) -> anyhow::Result<()> {
+    crate::state_backup::enter_gui();
     if let Some(cls) = opts.class.as_ref() {
         crate::set_window_class(cls);
     }
@@ -254,6 +256,7 @@ async fn async_run_serial(opts: SerialCommand) -> anyhow::Result<()> {
 }
 
 fn run_serial(config: config::ConfigHandle, opts: SerialCommand) -> anyhow::Result<()> {
+    crate::state_backup::enter_gui();
     if let Some(cls) = opts.class.as_ref() {
         crate::set_window_class(cls);
     }
@@ -1345,6 +1348,8 @@ fn build_initial_mux(
 }
 
 fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> anyhow::Result<()> {
+    // Before anything reads the state: an import staged from Settings.
+    crate::state_backup::enter_gui();
     if let Some(cls) = opts.class.as_ref() {
         crate::set_window_class(cls);
     }
