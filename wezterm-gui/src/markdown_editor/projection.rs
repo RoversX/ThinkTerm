@@ -190,6 +190,9 @@ pub(crate) struct MarkdownProjection {
     pub objects: Vec<ProjectedObject>,
     pub blocks: Vec<ProjectionBlock>,
     pub syntax: Vec<MarkdownSyntaxNode>,
+    /// Where each soft line break's `\n` sits, ascending: a line ending
+    /// inside a paragraph that CommonMark renders as a space.
+    pub soft_breaks: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -253,6 +256,7 @@ impl MarkdownProjection {
         let mut table: Option<TableBuilder> = None;
 
         for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
+            let soft_break = matches!(event, Event::SoftBreak);
             match event {
                 Event::Start(tag) => {
                     if let Some(kind) = syntax_kind_for_tag(&tag) {
@@ -476,6 +480,13 @@ impl MarkdownProjection {
                     });
                 }
                 Event::SoftBreak | Event::HardBreak => {
+                    if soft_break {
+                        if let Some(newline) =
+                            source.get(range.clone()).and_then(|text| text.find('\n'))
+                        {
+                            projection.soft_breaks.push(range.start + newline);
+                        }
+                    }
                     projection.text.push(ProjectedText {
                         source: range,
                         text: "\n".to_string(),
@@ -596,12 +607,14 @@ impl MarkdownProjection {
         })
     }
 
-    pub(crate) fn resolve_vault_links(&mut self, vault_root: &Path, current_note: &str) {
-        if !self
-            .objects
+    pub(crate) fn has_wiki_links(&self) -> bool {
+        self.objects
             .iter()
             .any(|object| matches!(object, ProjectedObject::WikiLink { .. }))
-        {
+    }
+
+    pub(crate) fn resolve_vault_links(&mut self, vault_root: &Path, current_note: &str) {
+        if !self.has_wiki_links() {
             return;
         }
         let paths = match crate::markdown_editor::vault_file_paths(vault_root) {
@@ -611,6 +624,19 @@ impl MarkdownProjection {
                 return;
             }
         };
+        self.resolve_links_among(Some(vault_root), paths, current_note);
+    }
+
+    /// Resolve wiki links against `paths`, files relative to one root with
+    /// `/` separators, as `resolve_vault_links` does against every file of a
+    /// Notebook. Embeds are rendered from `vault_root`; without one (files
+    /// that are not on this machine) they stay unrendered.
+    pub(crate) fn resolve_links_among(
+        &mut self,
+        vault_root: Option<&Path>,
+        paths: Vec<String>,
+        current_note: &str,
+    ) {
         let index = VaultLinkIndex::new(paths);
         let mut embed_budget = EmbedBudget::default();
         let current_directory = Path::new(current_note)
@@ -634,7 +660,7 @@ impl MarkdownProjection {
             *ambiguous_paths = resolution.ambiguous_paths;
             rendered_lines.clear();
             *embed_truncation = None;
-            if *embed {
+            if let (true, Some(vault_root)) = (*embed, vault_root) {
                 if let Some(path) = resolved_path.as_deref() {
                     let mut visiting = HashSet::new();
                     let preview = render_embedded_note(

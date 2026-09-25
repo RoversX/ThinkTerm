@@ -126,6 +126,10 @@ pub(crate) struct NoteHostState {
     /// link had no cached resolution; a background parse round trip owes us
     /// the authoritative vault lookup.
     links_resolution_pending: bool,
+    /// A resolution was asked for while a parse was already running: that
+    /// parse cannot have used what prompted it, so its result must not clear
+    /// `links_resolution_pending`.
+    links_requested_during_parse: bool,
     /// Memoized `caret_reveal_start` for the current projection, keyed by
     /// (revision, caret). `active_syntax` is a linear scan over every syntax
     /// node and refresh runs once per paint; a pure scroll frame must not pay
@@ -207,6 +211,7 @@ impl Default for NoteHostState {
             parse_requested_revision: None,
             parse_in_flight_revision: None,
             links_resolution_pending: false,
+            links_requested_during_parse: false,
             reveal_key_cache: None,
             background_wrap_preferred: false,
             wrap_work_estimate: 0,
@@ -263,6 +268,7 @@ impl NoteHostState {
         self.parse_requested_revision = None;
         self.parse_in_flight_revision = None;
         self.links_resolution_pending = false;
+        self.links_requested_during_parse = false;
         self.reveal_key_cache = None;
         self.reset_wrap_work_metrics();
         self.background_wrap_requested_key = None;
@@ -322,6 +328,7 @@ impl NoteHostState {
         self.parse_requested_revision = None;
         self.parse_in_flight_revision = None;
         self.links_resolution_pending = false;
+        self.links_requested_during_parse = false;
         self.reveal_key_cache = None;
         self.reset_wrap_work_metrics();
         self.background_wrap_requested_key = None;
@@ -496,7 +503,7 @@ impl NoteHostState {
             }
             self.visual_key = None;
         }
-        let caret = self.view.selection.focus.byte;
+        let caret = self.reveal_caret();
         let active_start = match self.reveal_key_cache {
             Some((cached_revision, cached_caret, result))
                 if cached_revision == revision && cached_caret == caret =>
@@ -520,7 +527,7 @@ impl NoteHostState {
                 source,
                 &self.projection,
                 self.view.mode,
-                self.view.selection.focus.byte,
+                self.reveal_caret(),
             ));
             self.refresh_wrap_work_metrics(source.len());
             self.visual_key = Some(key);
@@ -528,6 +535,16 @@ impl NoteHostState {
         }
         if let Some(stage) = projection_stage {
             stage.finish(true);
+        }
+    }
+
+    /// Where Live Preview reveals the Markdown under the caret. A read-only
+    /// document is a reading view: selecting in it reveals nothing.
+    fn reveal_caret(&self) -> usize {
+        if self.view.mode == super::EditorMode::ReadOnly {
+            usize::MAX
+        } else {
+            self.view.selection.focus.byte
         }
     }
 
@@ -559,7 +576,7 @@ impl NoteHostState {
             snapshot.revision,
             snapshot.source,
             self.view.mode,
-            self.view.selection.focus.byte,
+            self.reveal_caret(),
             document,
         ))
     }
@@ -579,7 +596,7 @@ impl NoteHostState {
         let display_revision = self.display_snapshot().map(|snapshot| snapshot.revision);
         if display_revision != Some(revision)
             || self.view.mode != mode
-            || self.view.selection.focus.byte != caret
+            || self.reveal_caret() != caret
         {
             return false;
         }
@@ -590,8 +607,9 @@ impl NoteHostState {
         let active_start = projection.caret_reveal_start(caret);
         self.projection = projection;
         self.reveal_key_cache = Some((revision, caret, active_start));
-        // The worker performed the authoritative vault-link resolution.
-        self.links_resolution_pending = false;
+        // The worker performed the authoritative vault-link resolution, unless
+        // more was asked for after it started.
+        self.links_resolution_pending = std::mem::take(&mut self.links_requested_during_parse);
         self.visual = Arc::new(visual);
         self.refresh_wrap_work_metrics(display_source_len);
         self.projection_revision = Some(revision);
@@ -705,6 +723,15 @@ impl NoteHostState {
         self.line_geometry_key = None;
         self.line_geometry = Arc::new(vec![]);
         true
+    }
+
+    /// Ask the next background parse to resolve wiki links again, as when
+    /// the files they could name have just become known.
+    pub(crate) fn request_link_resolution(&mut self) {
+        self.links_resolution_pending = true;
+        if self.parse_in_flight_revision.is_some() {
+            self.links_requested_during_parse = true;
+        }
     }
 
     pub(crate) fn background_parse_pending(&self) -> bool {
@@ -1208,6 +1235,37 @@ mod state_tests {
     }
 
     #[test]
+    fn read_only_documents_reveal_nothing_under_the_caret() {
+        let source = "A **bold** word\n\n## Heading\n";
+        let mut host = host_with_source(source);
+        host.view.mode = super::super::EditorMode::ReadOnly;
+        host.refresh_projection();
+        let key = host.visual_key;
+        let text = |host: &NoteHostState| {
+            host.visual
+                .lines
+                .iter()
+                .map(crate::markdown_editor::surface::VisualLine::text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let rendered = text(&host);
+        for caret in [
+            source.find("bold").unwrap(),
+            source.find("Heading").unwrap(),
+        ] {
+            host.view.selection = SourceSelection::caret(caret);
+            host.refresh_projection();
+            assert_eq!(
+                host.visual_key, key,
+                "a caret at {caret} must not re-lay out"
+            );
+            assert_eq!(text(&host), rendered);
+        }
+        assert!(!rendered.contains("**") && !rendered.contains("## "));
+    }
+
+    #[test]
     fn small_note_wiki_links_resolve_via_background_parse_not_ui_thread() {
         let source = "See [[Other Note]] for details.";
         let mut host = host_with_source(source);
@@ -1226,6 +1284,28 @@ mod state_tests {
         assert!(host.apply_background_parse(revision, mode, caret, resolved, visual));
         assert!(!host.background_parse_pending());
         assert!(host.background_parse_request().is_none());
+    }
+
+    #[test]
+    fn a_link_resolution_asked_for_mid_parse_outlives_that_parse() {
+        let source = "See [[Other Note]] for details.";
+        let mut host = host_with_source(source);
+        let (revision, _, mode, caret, _) =
+            host.background_parse_request().expect("resolution request");
+        // The files the links may name arrive while that parse runs.
+        host.request_link_resolution();
+        let resolved = MarkdownProjection::parse(source);
+        let visual = build_visual_document(source, &resolved, mode, caret);
+        assert!(host.apply_background_parse(revision, mode, caret, resolved, visual));
+        assert!(
+            host.background_parse_pending(),
+            "the parse that just landed never saw the new files"
+        );
+        let (revision, _, mode, caret, _) = host.background_parse_request().expect("another round");
+        let resolved = MarkdownProjection::parse(source);
+        let visual = build_visual_document(source, &resolved, mode, caret);
+        assert!(host.apply_background_parse(revision, mode, caret, resolved, visual));
+        assert!(!host.background_parse_pending());
     }
 
     #[test]

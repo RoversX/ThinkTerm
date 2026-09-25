@@ -11,9 +11,10 @@ use crate::termwindow::remote_files::{
     download_name_candidates, invalidate_remote_connection, invalidate_remote_connection_if_dead,
     local_path_is_occupied, remote_connection_key, remote_connection_manager,
     reserve_download_directory, reserve_download_path, RemoteAcquireError, RemoteFileBytes,
-    RemoteFileKind, RemoteFileRow, RemoteFilesEffect, RemoteFilesEvent, RemoteFilesPhase,
-    RemoteOperationOrigin, RemotePath, RemoteTransfer, RemoteTransferKind, RemoteTransferProgress,
-    RemoteTransferSource, RemoteTransferStatus, TransferFailure, REMOTE_TRANSFER_CANCELED,
+    RemoteFileEntry, RemoteFileKind, RemoteFileRow, RemoteFilesEffect, RemoteFilesEvent,
+    RemoteFilesPhase, RemoteOperationOrigin, RemotePath, RemoteProjectListing, RemoteTransfer,
+    RemoteTransferKind, RemoteTransferProgress, RemoteTransferSource, RemoteTransferStatus,
+    TransferFailure, REMOTE_TRANSFER_CANCELED,
 };
 use crate::termwindow::remote_walk::{
     plan_remote_walk, RemoteWalkEntry, RemoteWalkMode, RemoteWalkPlan,
@@ -51,7 +52,6 @@ use crate::workspace_threads;
 use anyhow::Context;
 use config::keyassignment::{ClipboardCopyDestination, ClipboardPasteSource, KeyAssignment};
 use fluent_bundle::FluentArgs;
-use ignore::{DirEntry as IgnoreDirEntry, WalkBuilder};
 use mux::pane::{Pane, PaneId};
 use mux::Mux;
 use std::borrow::Cow;
@@ -167,6 +167,8 @@ const SNIPPET_CARET_WIDTH: f32 = 3.0;
 const NOTE_TOOLBAR_HEIGHT: usize = 54;
 const NOTE_BODY_TOP_GAP: usize = 12;
 const NOTE_BODY_PADDING: usize = 24;
+/// The widest a rendered Markdown file preview's text runs.
+const MARKDOWN_PREVIEW_READING_MAX_WIDTH: usize = 1500;
 const NOTE_LINE_GAP: usize = 5;
 const NOTE_CARET_WIDTH: f32 = 2.0;
 const NOTE_TABLE_CELL_HORIZONTAL_PADDING: usize = 10;
@@ -329,7 +331,7 @@ const FILE_PREVIEW_FULL_LINE_SHAPE_MAX_COLS: usize = 4096;
 const FILE_PREVIEW_SCROLLBAR_THICKNESS: usize = 4;
 const FILE_PREVIEW_SCROLLBAR_HIT_SLOP: usize = 6;
 const FILE_TREE_ROW_LIMIT: usize = 2000;
-const FILE_INDEX_ENTRY_LIMIT: usize = 100_000;
+const FILE_INDEX_ENTRY_LIMIT: usize = thinkterm_file_index::ENTRY_LIMIT;
 // How long the file panel must stay closed/idle before its in-memory index and
 // buffers are released. Reopening within this window keeps everything resident.
 const FILE_INDEX_IDLE_RELEASE_SECS: u64 = 30;
@@ -826,6 +828,58 @@ fn classify_vault_failure(vault_root: &Path, err: &anyhow::Error) -> NoteVaultFa
         problem: problem_for_read_dir(fs::read_dir(vault_root).err().map(|err| err.kind())),
         detail: format!("{err:#}"),
     }
+}
+
+/// Where the note painter draws. The Note is the right sidebar's editor; the
+/// file preview renders a Markdown file read-only with the same painter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NoteSurface {
+    Note,
+    FilePreview,
+}
+
+/// One particular surface: which kind, and which instance of it. A file
+/// preview is rebuilt for every file it shows, so background work records the
+/// instance it started on and a result for an earlier one is dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NoteSurfaceTicket {
+    pub(crate) surface: NoteSurface,
+    instance: u64,
+}
+
+static NEXT_MARKDOWN_PREVIEW_INSTANCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Everything the note painter draws a surface from. The Note's lives in the
+/// `right_sidebar_note*` fields the painter and its helpers use; another
+/// surface keeps its own here and is installed into those fields only for the
+/// span of `TermWindow::with_note_surface`.
+#[derive(Default)]
+pub(crate) struct NoteSurfaceState {
+    host: crate::markdown_editor::NoteHostState,
+    table_horizontal_offsets: std::collections::BTreeMap<usize, f32>,
+    table_layouts: Vec<RightSidebarNoteTableLayout>,
+    code_highlight: NoteCodeHighlightState,
+    paint_cache: NotePaintCache,
+}
+
+/// The file preview's rendered Markdown: which preview it renders and the
+/// read-only surface it renders into. Dropped when the preview closes, the
+/// file changes, the preview switches to source, or the panel's memory is
+/// released.
+pub(crate) struct MarkdownPreviewSurface {
+    key: MarkdownPreviewKey,
+    /// Unique per surface built; never 0, which is the Note's.
+    instance: u64,
+    state: NoteSurfaceState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MarkdownPreviewKey {
+    /// The previewed file, local or remote.
+    path: String,
+    /// Bumped by every preview load, so a reload of the same path re-renders.
+    generation: u64,
 }
 
 /// Immutable component geometry for one visual/layout revision. Vertical
@@ -1366,7 +1420,7 @@ fn file_preview_close_requires_reflow(
 
 impl crate::TermWindow {
     fn right_sidebar_file_preview_active(&self) -> bool {
-        !self.right_sidebar_collapsed
+        self.right_sidebar_presented()
             && self.right_sidebar_mode == RightSidebarMode::Chat
             && self.right_sidebar_file_view == RightSidebarFileView::Preview
             && (self.right_sidebar_file_selected.is_some()
@@ -1407,7 +1461,7 @@ impl crate::TermWindow {
     }
 
     fn right_sidebar_file_preview_width(&self) -> Option<usize> {
-        if self.right_sidebar_collapsed
+        if !self.right_sidebar_presented()
             || self.right_sidebar_mode != RightSidebarMode::Chat
             || self.right_sidebar_file_view != RightSidebarFileView::Preview
             || (self.right_sidebar_file_selected.is_none()
@@ -1434,7 +1488,7 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn right_sidebar_note_pane_active(&self) -> bool {
-        !self.right_sidebar_collapsed
+        self.right_sidebar_presented()
             && self.right_sidebar_mode == RightSidebarMode::Tasks
             && self.right_sidebar_note_pane_expanded
             // Without a vault there is no editor to expand; the sidebar shows
@@ -1477,24 +1531,51 @@ impl crate::TermWindow {
         RightSidebarMode::any_panel_enabled()
     }
 
+    /// The width the TERMINAL is laid out against. Zero whenever the sidebar
+    /// is collapsed, hover reveal or not: a hover must never reflow a PTY.
+    /// Drawing and hit-testing ask `right_sidebar_presented_width`.
     pub fn right_sidebar_width(&self) -> usize {
-        if self.right_sidebar_collapsed || !self.right_sidebar_has_panels() {
+        if self.right_sidebar_collapsed {
             0
         } else {
-            // The file preview pane and the Note pane are mutually exclusive
-            // (different sidebar modes); at most one is non-zero.
-            let pane_width = self
-                .right_sidebar_file_preview_width()
-                .or_else(|| self.right_sidebar_note_pane_width())
-                .unwrap_or(0);
-            self.right_sidebar_tree_width()
-                .saturating_add(pane_width)
-                .min(if pane_width > 0 {
-                    self.right_sidebar_pane_total_max_width()
-                } else {
-                    self.right_sidebar_available_width()
-                })
+            self.right_sidebar_docked_width()
         }
+    }
+
+    /// The width the panel has when it is on screen, docked or not.
+    fn right_sidebar_docked_width(&self) -> usize {
+        if !self.right_sidebar_has_panels() {
+            return 0;
+        }
+        // The file preview pane and the Note pane are mutually exclusive
+        // (different sidebar modes); at most one is non-zero.
+        let pane_width = self
+            .right_sidebar_file_preview_width()
+            .or_else(|| self.right_sidebar_note_pane_width())
+            .unwrap_or(0);
+        self.right_sidebar_tree_width()
+            .saturating_add(pane_width)
+            .min(if pane_width > 0 {
+                self.right_sidebar_pane_total_max_width()
+            } else {
+                self.right_sidebar_available_width()
+            })
+    }
+
+    /// The width the panel is DRAWN and HIT-TESTED at: the docked width while
+    /// it is docked or hover-revealed, zero otherwise.
+    pub(crate) fn right_sidebar_presented_width(&self) -> usize {
+        if self.right_sidebar_presented() {
+            self.right_sidebar_docked_width()
+        } else {
+            0
+        }
+    }
+
+    /// Whether the panel is on screen at all, docked or by a hover reveal.
+    /// What the panel shows follows this; the terminal's layout does not.
+    pub(crate) fn right_sidebar_presented(&self) -> bool {
+        !self.right_sidebar_collapsed || self.right_sidebar_hover.is_presented()
     }
 
     pub fn right_sidebar_max_width(&self) -> usize {
@@ -1604,6 +1685,10 @@ impl crate::TermWindow {
     }
 
     pub fn toggle_right_sidebar(&mut self) {
+        // Collapsing must not instantly re-reveal under a pointer still on the
+        // button, and docking makes a reveal moot.
+        self.right_sidebar_hover.suppress_until_pointer_leaves();
+        self.right_sidebar_hover_was_presented = false;
         self.right_sidebar_collapsed = !self.right_sidebar_collapsed;
         if self.right_sidebar_collapsed {
             if self.right_sidebar_mode == RightSidebarMode::Tasks {
@@ -1623,6 +1708,8 @@ impl crate::TermWindow {
     }
 
     pub fn expand_right_sidebar(&mut self) {
+        self.right_sidebar_hover.suppress_until_pointer_leaves();
+        self.right_sidebar_hover_was_presented = false;
         self.right_sidebar_collapsed = false;
         self.kick_right_sidebar_file_rescan_cycle();
         self.request_right_sidebar_remote_files_connect(false);
@@ -1632,10 +1719,132 @@ impl crate::TermWindow {
         }
     }
 
+    /// The right-edge strip that arms a hover reveal, as (x, y, w, h) in
+    /// window pixels. Computed against the docked rect so it exists while the
+    /// panel does not; like the left one it leaves out the tab bar row, where
+    /// the pointer is on its way to the tabs or the sidebar button.
+    pub(crate) fn right_sidebar_hover_hot_zone(&self) -> Option<(usize, usize, usize, usize)> {
+        let rect = self.right_sidebar_rect_for_width(self.right_sidebar_docked_width())?;
+        let top_tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
+            self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize
+        } else {
+            0
+        };
+        let width = self.ui_px(crate::termwindow::ui::tokens::SIDEBAR_HOVER_HOT_ZONE_WIDTH);
+        let right_edge = rect.x.saturating_add(rect.width);
+        crate::termwindow::sidebar_hover::hot_zone(
+            right_edge.saturating_sub(width),
+            rect.y,
+            rect.height,
+            width,
+            top_tab_bar_height,
+        )
+    }
+
+    /// What the right sidebar's hover machine sees: the left one's rules,
+    /// mirrored. The panel also holds on while one of its text fields has the
+    /// keyboard -- the pointer drifting off must not take a note away mid-word.
+    pub(crate) fn right_sidebar_hover_input(&self) -> crate::termwindow::sidebar_hover::HoverInput {
+        use crate::termwindow::sidebar_hover::{HoverInput, PointerZone};
+        // A menu, modal or rename opened from the revealed panel holds it
+        // out; one open while it is away keeps it from revealing.
+        let overlay_open = self.modal.borrow().is_some()
+            || self.context_menu.is_some()
+            || self.native_context_menu_open
+            || self.inline_tab_rename.is_some();
+        let eligible = self.right_sidebar_collapsed
+            && self.right_sidebar_has_panels()
+            && !self.content_view_foreground()
+            && !self.content_view_transition_running()
+            && !self.frontend_surface_blocked()
+            && (!overlay_open || self.right_sidebar_hover.is_presented());
+        let pointer = match &self.current_mouse_event {
+            None => PointerZone::Away,
+            Some(event) => match right_sidebar_hover_zone(
+                event.coords.x,
+                event.coords.y,
+                self.right_sidebar_rect(),
+                self.right_sidebar_hover_hot_zone(),
+                self.ui_px(crate::termwindow::ui::tokens::SIDEBAR_HOVER_STICKY_ZONE_WIDTH),
+                self.ui_items.iter().any(|item| {
+                    matches!(item.item_type, UIItemType::RightSidebarToggle)
+                        && item.hit_test(event.coords.x, event.coords.y)
+                }),
+            ) {
+                // The rightmost pane's scrollbar runs down this edge too; a
+                // pointer on its thumb is after the scrollbar, not the panel.
+                // Only the thumb: the track spans the whole edge.
+                PointerZone::HotZone | PointerZone::NearHotZone
+                    if self.ui_items.iter().any(|item| {
+                        matches!(item.item_type, UIItemType::ScrollThumb(_))
+                            && item.hit_test(event.coords.x, event.coords.y)
+                    }) =>
+                {
+                    PointerZone::Away
+                }
+                zone => zone,
+            },
+        };
+        let pinned = !self.current_mouse_buttons.is_empty()
+            || self.current_mouse_capture.is_some()
+            || self.dragging.is_some()
+            || self.sidebar_row_drag.is_some()
+            || self.right_sidebar_file_drag.is_some()
+            || self.pane_tab_drag.is_some()
+            || overlay_open
+            // Focus only holds a panel that is out: a field left focused when
+            // the docked panel collapsed must not stop the next reveal.
+            || (self.right_sidebar_hover.is_presented()
+                && (self.right_sidebar_focused_input().is_some()
+                    || self.right_sidebar_note.view.focused));
+        HoverInput {
+            eligible,
+            pointer,
+            pinned,
+        }
+    }
+
+    /// Step the right sidebar's hover machine and keep what the panel shows in
+    /// step with it being on screen.
+    pub(crate) fn step_right_sidebar_hover(
+        &mut self,
+        now: Instant,
+    ) -> crate::termwindow::sidebar_hover::HoverFrame {
+        let input = self.right_sidebar_hover_input();
+        let frame = self.right_sidebar_hover.step(input, now);
+        self.sync_right_sidebar_hover_presence();
+        frame
+    }
+
+    /// A hover reveal opens the panel's content the way docking does, without
+    /// docking it; the panel leaving releases it the way collapsing does.
+    fn sync_right_sidebar_hover_presence(&mut self) {
+        let presented = self.right_sidebar_collapsed && self.right_sidebar_hover.is_presented();
+        if presented == self.right_sidebar_hover_was_presented {
+            return;
+        }
+        self.right_sidebar_hover_was_presented = presented;
+        if presented {
+            self.kick_right_sidebar_file_rescan_cycle();
+            self.request_right_sidebar_remote_files_connect(false);
+            if self.right_sidebar_mode == RightSidebarMode::Tasks {
+                self.right_sidebar_note_memory_release_token =
+                    self.right_sidebar_note_memory_release_token.wrapping_add(1);
+            }
+        } else {
+            // A reveal comes and goes with the pointer, so the remote
+            // connection and its preview wait for the idle release below
+            // rather than going the moment the panel slides away.
+            self.clear_right_sidebar_text_focus();
+            self.schedule_right_sidebar_file_memory_release();
+            self.schedule_right_sidebar_note_memory_release();
+        }
+    }
+
     /// The file panel (and its in-memory index) is only relevant while the right
     /// sidebar is open and in `Chat`/File mode.
     pub(crate) fn right_sidebar_file_view_active(&self) -> bool {
-        !self.right_sidebar_collapsed && self.right_sidebar_mode == RightSidebarMode::Chat
+        self.right_sidebar_presented() && self.right_sidebar_mode == RightSidebarMode::Chat
     }
 
     /// Schedule a delayed check that frees the file index + buffers if the panel
@@ -1695,10 +1904,11 @@ impl crate::TermWindow {
         // `close_right_sidebar_file_preview` only `.clear()`s the preview lines,
         // which keeps the (potentially large) capacity; drop it outright.
         self.right_sidebar_file_preview_lines = Vec::new();
-        self.right_sidebar_file_preview_raw_text = None;
+        self.set_right_sidebar_file_preview_raw_text(None);
 
         self.right_sidebar_file_index = None;
         self.right_sidebar_file_index_status = RightSidebarFileIndexStatus::Empty;
+        self.right_sidebar_remote_file_search.release();
         self.right_sidebar_file_browse_rows = Vec::new();
         self.right_sidebar_file_browse_cache_key = None;
         self.reset_right_sidebar_file_dir_cache();
@@ -1706,7 +1916,10 @@ impl crate::TermWindow {
         // status can no longer signal that, since it may never leave `Empty`.
         self.right_sidebar_file_view_needs_restore = true;
         // Remote trees survive a panel toggle so switching back is instant, but
-        // a panel left hidden this long should give them back too.
+        // a panel left hidden this long should give them back too. One that
+        // went away with a hover reveal still holds its lease: hiding stashes
+        // its tree first.
+        self.release_right_sidebar_remote_files_if_hidden();
         self.right_sidebar_remote_files.release_cached_trees();
         self.ui_shape_caches.borrow_mut().clear_file_preview();
         self.publish_ui_shape_cache_diagnostics();
@@ -1775,6 +1988,194 @@ impl crate::TermWindow {
         self.right_sidebar_note_paint_cache = NotePaintCache::default();
         self.ui_shape_caches.borrow_mut().clear_note();
         self.publish_ui_shape_cache_diagnostics();
+    }
+
+    fn set_right_sidebar_file_preview_raw_text(&mut self, text: Option<String>) {
+        self.right_sidebar_file_preview_raw_text = text;
+        self.right_sidebar_file_preview_text_generation = self
+            .right_sidebar_file_preview_text_generation
+            .wrapping_add(1);
+        // Rendered Markdown is only ever of the text it was built from.
+        self.right_sidebar_markdown_preview = None;
+    }
+
+    /// The previewed file when it is Markdown, as the key its rendering is
+    /// kept under. A remote selection is the one shown when there is one.
+    fn right_sidebar_previewed_markdown_path(&self) -> Option<String> {
+        if let Some(path) = self.right_sidebar_remote_files.selected.as_ref() {
+            return path
+                .extension()
+                .is_some_and(is_markdown_extension)
+                .then(|| path.as_str().to_string());
+        }
+        let path = self.right_sidebar_file_selected.as_ref()?;
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(is_markdown_extension)
+            .then(|| path.to_string_lossy().into_owned())
+    }
+
+    /// A Markdown file whose text the preview holds, so it can be rendered.
+    fn right_sidebar_markdown_preview_available(&self) -> bool {
+        self.right_sidebar_file_preview_message.is_none()
+            && self.right_sidebar_file_preview_image.is_none()
+            && self.right_sidebar_file_preview_raw_text.is_some()
+            && self.right_sidebar_previewed_markdown_path().is_some()
+    }
+
+    /// Whether the file preview shows rendered Markdown right now.
+    pub(crate) fn right_sidebar_markdown_preview_rendering(&self) -> bool {
+        self.right_sidebar_file_preview_active()
+            && self.right_sidebar_markdown_preview_available()
+            && crate::native_settings::right_sidebar_markdown_preview_rendered()
+    }
+
+    pub(crate) fn toggle_right_sidebar_markdown_preview_rendered(&mut self) {
+        let rendered = !crate::native_settings::right_sidebar_markdown_preview_rendered();
+        if let Err(err) =
+            crate::native_settings::save_right_sidebar_markdown_preview_rendered(rendered)
+        {
+            log::warn!("failed to save the Markdown preview mode: {err:#}");
+        }
+        if !rendered {
+            // Source keeps nothing of the rendering.
+            self.right_sidebar_markdown_preview = None;
+        }
+    }
+
+    /// Build the rendered surface for the previewed text, unless the one
+    /// there already renders it.
+    fn ensure_right_sidebar_markdown_preview(&mut self) -> bool {
+        let Some(path) = self.right_sidebar_previewed_markdown_path() else {
+            return false;
+        };
+        if self.right_sidebar_file_preview_raw_text.is_none() {
+            return false;
+        }
+        let key = MarkdownPreviewKey {
+            path,
+            generation: self.right_sidebar_file_preview_text_generation,
+        };
+        if self
+            .right_sidebar_markdown_preview
+            .as_ref()
+            .is_some_and(|preview| preview.key == key)
+        {
+            return true;
+        }
+        // Copied only to build: this runs every frame.
+        let Some(text) = self.right_sidebar_file_preview_raw_text.clone() else {
+            return false;
+        };
+        let document = self.markdown_preview_document(&key.path, text);
+        let mut state = NoteSurfaceState::default();
+        state.host.bind_document(document);
+        state.host.view.mode = EditorMode::ReadOnly;
+        self.right_sidebar_markdown_preview = Some(Box::new(MarkdownPreviewSurface {
+            key,
+            instance: NEXT_MARKDOWN_PREVIEW_INSTANCE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            state,
+        }));
+        true
+    }
+
+    /// The document a previewed Markdown file renders as: a session of its
+    /// own, never registered with the Notebook's and never saved. A local
+    /// file's images resolve beside it and cannot leave the project; a remote
+    /// file has no local folder, so it shows none from relative paths.
+    fn markdown_preview_document(
+        &self,
+        path: &str,
+        text: String,
+    ) -> crate::markdown_editor::VaultDocument {
+        let remote_relative = self
+            .right_sidebar_remote_files
+            .selected
+            .as_ref()
+            .map(|selected| {
+                self.right_sidebar_remote_files
+                    .root
+                    .as_ref()
+                    .and_then(|root| remote_relative_path(root, selected))
+                    .unwrap_or_else(|| selected.file_name().to_string())
+            });
+        markdown_preview_document(
+            path,
+            text,
+            remote_relative,
+            self.right_sidebar_file_index_root.as_deref(),
+        )
+    }
+
+    /// Paint the previewed Markdown rendered, with the Note's painter on the
+    /// preview's own read-only surface.
+    fn paint_right_sidebar_markdown_preview(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        x: usize,
+        top: usize,
+        width: usize,
+        bottom: usize,
+    ) -> anyhow::Result<()> {
+        let font_size = self.right_sidebar_file_preview_font_size();
+        self.with_note_surface(NoteSurface::FilePreview, |term_window| {
+            term_window.paint_note_editor_area(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                foreground,
+                muted_fg,
+                x,
+                top,
+                width,
+                bottom,
+                font_size,
+                false,
+                SvgIcon::FolderTree,
+            )
+        })
+        .unwrap_or(Ok(()))
+    }
+
+    /// The rendered/source switch beside a Markdown preview's close button.
+    /// Returns the width it takes, gap included.
+    fn paint_markdown_preview_toggle(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        x: usize,
+        y: usize,
+        size: usize,
+    ) -> anyhow::Result<usize> {
+        if !self.right_sidebar_markdown_preview_available() {
+            return Ok(0);
+        }
+        let icon = if crate::native_settings::right_sidebar_markdown_preview_rendered() {
+            SvgIcon::CodeXml
+        } else {
+            SvgIcon::Eye
+        };
+        self.paint_files_preview_header_icon_button(
+            layers,
+            chrome,
+            foreground,
+            muted_fg,
+            x,
+            y,
+            size,
+            icon,
+            UIItemType::RightSidebarFilePreviewMarkdownToggle,
+        )?;
+        Ok(size + self.ui_px(PREVIEW_HEADER_ACTION_GAP))
     }
 
     fn right_sidebar_file_view_state_key(&self) -> Option<(PathBuf, String)> {
@@ -2027,7 +2428,7 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn scroll_right_sidebar_snippets(&mut self, amount: i16) -> bool {
-        if self.right_sidebar_collapsed
+        if !self.right_sidebar_presented()
             || self.right_sidebar_mode != RightSidebarMode::Snippets
             || self.right_sidebar_snippet_view != RightSidebarSnippetView::List
             || amount == 0
@@ -2070,7 +2471,7 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn scroll_right_sidebar_file_preview_horizontal(&mut self, amount: i16) -> bool {
-        if self.right_sidebar_collapsed
+        if !self.right_sidebar_presented()
             || self.right_sidebar_mode != RightSidebarMode::Chat
             || self.right_sidebar_file_view != RightSidebarFileView::Preview
             || (self.right_sidebar_file_selected.is_none()
@@ -2146,7 +2547,7 @@ impl crate::TermWindow {
         self.right_sidebar_file_preview_highlight_cancel = Arc::new(AtomicUsize::new(0));
         let highlight_cancel = Arc::clone(&self.right_sidebar_file_preview_highlight_cancel);
         self.right_sidebar_file_preview_lines.clear();
-        self.right_sidebar_file_preview_raw_text = None;
+        self.set_right_sidebar_file_preview_raw_text(None);
         self.right_sidebar_file_preview_max_columns = 0;
         self.clear_right_sidebar_file_preview_slice_cache();
         self.right_sidebar_file_preview_image = None;
@@ -2246,7 +2647,7 @@ impl crate::TermWindow {
             .store(1, AtomicOrdering::Relaxed);
         self.right_sidebar_file_preview_highlight_cancel = Arc::new(AtomicUsize::new(0));
         self.right_sidebar_file_preview_lines.clear();
-        self.right_sidebar_file_preview_raw_text = None;
+        self.set_right_sidebar_file_preview_raw_text(None);
         self.right_sidebar_file_preview_max_columns = 0;
         self.clear_right_sidebar_file_preview_slice_cache();
         self.right_sidebar_file_preview_image = None;
@@ -2300,16 +2701,19 @@ impl crate::TermWindow {
         {
             if let Some(window) = self.window.as_ref().cloned() {
                 let code = code.clone();
+                let ticket = self.note_surface_ticket();
                 promise::spawn::spawn(async move {
                     smol::Timer::after(Duration::from_millis(NOTE_CODE_HIGHLIGHT_DEBOUNCE_MS))
                         .await;
                     window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                        term_window.start_note_code_highlight(
-                            code.source.start,
-                            key,
-                            generation,
-                            code,
-                        );
+                        term_window.with_note_surface_ticket(ticket, move |term_window| {
+                            term_window.start_note_code_highlight(
+                                code.source.start,
+                                key,
+                                generation,
+                                code,
+                            );
+                        });
                     })));
                 })
                 .detach();
@@ -2383,12 +2787,15 @@ impl crate::TermWindow {
             .in_flight
             .insert(block_start, (key, Arc::clone(&cancellation)));
         let source: Arc<str> = Arc::from(code.text.as_str());
+        let ticket = self.note_surface_ticket();
         syntax_highlight_pool().spawn(move || {
             let stage = crate::input_diagnostics::StageTimer::begin("note_highlight");
             let result = note_code_highlight_pair(&code, Some(cancellation.as_ref()));
             stage.finish(result.is_some());
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                term_window.apply_note_code_highlight_result(block_start, key, source, result);
+                term_window.with_note_surface_ticket(ticket, move |term_window| {
+                    term_window.apply_note_code_highlight_result(block_start, key, source, result);
+                });
             })));
         });
     }
@@ -2437,13 +2844,20 @@ impl crate::TermWindow {
             return;
         };
         self.right_sidebar_note_code_highlight.repaint_scheduled = true;
+        let ticket = self.note_surface_ticket();
+        let surface = ticket.surface;
         promise::spawn::spawn(async move {
             smol::Timer::after(Duration::from_millis(NOTE_CODE_HIGHLIGHT_REPAINT_MS)).await;
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                term_window
-                    .right_sidebar_note_code_highlight
-                    .repaint_scheduled = false;
-                if term_window.right_sidebar_note_visible() {
+                let visible = term_window
+                    .with_note_surface_ticket(ticket, |term_window| {
+                        term_window
+                            .right_sidebar_note_code_highlight
+                            .repaint_scheduled = false;
+                        surface != NoteSurface::Note || term_window.right_sidebar_note_visible()
+                    })
+                    .unwrap_or(false);
+                if visible {
                     term_window.invalidate_window();
                 }
             })));
@@ -2539,7 +2953,7 @@ impl crate::TermWindow {
         }
 
         self.right_sidebar_file_preview_lines = result.lines;
-        self.right_sidebar_file_preview_raw_text = result.raw_text;
+        self.set_right_sidebar_file_preview_raw_text(result.raw_text);
         self.right_sidebar_file_preview_max_columns = self
             .right_sidebar_file_preview_lines
             .iter()
@@ -2590,7 +3004,62 @@ impl crate::TermWindow {
         };
         let key = right_sidebar_open_with_cache_key(&path);
         self.start_right_sidebar_open_with_load_if_needed(&key, &path);
-        let items = self.right_sidebar_open_with_menu_items(&key, &path);
+        let items = self.right_sidebar_open_with_menu_items(&key, &path, false);
+        self.show_term_context_menu(context, anchor, items);
+    }
+
+    /// Right-clicking a local file's preview: what the text offers first, as
+    /// the remote preview's menu does, then the file, with every Open With
+    /// app in a submenu.
+    pub(crate) fn show_right_sidebar_file_preview_context_menu(
+        &mut self,
+        context: &dyn WindowOps,
+        anchor: window::Point,
+    ) {
+        let Some(path) = self.right_sidebar_file_selected.clone() else {
+            return;
+        };
+        let key = right_sidebar_open_with_cache_key(&path);
+        self.start_right_sidebar_open_with_load_if_needed(&key, &path);
+        let has_selection = self.right_sidebar_file_preview_selected_text().is_some();
+        let has_text = self.right_sidebar_file_preview_image.is_none()
+            && !self.right_sidebar_file_preview_lines.is_empty();
+        let path_string = path.to_string_lossy().to_string();
+        let open_with = self.right_sidebar_open_with_menu_items(&key, &path, true);
+
+        self.begin_context_menu_application_actions();
+        let copy_selection = self.context_menu_application_item_with_icon(
+            crate::i18n::tr("menu-copy"),
+            ContextMenuIcon::Copy,
+            crate::termwindow::ContextMenuApplicationAction::CopyRemotePreviewSelection,
+            has_selection,
+        );
+        let copy_all = self.context_menu_application_item_with_icon(
+            crate::i18n::tr("right-copy-all"),
+            ContextMenuIcon::Copy,
+            crate::termwindow::ContextMenuApplicationAction::CopyRemotePreviewAll,
+            has_text,
+        );
+        let items = vec![
+            copy_selection,
+            copy_all,
+            ContextMenuItem::item_with_icon(
+                crate::i18n::tr("right-copy-path"),
+                ContextMenuIcon::Copy,
+                KeyAssignment::CopyFilePathToClipboard(path_string.clone()),
+            ),
+            ContextMenuItem::Separator,
+            ContextMenuItem::item_with_icon(
+                super::context_menu::reveal_in_folder_label(),
+                ContextMenuIcon::Folder,
+                KeyAssignment::RevealFileInFolder(path_string),
+            ),
+            ContextMenuItem::submenu_with_icon(
+                crate::i18n::tr("right-open-with-menu"),
+                ContextMenuIcon::Application,
+                open_with,
+            ),
+        ];
         self.show_term_context_menu(context, anchor, items);
     }
 
@@ -2711,7 +3180,15 @@ impl crate::TermWindow {
         self.invalidate_window();
     }
 
-    fn right_sidebar_open_with_menu_items(&self, key: &str, path: &Path) -> Vec<ContextMenuItem> {
+    /// The Open With apps for `path`. The toolbar's list leaves out the app
+    /// its button already opens with; a submenu (`in_submenu`) lists every app
+    /// by its bare name, under a parent that says "Open With".
+    fn right_sidebar_open_with_menu_items(
+        &self,
+        key: &str,
+        path: &Path,
+        in_submenu: bool,
+    ) -> Vec<ContextMenuItem> {
         let path_string = path.to_string_lossy().to_string();
         let current_id = self
             .current_right_sidebar_open_with_app(key)
@@ -2755,10 +3232,16 @@ impl crate::TermWindow {
         let mut items: Vec<ContextMenuItem> =
             sorted_open_with_candidates(candidates, current_id.as_deref())
                 .into_iter()
-                .filter(|candidate| current_id.as_deref() != Some(candidate.id.as_str()))
+                .filter(|candidate| {
+                    in_submenu || current_id.as_deref() != Some(candidate.id.as_str())
+                })
                 .map(|candidate| {
                     ContextMenuItem::item_with_icon(
-                        right_sidebar_arg("right-open-with", "app", candidate.label.clone()),
+                        if in_submenu {
+                            candidate.label.clone()
+                        } else {
+                            right_sidebar_arg("right-open-with", "app", candidate.label.clone())
+                        },
                         ContextMenuIcon::Application,
                         KeyAssignment::OpenFileWith {
                             path: path_string.clone(),
@@ -2881,6 +3364,16 @@ impl crate::TermWindow {
     pub(crate) fn right_sidebar_file_preview_selected_text(&self) -> Option<String> {
         if !self.right_sidebar_file_preview_active() {
             return None;
+        }
+        if self.right_sidebar_markdown_preview_rendering() {
+            // The Markdown source of what is selected, as the Note copies.
+            let host = &self.right_sidebar_markdown_preview.as_ref()?.state.host;
+            let range = host.view.selection.range();
+            if range.is_empty() {
+                return None;
+            }
+            let session = host.session.as_ref()?;
+            return session.lock().source().get(range).map(str::to_string);
         }
         let (start, end) = self.right_sidebar_file_preview_selection_range()?;
         let mut text = String::new();
@@ -4006,6 +4499,97 @@ impl crate::TermWindow {
         self.show_term_context_menu(context, anchor, items);
     }
 
+    /// The wiki link under a point of the rendered Markdown preview: what it
+    /// resolved to and every file it could mean.
+    pub(crate) fn right_sidebar_markdown_preview_wiki_link_at(
+        &mut self,
+        x: f32,
+        y: f32,
+    ) -> Option<(Option<String>, Vec<String>)> {
+        self.with_note_surface(NoteSurface::FilePreview, |term_window| {
+            let host = &term_window.right_sidebar_note;
+            let range = host.atomic_source_for_point(x, y)?;
+            host.projection
+                .objects
+                .iter()
+                .find_map(|object| match object {
+                    crate::markdown_editor::ProjectedObject::WikiLink {
+                        source,
+                        resolved_path,
+                        ambiguous_paths,
+                        ..
+                    } if *source == range => Some((resolved_path.clone(), ambiguous_paths.clone())),
+                    _ => None,
+                })
+        })
+        .flatten()
+    }
+
+    /// The file a preview's wiki link resolved to, from its project-relative
+    /// path: under the local project root, or under the remote one for a
+    /// remote file. Either way it cannot leave the root.
+    fn right_sidebar_markdown_preview_link_action(
+        &self,
+        relative: &str,
+    ) -> Option<crate::termwindow::ContextMenuApplicationAction> {
+        if self.right_sidebar_remote_files.selected.is_some() {
+            let root = self.right_sidebar_remote_files.root.as_ref()?;
+            return remote_path_under(root, relative)
+                .map(crate::termwindow::ContextMenuApplicationAction::OpenRemoteFilePreview);
+        }
+        let preview = self.right_sidebar_markdown_preview.as_ref()?;
+        let raw_root = &preview.state.host.document.as_ref()?.vault_root;
+        let root = raw_root.canonicalize().ok()?;
+        let path = root.join(relative).canonicalize().ok()?;
+        // Checked in canonical form, opened in the root's own spelling, so the
+        // file keeps its place in the project (its tree row, its links).
+        let inside = path.strip_prefix(&root).ok()?;
+        Some(
+            crate::termwindow::ContextMenuApplicationAction::OpenFilePreview(raw_root.join(inside)),
+        )
+    }
+
+    /// Follow a rendered preview's wiki link: open the file it means in the
+    /// preview, or offer the files it could mean. An unresolved link (or one
+    /// in a remote file) does nothing -- a preview never creates notes.
+    pub(crate) fn follow_right_sidebar_markdown_preview_wiki_link(
+        &mut self,
+        context: &dyn WindowOps,
+        anchor: window::Point,
+        resolved: Option<String>,
+        ambiguous: Vec<String>,
+    ) {
+        if ambiguous.len() > 1 {
+            self.begin_context_menu_application_actions();
+            let items = ambiguous
+                .into_iter()
+                .filter_map(|relative| {
+                    let action = self.right_sidebar_markdown_preview_link_action(&relative)?;
+                    Some(self.context_menu_application_item_with_icon(
+                        relative,
+                        ContextMenuIcon::File,
+                        action,
+                        true,
+                    ))
+                })
+                .collect();
+            self.show_term_context_menu(context, anchor, items);
+            return;
+        }
+        match resolved
+            .as_deref()
+            .and_then(|relative| self.right_sidebar_markdown_preview_link_action(relative))
+        {
+            Some(crate::termwindow::ContextMenuApplicationAction::OpenFilePreview(path)) => {
+                self.open_right_sidebar_file_path(path);
+            }
+            Some(crate::termwindow::ContextMenuApplicationAction::OpenRemoteFilePreview(path)) => {
+                self.open_right_sidebar_remote_file_preview(path);
+            }
+            _ => {}
+        }
+    }
+
     pub(crate) fn show_right_sidebar_note_menu(
         &mut self,
         context: &dyn WindowOps,
@@ -4838,6 +5422,95 @@ impl crate::TermWindow {
         }
     }
 
+    /// Run `f` with `surface`'s state in the `right_sidebar_note*` fields,
+    /// then put the Note's back. The painter and the note helpers only ever
+    /// read those fields, so this is how they draw or update a surface other
+    /// than the Note without a line of them changing. Background work started
+    /// inside records `note_surface_installed` and comes back through here,
+    /// so a result can only land on the surface that asked for it; `None`
+    /// when that surface is gone by then.
+    pub(crate) fn with_note_surface<R>(
+        &mut self,
+        surface: NoteSurface,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Option<R> {
+        if surface == self.note_surface_installed {
+            return Some(f(self));
+        }
+        // Only ever entered from the Note's state: a nested switch would put
+        // one surface's state into another's slot when unwinding.
+        if self.note_surface_installed != NoteSurface::Note {
+            log::error!(
+                "note surface {surface:?} requested inside {:?}",
+                self.note_surface_installed
+            );
+            return None;
+        }
+        let mut preview = match surface {
+            NoteSurface::Note => unreachable!("handled above"),
+            NoteSurface::FilePreview => self.right_sidebar_markdown_preview.take()?,
+        };
+        self.swap_note_surface_state(&mut preview.state);
+        self.note_surface_installed = surface;
+        self.note_surface_instance = preview.instance;
+        let result = f(self);
+        self.note_surface_installed = NoteSurface::Note;
+        self.note_surface_instance = 0;
+        self.swap_note_surface_state(&mut preview.state);
+        // `f` sees no preview while it runs, so it cannot have replaced it.
+        self.right_sidebar_markdown_preview = Some(preview);
+        Some(result)
+    }
+
+    /// The surface installed right now, instance included, for background
+    /// work to come back to through `with_note_surface_ticket`.
+    pub(crate) fn note_surface_ticket(&self) -> NoteSurfaceTicket {
+        NoteSurfaceTicket {
+            surface: self.note_surface_installed,
+            instance: self.note_surface_instance,
+        }
+    }
+
+    /// `with_note_surface` for the exact surface `ticket` names: `None` when
+    /// that surface is gone, even if another of its kind has replaced it.
+    pub(crate) fn with_note_surface_ticket<R>(
+        &mut self,
+        ticket: NoteSurfaceTicket,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Option<R> {
+        let current = match ticket.surface {
+            NoteSurface::Note => 0,
+            NoteSurface::FilePreview if self.note_surface_installed == NoteSurface::FilePreview => {
+                self.note_surface_instance
+            }
+            NoteSurface::FilePreview => self.right_sidebar_markdown_preview.as_ref()?.instance,
+        };
+        if current != ticket.instance {
+            return None;
+        }
+        self.with_note_surface(ticket.surface, f)
+    }
+
+    fn swap_note_surface_state(&mut self, state: &mut NoteSurfaceState) {
+        std::mem::swap(&mut self.right_sidebar_note, &mut state.host);
+        std::mem::swap(
+            &mut self.right_sidebar_note_table_horizontal_offsets,
+            &mut state.table_horizontal_offsets,
+        );
+        std::mem::swap(
+            &mut self.right_sidebar_note_table_layouts,
+            &mut state.table_layouts,
+        );
+        std::mem::swap(
+            &mut self.right_sidebar_note_code_highlight,
+            &mut state.code_highlight,
+        );
+        std::mem::swap(
+            &mut self.right_sidebar_note_paint_cache,
+            &mut state.paint_cache,
+        );
+    }
+
     fn schedule_right_sidebar_note_parse(&mut self) {
         let Some((revision, source, mode, caret, document)) =
             self.right_sidebar_note.background_parse_request()
@@ -4848,12 +5521,33 @@ impl crate::TermWindow {
             self.right_sidebar_note.parse_in_flight_revision = None;
             return;
         };
+        let ticket = self.note_surface_ticket();
+        let surface = ticket.surface;
+        // A preview's wiki links resolve among its project's files; nothing is
+        // listed for a file without any.
+        let link_files = match &document {
+            Some((root, _)) if surface == NoteSurface::FilePreview && source.contains("[[") => {
+                self.preview_link_files(root)
+            }
+            _ => None,
+        };
         promise::spawn::spawn(async move {
             let result = promise::spawn::spawn_into_new_thread(move || {
                 let stage = crate::input_diagnostics::StageTimer::begin("note_projection");
                 let mut projection = crate::markdown_editor::MarkdownProjection::parse(&source);
                 if let Some((vault_root, relative_path)) = document {
-                    projection.resolve_vault_links(&vault_root, &relative_path);
+                    if surface == NoteSurface::Note {
+                        projection.resolve_vault_links(&vault_root, &relative_path);
+                    } else if projection.has_wiki_links() {
+                        if let Some(files) = link_files {
+                            resolve_preview_wiki_links(
+                                &mut projection,
+                                &vault_root,
+                                &relative_path,
+                                files,
+                            );
+                        }
+                    }
                 }
                 let visual = build_visual_document(&source, &projection, mode, caret);
                 stage.finish(true);
@@ -4861,25 +5555,28 @@ impl crate::TermWindow {
             })
             .await;
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                match result {
-                    Ok((projection, visual)) => {
-                        let applied = term_window
-                            .right_sidebar_note
-                            .apply_background_parse(revision, mode, caret, projection, visual);
-                        if applied {
-                            term_window
-                                .schedule_right_sidebar_note_spellcheck(Duration::from_millis(50));
-                            term_window.invalidate_window();
+                term_window.with_note_surface_ticket(ticket, move |term_window| {
+                    match result {
+                        Ok((projection, visual)) => {
+                            let applied = term_window
+                                .right_sidebar_note
+                                .apply_background_parse(revision, mode, caret, projection, visual);
+                            if applied {
+                                term_window.schedule_right_sidebar_note_spellcheck(
+                                    Duration::from_millis(50),
+                                );
+                                term_window.invalidate_window();
+                            }
+                        }
+                        Err(err) => {
+                            term_window.right_sidebar_note.parse_in_flight_revision = None;
+                            log::error!("failed to parse Note in background: {err:#}");
                         }
                     }
-                    Err(err) => {
-                        term_window.right_sidebar_note.parse_in_flight_revision = None;
-                        log::error!("failed to parse Note in background: {err:#}");
+                    if term_window.right_sidebar_note.background_parse_pending() {
+                        term_window.schedule_right_sidebar_note_parse();
                     }
-                }
-                if term_window.right_sidebar_note.background_parse_pending() {
-                    term_window.schedule_right_sidebar_note_parse();
-                }
+                });
             })));
         })
         .detach();
@@ -4905,6 +5602,7 @@ impl crate::TermWindow {
             self.right_sidebar_note.wrap_cache = wrap_cache;
             return;
         };
+        let ticket = self.note_surface_ticket();
         promise::spawn::spawn(async move {
             let result = promise::spawn::spawn_into_new_thread(move || {
                 // Worker-side wrap: slow is acceptable here. Decisions about
@@ -4931,7 +5629,7 @@ impl crate::TermWindow {
             })
             .await;
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                match result {
+                term_window.with_note_surface_ticket(ticket, move |term_window| match result {
                     Ok((wrapped, wrap_cache)) => {
                         term_window
                             .right_sidebar_note
@@ -4944,7 +5642,7 @@ impl crate::TermWindow {
                         }
                         log::error!("failed to wrap Note in background: {err:#}");
                     }
-                }
+                });
                 term_window.invalidate_window();
             })));
         })
@@ -4986,6 +5684,10 @@ impl crate::TermWindow {
         visual: &Arc<VisualDocument>,
         fonts: NotePrewarmFonts,
     ) {
+        // Prewarming serves the Note's typing latency; a preview does not type.
+        if self.note_surface_installed != NoteSurface::Note {
+            return;
+        }
         let same_target = self
             .right_sidebar_note_prewarm
             .as_ref()
@@ -5100,6 +5802,10 @@ impl crate::TermWindow {
     }
 
     fn schedule_right_sidebar_note_spellcheck(&mut self, delay: Duration) {
+        // A read-only surface other than the Note is never spell-checked.
+        if self.note_surface_installed != NoteSurface::Note {
+            return;
+        }
         let Some(window) = self.window.as_ref().cloned() else {
             return;
         };
@@ -5268,6 +5974,10 @@ impl crate::TermWindow {
     }
 
     fn sync_right_sidebar_note_native_text_input_snapshot(&mut self, wrap_key: usize) {
+        // Only the Note takes text input.
+        if self.note_surface_installed != NoteSurface::Note {
+            return;
+        }
         let active = self.right_sidebar_note.view.focused
             && self.right_sidebar_note.view.mode != EditorMode::ReadOnly;
         let Some(window) = self.window.as_ref().cloned() else {
@@ -5411,7 +6121,7 @@ impl crate::TermWindow {
     }
 
     fn right_sidebar_note_visible(&self) -> bool {
-        !self.right_sidebar_collapsed && self.right_sidebar_mode == RightSidebarMode::Tasks
+        self.right_sidebar_presented() && self.right_sidebar_mode == RightSidebarMode::Tasks
     }
 
     fn apply_right_sidebar_note_published_revision(
@@ -5608,14 +6318,37 @@ impl crate::TermWindow {
         }
     }
 
+    /// The panel as presented -- a hover reveal included. Terminal geometry
+    /// wants `right_sidebar_width` instead.
     pub fn right_sidebar_rect(&self) -> Option<RightSidebarRect> {
+        let mut rect = self.right_sidebar_rect_for_width(self.right_sidebar_presented_width())?;
+        // Off macOS the panel has no toggle of its own and the tab bar keeps
+        // the window buttons at its right end; a hover-revealed panel stays
+        // below the tab bar so both remain reachable.
+        if !cfg!(target_os = "macos")
+            && self.right_sidebar_collapsed
+            && self.show_tab_bar
+            && !self.config.tab_bar_at_bottom
+        {
+            let tab_bar = self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize;
+            let top = tab_bar.max(rect.y);
+            rect.height = rect.height.saturating_sub(top - rect.y);
+            rect.y = top;
+            if rect.height == 0 {
+                return None;
+            }
+        }
+        Some(rect)
+    }
+
+    fn right_sidebar_rect_for_width(&self, width: usize) -> Option<RightSidebarRect> {
         let border = self.get_os_border();
         let bottom_tab_bar_height = if self.config.tab_bar_at_bottom && self.show_tab_bar {
             self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize
         } else {
             0
         };
-        let width = self.right_sidebar_width().min(
+        let width = width.min(
             self.dimensions
                 .pixel_width
                 .saturating_sub((border.left + border.right).get() as usize),
@@ -6076,7 +6809,7 @@ impl crate::TermWindow {
         let Some(rect) = self.right_sidebar_rect() else {
             return None;
         };
-        if self.right_sidebar_collapsed
+        if !self.right_sidebar_presented()
             || self.right_sidebar_mode != RightSidebarMode::Snippets
             || self.right_sidebar_snippet_view != RightSidebarSnippetView::List
         {
@@ -7620,8 +8353,14 @@ impl crate::TermWindow {
         self.schedule_right_sidebar_note_parse();
         self.schedule_right_sidebar_note_spellcheck(Duration::from_millis(50));
 
-        let toolbar_height = self.ui_px(NOTE_TOOLBAR_HEIGHT);
-        let menu_size = toolbar_height;
+        // The Note has its toolbar; another surface brings its own header.
+        let is_note = self.note_surface_installed == NoteSurface::Note;
+        let toolbar_height = if is_note {
+            self.ui_px(NOTE_TOOLBAR_HEIGHT)
+        } else {
+            0
+        };
+        let menu_size = self.ui_px(NOTE_TOOLBAR_HEIGHT);
 
         let body_y = content_top + toolbar_height + self.ui_px(NOTE_BODY_TOP_GAP);
         let body_bottom = content_bottom.saturating_sub(self.ui_px(SIDEBAR_INSET));
@@ -7635,7 +8374,11 @@ impl crate::TermWindow {
             y: body_y,
             width: content_width,
             height: body_height,
-            item_type: UIItemType::RightSidebarNoteBody,
+            item_type: if is_note {
+                UIItemType::RightSidebarNoteBody
+            } else {
+                UIItemType::RightSidebarFilePreviewMarkdownBody
+            },
         });
 
         let settings = crate::native_settings::load();
@@ -7706,8 +8449,14 @@ impl crate::TermWindow {
         let preedit = self.right_sidebar_note.view.preedit.clone();
         let padding = self.ui_px(NOTE_BODY_PADDING) as f32;
         let available_reading_width = (content_width as f32 - padding * 2.0).max(1.0);
-        let reading_width = available_reading_width
-            .min(self.ui_f32(self.config.note_reading_max_width.max(320) as f32));
+        // A rendered file preview reads wider than a note: it is someone
+        // else's document, often a README laid out for a browser.
+        let reading_max_width = if self.note_surface_installed == NoteSurface::FilePreview {
+            MARKDOWN_PREVIEW_READING_MAX_WIDTH
+        } else {
+            self.config.note_reading_max_width.max(320)
+        };
+        let reading_width = available_reading_width.min(self.ui_f32(reading_max_width as f32));
         let text_left = content_x as f32 + (content_width as f32 - reading_width) / 2.0;
         let clip_left = text_left;
         let clip_right = text_left + reading_width;
@@ -7862,18 +8611,20 @@ impl crate::TermWindow {
             self.right_sidebar_note.code_block_layouts.clear();
             self.right_sidebar_note.viewport_height = body_height as f32;
             self.right_sidebar_note.content_height = body_height as f32;
-            self.paint_note_editor_toolbar(
-                layers,
-                chrome,
-                foreground,
-                muted_fg,
-                content_x,
-                content_top,
-                content_width,
-                menu_size,
-                show_tree_button,
-                tree_button_icon,
-            )?;
+            if is_note {
+                self.paint_note_editor_toolbar(
+                    layers,
+                    chrome,
+                    foreground,
+                    muted_fg,
+                    content_x,
+                    content_top,
+                    content_width,
+                    menu_size,
+                    show_tree_button,
+                    tree_button_icon,
+                )?;
+            }
             note_layout_stage.finish(true);
             if let Some(before) = note_stats_before {
                 let after = self
@@ -8125,10 +8876,20 @@ impl crate::TermWindow {
 
             let mut image_sources = HashMap::new();
             if let Some(document) = active_document.as_ref() {
+                // Embeds resolve to canonical paths; the root may not be one
+                // (a preview's project root is spelled as the user opened it).
+                let canonical_root = if document.vault_root.as_os_str().is_empty() {
+                    None
+                } else {
+                    document.vault_root.canonicalize().ok()
+                };
                 for object in &projected_objects {
                     let resolved = match object {
                         ProjectedObject::Image { source, target, .. } => {
+                            // A previewed file is not the user's own note: it
+                            // never makes the desktop fetch anything.
                             if self.config.note_remote_images_enabled
+                                && self.note_surface_installed == NoteSurface::Note
                                 && (target.starts_with("https://") || target.starts_with("http://"))
                             {
                                 Some((
@@ -8153,9 +8914,16 @@ impl crate::TermWindow {
                             resolved_path: Some(target),
                             ..
                         } => {
-                            let candidate = document.vault_root.join(target).canonicalize().ok();
-                            candidate
-                                .filter(|candidate| candidate.starts_with(&document.vault_root))
+                            // A remote preview has no local root: an empty one
+                            // would resolve against the process's own folder.
+                            canonical_root
+                                .as_ref()
+                                .and_then(|root| {
+                                    root.join(target)
+                                        .canonicalize()
+                                        .ok()
+                                        .filter(|candidate| candidate.starts_with(root))
+                                })
                                 .map(|path| {
                                     (source.start, RightSidebarNoteImageSource::Local(path))
                                 })
@@ -8445,7 +9213,13 @@ impl crate::TermWindow {
                         y: header_y,
                         width: wrap_width as usize,
                         height: header_height,
-                        item_type: UIItemType::RightSidebarNoteCodeToggle(code_row.block_start),
+                        item_type: if is_note {
+                            UIItemType::RightSidebarNoteCodeToggle(code_row.block_start)
+                        } else {
+                            UIItemType::RightSidebarFilePreviewMarkdownCodeToggle(
+                                code_row.block_start,
+                            )
+                        },
                     });
                     let control_size = self.ui_px(NOTE_CODE_CONTROL_SIZE);
                     let control_y = header_y + header_height.saturating_sub(control_size) / 2;
@@ -8463,7 +9237,13 @@ impl crate::TermWindow {
                         } else {
                             SvgIcon::ChevronDown
                         },
-                        UIItemType::RightSidebarNoteCodeToggle(code_row.block_start),
+                        if is_note {
+                            UIItemType::RightSidebarNoteCodeToggle(code_row.block_start)
+                        } else {
+                            UIItemType::RightSidebarFilePreviewMarkdownCodeToggle(
+                                code_row.block_start,
+                            )
+                        },
                     )?;
                     let copy_x = clip_right.max(text_left) as usize - control_size - self.ui_px(4);
                     self.paint_snippet_icon_button(
@@ -8475,7 +9255,13 @@ impl crate::TermWindow {
                         control_y,
                         control_size,
                         SvgIcon::Copy,
-                        UIItemType::RightSidebarNoteCodeCopy(code_row.block_start),
+                        if is_note {
+                            UIItemType::RightSidebarNoteCodeCopy(code_row.block_start)
+                        } else {
+                            UIItemType::RightSidebarFilePreviewMarkdownCodeCopy(
+                                code_row.block_start,
+                            )
+                        },
                     )?;
                     let language_x = leading_x + control_size + self.ui_px(4);
                     self.paint_sidebar_text(
@@ -9087,18 +9873,20 @@ impl crate::TermWindow {
                 self.ui_px(FILE_SCROLL_FADE_HEIGHT).min(body_height),
             )?;
         }
-        self.paint_note_editor_toolbar(
-            layers,
-            chrome,
-            foreground,
-            muted_fg,
-            content_x,
-            content_top,
-            content_width,
-            menu_size,
-            show_tree_button,
-            tree_button_icon,
-        )?;
+        if is_note {
+            self.paint_note_editor_toolbar(
+                layers,
+                chrome,
+                foreground,
+                muted_fg,
+                content_x,
+                content_top,
+                content_width,
+                menu_size,
+                show_tree_button,
+                tree_button_icon,
+            )?;
+        }
 
         if self.right_sidebar_note.content_height > self.right_sidebar_note.viewport_height {
             let track_height = body_height as f32;
@@ -10126,26 +10914,28 @@ impl crate::TermWindow {
         let refresh_x = content_x + content_width.saturating_sub(refresh_size);
         let refresh_y =
             content_top + self.ui_px(FILE_FILTER_HEIGHT).saturating_sub(refresh_size) / 2;
-        let label_width = content_width.saturating_sub(refresh_size + self.ui_px(SIDEBAR_INSET));
-        let label = self
-            .right_sidebar_remote_files
-            .target
-            .as_ref()
-            .map(|target| target.project_name.clone())
-            .unwrap_or_else(|| crate::i18n::tr("right-remote-files"));
-        self.paint_sidebar_text(
+        // The same filter box as a local project; the project's name heads
+        // the tree below it.
+        let filter_width = content_width.saturating_sub(refresh_size + self.ui_px(SIDEBAR_INSET));
+        let filter_label = crate::i18n::tr("right-filter-files");
+        let filter_input = self.right_sidebar_file_filter.clone();
+        self.paint_snippet_text_box(
             layers,
+            1,
             ui_font,
             ui_metrics,
-            &label,
+            chrome,
+            muted_fg,
             content_x,
-            content_top
-                + self
-                    .ui_px(FILE_FILTER_HEIGHT)
-                    .saturating_sub(ui_metrics.cell_size.height as usize)
-                    / 2,
-            label_width,
-            foreground,
+            content_top,
+            filter_width,
+            self.ui_px(FILE_FILTER_HEIGHT),
+            Some(SvgIcon::Search),
+            &filter_label,
+            &filter_input,
+            self.right_sidebar_file_focus == Some(RightSidebarFileField::Filter),
+            UIItemType::RightSidebarFileFilter,
+            false,
         )?;
         self.paint_files_preview_header_icon_button(
             layers,
@@ -10176,8 +10966,27 @@ impl crate::TermWindow {
             )?;
             tree_top += ui_metrics.cell_size.height as usize + self.ui_px(8);
         }
-        let rows = self.right_sidebar_remote_files.rows();
+        let query = self.right_sidebar_file_filter_for_tree().trim().to_string();
+        self.update_remote_file_search(&query);
+        let searching = !query.is_empty();
+        let rows = if searching {
+            Arc::clone(&self.right_sidebar_remote_file_search.rows)
+        } else {
+            Arc::new(self.right_sidebar_remote_files.rows())
+        };
         if rows.is_empty() {
+            let search = &self.right_sidebar_remote_file_search;
+            let message = match (&search.status, search.index.is_some()) {
+                _ if !searching => crate::i18n::tr("right-loading-remote-directory"),
+                (RemoteFileSearchStatus::NeedsUpdate, _) => {
+                    crate::i18n::tr("right-remote-search-needs-update")
+                }
+                (RemoteFileSearchStatus::Failed(message), false) => message.clone(),
+                (_, false) => crate::i18n::tr("right-indexing-files"),
+                // Still searching: say nothing rather than "no matches".
+                (_, true) if search.search_cancel.is_some() => String::new(),
+                (_, true) => crate::i18n::tr("right-no-matching-files"),
+            };
             return self.paint_files_message(
                 layers,
                 ui_font,
@@ -10189,16 +10998,17 @@ impl crate::TermWindow {
                 content_width,
                 content_bottom,
                 self.ui_px(22),
-                &crate::i18n::tr("right-loading-remote-directory"),
+                &message,
             );
         }
 
         let row_metrics = right_sidebar_file_row_metrics(ui_metrics);
-        let truncated_height = if self.right_sidebar_remote_files.has_truncated_directory() {
-            row_metrics.row_height
-        } else {
-            0
-        };
+        let truncated_height =
+            if !searching && self.right_sidebar_remote_files.has_truncated_directory() {
+                row_metrics.row_height
+            } else {
+                0
+            };
         let strip_rows = self.transfer_strip_rows(
             content_bottom
                 .saturating_sub(tree_top)
@@ -10263,19 +11073,23 @@ impl crate::TermWindow {
                 content_width,
                 tree_top.saturating_sub(content_top),
             )?;
-            self.paint_sidebar_text(
+            self.paint_snippet_text_box(
                 layers,
+                2,
                 ui_font,
                 ui_metrics,
-                &label,
+                chrome,
+                muted_fg,
                 content_x,
-                content_top
-                    + self
-                        .ui_px(FILE_FILTER_HEIGHT)
-                        .saturating_sub(ui_metrics.cell_size.height as usize)
-                        / 2,
-                label_width,
-                foreground,
+                content_top,
+                filter_width,
+                self.ui_px(FILE_FILTER_HEIGHT),
+                Some(SvgIcon::Search),
+                &filter_label,
+                &filter_input,
+                self.right_sidebar_file_focus == Some(RightSidebarFileField::Filter),
+                UIItemType::RightSidebarFileFilter,
+                false,
             )?;
             self.paint_files_preview_header_icon_button(
                 layers,
@@ -12131,7 +12945,12 @@ impl crate::TermWindow {
         anchor: Point,
         path: RemotePath,
     ) {
-        let Some(kind) = self.right_sidebar_remote_files.kind_for_path(&path) else {
+        // A search result can sit in a folder the tree never loaded.
+        let Some(kind) = self
+            .right_sidebar_remote_files
+            .kind_for_path(&path)
+            .or_else(|| self.right_sidebar_remote_file_search.kind_for_path(&path))
+        else {
             return;
         };
         let Some(origin) = self.current_remote_operation_origin() else {
@@ -13766,6 +14585,7 @@ impl crate::TermWindow {
 
     pub(crate) fn refresh_right_sidebar_remote_files(&mut self) {
         self.close_right_sidebar_file_preview();
+        self.right_sidebar_remote_file_search.release();
         let effects = self
             .right_sidebar_remote_files
             .transition(RemoteFilesEvent::Refresh);
@@ -13773,33 +14593,283 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn open_right_sidebar_remote_file(&mut self, path: RemotePath) {
-        match self.right_sidebar_remote_files.kind_for_path(&path) {
+        // A search result can sit in a folder the tree never loaded; its kind
+        // comes from the listing then.
+        let kind = self
+            .right_sidebar_remote_files
+            .kind_for_path(&path)
+            .or_else(|| self.right_sidebar_remote_file_search.kind_for_path(&path));
+        match kind {
             Some(RemoteFileKind::Directory) => {
                 let effects = self
                     .right_sidebar_remote_files
                     .transition(RemoteFilesEvent::ToggleDirectory(path));
                 self.apply_right_sidebar_remote_files_effects(effects);
             }
-            Some(RemoteFileKind::File) => {
-                if !self.right_sidebar_file_preview_active() {
-                    let max_tree_for_preview = self
-                        .right_sidebar_pane_total_max_width()
-                        .saturating_sub(self.ui_px(FILE_PREVIEW_PANE_MIN_WIDTH))
-                        .max(self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH));
-                    self.right_sidebar_file_tree_width = self
-                        .right_sidebar_width
-                        .clamp(self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH), max_tree_for_preview);
-                }
-                self.close_right_sidebar_file_preview();
-                self.right_sidebar_file_view = RightSidebarFileView::Preview;
-                self.right_sidebar_file_preview_message =
-                    Some("Loading remote file preview...".to_string());
-                let effects = self
-                    .right_sidebar_remote_files
-                    .transition(RemoteFilesEvent::SelectFile(path));
-                self.apply_right_sidebar_remote_files_effects(effects);
-            }
+            Some(RemoteFileKind::File) => self.open_right_sidebar_remote_file_preview(path),
             Some(RemoteFileKind::Symlink) | Some(RemoteFileKind::Other) | None => {}
+        }
+    }
+
+    /// Preview the remote file at `path`, known to be a file.
+    pub(crate) fn open_right_sidebar_remote_file_preview(&mut self, path: RemotePath) {
+        if !self.right_sidebar_file_preview_active() {
+            let max_tree_for_preview = self
+                .right_sidebar_pane_total_max_width()
+                .saturating_sub(self.ui_px(FILE_PREVIEW_PANE_MIN_WIDTH))
+                .max(self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH));
+            self.right_sidebar_file_tree_width = self
+                .right_sidebar_width
+                .clamp(self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH), max_tree_for_preview);
+        }
+        self.close_right_sidebar_file_preview();
+        self.right_sidebar_file_view = RightSidebarFileView::Preview;
+        self.right_sidebar_file_preview_message =
+            Some("Loading remote file preview...".to_string());
+        let effects = self
+            .right_sidebar_remote_files
+            .transition(RemoteFilesEvent::SelectFile(path));
+        self.apply_right_sidebar_remote_files_effects(effects);
+    }
+
+    fn remote_file_search_key(&self) -> Option<RemoteFileSearchKey> {
+        Some(RemoteFileSearchKey {
+            source_key: self.right_sidebar_remote_files.current_source_key()?,
+            root: self.right_sidebar_remote_files.root.clone()?,
+            respect_gitignore: self.config.right_sidebar_search_respects_gitignore,
+        })
+    }
+
+    /// Answer `query` for the remote project, listing the project on the
+    /// remote host first when there is no index for it yet or it has gone
+    /// stale. The listing is one short `thinkterm list-files` on the existing
+    /// connection; typing only searches what it returned.
+    fn update_remote_file_search(&mut self, query: &str) {
+        if query.is_empty() {
+            let search = &mut self.right_sidebar_remote_file_search;
+            search.cancel_search();
+            search.query.clear();
+            search.rows = Arc::default();
+            return;
+        }
+        let Some(key) = self.remote_file_search_key() else {
+            return;
+        };
+        if self.right_sidebar_remote_file_search.key.as_ref() != Some(&key) {
+            self.right_sidebar_remote_file_search.release();
+            self.right_sidebar_remote_file_search.key = Some(key.clone());
+        }
+        let search = &self.right_sidebar_remote_file_search;
+        let query_changed = search.query != query;
+        let stale = search
+            .built_at
+            .is_some_and(|at| at.elapsed() >= Duration::from_secs(FILE_INDEX_RESCAN_SECS));
+        let needs_listing = match &search.status {
+            RemoteFileSearchStatus::Idle => true,
+            RemoteFileSearchStatus::Indexing | RemoteFileSearchStatus::NeedsUpdate => false,
+            RemoteFileSearchStatus::Ready => stale && query_changed,
+            // Tried again when the query changes, not on every frame; a
+            // timeout only by a refresh or reconnect.
+            RemoteFileSearchStatus::Failed(message) => {
+                query_changed
+                    && message != crate::termwindow::remote_files::REMOTE_LISTING_TIMED_OUT
+            }
+        };
+        if needs_listing {
+            self.start_remote_file_search_listing(key.clone());
+        }
+        if query_changed {
+            self.right_sidebar_remote_file_search.query = query.to_string();
+            self.spawn_remote_file_search_rows(key.root);
+            self.right_sidebar_remote_file_tree_scroll_offset = 0.0;
+        }
+    }
+
+    /// Search the remote index for the current query off the UI thread, as
+    /// the local search is; the rows answer an earlier query until it lands.
+    /// A newer query cancels it.
+    fn spawn_remote_file_search_rows(&mut self, root: RemotePath) {
+        let search = &mut self.right_sidebar_remote_file_search;
+        search.cancel_search();
+        let Some(index) = search.index.clone() else {
+            search.rows = Arc::default();
+            return;
+        };
+        if search.query.is_empty() {
+            search.rows = Arc::default();
+            return;
+        }
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        search.search_cancel = Some(Arc::clone(&cancel));
+        let generation = search.generation;
+        let query = search.query.clone();
+        promise::spawn::spawn(async move {
+            let (rows, query) = promise::spawn::spawn_into_new_thread(move || {
+                let rows = remote_file_search_rows(&index, &root, &query, &cancel);
+                Ok::<_, anyhow::Error>((
+                    (!cancel.load(AtomicOrdering::Relaxed)).then_some(rows),
+                    query,
+                ))
+            })
+            .await?;
+            let Some(rows) = rows else {
+                return Ok(());
+            };
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                let search = &mut term_window.right_sidebar_remote_file_search;
+                if search.generation != generation || search.query != query {
+                    return;
+                }
+                search.search_cancel = None;
+                search.rows = Arc::new(rows);
+                term_window.invalidate_window();
+            })));
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+    }
+
+    /// The remote project's files, for a remote preview's wiki links: the
+    /// listing search keeps when there is one for this root; otherwise it is
+    /// requested, and the preview resolves its links again when it lands.
+    fn remote_file_paths_for_preview_links(&mut self) -> Option<Arc<Vec<String>>> {
+        let key = self.remote_file_search_key()?;
+        if self.right_sidebar_remote_file_search.key.as_ref() != Some(&key) {
+            self.right_sidebar_remote_file_search.release();
+            self.right_sidebar_remote_file_search.key = Some(key.clone());
+        }
+        if let Some(index) = self.right_sidebar_remote_file_search.index.as_ref() {
+            return Some(index.file_paths());
+        }
+        if self.right_sidebar_remote_file_search.status == RemoteFileSearchStatus::Idle {
+            self.start_remote_file_search_listing(key);
+        }
+        None
+    }
+
+    /// Where a preview rooted at `root` finds the files its wiki links may
+    /// name: a remote project's listing; the local project's search index when
+    /// there is one, else a walk under the search's rules; and for a file
+    /// outside the project, the files beside it. `None` while a remote
+    /// listing is still on its way.
+    fn preview_link_files(&mut self, root: &Path) -> Option<PreviewLinkFiles> {
+        if root.as_os_str().is_empty() {
+            return self
+                .remote_file_paths_for_preview_links()
+                .map(PreviewLinkFiles::Listed);
+        }
+        if self.right_sidebar_file_index_root.as_deref() != Some(root) {
+            return Some(PreviewLinkFiles::Folder);
+        }
+        Some(match self.right_sidebar_file_index.as_ref() {
+            Some(index) => PreviewLinkFiles::Listed(index.file_paths()),
+            None => PreviewLinkFiles::WalkProject {
+                respect_gitignore: self.config.right_sidebar_search_respects_gitignore,
+            },
+        })
+    }
+
+    fn start_remote_file_search_listing(&mut self, key: RemoteFileSearchKey) {
+        // Without a connection yet this stays Idle and is tried again once the
+        // lease lands.
+        let Some(lease) = self.right_sidebar_remote_files_lease.as_ref() else {
+            return;
+        };
+        if self.current_remote_connection_key().as_deref() != Some(lease.connection_key()) {
+            return;
+        }
+        let Some(operation_lease) = lease.operation_lease() else {
+            return;
+        };
+        let backend = lease.backend();
+        let connection_key = lease.connection_key().to_string();
+        let connection_id = lease.connection_id();
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        let project_name = self
+            .right_sidebar_remote_files
+            .target
+            .as_ref()
+            .map(|target| target.project_name.clone())
+            .unwrap_or_default();
+        let search = &mut self.right_sidebar_remote_file_search;
+        search.status = RemoteFileSearchStatus::Indexing;
+        let generation = search.generation;
+        promise::spawn::spawn(async move {
+            let listed = backend
+                .list_project_files(key.root.clone(), key.respect_gitignore)
+                .await;
+            drop(operation_lease);
+            if let Err(message) = &listed {
+                if crate::termwindow::remote_files::remote_listing_failure_is_transport(message) {
+                    invalidate_remote_connection_if_dead(&connection_key, connection_id, message);
+                }
+            }
+            let result = match listed {
+                Ok(RemoteProjectListing::Listed(listing)) => {
+                    let truncated = listing.truncated;
+                    promise::spawn::spawn_into_new_thread(move || {
+                        Ok(remote_file_index_from_listing(&project_name, &listing))
+                    })
+                    .await
+                    .map(|index| Some((Arc::new(index), truncated)))
+                    .map_err(|err| format!("Unable to index remote files: {err}"))
+                }
+                Ok(RemoteProjectListing::NeedsUpdate) => Ok(None),
+                Err(message) => Err(message),
+            };
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.apply_remote_file_search_listing(generation, key, result);
+            })));
+        })
+        .detach();
+    }
+
+    fn apply_remote_file_search_listing(
+        &mut self,
+        generation: u64,
+        key: RemoteFileSearchKey,
+        result: Result<Option<(Arc<RightSidebarFileIndex>, bool)>, String>,
+    ) {
+        let mut listed = false;
+        let search = &mut self.right_sidebar_remote_file_search;
+        if search.generation != generation || search.key.as_ref() != Some(&key) {
+            return;
+        }
+        match result {
+            Ok(Some((index, truncated))) => {
+                if truncated {
+                    log::warn!(
+                        "Remote file search stopped at a limit; some files will not be findable by name"
+                    );
+                }
+                search.index = Some(index);
+                search.status = RemoteFileSearchStatus::Ready;
+                search.built_at = Some(Instant::now());
+                listed = true;
+            }
+            Ok(None) => {
+                search.index = None;
+                search.status = RemoteFileSearchStatus::NeedsUpdate;
+            }
+            // An index from before stays searchable.
+            Err(message) => search.status = RemoteFileSearchStatus::Failed(message),
+        }
+        self.spawn_remote_file_search_rows(key.root.clone());
+        if listed && self.right_sidebar_remote_files.selected.is_some() {
+            // A remote preview may be waiting on these files for its links.
+            self.with_note_surface(NoteSurface::FilePreview, |term_window| {
+                if term_window.right_sidebar_note.projection.has_wiki_links() {
+                    term_window.right_sidebar_note.request_link_resolution();
+                }
+            });
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
         }
     }
 
@@ -13947,7 +15017,7 @@ impl crate::TermWindow {
                     return;
                 }
                 term_window.right_sidebar_file_preview_lines = result.lines;
-                term_window.right_sidebar_file_preview_raw_text = result.raw_text;
+                term_window.set_right_sidebar_file_preview_raw_text(result.raw_text);
                 term_window.right_sidebar_file_preview_max_columns = term_window
                     .right_sidebar_file_preview_lines
                     .iter()
@@ -14840,8 +15910,18 @@ impl crate::TermWindow {
         )?;
 
         let action_gap = self.ui_px(PREVIEW_HEADER_ACTION_GAP);
-        let available_after_back =
-            content_width.saturating_sub(button_size + self.ui_px(SIDEBAR_INSET));
+        let toggle_width = self.paint_markdown_preview_toggle(
+            layers,
+            chrome,
+            foreground,
+            muted_fg,
+            content_x + button_size + action_gap,
+            header_top,
+            button_size,
+        )?;
+        let available_after_back = content_width
+            .saturating_sub(button_size + self.ui_px(SIDEBAR_INSET))
+            .saturating_sub(toggle_width);
         // The label is always shown in full. Size the button to fit it, limited
         // only by the room left after the two icon buttons, the gaps and a small
         // reserved minimum for the filename — no fixed cap, so a wide pane is
@@ -14904,7 +15984,7 @@ impl crate::TermWindow {
             action_x += button_size + action_gap;
         }
 
-        let title_x = content_x + button_size + self.ui_px(SIDEBAR_INSET);
+        let title_x = content_x + button_size + self.ui_px(SIDEBAR_INSET) + toggle_width;
         let title_right = actions_x.saturating_sub(self.ui_px(SIDEBAR_INSET));
         let title_width = title_right.saturating_sub(title_x);
         let title = file_name_for_path(path);
@@ -14947,6 +16027,15 @@ impl crate::TermWindow {
             SvgIcon::X,
             UIItemType::RightSidebarRemoteFileBack,
         )?;
+        let toggle_width = self.paint_markdown_preview_toggle(
+            layers,
+            chrome,
+            foreground,
+            muted_fg,
+            content_x + button_size + self.ui_px(PREVIEW_HEADER_ACTION_GAP),
+            header_top,
+            button_size,
+        )?;
         let can_copy = self.right_sidebar_file_preview_image.is_none()
             && !self.right_sidebar_file_preview_lines.is_empty();
         let actions_x = content_x + content_width.saturating_sub(button_size);
@@ -14963,7 +16052,7 @@ impl crate::TermWindow {
                 UIItemType::RightSidebarRemoteFileCopyText,
             )?;
         }
-        let title_x = content_x + button_size + self.ui_px(SIDEBAR_INSET);
+        let title_x = content_x + button_size + self.ui_px(SIDEBAR_INSET) + toggle_width;
         let title_right = if can_copy {
             actions_x.saturating_sub(self.ui_px(SIDEBAR_INSET))
         } else {
@@ -15166,7 +16255,7 @@ impl crate::TermWindow {
         content_x: usize,
         content_top: usize,
         content_width: usize,
-        _content_bottom: usize,
+        content_bottom: usize,
     ) -> anyhow::Result<()> {
         let local_path = self.right_sidebar_file_selected.clone();
         let remote_path = self.right_sidebar_remote_files.selected.clone();
@@ -15204,7 +16293,22 @@ impl crate::TermWindow {
         let mut show_top_fade = false;
         let mut show_scrollbars = false;
 
-        if let Some(message) = self.right_sidebar_file_preview_message.clone() {
+        if self.right_sidebar_markdown_preview_rendering()
+            && self.ensure_right_sidebar_markdown_preview()
+        {
+            self.paint_right_sidebar_markdown_preview(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                foreground,
+                muted_fg,
+                metrics.x,
+                metrics.y,
+                metrics.width,
+                content_bottom,
+            )?;
+        } else if let Some(message) = self.right_sidebar_file_preview_message.clone() {
             self.paint_sidebar_text(
                 layers, ui_font, ui_metrics, &message, body_x, body_y, body_width, muted_fg,
             )?;
@@ -18865,26 +19969,11 @@ fn build_right_sidebar_file_index_with_cancel(
         char_bag: RightSidebarFileCharBag::from_str(project_name),
     }];
 
-    // `ignore` is ripgrep's walker: it prunes ignored directories as it goes
-    // rather than listing then discarding them, which is what keeps a project
-    // with a large vendored subtree from costing hundreds of milliseconds.
-    let mut builder = WalkBuilder::new(root);
-    builder
-        // Dotfiles stay visible — `.github`, `.cargo` and friends are part of
-        // the project. Only .gitignore decides what is hidden.
-        .hidden(false)
-        .follow_links(false)
-        .git_ignore(respect_gitignore)
-        .git_exclude(respect_gitignore)
-        // Only this project's own ignore rules: no global core.excludesFile and
-        // no walking up into parent repositories.
-        .git_global(false)
-        .parents(false)
-        // Honour .gitignore even in a directory that is not a git repo yet.
-        .require_git(false)
-        .filter_entry(should_index_walk_entry);
-
-    for entry in builder.build().skip(1) {
+    // The same rules a remote project is indexed with (`thinkterm list-files`).
+    for entry in thinkterm_file_index::project_walker(root, respect_gitignore)
+        .build()
+        .skip(1)
+    {
         if entries.len() >= FILE_INDEX_ENTRY_LIMIT {
             log::warn!(
                 "File search index for {} hit the {} entry limit; \
@@ -18922,7 +20011,7 @@ fn build_right_sidebar_file_index_with_cancel(
         return Err("File indexing canceled".to_string());
     }
 
-    Ok(RightSidebarFileIndex { entries })
+    Ok(RightSidebarFileIndex::new(entries))
 }
 
 /// Whether a directory that was just read differs from what the cache holds.
@@ -19111,45 +20200,314 @@ fn search_right_sidebar_file_index(
         .collect()
 }
 
-fn should_index_walk_entry(entry: &IgnoreDirEntry) -> bool {
-    if entry.depth() == 0 || !entry.file_type().is_some_and(|kind| kind.is_dir()) {
-        return true;
+/// What a remote project's search index is for: the connection, the root it
+/// lists and the ignore rule it was listed under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteFileSearchKey {
+    source_key: String,
+    root: RemotePath,
+    respect_gitignore: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RemoteFileSearchStatus {
+    #[default]
+    Idle,
+    Indexing,
+    Ready,
+    /// The remote host has no `thinkterm` that can list files.
+    NeedsUpdate,
+    Failed(String),
+}
+
+/// Search for a remote project: the listing `thinkterm list-files` sends back,
+/// indexed and searched here exactly as a local project's index is. Held only
+/// while it is used; released with the rest of the Files memory.
+#[derive(Default)]
+pub(crate) struct RemoteFileSearchState {
+    key: Option<RemoteFileSearchKey>,
+    status: RemoteFileSearchStatus,
+    index: Option<Arc<RightSidebarFileIndex>>,
+    built_at: Option<Instant>,
+    /// Bumped on every reset, so a listing requested before it is dropped.
+    generation: u64,
+    /// The query `rows` answer, or will once the search running for it
+    /// lands.
+    query: String,
+    /// Shared with each frame's painter rather than copied into it.
+    rows: Arc<Vec<RemoteFileRow>>,
+    /// Set to stop the search running off the UI thread; `Some` while one is.
+    search_cancel: Option<Arc<AtomicBool>>,
+}
+
+impl RemoteFileSearchState {
+    pub(crate) fn release(&mut self) {
+        self.cancel_search();
+        let generation = self.generation.wrapping_add(1);
+        *self = Self {
+            generation,
+            ..Self::default()
+        };
     }
-    let name = entry.file_name().to_string_lossy();
-    !should_skip_file_index_dir(&name)
+
+    fn cancel_search(&mut self) {
+        if let Some(cancel) = self.search_cancel.take() {
+            cancel.store(true, AtomicOrdering::Relaxed);
+        }
+    }
+
+    fn kind_for_path(&self, path: &RemotePath) -> Option<RemoteFileKind> {
+        self.rows
+            .iter()
+            .find(|row| &row.entry.path == path)
+            .map(|row| row.entry.kind)
+    }
+}
+
+/// Index a remote listing the way a local project is indexed. Paths stay
+/// relative to the root; entry 0 stands for the root itself, as search skips it.
+fn remote_file_index_from_listing(
+    project_name: &str,
+    listing: &thinkterm_file_index::Listing,
+) -> RightSidebarFileIndex {
+    let mut entries = Vec::with_capacity(listing.entries.len() + 1);
+    entries.push(RightSidebarFileIndexEntry {
+        path: PathBuf::new(),
+        name: project_name.to_string(),
+        display_path: project_name.to_string(),
+        is_dir: true,
+        name_char_bag: RightSidebarFileCharBag::from_str(project_name),
+        char_bag: RightSidebarFileCharBag::from_str(project_name),
+    });
+    for entry in &listing.entries {
+        let name = entry
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&entry.path)
+            .to_string();
+        entries.push(RightSidebarFileIndexEntry {
+            path: PathBuf::from(&entry.path),
+            name_char_bag: RightSidebarFileCharBag::from_str(&name),
+            name,
+            display_path: entry.path.clone(),
+            is_dir: entry.is_dir,
+            char_bag: RightSidebarFileCharBag::from_str(&entry.path),
+        });
+    }
+    RightSidebarFileIndex::new(entries)
+}
+
+/// `relative` under `root`, one component at a time, so a listing cannot name
+/// anything outside the root (`..`, `.` and empty components are refused).
+fn remote_path_under(root: &RemotePath, relative: &str) -> Option<RemotePath> {
+    let mut path = root.clone();
+    for component in relative.split('/') {
+        path = path.join_name(component).ok()?;
+    }
+    Some(path)
+}
+
+fn remote_file_search_rows(
+    index: &RightSidebarFileIndex,
+    root: &RemotePath,
+    query: &str,
+    cancel: &AtomicBool,
+) -> Vec<RemoteFileRow> {
+    search_right_sidebar_file_index(index, query, cancel)
+        .into_iter()
+        .filter_map(|row| {
+            let path = remote_path_under(root, &row.name)?;
+            Some(RemoteFileRow {
+                entry: RemoteFileEntry {
+                    path,
+                    name: row.name,
+                    kind: if row.is_dir {
+                        RemoteFileKind::Directory
+                    } else {
+                        RemoteFileKind::File
+                    },
+                    size: None,
+                },
+                depth: 0,
+                expanded: false,
+            })
+        })
+        .collect()
+}
+
+/// Where the pointer is for the right sidebar's hover machine: over the panel
+/// as presented, over the right-edge strip or the sidebar button that arm a
+/// reveal, in the wider band just inside the strip that keeps a running dwell
+/// alive, or away. The panel is checked first: once revealed, the strip is
+/// inside it.
+fn right_sidebar_hover_zone(
+    x: isize,
+    y: isize,
+    panel: Option<RightSidebarRect>,
+    hot_zone: Option<(usize, usize, usize, usize)>,
+    sticky_width: usize,
+    over_toggle: bool,
+) -> crate::termwindow::sidebar_hover::PointerZone {
+    use crate::termwindow::sidebar_hover::PointerZone;
+    let in_panel = panel.is_some_and(|rect| {
+        x >= rect.x as isize
+            && x < rect.x.saturating_add(rect.width) as isize
+            && y >= rect.y as isize
+            && y < rect.y.saturating_add(rect.height) as isize
+    });
+    if in_panel {
+        return PointerZone::Panel;
+    }
+    if over_toggle {
+        return PointerZone::HotZone;
+    }
+    let Some((zx, zy, zw, zh)) = hot_zone else {
+        return PointerZone::Away;
+    };
+    let right = zx.saturating_add(zw) as isize;
+    if y < zy as isize || y >= zy.saturating_add(zh) as isize || x >= right {
+        return PointerZone::Away;
+    }
+    if x >= zx as isize {
+        PointerZone::HotZone
+    } else if x >= right - sticky_width as isize {
+        PointerZone::NearHotZone
+    } else {
+        PointerZone::Away
+    }
+}
+
+/// See `TermWindow::markdown_preview_document`. `project_root` bounds where a
+/// local file's images may come from; a file outside it is bounded by its own
+/// folder.
+fn markdown_preview_document(
+    path: &str,
+    text: String,
+    remote_relative: Option<String>,
+    project_root: Option<&Path>,
+) -> crate::markdown_editor::VaultDocument {
+    // A session stats its path; a remote path means nothing on this machine,
+    // so a remote preview's session has none.
+    let session_path = if remote_relative.is_some() {
+        PathBuf::new()
+    } else {
+        PathBuf::from(path)
+    };
+    let session = Arc::new(parking_lot::Mutex::new(
+        crate::markdown_editor::MarkdownDocumentSession::new(
+            "file-preview".to_string(),
+            session_path,
+            text,
+        ),
+    ));
+    if let Some(relative_path) = remote_relative {
+        // No local root: nothing is read from this machine for it. The path
+        // relative to the remote project lets its wiki links resolve among
+        // the remote files.
+        return crate::markdown_editor::VaultDocument {
+            vault_root: PathBuf::new(),
+            relative_path,
+            document_path: PathBuf::new(),
+            session,
+        };
+    }
+    let document_path = PathBuf::from(path);
+    let root = project_root
+        .filter(|root| document_path.starts_with(root))
+        .map(Path::to_path_buf)
+        .or_else(|| document_path.parent().map(Path::to_path_buf))
+        .unwrap_or_default();
+    let relative_path = document_path
+        .strip_prefix(&root)
+        .map(path_to_display_string)
+        .unwrap_or_default();
+    crate::markdown_editor::VaultDocument {
+        vault_root: root,
+        relative_path,
+        document_path,
+        session,
+    }
+}
+
+/// The files a preview's wiki links resolve among; see
+/// `TermWindow::preview_link_files`.
+pub(crate) enum PreviewLinkFiles {
+    /// Relative to the root, `/`-separated.
+    Listed(Arc<Vec<String>>),
+    WalkProject {
+        respect_gitignore: bool,
+    },
+    /// Only the files directly in the root folder.
+    Folder,
+}
+
+/// A previewed file is not in a Notebook: its wiki links resolve among the
+/// project's files, never by walking everything under the root. A remote file
+/// has no local root, so nothing of this machine's is read for it.
+fn resolve_preview_wiki_links(
+    projection: &mut crate::markdown_editor::MarkdownProjection,
+    root: &Path,
+    relative_path: &str,
+    files: PreviewLinkFiles,
+) {
+    let paths = match files {
+        PreviewLinkFiles::Listed(paths) => {
+            Arc::try_unwrap(paths).unwrap_or_else(|paths| paths.as_ref().clone())
+        }
+        PreviewLinkFiles::WalkProject { respect_gitignore } => {
+            let Ok(listing) = thinkterm_file_index::list_project(
+                root,
+                respect_gitignore,
+                thinkterm_file_index::ENTRY_LIMIT,
+                Instant::now() + Duration::from_secs(5),
+            ) else {
+                return;
+            };
+            listing
+                .entries
+                .into_iter()
+                .filter(|entry| !entry.is_dir)
+                .map(|entry| entry.path)
+                .collect()
+        }
+        PreviewLinkFiles::Folder => match fs::read_dir(root) {
+            Ok(entries) => entries
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .take(thinkterm_file_index::ENTRY_LIMIT)
+                .collect(),
+            Err(_) => return,
+        },
+    };
+    if root.as_os_str().is_empty() {
+        projection.resolve_links_among(None, paths, relative_path);
+        return;
+    }
+    let Ok(root) = root.canonicalize() else {
+        return;
+    };
+    projection.resolve_links_among(Some(&root), paths, relative_path);
+}
+
+/// `path` relative to `root` with `/` separators, when it lies under it.
+fn remote_relative_path(root: &RemotePath, path: &RemotePath) -> Option<String> {
+    let root = root.as_str().trim_end_matches('/');
+    let rest = path.as_str().strip_prefix(root)?.strip_prefix('/')?;
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
+fn is_markdown_extension(extension: &str) -> bool {
+    extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
 }
 
 fn should_skip_file_index_dir(name: &str) -> bool {
-    matches!(
-        name,
-        ".git"
-            | ".hg"
-            | ".svn"
-            | "target"
-            | "node_modules"
-            | ".next"
-            | ".nuxt"
-            | ".turbo"
-            | ".cache"
-            | "dist"
-            | "build"
-            | "coverage"
-            | "vendor"
-            | ".venv"
-            | "venv"
-            | "__pycache__"
-    )
+    thinkterm_file_index::should_skip_dir(name)
 }
 
 fn path_to_display_string(path: &Path) -> String {
-    let mut display = String::new();
-    for component in path.components() {
-        if !display.is_empty() {
-            display.push('/');
-        }
-        display.push_str(&component.as_os_str().to_string_lossy());
-    }
-    display
+    thinkterm_file_index::display_path(path)
 }
 
 fn file_index_entry_cmp(
@@ -20671,6 +22029,296 @@ mod tests {
         assert_eq!(naturalish_cmp("tab2", "tab10"), std::cmp::Ordering::Less);
         assert_eq!(naturalish_cmp("tab10", "tab2"), std::cmp::Ordering::Greater);
         assert_eq!(naturalish_cmp("tab01", "tab1"), std::cmp::Ordering::Greater);
+    }
+
+    use super::{
+        remote_file_index_from_listing, remote_file_search_rows, remote_path_under,
+        right_sidebar_hover_zone, RemoteFileSearchState, RemoteFileSearchStatus,
+    };
+
+    #[test]
+    fn markdown_previews_render_read_only_from_their_own_session() {
+        use crate::markdown_editor::{EditorMode, NoteHostState, ProjectedObject};
+        let base = tempfile::tempdir().unwrap();
+        let project_root = base.path().join("project");
+        let docs = project_root.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("shot.png"), b"not really a png").unwrap();
+        let outside_root = base.path().join("other");
+        std::fs::create_dir_all(&outside_root).unwrap();
+        std::fs::write(outside_root.join("secret.png"), b"x").unwrap();
+        let file = docs.join("README.md");
+        let text = "# Title\n\nSome *text*.\n\n```rust\nfn main() {}\n```\n".to_string();
+
+        let document = super::markdown_preview_document(
+            file.to_str().unwrap(),
+            text.clone(),
+            None,
+            Some(&project_root),
+        );
+        assert_eq!(document.vault_root, project_root);
+        assert_eq!(document.relative_path, "docs/README.md");
+        // Images resolve beside the file and cannot leave the project.
+        assert!(crate::markdown_editor::resolve_local_image(
+            &document.vault_root,
+            &document.document_path,
+            "shot.png"
+        )
+        .is_ok());
+        // A real file one folder up from the project: reachable, but outside.
+        assert!(docs.join("../../other/secret.png").exists());
+        assert!(crate::markdown_editor::resolve_local_image(
+            &document.vault_root,
+            &document.document_path,
+            "../../other/secret.png"
+        )
+        .is_err());
+
+        let mut host = NoteHostState::default();
+        host.bind_document(document);
+        host.view.mode = EditorMode::ReadOnly;
+        host.refresh_projection();
+        assert!(host
+            .projection
+            .objects
+            .iter()
+            .any(|object| matches!(object, ProjectedObject::CodeBlock(_))));
+        // Read-only: typing changes nothing.
+        let session = host.session.clone().unwrap();
+        let changed = session.lock().insert_text(&mut host.view, "x");
+        assert!(!changed);
+        assert_eq!(session.lock().source(), text);
+
+        // Outside the project, the file's own folder bounds it.
+        let loose = outside_root.join("notes.md");
+        let document = super::markdown_preview_document(
+            loose.to_str().unwrap(),
+            String::new(),
+            None,
+            Some(&project_root),
+        );
+        assert_eq!(document.vault_root, outside_root);
+        // A remote file has no local folder to take images from.
+        let remote = super::markdown_preview_document(
+            "/srv/app/docs/README.md",
+            text,
+            Some("docs/README.md".to_string()),
+            None,
+        );
+        assert_eq!(remote.relative_path, "docs/README.md");
+        assert!(remote.document_path.as_os_str().is_empty());
+        assert!(crate::markdown_editor::resolve_local_image(
+            &remote.vault_root,
+            &remote.document_path,
+            "shot.png"
+        )
+        .is_err());
+        assert!(super::is_markdown_extension("MD"));
+        assert!(super::is_markdown_extension("markdown"));
+        assert!(!super::is_markdown_extension("mdx"));
+    }
+
+    #[test]
+    fn preview_wiki_links_resolve_among_the_project_files() {
+        use crate::markdown_editor::{MarkdownProjection, ProjectedObject};
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("docs/guide.md"), "# Guide").unwrap();
+        std::fs::write(root.join("node_modules/pkg/setup.md"), "").unwrap();
+        let walk = || super::PreviewLinkFiles::WalkProject {
+            respect_gitignore: true,
+        };
+        let resolved_in = |source: &str, root: &Path, current: &str, files| {
+            let mut projection = MarkdownProjection::parse(source);
+            super::resolve_preview_wiki_links(&mut projection, root, current, files);
+            projection
+                .objects
+                .iter()
+                .find_map(|object| match object {
+                    ProjectedObject::WikiLink { resolved_path, .. } => Some(resolved_path.clone()),
+                    _ => None,
+                })
+                .expect("a wiki link")
+        };
+        let resolved = |source: &str| resolved_in(source, root, "docs/README.md", walk());
+        assert_eq!(
+            resolved("See [[guide]]."),
+            Some("docs/guide.md".to_string())
+        );
+        // Dependency trees are not part of the project for links either.
+        assert_eq!(resolved("See [[setup]]."), None);
+        // The search index's paths serve as well as a walk.
+        let listed = super::PreviewLinkFiles::Listed(Arc::new(vec!["docs/guide.md".to_string()]));
+        assert_eq!(
+            resolved_in("See [[guide]].", root, "docs/README.md", listed),
+            Some("docs/guide.md".to_string())
+        );
+        // A file outside the project sees only the files beside it.
+        assert_eq!(
+            resolved_in(
+                "See [[guide]].",
+                root,
+                "README.md",
+                super::PreviewLinkFiles::Folder
+            ),
+            None
+        );
+        std::fs::write(root.join("notes.md"), "").unwrap();
+        assert_eq!(
+            resolved_in(
+                "See [[notes]].",
+                root,
+                "README.md",
+                super::PreviewLinkFiles::Folder
+            ),
+            Some("notes.md".to_string())
+        );
+        // Without a local root (a remote file) nothing local is walked.
+        let mut projection = MarkdownProjection::parse("See [[guide]].");
+        super::resolve_preview_wiki_links(&mut projection, Path::new(""), "README.md", walk());
+        assert!(projection.objects.iter().all(|object| !matches!(
+            object,
+            ProjectedObject::WikiLink {
+                resolved_path: Some(_),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn remote_preview_links_resolve_among_listed_files_without_reading_any() {
+        use crate::markdown_editor::{MarkdownProjection, ProjectedObject};
+        let root = RemotePath::from_server_absolute("/srv/app").unwrap();
+        let file = RemotePath::from_server_absolute("/srv/app/docs/README.md").unwrap();
+        assert_eq!(
+            super::remote_relative_path(&root, &file).as_deref(),
+            Some("docs/README.md")
+        );
+        let slash = RemotePath::from_server_absolute("/").unwrap();
+        assert_eq!(
+            super::remote_relative_path(&slash, &file).as_deref(),
+            Some("srv/app/docs/README.md")
+        );
+        let elsewhere = RemotePath::from_server_absolute("/srv/other/a.md").unwrap();
+        assert_eq!(super::remote_relative_path(&root, &elsewhere), None);
+        let sibling = RemotePath::from_server_absolute("/srv/application/a.md").unwrap();
+        assert_eq!(super::remote_relative_path(&root, &sibling), None);
+
+        let mut projection = MarkdownProjection::parse("See [[guide]].\n\n![[guide]]\n");
+        projection.resolve_links_among(None, vec!["docs/guide.md".to_string()], "docs/README.md");
+        let links: Vec<_> = projection
+            .objects
+            .iter()
+            .filter_map(|object| match object {
+                ProjectedObject::WikiLink {
+                    resolved_path,
+                    rendered_lines,
+                    ..
+                } => Some((resolved_path.clone(), rendered_lines.is_empty())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(links.len(), 2);
+        // Resolved, and the embed renders nothing: no local root to read from.
+        assert!(links
+            .iter()
+            .all(|(path, empty)| path.as_deref() == Some("docs/guide.md") && *empty));
+    }
+
+    #[test]
+    fn right_sidebar_hover_zones_mirror_the_left_edge() {
+        use crate::termwindow::sidebar_hover::PointerZone;
+        // A 1000px-wide window: the strip is the last 12px below a 40px tab
+        // bar, the sticky band the 28px ending at the window edge.
+        let hot = crate::termwindow::sidebar_hover::hot_zone(988, 0, 800, 12, 40);
+        assert_eq!(hot, Some((988, 40, 12, 760)));
+        let zone = |x, y, panel, toggle| right_sidebar_hover_zone(x, y, panel, hot, 28, toggle);
+        assert_eq!(zone(995, 400, None, false), PointerZone::HotZone);
+        assert_eq!(zone(988, 400, None, false), PointerZone::HotZone);
+        assert_eq!(zone(980, 400, None, false), PointerZone::NearHotZone);
+        assert_eq!(zone(972, 400, None, false), PointerZone::NearHotZone);
+        assert_eq!(zone(971, 400, None, false), PointerZone::Away);
+        assert_eq!(zone(500, 400, None, false), PointerZone::Away);
+        // Not in the tab bar row, where the pointer heads for the tabs...
+        assert_eq!(zone(995, 20, None, false), PointerZone::Away);
+        // ...unless it is on the sidebar button, which arms on its own.
+        assert_eq!(zone(960, 20, None, true), PointerZone::HotZone);
+        // Once out, the panel is the panel, strip included.
+        let panel = Some(super::RightSidebarRect {
+            x: 700,
+            y: 0,
+            width: 300,
+            height: 800,
+        });
+        assert_eq!(zone(995, 400, panel, false), PointerZone::Panel);
+        assert_eq!(zone(700, 400, panel, false), PointerZone::Panel);
+        assert_eq!(zone(699, 400, panel, false), PointerZone::Away);
+    }
+
+    #[test]
+    fn remote_search_finds_listed_files_under_the_root() {
+        let listing = thinkterm_file_index::Listing {
+            entries: vec![
+                thinkterm_file_index::ListedEntry {
+                    path: "src".to_string(),
+                    is_dir: true,
+                },
+                thinkterm_file_index::ListedEntry {
+                    path: "src/main.rs".to_string(),
+                    is_dir: false,
+                },
+                thinkterm_file_index::ListedEntry {
+                    path: "docs/main-notes.md".to_string(),
+                    is_dir: false,
+                },
+            ],
+            truncated: false,
+        };
+        let index = remote_file_index_from_listing("app", &listing);
+        let root = RemotePath::from_server_absolute("/srv/app").unwrap();
+        let rows = remote_file_search_rows(&index, &root, "main", &AtomicBool::new(false));
+        let found: Vec<_> = rows
+            .iter()
+            .map(|row| (row.entry.path.as_str().to_string(), row.entry.kind))
+            .collect();
+        assert!(found.contains(&("/srv/app/src/main.rs".to_string(), RemoteFileKind::File)));
+        assert!(found.contains(&(
+            "/srv/app/docs/main-notes.md".to_string(),
+            RemoteFileKind::File
+        )));
+        assert_eq!(found.len(), 2);
+        let dirs = remote_file_search_rows(&index, &root, "src", &AtomicBool::new(false));
+        assert_eq!(dirs[0].entry.kind, RemoteFileKind::Directory);
+        // The same matching as a local project: a path query searches paths.
+        assert_eq!(
+            remote_file_search_rows(&index, &root, "src/ma", &AtomicBool::new(false)).len(),
+            1
+        );
+        assert!(remote_file_search_rows(&index, &root, "", &AtomicBool::new(false)).is_empty());
+    }
+
+    #[test]
+    fn remote_search_results_cannot_leave_the_root() {
+        let root = RemotePath::from_server_absolute("/srv/app").unwrap();
+        assert!(remote_path_under(&root, "../etc/passwd").is_none());
+        assert!(remote_path_under(&root, "a/./b").is_none());
+        assert!(remote_path_under(&root, "a//b").is_none());
+        assert_eq!(
+            remote_path_under(&root, "a/b").unwrap().as_str(),
+            "/srv/app/a/b"
+        );
+    }
+
+    #[test]
+    fn remote_search_state_drops_stale_listings() {
+        let mut state = RemoteFileSearchState::default();
+        let before = state.generation;
+        state.release();
+        assert_ne!(state.generation, before);
+        assert!(state.index.is_none());
+        assert_eq!(state.status, RemoteFileSearchStatus::Idle);
     }
 
     #[test]

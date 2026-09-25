@@ -626,6 +626,11 @@ pub(crate) enum NoteEditorCommand {
 #[derive(Clone, Debug)]
 pub(crate) enum ContextMenuApplicationAction {
     Note(NoteEditorCommand),
+    /// Open this local file in the file preview: one of the files an
+    /// ambiguous wiki link in rendered Markdown could mean.
+    OpenFilePreview(PathBuf),
+    /// Open this remote file in the file preview, for the same reason.
+    OpenRemoteFilePreview(remote_files::RemotePath),
     EditRecordingOverlay,
     ClearRecordingOverlay,
     /// One entry of the Remote Hosts page's card menu, carrying the host it
@@ -815,6 +820,13 @@ pub enum UIItemType {
     RightSidebarNoteCodeToggle(usize),
     RightSidebarNoteCodeCopy(usize),
     RightSidebarNoteBody,
+    /// The file preview's rendered Markdown and its code block controls: the
+    /// Note's items, for the preview's own surface.
+    RightSidebarFilePreviewMarkdownBody,
+    RightSidebarFilePreviewMarkdownCodeToggle(usize),
+    RightSidebarFilePreviewMarkdownCodeCopy(usize),
+    /// Switches a Markdown file preview between rendered and source.
+    RightSidebarFilePreviewMarkdownToggle,
     RightSidebarNotePaneToggle,
     RightSidebarNotePaneResize,
     RightSidebarFilePreviewScrollTrack,
@@ -936,6 +948,32 @@ pub(crate) struct RightSidebarFileIndexEntry {
 #[derive(Clone, Debug)]
 pub(crate) struct RightSidebarFileIndex {
     pub entries: Vec<RightSidebarFileIndexEntry>,
+    /// The files' display paths, for resolving a preview's wiki links; built
+    /// once per index on first use.
+    file_paths: std::sync::OnceLock<Arc<Vec<String>>>,
+}
+
+impl RightSidebarFileIndex {
+    pub(crate) fn new(entries: Vec<RightSidebarFileIndexEntry>) -> Self {
+        Self {
+            entries,
+            file_paths: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Every file's path relative to the root (entry 0 is the root itself).
+    pub(crate) fn file_paths(&self) -> Arc<Vec<String>> {
+        Arc::clone(self.file_paths.get_or_init(|| {
+            Arc::new(
+                self.entries
+                    .iter()
+                    .skip(1)
+                    .filter(|entry| !entry.is_dir)
+                    .map(|entry| entry.display_path.clone())
+                    .collect(),
+            )
+        }))
+    }
 }
 
 /// One child of a directory we actually read. Deliberately smaller than
@@ -2687,6 +2725,12 @@ pub struct TermWindow {
     /// touches `workspace_sidebar_collapsed` or `workspace_sidebar_width`:
     /// the terminal must not reflow for a hover.
     workspace_sidebar_hover: sidebar_hover::SidebarHoverReveal,
+    /// Hover-reveal of the collapsed right sidebar: the same machine as the
+    /// left one's, mirrored onto the right edge.
+    right_sidebar_hover: sidebar_hover::SidebarHoverReveal,
+    /// Whether the right sidebar was on screen by hover at the last step, so
+    /// arriving and leaving can open and release what the panel shows.
+    right_sidebar_hover_was_presented: bool,
     /// The pointer is over the native macOS titlebar sidebar button (which
     /// lives outside our view, so `current_mouse_event` cannot see it).
     /// Feeds the hover-reveal as a hot zone.
@@ -2756,6 +2800,12 @@ pub struct TermWindow {
     right_sidebar_note_image_failures: HashMap<RightSidebarNoteImageSource, Instant>,
     right_sidebar_note_code_highlight: ui::right_sidebar::NoteCodeHighlightState,
     right_sidebar_note_paint_cache: ui::right_sidebar::NotePaintCache,
+    /// Which surface's state is in the `right_sidebar_note*` fields right now;
+    /// the Note's, except inside `with_note_surface`.
+    note_surface_installed: ui::right_sidebar::NoteSurface,
+    /// The installed surface's instance; 0 for the Note.
+    note_surface_instance: u64,
+    right_sidebar_markdown_preview: Option<Box<ui::right_sidebar::MarkdownPreviewSurface>>,
     right_sidebar_note_prewarm: Option<ui::right_sidebar::NotePrewarmState>,
     right_sidebar_note_memory_release_token: u64,
     right_sidebar_file_view: RightSidebarFileView,
@@ -2814,6 +2864,9 @@ pub struct TermWindow {
     /// The preview text before display sanitization (tab expansion, control
     /// stripping): the display lines are wrong for the clipboard.
     right_sidebar_file_preview_raw_text: Option<String>,
+    /// Bumped whenever the preview's text changes, so rendered Markdown knows
+    /// to rebuild.
+    right_sidebar_file_preview_text_generation: u64,
     right_sidebar_file_preview_max_columns: usize,
     right_sidebar_file_preview_image: Option<RightSidebarFilePreviewImage>,
     right_sidebar_file_preview_message: Option<String>,
@@ -2872,6 +2925,7 @@ pub struct TermWindow {
     /// worded without borrowing the queued plan.
     pending_local_copy_conflict_count: usize,
     right_sidebar_remote_file_tree_scroll_offset: f32,
+    right_sidebar_remote_file_search: ui::right_sidebar::RemoteFileSearchState,
     // Bumped to invalidate a pending periodic-rescan timer tick.
     right_sidebar_file_rescan_token: u64,
     // True while a keep-showing refresh build is in flight (drives the Refresh
@@ -3478,6 +3532,7 @@ impl TermWindow {
         self.content_view_fade.is_some()
             || self.active_content_view_index().is_some()
             || self.workspace_sidebar_hover.needs_frames()
+            || self.right_sidebar_hover.needs_frames()
             || self.overlay_scrollbar_owes_frames()
     }
 
@@ -3717,6 +3772,7 @@ impl TermWindow {
             self.recording_overlay.cancel_interaction();
             self.workspace_sidebar_swipe.cancel_immediately();
             self.workspace_sidebar_hover.cancel_immediately();
+            self.right_sidebar_hover.cancel_immediately();
             self.clear_workspace_space_swipe_frame_transition();
             self.right_sidebar_note.native_text_input_snapshot_key = None;
             window.set_native_text_input_snapshot(None);
@@ -4222,6 +4278,8 @@ impl TermWindow {
             workspace_space_swipe_needs_settle_start: false,
             workspace_sidebar_scrollbar_visible_until: None,
             workspace_sidebar_hover: sidebar_hover::SidebarHoverReveal::default(),
+            right_sidebar_hover: sidebar_hover::SidebarHoverReveal::default(),
+            right_sidebar_hover_was_presented: false,
             titlebar_sidebar_button_hovered: false,
             thread_ref_groups_collapsed: std::collections::HashSet::new(),
             workspace_sidebar_show_archived: false,
@@ -4262,6 +4320,9 @@ impl TermWindow {
             right_sidebar_note_image_failures: HashMap::new(),
             right_sidebar_note_code_highlight: ui::right_sidebar::NoteCodeHighlightState::default(),
             right_sidebar_note_paint_cache: ui::right_sidebar::NotePaintCache::default(),
+            note_surface_installed: ui::right_sidebar::NoteSurface::Note,
+            note_surface_instance: 0,
+            right_sidebar_markdown_preview: None,
             right_sidebar_note_prewarm: None,
             right_sidebar_note_memory_release_token: 0,
             right_sidebar_file_view: RightSidebarFileView::Tree,
@@ -4304,6 +4365,7 @@ impl TermWindow {
             right_sidebar_file_preview_highlight_cancel: Arc::new(AtomicUsize::new(0)),
             right_sidebar_file_preview_lines: Vec::new(),
             right_sidebar_file_preview_raw_text: None,
+            right_sidebar_file_preview_text_generation: 0,
             right_sidebar_file_preview_max_columns: 0,
             right_sidebar_file_preview_image: None,
             right_sidebar_file_preview_message: None,
@@ -4331,6 +4393,7 @@ impl TermWindow {
             local_copy_generation: 0,
             pending_local_copy_conflict_count: 0,
             right_sidebar_remote_file_tree_scroll_offset: 0.0,
+            right_sidebar_remote_file_search: Default::default(),
             right_sidebar_file_rescan_token: 0,
             right_sidebar_file_refreshing: false,
             right_sidebar_open_with_generation: 0,
@@ -4739,6 +4802,7 @@ impl TermWindow {
                 // settled overlay survives a resize cleanly, a mid-flight one
                 // would jump.
                 self.workspace_sidebar_hover.settle_immediately();
+                self.right_sidebar_hover.settle_immediately();
                 self.resize(dimensions, window_state, window, live_resizing);
                 Ok(true)
             }

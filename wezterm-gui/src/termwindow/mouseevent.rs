@@ -940,19 +940,31 @@ impl super::TermWindow {
         }
     }
 
+    /// The right sidebar's counterpart of `update_workspace_sidebar_hover`.
+    fn update_right_sidebar_hover(&mut self, context: &dyn WindowOps) {
+        if self.step_right_sidebar_hover(std::time::Instant::now())
+            != crate::termwindow::sidebar_hover::HoverFrame::None
+        {
+            context.invalidate();
+        }
+    }
+
     pub(crate) fn workspace_sidebar_hover_input(
         &self,
     ) -> crate::termwindow::sidebar_hover::HoverInput {
         use crate::termwindow::sidebar_hover::{HoverInput, PointerZone};
+        // A menu, modal or rename opened from the revealed panel holds it
+        // out; one open while it is away keeps it from revealing.
+        let overlay_open = self.modal.borrow().is_some()
+            || self.context_menu.is_some()
+            || self.native_context_menu_open
+            || self.inline_tab_rename.is_some();
         let eligible = crate::native_settings::workspace_sidebar_hover_reveal_enabled()
             && self.workspace_sidebar_collapsed
             && !self.content_view_foreground()
             && !self.content_view_transition_running()
             && !self.frontend_surface_blocked()
-            && self.modal.borrow().is_none()
-            && self.context_menu.is_none()
-            && !self.native_context_menu_open
-            && self.inline_tab_rename.is_none();
+            && (!overlay_open || self.workspace_sidebar_hover.is_presented());
         // Panel is checked before the hot zone on purpose: once revealed,
         // the strip is inside the panel.
         let pointer = match &self.current_mouse_event {
@@ -1018,6 +1030,7 @@ impl super::TermWindow {
             || self.sidebar_row_drag.is_some()
             || self.right_sidebar_file_drag.is_some()
             || self.pane_tab_drag.is_some()
+            || overlay_open
             // A Space swipe on the revealed panel pins it open: retreating
             // mid-gesture would slide the ground out from under the pages.
             || self.workspace_sidebar_swipe.is_active();
@@ -1381,6 +1394,48 @@ impl super::TermWindow {
         changed
     }
 
+    /// Scroll the file preview's rendered Markdown as the Note body scrolls:
+    /// vertically, and sideways (or with Shift) across a table or code block.
+    fn mouse_wheel_right_sidebar_markdown_preview(
+        &mut self,
+        event: &MouseEvent,
+        context: &dyn WindowOps,
+    ) -> bool {
+        use crate::termwindow::ui::right_sidebar::NoteSurface;
+        let shift_vertical = matches!(event.kind, WMEK::VertWheel(_))
+            && event.modifiers.contains(::window::Modifiers::SHIFT);
+        let (sideways, delta) = match event.kind {
+            WMEK::HorzWheel(_) => (true, self.sidebar_horizontal_scroll_delta(event)),
+            WMEK::VertWheel(_) if shift_vertical => {
+                (true, self.sidebar_vertical_scroll_delta(event))
+            }
+            WMEK::VertWheel(_) => (false, self.sidebar_vertical_scroll_delta(event)),
+            _ => return false,
+        };
+        let delta = delta.unwrap_or(0.0);
+        if delta.abs() <= f32::EPSILON {
+            return true;
+        }
+        let (x, y) = (event.coords.x as f32, event.coords.y as f32);
+        let changed = self
+            .with_note_surface(NoteSurface::FilePreview, |term_window| {
+                if sideways {
+                    term_window.scroll_right_sidebar_note_table_at(x, y, delta)
+                        || term_window
+                            .right_sidebar_note
+                            .scroll_code_block_at(x, y, delta)
+                } else {
+                    term_window.right_sidebar_note.reveal_caret = false;
+                    term_window.right_sidebar_note.scroll_by(delta)
+                }
+            })
+            .unwrap_or(false);
+        if changed {
+            context.invalidate();
+        }
+        true
+    }
+
     fn mouse_wheel_right_sidebar(&mut self, event: &MouseEvent, context: &dyn WindowOps) -> bool {
         if self.right_sidebar_mode == super::RightSidebarMode::Chat {
             if let Some(rect) = self.right_sidebar_file_preview_rect() {
@@ -1391,6 +1446,9 @@ impl super::TermWindow {
                     && y >= rect.y as isize
                     && y < rect.y.saturating_add(rect.height) as isize
                 {
+                    if self.right_sidebar_markdown_preview_rendering() {
+                        return self.mouse_wheel_right_sidebar_markdown_preview(event, context);
+                    }
                     let vert_delta = self.sidebar_vertical_scroll_delta(event).unwrap_or(0.0);
                     let changed = match event.kind {
                         WMEK::VertWheel(_) => self.scroll_right_sidebar_file_preview_by(vert_delta),
@@ -1586,6 +1644,10 @@ impl super::TermWindow {
             | UIItemType::RightSidebarFilePreviewHorizontalScrollTrack
             | UIItemType::RightSidebarFilePreviewHorizontalScrollThumb
             | UIItemType::RightSidebarFilePreviewText
+            | UIItemType::RightSidebarFilePreviewMarkdownBody
+            | UIItemType::RightSidebarFilePreviewMarkdownCodeToggle(_)
+            | UIItemType::RightSidebarFilePreviewMarkdownCodeCopy(_)
+            | UIItemType::RightSidebarFilePreviewMarkdownToggle
             | UIItemType::RightSidebarFileFilter
             | UIItemType::RightSidebarFileRefresh
             | UIItemType::RightSidebarFileRow(_)
@@ -1707,6 +1769,10 @@ impl super::TermWindow {
             | UIItemType::RightSidebarFilePreviewHorizontalScrollTrack
             | UIItemType::RightSidebarFilePreviewHorizontalScrollThumb
             | UIItemType::RightSidebarFilePreviewText
+            | UIItemType::RightSidebarFilePreviewMarkdownBody
+            | UIItemType::RightSidebarFilePreviewMarkdownCodeToggle(_)
+            | UIItemType::RightSidebarFilePreviewMarkdownCodeCopy(_)
+            | UIItemType::RightSidebarFilePreviewMarkdownToggle
             | UIItemType::RightSidebarFileFilter
             | UIItemType::RightSidebarFileRefresh
             | UIItemType::RightSidebarFileRow(_)
@@ -1940,6 +2006,7 @@ impl super::TermWindow {
         // hover-reveal machinery would slide the sidebar out underneath it.
         if self.command_palette.is_none() {
             self.update_workspace_sidebar_hover(context);
+            self.update_right_sidebar_hover(context);
         }
 
         if self.consume_context_menu_suppressed_release(&event) {
@@ -2097,6 +2164,18 @@ impl super::TermWindow {
                         self.update_right_sidebar_file_preview_selection(
                             event.coords.x,
                             event.coords.y,
+                        );
+                        context.invalidate();
+                    }
+                    if completed_drag.as_ref().is_some_and(|(item, _)| {
+                        item.item_type == UIItemType::RightSidebarFilePreviewMarkdownBody
+                    }) {
+                        self.with_note_surface(
+                            crate::termwindow::ui::right_sidebar::NoteSurface::FilePreview,
+                            |term_window| {
+                                term_window.right_sidebar_note.drag_selection_active = false;
+                                term_window.right_sidebar_note.drag_selection_base = None;
+                            },
                         );
                         context.invalidate();
                     }
@@ -2402,6 +2481,7 @@ impl super::TermWindow {
         self.current_mouse_event = None;
         // The machine reads `Away` now: cancels an Arming, starts a grace.
         self.update_workspace_sidebar_hover(context);
+        self.update_right_sidebar_hover(context);
         self.update_title();
         if !preserve_cursor {
             context.set_cursor(Some(MouseCursor::Arrow));
@@ -2801,6 +2881,14 @@ impl super::TermWindow {
             }
             UIItemType::RightSidebarNoteBody => {
                 self.drag_right_sidebar_note_selection(item, start_event, event, context);
+            }
+            UIItemType::RightSidebarFilePreviewMarkdownBody => {
+                self.drag_right_sidebar_markdown_preview_selection(
+                    item,
+                    start_event,
+                    event,
+                    context,
+                );
             }
             UIItemType::RightSidebarFileFilter
             | UIItemType::RightSidebarSnippetSearch
@@ -3776,6 +3864,12 @@ impl super::TermWindow {
             UIItemType::RightSidebarFilePreviewText => {
                 self.mouse_event_right_sidebar_file_preview_text(item, event, context);
             }
+            UIItemType::RightSidebarFilePreviewMarkdownBody
+            | UIItemType::RightSidebarFilePreviewMarkdownCodeToggle(_)
+            | UIItemType::RightSidebarFilePreviewMarkdownCodeCopy(_)
+            | UIItemType::RightSidebarFilePreviewMarkdownToggle => {
+                self.mouse_event_right_sidebar_markdown_preview(&item, &event, context);
+            }
             UIItemType::RightSidebarSnippetNew
             | UIItemType::RightSidebarSnippetBack
             | UIItemType::RightSidebarSnippetSave
@@ -4343,6 +4437,12 @@ impl super::TermWindow {
             UIItemType::RightSidebarFilePreviewText => {
                 self.mouse_event_right_sidebar_file_preview_text(item, event, context);
             }
+            UIItemType::RightSidebarFilePreviewMarkdownBody
+            | UIItemType::RightSidebarFilePreviewMarkdownCodeToggle(_)
+            | UIItemType::RightSidebarFilePreviewMarkdownCodeCopy(_)
+            | UIItemType::RightSidebarFilePreviewMarkdownToggle => {
+                self.mouse_event_right_sidebar_markdown_preview(&item, &event, context);
+            }
             UIItemType::RightSidebarSnippetNew
             | UIItemType::RightSidebarSnippetBack
             | UIItemType::RightSidebarSnippetSave
@@ -4644,6 +4744,179 @@ impl super::TermWindow {
         }
     }
 
+    /// The rendered Markdown in the file preview: the rendered/source switch,
+    /// and the code block controls, which act on the preview's own surface
+    /// exactly as the Note's act on the Note.
+    fn mouse_event_right_sidebar_markdown_preview(
+        &mut self,
+        item: &UIItem,
+        event: &MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        use crate::termwindow::ui::right_sidebar::NoteSurface;
+        let pressed = event.kind == WMEK::Press(MousePress::Left);
+        match item.item_type {
+            UIItemType::RightSidebarFilePreviewMarkdownToggle => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if pressed {
+                    self.toggle_right_sidebar_markdown_preview_rendered();
+                    context.invalidate();
+                }
+            }
+            UIItemType::RightSidebarFilePreviewMarkdownCodeToggle(source_start) => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if pressed {
+                    self.with_note_surface(NoteSurface::FilePreview, |term_window| {
+                        term_window
+                            .right_sidebar_note
+                            .toggle_code_block(source_start);
+                        term_window.right_sidebar_note.refresh_projection();
+                    });
+                    context.invalidate();
+                }
+            }
+            UIItemType::RightSidebarFilePreviewMarkdownCodeCopy(source_start) => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if pressed {
+                    let text = self
+                        .with_note_surface(NoteSurface::FilePreview, |term_window| {
+                            term_window
+                                .right_sidebar_note
+                                .projection
+                                .objects
+                                .iter()
+                                .find_map(|object| match object {
+                                    crate::markdown_editor::ProjectedObject::CodeBlock(code)
+                                        if code.source.start == source_start =>
+                                    {
+                                        Some(code.text.clone())
+                                    }
+                                    _ => None,
+                                })
+                        })
+                        .flatten();
+                    if let Some(text) = text {
+                        self.copy_to_clipboard(ClipboardCopyDestination::Clipboard, text);
+                    }
+                    context.invalidate();
+                }
+            }
+            UIItemType::RightSidebarFilePreviewMarkdownBody => {
+                // As the Note body, read-only: links open, text selects.
+                let (x, y) = (event.coords.x as f32, event.coords.y as f32);
+                let external_link = self
+                    .with_note_surface(NoteSurface::FilePreview, |term_window| {
+                        term_window
+                            .right_sidebar_note
+                            .external_link_target_for_point(x, y)
+                    })
+                    .flatten();
+                let wiki_link = self.right_sidebar_markdown_preview_wiki_link_at(x, y);
+                let over_link = external_link.is_some()
+                    || wiki_link.as_ref().is_some_and(|(resolved, ambiguous)| {
+                        resolved.is_some() || ambiguous.len() > 1
+                    });
+                context.set_cursor(Some(if over_link {
+                    MouseCursor::Hand
+                } else {
+                    MouseCursor::Text
+                }));
+                if event.kind == WMEK::Press(MousePress::Right) {
+                    // The same menu the source view offers.
+                    if self.right_sidebar_remote_files.selected.is_some() {
+                        self.show_right_sidebar_remote_file_preview_context_menu(
+                            context,
+                            event.coords,
+                        );
+                    } else {
+                        self.show_right_sidebar_file_preview_context_menu(context, event.coords);
+                    }
+                    return;
+                }
+                if !pressed {
+                    return;
+                }
+                let click_streak = self
+                    .last_mouse_click
+                    .as_ref()
+                    .map(|click| click.streak)
+                    .unwrap_or(1);
+                let extend = event.modifiers.contains(::window::Modifiers::SHIFT);
+                if click_streak == 1 && !extend {
+                    if let Some(target) = external_link {
+                        wezterm_open_url::open_url(&target);
+                        context.invalidate();
+                        return;
+                    }
+                    if let Some((resolved, ambiguous)) = wiki_link {
+                        self.follow_right_sidebar_markdown_preview_wiki_link(
+                            context,
+                            event.coords,
+                            resolved,
+                            ambiguous,
+                        );
+                        context.invalidate();
+                        return;
+                    }
+                }
+                self.with_note_surface(NoteSurface::FilePreview, |term_window| {
+                    let host = &mut term_window.right_sidebar_note;
+                    let position = host.source_position_for_point(x, y);
+                    let granularity = if click_streak >= 3 {
+                        crate::markdown_editor::SelectionGranularity::MarkdownBlock
+                    } else if click_streak == 2 {
+                        crate::markdown_editor::SelectionGranularity::Word
+                    } else {
+                        crate::markdown_editor::SelectionGranularity::Character
+                    };
+                    let atomic_range = host.atomic_source_for_point(x, y);
+                    match atomic_range {
+                        Some(range) if click_streak == 2 && !extend => {
+                            host.selection_granularity = granularity;
+                            host.view.selection = crate::markdown_editor::SourceSelection {
+                                anchor: crate::markdown_editor::SourcePosition::new(range.start),
+                                focus: crate::markdown_editor::SourcePosition::new(range.end),
+                            };
+                            host.drag_selection_base = Some(range);
+                        }
+                        _ => host.begin_selection(position, granularity, extend),
+                    }
+                    // A preview has no caret to chase: selecting never scrolls.
+                    host.reveal_caret = false;
+                    host.drag_selection_active = false;
+                    host.refresh_projection();
+                });
+                self.dragging.replace((item.clone(), event.clone()));
+                context.invalidate();
+            }
+            _ => {}
+        }
+    }
+
+    /// Extend the rendered Markdown preview's selection to where the pointer
+    /// is dragged, as the Note body does.
+    fn drag_right_sidebar_markdown_preview_selection(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        use crate::termwindow::ui::right_sidebar::NoteSurface;
+        let (x, y) = (event.coords.x as f32, event.coords.y as f32);
+        self.with_note_surface(NoteSurface::FilePreview, |term_window| {
+            let host = &mut term_window.right_sidebar_note;
+            host.drag_selection_active = true;
+            let position = host.source_position_for_point(x, y);
+            host.extend_selection_to(position);
+            host.reveal_caret = false;
+            host.refresh_projection();
+        });
+        context.set_cursor(Some(MouseCursor::Text));
+        context.invalidate();
+        self.dragging.replace((item, start_event));
+    }
+
     pub fn mouse_event_right_sidebar_file_preview_text(
         &mut self,
         item: UIItem,
@@ -4668,7 +4941,7 @@ impl super::TermWindow {
                 self.show_right_sidebar_remote_file_preview_context_menu(context, event.coords);
             }
             WMEK::Press(MousePress::Right) => {
-                self.show_right_sidebar_file_open_with_menu(context, event.coords);
+                self.show_right_sidebar_file_preview_context_menu(context, event.coords);
             }
             _ => {}
         }

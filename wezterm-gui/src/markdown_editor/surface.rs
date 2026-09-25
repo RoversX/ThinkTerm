@@ -944,6 +944,21 @@ pub(crate) fn build_visual_document(
         }
 
         if source.as_bytes()[idx] == b'\n' {
+            // Read-only renders a document as its reader would see it: a
+            // line ending inside a paragraph is a space, not a new line.
+            if mode == EditorMode::ReadOnly && projection.soft_breaks.binary_search(&idx).is_ok() {
+                append_run(
+                    &mut line,
+                    VisualRun {
+                        source: idx..idx + 1,
+                        text: Arc::new(" ".to_string()),
+                        style: InlineStyle::default(),
+                        atomic: true,
+                    },
+                );
+                idx += 1;
+                continue;
+            }
             let next = idx + 1;
             flush_line(&mut lines, &mut line, next);
             idx = next;
@@ -1254,6 +1269,44 @@ mod tests {
             projection.caret_reveal_start(caret),
             projection.caret_reveal_start(0)
         );
+    }
+
+    #[test]
+    fn read_only_joins_soft_line_breaks_into_one_line() {
+        let source = "One line\nwraps here.\n\n- item that\n  continues\n\n> quoted\n> more\n\nhard  \nbreak\n";
+        let projection = MarkdownProjection::parse(source);
+        let texts = |mode| {
+            build_visual_document(source, &projection, mode, 0)
+                .lines
+                .iter()
+                .map(VisualLine::text)
+                .filter(|text| !text.trim().is_empty())
+                .collect::<Vec<_>>()
+        };
+        let read_only = texts(EditorMode::ReadOnly);
+        assert!(
+            read_only.contains(&"One line wraps here.".to_string()),
+            "{:?}",
+            read_only
+        );
+        assert!(
+            read_only
+                .iter()
+                .any(|line| line.ends_with("item that continues")),
+            "{:?}",
+            read_only
+        );
+        assert!(
+            read_only.iter().any(|line| line.contains("quoted more")),
+            "{:?}",
+            read_only
+        );
+        // A hard break stays a break.
+        assert!(read_only.iter().any(|line| line.starts_with("hard")));
+        assert!(read_only.contains(&"break".to_string()), "{:?}", read_only);
+        // Live Preview keeps the source's lines, as the Note always has.
+        let live = texts(EditorMode::LivePreview);
+        assert!(live.contains(&"One line".to_string()), "{:?}", live);
     }
 
     #[test]

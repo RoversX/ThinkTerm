@@ -741,6 +741,206 @@ pub(crate) trait RemoteFileBackend: Send + Sync {
         let _ = remote;
         Box::pin(async { Err("This connection cannot create directories".to_string()) })
     }
+
+    /// Every file under `root` for search, listed on the remote host by
+    /// `thinkterm list-files` under the rules the local index uses.
+    fn list_project_files(
+        &self,
+        root: RemotePath,
+        respect_gitignore: bool,
+    ) -> RemoteFuture<RemoteProjectListing> {
+        let _ = (root, respect_gitignore);
+        Box::pin(async { Ok(RemoteProjectListing::NeedsUpdate) })
+    }
+}
+
+/// What listing a remote project for search came back with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteProjectListing {
+    Listed(thinkterm_file_index::Listing),
+    /// The remote host has no `thinkterm` that can list files: none at all, or
+    /// one from before `list-files`.
+    NeedsUpdate,
+}
+
+/// The most a remote listing may send: the entry limit times a generous path
+/// length. A listing past this is refused rather than held.
+const REMOTE_LISTING_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// How long the remote walk may run before it stops and says it is partial.
+const REMOTE_LISTING_TIME_LIMIT_SECS: u64 = 20;
+/// How much longer than that the desktop waits for the listing to arrive.
+const REMOTE_LISTING_GRACE_SECS: u64 = 15;
+/// A listing given up on. The remote may ignore the hangup sent after it, in
+/// which case its reader stays blocked until the connection goes, so this is
+/// not retried as the query changes.
+pub(crate) const REMOTE_LISTING_TIMED_OUT: &str = "The remote file listing timed out";
+const REMOTE_LISTING_EXEC_FAILED: &str = "Unable to run the remote file listing";
+const REMOTE_LISTING_READ_FAILED: &str = "Reading the remote file listing failed";
+
+/// Whether a listing failure came from the connection itself rather than
+/// from what the remote printed. Only those may retire the pooled connection:
+/// the remote's own words, a stray "broken pipe" among them, must not.
+pub(crate) fn remote_listing_failure_is_transport(message: &str) -> bool {
+    message.starts_with(REMOTE_LISTING_EXEC_FAILED)
+        || message.starts_with(REMOTE_LISTING_READ_FAILED)
+}
+
+/// Quote `value` for a POSIX shell: the command line an ssh exec runs goes
+/// through the remote user's shell.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// The command that lists `root` on the remote host: the host's configured
+/// `remote_wezterm_path` when there is one, as the mux proxy runs it; else
+/// `thinkterm` from where the proxy and the mobile probe look (an exec's shell
+/// does not read the startup files that put it on PATH). The search runs
+/// under `sh`, whatever the login shell is, and exits 127 when it finds none.
+fn list_files_command(
+    root: &RemotePath,
+    respect_gitignore: bool,
+    remote_command: Option<&str>,
+) -> String {
+    let mut args = format!("list-files --time-limit {REMOTE_LISTING_TIME_LIMIT_SECS}");
+    if respect_gitignore {
+        args.push_str(" --respect-gitignore");
+    }
+    let root = shell_quote(root.as_str());
+    if let Some(command) = remote_command {
+        return format!("{command} {args} -- {root}");
+    }
+    // No single quotes or `!` inside: it is single-quoted for every shell.
+    let search = format!(
+        "for p in \"$HOME/.local/bin/thinkterm\" \"$(command -v thinkterm)\" \
+         /usr/local/bin/thinkterm /opt/homebrew/bin/thinkterm \
+         /Applications/ThinkTerm.app/Contents/MacOS/thinkterm; do \
+         [ -n \"$p\" ] && [ -x \"$p\" ] && exec \"$p\" {args} -- \"$1\"; done; exit 127"
+    );
+    format!("sh -c '{search}' sh {root}")
+}
+
+/// Make sense of what `list_files_command` produced. A missing `thinkterm`
+/// (exit 127) or one that does not know `list-files` means the host needs
+/// updating; anything else that is not a whole listing is a failure.
+fn interpret_remote_listing(
+    stdout: &[u8],
+    stderr: &str,
+    exit_code: Option<u32>,
+) -> Result<RemoteProjectListing, String> {
+    if let Ok(listing) = thinkterm_file_index::parse_command_output(stdout) {
+        return Ok(RemoteProjectListing::Listed(listing));
+    }
+    if exit_code == Some(127)
+        || stderr.contains("unrecognized subcommand")
+        || stderr.contains("list-files")
+            && (stderr.contains("unexpected") || stderr.contains("invalid"))
+    {
+        return Ok(RemoteProjectListing::NeedsUpdate);
+    }
+    let detail = stderr.trim();
+    Err(if detail.is_empty() {
+        "The remote host did not return a file listing".to_string()
+    } else {
+        format!("The remote host could not list files: {detail}")
+    })
+}
+
+/// Run the listing on an exec channel of `session` and read it back. Blocking:
+/// call it off the UI thread. stderr drains on a thread of its own, so a
+/// remote that writes a lot there cannot stall the listing.
+fn run_remote_listing(exec: wezterm_ssh::ExecResult) -> Result<RemoteProjectListing, String> {
+    use portable_pty::{Child as _, ChildKiller as _};
+    use std::io::Read;
+    let wezterm_ssh::ExecResult {
+        stdin,
+        stdout,
+        mut stderr,
+        mut child,
+    } = exec;
+    drop(stdin);
+    let stderr = std::thread::spawn(move || {
+        let mut err = Vec::new();
+        let _ = (&mut stderr).take(16 * 1024).read_to_end(&mut err);
+        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        err
+    });
+    let mut out = Vec::new();
+    let read = stdout
+        .take(REMOTE_LISTING_MAX_BYTES + 1)
+        .read_to_end(&mut out)
+        .map_err(|err| format!("{REMOTE_LISTING_READ_FAILED}: {err}"));
+    if read.is_err() || out.len() as u64 > REMOTE_LISTING_MAX_BYTES {
+        let _ = child.kill();
+        read?;
+        return Err("The remote file listing is too large".to_string());
+    }
+    let err = stderr.join().unwrap_or_default();
+    let exit_code = child.wait().ok().map(|status| status.exit_code());
+    interpret_remote_listing(&out, &String::from_utf8_lossy(&err), exit_code)
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::*;
+
+    #[test]
+    fn roots_are_quoted_for_the_shell() {
+        assert_eq!(shell_quote("/srv/app"), "'/srv/app'");
+        assert_eq!(shell_quote("/srv/it's here"), "'/srv/it'\\''s here'");
+        let root = RemotePath::from_server_absolute("/srv/a b;rm -rf ~").unwrap();
+        let command = list_files_command(&root, true, None);
+        assert!(command.starts_with("sh -c '"));
+        assert!(command.ends_with("' sh '/srv/a b;rm -rf ~'"));
+        assert!(command.contains("--respect-gitignore -- \"$1\""));
+        assert!(!list_files_command(&root, false, None).contains("--respect-gitignore"));
+        // The script is one single-quoted word for any shell.
+        let script = &command["sh -c '".len()..command.len() - "' sh '/srv/a b;rm -rf ~'".len()];
+        assert!(!script.contains('\'') && !script.contains('!'));
+        assert_eq!(
+            list_files_command(&root, false, Some("/opt/tt/thinkterm")),
+            "/opt/tt/thinkterm list-files --time-limit 20 -- '/srv/a b;rm -rf ~'"
+        );
+    }
+
+    #[test]
+    fn listings_and_missing_commands_are_told_apart() {
+        let mut listed = vec![];
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "").unwrap();
+        thinkterm_file_index::write_listing(
+            dir.path(),
+            true,
+            10,
+            Instant::now() + Duration::from_secs(60),
+            &mut listed,
+        )
+        .unwrap();
+        match interpret_remote_listing(&listed, "", Some(0)).unwrap() {
+            RemoteProjectListing::Listed(listing) => assert_eq!(listing.entries.len(), 1),
+            other => panic!("{:?}", other),
+        }
+        let mut greeted = b"hello from .bashrc\n".to_vec();
+        greeted.extend_from_slice(&listed);
+        assert!(matches!(
+            interpret_remote_listing(&greeted, "", Some(0)).unwrap(),
+            RemoteProjectListing::Listed(_)
+        ));
+        assert_eq!(
+            interpret_remote_listing(b"", "", Some(127)).unwrap(),
+            RemoteProjectListing::NeedsUpdate
+        );
+        assert_eq!(
+            interpret_remote_listing(b"", "error: unrecognized subcommand 'list-files'", Some(2))
+                .unwrap(),
+            RemoteProjectListing::NeedsUpdate
+        );
+        assert!(
+            interpret_remote_listing(b"", "listing /x: not a directory", Some(1))
+                .unwrap_err()
+                .contains("not a directory")
+        );
+        assert!(interpret_remote_listing(&listed[..listed.len() - 2], "", Some(0)).is_err());
+    }
 }
 
 pub(crate) trait RemoteFileConnector: Send + Sync {
@@ -907,9 +1107,41 @@ struct SftpRemoteFileBackend {
     // the lifetime of this independent file connection.
     _session: Session,
     sftp: wezterm_ssh::Sftp,
+    /// The host's `remote_wezterm_path`, for `list-files`.
+    remote_command: Option<String>,
 }
 
 impl RemoteFileBackend for SftpRemoteFileBackend {
+    fn list_project_files(
+        &self,
+        root: RemotePath,
+        respect_gitignore: bool,
+    ) -> RemoteFuture<RemoteProjectListing> {
+        // An exec channel on the session this backend already holds: no second
+        // login, and it closes when the listing is read.
+        let session = self._session.clone();
+        let command = list_files_command(&root, respect_gitignore, self.remote_command.as_deref());
+        Box::pin(async move {
+            let exec = session
+                .exec(&command, None)
+                .await
+                .map_err(|err| format!("{REMOTE_LISTING_EXEC_FAILED}: {err:#}"))?;
+            // The remote walk stops itself at its time limit, but only between
+            // entries; one stuck on a dead mount must not hold the search.
+            let mut killer = portable_pty::ChildKiller::clone_killer(&exec.child);
+            let listing = smol::unblock(move || run_remote_listing(exec));
+            let timeout = async {
+                smol::Timer::after(Duration::from_secs(
+                    REMOTE_LISTING_TIME_LIMIT_SECS + REMOTE_LISTING_GRACE_SECS,
+                ))
+                .await;
+                let _ = killer.kill();
+                Err(REMOTE_LISTING_TIMED_OUT.to_string())
+            };
+            smol::future::or(listing, timeout).await
+        })
+    }
+
     fn resolve_root(&self, requested: String) -> RemoteFuture<RemotePath> {
         let sftp = self.sftp.clone();
         Box::pin(async move {
@@ -1511,6 +1743,7 @@ impl RemoteFileConnector for SshRemoteFileConnector {
                         let backend: Arc<dyn RemoteFileBackend> = Arc::new(SftpRemoteFileBackend {
                             sftp: session.sftp(),
                             _session: session,
+                            remote_command: config.remote_wezterm_path.clone(),
                         });
                         return Ok(backend);
                     }

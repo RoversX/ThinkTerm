@@ -236,6 +236,18 @@ impl crate::TermWindow {
             crate::termwindow::ContextMenuApplicationAction::Note(command) => {
                 self.perform_right_sidebar_note_command(command);
             }
+            crate::termwindow::ContextMenuApplicationAction::OpenFilePreview(path) => {
+                self.open_right_sidebar_file_path(path);
+                if let Some(window) = &self.window {
+                    window.invalidate();
+                }
+            }
+            crate::termwindow::ContextMenuApplicationAction::OpenRemoteFilePreview(path) => {
+                self.open_right_sidebar_remote_file_preview(path);
+                if let Some(window) = &self.window {
+                    window.invalidate();
+                }
+            }
             crate::termwindow::ContextMenuApplicationAction::SetFrontendAccessMode(mode) => {
                 self.request_frontend_access_mode(mode);
             }

@@ -448,6 +448,9 @@ pub(crate) struct NativeChromeSettings {
     pub(crate) workspace_sidebar_width: Option<usize>,
     /// Hover-reveal of the collapsed left sidebar; `None` means enabled.
     pub(crate) workspace_sidebar_hover_reveal: Option<bool>,
+    /// Whether the file preview shows a Markdown file rendered (the default)
+    /// or as source; the last choice is kept.
+    pub(crate) right_sidebar_markdown_preview_rendered: Option<bool>,
     pub(crate) right_sidebar_width: Option<usize>,
     pub(crate) right_sidebar_file_preview_width: Option<usize>,
     pub(crate) right_sidebar_note_pane_width: Option<usize>,
@@ -1417,6 +1420,19 @@ pub(crate) fn save_right_sidebar_width(width: usize) -> anyhow::Result<()> {
 pub(crate) fn save_right_sidebar_file_preview_width(width: usize) -> anyhow::Result<()> {
     let mut settings = load();
     settings.chrome.right_sidebar_file_preview_width = Some(width);
+    save(&settings)
+}
+
+pub(crate) fn right_sidebar_markdown_preview_rendered() -> bool {
+    load_shared()
+        .chrome
+        .right_sidebar_markdown_preview_rendered
+        .unwrap_or(true)
+}
+
+pub(crate) fn save_right_sidebar_markdown_preview_rendered(rendered: bool) -> anyhow::Result<()> {
+    let mut settings = load();
+    settings.chrome.right_sidebar_markdown_preview_rendered = Some(rendered);
     save(&settings)
 }
 

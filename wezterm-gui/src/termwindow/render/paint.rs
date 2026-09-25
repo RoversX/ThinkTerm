@@ -3483,6 +3483,122 @@ impl crate::TermWindow {
         }
     }
 
+    /// The right sidebar's counterpart of `advance_workspace_sidebar_hover`.
+    fn advance_right_sidebar_hover(&mut self, now: Instant) {
+        match self.step_right_sidebar_hover(now) {
+            crate::termwindow::sidebar_hover::HoverFrame::None => {}
+            crate::termwindow::sidebar_hover::HoverFrame::Now => {
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
+            }
+            crate::termwindow::sidebar_hover::HoverFrame::At(due) => {
+                self.update_next_frame_time(Some(due));
+            }
+        }
+    }
+
+    /// The left sidebar's hover shadow, mirrored: it falls off the revealed
+    /// right panel's LEFT edge, onto the terminal it floats over.
+    fn paint_right_sidebar_hover_shadow(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<()> {
+        let Some(rect) = self.right_sidebar_rect() else {
+            return Ok(());
+        };
+        let edge = rect.x as f32;
+        let top = rect.y as f32;
+        let height = rect.height as f32;
+        let spread = self.ui_f32(16.0);
+        const STEPS: usize = 8;
+        const BASE_ALPHA: f32 = 0.22;
+        let step_width = spread / STEPS as f32;
+        for i in 0..STEPS {
+            let t = (i as f32 + 0.5) / STEPS as f32;
+            let alpha = BASE_ALPHA * (1.0 - t) * (1.0 - t);
+            self.filled_rectangle(
+                layers,
+                0,
+                euclid::rect(edge - (i + 1) as f32 * step_width, top, step_width, height),
+                LinearRgba::with_components(0.0, 0.0, 0.0, alpha),
+            )
+            .context("right sidebar hover shadow strip")?;
+        }
+        Ok(())
+    }
+
+    /// Record the hover-revealed right sidebar off-screen, as the left one is,
+    /// holding back its hit targets until after the tab bar has laid out its
+    /// own. Returns the recording, how far the panel still has to travel
+    /// (0 = arrived) and the items to register once it is safe to.
+    fn record_right_sidebar_hover_overlay(
+        &mut self,
+        now: Instant,
+    ) -> anyhow::Result<Option<(HeapQuadAllocator, f32, Vec<UIItem>)>> {
+        if !self.right_sidebar_collapsed {
+            return Ok(None);
+        }
+        let Some(progress) = self.right_sidebar_hover.progress(now) else {
+            return Ok(None);
+        };
+        let ui_items_before = self.ui_items.len();
+        let mut panel_frame = HeapQuadAllocator::default();
+        let result = {
+            let mut panel_layers = TripleLayerQuadAllocator::Heap(&mut panel_frame);
+            self.paint_right_sidebar(&mut panel_layers)
+                .and_then(|_| self.paint_right_sidebar_hover_shadow(&mut panel_layers))
+        };
+        result.context("record hover-revealed right sidebar")?;
+        let mut items: Vec<UIItem> = self.ui_items.drain(ui_items_before..).collect();
+        if !self.right_sidebar_hover.is_fully_presented(now) {
+            // While the panel moves no target inside it is where it looks to
+            // be: one inert item over the part already on screen keeps clicks
+            // off the terminal underneath.
+            items.clear();
+            if let Some(rect) = self.right_sidebar_rect() {
+                let revealed = (rect.width as f32 * progress).round() as usize;
+                if revealed > 0 {
+                    let right_edge = rect.x.saturating_add(rect.width);
+                    items.push(UIItem {
+                        x: right_edge.saturating_sub(revealed),
+                        y: 0,
+                        width: revealed,
+                        height: rect.y + rect.height,
+                        item_type: UIItemType::RightSidebarBackground,
+                    });
+                }
+            }
+        }
+        Ok(Some((panel_frame, 1.0 - progress, items)))
+    }
+
+    /// Composite the recorded right sidebar above the tab bar, pushed right by
+    /// the part of it still to travel; the window crops the overhang.
+    fn paint_right_sidebar_hover_overlay(
+        &self,
+        overlay: &HeapQuadAllocator,
+        hidden: f32,
+    ) -> anyhow::Result<()> {
+        let Some(rect) = self.right_sidebar_rect() else {
+            return Ok(());
+        };
+        let gl_state = self.render_state.as_ref().unwrap();
+        let layer = gl_state
+            .layer_for_zindex(0)
+            .context("hover right sidebar layer")?;
+        let mut layers = layer.quad_allocator();
+        let offset_x = hidden * rect.width as f32;
+        let clip = crate::quad::QuadClipRect::from_top_left_pixels(
+            0.0,
+            0.0,
+            self.dimensions.pixel_width as f32,
+            self.dimensions.pixel_height as f32,
+            &self.dimensions,
+        );
+        overlay.apply_to_single_layer(&mut layers, 2, offset_x, clip)
+    }
+
     /// A soft shadow falling off the hover-revealed panel's right edge, so
     /// the overlay reads as a layer floating above the terminal rather than
     /// a slab butted against it. Only the hover overlay gets this: the
@@ -3899,6 +4015,7 @@ impl crate::TermWindow {
         let frame_now = Instant::now();
         self.advance_workspace_space_swipe_push(frame_now);
         self.advance_workspace_sidebar_hover(frame_now);
+        self.advance_right_sidebar_hover(frame_now);
         self.advance_content_view_fade(frame_now);
         // Card texture work is queued per pass; a retried pass re-queues it.
         self.pending_card_renders.borrow_mut().clear();
@@ -4172,6 +4289,7 @@ impl crate::TermWindow {
             // bar, so both its pixels and its hit targets land above the
             // chrome that would otherwise cover its top edge.
             let hover_overlay = self.record_workspace_sidebar_hover_overlay(frame_now)?;
+            let right_hover_overlay = self.record_right_sidebar_hover_overlay(frame_now)?;
 
             let render_space_push = self.workspace_space_swipe_push_active
                 && self.workspace_space_swipe_source_frame.is_some();
@@ -4376,8 +4494,12 @@ impl crate::TermWindow {
             }
 
             let mut chrome_layers = layer.quad_allocator();
-            self.paint_right_sidebar(&mut chrome_layers)
-                .context("paint_right_sidebar")?;
+            // A hover-revealed right sidebar was recorded above and is
+            // composited after the tab bar instead.
+            if !self.right_sidebar_collapsed {
+                self.paint_right_sidebar(&mut chrome_layers)
+                    .context("paint_right_sidebar")?;
+            }
 
             if self.show_tab_bar {
                 self.paint_tab_bar(&mut chrome_layers)
@@ -4411,6 +4533,33 @@ impl crate::TermWindow {
                         palette.sidebar_row_active_border.mul_alpha(0.7),
                     )
                     .context("paint sidebar hover arming hint")?;
+                }
+            }
+
+            // The right sidebar's reveal, composited after the tab bar for the
+            // same reasons as the left one's.
+            if let Some((overlay, hidden, items)) = right_hover_overlay {
+                self.paint_right_sidebar_hover_overlay(&overlay, hidden)
+                    .context("paint hover-revealed right sidebar")?;
+                self.ui_items.extend(items);
+            } else if self.right_sidebar_hover.is_arming() {
+                if let Some((zx, zy, zw, zh)) = self.right_sidebar_hover_hot_zone() {
+                    let hint_width =
+                        self.ui_px(crate::termwindow::ui::tokens::SIDEBAR_HOVER_HINT_WIDTH) as f32;
+                    let palette = self.chrome();
+                    let mut hint_layers = layer.quad_allocator();
+                    self.filled_rectangle(
+                        &mut hint_layers,
+                        2,
+                        euclid::rect(
+                            (zx + zw) as f32 - hint_width,
+                            zy as f32,
+                            hint_width,
+                            zh as f32,
+                        ),
+                        palette.sidebar_row_active_border.mul_alpha(0.7),
+                    )
+                    .context("paint right sidebar hover arming hint")?;
                 }
             }
         }
