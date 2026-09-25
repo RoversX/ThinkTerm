@@ -1079,8 +1079,16 @@ impl<P: Platform, L: Link> App<P, L> {
                 },
             )
             .await?;
-            let bottom = (cursor.y + 1).min(dims.physical_top + dims.viewport_rows as StableRowIndex);
-            let top = (bottom - rows as StableRowIndex).max(dims.scrollback_top);
+            if !dims.is_plausible() {
+                anyhow::bail!("the pane reported impossible dimensions");
+            }
+            let bottom = cursor
+                .y
+                .saturating_add(1)
+                .min(dims.physical_top + dims.viewport_rows as StableRowIndex);
+            let top = bottom
+                .saturating_sub(rows as StableRowIndex)
+                .max(dims.scrollback_top);
             let response = thinkterm_session::host::request(
                 &link,
                 Pdu::GetLines(codec::GetLines { pane_id, lines: vec![top..bottom] }),
@@ -3233,16 +3241,7 @@ impl<P: Platform, L: Link> App<P, L> {
 
     async fn list_panes(&self) -> Option<codec::ListPanesResponse> {
         let link = self.inner.borrow().link.clone();
-        match thinkterm_session::host::request(
-            &link,
-            Pdu::ListPanes(codec::ListPanes {}),
-            |pdu| match pdu {
-                Pdu::ListPanesResponse(p) => Ok(p),
-                other => Err(other),
-            },
-        )
-        .await
-        {
+        match crate::attach::list_panes(&link).await {
             Ok(list) => Some(list),
             Err(err) => {
                 log::warn!("listing panes: {err:#}");

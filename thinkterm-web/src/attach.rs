@@ -11,6 +11,19 @@ use thinkterm_proto::{ClientId, PaneId, RenderableDimensions, TabId};
 use thinkterm_session::host::request;
 use wezterm_term::TerminalSize;
 
+/// The server's pane list, with every tab whose sizes no screen could have
+/// blanked (`PaneNode::is_plausible`). The one way this crate asks for it, so
+/// no caller gets the sizes unchecked.
+pub async fn list_panes<L: Link>(link: &L) -> Result<codec::ListPanesResponse> {
+    let mut panes = request(link, Pdu::ListPanes(codec::ListPanes {}), |pdu| match pdu {
+        Pdu::ListPanesResponse(p) => Ok(p),
+        other => Err(other),
+    })
+    .await?;
+    crate::layout::blank_implausible_tabs(&mut panes);
+    Ok(panes)
+}
+
 pub struct Attached {
     pub pane_id: PaneId,
     pub tab_id: TabId,
@@ -67,11 +80,7 @@ pub async fn attach<L: Link>(
     )
     .await?;
 
-    let panes = request(link, Pdu::ListPanes(codec::ListPanes {}), |pdu| match pdu {
-        Pdu::ListPanesResponse(p) => Ok(p),
-        other => Err(other),
-    })
-    .await?;
+    let panes = list_panes(link).await?;
     // The first tab that has a pane, preferring its active one.
     let entry = panes
         .tabs
@@ -205,11 +214,7 @@ pub async fn reattach<L: Link>(
     )
     .await?;
 
-    let panes = request(link, Pdu::ListPanes(codec::ListPanes {}), |pdu| match pdu {
-        Pdu::ListPanesResponse(p) => Ok(p),
-        other => Err(other),
-    })
-    .await?;
+    let panes = list_panes(link).await?;
     let tab = panes
         .tabs
         .iter()

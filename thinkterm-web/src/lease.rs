@@ -74,12 +74,26 @@ impl Lease {
     }
 
     pub fn apply_viewport(&mut self, state: &codec::ClientViewportState) {
-        self.tab_sizes.insert(state.tab_id, state.canonical_size);
+        // The size lays out a whole tab; one no screen could have is not
+        // taken, though who holds the tab still is.
+        let size = thinkterm_proto::layout::terminal_size_is_plausible(&state.canonical_size)
+            .then_some(state.canonical_size);
+        if size.is_none() {
+            log::warn!(
+                "ignoring an impossible canonical size for tab {}",
+                state.tab_id
+            );
+        }
+        if let Some(size) = size {
+            self.tab_sizes.insert(state.tab_id, size);
+        }
         if Some(state.tab_id) != self.tab_id {
             return;
         }
         self.tab_owner = state.owner.clone();
-        self.canonical_size = Some(state.canonical_size);
+        if size.is_some() {
+            self.canonical_size = size;
+        }
         self.apply_access(&state.access);
         if self.fit && !self.owns_viewport() {
             self.fit = false;

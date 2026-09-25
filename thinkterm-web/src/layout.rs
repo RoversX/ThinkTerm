@@ -265,16 +265,17 @@ pub fn scaled(layout: &TabLayout, size: TerminalSize) -> Option<TabLayout> {
 
 /// Every pane in a tab, left to right, top to bottom, stacks included.
 pub fn leaves(node: &PaneNode) -> Vec<&PaneEntry> {
-    match node {
-        PaneNode::Empty => vec![],
-        PaneNode::Leaf(entry) => vec![entry],
-        PaneNode::Stack(stack) => stack.panes.iter().collect(),
-        PaneNode::Split { left, right, .. } => {
-            let mut all = leaves(left);
-            all.extend(leaves(right));
-            all
-        }
+    node.entries()
+}
+
+/// Blank every tab whose sizes no screen could have, and say so; see
+/// `thinkterm_proto::layout::blank_implausible_tabs`.
+pub fn blank_implausible_tabs(list: &mut ListPanesResponse) -> usize {
+    let blanked = thinkterm_proto::layout::blank_implausible_tabs(&mut list.tabs);
+    if blanked > 0 {
+        log::warn!("ignoring {blanked} tab(s) with impossible pane sizes");
     }
+    blanked
 }
 
 /// The tab that holds `pane_id`.
@@ -739,5 +740,30 @@ mod tests {
         };
         assert!(matches!(tab_containing(&list, 7), Some(PaneNode::Leaf(e)) if e.pane_id == 7));
         assert!(tab_containing(&list, 9).is_none());
+    }
+
+    #[test]
+    fn tabs_with_impossible_pane_sizes_are_blanked_in_place() {
+        let mut list = ListPanesResponse {
+            tabs: vec![
+                PaneNode::Leaf(pane(1, 80, 24, 0, 0, true)),
+                PaneNode::Leaf(pane(2, 80, 100_000, 0, 0, true)),
+                PaneNode::Leaf(pane(3, 200_000, 24, 0, 0, true)),
+                PaneNode::Leaf(pane(4, 80, 24, 0, 0, true)),
+            ],
+            tab_titles: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+            window_titles: Default::default(),
+        };
+        let mut overflowing = pane(5, 80, 24, 0, 0, true);
+        overflowing.physical_top = StableRowIndex::MAX;
+        list.tabs.push(PaneNode::Leaf(overflowing));
+        assert_eq!(blank_implausible_tabs(&mut list), 3);
+        assert!(matches!(list.tabs[0], PaneNode::Leaf(ref e) if e.pane_id == 1));
+        assert!(matches!(list.tabs[1], PaneNode::Empty));
+        assert!(matches!(list.tabs[2], PaneNode::Empty));
+        assert!(matches!(list.tabs[3], PaneNode::Leaf(ref e) if e.pane_id == 4));
+        assert!(matches!(list.tabs[4], PaneNode::Empty));
+        // Titles still line up with their tabs.
+        assert_eq!(list.tab_titles[3], "d");
     }
 }

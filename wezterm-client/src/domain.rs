@@ -3693,6 +3693,23 @@ impl ClientDomain {
         // window's tabs in its order, and a mirror keeps that order.
         let mut placed: HashMap<WindowId, usize> = HashMap::new();
         for (mut tabroot, tab_title) in panes.tabs.into_iter().zip(panes.tab_titles.iter()) {
+            // Sizes off the wire build grids and layouts below. A tab listed
+            // with sizes no screen could have is left as it was: not built
+            // from, and not swept either, since it has not gone away.
+            if !tabroot.is_plausible() {
+                log::warn!(
+                    "domain {}: ignoring a tab listed with impossible pane sizes",
+                    inner.local_domain_id
+                );
+                if let Some((remote_window_id, remote_tab_id)) = tabroot.window_and_tab_ids() {
+                    remote_windows_to_forget.remove(&remote_window_id);
+                    remote_tabs_to_forget.remove(&remote_tab_id);
+                }
+                for entry in tabroot.entries() {
+                    remote_panes_to_forget.remove(&entry.pane_id);
+                }
+                continue;
+            }
             // Translate remote stack ids into stable local ids BEFORE the
             // tree rebuild, so that GUI state keyed by pane_stack_id
             // (collapse layouts, level-2 tab bar scroll) survives resyncs.
@@ -5058,6 +5075,9 @@ impl Domain for ClientDomain {
             })
             .await?;
 
+        if !thinkterm_proto::layout::terminal_size_is_plausible(&result.size) {
+            bail!("the server described the new pane with an impossible size");
+        }
         let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
             &inner,
             result.tab_id,
@@ -5454,6 +5474,9 @@ impl Domain for ClientDomain {
             return Ok(moved_pane);
         }
 
+        if !thinkterm_proto::layout::terminal_size_is_plausible(&result.size) {
+            bail!("the server described the new pane with an impossible size");
+        }
         let pane: Arc<dyn Pane> = Arc::new(ClientPane::new(
             &inner,
             result.tab_id,

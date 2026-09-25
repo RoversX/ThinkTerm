@@ -43,6 +43,29 @@ pub struct PaneSession<H: SessionHost> {
     host_pane_id: HostPaneId,
 }
 
+/// The size a session starts from, as the server listed it. Grids and row
+/// caches are built from it before any render delta could be refused, so an
+/// impossible one is brought into bounds here: each client drops such a pane
+/// when it can, and this is the floor under all of them.
+fn plausible_dimensions(dimensions: RenderableDimensions) -> RenderableDimensions {
+    if dimensions.is_plausible() {
+        return dimensions;
+    }
+    log::warn!("a pane was listed with impossible dimensions; starting it from bounded ones");
+    use thinkterm_proto::layout::{MAX_PANE_CELLS, MAX_PANE_PIXELS};
+    let viewport_rows = dimensions.viewport_rows.min(MAX_PANE_CELLS);
+    RenderableDimensions {
+        cols: dimensions.cols.min(MAX_PANE_CELLS),
+        viewport_rows,
+        scrollback_rows: viewport_rows,
+        physical_top: 0,
+        scrollback_top: 0,
+        pixel_width: dimensions.pixel_width.min(MAX_PANE_PIXELS),
+        pixel_height: dimensions.pixel_height.min(MAX_PANE_PIXELS),
+        ..dimensions
+    }
+}
+
 impl<H: SessionHost> PaneSession<H> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -56,6 +79,7 @@ impl<H: SessionHost> PaneSession<H> {
         title: &str,
         alt_screen: bool,
     ) -> Arc<Self> {
+        let dimensions = plausible_dimensions(dimensions);
         let state = PaneState::new(
             config,
             dimensions,
@@ -731,10 +755,7 @@ impl<H: SessionHost> PaneSession<H> {
     ) {
         // Reject impossible geometry before it reaches cache seeding or any
         // frontend. Clamping only dirty ranges leaves those other walks open.
-        if delta.dimensions.viewport_rows > 10_000
-            || delta.dimensions.cols > 10_000
-            || delta.dimensions.physical_top.checked_add(delta.dimensions.viewport_rows as StableRowIndex).is_none()
-        {
+        if !delta.dimensions.is_plausible() {
             log::warn!("ignoring render update with invalid pane dimensions");
             return;
         }
@@ -771,7 +792,7 @@ impl<H: SessionHost> PaneSession<H> {
         // only marks cached rows stale, and past as many rows as the cache
         // holds that is the same work as marking the whole cache stale, so
         // the walk stops there and the one sweep takes over.
-        const MAX_VIEWPORT_ROWS: usize = 10_000;
+        const MAX_VIEWPORT_ROWS: usize = thinkterm_proto::layout::MAX_PANE_CELLS;
         let physical_top = delta.dimensions.physical_top;
         let row_end = physical_top.saturating_add(
             delta.dimensions.viewport_rows.min(MAX_VIEWPORT_ROWS) as StableRowIndex,
@@ -1245,6 +1266,39 @@ enum Nearest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_impossible_listed_size_starts_in_bounds() {
+        use thinkterm_proto::layout::MAX_PANE_CELLS;
+        let wild = RenderableDimensions {
+            cols: usize::MAX,
+            viewport_rows: 100_000,
+            scrollback_rows: 100_000,
+            physical_top: StableRowIndex::MAX,
+            scrollback_top: 0,
+            dpi: 72,
+            pixel_width: usize::MAX,
+            pixel_height: 800,
+            reverse_video: false,
+        };
+        let tamed = plausible_dimensions(wild);
+        assert!(tamed.is_plausible());
+        assert_eq!((tamed.cols, tamed.viewport_rows), (MAX_PANE_CELLS, MAX_PANE_CELLS));
+        assert_eq!(tamed.physical_top, 0);
+        // An ordinary size passes through untouched.
+        let ordinary = RenderableDimensions {
+            cols: 80,
+            viewport_rows: 24,
+            scrollback_rows: 24,
+            physical_top: 0,
+            ..wild
+        };
+        let ordinary = RenderableDimensions {
+            pixel_width: 640,
+            ..ordinary
+        };
+        assert_eq!(plausible_dimensions(ordinary), ordinary);
+    }
     use crate::host::{DetachedFuture, HostConfig, LinkError};
     use crate::input::{LocalFuture, PaneLink};
     use codec::{GetImageCellResponse, GetLinesResponse, UnitResponse};

@@ -47,3 +47,21 @@ pub struct RenderableDimensions {
 }
 #[cfg(feature = "lua")]
 impl_lua_conversion_dynamic!(RenderableDimensions);
+
+impl RenderableDimensions {
+    /// Within the bounds a pane may have (`layout::MAX_PANE_CELLS`), with
+    /// every row index sum and difference a client takes over them in range.
+    pub fn is_plausible(&self) -> bool {
+        use crate::layout::{MAX_PANE_CELLS, MAX_PANE_PIXELS};
+        self.cols <= MAX_PANE_CELLS
+            && self.viewport_rows <= MAX_PANE_CELLS
+            && self.pixel_width <= MAX_PANE_PIXELS
+            && self.pixel_height <= MAX_PANE_PIXELS
+            && self.scrollback_top <= self.physical_top
+            && self
+                .physical_top
+                .checked_add(self.viewport_rows as StableRowIndex)
+                .is_some()
+            && self.physical_top.checked_sub(self.scrollback_top).is_some()
+    }
+}
