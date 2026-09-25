@@ -424,7 +424,7 @@ impl crate::TermWindow {
         self.get_panes_to_render()
             .iter()
             .find(|pos| pos.pane.pane_id() == pane_id)
-            .and_then(|pos| self.pane_frame_rect(pos).ok())
+            .and_then(|pos| self.pane_mask_frame(pos).ok())
     }
 
     pub(crate) fn active_pane_recording_masks_empty(&self) -> bool {

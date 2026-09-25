@@ -432,11 +432,7 @@ impl super::TermWindow {
 
     /// The gap the window tab row leaves between neighbouring tabs.
     pub(super) fn window_tab_gap_pixels(&self) -> f32 {
-        if self.config.use_fancy_tab_bar {
-            self.ui_px(WINDOW_TAB_GAP) as f32
-        } else {
-            0.0
-        }
+        self.ui_px(WINDOW_TAB_GAP) as f32
     }
 
     /// How many surfaces the window tab row paints: the mux tabs plus the
@@ -477,7 +473,6 @@ impl super::TermWindow {
 
     pub(crate) fn window_tab_chrome_params(&self) -> WindowTabChromeParams {
         WindowTabChromeParams {
-            use_fancy_tab_bar: self.config.use_fancy_tab_bar,
             workspace_sidebar_width: self.workspace_sidebar_width(),
             window_state: self.window_state,
             window_decorations: self.config.window_decorations,
@@ -485,17 +480,11 @@ impl super::TermWindow {
             integrated_title_button_style: self.config.integrated_title_button_style,
             cell_width: self.render_metrics.cell_size.width.max(1) as f32,
             dpi: self.dimensions.dpi,
-            top_fancy_row_height: if self.show_tab_bar
-                && self.config.use_fancy_tab_bar
-                && !self.config.tab_bar_at_bottom
-            {
-                self.tab_bar_pixel_height()
-                    .ok()
-                    .map(|h| h.ceil() as usize)
-                    .filter(|h| *h > 0)
-            } else {
-                None
-            },
+            top_fancy_row_height: self
+                .tab_bar_pixel_height()
+                .ok()
+                .map(|h| h.ceil() as usize)
+                .filter(|h| *h > 0),
         }
     }
 
@@ -532,16 +521,12 @@ impl super::TermWindow {
 
     pub(super) fn window_tab_trailing_action_reserved_width(&self) -> usize {
         let configured_button_size = self.ui_px(WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE);
-        let action_button_size = if self.config.use_fancy_tab_bar {
+        let action_button_size = {
             let row_height = self
                 .tab_bar_pixel_height()
                 .unwrap_or(configured_button_size as f32)
                 .ceil() as usize;
-            let content_top_spacer = if self.config.tab_bar_at_bottom {
-                0
-            } else {
-                self.ui_px(WINDOW_TAB_TOP_SPACER).min(row_height)
-            };
+            let content_top_spacer = self.ui_px(WINDOW_TAB_TOP_SPACER).min(row_height);
             let content_height = row_height.saturating_sub(content_top_spacer);
             let tab_font_cell_height_upper_bound = content_height.div_ceil(2);
             content_height
@@ -549,8 +534,6 @@ impl super::TermWindow {
                 .max(tab_font_cell_height_upper_bound)
                 .max(1)
                 .max(configured_button_size)
-        } else {
-            configured_button_size
         };
         let action_button_count = if !self.right_sidebar_has_panels() {
             // Every sidebar panel is off, so fancy_tab_bar paints no toggle;
@@ -605,11 +588,10 @@ impl super::TermWindow {
             // derived from this number, so a one-pixel disagreement would clip
             // the last tab in a row that otherwise fits exactly.
             .saturating_sub(left_padding.max(0.0).ceil() as usize)
-            .saturating_sub(if self.config.use_fancy_tab_bar {
-                self.ui_px(TAB_ROW_START_PADDING) + self.window_tab_trailing_action_reserved_width()
-            } else {
-                0
-            })
+            .saturating_sub(
+                self.ui_px(TAB_ROW_START_PADDING)
+                    + self.window_tab_trailing_action_reserved_width(),
+            )
             .max(1) as f32
     }
 
@@ -838,11 +820,7 @@ impl super::TermWindow {
         };
 
         let border = self.get_os_border();
-        let top_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().unwrap_or(0.)
-        } else {
-            0.0
-        };
+        let (top_bar_height, _) = self.pane_area_insets();
         let cell_height = self.render_metrics.cell_size.height as f32;
         let x = event.coords.x as f32;
         let y = event.coords.y as f32;
@@ -857,7 +835,8 @@ impl super::TermWindow {
             let Ok((pane_x, pane_width)) = self.pane_chrome_span(&pos) else {
                 continue;
             };
-            let pane_y = top_bar_height + border.top.get() as f32 + pos.top as f32 * cell_height;
+            let pane_y = top_bar_height + border.top.get() as f32 + pos.top as f32 * cell_height
+                - self.pane_nav_lift(&pos);
             if x >= pane_x && x < pane_x + pane_width && y >= pane_y && y < pane_y + nav_height {
                 // The zoomed branch of iter_panes fills pane_stack_id with
                 // the pane's own id, not the real stack id; resolve through
@@ -870,19 +849,14 @@ impl super::TermWindow {
             }
         }
 
-        if self.show_tab_bar {
-            let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
-            let tab_bar_y = if self.config.tab_bar_at_bottom {
-                self.dimensions.pixel_height as f32 - tab_bar_height - border.bottom.get() as f32
-            } else {
-                border.top.get() as f32
-            };
-            if event.coords.x >= self.tab_bar_left_edge() as isize
-                && y >= tab_bar_y
-                && y < tab_bar_y + tab_bar_height
-            {
-                return Some(TabWheelSurface::Window);
-            }
+        let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
+        let tab_bar_y = border.top.get() as f32;
+        if event.coords.x >= self.tab_bar_left_edge() as isize
+            && (event.coords.x as f32) < self.terminal_viewport_right()
+            && y >= tab_bar_y
+            && y < tab_bar_y + tab_bar_height
+        {
+            return Some(TabWheelSurface::Window);
         }
 
         None
@@ -1580,7 +1554,7 @@ impl super::TermWindow {
 
     fn leave_ui_item(&mut self, item: &UIItem) {
         match item.item_type {
-            UIItemType::TabBar(_) => {
+            UIItemType::TabBar(_) | UIItemType::TerminalBar(_) => {
                 self.update_title_post_status();
             }
             UIItemType::CloseTab(_)
@@ -1707,7 +1681,7 @@ impl super::TermWindow {
 
     fn enter_ui_item(&mut self, item: &UIItem) {
         match item.item_type {
-            UIItemType::TabBar(_) => {}
+            UIItemType::TabBar(_) | UIItemType::TerminalBar(_) => {}
             UIItemType::CloseTab(_)
             | UIItemType::PaneNav { .. }
             | UIItemType::ProjectNew
@@ -1805,11 +1779,7 @@ impl super::TermWindow {
         pos: &PositionedPane,
     ) -> ClickPosition {
         let border = self.get_os_border();
-        let first_line_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().unwrap_or(0.) as isize
-        } else {
-            0
-        } + border.top.get() as isize;
+        let first_line_offset = self.pane_area_insets().0 as isize + border.top.get() as isize;
         let (padding_left, padding_top) = self.padding_left_top();
 
         let global_cell_size = self.render_metrics.cell_size;
@@ -2059,11 +2029,7 @@ impl super::TermWindow {
 
         let border = self.get_os_border();
 
-        let first_line_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().unwrap_or(0.) as isize
-        } else {
-            0
-        } + border.top.get() as isize;
+        let first_line_offset = self.pane_area_insets().0 as isize + border.top.get() as isize;
 
         let (padding_left, padding_top) = self.padding_left_top();
 
@@ -2369,7 +2335,7 @@ impl super::TermWindow {
 
             match (self.last_ui_item.take(), &ui_item) {
                 (Some(prior), Some(item)) => {
-                    if prior != *item || !self.config.use_fancy_tab_bar {
+                    if prior != *item {
                         self.leave_ui_item(&prior);
                         self.enter_ui_item(item);
                         context.invalidate();
@@ -3707,6 +3673,9 @@ impl super::TermWindow {
             UIItemType::TabBar(item) => {
                 self.mouse_event_tab_bar(item, event, context);
             }
+            UIItemType::TerminalBar(item) => {
+                self.mouse_event_terminal_bar(item, event, context);
+            }
             UIItemType::AboveScrollThumb(track) => {
                 let pane = self.scroll_track_pane(track).unwrap_or(pane);
                 self.mouse_event_above_scroll_thumb(item, pane, event, context);
@@ -4274,6 +4243,9 @@ impl super::TermWindow {
             }
             UIItemType::TabBar(item) => {
                 self.mouse_event_tab_bar(item, event, context);
+            }
+            UIItemType::TerminalBar(item) => {
+                self.mouse_event_terminal_bar(item, event, context);
             }
             UIItemType::CloseTab(idx) => {
                 self.mouse_event_close_tab(idx, event, context);
@@ -8303,6 +8275,26 @@ impl super::TermWindow {
             _ => {}
         }
         context.set_cursor(Some(MouseCursor::Arrow));
+    }
+
+    /// The terminal bar lives inside the terminal area: its tabs and new tab
+    /// button press like the window tab row's, but it is no title bar, so
+    /// its blank and status cells neither move nor maximize the window.
+    pub fn mouse_event_terminal_bar(
+        &mut self,
+        item: TabBarItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        let pressable = matches!(
+            item,
+            TabBarItem::Tab { .. } | TabBarItem::NewTabButton { .. }
+        );
+        if pressable && matches!(event.kind, WMEK::Press(_)) {
+            self.mouse_event_tab_bar(item, event, context);
+        } else {
+            context.set_cursor(Some(MouseCursor::Arrow));
+        }
     }
 
     pub fn mouse_event_above_scroll_thumb(

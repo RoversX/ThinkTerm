@@ -2,7 +2,7 @@ use crate::termwindow::content_view::ContentViewId;
 use crate::termwindow::ui::status_icon::UiStatusKind;
 use crate::termwindow::ui::terminal_title_for_display;
 use crate::termwindow::{PaneInformation, TabInformation, UIItem, UIItemType};
-use config::{ConfigHandle, TabBarColors};
+use config::{Config, ConfigHandle, TabBarColors};
 use finl_unicode::grapheme_clusters::Graphemes;
 use mlua::FromLua;
 use termwiz::cell::{unicode_column_width, Cell, CellAttributes};
@@ -40,6 +40,47 @@ pub enum TabBarItem {
     },
 }
 
+/// Which bar a [`TabBarState`] describes. The wezterm tab bar options and
+/// `format-tab-title` configure the terminal bar only: Lua sees the terminal
+/// area, and the window tab row around it is ThinkTerm's chrome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabBarKind {
+    /// ThinkTerm's window tab row, with its own titles.
+    WindowTabs,
+    /// The wezterm tab bar, drawn inside the terminal area.
+    TerminalBar,
+    /// The same place when only status text asked for it: no tabs.
+    TerminalStatus,
+}
+
+impl TabBarKind {
+    /// Whether titles take the fancy row's form rather than the retro one.
+    fn fancy(self) -> bool {
+        self == Self::WindowTabs
+    }
+}
+
+/// Whether the terminal bar shows, and as what. The wezterm tab bar options
+/// decide, as they would for wezterm's own bar: a retro bar shows its tabs; a
+/// fancy one -- which the window tab row already is -- earns a line only for
+/// status text.
+pub(crate) fn terminal_bar_kind(
+    config: &Config,
+    num_tabs: usize,
+    has_status: bool,
+) -> Option<TabBarKind> {
+    if !config.enable_tab_bar || (config.hide_tab_bar_if_only_one_tab && num_tabs <= 1) {
+        return None;
+    }
+    if !config.use_fancy_tab_bar {
+        Some(TabBarKind::TerminalBar)
+    } else if has_status {
+        Some(TabBarKind::TerminalStatus)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TabEntry {
     pub item: TabBarItem,
@@ -55,11 +96,27 @@ struct TitleText {
     len: usize,
 }
 
+/// The configuration as handed to Lua. `resolved_palette.tab_bar` is empty
+/// unless the file or its scheme names tab bar colours, yet the bar is always
+/// painted with some; plugins read them, so give them the ones in use.
+pub(crate) fn config_for_lua(config: &ConfigHandle, tab_bar: Option<&TabBarColors>) -> Config {
+    let mut config = (**config).clone();
+    fill_tab_bar_colors(&mut config, tab_bar);
+    config
+}
+
+fn fill_tab_bar_colors(config: &mut Config, tab_bar: Option<&TabBarColors>) {
+    if config.resolved_palette.tab_bar.is_none() {
+        config.resolved_palette.tab_bar = tab_bar.cloned();
+    }
+}
+
 fn call_format_tab_title(
     tab: &TabInformation,
     tab_info: &[TabInformation],
     pane_info: &[PaneInformation],
     config: &ConfigHandle,
+    tab_bar: &TabBarColors,
     hover: bool,
     tab_max_width: usize,
 ) -> Option<TitleText> {
@@ -76,7 +133,7 @@ fn call_format_tab_title(
                         tab.clone(),
                         tabs,
                         panes,
-                        (**config).clone(),
+                        config_for_lua(config, Some(tab_bar)),
                         hover,
                         tab_max_width,
                     ),
@@ -174,10 +231,25 @@ fn compute_tab_title(
     tab_info: &[TabInformation],
     pane_info: &[PaneInformation],
     config: &ConfigHandle,
+    tab_bar: &TabBarColors,
+    kind: TabBarKind,
     hover: bool,
     tab_max_width: usize,
 ) -> TitleText {
-    let title = call_format_tab_title(tab, tab_info, pane_info, config, hover, tab_max_width);
+    let fancy = kind.fancy();
+    let title = if kind == TabBarKind::WindowTabs {
+        None
+    } else {
+        call_format_tab_title(
+            tab,
+            tab_info,
+            pane_info,
+            config,
+            tab_bar,
+            hover,
+            tab_max_width,
+        )
+    };
 
     match title {
         Some(title) => title,
@@ -187,7 +259,7 @@ fn compute_tab_title(
 
             if let Some(pane) = &tab.active_pane {
                 let mut title = if tab.tab_title.is_empty() {
-                    if config.use_fancy_tab_bar {
+                    if fancy {
                         "Terminal".to_string()
                     } else {
                         terminal_title_for_display(&pane.title).to_string()
@@ -196,8 +268,8 @@ fn compute_tab_title(
                     tab.tab_title.clone()
                 };
 
-                let classic_spacing = if config.use_fancy_tab_bar { "" } else { " " };
-                if config.show_tab_index_in_tab_bar && !config.use_fancy_tab_bar {
+                let classic_spacing = if fancy { "" } else { " " };
+                if config.show_tab_index_in_tab_bar && !fancy {
                     let index = format!(
                         "{classic_spacing}{}: ",
                         tab.tab_index
@@ -213,7 +285,7 @@ fn compute_tab_title(
                     title = format!("{}{classic_spacing}", title);
                 }
 
-                if !config.use_fancy_tab_bar {
+                if !fancy {
                     match pane.progress {
                         Progress::None => {}
                         Progress::Percentage(pct) | Progress::Error(pct) => {
@@ -234,7 +306,7 @@ fn compute_tab_title(
                     }
                 }
 
-                if !config.use_fancy_tab_bar {
+                if !fancy {
                     len += unicode_column_width(TERMINAL_TAB_ICON, None);
                     items.push(FormatItem::Text(TERMINAL_TAB_ICON.to_string()));
                 }
@@ -243,7 +315,7 @@ fn compute_tab_title(
                 // easier to click on tab titles, but we'll still go below
                 // this if there are too many tabs to fit the window at
                 // this width.
-                if !config.use_fancy_tab_bar {
+                if !fancy {
                     while len + unicode_column_width(&title, None) < 5 {
                         title.push(' ');
                     }
@@ -338,17 +410,18 @@ impl TabBarState {
         mouse_x: Option<usize>,
         x: &mut usize,
         config: &ConfigHandle,
+        fancy: bool,
         items: &mut Vec<TabEntry>,
         line: &mut Line,
         colors: &TabBarColors,
     ) {
-        let default_cell = if config.use_fancy_tab_bar {
+        let default_cell = if fancy {
             CellAttributes::default()
         } else {
             colors.new_tab().as_cell_attributes()
         };
 
-        let default_cell_hover = if config.use_fancy_tab_bar {
+        let default_cell_hover = if fancy {
             CellAttributes::default()
         } else {
             colors.new_tab_hover().as_cell_attributes()
@@ -437,18 +510,30 @@ impl TabBarState {
         tab_scroll_offset: f32,
         left_status: &str,
         right_status: &str,
+        kind: TabBarKind,
+        themed: bool,
     ) -> Self {
         let colors = colors.cloned().unwrap_or_else(TabBarColors::default);
+        let fancy = kind.fancy();
+        // Colours derived from the terminal are its own ground: leave those
+        // cells on the default background, painted exactly as the terminal's.
+        let ground = |attrs: CellAttributes| {
+            let mut attrs = attrs;
+            if themed {
+                attrs.set_background(ColorSpec::Default);
+            }
+            attrs
+        };
 
-        let active_cell_attrs = colors.active_tab().as_cell_attributes();
-        let inactive_hover_attrs = colors.inactive_tab_hover().as_cell_attributes();
-        let inactive_cell_attrs = colors.inactive_tab().as_cell_attributes();
-        let new_tab_hover_attrs = colors.new_tab_hover().as_cell_attributes();
-        let new_tab_attrs = colors.new_tab().as_cell_attributes();
+        let active_cell_attrs = ground(colors.active_tab().as_cell_attributes());
+        let inactive_hover_attrs = ground(colors.inactive_tab_hover().as_cell_attributes());
+        let inactive_cell_attrs = ground(colors.inactive_tab().as_cell_attributes());
+        let new_tab_hover_attrs = ground(colors.new_tab_hover().as_cell_attributes());
+        let new_tab_attrs = ground(colors.new_tab().as_cell_attributes());
 
         let new_tab = parse_status_text(
             &config.tab_bar_style.new_tab,
-            if config.use_fancy_tab_bar {
+            if fancy {
                 CellAttributes::default()
             } else {
                 new_tab_attrs.clone()
@@ -456,7 +541,7 @@ impl TabBarState {
         );
         let new_tab_hover = parse_status_text(
             &config.tab_bar_style.new_tab_hover,
-            if config.use_fancy_tab_bar {
+            if fancy {
                 CellAttributes::default()
             } else {
                 new_tab_hover_attrs.clone()
@@ -471,7 +556,14 @@ impl TabBarState {
 
         let mut active_tab_no = 0;
 
-        let tab_titles: Vec<TitleText> = if config.show_tabs_in_tab_bar {
+        // `show_tabs_in_tab_bar` is a wezterm option: the window tab row keeps
+        // its tabs whatever it says.
+        let show_tabs = match kind {
+            TabBarKind::WindowTabs => true,
+            TabBarKind::TerminalBar => config.show_tabs_in_tab_bar,
+            TabBarKind::TerminalStatus => false,
+        };
+        let tab_titles: Vec<TitleText> = if show_tabs {
             tab_info
                 .iter()
                 .map(|tab| {
@@ -483,6 +575,8 @@ impl TabBarState {
                         tab_info,
                         pane_info,
                         config,
+                        &colors,
+                        kind,
                         false,
                         config.tab_max_width,
                     )
@@ -494,8 +588,17 @@ impl TabBarState {
         let number_of_tabs = tab_titles.len();
         let show_new_tab_button = false;
 
+        let black_cell = Cell::blank_with_attrs(ground(
+            CellAttributes::default()
+                .set_background(ColorSpec::TrueColor(*colors.background()))
+                .clone(),
+        ));
+        // The left status leads the line; the tabs get what it leaves.
+        let left_status_line = parse_status_text(left_status, black_cell.attrs().clone());
+
         let available_cells = title_width.saturating_sub(
-            number_of_tabs.saturating_sub(1)
+            left_status_line.len()
+                + number_of_tabs.saturating_sub(1)
                 + if show_new_tab_button {
                     new_tab.len()
                 } else {
@@ -503,15 +606,24 @@ impl TabBarState {
                 },
         );
         let tab_width_max = config.tab_max_width;
-        let visible_tab_range = if config.use_fancy_tab_bar {
+        let visible_tab_range = if fancy {
             0..tab_titles.len()
         } else {
-            visible_tab_range_from_scroll(
-                &tab_titles,
-                tab_scroll_offset.max(0.0).floor() as usize,
-                tab_width_max,
-                available_cells,
-            )
+            // Nothing scrolls the terminal bar, so it follows the active tab:
+            // the first offset that keeps it in view.
+            let mut offset = tab_scroll_offset.max(0.0).floor() as usize;
+            let mut range =
+                visible_tab_range_from_scroll(&tab_titles, offset, tab_width_max, available_cells);
+            while !range.contains(&active_tab_no) && offset < active_tab_no {
+                offset += 1;
+                range = visible_tab_range_from_scroll(
+                    &tab_titles,
+                    offset,
+                    tab_width_max,
+                    available_cells,
+                );
+            }
+            range
         };
 
         let mut line = Line::with_width(0, SEQ_ZERO);
@@ -519,31 +631,15 @@ impl TabBarState {
         let mut x = 0;
         let mut items = vec![];
 
-        let black_cell = Cell::blank_with_attrs(
-            CellAttributes::default()
-                .set_background(ColorSpec::TrueColor(*colors.background()))
-                .clone(),
-        );
-
-        if use_integrated_title_buttons
-            && config.integrated_title_button_style == IntegratedTitleButtonStyle::MacOsNative
-            && config.use_fancy_tab_bar == false
-            && config.tab_bar_at_bottom == false
-        {
-            for _ in 0..10 as usize {
-                line.insert_cell(0, black_cell.clone(), title_width, SEQ_ZERO);
-                x += 1;
-            }
-        }
-
         if use_integrated_title_buttons
             && config.integrated_title_button_style != IntegratedTitleButtonStyle::MacOsNative
             && config.integrated_title_button_alignment == IntegratedTitleButtonAlignment::Left
         {
-            Self::integrated_title_buttons(mouse_x, &mut x, config, &mut items, &mut line, &colors);
+            Self::integrated_title_buttons(
+                mouse_x, &mut x, config, fancy, &mut items, &mut line, &colors,
+            );
         }
 
-        let left_status_line = parse_status_text(left_status, black_cell.attrs().clone());
         if left_status_line.len() > 0 {
             items.push(TabEntry {
                 item: TabBarItem::LeftStatus,
@@ -572,6 +668,8 @@ impl TabBarState {
                 tab_info,
                 pane_info,
                 config,
+                &colors,
+                kind,
                 hover,
                 tab_title_len,
             );
@@ -589,7 +687,7 @@ impl TabBarState {
             let esc = format_as_escapes(tab_title.items.clone()).expect("already parsed ok above");
             let mut tab_line = parse_status_text(
                 &esc,
-                if config.use_fancy_tab_bar {
+                if fancy {
                     CellAttributes::default()
                 } else {
                     cell_attrs.clone()
@@ -597,7 +695,7 @@ impl TabBarState {
             );
 
             let title = tab_line.clone();
-            let status = if config.use_fancy_tab_bar {
+            let status = if fancy {
                 tab_info[tab_idx]
                     .active_pane
                     .as_ref()
@@ -722,7 +820,9 @@ impl TabBarState {
             && config.integrated_title_button_alignment == IntegratedTitleButtonAlignment::Right
         {
             x = title_width;
-            Self::integrated_title_buttons(mouse_x, &mut x, config, &mut items, &mut line, &colors);
+            Self::integrated_title_buttons(
+                mouse_x, &mut x, config, fancy, &mut items, &mut line, &colors,
+            );
         }
 
         Self { line, items }
@@ -743,7 +843,7 @@ impl TabBarState {
                 width: entry.width * cell_width,
                 y,
                 height: cell_height,
-                item_type: UIItemType::TabBar(entry.item),
+                item_type: UIItemType::TerminalBar(entry.item),
             });
         }
 
@@ -854,4 +954,60 @@ pub fn parse_status_text(text: &str, default_cell: CellAttributes) -> Line {
     });
     flush_print(&mut print_buffer, &mut cells, &pen);
     Line::from_cells(cells, SEQ_ZERO)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use config::RgbaColor;
+
+    fn colors(rgb: (u8, u8, u8)) -> TabBarColors {
+        TabBarColors {
+            background: Some(RgbaColor::from(rgb)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn lua_sees_the_tab_bar_colours_in_use_when_none_are_configured() {
+        let mut config = Config::default_config();
+        config.resolved_palette.tab_bar = None;
+        fill_tab_bar_colors(&mut config, Some(&colors((1, 2, 3))));
+        assert_eq!(config.resolved_palette.tab_bar, Some(colors((1, 2, 3))));
+    }
+
+    #[test]
+    fn terminal_bar_shows_what_the_wezterm_options_ask_for() {
+        let mut config = Config::default_config();
+        config.enable_tab_bar = true;
+        config.hide_tab_bar_if_only_one_tab = false;
+        config.use_fancy_tab_bar = true;
+        // A fancy bar is the window tab row already; only status text adds a line.
+        assert_eq!(terminal_bar_kind(&config, 2, false), None);
+        assert_eq!(
+            terminal_bar_kind(&config, 2, true),
+            Some(TabBarKind::TerminalStatus)
+        );
+        config.use_fancy_tab_bar = false;
+        assert_eq!(
+            terminal_bar_kind(&config, 2, false),
+            Some(TabBarKind::TerminalBar)
+        );
+        config.hide_tab_bar_if_only_one_tab = true;
+        assert_eq!(terminal_bar_kind(&config, 1, true), None);
+        assert_eq!(
+            terminal_bar_kind(&config, 2, true),
+            Some(TabBarKind::TerminalBar)
+        );
+        config.enable_tab_bar = false;
+        assert_eq!(terminal_bar_kind(&config, 2, true), None);
+    }
+
+    #[test]
+    fn configured_tab_bar_colours_reach_lua_unchanged() {
+        let mut config = Config::default_config();
+        config.resolved_palette.tab_bar = Some(colors((9, 9, 9)));
+        fill_tab_bar_colors(&mut config, Some(&colors((1, 2, 3))));
+        assert_eq!(config.resolved_palette.tab_bar, Some(colors((9, 9, 9))));
+    }
 }

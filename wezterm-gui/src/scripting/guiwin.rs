@@ -179,7 +179,7 @@ impl UserData for GuiWin {
                 .map_err(|e| anyhow::anyhow!("{:#}", e))
                 .map_err(luaerr)?;
 
-            Ok((*config).clone())
+            Ok(config)
         });
         methods.add_async_method("get_config_overrides", |lua, this, _: ()| async move {
             let (tx, rx) = smol::channel::bounded(1);

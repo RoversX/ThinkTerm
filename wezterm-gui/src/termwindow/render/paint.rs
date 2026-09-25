@@ -1562,7 +1562,7 @@ impl crate::TermWindow {
             self.paint_right_sidebar(&mut right)
                 .context("record right sidebar")?;
         }
-        if self.show_tab_bar {
+        {
             let mut top = TripleLayerQuadAllocator::Heap(&mut chrome.top);
             self.paint_tab_bar(&mut top).context("record tab bar")?;
         }
@@ -2996,16 +2996,7 @@ impl crate::TermWindow {
 
         let (padding_left, padding_top) = self.padding_left_top();
         let border = self.get_os_border();
-        let tab_bar_height = if self.show_tab_bar {
-            self.tab_bar_pixel_height().unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        let (top_tab_height, bottom_tab_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
-        } else {
-            (tab_bar_height, 0.0)
-        };
+        let (top_tab_height, bottom_tab_height) = self.pane_area_insets();
 
         let grid_left = padding_left + border.left.get() as f32;
         let grid_top = border.top.get() as f32 + top_tab_height + padding_top;
@@ -4106,13 +4097,8 @@ impl crate::TermWindow {
 
         if paint_terminal_background {
             // Regular window background color
-            let background = if matches!(
-                crate::native_settings::effective_appearance(),
-                window::Appearance::Dark | window::Appearance::DarkHighContrast
-            ) {
-                self.chrome()
-                    .sidebar_bg
-                    .mul_alpha(self.config.window_background_opacity)
+            let background = if let Some(ground) = self.dark_terminal_ground() {
+                ground.mul_alpha(self.config.window_background_opacity)
             } else if panes.len() == 1 {
                 // If we're the only pane, use the pane's palette
                 // to draw the padding background
@@ -4212,11 +4198,16 @@ impl crate::TermWindow {
                     }
                 }
                 self.paint_pane(&pos, &mut layers).context("paint_pane")?;
-                if let Ok(frame) = self.pane_frame_rect(&pos) {
+                if let Ok(frame) = self.pane_mask_frame(&pos) {
                     self.paint_pane_recording_masks(pos.pane.pane_id(), frame, &mut layers)?;
                 }
             }
 
+            // Part of the terminal, gone with the panes wherever they are:
+            // after them, and before their dividers, which run through it
+            // and take the pointer there.
+            self.paint_terminal_bar(&mut layers)
+                .context("paint_terminal_bar")?;
             if let Some(pane) = self.get_active_pane_or_overlay() {
                 let splits = self.get_splits();
                 for split in &splits {
@@ -4501,10 +4492,8 @@ impl crate::TermWindow {
                     .context("paint_right_sidebar")?;
             }
 
-            if self.show_tab_bar {
-                self.paint_tab_bar(&mut chrome_layers)
-                    .context("paint_tab_bar")?;
-            }
+            self.paint_tab_bar(&mut chrome_layers)
+                .context("paint_tab_bar")?;
             drop(chrome_layers);
 
             if let Some((overlay, hidden, items)) = hover_overlay {

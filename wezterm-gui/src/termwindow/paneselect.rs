@@ -61,11 +61,7 @@ impl PaneSelector {
             .expect("to resolve pane selection font");
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
 
-        let top_bar_height = if term_window.show_tab_bar && !term_window.config.tab_bar_at_bottom {
-            term_window.tab_bar_pixel_height().unwrap()
-        } else {
-            0.
-        };
+        let top_bar_height = term_window.pane_area_insets().0;
         let (padding_left, padding_top) = term_window.padding_left_top();
         let border = term_window.get_os_border();
         let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;

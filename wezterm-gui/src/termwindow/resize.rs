@@ -2283,10 +2283,11 @@ impl super::TermWindow {
     ) -> (TerminalSize, Dimensions, ResizeIncrementCalculator) {
         let config = &self.config;
 
-        let tab_bar_height = if self.show_tab_bar {
-            self.tab_bar_pixel_height().unwrap_or(0.)
-        } else {
-            0.
+        // Everything above and below the pane tree: the window tab row and
+        // the terminal bar.
+        let tab_bar_height = {
+            let (top, bottom) = self.pane_area_insets();
+            top + bottom
         };
 
         let border = self.get_os_border();
@@ -2831,6 +2832,7 @@ impl super::TermWindow {
         // final size, which in that case should result in a NOP
         // change to the tab size.
 
+        self.settle_terminal_bar_kind();
         let (size, dims, ri_calc) =
             self.resize_layout_for_dimensions(dimensions, scale_changed_cells);
 
@@ -3128,12 +3130,11 @@ impl super::TermWindow {
             dpi: size.dpi,
         };
 
-        let show_tab_bar = config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab;
-        let tab_bar_height = if show_tab_bar {
-            self.tab_bar_pixel_height()? as usize
-        } else {
-            0
-        };
+        let tab_bar_height = self.tab_bar_pixel_height()? as usize
+            + crate::termwindow::render::tab_bar::terminal_bar_height(
+                self.terminal_bar_kind,
+                &render_metrics,
+            );
 
         let h_context = DimensionContext {
             dpi: self.dimensions.dpi as f32,

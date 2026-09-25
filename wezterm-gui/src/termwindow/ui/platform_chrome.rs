@@ -12,7 +12,6 @@ use window::{
 
 #[derive(Debug, Clone, Copy)]
 pub struct WindowTabChromeParams {
-    pub use_fancy_tab_bar: bool,
     pub workspace_sidebar_width: usize,
     pub window_state: WindowState,
     pub window_decorations: WindowDecorations,
@@ -98,7 +97,7 @@ impl WindowTabChromeParams {
     }
 
     pub fn leading_action_slot_count(self) -> usize {
-        if !self.use_fancy_tab_bar || self.workspace_sidebar_width > 0 {
+        if self.workspace_sidebar_width > 0 {
             return 0;
         }
 
@@ -118,8 +117,7 @@ impl WindowTabChromeParams {
     }
 
     pub fn shows_sidebar_toggle_action(self) -> bool {
-        self.use_fancy_tab_bar
-            && self.workspace_sidebar_width == 0
+        self.workspace_sidebar_width == 0
             && (self.window_state.contains(WindowState::FULL_SCREEN) || !cfg!(target_os = "macos"))
     }
 
@@ -270,7 +268,6 @@ mod tests {
         top_fancy_row_height: Option<usize>,
     ) -> WindowTabChromeParams {
         WindowTabChromeParams {
-            use_fancy_tab_bar: true,
             workspace_sidebar_width,
             window_state,
             window_decorations: WindowDecorations::INTEGRATED_BUTTONS | WindowDecorations::RESIZE,

@@ -15,7 +15,7 @@ use crate::scripting::guiwin::GuiWin;
 use crate::scrollbar::*;
 use crate::selection::Selection;
 use crate::shapecache::*;
-use crate::tabbar::{TabBarItem, TabBarState};
+use crate::tabbar::{TabBarItem, TabBarKind, TabBarState};
 use crate::termwindow::background::{
     load_background_image, reload_background_image, LoadedBackgroundLayer,
 };
@@ -173,12 +173,15 @@ pub(crate) mod transfer_walk;
 pub mod ui;
 pub mod webgpu;
 
-pub(crate) fn theme_aligned_tab_bar_colors_from_palette(palette: &ColorPalette) -> TabBarColors {
+/// Tab bar colours taken from the terminal: its foreground, on `background`.
+pub(crate) fn theme_aligned_tab_bar_colors_from_palette(
+    palette: &ColorPalette,
+    background: LinearRgba,
+) -> TabBarColors {
     fn rgba(color: LinearRgba) -> RgbaColor {
         color.to_srgb().into()
     }
 
-    let background = palette.resolve_bg(ColorAttribute::Default).to_linear();
     let foreground = palette.foreground.to_linear();
     let muted = foreground.mul_alpha(0.68);
 
@@ -563,7 +566,7 @@ pub enum TermWindowNotif {
         pane_id: PaneId,
         tx: Sender<String>,
     },
-    GetEffectiveConfig(Sender<ConfigHandle>),
+    GetEffectiveConfig(Sender<config::Config>),
     FinishWindowEvent {
         name: String,
         again: bool,
@@ -738,6 +741,9 @@ pub struct ScrollTrack {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UIItemType {
     TabBar(TabBarItem),
+    /// An item of the terminal bar: the tab or status bar a wezterm
+    /// configuration draws, which lives inside the terminal area.
+    TerminalBar(TabBarItem),
     CloseTab(usize),
     PaneNav {
         pane_id: PaneId,
@@ -2429,9 +2435,13 @@ pub struct TermWindow {
     leader_is_down: Option<std::time::Instant>,
     dead_key_status: DeadKeyStatus,
     key_table_state: KeyTableState,
-    show_tab_bar: bool,
     show_scroll_bar: bool,
     tab_bar: TabBarState,
+    /// What the terminal bar holds while it shows; it takes room from the
+    /// pane tree, so this changes only through a reload (see
+    /// `tabbar::terminal_bar_kind`).
+    terminal_bar_kind: Option<TabBarKind>,
+    terminal_bar: TabBarState,
     fancy_tab_bar: Option<box_model::ComputedElement>,
     tab_bar_scroll_offset: f32,
     tab_bar_scroll_target: f32,
@@ -2557,6 +2567,10 @@ pub struct TermWindow {
     /// Refreshed in `config_was_reloaded`, which is also where a colour scheme
     /// override and an appearance change both land.
     chrome_palette: crate::ui::UiPalette,
+    /// The interface appearance `chrome_palette` was resolved for. A palette
+    /// following the terminal takes its own from the scheme instead, so the
+    /// two can differ.
+    chrome_appearance: ::window::Appearance,
     shape_generation: usize,
     shape_cache: RefCell<LfuCache<ShapeCacheKey, anyhow::Result<Rc<Vec<ShapedInfo>>>>>,
     /// Per-domain shaping caches for proportional UI text (chrome / Note /
@@ -3945,14 +3959,13 @@ impl TermWindow {
         let render_metrics = RenderMetrics::new(&fontconfig)?;
         log::trace!("using render_metrics {:#?}", render_metrics);
 
-        // Initially we have only a single tab, so take that into account
-        // for the tab bar state.
-        let show_tab_bar = config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab;
-        let tab_bar_height = if show_tab_bar {
-            Self::tab_bar_pixel_height_impl(&config, &fontconfig, &render_metrics)? as usize
-        } else {
-            0
-        };
+        // Initially we have only a single tab, and no status text yet.
+        let terminal_bar_kind = crate::tabbar::terminal_bar_kind(&config, 1, false);
+        let tab_bar_height = Self::tab_bar_pixel_height_impl(&fontconfig)? as usize
+            + crate::termwindow::render::tab_bar::terminal_bar_height(
+                terminal_bar_kind,
+                &render_metrics,
+            );
 
         let terminal_size = TerminalSize {
             rows: physical_rows,
@@ -4103,9 +4116,10 @@ impl TermWindow {
             input_map: InputMap::new(&config),
             leader_is_down: None,
             dead_key_status: DeadKeyStatus::None,
-            show_tab_bar,
             show_scroll_bar: config.enable_scroll_bar,
             tab_bar: TabBarState::default(),
+            terminal_bar_kind,
+            terminal_bar: TabBarState::default(),
             fancy_tab_bar: None,
             tab_bar_scroll_offset: 0.0,
             tab_bar_scroll_target: 0.0,
@@ -4155,6 +4169,7 @@ impl TermWindow {
                 &config,
                 None,
             ),
+            chrome_appearance: crate::native_settings::effective_appearance(),
             shape_generation: 0,
             shape_cache: RefCell::new(LfuCache::new_weighted(
                 "shape_cache.hit.rate",
@@ -5223,9 +5238,18 @@ impl TermWindow {
                     .context("send GetTerminalSize response")?;
             }
             TermWindowNotif::GetEffectiveConfig(tx) => {
-                tx.try_send(self.config.clone())
-                    .map_err(chan_err)
-                    .context("send GetEffectiveConfig response")?;
+                let tab_bar = self
+                    .config
+                    .resolved_palette
+                    .tab_bar
+                    .is_none()
+                    .then(|| self.theme_aligned_tab_bar_colors());
+                tx.try_send(crate::tabbar::config_for_lua(
+                    &self.config,
+                    tab_bar.as_ref(),
+                ))
+                .map_err(chan_err)
+                .context("send GetEffectiveConfig response")?;
             }
             TermWindowNotif::FinishWindowEvent { name, again } => {
                 self.finish_window_event(&name, again);
@@ -6734,9 +6758,10 @@ impl TermWindow {
     /// too; this is the direct route, for when the appearance moved without a
     /// configuration reload behind it.
     pub(crate) fn refresh_chrome(&mut self) {
+        self.chrome_appearance = crate::native_settings::effective_appearance();
         self.chrome_palette = crate::native_settings::chrome_palette(
             crate::native_settings::load_shared().appearance.theme_mode,
-            crate::native_settings::effective_appearance(),
+            self.chrome_appearance,
             &self.config,
             self.scheme_preview_ground,
         );
@@ -6928,9 +6953,10 @@ impl TermWindow {
         // outlives its mux window still paints, and nothing else re-resolves
         // these two -- the settings-window routes reach them only through
         // their own notifies.
+        self.chrome_appearance = crate::native_settings::effective_appearance();
         self.chrome_palette = crate::native_settings::chrome_palette(
             crate::native_settings::load_shared().appearance.theme_mode,
-            crate::native_settings::effective_appearance(),
+            self.chrome_appearance,
             &config,
             self.scheme_preview_ground,
         );
@@ -6958,11 +6984,7 @@ impl TermWindow {
             Some(window) => window,
             _ => return,
         };
-        if window.len() == 1 {
-            self.show_tab_bar = config.enable_tab_bar && !config.hide_tab_bar_if_only_one_tab;
-        } else {
-            self.show_tab_bar = config.enable_tab_bar;
-        }
+        self.terminal_bar_kind = self.wanted_terminal_bar_kind(&config, window.len());
         *self.cursor_blink_state.borrow_mut() = ColorEase::new(
             config.cursor_blink_rate,
             config.cursor_blink_ease_in,
@@ -7134,62 +7156,29 @@ impl TermWindow {
                 .saturating_sub(border.bottom.get() as usize) as f32;
             return euclid::rect(left, top, (right - left).max(0.0), (bottom - top).max(0.0));
         }
-        let top_tab_h = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        let bottom_tab_h = if self.show_tab_bar && self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        // Deliberately *not* inset by `window_padding`: that padding belongs to
-        // the terminal grid, and content views are UI panels that own the whole
-        // area. Applying it only added a left/top gap (the right/bottom edges
-        // never subtracted it) that nothing painted, so the window background
+        // The whole terminal area, terminal bar included. Deliberately *not*
+        // inset by `window_padding`: that padding belongs to the terminal
+        // grid, and content views are UI panels that own the whole area.
+        // Applying it only added a left/top gap (the right/bottom edges never
+        // subtracted it) that nothing painted, so the window background
         // showed through as an L-shaped border.
-        let left = self.workspace_sidebar_width() as f32 + border.left.get() as f32;
-        let top = border.top.get() as f32 + top_tab_h;
-        let right = self
-            .dimensions
-            .pixel_width
-            .saturating_sub(border.right.get() as usize)
-            .saturating_sub(self.right_sidebar_width()) as f32;
-        let bottom =
-            (self.dimensions.pixel_height as f32 - border.bottom.get() as f32 - bottom_tab_h)
-                .max(top);
-        euclid::rect(left, top, (right - left).max(0.0), (bottom - top).max(0.0))
+        self.terminal_content_rect()
     }
 
     /// Where the terminal grid itself lives: the window minus the sidebars,
-    /// the tab bar and the borders.
+    /// the window tab row and the borders.
     ///
     /// Unlike [`Self::content_view_area`] this ignores whether a full-window
     /// view is currently open, because it answers a question about the
     /// terminal rather than about the view sitting on top of it.
     pub(crate) fn terminal_content_rect(&self) -> RectF {
         let border = self.get_os_border();
-        let top_tab_h = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        let bottom_tab_h = if self.show_tab_bar && self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height().unwrap_or(0.0)
-        } else {
-            0.0
-        };
+        // The terminal bar is part of the terminal, and the top panes' nav
+        // bars rise into its band: only the window tab row is outside.
         let left = self.workspace_sidebar_width() as f32 + border.left.get() as f32;
-        let top = border.top.get() as f32 + top_tab_h;
-        let right = self
-            .dimensions
-            .pixel_width
-            .saturating_sub(border.right.get() as usize)
-            .saturating_sub(self.right_sidebar_width()) as f32;
-        let bottom =
-            (self.dimensions.pixel_height as f32 - border.bottom.get() as f32 - bottom_tab_h)
-                .max(top);
+        let top = border.top.get() as f32 + self.tab_bar_pixel_height().unwrap_or(0.0);
+        let right = self.terminal_viewport_right();
+        let bottom = (self.dimensions.pixel_height as f32 - border.bottom.get() as f32).max(top);
         euclid::rect(left, top, (right - left).max(0.0), (bottom - top).max(0.0))
     }
 
@@ -7954,9 +7943,70 @@ impl TermWindow {
         self.update_title_impl();
     }
 
-    fn theme_aligned_tab_bar_colors(&mut self) -> TabBarColors {
-        let palette = self.palette().clone();
-        theme_aligned_tab_bar_colors_from_palette(&palette)
+    /// Whether the status text shows anything: plugins clear it with bare
+    /// formatting as often as with "".
+    fn has_status_text(&self) -> bool {
+        [&self.left_status, &self.right_status]
+            .iter()
+            .any(|status| crate::tabbar::parse_status_text(status, Default::default()).len() > 0)
+    }
+
+    /// Bring the terminal bar up to date ahead of a layout, which then makes
+    /// room for the bar it is about to show; `update_title` finds nothing
+    /// left to change and so does not lay the window out a second time.
+    pub(crate) fn settle_terminal_bar_kind(&mut self) {
+        let Some(num_tabs) = Mux::get()
+            .get_window(self.mux_window_id)
+            .map(|window| window.len())
+        else {
+            return;
+        };
+        self.terminal_bar_kind = self.wanted_terminal_bar_kind(&self.config, num_tabs);
+    }
+
+    /// The terminal bar `config` asks for. A status-only bar stays once
+    /// shown: status text that comes and goes (a LEADER marker, a mode name)
+    /// must not resize the terminal every time, nor a reload drop it.
+    fn wanted_terminal_bar_kind(
+        &self,
+        config: &config::Config,
+        num_tabs: usize,
+    ) -> Option<TabBarKind> {
+        crate::tabbar::terminal_bar_kind(
+            config,
+            num_tabs,
+            self.has_status_text() || self.terminal_bar_kind == Some(TabBarKind::TerminalStatus),
+        )
+    }
+
+    /// Tab bar colours for a configuration that names none, on the terminal
+    /// background as painted -- the terminal bar sits inside the terminal.
+    pub(crate) fn theme_aligned_tab_bar_colors(&mut self) -> TabBarColors {
+        let background = self.terminal_default_background();
+        theme_aligned_tab_bar_colors_from_palette(&self.palette().clone(), background)
+    }
+
+    /// The terminal's ground in a dark interface: the chrome's colour rather
+    /// than the scheme's background. `None` in a light one, where the scheme's
+    /// background shows. Read off the appearance cached with the chrome
+    /// palette; asking for it anew is costly (see `chrome_palette`).
+    pub(crate) fn dark_terminal_ground(&self) -> Option<LinearRgba> {
+        matches!(
+            self.chrome_appearance,
+            ::window::Appearance::Dark | ::window::Appearance::DarkHighContrast
+        )
+        .then(|| self.chrome().sidebar_bg)
+    }
+
+    /// The terminal's default background as painted.
+    pub(crate) fn terminal_default_background(&mut self) -> LinearRgba {
+        match self.dark_terminal_ground() {
+            Some(ground) => ground,
+            None => self
+                .palette()
+                .resolve_bg(ColorAttribute::Default)
+                .to_linear(),
+        }
     }
 
     fn update_title_impl(&mut self) {
@@ -7970,29 +8020,19 @@ impl TermWindow {
         let active_tab = tabs.iter().find(|t| t.is_active).cloned();
         let active_pane = panes.iter().find(|p| p.is_active).cloned();
 
-        let border = self.get_os_border();
-        let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
-        let tab_bar_y = if self.config.tab_bar_at_bottom {
-            ((self.dimensions.pixel_height as f32) - (tab_bar_height + border.bottom.get() as f32))
-                .max(0.)
-        } else {
-            border.top.get() as f32
-        };
+        // Decided before the bar is built, so one that has just appeared
+        // paints its content at once. Without a window yet the change waits
+        // for the first layout, which settles it (`settle_terminal_bar_kind`).
+        let terminal_bar_kind = self.wanted_terminal_bar_kind(&self.config, window.len());
+        let terminal_bar_moved =
+            self.window.is_some() && terminal_bar_kind != self.terminal_bar_kind;
+        if terminal_bar_moved {
+            self.terminal_bar_kind = terminal_bar_kind;
+        }
 
-        let tab_bar_height = self.tab_bar_pixel_height().unwrap_or(0.);
+        let cell_width = self.render_metrics.cell_size.width.max(1) as usize;
         let tab_bar_x = self.tab_bar_left_edge();
         let tab_bar_width = self.dimensions.pixel_width.saturating_sub(tab_bar_x).max(1);
-
-        let hovering_in_tab_bar = match &self.current_mouse_event {
-            Some(event) => {
-                let mouse_y = event.coords.y as f32;
-                let mouse_x = event.coords.x.max(0) as usize;
-                mouse_x >= tab_bar_x
-                    && mouse_y >= tab_bar_y as f32
-                    && mouse_y < tab_bar_y as f32 + tab_bar_height
-            }
-            None => false,
-        };
 
         let has_explicit_tab_colors = self.config.resolved_palette.tab_bar.is_some();
         let themed_tab_bar_colors = if has_explicit_tab_colors {
@@ -8001,32 +8041,29 @@ impl TermWindow {
             Some(self.theme_aligned_tab_bar_colors())
         };
         let tab_bar_colors = if has_explicit_tab_colors {
-            self.config.resolved_palette.tab_bar.as_ref()
+            self.config.resolved_palette.tab_bar.clone()
         } else {
-            themed_tab_bar_colors.as_ref()
+            themed_tab_bar_colors.clone()
         };
 
+        // The window tab row lays its tabs out itself; this supplies their
+        // titles and progress.
         let new_tab_bar = TabBarState::new(
-            (tab_bar_width / self.render_metrics.cell_size.width as usize).max(1),
-            if hovering_in_tab_bar {
-                self.current_mouse_event.as_ref().map(|event| {
-                    event.coords.x.saturating_sub(tab_bar_x as isize).max(0) as usize
-                        / self.render_metrics.cell_size.width as usize
-                })
-            } else {
-                None
-            },
+            (tab_bar_width / cell_width).max(1),
+            None,
             &tabs,
             &panes,
-            tab_bar_colors,
+            tab_bar_colors.as_ref(),
             &self.config,
             crate::termwindow::ui::platform_chrome::uses_integrated_window_buttons(
                 self.config.window_decorations,
                 self.window_state,
             ),
             self.tab_bar_scroll_offset,
-            &self.left_status,
-            &self.right_status,
+            "",
+            "",
+            TabBarKind::WindowTabs,
+            !has_explicit_tab_colors,
         );
         if new_tab_bar != self.tab_bar {
             self.tab_bar = new_tab_bar;
@@ -8037,11 +8074,48 @@ impl TermWindow {
             }
         }
 
+        if let (Some(kind), Some(rect)) = (self.terminal_bar_kind, self.terminal_bar_rect()) {
+            let bar_x = rect.origin.x.max(0.) as usize;
+            let mouse_x = self.current_mouse_event.as_ref().and_then(|event| {
+                rect.contains(euclid::point2(event.coords.x as f32, event.coords.y as f32))
+                    .then(|| (event.coords.x.max(0) as usize).saturating_sub(bar_x) / cell_width)
+            });
+            let new_terminal_bar = TabBarState::new(
+                (rect.size.width.max(0.) as usize / cell_width).max(1),
+                mouse_x,
+                &tabs,
+                &panes,
+                tab_bar_colors.as_ref(),
+                &self.config,
+                false,
+                0.,
+                &self.left_status,
+                &self.right_status,
+                kind,
+                !has_explicit_tab_colors,
+            );
+            if new_terminal_bar != self.terminal_bar {
+                self.terminal_bar = new_terminal_bar;
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
+            }
+        }
+
         let num_tabs = window.len();
+        drop(window);
+        // The terminal bar took its row from the pane tree or gave it back.
+        // Lay the window out again -- not through a config reload, which
+        // would also cancel a pending leader and clear the shape caches.
+        if terminal_bar_moved {
+            if let Some(window) = self.window.as_ref().cloned() {
+                let dimensions = self.dimensions;
+                self.apply_dimensions(&dimensions, None, &window);
+            }
+        }
         if num_tabs == 0 {
             return;
         }
-        drop(window);
 
         let title = match config::run_immediate_with_lua_config(|lua| {
             if let Some(lua) = lua {
@@ -8057,7 +8131,10 @@ impl TermWindow {
                             active_pane.clone(),
                             tabs,
                             panes,
-                            (*self.config).clone(),
+                            crate::tabbar::config_for_lua(
+                                &self.config,
+                                themed_tab_bar_colors.as_ref(),
+                            ),
                         ),
                     ),
                 )?;
@@ -8146,20 +8223,6 @@ impl TermWindow {
 
         if let Some(window) = self.window.as_ref() {
             window.set_title(&title);
-
-            let show_tab_bar = if num_tabs == 1 {
-                self.config.enable_tab_bar && !self.config.hide_tab_bar_if_only_one_tab
-            } else {
-                self.config.enable_tab_bar
-            };
-
-            // If the number of tabs changed and caused the tab bar to
-            // hide/show, then we'll need to resize things.  It is simplest
-            // to piggy back on the config reloading code for that, so that
-            // is what we're doing.
-            if show_tab_bar != self.show_tab_bar {
-                self.config_was_reloaded();
-            }
         }
         self.schedule_next_status_update();
     }

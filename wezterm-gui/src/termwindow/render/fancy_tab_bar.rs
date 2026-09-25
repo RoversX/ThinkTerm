@@ -60,18 +60,8 @@ impl crate::TermWindow {
 
         let border = self.get_os_border();
         let row_x = self.tab_bar_left_edge();
-        let row_y = if self.config.tab_bar_at_bottom {
-            self.dimensions
-                .pixel_height
-                .saturating_sub(row_height + border.bottom.get() as usize)
-        } else {
-            border.top.get() as usize
-        };
-        let content_top_spacer = if self.config.tab_bar_at_bottom {
-            0
-        } else {
-            self.ui_px(WINDOW_TAB_TOP_SPACER).min(row_height)
-        };
+        let row_y = border.top.get() as usize;
+        let content_top_spacer = self.ui_px(WINDOW_TAB_TOP_SPACER).min(row_height);
         let content_row_y = row_y + content_top_spacer;
         let content_row_height = row_height.saturating_sub(content_top_spacer);
         let icon_size = self.ui_px(TAB_ICON_SIZE).min(content_row_height);
@@ -126,11 +116,7 @@ impl crate::TermWindow {
             .get_active_tab_for_window(self.mux_window_id)
             .is_some_and(|tab| tab.iter_panes_ignoring_zoom().len() > 1);
         if show_pane_layer_divider {
-            let divider_y = if self.config.tab_bar_at_bottom {
-                row_y
-            } else {
-                row_y + row_height
-            };
+            let divider_y = row_y + row_height;
             self.filled_rectangle(
                 layers,
                 1,
@@ -508,9 +494,7 @@ impl crate::TermWindow {
             let icon_size = action_icon_size.min(button_size.saturating_sub(2));
 
             if is_sidebar_toggle {
-                let button_y = if self.config.tab_bar_at_bottom {
-                    row_y + (row_height.saturating_sub(button_size) / 2)
-                } else if is_fullscreen_sidebar_toggle {
+                let button_y = if is_fullscreen_sidebar_toggle {
                     row_y.saturating_sub(self.ui_px(WINDOW_TAB_TOP_SPACER))
                         + self.ui_px(SIDEBAR_INSET)
                         + self.ui_px(WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET)

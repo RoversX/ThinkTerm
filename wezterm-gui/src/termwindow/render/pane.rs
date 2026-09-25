@@ -245,17 +245,7 @@ impl crate::TermWindow {
     }
 
     fn pane_content_origin(&self, pos: &PositionedPane) -> anyhow::Result<(f32, f32)> {
-        let tab_bar_height = if self.show_tab_bar {
-            self.tab_bar_pixel_height()
-                .context("tab_bar_pixel_height")?
-        } else {
-            0.
-        };
-        let top_bar_height = if self.config.tab_bar_at_bottom {
-            0.0
-        } else {
-            tab_bar_height
-        };
+        let (top_bar_height, _) = self.pane_area_insets();
         let border = self.get_os_border();
         let (padding_left, _) = self.padding_left_top();
         Ok((
@@ -302,8 +292,29 @@ impl crate::TermWindow {
         if self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id) && pos.top > 0 {
             height = height.max(self.pane_nav_bar_height() as f32);
         }
+        // The frame starts at the nav bar, lifted for panes along the top.
+        let lift = self.pane_nav_lift(pos);
 
-        Ok(euclid::rect(pane_x, pane_y, pane_width, height))
+        Ok(euclid::rect(
+            pane_x,
+            pane_y - lift,
+            pane_width,
+            height + lift,
+        ))
+    }
+
+    /// The pane's rectangle without that lift. Recording masks are kept as
+    /// fractions of it, so it has to move with the pane's rows when a
+    /// terminal bar comes or goes, as the whole frame did before the lift.
+    pub(crate) fn pane_mask_frame(&self, pos: &PositionedPane) -> anyhow::Result<RectF> {
+        let frame = self.pane_frame_rect(pos)?;
+        let lift = self.pane_nav_lift(pos);
+        Ok(euclid::rect(
+            frame.origin.x,
+            frame.origin.y + lift,
+            frame.size.width,
+            frame.size.height - lift,
+        ))
     }
 
     fn paint_collapsed_pane_nav_bar(
@@ -348,7 +359,15 @@ impl crate::TermWindow {
                 .clamp(24, 30);
             let icon_size = button_size.saturating_sub(8).clamp(16, 22);
             let x = strip_left + (strip_width.saturating_sub(button_size) / 2);
-            let mut y = strip_top + COLLAPSED_EDGE_PADDING;
+            // A terminal bar across the top runs through a strip lifted to the
+            // top edge (see `pane_nav_lift`): its chips start below the bar.
+            let chips_top = match self.terminal_bar_rect() {
+                Some(bar) if self.pane_nav_lift(pos) > 0. => {
+                    (bar.max_y().max(0.0) as usize).max(strip_top)
+                }
+                _ => strip_top,
+            };
+            let mut y = chips_top + COLLAPSED_EDGE_PADDING;
 
             if let Some(tab) = &active_tab {
                 if y.saturating_add(button_size) <= strip_bottom {
@@ -757,6 +776,7 @@ impl crate::TermWindow {
         }
 
         let (_, pane_y) = self.pane_content_origin(pos)?;
+        let pane_y = pane_y - self.pane_nav_lift(pos);
         if pos.width == 0 {
             return Ok(0);
         }
@@ -1403,17 +1423,7 @@ impl crate::TermWindow {
 
         let (padding_left, padding_top) = self.padding_left_top();
 
-        let tab_bar_height = if self.show_tab_bar {
-            self.tab_bar_pixel_height()
-                .context("tab_bar_pixel_height")?
-        } else {
-            0.
-        };
-        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
-        } else {
-            (tab_bar_height, 0.0)
-        };
+        let (top_bar_height, bottom_bar_height) = self.pane_area_insets();
 
         let border = self.get_os_border();
         let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
@@ -1488,13 +1498,7 @@ impl crate::TermWindow {
         let window_is_transparent =
             !self.window_background.is_empty() || config.window_background_opacity != 1.0;
 
-        let dark_chrome_background = matches!(
-            crate::native_settings::effective_appearance(),
-            window::Appearance::Dark | window::Appearance::DarkHighContrast
-        )
-        .then(|| {
-            self.chrome().sidebar_bg
-        });
+        let dark_chrome_background = self.dark_terminal_ground();
         let default_bg = dark_chrome_background
             .unwrap_or_else(|| palette.resolve_bg(ColorAttribute::Default).to_linear())
             .mul_alpha(if window_is_transparent {
@@ -1544,7 +1548,7 @@ impl crate::TermWindow {
                 width,
                 // Go all the way to the bottom if we're bottom-most
                 if pos.top + pos.height >= self.terminal_size.rows as usize {
-                    self.dimensions.pixel_height as f32 - y
+                    self.pane_area_bottom() - y
                 } else {
                     (pos.height as f32 * cell_height) + height_delta as f32
                 },
@@ -1738,7 +1742,8 @@ impl crate::TermWindow {
             /// the smooth-scroll remainder. Only the rows at the pane's top
             /// and bottom can poke out of it, so only those pay for
             /// cropping; the rest are moved as they are. With no remainder
-            /// this is the plain replay it always was.
+            /// this is the plain replay it always was. The first `cut_rows`
+            /// reach under a terminal bar and are cropped at its edge.
             fn replay_line(
                 layers: &mut dyn TripleLayerQuadAllocatorTrait,
                 heap: &HeapQuadAllocator,
@@ -1746,7 +1751,11 @@ impl crate::TermWindow {
                 pane_clip: QuadClipRect,
                 line_idx: usize,
                 row_count: usize,
+                cut_rows: usize,
             ) -> anyhow::Result<()> {
+                if line_idx < cut_rows {
+                    return heap.apply_to_clipped_at(layers, 0.0, -scroll_px, pane_clip, 1.0);
+                }
                 if scroll_px == 0.0 {
                     return heap.apply_to(layers);
                 }
@@ -1762,6 +1771,7 @@ impl crate::TermWindow {
                 scroll_px: f32,
                 pane_clip: QuadClipRect,
                 row_count: usize,
+                cut_rows: usize,
                 term_window: &'a mut crate::TermWindow,
                 selrange: Option<SelectionRange>,
                 rectangular: bool,
@@ -1795,7 +1805,7 @@ impl crate::TermWindow {
                 + (pos.top as f32 * global_render_metrics.cell_size.height as f32)
                 + pane_nav_height as f32;
 
-            if let Ok(frame) = self.pane_frame_rect(pos) {
+            if let Ok(frame) = self.pane_mask_frame(pos) {
                 self.update_recording_mask_grid(
                     pane_id,
                     frame,
@@ -1823,9 +1833,26 @@ impl crate::TermWindow {
                 );
             }
 
+            // A top pane too short for its whole nav bar starts its rows
+            // inside the terminal bar's band (see `pane_nav_lift`). The bar
+            // covers them there and takes their clicks, so they are cut at
+            // its lower edge rather than drawn through it.
+            let content_top = if self.pane_nav_lift(pos) > 0. {
+                self.terminal_bar_rect()
+                    .map_or(pane_top_pixel_y, |bar| pane_top_pixel_y.max(bar.max_y()))
+            } else {
+                pane_top_pixel_y
+            };
+            let cut_rows = if content_top > pane_top_pixel_y {
+                ((content_top - pane_top_pixel_y + scroll_px)
+                    / pane_render_metrics.cell_size.height.max(1) as f32)
+                    .ceil() as usize
+            } else {
+                0
+            };
             let pane_clip = QuadClipRect::from_top_left_pixels(
                 left_pixel_x,
-                pane_top_pixel_y,
+                content_top,
                 left_pixel_x
                     + render_dims.cols as f32 * pane_render_metrics.cell_size.width as f32,
                 pane_top_pixel_y
@@ -1837,6 +1864,7 @@ impl crate::TermWindow {
                 scroll_px,
                 pane_clip,
                 row_count,
+                cut_rows,
                 term_window: self,
                 selrange,
                 rectangular,
@@ -1968,6 +1996,7 @@ impl crate::TermWindow {
                                 self.pane_clip,
                                 line_idx,
                                 self.row_count,
+                                self.cut_rows,
                             )
                             .context("cached_quad.layers.apply_to")?;
                             self.term_window.update_next_frame_time(cached_quad.expires);
@@ -2071,6 +2100,7 @@ impl crate::TermWindow {
                         self.pane_clip,
                         line_idx,
                         self.row_count,
+                        self.cut_rows,
                     )
                     .context("HeapQuadAllocator::apply_to")?;
 
@@ -2143,7 +2173,7 @@ impl crate::TermWindow {
                     current_viewport,
                     scroll_px / pane_render_metrics.cell_size.height.max(1) as f32,
                     pane_content_right,
-                    pane_top_pixel_y,
+                    content_top,
                     content_bottom,
                 )?;
             }
@@ -2172,16 +2202,7 @@ impl crate::TermWindow {
         let cell_width = self.render_metrics.cell_size.width as f32;
         let cell_height = self.render_metrics.cell_size.height as f32;
         let (padding_left, padding_top) = self.padding_left_top();
-        let tab_bar_height = if self.show_tab_bar {
-            self.tab_bar_pixel_height()?
-        } else {
-            0.
-        };
-        let (top_bar_height, _bottom_bar_height) = if self.config.tab_bar_at_bottom {
-            (0.0, tab_bar_height)
-        } else {
-            (tab_bar_height, 0.0)
-        };
+        let (top_bar_height, _bottom_bar_height) = self.pane_area_insets();
 
         let border = self.get_os_border();
         let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
@@ -2229,7 +2250,7 @@ impl crate::TermWindow {
             background_width,
             // Go all the way to the bottom if we're bottom-most
             if pos.top + pos.height >= self.terminal_size.rows as usize {
-                self.dimensions.pixel_height as f32 - y
+                self.pane_area_bottom() - y
             } else {
                 (pos.height as f32 * cell_height) + height_delta as f32
             },

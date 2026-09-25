@@ -17,11 +17,7 @@ impl crate::TermWindow {
         let cell_height = self.render_metrics.cell_size.height as f32;
 
         let border = self.get_os_border();
-        let first_row_offset = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
-            self.tab_bar_pixel_height()?
-        } else {
-            0.
-        } + border.top.get() as f32;
+        let first_row_offset = self.pane_area_insets().0 + border.top.get() as f32;
 
         let (padding_left, padding_top) = self.padding_left_top();
 
@@ -29,26 +25,40 @@ impl crate::TermWindow {
         let pos_x = split.left as f32 * cell_width + padding_left + border.left.get() as f32;
 
         if split.direction == SplitDirection::Horizontal {
+            let x = pos_x + (cell_width / 2.0);
+            let width = self.render_metrics.underline_height as f32;
+            let mut top = pos_y - (cell_height / 2.0);
+            let mut bottom = top + (1. + split.size as f32) * cell_height;
+            // Between the top panes the line reaches up beside their lifted
+            // nav bars (see `pane_nav_lift`), straight through the terminal
+            // bar under them; along the bottom it stops short of the bar.
+            let mut lift = 0.;
+            match self.terminal_bar_placement() {
+                Some(bar) if !bar.at_bottom && split.top == 0 => lift = bar.height,
+                Some(bar) if bar.at_bottom => bottom = bottom.min(self.pane_area_bottom()),
+                _ => {}
+            }
+            // Never above the terminal area: with no top padding (tabline.wez
+            // zeroes it) the half-cell overhang reached into the window tab
+            // row.
+            let area_top = border.top.get() as f32 + self.tab_bar_pixel_height().unwrap_or(0.);
+            top = (top - lift).max(area_top);
             self.filled_rectangle(
                 layers,
                 2,
-                euclid::rect(
-                    pos_x + (cell_width / 2.0),
-                    pos_y - (cell_height / 2.0),
-                    self.render_metrics.underline_height as f32,
-                    (1. + split.size as f32) * cell_height,
-                ),
+                euclid::rect(x, top, width, (bottom - top).max(0.)),
                 foreground,
             )?;
+            // The drag area follows it up.
+            let item_top =
+                padding_top as usize + first_row_offset as usize + split.top * cell_height as usize;
             self.ui_items.push(UIItem {
                 x: border.left.get() as usize
                     + padding_left as usize
                     + (split.left * cell_width as usize),
                 width: cell_width as usize,
-                y: padding_top as usize
-                    + first_row_offset as usize
-                    + split.top * cell_height as usize,
-                height: split.size * cell_height as usize,
+                y: item_top.saturating_sub(lift as usize),
+                height: split.size * cell_height as usize + lift as usize,
                 item_type: UIItemType::Split(split.clone()),
             });
         } else {
