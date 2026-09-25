@@ -46,6 +46,7 @@ textwrap.workspace  =true
 thinkterm-proto.workspace = true
 thinkterm-tui = { path = "../thinkterm-tui" }
 thinkterm-update.workspace = true
+thinkterm-file-index.workspace = true
 umask.workspace = true
 url.workspace = true
 wezterm-client.workspace = true

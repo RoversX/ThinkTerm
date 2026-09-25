@@ -7752,6 +7752,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkterm-file-index"
+version = "0.1.0"
+dependencies = [
+ "ignore",
+ "tempfile",
+]
+
+[[package]]
 name = "thinkterm-font-core"
 version = "0.1.0"
 dependencies = [
@@ -9366,6 +9374,7 @@ dependencies = [
  "termwiz 0.24.0",
  "termwiz-funcs",
  "textwrap",
+ "thinkterm-file-index",
  "thinkterm-proto",
  "thinkterm-tui",
  "thinkterm-update",

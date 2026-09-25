@@ -1,0 +1,11 @@
+[package]
+name = "thinkterm-file-index"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ignore.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -256,6 +256,11 @@ enum SubCommand {
     #[command(name = "update", about = "Check for a newer release and install it")]
     Update(UpdateCommand),
 
+    /// Write a project's file listing for search. The desktop runs this on a
+    /// remote host over ssh; it is not meant to be run by hand.
+    #[command(name = "list-files", hide = true)]
+    ListFiles(ListFilesCommand),
+
     /// Generate shell completion information
     #[command(name = "shell-completion")]
     ShellCompletion {
@@ -884,6 +889,43 @@ impl UpdateCommand {
 }
 
 #[derive(Debug, Parser, Clone)]
+struct ListFilesCommand {
+    /// The project folder.
+    #[arg(value_parser, value_hint = ValueHint::DirPath)]
+    root: std::path::PathBuf,
+
+    /// Leave out what the project's .gitignore excludes.
+    #[arg(long)]
+    respect_gitignore: bool,
+
+    /// Stop after this many entries (at most the index limit).
+    #[arg(long, default_value_t = thinkterm_file_index::ENTRY_LIMIT)]
+    limit: usize,
+
+    /// Stop after this many seconds.
+    #[arg(long, default_value_t = 20)]
+    time_limit: u64,
+}
+
+impl ListFilesCommand {
+    fn run(&self) -> anyhow::Result<()> {
+        let limit = self.limit.min(thinkterm_file_index::ENTRY_LIMIT);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(self.time_limit.min(120));
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+        thinkterm_file_index::write_listing(
+            &self.root,
+            self.respect_gitignore,
+            limit,
+            deadline,
+            &mut out,
+        )
+        .with_context(|| format!("listing {}", self.root.display()))
+    }
+}
+
+#[derive(Debug, Parser, Clone)]
 struct SetCwdCommand {
     /// The directory to specify.
     /// If omitted, will use the current directory of the process itself.
@@ -1028,6 +1070,7 @@ fn run() -> anyhow::Result<()> {
         SubCommand::Record(cmd) => cmd.run(init_config(&opts)?),
         SubCommand::Replay(cmd) => cmd.run(),
         SubCommand::Update(cmd) => cmd.run(),
+        SubCommand::ListFiles(cmd) => cmd.run(),
         SubCommand::Tui(cmd) => thinkterm_tui::run(
             init_config(&opts)?,
             thinkterm_tui::TuiOptions {
