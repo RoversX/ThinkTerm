@@ -11,7 +11,7 @@ use mux::connui::{ConnectionUI, ConnectionUIParams};
 use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource};
 use mux::pane::{Pane, PaneId};
 use mux::tab::{SplitRequest, Tab, TabId};
-use mux::window::WindowId;
+use mux::window::{Window, WindowId};
 use mux::{Mux, MuxNotification};
 use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
@@ -1724,6 +1724,37 @@ fn collect_pane_ids(node: &mux::tab::PaneNode, out: &mut Vec<PaneId>) {
         mux::tab::PaneNode::Stack(stack) => {
             out.extend(stack.panes.iter().map(|entry| entry.pane_id))
         }
+    }
+}
+
+/// Keep a mirrored window's tabs in the order the server lists them: move
+/// `tab_id` to `*slot`, the next listed position, and move that on. A tab the
+/// window does not hold takes no position.
+fn place_in_listed_order(window: &mut Window, slot: &mut usize, tab_id: TabId) {
+    let Some(at) = window.idx_by_id(tab_id) else {
+        return;
+    };
+    if at != *slot && *slot < window.len() {
+        let active = window.get_active().map(|tab| tab.tab_id());
+        let moved = window.remove_by_idx(at);
+        window.insert(*slot, &moved);
+        if let Some(active) = active.and_then(|id| window.idx_by_id(id)) {
+            window.set_active_without_saving(active);
+        }
+    }
+    *slot += 1;
+}
+
+/// `place_in_listed_order` for `window_id`, with the positions `placed` has
+/// handed out in it so far.
+fn place_listed_tab(
+    mux: &Mux,
+    placed: &mut HashMap<WindowId, usize>,
+    window_id: WindowId,
+    tab_id: TabId,
+) {
+    if let Some(mut window) = mux.get_window_mut(window_id) {
+        place_in_listed_order(&mut window, placed.entry(window_id).or_insert(0), tab_id);
     }
 }
 
@@ -3704,6 +3735,14 @@ impl ClientDomain {
                 if let Some((remote_window_id, remote_tab_id)) = tabroot.window_and_tab_ids() {
                     remote_windows_to_forget.remove(&remote_window_id);
                     remote_tabs_to_forget.remove(&remote_tab_id);
+                    // Its mirror stays in the window, so it keeps its place:
+                    // the tabs listed after it must not move in ahead of it.
+                    if let (Some(window_id), Some(tab_id)) = (
+                        inner.remote_to_local_window(remote_window_id),
+                        inner.remote_to_local_tab_id(remote_tab_id),
+                    ) {
+                        place_listed_tab(&mux, &mut placed, window_id, tab_id);
+                    }
                 }
                 for entry in tabroot.entries() {
                     remote_panes_to_forget.remove(&entry.pane_id);
@@ -3865,19 +3904,7 @@ impl ClientDomain {
                             // reservation).
                             mux.add_tab_to_window(&tab, local_window_id)?;
                         }
-                        let slot = placed.entry(local_window_id).or_insert(0);
-                        if let Some(mut window) = mux.get_window_mut(local_window_id) {
-                            let at = window.idx_by_id(tab.tab_id());
-                            if let Some(at) = at.filter(|at| *at != *slot && *slot < window.len()) {
-                                let active = window.get_active().map(|t| t.tab_id());
-                                let moved = window.remove_by_idx(at);
-                                window.insert(*slot, &moved);
-                                if let Some(active) = active.and_then(|id| window.idx_by_id(id)) {
-                                    window.set_active_without_saving(active);
-                                }
-                            }
-                        }
-                        *slot += 1;
+                        place_listed_tab(&mux, &mut placed, local_window_id, tab.tab_id());
                         continue;
                     }
                     // The mapping went stale after the initial sweep. Fall
@@ -3908,6 +3935,7 @@ impl ClientDomain {
                                 local_window_id,
                             );
                             mux.add_tab_to_window(&tab, local_window_id)?;
+                            place_listed_tab(&mux, &mut placed, local_window_id, tab.tab_id());
                             continue;
                         }
                     }
@@ -3940,6 +3968,7 @@ impl ClientDomain {
                             local_window_id,
                         );
                         mux.add_tab_to_window(&tab, local_window_id)?;
+                        place_listed_tab(&mux, &mut placed, local_window_id, tab.tab_id());
                         primary_window_id.take();
                         continue;
                     }
@@ -3960,6 +3989,7 @@ impl ClientDomain {
                 }
                 inner.record_remote_to_local_window_mapping(remote_window_id, *local_window_id);
                 mux.add_tab_to_window(&tab, *local_window_id)?;
+                place_listed_tab(&mux, &mut placed, *local_window_id, tab.tab_id());
             }
         }
 
@@ -4143,12 +4173,13 @@ mod tests {
     use super::{
         accepts_generation, acknowledge_recovery_target, active_remote_tabs_by_workspace,
         attach_with_retry_loop, consistent_remote_tab_id, is_fatal_attach_error,
-        next_attach_backoff, owns_remote_viewport_from_states, remote_frontend_gate_from_state,
-        remote_move_pane_id, server_runtime_replaced, stale_mirrors_to_reap,
-        thread_id_for_workspace, AttachRetryOutcome, AttachRetryTiming, AutomaticRemotePaneResize,
-        FrontendRecoveryAck, FrontendRecoveryBarrier, FrontendRecoverySlot, MirrorOrigin,
-        RemoteFrontendGate, ResyncCoordinatorState, ResyncDriverAction, ResyncOutcome,
-        ResyncRequestKind, SharedResyncCompletion, ViewportLatencyState,
+        next_attach_backoff, owns_remote_viewport_from_states, place_in_listed_order,
+        remote_frontend_gate_from_state, remote_move_pane_id, server_runtime_replaced,
+        stale_mirrors_to_reap, thread_id_for_workspace, AttachRetryOutcome, AttachRetryTiming,
+        AutomaticRemotePaneResize, FrontendRecoveryAck, FrontendRecoveryBarrier,
+        FrontendRecoverySlot, MirrorOrigin, RemoteFrontendGate, ResyncCoordinatorState,
+        ResyncDriverAction, ResyncOutcome, ResyncRequestKind, SharedResyncCompletion,
+        ViewportLatencyState,
     };
     use crate::client::ClientConnectionPhase;
     use mux::connui::ConnectionUI;
@@ -4198,6 +4229,43 @@ mod tests {
             }),
             now,
         );
+    }
+
+    #[test]
+    fn a_tab_listed_with_impossible_sizes_keeps_its_place() {
+        // Window methods notify the process-wide Mux; nothing else here uses it.
+        let _ = promise::spawn::SimpleExecutor::new();
+        mux::Mux::set_mux(&std::sync::Arc::new(mux::Mux::new(None)));
+        let size = wezterm_term::TerminalSize::default();
+        let tabs: Vec<_> = (0..3)
+            .map(|_| std::sync::Arc::new(mux::tab::Tab::new(&size)))
+            .collect();
+        let ids: Vec<_> = tabs.iter().map(|tab| tab.tab_id()).collect();
+        let mut window = mux::window::Window::new(None, None, None);
+        for tab in &tabs {
+            window.push(tab);
+        }
+        let order = |window: &mux::window::Window| {
+            window.iter().map(|tab| tab.tab_id()).collect::<Vec<_>>()
+        };
+
+        // Listed A, X, B with X's sizes impossible: X is not rebuilt, but its
+        // mirror still takes its turn, so B does not move in ahead of it.
+        let mut slot = 0;
+        for id in [ids[0], ids[1], ids[2]] {
+            place_in_listed_order(&mut window, &mut slot, id);
+        }
+        assert_eq!(order(&window), [ids[0], ids[1], ids[2]]);
+
+        // Listed in another order, the window follows; a tab it does not hold
+        // takes no place.
+        let elsewhere = mux::tab::Tab::new(&size).tab_id();
+        let mut slot = 0;
+        for id in [ids[2], elsewhere, ids[0], ids[1]] {
+            place_in_listed_order(&mut window, &mut slot, id);
+        }
+        assert_eq!(slot, 3);
+        assert_eq!(order(&window), [ids[2], ids[0], ids[1]]);
     }
 
     #[test]
