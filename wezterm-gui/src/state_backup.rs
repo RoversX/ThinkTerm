@@ -189,8 +189,16 @@ fn export_to(
 /// quit. Blocking: call it off the UI thread.
 pub(crate) fn stage_import(from: &Path) -> Result<()> {
     stage_import_into(from, &crate::native_paths::data_dir())?;
-    IMPORT_STAGED.store(true, Ordering::Relaxed);
+    note_staged();
     Ok(())
+}
+
+/// A new import waits, and stands in for any that failed before it.
+fn note_staged() {
+    IMPORT_STAGED.store(true, Ordering::Relaxed);
+    *LAST_IMPORT_ERROR
+        .lock()
+        .unwrap_or_else(|err| err.into_inner()) = None;
 }
 
 fn stage_import_into(from: &Path, data: &Path) -> Result<()> {
@@ -257,8 +265,10 @@ pub(crate) fn enter_gui() {
             return;
         }
     };
-    if data.join(PENDING).is_dir() {
-        let alone = match wait_for(|| lock.try_lock()) {
+    let pending = data.join(PENDING);
+    if pending.is_dir() {
+        // Waiting stops early if another launch applies it meanwhile.
+        let alone = match wait_for(|| lock.try_lock(), || pending.is_dir()) {
             Ok(alone) => alone,
             Err(err) => {
                 // A folder that cannot lock cannot say whether a window runs;
@@ -267,7 +277,8 @@ pub(crate) fn enter_gui() {
                 true
             }
         };
-        if alone {
+        // A launch that took the lock first may have applied it meanwhile.
+        if alone && pending.is_dir() {
             let targets: Vec<(&str, PathBuf)> = state_files()
                 .into_iter()
                 .filter_map(|(name, path)| Some((name, path?)))
@@ -281,28 +292,34 @@ pub(crate) fn enter_gui() {
                         .unwrap_or_else(|err| err.into_inner()) = Some(format!("{err:#}"));
                 }
             }
+        }
+        if alone {
             let _ = lock.unlock();
-        } else {
+        } else if pending.is_dir() {
             log::warn!("another ThinkTerm window still runs; the import waits for a later launch");
         }
     }
-    IMPORT_STAGED.store(data.join(PENDING).is_dir(), Ordering::Relaxed);
+    IMPORT_STAGED.store(pending.is_dir(), Ordering::Relaxed);
     // Joined for good; waits only while another launch is mid-import.
-    if let Ok(false) | Err(_) = wait_for(|| lock.try_lock_shared()) {
+    if let Ok(false) | Err(_) = wait_for(|| lock.try_lock_shared(), || true) {
         log::warn!("cannot hold the window lock; an import could apply under this window");
     }
     static HELD: std::sync::OnceLock<fs::File> = std::sync::OnceLock::new();
     let _ = HELD.set(lock);
 }
 
-/// Try `lock` until it succeeds or `WAIT_FOR_OTHERS` passes: `Ok(false)` if
-/// it is still held elsewhere, `Err` if the folder cannot lock at all.
-fn wait_for(lock: impl Fn() -> Result<(), fs::TryLockError>) -> std::io::Result<bool> {
+/// Try `lock` until it succeeds, `WAIT_FOR_OTHERS` passes or `wanted` stops
+/// holding: `Ok(false)` if it is still held elsewhere or no longer wanted,
+/// `Err` if the folder cannot lock at all.
+fn wait_for(
+    lock: impl Fn() -> Result<(), fs::TryLockError>,
+    wanted: impl Fn() -> bool,
+) -> std::io::Result<bool> {
     let deadline = Instant::now() + WAIT_FOR_OTHERS;
     loop {
         match lock() {
             Ok(()) => return Ok(true),
-            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+            Err(fs::TryLockError::WouldBlock) if Instant::now() < deadline && wanted() => {
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(fs::TryLockError::WouldBlock) => return Ok(false),
@@ -314,19 +331,32 @@ fn wait_for(lock: impl Fn() -> Result<(), fs::TryLockError>) -> std::io::Result<
 /// Put the staged files in place. Every file is first copied beside its
 /// target, and what it replaces kept, before any target is touched; if that
 /// fails the copies are removed and nothing changes. Then each is renamed
-/// over its target. The staged import is cleared either way, so a failure is
-/// reported once rather than retried at every launch.
+/// over its target; if one cannot be, the ones before it get back what they
+/// replaced, so a failure changes nothing then either. The staged import is
+/// cleared either way, so a failure is reported once rather than retried at
+/// every launch.
 fn apply_pending_into(data: &Path, targets: &[(&str, PathBuf)]) -> Result<()> {
     let pending = data.join(PENDING);
+    // Already applied, by a launch that took the lock first.
+    if !pending.is_dir() {
+        return Ok(());
+    }
     let result = prepare_and_replace(&pending, targets);
     let cleared = fs::remove_dir_all(&pending).context("clear the staged import");
     result.and(cleared)
 }
 
+/// A staged file on its way in: its copy beside the target, and where what
+/// it replaces is kept (`None` when nothing was there).
+struct Incoming<'a> {
+    temp: PathBuf,
+    target: &'a PathBuf,
+    kept: Option<PathBuf>,
+}
+
 fn prepare_and_replace(pending: &Path, targets: &[(&str, PathBuf)]) -> Result<()> {
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let mut prepared: Vec<(PathBuf, &PathBuf)> = vec![];
-    let mut kept: Vec<PathBuf> = vec![];
+    let mut incoming: Vec<Incoming> = vec![];
     let prepare = (|| -> Result<()> {
         for (name, target) in targets {
             let from = pending.join(name);
@@ -336,44 +366,72 @@ fn prepare_and_replace(pending: &Path, targets: &[(&str, PathBuf)]) -> Result<()
             if let Some(parent) = target.parent() {
                 config::create_user_owned_dirs(parent)?;
             }
-            if target.is_file() {
-                let stem = Path::new(name)
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .unwrap_or(name);
-                let keep = target.with_file_name(format!("{stem}.before-import-{stamp}.json"));
-                fs::copy(target, &keep).with_context(|| format!("keep the current {name}"))?;
-                kept.push(keep);
+            let stem = Path::new(name)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or(name);
+            // Listed before either is written, so a copy cut short (a full
+            // disk) is removed with the rest.
+            let file = Incoming {
+                temp: target.with_file_name(format!(".{name}.importing")),
+                target,
+                kept: target
+                    .is_file()
+                    .then(|| target.with_file_name(format!("{stem}.before-import-{stamp}.json"))),
+            };
+            incoming.push(file);
+            let file = incoming.last().expect("just pushed");
+            if let Some(kept) = &file.kept {
+                fs::copy(target, kept).with_context(|| format!("keep the current {name}"))?;
             }
-            let temp = target.with_file_name(format!(".{name}.importing"));
-            fs::copy(&from, &temp).with_context(|| format!("copy {name}"))?;
-            prepared.push((temp.clone(), target));
-            make_private(&temp)?;
+            fs::copy(&from, &file.temp).with_context(|| format!("copy {name}"))?;
+            make_private(&file.temp)?;
         }
         Ok(())
     })();
     if let Err(err) = prepare {
-        for (temp, _) in &prepared {
-            let _ = fs::remove_file(temp);
-        }
-        for keep in &kept {
-            let _ = fs::remove_file(keep);
-        }
+        discard(&incoming);
         return Err(err);
     }
+    for (replaced, file) in incoming.iter().enumerate() {
+        if let Err(err) = fs::rename(&file.temp, file.target) {
+            let err = anyhow::Error::new(err).context(format!("replace {}", file.target.display()));
+            discard(&incoming[replaced..]);
+            return match put_back(&incoming[..replaced]) {
+                Ok(()) => Err(err),
+                Err(put_back) => Err(err.context(format!("{put_back:#}"))),
+            };
+        }
+    }
+    Ok(())
+}
+
+/// Remove what was prepared for files not put in place.
+fn discard(files: &[Incoming]) {
+    for file in files {
+        let _ = fs::remove_file(&file.temp);
+        if let Some(kept) = &file.kept {
+            let _ = fs::remove_file(kept);
+        }
+    }
+}
+
+/// Give files already replaced back what they replaced: the kept copy, or
+/// nothing where there was nothing. A copy that cannot go back stays kept.
+fn put_back(replaced: &[Incoming]) -> Result<()> {
     let mut failed = None;
-    for (temp, target) in &prepared {
-        if let Err(err) = fs::rename(temp, target) {
-            let _ = fs::remove_file(temp);
+    for file in replaced.iter().rev() {
+        let result = match &file.kept {
+            Some(kept) => fs::rename(kept, file.target),
+            None => fs::remove_file(file.target),
+        };
+        if let Err(err) = result {
             failed.get_or_insert_with(|| {
-                anyhow::Error::new(err).context(format!("replace {}", target.display()))
+                anyhow::Error::new(err).context(format!("put back {}", file.target.display()))
             });
         }
     }
-    match failed {
-        Some(err) => Err(err),
-        None => Ok(()),
-    }
+    failed.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
@@ -495,6 +553,54 @@ mod test {
     }
 
     #[test]
+    fn an_import_another_launch_applied_meanwhile_is_not_a_failure() {
+        let base = tempfile::tempdir().unwrap();
+        let backup = exported(base.path());
+        let data = base.path().join("data");
+        let store = data.join(STORE);
+        write(&data, STORE, "{\"current\":true}");
+        stage_import_into(&backup, &data).unwrap();
+        let targets = [(STORE, store.clone())];
+        // The first launch applies it; the second got the lock after that.
+        apply_pending_into(&data, &targets).unwrap();
+        apply_pending_into(&data, &targets).unwrap();
+        assert_eq!(
+            fs::read(&store).unwrap(),
+            fs::read(backup.join(STORE)).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_failure_while_replacing_puts_back_what_was_replaced() {
+        let base = tempfile::tempdir().unwrap();
+        let backup = exported(base.path());
+        let data = base.path().join("data");
+        let store = data.join(STORE);
+        write(&data, STORE, "{\"current\":true}");
+        stage_import_into(&backup, &data).unwrap();
+        // A folder where the hosts file goes: it is prepared like any other,
+        // but nothing can be renamed over it, and the store goes first.
+        let elsewhere = base.path().join("elsewhere");
+        let hosts = elsewhere.join("ssh_hosts.json");
+        fs::create_dir_all(hosts.join("in-the-way")).unwrap();
+        let targets = [(STORE, store.clone()), ("ssh_hosts.json", hosts.clone())];
+        assert!(apply_pending_into(&data, &targets).is_err());
+        assert_eq!(fs::read_to_string(&store).unwrap(), "{\"current\":true}");
+        assert!(hosts.is_dir());
+        // Nothing prepared or kept is left behind.
+        assert_eq!(names_in(&data), vec![STORE.to_string()]);
+        assert_eq!(names_in(&elsewhere), vec!["ssh_hosts.json".to_string()]);
+    }
+
+    #[test]
+    fn a_new_import_clears_the_last_failure() {
+        *LAST_IMPORT_ERROR.lock().unwrap() = Some("disk full".to_string());
+        note_staged();
+        assert!(import_staged());
+        assert_eq!(last_import_error(), None);
+    }
+
+    #[test]
     fn a_folder_that_is_not_a_backup_is_refused() {
         let base = tempfile::tempdir().unwrap();
         let data = base.path().join("data");
@@ -521,9 +627,21 @@ mod test {
             starting.try_lock(),
             Err(fs::TryLockError::WouldBlock)
         ));
-        assert!(wait_for(|| starting.try_lock_shared()).unwrap());
+        assert!(wait_for(|| starting.try_lock_shared(), || true).unwrap());
         drop(running);
         starting.unlock().unwrap();
-        assert!(wait_for(|| starting.try_lock()).unwrap());
+        assert!(wait_for(|| starting.try_lock(), || true).unwrap());
+    }
+
+    #[test]
+    fn a_launch_stops_waiting_once_the_import_is_no_longer_wanted() {
+        let base = tempfile::tempdir().unwrap();
+        let path = base.path().join(RUNNING_LOCK);
+        let running = fs::File::create(&path).unwrap();
+        running.try_lock_shared().unwrap();
+        let starting = fs::File::create(&path).unwrap();
+        let begun = Instant::now();
+        assert!(!wait_for(|| starting.try_lock(), || false).unwrap());
+        assert!(begun.elapsed() < WAIT_FOR_OTHERS);
     }
 }
