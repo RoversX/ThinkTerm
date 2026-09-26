@@ -18118,6 +18118,15 @@ impl crate::TermWindow {
             )?;
             text_x += icon_size + icon_label_gap;
         }
+        // A label that fits is centred on its advance width but may draw into
+        // the padding: a glyph's image can reach a pixel or two past its
+        // advance, and the painter drops any glyph whose image crosses the
+        // bound, so at exactly the advance width "Paste" read "Past".
+        let label_room = if measured_text_width <= available_label_width {
+            (x + width).saturating_sub(text_x)
+        } else {
+            text_width
+        };
         self.paint_sidebar_text(
             layers,
             ui_font,
@@ -18125,7 +18134,7 @@ impl crate::TermWindow {
             label,
             text_x,
             y + (height.saturating_sub(ui_metrics.cell_size.height as usize)) / 2,
-            text_width,
+            label_room,
             color,
         )
     }
