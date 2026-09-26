@@ -8636,6 +8636,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkterm-snippets"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "criterion",
+ "log",
+ "memchr",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "thinkterm-syntax"
 version = "0.1.0"
 dependencies = [
@@ -10520,6 +10534,7 @@ dependencies = [
  "thinkterm-i18n",
  "thinkterm-proto",
  "thinkterm-render",
+ "thinkterm-snippets",
  "thinkterm-syntax",
  "thinkterm-update",
  "thiserror 1.0.69",

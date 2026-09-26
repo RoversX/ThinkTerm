@@ -6922,19 +6922,7 @@ impl crate::TermWindow {
     }
 
     fn filtered_snippet_count(&self) -> usize {
-        let needle = self
-            .right_sidebar_snippet_search
-            .text()
-            .trim()
-            .to_ascii_lowercase();
-        crate::snippets::list_snippets()
-            .into_iter()
-            .filter(|snippet| {
-                needle.is_empty()
-                    || snippet.title.to_ascii_lowercase().contains(&needle)
-                    || snippet.body.to_ascii_lowercase().contains(&needle)
-            })
-            .count()
+        crate::snippets::matching_snippet_count(&self.right_sidebar_snippet_search.text())
     }
 
     pub fn paint_right_sidebar(
@@ -7404,7 +7392,8 @@ impl crate::TermWindow {
                 return Ok(());
             }
             RightSidebarMode::Snippets => {
-                self.paint_snippets_sidebar(
+                let stage = crate::input_diagnostics::StageTimer::begin("snippet_paint");
+                let result = self.paint_snippets_sidebar(
                     layers,
                     &ui_font,
                     ui_metrics,
@@ -7416,7 +7405,9 @@ impl crate::TermWindow {
                     content_width,
                     rect.y.saturating_add(rect.height),
                     icon_size,
-                )?;
+                );
+                stage.finish(result.is_ok());
+                result?;
                 return Ok(());
             }
             RightSidebarMode::Tasks => {
@@ -17242,19 +17233,9 @@ impl crate::TermWindow {
                 .ui_px(SNIPPET_TOOLBAR_HEIGHT)
                 .max(self.ui_px(SNIPPET_SEARCH_HEIGHT))
             + self.ui_px(SNIPPET_LIST_TOP_GAP);
-        let needle = self
-            .right_sidebar_snippet_search
-            .text()
-            .trim()
-            .to_ascii_lowercase();
-        let snippets: Vec<_> = crate::snippets::list_snippets()
-            .into_iter()
-            .filter(|snippet| {
-                needle.is_empty()
-                    || snippet.title.to_ascii_lowercase().contains(&needle)
-                    || snippet.body.to_ascii_lowercase().contains(&needle)
-            })
-            .collect();
+        let query = self.right_sidebar_snippet_search.text();
+        let searching = !query.trim().is_empty();
+        let snippets = crate::snippets::matching_snippets(&query);
         let row_height = self.ui_px(SNIPPET_CARD_HEIGHT) + self.ui_px(SNIPPET_ROW_GAP);
         // The panel's bottom padding, which doubles as the mask that keeps
         // cards out of it; whatever overshoots it is cut by the window edge.
@@ -17317,7 +17298,7 @@ impl crate::TermWindow {
                 empty_icon_size,
                 muted_fg,
             )?;
-            let empty_label = if needle.is_empty() {
+            let empty_label = if !searching {
                 crate::i18n::tr("right-no-snippets")
             } else {
                 crate::i18n::tr("right-no-matching-snippets")

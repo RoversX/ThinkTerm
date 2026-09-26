@@ -1,0 +1,28 @@
+[package]
+name = "thinkterm-snippets"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = ["native"]
+# The store as a file on disk, and fresh random ids. Without it the crate is
+# plain data and builds anywhere, WebAssembly included.
+native = ["dep:log", "dep:tempfile", "dep:uuid"]
+
+[dependencies]
+anyhow.workspace = true
+log = { workspace = true, optional = true }
+memchr.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tempfile = { workspace = true, optional = true }
+uuid = { workspace = true, features = ["v4"], optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "matching"
+harness = false
