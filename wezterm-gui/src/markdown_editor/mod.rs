@@ -6,6 +6,7 @@
 
 mod document;
 mod host;
+pub(crate) mod mermaid;
 mod projection;
 mod remote_image;
 mod spellcheck;

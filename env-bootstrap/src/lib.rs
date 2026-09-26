@@ -165,9 +165,36 @@ pub fn set_lang_from_locale() {
     }
 }
 
+thread_local! {
+    static QUIET_PANICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with this thread's panics kept out of the log and off the screen.
+/// For code the caller already guards with `catch_unwind` because what it is
+/// fed can break it (a parser reading a note): the message may quote that
+/// input, so the caller notes the failure itself, without it.
+pub fn with_quiet_panics<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            QUIET_PANICS.with(|quiet| quiet.set(self.0));
+        }
+    }
+    let _restore = Restore(QUIET_PANICS.with(|quiet| quiet.replace(true)));
+    f()
+}
+
+/// Whether a panic on this thread happens inside `with_quiet_panics`.
+pub fn panics_are_quiet() -> bool {
+    QUIET_PANICS.with(|quiet| quiet.get())
+}
+
 fn register_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if panics_are_quiet() {
+            return;
+        }
         let payload = info.payload();
         // panic! with a format string produces a String payload, not &str;
         // handle both or e.g. wgpu validation errors log as "!?"

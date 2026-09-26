@@ -54,6 +54,83 @@ debug = "line-tables-only"
 split-debuginfo = "packed"
 strip = "symbols"
 
+# Mermaid support (merman and what only it links in) is a lot of code for
+# little time: a diagram is drawn off the UI thread, and parsing one on it
+# takes under 10 ms even at this level, for the longest drawn. Optimized for
+# size, it adds about half as much to the binary. `dist` inherits these.
+[profile.release.package.approx]
+opt-level = "z"
+[profile.release.package.beef]
+opt-level = "z"
+[profile.release.package.by_address]
+opt-level = "z"
+[profile.release.package.cssparser]
+opt-level = "z"
+[profile.release.package.dtoa]
+opt-level = "z"
+[profile.release.package.dtoa-short]
+opt-level = "z"
+[profile.release.package.dugong]
+opt-level = "z"
+[profile.release.package.dugong-graphlib]
+opt-level = "z"
+[profile.release.package.getopts]
+opt-level = "z"
+[profile.release.package.htmlize]
+opt-level = "z"
+[profile.release.package.json5]
+opt-level = "z"
+[profile.release.package.lalrpop-util]
+opt-level = "z"
+[profile.release.package.logos]
+opt-level = "z"
+[profile.release.package.lol_html]
+opt-level = "z"
+[profile.release.package.manatee]
+opt-level = "z"
+[profile.release.package.matrixmultiply]
+opt-level = "z"
+[profile.release.package.merman]
+opt-level = "z"
+[profile.release.package.merman-core]
+opt-level = "z"
+[profile.release.package.merman-render]
+opt-level = "z"
+[profile.release.package.nalgebra]
+opt-level = "z"
+[profile.release.package.palette]
+opt-level = "z"
+[profile.release.package.palette_math]
+opt-level = "z"
+[profile.release.package.pastey]
+opt-level = "z"
+[profile.release.package.polycool]
+opt-level = "z"
+[profile.release.package.precomputed-hash]
+opt-level = "z"
+[profile.release.package.pulldown-cmark-escape]
+opt-level = "z"
+[profile.release.package.rawpointer]
+opt-level = "z"
+[profile.release.package.roughr-merman]
+opt-level = "z"
+[profile.release.package.ryu-js]
+opt-level = "z"
+[profile.release.package.safe_arch]
+opt-level = "z"
+[profile.release.package.selectors]
+opt-level = "z"
+[profile.release.package.servo_arc]
+opt-level = "z"
+[profile.release.package.simba]
+opt-level = "z"
+[profile.release.package.unicode-vo]
+opt-level = "z"
+[profile.release.package.web-time]
+opt-level = "z"
+[profile.release.package.wide]
+opt-level = "z"
+
 [profile.dev]
 debug = 0
 # https://jakedeichert.com/blog/reducing-rust-incremental-compilation-times-on-macos-by-70-percent/
@@ -232,6 +309,11 @@ reqwest = "0.12"
 rustybuzz = "0.20"
 resize = "0.5"
 resvg = { version = "0.45.1", default-features = false }
+# Mermaid diagrams in Markdown, parsed and laid out in Rust and drawn to
+# SVG; resvg rasterizes them.
+merman = { version = "0.7.0", default-features = false, features = ["render"] }
+merman-render = { version = "0.7.0", default-features = false }
+ttf-parser = "0.25"
 rstest = "0.21"
 ruzstd = "0.8"
 rusqlite = "0.32"

@@ -1121,12 +1121,82 @@ pub(crate) struct RightSidebarFilePreviewImage {
     pub width: u32,
     pub height: u32,
     pub encoded_bytes: usize,
+    /// How far a note may enlarge it to fill the column: a photo or logo
+    /// reads better bigger; a diagram, drawn at the size it is shown, would
+    /// only blur.
+    pub max_upscale: f32,
+    /// A diagram's own size in points, from which it is drawn again when the
+    /// room it is shown in changes; `None` for a picture, which has only its
+    /// pixels.
+    pub natural_size: Option<(f32, f32)>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone)]
 pub(crate) enum RightSidebarNoteImageSource {
     Local(PathBuf),
     Remote(String),
+    /// A Mermaid block, drawn: its text and the look it is drawn in. Its size
+    /// follows the room it is shown in, without a new entry per size.
+    Mermaid {
+        /// The text's hash, worked out once. It stands for the text in
+        /// lookups, made every frame, which then never read the whole text.
+        hash: u64,
+        source: Arc<str>,
+        style: crate::markdown_editor::mermaid::DiagramStyle,
+    },
+}
+
+impl PartialEq for RightSidebarNoteImageSource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Local(path), Self::Local(other)) => path == other,
+            (Self::Remote(url), Self::Remote(other)) => url == other,
+            (
+                Self::Mermaid {
+                    hash,
+                    source,
+                    style,
+                },
+                Self::Mermaid {
+                    hash: other_hash,
+                    source: other_source,
+                    style: other_style,
+                },
+            ) => hash == other_hash && style == other_style && source.len() == other_source.len(),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for RightSidebarNoteImageSource {}
+
+impl std::hash::Hash for RightSidebarNoteImageSource {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Local(path) => path.hash(state),
+            Self::Remote(url) => url.hash(state),
+            Self::Mermaid { hash, style, .. } => {
+                hash.hash(state);
+                style.hash(state);
+            }
+        }
+    }
+}
+
+// By hand, so a diagram's text (a note's content) never reaches a log line.
+impl std::fmt::Debug for RightSidebarNoteImageSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(path) => f.debug_tuple("Local").field(path).finish(),
+            Self::Remote(url) => f.debug_tuple("Remote").field(url).finish(),
+            Self::Mermaid { source, style, .. } => f
+                .debug_struct("Mermaid")
+                .field("bytes", &source.len())
+                .field("style", style)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2812,6 +2882,12 @@ pub struct TermWindow {
     right_sidebar_note_images_loading: HashSet<RightSidebarNoteImageSource>,
     right_sidebar_note_image_order: VecDeque<RightSidebarNoteImageSource>,
     right_sidebar_note_image_failures: HashMap<RightSidebarNoteImageSource, Instant>,
+    /// Moves on each time the Note image cache is emptied, so a load started
+    /// before that does not refill it.
+    right_sidebar_note_image_epoch: u64,
+    /// The room diagrams were last shown in, and since when: a diagram is
+    /// drawn again for a new width only once the width holds still.
+    right_sidebar_note_diagram_room: Option<(crate::markdown_editor::mermaid::DiagramBox, Instant)>,
     right_sidebar_note_code_highlight: ui::right_sidebar::NoteCodeHighlightState,
     right_sidebar_note_paint_cache: ui::right_sidebar::NotePaintCache,
     /// Which surface's state is in the `right_sidebar_note*` fields right now;
@@ -4333,6 +4409,8 @@ impl TermWindow {
             right_sidebar_note_images_loading: HashSet::new(),
             right_sidebar_note_image_order: VecDeque::new(),
             right_sidebar_note_image_failures: HashMap::new(),
+            right_sidebar_note_image_epoch: 0,
+            right_sidebar_note_diagram_room: None,
             right_sidebar_note_code_highlight: ui::right_sidebar::NoteCodeHighlightState::default(),
             right_sidebar_note_paint_cache: ui::right_sidebar::NotePaintCache::default(),
             note_surface_installed: ui::right_sidebar::NoteSurface::Note,

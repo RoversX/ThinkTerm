@@ -86,6 +86,11 @@ pub(crate) struct NoteHostState {
     pub wrap_cache: VisualWrapCache,
     pub projection_revision: Option<u64>,
     pub visual_key: Option<(u64, super::EditorMode, usize)>,
+    /// The Mermaid verdicts `visual` was laid out with: when a diagram that
+    /// parsed turns out not to draw, the layout is rebuilt to show its code.
+    diagram_epoch: u64,
+    /// The verdicts the background parse in flight lays out with.
+    parse_diagram_epoch: u64,
     wrapped_key: Option<(u64, super::EditorMode, usize, usize)>,
     pub line_layouts: Vec<NoteLineLayout>,
     pub line_geometry_key: Option<u64>,
@@ -181,6 +186,8 @@ impl Default for NoteHostState {
             wrap_cache: VisualWrapCache::default(),
             projection_revision: None,
             visual_key: None,
+            diagram_epoch: 0,
+            parse_diagram_epoch: 0,
             wrapped_key: None,
             line_layouts: vec![],
             line_geometry_key: None,
@@ -294,12 +301,15 @@ impl NoteHostState {
         // Deliberately uncached: this is a partial seed projection that the
         // full background parse replaces.
         self.reveal_key_cache = None;
-        let active_start = self.projection.caret_reveal_start(0);
+        // The caret the full parse will use, so a read-only preview reveals
+        // nothing here either (a diagram first on the page stays a diagram).
+        let caret = self.reveal_caret();
+        let active_start = self.projection.caret_reveal_start(caret);
         self.visual = Arc::new(build_visual_document(
             source,
             &self.projection,
             self.view.mode,
-            0,
+            caret,
         ));
         // Record the FULL document size (the gate metrics must not lie about
         // what the display represents), but keep the seed itself on the
@@ -503,6 +513,18 @@ impl NoteHostState {
             }
             self.visual_key = None;
         }
+        let diagram_epoch = super::mermaid::verdict_epoch();
+        if self.diagram_epoch != diagram_epoch {
+            self.diagram_epoch = diagram_epoch;
+            if source.len() > BACKGROUND_PARSE_THRESHOLD_BYTES {
+                // Laid out again off the UI thread, as a long note always is;
+                // the current layout shows until then.
+                self.projection_revision = None;
+                self.parse_requested_revision = Some(revision);
+                return;
+            }
+            self.visual_key = None;
+        }
         let caret = self.reveal_caret();
         let active_start = match self.reveal_key_cache {
             Some((cached_revision, cached_caret, result))
@@ -568,6 +590,7 @@ impl NoteHostState {
             return None;
         }
         self.parse_in_flight_revision = Some(snapshot.revision);
+        self.parse_diagram_epoch = super::mermaid::verdict_epoch();
         let document = self
             .document
             .as_ref()
@@ -611,6 +634,9 @@ impl NoteHostState {
         // more was asked for after it started.
         self.links_resolution_pending = std::mem::take(&mut self.links_requested_during_parse);
         self.visual = Arc::new(visual);
+        // Laid out with the verdicts of when it was asked for: any change
+        // since shows at the next refresh.
+        self.diagram_epoch = self.parse_diagram_epoch;
         self.refresh_wrap_work_metrics(display_source_len);
         self.projection_revision = Some(revision);
         self.visual_key = Some((revision, mode, active_start));
@@ -1190,6 +1216,34 @@ mod state_tests {
         ))));
         host.refresh_projection();
         host
+    }
+
+    #[test]
+    fn a_diagram_found_not_to_draw_is_laid_out_again_as_code() {
+        // Parses, but relates to a requirement nobody defined.
+        let source = "Intro\n\n```mermaid\nrequirementDiagram\n    requirement two {\n    id: 2\n    text: t\n    risk: low\n    verifymethod: test\n    }\n    two - satisfies -> elsewhere\n```\n";
+        let mut host = host_with_source(source);
+        let diagram = |host: &NoteHostState| {
+            host.visual
+                .lines
+                .iter()
+                .any(|line| line.kind == crate::markdown_editor::surface::VisualLineKind::Image)
+        };
+        assert!(diagram(&host));
+        let code = source
+            .split("```mermaid\n")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches("```\n");
+        let room = super::super::mermaid::DiagramBox {
+            width: 800.0,
+            height: 800.0,
+            scale: 1.0,
+        };
+        let style = super::super::mermaid::DiagramStyle { dark: false };
+        assert!(super::super::mermaid::render(code, style, room).is_err());
+        host.refresh_projection();
+        assert!(!diagram(&host));
     }
 
     #[test]

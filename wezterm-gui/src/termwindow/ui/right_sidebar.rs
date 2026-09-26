@@ -177,6 +177,9 @@ const NOTE_TABLE_MIN_COLUMN_WIDTH: usize = 120;
 const NOTE_TABLE_MAX_COLUMN_WIDTH: usize = 480;
 const NOTE_TABLE_SCROLLBAR_HEIGHT: usize = 3;
 const NOTE_CODE_HEADER_HEIGHT: usize = 38;
+/// A code block's header names its language in small print, a caption to the
+/// code rather than a heading over it: this much of the note's text size.
+const NOTE_CODE_LABEL_SCALE: f64 = 0.8;
 const NOTE_CODE_HORIZONTAL_PADDING: usize = 12;
 const NOTE_CODE_VERTICAL_PADDING: usize = 9;
 const NOTE_CODE_CONTROL_SIZE: usize = 28;
@@ -188,6 +191,11 @@ const NOTE_CODE_HIGHLIGHT_REPAINT_MS: u64 = 8;
 const NOTE_AUTOSAVE_MS: u64 = 500;
 const NOTE_SPELLCHECK_DEBOUNCE_MS: u64 = 300;
 const NOTE_IMAGE_CACHE_CAPACITY: usize = 32;
+/// How far a Markdown image may be enlarged to fill the column.
+const NOTE_IMAGE_MAX_UPSCALE: f32 = 3.0;
+/// How long the width diagrams are shown at must hold still before they are
+/// drawn again for it, so a drag redraws them once, at its end.
+const NOTE_DIAGRAM_SETTLE: Duration = Duration::from_millis(300);
 const NOTE_IMAGE_CACHE_MAX_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 const NOTE_VAULT_SPLIT_MIN_WIDTH: usize = 620;
 const NOTE_VAULT_TREE_WIDTH: usize = 230;
@@ -604,18 +612,18 @@ fn note_image_display_size(
     image_height: u32,
     available_width: f32,
     available_height: f32,
+    max_upscale: f32,
 ) -> (f32, f32) {
     if image_width == 0 || image_height == 0 || available_width <= 0.0 || available_height <= 0.0 {
         return (0.0, 0.0);
     }
 
     // Markdown images should be useful at reading distance, including small
-    // logos and diagrams.  Allow moderate upscaling while bounding both axes;
-    // giant/tall images remain contained inside the current viewport.
-    const MAX_UPSCALE: f32 = 3.0;
+    // logos, so they may be enlarged (up to `max_upscale`) while both axes
+    // stay bounded; giant/tall images remain inside the current viewport.
     let scale = (available_width / image_width as f32)
         .min(available_height / image_height as f32)
-        .min(MAX_UPSCALE);
+        .min(max_upscale);
     (
         (image_width as f32 * scale).max(1.0),
         (image_height as f32 * scale).max(1.0),
@@ -630,7 +638,14 @@ fn note_image_row_height(
 ) -> f32 {
     image
         .map(|image| {
-            note_image_display_size(image.width, image.height, available_width, available_height).1
+            note_image_display_size(
+                image.width,
+                image.height,
+                available_width,
+                available_height,
+                image.max_upscale,
+            )
+            .1
         })
         .unwrap_or(text_height)
         .max(text_height)
@@ -702,7 +717,9 @@ fn note_open_pending_for_vault(opening: Option<&(PathBuf, String)>, vault_root: 
 #[derive(Debug, Clone)]
 struct NoteCodeRowPaintLayout {
     block_start: usize,
-    language: String,
+    /// What the block's header says: its language, and for a Mermaid block
+    /// that cannot be drawn, that it cannot.
+    label: String,
     code: Arc<ProjectedCodeBlock>,
     row_index: usize,
     row_count: usize,
@@ -1980,6 +1997,9 @@ impl crate::TermWindow {
         self.right_sidebar_note_images_loading.clear();
         self.right_sidebar_note_image_order.clear();
         self.right_sidebar_note_image_failures.clear();
+        self.right_sidebar_note_image_epoch = self.right_sidebar_note_image_epoch.wrapping_add(1);
+        self.right_sidebar_note_diagram_room = None;
+        crate::markdown_editor::mermaid::release();
         self.right_sidebar_note_code_highlight = NoteCodeHighlightState::default();
         self.right_sidebar_note_paint_cache = NotePaintCache::default();
         self.ui_shape_caches.borrow_mut().clear_note();
@@ -8401,6 +8421,11 @@ impl crate::TermWindow {
             .fonts
             .resolve_font(&self.config.font)
             .context("Note code font")?;
+        let code_label_font = self
+            .fonts
+            .title_font_with_size(base_font_size * NOTE_CODE_LABEL_SCALE)
+            .context("Note code label font")?;
+        let code_label_metrics = RenderMetrics::with_font_metrics(&code_label_font.metrics());
         let h1_metrics = RenderMetrics::with_font_metrics(&h1_font.metrics());
         let h2_metrics = RenderMetrics::with_font_metrics(&h2_font.metrics());
         let h3_metrics = RenderMetrics::with_font_metrics(&h3_font.metrics());
@@ -8639,6 +8664,8 @@ impl crate::TermWindow {
         let active_document = self.right_sidebar_note.document.clone();
         let mut component_hasher = DefaultHasher::new();
         wrap_key.hash(&mut component_hasher);
+        // Diagrams are drawn in the note's look.
+        use_dark_syntax_theme.hash(&mut component_hasher);
         (Arc::as_ptr(&visual) as usize).hash(&mut component_hasher);
         self.right_sidebar_note
             .projection_revision
@@ -8837,18 +8864,30 @@ impl crate::TermWindow {
                     } else {
                         code_vertical_padding * 2.0 + code_line_height * row_count as f32
                     };
-                let language = code
-                    .language
-                    .as_deref()
-                    .unwrap_or("code")
-                    .to_ascii_uppercase();
+                let language = code.language.as_deref().unwrap_or("code");
+                // Only what is already known: while the block is edited its
+                // text changes with every key, and parsing it here would too.
+                let problem = crate::markdown_editor::mermaid::is_mermaid(Some(language))
+                    .then(|| crate::markdown_editor::mermaid::known_problem(&code.text))
+                    .flatten();
+                let label = match problem {
+                    Some(crate::markdown_editor::mermaid::Verdict::TooLarge) => format!(
+                        "{language}  ⚠ {}",
+                        crate::i18n::tr("right-notes-mermaid-too-large")
+                    ),
+                    Some(_) => format!(
+                        "{language}  ⚠ {}",
+                        crate::i18n::tr("right-notes-mermaid-unreadable")
+                    ),
+                    None => language.to_string(),
+                };
                 let code = Arc::new(code.clone());
                 for (row_index, visual_index) in row_indices.into_iter().enumerate() {
                     code_rows.insert(
                         visual_index,
                         NoteCodeRowPaintLayout {
                             block_start: code.source.start,
-                            language: language.clone(),
+                            label: label.clone(),
                             code: Arc::clone(&code),
                             row_index,
                             row_count,
@@ -8862,6 +8901,12 @@ impl crate::TermWindow {
             }
 
             let mut image_sources = HashMap::new();
+            let diagram_starts: HashSet<usize> = visual
+                .lines
+                .iter()
+                .filter(|line| line.kind == VisualLineKind::Image)
+                .map(|line| line.source.start)
+                .collect();
             if let Some(document) = active_document.as_ref() {
                 // Embeds resolve to canonical paths; the root may not be one
                 // (a preview's project root is spelled as the user opened it).
@@ -8894,6 +8939,25 @@ impl crate::TermWindow {
                                     (source.start, RightSidebarNoteImageSource::Local(path))
                                 })
                             }
+                        }
+                        // Only a block shown as its diagram: one being edited
+                        // or shown as code has no picture to find.
+                        ProjectedObject::CodeBlock(code)
+                            if crate::markdown_editor::mermaid::is_mermaid(
+                                code.language.as_deref(),
+                            ) && diagram_starts.contains(&code.source.start) =>
+                        {
+                            let source: Arc<str> = Arc::from(code.text.as_str());
+                            Some((
+                                code.source.start,
+                                RightSidebarNoteImageSource::Mermaid {
+                                    hash: crate::markdown_editor::mermaid::content_hash(&source),
+                                    source,
+                                    style: crate::markdown_editor::mermaid::DiagramStyle {
+                                        dark: use_dark_syntax_theme,
+                                    },
+                                },
+                            ))
                         }
                         ProjectedObject::WikiLink {
                             source,
@@ -8937,6 +9001,24 @@ impl crate::TermWindow {
         let image_max_height = (body_height as f32 * 0.72)
             .max(ui_metrics.cell_size.height as f32)
             .min(self.ui_f32(720.0));
+        // Whole pixels, so a diagram drawn to fill it is shown unscaled; its
+        // labels come out the size of the note's text.
+        let diagram_room = crate::markdown_editor::mermaid::DiagramBox {
+            width: wrap_width.floor(),
+            height: image_max_height.floor(),
+            scale: base_font_size as f32 * self.dimensions.dpi as f32
+                / 72.0
+                / crate::markdown_editor::mermaid::LABEL_SIZE,
+        };
+        let diagram_room_since = match self.right_sidebar_note_diagram_room {
+            Some((room, since)) if room == diagram_room => since,
+            _ => {
+                let now = Instant::now();
+                self.right_sidebar_note_diagram_room = Some((diagram_room, now));
+                now
+            }
+        };
+        let diagram_room_settled = diagram_room_since.elapsed() >= NOTE_DIAGRAM_SETTLE;
         let line_gap = self.ui_px(NOTE_LINE_GAP) as f32;
         let mut geometry_hasher = DefaultHasher::new();
         wrap_key.hash(&mut geometry_hasher);
@@ -9250,17 +9332,18 @@ impl crate::TermWindow {
                             )
                         },
                     )?;
-                    let language_x = leading_x + control_size + self.ui_px(4);
+                    let label_x = leading_x + control_size + self.ui_px(4);
                     self.paint_sidebar_text(
                         layers,
-                        ui_font,
-                        ui_metrics,
-                        &code_row.language,
-                        language_x,
+                        &code_label_font,
+                        code_label_metrics,
+                        &code_row.label,
+                        label_x,
                         header_y
-                            + header_height.saturating_sub(ui_metrics.cell_size.height as usize)
+                            + header_height
+                                .saturating_sub(code_label_metrics.cell_size.height as usize)
                                 / 2,
-                        copy_x.saturating_sub(language_x + self.ui_px(4)),
+                        copy_x.saturating_sub(label_x + self.ui_px(4)),
                         muted_fg,
                     )?;
                     self.filled_rectangle(
@@ -9290,9 +9373,22 @@ impl crate::TermWindow {
                 .as_ref()
                 .and_then(|source| self.right_sidebar_note_images.get(source))
                 .cloned();
-            if note_image.is_none() {
-                if let Some(source) = note_image_source.clone() {
-                    self.schedule_right_sidebar_note_image(source);
+            if let Some(source) = note_image_source.clone() {
+                // Load what is missing. A diagram drawn for another width is
+                // drawn again once the width holds still, shown scaled meanwhile.
+                let redraw = note_image.as_ref().is_some_and(|image| {
+                    image.natural_size.is_some_and(|natural| {
+                        crate::markdown_editor::mermaid::needs_redraw(
+                            image.width,
+                            crate::markdown_editor::mermaid::raster_size(natural, diagram_room).0,
+                        )
+                    })
+                });
+                if redraw && !diagram_room_settled {
+                    // Paint again once it has held still, should nothing else.
+                    self.update_next_frame_time(Some(diagram_room_since + NOTE_DIAGRAM_SETTLE));
+                } else if note_image.is_none() || redraw {
+                    self.schedule_right_sidebar_note_image(source, diagram_room);
                 }
             }
 
@@ -10192,12 +10288,30 @@ impl crate::TermWindow {
         self.request_right_sidebar_note_open(vault.root, relative_path, create, project_id, false)
     }
 
-    fn schedule_right_sidebar_note_image(&mut self, source: RightSidebarNoteImageSource) {
-        if self.right_sidebar_note_images.contains_key(&source)
-            || self
-                .right_sidebar_note_image_failures
-                .get(&source)
-                .is_some_and(|failed| failed.elapsed() < Duration::from_secs(60))
+    /// Load `source`'s image, or draw it to fit `room` when it is a diagram;
+    /// what arrives replaces what is cached. One load per source at a time.
+    fn schedule_right_sidebar_note_image(
+        &mut self,
+        source: RightSidebarNoteImageSource,
+        room: crate::markdown_editor::mermaid::DiagramBox,
+    ) {
+        // Diagrams are drawn one at a time anyway: starting just one keeps the
+        // rest from each parking a thread until its turn.
+        let is_diagram = |source: &RightSidebarNoteImageSource| {
+            matches!(source, RightSidebarNoteImageSource::Mermaid { .. })
+        };
+        if is_diagram(&source)
+            && self
+                .right_sidebar_note_images_loading
+                .iter()
+                .any(is_diagram)
+        {
+            return;
+        }
+        if self
+            .right_sidebar_note_image_failures
+            .get(&source)
+            .is_some_and(|failed| failed.elapsed() < Duration::from_secs(60))
             || !self
                 .right_sidebar_note_images_loading
                 .insert(source.clone())
@@ -10208,10 +10322,27 @@ impl crate::TermWindow {
             self.right_sidebar_note_images_loading.remove(&source);
             return;
         };
+        let epoch = self.right_sidebar_note_image_epoch;
         promise::spawn::spawn(async move {
             let load_source = source.clone();
             let result = promise::spawn::spawn_into_new_thread(move || match load_source {
                 RightSidebarNoteImageSource::Local(path) => load_file_preview_image(&path),
+                RightSidebarNoteImageSource::Mermaid { source, style, .. } => {
+                    let stage = crate::input_diagnostics::StageTimer::begin("note_diagram");
+                    let drawn = crate::markdown_editor::mermaid::render(&source, style, room);
+                    stage.finish(drawn.is_ok());
+                    let drawn = drawn?;
+                    // Kept compressed, and counted as such, as a file image is.
+                    let encoded_bytes = drawn.png.len();
+                    Ok(RightSidebarFilePreviewImage {
+                        data: Arc::new(ImageData::with_data(ImageDataType::EncodedFile(drawn.png))),
+                        width: drawn.width,
+                        height: drawn.height,
+                        encoded_bytes,
+                        max_upscale: 1.0,
+                        natural_size: Some(drawn.natural),
+                    })
+                }
                 RightSidebarNoteImageSource::Remote(url) => {
                     let image = load_remote_image(&url)?;
                     let encoded_bytes = image.bytes.len();
@@ -10222,11 +10353,17 @@ impl crate::TermWindow {
                         width,
                         height,
                         encoded_bytes,
+                        max_upscale: NOTE_IMAGE_MAX_UPSCALE,
+                        natural_size: None,
                     })
                 }
             })
             .await;
             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                // The cache was emptied meanwhile: nothing is waiting for this.
+                if term_window.right_sidebar_note_image_epoch != epoch {
+                    return;
+                }
                 term_window
                     .right_sidebar_note_images_loading
                     .remove(&source);
@@ -10261,10 +10398,27 @@ impl crate::TermWindow {
                         }
                     }
                     Err(err) => {
+                        // Only failures recent enough to hold a retry back.
+                        let now = Instant::now();
                         term_window
                             .right_sidebar_note_image_failures
-                            .insert(source.clone(), Instant::now());
-                        log::warn!("unable to render Note image {:?}: {err:#}", source);
+                            .retain(|_, failed| {
+                                now.duration_since(*failed) < Duration::from_secs(60)
+                            });
+                        term_window
+                            .right_sidebar_note_image_failures
+                            .insert(source.clone(), now);
+                        match &source {
+                            // A diagram's errors quote it, and it is the
+                            // note's own text: say only that it failed.
+                            RightSidebarNoteImageSource::Mermaid { source, .. } => {
+                                log::warn!(
+                                    "unable to draw a Mermaid diagram ({} bytes)",
+                                    source.len()
+                                )
+                            }
+                            _ => log::warn!("unable to render Note image {:?}: {err:#}", source),
+                        }
                     }
                 }
                 term_window.invalidate_window();
@@ -10289,9 +10443,11 @@ impl crate::TermWindow {
             return Ok(());
         }
         let (draw_width, draw_height) =
-            note_image_display_size(image.width, image.height, width, height);
-        let draw_x = x + (width - draw_width) / 2.0;
-        let draw_y = y + (height - draw_height) / 2.0;
+            note_image_display_size(image.width, image.height, width, height, image.max_upscale);
+        // On whole pixels, so a diagram drawn at the size it is shown maps
+        // one texel to one pixel instead of blurring across two.
+        let draw_x = (x + (width - draw_width) / 2.0).round();
+        let draw_y = (y + (height - draw_height) / 2.0).round();
         let Some(gl_state) = self.render_state.as_ref() else {
             return Ok(());
         };
@@ -19618,6 +19774,8 @@ fn remote_preview_from_bytes(
                         width,
                         height,
                         encoded_bytes,
+                        max_upscale: NOTE_IMAGE_MAX_UPSCALE,
+                        natural_size: None,
                     }),
                     message: None,
                     truncated: false,
@@ -19702,6 +19860,8 @@ fn load_file_preview_image(path: &Path) -> anyhow::Result<RightSidebarFilePrevie
         width,
         height,
         encoded_bytes,
+        max_upscale: NOTE_IMAGE_MAX_UPSCALE,
+        natural_size: None,
     })
 }
 
@@ -21799,13 +21959,16 @@ mod tests {
 
     #[test]
     fn note_images_scale_responsively_without_escaping_the_viewport() {
-        assert_eq!(note_image_display_size(0, 100, 600.0, 500.0), (0.0, 0.0));
         assert_eq!(
-            note_image_display_size(200, 100, 600.0, 500.0),
+            note_image_display_size(0, 100, 600.0, 500.0, super::NOTE_IMAGE_MAX_UPSCALE),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            note_image_display_size(200, 100, 600.0, 500.0, super::NOTE_IMAGE_MAX_UPSCALE),
             (600.0, 300.0)
         );
         assert_eq!(
-            note_image_display_size(1200, 2400, 600.0, 500.0),
+            note_image_display_size(1200, 2400, 600.0, 500.0, super::NOTE_IMAGE_MAX_UPSCALE),
             (250.0, 500.0)
         );
     }

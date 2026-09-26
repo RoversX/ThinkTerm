@@ -600,6 +600,9 @@ pub(crate) fn build_visual_document(
     }
 
     let visible = projection.visible_source_ranges(source, caret, false);
+    // Where the caret's syntax starts: what the host keys this document by, so
+    // anything decided by the caret must be decided by this instead.
+    let reveal_start = projection.caret_reveal_start(caret);
     let mut objects: Vec<&ProjectedObject> = projection.objects.iter().collect();
     objects.sort_by_key(|object| {
         let range = object.source();
@@ -708,6 +711,34 @@ pub(crate) fn build_visual_document(
                             runs: vec![VisualRun {
                                 source: object_source.clone(),
                                 text: Arc::new(format!("▧ {label}")),
+                                style: InlineStyle::default(),
+                                atomic: true,
+                            }],
+                        });
+                    }
+                    // A Mermaid block is its diagram, unless the caret is in it
+                    // (to edit it), its fence is not closed (still being
+                    // written, or cut off where a long note's first screen
+                    // ends), or it does not draw (then it stays code, and its
+                    // header says why).
+                    ProjectedObject::CodeBlock(code)
+                        if super::mermaid::is_mermaid(code.language.as_deref())
+                            && !range.contains(&reveal_start)
+                            && code.source.end > code.content.end
+                            && super::mermaid::draws(&code.text) =>
+                    {
+                        flush_line_if_content(&mut lines, &mut line, idx);
+                        lines.push(VisualLine {
+                            source: range.clone(),
+                            block: BlockKind::Paragraph,
+                            kind: VisualLineKind::Image,
+                            continuation_indent_bits: 0.0f32.to_bits(),
+                            runs: vec![VisualRun {
+                                source: range.clone(),
+                                text: Arc::new(format!(
+                                    "▧ {}",
+                                    crate::i18n::tr("right-notes-mermaid-diagram")
+                                )),
                                 style: InlineStyle::default(),
                                 atomic: true,
                             }],
@@ -1276,6 +1307,101 @@ mod tests {
             projection.caret_reveal_start(caret),
             projection.caret_reveal_start(0)
         );
+    }
+
+    #[test]
+    fn mermaid_blocks_are_drawn_unless_edited_or_unreadable() {
+        let source = "Before\n\n```mermaid\nflowchart TD\n    A --> B\n```\n\nAfter\n";
+        let projection = MarkdownProjection::parse(source);
+        let fence = source.find("```mermaid").unwrap();
+        // Read and away from the caret, the block is one diagram line.
+        let doc = build_visual_document(source, &projection, EditorMode::ReadOnly, usize::MAX);
+        let diagrams: Vec<_> = doc
+            .lines
+            .iter()
+            .filter(|line| line.kind == VisualLineKind::Image)
+            .collect();
+        assert_eq!(diagrams.len(), 1);
+        assert_eq!(diagrams[0].source.start, fence);
+        assert!(!doc.lines.iter().any(|line| line.text().contains("A --> B")));
+        assert!(doc.lines.iter().any(|line| line.text() == "After"));
+        // The caret in the block shows its code, to edit.
+        let caret = source.find("A --> B").unwrap();
+        let doc = build_visual_document(source, &projection, EditorMode::LivePreview, caret);
+        assert!(doc
+            .lines
+            .iter()
+            .all(|line| line.kind != VisualLineKind::Image));
+        assert!(doc.lines.iter().any(|line| line.text().contains("A --> B")));
+        // Unreadable, it stays code.
+        let bad = "```mermaid\nflowchart TD\n    A --> \n    B -->> (((\n```\n";
+        let projection = MarkdownProjection::parse(bad);
+        let doc = build_visual_document(bad, &projection, EditorMode::ReadOnly, usize::MAX);
+        assert!(doc
+            .lines
+            .iter()
+            .all(|line| line.kind != VisualLineKind::Image));
+        let code_lines = doc
+            .lines
+            .iter()
+            .filter(|line| line.block == BlockKind::CodeBlock)
+            .count();
+        assert_eq!(code_lines, 3);
+        assert!(doc
+            .lines
+            .iter()
+            .any(|line| line.text().contains("B -->> (((")));
+    }
+
+    #[test]
+    fn an_unclosed_mermaid_block_is_not_drawn() {
+        let closed = "```mermaid\nflowchart TD\n    A --> B\n```";
+        let open = "```mermaid\nflowchart TD\n    A --> B\n";
+        for (source, drawn) in [(closed, true), (open, false)] {
+            let projection = MarkdownProjection::parse(source);
+            let doc = build_visual_document(source, &projection, EditorMode::ReadOnly, usize::MAX);
+            let images = doc
+                .lines
+                .iter()
+                .any(|line| line.kind == VisualLineKind::Image);
+            assert_eq!(images, drawn, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn mermaid_blocks_follow_the_hosts_reveal_key() {
+        let source =
+            "Intro **bold**\n\n```mermaid\nflowchart TD\n    A --> B\n```\n**Bold** after\n";
+        let projection = MarkdownProjection::parse(source);
+        let mut seen: HashMap<usize, (usize, Vec<String>)> = HashMap::new();
+        for caret in 0..=source.len() {
+            let doc = build_visual_document(source, &projection, EditorMode::LivePreview, caret);
+            let lines = doc
+                .lines
+                .iter()
+                .map(|line| format!("{:?} {}", line.kind, line.text()))
+                .collect::<Vec<_>>();
+            // Carets the host treats alike get the same document.
+            let key = projection.caret_reveal_start(caret);
+            match seen.get(&key) {
+                Some((first, expected)) => {
+                    assert_eq!(&lines, expected, "caret {caret} vs {first}")
+                }
+                None => {
+                    seen.insert(key, (caret, lines));
+                }
+            }
+        }
+        // On the closing fence the code shows; on the next line, the diagram.
+        let closing_end = source.find("```\n**").unwrap() + 3;
+        let shows_diagram = |caret| {
+            build_visual_document(source, &projection, EditorMode::LivePreview, caret)
+                .lines
+                .iter()
+                .any(|line| line.kind == VisualLineKind::Image)
+        };
+        assert!(!shows_diagram(closing_end));
+        assert!(shows_diagram(closing_end + 1));
     }
 
     #[test]

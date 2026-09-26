@@ -93,7 +93,12 @@ ratelim.workspace = true
 rayon.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
-resvg.workspace = true
+# Text, for the labels in Mermaid diagrams.
+resvg = { workspace = true, features = ["text", "system-fonts", "memmap-fonts"] }
+merman.workspace = true
+lru.workspace = true
+merman-render.workspace = true
+ttf-parser.workspace = true
 semver.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
 serde_json.workspace = true

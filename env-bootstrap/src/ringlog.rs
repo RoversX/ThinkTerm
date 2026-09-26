@@ -285,6 +285,10 @@ fn setup_pretty() -> (LevelFilter, Logger) {
         ("gfx_backend_metal", LevelFilter::Error),
         ("tracing", LevelFilter::Error),
         ("zbus", LevelFilter::Error),
+        // Their warnings quote the SVG they read, and a Note's Mermaid diagram
+        // is drawn through them: the note's text must not reach the log.
+        ("usvg", LevelFilter::Off),
+        ("resvg", LevelFilter::Off),
     ] {
         filters.filter_module(module, level);
     }

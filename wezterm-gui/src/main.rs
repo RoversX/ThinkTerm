@@ -1474,6 +1474,9 @@ fn fatal_toast_notification(title: &str, message: &str) {
 fn notify_on_panic() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if env_bootstrap::panics_are_quiet() {
+            return;
+        }
         if let Some(s) = info.payload().downcast_ref::<&str>() {
             fatal_toast_notification("Wezterm panic", s);
         }
