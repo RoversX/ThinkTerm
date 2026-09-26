@@ -7932,6 +7932,7 @@ dependencies = [
  "smol",
  "termwiz 0.24.0",
  "thinkterm-core",
+ "thinkterm-proto",
  "toml 0.8.23",
  "uuid",
  "wezterm-client",

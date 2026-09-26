@@ -3298,12 +3298,19 @@ fn local_tab_size(
 /// last measured — full-width output arrives and is then clipped to the width
 /// the terminal had before it was resized.
 fn adopt_local_tab_size(local_tab_id: TabId, size: TerminalSize) {
-    if size.rows == 0 || size.cols == 0 {
+    if !adoptable_tab_size(&size) {
         return;
     }
     if let Some(tab) = Mux::get().get_tab(local_tab_id) {
         tab.resize(size);
     }
+}
+
+/// Whether a tab size may lay the tab out here. The canonical size comes off
+/// the wire, and one past what any screen holds would size every pane grid in
+/// the tab from it.
+fn adoptable_tab_size(size: &TerminalSize) -> bool {
+    size.rows > 0 && size.cols > 0 && thinkterm_proto::layout::terminal_size_is_plausible(size)
 }
 
 async fn dispatch_actions(state: &mut TuiState) {
@@ -7181,6 +7188,22 @@ mod tests {
             reported,
             "a masked renderer keeps the size its own terminal will come back to"
         );
+    }
+
+    #[test]
+    fn a_tab_size_no_screen_could_have_is_not_adopted() {
+        use thinkterm_proto::layout::MAX_PANE_CELLS;
+        let size = |cols, rows| TerminalSize {
+            rows,
+            cols,
+            ..TerminalSize::default()
+        };
+        assert!(adoptable_tab_size(&size(100, 30)));
+        assert!(adoptable_tab_size(&size(MAX_PANE_CELLS, MAX_PANE_CELLS)));
+        assert!(!adoptable_tab_size(&size(0, 30)), "nothing to lay out");
+        // What a broken or hostile server could answer as the canonical size.
+        assert!(!adoptable_tab_size(&size(MAX_PANE_CELLS + 1, 30)));
+        assert!(!adoptable_tab_size(&size(100, usize::MAX)));
     }
 
     /// The loop that used to eat a row per layout, run five times.
