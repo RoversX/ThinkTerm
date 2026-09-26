@@ -330,33 +330,40 @@ where
                     && visual_line_has_non_whitespace(&current)
                     && width + piece_width > max_width))
         {
-            for (relative, grapheme) in run.text.grapheme_indices(true) {
-                let grapheme_source = if run.atomic {
+            // Break between words, and inside one only when it alone is too
+            // wide (a URL breaks anywhere).
+            let mut pieces = Vec::new();
+            let mut start = 0usize;
+            for (end, _) in linebreaks(&run.text) {
+                let piece = &run.text[start..end];
+                let piece_width = measure(line.block, run.style, piece)?.max(0.0);
+                if break_anywhere || piece_width > max_width {
+                    for (relative, grapheme) in piece.grapheme_indices(true) {
+                        let grapheme_width = measure(line.block, run.style, grapheme)?.max(0.0);
+                        pieces.push((start + relative, grapheme, grapheme_width));
+                    }
+                } else {
+                    pieces.push((start, piece, piece_width));
+                }
+                start = end;
+            }
+            for (relative, piece, piece_width) in pieces {
+                let piece_source = if run.atomic {
                     run.source.clone()
                 } else {
-                    run.source.start + relative..run.source.start + relative + grapheme.len()
+                    run.source.start + relative..run.source.start + relative + piece.len()
                 };
-                let grapheme_width = measure(line.block, run.style, grapheme)?.max(0.0);
-                let grapheme_is_whitespace = grapheme.chars().all(char::is_whitespace);
-                if !grapheme_is_whitespace
+                let piece_is_whitespace = piece.chars().all(char::is_whitespace);
+                if !piece_is_whitespace
                     && visual_line_has_non_whitespace(&current)
-                    && width + grapheme_width > max_width
+                    && width + piece_width > max_width
                 {
                     lines.push(current);
-                    (current, width) = continuation_visual_line(
-                        line,
-                        grapheme_source.start,
-                        hanging_indent.as_ref(),
-                    );
+                    (current, width) =
+                        continuation_visual_line(line, piece_source.start, hanging_indent.as_ref());
                 }
-                append_text_run(
-                    &mut current,
-                    grapheme_source,
-                    grapheme,
-                    run.style,
-                    run.atomic,
-                );
-                width += grapheme_width;
+                append_text_run(&mut current, piece_source, piece, run.style, run.atomic);
+                width += piece_width;
             }
             continue;
         }
@@ -1493,6 +1500,38 @@ mod tests {
             .filter(|line| line.block == BlockKind::Properties)
             .skip(1)
             .all(|line| line.continuation_indent() > 0.0));
+    }
+
+    #[test]
+    fn pixel_wrap_breaks_long_atomic_text_between_words() {
+        let source = 0..3;
+        let line = VisualLine {
+            source: source.clone(),
+            block: BlockKind::Paragraph,
+            kind: VisualLineKind::Text,
+            continuation_indent_bits: 0.0f32.to_bits(),
+            runs: vec![VisualRun {
+                source: source.clone(),
+                text: Arc::new("alpha can’t gamma".to_string()),
+                style: InlineStyle::default(),
+                atomic: true,
+            }],
+        };
+        let mut lines = Vec::new();
+        wrap_visual_line_by_width(
+            &line,
+            8.0,
+            &mut |_, _, text: &str| Ok::<_, ()>(text.graphemes(true).count() as f32),
+            &mut lines,
+        )
+        .unwrap();
+
+        let rows = lines.iter().map(VisualLine::text).collect::<Vec<_>>();
+        assert_eq!(rows, ["alpha ", "can’t ", "gamma"]);
+        assert!(lines
+            .iter()
+            .flat_map(|line| &line.runs)
+            .all(|run| run.atomic && run.source == source));
     }
 
     #[test]
