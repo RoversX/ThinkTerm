@@ -52,6 +52,7 @@ package() {
   install -Dm755 squashfs-root/usr/bin/wezterm -t "${pkgdir}/usr/bin/"
   install -Dm755 squashfs-root/usr/bin/thinkterm-gui -t "${pkgdir}/usr/bin/"
   install -Dm755 squashfs-root/usr/bin/thinkterm-mux-server -t "${pkgdir}/usr/bin/"
+  install -Dm755 squashfs-root/usr/bin/thinkterm-plugin-server -t "${pkgdir}/usr/bin/"
   install -Dm644 squashfs-root/usr/share/doc/thinkterm/LICENSE.md \
                  squashfs-root/usr/share/doc/thinkterm/LICENSE-MIT \
                  squashfs-root/usr/share/doc/thinkterm/NOTICE \

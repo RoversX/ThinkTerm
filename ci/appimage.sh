@@ -11,6 +11,7 @@ install -Dsm755 -t AppDir/usr/bin target/$PROFILE/thinkterm-mux-server
 install -Dsm755 -t AppDir/usr/bin target/$PROFILE/thinkterm
 install -Dsm755 -t AppDir/usr/bin target/$PROFILE/wezterm
 install -Dsm755 -t AppDir/usr/bin target/$PROFILE/thinkterm-gui
+install -Dsm755 -t AppDir/usr/bin target/$PROFILE/thinkterm-plugin-server
 install -Dsm755 -t AppDir/usr/bin target/$PROFILE/strip-ansi-escapes
 install -Dm644 assets/icon/terminal.png AppDir/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
 install -Dm644 assets/wezterm.desktop AppDir/usr/share/applications/com.roversx.thinkterm.desktop

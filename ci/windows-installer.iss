@@ -50,6 +50,7 @@ Source: "{#MyAppSourceDir}\thinkterm.exe"; DestDir: "{app}"; Flags: ignoreversio
 Source: "{#MyAppSourceDir}\wezterm.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSourceDir}\thinkterm-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSourceDir}\thinkterm-mux-server.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSourceDir}\thinkterm-plugin-server.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSourceDir}\mesa\opengl32.dll"; DestDir: "{app}\mesa"; Flags: ignoreversion
 Source: "{#MyAppSourceDir}\libEGL.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSourceDir}\libGLESv2.dll"; DestDir: "{app}"; Flags: ignoreversion

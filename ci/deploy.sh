@@ -100,7 +100,7 @@ case $OSTYPE in
       esac
     fi
 
-    for bin in wezterm thinkterm thinkterm-mux-server thinkterm-gui strip-ansi-escapes ; do
+    for bin in wezterm thinkterm thinkterm-mux-server thinkterm-gui thinkterm-plugin-server strip-ansi-escapes ; do
       if [[ -n "$macos_bin_dir" ]] ; then
         cp $macos_bin_dir/$bin $zipdir/ThinkTerm.app/Contents/MacOS/$bin
       # If the user ran a simple `cargo build --release`, then we want to allow
@@ -122,7 +122,7 @@ case $OSTYPE in
     # report's addresses can be resolved against the matching build.
     symdir="$zipdir-dSYM"
     rm -rf "$symdir" "$symdir.zip"
-    for bin in wezterm thinkterm thinkterm-mux-server thinkterm-gui strip-ansi-escapes ; do
+    for bin in wezterm thinkterm thinkterm-mux-server thinkterm-gui thinkterm-plugin-server strip-ansi-escapes ; do
       dsym="${macos_bin_dir:-$TARGET_DIR/$PROFILE}/$bin.dSYM"
       if [[ -d "$dsym" ]] ; then
         mkdir -p "$symdir"
@@ -237,6 +237,7 @@ case $OSTYPE in
       "$artifact_dir/wezterm.exe" \
       "$artifact_dir/thinkterm-mux-server.exe" \
       "$artifact_dir/thinkterm-gui.exe" \
+      "$artifact_dir/thinkterm-plugin-server.exe" \
       "$artifact_dir/strip-ansi-escapes.exe" \
       assets/windows/conhost/conpty.dll \
       assets/windows/conhost/OpenConsole.exe \
@@ -307,7 +308,7 @@ source ~/.cargo/env
 
 cargo build --profile ${PROFILE} \
       -p wezterm-gui -p wezterm -p wezterm-mux-server \
-      -p strip-ansi-escapes
+      -p thinkterm-plugin-server -p strip-ansi-escapes
 BUILDEOFEOF
 )
           BUILD_REQUIRES=$(cat <<BREQEOF
@@ -388,6 +389,7 @@ install -Dm755 assets/open-thinkterm-here assets/open-wezterm-here -t %{buildroo
 install -Dsm755 $TARGET_DIR/$PROFILE/thinkterm -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/$PROFILE/wezterm -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/$PROFILE/thinkterm-gui -t %{buildroot}/usr/bin
+install -Dsm755 $TARGET_DIR/$PROFILE/thinkterm-plugin-server -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/$PROFILE/thinkterm-mux-server -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/$PROFILE/strip-ansi-escapes -t %{buildroot}/usr/bin
 install -Dm644 assets/shell-integration/* -t %{buildroot}/etc/profile.d
@@ -413,6 +415,7 @@ install -Dm644 LICENSE-MIT %{buildroot}/usr/share/licenses/thinkterm-server/LICE
 /usr/bin/thinkterm
 /usr/bin/wezterm
 /usr/bin/thinkterm-gui
+/usr/bin/thinkterm-plugin-server
 /usr/bin/thinkterm-mux-server
 /usr/bin/strip-ansi-escapes
 /usr/bin/open-thinkterm-here
@@ -553,6 +556,7 @@ EOF
           install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/strip-ansi-escapes
           if [[ "$variant" == desktop ]] ; then
             install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/thinkterm-gui
+            install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/thinkterm-plugin-server
             install -Dm755 -t $root/usr/bin assets/open-thinkterm-here assets/open-wezterm-here
             install -Dm644 assets/icon/terminal.png $root/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
             install -Dm644 assets/wezterm.desktop $root/usr/share/applications/com.roversx.thinkterm.desktop
@@ -656,6 +660,7 @@ EOF
           $TARGET_DIR/$PROFILE/wezterm \
           $TARGET_DIR/$PROFILE/thinkterm-mux-server \
           $TARGET_DIR/$PROFILE/thinkterm-gui \
+          $TARGET_DIR/$PROFILE/thinkterm-plugin-server \
           $TARGET_DIR/$PROFILE/strip-ansi-escapes
         linux_tarball thinkterm-server \
           $TARGET_DIR/$PROFILE/thinkterm \
@@ -688,6 +693,7 @@ source="
   $TARGET_DIR/$PROFILE/wezterm
   $TARGET_DIR/$PROFILE/thinkterm-gui
   $TARGET_DIR/$PROFILE/thinkterm-mux-server
+  $TARGET_DIR/$PROFILE/thinkterm-plugin-server
   assets/open-thinkterm-here
   assets/open-wezterm-here
   assets/wezterm.desktop
@@ -712,6 +718,7 @@ package() {
   install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/wezterm
   install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/thinkterm-gui
   install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/thinkterm-mux-server
+  install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/thinkterm-plugin-server
 
   install -Dm644 "\$srcdir"/wezterm.desktop "\$pkgdir"/usr/share/applications/com.roversx.thinkterm.desktop
   install -Dm644 "\$srcdir"/wezterm.appdata.xml "\$pkgdir"/usr/share/metainfo/com.roversx.thinkterm.appdata.xml

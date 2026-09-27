@@ -77,13 +77,15 @@ $ ./get-deps
 $ cargo build --release
 ```
 
-That produces three binaries, whose names do not match their crate directories:
+That produces four binaries, three of whose names do not match their crate
+directories:
 
 | Binary | Crate | What it is |
 | --- | --- | --- |
 | `thinkterm-gui` | `wezterm-gui/` | The terminal itself |
 | `thinkterm-mux-server` | `wezterm-mux-server/` | The multiplexer server |
 | `thinkterm` | `wezterm/` | The CLI |
+| `thinkterm-plugin-server` | `thinkterm-plugin-server/` | Runs the plugins (Snippets so far) apart from the mux; started when first needed |
 
 `wezterm/` also builds a `wezterm` binary. That is a deliberate compatibility
 shim, not a leftover — the environment variables ThinkTerm sets promise that a
@@ -98,6 +100,7 @@ shim, not a leftover — the environment variables ThinkTerm sets promise that a
 | `wezterm-gui/` | The GUI. Rendering, windowing, and most ThinkTerm-specific UI. |
 | `mux/` | The multiplexer model: panes, tabs, windows, domains. |
 | `codec/` | The mux wire protocol. |
+| `thinkterm-plugin-channel/` | How clients reach the plugin host; the mux carries a browser's frames there unread. |
 | `thinkterm-proto/` | Pure data types shared by the protocol. |
 | `thinkterm-core/`, `thinkterm-tui/`, `thinkterm-syntax/` | ThinkTerm's own crates. |
 | `wezterm-client/` | The mux client used by the GUI and the TUI. |

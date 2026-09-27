@@ -312,6 +312,7 @@ jobs:
             -p wezterm \
             -p wezterm-gui \
             -p wezterm-mux-server \
+            -p thinkterm-plugin-server \
             -p strip-ansi-escapes
 
       - name: Fetch the browser bundle
@@ -419,7 +420,7 @@ jobs:
         shell: cmd
         run: |
           PATH C:\Strawberry\perl\bin;%PATH%
-          cargo build --profile %CARGO_PROFILE% -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
+          cargo build --profile %CARGO_PROFILE% -p wezterm -p wezterm-gui -p wezterm-mux-server -p thinkterm-plugin-server -p strip-ansi-escapes
 
       - name: Fetch the browser bundle
         uses: actions/download-artifact@v8
@@ -547,6 +548,7 @@ jobs:
             -p wezterm \
             -p wezterm-gui \
             -p wezterm-mux-server \
+            -p thinkterm-plugin-server \
             -p strip-ansi-escapes
 
       - name: Fetch the browser bundle

@@ -39,6 +39,7 @@
                 "install -Dm755 ./target/release/wezterm -t /app/bin/",
                 "install -Dm755 ./target/release/thinkterm-gui -t /app/bin/",
                 "install -Dm755 ./target/release/thinkterm-mux-server -t /app/bin/",
+                "install -Dm755 ./target/release/thinkterm-plugin-server -t /app/bin/",
                 "install -Dm755 ./target/release/strip-ansi-escapes -t /app/bin/",
                 "install -Dm644 assets/shell-integration/* -t /app/extra/export/share/etc/profile.d",
                 "install -Dm644 assets/shell-completion/zsh /app/extra/export/share/zsh/site-functions/_thinkterm",
