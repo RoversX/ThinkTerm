@@ -1095,6 +1095,7 @@ fn web_peer_may_send(pdu: &Pdu) -> bool {
             | Pdu::SetClientView(_)
             | Pdu::SetFrontendAccessMode(_)
             | Pdu::GetAgentStatuses(_)
+            | Pdu::PluginFrame(_)
     )
 }
 
@@ -1106,6 +1107,10 @@ pub struct SessionHandler {
     client_registration: Option<ClientRegistrationId>,
     palette_session_id: Option<PaletteSessionId>,
     proxy_client_id: Option<ClientId>,
+    /// This client's connection to the plugin host, from its first
+    /// `PluginFrame` on; it closes when this does, or when the client
+    /// sends an empty frame.
+    plugin_pipe: Option<crate::plugin_relay::Pipe>,
 }
 
 impl Drop for SessionHandler {
@@ -1135,6 +1140,7 @@ impl SessionHandler {
             client_registration: None,
             palette_session_id: None,
             proxy_client_id: None,
+            plugin_pipe: None,
         }
     }
 
@@ -2362,6 +2368,22 @@ impl SessionHandler {
                                 .map(Into::into),
                         })))
                     }
+                }
+            }
+
+            // Carried to the plugin host unread; see plugin_relay.
+            Pdu::PluginFrame(PluginFrame { data }) => {
+                if data.is_empty() {
+                    self.plugin_pipe = None;
+                    send_response(Ok(Pdu::UnitResponse(UnitResponse {})));
+                    return;
+                }
+                if !self.plugin_pipe.as_ref().is_some_and(|pipe| pipe.is_open()) {
+                    self.plugin_pipe =
+                        Some(crate::plugin_relay::Pipe::open(self.to_write_tx.clone()));
+                }
+                if let Some(pipe) = &self.plugin_pipe {
+                    pipe.send(data, Box::new(send_response));
                 }
             }
 

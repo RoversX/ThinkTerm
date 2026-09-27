@@ -577,7 +577,10 @@ macro_rules! pdu {
 ///     port is minted, listed and revoked over the mux connection
 ///     (WebTokenMint/List/Revoke), the way TLS credentials are obtained.
 /// 72: Web status and minted links carry the live TLS certificate identity.
-pub const CODEC_VERSION: usize = 72;
+/// 73: The plugin channel: a client reaches the plugin host on the server's
+///     machine through its mux connection (PluginFrame), which the server
+///     carries unread.
+pub const CODEC_VERSION: usize = 73;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -671,6 +674,7 @@ pdu! {
     WebServerStatus: 93,
     DefaultPalette: 94,
     MoveTab: 95,
+    PluginFrame: 96,
 }
 
 impl Pdu {
@@ -1547,6 +1551,23 @@ pub struct MoveTab {
     pub window_id: WindowId,
     pub tab_id: TabId,
     pub index: usize,
+}
+
+/// One frame of the plugin channel (the thinkterm-plugin-channel crate), between
+/// a client and the plugin host on the server's machine. The server passes
+/// it on without reading it.
+///
+/// From a client: for the host, over a connection the server opens at the
+/// first frame and keeps for this client until it disconnects. Answered
+/// with `UnitResponse` once the frame has left, or with an error when there
+/// is no host to reach. An empty frame closes that connection.
+///
+/// From the server, unasked: a frame the host sent, or an empty one when
+/// the connection to the host closed.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct PluginFrame {
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -2560,7 +2581,7 @@ mod test {
         // The exact assertion is the tripwire: whoever bumps the codec must
         // come here, confirm the round-trips still cover the new version,
         // and advance it deliberately.
-        assert_eq!(CODEC_VERSION, 72);
+        assert_eq!(CODEC_VERSION, 73);
         use thinkterm_proto::{AgentEvidence, AgentState, AgentStatus};
 
         fn round_trip(pdu: Pdu) {
@@ -2596,6 +2617,18 @@ mod test {
                 workspace: "default".to_string(),
             }],
         }));
+    }
+
+    #[test]
+    fn plugin_frames_round_trip_as_bytes() {
+        for data in [vec![], b"{\"call\":{}}".to_vec(), vec![0u8; 70_000]] {
+            let pdu = Pdu::PluginFrame(PluginFrame { data });
+            let mut encoded = Vec::new();
+            pdu.encode(&mut encoded, 0x73).unwrap();
+            let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+            assert_eq!(decoded.serial, 0x73);
+            assert_eq!(decoded.pdu, pdu);
+        }
     }
 
     #[test]

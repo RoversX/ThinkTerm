@@ -45,6 +45,7 @@ wezterm-term = { workspace=true, features=["use_serde"] }
 wezterm-uds.workspace = true
 varbincode.workspace = true
 zstd.workspace = true
+thinkterm-plugin-channel = { workspace = true, features = ["native"] }
 thinkterm-proto.workspace = true
 
 [target."cfg(unix)".dependencies]
