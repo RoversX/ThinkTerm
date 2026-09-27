@@ -1,12 +1,16 @@
 //! The snippets plugin: the one copy of the user's snippets, the file it is
 //! kept in, and everything done with it. Clients show what it answers.
+//!
+//! It is written against thinkterm-plugin-sdk like any installed plugin,
+//! and runs inside the host (or out of it, with `--serve-plugin snippets`).
 
-use crate::host::{Outcome, Plugin};
+use crate::stamp::{stamp, Stamp};
 use anyhow::Context;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use thinkterm_snippets::wire::{Event, Request, Row, Saved, Snippet, PLUGIN};
+use thinkterm_plugin_sdk::{Cx, Plugin};
+use thinkterm_snippets::wire::{Event, Request, Row, Saved, Snippet};
 use thinkterm_snippets::{file, SnippetRecord, SnippetStore};
 
 pub struct Snippets {
@@ -16,20 +20,6 @@ pub struct Snippets {
     /// The file as this host last read or wrote it, to notice it being
     /// replaced from outside -- by a restored backup, say.
     seen: Option<Stamp>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Stamp {
-    len: u64,
-    modified: Option<SystemTime>,
-}
-
-fn stamp(path: &Path) -> Option<Stamp> {
-    let meta = std::fs::metadata(path).ok()?;
-    Some(Stamp {
-        len: meta.len(),
-        modified: meta.modified().ok(),
-    })
 }
 
 fn now_ms() -> u64 {
@@ -64,13 +54,13 @@ impl Snippets {
     /// the file changed behind this host's back, which is a change for
     /// every client too. A file that does not read is an error, never an
     /// empty store: an empty one would be written over it by the next save.
-    fn current(&mut self, outcome: &mut Outcome) -> anyhow::Result<&mut SnippetStore> {
+    fn current(&mut self, cx: &mut Cx) -> anyhow::Result<&mut SnippetStore> {
         let now = stamp(&self.path);
         if self.store.is_none() || now != self.seen {
             let store = file::load(&self.path)?;
             if self.store.is_some() {
                 log::info!("{} changed on disk; reloaded it", self.path.display());
-                outcome.events.push(changed());
+                cx.emit(changed());
             }
             self.store = Some(store);
             self.seen = now;
@@ -79,32 +69,28 @@ impl Snippets {
     }
 
     /// Keeps `next` once it is on disk, and tells the clients.
-    fn commit(&mut self, next: SnippetStore, outcome: &mut Outcome) -> anyhow::Result<()> {
+    fn commit(&mut self, next: SnippetStore, cx: &mut Cx) -> anyhow::Result<()> {
         file::save(&self.path, &next)?;
         self.store = Some(next);
         self.seen = stamp(&self.path);
-        outcome.events.push(changed());
+        cx.emit(changed());
         Ok(())
     }
 }
 
 impl Plugin for Snippets {
-    fn name(&self) -> &'static str {
-        PLUGIN
-    }
-
-    fn call(&mut self, body: Value, outcome: &mut Outcome) -> anyhow::Result<Value> {
+    fn call(&mut self, body: Value, cx: &mut Cx) -> anyhow::Result<Value> {
         let request: Request =
             serde_json::from_value(body).context("not a request the snippets plugin knows")?;
         let answer = match request {
             Request::List { query } => {
-                let store = self.current(outcome)?;
+                let store = self.current(cx)?;
                 let rows: Vec<Row> = store.matching(&query).map(row).collect();
-                outcome.watch = true;
+                cx.watch();
                 serde_json::to_value(rows)?
             }
             Request::Get { id } => {
-                let store = self.current(outcome)?;
+                let store = self.current(cx)?;
                 let snippet = store.get(&id).map(|snippet| Snippet {
                     id: snippet.id.clone(),
                     title: snippet.title.clone(),
@@ -113,7 +99,7 @@ impl Plugin for Snippets {
                 serde_json::to_value(snippet)?
             }
             Request::Text { id, run } => {
-                let store = self.current(outcome)?;
+                let store = self.current(cx)?;
                 let text = store.get(&id).and_then(|snippet| {
                     if run {
                         thinkterm_snippets::run_text(&snippet.body)
@@ -130,7 +116,7 @@ impl Plugin for Snippets {
                 }
                 // Saved before it is kept, so a change that did not reach
                 // the disk is neither kept nor announced.
-                let mut next = self.current(outcome)?.clone();
+                let mut next = self.current(cx)?.clone();
                 let now = now_ms();
                 let saved = match id {
                     None => {
@@ -142,14 +128,14 @@ impl Plugin for Snippets {
                         None => return Ok(serde_json::to_value(Saved::Gone)?),
                     },
                 };
-                self.commit(next, outcome)?;
+                self.commit(next, cx)?;
                 serde_json::to_value(Saved::Saved { id: saved })?
             }
             Request::Delete { id } => {
-                let mut next = self.current(outcome)?.clone();
+                let mut next = self.current(cx)?.clone();
                 let deleted = next.delete(&id, now_ms());
                 if deleted {
-                    self.commit(next, outcome)?;
+                    self.commit(next, cx)?;
                 }
                 Value::Bool(deleted)
             }
@@ -162,23 +148,31 @@ impl Plugin for Snippets {
 mod tests {
     use super::*;
     use serde_json::json;
+    use thinkterm_plugin_sdk::Effects;
 
-    fn ask(plugin: &mut Snippets, request: Request) -> (Value, Outcome) {
-        let mut outcome = Outcome::default();
+    fn ask(plugin: &mut Snippets, request: Request) -> (Value, Effects) {
+        let mut cx = Cx::new();
         let answer = plugin
-            .call(serde_json::to_value(request).unwrap(), &mut outcome)
+            .call(serde_json::to_value(request).unwrap(), &mut cx)
             .unwrap();
-        (answer, outcome)
+        (answer, cx.finish())
+    }
+
+    /// Calls the plugin with raw JSON.
+    fn call(plugin: &mut Snippets, body: Value) -> anyhow::Result<(Value, Effects)> {
+        let mut cx = Cx::new();
+        let answer = plugin.call(body, &mut cx)?;
+        Ok((answer, cx.finish()))
     }
 
     fn list(plugin: &mut Snippets, query: &str) -> Vec<Row> {
-        let (answer, outcome) = ask(
+        let (answer, effects) = ask(
             plugin,
             Request::List {
                 query: query.into(),
             },
         );
-        assert!(outcome.watch, "a list is followed");
+        assert!(effects.watch, "a list is followed");
         serde_json::from_value(answer).unwrap()
     }
 
@@ -204,17 +198,15 @@ mod tests {
         let mut plugin = plugin_in(&dir);
         assert!(list(&mut plugin, "").is_empty());
 
-        let mut outcome = Outcome::default();
-        let answer = plugin
-            .call(
-                json!({"op": "save", "title": "", "body": "  git status  \n"}),
-                &mut outcome,
-            )
-            .unwrap();
+        let (answer, effects) = call(
+            &mut plugin,
+            json!({"op": "save", "title": "", "body": "  git status  \n"}),
+        )
+        .unwrap();
         let Saved::Saved { id } = serde_json::from_value(answer).unwrap() else {
             panic!("not saved");
         };
-        assert_eq!(outcome.events, [changed()]);
+        assert_eq!(effects.events, [changed()]);
         assert!(id.starts_with("snippet-"));
         let rows = list(&mut plugin, "");
         assert_eq!(
@@ -251,12 +243,12 @@ mod tests {
             ("Fetch", "git fetch")
         );
 
-        let (answer, outcome) = ask(&mut plugin, Request::Delete { id: id.clone() });
+        let (answer, effects) = ask(&mut plugin, Request::Delete { id: id.clone() });
         assert_eq!(answer, json!(true));
-        assert_eq!(outcome.events, [changed()]);
-        let (answer, outcome) = ask(&mut plugin, Request::Delete { id: id.clone() });
+        assert_eq!(effects.events, [changed()]);
+        let (answer, effects) = ask(&mut plugin, Request::Delete { id: id.clone() });
         assert_eq!(answer, json!(false));
-        assert!(outcome.events.is_empty(), "nothing changed");
+        assert!(effects.events.is_empty(), "nothing changed");
         assert_eq!(save(&mut plugin, Some(&id), "", "git fetch"), Saved::Gone);
         let (answer, _) = ask(&mut plugin, Request::Get { id });
         assert_eq!(answer, Value::Null);
@@ -311,16 +303,13 @@ mod tests {
         restored.create("b".into(), "", "pwd --physical".into(), 2);
         file::save(&path, &restored).unwrap();
 
-        let mut outcome = Outcome::default();
-        let answer = plugin
-            .call(json!({"op": "list", "query": ""}), &mut outcome)
-            .unwrap();
+        let (answer, effects) = call(&mut plugin, json!({"op": "list", "query": ""})).unwrap();
         let rows: Vec<Row> = serde_json::from_value(answer).unwrap();
         assert_eq!(
             rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             ["b"]
         );
-        assert_eq!(outcome.events, [changed()]);
+        assert_eq!(effects.events, [changed()]);
     }
 
     #[test]
@@ -329,16 +318,12 @@ mod tests {
         let path = dir.path().join("snippets.json");
         std::fs::write(&path, "not json").unwrap();
         let mut plugin = plugin_in(&dir);
-        let mut outcome = Outcome::default();
-        assert!(plugin
-            .call(json!({"op": "list", "query": ""}), &mut outcome)
-            .is_err());
-        assert!(plugin
-            .call(
-                json!({"op": "save", "title": "", "body": "ls"}),
-                &mut outcome
-            )
-            .is_err());
+        assert!(call(&mut plugin, json!({"op": "list", "query": ""})).is_err());
+        assert!(call(
+            &mut plugin,
+            json!({"op": "save", "title": "", "body": "ls"})
+        )
+        .is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
     }
 
@@ -346,9 +331,6 @@ mod tests {
     fn an_unknown_request_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut plugin = plugin_in(&dir);
-        let mut outcome = Outcome::default();
-        assert!(plugin
-            .call(json!({"op": "frobnicate"}), &mut outcome)
-            .is_err());
+        assert!(call(&mut plugin, json!({"op": "frobnicate"})).is_err());
     }
 }

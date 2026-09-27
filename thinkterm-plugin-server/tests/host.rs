@@ -1,55 +1,15 @@
 //! The host as its clients see it: a real process, started by the client
 //! library, on a socket in a directory of the test's own.
 
+mod common;
+
+use common::{host_in, next_notice, session, spawn, stop, wait_until, WAIT};
 use serde_json::{json, Value};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use thinkterm_plugin_channel::client::{Answer, Connection, Host, Notice, Session};
 use thinkterm_plugin_channel::wire::{read_frame, write_frame, FromHost, ToHost, PROTOCOL};
 use thinkterm_snippets::wire::{Event, Request, Row, Saved, PLUGIN};
-
-const WAIT: Duration = Duration::from_secs(10);
-
-fn host_in(dir: &Path) -> Host {
-    Host {
-        socket: dir.join("sock"),
-        lock: dir.join("lock"),
-        data_dir: dir.join("data"),
-        log: dir.join("log"),
-        program: PathBuf::from(env!("CARGO_BIN_EXE_thinkterm-plugin-server")),
-    }
-}
-
-/// A host started by hand, with arguments the client library does not pass.
-fn spawn(host: &Host, extra: &[&str]) -> Child {
-    Command::new(&host.program)
-        .arg("--socket")
-        .arg(&host.socket)
-        .arg("--lock")
-        .arg(&host.lock)
-        .arg("--data-dir")
-        .arg(&host.data_dir)
-        .args(extra)
-        .spawn()
-        .unwrap()
-}
-
-/// Leaves no host running after the test.
-fn stop(host: &Host) {
-    if let Ok(mut connection) = host.connect() {
-        let _ = connection.send(&ToHost::Quit);
-    }
-}
-
-fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + WAIT;
-    while !done() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
 
 fn call(connection: &mut Connection, id: u64, request: Request) {
     connection
@@ -250,16 +210,6 @@ fn a_host_from_a_newer_build_is_left_alone() {
     assert!(host.socket.exists());
 }
 
-/// A session, and the notices it gives.
-fn session(host: &Host) -> (Session, mpsc::Receiver<Notice>) {
-    let (tx, rx) = mpsc::channel();
-    let session = Session::start(host.clone(), move |notice| {
-        let _ = tx.send(notice);
-    })
-    .unwrap();
-    (session, rx)
-}
-
 fn ask(session: &Session, request: Request) -> Answer {
     let (tx, rx) = mpsc::channel();
     session.call(
@@ -270,17 +220,6 @@ fn ask(session: &Session, request: Request) -> Answer {
         },
     );
     rx.recv_timeout(WAIT).expect("every call is answered")
-}
-
-fn next_notice(notices: &mpsc::Receiver<Notice>, wanted: impl Fn(&Notice) -> bool) -> Notice {
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        let notice = notices.recv_timeout(left).expect("a notice");
-        if wanted(&notice) {
-            return notice;
-        }
-    }
 }
 
 #[test]

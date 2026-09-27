@@ -1,0 +1,29 @@
+# The manifest ThinkTerm reads to find this plugin and its program.
+# docs/thinkterm/plugins.md describes every key.
+id = "text-tools"
+name = "Text Tools"
+version = "0.1.0"
+description = "Decodes text, and makes UUIDs."
+api = 1
+
+[run]
+program = "thinkterm-plugin-example"
+
+[run.windows]
+program = "thinkterm-plugin-example.exe"
+
+[locales.zh-CN]
+name = "文本工具"
+description = "解码文字，生成 UUID。"
+
+[locales.ja-JP]
+name = "テキストツール"
+description = "テキストをデコードし、UUID を作ります。"
+
+[locales.de-DE]
+name = "Textwerkzeuge"
+description = "Dekodiert Text und erzeugt UUIDs."
+
+[locales.fr-FR]
+name = "Outils de texte"
+description = "Décode du texte et crée des UUID."

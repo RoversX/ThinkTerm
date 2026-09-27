@@ -8590,15 +8590,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkterm-plugin-example"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "serde_json",
+ "thinkterm-plugin-sdk",
+ "uuid",
+]
+
+[[package]]
+name = "thinkterm-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thinkterm-plugin-channel",
+]
+
+[[package]]
 name = "thinkterm-plugin-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "log",
+ "serde",
  "serde_json",
  "tempfile",
  "thinkterm-plugin-channel",
+ "thinkterm-plugin-sdk",
  "thinkterm-snippets",
+ "toml 0.8.23",
  "wezterm-uds",
 ]
 
@@ -10212,6 +10236,7 @@ dependencies = [
  "termwiz-funcs",
  "textwrap",
  "thinkterm-file-index",
+ "thinkterm-plugin-channel",
  "thinkterm-proto",
  "thinkterm-tui",
  "thinkterm-update",

@@ -1,0 +1,16 @@
+[package]
+name = "thinkterm-plugin-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# An example ThinkTerm plugin, to copy and change. Its dependencies name
+# their versions rather than the workspace's, so the directory builds on
+# its own once the SDK path below points at a checkout of ThinkTerm.
+
+[dependencies]
+anyhow = "1.0"
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+serde_json = "1.0"
+thinkterm-plugin-sdk = { path = "../thinkterm-plugin-sdk" }
+uuid = { version = "1.13", features = ["v4"] }

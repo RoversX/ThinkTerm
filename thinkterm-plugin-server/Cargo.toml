@@ -14,10 +14,11 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 log.workspace = true
+serde = { workspace = true, features = ["derive", "std"] }
 serde_json.workspace = true
-thinkterm-plugin-channel = { workspace = true, features = ["native"] }
-thinkterm-snippets = { workspace = true, features = ["native"] }
-wezterm-uds.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
+thinkterm-plugin-channel = { workspace = true, features = ["native"] }
+thinkterm-plugin-sdk.workspace = true
+thinkterm-snippets = { workspace = true, features = ["native"] }
+toml.workspace = true
+wezterm-uds.workspace = true

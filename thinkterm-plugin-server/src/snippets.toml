@@ -1,0 +1,24 @@
+# The Snippets plugin's manifest: an installed plugin's, less the program,
+# which is the host itself. Clients take its name and description from
+# here, in the user's language, like any plugin's.
+id = "snippets"
+name = "Snippets"
+description = "Saved commands and text you can paste into a pane."
+api = 1
+clients = ["desktop", "web"]
+
+[locales.zh-CN]
+name = "片段"
+description = "保存的命令和文本，可以粘贴到面板中。"
+
+[locales.ja-JP]
+name = "スニペット"
+description = "保存したコマンドやテキストを、ペインに貼り付けられます。"
+
+[locales.de-DE]
+name = "Snippets"
+description = "Gespeicherte Befehle und Texte, die Sie in ein Pane einfügen können."
+
+[locales.fr-FR]
+name = "Extraits"
+description = "Commandes et textes enregistrés, à coller dans un panneau."

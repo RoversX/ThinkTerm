@@ -4,10 +4,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{self, Read, Write};
 
-/// The version of this format. A client that finds a host speaking an
-/// older one asks it to quit and starts its own; one that finds a newer
-/// host leaves it alone.
-pub const PROTOCOL: u32 = 1;
+/// The version of this format and of what the host answers. A client that
+/// finds a host speaking an older one asks it to quit and starts its own;
+/// one that finds a newer host leaves it alone. 2 added the host's own API
+/// (`registry`) and installed plugins; 3 took commands and notifications
+/// out of it.
+pub const PROTOCOL: u32 = 3;
 
 /// The largest frame either side sends or accepts, so a confused peer
 /// cannot have the other allocate without bound. A thousand scripts of

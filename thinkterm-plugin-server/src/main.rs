@@ -4,12 +4,22 @@
 //! the socket (see thinkterm-plugin-channel); it exits by itself once nothing has
 //! been connected for a while. One runs at a time: it holds a lock for as
 //! long as it runs, and a second one gives way.
+//!
+//! The plugins built into it run inside it. An installed plugin runs as a
+//! program of its own, which the host starts when the plugin is first used
+//! and stops when it exits (see registry and docs/thinkterm/plugins.md).
 
 // Started in the background, never from a console: no window of its own.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod builtins;
 mod host;
+mod manifest;
+mod process;
+mod registry;
 mod snippets;
+mod stamp;
+mod switches;
 
 use anyhow::Context;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -24,12 +34,18 @@ const IDLE_EXIT: Duration = Duration::from_secs(30);
 /// How long a host waits for the lock before leaving it to the one that
 /// holds it: long enough for a host that was asked to quit to be gone.
 const LOCK_WAIT: Duration = Duration::from_secs(3);
+/// How long an installed plugin's program has to say it is ready.
+const READY_WITHIN: Duration = Duration::from_secs(10);
 
 struct Args {
     socket: PathBuf,
     lock: PathBuf,
     data_dir: PathBuf,
     idle: Duration,
+    ready_within: Duration,
+    /// Serve this built-in plugin over standard input and output, as an
+    /// installed plugin's program does, instead of being the host.
+    serve_plugin: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -38,6 +54,15 @@ fn parse_args() -> Result<Args, String> {
         lock: paths::lock(),
         data_dir: paths::data_dir(),
         idle: IDLE_EXIT,
+        ready_within: READY_WITHIN,
+        serve_plugin: None,
+    };
+    let seconds = |name: &str, value: &std::ffi::OsStr| {
+        value
+            .to_str()
+            .and_then(|secs| secs.parse().ok())
+            .map(Duration::from_secs)
+            .ok_or_else(|| format!("{name} needs a number of seconds"))
     };
     let mut given = std::env::args_os().skip(1);
     while let Some(arg) = given.next() {
@@ -49,13 +74,9 @@ fn parse_args() -> Result<Args, String> {
             "--socket" => args.socket = value.into(),
             "--lock" => args.lock = value.into(),
             "--data-dir" => args.data_dir = value.into(),
-            "--idle-secs" => {
-                let secs = value
-                    .to_str()
-                    .and_then(|secs| secs.parse().ok())
-                    .ok_or_else(|| format!("{name} needs a number of seconds"))?;
-                args.idle = Duration::from_secs(secs);
-            }
+            "--idle-secs" => args.idle = seconds(&name, &value)?,
+            "--ready-secs" => args.ready_within = seconds(&name, &value)?,
+            "--serve-plugin" => args.serve_plugin = Some(value.to_string_lossy().into_owned()),
             _ => return Err(format!("unknown argument {name}")),
         }
     }
@@ -102,6 +123,17 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if let Some(id) = &args.serve_plugin {
+        let Some(plugin) = builtins::one(id, &args.data_dir) else {
+            eprintln!("thinkterm-plugin-server: there is no built-in plugin {id:?}");
+            std::process::exit(2);
+        };
+        if let Err(err) = thinkterm_plugin_sdk::run(plugin) {
+            log::error!("serving {id}: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Err(err) = run(args) {
         log::error!("{err:#}");
         std::process::exit(1);
@@ -125,10 +157,12 @@ fn run(args: Args) -> anyhow::Result<()> {
     make_private(&args.socket);
     log::info!("listening at {}", args.socket.display());
 
-    let plugins: Vec<Box<dyn host::Plugin>> = vec![Box::new(snippets::Snippets::new(
-        args.data_dir.join("snippets.json"),
-    ))];
-    let host = host::Host::new(args.socket, args.idle, plugins);
+    let registry = registry::Registry::new(
+        &args.data_dir,
+        builtins::all(&args.data_dir),
+        args.ready_within,
+    );
+    let host = host::Host::new(args.socket, args.idle, registry);
     host.exit_when_idle();
     for stream in listener.incoming() {
         match stream {

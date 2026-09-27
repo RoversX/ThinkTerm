@@ -1,0 +1,15 @@
+[package]
+name = "thinkterm-plugin-sdk"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# What a ThinkTerm plugin is written with: the Plugin trait, and the loop
+# that speaks the plugin protocol over standard input and output. Kept to
+# serde and anyhow, so a plugin that uses it stays small.
+
+[dependencies]
+anyhow.workspace = true
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json.workspace = true
+thinkterm-plugin-channel.workspace = true

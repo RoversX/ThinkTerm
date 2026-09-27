@@ -266,14 +266,20 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Dropping the session ends it.
 pub struct Session {
     jobs: Sender<Job>,
+    call_timeout: Duration,
+}
+
+/// A call on its way: to which plugin, what, how long it may wait for its
+/// answer, and whom to tell.
+struct Call {
+    plugin: String,
+    body: Value,
+    wait: Duration,
+    reply: Reply,
 }
 
 enum Job {
-    Call {
-        plugin: String,
-        body: Value,
-        reply: Reply,
-    },
+    Call(Call),
     /// What the host sent over connection number `.0`.
     Heard(u64, io::Result<FromHost>),
     Stop,
@@ -306,20 +312,33 @@ impl Session {
         let readers = jobs.clone();
         std::thread::Builder::new()
             .name("plugin-session".into())
-            .spawn(move || serve_session(host, call_timeout, queue, readers, notice))?;
-        Ok(Self { jobs })
+            .spawn(move || serve_session(host, queue, readers, notice))?;
+        Ok(Self { jobs, call_timeout })
     }
 
     /// Asks `plugin`. `reply` is called with the answer on the session's
     /// thread, or with why there is none.
     pub fn call(&self, plugin: &str, body: Value, reply: impl FnOnce(Answer) + Send + 'static) {
-        let job = Job::Call {
+        self.call_within(plugin, body, self.call_timeout, reply)
+    }
+
+    /// Asks `plugin`, waiting `wait` for the answer: for a call that is
+    /// known to take long.
+    pub fn call_within(
+        &self,
+        plugin: &str,
+        body: Value,
+        wait: Duration,
+        reply: impl FnOnce(Answer) + Send + 'static,
+    ) {
+        let job = Job::Call(Call {
             plugin: plugin.to_string(),
             body,
+            wait,
             reply: Box::new(reply),
-        };
-        if let Err(mpsc::SendError(Job::Call { reply, .. })) = self.jobs.send(job) {
-            reply(Err("the plugin session has ended".into()));
+        });
+        if let Err(mpsc::SendError(Job::Call(call))) = self.jobs.send(job) {
+            (call.reply)(Err("the plugin session has ended".into()));
         }
     }
 }
@@ -330,13 +349,18 @@ impl Drop for Session {
     }
 }
 
-/// The calls sent and not yet answered: when each gives up, and whom to
-/// tell.
-type Waiting = HashMap<u64, (Instant, Reply)>;
+/// A call sent and not yet answered: when it gives up, how long that was,
+/// and whom to tell.
+struct Waiter {
+    deadline: Instant,
+    wait: Duration,
+    reply: Reply,
+}
+
+type Waiting = HashMap<u64, Waiter>;
 
 fn serve_session(
     host: Host,
-    call_timeout: Duration,
     queue: Receiver<Job>,
     readers: Sender<Job>,
     mut notice: impl FnMut(Notice),
@@ -345,7 +369,7 @@ fn serve_session(
     let mut generation = 0u64;
     let mut retry = SESSION_RETRY_FIRST;
     // Calls made while there was no connection, sent on the next one.
-    let mut queued: Vec<(String, Value, Reply)> = Vec::new();
+    let mut queued: Vec<Call> = Vec::new();
     loop {
         let connected = host.connect().and_then(|connection| {
             let reader = connection.try_clone()?;
@@ -355,8 +379,8 @@ fn serve_session(
             Ok(handles) => handles,
             Err(err) => {
                 let why = format!("{err:#}");
-                for (_, _, reply) in queued.drain(..) {
-                    reply(Err(why.clone()));
+                for call in queued.drain(..) {
+                    (call.reply)(Err(why.clone()));
                 }
                 notice(Notice::Trouble(why));
                 if !pause(&queue, retry, &mut queued) {
@@ -390,27 +414,20 @@ fn serve_session(
 
         let mut waiting = Waiting::new();
         let mut alive = true;
-        for (plugin, body, reply) in queued.drain(..) {
+        for call in queued.drain(..) {
             if alive {
-                let deadline = Instant::now() + call_timeout;
-                alive = send_call(
-                    &mut connection,
-                    &mut next_id,
-                    &mut waiting,
-                    (plugin, body, reply),
-                    deadline,
-                );
+                alive = send_call(&mut connection, &mut next_id, &mut waiting, call);
             } else {
-                reply(Err("the plugin host went away".into()));
+                (call.reply)(Err("the plugin host went away".into()));
             }
         }
         while alive {
-            let job = match waiting.values().map(|(deadline, _)| *deadline).min() {
+            let job = match waiting.values().map(|waiter| waiter.deadline).min() {
                 Some(deadline) => {
                     match queue.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                         Ok(job) => Ok(job),
                         Err(RecvTimeoutError::Timeout) => {
-                            give_up_overdue(&mut waiting, call_timeout);
+                            give_up_overdue(&mut waiting);
                             continue;
                         }
                         Err(RecvTimeoutError::Disconnected) => Err(()),
@@ -419,30 +436,19 @@ fn serve_session(
                 None => queue.recv().map_err(drop),
             };
             match job {
-                Ok(Job::Call {
-                    plugin,
-                    body,
-                    reply,
-                }) => {
-                    let deadline = Instant::now() + call_timeout;
-                    alive = send_call(
-                        &mut connection,
-                        &mut next_id,
-                        &mut waiting,
-                        (plugin, body, reply),
-                        deadline,
-                    )
+                Ok(Job::Call(call)) => {
+                    alive = send_call(&mut connection, &mut next_id, &mut waiting, call)
                 }
                 Ok(Job::Heard(from, _)) if from != generation => {}
                 Ok(Job::Heard(_, Ok(FromHost::Ok { id, body }))) => {
                     retry = SESSION_RETRY_FIRST;
-                    if let Some((_, reply)) = waiting.remove(&id) {
-                        reply(Ok(body));
+                    if let Some(waiter) = waiting.remove(&id) {
+                        (waiter.reply)(Ok(body));
                     }
                 }
                 Ok(Job::Heard(_, Ok(FromHost::Error { id, message }))) => {
-                    if let Some((_, reply)) = waiting.remove(&id) {
-                        reply(Err(message));
+                    if let Some(waiter) = waiting.remove(&id) {
+                        (waiter.reply)(Err(message));
                     }
                 }
                 Ok(Job::Heard(_, Ok(FromHost::Event { plugin, body }))) => {
@@ -452,16 +458,16 @@ fn serve_session(
                 Ok(Job::Heard(_, Err(_))) => alive = false,
                 Ok(Job::Stop) | Err(()) => {
                     connection.shutdown();
-                    for (_, (_, reply)) in waiting.drain() {
-                        reply(Err("the plugin session has ended".into()));
+                    for (_, waiter) in waiting.drain() {
+                        (waiter.reply)(Err("the plugin session has ended".into()));
                     }
                     return;
                 }
             }
         }
         connection.shutdown();
-        for (_, (_, reply)) in waiting.drain() {
-            reply(Err("the plugin host went away".into()));
+        for (_, waiter) in waiting.drain() {
+            (waiter.reply)(Err("the plugin host went away".into()));
         }
         // A host that answered reset this; one that keeps failing is asked
         // less and less often.
@@ -472,28 +478,32 @@ fn serve_session(
     }
 }
 
-/// Sends a call, to be answered through `reply` by `deadline`. False when
-/// the host has gone, which `reply` is told.
+/// Sends a call, to be answered through its reply once its wait is up at
+/// the latest. False when the host has gone, which the reply is told.
 fn send_call(
     connection: &mut Connection,
     next_id: &mut u64,
     waiting: &mut Waiting,
-    (plugin, body, reply): (String, Value, Reply),
-    deadline: Instant,
+    call: Call,
 ) -> bool {
     *next_id += 1;
-    let call = ToHost::Call {
+    let message = ToHost::Call {
         id: *next_id,
-        plugin,
-        body,
+        plugin: call.plugin,
+        body: call.body,
     };
-    match connection.send(&call) {
+    match connection.send(&message) {
         Ok(()) => {
-            waiting.insert(*next_id, (deadline, reply));
+            let waiter = Waiter {
+                deadline: Instant::now() + call.wait,
+                wait: call.wait,
+                reply: call.reply,
+            };
+            waiting.insert(*next_id, waiter);
             true
         }
         Err(err) => {
-            reply(Err(format!("the plugin host went away: {err}")));
+            (call.reply)(Err(format!("the plugin host went away: {err}")));
             false
         }
     }
@@ -501,17 +511,18 @@ fn send_call(
 
 /// Tells the calls whose time is up that no answer is coming. One that
 /// arrives later finds nobody waiting and is dropped.
-fn give_up_overdue(waiting: &mut Waiting, call_timeout: Duration) {
+fn give_up_overdue(waiting: &mut Waiting) {
     let now = Instant::now();
     let overdue: Vec<u64> = waiting
         .iter()
-        .filter(|(_, (deadline, _))| *deadline <= now)
+        .filter(|(_, waiter)| waiter.deadline <= now)
         .map(|(id, _)| *id)
         .collect();
     for id in overdue {
-        if let Some((_, reply)) = waiting.remove(&id) {
-            reply(Err(format!(
-                "the plugin host did not answer within {call_timeout:?}"
+        if let Some(waiter) = waiting.remove(&id) {
+            (waiter.reply)(Err(format!(
+                "the plugin host did not answer within {:?}",
+                waiter.wait
             )));
         }
     }
@@ -520,7 +531,7 @@ fn give_up_overdue(waiting: &mut Waiting, call_timeout: Duration) {
 /// Waits `delay` before the next attempt, keeping the calls made meanwhile;
 /// a call cuts the wait short, since someone is waiting on it. False when
 /// the session was ended.
-fn pause(queue: &Receiver<Job>, delay: Duration, queued: &mut Vec<(String, Value, Reply)>) -> bool {
+fn pause(queue: &Receiver<Job>, delay: Duration, queued: &mut Vec<Call>) -> bool {
     let until = Instant::now() + delay;
     loop {
         let left = until.saturating_duration_since(Instant::now());
@@ -528,12 +539,8 @@ fn pause(queue: &Receiver<Job>, delay: Duration, queued: &mut Vec<(String, Value
             return true;
         }
         match queue.recv_timeout(left) {
-            Ok(Job::Call {
-                plugin,
-                body,
-                reply,
-            }) => {
-                queued.push((plugin, body, reply));
+            Ok(Job::Call(call)) => {
+                queued.push(call);
                 return true;
             }
             Ok(Job::Heard(..)) => {}

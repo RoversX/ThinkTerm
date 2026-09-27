@@ -85,7 +85,7 @@ directories:
 | `thinkterm-gui` | `wezterm-gui/` | The terminal itself |
 | `thinkterm-mux-server` | `wezterm-mux-server/` | The multiplexer server |
 | `thinkterm` | `wezterm/` | The CLI |
-| `thinkterm-plugin-server` | `thinkterm-plugin-server/` | Runs the plugins (Snippets so far) apart from the mux; started when first needed |
+| `thinkterm-plugin-server` | `thinkterm-plugin-server/` | Runs the plugins (Snippets built in, installed ones as processes of their own) apart from the mux; started when first needed |
 
 `wezterm/` also builds a `wezterm` binary. That is a deliberate compatibility
 shim, not a leftover — the environment variables ThinkTerm sets promise that a

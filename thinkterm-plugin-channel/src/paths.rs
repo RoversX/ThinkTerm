@@ -1,7 +1,7 @@
 //! Where the plugin host lives on this machine. Every client works these
 //! out the same way, so they all find the one host.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The directory the mux keeps its own socket in (config's `RUNTIME_DIR`),
 /// worked out the same way without loading config: the host is a small
@@ -19,6 +19,16 @@ pub fn data_dir() -> PathBuf {
     dirs_next::data_dir()
         .unwrap_or_else(|| home_dir().join(".local/share"))
         .join("ThinkTerm")
+}
+
+/// Where the host looks for installed plugins, one directory each.
+pub fn plugins_dir() -> PathBuf {
+    plugins_dir_in(&data_dir())
+}
+
+/// The plugins directory of a host keeping its data in `data_dir`.
+pub fn plugins_dir_in(data_dir: &Path) -> PathBuf {
+    data_dir.join("plugins")
 }
 
 fn home_dir() -> PathBuf {

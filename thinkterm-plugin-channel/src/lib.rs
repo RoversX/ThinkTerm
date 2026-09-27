@@ -13,10 +13,12 @@
 //!
 //! A frame is a little-endian `u32` length and that many bytes of JSON: a
 //! [`wire::ToHost`] one way, a [`wire::FromHost`] the other. What a call's
-//! body means is up to the plugin it names.
+//! body means is up to the plugin it names; the host's own API, the list of
+//! plugins and their commands, is [`registry`].
 
 #[cfg(feature = "native")]
 pub mod client;
 #[cfg(feature = "native")]
 pub mod paths;
+pub mod registry;
 pub mod wire;
