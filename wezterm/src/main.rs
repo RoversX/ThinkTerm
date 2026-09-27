@@ -18,6 +18,7 @@ use wezterm_gui_subcommands::*;
 
 mod asciicast;
 mod cli;
+mod plugin;
 
 //    let message = "; ❤ 😍🤢\n\x1b[91;mw00t\n\x1b[37;104;m bleet\x1b[0;m.";
 
@@ -255,6 +256,12 @@ enum SubCommand {
 
     #[command(name = "update", about = "Check for a newer release and install it")]
     Update(UpdateCommand),
+
+    #[command(
+        name = "plugin",
+        about = "List, turn on and off, reload and run plugins"
+    )]
+    Plugin(plugin::PluginCommand),
 
     /// Write a project's file listing for search. The desktop runs this on a
     /// remote host over ssh; it is not meant to be run by hand.
@@ -1070,6 +1077,7 @@ fn run() -> anyhow::Result<()> {
         SubCommand::Record(cmd) => cmd.run(init_config(&opts)?),
         SubCommand::Replay(cmd) => cmd.run(),
         SubCommand::Update(cmd) => cmd.run(),
+        SubCommand::Plugin(cmd) => cmd.run(),
         SubCommand::ListFiles(cmd) => cmd.run(),
         SubCommand::Tui(cmd) => thinkterm_tui::run(
             init_config(&opts)?,
