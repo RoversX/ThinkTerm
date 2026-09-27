@@ -8577,6 +8577,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkterm-plugin-channel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs-next",
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "wezterm-uds",
+]
+
+[[package]]
+name = "thinkterm-plugin-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "serde_json",
+ "tempfile",
+ "thinkterm-plugin-channel",
+ "thinkterm-snippets",
+ "wezterm-uds",
+]
+
+[[package]]
 name = "thinkterm-proto"
 version = "0.1.0"
 dependencies = [
@@ -8741,9 +8767,11 @@ dependencies = [
  "thinkterm-font-core",
  "thinkterm-font-web",
  "thinkterm-i18n",
+ "thinkterm-plugin-channel",
  "thinkterm-proto",
  "thinkterm-render",
  "thinkterm-session",
+ "thinkterm-snippets",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -10532,6 +10560,7 @@ dependencies = [
  "thinkterm-core",
  "thinkterm-file-index",
  "thinkterm-i18n",
+ "thinkterm-plugin-channel",
  "thinkterm-proto",
  "thinkterm-render",
  "thinkterm-snippets",
@@ -10665,6 +10694,7 @@ dependencies = [
  "soketto",
  "tempfile",
  "termwiz 0.24.0",
+ "thinkterm-plugin-channel",
  "thinkterm-proto",
  "url",
  "uuid",

@@ -1,0 +1,23 @@
+[package]
+name = "thinkterm-plugin-server"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The process ThinkTerm's plugins run in, apart from the mux and the GUI.
+# Kept small on purpose: it runs whenever a plugin is in use.
+
+[[bin]]
+name = "thinkterm-plugin-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+serde_json.workspace = true
+thinkterm-plugin-channel = { workspace = true, features = ["native"] }
+thinkterm-snippets = { workspace = true, features = ["native"] }
+wezterm-uds.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

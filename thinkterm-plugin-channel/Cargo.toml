@@ -1,0 +1,22 @@
+[package]
+name = "thinkterm-plugin-channel"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = ["native"]
+# Finding, starting and talking to the plugin host. Without it the crate is
+# the message format alone, which a browser speaks through the mux.
+native = ["dep:anyhow", "dep:dirs-next", "dep:log", "dep:wezterm-uds"]
+
+[dependencies]
+anyhow = { workspace = true, optional = true }
+dirs-next = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json.workspace = true
+wezterm-uds = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true

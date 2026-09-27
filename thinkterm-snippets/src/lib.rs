@@ -15,6 +15,8 @@ use std::sync::OnceLock;
 
 #[cfg(feature = "native")]
 pub mod file;
+pub mod view;
+pub mod wire;
 
 pub type SnippetId = String;
 
@@ -84,6 +86,36 @@ pub fn title_from_body(body: &str) -> String {
         .chars()
         .take(48)
         .collect()
+}
+
+/// The line a snippet shows under its title: the body's first non-empty
+/// line, shortened.
+pub fn preview(body: &str) -> String {
+    body.lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+        .unwrap_or("")
+        .chars()
+        .take(96)
+        .collect()
+}
+
+/// What running a snippet types into a pane: the body without its blank
+/// first and last lines, each line ended with Enter. `None` for a body with
+/// nothing to run.
+pub fn run_text(body: &str) -> Option<String> {
+    let normalized = body.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<_> = normalized.split('\n').collect();
+    let start = lines.iter().position(|line| !line.trim().is_empty())?;
+    let end = lines.iter().rposition(|line| !line.trim().is_empty())?;
+    let trimmed = lines[start..=end].join("\n");
+
+    let mut buffer = String::with_capacity(trimmed.len() + 1);
+    buffer.push_str(&trimmed);
+    buffer.push('\n');
+    Some(buffer.replace('\n', "\r"))
 }
 
 fn normalized_title(title: &str, body: &str) -> String {
@@ -345,6 +377,33 @@ mod tests {
     #[test]
     fn title_falls_back_to_first_non_empty_body_line() {
         assert_eq!(title_from_body("\n  ls -la\npwd"), "ls -la");
+    }
+
+    #[test]
+    fn the_preview_is_the_first_line_with_text() {
+        assert_eq!(preview("\n   \n  git status  \nls"), "git status");
+        assert_eq!(preview(&"x".repeat(200)).chars().count(), 96);
+        assert_eq!(preview(" \n"), "");
+    }
+
+    #[test]
+    fn run_text_appends_single_enter() {
+        assert_eq!(run_text("sudo apt update").unwrap(), "sudo apt update\r");
+    }
+
+    #[test]
+    fn run_text_trims_outer_blank_lines() {
+        assert_eq!(run_text("\n\ncmd\r\n").unwrap(), "cmd\r");
+    }
+
+    #[test]
+    fn run_text_preserves_internal_script_lines() {
+        assert_eq!(run_text("one\ntwo").unwrap(), "one\rtwo\r");
+    }
+
+    #[test]
+    fn run_text_ignores_blank_body() {
+        assert!(run_text("\n \r\n\t").is_none());
     }
 
     #[test]

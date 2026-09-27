@@ -101,6 +101,12 @@ impl UnixStream {
     pub fn connect<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         Ok(Self(StreamImpl::connect(path)?))
     }
+
+    /// A second handle on the same socket, wrapped like the first, so one
+    /// thread can read while another writes.
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self(self.0.try_clone()?))
+    }
 }
 
 impl std::ops::Deref for UnixStream {
