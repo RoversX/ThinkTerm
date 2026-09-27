@@ -700,7 +700,7 @@ settings-about-privacy = 隐私
 settings-about-config-file = 配置文件
 settings-about-data-folder = 数据目录
 # --- 侧栏 ------------------------------------------------------------------
-settings-section-sidebar = 侧栏
+settings-section-sidebar = 侧栏与插件
 settings-sidebar-description = 选择右侧栏提供哪些面板。全部关掉，侧栏就不显示了。
 settings-sidebar-files-description = 浏览工作目录，以及通过 SFTP 浏览远程目录。
 settings-sidebar-notes-description = 与项目放在一起的 Markdown 笔记。
@@ -723,6 +723,27 @@ settings-update-method-system = 由系统包管理器安装:从发布页下载�
 settings-update-method-windows = 由 Windows 安装器安装;安装更新会下载新安装器并运行。
 settings-update-method-source = 这是从源码构建的版本:拉取仓库后重新构建。
 settings-update-method-unknown = 这个副本不是由安装脚本安装的,ThinkTerm 不会替换它;请按原来的安装方式更新。
+
+# --- 插件:设置里的插件页 ---
+settings-section-plugins = 插件
+settings-plugins-description = 插件只会显示在右侧栏里。装进来的插件在这里开关、重新加载。
+settings-plugins-folder = 插件文件夹
+settings-plugins-open-folder = 打开
+settings-plugins-reload = 重新加载插件
+settings-plugins-reload-description = 找出新加或删掉的插件，并重启正在运行的插件。
+settings-plugins-reload-button = 重新加载
+settings-plugins-builtin = 内置
+settings-plugins-builtin-panel = 内置 · 提供右侧栏的「{ $panel }」面板
+settings-plugins-starting = 正在启动…
+settings-plugins-running = 运行中
+settings-plugins-crashed = 已停止：{ $reason }
+settings-plugins-failed = 出错：{ $reason }
+settings-plugins-invalid = 无法使用：{ $reason }
+settings-plugins-unsupported = 不支持这个系统
+settings-plugins-unusable = 不可用
+settings-plugins-loading = 正在加载插件…
+settings-plugins-unavailable = 插件暂时不可用：{ $reason }
+settings-plugins-refused = 没能修改插件：{ $reason }
 
 # --- 网页端:用浏览器访问这台机器的终端 ---
 settings-section-web = 网页

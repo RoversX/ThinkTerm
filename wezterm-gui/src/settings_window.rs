@@ -420,6 +420,8 @@ fn initial_section() -> SettingsSection {
         "workspaces" => SettingsSection::Workspaces,
         "agents" => SettingsSection::Agents,
         "web" => SettingsSection::Web,
+        // The plugins are on the Sidebar page, the only place they show.
+        "plugins" => SettingsSection::Sidebar,
         "archived" => SettingsSection::Archived,
         "keymap" => SettingsSection::Keymap,
         "commandpalette" => SettingsSection::CommandPalette,
@@ -434,6 +436,9 @@ fn initial_section() -> SettingsSection {
     };
     if section == SettingsSection::Agents {
         crate::agent_status::refresh_path_probe();
+    }
+    if section == SettingsSection::Sidebar {
+        crate::plugins::refresh();
     }
     section
 }
@@ -648,10 +653,15 @@ impl SettingsSection {
                 "Panels",
                 "Files",
                 "Notes",
-                "Snippets",
                 "Agents",
                 "Agent Panel",
                 "Right Sidebar",
+                "Snippets",
+                "Plugins",
+                "Plugin",
+                "Extensions",
+                "Reload",
+                "Installed",
             ],
             Self::Backup => &[
                 "Backup",
@@ -844,6 +854,77 @@ fn settings_tr(id: &'static str, values: &[(&'static str, String)]) -> String {
     crate::i18n::tr_args(id, &args)
 }
 
+/// A plugin id as something a `Copy` action can carry, hashed as a token
+/// id is: two plugins in one list do not collide.
+fn plugin_key(id: &str) -> u64 {
+    web_token_key(id)
+}
+
+/// Every window lays its right sidebar out again. Not invalidate_all_windows:
+/// the sidebar's width can have gone to or from zero, and only a real
+/// relayout resizes the panes around that.
+fn right_sidebar_panels_changed() {
+    if let Some(front_end) = crate::frontend::try_front_end() {
+        for gui_window in front_end.gui_windows() {
+            gui_window
+                .window
+                .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                    |term_window| {
+                        term_window.right_sidebar_panels_changed();
+                    },
+                )));
+        }
+    }
+}
+
+/// The right-sidebar panel a built-in plugin provides, by its label.
+fn builtin_panel_label(id: &str) -> Option<String> {
+    (id == thinkterm_snippets::wire::PLUGIN).then(|| crate::i18n::tr("right-mode-snippets"))
+}
+
+/// What a plugin's row says under its name: where it came from, what state
+/// it is in when that is worth saying, and what it does. A built-in one
+/// says which panel it provides.
+fn plugin_row_description(plugin: &thinkterm_plugin_channel::registry::Info) -> String {
+    use thinkterm_plugin_channel::registry::State;
+    if let Some(panel) = plugin
+        .builtin
+        .then(|| builtin_panel_label(&plugin.id))
+        .flatten()
+    {
+        return settings_tr("settings-plugins-builtin-panel", &[("panel", panel)]);
+    }
+    let origin = if plugin.builtin {
+        crate::i18n::tr("settings-plugins-builtin")
+    } else {
+        plugin.version.clone()
+    };
+    let state = match &plugin.state {
+        State::Off | State::Idle => None,
+        State::Starting => Some(crate::i18n::tr("settings-plugins-starting")),
+        State::Running => Some(crate::i18n::tr("settings-plugins-running")),
+        State::Crashed { reason } => Some(settings_tr(
+            "settings-plugins-crashed",
+            &[("reason", reason.clone())],
+        )),
+        State::Failed { reason } => Some(settings_tr(
+            "settings-plugins-failed",
+            &[("reason", reason.clone())],
+        )),
+        State::Invalid { reason } => Some(settings_tr(
+            "settings-plugins-invalid",
+            &[("reason", reason.clone())],
+        )),
+        State::Unsupported { .. } => Some(crate::i18n::tr("settings-plugins-unsupported")),
+    };
+    vec![Some(origin), state, Some(plugin.description.clone())]
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 /// A token id as something a `Copy` action can carry. Ids are random, so a
 /// 64-bit hash of one is as good as the id for telling rows apart.
 fn web_token_key(id: &str) -> u64 {
@@ -875,6 +956,11 @@ enum SettingsAction {
     Hint(&'static str),
     /// Turn one right-sidebar panel on or off.
     ToggleRightSidebarPanel(crate::termwindow::RightSidebarMode),
+    /// Turn a plugin on or off. Carries `plugin_key(id)`, as RevokeWebToken
+    /// carries its token's: the list can change between press and release.
+    TogglePlugin(u64),
+    ReloadPlugins,
+    OpenPluginsFolder,
     ToggleAgentDetails(&'static str),
     /// Index into the archived rows cached at paint time.
     UnarchiveArchivedRow(usize),
@@ -1465,6 +1551,9 @@ struct SettingsUiState {
     /// must cut off the row that was under the pointer, not whichever row
     /// holds that index after the list refreshed.
     web_tokens: Vec<codec::WebTokenInfo>,
+    /// The plugins' switches as last painted: each one's key, its id and
+    /// the position it showed.
+    plugin_switches: Vec<(u64, String, bool)>,
     /// The shells found on this machine. Refreshed when the Terminal
     /// section is entered, never while painting: discovery touches the
     /// filesystem, and the paint path must not.
@@ -1523,6 +1612,7 @@ impl SettingsUiState {
             memory_snapshot_copied_until: None,
             archived_rows: Vec::new(),
             web_tokens: Vec::new(),
+            plugin_switches: Vec::new(),
             shell_catalog: Vec::new(),
             confirm_delete_archived: None,
             confirm_stop_server: false,
@@ -3988,6 +4078,10 @@ impl SettingsWindow {
             // on entry and the row paints from the cache.
             self.refresh_shell_catalog();
         }
+        if section == SettingsSection::Sidebar {
+            // Plugins installed or removed since are found on entry.
+            crate::plugins::refresh();
+        }
         if matches!(section, SettingsSection::Update | SettingsSection::About) {
             // Re-read the cache the background checker writes, so re-entering
             // the page picks up a check that ran while the window sat on
@@ -4596,6 +4690,54 @@ impl SettingsWindow {
                 }
                 window.invalidate();
             }
+            SettingsAction::ToggleRightSidebarPanel(
+                crate::termwindow::RightSidebarMode::Snippets,
+            ) => {
+                // Snippets is a built-in plugin, and its panel's switch is
+                // the plugin's, which every client follows. What was chosen
+                // is kept here too, so this desktop's panel follows at once.
+                self.ui.open_dropdown = None;
+                let enabled = !self
+                    .right_sidebar_panel_enabled(crate::termwindow::RightSidebarMode::Snippets);
+                let chrome = &mut self.native_settings.chrome;
+                chrome.right_sidebar_snippets_enabled = None;
+                chrome.snippets_plugin_enabled = Some(enabled);
+                match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => right_sidebar_panels_changed(),
+                    Err(err) => {
+                        self.status = format!("Unable to save sidebar panel setting: {err:#}");
+                    }
+                }
+                crate::plugins::set_enabled(thinkterm_snippets::wire::PLUGIN, enabled);
+            }
+            SettingsAction::TogglePlugin(key) => {
+                self.ui.open_dropdown = None;
+                let switch = self
+                    .ui
+                    .plugin_switches
+                    .iter()
+                    .find(|(shown, _, _)| *shown == key)
+                    .cloned();
+                if let Some((_, id, enabled)) = switch {
+                    crate::plugins::set_enabled(&id, !enabled);
+                }
+                window.invalidate();
+            }
+            SettingsAction::ReloadPlugins => {
+                self.ui.open_dropdown = None;
+                crate::plugins::reload();
+            }
+            SettingsAction::OpenPluginsFolder => {
+                self.ui.open_dropdown = None;
+                let dir = thinkterm_plugin_channel::paths::plugins_dir();
+                // Made so there is something to open, and to drop a plugin
+                // into.
+                if let Err(err) = std::fs::create_dir_all(&dir) {
+                    self.status = format!("Unable to create {}: {err:#}", dir.display());
+                } else {
+                    Self::open_path(dir);
+                }
+            }
             SettingsAction::ToggleRightSidebarPanel(panel) => {
                 self.ui.open_dropdown = None;
                 let slot = self.right_sidebar_panel_slot(panel);
@@ -4606,20 +4748,7 @@ impl SettingsWindow {
                         // closure reads the new shared value; without this the
                         // gate waits for the next safety tick.
                         mux::agent_status::refresh_enabled();
-                        // Not invalidate_all_windows: the sidebar's width can
-                        // have gone to or from zero, and only a real relayout
-                        // resizes the panes around that.
-                        if let Some(front_end) = crate::frontend::try_front_end() {
-                            for gui_window in front_end.gui_windows() {
-                                gui_window.window.notify(
-                                    crate::termwindow::TermWindowNotif::Apply(Box::new(
-                                        |term_window| {
-                                            term_window.right_sidebar_panels_changed();
-                                        },
-                                    )),
-                                );
-                            }
-                        }
+                        right_sidebar_panels_changed();
                     }
                     Err(err) => {
                         self.status = format!("Unable to save sidebar panel setting: {err:#}");
@@ -9157,10 +9286,6 @@ impl SettingsWindow {
         let panels = Self::RIGHT_SIDEBAR_PANELS;
         let (card_y, first_row_y) = self.settings_card_geometry(section_y, panels.len());
         let card_height = self.settings_card_height(panels.len());
-        self.ui.content_scroll.set_extents(
-            self.content_viewport_extent(),
-            self.settings_content_extent(card_y + scroll + card_height),
-        );
 
         self.draw_text(
             layers,
@@ -9184,6 +9309,165 @@ impl SettingsWindow {
                 &Self::right_sidebar_panel_description(panel),
                 self.right_sidebar_panel_enabled(panel),
                 SettingsAction::ToggleRightSidebarPanel(panel),
+                index > 0,
+            )?;
+        }
+        // The plugins below the panels: whatever a plugin shows, it shows in
+        // the sidebar.
+        let plugins_title_y = card_y + card_height + self.settings_section_card_gap();
+        self.paint_plugins(layers, x, max_width, plugins_title_y)
+    }
+
+    /// The plugins, on the Sidebar page from `title_y`: where they are
+    /// installed, reloading them, and each as the plugin host last listed
+    /// it. An installed one has its switch here; a built-in one says which
+    /// panel it provides, whose switch is above.
+    fn paint_plugins(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+        title_y: f32,
+    ) -> anyhow::Result<()> {
+        use thinkterm_plugin_channel::registry::State;
+        let palette = self.palette();
+        let body_font = Rc::clone(&self.body_font);
+        let scroll = self.ui.content_scroll.offset;
+        let row_step = self.settings_row_step();
+        let card_padding = self.ui_px(36.0);
+        let row_x = x + card_padding;
+        let row_width = max_width - card_padding * 2.0;
+
+        let plugins = crate::plugins::plugins();
+        let card_y = title_y + self.settings_section_card_gap().min(54.0);
+        let first_row_y = card_y + self.settings_card_top_padding();
+        let card_height = self.settings_card_height(2);
+        let list_rows = plugins.as_ref().map_or(1, |plugins| plugins.len().max(1));
+        let list_y = card_y + card_height + self.settings_section_card_gap();
+        let list_first_row_y = list_y + (first_row_y - card_y);
+        let list_height = self.settings_card_height(list_rows);
+        self.ui.content_scroll.set_extents(
+            self.content_viewport_extent(),
+            self.settings_content_extent(list_y + scroll + list_height),
+        );
+
+        // In the primary colour when it is news: a change refused, or the
+        // host gone, which makes the list below only what was last heard.
+        let (description, description_color) =
+            match (crate::plugins::refused(), crate::plugins::trouble()) {
+                (Some(why), _) => (
+                    settings_tr("settings-plugins-refused", &[("reason", why)]),
+                    palette.text,
+                ),
+                (None, Some(why)) => (
+                    settings_tr("settings-plugins-unavailable", &[("reason", why)]),
+                    palette.text,
+                ),
+                (None, None) => (
+                    crate::i18n::tr("settings-plugins-description"),
+                    palette.secondary_text,
+                ),
+            };
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            title_y,
+            &description,
+            description_color,
+            max_width,
+        )?;
+
+        self.paint_group_card(layers, x, card_y, max_width, card_height)?;
+        self.paint_action_setting_row(
+            layers,
+            row_x,
+            first_row_y,
+            row_width,
+            &crate::i18n::tr("settings-plugins-folder"),
+            &thinkterm_plugin_channel::paths::plugins_dir()
+                .display()
+                .to_string(),
+            &crate::i18n::tr("settings-plugins-open-folder"),
+            SettingsAction::OpenPluginsFolder,
+            false,
+        )?;
+        self.paint_action_setting_row(
+            layers,
+            row_x,
+            first_row_y + row_step,
+            row_width,
+            &crate::i18n::tr("settings-plugins-reload"),
+            &crate::i18n::tr("settings-plugins-reload-description"),
+            &crate::i18n::tr("settings-plugins-reload-button"),
+            SettingsAction::ReloadPlugins,
+            true,
+        )?;
+
+        self.paint_group_card(layers, x, list_y, max_width, list_height)?;
+        self.ui.plugin_switches.clear();
+        let Some(plugins) = plugins.filter(|plugins| !plugins.is_empty()) else {
+            let label = match crate::plugins::trouble() {
+                Some(why) => settings_tr("settings-plugins-unavailable", &[("reason", why)]),
+                None => crate::i18n::tr("settings-plugins-loading"),
+            };
+            return self.draw_text(
+                layers,
+                &body_font,
+                row_x,
+                list_first_row_y,
+                &label,
+                palette.secondary_text,
+                row_width,
+            );
+        };
+        for (index, plugin) in plugins.iter().enumerate() {
+            let y = list_first_row_y + row_step * index as f32;
+            let description = plugin_row_description(plugin);
+            if plugin.builtin {
+                // Its switch is its panel's, among the panels above.
+                self.paint_label_row(
+                    layers,
+                    row_x,
+                    y,
+                    row_width,
+                    &plugin.name,
+                    &description,
+                    index > 0,
+                )?;
+                continue;
+            }
+            if matches!(
+                plugin.state,
+                State::Invalid { .. } | State::Unsupported { .. }
+            ) {
+                // Nothing a switch could do for it.
+                self.paint_setting_row(
+                    layers,
+                    row_x,
+                    y,
+                    row_width,
+                    &plugin.name,
+                    &description,
+                    &crate::i18n::tr("settings-plugins-unusable"),
+                    index > 0,
+                )?;
+                continue;
+            }
+            let key = plugin_key(&plugin.id);
+            let enabled = crate::plugins::switching(&plugin.id).unwrap_or(plugin.enabled);
+            self.ui
+                .plugin_switches
+                .push((key, plugin.id.clone(), enabled));
+            self.paint_toggle_setting_row(
+                layers,
+                row_x,
+                y,
+                row_width,
+                &plugin.name,
+                &description,
+                enabled,
+                SettingsAction::TogglePlugin(key),
                 index > 0,
             )?;
         }
@@ -9571,6 +9855,35 @@ impl SettingsWindow {
             palette.rule,
         )?;
         Ok(())
+    }
+
+    /// A row that only tells: its label and its description, no control.
+    fn paint_label_row(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        label: &str,
+        description: &str,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
+        if draw_top_rule {
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
+        }
+        self.draw_text(layers, &ui_font, x, y, label, palette.text, width)?;
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            self.settings_row_description_y(y),
+            description,
+            palette.secondary_text,
+            width,
+        )
     }
 
     fn paint_setting_row(

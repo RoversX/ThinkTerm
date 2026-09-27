@@ -700,7 +700,7 @@ settings-about-privacy = プライバシー
 settings-about-config-file = 設定ファイル
 settings-about-data-folder = データフォルダ
 # --- サイドバー ------------------------------------------------------------
-settings-section-sidebar = サイドバー
+settings-section-sidebar = サイドバーとプラグイン
 settings-sidebar-description = 右サイドバーに表示するパネルを選びます。すべてオフにするとサイドバー自体が消えます。
 settings-sidebar-files-description = 作業ディレクトリと、SFTP 経由のリモートディレクトリを閲覧します。
 settings-sidebar-notes-description = プロジェクトと一緒に置く Markdown のノートです。
@@ -723,6 +723,27 @@ settings-update-method-system = システムのパッケージマネージャー
 settings-update-method-windows = Windows インストーラーでインストールされています。アップデートは新しいインストーラーをダウンロードして実行します。
 settings-update-method-source = ソースからのビルドです。リポジトリを更新して再ビルドしてください。
 settings-update-method-unknown = このコピーはインストールスクリプトによるものではないため、ThinkTerm は置き換えません。元の方法で更新してください。
+
+# --- プラグイン:設定のプラグインページ ---
+settings-section-plugins = プラグイン
+settings-plugins-description = プラグインは右サイドバーにだけ表示されます。インストールしたものはここでオン・オフ、再読み込みします。
+settings-plugins-folder = プラグインフォルダー
+settings-plugins-open-folder = 開く
+settings-plugins-reload = プラグインを再読み込み
+settings-plugins-reload-description = 追加・削除されたプラグインを見つけ、実行中のプラグインを再起動します。
+settings-plugins-reload-button = 再読み込み
+settings-plugins-builtin = 内蔵
+settings-plugins-builtin-panel = 内蔵 · 右サイドバーの「{ $panel }」パネルを提供します
+settings-plugins-starting = 起動中…
+settings-plugins-running = 実行中
+settings-plugins-crashed = 停止しました：{ $reason }
+settings-plugins-failed = 失敗しました：{ $reason }
+settings-plugins-invalid = 使用できません：{ $reason }
+settings-plugins-unsupported = このシステムでは使用できません
+settings-plugins-unusable = 使用不可
+settings-plugins-loading = プラグインを読み込み中…
+settings-plugins-unavailable = プラグインは利用できません：{ $reason }
+settings-plugins-refused = プラグインを変更できませんでした：{ $reason }
 
 # --- Web: ブラウザからこのマシンの端末へ ---
 settings-section-web = Web

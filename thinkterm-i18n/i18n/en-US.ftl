@@ -715,7 +715,7 @@ settings-about-privacy = Privacy
 settings-about-config-file = Config File
 settings-about-data-folder = Data Folder
 # --- Sidebar ---------------------------------------------------------------
-settings-section-sidebar = Sidebar
+settings-section-sidebar = Sidebar & Plugins
 settings-sidebar-description = Choose which panels the right sidebar offers. Turn them all off and the sidebar goes away.
 settings-sidebar-files-description = Browse the working directory, and remote directories over SFTP.
 settings-sidebar-notes-description = Markdown notes kept alongside the project.
@@ -738,6 +738,27 @@ settings-update-method-system = Installed by the system package manager: install
 settings-update-method-windows = Installed by the Windows installer; installing an update downloads the new installer and runs it.
 settings-update-method-source = This is a build from source: pull the repository and build again.
 settings-update-method-unknown = This copy was not installed by the install script, so ThinkTerm will not replace it; update it the way it was installed.
+
+# --- Plugins: Settings › Plugins ---
+settings-section-plugins = Plugins
+settings-plugins-description = Plugins show only in the right sidebar. Installed ones are switched and reloaded here.
+settings-plugins-folder = Plugins folder
+settings-plugins-open-folder = Open
+settings-plugins-reload = Reload plugins
+settings-plugins-reload-description = Find plugins that were added or removed, and restart the ones that are running.
+settings-plugins-reload-button = Reload
+settings-plugins-builtin = Built in
+settings-plugins-builtin-panel = Built in · Provides the { $panel } panel in the right sidebar
+settings-plugins-starting = Starting…
+settings-plugins-running = Running
+settings-plugins-crashed = Stopped: { $reason }
+settings-plugins-failed = Failed: { $reason }
+settings-plugins-invalid = Can't be used: { $reason }
+settings-plugins-unsupported = Not available on this system
+settings-plugins-unusable = Unavailable
+settings-plugins-loading = Loading plugins…
+settings-plugins-unavailable = Plugins are unavailable: { $reason }
+settings-plugins-refused = The plugin was not changed: { $reason }
 
 # --- Web: browser access to this machine's terminals ---
 settings-section-web = Web

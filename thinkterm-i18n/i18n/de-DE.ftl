@@ -715,7 +715,7 @@ settings-about-privacy = Datenschutz
 settings-about-config-file = Konfigurationsdatei
 settings-about-data-folder = Datenordner
 # --- Seitenleiste ----------------------------------------------------------
-settings-section-sidebar = Seitenleiste
+settings-section-sidebar = Seitenleiste & Plugins
 settings-sidebar-description = Wählen Sie aus, welche Panels die rechte Seitenleiste anbietet. Schalten Sie alle aus, verschwindet die Seitenleiste.
 settings-sidebar-files-description = Durchsuchen Sie das Arbeitsverzeichnis und Remote-Verzeichnisse über SFTP.
 settings-sidebar-notes-description = Markdown-Notizen, die beim Projekt liegen.
@@ -738,6 +738,27 @@ settings-update-method-system = Von der Paketverwaltung des Systems installiert:
 settings-update-method-windows = Vom Windows-Installer installiert; ein Update lädt den neuen Installer herunter und führt ihn aus.
 settings-update-method-source = Dies ist ein Build aus dem Quellcode: Holen Sie das Repository und bauen Sie es erneut.
 settings-update-method-unknown = Diese Kopie wurde nicht vom Installationsskript installiert, deshalb ersetzt ThinkTerm sie nicht; aktualisieren Sie sie so, wie sie installiert wurde.
+
+# --- Plugins: Einstellungen › Plugins ---
+settings-section-plugins = Plugins
+settings-plugins-description = Plugins erscheinen nur in der rechten Seitenleiste. Installierte schalten und laden Sie hier neu.
+settings-plugins-folder = Plugin-Ordner
+settings-plugins-open-folder = Öffnen
+settings-plugins-reload = Plugins neu laden
+settings-plugins-reload-description = Hinzugefügte oder entfernte Plugins finden und laufende Plugins neu starten.
+settings-plugins-reload-button = Neu laden
+settings-plugins-builtin = Integriert
+settings-plugins-builtin-panel = Integriert · Stellt das Panel „{ $panel }“ in der rechten Seitenleiste bereit
+settings-plugins-starting = Wird gestartet …
+settings-plugins-running = Läuft
+settings-plugins-crashed = Angehalten: { $reason }
+settings-plugins-failed = Fehlgeschlagen: { $reason }
+settings-plugins-invalid = Nicht verwendbar: { $reason }
+settings-plugins-unsupported = Auf diesem System nicht verfügbar
+settings-plugins-unusable = Nicht verfügbar
+settings-plugins-loading = Plugins werden geladen …
+settings-plugins-unavailable = Plugins sind nicht verfügbar: { $reason }
+settings-plugins-refused = Das Plugin wurde nicht geändert: { $reason }
 
 # --- Web: die Terminals dieses Rechners im Browser erreichen ---
 settings-section-web = Web

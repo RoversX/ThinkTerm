@@ -468,7 +468,15 @@ pub(crate) struct NativeChromeSettings {
     /// a separate window, so turning one back on is still reachable.
     pub(crate) right_sidebar_files_enabled: Option<bool>,
     pub(crate) right_sidebar_notes_enabled: Option<bool>,
+    /// The Snippets panel's own switch from before Snippets was a plugin.
+    /// Only ever read to carry an "off" over to the plugin's switch, once
+    /// (`plugins::follow_snippets_switch`), and cleared then.
     pub(crate) right_sidebar_snippets_enabled: Option<bool>,
+    /// The Snippets plugin's switch as the plugin host last said it, so the
+    /// panel is offered or not from the start; the host's switch, which the
+    /// panel's in Settings › Sidebar & Plugins flips, is the one that
+    /// counts.
+    pub(crate) snippets_plugin_enabled: Option<bool>,
     /// Feature toggle for agent status detection and the right-sidebar
     /// Agents panel. Absent means on -- it was off by default while the
     /// detection was new, and is a panel toggle like the three above now.
@@ -1366,10 +1374,10 @@ pub(crate) fn right_sidebar_panel_toggles() -> RightSidebarPanelToggles {
     RightSidebarPanelToggles {
         files: settings.chrome.right_sidebar_files_enabled.unwrap_or(true),
         notes: settings.chrome.right_sidebar_notes_enabled.unwrap_or(true),
-        snippets: settings
-            .chrome
-            .right_sidebar_snippets_enabled
-            .unwrap_or(true),
+        // An "off" from before Snippets was a plugin stands until the
+        // plugin's switch has taken it over.
+        snippets: settings.chrome.right_sidebar_snippets_enabled != Some(false)
+            && settings.chrome.snippets_plugin_enabled.unwrap_or(true),
     }
 }
 

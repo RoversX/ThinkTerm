@@ -712,7 +712,7 @@ settings-about-privacy = Confidentialité
 settings-about-config-file = Fichier de configuration
 settings-about-data-folder = Dossier de données
 # --- Barre latérale --------------------------------------------------------
-settings-section-sidebar = Barre latérale
+settings-section-sidebar = Panneaux et extensions
 settings-sidebar-description = Choisissez les panneaux proposés par la barre latérale droite. Désactivez-les tous et elle disparaît.
 settings-sidebar-files-description = Parcourir le répertoire de travail, et les répertoires distants via SFTP.
 settings-sidebar-notes-description = Notes Markdown conservées avec le projet.
@@ -735,6 +735,27 @@ settings-update-method-system = Installé par le gestionnaire de paquets du syst
 settings-update-method-windows = Installé par l'installateur Windows ; la mise à jour télécharge le nouvel installateur et l'exécute.
 settings-update-method-source = Ceci est une compilation depuis les sources : mettez à jour le dépôt et recompilez.
 settings-update-method-unknown = Cette copie n'a pas été installée par le script d'installation ; ThinkTerm ne la remplacera pas. Mettez-la à jour comme elle a été installée.
+
+# --- Extensions : Réglages › Extensions ---
+settings-section-plugins = Extensions
+settings-plugins-description = Les extensions ne s'affichent que dans la barre latérale droite. Celles installées se règlent ici.
+settings-plugins-folder = Dossier des extensions
+settings-plugins-open-folder = Ouvrir
+settings-plugins-reload = Recharger les extensions
+settings-plugins-reload-description = Trouver les extensions ajoutées ou supprimées, et redémarrer celles qui tournent.
+settings-plugins-reload-button = Recharger
+settings-plugins-builtin = Intégrée
+settings-plugins-builtin-panel = Intégré · Fournit le panneau « { $panel } » de la barre latérale droite
+settings-plugins-starting = Démarrage…
+settings-plugins-running = En cours d'exécution
+settings-plugins-crashed = Arrêtée : { $reason }
+settings-plugins-failed = En échec : { $reason }
+settings-plugins-invalid = Inutilisable : { $reason }
+settings-plugins-unsupported = Indisponible sur ce système
+settings-plugins-unusable = Indisponible
+settings-plugins-loading = Chargement des extensions…
+settings-plugins-unavailable = Les extensions sont indisponibles : { $reason }
+settings-plugins-refused = L'extension n'a pas été modifiée : { $reason }
 
 # --- Web : accéder à ces terminaux depuis un navigateur ---
 settings-section-web = Web

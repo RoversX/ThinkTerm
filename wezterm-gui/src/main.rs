@@ -55,6 +55,7 @@ mod native_paths;
 mod native_settings;
 mod overlay;
 mod perf;
+mod plugins;
 mod quad;
 mod renderstate;
 mod resize_increment_calculator;
