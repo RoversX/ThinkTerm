@@ -1,8 +1,11 @@
 <script lang="ts">
-  // The desktop's right-hand Agents panel: one row per pane a coding agent
-  // runs in, with its live state. What `agent_panel.rs` paints, from the
-  // rows the wasm publishes (thinkterm-web/src/agents.rs); a click on a row
-  // brings that pane on show.
+  // The desktop's right-hand panel: its Agents tab, one row per pane a
+  // coding agent runs in with its live state, as `agent_panel.rs` paints
+  // it from the rows the wasm publishes (thinkterm-web/src/agents.rs), a
+  // click on a row bringing that pane on show; and its Snippets tab
+  // (SnippetsBar, SnippetsList).
+  import SnippetsBar from './SnippetsBar.svelte';
+  import SnippetsList from './SnippetsList.svelte';
   import { handle } from './client';
   import { refreshViews, s, views } from './client.svelte';
   import { agentIcon, circleAlert, circleCheck, iconByName, loaderCircle } from './icons';
@@ -12,6 +15,7 @@
   // (thinkterm-web/src/agents.rs `panel_tabs`); drawn here.
   const tabs = $derived(views.agents.tabs);
   const active = $derived(views.agents.active);
+  const heading = $derived(tabs.find((tab) => tab.id === active)?.label ?? s('web-agents-title'));
 
   const rows = $derived(views.agents.rows);
   const summary = $derived(views.agents.summary);
@@ -26,11 +30,23 @@
     };
   });
 
+  // What the panel shows is followed only while it is up: the snippets,
+  // and the server's connection to the plugin host for them, go with it.
+  $effect(() => {
+    handle.client?.set_right_panel_shown(true);
+    return () => handle.client?.set_right_panel_shown(false);
+  });
+
   // A click anywhere in a row is that row's, as it is on the desktop: the
   // whole row is the target, not a button inside it.
   function onClick(ev: MouseEvent) {
     const target = ev.target;
     if (!(target instanceof Element)) return;
+    const mode = target.closest('.mode:not(.off)')?.getAttribute('data-mode');
+    if (mode) {
+      if (mode !== active && handle.client?.set_right_panel(mode)) refreshViews();
+      return;
+    }
     const raw = target.closest('.ag')?.getAttribute('data-pane');
     if (raw === null || raw === undefined) return;
     const pane = Number(raw);
@@ -131,7 +147,7 @@
 >
   <div class="handle"></div>
   <div class="hd">
-    <span class="ti">{s('web-agents-title')}</span>
+    <span class="ti">{heading}</span>
     <!-- The desktop's selector: four segments, the active one a filled pill
          carrying its label, the rest icon-only. -->
     <div class="modes" role="tablist">
@@ -148,8 +164,15 @@
         >{@html iconByName(tab.icon) ?? ''}{#if tab.id === active}<span class="ml">{tab.label}</span>{/if}</span>
       {/each}
     </div>
-    <span class="sum">{summary}</span>
+    {#if active === 'snippets'}
+      <SnippetsBar />
+    {:else}
+      <span class="sum">{summary}</span>
+    {/if}
   </div>
+  {#if active === 'snippets'}
+    <SnippetsList />
+  {:else}
   <div class="list">
     {#each rows as row (row.pane)}
       <div class="ag" class:elsewhere={!row.here} data-pane={row.pane} title={row.place}>
@@ -168,4 +191,5 @@
       </div>
     {/each}
   </div>
+  {/if}
 </aside>

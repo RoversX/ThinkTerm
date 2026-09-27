@@ -23,6 +23,7 @@ use thinkterm_render::pipeline::GpuTexture;
 use thinkterm_render::quad::HeapQuadAllocator;
 use thinkterm_render::vertex::Vertex;
 use thinkterm_session::pane::PaneSession;
+use thinkterm_snippets::wire as snippets_wire;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::input::{MouseButton, MouseEvent, MouseEventKind};
 use wezterm_term::{KeyModifiers, StableRowIndex, TerminalSize};
@@ -164,6 +165,11 @@ impl Selection {
 /// hammered.
 const RECONNECT_MIN_MS: f64 = 500.0;
 const RECONNECT_MAX_MS: f64 = 15_000.0;
+/// How long a call to the plugin host waits for its answer.
+const PLUGIN_CALL_TIMEOUT_MS: f64 = 10_000.0;
+/// How long a snippet's Run or Paste waits for its text: a command that
+/// arrives later than this is not the one the press was for.
+const SNIPPET_SEND_WAIT_MS: f64 = 3_000.0;
 /// After this many failed attempts the status line stops saying
 /// "reconnecting" and admits it may never work.
 const RECONNECT_DOUBT_AFTER: u32 = 6;
@@ -409,6 +415,13 @@ pub struct Inner<P: Platform, L: Link> {
     after_take_over: Option<AfterTakeOver>,
     /// How the last ask for the terminal went, for the card to say.
     claim: Claim,
+    /// The right panel's tab on show (`agents.rs` `panel_tabs`), and
+    /// whether the page has the panel up at all.
+    right_panel: &'static str,
+    right_panel_shown: bool,
+    snippets: crate::snippets::SnippetsModel,
+    /// Calls to the plugin host waiting for their answers.
+    plugin_calls: crate::plugins::PluginCalls,
 }
 
 /// One pane's own font: its scale over the page's size, and what draws it.
@@ -631,6 +644,10 @@ impl<P: Platform, L: Link> App<P, L> {
             closing_since: None,
             after_take_over: None,
             claim: Claim::Idle,
+            right_panel: "agents",
+            right_panel_shown: false,
+            snippets: Default::default(),
+            plugin_calls: Default::default(),
         };
         let app = Rc::new(Self {
             platform: setup.platform,
@@ -1221,6 +1238,11 @@ impl<P: Platform, L: Link> App<P, L> {
                 self.refresh_status();
                 self.request_frame();
             }
+            // The plugin host, through the server; see `plugin_frame`.
+            Pdu::PluginFrame(codec::PluginFrame { data }) => {
+                drop(inner);
+                self.plugin_frame(data);
+            }
             Pdu::SetClipboard(clip) => {
                 // Every pane on the server pushes to every client. Only a
                 // pane this page shows may write the device's clipboard,
@@ -1243,6 +1265,9 @@ impl<P: Platform, L: Link> App<P, L> {
                 return;
             }
             inner.disconnected = Some(reason.clone());
+            // The server's connection to the plugin host went with it.
+            inner.snippets.connection_lost();
+            inner.plugin_calls.lost("the connection to the server closed");
             // The connection that just died settles its own backoff here:
             // one that held for a while earns the short delay back, one
             // that did not keeps the long one. Left set, a frame drawn
@@ -1348,6 +1373,7 @@ impl<P: Platform, L: Link> App<P, L> {
         match outcome {
             Ok(list) => {
                 self.reconnected();
+                self.snippets_follow();
                 // The tab is laid out again from the fresh listing: panes
                 // that came or went while the socket was down are taken
                 // up or let go, and the ones that stayed keep their cells.
@@ -3853,7 +3879,246 @@ impl<P: Platform, L: Link> App<P, L> {
         });
         let summary = crate::agents::summary(&rows);
         let tabs = crate::agents::panel_tabs();
-        crate::agents::AgentsView { rows, summary, tabs, active: "agents" }
+        crate::agents::AgentsView { rows, summary, tabs, active: inner.right_panel }
+    }
+
+    /// Show a tab of the right panel by its id. False for one the page
+    /// does not offer.
+    pub fn set_right_panel(self: &Rc<Self>, id: &str) -> bool {
+        let Some(tab) = crate::agents::panel_tabs().into_iter().find(|tab| tab.id == id && tab.available) else {
+            return false;
+        };
+        self.inner.borrow_mut().right_panel = tab.id;
+        self.snippets_follow();
+        true
+    }
+
+    /// The page put the right panel up, or took it down.
+    pub fn set_right_panel_shown(self: &Rc<Self>, shown: bool) {
+        self.inner.borrow_mut().right_panel_shown = shown;
+        self.snippets_follow();
+    }
+
+    /// Follow the snippets while their tab is on show, and let them and
+    /// the server's connection to the plugin host go when it is not.
+    fn snippets_follow(self: &Rc<Self>) {
+        let (ask, close) = {
+            let inner = &mut *self.inner.borrow_mut();
+            let wanted = inner.right_panel_shown && inner.right_panel == "snippets";
+            if !wanted {
+                (false, inner.snippets.close())
+            } else if inner.disconnected.is_some() {
+                // Asked for once the connection is back.
+                (false, false)
+            } else {
+                inner.snippets.open();
+                (true, false)
+            }
+        };
+        if ask {
+            self.snippets_list();
+        }
+        if close {
+            self.send_plugin_frame(Vec::new(), None);
+        }
+        Self::notify(&self.inner.borrow());
+    }
+
+    /// One frame for the plugin host, through the server, on the wire now
+    /// and so behind every frame sent before it. The call it carries, if
+    /// any, fails when the server cannot pass it on.
+    fn send_plugin_frame(self: &Rc<Self>, data: Vec<u8>, call: Option<u64>) {
+        let answer = {
+            let inner = &mut *self.inner.borrow_mut();
+            if inner.disconnected.is_some() {
+                if let Some(call) = call {
+                    inner.plugin_calls.fail(call, "not connected to the server");
+                }
+                return;
+            }
+            inner.link.request(Pdu::PluginFrame(codec::PluginFrame { data }))
+        };
+        let app = Rc::clone(self);
+        self.spawn(async move {
+            let refused = match answer.await {
+                Ok(Pdu::UnitResponse(_)) => return,
+                Ok(Pdu::ErrorResponse(err)) => err.reason,
+                Ok(other) => format!("unexpected answer {}", other.pdu_name()),
+                Err(err) => format!("{err:#}"),
+            };
+            log::warn!("plugin channel: {refused}");
+            if let Some(call) = call {
+                app.inner.borrow_mut().plugin_calls.fail(call, &refused);
+            }
+        });
+    }
+
+    /// Ask a plugin on the server's machine: its answer, or why there is
+    /// none. A host that does not answer in time is given up on, so a save
+    /// or a list never waits for good.
+    async fn plugin_call(self: &Rc<Self>, plugin: &str, body: serde_json::Value) -> crate::plugins::Answer {
+        let (id, frame, answer) = self.inner.borrow_mut().plugin_calls.call(plugin, body);
+        self.send_plugin_frame(frame, Some(id));
+        let weak = Rc::downgrade(self);
+        self.platform.set_timeout(
+            PLUGIN_CALL_TIMEOUT_MS,
+            Box::new(move || {
+                if let Some(app) = weak.upgrade() {
+                    app.inner.borrow_mut().plugin_calls.fail(id, "the plugin host did not answer in time");
+                }
+            }),
+        );
+        answer.await.unwrap_or_else(|_| Err("the call was dropped".into()))
+    }
+
+    /// A frame from the plugin host, through the server: an answer, an
+    /// event, or -- empty -- word that the server's connection to the host
+    /// closed. The snippets are then asked for again, after a pause that
+    /// grows while the host keeps going away.
+    fn plugin_frame(self: &Rc<Self>, data: Vec<u8>) {
+        if data.is_empty() {
+            let delay = {
+                let inner = &mut *self.inner.borrow_mut();
+                let again = inner.snippets.host_gone().then(|| inner.snippets.retry_delay_ms());
+                inner.plugin_calls.lost("the plugin host went away");
+                again
+            };
+            if let Some(delay) = delay {
+                let weak = Rc::downgrade(self);
+                self.platform.set_timeout(
+                    delay,
+                    Box::new(move || {
+                        if let Some(app) = weak.upgrade() {
+                            app.snippets_follow();
+                        }
+                    }),
+                );
+            }
+            Self::notify(&self.inner.borrow());
+            return;
+        }
+        let event = self.inner.borrow_mut().plugin_calls.heard(&data);
+        if let Some((plugin, body)) = event {
+            let changed = plugin == snippets_wire::PLUGIN
+                && matches!(serde_json::from_value(body), Ok(snippets_wire::Event::Changed));
+            if changed {
+                self.inner.borrow_mut().snippets.snippets_changed();
+                self.snippets_list();
+            }
+        }
+    }
+
+    /// Ask the plugin host for the rows the tab's search matches: one
+    /// request at a time, the newest search asked for once it lands.
+    fn snippets_list(self: &Rc<Self>) {
+        let Some(query) = self.inner.borrow_mut().snippets.next_list() else {
+            return;
+        };
+        let app = Rc::clone(self);
+        self.spawn(async move {
+            let answer = app.snippets_call(snippets_wire::Request::List { query: query.clone() }).await;
+            app.inner.borrow_mut().snippets.listed(query, answer);
+            // The search may have moved on while this was out.
+            app.snippets_list();
+            Self::notify(&app.inner.borrow());
+        });
+    }
+
+    async fn snippets_call(self: &Rc<Self>, request: snippets_wire::Request) -> crate::plugins::Answer {
+        let body = serde_json::to_value(request).expect("a snippets request always serialises");
+        self.plugin_call(snippets_wire::PLUGIN, body).await
+    }
+
+    /// The Snippets tab: JSON `SnippetsView`.
+    pub fn snippets_view(&self) -> crate::snippets::SnippetsView {
+        self.inner.borrow().snippets.view()
+    }
+
+    pub fn snippets_revision(&self) -> u64 {
+        self.inner.borrow().snippets.revision()
+    }
+
+    /// The search box: the plugin host is asked what it matches.
+    pub fn snippets_search(self: &Rc<Self>, query: &str) {
+        self.inner.borrow_mut().snippets.set_query(query);
+        self.snippets_list();
+        Self::notify(&self.inner.borrow());
+    }
+
+    /// A snippet whole, for the editor: JSON `Snippet`, or `null`.
+    pub async fn snippet(self: &Rc<Self>, id: String) -> String {
+        match self.snippets_call(snippets_wire::Request::Get { id }).await {
+            Ok(body) => body.to_string(),
+            Err(why) => {
+                log::warn!("snippets: {why}");
+                "null".to_string()
+            }
+        }
+    }
+
+    /// Save what the editor holds, as the plugin host decides: JSON
+    /// `Saved`, or an `error` outcome with its message.
+    pub async fn snippet_save(self: &Rc<Self>, id: Option<String>, title: String, body: String) -> String {
+        match self.snippets_call(snippets_wire::Request::Save { id, title, body }).await {
+            Ok(body) => body.to_string(),
+            Err(message) => serde_json::json!({ "outcome": "error", "message": message }).to_string(),
+        }
+    }
+
+    pub async fn snippet_delete(self: &Rc<Self>, id: String) -> bool {
+        match self.snippets_call(snippets_wire::Request::Delete { id }).await {
+            Ok(serde_json::Value::Bool(deleted)) => deleted,
+            Ok(_) => false,
+            Err(why) => {
+                log::warn!("snippets: {why}");
+                false
+            }
+        }
+    }
+
+    /// A snippet into the focused pane, as the plugin host says to send
+    /// it: pasted, or typed and run. Into the pane focused at the press,
+    /// never whichever is focused when the answer comes, and not at all
+    /// once that pane is off the page or the answer comes too late to still
+    /// be what was meant.
+    pub async fn snippet_paste(self: &Rc<Self>, id: String, run: bool) -> bool {
+        let (pane, pressed) = {
+            let inner = self.inner.borrow();
+            (inner.focused_pane, inner.platform.monotonic_ms())
+        };
+        let text = match self.snippets_call(snippets_wire::Request::Text { id, run }).await {
+            Ok(serde_json::Value::String(text)) => text,
+            Ok(_) => return false,
+            Err(why) => {
+                log::warn!("snippets: {why}");
+                return false;
+            }
+        };
+        if self.platform.monotonic_ms() - pressed > SNIPPET_SEND_WAIT_MS {
+            log::warn!("not sending a snippet: its text came too late");
+            return false;
+        }
+        self.send_snippet_to(pane, &text, !run)
+    }
+
+    /// `text` into `pane`, if it is still on the page and this page may type:
+    /// as a paste, or as typed keys.
+    fn send_snippet_to(&self, pane: PaneId, text: &str, paste: bool) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if inner.disconnected.is_some() || !Self::may_type(&inner) {
+            return false;
+        }
+        let platform = Rc::clone(&inner.platform);
+        let Some(cell) = inner.panes.get_mut(&pane) else {
+            return false;
+        };
+        cell.scroll_from_bottom = 0;
+        cell.scroll_px = 0.0;
+        let start = if paste { cell.session.paste(text) } else { cell.session.write_bytes(text.as_bytes()) };
+        Self::spawn_drain(&platform, &cell.session, start);
+        drop(inner);
+        self.request_frame();
+        true
     }
 
     /// Bring an agent's pane on show: switch to it here, or open the

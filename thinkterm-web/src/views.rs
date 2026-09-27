@@ -159,6 +159,18 @@ pub const STRING_KEYS: &[&str] = &[
     "common-reset",
     "web-tip-new-pane",
     "command-palette-empty",
+    "right-new-snippet",
+    "right-edit-snippet",
+    "right-search",
+    "right-run",
+    "menu-paste",
+    "right-save",
+    "right-cancel",
+    "right-action-description",
+    "right-action-description-placeholder",
+    "right-script-required",
+    "right-script-placeholder",
+    "web-tip-delete-snippet",
 ];
 
 pub fn strings() -> std::collections::BTreeMap<&'static str, String> {

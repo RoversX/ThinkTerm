@@ -4,7 +4,7 @@
 
 import { flushSync } from 'svelte';
 import { handle, type Client } from './client';
-import type { AgentsView, NavsView, SidebarView, StatusView, Strings, TabsView, WebSettings } from './model';
+import type { AgentsView, NavsView, SidebarView, SnippetsView, StatusView, Strings, TabsView, WebSettings } from './model';
 
 export const views = $state({
   tabs: null as TabsView | null,
@@ -16,6 +16,8 @@ export const views = $state({
   } as SidebarView,
   /** The right-hand panel's rows, whether it is on show or not. */
   agents: { rows: [], summary: '', tabs: [], active: 'agents' } as AgentsView,
+  /** The right panel's Snippets tab; loading until it is first on show. */
+  snippets: { state: 'loading', reason: null, rows: [], query: '', empty: '', answers: null, asked: 0, revision: 0 } as SnippetsView,
   /** The page's own preferences, as the wasm holds them (settings.rs). */
   settings: {
     language: 'system',
@@ -62,12 +64,16 @@ export function attach(client: Client) {
   let lastStrings = '';
   let lastSidebar = '';
   let lastAgents = '';
+  // The snippets can be long; their view is read only when it moved.
+  let lastSnippets = -1;
   let lastSettings = '';
   const read = () => {
     const strings = client.strings();
     if (strings !== lastStrings) {
       lastStrings = strings;
       views.strings = JSON.parse(strings) as Strings;
+      // Its words are in the language too.
+      lastSnippets = -1;
     }
     const tabs = client.tabs();
     if (tabs !== lastTabs) {
@@ -93,6 +99,11 @@ export function attach(client: Client) {
     if (agents !== lastAgents) {
       lastAgents = agents;
       views.agents = JSON.parse(agents) as AgentsView;
+    }
+    const snippets = client.snippets_revision();
+    if (snippets !== lastSnippets) {
+      lastSnippets = snippets;
+      views.snippets = JSON.parse(client.snippets()) as SnippetsView;
     }
     const settings = client.settings();
     if (settings !== lastSettings) {

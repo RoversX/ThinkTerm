@@ -203,6 +203,28 @@ export type PanelTab = {
 
 export type AgentsView = { rows: AgentRow[]; summary: string; tabs: PanelTab[]; active: string };
 
+// The right panel's Snippets tab (thinkterm-web/src/snippets.rs
+// `SnippetsView`): the snippets the plugin host keeps, filtered by the
+// search, as the desktop's panel lists them.
+
+export type SnippetRow = { id: string; title: string; preview: string };
+
+export type SnippetsView = {
+  /** `loading` until the host has sent them; `unavailable` when this
+      server cannot reach a plugin host, with `reason`. */
+  state: 'loading' | 'ready' | 'unavailable';
+  reason: string | null;
+  rows: SnippetRow[];
+  query: string;
+  /** What an empty list says. */
+  empty: string;
+  /** The search the rows answer: `query`, once they have caught up. */
+  answers: string | null;
+  /** How many times the rows were asked for, for probes. */
+  asked: number;
+  revision: number;
+};
+
 // The page's own preferences (thinkterm-web/src/settings.rs `WebSettings`),
 // whose JSON names are kebab-case.
 

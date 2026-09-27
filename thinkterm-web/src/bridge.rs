@@ -117,6 +117,63 @@ impl Client {
         self.app.agent_reveal(pane as usize)
     }
 
+    /// Show the right panel's tab `id` ("agents", "snippets"). False for
+    /// one the page does not offer.
+    pub fn set_right_panel(&self, id: String) -> bool {
+        self.app.set_right_panel(&id)
+    }
+
+    /// The page put the right panel up (`true`) or took it down.
+    pub fn set_right_panel_shown(&self, shown: bool) {
+        self.app.set_right_panel_shown(shown);
+    }
+
+    /// The Snippets tab: JSON `SnippetsView`.
+    pub fn snippets(&self) -> String {
+        json(&self.app.snippets_view())
+    }
+
+    /// Changes when `snippets()` would, so the page reads it only then.
+    pub fn snippets_revision(&self) -> u32 {
+        self.app.snippets_revision() as u32
+    }
+
+    pub fn snippets_search(&self, query: String) {
+        self.app.snippets_search(&query);
+    }
+
+    /// A snippet for the editor: a promise of JSON `{id, title, body}`, or
+    /// `null`.
+    pub fn snippet(&self, id: String) -> js_sys::Promise {
+        let app = Rc::clone(&self.app);
+        wasm_bindgen_futures::future_to_promise(async move { Ok(JsValue::from_str(&app.snippet(id).await)) })
+    }
+
+    /// Save what the editor holds, a new snippet when `id` is absent: a
+    /// promise of JSON `{outcome}` -- `saved` (with `id`), `empty`, `gone`,
+    /// or `error` (with `message`).
+    pub fn snippet_save(&self, id: Option<String>, title: String, body: String) -> js_sys::Promise {
+        let app = Rc::clone(&self.app);
+        wasm_bindgen_futures::future_to_promise(async move {
+            Ok(JsValue::from_str(&app.snippet_save(id, title, body).await))
+        })
+    }
+
+    /// A promise of whether there was such a snippet to delete.
+    pub fn snippet_delete(&self, id: String) -> js_sys::Promise {
+        let app = Rc::clone(&self.app);
+        wasm_bindgen_futures::future_to_promise(async move { Ok(JsValue::from_bool(app.snippet_delete(id).await)) })
+    }
+
+    /// Paste a snippet into the focused pane, or type it and run it: a
+    /// promise of whether anything was sent.
+    pub fn snippet_paste(&self, id: String, run: bool) -> js_sys::Promise {
+        let app = Rc::clone(&self.app);
+        wasm_bindgen_futures::future_to_promise(async move {
+            Ok(JsValue::from_bool(app.snippet_paste(id, run).await))
+        })
+    }
+
     /// The languages the page can be set to: JSON `[{preference, label}]`,
     /// "system" first, labelled in the active locale.
     pub fn languages(&self) -> String {

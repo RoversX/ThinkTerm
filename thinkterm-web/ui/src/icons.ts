@@ -3,6 +3,7 @@
 // colour from CSS `color` and its size from CSS.
 
 import archive from '../../../third_party/lucide/icons/archive.svg?raw';
+import arrowLeft from '../../../third_party/lucide/icons/arrow-left.svg?raw';
 import archiveRestore from '../../../third_party/lucide/icons/archive-restore.svg?raw';
 import bell from '../../../third_party/lucide/icons/bell.svg?raw';
 import info from '../../../third_party/lucide/icons/info.svg?raw';
@@ -59,6 +60,7 @@ import brandCopilot from '../../../third_party/simple-icons/icons/githubcopilot.
 
 export {
   archive,
+  arrowLeft,
   archiveRestore,
   bell,
   bot,

@@ -49,10 +49,13 @@ pub struct AgentsView {
 }
 
 /// The panel's sections, in the desktop's order, but only those the page
-/// can open: a button for a feature the browser lacks is noise. Files,
-/// Notes and Code join here when they get a wire.
+/// can open: a button for a feature the browser lacks is noise. Files and
+/// Notes join here when they get a wire.
 pub fn panel_tabs() -> Vec<PanelTab> {
-    [("agents", "bot", "right-mode-agents")]
+    [
+        ("snippets", "code-xml", "right-mode-snippets"),
+        ("agents", "bot", "right-mode-agents"),
+    ]
         .into_iter()
         .map(|(id, icon, key)| {
             let label = tr(key);
@@ -64,9 +67,9 @@ pub fn panel_tabs() -> Vec<PanelTab> {
 #[cfg(test)]
 mod panel_tests {
     #[test]
-    fn only_agents_is_available_in_a_browser() {
+    fn snippets_and_agents_are_available_in_a_browser() {
         let tabs = super::panel_tabs();
-        assert!(tabs.iter().map(|t| t.id).eq(["agents"]));
+        assert!(tabs.iter().map(|t| t.id).eq(["snippets", "agents"]));
         assert!(tabs.iter().all(|t| t.available));
     }
 }

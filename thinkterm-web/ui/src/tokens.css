@@ -232,6 +232,47 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 #agents .st.spin { color: var(--open); }
 #agents .st.alert { color: var(--warn); }
 #agents .st.idle { color: var(--muted); }
+/* A tab of the selector that can be opened lifts under the pointer. */
+#agents .mode:not(.on):not(.off):hover { color: var(--text); }
+/* The Snippets tab (SnippetsBar, SnippetsList), as the desktop draws it:
+   a toolbar line of search and new-snippet button, then rounded cards of
+   a title and the first line of the script, whose Run, Paste and delete
+   come up under the pointer. */
+#agents .sbar { display: flex; align-items: center; gap: 6px; min-height: 32px; margin-top: 6px; }
+#agents .sb-search { display: flex; align-items: center; gap: 6px; flex: 1 1 auto; min-width: 0; height: 30px; box-sizing: border-box; padding: 0 9px; border-radius: 999px; background: var(--btn); border: 1px solid var(--btn-border); color: var(--muted); }
+#agents .sb-glass { display: inline-flex; flex: none; }
+#agents .sb-glass svg { width: 14px; height: 14px; }
+#agents .sb-search input { flex: 1 1 auto; min-width: 0; background: transparent; border: 0; outline: none; color: var(--text); font: 500 13px var(--ui); user-select: text; -webkit-user-select: text; }
+#agents .sb-search input::-webkit-search-cancel-button { display: none; }
+#agents .sb-icon { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 30px; height: 30px; box-sizing: border-box; border-radius: 999px; background: var(--btn); border: 1px solid var(--btn-border); color: var(--text2); padding: 0; transition: var(--fade); }
+#agents .sb-icon:hover { background: var(--btn-hover); color: var(--text); }
+#agents .sb-icon svg { width: 15px; height: 15px; }
+#agents .sb-title { flex: 1 1 auto; min-width: 0; color: var(--text); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#agents .sb-save { flex: none; height: 30px; padding: 0 14px; border-radius: 999px; background: var(--accent); border: 0; color: #fff; font: 600 13px var(--ui); }
+/* The toolbar line sits 6px lower than the summary it replaces. */
+#agents .list.snippets, #agents .list.snippet-editor { top: 122px; }
+#agents .list.snippets { gap: 8px; }
+#agents .sn { display: flex; flex-direction: column; gap: 6px; flex: none; box-sizing: border-box; padding: 10px 12px; border-radius: 14px; background: var(--btn); border: 1px solid var(--btn-border); transition: var(--fade); }
+#agents .sn:hover { background: var(--btn-hover); border-color: var(--ctl-border); }
+#agents .sn-top { display: flex; align-items: center; gap: 6px; min-height: 26px; }
+#agents .sn-title { flex: 1 1 auto; min-width: 0; color: var(--text); line-height: 20px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#agents .sn-actions { display: none; flex: none; gap: 5px; }
+#agents .sn:hover .sn-actions, #agents .sn:focus-within .sn-actions { display: inline-flex; }
+#agents .sn-btn { display: inline-flex; align-items: center; justify-content: center; height: 26px; min-width: 26px; box-sizing: border-box; padding: 0 9px; border-radius: 999px; background: var(--ctl); border: 1px solid var(--ctl-border); color: var(--text); font: 500 12px var(--ui); transition: var(--fade); }
+#agents .sn-btn:hover { background: var(--ctl-hover); }
+#agents .sn-del { padding: 0; width: 26px; color: var(--text2); }
+#agents .sn-del svg { width: 14px; height: 14px; }
+#agents .sn-del.armed { width: auto; padding: 0 9px; color: var(--danger); }
+#agents .sn-preview { color: var(--muted); font-size: 13px; line-height: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#agents .sn-empty { display: flex; align-items: center; gap: 10px; min-height: 56px; box-sizing: border-box; padding: 0 14px; border-radius: 14px; background: var(--btn); border: 1px solid var(--btn-border); color: var(--muted); }
+#agents .sn-empty .ic { color: var(--muted); }
+#agents .sn-empty-t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#agents .snippet-editor { gap: 6px; }
+#agents .se-label { color: var(--muted); font-size: 12px; margin-top: 6px; }
+#agents .se-field { box-sizing: border-box; width: 100%; font: 400 14px var(--ui); color: var(--text); background: var(--ctl); border: 1px solid var(--ctl-border); border-radius: 9px; padding: 8px 10px; outline: none; user-select: text; -webkit-user-select: text; transition: var(--fade); }
+#agents .se-field:focus { border-color: var(--edge); }
+#agents .se-body { min-height: 180px; flex: none; resize: vertical; font: 400 13px ui-monospace, "SF Mono", Menlo, monospace; line-height: 1.45; white-space: pre; overflow: auto; }
+#agents .se-body.want { border-color: var(--danger); }
 .nav { position: absolute; pointer-events: auto; box-sizing: border-box; display: flex; align-items: center; gap: 9px; padding: 0 5px; background: var(--bg); color: var(--text2); user-select: none; overflow: hidden; }
 .nav.focused { color: var(--text); }
 .nav .caps { display: flex; gap: 9px; flex: 1 1 auto; min-width: 0; overflow: hidden; }
@@ -485,6 +526,9 @@ body[data-mobile] #agents { padding-right: var(--safe-r); }
 /* Their edges are dragged with a pointer, which a phone has not got. */
 body[data-mobile] #side .handle,
 body[data-mobile] #agents .handle { display: none; }
+/* No pointer to hover with: a snippet's buttons stay up. */
+body[data-mobile] #agents .sn-actions { display: inline-flex; }
+@media (hover: none) { #agents .sn-actions { display: inline-flex; } }
 /* A row, a button and a footer icon a thumb can hit. The list's insets and
    the panel's rhythm are the desktop's; only the heights grow. */
 body[data-mobile] #side .row { min-height: 44px; }
