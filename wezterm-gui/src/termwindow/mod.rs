@@ -2851,6 +2851,11 @@ pub struct TermWindow {
     right_sidebar_snippet_body: TextInputState,
     right_sidebar_snippet_scroll_offset: f32,
     right_sidebar_snippet_scrollbar_visible_until: Option<Instant>,
+    /// This window's view of the snippets: the rows the plugin host sent
+    /// for its search, and when to ask again.
+    right_sidebar_snippet_listing: thinkterm_snippets::view::Listing,
+    /// A save from this window's editor is on its way.
+    right_sidebar_snippet_saving: bool,
     right_sidebar_note: crate::markdown_editor::NoteHostState,
     right_sidebar_note_view: RightSidebarNoteView,
     right_sidebar_note_vault_index_root: Option<PathBuf>,
@@ -4388,6 +4393,8 @@ impl TermWindow {
             right_sidebar_snippet_body: TextInputState::new(),
             right_sidebar_snippet_scroll_offset: 0.0,
             right_sidebar_snippet_scrollbar_visible_until: None,
+            right_sidebar_snippet_listing: Default::default(),
+            right_sidebar_snippet_saving: false,
             right_sidebar_note: crate::markdown_editor::NoteHostState::default(),
             right_sidebar_note_view: RightSidebarNoteView::Editor,
             right_sidebar_note_vault_index_root: None,

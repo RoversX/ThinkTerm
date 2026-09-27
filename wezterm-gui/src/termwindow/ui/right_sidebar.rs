@@ -344,6 +344,9 @@ const FILE_INDEX_ENTRY_LIMIT: usize = thinkterm_file_index::ENTRY_LIMIT;
 // buffers are released. Reopening within this window keeps everything resident.
 const FILE_INDEX_IDLE_RELEASE_SECS: u64 = 30;
 const NOTE_IDLE_RELEASE_SECS: u64 = 30;
+/// How long a snippet's Run or Paste waits for its text: a command that
+/// arrives later than this is not the one the press was for.
+const SNIPPET_SEND_WAIT: Duration = Duration::from_secs(3);
 // How often the Files panel re-scans the tree while it's visible + focused.
 const FILE_INDEX_RESCAN_SECS: u64 = 90;
 // Max number of (root, project) view-state snapshots kept in memory.
@@ -2379,10 +2382,19 @@ impl crate::TermWindow {
         self.right_sidebar_snippet_focus = Some(RightSidebarSnippetField::Title);
     }
 
+    /// Opens the editor on a snippet once the plugin host has sent it.
     pub(crate) fn open_existing_snippet_editor(&mut self, id: &str) {
-        let Some(snippet) = crate::snippets::get_snippet(id) else {
+        let Some(window) = self.window.clone() else {
             return;
         };
+        crate::snippets::open(id, window, |term_window, snippet| {
+            if let Some(snippet) = snippet {
+                term_window.show_snippet_editor(snippet);
+            }
+        });
+    }
+
+    fn show_snippet_editor(&mut self, snippet: crate::snippets::Snippet) {
         if self.right_sidebar_mode == RightSidebarMode::Tasks {
             self.clear_right_sidebar_text_focus();
             self.schedule_right_sidebar_note_memory_release();
@@ -2403,35 +2415,100 @@ impl crate::TermWindow {
         self.right_sidebar_snippet_body.clear();
     }
 
+    /// Hands what the editor holds to the plugin host, which decides what
+    /// comes of it; the editor follows its answer.
     pub(crate) fn save_snippet_editor(&mut self) {
-        let body = self.right_sidebar_snippet_body.text().trim().to_string();
-        if body.is_empty() {
-            self.right_sidebar_snippet_focus = Some(RightSidebarSnippetField::Body);
+        let editing = self.right_sidebar_snippet_view.clone();
+        let id = match &editing {
+            RightSidebarSnippetView::List => return,
+            RightSidebarSnippetView::EditNew => None,
+            RightSidebarSnippetView::EditExisting(id) => Some(id.clone()),
+        };
+        // A second press waits for the first one's answer rather than
+        // saving a new snippet twice.
+        if self.right_sidebar_snippet_saving {
             return;
         }
-        let title = self.right_sidebar_snippet_title.text().trim().to_string();
-        let result = match self.right_sidebar_snippet_view.clone() {
-            RightSidebarSnippetView::List => return,
-            RightSidebarSnippetView::EditNew => {
-                crate::snippets::create_snippet(title, body).map(Some)
-            }
-            RightSidebarSnippetView::EditExisting(id) => {
-                crate::snippets::update_snippet(&id, title, body)
-            }
+        let Some(window) = self.window.clone() else {
+            return;
         };
-        match result {
-            Ok(Some(_)) => self.close_snippet_editor(),
-            Ok(None) => {
-                self.right_sidebar_snippet_view = RightSidebarSnippetView::EditNew;
+        self.right_sidebar_snippet_saving = true;
+        let title = self.right_sidebar_snippet_title.text().to_string();
+        let body = self.right_sidebar_snippet_body.text().to_string();
+        crate::snippets::save(id, title, body, window, move |term_window, saved| {
+            term_window.right_sidebar_snippet_saving = false;
+            // The editor moved on meanwhile: the answer is not for it.
+            if term_window.right_sidebar_snippet_view != editing {
+                return;
             }
-            Err(err) => log::error!("failed to save snippet: {err:#}"),
+            match saved {
+                Ok(crate::snippets::Saved::Saved { .. }) => term_window.close_snippet_editor(),
+                Ok(crate::snippets::Saved::Empty) => {
+                    term_window.right_sidebar_snippet_focus = Some(RightSidebarSnippetField::Body);
+                }
+                // Deleted meanwhile: what was typed is kept, as a new one.
+                Ok(crate::snippets::Saved::Gone) => {
+                    term_window.right_sidebar_snippet_view = RightSidebarSnippetView::EditNew;
+                }
+                // What was typed stays in the editor.
+                Err(why) => log::error!("failed to save snippet: {why}"),
+            }
+        });
+    }
+
+    /// The rows the Snippets panel shows for this window's search, as the
+    /// plugin host last sent them. A search it has not answered is asked
+    /// about, one request at a time (thinkterm-snippets `view`).
+    fn snippet_rows(&mut self) -> Vec<crate::snippets::Row> {
+        let Some(window) = self.window.clone() else {
+            return Vec::new();
+        };
+        crate::snippets::in_use(&window);
+        let query = self.right_sidebar_snippet_search.text();
+        let listing = &mut self.right_sidebar_snippet_listing;
+        listing.set_query(&query);
+        if let Some(query) = listing.next() {
+            crate::snippets::list(query, window, |term_window, query, rows| {
+                term_window.snippets_listed(query, rows);
+            });
+        }
+        listing.rows().map(<[_]>::to_vec).unwrap_or_default()
+    }
+
+    fn snippets_listed(
+        &mut self,
+        query: String,
+        rows: std::result::Result<Vec<crate::snippets::Row>, String>,
+    ) {
+        if let Err(why) = self.right_sidebar_snippet_listing.answered(query, rows) {
+            log::warn!("snippets: {why}");
+        }
+    }
+
+    /// The snippets changed, or the plugin host is back: this window's
+    /// rows are asked for again.
+    pub(crate) fn snippets_changed(&mut self) {
+        self.right_sidebar_snippet_listing.changed();
+    }
+
+    /// The session with the plugin host was let go, and this window's rows
+    /// with it.
+    pub(crate) fn snippets_released(&mut self) {
+        self.right_sidebar_snippet_listing.clear();
+    }
+
+    fn snippet_availability(&self) -> crate::snippets::Availability {
+        if self.right_sidebar_snippet_listing.rows().is_some() {
+            return crate::snippets::Availability::Ready;
+        }
+        match crate::snippets::trouble() {
+            Some(why) => crate::snippets::Availability::Unavailable(why),
+            None => crate::snippets::Availability::Loading,
         }
     }
 
     pub(crate) fn delete_snippet(&mut self, id: &str) {
-        if let Err(err) = crate::snippets::delete_snippet(id) {
-            log::error!("failed to delete snippet {id}: {err:#}");
-        }
+        crate::snippets::delete(id);
         if matches!(
             self.right_sidebar_snippet_view,
             RightSidebarSnippetView::EditExisting(ref editing_id) if editing_id == id
@@ -4151,23 +4228,34 @@ impl crate::TermWindow {
         self.invalidate_window();
     }
 
+    /// Puts a snippet into the active pane: the plugin host says what to
+    /// send, pasted or, with `run`, typed and run. Into the pane active at
+    /// the press, never whichever is active when the answer comes, and not
+    /// at all once that pane is gone or the answer comes too late to still
+    /// be what was meant.
     pub(crate) fn paste_snippet_to_active_pane(&mut self, id: &str, run: bool) {
-        let Some(snippet) = crate::snippets::get_snippet(id) else {
+        let (Some(window), Some(pane)) = (self.window.clone(), self.get_active_pane_or_overlay())
+        else {
             return;
         };
-        let Some(pane) = self.get_active_pane_or_overlay() else {
-            return;
-        };
-        if run {
-            let Some(buffer) = snippet_run_buffer(&snippet.body) else {
+        let pressed = Instant::now();
+        let id = id.to_string();
+        crate::snippets::text(&id.clone(), run, window, move |_term_window, text| {
+            if pane.is_dead() {
                 return;
-            };
-            if let Err(err) = pane.writer().write_all(&buffer) {
-                log::error!("failed to run snippet {id}: {err:#}");
             }
-        } else if let Err(err) = pane.send_paste(&snippet.body) {
-            log::error!("failed to paste snippet {id}: {err:#}");
-        }
+            if pressed.elapsed() > SNIPPET_SEND_WAIT {
+                log::warn!("not sending snippet {id}: its text came too late");
+                return;
+            }
+            if run {
+                if let Err(err) = pane.writer().write_all(text.as_bytes()) {
+                    log::error!("failed to run snippet {id}: {err:#}");
+                }
+            } else if let Err(err) = pane.send_paste(&text) {
+                log::error!("failed to paste snippet {id}: {err:#}");
+            }
+        });
     }
 
     pub(crate) fn copy_right_sidebar_focused_input(&self, destination: ClipboardCopyDestination) {
@@ -6922,7 +7010,9 @@ impl crate::TermWindow {
     }
 
     fn filtered_snippet_count(&self) -> usize {
-        crate::snippets::matching_snippet_count(&self.right_sidebar_snippet_search.text())
+        self.right_sidebar_snippet_listing
+            .rows()
+            .map_or(0, <[_]>::len)
     }
 
     pub fn paint_right_sidebar(
@@ -17235,7 +17325,7 @@ impl crate::TermWindow {
             + self.ui_px(SNIPPET_LIST_TOP_GAP);
         let query = self.right_sidebar_snippet_search.text();
         let searching = !query.trim().is_empty();
-        let snippets = crate::snippets::matching_snippets(&query);
+        let snippets = self.snippet_rows();
         let row_height = self.ui_px(SNIPPET_CARD_HEIGHT) + self.ui_px(SNIPPET_ROW_GAP);
         // The panel's bottom padding, which doubles as the mask that keeps
         // cards out of it; whatever overshoots it is cut by the window edge.
@@ -17250,10 +17340,13 @@ impl crate::TermWindow {
         let scroll_offset = self.right_sidebar_snippet_scroll_offset;
 
         if snippets.is_empty() {
+            let availability = self.snippet_availability();
             let empty_height = self
                 .ui_px(RIGHT_SIDEBAR_EMPTY_HEIGHT)
                 .min(content_bottom.saturating_sub(list_top + self.ui_px(SIDEBAR_INSET)));
-            if empty_height == 0 {
+            // Still on their way from the plugin host, usually for a frame
+            // or two: saying there are none would be wrong, so say nothing.
+            if empty_height == 0 || availability == crate::snippets::Availability::Loading {
                 // No room for the empty-state card, but the toolbar must
                 // still paint: it holds the search box, and losing it here
                 // would leave a non-matching filter impossible to clear.
@@ -17298,10 +17391,12 @@ impl crate::TermWindow {
                 empty_icon_size,
                 muted_fg,
             )?;
-            let empty_label = if !searching {
-                crate::i18n::tr("right-no-snippets")
-            } else {
-                crate::i18n::tr("right-no-matching-snippets")
+            let empty_label = match availability {
+                crate::snippets::Availability::Unavailable(_) => {
+                    crate::i18n::tr("right-snippets-unavailable")
+                }
+                _ if !searching => crate::i18n::tr("right-no-snippets"),
+                _ => crate::i18n::tr("right-no-matching-snippets"),
             };
             self.paint_sidebar_text(
                 layers,
@@ -17638,7 +17733,7 @@ impl crate::TermWindow {
         x: usize,
         y: usize,
         width: usize,
-        snippet: &crate::snippets::SnippetRecord,
+        snippet: &crate::snippets::Row,
         clip_top: usize,
         clip_bottom: usize,
         // Bounds of the two opaque scroll masks. Text is a quad the sidebar
@@ -17723,14 +17818,13 @@ impl crate::TermWindow {
                 foreground,
             )?;
         }
-        let preview = snippet_preview(&snippet.body);
         let preview_y = y + self.ui_px(SIDEBAR_INSET) * 2 + cell_height + 8;
         if visible(preview_y, cell_height) {
             self.paint_sidebar_text(
                 layers,
                 ui_font,
                 ui_metrics,
-                &preview,
+                &snippet.preview,
                 text_x,
                 preview_y,
                 width.saturating_sub(card_pad * 2),
@@ -20755,31 +20849,6 @@ fn remote_file_icon(row: &RemoteFileRow) -> RightSidebarFileIcon {
     RightSidebarFileIcon::Svg(icon)
 }
 
-fn snippet_preview(body: &str) -> String {
-    body.lines()
-        .find_map(|line| {
-            let trimmed = line.trim();
-            (!trimmed.is_empty()).then_some(trimmed)
-        })
-        .unwrap_or("")
-        .chars()
-        .take(96)
-        .collect()
-}
-
-fn snippet_run_buffer(body: &str) -> Option<Vec<u8>> {
-    let normalized = body.replace("\r\n", "\n").replace('\r', "\n");
-    let lines: Vec<_> = normalized.split('\n').collect();
-    let start = lines.iter().position(|line| !line.trim().is_empty())?;
-    let end = lines.iter().rposition(|line| !line.trim().is_empty())?;
-    let trimmed = lines[start..=end].join("\n");
-
-    let mut buffer = String::with_capacity(trimmed.len() + 1);
-    buffer.push_str(&trimmed);
-    buffer.push('\n');
-    Some(buffer.replace('\n', "\r").into_bytes())
-}
-
 /// Wrap a filesystem path to a width, breaking after separators.
 ///
 /// The generic wrapper breaks wherever the width runs out, which cuts a
@@ -21054,12 +21123,11 @@ mod tests {
         right_sidebar_file_browse_rows_from_dir_cache, right_sidebar_file_row_metrics,
         right_sidebar_open_with_cache_key, sanitize_preview_text, scrollable_note_table_columns,
         search_right_sidebar_file_index, sidebar_message_layout, sidebar_row_element_visible,
-        snippet_cursor_visible, snippet_run_buffer, sorted_open_with_candidates,
-        spawn_pasted_image_staging, stage_pasted_image, terminal_paste_snapshot_mismatch,
-        virtual_note_line_range, visible_code_block_rounded_edges, visible_file_row_range,
-        wrap_snippet_text_for_width, FileReleaseAction, FileRowPlacement,
-        NoteApproximateTextMetrics, NoteCodeHighlightEntry, NoteCodeHighlightState,
-        NoteReleaseAction, NoteVaultProblem, RemoteLeaseFailureDisposition,
+        snippet_cursor_visible, sorted_open_with_candidates, spawn_pasted_image_staging,
+        stage_pasted_image, terminal_paste_snapshot_mismatch, virtual_note_line_range,
+        visible_code_block_rounded_edges, visible_file_row_range, wrap_snippet_text_for_width,
+        FileReleaseAction, FileRowPlacement, NoteApproximateTextMetrics, NoteCodeHighlightEntry,
+        NoteCodeHighlightState, NoteReleaseAction, NoteVaultProblem, RemoteLeaseFailureDisposition,
         TerminalPasteSnapshotMismatch, TerminalPasteTarget, FILE_PREVIEW_MAX_BYTES,
         LOCAL_COPY_CHUNK, NOTE_CODE_BLOCK_RADIUS, NOTE_CODE_HEADER_HEIGHT,
     };
@@ -23166,29 +23234,6 @@ mod tests {
         assert_eq!(preview_text_range("abприветcd", 2, 8), "привет");
         assert_eq!(preview_text_range("ab你好cd", 4, 2), "");
         assert_eq!(preview_text_range("ab你好cd", 4, 99), "cd");
-    }
-
-    #[test]
-    fn snippet_run_buffer_appends_single_enter() {
-        assert_eq!(
-            snippet_run_buffer("sudo apt update").unwrap(),
-            b"sudo apt update\r"
-        );
-    }
-
-    #[test]
-    fn snippet_run_buffer_trims_outer_blank_lines() {
-        assert_eq!(snippet_run_buffer("\n\ncmd\r\n").unwrap(), b"cmd\r");
-    }
-
-    #[test]
-    fn snippet_run_buffer_preserves_internal_script_lines() {
-        assert_eq!(snippet_run_buffer("one\ntwo").unwrap(), b"one\rtwo\r");
-    }
-
-    #[test]
-    fn snippet_run_buffer_ignores_blank_body() {
-        assert!(snippet_run_buffer("\n \r\n\t").is_none());
     }
 
     #[test]
