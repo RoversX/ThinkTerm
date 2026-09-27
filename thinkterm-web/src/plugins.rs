@@ -52,6 +52,12 @@ impl PluginCalls {
         self.answer(id, Err(why.to_string()));
     }
 
+    /// Whether any call is waiting for its answer: the way to the host is
+    /// kept open until none is.
+    pub fn waiting(&self) -> bool {
+        !self.waiting.is_empty()
+    }
+
     /// The way to the host is gone: nothing still waiting will be answered.
     pub fn lost(&mut self, why: &str) {
         for (_, waiting) in self.waiting.drain() {

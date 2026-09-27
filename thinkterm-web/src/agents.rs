@@ -50,13 +50,15 @@ pub struct AgentsView {
 
 /// The panel's sections, in the desktop's order, but only those the page
 /// can open: a button for a feature the browser lacks is noise. Files and
-/// Notes join here when they get a wire.
-pub fn panel_tabs() -> Vec<PanelTab> {
+/// Notes join here when they get a wire. Snippets is there while its
+/// plugin is on, as on the desktop.
+pub fn panel_tabs(snippets: bool) -> Vec<PanelTab> {
     [
         ("snippets", "code-xml", "right-mode-snippets"),
         ("agents", "bot", "right-mode-agents"),
     ]
         .into_iter()
+        .filter(|(id, _, _)| snippets || *id != "snippets")
         .map(|(id, icon, key)| {
             let label = tr(key);
             PanelTab { id, icon, label: label.clone(), available: true, tip: label }
@@ -68,9 +70,11 @@ pub fn panel_tabs() -> Vec<PanelTab> {
 mod panel_tests {
     #[test]
     fn snippets_and_agents_are_available_in_a_browser() {
-        let tabs = super::panel_tabs();
+        let tabs = super::panel_tabs(true);
         assert!(tabs.iter().map(|t| t.id).eq(["snippets", "agents"]));
         assert!(tabs.iter().all(|t| t.available));
+        let tabs = super::panel_tabs(false);
+        assert!(tabs.iter().map(|t| t.id).eq(["agents"]), "the plugin is off");
     }
 }
 

@@ -414,6 +414,10 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 #settings .switch input:checked + .knob { background: var(--accent); }
 #settings .switch input:checked + .knob::after { transform: translateX(16px); }
 #settings .err { padding: 0 2px 8px 2px; color: var(--danger); font-size: 12px; }
+/* A section's own sentence above its cards, and a row's state where it
+   has no control. */
+#settings .sdesc { padding: 0 2px 12px 2px; color: var(--muted); font-size: 13px; font-weight: 500; }
+#settings .pilltag { flex: none; color: var(--muted); font: 500 12px var(--ui); }
 /* Focus lives here so the IME composes into a real text field; the
    field itself stays out of sight. */
 #kbd { position: fixed; left: 0; top: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; margin: 0; resize: none; overflow: hidden; pointer-events: none; }

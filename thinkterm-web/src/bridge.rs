@@ -174,6 +174,38 @@ impl Client {
         })
     }
 
+    /// Something on the page needs the plugin list, or no longer does:
+    /// `settings` or `panel`.
+    pub fn plugins_want(&self, who: String, on: bool) {
+        self.app.plugins_want(&who, on);
+    }
+
+    /// The plugin list in Settings › Sidebar & Plugins: JSON `PluginsView`.
+    pub fn plugins(&self) -> String {
+        json(&self.app.plugins_view())
+    }
+
+    /// Changes when `plugins()` would, so the page reads it only then.
+    pub fn plugins_revision(&self) -> u32 {
+        self.app.plugins_revision() as u32
+    }
+
+    /// Turn a plugin on or off: a promise of whether the plugin host took
+    /// the change.
+    pub fn plugin_set_enabled(&self, id: String, enabled: bool) -> js_sys::Promise {
+        let app = Rc::clone(&self.app);
+        wasm_bindgen_futures::future_to_promise(async move {
+            Ok(JsValue::from_bool(app.plugin_set_enabled(id, enabled).await))
+        })
+    }
+
+    /// Look for new and removed plugins, and restart the running ones: a
+    /// promise of whether the plugin host did.
+    pub fn plugins_reload(&self) -> js_sys::Promise {
+        let app = Rc::clone(&self.app);
+        wasm_bindgen_futures::future_to_promise(async move { Ok(JsValue::from_bool(app.plugins_reload().await)) })
+    }
+
     /// The languages the page can be set to: JSON `[{preference, label}]`,
     /// "system" first, labelled in the active locale.
     pub fn languages(&self) -> String {

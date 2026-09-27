@@ -225,6 +225,36 @@ export type SnippetsView = {
   revision: number;
 };
 
+// The plugin list in Settings › Sidebar & Plugins
+// (thinkterm-web/src/plugin_list.rs `PluginsView`): the plugins the plugin
+// host on the server's machine runs, as the desktop's lists them.
+
+export type PluginRow = {
+  /** Tells rows apart: two installed plugins can claim one id. */
+  key: string;
+  id: string;
+  name: string;
+  /** Where it came from, its state, what it does: one line. */
+  detail: string;
+  /** The switch as it is to be shown, a change on its way included. */
+  enabled: boolean;
+  /** Whether a switch could do anything for it. */
+  switchable: boolean;
+  /** Built into ThinkTerm: its switch is its panel's, not in the list. */
+  builtin: boolean;
+};
+
+export type PluginsView = {
+  state: 'loading' | 'ready' | 'unavailable';
+  /** What the section says besides its list: loading, or why the host
+      cannot be reached (then the list is only what was last heard). */
+  status: string;
+  rows: PluginRow[];
+  /** Why the last change asked here was refused. */
+  refused: string | null;
+  revision: number;
+};
+
 // The page's own preferences (thinkterm-web/src/settings.rs `WebSettings`),
 // whose JSON names are kebab-case.
 

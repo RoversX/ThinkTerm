@@ -38,7 +38,7 @@ async function browserWs() { for (let i = 0; i < 50; i++) { try { return await n
   const toggleFromSettings = async () => {
     if (!(await click("#side [data-action=settings]"))) fail("no gear in the sidebar footer");
     await until("the settings panel", () => ev("!!document.getElementById('settings')"));
-    await click("#settings [data-section=agents]");
+    await click("#settings [data-section=sidebar]");
     if (!(await click("#settings input[data-setting=agents-panel]"))) fail("no agents-panel switch");
     if (!(await click("#settings .sc"))) fail("no close button");
     await until("the settings panel to close", () => ev("!document.getElementById('settings')"));

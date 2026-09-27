@@ -171,6 +171,15 @@ pub const STRING_KEYS: &[&str] = &[
     "right-script-required",
     "right-script-placeholder",
     "web-tip-delete-snippet",
+    "settings-sidebar-description",
+    "right-mode-snippets",
+    "settings-sidebar-snippets-description",
+    "settings-section-plugins",
+    "settings-plugins-description",
+    "settings-plugins-reload",
+    "settings-plugins-reload-description",
+    "settings-plugins-reload-button",
+    "settings-plugins-unusable",
 ];
 
 pub fn strings() -> std::collections::BTreeMap<&'static str, String> {

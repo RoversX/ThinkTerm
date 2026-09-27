@@ -3,8 +3,9 @@
   // holds them (thinkterm-web/src/settings.rs) and applies the language and
   // the font itself; the theme is painted here, and the rest is read by
   // whatever it concerns.
+  import { handle } from './client';
   import { s, views } from './client.svelte';
-  import { bot, info, minus, palette, panelLeft, plus, rotateCcw, search, slidersHorizontal, x } from './icons';
+  import { info, minus, palette, panelLeft, plus, rotateCcw, search, slidersHorizontal, x } from './icons';
   import { applyTheme, closeSettings, FOLLOW_DESKTOP, loadSchemes, panel, pickScheme, previewScheme, schemes, setSetting, storedScheme } from './settings.svelte';
   import type { Hotkey, Scheme, ScrollMode, Theme } from './model';
   import { POP, WINDOW, ms } from './motion';
@@ -26,12 +27,13 @@
 
   // The window's sections, as the desktop's settings window lists them
   // on the left; the page has fewer rows, so fewer sections.
-  type Section = 'general' | 'appearance' | 'sidebar' | 'agents' | 'about';
+  // The panels and the plugins are both under Sidebar: whatever a plugin
+  // shows, it shows in a panel.
+  type Section = 'general' | 'appearance' | 'sidebar' | 'about';
   const SECTIONS: [Section, string, string][] = [
     ['general', 'settings-section-general', slidersHorizontal],
     ['appearance', 'settings-section-appearance', palette],
     ['sidebar', 'settings-section-sidebar', panelLeft],
-    ['agents', 'settings-section-agents', bot],
     ['about', 'settings-section-about', info],
   ];
   let section = $state<Section>('general');
@@ -71,6 +73,42 @@
 
   // The theme is the page's to paint, whether the panel is open or not.
   $effect(() => applyTheme(settings.theme));
+
+  // The plugins the plugin host on the server's machine runs, under the
+  // panels: asked for while Sidebar is on show, or a search could find one
+  // there. Told only when that changes: a want let go and taken again would
+  // close the server's way to the host in between.
+  const plugins = $derived(views.plugins);
+  let pluginsWanted = false;
+  $effect(() => {
+    const wanted = panel.open && (section === 'sidebar' || query.trim() !== '');
+    if (wanted === pluginsWanted) return;
+    pluginsWanted = wanted;
+    handle.client?.plugins_want('settings', wanted);
+  });
+  /** The plugins a search finds, or every one on the section's own page. */
+  const pluginRows = $derived(
+    query.trim() === '' || shows('sidebar', s('settings-section-plugins'))
+      ? plugins.rows
+      : plugins.rows.filter((row) => shows('sidebar', row.name)),
+  );
+  /** Snippets, a built-in plugin: its switch is its panel's. */
+  const snippetsRow = $derived(plugins.rows.find((row) => row.builtin && row.id === 'snippets'));
+  let reloading = $state(false);
+
+  function onPlugin(id: string, ev: Event) {
+    const field = ev.currentTarget;
+    if (field instanceof HTMLInputElement) void handle.client?.plugin_set_enabled(id, field.checked);
+  }
+
+  async function reloadPlugins() {
+    reloading = true;
+    try {
+      await handle.client?.plugins_reload();
+    } finally {
+      reloading = false;
+    }
+  }
 
   // The size the "Fixed size" field offers: the pinned one, else the size
   // the terminal is drawn at now, so choosing "Fixed size" pins what is
@@ -339,13 +377,52 @@
         </div>
       {/if}
 
-      {#if shows('agents', s('web-settings-agents-panel'))}
+      <!-- The right panel's panels, a switch each. Snippets is a built-in
+           plugin, and its switch is the plugin's. -->
+      {#if shows('sidebar', s('web-settings-agents-panel')) || shows('sidebar', s('right-mode-snippets'))}
+        {#if query.trim() === ''}<div class="sdesc">{d('settings-sidebar-description')}</div>{/if}
+        <div class="card">
+          {#if shows('sidebar', s('web-settings-agents-panel'))}
+            <div class="srow">
+              <div class="tx"><div class="lab">{s('web-settings-agents-panel')}</div><div class="desc">{d('web-settings-agents-panel-description')}</div></div>
+              <label class="switch"><input type="checkbox" data-setting="agents-panel" checked={settings['agents-panel']} onchange={(ev) => onFlag('agents-panel', ev)} /><span class="knob"></span></label>
+            </div>
+          {/if}
+          {#if shows('sidebar', s('right-mode-snippets'))}
+            <div class="srow">
+              <div class="tx"><div class="lab">{s('right-mode-snippets')}</div><div class="desc">{d('settings-sidebar-snippets-description')}</div></div>
+              <label class="switch"><input type="checkbox" data-panel-switch="snippets" checked={snippetsRow?.enabled ?? false} disabled={!snippetsRow?.switchable} onchange={(ev) => onPlugin('snippets', ev)} /><span class="knob"></span></label>
+            </div>
+          {/if}
+        </div>
+      {/if}
+
+      {#if shows('sidebar', s('settings-section-plugins')) || (query.trim() !== '' && pluginRows.length > 0)}
+        {#if query.trim() === ''}<div class="sdesc">{d('settings-plugins-description')}</div>{/if}
         <div class="card">
           <div class="srow">
-            <div class="tx"><div class="lab">{s('web-settings-agents-panel')}</div><div class="desc">{d('web-settings-agents-panel-description')}</div></div>
-            <label class="switch"><input type="checkbox" data-setting="agents-panel" checked={settings['agents-panel']} onchange={(ev) => onFlag('agents-panel', ev)} /><span class="knob"></span></label>
+            <div class="tx"><div class="lab">{s('settings-plugins-reload')}</div><div class="desc">{d('settings-plugins-reload-description')}</div></div>
+            <button class="pillbtn" type="button" data-action="reload-plugins" disabled={reloading} onclick={reloadPlugins}>{s('settings-plugins-reload-button')}</button>
           </div>
         </div>
+        {#if plugins.state === 'ready' && plugins.status !== ''}<div class="err">{plugins.status}</div>{/if}
+        <div class="card" data-plugins={plugins.state}>
+          {#each pluginRows as row (row.key)}
+            <div class="srow" data-plugin={row.id}>
+              <div class="tx"><div class="lab">{row.name}</div><div class="desc">{row.detail}</div></div>
+              {#if row.builtin}
+                <!-- Its switch is its panel's, above. -->
+              {:else if row.switchable}
+                <label class="switch"><input type="checkbox" data-plugin-switch={row.id} checked={row.enabled} onchange={(ev) => onPlugin(row.id, ev)} /><span class="knob"></span></label>
+              {:else}
+                <span class="pilltag">{s('settings-plugins-unusable')}</span>
+              {/if}
+            </div>
+          {:else}
+            <div class="srow"><div class="tx"><div class="desc">{plugins.status}</div></div></div>
+          {/each}
+        </div>
+        {#if plugins.refused}<div class="err">{plugins.refused}</div>{/if}
       {/if}
 
       {#if shows('about', s('settings-section-about'))}

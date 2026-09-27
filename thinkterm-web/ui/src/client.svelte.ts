@@ -4,7 +4,7 @@
 
 import { flushSync } from 'svelte';
 import { handle, type Client } from './client';
-import type { AgentsView, NavsView, SidebarView, SnippetsView, StatusView, Strings, TabsView, WebSettings } from './model';
+import type { AgentsView, NavsView, PluginsView, SidebarView, SnippetsView, StatusView, Strings, TabsView, WebSettings } from './model';
 
 export const views = $state({
   tabs: null as TabsView | null,
@@ -18,6 +18,8 @@ export const views = $state({
   agents: { rows: [], summary: '', tabs: [], active: 'agents' } as AgentsView,
   /** The right panel's Snippets tab; loading until it is first on show. */
   snippets: { state: 'loading', reason: null, rows: [], query: '', empty: '', answers: null, asked: 0, revision: 0 } as SnippetsView,
+  /** The plugin list in Settings › Sidebar & Plugins. */
+  plugins: { state: 'loading', status: '', rows: [], refused: null, revision: 0 } as PluginsView,
   /** The page's own preferences, as the wasm holds them (settings.rs). */
   settings: {
     language: 'system',
@@ -66,6 +68,7 @@ export function attach(client: Client) {
   let lastAgents = '';
   // The snippets can be long; their view is read only when it moved.
   let lastSnippets = -1;
+  let lastPlugins = -1;
   let lastSettings = '';
   const read = () => {
     const strings = client.strings();
@@ -74,6 +77,7 @@ export function attach(client: Client) {
       views.strings = JSON.parse(strings) as Strings;
       // Its words are in the language too.
       lastSnippets = -1;
+      lastPlugins = -1;
     }
     const tabs = client.tabs();
     if (tabs !== lastTabs) {
@@ -104,6 +108,11 @@ export function attach(client: Client) {
     if (snippets !== lastSnippets) {
       lastSnippets = snippets;
       views.snippets = JSON.parse(client.snippets()) as SnippetsView;
+    }
+    const plugins = client.plugins_revision();
+    if (plugins !== lastPlugins) {
+      lastPlugins = plugins;
+      views.plugins = JSON.parse(client.plugins()) as PluginsView;
     }
     const settings = client.settings();
     if (settings !== lastSettings) {

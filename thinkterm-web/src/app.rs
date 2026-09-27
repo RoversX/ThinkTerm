@@ -23,6 +23,7 @@ use thinkterm_render::pipeline::GpuTexture;
 use thinkterm_render::quad::HeapQuadAllocator;
 use thinkterm_render::vertex::Vertex;
 use thinkterm_session::pane::PaneSession;
+use thinkterm_plugin_channel::registry as plugins_api;
 use thinkterm_snippets::wire as snippets_wire;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::input::{MouseButton, MouseEvent, MouseEventKind};
@@ -167,6 +168,10 @@ const RECONNECT_MIN_MS: f64 = 500.0;
 const RECONNECT_MAX_MS: f64 = 15_000.0;
 /// How long a call to the plugin host waits for its answer.
 const PLUGIN_CALL_TIMEOUT_MS: f64 = 10_000.0;
+/// How long the server's way to the plugin host is kept once nothing needs
+/// it: Settings › Sidebar & Plugins opened again soon after, or a panel
+/// switched back to, finds it there.
+const PLUGIN_PIPE_LINGER_MS: f64 = 30_000.0;
 /// How long a snippet's Run or Paste waits for its text: a command that
 /// arrives later than this is not the one the press was for.
 const SNIPPET_SEND_WAIT_MS: f64 = 3_000.0;
@@ -420,8 +425,16 @@ pub struct Inner<P: Platform, L: Link> {
     right_panel: &'static str,
     right_panel_shown: bool,
     snippets: crate::snippets::SnippetsModel,
+    /// The plugins as last heard, and what wants them.
+    plugin_list: crate::plugin_list::PluginsModel,
     /// Calls to the plugin host waiting for their answers.
     plugin_calls: crate::plugins::PluginCalls,
+    /// The server holds a way to the plugin host for this page: frames were
+    /// sent since it was last closed.
+    plugin_pipe: bool,
+    /// Counts the lingers after the last need, so only the latest lets the
+    /// way to the host go.
+    plugin_pipe_linger: u64,
 }
 
 /// One pane's own font: its scale over the page's size, and what draws it.
@@ -647,7 +660,10 @@ impl<P: Platform, L: Link> App<P, L> {
             right_panel: "agents",
             right_panel_shown: false,
             snippets: Default::default(),
+            plugin_list: Default::default(),
             plugin_calls: Default::default(),
+            plugin_pipe: false,
+            plugin_pipe_linger: 0,
         };
         let app = Rc::new(Self {
             platform: setup.platform,
@@ -1267,6 +1283,8 @@ impl<P: Platform, L: Link> App<P, L> {
             inner.disconnected = Some(reason.clone());
             // The server's connection to the plugin host went with it.
             inner.snippets.connection_lost();
+            inner.plugin_list.connection_lost();
+            inner.plugin_pipe = false;
             inner.plugin_calls.lost("the connection to the server closed");
             // The connection that just died settles its own backoff here:
             // one that held for a while earns the short delay back, one
@@ -1373,7 +1391,7 @@ impl<P: Platform, L: Link> App<P, L> {
         match outcome {
             Ok(list) => {
                 self.reconnected();
-                self.snippets_follow();
+                self.plugins_follow();
                 // The tab is laid out again from the fresh listing: panes
                 // that came or went while the socket was down are taken
                 // up or let go, and the ones that stayed keep their cells.
@@ -3878,50 +3896,195 @@ impl<P: Platform, L: Link> App<P, L> {
             inner.panes.get(&pane).map(|c| crate::navbar::display_title(&c.title).0)
         });
         let summary = crate::agents::summary(&rows);
-        let tabs = crate::agents::panel_tabs();
+        let tabs = crate::agents::panel_tabs(Self::snippets_offered(&inner));
         crate::agents::AgentsView { rows, summary, tabs, active: inner.right_panel }
     }
 
     /// Show a tab of the right panel by its id. False for one the page
     /// does not offer.
     pub fn set_right_panel(self: &Rc<Self>, id: &str) -> bool {
-        let Some(tab) = crate::agents::panel_tabs().into_iter().find(|tab| tab.id == id && tab.available) else {
+        let offered = Self::snippets_offered(&self.inner.borrow());
+        let Some(tab) = crate::agents::panel_tabs(offered).into_iter().find(|tab| tab.id == id && tab.available) else {
             return false;
         };
         self.inner.borrow_mut().right_panel = tab.id;
-        self.snippets_follow();
+        self.plugins_follow();
         true
     }
 
-    /// The page put the right panel up, or took it down.
+    /// The page put the right panel up, or took it down. While it is up
+    /// the plugin list is followed: its Snippets tab is there only while
+    /// the Snippets plugin is on.
     pub fn set_right_panel_shown(self: &Rc<Self>, shown: bool) {
-        self.inner.borrow_mut().right_panel_shown = shown;
-        self.snippets_follow();
+        {
+            let inner = &mut *self.inner.borrow_mut();
+            inner.right_panel_shown = shown;
+            inner.plugin_list.want("panel", shown);
+        }
+        self.plugins_follow();
     }
 
-    /// Follow the snippets while their tab is on show, and let them and
-    /// the server's connection to the plugin host go when it is not.
-    fn snippets_follow(self: &Rc<Self>) {
-        let (ask, close) = {
-            let inner = &mut *self.inner.borrow_mut();
-            let wanted = inner.right_panel_shown && inner.right_panel == "snippets";
-            if !wanted {
-                (false, inner.snippets.close())
-            } else if inner.disconnected.is_some() {
-                // Asked for once the connection is back.
-                (false, false)
-            } else {
-                inner.snippets.open();
-                (true, false)
-            }
+    /// Whether the right panel offers Snippets: unless the plugin list, as
+    /// last heard, has its plugin off or broken.
+    fn snippets_offered(inner: &Inner<P, L>) -> bool {
+        inner.plugin_list.usable(snippets_wire::PLUGIN) != Some(false)
+    }
+
+    /// Something on the page needs the plugin list, or no longer does:
+    /// `who` is `settings` or `panel`.
+    pub fn plugins_want(self: &Rc<Self>, who: &str, on: bool) {
+        let who = match who {
+            "settings" => "settings",
+            "panel" => "panel",
+            _ => return,
         };
-        if ask {
+        self.inner.borrow_mut().plugin_list.want(who, on);
+        self.plugins_follow();
+    }
+
+    /// Whether the Snippets tab is on show, and so the snippets followed.
+    fn snippets_wanted(inner: &Inner<P, L>) -> bool {
+        inner.right_panel_shown && inner.right_panel == "snippets"
+    }
+
+    /// Whether anything needs the server's way to the plugin host: a tab or
+    /// section on show, or a call waiting for its answer.
+    fn plugin_pipe_needed(inner: &Inner<P, L>) -> bool {
+        Self::snippets_wanted(inner) || inner.plugin_list.wanted() || inner.plugin_calls.waiting()
+    }
+
+    /// Follow what the page shows of the plugins: the snippets while their
+    /// tab is on show, the plugin list while something needs it. The
+    /// server's way to the plugin host is let go a while after nothing needs
+    /// it any more.
+    fn plugins_follow(self: &Rc<Self>) {
+        let ask_snippets = {
+            let inner = &mut *self.inner.borrow_mut();
+            if !Self::snippets_offered(inner) && inner.right_panel == "snippets" {
+                inner.right_panel = "agents";
+            }
+            let snippets_wanted = Self::snippets_wanted(inner);
+            let mut ask_snippets = false;
+            if !snippets_wanted {
+                inner.snippets.close();
+            } else if inner.disconnected.is_none() {
+                // Asked for once the connection is back, otherwise.
+                inner.snippets.open();
+                ask_snippets = true;
+            }
+            ask_snippets
+        };
+        if ask_snippets {
             self.snippets_list();
         }
+        self.plugins_list();
+        self.linger_plugin_pipe();
+        Self::notify(&self.inner.borrow());
+    }
+
+    /// Once nothing needs the server's way to the plugin host, it is let go
+    /// after a while: looked at whenever a need may have ended -- something
+    /// went off show, or a call was answered.
+    fn linger_plugin_pipe(self: &Rc<Self>) {
+        let linger = {
+            let inner = &mut *self.inner.borrow_mut();
+            if Self::plugin_pipe_needed(inner) || !inner.plugin_pipe {
+                return;
+            }
+            inner.plugin_pipe_linger += 1;
+            inner.plugin_pipe_linger
+        };
+        let weak = Rc::downgrade(self);
+        self.platform.set_timeout(
+            PLUGIN_PIPE_LINGER_MS,
+            Box::new(move || {
+                if let Some(app) = weak.upgrade() {
+                    app.plugin_pipe_let_go(linger);
+                }
+            }),
+        );
+    }
+
+    /// The linger after the last need is over: the way to the host is let
+    /// go, unless something needed it meanwhile or a later linger runs.
+    fn plugin_pipe_let_go(self: &Rc<Self>, linger: u64) {
+        let close = {
+            let inner = &mut *self.inner.borrow_mut();
+            let close = inner.plugin_pipe_linger == linger
+                && inner.plugin_pipe
+                && inner.disconnected.is_none()
+                && !Self::plugin_pipe_needed(inner);
+            if close {
+                inner.plugin_pipe = false;
+                inner.plugin_list.connection_lost();
+            }
+            close
+        };
         if close {
             self.send_plugin_frame(Vec::new(), None);
         }
+    }
+
+    /// Ask the plugin host for the plugin list, if something needs it and it
+    /// is out of date: one request at a time.
+    fn plugins_list(self: &Rc<Self>) {
+        let locale = {
+            let inner = &mut *self.inner.borrow_mut();
+            if inner.disconnected.is_some() {
+                return;
+            }
+            let Some(locale) = inner.plugin_list.next_list(thinkterm_i18n::current_locale()) else {
+                return;
+            };
+            locale
+        };
+        let app = Rc::clone(self);
+        self.spawn(async move {
+            let request = plugins_api::Request::List { locale };
+            let body = serde_json::to_value(request).expect("a plugin request always serialises");
+            let answer = app.plugin_call(plugins_api::PLUGIN, body).await;
+            app.inner.borrow_mut().plugin_list.listed(answer);
+            // A change may have come meanwhile, and the Snippets tab
+            // follows its plugin's switch.
+            app.plugins_follow();
+        });
+    }
+
+    /// The plugin list in Settings › Sidebar & Plugins: JSON `PluginsView`.
+    pub fn plugins_view(&self) -> crate::plugin_list::PluginsView {
+        self.inner.borrow().plugin_list.view()
+    }
+
+    pub fn plugins_revision(&self) -> u64 {
+        self.inner.borrow().plugin_list.revision()
+    }
+
+    /// Turn a plugin on or off. The switch shows the change until the
+    /// host answers; false when it refused.
+    pub async fn plugin_set_enabled(self: &Rc<Self>, id: String, enabled: bool) -> bool {
+        self.inner.borrow_mut().plugin_list.switching(&id, enabled);
         Self::notify(&self.inner.borrow());
+        let request = plugins_api::Request::SetEnabled { id: id.clone(), enabled };
+        let body = serde_json::to_value(request).expect("a plugin request always serialises");
+        let answer = self.plugin_call(plugins_api::PLUGIN, body).await.map(drop);
+        let done = answer.is_ok();
+        self.inner.borrow_mut().plugin_list.switched(&id, answer);
+        self.plugins_follow();
+        done
+    }
+
+    /// Look for new and removed plugins on the server's machine, and
+    /// restart the running ones.
+    pub async fn plugins_reload(self: &Rc<Self>) -> bool {
+        let request = plugins_api::Request::Reload { id: None };
+        let body = serde_json::to_value(request).expect("a plugin request always serialises");
+        let answer = self.plugin_call(plugins_api::PLUGIN, body).await;
+        let done = answer.is_ok();
+        if let Err(why) = answer {
+            self.inner.borrow_mut().plugin_list.refused(why);
+        }
+        self.plugins_follow();
+        done
     }
 
     /// One frame for the plugin host, through the server, on the wire now
@@ -3936,6 +4099,9 @@ impl<P: Platform, L: Link> App<P, L> {
                 }
                 return;
             }
+            // A frame opens the server's way to the host; an empty one
+            // closes it.
+            inner.plugin_pipe = !data.is_empty();
             inner.link.request(Pdu::PluginFrame(codec::PluginFrame { data }))
         };
         let app = Rc::clone(self);
@@ -3956,19 +4122,41 @@ impl<P: Platform, L: Link> App<P, L> {
     /// Ask a plugin on the server's machine: its answer, or why there is
     /// none. A host that does not answer in time is given up on, so a save
     /// or a list never waits for good.
-    async fn plugin_call(self: &Rc<Self>, plugin: &str, body: serde_json::Value) -> crate::plugins::Answer {
+    fn plugin_call(self: &Rc<Self>, plugin: &str, body: serde_json::Value) -> impl Future<Output = crate::plugins::Answer> {
+        self.plugin_call_within(plugin, body, PLUGIN_CALL_TIMEOUT_MS)
+    }
+
+    /// [`plugin_call`](Self::plugin_call), waiting `wait_ms` for the answer.
+    /// The call is on its way when this returns, before its answer is
+    /// awaited: whatever the page does next finds it waiting, and keeps the
+    /// way to the host for it.
+    fn plugin_call_within(
+        self: &Rc<Self>,
+        plugin: &str,
+        body: serde_json::Value,
+        wait_ms: f64,
+    ) -> impl Future<Output = crate::plugins::Answer> {
         let (id, frame, answer) = self.inner.borrow_mut().plugin_calls.call(plugin, body);
         self.send_plugin_frame(frame, Some(id));
         let weak = Rc::downgrade(self);
+        let timeout = weak.clone();
         self.platform.set_timeout(
-            PLUGIN_CALL_TIMEOUT_MS,
+            wait_ms,
             Box::new(move || {
-                if let Some(app) = weak.upgrade() {
+                if let Some(app) = timeout.upgrade() {
                     app.inner.borrow_mut().plugin_calls.fail(id, "the plugin host did not answer in time");
                 }
             }),
         );
-        answer.await.unwrap_or_else(|_| Err("the call was dropped".into()))
+        async move {
+            let answer = answer.await.unwrap_or_else(|_| Err("the call was dropped".into()));
+            // The way to the host was kept for this call; it may be the last
+            // thing that needed it.
+            if let Some(app) = weak.upgrade() {
+                app.linger_plugin_pipe();
+            }
+            answer
+        }
     }
 
     /// A frame from the plugin host, through the server: an answer, an
@@ -3979,7 +4167,11 @@ impl<P: Platform, L: Link> App<P, L> {
         if data.is_empty() {
             let delay = {
                 let inner = &mut *self.inner.borrow_mut();
-                let again = inner.snippets.host_gone().then(|| inner.snippets.retry_delay_ms());
+                inner.plugin_pipe = false;
+                let snippets_again = inner.snippets.host_gone();
+                inner.plugin_list.connection_lost();
+                let delay = inner.snippets.retry_delay_ms().max(inner.plugin_list.retry_delay_ms());
+                let again = (snippets_again || inner.plugin_list.wanted()).then_some(delay);
                 inner.plugin_calls.lost("the plugin host went away");
                 again
             };
@@ -3989,7 +4181,8 @@ impl<P: Platform, L: Link> App<P, L> {
                     delay,
                     Box::new(move || {
                         if let Some(app) = weak.upgrade() {
-                            app.snippets_follow();
+                            app.inner.borrow_mut().plugin_list.retry();
+                            app.plugins_follow();
                         }
                     }),
                 );
@@ -3998,13 +4191,24 @@ impl<P: Platform, L: Link> App<P, L> {
             return;
         }
         let event = self.inner.borrow_mut().plugin_calls.heard(&data);
-        if let Some((plugin, body)) = event {
-            let changed = plugin == snippets_wire::PLUGIN
-                && matches!(serde_json::from_value(body), Ok(snippets_wire::Event::Changed));
-            if changed {
-                self.inner.borrow_mut().snippets.snippets_changed();
-                self.snippets_list();
+        let Some((plugin, body)) = event else {
+            return;
+        };
+        if plugin == plugins_api::PLUGIN {
+            match serde_json::from_value(body) {
+                Ok(plugins_api::Event::Changed) => {
+                    self.inner.borrow_mut().plugin_list.list_changed();
+                    self.plugins_list();
+                }
+                Err(err) => log::warn!("a plugin list event that does not read: {err}"),
             }
+            return;
+        }
+        let changed = plugin == snippets_wire::PLUGIN
+            && matches!(serde_json::from_value(body), Ok(snippets_wire::Event::Changed));
+        if changed {
+            self.inner.borrow_mut().snippets.snippets_changed();
+            self.snippets_list();
         }
     }
 
@@ -4098,12 +4302,12 @@ impl<P: Platform, L: Link> App<P, L> {
             log::warn!("not sending a snippet: its text came too late");
             return false;
         }
-        self.send_snippet_to(pane, &text, !run)
+        self.send_text_to(pane, &text, !run)
     }
 
     /// `text` into `pane`, if it is still on the page and this page may type:
     /// as a paste, or as typed keys.
-    fn send_snippet_to(&self, pane: PaneId, text: &str, paste: bool) -> bool {
+    fn send_text_to(&self, pane: PaneId, text: &str, paste: bool) -> bool {
         let mut inner = self.inner.borrow_mut();
         if inner.disconnected.is_some() || !Self::may_type(&inner) {
             return false;
