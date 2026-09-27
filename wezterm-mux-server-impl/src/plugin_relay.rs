@@ -14,6 +14,8 @@ use smol::channel::{bounded, Receiver, Sender, TrySendError};
 use smol::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use smol::Async;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use thinkterm_plugin_channel::client::{Connection, Host};
 use thinkterm_plugin_channel::wire::{frame_header, frame_len};
 
@@ -29,10 +31,15 @@ pub(crate) type Respond = Box<dyn FnOnce(anyhow::Result<Pdu>) + Send>;
 pub(crate) struct Pipe {
     frames: Sender<(Vec<u8>, Respond)>,
     carrier: Option<smol::Task<()>>,
+    /// Set once the client has closed it, or gone: it is not told the
+    /// connection ended. Told, a client that had opened another meanwhile
+    /// would take the word for that one's.
+    let_go: Arc<AtomicBool>,
 }
 
 impl Drop for Pipe {
     fn drop(&mut self) {
+        self.let_go.store(true, Ordering::Release);
         // The carrier drains the queue, finds it closed, and ends.
         self.frames.close();
         if let Some(carrier) = self.carrier.take() {
@@ -52,11 +59,16 @@ impl Pipe {
         connect: impl FnOnce() -> anyhow::Result<Connection> + Send + 'static,
     ) -> Self {
         let (frames, queued) = bounded(QUEUE);
+        let let_go = Arc::new(AtomicBool::new(false));
         Self {
             frames,
             carrier: Some(crate::connections::spawn_task(carry(
-                queued, to_client, connect,
+                queued,
+                to_client,
+                connect,
+                Arc::clone(&let_go),
             ))),
+            let_go,
         }
     }
 
@@ -83,6 +95,7 @@ async fn carry(
     queued: Receiver<(Vec<u8>, Respond)>,
     to_client: PduSender,
     connect: impl FnOnce() -> anyhow::Result<Connection> + Send + 'static,
+    let_go: Arc<AtomicBool>,
 ) {
     // Off the connection threads: reaching the host may mean starting it.
     let stream = match smol::unblock(move || -> anyhow::Result<_> {
@@ -123,7 +136,11 @@ async fn carry(
     };
     smol::future::or(outbound, inbound).await;
     refuse_waiting(&queued, "the connection to the plugin host has closed");
-    // An empty frame: the client may open another connection when it wants.
+    if let_go.load(Ordering::Acquire) {
+        return;
+    }
+    // An empty frame: the host went, and the client may open another
+    // connection when it wants.
     let _ = to_client.send(DecodedPdu {
         serial: 0,
         pdu: Pdu::PluginFrame(PluginFrame { data: vec![] }),
@@ -270,6 +287,27 @@ mod tests {
             fake.join().unwrap(),
             [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
         );
+    }
+
+    #[test]
+    fn a_pipe_the_client_closed_is_not_announced_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_at(dir.path());
+        let listener = wezterm_uds::UnixListener::bind(&host.socket).unwrap();
+        let fake = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let hello = FromHost::Hello { protocol: PROTOCOL }.encode();
+            wire::write_frame(&mut stream, &hello).unwrap();
+            while wire::read_frame(&mut stream).is_ok() {}
+        });
+        let (sender, pushes) = client();
+        let pipe = Pipe::open_with(sender, move || host.connect());
+        assert!(matches!(send(&pipe, b"one"), Ok(Pdu::UnitResponse(_))));
+        drop(pipe);
+        fake.join().unwrap();
+        // The client asked: an empty frame now would read as the end of a
+        // connection it opened since.
+        assert!(pushes.recv_timeout(Duration::from_millis(300)).is_err());
     }
 
     #[test]
