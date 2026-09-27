@@ -435,6 +435,7 @@ install -Dm644 LICENSE-MIT %{buildroot}/usr/share/licenses/thinkterm-server/LICE
 %files -n thinkterm-server
 /usr/bin/thinkterm
 /usr/bin/wezterm
+/usr/bin/thinkterm-plugin-server
 /usr/bin/thinkterm-mux-server
 /usr/bin/strip-ansi-escapes
 /usr/share/licenses/thinkterm-server/*
@@ -551,12 +552,12 @@ EOF
           fi
 
           install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/thinkterm-mux-server
+          install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/thinkterm-plugin-server
           install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/thinkterm
           install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/wezterm
           install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/strip-ansi-escapes
           if [[ "$variant" == desktop ]] ; then
             install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/thinkterm-gui
-            install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/thinkterm-plugin-server
             install -Dm755 -t $root/usr/bin assets/open-thinkterm-here assets/open-wezterm-here
             install -Dm644 assets/icon/terminal.png $root/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
             install -Dm644 assets/wezterm.desktop $root/usr/share/applications/com.roversx.thinkterm.desktop
@@ -616,9 +617,11 @@ EOF
         #                                        it needs no graphics library
         #
         # Both carry the wezterm shim that third-party tools expect on PATH
-        # whenever TERM_PROGRAM says WezTerm. The arch is uname -m as-is
-        # (x86_64, aarch64): install.sh runs the same command on the target
-        # host and wants a name it can build without a mapping table.
+        # whenever TERM_PROGRAM says WezTerm, and the plugin server: a
+        # browser that opens a host's page uses that host's plugins. The
+        # arch is uname -m as-is (x86_64, aarch64): install.sh runs the same
+        # command on the target host and wants a name it can build without a
+        # mapping table.
         linux_tarball() {
           local variant=$1 tardir
           shift
@@ -666,6 +669,7 @@ EOF
           $TARGET_DIR/$PROFILE/thinkterm \
           $TARGET_DIR/$PROFILE/wezterm \
           $TARGET_DIR/$PROFILE/thinkterm-mux-server \
+          $TARGET_DIR/$PROFILE/thinkterm-plugin-server \
           $TARGET_DIR/$PROFILE/strip-ansi-escapes
       ;;
     esac

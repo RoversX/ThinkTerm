@@ -59,8 +59,8 @@ pub fn build_from_source_instructions(version: &str) -> String {
     format!(
         "Build ThinkTerm {version} from source on that host instead:\n  \
          {checkout}\n  \
-         cd thinkterm && ./get-deps && cargo build --release -p wezterm -p wezterm-mux-server\n  \
-         install -Dm755 target/release/thinkterm target/release/wezterm target/release/thinkterm-mux-server -t ~/.local/bin\n\
+         cd thinkterm && ./get-deps && cargo build --release -p wezterm -p wezterm-mux-server -p thinkterm-plugin-server\n  \
+         install -Dm755 target/release/thinkterm target/release/wezterm target/release/thinkterm-mux-server target/release/thinkterm-plugin-server -t ~/.local/bin\n\
          then stop the old thinkterm-mux-server there and reconnect."
     )
 }
@@ -463,6 +463,10 @@ mod tests {
         let text = build_from_source_instructions("0.2.0");
         assert!(text.contains("--branch 0.2.0"), "{text}");
         assert!(text.contains("thinkterm-mux-server"), "{text}");
+        assert!(
+            text.contains("target/release/thinkterm-plugin-server"),
+            "{text}"
+        );
     }
 
     #[test]
