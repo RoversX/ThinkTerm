@@ -371,6 +371,15 @@ fn preview_quad_key(
     }
 }
 
+fn clip_right_sidebar_hover_items(items: &mut Vec<UIItem>, top: usize, bottom: usize) {
+    items.retain_mut(|item| {
+        let end = item.y.saturating_add(item.height).min(bottom);
+        item.y = item.y.max(top);
+        item.height = end.saturating_sub(item.y);
+        item.height > 0
+    });
+}
+
 fn quad_clip_rect(rect: RectF, dimensions: &Dimensions) -> QuadClipRect {
     QuadClipRect::from_top_left_pixels(
         rect.min_x(),
@@ -3563,6 +3572,13 @@ impl crate::TermWindow {
                 }
             }
         }
+        if !cfg!(target_os = "macos") {
+            if let Some(rect) = self.right_sidebar_rect() {
+                // The shared painters include top chrome backgrounds. Neither
+                // those targets nor the moving panel may cover window buttons.
+                clip_right_sidebar_hover_items(&mut items, rect.y, rect.y + rect.height);
+            }
+        }
         Ok(Some((panel_frame, 1.0 - progress, items)))
     }
 
@@ -3584,7 +3600,11 @@ impl crate::TermWindow {
         let offset_x = hidden * rect.width as f32;
         let clip = crate::quad::QuadClipRect::from_top_left_pixels(
             0.0,
-            0.0,
+            if cfg!(target_os = "macos") {
+                0.0
+            } else {
+                rect.y as f32
+            },
             self.dimensions.pixel_width as f32,
             self.dimensions.pixel_height as f32,
             &self.dimensions,
@@ -4602,6 +4622,28 @@ impl crate::TermWindow {
 mod tests {
     use super::*;
     use crate::quad::TripleLayerQuadAllocatorTrait;
+
+    #[test]
+    fn right_sidebar_hover_keeps_tab_bar_buttons_clickable() {
+        // Test both the narrow blocker used during animation and the full
+        // panel, including a top background and content crossing its edge.
+        for width in [30, 300] {
+            let item = |y, height| UIItem {
+                x: 1000 - width,
+                y,
+                width,
+                height,
+                item_type: UIItemType::RightSidebarBackground,
+            };
+            let mut items = vec![item(0, 40), item(0, 800), item(35, 30), item(100, 20)];
+            clip_right_sidebar_hover_items(&mut items, 40, 800);
+            assert_eq!(items.len(), 3);
+            assert!(items.iter().all(|item| !item.hit_test(990, 20)));
+            assert!(items.iter().any(|item| item.hit_test(990, 50)));
+            assert_eq!((items[1].y, items[1].height), (40, 25));
+            assert_eq!((items[2].y, items[2].height), (100, 20));
+        }
+    }
 
     fn test_preview(area: RectF) -> TerminalPreviewRequest {
         TerminalPreviewRequest {

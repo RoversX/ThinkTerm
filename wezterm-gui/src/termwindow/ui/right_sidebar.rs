@@ -1841,7 +1841,7 @@ impl crate::TermWindow {
             rect.y,
             rect.height,
             width,
-            top_tab_bar_height,
+            rect.y.saturating_add(top_tab_bar_height),
         )
     }
 
@@ -6523,7 +6523,7 @@ impl crate::TermWindow {
         // below the tab bar so both remain reachable.
         if !cfg!(target_os = "macos") && self.right_sidebar_collapsed {
             let tab_bar = self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize;
-            let top = tab_bar.max(rect.y);
+            let top = rect.y.saturating_add(tab_bar);
             rect.height = rect.height.saturating_sub(top - rect.y);
             rect.y = top;
             if rect.height == 0 {
@@ -7084,6 +7084,22 @@ impl crate::TermWindow {
         }
     }
 
+    fn right_sidebar_top_bar_layout(&self, rect: RightSidebarRect) -> (usize, usize) {
+        let y = rect.y + self.ui_px(SIDEBAR_INSET) * 2;
+        // A non-macOS hover panel already sits below the window buttons and
+        // has no toggle of its own, so it needs no additional button row.
+        let height = if !cfg!(target_os = "macos") && self.right_sidebar_collapsed {
+            0
+        } else {
+            self.ui_px(RIGHT_SIDEBAR_TOP_BAR_HEIGHT).min(
+                rect.y
+                    .saturating_add(rect.height)
+                    .saturating_sub(y + self.ui_px(SIDEBAR_INSET)),
+            )
+        };
+        (y, height)
+    }
+
     fn right_sidebar_snippet_scroll_metrics(&self) -> Option<(usize, usize, usize)> {
         let Some(rect) = self.right_sidebar_rect() else {
             return None;
@@ -7095,12 +7111,7 @@ impl crate::TermWindow {
             return None;
         }
 
-        let top_bar_y = rect.y + self.ui_px(SIDEBAR_INSET) * 2;
-        let top_bar_height = self.ui_px(RIGHT_SIDEBAR_TOP_BAR_HEIGHT).min(
-            rect.y
-                .saturating_add(rect.height)
-                .saturating_sub(top_bar_y + self.ui_px(SIDEBAR_INSET)),
-        );
+        let (top_bar_y, top_bar_height) = self.right_sidebar_top_bar_layout(rect);
         let content_top = top_bar_y
             + top_bar_height
             + self.ui_px(RIGHT_SIDEBAR_MODE_HEIGHT)
@@ -7414,17 +7425,8 @@ impl crate::TermWindow {
 
         let content_x = rect.x + self.ui_px(SIDEBAR_INSET) * 2;
         let content_width = rect.width.saturating_sub(self.ui_px(SIDEBAR_INSET) * 4);
-        let top_bar_y = rect.y + self.ui_px(SIDEBAR_INSET) * 2;
-        let top_bar_height = self.ui_px(RIGHT_SIDEBAR_TOP_BAR_HEIGHT).min(
-            rect.y
-                .saturating_add(rect.height)
-                .saturating_sub(top_bar_y + self.ui_px(SIDEBAR_INSET)),
-        );
-        if top_bar_height == 0 {
-            return Ok(());
-        }
-
-        if cfg!(target_os = "macos") {
+        let (top_bar_y, top_bar_height) = self.right_sidebar_top_bar_layout(rect);
+        if cfg!(target_os = "macos") && top_bar_height > 0 {
             let close_button_size = self
                 .ui_px(RIGHT_SIDEBAR_CLOSE_BUTTON_SIZE)
                 .min(top_bar_height)
