@@ -8,12 +8,16 @@ struct ThinkTermApp: App {
     var body: some Scene {
         WindowGroup {
             Group {
+                #if DEBUG
                 if ProcessInfo.processInfo.arguments.contains(where: { $0.hasPrefix("--auto") || $0.hasSuffix("test") }) {
                     // The automated flows go straight to the probe's host.
                     NavigationStack { TerminalScreen(model: sessions.model(for: nil, store: store)) }
                 } else {
                     RootTabs(store: store)
                 }
+                #else
+                RootTabs(store: store)
+                #endif
             }
             .environmentObject(store)
             .environmentObject(sessions)

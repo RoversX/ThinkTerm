@@ -104,11 +104,13 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     private var wantsSurface = false
     private var lastSize: (Int, Int, Double) = (0, 0, 0)
 
+    #if DEBUG
     // The probe's ssh setup, for the automated flows: a throwaway key and
     // a wrapper that points the remote proxy at an isolated HOME.
     private var probeKeyPath = "/tmp/ttp-ssh/userkey"
     private var probeRemoteCommand = "/tmp/ttp-ssh/thinkterm-remote cli --prefer-mux proxy"
     private var probeUser = probeUserName()
+    #endif
 
     init(host: Host?, store: HostStore?) {
         self.host = host
@@ -122,9 +124,11 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             guard let i = args.firstIndex(of: name), i + 1 < args.count else { return nil }
             return args[i + 1]
         }
+        #if DEBUG
         if let u = arg("--user") { probeUser = u }
         if let k = arg("--key") { probeKeyPath = k }
         if let c = arg("--remote-command") { probeRemoteCommand = c }
+        #endif
 
         let link = CADisplayLink(target: self, selector: #selector(tick))
         link.add(to: .main, forMode: .common)
@@ -156,12 +160,14 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             self.connect()
         }.store(in: &subscriptions)
         settings.$devMode.sink { [weak self] on in self?.wantsStats = on || (self?.wantsStats ?? false) }.store(in: &subscriptions)
+        #if DEBUG
         if args.contains("--autotest") { scheduleAutotest() }
         if args.contains("--autoconnect") { scheduleAutoconnect() }
         if args.contains("--imetest") { scheduleImeTest() }
         if args.contains("--seltest") { scheduleSelectionTest() }
         if args.contains("--treetest") { scheduleTreeTest() }
         if args.contains("--uitest") { scheduleUiTest() }
+        #endif
     }
 
     /// The screen went away but the connection stays: the frame loop
@@ -201,7 +207,10 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     func connect() {
         restoredThread = false
         guard let host else {
+            // Only the automated flows open a screen with no host.
+            #if DEBUG
             connectProbe()
+            #endif
             return
         }
         let account = host.id.uuidString
@@ -215,6 +224,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         )
     }
 
+    #if DEBUG
     /// The probe's connection: the private sshd on this Mac.
     func connectProbe() {
         connect(
@@ -222,6 +232,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
             secret: probeKeyPath, passphrase: nil, knownHost: hostKeyToRemember, remoteCommand: probeRemoteCommand
         )
     }
+    #endif
 
     private func connect(hostname: String, port: Int, user: String, authKind: String, secret: String, passphrase: String?, knownHost: String?, remoteCommand: String) {
         clearHostKeyRequest()
@@ -687,6 +698,7 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
         log(line)
     }
 
+    #if DEBUG
     private func scheduleAutotest() {
         let q = DispatchQueue.main
         q.asyncAfter(deadline: .now() + 2.0) { self.report("start") }
@@ -909,8 +921,10 @@ final class TerminalModel: ObservableObject, @unchecked Sendable {
     private func inputsSent() -> Int64 { Int64(statsField("inputs_sent")) ?? -1 }
     private func composingFlag() -> String { statsField("composing") }
     private func sizeString() -> String { statsField("size") }
+    #endif
 }
 
+#if DEBUG
 /// The Mac user the probe's key belongs to: the `user@host` comment
 /// ssh-keygen wrote at the end of the public key. The simulator gives an
 /// app neither USER nor a real NSUserName.
@@ -923,6 +937,7 @@ func probeUserName() -> String {
     let env = ProcessInfo.processInfo.environment["USER"] ?? ""
     return env.isEmpty ? NSUserName() : env
 }
+#endif
 
 /// UniFFI hands the callback object to the core thread; it forwards to the
 /// model without touching anything that needs the main thread.
