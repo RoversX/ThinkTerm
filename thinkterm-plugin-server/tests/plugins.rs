@@ -221,7 +221,7 @@ fn a_manifest_that_cannot_be_used_is_listed_with_why() {
         "clash",
         &copy.replace("\"snippets-copy\"", "\"snippets\""),
     );
-    install(&host, "future", &copy.replace("api = 1", "api = 2"));
+    install(&host, "future", &copy.replace("api = 1", "api = 99"));
     std::fs::create_dir_all(host.data_dir.join("plugins/empty")).unwrap();
     let (session, _notices) = session(&host);
 
@@ -285,6 +285,28 @@ fn plugins_have_no_commands_to_run() {
     assert!(why.contains("not a request the plugin host knows"), "{why}");
     drop(session);
     stop(&host);
+}
+
+#[test]
+fn a_plugin_someone_watches_runs_on_unused() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host_in(dir.path());
+    install(&host, "copy", &snippets_copy(&host));
+    let mut child = spawn(&host, &["--briefly-secs", "1"]);
+    wait_until("the host to listen", || host.socket.exists());
+    let (session, _notices) = session(&host);
+    // Listing snippets watches them: the session hears when they change.
+    call(
+        &session,
+        "snippets-copy",
+        json!({"op": "list", "query": ""}),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(info(&session, "snippets-copy").state, State::Running);
+    drop(session);
+    stop(&host);
+    wait_until("the host to quit", || child.try_wait().unwrap().is_some());
 }
 
 #[test]
@@ -399,6 +421,209 @@ program = "plugin.sh"
         pid(call(&session, "shell", json!({"op": "pid"})));
         drop(session);
         stop(&host);
+    }
+
+    fn set_background(session: &Session, id: &str, background: Option<api::Background>) -> Answer {
+        manage(
+            session,
+            api::Request::SetBackground {
+                id: id.into(),
+                background,
+            },
+        )
+    }
+
+    #[test]
+    fn a_plugin_gone_unused_stops_after_as_long_as_it_may_run_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_in(dir.path());
+        install_script(&host, WELL_BEHAVED);
+        let mut child = spawn(&host, &["--briefly-secs", "2", "--never-secs", "1"]);
+        wait_until("the host to listen", || host.socket.exists());
+        let (session, _notices) = session(&host);
+        let shell = info(&session, "shell");
+        assert_eq!(
+            (shell.background, shell.background_default),
+            (api::Background::Briefly, api::Background::Briefly)
+        );
+
+        let first = pid(call(&session, "shell", json!({"op": "pid"})));
+        assert_eq!(info(&session, "shell").state, State::Running);
+        wait_until("the unused plugin to stop", || {
+            info(&session, "shell").state == State::Idle
+        });
+        // Used again, it starts again.
+        assert_ne!(pid(call(&session, "shell", json!({"op": "pid"}))), first);
+
+        assert_eq!(
+            set_background(&session, "shell", Some(api::Background::Never)),
+            Ok(Value::Null)
+        );
+        let shell = info(&session, "shell");
+        assert_eq!(
+            (shell.background, shell.background_default),
+            (api::Background::Never, api::Background::Briefly),
+            "the user's choice, shown against the manifest's"
+        );
+        wait_until("it to stop sooner", || {
+            info(&session, "shell").state == State::Idle
+        });
+        assert_eq!(set_background(&session, "shell", None), Ok(Value::Null));
+        assert_eq!(info(&session, "shell").background, api::Background::Briefly);
+        assert!(set_background(&session, "snippets", Some(api::Background::Never)).is_err());
+        assert!(set_background(&session, "nothing", None).is_err());
+        drop(session);
+        stop(&host);
+        wait_until("the host to quit", || child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_call_never_answered_stops_counting_as_a_use_in_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_in(dir.path());
+        install_script(&host, WELL_BEHAVED);
+        let mut child = spawn(&host, &["--never-secs", "1", "--pending-secs", "2"]);
+        wait_until("the host to listen", || host.socket.exists());
+        let (session, _notices) = session(&host);
+        set_background(&session, "shell", Some(api::Background::Never)).unwrap();
+        // The client gives up at once; the host keeps the call waiting,
+        // and no other call comes after it.
+        session.call_within(
+            "shell",
+            json!({"op": "hang"}),
+            Duration::from_millis(100),
+            |_| {},
+        );
+        wait_until("it to start", || {
+            info(&session, "shell").state == State::Running
+        });
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(
+            info(&session, "shell").state,
+            State::Running,
+            "used while the call waits"
+        );
+        wait_until("it to stop unused once the call is let go of", || {
+            info(&session, "shell").state == State::Idle
+        });
+        drop(session);
+        stop(&host);
+        wait_until("the host to quit", || child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_plugin_that_runs_always_runs_while_thinkterm_keeps_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_in(dir.path());
+        let program = install_script(&host, WELL_BEHAVED);
+        let manifest = program.with_file_name("plugin.toml");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::write(
+            &manifest,
+            text.replace(
+                "program = \"plugin.sh\"",
+                "program = \"plugin.sh\"\nbackground = \"always\"",
+            ),
+        )
+        .unwrap();
+        let mut child = spawn(&host, &["--briefly-secs", "1"]);
+        wait_until("the host to listen", || host.socket.exists());
+        let (session, _notices) = session(&host);
+        let shell = info(&session, "shell");
+        assert_eq!(shell.background_default, api::Background::Always);
+        assert_eq!(shell.state, State::Idle, "nothing keeps ThinkTerm up yet");
+        // Where ThinkTerm looks to know it is to keep the host up.
+        let always = thinkterm_plugin_channel::paths::always_in(&host.data_dir);
+        assert_eq!(std::fs::read_to_string(&always).unwrap(), "shell\n");
+
+        // ThinkTerm running on the machine connects, and says so.
+        let mut keeper = host.connect().unwrap();
+        keeper
+            .send(&ToHost::Call {
+                id: 1,
+                plugin: api::PLUGIN.into(),
+                body: json!({"op": "keep"}),
+            })
+            .unwrap();
+        wait_until("it to start by itself", || {
+            info(&session, "shell").state == State::Running
+        });
+        let first = pid(call(&session, "shell", json!({"op": "pid"})));
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(
+            info(&session, "shell").state,
+            State::Running,
+            "unused, and kept"
+        );
+
+        // Stopped by itself, it is started again after a pause.
+        let why = call(&session, "shell", json!({"op": "crash"})).unwrap_err();
+        assert!(why.contains("exited with status 3"), "{why}");
+        wait_until("it to start again", || {
+            info(&session, "shell").state == State::Running
+        });
+        assert_ne!(pid(call(&session, "shell", json!({"op": "pid"}))), first);
+
+        // Once ThinkTerm is gone, it runs as the others do.
+        keeper.shutdown();
+        drop(keeper);
+        wait_until("it to stop unused", || {
+            info(&session, "shell").state == State::Idle
+        });
+        set_background(&session, "shell", Some(api::Background::Briefly)).unwrap();
+        assert!(
+            !always.exists(),
+            "none runs always: nothing to keep the host up for"
+        );
+        drop(session);
+        stop(&host);
+        wait_until("the host to quit", || child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_plugin_installed_to_run_always_is_found_when_thinkterm_keeps_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_in(dir.path());
+        let mut child = spawn(&host, &[]);
+        wait_until("the host to listen", || host.socket.exists());
+        let keep = |keeper: &mut thinkterm_plugin_channel::client::Connection| {
+            keeper
+                .send(&ToHost::Call {
+                    id: 1,
+                    plugin: api::PLUGIN.into(),
+                    body: json!({"op": "keep"}),
+                })
+                .unwrap();
+        };
+        let mut keeper = host.connect().unwrap();
+        keep(&mut keeper);
+        let always = thinkterm_plugin_channel::paths::always_in(&host.data_dir);
+
+        // Installed while the host runs, and nothing asked for the list.
+        let program = install_script(&host, WELL_BEHAVED);
+        let manifest = program.with_file_name("plugin.toml");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::write(
+            &manifest,
+            text.replace(
+                "program = \"plugin.sh\"",
+                "program = \"plugin.sh\"\nbackground = \"always\"",
+            ),
+        )
+        .unwrap();
+        keep(&mut keeper);
+        wait_until("it to be marked", || {
+            std::fs::read_to_string(&always).is_ok_and(|ids| ids == "shell\n")
+        });
+        let (session, _notices) = session(&host);
+        wait_until("it to start by itself", || {
+            info(&session, "shell").state == State::Running
+        });
+        drop(session);
+        keeper.shutdown();
+        drop(keeper);
+        stop(&host);
+        wait_until("the host to quit", || child.try_wait().unwrap().is_some());
     }
 
     #[test]

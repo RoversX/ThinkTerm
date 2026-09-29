@@ -1,11 +1,48 @@
 //! The plugin host's own API: the plugins it knows, turning them on and
-//! off, and reloading them. It is called as the plugin named [`PLUGIN`],
-//! and its events go to every client that asked for the list.
+//! off, how long they run unused, and reloading them. It is called as the
+//! plugin named [`PLUGIN`], and its events go to every client that asked
+//! for the list.
 
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// The name calls address and events carry.
 pub const PLUGIN: &str = "plugins";
+
+/// Directories looked at in the plugins directory; one with more than this
+/// is not a plugins directory someone keeps by hand.
+pub const DIR_LIMIT: usize = 256;
+
+/// How long an installed plugin's program runs while nothing uses it --
+/// no panel of it on show, no call to it unanswered, no client watching
+/// it. Its manifest says which it needs; the user can choose another.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Background {
+    /// Started with ThinkTerm and kept running for as long as ThinkTerm
+    /// runs on the machine: its desktop or its mux server.
+    Always,
+    /// Stopped when it has not been used for [`Background::BRIEFLY`].
+    #[default]
+    Briefly,
+    /// Stopped once it has not been used for [`Background::NEVER`]: a
+    /// moment, so that a panel shown again at once finds it running.
+    Never,
+}
+
+impl Background {
+    pub const BRIEFLY: Duration = Duration::from_secs(120);
+    pub const NEVER: Duration = Duration::from_secs(10);
+
+    /// How long it runs unused, `None` for as long as ThinkTerm does.
+    pub fn unused_for(self) -> Option<Duration> {
+        match self {
+            Self::Always => None,
+            Self::Briefly => Some(Self::BRIEFLY),
+            Self::Never => Some(Self::NEVER),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -20,6 +57,19 @@ pub enum Request {
     /// Turn a plugin on or off. Answered with `null`; the change is
     /// announced.
     SetEnabled { id: String, enabled: bool },
+    /// Choose how long a plugin runs unused; `None` goes back to what its
+    /// manifest says. Answered with `null`; the change is announced.
+    SetBackground {
+        id: String,
+        #[serde(default)]
+        background: Option<Background>,
+    },
+    /// The caller is ThinkTerm running on this machine -- a desktop or a
+    /// mux server -- and stays connected for as long as it runs: while one
+    /// is, the plugins that run [`Background::Always`] do. The host looks
+    /// for new plugins first, so that one installed meanwhile is among
+    /// them. Answered with `null`.
+    Keep,
     /// Stop a plugin, read its manifest again and forget that it failed;
     /// every installed plugin when `id` is absent, looking for new and
     /// removed ones too. Answered with `null`; the change is announced.
@@ -46,6 +96,26 @@ pub struct Info {
     pub dir: Option<String>,
     pub enabled: bool,
     pub state: State,
+    /// The panel it adds to the right sidebar, if it adds one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel: Option<Panel>,
+    /// How long it runs unused: the user's choice, else its manifest's.
+    /// A built-in plugin runs inside the host, and is never started or
+    /// stopped: this is its default.
+    #[serde(default)]
+    pub background: Background,
+    /// What its manifest says, which the user's choice is shown against.
+    #[serde(default)]
+    pub background_default: Background,
+}
+
+/// A plugin's panel in the right sidebar, which the selector offers under
+/// the plugin's name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Panel {
+    /// A Lucide icon's name, for the selector; one a client does not have
+    /// shows as a puzzle piece.
+    pub icon: String,
 }
 
 impl Info {
@@ -135,6 +205,28 @@ mod tests {
         );
         assert!(serde_json::from_value::<Request>(json!({"op": "run"})).is_err());
         assert_eq!(
+            serde_json::from_value::<Request>(
+                json!({"op": "set_background", "id": "a", "background": "always"})
+            )
+            .unwrap(),
+            Request::SetBackground {
+                id: "a".into(),
+                background: Some(Background::Always)
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<Request>(json!({"op": "set_background", "id": "a"})).unwrap(),
+            Request::SetBackground {
+                id: "a".into(),
+                background: None
+            },
+            "none goes back to the manifest's"
+        );
+        assert_eq!(to_value(Request::Keep).unwrap(), json!({"op": "keep"}));
+        assert_eq!(Background::default(), Background::Briefly);
+        assert_eq!(Background::Always.unused_for(), None);
+        assert_eq!(Background::Never.unused_for(), Some(Background::NEVER));
+        assert_eq!(
             to_value(State::Crashed {
                 reason: "exit status 1".into()
             })
@@ -159,6 +251,9 @@ mod tests {
             dir: None,
             enabled: true,
             state: State::Idle,
+            panel: None,
+            background: Background::Briefly,
+            background_default: Background::Briefly,
         };
         assert!(info.usable());
         info.state = State::Failed {

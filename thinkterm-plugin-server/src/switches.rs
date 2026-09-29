@@ -1,12 +1,16 @@
-//! Which plugins are turned off: `plugins.json` in the data directory. A
-//! plugin that is not in it is on. A switch stays when its plugin is
-//! removed, so a plugin installed again comes back as it was left.
+//! Which plugins are turned off, and how long the user lets each run
+//! unused: `plugins.json` in the data directory. A plugin that is not in it
+//! is on, and runs as its manifest says. A switch stays when its plugin is
+//! removed, so a plugin installed again comes back as it was left. Builds
+//! share the file: what one does not know is kept as another wrote it.
 
 use crate::stamp::{stamp, Stamp};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
+use thinkterm_plugin_channel::registry::Background;
 
 pub const FILE: &str = "plugins.json";
 
@@ -14,11 +18,36 @@ pub const FILE: &str = "plugins.json";
 struct Stored {
     #[serde(default)]
     plugins: BTreeMap<String, Switch>,
+    /// What a newer build keeps here, as it wrote it.
+    #[serde(flatten)]
+    rest: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Switch {
+    #[serde(default = "on")]
     enabled: bool,
+    /// The user's choice, as written; none, the manifest's. One this build
+    /// does not know counts as none, and is kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    background: Option<Value>,
+    /// What a newer build keeps here, as it wrote it.
+    #[serde(flatten)]
+    rest: BTreeMap<String, Value>,
+}
+
+impl Default for Switch {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            background: None,
+            rest: BTreeMap::new(),
+        }
+    }
+}
+
+fn on() -> bool {
+    true
 }
 
 pub struct Switches {
@@ -70,15 +99,44 @@ impl Switches {
             .map_or(true, |switch| switch.enabled)
     }
 
+    /// How long the user lets plugin `id` run unused, if they chose.
+    pub fn background(&self, id: &str) -> Option<Background> {
+        let chosen = self.stored.plugins.get(id)?.background.as_ref()?;
+        Background::deserialize(chosen).ok()
+    }
+
     /// Turns a plugin on or off, on disk before it counts. The file is
     /// written over as last read: [`refresh`](Self::refresh) first, and act
     /// on what another host moved. False when it already was.
     pub fn set(&mut self, id: &str, enabled: bool) -> anyhow::Result<bool> {
-        if self.enabled(id) == enabled {
+        self.change(id, |switch| switch.enabled = enabled)
+    }
+
+    /// Keeps the user's choice of how long plugin `id` runs unused, `None`
+    /// for its manifest's, as [`set`](Self::set) keeps a switch.
+    pub fn set_background(
+        &mut self,
+        id: &str,
+        background: Option<Background>,
+    ) -> anyhow::Result<bool> {
+        let background = background.map(|background| {
+            serde_json::to_value(background).expect("a choice always serialises")
+        });
+        self.change(id, |switch| switch.background = background)
+    }
+
+    /// Changes plugin `id`'s entry and writes the file, if that moved it.
+    fn change(&mut self, id: &str, change: impl FnOnce(&mut Switch)) -> anyhow::Result<bool> {
+        let mut next = self.stored.clone();
+        let switch = next.plugins.entry(id.to_string()).or_default();
+        let before = switch.clone();
+        change(switch);
+        if *switch == before && self.stored.plugins.contains_key(id) {
             return Ok(false);
         }
-        let mut next = self.stored.clone();
-        next.plugins.insert(id.to_string(), Switch { enabled });
+        if *switch == Switch::default() && !self.stored.plugins.contains_key(id) {
+            return Ok(false);
+        }
         let dir = self
             .path
             .parent()
@@ -115,6 +173,71 @@ mod tests {
         assert!(switches.refresh());
         assert!(switches.enabled("a"));
         assert!(!switches.refresh(), "nothing new");
+    }
+
+    #[test]
+    fn a_choice_of_background_is_kept_beside_the_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let mut switches = Switches::load(path.clone());
+        assert_eq!(switches.background("a"), None, "the manifest's");
+        assert!(
+            !switches.set_background("a", None).unwrap(),
+            "nothing to keep"
+        );
+        assert!(switches
+            .set_background("a", Some(Background::Always))
+            .unwrap());
+        assert!(!switches
+            .set_background("a", Some(Background::Always))
+            .unwrap());
+        assert!(switches.enabled("a"), "still on");
+        let read = Switches::load(path.clone());
+        assert_eq!(read.background("a"), Some(Background::Always));
+        assert!(switches.set("a", false).unwrap());
+        assert_eq!(
+            Switches::load(path.clone()).background("a"),
+            Some(Background::Always)
+        );
+        assert!(switches.set_background("a", None).unwrap());
+        assert_eq!(Switches::load(path.clone()).background("a"), None);
+        assert!(!Switches::load(path.clone()).enabled("a"));
+        // A file from before there was a choice reads as it did.
+        std::fs::write(&path, r#"{"plugins": {"b": {"enabled": false}}}"#).unwrap();
+        let old = Switches::load(path);
+        assert!(!old.enabled("b"));
+        assert_eq!(old.background("b"), None);
+    }
+
+    #[test]
+    fn what_a_newer_build_wrote_is_kept_and_what_it_chose_counts_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let newer = serde_json::json!({
+            "plugins": {
+                "a": {"enabled": false, "background": "hourly", "pinned": true},
+                "b": {"background": "always"}
+            },
+            "order": ["b", "a"]
+        });
+        std::fs::write(&path, newer.to_string()).unwrap();
+        let mut switches = Switches::load(path.clone());
+        assert!(!switches.enabled("a"), "the rest of the file still reads");
+        assert_eq!(switches.background("a"), None, "a choice it does not know");
+        assert_eq!(switches.background("b"), Some(Background::Always));
+        assert!(switches.set("b", false).unwrap());
+        let written: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({
+                "plugins": {
+                    "a": {"enabled": false, "background": "hourly", "pinned": true},
+                    "b": {"enabled": false, "background": "always"}
+                },
+                "order": ["b", "a"]
+            }),
+            "kept as the newer build wrote it"
+        );
     }
 
     #[test]

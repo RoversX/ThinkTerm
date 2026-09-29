@@ -7,7 +7,9 @@
 //!
 //! The plugins built into it run inside it. An installed plugin runs as a
 //! program of its own, which the host starts when the plugin is first used
-//! and stops when it exits (see registry and docs/thinkterm/plugins.md).
+//! -- or at once, for one that runs always while ThinkTerm keeps the host --
+//! and stops once it has gone unused for long enough, or when the host
+//! exits (see registry and docs/thinkterm/plugins.md).
 
 // Started in the background, never from a console: no window of its own.
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -43,6 +45,8 @@ struct Args {
     data_dir: PathBuf,
     idle: Duration,
     ready_within: Duration,
+    /// How long programs run unused; a test's are shorter.
+    limits: registry::Limits,
     /// Serve this built-in plugin over standard input and output, as an
     /// installed plugin's program does, instead of being the host.
     serve_plugin: Option<String>,
@@ -55,6 +59,7 @@ fn parse_args() -> Result<Args, String> {
         data_dir: paths::data_dir(),
         idle: IDLE_EXIT,
         ready_within: READY_WITHIN,
+        limits: registry::Limits::default(),
         serve_plugin: None,
     };
     let seconds = |name: &str, value: &std::ffi::OsStr| {
@@ -76,6 +81,9 @@ fn parse_args() -> Result<Args, String> {
             "--data-dir" => args.data_dir = value.into(),
             "--idle-secs" => args.idle = seconds(&name, &value)?,
             "--ready-secs" => args.ready_within = seconds(&name, &value)?,
+            "--briefly-secs" => args.limits.briefly = seconds(&name, &value)?,
+            "--never-secs" => args.limits.never = seconds(&name, &value)?,
+            "--pending-secs" => args.limits.pending = seconds(&name, &value)?,
             "--serve-plugin" => args.serve_plugin = Some(value.to_string_lossy().into_owned()),
             _ => return Err(format!("unknown argument {name}")),
         }
@@ -161,6 +169,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         &args.data_dir,
         builtins::all(&args.data_dir),
         args.ready_within,
+        args.limits,
     );
     let host = host::Host::new(args.socket, args.idle, registry);
     host.exit_when_idle();

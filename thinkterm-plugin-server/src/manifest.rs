@@ -6,8 +6,8 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use thinkterm_plugin_channel::registry;
-use thinkterm_plugin_sdk::protocol::API;
+use thinkterm_plugin_channel::registry::{self, Background, Panel};
+use thinkterm_plugin_sdk::protocol::{API, PANEL_API};
 
 pub const FILE: &str = "plugin.toml";
 /// The longest id: it names a directory, a switch, and every event.
@@ -29,7 +29,15 @@ struct Raw {
     #[serde(default)]
     run: Option<RawRun>,
     #[serde(default)]
+    panel: Option<RawPanel>,
+    #[serde(default)]
     locales: BTreeMap<String, RawLocale>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawPanel {
+    #[serde(default)]
+    icon: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -38,6 +46,10 @@ struct RawRun {
     program: Option<String>,
     #[serde(default)]
     args: Option<Vec<String>>,
+    /// How long the program runs unused: `[run]`'s own, the same on every
+    /// system.
+    #[serde(default)]
+    background: Option<Background>,
     #[serde(default)]
     macos: Option<Box<RawRun>>,
     #[serde(default)]
@@ -61,6 +73,10 @@ pub struct Manifest {
     pub version: String,
     pub description: String,
     pub platforms: Vec<String>,
+    /// The panel it adds to the right sidebar.
+    pub panel: Option<Panel>,
+    /// How long its program runs unused, unless the user chose otherwise.
+    pub background: Background,
     /// The program for this system, and its arguments. None for a built-in
     /// plugin, and for one that does not run on this system.
     run: Option<(String, Vec<String>)>,
@@ -94,6 +110,9 @@ pub fn valid_id(id: &str) -> bool {
 fn id_rule() -> String {
     format!("a-z, 0-9 and \"-\", at most {ID_LIMIT} characters")
 }
+
+/// The icon a panel that names none, or one no client has, gets.
+const PANEL_ICON: &str = thinkterm_plugin_sdk::panel::ICONS[0];
 
 impl Manifest {
     /// The manifest in an installed plugin's directory.
@@ -146,6 +165,11 @@ impl Manifest {
             .map(|platform| platform.to_ascii_lowercase())
             .collect();
         let supported = supports(&platforms);
+        let background = raw
+            .run
+            .as_ref()
+            .and_then(|run| run.background)
+            .unwrap_or_default();
         let run = match (builtin, raw.run) {
             (true, None) => None,
             (true, Some(_)) => return Err("a built-in plugin runs no program".into()),
@@ -156,6 +180,19 @@ impl Manifest {
         if !builtin && raw.version.trim().is_empty() {
             return Err("the version is empty".into());
         }
+        let panel = match raw.panel {
+            None => None,
+            Some(_) if builtin => return Err("a built-in plugin's panel is ThinkTerm's own".into()),
+            Some(_) if raw.api < PANEL_API => {
+                return Err(format!("a [panel] needs api = {PANEL_API} or later"))
+            }
+            Some(panel) => Some(Panel {
+                icon: panel
+                    .icon
+                    .filter(|icon| thinkterm_plugin_sdk::panel::ICONS.contains(&icon.as_str()))
+                    .unwrap_or_else(|| PANEL_ICON.to_string()),
+            }),
+        };
         let locales = raw
             .locales
             .into_iter()
@@ -173,6 +210,8 @@ impl Manifest {
             version: raw.version,
             description: raw.description,
             platforms,
+            panel,
+            background,
             run,
             locales,
         })
@@ -325,6 +364,24 @@ mod tests {
         assert_eq!(manifest.localized("ja-JP").description, "デコード");
         assert_eq!(manifest.localized("").name, "Text Tools");
         assert_eq!(manifest.localized("de-DE").name, "Text Tools");
+        assert_eq!(manifest.background, Background::Briefly, "unless it says");
+    }
+
+    #[test]
+    fn a_manifest_says_how_long_its_program_runs_unused() {
+        let with =
+            |line: &str| Manifest::parse(&EXAMPLE.replacen("args = [\"--stdio\"]", line, 1), false);
+        assert_eq!(
+            with("background = \"always\"").unwrap().background,
+            Background::Always
+        );
+        assert_eq!(
+            with("background = \"never\"").unwrap().background,
+            Background::Never
+        );
+        assert!(with("background = \"sometimes\"")
+            .unwrap_err()
+            .contains("line"));
     }
 
     #[test]
@@ -335,7 +392,7 @@ mod tests {
         };
         assert!(broken("text-tools", "Text Tools").contains("is not a-z"));
         assert!(broken("text-tools", "plugins").contains("ThinkTerm's own"));
-        assert!(broken("api = 1", "api = 2").contains("newer ThinkTerm"));
+        assert!(broken("api = 1", "api = 3").contains("newer ThinkTerm"));
         assert!(broken("api = 1", "api = 0").contains("api must be"));
         assert!(broken("version = \"0.1.0\"", "").contains("version"));
         let unreadable = broken("[run]", "[run");
@@ -343,6 +400,32 @@ mod tests {
         assert!(Manifest::parse(EXAMPLE, true)
             .unwrap_err()
             .contains("runs no program"));
+    }
+
+    #[test]
+    fn a_panel_needs_the_api_that_draws_one() {
+        let with_panel = |api: u32, panel: &str| {
+            let text = EXAMPLE.replace("api = 1", &format!("api = {api}"));
+            Manifest::parse(&format!("{text}\n{panel}\n"), false)
+        };
+        let manifest = with_panel(2, "[panel]\nicon = \"git-compare\"").unwrap();
+        assert_eq!(manifest.panel.unwrap().icon, "git-compare");
+        let manifest = with_panel(2, "[panel]\nicon = \"Not An Icon\"").unwrap();
+        assert_eq!(manifest.panel.unwrap().icon, PANEL_ICON);
+        let manifest = with_panel(2, "[panel]\nicon = \"house\"").unwrap();
+        assert_eq!(
+            manifest.panel.unwrap().icon,
+            PANEL_ICON,
+            "a Lucide icon no client has"
+        );
+        assert_eq!(
+            with_panel(2, "[panel]").unwrap().panel.unwrap().icon,
+            PANEL_ICON
+        );
+        assert!(with_panel(2, "").unwrap().panel.is_none());
+        assert!(with_panel(1, "[panel]")
+            .unwrap_err()
+            .contains("needs api = 2"));
     }
 
     #[test]
@@ -400,6 +483,27 @@ mod tests {
         }
         for id in ["", "-a", "A", "a_b", "a b", &"a".repeat(65)] {
             assert!(!valid_id(id), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_manifest_nested_as_deep_as_toml_goes_is_read_on_a_hosts_stack() {
+        // The parser takes 80 levels, and refuses more.
+        let deepest = |open: &str, close: &str| {
+            format!(
+                "id = \"a\"\nname = \"A\"\napi = 1\nx = {}1{}\n[run]\nprogram = \"a\"\n",
+                open.repeat(79),
+                close.repeat(79)
+            )
+        };
+        for text in [deepest("[", "]"), deepest("{a=", "}")] {
+            // Read or refused, as long as it is not the host aborted.
+            std::thread::Builder::new()
+                .stack_size(crate::process::STACK)
+                .spawn(move || Manifest::parse(&text, false).is_ok())
+                .unwrap()
+                .join()
+                .unwrap();
         }
     }
 }

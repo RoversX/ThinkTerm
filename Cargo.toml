@@ -16,6 +16,7 @@ members = [
   "thinkterm-mobile",
   "thinkterm-plugin-channel",
   "thinkterm-plugin-example",
+  "thinkterm-plugin-panel",
   "thinkterm-plugin-sdk",
   "thinkterm-plugin-server",
   "thinkterm-session",
@@ -184,6 +185,7 @@ thinkterm-font-core = { path = "thinkterm-font-core" }
 thinkterm-font-web = { path = "thinkterm-font-web" }
 thinkterm-i18n = { path = "thinkterm-i18n" }
 thinkterm-plugin-channel = { path = "thinkterm-plugin-channel", default-features = false }
+thinkterm-plugin-panel = { path = "thinkterm-plugin-panel" }
 thinkterm-plugin-sdk = { path = "thinkterm-plugin-sdk" }
 thinkterm-proto = { path = "thinkterm-proto" }
 thinkterm-render = { path = "thinkterm-render" }

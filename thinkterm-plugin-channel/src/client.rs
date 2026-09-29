@@ -1,7 +1,7 @@
 //! Reaching the host: connecting to it, starting it when nothing answers,
 //! and replacing one that speaks an older protocol.
 
-use crate::wire::{read_frame, write_frame, FromHost, ToHost, PROTOCOL};
+use crate::wire::{read_frame, write_frame, FromHost, PanelEvent, PanelRequest, ToHost, PROTOCOL};
 use anyhow::{anyhow, bail, Context};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -245,6 +245,198 @@ impl Connection {
     }
 }
 
+/// How often a keeper looks at whether any plugin runs always: soon after
+/// one is chosen to, it runs.
+const KEEP_LOOK: Duration = Duration::from_secs(2);
+/// The pause before a keeper reaches the host again after losing it,
+/// doubling while the host stays away.
+const KEEP_RETRY_FIRST: Duration = Duration::from_secs(1);
+const KEEP_RETRY_LAST: Duration = Duration::from_secs(30);
+/// A keeper's stack: room to read a manifest nested as deep as the TOML
+/// parser lets one go (80 levels), which takes 512 KiB in a release build
+/// and 2 MiB in a debug one, unoptimized: twice that. A thread that runs
+/// out aborts the process -- the desktop, or the mux with every session.
+const KEEP_STACK: usize = if cfg!(debug_assertions) {
+    4 * 1024 * 1024
+} else {
+    1024 * 1024
+};
+
+/// Keeps the host up while any plugin runs always, for as long as this
+/// process runs, telling it this is ThinkTerm running on the machine
+/// (`registry::Request::Keep`): while one is connected so, those plugins
+/// run, and once none is, they stop with the host. For the desktop and the
+/// mux server. Which plugins run always is the host's word, in a file of
+/// its data directory ([`crate::paths::always`]): with none, no host is
+/// started or kept for this -- unless a plugin whose manifest says it runs
+/// always was installed where the host has not looked since, which the
+/// host is then started to look at.
+pub fn keep_host_up() {
+    let keeping = std::thread::Builder::new()
+        .name("plugin-keeper".into())
+        .stack_size(KEEP_STACK)
+        .spawn(|| {
+            let plugins = crate::paths::plugins_dir();
+            let mut manifests = Manifests::default();
+            let mut retry = KEEP_RETRY_FIRST;
+            loop {
+                // Read first, so that the host's answer marks what it looked at.
+                let unlooked = manifests.unlooked(&plugins);
+                if !unlooked && !any_runs_always() {
+                    std::thread::sleep(KEEP_LOOK);
+                    continue;
+                }
+                let kept = Host::for_this_build()
+                    .map_err(anyhow::Error::from)
+                    .and_then(|host| host.connect())
+                    .and_then(|mut connection| {
+                        keep(&mut connection)?;
+                        connection.stream.set_read_timeout(Some(KEEP_LOOK))?;
+                        Ok(connection)
+                    });
+                match kept {
+                    Ok(mut connection) => {
+                        retry = KEEP_RETRY_FIRST;
+                        // Held until the host goes, or nothing runs always
+                        // any more. The host looks for new plugins at each
+                        // `keep`, and has once it answers.
+                        loop {
+                            match connection.recv() {
+                                Ok(FromHost::Ok { .. } | FromHost::Error { .. }) => {
+                                    manifests.looked();
+                                }
+                                Ok(_) => {}
+                                Err(err) if is_timeout(&err) => {
+                                    if manifests.unlooked(&plugins) {
+                                        if keep(&mut connection).is_err() {
+                                            break;
+                                        }
+                                    } else if !any_runs_always() {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        connection.shutdown();
+                    }
+                    Err(err) => log::info!("keeping the plugin host up: {err:#}"),
+                }
+                std::thread::sleep(retry);
+                retry = (retry * 2).min(KEEP_RETRY_LAST);
+            }
+        });
+    if let Err(err) = keeping {
+        log::warn!("cannot keep the plugin host up: {err}");
+    }
+}
+
+/// Tells the host this is ThinkTerm running on the machine.
+fn keep(connection: &mut Connection) -> io::Result<()> {
+    connection.send(&ToHost::Call {
+        id: 1,
+        plugin: crate::registry::PLUGIN.into(),
+        body: serde_json::json!({"op": "keep"}),
+    })
+}
+
+/// Whether the host last said some plugin runs always.
+fn any_runs_always() -> bool {
+    std::fs::read_to_string(crate::paths::always())
+        .is_ok_and(|ids| ids.lines().any(|id| !id.trim().is_empty()))
+}
+
+/// What a keeper knows of the installed plugins' manifests, each read again
+/// only once it changed: whether it says its plugin runs always, and
+/// whether the host has looked at it as it is since. Only the host says
+/// for sure what runs always -- a plugin can be off, or not for this
+/// system -- so a manifest that says so has it looked at once.
+#[derive(Default)]
+struct Manifests {
+    known: HashMap<PathBuf, Known>,
+}
+
+struct Known {
+    changed: (Option<std::time::SystemTime>, u64),
+    always: bool,
+    looked: bool,
+}
+
+impl Manifests {
+    /// Whether a manifest under `plugins`, a plugins directory, says its
+    /// plugin runs always and has not been looked at as it is.
+    fn unlooked(&mut self, plugins: &Path) -> bool {
+        let Ok(entries) = fs::read_dir(plugins) else {
+            self.known.clear();
+            return false;
+        };
+        let mut found = std::collections::HashSet::new();
+        for entry in entries
+            .filter_map(Result::ok)
+            .take(crate::registry::DIR_LIMIT)
+        {
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let manifest = entry.path().join("plugin.toml");
+            let Ok(meta) = fs::metadata(&manifest) else {
+                continue;
+            };
+            let changed = (meta.modified().ok(), meta.len());
+            if !self
+                .known
+                .get(&manifest)
+                .is_some_and(|known| known.changed == changed)
+            {
+                let always = says_always(&manifest);
+                self.known.insert(
+                    manifest.clone(),
+                    Known {
+                        changed,
+                        always,
+                        looked: false,
+                    },
+                );
+            }
+            found.insert(manifest);
+        }
+        self.known.retain(|manifest, _| found.contains(manifest));
+        self.known
+            .values()
+            .any(|known| known.always && !known.looked)
+    }
+
+    /// The host has looked at every manifest as it last was.
+    fn looked(&mut self) {
+        for known in self.known.values_mut() {
+            known.looked = true;
+        }
+    }
+}
+
+/// Whether the manifest at `path` says its plugin runs always.
+fn says_always(path: &Path) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Manifest {
+        #[serde(default)]
+        run: Option<Run>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Run {
+        #[serde(default)]
+        background: Option<String>,
+    }
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str::<Manifest>(&text).ok())
+        .and_then(|manifest| manifest.run?.background)
+        .is_some_and(|background| background == "always")
+}
+
+fn is_timeout(err: &io::Error) -> bool {
+    matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+}
+
 /// A call's answer, or why there is none.
 pub type Answer = Result<Value, String>;
 
@@ -263,6 +455,8 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// own: the host is started when it is not running, a lost connection is
 /// made again with a pause that grows while the host keeps going away, and
 /// every call is answered, with an error when the host cannot answer it.
+/// A plugin's panel lives on one connection: one lost takes its panels
+/// with it, and the owner opens them again when told it is connected.
 /// Dropping the session ends it.
 pub struct Session {
     jobs: Sender<Job>,
@@ -280,6 +474,7 @@ struct Call {
 
 enum Job {
     Call(Call),
+    Panel(u64, PanelRequest),
     /// What the host sent over connection number `.0`.
     Heard(u64, io::Result<FromHost>),
     Stop,
@@ -288,13 +483,16 @@ enum Job {
 /// What a session tells its owner, on the session's thread.
 #[derive(Debug)]
 pub enum Notice {
-    /// Connected, for the first time or again: whatever the owner follows
-    /// is to be asked for anew.
-    Connected,
+    /// Connected, for the first time or `again`: whatever the owner follows
+    /// is to be asked for anew, and, connected again, its panels opened
+    /// anew -- the last connection took them with it.
+    Connected { again: bool },
     /// The host cannot be reached, and why. The session keeps trying.
     Trouble(String),
     /// Something a plugin told the clients watching it.
     Event { plugin: String, body: Value },
+    /// About the owner's panel `view`.
+    Panel { view: u64, event: PanelEvent },
 }
 
 impl Session {
@@ -341,6 +539,13 @@ impl Session {
             (call.reply)(Err("the plugin session has ended".into()));
         }
     }
+
+    /// Tells the host about the owner's panel `view`. Made while there is
+    /// no connection, it goes nowhere: the panels are opened again once
+    /// there is.
+    pub fn panel(&self, view: u64, request: PanelRequest) {
+        let _ = self.jobs.send(Job::Panel(view, request));
+    }
 }
 
 impl Drop for Session {
@@ -370,6 +575,9 @@ fn serve_session(
     let mut retry = SESSION_RETRY_FIRST;
     // Calls made while there was no connection, sent on the next one.
     let mut queued: Vec<Call> = Vec::new();
+    // Something about a panel went nowhere: the owner opens its panels
+    // again on the next connection, the first one included.
+    let mut panels_lost = false;
     loop {
         let connected = host.connect().and_then(|connection| {
             let reader = connection.try_clone()?;
@@ -383,7 +591,7 @@ fn serve_session(
                     (call.reply)(Err(why.clone()));
                 }
                 notice(Notice::Trouble(why));
-                if !pause(&queue, retry, &mut queued) {
+                if !pause(&queue, retry, &mut queued, &mut panels_lost) {
                     return;
                 }
                 retry = (retry * 2).min(SESSION_RETRY_LAST);
@@ -405,12 +613,15 @@ fn serve_session(
         if let Err(err) = listening {
             log::warn!("cannot read from the plugin host: {err}");
             connection.shutdown();
-            if !pause(&queue, retry, &mut queued) {
+            if !pause(&queue, retry, &mut queued, &mut panels_lost) {
                 return;
             }
             continue;
         }
-        notice(Notice::Connected);
+        notice(Notice::Connected {
+            again: generation > 1 || panels_lost,
+        });
+        panels_lost = false;
 
         let mut waiting = Waiting::new();
         let mut alive = true;
@@ -439,6 +650,10 @@ fn serve_session(
                 Ok(Job::Call(call)) => {
                     alive = send_call(&mut connection, &mut next_id, &mut waiting, call)
                 }
+                Ok(Job::Panel(view, request)) => {
+                    alive = connection.send(&ToHost::Panel { view, request }).is_ok();
+                    panels_lost |= !alive;
+                }
                 Ok(Job::Heard(from, _)) if from != generation => {}
                 Ok(Job::Heard(_, Ok(FromHost::Ok { id, body }))) => {
                     retry = SESSION_RETRY_FIRST;
@@ -453,6 +668,9 @@ fn serve_session(
                 }
                 Ok(Job::Heard(_, Ok(FromHost::Event { plugin, body }))) => {
                     notice(Notice::Event { plugin, body })
+                }
+                Ok(Job::Heard(_, Ok(FromHost::Panel { view, event }))) => {
+                    notice(Notice::Panel { view, event })
                 }
                 Ok(Job::Heard(_, Ok(FromHost::Hello { .. }))) => {}
                 Ok(Job::Heard(_, Err(_))) => alive = false,
@@ -471,7 +689,7 @@ fn serve_session(
         }
         // A host that answered reset this; one that keeps failing is asked
         // less and less often.
-        if !pause(&queue, retry, &mut queued) {
+        if !pause(&queue, retry, &mut queued, &mut panels_lost) {
             return;
         }
         retry = (retry * 2).min(SESSION_RETRY_LAST);
@@ -529,9 +747,15 @@ fn give_up_overdue(waiting: &mut Waiting) {
 }
 
 /// Waits `delay` before the next attempt, keeping the calls made meanwhile;
-/// a call cuts the wait short, since someone is waiting on it. False when
-/// the session was ended.
-fn pause(queue: &Receiver<Job>, delay: Duration, queued: &mut Vec<Call>) -> bool {
+/// a call cuts the wait short, since someone is waiting on it. What is said
+/// about a panel meanwhile goes nowhere, and `panels_lost` says so. False
+/// when the session was ended.
+fn pause(
+    queue: &Receiver<Job>,
+    delay: Duration,
+    queued: &mut Vec<Call>,
+    panels_lost: &mut bool,
+) -> bool {
     let until = Instant::now() + delay;
     loop {
         let left = until.saturating_duration_since(Instant::now());
@@ -544,8 +768,70 @@ fn pause(queue: &Receiver<Job>, delay: Duration, queued: &mut Vec<Call>) -> bool
                 return true;
             }
             Ok(Job::Heard(..)) => {}
+            Ok(Job::Panel(..)) => *panels_lost = true,
             Ok(Job::Stop) | Err(RecvTimeoutError::Disconnected) => return false,
             Err(RecvTimeoutError::Timeout) => return true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_manifest_that_says_it_runs_always_is_looked_at_once_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugins = dir.path().join("plugins");
+        let mut manifests = Manifests::default();
+        assert!(!manifests.unlooked(&plugins), "nothing installed");
+        let install = |name: &str, run: &str| {
+            let at = plugins.join(name);
+            fs::create_dir_all(&at).unwrap();
+            let manifest = format!("id = \"{name}\"\nname = \"N\"\napi = 1\n[run]\n{run}\n");
+            fs::write(at.join("plugin.toml"), manifest).unwrap();
+        };
+        install("a", "program = \"a\"");
+        install("b", "program = \"b\"\nbackground = \"never\"");
+        fs::create_dir_all(plugins.join(".hidden")).unwrap();
+        assert!(!manifests.unlooked(&plugins), "none says it runs always");
+
+        install("c", "program = \"c\"\nbackground = \"always\"");
+        assert!(manifests.unlooked(&plugins), "the host has to say");
+        assert!(manifests.unlooked(&plugins), "until it has looked");
+        manifests.looked();
+        assert!(!manifests.unlooked(&plugins), "looked at, as it is");
+
+        install("c", "program = \"c2\"\nbackground = \"always\"");
+        assert!(manifests.unlooked(&plugins), "changed since");
+        manifests.looked();
+        fs::remove_dir_all(plugins.join("c")).unwrap();
+        assert!(!manifests.unlooked(&plugins));
+        assert_eq!(manifests.known.len(), 2, "what is gone is let go of");
+    }
+
+    #[test]
+    fn a_manifest_nested_as_deep_as_toml_goes_is_read_on_a_keepers_stack() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plugin.toml");
+        // The parser takes 80 levels, and refuses more.
+        let deepest = |open: &str, close: &str| {
+            format!(
+                "id = \"a\"\nx = {}1{}\n[run]\nbackground = \"always\"\n",
+                open.repeat(79),
+                close.repeat(79)
+            )
+        };
+        for manifest in [deepest("[", "]"), deepest("{a=", "}")] {
+            fs::write(&path, manifest).unwrap();
+            let path = path.clone();
+            let read = std::thread::Builder::new()
+                .stack_size(KEEP_STACK)
+                .spawn(move || says_always(&path))
+                .unwrap()
+                .join()
+                .unwrap();
+            assert!(read, "read, not aborted");
         }
     }
 }

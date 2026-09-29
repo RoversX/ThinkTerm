@@ -31,6 +31,30 @@ pub fn plugins_dir_in(data_dir: &Path) -> PathBuf {
     data_dir.join("plugins")
 }
 
+/// Where the host writes the plugins that run always, one id a line, for
+/// ThinkTerm to keep it up for them; there is no file while none does.
+/// Scoped to the build profile, as the host's socket is: a debug build's
+/// ThinkTerm keeps the debug host up, not a second host for the release
+/// build's plugins.
+pub fn always() -> PathBuf {
+    always_in(&data_dir())
+}
+
+/// [`always`], for a host keeping its data in `data_dir`.
+pub fn always_in(data_dir: &Path) -> PathBuf {
+    data_dir.join(profile_scoped("plugins-always"))
+}
+
+/// Whether anything is installed in `dir`, a plugins directory: an entry
+/// that is not hidden. Reads the directory, so off a thread that paints.
+pub fn any_installed(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut entries| {
+        entries.any(|entry| {
+            entry.is_ok_and(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+        })
+    })
+}
+
 fn home_dir() -> PathBuf {
     dirs_next::home_dir().unwrap_or_default()
 }
@@ -39,12 +63,15 @@ fn home_dir() -> PathBuf {
 /// `runtime_file_name` scopes the mux's files: a debug build never reaches
 /// the release build's host.
 fn runtime_file(base: &str) -> PathBuf {
-    let name = if cfg!(debug_assertions) {
+    runtime_dir().join(profile_scoped(base))
+}
+
+fn profile_scoped(base: &str) -> String {
+    if cfg!(debug_assertions) {
         format!("{base}-debug")
     } else {
         base.to_string()
-    };
-    runtime_dir().join(name)
+    }
 }
 
 pub fn socket() -> PathBuf {

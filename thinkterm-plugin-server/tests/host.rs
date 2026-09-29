@@ -227,7 +227,7 @@ fn a_session_follows_the_host_across_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     let host = host_in(dir.path());
     let (session, notices) = session(&host);
-    next_notice(&notices, |n| matches!(n, Notice::Connected));
+    next_notice(&notices, |n| matches!(n, Notice::Connected { .. }));
     let listed = ask(
         &session,
         Request::List {
@@ -257,7 +257,7 @@ fn a_session_follows_the_host_across_a_restart() {
 
     // The host goes; the session starts another and says so.
     stop(&host);
-    next_notice(&notices, |n| matches!(n, Notice::Connected));
+    next_notice(&notices, |n| matches!(n, Notice::Connected { .. }));
     let rows: Vec<Row> = serde_json::from_value(
         ask(
             &session,
@@ -312,7 +312,7 @@ fn a_call_to_a_host_that_hangs_is_given_up_on() {
         let _ = tx.send(notice);
     })
     .unwrap();
-    next_notice(&notices, |n| matches!(n, Notice::Connected));
+    next_notice(&notices, |n| matches!(n, Notice::Connected { .. }));
     let started = Instant::now();
     let why = ask(
         &session,

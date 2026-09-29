@@ -44,7 +44,17 @@ const ERRORS_LOGGED: usize = 4 * 1024 * 1024;
 const ERROR_LINE: u64 = 4096;
 /// What is left of [`ERRORS_LOGGED`].
 static ERRORS_LEFT: AtomicUsize = AtomicUsize::new(ERRORS_LOGGED);
-const STACK: usize = 256 * 1024;
+/// The stack of the host's threads, here and in `host`. They parse JSON and
+/// move bytes, and any of them may read a manifest -- a scan, a tidy -- one
+/// nested as deep as the TOML parser goes (80 levels) taking 512 KiB in a
+/// release build and 2 MiB in a debug one, unoptimized: twice that here. A
+/// thread that runs out aborts the host; what it does not touch of its
+/// stack is only reserved.
+pub const STACK: usize = if cfg!(debug_assertions) {
+    4 * 1024 * 1024
+} else {
+    1024 * 1024
+};
 
 /// What the host hears about a program, on the program's own threads.
 pub trait Listener: Send + Sync + 'static {
@@ -200,7 +210,7 @@ impl Process {
                             Ok(false) => break None,
                             Err(err) => break Some(format!("{err}")),
                         }
-                        match serde_json::from_slice::<FromPlugin>(&line) {
+                        match FromPlugin::read(&line) {
                             Ok(message) => listener.said(&id, generation, message),
                             Err(err) if noise < NOISE_LOGGED => {
                                 noise += 1;
@@ -291,17 +301,47 @@ impl Process {
         Ok(())
     }
 
+    /// Sends a message no answer is waited for: one about a panel.
+    pub fn tell(&mut self, message: &ToPlugin) -> Result<(), Refused> {
+        let mut line = Vec::new();
+        protocol::write_message(&mut line, message)
+            .map_err(|err| Refused::Busy(format!("{err}")))?;
+        self.tell_line(line)
+    }
+
+    /// Sends a message already written out as a line, its end included.
+    pub fn tell_line(&mut self, line: Vec<u8>) -> Result<(), Refused> {
+        match self.outbox.try_send(line) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                Err(Refused::Gone("it is not reading what it is sent".into()))
+            }
+            Err(TrySendError::Disconnected(_)) => Err(Refused::Gone("its input is closed".into())),
+        }
+    }
+
+    /// Whether calls to it wait for their answers.
+    pub fn busy(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// The client waiting for the answer to `id`, now that it came.
     pub fn answered(&mut self, id: u64) -> Option<Waiter> {
         self.pending.remove(&id).map(|(waiter, _)| waiter)
     }
 
-    /// Lets go of the calls made longer than [`PENDING_EXPIRY`] ago: whoever
-    /// made them stopped waiting long since. Hands them back.
-    pub fn expire(&mut self) -> Vec<Waiter> {
+    /// When the oldest call still waiting for its answer was made.
+    pub fn oldest_call(&self) -> Option<Instant> {
+        self.pending.values().map(|(_, made)| *made).min()
+    }
+
+    /// Lets go of the calls made longer than `limit` ago -- normally
+    /// [`PENDING_EXPIRY`]: whoever made them stopped waiting long since.
+    /// Hands them back.
+    pub fn expire(&mut self, limit: Duration) -> Vec<Waiter> {
         let mut expired = Vec::new();
         self.pending.retain(|_, (waiter, made)| {
-            let keep = made.elapsed() < PENDING_EXPIRY;
+            let keep = made.elapsed() < limit;
             if !keep {
                 expired.push(*waiter);
             }

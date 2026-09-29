@@ -8,14 +8,15 @@ publish = false
 default = ["native"]
 # Finding, starting and talking to the plugin host. Without it the crate is
 # the message format alone, which a browser speaks through the mux.
-native = ["dep:anyhow", "dep:dirs-next", "dep:log", "dep:wezterm-uds"]
+native = ["dep:anyhow", "dep:dirs-next", "dep:log", "dep:toml", "dep:wezterm-uds"]
 
 [dependencies]
 anyhow = { workspace = true, optional = true }
 dirs-next = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive", "std"] }
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+toml = { workspace = true, optional = true }
 wezterm-uds = { workspace = true, optional = true }
 
 [dev-dependencies]

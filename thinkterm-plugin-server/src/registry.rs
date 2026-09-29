@@ -4,8 +4,10 @@
 //!
 //! The directory is looked at again whenever the list is asked for, and a
 //! plugin's manifest and program whenever it is used, so installing,
-//! removing, editing and rebuilding a plugin need no restart. Nothing
-//! starts a plugin's program but a client using the plugin, and no program
+//! removing, editing and rebuilding a plugin need no restart. A plugin's
+//! program starts when a client uses the plugin -- or, for one that runs
+//! always, while ThinkTerm keeps the host -- and stops once it has gone
+//! unused for as long as the plugin may run so ([`Background`]). No program
 //! starts while one that ran under the same id -- from whichever directory
 //! -- is still on its way out: they share a data directory, and calls made
 //! meanwhile wait for it to be gone.
@@ -17,18 +19,50 @@ use crate::switches::{self, Switches};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use thinkterm_plugin_channel::registry::{Info, State};
-use thinkterm_plugin_sdk::protocol::{ToPlugin, API};
+use thinkterm_plugin_channel::registry::{Background, Info, State, DIR_LIMIT};
+use thinkterm_plugin_sdk::protocol::{ToPlugin, API, PANEL_API};
 use thinkterm_plugin_sdk::Plugin;
 
 /// Crashes within [`CRASH_WINDOW`] that mark a plugin failed.
 const CRASH_LIMIT: usize = 3;
 const CRASH_WINDOW: Duration = Duration::from_secs(60);
-/// Directories looked at in the plugins directory; one with more than this
-/// is not a plugins directory someone keeps by hand.
-const DIR_LIMIT: usize = 256;
 /// How long the programs still running when the host exits have to exit.
 const EXIT_GRACE: Duration = Duration::from_secs(1);
+/// How long a plugin that runs always rests after it stopped by itself
+/// before it is started again.
+const RESTART_PAUSE: Duration = Duration::from_secs(2);
+
+/// How long programs run unused, by how long their plugins may, and how
+/// long a call waits for its answer: what [`Background`] and
+/// [`process::PENDING_EXPIRY`] say, but for a test's much shorter ones.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    pub briefly: Duration,
+    pub never: Duration,
+    pub pending: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            briefly: Background::BRIEFLY,
+            never: Background::NEVER,
+            pending: process::PENDING_EXPIRY,
+        }
+    }
+}
+
+impl Limits {
+    /// How long a plugin that runs `background` runs unused, `None` for as
+    /// long as the host is kept.
+    fn unused_for(&self, background: Background) -> Option<Duration> {
+        match background {
+            Background::Always => None,
+            Background::Briefly => Some(self.briefly),
+            Background::Never => Some(self.never),
+        }
+    }
+}
 
 /// A plugin built into the host, which runs inside it.
 pub struct Builtin {
@@ -70,6 +104,8 @@ struct Installed {
     exiting: Vec<Exiting>,
     /// The calls waiting for such a program to be gone.
     queued: Vec<Queued>,
+    /// Since when its running program has gone unused.
+    unused_since: Option<Instant>,
 }
 
 enum Run {
@@ -97,6 +133,7 @@ impl Installed {
             crashes: Vec::new(),
             exiting: Vec::new(),
             queued: Vec::new(),
+            unused_since: None,
         };
         installed.read_manifest();
         installed
@@ -162,6 +199,12 @@ impl Fallout {
     }
 }
 
+/// Why a panel could not be opened, and whether opening it again may work.
+pub struct Refusal {
+    pub reason: String,
+    pub again: bool,
+}
+
 /// Which plugin a call is for.
 pub enum Lookup {
     Builtin(usize),
@@ -180,10 +223,19 @@ pub struct Registry {
     /// taken for another run's.
     generation: u64,
     ready_within: Duration,
+    limits: Limits,
+    /// Where the plugins that run always are written, and what was last.
+    always_file: PathBuf,
+    always_written: Option<Vec<String>>,
 }
 
 impl Registry {
-    pub fn new(data_dir: &Path, builtins: Vec<Builtin>, ready_within: Duration) -> Self {
+    pub fn new(
+        data_dir: &Path,
+        builtins: Vec<Builtin>,
+        ready_within: Duration,
+        limits: Limits,
+    ) -> Self {
         let mut registry = Self {
             plugins_dir: thinkterm_plugin_channel::paths::plugins_dir_in(data_dir),
             plugin_data: data_dir.join("plugin-data"),
@@ -192,6 +244,9 @@ impl Registry {
             installed: Vec::new(),
             generation: 0,
             ready_within,
+            limits,
+            always_file: thinkterm_plugin_channel::paths::always_in(data_dir),
+            always_written: None,
         };
         // Nobody is connected yet to be told what it found.
         registry.scan(&mut Fallout::default());
@@ -349,7 +404,18 @@ impl Registry {
             dir: None,
             enabled,
             state: if enabled { State::Idle } else { State::Off },
+            panel: None,
+            background: Background::default(),
+            background_default: Background::default(),
         }
+    }
+
+    /// How long a plugin with `manifest` runs unused: the user's choice,
+    /// else its manifest's.
+    fn background(&self, manifest: &Manifest) -> Background {
+        self.switches
+            .background(&manifest.id)
+            .unwrap_or(manifest.background)
     }
 
     fn installed_info(&self, installed: &Installed, locale: &str) -> Info {
@@ -368,6 +434,9 @@ impl Registry {
                     state: State::Invalid {
                         reason: reason.clone(),
                     },
+                    panel: None,
+                    background: Background::default(),
+                    background_default: Background::default(),
                 }
             }
         };
@@ -410,6 +479,9 @@ impl Registry {
             dir,
             enabled,
             state,
+            panel: manifest.panel.clone(),
+            background: self.background(manifest),
+            background_default: manifest.background,
         }
     }
 
@@ -496,6 +568,185 @@ impl Registry {
         Ok(())
     }
 
+    /// Keeps the user's choice of how long plugin `id` runs unused, `None`
+    /// for its manifest's. Acted on at the next [`tidy`](Self::tidy).
+    pub fn set_background(
+        &mut self,
+        id: &str,
+        background: Option<Background>,
+        fallout: &mut Fallout,
+    ) -> Result<(), String> {
+        let known = self
+            .installed
+            .iter()
+            .any(|installed| installed.id() == Some(id));
+        if !known {
+            let why = if self
+                .builtins
+                .iter()
+                .any(|builtin| builtin.manifest.id == id)
+            {
+                format!("{id:?} runs inside ThinkTerm, not on its own")
+            } else {
+                format!("there is no plugin {id:?}")
+            };
+            return Err(why);
+        }
+        self.follow_switches(fallout);
+        let moved = self
+            .switches
+            .set_background(id, background)
+            .map_err(|err| format!("cannot save the choice: {err:#}"))?;
+        if moved {
+            log::info!("plugin {id} runs unused: {background:?}");
+            fallout.changed = true;
+        }
+        Ok(())
+    }
+
+    /// Stops the programs that have gone unused for as long as their
+    /// plugins may run so, and starts the ones that run always while
+    /// ThinkTerm `kept` the host -- restarting one that stopped by itself
+    /// after a pause, until it has stopped too often. `used` says whether a
+    /// plugin, by id, has a panel on show or a client watching it; a call
+    /// waiting for its answer counts as a use too. Hands back when the next
+    /// program is due to be stopped or started, if any is.
+    pub fn tidy(
+        &mut self,
+        now: Instant,
+        kept: bool,
+        used: impl Fn(&str) -> bool,
+        listener: &Arc<dyn Listener>,
+        fallout: &mut Fallout,
+    ) -> Option<Instant> {
+        self.mark_always();
+        let mut next: Option<Instant> = None;
+        let mut due = |at: Instant| next = Some(next.map_or(at, |next| next.min(at)));
+        // A call the program never answers is let go of in time, and stops
+        // counting as a use of it, though no other call comes to find it.
+        let pending = self.limits.pending;
+        for installed in &mut self.installed {
+            if let Run::Running(process) = &mut installed.run {
+                let expired = process.expire(pending);
+                if !expired.is_empty() {
+                    fallout.lost(expired, "the plugin did not answer in time");
+                }
+                if let Some(made) = process.oldest_call() {
+                    due(made + pending);
+                }
+            }
+        }
+        for index in 0..self.installed.len() {
+            let installed = &self.installed[index];
+            let Some(manifest) = installed
+                .manifest
+                .as_ref()
+                .ok()
+                .filter(|_| installed.shadowed.is_none())
+            else {
+                continue;
+            };
+            let id = manifest.id.clone();
+            let background = self.background(manifest);
+            // One that cannot run -- turned off, or not for this system --
+            // is not tried each time.
+            let always = kept
+                && background == Background::Always
+                && manifest.supported()
+                && self.switches.enabled(&id);
+            let in_use = |installed: &Installed| match &installed.run {
+                Run::Running(process) => {
+                    always || process.busy() || !installed.queued.is_empty() || used(&id)
+                }
+                _ => false,
+            };
+            match &installed.run {
+                Run::Running(_) if in_use(installed) => {
+                    self.installed[index].unused_since = None;
+                }
+                Run::Running(_) => {
+                    // With nothing keeping ThinkTerm up, one that runs
+                    // always runs as the others do.
+                    let limit = self
+                        .limits
+                        .unused_for(background)
+                        .unwrap_or(self.limits.briefly);
+                    let installed = &mut self.installed[index];
+                    let since = *installed.unused_since.get_or_insert(now);
+                    if now.saturating_duration_since(since) >= limit {
+                        installed.unused_since = None;
+                        installed.stop(&format!("it went unused for {limit:?}"), fallout);
+                    } else {
+                        due(since + limit);
+                    }
+                }
+                Run::Idle | Run::Crashed(_) if always => {
+                    if let (Run::Crashed(_), Some(crashed)) =
+                        (&installed.run, installed.crashes.last())
+                    {
+                        let again = *crashed + RESTART_PAUSE;
+                        if now < again {
+                            due(again);
+                            continue;
+                        }
+                    }
+                    if self.still_exiting(&id) {
+                        // Started once it is gone: word of that runs this again.
+                        continue;
+                    }
+                    let Ok(launch) = self.launchable(index, fallout) else {
+                        continue;
+                    };
+                    if launch.id != id {
+                        continue;
+                    }
+                    log::info!("starting plugin {id}: it runs always");
+                    if let Err(why) = self.start(index, launch, listener, fallout) {
+                        log::warn!("plugin {id} runs always, and cannot start: {why}");
+                    }
+                }
+                _ => {}
+            }
+        }
+        next
+    }
+
+    /// Writes which plugins run always -- on, usable and not given up on --
+    /// where ThinkTerm looks to keep the host up for them, when that
+    /// changed; with none, there is no file. A write that fails is said
+    /// once, and tried again at the next change.
+    fn mark_always(&mut self) {
+        let mut always: Vec<String> = self
+            .installed
+            .iter()
+            .filter(|installed| installed.shadowed.is_none())
+            .filter(|installed| !matches!(installed.run, Run::Failed { .. }))
+            .filter_map(|installed| installed.manifest.as_ref().ok())
+            .filter(|manifest| {
+                manifest.supported()
+                    && self.switches.enabled(&manifest.id)
+                    && self.background(manifest) == Background::Always
+            })
+            .map(|manifest| manifest.id.clone())
+            .collect();
+        always.sort();
+        if self.always_written.as_ref() == Some(&always) {
+            return;
+        }
+        let written = if always.is_empty() {
+            match std::fs::remove_file(&self.always_file) {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
+                _ => Ok(()),
+            }
+        } else {
+            write_whole(&self.always_file, always.join("\n") + "\n")
+        };
+        if let Err(err) = written {
+            log::warn!("writing {}: {err:#}", self.always_file.display());
+        }
+        self.always_written = Some(always);
+    }
+
     /// Stops a plugin, reads its manifest again and forgets that it failed:
     /// every installed plugin when `id` is `None`, after looking for new and
     /// removed ones.
@@ -572,6 +823,118 @@ impl Registry {
         calls.push(call);
         self.deliver(index, launch, calls, listener, fallout);
         Ok(())
+    }
+
+    /// Sends the installed plugin at `index`, found answering to `id`, the
+    /// message opening a panel of it, starting its program if it is not
+    /// running -- and again if it was rebuilt. Hands back the run the panel
+    /// is open on. A program of the id still on its way out is not waited
+    /// for, as a call would: the client is to try again.
+    pub fn open_panel(
+        &mut self,
+        id: &str,
+        index: usize,
+        message: &ToPlugin,
+        listener: &Arc<dyn Listener>,
+        fallout: &mut Fallout,
+    ) -> Result<u64, Refusal> {
+        let for_good = |reason: String| Refusal {
+            reason,
+            again: false,
+        };
+        let launch = self.launchable(index, fallout).map_err(for_good)?;
+        if launch.id != id {
+            return Err(for_good(format!("there is no plugin named {id:?}")));
+        }
+        let installed = &mut self.installed[index];
+        let Ok(manifest) = &installed.manifest else {
+            return Err(for_good(format!("there is no plugin named {id:?}")));
+        };
+        if manifest.panel.is_none() {
+            return Err(for_good(format!("{} has no panel", manifest.name)));
+        }
+        if let Run::Running(process) = &installed.run {
+            if stamp(&process.program) != process.program_stamp {
+                installed.stop("its program changed, and it is started again", fallout);
+            }
+        }
+        if self.still_exiting(id) {
+            return Err(Refusal {
+                reason: "it is still stopping".into(),
+                again: true,
+            });
+        }
+        if !matches!(self.installed[index].run, Run::Running(_)) {
+            self.start(index, launch, listener, fallout)
+                .map_err(for_good)?;
+        }
+        let Run::Running(process) = &mut self.installed[index].run else {
+            unreachable!("just started");
+        };
+        let generation = process.generation;
+        match process.tell(message) {
+            Ok(()) => Ok(generation),
+            Err(Refused::Busy(reason)) => Err(Refusal {
+                reason,
+                again: true,
+            }),
+            Err(Refused::Gone(why)) => {
+                self.gave_up(id, generation, why.clone(), false, fallout);
+                Err(Refusal {
+                    reason: why,
+                    again: true,
+                })
+            }
+        }
+    }
+
+    /// Sends `message` to the program of plugin `id` if its run
+    /// `generation` is the one going on. False when it is not: the panels
+    /// open on it are closed by then, or about to be.
+    pub fn tell(
+        &mut self,
+        id: &str,
+        generation: u64,
+        message: &ToPlugin,
+        fallout: &mut Fallout,
+    ) -> bool {
+        let Some(process) = self.process(id, generation) else {
+            return false;
+        };
+        let told = process.tell(message);
+        self.told(id, generation, told, fallout)
+    }
+
+    /// [`tell`](Self::tell), with the message written out as a line already.
+    pub fn tell_line(
+        &mut self,
+        id: &str,
+        generation: u64,
+        line: Vec<u8>,
+        fallout: &mut Fallout,
+    ) -> bool {
+        let Some(process) = self.process(id, generation) else {
+            return false;
+        };
+        let told = process.tell_line(line);
+        self.told(id, generation, told, fallout)
+    }
+
+    fn told(
+        &mut self,
+        id: &str,
+        generation: u64,
+        told: Result<(), Refused>,
+        fallout: &mut Fallout,
+    ) -> bool {
+        match told {
+            Ok(()) => true,
+            Err(Refused::Busy(_)) => false,
+            Err(Refused::Gone(why)) => {
+                self.gave_up(id, generation, why, false, fallout);
+                false
+            }
+        }
     }
 
     /// Whether a program that ran under `id` is still on its way out, from
@@ -670,10 +1033,11 @@ impl Registry {
                 return;
             }
         }
+        let pending = self.limits.pending;
         let Run::Running(process) = &mut self.installed[index].run else {
             unreachable!("just started");
         };
-        let expired = process.expire();
+        let expired = process.expire(pending);
         fallout.lost(expired, "the plugin did not answer in time");
         let mut gone = None;
         let mut calls = calls.into_iter();
@@ -778,23 +1142,29 @@ impl Registry {
             })
     }
 
-    /// The run's program said it is ready, speaking plugin API `api`.
+    /// The run's program said it is ready, speaking plugin API `api`: any
+    /// this ThinkTerm speaks, and one that draws a panel if it has one.
     pub fn ready(&mut self, id: &str, generation: u64, api: u32, fallout: &mut Fallout) {
         let Some(process) = self.process(id, generation) else {
             return;
         };
         process.ready = true;
         fallout.changed = true;
-        if api == API {
+        let has_panel = self.installed.iter().any(|installed| {
+            installed.answers_to(id)
+                && installed
+                    .manifest
+                    .as_ref()
+                    .is_ok_and(|manifest| manifest.panel.is_some())
+        });
+        let why = if !(1..=API).contains(&api) {
+            format!("it speaks plugin API {api}; this ThinkTerm speaks 1 to {API}")
+        } else if has_panel && api < PANEL_API {
+            format!("it speaks plugin API {api}, and its panel needs {PANEL_API}")
+        } else {
             return;
-        }
-        self.gave_up(
-            id,
-            generation,
-            format!("it speaks plugin API {api}; this ThinkTerm speaks {API}"),
-            true,
-            fallout,
-        );
+        };
+        self.gave_up(id, generation, why, true, fallout);
     }
 
     /// The run's program has exited. One told to stop is gone at last: the
@@ -906,4 +1276,17 @@ impl Registry {
             process::stop_all(running, exiting, EXIT_GRACE);
         }
     }
+}
+
+/// Writes `text` to `path` whole, or not at all.
+fn write_whole(path: &Path, text: String) -> anyhow::Result<()> {
+    use std::io::Write;
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no directory", path.display()))?;
+    std::fs::create_dir_all(dir)?;
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    file.write_all(text.as_bytes())?;
+    file.persist(path)?;
+    Ok(())
 }

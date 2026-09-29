@@ -8586,6 +8586,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "toml 0.8.23",
  "wezterm-uds",
 ]
 
@@ -8601,6 +8602,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkterm-plugin-panel"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "thinkterm-plugin-sdk"
 version = "0.1.0"
 dependencies = [
@@ -8608,6 +8618,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thinkterm-plugin-channel",
+ "thinkterm-plugin-panel",
 ]
 
 [[package]]
