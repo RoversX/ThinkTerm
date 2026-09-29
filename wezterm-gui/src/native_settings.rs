@@ -1,6 +1,7 @@
 use config::ConfigHandle;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -481,6 +482,21 @@ pub(crate) struct NativeChromeSettings {
     /// Agents panel. Absent means on -- it was off by default while the
     /// detection was new, and is a panel toggle like the three above now.
     pub(crate) agent_panel_enabled: Option<bool>,
+    /// The panels plugins add to the right sidebar, as the plugin host last
+    /// listed them (`plugins::follow_panels`): offered from the start,
+    /// before the host is asked.
+    pub(crate) plugin_panels: Vec<NativePluginPanel>,
+    /// How wide the user made each plugin's extended view, by plugin, in
+    /// unscaled pixels. A plugin's goes when the host lists it no more.
+    pub(crate) plugin_extended_widths: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub(crate) struct NativePluginPanel {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    /// A Lucide icon's name.
+    pub(crate) icon: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1367,6 +1383,8 @@ pub(crate) struct RightSidebarPanelToggles {
     pub(crate) files: bool,
     pub(crate) notes: bool,
     pub(crate) snippets: bool,
+    /// Whether any plugin adds a panel.
+    pub(crate) plugins: bool,
 }
 
 pub(crate) fn right_sidebar_panel_toggles() -> RightSidebarPanelToggles {
@@ -1378,7 +1396,13 @@ pub(crate) fn right_sidebar_panel_toggles() -> RightSidebarPanelToggles {
         // plugin's switch has taken it over.
         snippets: settings.chrome.right_sidebar_snippets_enabled != Some(false)
             && settings.chrome.snippets_plugin_enabled.unwrap_or(true),
+        plugins: !settings.chrome.plugin_panels.is_empty(),
     }
+}
+
+/// The panels plugins add to the right sidebar, as last heard.
+pub(crate) fn plugin_panels() -> Vec<NativePluginPanel> {
+    load_shared().chrome.plugin_panels.clone()
 }
 
 pub(crate) fn right_sidebar_width() -> Option<usize> {
@@ -1441,6 +1465,24 @@ pub(crate) fn right_sidebar_markdown_preview_rendered() -> bool {
 pub(crate) fn save_right_sidebar_markdown_preview_rendered(rendered: bool) -> anyhow::Result<()> {
     let mut settings = load();
     settings.chrome.right_sidebar_markdown_preview_rendered = Some(rendered);
+    save(&settings)
+}
+
+/// How wide the user made plugin `plugin`'s extended view.
+pub(crate) fn plugin_extended_width(plugin: &str) -> Option<usize> {
+    load_shared()
+        .chrome
+        .plugin_extended_widths
+        .get(plugin)
+        .copied()
+}
+
+pub(crate) fn save_plugin_extended_width(plugin: &str, width: usize) -> anyhow::Result<()> {
+    let mut settings = load();
+    settings
+        .chrome
+        .plugin_extended_widths
+        .insert(plugin.to_string(), width);
     save(&settings)
 }
 

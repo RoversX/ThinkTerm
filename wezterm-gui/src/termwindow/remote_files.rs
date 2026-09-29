@@ -224,6 +224,26 @@ pub(crate) struct RemoteFileBytes {
     pub truncated: bool,
 }
 
+/// What a program run over the connection printed, whether it printed more
+/// than was kept, and the status it ended with: `None` when it was killed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteRun {
+    pub out: Vec<u8>,
+    pub cut: bool,
+    pub status: Option<u32>,
+}
+
+/// What is at a remote path, a link not followed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteStat {
+    pub kind: RemoteFileKind,
+    pub size: u64,
+    /// When it last changed, in seconds since 1970.
+    pub modified: Option<u64>,
+    /// Where a link points.
+    pub target: Option<String>,
+}
+
 /// Bytes moved per round trip. SFTP is request/response over a single
 /// channel, so a bigger chunk means fewer round trips; this matches the read
 /// path's buffer and still leaves a cancel responsive on a slow link.
@@ -742,6 +762,21 @@ pub(crate) trait RemoteFileBackend: Send + Sync {
         Box::pin(async { Err("This connection cannot create directories".to_string()) })
     }
 
+    /// Runs `command`, a line for the remote user's shell, keeping at most
+    /// `limit` bytes of what it prints; killed once it has run for `wait`.
+    /// For a plugin's panel beside a terminal there (`plugin_panel`). The
+    /// default refuses, as the other operations beyond reading do.
+    fn run(&self, command: String, limit: usize, wait: Duration) -> RemoteFuture<RemoteRun> {
+        let _ = (command, limit, wait);
+        Box::pin(async { Err("This connection cannot run programs".to_string()) })
+    }
+
+    /// What is at `path`, a link not followed: `None` when nothing is.
+    fn stat(&self, path: String) -> RemoteFuture<Option<RemoteStat>> {
+        let _ = path;
+        Box::pin(async { Err("This connection cannot look at files".to_string()) })
+    }
+
     /// Every file under `root` for search, listed on the remote host by
     /// `thinkterm list-files` under the rules the local index uses.
     fn list_project_files(
@@ -789,6 +824,95 @@ pub(crate) fn remote_listing_failure_is_transport(message: &str) -> bool {
 /// through the remote user's shell.
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// The command line that runs `args` -- a program and its arguments -- in
+/// the directory `cwd` on the remote host: under `sh`, whatever the login
+/// shell is, every word quoted for the shell that reads the line. The
+/// program reads nothing: the channel's input stays open while it runs
+/// ([`close_remote_exec`]), and one that read it would wait.
+pub(crate) fn run_command_line(cwd: &str, args: &[String]) -> String {
+    let mut line = String::from("sh -c 'cd \"$1\" && shift && exec \"$@\" </dev/null' sh ");
+    line.push_str(&shell_quote(cwd));
+    for arg in args {
+        line.push(' ');
+        line.push_str(&shell_quote(arg));
+    }
+    line
+}
+
+/// How long a program on another machine that was killed -- it printed
+/// too much, or ran too long -- is given to be done with before its channel
+/// is closed on it. A server that takes the kill ends the channel within
+/// this, once what it still holds has been read; one closed sooner is left
+/// holding that, and keeps the channel open. Where the kill does nothing --
+/// ssh2 sends no signals, nor does every server take them -- the close cuts
+/// the program off, and it stops at its next write.
+const REMOTE_KILL_GRACE: Duration = Duration::from_secs(10);
+
+/// Lets go of the input of an exec channel, which closes the channel:
+/// wezterm-ssh closes one whose input ends, and what the program prints
+/// after that is lost, so the input is held until the program is done
+/// with. One that was `killed` is given [`REMOTE_KILL_GRACE`] first.
+fn close_remote_exec(stdin: wezterm_ssh::FileDescriptor, killed: bool) {
+    if !killed {
+        return drop(stdin);
+    }
+    let _ = std::thread::Builder::new()
+        .name("remote-exec-close".into())
+        .spawn(move || {
+            std::thread::sleep(REMOTE_KILL_GRACE);
+            drop(stdin);
+        });
+}
+
+/// Reads what is left of `from`, a stream of an exec channel, to its end on
+/// a thread of its own: the channel ends only once all it carries is read.
+fn drain_remote(mut from: wezterm_ssh::FileDescriptor) {
+    let _ = std::thread::Builder::new()
+        .name("remote-exec-drain".into())
+        .spawn(move || {
+            let _ = std::io::copy(&mut from, &mut std::io::sink());
+        });
+}
+
+/// Reads what a program run on an exec channel prints, keeping at most
+/// `limit` bytes and killing it past that, and how it ended. Blocking: call
+/// it off the UI thread. Its standard error drains on a thread of its own,
+/// so a program that writes much there cannot stall it, and so does the
+/// rest of what a program killed so prints.
+fn read_remote_run(
+    mut stdout: wezterm_ssh::FileDescriptor,
+    stderr: wezterm_ssh::FileDescriptor,
+    mut child: wezterm_ssh::SshChildProcess,
+    limit: usize,
+) -> Result<RemoteRun, String> {
+    use portable_pty::{Child as _, ChildKiller as _};
+    use std::io::Read;
+    drain_remote(stderr);
+    let mut out = Vec::new();
+    (&mut stdout)
+        .take(limit as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|err| format!("Reading what it printed failed: {err}"))?;
+    let cut = out.len() > limit;
+    if cut {
+        out.truncate(limit);
+        let _ = child.kill();
+        drain_remote(stdout);
+        return Ok(RemoteRun {
+            out,
+            cut,
+            status: None,
+        });
+    }
+    // One killed by a signal has no status of its own.
+    let status = child
+        .wait()
+        .ok()
+        .filter(|status| status.signal().is_none())
+        .map(|status| status.exit_code());
+    Ok(RemoteRun { out, cut, status })
 }
 
 /// The command that lists `root` on the remote host: the host's configured
@@ -845,19 +969,17 @@ fn interpret_remote_listing(
     })
 }
 
-/// Run the listing on an exec channel of `session` and read it back. Blocking:
-/// call it off the UI thread. stderr drains on a thread of its own, so a
-/// remote that writes a lot there cannot stall the listing.
-fn run_remote_listing(exec: wezterm_ssh::ExecResult) -> Result<RemoteProjectListing, String> {
+/// Run the listing on an exec channel of `session` and read it back, and
+/// whether the listing program was killed. Blocking: call it off the UI
+/// thread. stderr drains on a thread of its own, so a remote that writes a
+/// lot there cannot stall the listing.
+fn run_remote_listing(
+    mut stdout: wezterm_ssh::FileDescriptor,
+    mut stderr: wezterm_ssh::FileDescriptor,
+    mut child: wezterm_ssh::SshChildProcess,
+) -> (Result<RemoteProjectListing, String>, bool) {
     use portable_pty::{Child as _, ChildKiller as _};
     use std::io::Read;
-    let wezterm_ssh::ExecResult {
-        stdin,
-        stdout,
-        mut stderr,
-        mut child,
-    } = exec;
-    drop(stdin);
     let stderr = std::thread::spawn(move || {
         let mut err = Vec::new();
         let _ = (&mut stderr).take(16 * 1024).read_to_end(&mut err);
@@ -865,23 +987,34 @@ fn run_remote_listing(exec: wezterm_ssh::ExecResult) -> Result<RemoteProjectList
         err
     });
     let mut out = Vec::new();
-    let read = stdout
+    let read = (&mut stdout)
         .take(REMOTE_LISTING_MAX_BYTES + 1)
         .read_to_end(&mut out)
         .map_err(|err| format!("{REMOTE_LISTING_READ_FAILED}: {err}"));
     if read.is_err() || out.len() as u64 > REMOTE_LISTING_MAX_BYTES {
         let _ = child.kill();
-        read?;
-        return Err("The remote file listing is too large".to_string());
+        drain_remote(stdout);
+        let failed = read.and(Err("The remote file listing is too large".to_string()));
+        return (failed, true);
     }
     let err = stderr.join().unwrap_or_default();
     let exit_code = child.wait().ok().map(|status| status.exit_code());
-    interpret_remote_listing(&out, &String::from_utf8_lossy(&err), exit_code)
+    let listing = interpret_remote_listing(&out, &String::from_utf8_lossy(&err), exit_code);
+    (listing, false)
 }
 
 #[cfg(test)]
 mod listing_tests {
     use super::*;
+
+    #[test]
+    fn a_program_run_there_is_quoted_word_by_word() {
+        let args = ["git".to_string(), "it's".to_string(), "$HOME".to_string()];
+        assert_eq!(
+            run_command_line("/srv/a b", &args),
+            "sh -c 'cd \"$1\" && shift && exec \"$@\" </dev/null' sh '/srv/a b' 'git' 'it'\\''s' '$HOME'"
+        );
+    }
 
     #[test]
     fn roots_are_quoted_for_the_shell() {
@@ -1112,6 +1245,79 @@ struct SftpRemoteFileBackend {
 }
 
 impl RemoteFileBackend for SftpRemoteFileBackend {
+    fn run(&self, command: String, limit: usize, wait: Duration) -> RemoteFuture<RemoteRun> {
+        // An exec channel on the session this backend already holds, as the
+        // search listing's.
+        let session = self._session.clone();
+        let sftp = self.sftp.clone();
+        Box::pin(async move {
+            let wezterm_ssh::ExecResult {
+                stdin,
+                stdout,
+                stderr,
+                child,
+            } = session
+                .exec(&command, None)
+                .await
+                .map_err(|err| format!("Unable to run it there: {err:#}"))?;
+            let mut killer = portable_pty::ChildKiller::clone_killer(&child);
+            let ran = smol::unblock(move || read_remote_run(stdout, stderr, child, limit));
+            let ran = async { Some(ran.await) };
+            let timeout = async {
+                smol::Timer::after(wait).await;
+                let _ = killer.kill();
+                None
+            };
+            let ran = smol::future::or(ran, timeout).await;
+            // Killed when it printed too much, or ran out of time.
+            let killed = matches!(&ran, None | Some(Ok(RemoteRun { cut: true, .. })));
+            close_remote_exec(stdin, killed);
+            let ran = ran.unwrap_or_else(|| Err(format!("It ran longer than {wait:?}")))?;
+            // A channel that ends with no status -- the connection went --
+            // is said by wezterm-ssh to have ended with 1: told apart by
+            // whether the connection still answers.
+            if ran.status == Some(1) && sftp.symlink_metadata(".".to_string()).await.is_err() {
+                return Err("The connection closed while it ran".to_string());
+            }
+            Ok(ran)
+        })
+    }
+
+    fn stat(&self, path: String) -> RemoteFuture<Option<RemoteStat>> {
+        let sftp = self.sftp.clone();
+        Box::pin(async move {
+            let metadata = match sftp.symlink_metadata(path.clone()).await {
+                Ok(metadata) => metadata,
+                Err(err) if sftp_error_is_missing(&err) => return Ok(None),
+                Err(err) => return Err(format!("Unable to look at {path}: {err}")),
+            };
+            let kind = if metadata.is_symlink() {
+                RemoteFileKind::Symlink
+            } else if metadata.is_dir() {
+                RemoteFileKind::Directory
+            } else if metadata.is_file() {
+                RemoteFileKind::File
+            } else {
+                RemoteFileKind::Other
+            };
+            let target = match kind {
+                RemoteFileKind::Symlink => sftp
+                    .read_link(path.clone())
+                    .await
+                    .map(|target| target.to_string())
+                    .map_err(|err| format!("Unable to read the link {path}: {err}"))
+                    .map(Some)?,
+                _ => None,
+            };
+            Ok(Some(RemoteStat {
+                kind,
+                size: metadata.size.unwrap_or(0),
+                modified: metadata.modified,
+                target,
+            }))
+        })
+    }
+
     fn list_project_files(
         &self,
         root: RemotePath,
@@ -1122,23 +1328,30 @@ impl RemoteFileBackend for SftpRemoteFileBackend {
         let session = self._session.clone();
         let command = list_files_command(&root, respect_gitignore, self.remote_command.as_deref());
         Box::pin(async move {
-            let exec = session
+            let wezterm_ssh::ExecResult {
+                stdin,
+                stdout,
+                stderr,
+                child,
+            } = session
                 .exec(&command, None)
                 .await
                 .map_err(|err| format!("{REMOTE_LISTING_EXEC_FAILED}: {err:#}"))?;
             // The remote walk stops itself at its time limit, but only between
             // entries; one stuck on a dead mount must not hold the search.
-            let mut killer = portable_pty::ChildKiller::clone_killer(&exec.child);
-            let listing = smol::unblock(move || run_remote_listing(exec));
+            let mut killer = portable_pty::ChildKiller::clone_killer(&child);
+            let listing = smol::unblock(move || run_remote_listing(stdout, stderr, child));
             let timeout = async {
                 smol::Timer::after(Duration::from_secs(
                     REMOTE_LISTING_TIME_LIMIT_SECS + REMOTE_LISTING_GRACE_SECS,
                 ))
                 .await;
                 let _ = killer.kill();
-                Err(REMOTE_LISTING_TIMED_OUT.to_string())
+                (Err(REMOTE_LISTING_TIMED_OUT.to_string()), true)
             };
-            smol::future::or(listing, timeout).await
+            let (listing, killed) = smol::future::or(listing, timeout).await;
+            close_remote_exec(stdin, killed);
+            listing
         })
     }
 

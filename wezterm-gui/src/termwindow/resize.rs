@@ -2978,6 +2978,9 @@ impl super::TermWindow {
                 rescale_ui_usize(self.right_sidebar_file_preview_width, old_dpi, new_dpi);
             self.right_sidebar_note_pane_width =
                 rescale_ui_usize(self.right_sidebar_note_pane_width, old_dpi, new_dpi);
+            if let Some(panel) = self.right_sidebar_plugin.as_mut() {
+                panel.extended_width = rescale_ui_usize(panel.extended_width, old_dpi, new_dpi);
+            }
         }
 
         if scale_changed {

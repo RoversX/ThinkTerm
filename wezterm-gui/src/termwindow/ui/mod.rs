@@ -4,6 +4,7 @@ pub mod context_menu;
 pub mod folder_problem;
 pub mod icons;
 pub mod platform_chrome;
+pub mod plugin_panel;
 pub mod right_sidebar;
 pub mod recording_overlay;
 pub mod sidebar;

@@ -4,6 +4,7 @@ use window::Image;
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SvgIcon {
+    Activity,
     Archive,
     ArchiveRestore,
     ArrowDown,
@@ -13,6 +14,10 @@ pub enum SvgIcon {
     Bell,
     Bot,
     Braces,
+    Bug,
+    Calendar,
+    ChartCandlestick,
+    ChartLine,
     Check,
     ChevronDown,
     ChevronRight,
@@ -20,6 +25,8 @@ pub enum SvgIcon {
     CodeXml,
     ClipboardPaste,
     Copy,
+    Cpu,
+    Database,
     Download,
     Ellipsis,
     Expand,
@@ -34,6 +41,9 @@ pub enum SvgIcon {
     FolderOpen,
     FolderPlus,
     FolderTree,
+    Gauge,
+    GitBranch,
+    GitCompare,
     Globe,
     Grid2x2,
     House,
@@ -44,6 +54,7 @@ pub enum SvgIcon {
     Loader,
     LoaderCircle,
     ListChecks,
+    ListTodo,
     Maximize2,
     MemoryStick,
     MessageCircle,
@@ -61,6 +72,7 @@ pub enum SvgIcon {
     Pin,
     PinOff,
     Plus,
+    Puzzle,
     RotateCcw,
     RefreshCw,
     Redo,
@@ -102,8 +114,47 @@ pub enum SvgIcon {
 }
 
 impl SvgIcon {
+    /// The icon a plugin's panel names: one of those
+    /// `thinkterm_plugin_panel::ICONS` lists, else the puzzle piece.
+    pub fn for_panel(name: &str) -> Self {
+        match name {
+            "activity" => Self::Activity,
+            "bug" => Self::Bug,
+            "calendar" => Self::Calendar,
+            "chart-candlestick" => Self::ChartCandlestick,
+            "chart-line" => Self::ChartLine,
+            "cpu" => Self::Cpu,
+            "database" => Self::Database,
+            "gauge" => Self::Gauge,
+            "git-branch" => Self::GitBranch,
+            "git-compare" => Self::GitCompare,
+            "list-todo" => Self::ListTodo,
+            _ => Self::Puzzle,
+        }
+    }
+
     pub fn bytes(self) -> &'static [u8] {
         match self {
+            Self::Activity => include_bytes!("../../../../third_party/lucide/icons/activity.svg"),
+            Self::Bug => include_bytes!("../../../../third_party/lucide/icons/bug.svg"),
+            Self::Calendar => include_bytes!("../../../../third_party/lucide/icons/calendar.svg"),
+            Self::ChartCandlestick => {
+                include_bytes!("../../../../third_party/lucide/icons/chart-candlestick.svg")
+            }
+            Self::ChartLine => {
+                include_bytes!("../../../../third_party/lucide/icons/chart-line.svg")
+            }
+            Self::Cpu => include_bytes!("../../../../third_party/lucide/icons/cpu.svg"),
+            Self::Database => include_bytes!("../../../../third_party/lucide/icons/database.svg"),
+            Self::Gauge => include_bytes!("../../../../third_party/lucide/icons/gauge.svg"),
+            Self::GitBranch => {
+                include_bytes!("../../../../third_party/lucide/icons/git-branch.svg")
+            }
+            Self::GitCompare => {
+                include_bytes!("../../../../third_party/lucide/icons/git-compare.svg")
+            }
+            Self::ListTodo => include_bytes!("../../../../third_party/lucide/icons/list-todo.svg"),
+            Self::Puzzle => include_bytes!("../../../../third_party/lucide/icons/puzzle.svg"),
             Self::Archive => include_bytes!("../../../../third_party/lucide/icons/archive.svg"),
             Self::ArchiveRestore => {
                 include_bytes!("../../../../third_party/lucide/icons/archive-restore.svg")
@@ -700,6 +751,19 @@ mod tests {
             SvgIcon::Terminal,
             SvgIcon::Trash2,
             SvgIcon::X,
+            // What a plugin's panel is shown by in the selector.
+            SvgIcon::Activity,
+            SvgIcon::Bug,
+            SvgIcon::Calendar,
+            SvgIcon::ChartCandlestick,
+            SvgIcon::ChartLine,
+            SvgIcon::Cpu,
+            SvgIcon::Database,
+            SvgIcon::Gauge,
+            SvgIcon::GitBranch,
+            SvgIcon::GitCompare,
+            SvgIcon::ListTodo,
+            SvgIcon::Puzzle,
             // The agent marks come from a different upstream than the
             // rest, sized in `em` rather than pixels: keep them covered so
             // a re-vendored file that usvg cannot size fails here.

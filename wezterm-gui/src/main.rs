@@ -1446,6 +1446,10 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
     .detach();
 
     maybe_show_configuration_error_window();
+    // Once the GUI can be handed work: the panels plugins add, if any
+    // plugin is installed.
+    crate::plugins::look_for_panels();
+
     // A debugging hook alongside THINKTERM_FRAME_DUMP: open the Settings
     // window on a given section once the GUI is up, so a page can be
     // captured from a scripted launch with no keyboard or mouse.
@@ -1456,6 +1460,25 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
                 crate::settings_window::show_update_page();
             } else {
                 crate::settings_window::show();
+            }
+        })
+        .detach();
+    }
+    // Likewise a plugin's panel, by the plugin's id: the right sidebar is
+    // opened on it in every window.
+    if let Some(plugin) = std::env::var_os("THINKTERM_OPEN_PANEL") {
+        let plugin = plugin.to_string_lossy().into_owned();
+        promise::spawn::spawn_into_main_thread(async move {
+            smol::Timer::after(std::time::Duration::from_millis(2500)).await;
+            if let Some(front_end) = crate::frontend::try_front_end() {
+                for gui_window in front_end.gui_windows() {
+                    let plugin = plugin.clone();
+                    gui_window
+                        .window
+                        .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                            move |term_window| term_window.show_plugin_panel(&plugin),
+                        )));
+                }
             }
         })
         .detach();

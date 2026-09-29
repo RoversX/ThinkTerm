@@ -1481,6 +1481,26 @@ impl super::TermWindow {
             }
         }
 
+        if let super::RightSidebarMode::Plugin(_) = self.right_sidebar_mode {
+            // Across a list wider than the panel: the trackpad's own, or
+            // the wheel with Shift.
+            let shift_vertical = matches!(event.kind, WMEK::VertWheel(_))
+                && event.modifiers.contains(::window::Modifiers::SHIFT);
+            let (dx, dy) = match event.kind {
+                WMEK::HorzWheel(_) => (self.sidebar_horizontal_scroll_delta(event), None),
+                WMEK::VertWheel(_) if shift_vertical => {
+                    (self.sidebar_vertical_scroll_delta(event), None)
+                }
+                WMEK::VertWheel(_) => (None, self.sidebar_vertical_scroll_delta(event)),
+                _ => return false,
+            };
+            let (dx, dy) = (dx.unwrap_or(0.0), dy.unwrap_or(0.0));
+            if (dx != 0.0 || dy != 0.0) && self.plugin_panel_wheel(event, dx, dy) {
+                context.invalidate();
+            }
+            return true;
+        }
+
         let delta = match event.kind {
             WMEK::VertWheel(_) => self.sidebar_vertical_scroll_delta(event).unwrap_or(0.0),
             WMEK::HorzWheel(_) => return true,
@@ -1538,6 +1558,8 @@ impl super::TermWindow {
                     context.invalidate();
                 }
             }
+            // Taken, both ways, above.
+            super::RightSidebarMode::Plugin(_) => {}
         }
         true
     }
@@ -1556,6 +1578,14 @@ impl super::TermWindow {
         match item.item_type {
             UIItemType::TabBar(_) | UIItemType::TerminalBar(_) => {
                 self.update_title_post_status();
+            }
+            UIItemType::RightSidebarPluginPanel | UIItemType::RightSidebarPluginExtended => {
+                let extended = item.item_type == UIItemType::RightSidebarPluginExtended;
+                if self.plugin_panel_pointer_left(extended) {
+                    if let Some(window) = self.window.as_ref() {
+                        window.invalidate();
+                    }
+                }
             }
             UIItemType::CloseTab(_)
             | UIItemType::PaneNav { .. }
@@ -1589,6 +1619,9 @@ impl super::TermWindow {
             | UIItemType::RightSidebarResize
             | UIItemType::RightSidebarFilePreviewResize
             | UIItemType::RightSidebarNotePaneResize
+            | UIItemType::RightSidebarPluginExtendedResize
+            | UIItemType::RightSidebarPluginExtendedClose
+            | UIItemType::RightSidebarPluginConnect(_)
             | UIItemType::RightSidebarNotePaneToggle
             | UIItemType::RightSidebarAgent(_)
             | UIItemType::RightSidebarSnippetNew
@@ -1714,8 +1747,13 @@ impl super::TermWindow {
             | UIItemType::RightSidebarResize
             | UIItemType::RightSidebarFilePreviewResize
             | UIItemType::RightSidebarNotePaneResize
+            | UIItemType::RightSidebarPluginExtendedResize
             | UIItemType::RightSidebarNotePaneToggle
             | UIItemType::RightSidebarAgent(_)
+            | UIItemType::RightSidebarPluginPanel
+            | UIItemType::RightSidebarPluginExtended
+            | UIItemType::RightSidebarPluginExtendedClose
+            | UIItemType::RightSidebarPluginConnect(_)
             | UIItemType::RightSidebarSnippetNew
             | UIItemType::RightSidebarSnippetBack
             | UIItemType::RightSidebarSnippetSave
@@ -2116,6 +2154,19 @@ impl super::TermWindow {
                                 && self.right_sidebar_note_pane_rect().is_some())
                     }) {
                         self.persist_right_sidebar_note_pane_width();
+                    }
+                    if completed_drag.as_ref().is_some_and(|(item, _)| {
+                        item.item_type == UIItemType::RightSidebarPluginExtendedResize
+                            || (item.item_type == UIItemType::RightSidebarResize
+                                && self.right_sidebar_plugin_extended_rect().is_some())
+                    }) {
+                        self.persist_right_sidebar_plugin_extended_width();
+                    }
+                    if completed_drag.as_ref().is_some_and(|(item, _)| {
+                        item.item_type == UIItemType::RightSidebarPluginExtendedResize
+                    }) {
+                        // The panel beside it gave or took what it did.
+                        self.persist_right_sidebar_width();
                     }
                     if completed_drag
                         .as_ref()
@@ -2817,6 +2868,9 @@ impl super::TermWindow {
             }
             UIItemType::RightSidebarNotePaneResize => {
                 self.drag_right_sidebar_note_pane_resize(item, start_event, event, context);
+            }
+            UIItemType::RightSidebarPluginExtendedResize => {
+                self.drag_right_sidebar_plugin_extended_resize(item, start_event, event, context);
             }
             UIItemType::RightSidebarSnippetScrollThumb => {
                 self.drag_right_sidebar_snippet_scroll_thumb(item, start_event, event, context);
@@ -3614,6 +3668,8 @@ impl super::TermWindow {
             self.set_right_sidebar_file_preview_total_width(width);
         } else if self.right_sidebar_note_pane_rect().is_some() {
             self.set_right_sidebar_note_pane_total_width(width);
+        } else if self.right_sidebar_plugin_extended_rect().is_some() {
+            self.set_right_sidebar_plugin_extended_total_width(width);
         } else {
             self.set_right_sidebar_width(width);
         }
@@ -3644,6 +3700,20 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         if self.set_right_sidebar_note_pane_split_x(event.coords.x) {
+            context.invalidate();
+        }
+        context.set_cursor(Some(MouseCursor::SizeLeftRight));
+        self.dragging.replace((item, start_event));
+    }
+
+    fn drag_right_sidebar_plugin_extended_resize(
+        &mut self,
+        item: UIItem,
+        start_event: MouseEvent,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if self.set_right_sidebar_plugin_extended_split_x(event.coords.x) {
             context.invalidate();
         }
         context.set_cursor(Some(MouseCursor::SizeLeftRight));
@@ -3808,6 +3878,10 @@ impl super::TermWindow {
             UIItemType::RightSidebarNotePaneResize => {
                 self.mouse_event_right_sidebar_note_pane_resize(item, event, context);
             }
+            UIItemType::RightSidebarPluginExtendedResize => {
+                // Pressed, it is dragged as the Note pane's line is.
+                self.mouse_event_right_sidebar_note_pane_resize(item, event, context);
+            }
             UIItemType::RightSidebarSnippetScrollTrack => {
                 self.mouse_event_right_sidebar_snippet_scroll_track(item, event, context);
             }
@@ -3853,6 +3927,24 @@ impl super::TermWindow {
             }
             UIItemType::RightSidebarAgent(_) => {
                 self.mouse_event_right_sidebar_agent(item.clone(), event, context);
+            }
+            UIItemType::RightSidebarPluginPanel => {
+                self.mouse_event_plugin_panel(event, context, false);
+            }
+            UIItemType::RightSidebarPluginExtended => {
+                self.mouse_event_plugin_panel(event, context, true);
+            }
+            UIItemType::RightSidebarPluginExtendedClose => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.dismiss_plugin_extended();
+                }
+            }
+            UIItemType::RightSidebarPluginConnect(extended) => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.plugin_panel_connect(extended);
+                }
             }
             UIItemType::RightSidebarNoteMenu
             | UIItemType::RightSidebarNoteChooseVault
@@ -4384,6 +4476,10 @@ impl super::TermWindow {
             UIItemType::RightSidebarNotePaneResize => {
                 self.mouse_event_right_sidebar_note_pane_resize(item, event, context);
             }
+            UIItemType::RightSidebarPluginExtendedResize => {
+                // Pressed, it is dragged as the Note pane's line is.
+                self.mouse_event_right_sidebar_note_pane_resize(item, event, context);
+            }
             UIItemType::RightSidebarSnippetScrollTrack => {
                 self.mouse_event_right_sidebar_snippet_scroll_track(item, event, context);
             }
@@ -4429,6 +4525,24 @@ impl super::TermWindow {
             }
             UIItemType::RightSidebarAgent(_) => {
                 self.mouse_event_right_sidebar_agent(item.clone(), event, context);
+            }
+            UIItemType::RightSidebarPluginPanel => {
+                self.mouse_event_plugin_panel(event, context, false);
+            }
+            UIItemType::RightSidebarPluginExtended => {
+                self.mouse_event_plugin_panel(event, context, true);
+            }
+            UIItemType::RightSidebarPluginExtendedClose => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.dismiss_plugin_extended();
+                }
+            }
+            UIItemType::RightSidebarPluginConnect(extended) => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.plugin_panel_connect(extended);
+                }
             }
             UIItemType::RightSidebarNoteMenu
             | UIItemType::RightSidebarNoteChooseVault

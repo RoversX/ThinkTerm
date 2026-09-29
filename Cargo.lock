@@ -10616,6 +10616,7 @@ dependencies = [
  "thinkterm-file-index",
  "thinkterm-i18n",
  "thinkterm-plugin-channel",
+ "thinkterm-plugin-panel",
  "thinkterm-proto",
  "thinkterm-render",
  "thinkterm-snippets",

@@ -119,6 +119,7 @@ tiny-skia.workspace = true
 thinkterm-syntax = { path = "../thinkterm-syntax" }
 thinkterm-core.workspace = true
 thinkterm-plugin-channel = { workspace = true, features = ["native"] }
+thinkterm-plugin-panel.workspace = true
 thinkterm-snippets = { workspace = true, features = ["native"] }
 trash.workspace = true
 umask.workspace = true

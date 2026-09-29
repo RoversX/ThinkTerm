@@ -9294,6 +9294,7 @@ impl SettingsWindow {
             Panel::Tasks => &mut chrome.right_sidebar_notes_enabled,
             Panel::Snippets => &mut chrome.right_sidebar_snippets_enabled,
             Panel::Agents => &mut chrome.agent_panel_enabled,
+            Panel::Plugin(_) => unreachable!("a plugin's panel is switched with its plugin"),
         }
     }
 
@@ -9313,6 +9314,7 @@ impl SettingsWindow {
             Panel::Tasks => "right-mode-notes",
             Panel::Snippets => "right-mode-snippets",
             Panel::Agents => "right-mode-agents",
+            Panel::Plugin(_) => unreachable!("a plugin's panel is listed with its plugin"),
         })
     }
 
@@ -9323,6 +9325,7 @@ impl SettingsWindow {
             Panel::Tasks => "settings-sidebar-notes-description",
             Panel::Snippets => "settings-sidebar-snippets-description",
             Panel::Agents => "settings-agent-panel-description",
+            Panel::Plugin(_) => unreachable!("a plugin's panel is listed with its plugin"),
         })
     }
 

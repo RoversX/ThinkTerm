@@ -35,7 +35,7 @@ use crate::termwindow::ui::tokens::{
     WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
 };
 use crate::termwindow::{
-    NoteEditorCommand, PendingLocalCopy, PendingRemoteConfirm, RightSidebarFileCharBag,
+    NoteEditorCommand, PanelId, PendingLocalCopy, PendingRemoteConfirm, RightSidebarFileCharBag,
     RightSidebarFileDirCache, RightSidebarFileDirEntry, RightSidebarFileField,
     RightSidebarFileIndex, RightSidebarFileIndexEntry, RightSidebarFileIndexStatus,
     RightSidebarFilePreviewImage, RightSidebarFilePreviewLine, RightSidebarFilePreviewSelection,
@@ -86,6 +86,11 @@ const RIGHT_SIDEBAR_CLOSE_ICON_SIZE: usize = 27;
 const RIGHT_SIDEBAR_CLOSE_BUTTON_X_ADJUST: usize = 8;
 const RIGHT_SIDEBAR_CLOSE_BUTTON_Y_ADJUST: usize = 16;
 const RIGHT_SIDEBAR_MODE_HEIGHT: usize = 72;
+/// The most panels the selector names the active one of: past this its
+/// label has no room, and every panel is its icon alone, the active one
+/// told by its pill. The browser's selector does the same
+/// (thinkterm-web/src/agents.rs).
+const RIGHT_SIDEBAR_LABELED_MODES: usize = 5;
 const RIGHT_SIDEBAR_EMPTY_HEIGHT: usize = 88;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,6 +335,11 @@ const FILE_PREVIEW_PANE_MIN_WIDTH: usize = 360;
 const FILE_PREVIEW_PANE_DEFAULT_WIDTH: usize = 560;
 const NOTE_PANE_MIN_WIDTH: usize = FILE_PREVIEW_PANE_MIN_WIDTH;
 const NOTE_PANE_DEFAULT_WIDTH: usize = FILE_PREVIEW_PANE_DEFAULT_WIDTH;
+/// A plugin's extended view: 360 and 560 points at the least and to start
+/// with, as in a browser. Twice the file preview's: it is there for what a
+/// sidebar has no room for.
+const PLUGIN_EXTENDED_MIN_WIDTH: usize = FILE_PREVIEW_PANE_MIN_WIDTH * 2;
+const PLUGIN_EXTENDED_DEFAULT_WIDTH: usize = FILE_PREVIEW_PANE_DEFAULT_WIDTH * 2;
 const FILE_PREVIEW_SLICE_CACHE_CAPACITY: usize = 256;
 // Lines up to this many columns are shaped whole (once, cached) so horizontal
 // scrolling is pure translation of the cached glyph run instead of re-shaping a
@@ -1346,14 +1356,21 @@ impl RightSidebarMode {
     const ALL: [Self; 4] = [Self::Chat, Self::Tasks, Self::Snippets, Self::Agents];
 
     /// The panels the selector offers, in order. Reading the toggles here
-    /// rather than hard-coding the list is what lets Settings hide a panel --
-    /// and is the seam a future plugin would extend.
+    /// rather than hard-coding the list is what lets Settings hide a panel;
+    /// the plugins' panels follow ThinkTerm's own, as the plugin host last
+    /// listed them.
     pub(crate) fn enabled_panels() -> Vec<Self> {
         let toggles = crate::native_settings::right_sidebar_panel_toggles();
+        let plugins = crate::native_settings::plugin_panels();
         Self::ALL
             .iter()
             .copied()
             .filter(|panel| panel.enabled_with(&toggles))
+            .chain(
+                plugins
+                    .iter()
+                    .filter_map(|panel| Some(Self::Plugin(PanelId::new(&panel.id)?))),
+            )
             .collect()
     }
 
@@ -1363,7 +1380,7 @@ impl RightSidebarMode {
     /// stops at the first panel that is on.
     pub(crate) fn any_panel_enabled() -> bool {
         let toggles = crate::native_settings::right_sidebar_panel_toggles();
-        Self::ALL.iter().any(|panel| panel.enabled_with(&toggles))
+        toggles.plugins || Self::ALL.iter().any(|panel| panel.enabled_with(&toggles))
     }
 
     pub(crate) fn panel_enabled(self) -> bool {
@@ -1381,7 +1398,18 @@ impl RightSidebarMode {
             // last, where the short-circuit in `any_panel_enabled` reaches it
             // only when the other three are off.
             Self::Agents => crate::agent_status::enabled(),
+            Self::Plugin(_) => toggles.plugins && self.plugin_panel().is_some(),
         }
+    }
+
+    /// The plugin panel this mode shows, as last heard.
+    pub(crate) fn plugin_panel(self) -> Option<crate::native_settings::NativePluginPanel> {
+        let Self::Plugin(id) = self else {
+            return None;
+        };
+        crate::native_settings::plugin_panels()
+            .into_iter()
+            .find(|panel| panel.id == id.as_str())
     }
 
     fn icon(self) -> SvgIcon {
@@ -1390,6 +1418,9 @@ impl RightSidebarMode {
             Self::Tasks => SvgIcon::NotebookTabs,
             Self::Snippets => SvgIcon::CodeXml,
             Self::Agents => SvgIcon::Bot,
+            Self::Plugin(_) => self
+                .plugin_panel()
+                .map_or(SvgIcon::Puzzle, |panel| SvgIcon::for_panel(&panel.icon)),
         }
     }
 
@@ -1399,6 +1430,10 @@ impl RightSidebarMode {
             Self::Tasks => crate::i18n::tr("right-mode-notes"),
             Self::Snippets => crate::i18n::tr("right-mode-snippets"),
             Self::Agents => crate::i18n::tr("right-mode-agents"),
+            Self::Plugin(_) => self
+                .plugin_panel()
+                .map(|panel| panel.name)
+                .unwrap_or_default(),
         }
     }
 }
@@ -1428,6 +1463,13 @@ pub fn right_sidebar_note_pane_width_for_dpi(dpi: usize) -> usize {
         .map(|width| scale_ui_usize(width, dpi))
         .unwrap_or_else(|| scale_ui_usize(NOTE_PANE_DEFAULT_WIDTH, dpi))
         .max(min_width)
+}
+
+/// How wide the user made plugin `plugin`'s extended view, in window
+/// pixels at `dpi`; 0 when they never did.
+pub fn right_sidebar_plugin_extended_width_for(plugin: &str, dpi: usize) -> usize {
+    crate::native_settings::plugin_extended_width(plugin)
+        .map_or(0, |width| scale_ui_usize(width, dpi))
 }
 
 fn file_preview_close_requires_reflow(
@@ -1543,6 +1585,49 @@ impl crate::TermWindow {
         Some(configured_width.clamp(self.ui_px(NOTE_PANE_MIN_WIDTH), max_pane_width))
     }
 
+    /// Whether the sidebar shows a plugin's panel that asks for its
+    /// extended view. Only the panel of the plugin its mode names: one left
+    /// open from the mode before, until the next paint lets it go, would
+    /// keep its room for it, and the switch would not lay the terminal out
+    /// again.
+    fn right_sidebar_plugin_extended_active(&self) -> bool {
+        let RightSidebarMode::Plugin(id) = self.right_sidebar_mode else {
+            return false;
+        };
+        self.right_sidebar_presented()
+            && self
+                .right_sidebar_plugin
+                .as_ref()
+                .is_some_and(|panel| panel.plugin() == id.as_str() && panel.wants_extended())
+    }
+
+    /// The most a plugin's extended view can have beside the sidebar; none
+    /// when that is less than it takes.
+    fn right_sidebar_plugin_extended_room(&self) -> Option<usize> {
+        let max = self
+            .right_sidebar_pane_total_max_width()
+            .saturating_sub(self.right_sidebar_tree_width());
+        (max >= self.ui_px(PLUGIN_EXTENDED_MIN_WIDTH)).then_some(max)
+    }
+
+    /// Whether a plugin's panel would get its extended view were it to ask
+    /// for one: there is room for it beside the sidebar.
+    pub(crate) fn right_sidebar_plugin_can_extend(&self) -> bool {
+        self.right_sidebar_plugin_extended_room().is_some()
+    }
+
+    fn right_sidebar_plugin_extended_width(&self) -> Option<usize> {
+        if !self.right_sidebar_plugin_extended_active() {
+            return None;
+        }
+        let max = self.right_sidebar_plugin_extended_room()?;
+        let chosen = match self.right_sidebar_plugin.as_ref()?.extended_width {
+            0 => self.ui_px(PLUGIN_EXTENDED_DEFAULT_WIDTH),
+            width => width,
+        };
+        Some(chosen.clamp(self.ui_px(PLUGIN_EXTENDED_MIN_WIDTH), max))
+    }
+
     /// Whether the sidebar has anything to show. Turning off every panel in
     /// Settings hides it outright rather than leaving an empty selector: the
     /// terminal reclaims the space through the same zero-width path collapse
@@ -1567,11 +1652,13 @@ impl crate::TermWindow {
         if !self.right_sidebar_has_panels() {
             return 0;
         }
-        // The file preview pane and the Note pane are mutually exclusive
-        // (different sidebar modes); at most one is non-zero.
+        // The file preview pane, the Note pane and a plugin's extended view
+        // are mutually exclusive (different sidebar modes); at most one is
+        // non-zero.
         let pane_width = self
             .right_sidebar_file_preview_width()
             .or_else(|| self.right_sidebar_note_pane_width())
+            .or_else(|| self.right_sidebar_plugin_extended_width())
             .unwrap_or(0);
         self.right_sidebar_tree_width()
             .saturating_add(pane_width)
@@ -1714,6 +1801,7 @@ impl crate::TermWindow {
             if self.right_sidebar_mode == RightSidebarMode::Tasks {
                 self.clear_right_sidebar_text_focus();
             }
+            self.close_plugin_panel();
             self.schedule_right_sidebar_file_memory_release();
             self.release_right_sidebar_remote_files_if_hidden();
             self.schedule_right_sidebar_note_memory_release();
@@ -2300,7 +2388,7 @@ impl crate::TermWindow {
             RightSidebarMode::Chat => self.right_sidebar_file_focus.is_some(),
             RightSidebarMode::Snippets => self.right_sidebar_snippet_focus.is_some(),
             RightSidebarMode::Tasks => self.right_sidebar_note.view.focused,
-            RightSidebarMode::Agents => false,
+            RightSidebarMode::Agents | RightSidebarMode::Plugin(_) => false,
         }
     }
 
@@ -5102,7 +5190,7 @@ impl crate::TermWindow {
                     self.right_sidebar_snippet_scroll_offset = 0.0;
                 }
             }
-            RightSidebarMode::Tasks | RightSidebarMode::Agents => {}
+            RightSidebarMode::Tasks | RightSidebarMode::Agents | RightSidebarMode::Plugin(_) => {}
         }
     }
 
@@ -6398,7 +6486,9 @@ impl crate::TermWindow {
                 Some(RightSidebarSnippetField::Body) => Some(&self.right_sidebar_snippet_body),
                 None => None,
             },
-            RightSidebarMode::Tasks | RightSidebarMode::Agents => None,
+            RightSidebarMode::Tasks | RightSidebarMode::Agents | RightSidebarMode::Plugin(_) => {
+                None
+            }
         }
     }
 
@@ -6418,7 +6508,9 @@ impl crate::TermWindow {
                 Some(RightSidebarSnippetField::Body) => Some(&mut self.right_sidebar_snippet_body),
                 None => None,
             },
-            RightSidebarMode::Tasks | RightSidebarMode::Agents => None,
+            RightSidebarMode::Tasks | RightSidebarMode::Agents | RightSidebarMode::Plugin(_) => {
+                None
+            }
         }
     }
 
@@ -6578,6 +6670,98 @@ impl crate::TermWindow {
         let old_tree = self.right_sidebar_width;
         self.set_right_sidebar_width(tree_width);
         old_pane != self.right_sidebar_note_pane_width || old_tree != self.right_sidebar_width
+    }
+
+    /// Where a plugin's extended view goes: the left of the sidebar, as the
+    /// Note pane does.
+    pub(crate) fn right_sidebar_plugin_extended_rect(&self) -> Option<RightSidebarRect> {
+        let sidebar = self.right_sidebar_rect()?;
+        let width = self.right_sidebar_plugin_extended_width()?;
+        if sidebar.width <= width {
+            return None;
+        }
+        Some(RightSidebarRect {
+            x: sidebar.x,
+            y: sidebar.y,
+            width,
+            height: sidebar.height,
+        })
+    }
+
+    /// The line between a plugin's extended view and its panel dragged to
+    /// `split_x`: the one grows as much as the other shrinks.
+    pub(crate) fn set_right_sidebar_plugin_extended_split_x(&mut self, split_x: isize) -> bool {
+        let Some(total_rect) = self.right_sidebar_rect() else {
+            return false;
+        };
+        if self.right_sidebar_plugin_extended_rect().is_none() {
+            return false;
+        }
+
+        let total_left = total_rect.x;
+        let total_right = total_rect.x.saturating_add(total_rect.width);
+        let min_extended = self.ui_px(PLUGIN_EXTENDED_MIN_WIDTH);
+        let max_extended = total_rect
+            .width
+            .saturating_sub(self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH));
+        let min_panel = self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH);
+        let max_panel = self.right_sidebar_max_width().min(total_rect.width);
+        let min_split = total_left
+            .saturating_add(min_extended)
+            .max(total_right.saturating_sub(max_panel));
+        let max_split = total_right
+            .saturating_sub(min_panel)
+            .min(total_left.saturating_add(max_extended));
+        if min_split > max_split {
+            return false;
+        }
+
+        let split_x = split_x.clamp(min_split as isize, max_split as isize) as usize;
+        let extended_width = split_x.saturating_sub(total_left);
+        let panel_width = total_right.saturating_sub(split_x);
+        let Some(panel) = self.right_sidebar_plugin.as_mut() else {
+            return false;
+        };
+        let old_extended = std::mem::replace(&mut panel.extended_width, extended_width);
+        let old_panel = self.right_sidebar_width;
+        self.set_right_sidebar_width(panel_width);
+        old_extended != extended_width || old_panel != self.right_sidebar_width
+    }
+
+    /// The sidebar's outer edge dragged to make it `width` wide while a
+    /// plugin's extended view is on show: the view takes what the panel
+    /// does not.
+    pub(crate) fn set_right_sidebar_plugin_extended_total_width(&mut self, width: usize) -> bool {
+        if self.right_sidebar_plugin_extended_rect().is_none() {
+            return false;
+        }
+        let panel_width = self.right_sidebar_tree_width();
+        let min = self.ui_px(PLUGIN_EXTENDED_MIN_WIDTH);
+        let Some(max) = self.right_sidebar_plugin_extended_room() else {
+            return false;
+        };
+        let Some(panel) = self.right_sidebar_plugin.as_mut() else {
+            return false;
+        };
+        let extended_width = width.saturating_sub(panel_width).clamp(min, max);
+        std::mem::replace(&mut panel.extended_width, extended_width) != extended_width
+    }
+
+    /// Keeps how wide the extended view of the plugin on show is, for the
+    /// next time it is.
+    pub fn persist_right_sidebar_plugin_extended_width(&self) {
+        let Some(panel) = self.right_sidebar_plugin.as_ref() else {
+            return;
+        };
+        let width = self
+            .right_sidebar_plugin_extended_width()
+            .unwrap_or(panel.extended_width)
+            .max(self.ui_px(PLUGIN_EXTENDED_MIN_WIDTH));
+        let width = unscale_ui_usize(width, self.dimensions.dpi);
+        if let Err(err) = crate::native_settings::save_plugin_extended_width(panel.plugin(), width)
+        {
+            log::warn!("failed to save the width of a plugin's extended view: {err:#}");
+        }
     }
 
     pub fn persist_right_sidebar_note_pane_width(&self) {
@@ -7114,6 +7298,42 @@ impl crate::TermWindow {
             .context("right sidebar note pane left separator")?;
         }
 
+        // A plugin's extended view: its ground and edge here, what the
+        // plugin draws in it with the panel's, below.
+        if let Some(extended_rect) = self.right_sidebar_plugin_extended_rect() {
+            self.filled_rectangle(
+                layers,
+                0,
+                euclid::rect(
+                    extended_rect.x as f32,
+                    0.0,
+                    extended_rect.width as f32,
+                    extended_rect.y.saturating_add(extended_rect.height) as f32,
+                ),
+                sidebar_bg,
+            )
+            .context("right sidebar plugin extended view background")?;
+            self.ui_items.push(UIItem {
+                x: extended_rect.x,
+                y: 0,
+                width: extended_rect.width,
+                height: extended_rect.y.saturating_add(extended_rect.height),
+                item_type: UIItemType::RightSidebarBackground,
+            });
+            self.filled_rectangle(
+                layers,
+                1,
+                euclid::rect(
+                    extended_rect.x as f32,
+                    extended_rect.y as f32,
+                    1.0,
+                    extended_rect.height as f32,
+                ),
+                chrome.separator,
+            )
+            .context("right sidebar plugin extended view left separator")?;
+        }
+
         if rect.y > 0 {
             self.filled_rectangle(
                 layers,
@@ -7178,6 +7398,17 @@ impl crate::TermWindow {
                 width: self.ui_px(SIDEBAR_RESIZE_HANDLE_WIDTH),
                 height: rect.height,
                 item_type: UIItemType::RightSidebarNotePaneResize,
+            });
+        }
+        if self.right_sidebar_plugin_extended_rect().is_some() {
+            self.ui_items.push(UIItem {
+                x: rect
+                    .x
+                    .saturating_sub(self.ui_px(SIDEBAR_RESIZE_HANDLE_WIDTH) / 2),
+                y: rect.y,
+                width: self.ui_px(SIDEBAR_RESIZE_HANDLE_WIDTH),
+                height: rect.height,
+                item_type: UIItemType::RightSidebarPluginExtendedResize,
             });
         }
 
@@ -7307,27 +7538,36 @@ impl crate::TermWindow {
             .clamp(self.ui_px(24), self.ui_px(30))
             .min(mode_height.saturating_sub(self.ui_px(22)))
             .max(1);
-        let active_mode_label = self.right_sidebar_mode.label();
-        let active_label_target_width = self
-            .sidebar_text_width(&ui_font, &active_mode_label)?
-            .ceil() as usize
-            + self.ui_px(MODE_LABEL_CLIP_SLOP);
+        let labeled = modes.len() <= RIGHT_SIDEBAR_LABELED_MODES;
+        let active_label_target_width = if labeled {
+            let active_mode_label = self.right_sidebar_mode.label();
+            self.sidebar_text_width(&ui_font, &active_mode_label)?
+                .ceil() as usize
+                + self.ui_px(MODE_LABEL_CLIP_SLOP)
+        } else {
+            0
+        };
         let inactive_segment_min_width = (mode_icon_size + self.ui_px(SIDEBAR_INSET) * 4)
             .max(self.ui_px(70))
             .min((content_width / modes.len()).max(1));
         let inactive_segment_count = modes.len().saturating_sub(1);
         let inactive_segments_min_width =
             inactive_segment_min_width.saturating_mul(inactive_segment_count);
-        let active_segment_width = (mode_icon_size
-            + self.ui_px(SIDEBAR_ICON_GAP)
-            + active_label_target_width
-            + self.ui_px(SIDEBAR_INSET) * 6)
-            .min(
-                content_width
-                    .saturating_sub(inactive_segments_min_width)
-                    .max(1),
-            )
-            .max(1);
+        let active_segment_width = if labeled {
+            (mode_icon_size
+                + self.ui_px(SIDEBAR_ICON_GAP)
+                + active_label_target_width
+                + self.ui_px(SIDEBAR_INSET) * 6)
+                .min(
+                    content_width
+                        .saturating_sub(inactive_segments_min_width)
+                        .max(1),
+                )
+                .max(1)
+        } else {
+            // A share like the others'.
+            (content_width / modes.len()).max(1)
+        };
         let inactive_segments_width = content_width.saturating_sub(active_segment_width);
         let inactive_segment_width = if inactive_segment_count > 0 {
             inactive_segments_width / inactive_segment_count
@@ -7369,17 +7609,33 @@ impl crate::TermWindow {
                 item_type: UIItemType::RightSidebarMode(mode),
             });
 
+            // The pill the active segment is filled with, and the hover:
+            // the segment less an inset, or with icons alone, a circle
+            // round the icon.
+            let inner_inset = self.ui_px(5);
+            let pill = if labeled {
+                euclid::rect(
+                    (segment_x + inner_inset) as f32,
+                    (mode_y + inner_inset) as f32,
+                    segment_width.saturating_sub(inner_inset * 2) as f32,
+                    mode_height.saturating_sub(inner_inset * 2) as f32,
+                )
+            } else {
+                let diameter = segment_width
+                    .min(mode_height)
+                    .saturating_sub(inner_inset * 2);
+                euclid::rect(
+                    (segment_x + segment_width.saturating_sub(diameter) / 2) as f32,
+                    (mode_y + mode_height.saturating_sub(diameter) / 2) as f32,
+                    diameter as f32,
+                    diameter as f32,
+                )
+            };
             if active {
-                let inner_inset = self.ui_px(5);
                 self.fill_rounded_rectangle_with_border(
                     layers,
                     2,
-                    euclid::rect(
-                        (segment_x + inner_inset) as f32,
-                        (mode_y + inner_inset) as f32,
-                        segment_width.saturating_sub(inner_inset * 2) as f32,
-                        mode_height.saturating_sub(inner_inset * 2) as f32,
-                    ),
+                    pill,
                     chrome.control_bg,
                     chrome.control_border,
                     WINDOW_TAB_ADD_BUTTON_RADIUS,
@@ -7390,19 +7646,14 @@ impl crate::TermWindow {
                 self.fill_rounded_rectangle(
                     layers,
                     2,
-                    euclid::rect(
-                        (segment_x + self.ui_px(5)) as f32,
-                        (mode_y + self.ui_px(5)) as f32,
-                        segment_width.saturating_sub(self.ui_px(10)) as f32,
-                        mode_height.saturating_sub(self.ui_px(10)) as f32,
-                    ),
+                    pill,
                     chrome.sidebar_button_hover_bg,
                     WINDOW_TAB_ADD_BUTTON_RADIUS,
                 )
                 .context("right sidebar hovered mode")?;
             }
 
-            let label_width = if active {
+            let label_width = if active && labeled {
                 segment_width
                     .saturating_sub(
                         mode_icon_size
@@ -7413,7 +7664,7 @@ impl crate::TermWindow {
             } else {
                 0
             };
-            let total_width = if active {
+            let total_width = if label_width > 0 {
                 mode_icon_size + self.ui_px(SIDEBAR_ICON_GAP) + label_width
             } else {
                 mode_icon_size
@@ -7455,6 +7706,11 @@ impl crate::TermWindow {
         if !self.right_sidebar_mode.panel_enabled() {
             self.fall_back_to_an_enabled_panel();
             return Ok(());
+        }
+        // A plugin's panel on show only while its mode is: the plugin is
+        // told it went, and what it held is let go.
+        if !matches!(self.right_sidebar_mode, RightSidebarMode::Plugin(_)) {
+            self.close_plugin_panel();
         }
         match self.right_sidebar_mode {
             RightSidebarMode::Chat => {
@@ -7536,6 +7792,71 @@ impl crate::TermWindow {
                     content_width,
                     rect.y.saturating_add(rect.height),
                 )?;
+                return Ok(());
+            }
+            RightSidebarMode::Plugin(_) => {
+                let Some(panel) = self.right_sidebar_mode.plugin_panel() else {
+                    self.fall_back_to_an_enabled_panel();
+                    return Ok(());
+                };
+                let stage = crate::input_diagnostics::StageTimer::begin("plugin_panel_paint");
+                let result = self.plugin_panel_paint().and_then(|paint| {
+                    // The panel's own padding is the plugin's to draw.
+                    self.paint_plugin_panel(
+                        layers,
+                        &panel.id,
+                        &paint,
+                        &ui_font,
+                        ui_metrics,
+                        chrome,
+                        rect.x + self.ui_px(SIDEBAR_INSET),
+                        content_top,
+                        rect.width.saturating_sub(self.ui_px(SIDEBAR_INSET) * 2),
+                        rect.y.saturating_add(rect.height),
+                    )?;
+                    // Its extended view from the top, as the file preview
+                    // is, with the preview's close button where the preview
+                    // has it: ThinkTerm's, over what the plugin draws.
+                    let Some(extended_rect) = self.right_sidebar_plugin_extended_rect() else {
+                        return Ok(());
+                    };
+                    let close_x = extended_rect.x + self.ui_px(SIDEBAR_INSET) * 2;
+                    let close_y = extended_rect.y
+                        + self.ui_px(SIDEBAR_INSET) * 2
+                        + self.ui_px(PREVIEW_HEADER_TOP_GAP);
+                    let close_size = self.ui_px(PREVIEW_HEADER_BUTTON).min(
+                        extended_rect
+                            .width
+                            .saturating_sub(self.ui_px(SIDEBAR_INSET) * 4),
+                    );
+                    self.paint_plugin_panel_extended(
+                        layers,
+                        &paint,
+                        &ui_font,
+                        ui_metrics,
+                        chrome,
+                        extended_rect.x + self.ui_px(SIDEBAR_INSET),
+                        extended_rect.y + self.ui_px(SIDEBAR_INSET) * 2,
+                        extended_rect
+                            .width
+                            .saturating_sub(self.ui_px(SIDEBAR_INSET) * 2),
+                        extended_rect.y.saturating_add(extended_rect.height),
+                        (close_x, close_y, close_size),
+                    )?;
+                    self.paint_files_preview_header_icon_button(
+                        layers,
+                        chrome,
+                        foreground,
+                        muted_fg,
+                        close_x,
+                        close_y,
+                        close_size,
+                        SvgIcon::X,
+                        UIItemType::RightSidebarPluginExtendedClose,
+                    )
+                });
+                stage.finish(result.is_ok());
+                result?;
                 return Ok(());
             }
         }
@@ -11029,6 +11350,7 @@ impl crate::TermWindow {
                 content_width,
                 label,
                 enabled,
+                UIItemType::RightSidebarRemoteFileConnect,
             )?;
         }
         Ok(())
@@ -11062,7 +11384,8 @@ impl crate::TermWindow {
     /// as a primary button (accent fill) rather than reusing the neutral
     /// `sidebar_button_bg` that the surrounding message cards use — otherwise
     /// the only clickable thing on screen looks exactly like the text above it.
-    fn paint_remote_files_connect_button(
+    /// A plugin's panel waiting to connect shows the same one (`item_type`).
+    pub(crate) fn paint_remote_files_connect_button(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
         ui_font: &Rc<LoadedFont>,
@@ -11073,6 +11396,7 @@ impl crate::TermWindow {
         width: usize,
         label: &str,
         enabled: bool,
+        item_type: UIItemType,
     ) -> anyhow::Result<()> {
         let height = self.ui_px(REMOTE_EMPTY_BUTTON_HEIGHT);
         let hovered = enabled && self.is_pointer_over_ui_rect(x, y, width, height);
@@ -11099,7 +11423,7 @@ impl crate::TermWindow {
                 y,
                 width,
                 height,
-                item_type: UIItemType::RightSidebarRemoteFileConnect,
+                item_type,
             });
         }
         let label_width = self
@@ -11796,7 +12120,7 @@ impl crate::TermWindow {
         }
     }
 
-    fn active_remote_project_for_files(
+    pub(crate) fn active_remote_project_for_files(
         &self,
     ) -> Result<Option<workspace_threads::RemoteFilesTarget>, String> {
         let mux = Mux::get();
@@ -11842,7 +12166,7 @@ impl crate::TermWindow {
     /// without this the server (or a NAT) reaps it and the next browse fails.
     const REMOTE_FILES_KEEPALIVE_SECS: &'static str = "30";
 
-    fn ssh_config_for_remote_files_target(
+    pub(crate) fn ssh_config_for_remote_files_target(
         target: &workspace_threads::RemoteFilesTarget,
     ) -> Result<config::SshDomain, String> {
         let mut domain = Self::ssh_config_for_remote_files_source(target)?;

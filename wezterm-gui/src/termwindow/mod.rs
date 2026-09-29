@@ -856,6 +856,21 @@ pub enum UIItemType {
     /// A row in the transfer strip. Clicking cancels it while it runs and
     /// dismisses it once it has finished.
     RightSidebarRemoteTransfer(u64),
+    /// The area a plugin's panel draws in: the pointer and the wheel over it
+    /// go to the panel's player.
+    RightSidebarPluginPanel,
+    /// The same, for the panel's extended view.
+    RightSidebarPluginExtended,
+    /// The close button at the extended view's top left, ThinkTerm's own
+    /// whatever the plugin draws.
+    RightSidebarPluginExtendedClose,
+    /// The button a plugin's view -- the extended one with `true` -- shows
+    /// while its plugin waits for ThinkTerm to connect to the machine beside
+    /// it.
+    RightSidebarPluginConnect(bool),
+    /// The line between a plugin's extended view and its panel, dragged to
+    /// share the room between them.
+    RightSidebarPluginExtendedResize,
     ContextMenuBackdrop,
     ContextMenuItem(Vec<usize>),
     /// Backdrop of the command palette; the palette routes its own pointer
@@ -877,6 +892,44 @@ pub enum RightSidebarMode {
     /// Agent status panel; only offered while the agent-panel feature
     /// toggle is on (`crate::agent_status::enabled`).
     Agents,
+    /// The panel the plugin with this id draws.
+    Plugin(PanelId),
+}
+
+/// A plugin's id, held in place so that a mode naming it stays `Copy`: at
+/// most 64 bytes, as the plugin host takes them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PanelId {
+    len: u8,
+    bytes: [u8; PanelId::LIMIT],
+}
+
+impl PanelId {
+    const LIMIT: usize = 64;
+
+    /// `None` for an id longer than the host takes.
+    pub fn new(id: &str) -> Option<Self> {
+        let len = id.len();
+        if len > Self::LIMIT {
+            return None;
+        }
+        let mut bytes = [0; Self::LIMIT];
+        bytes[..len].copy_from_slice(id.as_bytes());
+        Some(Self {
+            len: len as u8,
+            bytes,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len as usize]).expect("made from a str")
+    }
+}
+
+impl std::fmt::Debug for PanelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2854,6 +2907,18 @@ pub struct TermWindow {
     /// This window's view of the snippets: the rows the plugin host sent
     /// for its search, and when to ask again.
     right_sidebar_snippet_listing: thinkterm_snippets::view::Listing,
+    /// The plugin panel on show in this window, while one is.
+    pub(crate) right_sidebar_plugin: Option<ui::plugin_panel::PluginPanel>,
+    /// Whether each domain whose panes the plugin panel was beside runs
+    /// them on this machine: `None` while a look off this thread finds out.
+    /// The answer is the domain's, so another pane of one looked at already
+    /// has it at once. One entry a domain, dropped with the panel.
+    pub(crate) plugin_panel_domains: Vec<(DomainId, Option<bool>)>,
+    /// How the machine the pane in focus runs on is reached when that is
+    /// another, for the plugin panel, and when that was found: for one
+    /// pane, found again every few seconds.
+    pub(crate) plugin_panel_reach:
+        Option<(PaneId, Instant, Result<ui::plugin_panel::Reach, String>)>,
     /// A save from this window's editor is on its way.
     right_sidebar_snippet_saving: bool,
     right_sidebar_note: crate::markdown_editor::NoteHostState,
@@ -4394,6 +4459,9 @@ impl TermWindow {
             right_sidebar_snippet_scroll_offset: 0.0,
             right_sidebar_snippet_scrollbar_visible_until: None,
             right_sidebar_snippet_listing: Default::default(),
+            right_sidebar_plugin: None,
+            plugin_panel_domains: Vec::new(),
+            plugin_panel_reach: None,
             right_sidebar_snippet_saving: false,
             right_sidebar_note: crate::markdown_editor::NoteHostState::default(),
             right_sidebar_note_view: RightSidebarNoteView::Editor,
@@ -11371,6 +11439,7 @@ impl Drop for TermWindow {
         // from leaving its Space permanently marked as occupied.
         crate::workspace_threads::release_window_space(self.space_owner_id);
         crate::input_diagnostics::remove_gauges_for_source(self.space_owner_id);
+        self.close_plugin_panel();
         self.clear_gui_recovery_intent();
         gpu_debug(format!(
             "drop main_window backend={} size={}x{} dpi={}",

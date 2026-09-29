@@ -3531,6 +3531,8 @@ impl crate::TermWindow {
             return Ok(None);
         }
         let Some(progress) = self.right_sidebar_hover.progress(now) else {
+            // Nothing of the sidebar shows: a plugin's panel is let go.
+            self.close_plugin_panel();
             return Ok(None);
         };
         let ui_items_before = self.ui_items.len();
