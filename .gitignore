@@ -86,6 +86,9 @@ __pycache__/
 
 *.md
 
+# Keep translated project READMEs under version control.
+!/README.*.md
+
 # Keep the contributor agreement visible in new pull requests.
 !/.github/pull_request_template.md
 

@@ -1,169 +1,165 @@
 # ThinkTerm
 
-A workspace-first terminal built for heavy AI workflows. Built on [WezTerm](https://github.com/wezterm/wezterm), keeping its fast, low-memory terminal core.
+**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Français](README.fr-FR.md) · [Deutsch](README.de-DE.md)
 
-> *[main window screenshot]*
+## 📥 Download
 
----
+**[View releases](https://github.com/RoversX/ThinkTerm/releases)**
 
-## Why ThinkTerm exists
+🌐 **Website**: [closex.org/thinkterm](https://closex.org/thinkterm/)
 
-I've used a lot of terminals. Some eat absurd amounts of memory. Some I just don't like looking at. Some are fast and good-looking but closed — you can't change anything. I never found one that satisfied me on memory, appearance, and openness at the same time.
+📚 **Documentation**: [docs.closex.org/thinkterm](https://docs.closex.org/thinkterm/)
 
-What actually made me start building was AI agents. Once you have five or six agents running long tasks in different project directories, a normal tab bar stops meaning anything — a dozen tabs, all titled `zsh`, or all renamed by the program to the same string, each one scrolling output. To find out which is still working, which is waiting on you, and which finished twenty minutes ago, you have to click through them one by one.
+**Your machines fuse into one.**
 
-The more sessions and the more output, the worse it gets. Which is exactly what an agent workflow looks like all day.
+ThinkTerm is an open-source **terminal with a built-in multiplexer, written in Rust**, built on [WezTerm](https://github.com/wezterm/wezterm). Its mux server runs your shells, tools, and coding agents; desktop, TUI, and browser clients connect to those sessions. Bring local and remote work into one workspace, and return to it from another device.
 
-ThinkTerm organizes sessions into three layers — **Space / Project / Thread** — and gives every Thread its own work status.
+**Platforms:** macOS · Linux · Windows · Web · TUI — iOS and Android in development.
 
-More importantly, that structure doesn't belong to any one machine. Your laptop, your work dev box, a VPS — each runs its own mux server, but their workspaces **all show up in the same sidebar**. Local Spaces on top, then one group per server with its own connection state. Switching between them feels no different from switching a local tab.
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <img src="assets/screenshots/workspace.jpeg" alt="Split terminals, source preview, and project file tree" width="100%">
+      <br><strong>Project workspace</strong>
+    </td>
+    <td width="50%" align="center">
+      <img src="assets/screenshots/agents.jpeg" alt="Agent status beside a remote terminal and workspace sidebar" width="100%">
+      <br><strong>Agents across machines</strong>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="assets/screenshots/overview.jpeg" alt="Live terminal previews grouped by Space" width="100%">
+      <br><strong>Session overview</strong>
+    </td>
+    <td width="50%" align="center">
+      <img src="assets/screenshots/spaces.jpeg" alt="Space selector alongside project Threads" width="100%">
+      <br><strong>Spaces</strong>
+    </td>
+  </tr>
+</table>
 
-Sessions are held by the server, so you can close your laptop, connect from another device, and find your work exactly as you left it. Several devices connected at once see the same structure. **In practice, your machines fuse into one.**
+## A multiplexer at the core
 
-And since every agent lives in a pane the mux can address, they also have a channel to talk to each other.
+A terminal multiplexer manages multiple terminal sessions and lets clients attach to them. In ThinkTerm, **the mux server owns the sessions, tabs, and split panes**. The client displays them and sends your input.
 
----
+- **Detach and return.** Disconnecting a client leaves its server-held sessions running. Reconnect later to continue the same shell, build, or agent task. Explicitly closing a pane is a separate action.
+- **Access the same sessions from different clients.** Use the desktop, `thinkterm tui`, or the browser to connect to the server. Multiple clients can be attached at once; each offers its own interface to the shared sessions.
+- **Work across machines.** Each host runs its own mux server. ThinkTerm Connect brings those remote workspaces into the desktop alongside local work, so you can switch machines from the sidebar. Processes continue to run on their original host.
 
-## Core concepts
+Session persistence depends on the mux server and its host remaining available; it does not restore running processes after a server restart or host reboot.
 
-| Layer | What it is |
-|---|---|
-| **Space** | A working context. It can be local, bound to a remote mux server, or bound to an Obsidian-compatible Vault for notes |
-| **Project** | A directory |
-| **Thread** | A session with its own split layout; can be pinned or marked unread |
+## Why ThinkTerm
 
-Threads carry one of four states, shown live in the sidebar and filterable: **running / needs attention / done / idle**. When a Thread you aren't watching finishes — or starts waiting on you — a short sound plays.
+Running several agents across different projects quickly turns a tab bar into a guessing game: which session is working, which needs input, and where did that build finish? ThinkTerm puts the project structure and work status beside the terminal, with local and remote work visible together.
 
----
+Rust powers ThinkTerm's terminal core, mux server, desktop client, and TUI. The desktop renders through the GPU without Electron or an embedded web view. Built on WezTerm, this native foundation supports workspace organization, persistent remote sessions, and tools for working alongside agents.
 
-## Remote that feels local
+## Workspaces that follow your work
 
-There's a large gap between "it connects to a remote host" and "it feels like it's running here." Most of the engineering in ThinkTerm went into closing it:
+| Layer | Purpose |
+| --- | --- |
+| **Space** | A working context for local work, a remote mux connection, or a notes Vault. |
+| **Project** | A project directory within that context. |
+| **Thread** | A session with tabs and split panes; pin it or mark it unread. |
 
-- **Typing doesn't wait for the round trip** — predictive local echo puts keystrokes on screen immediately, without waiting for the server to confirm
-- **Splits aren't a local-only luxury** — split trees, the second-level tab bar, drag-to-split, and dragging dividers to resize all work in remote sessions, and behave the same as local
-- **Sizes don't jitter** — the resize races in remote layouts have been eliminated one by one; dragging a divider no longer causes snap-back, squeeze, or resync storms
-- **The scroll wheel is accurate** — in mouse-mode programs like vim and less, the original notch count is preserved, so scrolling isn't too fast or too slow
-- **Client state stays yours** — focus and selection are locally authoritative and won't be scrambled by server echo; each client holds its own palette, so changing the theme on one device doesn't change it on another
-- **It comes back on its own** — after a network drop it reconnects and restores the session. "Disconnect (server keeps running)" and "delete on the server" are strictly separate actions
+Local and remote workspaces share the sidebar. Thread status helps distinguish running work, work needing attention, completed work, and idle sessions. The overview displays live terminal previews grouped by Space, so you can find a session without opening every tab.
 
-The result: a remote Space feels no different from a local one. You usually forget you're connected to another machine.
+## Built for daily terminal work
 
----
+- **Rust, performance, and memory efficiency.** ThinkTerm is built for demanding terminal workflows. Terminal throughput, rendering efficiency, and memory use are ongoing optimization priorities, with the goal of keeping many sessions and agents responsive as they work in parallel.
+- **Agent status.** The Agents panel brings recognized coding agents into one list with their work status and project context. Agent detection and the panel can be disabled in settings.
+- **Remote sessions.** Choose SSH, Mosh, or persistent mux sessions through ThinkTerm Connect. Remote mux sessions support tabs, splits, resizing, and reconnecting. Predictive local echo can reduce perceived typing latency on slower connections.
+- **Files beside the terminal.** Browse project files, preview source with syntax highlighting, and open files in an external editor. Remote file access uses SFTP, with uploads, downloads, and drag-and-drop transfers.
+- **Notes.** Work with Markdown in an Obsidian-compatible Vault, including tables, code blocks, and autosave. The files remain ordinary Markdown in a directory you choose.
+- **Snippets and plugins.** Snippets is built in. Plugins can add sidebar panels to the desktop and browser; the repository includes a [Diff plugin](plugins/diff) for inspecting the adjacent terminal's Git changes. Build your own plugins in Rust with the [ThinkTerm SDK](docs/thinkterm/plugins.md#rust-sdk). See the [plugin guide](docs/thinkterm/plugins.md) for setup and development.
+- **A capable terminal core.** Ligatures, color emoji, true color, hyperlinks, inline images, copy mode, and shell integration come from WezTerm. See the [WezTerm feature reference](https://wezterm.org/features.html) for more terminal capabilities.
+- **Native desktop settings.** Adjust themes, UI font sizes, terminal options, and the renderer. Both the main window and settings support WebGPU and OpenGL, with an OpenGL fallback if WebGPU initialization fails.
+- **Five interface languages.** English, 简体中文, 日本語, Français, and Deutsch.
 
-## The same workspace, in a plain terminal
+The CLI also exposes panes to automation: `thinkterm cli send-text` sends input and `thinkterm cli get-text` reads terminal output. Agents can use these commands to interact through their terminals. The [collaboration notes](docs/thinkterm/agent-collaboration.md) describe the demonstrated workflow and the limits of terminal input as a messaging mechanism.
 
-```bash
-thinkterm tui [DOMAIN ...]
+## Choose how you connect
+
+| Client | Current scope |
+| --- | --- |
+| **Desktop** | Native application for macOS, Linux, and Windows. |
+| **TUI** | Workspace navigation and terminal control inside an existing terminal, through `thinkterm tui`. |
+| **Browser** | A client served by your own mux server; requires WebGPU and a secure browser context. Browser access must be enabled explicitly. |
+| **iOS and Android** | Native clients in development, with a shared Rust core, GPU rendering, and SSH transport. Mobile release readiness and device coverage are still being established. |
+
+The clients connect to server-held sessions; their interfaces and feature coverage differ.
+
+### Terminal interface
+
+```sh
+thinkterm tui
+thinkterm tui --help
 ```
 
-The TUI is a subcommand of the `thinkterm` binary, not a second program — it costs nothing when it isn't running, and exiting detaches from the server **without ending any session**.
+The TUI supports workspace navigation, tabs, splits, resizing, copy mode, and mouse input. Exiting detaches from the server without closing its sessions. Run it from a separate terminal; launching it inside ThinkTerm's own session can trigger the nested-session guard.
 
-It isn't a read-only mirror of the GUI. It's a peer client of the same authoritative server: Space/Project/Thread data is accepted only from server snapshots, and every change waits for the server to acknowledge it before the display updates, so having the GUI and TUI open at once never leaves them disagreeing. It can do what the GUI can — new tabs, splits, resizing, closing panes, reordering the sidebar, copy mode — with full mouse support.
+### Browser access
 
-The use case is straightforward: SSH into a machine, or just skip the GUI, and your workspace is still right there. Run `thinkterm tui --help` for the current command-line options.
+Enable a listener in **Settings → Web**, then create an access token for the browser. The mux server serves the client and its assets. Connections away from loopback require HTTPS by default; the browser also needs a secure context to expose WebGPU.
 
-On Linux and macOS, one command installs either variant for the current user, with no root and no package manager:
+See [Browser access](docs/thinkterm/web-access.md) for listener setup, tokens, SSH forwarding, and certificate handling.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/RoversX/thinkterm/main/install.sh | sh
+### Mobile development
+
+The [iOS](ios) and [Android](android) apps use native interfaces and the shared [mobile core](thinkterm-mobile). They connect over SSH to sessions on another machine. They are under active development and are not presented here as released mobile products.
+
+## Getting started
+
+For a desktop build on macOS or Linux, install Rust and your platform's build tools, then:
+
+```sh
+git clone --recursive https://github.com/RoversX/ThinkTerm.git
+cd ThinkTerm
+./get-deps
+cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p thinkterm-plugin-server
 ```
 
-It asks whether you want the desktop build or the server build (CLI + TUI + mux server, no GUI and, on Linux, no graphics libraries); `sh -s -- --server` or `--desktop` skips the question. Linux gets a tarball unpacked under `~/.local` and needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12, RHEL 10); macOS gets the signed `ThinkTerm.app` plus command-line links in `~/.local/bin`. Downloads are verified against the digest GitHub recorded for them. The mux server runs as your user; on Linux, `loginctl enable-linger $USER` keeps it alive after you log out.
+The binaries are written to `target/release`. See [Contributing](CONTRIBUTING.md) for the source layout and development workflow. The [browser build script](ci/build-web.sh) builds the separate Web assets; mobile build entry points are [ios/build.sh](ios/build.sh) and [android/build.sh](android/build.sh).
 
-`thinkterm update` upgrades an install the script made; for a deb, rpm, AppImage, Homebrew or source build it names the right way to update instead. When the desktop connects to a remote host whose mux server runs an incompatible version, it offers to install its own version there over the same SSH connection, and then to restart the server (which ends the sessions it holds).
+Once the binaries are on your `PATH`:
 
----
-
-## Agents can talk to each other
-
-Because the mux can address any pane across windows, Threads, and connected clients, one agent can push a task into another agent's pane and read the result back:
-
-```
-Agent A ──send-text──► Agent B's terminal input
-                       Agent B works, prints a response
-Agent A ◄──get-text─── reads the result
+```sh
+thinkterm start              # Open the desktop application
+thinkterm tui                # Open the terminal interface
+thinkterm connect <name>     # Attach to a configured mux domain
+thinkterm cli --help         # Inspect and control mux sessions
+thinkterm plugin list        # List available plugins
+thinkterm --help             # Show all commands
 ```
 
-This uses two CLI primitives that already exist — `thinkterm cli send-text` and `get-text` — and **requires no changes to the agents themselves**. Codex, Claude Code, a shell script, any interactive terminal program can take part.
+## Documentation and development
 
-It has already produced a real collaboration: Claude Code, running in one Thread, noticed that Codex in another Thread had reached a wrong conclusion (Codex's process-list command ran inside an isolated PID namespace and found no mux server). Claude sent a correction into Codex's pane; Codex re-investigated, corrected itself, and printed a response; Claude read it back and reported to the user.
+- [Browser access](docs/thinkterm/web-access.md)
+- [Plugins](docs/thinkterm/plugins.md)
+- [Contributing](CONTRIBUTING.md)
 
-Today this works by injecting terminal input. A more structured task protocol is being designed — see [Agent Collaboration](docs/thinkterm/agent-collaboration.md).
+## Configuration and privacy
 
----
+ThinkTerm uses Lua configuration with its own default ThinkTerm paths and supports many WezTerm options. **Settings → Compatibility** can import selected fields from an existing WezTerm configuration. Explicit file overrides, including `THINKTERM_CONFIG_FILE` and the compatibility variable `WEZTERM_CONFIG_FILE`, can select another file.
 
-## Features
+The project collects no usage telemetry. Update checks can be disabled with `check_for_updates = false`. Features such as remote connections and loading images in Notes make network requests when used; remote Note images can be disabled with `note_remote_images_enabled = false`.
 
-**Remote files** — Browse remote directories over SFTP, with uploads, downloads, recursive transfers, conflict handling, and retry on failure. Files can be dropped straight onto a remote terminal to upload. Idle connections close after a configurable timeout.
+The desktop SSH host book encrypts saved passwords with a locally stored key. Anyone with both the key and encrypted host data, including in a backup, can decrypt the passwords. Browser access tokens grant access to the server's terminal sessions and should be treated as credentials.
 
-**SSH host book** — Your own host list, alongside a read-only view of `~/.ssh/config`. Each host can connect over plain SSH, **Mosh**, or **ThinkTerm Connect (persistent mux)**. Saved passwords are encrypted at rest with AES-256-GCM, with the key stored separately (mode 0600) — that protects against sync, backups, and someone glancing at the file; anyone holding both the key and the ciphertext can still decrypt, which is the known trade-off of a key-on-disk scheme versus the system keychain.
+See [PRIVACY.md](PRIVACY.md) for the privacy policy and browser data handling.
 
-**Content sidebar** — Three panels: *Files* (tree, syntax-highlighted preview, fuzzy search, drag and drop, Open With), *Notes* (a built-in Markdown editor bound to an Obsidian-compatible Vault, with tables, code highlighting, spell check, remote images, and autosave), and *Snippets* (a command snippet library).
+## Acknowledgments
 
-**The terminal itself** — WezTerm's GPU rendering, ligatures, color emoji, true color, hyperlinks, copy mode, inline images, and shell integration.
+- Thank you to **[@wez](https://github.com/wez/) and the [WezTerm](https://github.com/wezterm/wezterm) contributors** for the terminal core and multiplexer foundations on which ThinkTerm is built, including terminal emulation, font and GPU rendering, and SSH support.
+- Thank you to the **[herdr](https://github.com/herdrdev/herdr) contributors** for the agent detection manifests used by ThinkTerm.
+- Thank you to **Lucide, Simple Icons, Lobe Icons, and material-icon-theme** for their icon resources.
+- Thank you to everyone contributing code, translations, testing, bug reports, and feedback to **ThinkTerm**.
 
-**Interface** — A native settings window, per-area font sizes, and a theme that follows the system or is pinned light or dark. Available in **English, 简体中文, 日本語, and Français**, switching instantly.
+Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 
----
+## License
 
-## Command line
+ThinkTerm is licensed under **GPL-3.0-only** — see [LICENSE.md](LICENSE.md). Code originating from WezTerm retains its original MIT license in [LICENSE-MIT](LICENSE-MIT). The agent detection manifests from herdr are licensed under **Apache-2.0**.
 
-```
-thinkterm start              Start the GUI (alias -e)
-thinkterm tui [DOMAIN ...]   Open the ThinkTerm interface in the current terminal
-thinkterm connect <name>     Connect to a ThinkTerm multiplexer
-thinkterm ssh / serial       SSH session / serial port
-thinkterm cli <subcommand>   Interact with the mux server
-thinkterm imgcat <file>      Print an image to the terminal
-thinkterm update             Check for a newer release and install it
-```
-
-Run `thinkterm --help` for the full list.
-
----
-
-## Configuration and data
-
-ThinkTerm uses a WezTerm-compatible Lua config on its own paths, and **never reads or writes your existing WezTerm config**. It takes the first of `$THINKTERM_CONFIG_FILE`, `~/.config/thinkterm/thinkterm.lua`, `~/.config/thinkterm/wezterm.lua`, `~/.thinkterm.lua`. The options themselves match WezTerm — see the [WezTerm config reference](https://wezterm.org/config/files.html).
-
-Settings → Compatibility can load an existing WezTerm config and import chosen fields one by one. That's a one-time copy; the two never share live state.
-
-Workspace data lives in `~/Library/Application Support/ThinkTerm/` (`~/.local/share/ThinkTerm/` on Linux): the Space/Project/Thread structure, the SSH host book (passwords as ciphertext), snippets, and the encryption key `secret.key`. A Notes Vault is a directory you choose; its contents are ordinary Markdown files, and ThinkTerm only records the binding.
-
----
-
-## Roadmap
-
-**Mobile clients** (design stage, not yet implemented) — iOS and Android as pure mux clients: sessions are always held by the desktop or server, so the phone app being killed by the OS never ends a session. A shared Rust core bridged to native UI through UniFFI, terminal rendering via wgpu, QR pairing with per-device mTLS, and private keys held in Secure Enclave / Keystore. Not planned: a local shell on the phone, a mobile mux daemon, or promises of a permanent background connection.
-
-Groundwork has been landing: the mux protocol now supports moving panes between stacks, per-client palette state, and a **session tree owned by the server**. `thinkterm tui` is the first implementation of this thin-client architecture.
-
-**Structured agent collaboration** — see above.
-
----
-
-## Privacy
-
-ThinkTerm collects no analytics or usage telemetry. Its only automatic
-background internet request is an update check: once every 24 hours it asks the
-GitHub Releases API whether a newer version exists, and you can turn that off
-with `check_for_updates = false`. Features you choose to use can make their own
-connections, including SSH, SFTP, Mosh, ThinkTerm Connect, opening links, and
-loading HTTP(S) images embedded in Notes. Remote Note images are enabled by
-default and can be disabled with `note_remote_images_enabled = false`.
-Scrollback lives in memory only.
-
-See [PRIVACY.md](PRIVACY.md) for the project's privacy policy.
-
----
-
-## Credits and license
-
-ThinkTerm is built on [WezTerm](https://github.com/wezterm/wezterm), written in Rust by [@wez](https://github.com/wez/). Terminal emulation, font rendering, GPU drawing, the multiplexer protocol, and SSH transport all come from that project. Thank you.
-
-ThinkTerm is released under **GPL-3.0-only** — see [LICENSE.md](LICENSE.md). Code originating from WezTerm remains under its original MIT license, preserved verbatim in [LICENSE-MIT](LICENSE-MIT). Bundled assets and other third-party components are listed in [NOTICE](NOTICE) and [licenses/README.md](licenses/README.md).
-
-Icons from [Lucide](https://github.com/lucide-icons/lucide), [Simple Icons](https://github.com/simple-icons/simple-icons), [Lobe Icons](https://github.com/lobehub/lobe-icons), and material-icon-theme. Agent detection manifests from [herdr](https://github.com/herdrdev/herdr), under the Apache License 2.0. Full bundled-asset attributions are in [NOTICE](NOTICE).
-
-Contributing: see [CONTRIBUTING.md](CONTRIBUTING.md).
+See [NOTICE](NOTICE) and [licenses/README.md](licenses/README.md) for the full third-party attributions and licenses of bundled components and assets.
