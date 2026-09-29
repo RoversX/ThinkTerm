@@ -1,9 +1,10 @@
 //! The fetcher: git asked, on a thread of its own, about the directories the
 //! panels on show are in -- every [`EVERY`], or less often in a repository
-//! git takes a while over, and at once when a panel comes, moves or picks a
-//! file -- and the panels drawn again when what it says changed. Nothing is
-//! asked while no panel is on show. A directory on another machine is
-//! looked at there, through ThinkTerm ([`There`]).
+//! git takes a while over, and at once when a panel comes or moves -- and
+//! the panels drawn again when what it says changed. A file picked has its
+//! diff alone read at once, and none read when one is kept from before.
+//! Nothing is asked while no panel is on show. A directory on another
+//! machine is looked at there, through ThinkTerm ([`There`]).
 
 use crate::git::{
     self, Change, Counted, Failure, FileDiff, Found, Machine, Meta, Snapshot, Status,
@@ -24,6 +25,11 @@ pub const EVERY: Duration = Duration::from_secs(2);
 const ASK_WAIT: Duration = Duration::from_secs(30);
 /// How many directories no panel is in any more keep what was found there.
 const KEPT: usize = 4;
+/// How many files' diffs a directory keeps once no panel shows them, and
+/// how much of what git printed for them: a file picked again is shown at
+/// once, while the list has it as it had it.
+const KEPT_DIFFS: usize = 32;
+const KEPT_DIFF_BYTES: usize = 4 * 1024 * 1024;
 
 pub type Shared = Arc<(Mutex<State>, Condvar)>;
 
@@ -101,6 +107,9 @@ pub struct State {
     picked_in: HashMap<Dir, String>,
     /// A look is wanted at once.
     poked: bool,
+    /// A panel picked a file: its diff is wanted at once, the repository
+    /// not looked at again for it.
+    picking: bool,
     /// The fetcher was handed something to look at since the last panel
     /// went: what it keeps for that is still to be let go.
     looking: bool,
@@ -129,16 +138,26 @@ pub struct Repo {
     pub snapshot: Snapshot,
     /// Changes whenever the files listed do.
     pub revision: u32,
-    /// The picked files' diffs, by path, as last read.
+    /// The diffs of the files the panels show, by path, as last read, and
+    /// of some shown before ([`KEPT_DIFFS`]).
     pub diffs: HashMap<String, Read>,
 }
 
+#[derive(Clone)]
 pub struct Read {
     pub diff: Arc<FileDiff>,
     /// Changes whenever the diff does.
     pub version: u32,
     /// What git printed, hashed: the same again is the same diff.
     raw: u64,
+    /// The file as the list had it when this was read: listed otherwise
+    /// since, it changed, and this is not its diff any more.
+    of: Change,
+    /// How much git printed: what keeping it costs.
+    bytes: usize,
+    /// When it was last read for a panel to show: those shown longest ago
+    /// are let go first.
+    shown: Instant,
 }
 
 impl State {
@@ -183,11 +202,14 @@ impl State {
 
 impl Read {
     #[cfg(test)]
-    pub fn new(diff: FileDiff, version: u32) -> Self {
+    pub fn new(of: Change, diff: FileDiff, version: u32) -> Self {
         Self {
             diff: Arc::new(diff),
             version,
             raw: 0,
+            of,
+            bytes: 0,
+            shown: Instant::now(),
         }
     }
 }
@@ -224,14 +246,15 @@ pub fn place(shared: &Shared, panel: u64, dir: Option<Dir>, inside: bool) {
     }
 }
 
-/// Panel `panel` picked the file at `path`, or put it down: read at once,
-/// and picked again when a panel comes back to the directory.
+/// Panel `panel` picked the file at `path`, or put it down: its diff read
+/// at once unless it was read before, and picked again when a panel comes
+/// back to the directory.
 pub fn pick(shared: &Shared, panel: u64, path: Option<String>) {
     let mut state = lock(shared);
     let State {
         views,
         picked_in,
-        poked,
+        picking,
         ..
     } = &mut *state;
     let want = views.entry(panel).or_default();
@@ -243,7 +266,7 @@ pub fn pick(shared: &Shared, panel: u64, path: Option<String>) {
             };
         }
         want.picked = path;
-        *poked = true;
+        *picking = true;
         shared.1.notify_all();
     }
 }
@@ -352,6 +375,13 @@ struct Job {
     wants: Vec<Want>,
 }
 
+/// Where the fetcher goes next, and whether it looks at each place afresh
+/// or only reads the diffs picked there ([`State::picking`]).
+struct Turn {
+    jobs: BTreeMap<Dir, Job>,
+    look: bool,
+}
+
 /// Looks for as long as the plugin runs, telling the panels to draw anew
 /// whenever something changed.
 pub fn fetch(shared: Shared, emitter: Emitter) {
@@ -359,7 +389,7 @@ pub fn fetch(shared: Shared, emitter: Emitter) {
     let mut versions = 0u32;
     let mut wait = EVERY;
     loop {
-        let jobs = next_jobs(&shared, wait);
+        let Turn { jobs, look } = next_jobs(&shared, wait);
         // What was counted in a directory left last goes with its place.
         let left = lock(&shared).left.clone();
         counted.retain(|dir, _| jobs.contains_key(dir) || left.contains(dir));
@@ -374,6 +404,12 @@ pub fn fetch(shared: Shared, emitter: Emitter) {
                     machine: host.machine.clone(),
                 }),
             };
+            if !look {
+                // A file picked: its diff alone, against the files the last
+                // look listed. The next look lists them again.
+                changed |= read_picked(&shared, &*machine, &dir, &job.wants, &mut versions);
+                continue;
+            }
             let found = git::look(
                 &*machine,
                 &dir.path,
@@ -384,14 +420,15 @@ pub fn fetch(shared: Shared, emitter: Emitter) {
                 Ok(Found::NotRepo) => Place::NotRepo,
                 Err(why) => Place::Failed(why),
                 Ok(Found::Repo(snapshot)) => {
-                    let diffs = read_diffs(
-                        &shared,
-                        &*machine,
-                        &dir,
-                        &snapshot,
-                        &job.wants,
-                        &mut versions,
-                    );
+                    let shown = shown_files(&snapshot, &job.wants);
+                    let read =
+                        read_files(&shared, &*machine, &dir, &snapshot, &shown, &mut versions);
+                    let diffs = match lock(&shared).places.get(&dir) {
+                        Some(Place::Repo(before)) => {
+                            keep_diffs(read, &before.diffs, &snapshot, &shown)
+                        }
+                        _ => read,
+                    };
                     Place::Repo(Repo {
                         snapshot,
                         revision: 0,
@@ -401,27 +438,33 @@ pub fn fetch(shared: Shared, emitter: Emitter) {
             };
             changed |= settle(&mut lock(&shared), dir, place, &mut versions);
         }
-        // A repository git takes long over is looked at less often.
-        wait = EVERY.max(started.elapsed() * 4);
+        if look {
+            // A repository git takes long over is looked at less often.
+            wait = EVERY.max(started.elapsed() * 4);
+        }
         if changed {
             emitter.redraw();
         }
     }
 }
 
-/// Waits for a panel to want a look, or for `wait` to pass while one is on
-/// show: then what to look at, each directory a panel is in with what the
-/// panels there want of it. The places no panel is in are let go but for
-/// those left last; once the last panel has gone, nothing is to be looked
-/// at, once, so that the fetcher lets go of what it keeps for the others
-/// too, before it waits.
-fn next_jobs(shared: &Shared, wait: Duration) -> BTreeMap<Dir, Job> {
+/// Waits for a panel to want a look or a file read, or for `wait` to pass
+/// while one is on show: then what to look at, each directory a panel is in
+/// with what the panels there want of it, and whether it is looked at
+/// afresh. The places no panel is in are let go but for those left last;
+/// once the last panel has gone, nothing is to be looked at, once, so that
+/// the fetcher lets go of what it keeps for the others too, before it waits.
+fn next_jobs(shared: &Shared, wait: Duration) -> Turn {
     let mut state = lock(shared);
+    let mut due = false;
     loop {
         if state.views.is_empty() {
             if std::mem::take(&mut state.looking) {
                 state.keep_places();
-                return BTreeMap::new();
+                return Turn {
+                    jobs: BTreeMap::new(),
+                    look: true,
+                };
             }
             state = shared
                 .1
@@ -429,7 +472,7 @@ fn next_jobs(shared: &Shared, wait: Duration) -> BTreeMap<Dir, Job> {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             continue;
         }
-        if state.poked {
+        if state.poked || state.picking {
             break;
         }
         let (next, timeout) = shared
@@ -438,10 +481,13 @@ fn next_jobs(shared: &Shared, wait: Duration) -> BTreeMap<Dir, Job> {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state = next;
         if timeout.timed_out() && !state.views.is_empty() {
+            due = true;
             break;
         }
     }
+    let look = due || state.poked;
     state.poked = false;
+    state.picking = false;
     state.looking = true;
     let mut jobs: BTreeMap<Dir, Job> = BTreeMap::new();
     for (view, want) in &state.views {
@@ -455,20 +501,13 @@ fn next_jobs(shared: &Shared, wait: Duration) -> BTreeMap<Dir, Job> {
         }
     }
     state.keep_places();
-    jobs
+    Turn { jobs, look }
 }
 
-/// The diffs of the files the panels in `dir` show, as [`State::shown`]
-/// finds them, each read again and parsed only when git prints something
-/// new for it.
-fn read_diffs(
-    shared: &Shared,
-    machine: &dyn Machine,
-    dir: &Dir,
-    snapshot: &Snapshot,
-    wants: &[Want],
-    versions: &mut u32,
-) -> HashMap<String, Read> {
+/// The files the panels that want `wants` show of `snapshot`, as
+/// [`State::shown`] finds them: each one's pick, or its first file when it
+/// shows the lines itself.
+fn shown_files<'a>(snapshot: &'a Snapshot, wants: &[Want]) -> Vec<&'a Change> {
     let mut shown: Vec<&Change> = Vec::new();
     for want in wants {
         let picked = want
@@ -482,14 +521,28 @@ fn read_diffs(
             }
         }
     }
+    shown
+}
+
+/// The diffs of `files`, each read again and parsed only when git prints
+/// something new for it.
+fn read_files(
+    shared: &Shared,
+    machine: &dyn Machine,
+    dir: &Dir,
+    snapshot: &Snapshot,
+    files: &[&Change],
+    versions: &mut u32,
+) -> HashMap<String, Read> {
     let mut diffs = HashMap::new();
-    for file in shown {
+    for &file in files {
         let raw = git::diff(machine, snapshot, file);
         let hash = {
             let mut hasher = DefaultHasher::new();
             raw.hash(&mut hasher);
             hasher.finish()
         };
+        let bytes = raw.as_ref().map_or(0, |(out, _)| out.len());
         let known = match lock(shared).places.get(dir) {
             Some(Place::Repo(repo)) => repo
                 .diffs
@@ -498,28 +551,103 @@ fn read_diffs(
                 .map(|read| (Arc::clone(&read.diff), read.version)),
             _ => None,
         };
-        let read = match known {
-            Some((diff, version)) => Read {
-                diff,
-                version,
-                raw: hash,
-            },
+        let (diff, version) = match known {
+            Some(known) => known,
             None => {
                 let diff = match raw {
-                    Ok((bytes, cut)) => git::lines(&bytes, cut, file.status == Status::Untracked),
+                    Ok((out, cut)) => git::lines(&out, cut, file.status == Status::Untracked),
                     Err(why) => git::failed(why),
                 };
                 *versions = versions.wrapping_add(1);
-                Read {
-                    diff: Arc::new(diff),
-                    version: *versions,
-                    raw: hash,
-                }
+                (Arc::new(diff), *versions)
             }
         };
-        diffs.insert(file.path.clone(), read);
+        diffs.insert(
+            file.path.clone(),
+            Read {
+                diff,
+                version,
+                raw: hash,
+                of: file.clone(),
+                bytes,
+                shown: Instant::now(),
+            },
+        );
     }
     diffs
+}
+
+/// Reads the diffs the panels in `dir` show that none is kept of -- that
+/// of a file just picked -- against the files the last look there listed;
+/// true when one was read. While nothing is listed there, the look that
+/// lists it reads it.
+fn read_picked(
+    shared: &Shared,
+    machine: &dyn Machine,
+    dir: &Dir,
+    wants: &[Want],
+    versions: &mut u32,
+) -> bool {
+    let (snapshot, unread) = {
+        let state = lock(shared);
+        let Some(Place::Repo(repo)) = state.places.get(dir) else {
+            return false;
+        };
+        let unread: Vec<Change> = shown_files(&repo.snapshot, wants)
+            .into_iter()
+            .filter(|file| !repo.diffs.contains_key(&file.path))
+            .cloned()
+            .collect();
+        if unread.is_empty() {
+            return false;
+        }
+        (repo.snapshot.clone(), unread)
+    };
+    let unread: Vec<&Change> = unread.iter().collect();
+    let read = read_files(shared, machine, dir, &snapshot, &unread, versions);
+    let mut state = lock(shared);
+    match state.places.get_mut(dir) {
+        // Unless it was let go, or looked at afresh, meanwhile.
+        Some(Place::Repo(repo)) if repo.snapshot == snapshot => {
+            let before = std::mem::take(&mut repo.diffs);
+            repo.diffs = keep_diffs(read, &before, &snapshot, &shown_files(&snapshot, wants));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// What a directory keeps of the diffs it has: those `read` now, the rest
+/// of those `shown`, and of those shown before, each whose file `snapshot`
+/// lists as it was listed when read, the last shown first, to at most
+/// [`KEPT_DIFFS`] files and [`KEPT_DIFF_BYTES`].
+fn keep_diffs(
+    mut read: HashMap<String, Read>,
+    before: &HashMap<String, Read>,
+    snapshot: &Snapshot,
+    shown: &[&Change],
+) -> HashMap<String, Read> {
+    let mut rest: Vec<(&String, &Read)> = Vec::new();
+    for (path, old) in before {
+        if read.contains_key(path) || !snapshot.files.contains(&old.of) {
+            continue;
+        }
+        if shown.iter().any(|file| &file.path == path) {
+            read.insert(path.clone(), old.clone());
+        } else {
+            rest.push((path, old));
+        }
+    }
+    rest.sort_by_key(|(_, read)| std::cmp::Reverse(read.shown));
+    let mut bytes = 0;
+    for (path, old) in rest.into_iter().take(KEPT_DIFFS) {
+        if bytes + old.bytes > KEPT_DIFF_BYTES {
+            continue;
+        }
+        bytes += old.bytes;
+        read.insert(path.clone(), old.clone());
+    }
+    read
 }
 
 /// Takes in what was found in `dir`; true when it differs from what was.
@@ -582,21 +710,22 @@ mod tests {
         }
     }
 
+    fn change(path: &str) -> Change {
+        Change {
+            path: path.to_string(),
+            from: None,
+            status: Status::Modified,
+            counts: Some((1, 1)),
+        }
+    }
+
     fn snapshot(paths: &[&str]) -> Snapshot {
         Snapshot {
             root: "/home/user/project".into(),
             branch: "main".into(),
             unborn: false,
             base: "HEAD".into(),
-            files: paths
-                .iter()
-                .map(|path| Change {
-                    path: path.to_string(),
-                    from: None,
-                    status: Status::Modified,
-                    counts: Some((1, 1)),
-                })
-                .collect(),
+            files: paths.iter().map(|path| change(path)).collect(),
             more: 0,
         }
     }
@@ -607,7 +736,10 @@ mod tests {
             revision: 0,
             diffs: diffs
                 .iter()
-                .map(|(path, version)| (path.to_string(), Read::new(FileDiff::default(), *version)))
+                .map(|(path, version)| {
+                    let read = Read::new(change(path), FileDiff::default(), *version);
+                    (path.to_string(), read)
+                })
                 .collect(),
         })
     }
@@ -726,7 +858,7 @@ mod tests {
         );
         place(&shared, 1, Some(here.clone()), false);
         place(&shared, 2, Some(there.clone()), false);
-        let jobs = next_jobs(&shared, Duration::ZERO);
+        let jobs = next_jobs(&shared, Duration::ZERO).jobs;
         assert_eq!(jobs.len(), 2, "the same path on two machines is two places");
         assert_eq!(jobs[&there].views, [2], "asked on the panel's behalf");
         {
@@ -737,13 +869,13 @@ mod tests {
         close(&shared, 2);
         assert_eq!(lock(&shared).places.len(), 2, "kept, left last");
         assert_eq!(
-            next_jobs(&shared, Duration::ZERO).len(),
+            next_jobs(&shared, Duration::ZERO).jobs.len(),
             1,
             "and not looked at"
         );
         close(&shared, 1);
         assert!(
-            next_jobs(&shared, Duration::ZERO).is_empty(),
+            next_jobs(&shared, Duration::ZERO).jobs.is_empty(),
             "nothing is looked at once the last panel went"
         );
         let state = lock(&shared);
@@ -759,11 +891,11 @@ mod tests {
         lock(&shared).places.insert(repo.clone(), Place::NotRepo);
         pick(&shared, 1, Some("src/main.rs".into()));
         // Looked at while on show.
-        assert_eq!(next_jobs(&shared, Duration::ZERO).len(), 1);
+        assert_eq!(next_jobs(&shared, Duration::ZERO).jobs.len(), 1);
         // The sidebar goes to another of its panels, or closes: the view
         // goes, and the fetcher is let go.
         close(&shared, 1);
-        assert!(next_jobs(&shared, Duration::ZERO).is_empty());
+        assert!(next_jobs(&shared, Duration::ZERO).jobs.is_empty());
         // Shown again, as a new view.
         place(&shared, 2, Some(repo.clone()), false);
         let state = lock(&shared);
@@ -795,7 +927,7 @@ mod tests {
         assert!(found(&lock(&shared), &root), "kept while the panel is away");
         lock(&shared).places.insert(src.clone(), Place::NotRepo);
         place(&shared, 1, Some(root.clone()), false);
-        let jobs = next_jobs(&shared, Duration::ZERO);
+        let jobs = next_jobs(&shared, Duration::ZERO).jobs;
         let state = lock(&shared);
         assert!(found(&state, &root), "there at once, and looked at again");
         assert!(jobs.contains_key(&root) && !jobs.contains_key(&src));
@@ -860,5 +992,133 @@ mod tests {
         assert_ne!(dir, other_account, "another account on the host");
         assert_ne!(dir.key(), other_account.key());
         assert_eq!(dir.to_string(), other_account.to_string(), "shown alike");
+    }
+    /// A machine that runs no git, and tells what it was asked to run.
+    #[derive(Default)]
+    struct Asked(std::cell::RefCell<Vec<String>>);
+
+    impl Machine for Asked {
+        fn git(
+            &self,
+            _dir: &str,
+            args: &[&str],
+            _limit: usize,
+        ) -> Result<(Vec<u8>, bool), Failure> {
+            self.0.borrow_mut().push(args.join(" "));
+            let path = args.last().copied().unwrap_or_default();
+            Ok((
+                format!("@@ -1 +1 @@\n-old {path}\n+new {path}\n").into_bytes(),
+                false,
+            ))
+        }
+
+        fn stat(&self, _path: &str) -> Option<Meta> {
+            None
+        }
+
+        fn read(&self, _path: &str, _limit: usize) -> Result<(Vec<u8>, bool), String> {
+            Ok((Vec::new(), false))
+        }
+    }
+
+    fn diffs_in(shared: &Shared, dir: &Dir) -> Vec<String> {
+        match lock(shared).places.get(dir) {
+            Some(Place::Repo(repo)) => {
+                let mut paths: Vec<String> = repo.diffs.keys().cloned().collect();
+                paths.sort();
+                paths
+            }
+            _ => panic!("no repository"),
+        }
+    }
+
+    #[test]
+    fn a_pick_asks_for_no_look_and_a_panel_moving_or_the_time_passing_does() {
+        let shared = Shared::default();
+        let dir = here("/home/user/project");
+        place(&shared, 1, Some(dir.clone()), false);
+        assert!(next_jobs(&shared, Duration::ZERO).look, "a panel came");
+        pick(&shared, 1, Some("a".into()));
+        let turn = next_jobs(&shared, Duration::from_secs(60));
+        assert!(!turn.look, "at once, and the picked file's diff alone");
+        assert_eq!(turn.jobs[&dir].wants[0].picked.as_deref(), Some("a"));
+        assert!(next_jobs(&shared, Duration::ZERO).look, "in time, a look");
+    }
+
+    #[test]
+    fn a_file_picked_is_read_alone_and_one_read_before_is_not_read_again() {
+        let shared = Shared::default();
+        let dir = here("/home/user/project");
+        place(&shared, 1, Some(dir.clone()), false);
+        lock(&shared)
+            .places
+            .insert(dir.clone(), repo(&["a", "b"], &[]));
+        // The look the panel's coming asked for, taken.
+        assert!(next_jobs(&shared, Duration::ZERO).look);
+        let machine = Asked::default();
+        let mut versions = 0;
+        let mut read_picked_now = |path: &str| {
+            pick(&shared, 1, Some(path.into()));
+            let turn = next_jobs(&shared, Duration::from_secs(60));
+            assert!(!turn.look);
+            read_picked(
+                &shared,
+                &machine,
+                &dir,
+                &turn.jobs[&dir].wants,
+                &mut versions,
+            )
+        };
+        assert!(read_picked_now("a"));
+        assert!(read_picked_now("b"));
+        assert!(!read_picked_now("a"), "kept from before: nothing to read");
+        let asked = machine.0.take();
+        assert_eq!(asked.len(), 2, "one git a file, and no look: {asked:?}");
+        assert!(asked[0].starts_with("diff HEAD") && asked[0].ends_with("-- a"));
+        assert!(asked[1].ends_with("-- b"));
+        assert_eq!(diffs_in(&shared, &dir), ["a", "b"], "the one put down kept");
+    }
+
+    #[test]
+    fn a_diff_is_kept_while_its_file_is_listed_as_it_was_and_no_more_of_them_than_so_many() {
+        let read = |path: &str, bytes: usize, ago: u64| {
+            let mut read = Read::new(change(path), FileDiff::default(), 1);
+            read.bytes = bytes;
+            read.shown = Instant::now() - Duration::from_secs(ago);
+            (path.to_string(), read)
+        };
+        let before: HashMap<String, Read> =
+            [read("a", 10, 3), read("b", 10, 2), read("c", 10, 1)].into();
+        let mut listed = snapshot(&["a", "b"]);
+        listed.files[0].counts = Some((2, 1));
+        let shown = [&listed.files[1]];
+        let kept = keep_diffs(HashMap::new(), &before, &listed, &shown);
+        let mut paths: Vec<&String> = kept.keys().collect();
+        paths.sort();
+        assert_eq!(paths, ["b"], "a changed since, c committed");
+
+        // Of those no panel shows, the last shown, up to so many and so much.
+        let many: Vec<String> = (0..KEPT_DIFFS + 3).map(|n| format!("f{n}")).collect();
+        let names: Vec<&str> = many.iter().map(String::as_str).collect();
+        let listed = snapshot(&names);
+        let before: HashMap<String, Read> = many
+            .iter()
+            .enumerate()
+            .map(|(n, path)| read(path, 10, n as u64))
+            .collect();
+        let kept = keep_diffs(HashMap::new(), &before, &listed, &[]);
+        assert_eq!(kept.len(), KEPT_DIFFS);
+        assert!(kept.contains_key("f0") && !kept.contains_key(&format!("f{}", KEPT_DIFFS)));
+        let before: HashMap<String, Read> =
+            [read("big", KEPT_DIFF_BYTES + 1, 0), read("small", 10, 5)].into();
+        let listed = snapshot(&["big", "small"]);
+        let kept = keep_diffs(HashMap::new(), &before, &listed, &[]);
+        assert!(!kept.contains_key("big") && kept.contains_key("small"));
+        let shown = [&listed.files[0]];
+        let kept = keep_diffs(HashMap::new(), &before, &listed, &shown);
+        assert!(
+            kept.contains_key("big"),
+            "shown, it is kept whatever it costs"
+        );
     }
 }

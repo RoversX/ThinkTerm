@@ -854,7 +854,11 @@ mod tests {
         ];
         let diffs = [(
             "src/long.rs".to_string(),
-            Read::new(git::lines(long.as_bytes(), false, false), 7),
+            Read::new(
+                files[1].clone(),
+                git::lines(long.as_bytes(), false, false),
+                7,
+            ),
         )];
         {
             let mut state = watch::lock(&shared);
