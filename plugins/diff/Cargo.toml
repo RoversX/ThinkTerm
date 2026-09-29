@@ -1,0 +1,18 @@
+[package]
+name = "thinkterm-plugin-diff"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A ThinkTerm plugin with a panel: the changes in the git repository of the
+# terminal beside it, shown the way GitHub Desktop shows them. Its
+# dependencies name their versions rather than the workspace's, so the
+# directory builds on its own once the SDK path below points at a checkout
+# of ThinkTerm.
+
+[dependencies]
+thinkterm-plugin-sdk = { path = "../../thinkterm-plugin-sdk" }
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

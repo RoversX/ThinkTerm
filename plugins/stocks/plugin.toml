@@ -1,0 +1,32 @@
+# The manifest ThinkTerm reads to find this plugin and its program.
+# docs/thinkterm/plugins.md describes every key.
+id = "stocks"
+name = "Stocks"
+version = "0.1.0"
+description = "A watchlist of quotes from Yahoo Finance, with a chart of the one picked."
+api = 2
+
+[run]
+program = "thinkterm-plugin-stocks"
+
+[run.windows]
+program = "thinkterm-plugin-stocks.exe"
+
+[panel]
+icon = "chart-line"
+
+[locales.zh-CN]
+name = "股票"
+description = "Yahoo Finance 的自选股行情，外加选中那只的走势图。"
+
+[locales.ja-JP]
+name = "株価"
+description = "Yahoo Finance のウォッチリストと、選んだ銘柄のチャート。"
+
+[locales.de-DE]
+name = "Aktien"
+description = "Eine Watchlist mit Kursen von Yahoo Finance und dem Chart der gewählten."
+
+[locales.fr-FR]
+name = "Bourse"
+description = "Une liste de cours de Yahoo Finance, avec le graphique de celui choisi."

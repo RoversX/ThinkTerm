@@ -8591,6 +8591,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkterm-plugin-diff"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thinkterm-plugin-sdk",
+ "unicode-width",
+]
+
+[[package]]
 name = "thinkterm-plugin-example"
 version = "0.1.0"
 dependencies = [
@@ -8635,6 +8644,16 @@ dependencies = [
  "thinkterm-snippets",
  "toml 0.8.23",
  "wezterm-uds",
+]
+
+[[package]]
+name = "thinkterm-plugin-stocks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "http_req",
+ "serde_json",
+ "thinkterm-plugin-sdk",
 ]
 
 [[package]]

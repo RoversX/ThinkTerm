@@ -1,0 +1,32 @@
+# The manifest ThinkTerm reads to find this plugin and its program.
+# docs/thinkterm/plugins.md describes every key.
+id = "diff"
+name = "Diff"
+version = "0.1.0"
+description = "Shows the changes in the git repository of the terminal beside it, the way GitHub Desktop does."
+api = 2
+
+[run]
+program = "thinkterm-plugin-diff"
+
+[run.windows]
+program = "thinkterm-plugin-diff.exe"
+
+[panel]
+icon = "git-compare"
+
+[locales.zh-CN]
+name = "Diff"
+description = "照 GitHub Desktop 的样子，显示旁边终端所在 git 仓库里的改动。"
+
+[locales.ja-JP]
+name = "Diff"
+description = "隣のターミナルがいる git リポジトリの変更を、GitHub Desktop のように表示します。"
+
+[locales.de-DE]
+name = "Diff"
+description = "Zeigt die Änderungen im git-Repository des Terminals daneben, wie GitHub Desktop."
+
+[locales.fr-FR]
+name = "Diff"
+description = "Montre les modifications du dépôt git du terminal voisin, comme GitHub Desktop."
