@@ -247,7 +247,7 @@ jobs:
           name: web-bundle
           path: thinkterm-web/www
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 3
 
   macos:
     name: macos ${{ matrix.arch }}
@@ -342,9 +342,9 @@ jobs:
             ThinkTerm-macos-*.zip
             !ThinkTerm-macos-*-dSYM.zip
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 3
 
-      # The symbols stay a workflow artifact (kept 90 days), not a release
+      # The symbols stay a workflow artifact (kept 3 days), not a release
       # asset: nobody but us reads a crash report against them, and on the
       # release page they would only look like another download.
       - name: Upload symbols
@@ -353,6 +353,7 @@ jobs:
           name: macos-${{ matrix.arch }}-symbols
           path: ThinkTerm-macos-*-dSYM.zip
           if-no-files-found: error
+          retention-days: 3
 
   windows:
     name: windows x86_64
@@ -441,7 +442,7 @@ jobs:
             !ThinkTerm-*-pdb.zip
             ThinkTerm-*.exe
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 3
 
       - name: Upload symbols
         # The ordinary release profile does not produce a separate PDB bundle.
@@ -451,6 +452,7 @@ jobs:
           name: windows-x86_64-symbols
           path: ThinkTerm-*-pdb.zip
           if-no-files-found: error
+          retention-days: 3
 
   # Each distro builds inside its own container so the resulting deb/rpm links
   # against that distro's glibc, and the arch comes from the runner underneath.
@@ -587,7 +589,7 @@ jobs:
             ThinkTerm-*.AppImage
             ThinkTerm-*.AppImage.zsync
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 3
 
   publish:
     name: publish
