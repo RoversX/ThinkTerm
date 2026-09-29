@@ -885,6 +885,28 @@ fn right_sidebar_panels_changed() {
     }
 }
 
+/// The name of how long a plugin runs unused, as an i18n key.
+fn background_label(background: thinkterm_plugin_channel::registry::Background) -> &'static str {
+    use thinkterm_plugin_channel::registry::Background;
+    match background {
+        Background::Always => "settings-plugins-background-always",
+        Background::Briefly => "settings-plugins-background-briefly",
+        Background::Never => "settings-plugins-background-never",
+    }
+}
+
+/// What running so means, as an i18n key.
+fn background_description(
+    background: thinkterm_plugin_channel::registry::Background,
+) -> &'static str {
+    use thinkterm_plugin_channel::registry::Background;
+    match background {
+        Background::Always => "settings-plugins-background-always-description",
+        Background::Briefly => "settings-plugins-background-briefly-description",
+        Background::Never => "settings-plugins-background-never-description",
+    }
+}
+
 /// The right-sidebar panel a built-in plugin provides, by its label.
 fn builtin_panel_label(id: &str) -> Option<String> {
     (id == thinkterm_snippets::wire::PLUGIN).then(|| crate::i18n::tr("right-mode-snippets"))
@@ -967,6 +989,10 @@ enum SettingsAction {
     /// Turn a plugin on or off. Carries `plugin_key(id)`, as RevokeWebToken
     /// carries its token's: the list can change between press and release.
     TogglePlugin(u64),
+    /// How long a plugin runs unused, keyed as TogglePlugin: the menu of the
+    /// choices, and one chosen.
+    TogglePluginBackgroundMenu(u64),
+    SetPluginBackground(u64, thinkterm_plugin_channel::registry::Background),
     ReloadPlugins,
     OpenPluginsFolder,
     ToggleAgentDetails(&'static str),
@@ -1089,6 +1115,10 @@ enum SettingsDropdown {
     DefaultShell,
     CommandPaletteHotkey,
     WebLinkTtl,
+    /// How long an installed plugin runs unused, keyed as TogglePlugin: its
+    /// row is where the list put it, so the menu opens under the pill last
+    /// painted for it.
+    PluginBackground(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1562,6 +1592,16 @@ struct SettingsUiState {
     /// The plugins' switches as last painted: each one's key, its id and
     /// the position it showed.
     plugin_switches: Vec<(u64, String, bool)>,
+    /// The plugins whose background was offered as last painted: each
+    /// one's key, its id and its manifest's choice.
+    plugin_backgrounds: Vec<(
+        u64,
+        String,
+        thinkterm_plugin_channel::registry::Background,
+    )>,
+    /// The pill of the plugin whose background menu is open, as last
+    /// painted: the menu opens under it.
+    plugin_background_pill: Option<(u64, window::RectF)>,
     /// The shells found on this machine. Refreshed when the Terminal
     /// section is entered, never while painting: discovery touches the
     /// filesystem, and the paint path must not.
@@ -1621,6 +1661,8 @@ impl SettingsUiState {
             archived_rows: Vec::new(),
             web_tokens: Vec::new(),
             plugin_switches: Vec::new(),
+            plugin_backgrounds: Vec::new(),
+            plugin_background_pill: None,
             shell_catalog: Vec::new(),
             confirm_delete_archived: None,
             confirm_stop_server: false,
@@ -2675,6 +2717,8 @@ impl SettingsWindow {
                         | SettingsAction::SetCommandPaletteHotkey(_)
                         | SettingsAction::ToggleWebLinkTtlMenu
                         | SettingsAction::SetWebLinkTtl(_)
+                        | SettingsAction::TogglePluginBackgroundMenu(_)
+                        | SettingsAction::SetPluginBackground(..)
                         | SettingsAction::DropdownMenuBackdrop,
                     ) => {
                         self.set_focused_input(None);
@@ -4738,6 +4782,28 @@ impl SettingsWindow {
                     .cloned();
                 if let Some((_, id, enabled)) = switch {
                     crate::plugins::set_enabled(&id, !enabled);
+                }
+                window.invalidate();
+            }
+            SettingsAction::TogglePluginBackgroundMenu(key) => {
+                let menu = SettingsDropdown::PluginBackground(key);
+                self.ui.open_dropdown = if self.ui.open_dropdown == Some(menu) {
+                    None
+                } else {
+                    Some(menu)
+                };
+                window.invalidate();
+            }
+            SettingsAction::SetPluginBackground(key, background) => {
+                self.ui.open_dropdown = None;
+                let offered = self
+                    .ui
+                    .plugin_backgrounds
+                    .iter()
+                    .find(|(shown, _, _)| *shown == key)
+                    .cloned();
+                if let Some((_, id, default)) = offered {
+                    crate::plugins::set_background(&id, background, default);
                 }
                 window.invalidate();
             }
@@ -9381,8 +9447,9 @@ impl SettingsWindow {
 
     /// The plugins, on the Sidebar page from `title_y`: where they are
     /// installed, reloading them, and each as the plugin host last listed
-    /// it. An installed one has its switch here; a built-in one says which
-    /// panel it provides, whose switch is above.
+    /// it. An installed one has its switch here, and, while on, how long it
+    /// runs unused beside it; a built-in one says which panel it provides,
+    /// whose switch is above.
     fn paint_plugins(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -9467,6 +9534,8 @@ impl SettingsWindow {
 
         self.paint_group_card(layers, x, list_y, max_width, list_height)?;
         self.ui.plugin_switches.clear();
+        self.ui.plugin_backgrounds.clear();
+        self.ui.plugin_background_pill = None;
         let Some(plugins) = plugins.filter(|plugins| !plugins.is_empty()) else {
             let label = match crate::plugins::trouble() {
                 Some(why) => settings_tr("settings-plugins-unavailable", &[("reason", why)]),
@@ -9520,17 +9589,290 @@ impl SettingsWindow {
             self.ui
                 .plugin_switches
                 .push((key, plugin.id.clone(), enabled));
-            self.paint_toggle_setting_row(
+            self.paint_plugin_row(
                 layers,
                 row_x,
                 y,
                 row_width,
-                &plugin.name,
+                key,
+                plugin,
                 &description,
                 enabled,
-                SettingsAction::TogglePlugin(key),
                 index > 0,
             )?;
+        }
+        Ok(())
+    }
+
+    /// An installed plugin's row: its name and what it is on the left; its
+    /// switch on the right and, while it is on, how long it runs unused in
+    /// a pill beside the switch, whose menu offers the three choices.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_plugin_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        key: u64,
+        plugin: &thinkterm_plugin_channel::registry::Info,
+        description: &str,
+        enabled: bool,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
+        if draw_top_rule {
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
+        }
+        let control_y = y + self.ui_px(4.0);
+        let control_height = self.ui_px(CONTROL_HEIGHT);
+        let switch_width = self.ui_px(SWITCH_WIDTH);
+        let switch_x = x + width - switch_width;
+        let toggle = SettingsAction::TogglePlugin(key);
+        let reach = self.ui_px(8.0);
+        self.ui_context.push(
+            rect(
+                switch_x - reach,
+                control_y,
+                switch_width + reach,
+                control_height,
+            ),
+            WidgetKind::Button,
+            toggle,
+        );
+        let mut text_right = switch_x - self.ui_px(24.0);
+
+        if enabled {
+            self.ui
+                .plugin_backgrounds
+                .push((key, plugin.id.clone(), plugin.background_default));
+            let chosen = crate::plugins::choosing(&plugin.id).unwrap_or(plugin.background);
+            let label = crate::i18n::tr(background_label(chosen));
+            let pill_width = (self.measure_text_width(&ui_font, &label) + self.ui_px(68.0))
+                .max(self.ui_px(120.0));
+            let pill = rect(
+                switch_x - self.ui_px(16.0) - pill_width,
+                control_y,
+                pill_width,
+                control_height,
+            );
+            let menu = SettingsAction::TogglePluginBackgroundMenu(key);
+            self.ui_context.push(pill, WidgetKind::Button, menu);
+            let open = self.ui.open_dropdown == Some(SettingsDropdown::PluginBackground(key));
+            let hovered = self.ui.interaction.hovered == Some(menu);
+            let pressed = self.ui.interaction.pressed == Some(menu);
+            let bg = if pressed || hovered {
+                palette.control_hover_bg
+            } else {
+                palette.control_bg
+            };
+            let border = if open {
+                palette.nav_selected_bg
+            } else if hovered || pressed {
+                palette.separator
+            } else {
+                palette.control_border
+            };
+            self.paint_dropdown_pill(layers, pill, &label, bg, border)?;
+            if open {
+                self.ui.plugin_background_pill = Some((key, pill));
+            }
+            text_right = pill.origin.x - self.ui_px(24.0);
+        }
+
+        let text_width = (text_right - x).max(width * 0.35);
+        self.draw_text(layers, &ui_font, x, y, &plugin.name, palette.text, text_width)?;
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            self.settings_row_description_y(y),
+            description,
+            palette.secondary_text,
+            text_width,
+        )?;
+        let hovered = self.ui.interaction.hovered == Some(toggle);
+        let pressed = self.ui.interaction.pressed == Some(toggle);
+        self.paint_switch(
+            layers,
+            switch_x,
+            control_y + (control_height - self.ui_px(SWITCH_HEIGHT)) / 2.0,
+            enabled,
+            hovered,
+            pressed,
+        )
+    }
+
+    /// The menu of how long plugin `key` runs unused, under its `pill`: each
+    /// choice by its name and what it means, the manifest's said to be so.
+    fn paint_plugin_background_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        key: u64,
+        pill: window::RectF,
+    ) -> anyhow::Result<()> {
+        use thinkterm_plugin_channel::registry::Background;
+        let Some((_, id, default)) = self
+            .ui
+            .plugin_backgrounds
+            .iter()
+            .find(|(shown, _, _)| *shown == key)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let chosen = crate::plugins::plugins()
+            .and_then(|plugins| plugins.into_iter().find(|plugin| plugin.id == id))
+            .map_or(default, |plugin| plugin.background);
+        let chosen = crate::plugins::choosing(&id).unwrap_or(chosen);
+        let options: Vec<(String, String, SettingsAction, bool)> =
+            [Background::Always, Background::Briefly, Background::Never]
+                .iter()
+                .copied()
+                .map(|background| {
+                    let mut meaning = crate::i18n::tr(background_description(background));
+                    if background == default {
+                        meaning = format!(
+                            "{meaning} · {}",
+                            crate::i18n::tr("settings-plugins-background-default")
+                        );
+                    }
+                    (
+                        crate::i18n::tr(background_label(background)),
+                        meaning,
+                        SettingsAction::SetPluginBackground(key, background),
+                        background == chosen,
+                    )
+                })
+                .collect();
+        self.paint_described_dropdown_menu(layers, pill, &options)
+    }
+
+    /// [`paint_dropdown_menu`], with a line under each choice saying what it
+    /// means: under `pill`, as wide as its longest line and flush with the
+    /// pill's right edge -- over it, where there is no room below. Painted on
+    /// the top layer, so the icons of the rows it covers do not show through.
+    fn paint_described_dropdown_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        pill: window::RectF,
+        options: &[(String, String, SettingsAction, bool)],
+    ) -> anyhow::Result<()> {
+        const LAYER: usize = 2;
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
+        let line = self.metrics.cell_size.height as f32;
+        let row_height = line * 2.0 + self.ui_px(20.0);
+        let row_gap = self.ui_px(6.0);
+        let menu_padding = self.ui_px(8.0);
+        let menu_height = menu_padding * 2.0
+            + row_height * options.len() as f32
+            + row_gap * options.len().saturating_sub(1) as f32;
+        let widest = options
+            .iter()
+            .map(|(label, meaning, _, _)| {
+                self.measure_text_width(&ui_font, label)
+                    .max(self.measure_text_width(&body_font, meaning))
+            })
+            .fold(0.0, f32::max);
+        let right = pill.origin.x + pill.size.width;
+        let width = (widest + self.ui_px(48.0))
+            .max(pill.size.width)
+            .min(right - self.ui_px(8.0));
+        let x = right - width;
+        let below = pill.origin.y + pill.size.height + self.ui_px(8.0);
+        let y = if below + menu_height <= self.content_bottom() - self.ui_px(8.0) {
+            below
+        } else {
+            (pill.origin.y - self.ui_px(8.0) - menu_height).max(self.content_scroll_area_top())
+        };
+        let menu_bg = match self.effective_appearance() {
+            Appearance::Light | Appearance::LightHighContrast => rgba(248, 248, 250, 1.0),
+            Appearance::Dark | Appearance::DarkHighContrast => rgba(34, 34, 36, 1.0),
+        };
+        // As in `paint_dropdown_menu`: the whole menu is claimed, so a click
+        // between its rows does not reach what it is painted over.
+        self.ui_context.push(
+            rect(x, y, width, menu_height),
+            WidgetKind::Button,
+            SettingsAction::DropdownMenuBackdrop,
+        );
+        self.draw_rounded_frame(
+            layers,
+            LAYER,
+            x,
+            y,
+            width,
+            menu_height,
+            menu_bg,
+            palette.control_border,
+            self.ui_px(CONTROL_RADIUS),
+        )?;
+        let mut row_y = y + menu_padding;
+        for (label, meaning, action, selected) in options {
+            let (action, selected) = (*action, *selected);
+            let row_rect = rect(
+                x + self.ui_px(8.0),
+                row_y,
+                width - self.ui_px(16.0),
+                row_height,
+            );
+            self.ui_context.push(row_rect, WidgetKind::Button, action);
+            let hovered = self.ui.interaction.hovered == Some(action);
+            let pressed = self.ui.interaction.pressed == Some(action);
+            let row_bg = if selected {
+                Some(palette.nav_selected_bg)
+            } else if pressed {
+                Some(palette.control_pressed_bg)
+            } else if hovered {
+                Some(palette.control_hover_bg)
+            } else {
+                None
+            };
+            if let Some(row_bg) = row_bg {
+                self.draw_rounded_rect(
+                    layers,
+                    LAYER,
+                    row_rect.origin.x,
+                    row_rect.origin.y,
+                    row_rect.size.width,
+                    row_rect.size.height,
+                    row_bg,
+                    self.ui_px(9.0),
+                )?;
+            }
+            let text_x = row_rect.origin.x + self.ui_px(14.0);
+            let text_width = row_rect.size.width - self.ui_px(28.0);
+            let top = row_rect.origin.y + self.ui_px(10.0);
+            let (label_color, meaning_color) = if selected {
+                (palette.selected_text, palette.selected_text)
+            } else {
+                (palette.text, palette.secondary_text)
+            };
+            self.draw_text_on_layer(
+                layers,
+                LAYER,
+                &ui_font,
+                text_x,
+                top,
+                label,
+                label_color,
+                text_width,
+            )?;
+            self.draw_text_on_layer(
+                layers,
+                LAYER,
+                &body_font,
+                text_x,
+                top + line,
+                meaning,
+                meaning_color,
+                text_width,
+            )?;
+            row_y += row_height + row_gap;
         }
         Ok(())
     }
@@ -11671,6 +12013,15 @@ impl SettingsWindow {
         let Some(dropdown) = self.ui.open_dropdown else {
             return Ok(());
         };
+        // Under its pill, wherever the plugin list put it.
+        if let SettingsDropdown::PluginBackground(key) = dropdown {
+            return match self.ui.plugin_background_pill {
+                Some((shown, pill)) if shown == key => {
+                    self.paint_plugin_background_menu(layers, key, pill)
+                }
+                _ => Ok(()),
+            };
+        }
 
         let scroll = self.ui.content_scroll.offset;
         let card_padding = self.ui_px(36.0);
@@ -11696,7 +12047,8 @@ impl SettingsWindow {
                     SettingsDropdown::MainRenderer
                     | SettingsDropdown::DefaultShell
                     | SettingsDropdown::CommandPaletteHotkey
-                    | SettingsDropdown::WebLinkTtl => return Ok(()),
+                    | SettingsDropdown::WebLinkTtl
+                    | SettingsDropdown::PluginBackground(_) => return Ok(()),
                 };
                 (x + card_padding, row_y, max_width - card_padding * 2.0)
             }
@@ -11708,7 +12060,8 @@ impl SettingsWindow {
                     SettingsDropdown::AppIcon
                     | SettingsDropdown::DefaultShell
                     | SettingsDropdown::CommandPaletteHotkey
-                    | SettingsDropdown::WebLinkTtl => return Ok(()),
+                    | SettingsDropdown::WebLinkTtl
+                    | SettingsDropdown::PluginBackground(_) => return Ok(()),
                 };
                 (x + card_padding, row_y, max_width - card_padding * 2.0)
             }
@@ -11722,7 +12075,8 @@ impl SettingsWindow {
                     | SettingsDropdown::AppIcon
                     | SettingsDropdown::MainRenderer
                     | SettingsDropdown::CommandPaletteHotkey
-                    | SettingsDropdown::WebLinkTtl => return Ok(()),
+                    | SettingsDropdown::WebLinkTtl
+                    | SettingsDropdown::PluginBackground(_) => return Ok(()),
                 };
                 (x + card_padding, row_y, max_width - card_padding * 2.0)
             }
@@ -11789,6 +12143,8 @@ impl SettingsWindow {
                 control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
                 control_width,
             ),
+            // Painted under its pill, above.
+            SettingsDropdown::PluginBackground(_) => Ok(()),
         }
     }
 

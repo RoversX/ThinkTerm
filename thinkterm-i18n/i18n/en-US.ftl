@@ -762,6 +762,14 @@ settings-plugins-unusable = Unavailable
 settings-plugins-loading = Loading plugins…
 settings-plugins-unavailable = Plugins are unavailable: { $reason }
 settings-plugins-refused = The plugin was not changed: { $reason }
+settings-plugins-background = Background
+settings-plugins-background-always = Keep alive
+settings-plugins-background-briefly = On demand
+settings-plugins-background-never = Stop after use
+settings-plugins-background-always-description = Starts with ThinkTerm and runs for as long as ThinkTerm runs on this machine
+settings-plugins-background-briefly-description = Starts when used, and stops 2 minutes after it was last used
+settings-plugins-background-never-description = Starts when used, and stops right after it was last used
+settings-plugins-background-default = The plugin's default
 
 # --- Web: browser access to this machine's terminals ---
 settings-section-web = Web

@@ -747,6 +747,14 @@ settings-plugins-unusable = 不可用
 settings-plugins-loading = 正在加载插件…
 settings-plugins-unavailable = 插件暂时不可用：{ $reason }
 settings-plugins-refused = 没能修改插件：{ $reason }
+settings-plugins-background = 后台运行
+settings-plugins-background-always = 保活
+settings-plugins-background-briefly = 按需
+settings-plugins-background-never = 用完就停
+settings-plugins-background-always-description = 随 ThinkTerm 启动，ThinkTerm 在这台机器上运行时一直运行
+settings-plugins-background-briefly-description = 用到时启动，不用 2 分钟后停止
+settings-plugins-background-never-description = 用到时启动，用完马上停止
+settings-plugins-background-default = 插件默认
 
 # --- 网页端:用浏览器访问这台机器的终端 ---
 settings-section-web = 网页

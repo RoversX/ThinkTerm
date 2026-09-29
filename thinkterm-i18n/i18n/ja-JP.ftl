@@ -747,6 +747,14 @@ settings-plugins-unusable = 使用不可
 settings-plugins-loading = プラグインを読み込み中…
 settings-plugins-unavailable = プラグインは利用できません：{ $reason }
 settings-plugins-refused = プラグインを変更できませんでした：{ $reason }
+settings-plugins-background = バックグラウンド
+settings-plugins-background-always = 常駐
+settings-plugins-background-briefly = 必要なときだけ
+settings-plugins-background-never = 使ったら停止
+settings-plugins-background-always-description = ThinkTerm と一緒に起動し、このマシンで ThinkTerm が動いている間は動き続けます
+settings-plugins-background-briefly-description = 使うときに起動し、最後に使ってから 2 分で停止します
+settings-plugins-background-never-description = 使うときに起動し、使い終わるとすぐ停止します
+settings-plugins-background-default = プラグインの既定
 
 # --- Web: ブラウザからこのマシンの端末へ ---
 settings-section-web = Web

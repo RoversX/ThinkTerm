@@ -759,6 +759,14 @@ settings-plugins-unusable = Indisponible
 settings-plugins-loading = Chargement des extensions…
 settings-plugins-unavailable = Les extensions sont indisponibles : { $reason }
 settings-plugins-refused = L'extension n'a pas été modifiée : { $reason }
+settings-plugins-background = Arrière-plan
+settings-plugins-background-always = Maintenir actif
+settings-plugins-background-briefly = À la demande
+settings-plugins-background-never = Arrêter après usage
+settings-plugins-background-always-description = Démarre avec ThinkTerm et tourne tant que ThinkTerm tourne sur cette machine
+settings-plugins-background-briefly-description = Démarre à l'usage et s'arrête 2 minutes après la dernière utilisation
+settings-plugins-background-never-description = Démarre à l'usage et s'arrête juste après la dernière utilisation
+settings-plugins-background-default = Par défaut du plugin
 
 # --- Web : accéder à ces terminaux depuis un navigateur ---
 settings-section-web = Web
