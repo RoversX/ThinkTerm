@@ -4,7 +4,7 @@
 
 ## 📥 下载
 
-**[前往 Releases](https://github.com/RoversX/ThinkTerm/releases)**
+**[点击下载](https://github.com/RoversX/ThinkTerm/releases)** - 获取最新版本
 
 🌐 **官网**: [closex.org/thinkterm](https://closex.org/thinkterm/)
 
@@ -143,7 +143,9 @@ thinkterm --help             # 查看所有命令
 
 ThinkTerm 使用 Lua 配置，默认读取自己的 ThinkTerm 路径，并支持许多 WezTerm 配置选项。**Settings → Compatibility（设置 → 兼容性）** 可以从已有 WezTerm 配置中导入选定字段。也可以通过 `THINKTERM_CONFIG_FILE` 或兼容变量 `WEZTERM_CONFIG_FILE` 等显式文件覆盖方式选择其他文件。
 
-项目不收集使用遥测。设置 `check_for_updates = false` 可关闭更新检查。远程连接、笔记图片加载等功能在使用时会发起网络请求；设置 `note_remote_images_enabled = false` 可关闭笔记中的远程图片。
+### ThinkTerm 不使用任何遥测或跟踪器
+
+设置 `check_for_updates = false` 可关闭更新检查。远程连接、笔记图片加载等功能在使用时会发起网络请求；设置 `note_remote_images_enabled = false` 可关闭笔记中的远程图片。
 
 桌面端 SSH 主机簿使用本地保存的密钥加密密码。任何同时持有密钥和加密主机数据的人都可以解密密码，包括从备份中获得两者的情况。浏览器访问令牌可用于访问服务端终端会话，应作为凭据保管。
 

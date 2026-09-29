@@ -4,7 +4,7 @@
 
 ## 📥 Téléchargement
 
-**[Voir les releases](https://github.com/RoversX/ThinkTerm/releases)**
+**[Télécharger ici](https://github.com/RoversX/ThinkTerm/releases)** - Obtenir la dernière version
 
 🌐 **Site web**: [closex.org/thinkterm](https://closex.org/thinkterm/)
 
@@ -143,7 +143,9 @@ thinkterm --help             # Afficher toutes les commandes
 
 ThinkTerm utilise une configuration Lua, avec ses propres chemins par défaut, et prend en charge de nombreuses options de WezTerm. **Settings → Compatibility** permet d'importer les champs choisis d'une configuration WezTerm existante. Un fichier peut aussi être sélectionné explicitement, notamment avec `THINKTERM_CONFIG_FILE` ou la variable de compatibilité `WEZTERM_CONFIG_FILE`.
 
-Le projet ne collecte aucune télémétrie d'utilisation. La recherche de mises à jour peut être désactivée avec `check_for_updates = false`. Les connexions distantes ou le chargement d'images dans les notes effectuent des requêtes réseau lors de leur utilisation ; les images distantes des notes peuvent être désactivées avec `note_remote_images_enabled = false`.
+### ThinkTerm n’utilise aucune télémétrie ni aucun traceur
+
+La recherche de mises à jour peut être désactivée avec `check_for_updates = false`. Les connexions distantes ou le chargement d'images dans les notes effectuent des requêtes réseau lors de leur utilisation ; les images distantes des notes peuvent être désactivées avec `note_remote_images_enabled = false`.
 
 Le carnet d'hôtes SSH de l'application de bureau chiffre les mots de passe avec une clé conservée localement. Toute personne possédant à la fois cette clé et les données chiffrées, y compris dans une sauvegarde, peut déchiffrer les mots de passe. Les jetons d'accès du navigateur donnent accès aux sessions terminal du serveur et doivent être traités comme des identifiants d'accès.
 

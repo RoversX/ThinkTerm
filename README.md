@@ -4,7 +4,7 @@
 
 ## 📥 Download
 
-**[View releases](https://github.com/RoversX/ThinkTerm/releases)**
+**[Download here](https://github.com/RoversX/ThinkTerm/releases)** - Get the latest release
 
 🌐 **Website**: [closex.org/thinkterm](https://closex.org/thinkterm/)
 
@@ -143,7 +143,9 @@ thinkterm --help             # Show all commands
 
 ThinkTerm uses Lua configuration with its own default ThinkTerm paths and supports many WezTerm options. **Settings → Compatibility** can import selected fields from an existing WezTerm configuration. Explicit file overrides, including `THINKTERM_CONFIG_FILE` and the compatibility variable `WEZTERM_CONFIG_FILE`, can select another file.
 
-The project collects no usage telemetry. Update checks can be disabled with `check_for_updates = false`. Features such as remote connections and loading images in Notes make network requests when used; remote Note images can be disabled with `note_remote_images_enabled = false`.
+### ThinkTerm uses no telemetry or trackers
+
+Update checks can be disabled with `check_for_updates = false`. Features such as remote connections and loading images in Notes make network requests when used; remote Note images can be disabled with `note_remote_images_enabled = false`.
 
 The desktop SSH host book encrypts saved passwords with a locally stored key. Anyone with both the key and encrypted host data, including in a backup, can decrypt the passwords. Browser access tokens grant access to the server's terminal sessions and should be treated as credentials.
 

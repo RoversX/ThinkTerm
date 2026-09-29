@@ -4,7 +4,7 @@
 
 ## 📥 Download
 
-**[Releases ansehen](https://github.com/RoversX/ThinkTerm/releases)**
+**[Hier herunterladen](https://github.com/RoversX/ThinkTerm/releases)** - Die neueste Version erhalten
 
 🌐 **Website**: [closex.org/thinkterm](https://closex.org/thinkterm/)
 
@@ -143,7 +143,9 @@ thinkterm --help             # Alle Befehle anzeigen
 
 ThinkTerm wird über Lua konfiguriert, verwendet standardmäßig eigene ThinkTerm-Pfade und unterstützt viele WezTerm-Optionen. Unter **Settings → Compatibility** lassen sich ausgewählte Felder aus einer vorhandenen WezTerm-Konfiguration importieren. Eine andere Datei kann auch ausdrücklich angegeben werden, etwa über `THINKTERM_CONFIG_FILE` oder die Kompatibilitätsvariable `WEZTERM_CONFIG_FILE`.
 
-Das Projekt sammelt keine Nutzungstelemetrie. Die Suche nach Updates lässt sich mit `check_for_updates = false` abschalten. Funktionen wie Remote-Verbindungen und das Laden von Bildern in Notizen senden bei ihrer Nutzung Netzwerkanfragen. Entfernte Bilder in Notizen können mit `note_remote_images_enabled = false` deaktiviert werden.
+### ThinkTerm verwendet keinerlei Telemetrie oder Tracker
+
+Die Suche nach Updates lässt sich mit `check_for_updates = false` abschalten. Funktionen wie Remote-Verbindungen und das Laden von Bildern in Notizen senden bei ihrer Nutzung Netzwerkanfragen. Entfernte Bilder in Notizen können mit `note_remote_images_enabled = false` deaktiviert werden.
 
 Das SSH-Hostverzeichnis der Desktop-Anwendung verschlüsselt gespeicherte Passwörter mit einem lokal abgelegten Schlüssel. Wer sowohl den Schlüssel als auch die verschlüsselten Hostdaten besitzt, beispielsweise aus einem Backup, kann die Passwörter entschlüsseln. Browser-Zugriffstokens erlauben den Zugriff auf die Terminalsitzungen des Servers und müssen wie Zugangsdaten behandelt werden.
 

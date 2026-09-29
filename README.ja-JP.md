@@ -4,7 +4,7 @@
 
 ## 📥 ダウンロード
 
-**[リリースページを開く](https://github.com/RoversX/ThinkTerm/releases)**
+**[こちらからダウンロード](https://github.com/RoversX/ThinkTerm/releases)** - 最新リリースを入手
 
 🌐 **公式サイト**: [closex.org/thinkterm](https://closex.org/thinkterm/)
 
@@ -143,7 +143,9 @@ thinkterm --help             # すべてのコマンドを表示
 
 ThinkTerm は Lua で設定し、既定では ThinkTerm 独自のパスを使用します。多くの WezTerm オプションに対応しています。**Settings → Compatibility（設定 → 互換性）** では、既存の WezTerm 設定から選択した項目を取り込めます。`THINKTERM_CONFIG_FILE` や互換用の `WEZTERM_CONFIG_FILE` など、明示的なファイル指定で別のファイルを選ぶこともできます。
 
-本プロジェクトは利用状況のテレメトリーを収集しません。`check_for_updates = false` で更新確認を無効にできます。リモート接続やノート内の画像読み込みなどは、利用時にネットワーク通信を行います。ノートのリモート画像は `note_remote_images_enabled = false` で無効にできます。
+### ThinkTerm はテレメトリーやトラッカーを一切使用しません
+
+`check_for_updates = false` で更新確認を無効にできます。リモート接続やノート内の画像読み込みなどは、利用時にネットワーク通信を行います。ノートのリモート画像は `note_remote_images_enabled = false` で無効にできます。
 
 デスクトップ版の SSH ホスト一覧は、ローカルに保存した鍵でパスワードを暗号化します。バックアップを含め、鍵と暗号化されたホストデータの両方を持つ人はパスワードを復号できます。ブラウザーのアクセストークンはサーバー上のターミナルセッションへのアクセスを許可するため、認証情報として管理してください。
 
