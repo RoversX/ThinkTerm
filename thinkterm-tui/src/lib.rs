@@ -615,9 +615,13 @@ async fn run_async(config: ConfigHandle, options: TuiOptions) -> Result<()> {
         {
             Ok(()) => {
                 if let Err(err) = guard_against_same_server_nesting(&domain) {
-                    domain.perform_detach();
-                    attach_failures.push(format!("{name}: {err:#}"));
-                    continue;
+                    // Retrying cannot make this target safe. Leave the
+                    // caller's terminal alone instead of opening the TUI.
+                    for attached in domains.values() {
+                        attached.perform_detach();
+                    }
+                    return Err(err)
+                        .with_context(|| format!("cannot open ThinkTerm TUI on {name}"));
                 }
                 match fetch_current_session(&domain).await {
                     Ok((_generation, snapshot)) => {
@@ -888,11 +892,15 @@ fn guard_against_same_server_nesting(domain: &ClientDomain) -> Result<()> {
 
 fn check_nesting(origin: Option<&str>, inside_thinkterm_pane: bool, target: &str) -> Result<()> {
     if origin == Some(target) {
-        anyhow::bail!("refusing to run ThinkTerm TUI inside a pane owned by the same mux server");
+        anyhow::bail!(
+            "nested TUI: this terminal is already hosted by the target mux server. \
+             Run `thinkterm tui` from another terminal application, or select a different mux domain"
+        );
     }
     if inside_thinkterm_pane && origin.is_none() {
         anyhow::bail!(
-            "refusing nested TUI: this pane predates server identity support, so a different target cannot be proven"
+            "nested TUI: this ThinkTerm pane has no mux server identity, so a different target cannot be verified. \
+             Run `thinkterm tui` from another terminal application"
         );
     }
     Ok(())
