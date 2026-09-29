@@ -34,8 +34,8 @@ DATA="$HOME/Library/Application Support/ThinkTerm"
 # read; and a second copy of the example under another directory, which
 # claims its id and so is listed as not used.
 mkdir -p "$DATA/plugins/text-tools" "$DATA/plugins/broken" "$DATA/plugins/twin"
-cp "$REPO/thinkterm-plugin-example/plugin.toml" "$BIN/thinkterm-plugin-example" "$DATA/plugins/text-tools/"
-cp "$REPO/thinkterm-plugin-example/plugin.toml" "$DATA/plugins/twin/"
+cp "$REPO/plugins/example/plugin.toml" "$BIN/thinkterm-plugin-example" "$DATA/plugins/text-tools/"
+cp "$REPO/plugins/example/plugin.toml" "$DATA/plugins/twin/"
 echo 'id = ' > "$DATA/plugins/broken/plugin.toml"
 "$BIN/thinkterm-mux-server" --config-file "$T/web.lua" --daemonize
 i=0; until curl -s -o /dev/null "http://127.0.0.1:$PORT/"; do i=$((i+1)); [ $i -lt 50 ] || { echo "server did not come up" >&2; exit 1; }; sleep 0.2; done
@@ -44,7 +44,7 @@ PLUGIN_CLI="env HOME=$HOME THINKTERM_NO_PRIVACY_DISCLAIM=1 $BIN/thinkterm plugin
 URL=$($CLI web-token mint --label plugins --ttl 1h --url-only 2>/dev/null | head -1)
 status=0
 HOME=$REAL_HOME TEST_HOME="$HOME" MUX_CLI="$CLI" PLUGIN_CLI="$PLUGIN_CLI" PLUGINS_DATA="$DATA" \
-  EXAMPLE_DIR="$REPO/thinkterm-plugin-example" EXAMPLE_BIN="$BIN/thinkterm-plugin-example" \
+  EXAMPLE_DIR="$REPO/plugins/example" EXAMPLE_BIN="$BIN/thinkterm-plugin-example" \
   node "$REPO/thinkterm-web/smoke/plugins-test.js" "$URL" "$OUT" || status=$?
 for p in $(pgrep -f "$T/" || true); do kill "$p" 2>/dev/null || true; done
 sleep 0.5
