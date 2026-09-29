@@ -3508,8 +3508,9 @@ impl crate::TermWindow {
             return Ok(());
         };
         let edge = rect.x as f32;
-        let top = rect.y as f32;
-        let height = rect.height as f32;
+        let top = if cfg!(target_os = "macos") { rect.y } else { 0 };
+        let height = (rect.y + rect.height - top) as f32;
+        let top = top as f32;
         let spread = self.ui_f32(16.0);
         const STEPS: usize = 8;
         const BASE_ALPHA: f32 = 0.22;
@@ -3600,11 +3601,7 @@ impl crate::TermWindow {
         let offset_x = hidden * rect.width as f32;
         let clip = crate::quad::QuadClipRect::from_top_left_pixels(
             0.0,
-            if cfg!(target_os = "macos") {
-                0.0
-            } else {
-                rect.y as f32
-            },
+            0.0,
             self.dimensions.pixel_width as f32,
             self.dimensions.pixel_height as f32,
             &self.dimensions,
@@ -4514,8 +4511,11 @@ impl crate::TermWindow {
                     .context("paint_right_sidebar")?;
             }
 
-            self.paint_tab_bar(&mut chrome_layers)
+            let defer_trailing_actions = !cfg!(target_os = "macos") && right_hover_overlay.is_some();
+            let tab_items = self
+                .paint_fancy_tab_bar(&mut chrome_layers, defer_trailing_actions)
                 .context("paint_tab_bar")?;
+            self.ui_items.extend(tab_items);
             drop(chrome_layers);
 
             if let Some((overlay, hidden, items)) = hover_overlay {
@@ -4553,6 +4553,24 @@ impl crate::TermWindow {
                 self.paint_right_sidebar_hover_overlay(&overlay, hidden)
                     .context("paint hover-revealed right sidebar")?;
                 self.ui_items.extend(items);
+                if !cfg!(target_os = "macos") {
+                    // Keep the full-height hover background, with the window
+                    // and sidebar buttons above it. Flatten their sub-layers
+                    // just like the panel so button fills remain visible too.
+                    let mut buttons = HeapQuadAllocator::default();
+                    let mut button_layers = TripleLayerQuadAllocator::Heap(&mut buttons);
+                    let button_items = self.paint_window_tab_trailing_actions(&mut button_layers)?;
+                    let mut layers = layer.quad_allocator();
+                    let clip = QuadClipRect::from_top_left_pixels(
+                        0.0,
+                        0.0,
+                        self.dimensions.pixel_width as f32,
+                        self.dimensions.pixel_height as f32,
+                        &self.dimensions,
+                    );
+                    buttons.apply_to_single_layer(&mut layers, 2, 0.0, clip)?;
+                    self.ui_items.extend(button_items);
+                }
             } else if self.right_sidebar_hover.is_arming() {
                 if let Some((zx, zy, zw, zh)) = self.right_sidebar_hover_hot_zone() {
                     let hint_width =

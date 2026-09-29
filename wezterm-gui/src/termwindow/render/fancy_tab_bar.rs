@@ -41,6 +41,7 @@ impl crate::TermWindow {
     pub fn paint_fancy_tab_bar(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
+        defer_trailing_actions: bool,
     ) -> anyhow::Result<Vec<UIItem>> {
         let chrome = self.chrome();
         let row_height = self.tab_bar_pixel_height()?.ceil() as usize;
@@ -273,6 +274,41 @@ impl crate::TermWindow {
             .context("fancy tab bar trailing action mask")?;
         }
 
+        if !defer_trailing_actions {
+            ui_items.extend(self.paint_window_tab_trailing_actions(layers)?);
+        }
+
+        Ok(ui_items)
+    }
+
+    pub(crate) fn paint_window_tab_trailing_actions(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+    ) -> anyhow::Result<Vec<UIItem>> {
+        let row_height = self.tab_bar_pixel_height()?.ceil() as usize;
+        if row_height == 0 {
+            return Ok(Vec::new());
+        }
+        let border = self.get_os_border();
+        let content_top_spacer = self.ui_px(WINDOW_TAB_TOP_SPACER).min(row_height);
+        let content_row_y = border.top.get() as usize + content_top_spacer;
+        let content_row_height = row_height.saturating_sub(content_top_spacer);
+        let icon_size = self.ui_px(TAB_ICON_SIZE).min(content_row_height);
+        let button_size = content_row_height
+            .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
+            .max(icon_size);
+        let row_x = self.tab_bar_left_edge();
+        let row_width = self
+            .dimensions
+            .pixel_width
+            .saturating_sub(row_x + border.right.get() as usize)
+            .saturating_sub(self.right_sidebar_width())
+            .max(1);
+        let row_right = row_x + row_width;
+        let chrome = self.chrome();
+        let foreground = chrome.text;
+        let muted_fg = chrome.secondary_text;
+        let mut ui_items = Vec::new();
         let mut action_right = row_right.saturating_sub(self.ui_px(WINDOW_TAB_INSET) + 2);
         if self.fancy_tab_bar_shows_window_buttons() {
             let window_button_right = if self.right_sidebar_width() > 0 {

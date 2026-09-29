@@ -56,7 +56,7 @@ impl crate::TermWindow {
     /// ThinkTerm's window tab row. The wezterm tab bar options configure the
     /// terminal bar instead (see `tabbar::TabBarKind`).
     pub fn paint_tab_bar(&mut self, layers: &mut TripleLayerQuadAllocator) -> anyhow::Result<()> {
-        let mut tab_bar_items = self.paint_fancy_tab_bar(layers)?;
+        let mut tab_bar_items = self.paint_fancy_tab_bar(layers, false)?;
         self.ui_items.append(&mut tab_bar_items);
         Ok(())
     }
