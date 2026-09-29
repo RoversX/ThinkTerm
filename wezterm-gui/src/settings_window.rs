@@ -6,7 +6,7 @@ use crate::termwindow::render::corners::{
     BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
     TOP_RIGHT_ROUNDED_CORNER,
 };
-use crate::termwindow::render::draw::draw_webgpu_layers;
+use crate::termwindow::render::draw::{draw_opengl_layers, draw_webgpu_layers};
 use crate::termwindow::webgpu::WebGpuState;
 use crate::ui::{
     rect, scale_ui_f32, scale_ui_usize, BrandIcon, ButtonSpec, ButtonVariant, ControlState,
@@ -2223,10 +2223,110 @@ pub fn show() {
                         }
                     });
                     log::error!("failed to open settings window: {err:#}");
+                    wezterm_toast_notification::persistent_toast_notification(
+                        &crate::i18n::tr("settings-window-title"),
+                        &settings_tr(
+                            "settings-window-open-error",
+                            &[("error", format!("{err:#}"))],
+                        ),
+                    );
                 }
             })
             .detach();
         }
+    }
+}
+
+async fn create_settings_renderer<T>(
+    requested: NativeRendererBackend,
+    webgpu: impl std::future::Future<Output = anyhow::Result<T>>,
+    opengl: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    if requested == NativeRendererBackend::OpenGL {
+        return opengl.await.context("OpenGL initialization failed");
+    }
+    match webgpu.await {
+        Ok(renderer) => Ok(renderer),
+        Err(webgpu_error) => {
+            log::warn!("settings WebGPU initialization failed: {webgpu_error:#}; trying OpenGL");
+            opengl.await.map_err(|opengl_error| {
+                anyhow::anyhow!(
+                    "WebGPU initialization failed: {webgpu_error:#}; \
+                     OpenGL initialization failed: {opengl_error:#}"
+                )
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod renderer_tests {
+    use super::*;
+
+    #[test]
+    fn opengl_selection_never_initializes_webgpu() {
+        let result = smol::block_on(create_settings_renderer(
+            NativeRendererBackend::OpenGL,
+            async { panic!("WebGPU must not be polled") },
+            async { Ok("OpenGL") },
+        ));
+        assert_eq!(result.unwrap(), "OpenGL");
+    }
+
+    #[test]
+    fn webgpu_success_does_not_initialize_opengl() {
+        let result = smol::block_on(create_settings_renderer(
+            NativeRendererBackend::WebGpu,
+            async { Ok("WebGPU") },
+            async { panic!("OpenGL must not be polled") },
+        ));
+        assert_eq!(result.unwrap(), "WebGPU");
+    }
+
+    #[test]
+    fn webgpu_failure_falls_back_to_opengl() {
+        let attempts = RefCell::new(Vec::new());
+        let result = smol::block_on(create_settings_renderer(
+            NativeRendererBackend::WebGpu,
+            async {
+                attempts.borrow_mut().push("WebGPU");
+                anyhow::bail!("adapter unavailable")
+            },
+            async {
+                attempts.borrow_mut().push("OpenGL");
+                Ok("OpenGL")
+            },
+        ));
+        assert_eq!(result.unwrap(), "OpenGL");
+        assert_eq!(*attempts.borrow(), vec!["WebGPU", "OpenGL"]);
+    }
+
+    #[test]
+    fn both_renderer_failures_keep_both_causes() {
+        let error = smol::block_on(create_settings_renderer::<()>(
+            NativeRendererBackend::WebGpu,
+            async { Err(anyhow::anyhow!("adapter unavailable").context("device creation")) },
+            async { Err(anyhow::anyhow!("shader compilation failed")) },
+        ))
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message
+            .contains("WebGPU initialization failed: device creation: adapter unavailable"));
+        assert!(message.contains("OpenGL initialization failed: shader compilation failed"));
+    }
+
+    #[test]
+    fn explicit_opengl_failure_reports_the_backend() {
+        let error = smol::block_on(create_settings_renderer::<()>(
+            NativeRendererBackend::OpenGL,
+            async { panic!("WebGPU must not be polled") },
+            async { anyhow::bail!("context creation failed") },
+        ))
+        .unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "OpenGL initialization failed: context creation failed"
+        );
     }
 }
 
@@ -2471,33 +2571,48 @@ impl SettingsWindow {
         .await?;
 
         window.set_title(&title);
-        let webgpu = match WebGpuState::new(&window, dimensions, &config).await {
-            Ok(webgpu) => Rc::new(webgpu),
+        let render_state = create_settings_renderer(
+            active_main_renderer,
+            async {
+                let webgpu = Rc::new(WebGpuState::new(&window, dimensions, &config).await?);
+                let settings = settings.borrow();
+                // Window creation can already have delivered a resize or DPI
+                // change. Keep the latest dimensions and font metrics.
+                webgpu.resize(settings.dimensions);
+                RenderState::new(
+                    RenderContext::WebGpu(webgpu),
+                    &settings.fonts,
+                    &settings.metrics,
+                    256,
+                )
+            },
+            async {
+                let gl = window.enable_opengl().await?;
+                let settings = settings.borrow();
+                RenderState::new(
+                    RenderContext::Glium(gl),
+                    &settings.fonts,
+                    &settings.metrics,
+                    256,
+                )
+            },
+        )
+        .await;
+        let render_state = match render_state {
+            Ok(render_state) => render_state,
             Err(err) => {
                 window.close();
                 return Err(err);
             }
         };
-        // `dimensions` is still the pre-window guess: we had to pick a dpi
-        // before there was a window to ask. A Resized event can already have
-        // landed while the window and its gpu surface were being created, and
-        // that handler is what rebuilt the ui tokens and re-rasterized the
-        // fonts. Writing the guess back wholesale would strand the geometry on
-        // the old dpi while the tokens and fonts sit on the new one, which
-        // paints half-size controls around full-size text.
-        let mut dimensions = dimensions;
-        dimensions.dpi = settings.borrow().dimensions.dpi;
-        webgpu.resize(dimensions);
-        let dimensions = *webgpu.dimensions.borrow();
         {
             let mut settings = settings.borrow_mut();
-            settings.dimensions = dimensions;
-            if let Err(err) = settings.created(RenderContext::WebGpu(Rc::clone(&webgpu))) {
-                window.close();
-                return Err(err);
+            if let RenderContext::WebGpu(webgpu) = &render_state.context {
+                settings.dimensions = *webgpu.dimensions.borrow();
+                settings.webgpu = Some(Rc::clone(webgpu));
             }
-            settings.webgpu.replace(webgpu);
-            settings.window.replace(window.clone());
+            settings.render_state = Some(render_state);
+            settings.window = Some(window.clone());
         }
 
         let installed = SETTINGS_WINDOW.with(|slot| {
@@ -2523,12 +2638,6 @@ impl SettingsWindow {
         window.show();
         window.invalidate();
 
-        Ok(())
-    }
-
-    fn created(&mut self, context: RenderContext) -> anyhow::Result<()> {
-        self.render_state
-            .replace(RenderState::new(context, &self.fonts, &self.metrics, 256)?);
         Ok(())
     }
 
@@ -2851,10 +2960,10 @@ impl SettingsWindow {
     fn settings_resource_lines(&self) -> Vec<String> {
         let mut lines = vec![format!(
             "Settings window: backend={} size={}x{} dpi={}",
-            if self.webgpu.is_some() {
-                "WebGpu"
-            } else {
-                "none"
+            match self.render_state.as_ref().map(|state| &state.context) {
+                Some(RenderContext::WebGpu(_)) => "WebGpu",
+                Some(RenderContext::Glium(_)) => "OpenGL",
+                None => "none",
             },
             self.dimensions.pixel_width,
             self.dimensions.pixel_height,
@@ -5267,13 +5376,18 @@ impl SettingsWindow {
     }
 
     fn do_paint(&mut self, window: &Window) -> bool {
-        if self.webgpu.is_none() || self.render_state.is_none() {
+        if self.render_state.is_none() {
             return false;
         }
 
         let paint_start = crate::perf::now();
         let animating = self.advance_scroll_animations(Instant::now());
-        match self.do_paint_webgpu() {
+        let result = if self.webgpu.is_some() {
+            self.do_paint_webgpu()
+        } else {
+            self.do_paint_opengl(window)
+        };
+        match result {
             Ok(ok) => {
                 crate::perf::log_duration("settings_paint", paint_start);
                 if animating {
@@ -5283,7 +5397,7 @@ impl SettingsWindow {
             }
             Err(err) => {
                 crate::perf::log_duration("settings_paint_failed", paint_start);
-                log::error!("settings window webgpu paint failed: {err:#}");
+                log::error!("settings window paint failed: {err:#}");
                 false
             }
         }
@@ -5315,7 +5429,7 @@ impl SettingsWindow {
         }
     }
 
-    fn do_paint_webgpu_impl(&mut self, webgpu: &WebGpuState) -> anyhow::Result<bool> {
+    fn prepare_paint(&mut self) -> anyhow::Result<bool> {
         for _ in 0..3 {
             let paint_pass_start = crate::perf::now();
             match self.paint_pass() {
@@ -5384,6 +5498,84 @@ impl SettingsWindow {
                     break;
                 }
             }
+        }
+
+        Ok(true)
+    }
+
+    fn do_paint_opengl(&mut self, window: &Window) -> anyhow::Result<bool> {
+        if self.dimensions.pixel_width == 0 || self.dimensions.pixel_height == 0 {
+            return Ok(false);
+        }
+        if !self.prepare_paint()? {
+            return Ok(false);
+        }
+        let render_state = self
+            .render_state
+            .as_ref()
+            .context("settings render state missing")?;
+        let RenderContext::Glium(gl) = &render_state.context else {
+            anyhow::bail!("settings OpenGL context missing");
+        };
+        anyhow::ensure!(!gl.is_context_lost(), "settings OpenGL context was lost");
+        let config = configuration();
+        let corner_radius = crate::termwindow::render::draw::effective_window_corner_radius(
+            config.window_decorations,
+            self.window_state,
+            self.dimensions.dpi,
+        );
+        let clear_color = if corner_radius > 0.0 {
+            LinearRgba::with_components(0.0, 0.0, 0.0, 0.0)
+        } else {
+            self.palette().window_bg
+        };
+        let mut frame = window::glium::Frame::new(
+            Rc::clone(gl),
+            (
+                self.dimensions.pixel_width as u32,
+                self.dimensions.pixel_height as u32,
+            ),
+        );
+        let no_blink = std::array::from_fn(|_| crate::colorease::ColorEaseUniform {
+            in_function: [1.0; 4],
+            out_function: [0.0; 4],
+            in_duration_ms: 1,
+            out_duration_ms: 1,
+        });
+        let draw_result = draw_opengl_layers(
+            &mut frame,
+            render_state,
+            self.dimensions,
+            [1.0, 1.0, 1.0],
+            0,
+            clear_color,
+            corner_radius,
+            crate::termwindow::render::draw::effective_window_border(
+                config.window_decorations,
+                self.window_state,
+                self.dimensions.dpi,
+                self.effective_appearance(),
+            ),
+            matches!(
+                config
+                    .freetype_render_target
+                    .unwrap_or(config.freetype_load_target),
+                config::FreeTypeLoadTarget::HorizontalLcd | config::FreeTypeLoadTarget::VerticalLcd
+            ),
+            &no_blink,
+        );
+        // glium panics when an unfinished Frame is dropped, even on draw failure.
+        let present_result = window
+            .finish_frame(frame)
+            .context("present settings OpenGL frame");
+        draw_result?;
+        present_result?;
+        Ok(true)
+    }
+
+    fn do_paint_webgpu_impl(&mut self, webgpu: &WebGpuState) -> anyhow::Result<bool> {
+        if !self.prepare_paint()? {
+            return Ok(false);
         }
 
         let corner_radius = crate::termwindow::render::draw::effective_window_corner_radius(
