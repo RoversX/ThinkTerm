@@ -1237,8 +1237,10 @@ impl RemoteRenameBackend for SftpRemoteRenameBackend {
 
 struct SftpRemoteFileBackend {
     // Sftp only retains a request sender.  Keep the Session handle alive for
-    // the lifetime of this independent file connection.
-    _session: Session,
+    // the lifetime of this independent file connection.  Shared, never
+    // cloned: every clone of a Session tells the session it was dropped when
+    // it goes, and the session then ends as soon as its channels close.
+    session: Arc<Session>,
     sftp: wezterm_ssh::Sftp,
     /// The host's `remote_wezterm_path`, for `list-files`.
     remote_command: Option<String>,
@@ -1248,7 +1250,7 @@ impl RemoteFileBackend for SftpRemoteFileBackend {
     fn run(&self, command: String, limit: usize, wait: Duration) -> RemoteFuture<RemoteRun> {
         // An exec channel on the session this backend already holds, as the
         // search listing's.
-        let session = self._session.clone();
+        let session = Arc::clone(&self.session);
         let sftp = self.sftp.clone();
         Box::pin(async move {
             let wezterm_ssh::ExecResult {
@@ -1325,7 +1327,7 @@ impl RemoteFileBackend for SftpRemoteFileBackend {
     ) -> RemoteFuture<RemoteProjectListing> {
         // An exec channel on the session this backend already holds: no second
         // login, and it closes when the listing is read.
-        let session = self._session.clone();
+        let session = Arc::clone(&self.session);
         let command = list_files_command(&root, respect_gitignore, self.remote_command.as_deref());
         Box::pin(async move {
             let wezterm_ssh::ExecResult {
@@ -1955,7 +1957,7 @@ impl RemoteFileConnector for SshRemoteFileConnector {
                     SessionEvent::Authenticated => {
                         let backend: Arc<dyn RemoteFileBackend> = Arc::new(SftpRemoteFileBackend {
                             sftp: session.sftp(),
-                            _session: session,
+                            session: Arc::new(session),
                             remote_command: config.remote_wezterm_path.clone(),
                         });
                         return Ok(backend);
