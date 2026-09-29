@@ -43,6 +43,13 @@ fn client_domains(config: &config::ConfigHandle) -> Vec<ClientDomainConfig> {
     domains
 }
 
+/// Keeps the plugin host up for as long as this server runs while a plugin
+/// runs always, as the desktop does: those run while ThinkTerm runs on the
+/// machine, and on a host with no desktop this server is ThinkTerm.
+pub fn keep_plugin_host_up() {
+    thinkterm_plugin_channel::client::keep_host_up();
+}
+
 pub fn update_mux_domains(config: &ConfigHandle) -> anyhow::Result<()> {
     update_mux_domains_impl(config, false)
 }

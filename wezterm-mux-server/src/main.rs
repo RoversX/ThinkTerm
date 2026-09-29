@@ -390,6 +390,8 @@ fn run() -> anyhow::Result<()> {
     if let Some(fd) = opts.pid_file_fd {
         wezterm_mux_server_impl::handoff::remember_pid_file_fd(fd);
     }
+    // Past daemonizing: its thread is the one this process keeps.
+    wezterm_mux_server_impl::keep_plugin_host_up();
 
     let activity = Activity::new();
 
