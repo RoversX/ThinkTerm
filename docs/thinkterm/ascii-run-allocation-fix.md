@@ -10,7 +10,7 @@ The existing scalar, owned-run, and first-action parser APIs keep their observab
 
 ## Comparison setup
 
-Three release binaries were tested: `e791e31` (before the three throughput optimizations), `23b052a` (owned runs, before this fix), and the borrowed-run fix (`96dc67c`; measured source matches its production patch). All runs used macOS arm64, a 120x32 PTY, 3,500 scrollback lines, private sockets, and a sandbox protecting existing user settings/sessions. No GUI client was attached. Builds and tests were finished before timing. Each suite used three rounds in the orders baseline/before/fixed, fixed/before/baseline, before/baseline/fixed.
+Three release binaries were tested: one before the three throughput optimizations, one with owned runs before this fix, and one with the borrowed-run fix (its measured source matches the production patch). All runs used macOS arm64, a 120x32 PTY, 3,500 scrollback lines, private sockets, and a sandbox protecting existing user settings/sessions. No GUI client was attached. Builds and tests were finished before timing. Each suite used three rounds in the orders baseline/before/fixed, fixed/before/baseline, before/baseline/fixed.
 
 The short-run fixtures are deterministic: `unicode-N` repeats N ASCII x characters followed by 中; `sgr-N` alternates ANSI red and green text of N characters each. Each case sends approximately 32 MiB in approximately 64 KiB writes after a 256 KiB warm-up. A terminal status query waits for preceding output to be applied. Kitten 0.49.0 used `__benchmark__ --repetitions 100` for all six workloads; kitten randomizes its inputs.
 

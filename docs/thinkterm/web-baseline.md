@@ -1,9 +1,8 @@
 # Browser client: performance baseline
 
-Measured 2026-09-09 on `web-client` (one-pane numbers after 6473846, the
-four-pane run after the mirror landed), on an Apple-silicon Mac,
-headless Chrome (`--headless=new --enable-unsafe-webgpu`), release server,
-release bundle through `ci/build-web.sh` with `wasm-opt -Oz` (binaryen 132).
+Measured 2026-09-09 (the four-pane run after the mirror landed), on an
+Apple-silicon Mac, headless Chrome (`--headless=new --enable-unsafe-webgpu`),
+release server, release bundle through `ci/build-web.sh` with `wasm-opt -Oz` (binaryen 132).
 Three runs of `thinkterm-web/smoke/bench.sh`; the spread between runs is
 given where it matters. Nothing here is a target: it is the number to beat,
 and the number a change must not make worse.

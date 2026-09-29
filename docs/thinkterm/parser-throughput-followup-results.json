@@ -1,5 +1,4 @@
 {
-  "baseline_commit": "e791e310a72915ed7f9a03208437ec34166263cb",
   "candidate_code_patch_sha256": "098e81d761c98d597d4813e10c4d9dd6ab3bb6fecf8c534124ee39a4313238a7",
   "binary_sha256": {
     "baseline": "654e2917ad8e23951c7bacd0b66ea0bd23f9f203d7f78393f2fdb465aff05ac2",

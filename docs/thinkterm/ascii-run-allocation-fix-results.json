@@ -1,6 +1,4 @@
 {
-  "baseline_commit": "e791e31",
-  "before_commit": "23b052a",
   "production_patch_sha256": "d880e7ba41cc32c4ea8cc3c9e2dfd15972d4437d273a93cb67ddad3c7391e242",
   "binary_sha256": {
     "baseline": "654e2917ad8e23951c7bacd0b66ea0bd23f9f203d7f78393f2fdb465aff05ac2",
@@ -2068,6 +2066,5 @@
         "server_exit": 0
       }
     }
-  },
-  "fixed_commit": "96dc67cf7f27cce34c6a0fe9c00316ff7b981355"
+  }
 }

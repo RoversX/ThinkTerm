@@ -5,7 +5,7 @@ measures the next optimizations against a newer baseline. The results below
 describe the earlier screen-write batching change.
 
 Measured on 2026-09-23 with an Apple M1 Pro (16 GiB RAM), macOS, and kitten
-0.49.0. The baseline is commit `06bdaa4`, before the parser optimizations. Both
+0.49.0. The baseline is the build before the parser optimizations. Both
 binaries were built locally with the same Cargo release profile. The measured
 binary hashes and individual runs are in [the results JSON](parser-throughput-results.json).
 
