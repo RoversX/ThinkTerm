@@ -22,6 +22,7 @@ euclid.workspace = true
 futures.workspace = true
 log.workspace = true
 nucleo-matcher.workspace = true
+percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 termwiz = { workspace = true, features = ["use_serde"] }
@@ -29,6 +30,7 @@ thinkterm-font-core.workspace = true
 thinkterm-font-web.workspace = true
 thinkterm-i18n.workspace = true
 thinkterm-plugin-channel.workspace = true
+thinkterm-plugin-panel.workspace = true
 thinkterm-proto.workspace = true
 thinkterm-render = { workspace = true, features = ["wgpu"] }
 thinkterm-session.workspace = true

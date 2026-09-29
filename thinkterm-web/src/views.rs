@@ -173,6 +173,7 @@ pub const STRING_KEYS: &[&str] = &[
     "web-tip-delete-snippet",
     "settings-sidebar-description",
     "right-mode-snippets",
+    "right-plugin-starting",
     "settings-sidebar-snippets-description",
     "settings-section-plugins",
     "settings-plugins-description",
@@ -180,6 +181,9 @@ pub const STRING_KEYS: &[&str] = &[
     "settings-plugins-reload-description",
     "settings-plugins-reload-button",
     "settings-plugins-unusable",
+    "settings-plugins-background-always",
+    "settings-plugins-background-briefly",
+    "settings-plugins-background-never",
 ];
 
 pub fn strings() -> std::collections::BTreeMap<&'static str, String> {
@@ -244,6 +248,44 @@ mod tests {
             assert!(thinkterm_i18n::has_key(key), "{key}");
         }
         assert_eq!(strings()["web-tip-sidebar"].is_empty(), false);
+    }
+
+    /// A key the page's sources name in quotes -- in a call, or in a list
+    /// of choices -- reaches the page, which shows the key itself otherwise.
+    #[test]
+    fn every_string_the_page_names_is_sent_to_it() {
+        let ui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/src");
+        let mut missing = Vec::new();
+        for entry in std::fs::read_dir(&ui).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !(name.ends_with(".svelte") || name.ends_with(".ts")) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let bytes = text.as_bytes();
+            let mut at = 0;
+            while at < bytes.len() {
+                let quote = bytes[at];
+                at += 1;
+                if !matches!(quote, b'\'' | b'"' | b'`') {
+                    continue;
+                }
+                let Some(len) = bytes[at..].iter().position(|&b| b == quote) else {
+                    continue;
+                };
+                let quoted = &text[at..at + len];
+                let key_like = quoted.starts_with(|c: char| c.is_ascii_lowercase())
+                    && quoted.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+                if key_like && thinkterm_i18n::has_key(quoted) {
+                    if !STRING_KEYS.contains(&quoted) {
+                        missing.push(format!("{name}: {quoted}"));
+                    }
+                    at += len + 1;
+                }
+            }
+        }
+        assert!(missing.is_empty(), "named by the page and not sent to it: {missing:?}");
     }
 
     #[test]

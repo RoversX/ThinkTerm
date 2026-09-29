@@ -128,6 +128,90 @@ impl Client {
         self.app.set_right_panel_shown(shown);
     }
 
+    /// How much room the page gives a plugin's panel -- or, `extended`, its
+    /// extended view -- in CSS pixels, how its text measures, and whether
+    /// there is room for an extended view: JSON `Env`. Returns an error
+    /// text or "".
+    pub fn plugin_panel_env(&self, extended: bool, env: String) -> String {
+        match serde_json::from_str(&env) {
+            Ok(env) => {
+                self.app.plugin_panel_env(extended, env);
+                String::new()
+            }
+            Err(err) => format!("{err}"),
+        }
+    }
+
+    /// The plugin panel on show, or its extended view: JSON `PanelView`, or
+    /// `null` when none is.
+    pub fn plugin_panel(&self, extended: bool) -> String {
+        json(&self.app.plugin_panel_view(extended))
+    }
+
+    /// Changes when `plugin_panel(extended)` would, so the page paints only
+    /// then.
+    pub fn plugin_panel_revision(&self, extended: bool) -> f64 {
+        self.app.plugin_panel_revision(extended) as f64
+    }
+
+    /// Whether the plugin panel on show asks for its extended view: the
+    /// page gives it room beside the right panel while it does.
+    pub fn plugin_panel_extended(&self) -> bool {
+        self.app.plugin_panel_extended()
+    }
+
+    /// The extended view's close button, pressed.
+    pub fn plugin_extended_close(&self) {
+        self.app.plugin_extended_close();
+    }
+
+    /// The page took the room it gave the extended view away.
+    pub fn plugin_extended_gone(&self) {
+        self.app.plugin_extended_gone();
+    }
+
+    /// The pointer over the plugin panel, or its extended view, in CSS
+    /// pixels from its corner. True when it is to be painted again.
+    pub fn plugin_panel_pointer(&self, extended: bool, x: f32, y: f32) -> bool {
+        self.app.plugin_panel_pointer(extended, x, y)
+    }
+
+    pub fn plugin_panel_leave(&self, extended: bool) -> bool {
+        self.app.plugin_panel_leave(extended)
+    }
+
+    /// A press in the plugin panel, or its extended view: `button` 0, 1 or
+    /// 2 as the DOM numbers them, `count` 2 for a double click. True when
+    /// the plugin hears of it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plugin_panel_click(
+        &self,
+        extended: bool,
+        x: f32,
+        y: f32,
+        button: u8,
+        count: u32,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+        meta: bool,
+    ) -> bool {
+        use thinkterm_plugin_panel::{Button, Mods};
+        let button = match button {
+            1 => Button::Middle,
+            2 => Button::Right,
+            _ => Button::Left,
+        };
+        let mods = Mods { shift, ctrl, alt, cmd: meta };
+        self.app.plugin_panel_click(extended, x, y, button, count.max(1), mods)
+    }
+
+    /// The wheel over the plugin panel, or its extended view, `dy` CSS
+    /// pixels down. True when something in it scrolled.
+    pub fn plugin_panel_wheel(&self, extended: bool, x: f32, y: f32, dx: f32, dy: f32) -> bool {
+        self.app.plugin_panel_wheel(extended, x, y, dx, dy)
+    }
+
     /// The Snippets tab: JSON `SnippetsView`.
     pub fn snippets(&self) -> String {
         json(&self.app.snippets_view())
@@ -196,6 +280,15 @@ impl Client {
         let app = Rc::clone(&self.app);
         wasm_bindgen_futures::future_to_promise(async move {
             Ok(JsValue::from_bool(app.plugin_set_enabled(id, enabled).await))
+        })
+    }
+
+    /// How long a plugin runs unused -- `always`, `briefly` or `never`: a
+    /// promise of whether the plugin host took the choice.
+    pub fn plugin_set_background(&self, id: String, background: String) -> js_sys::Promise {
+        let app = Rc::clone(&self.app);
+        wasm_bindgen_futures::future_to_promise(async move {
+            Ok(JsValue::from_bool(app.plugin_set_background(id, background).await))
         })
     }
 

@@ -4,9 +4,10 @@
 // Snippets; nothing of a plugin shows outside the sidebar -- the palette
 // offers none of it, and calls made from the command line leave nothing on
 // the page; a plugin installed while the page is open is found
-// when the settings open again; a plugin turned off stops, and Snippets
-// turned off leaves the right panel; a reload stops the running plugin; and
-// a plugin whose program is gone says why in its row.
+// when the settings open again; a plugin turned off stops, one chosen to run
+// always starts by itself, and Snippets turned off leaves the right panel; a
+// reload stops the running plugin; and a plugin whose program is gone says
+// why in its row.
 //   node plugins-test.js <url> <out.png>
 // Reads TEST_HOME (the server's HOME), MUX_CLI (`thinkterm cli` pinned to
 // the server), PLUGIN_CLI (`thinkterm plugin` under that HOME) and
@@ -138,6 +139,23 @@ const switches = () => { try { return fs.readFileSync(`${PLUGINS_DATA}/plugins.j
   await click('#settings [data-plugin-switch="text-tools"]');
   await until("the example on", async () => (await row("text-tools"))?.on === true);
   out.switch = "ok";
+
+  // --- (c2) How long it runs unused: chosen here, kept on disk beside its
+  // switch, and "always" has the server's machine keep it running -- the
+  // mux, ThinkTerm there, keeps the plugin host up for it and it starts by
+  // itself. The manifest's own choice again is no choice at all.
+  const picker = '#settings select[data-plugin-background="text-tools"]';
+  const choose = (value) => ev(`(() => { const select = document.querySelector('${picker}'); select.value = '${value}'; select.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+  const chosen = () => ev(`document.querySelector('${picker}')?.value ?? null`);
+  await until("the background beside the switch", async () => (await chosen()) === "briefly");
+  const always = () => { try { return fs.readFileSync(`${PLUGINS_DATA}/plugins-always`, "utf8"); } catch { return ""; } };
+  if (always()) fail("a plugin runs always before any was chosen to: " + always());
+  await choose("always");
+  await until("always, on disk", async () => (await chosen()) === "always" && /"background": "always"/.test(switches()) && /text-tools/.test(always()));
+  await until("it to start by itself", () => pids("thinkterm-plugin-example").length === 1, 30000);
+  await choose("briefly");
+  await until("the manifest's own again", async () => (await chosen()) === "briefly" && !/background/.test(switches()) && !always());
+  out.background = "ok";
 
   // --- (d) Snippets off takes its tab out of the right panel.
   await click("#settings .sc");

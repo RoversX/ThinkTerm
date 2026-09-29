@@ -25,13 +25,15 @@ pub struct AgentRow {
 }
 
 /// One tab of the right panel's selector, as the desktop lists them
-/// (`RightSidebarMode::ALL`: Files, Notes, Code, Agents). Which exist and
-/// which the browser can open is decided here, not in the display layer.
+/// (`RightSidebarMode::ALL`: Files, Notes, Code, Agents, then the plugins'
+/// panels). Which exist and which the browser can open is decided here,
+/// not in the display layer.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PanelTab {
-    pub id: &'static str,
+    /// `snippets`, `agents`, or `plugin:` and the plugin's id.
+    pub id: String,
     /// A lucide name, as the menus name theirs.
-    pub icon: &'static str,
+    pub icon: String,
     pub label: String,
     /// Off for the panels whose APIs the browser has not got; the tip
     /// says so, and a press does nothing.
@@ -45,15 +47,43 @@ pub struct AgentsView {
     pub summary: String,
     /// The selector above the panel, and which of its tabs is showing.
     pub tabs: Vec<PanelTab>,
-    pub active: &'static str,
+    pub active: String,
+    /// Whether the active tab carries its label ([`labeled`]).
+    pub labeled: bool,
+}
+
+/// The most tabs the selector names the active one of: past this its label
+/// has no room, and every tab is its icon alone, the active one told by its
+/// pill -- as the desktop's selector does (`right_sidebar.rs`,
+/// RIGHT_SIDEBAR_LABELED_MODES).
+pub const LABELED_TABS: usize = 5;
+
+/// Whether the selector over `tabs` names the active one.
+pub fn labeled(tabs: &[PanelTab]) -> bool {
+    tabs.len() <= LABELED_TABS
+}
+
+/// A panel a plugin adds, as the plugin list names it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginPanel {
+    pub id: String,
+    pub name: String,
+    /// A Lucide icon's name, one of `thinkterm_plugin_panel::ICONS`.
+    pub icon: String,
+}
+
+/// The tab id of plugin `id`'s panel.
+pub fn plugin_tab(id: &str) -> String {
+    format!("plugin:{id}")
 }
 
 /// The panel's sections, in the desktop's order, but only those the page
 /// can open: a button for a feature the browser lacks is noise. Files and
 /// Notes join here when they get a wire. Snippets is there while its
-/// plugin is on, as on the desktop.
-pub fn panel_tabs(snippets: bool) -> Vec<PanelTab> {
-    [
+/// plugin is on, as on the desktop, and the plugins' panels after the
+/// rest.
+pub fn panel_tabs(snippets: bool, plugins: &[PluginPanel]) -> Vec<PanelTab> {
+    let own = [
         ("snippets", "code-xml", "right-mode-snippets"),
         ("agents", "bot", "right-mode-agents"),
     ]
@@ -61,20 +91,40 @@ pub fn panel_tabs(snippets: bool) -> Vec<PanelTab> {
         .filter(|(id, _, _)| snippets || *id != "snippets")
         .map(|(id, icon, key)| {
             let label = tr(key);
-            PanelTab { id, icon, label: label.clone(), available: true, tip: label }
-        })
-        .collect()
+            PanelTab { id: id.to_string(), icon: icon.to_string(), label: label.clone(), available: true, tip: label }
+        });
+    let plugins = plugins.iter().map(|panel| PanelTab {
+        id: plugin_tab(&panel.id),
+        icon: panel.icon.clone(),
+        label: panel.name.clone(),
+        available: true,
+        tip: panel.name.clone(),
+    });
+    own.chain(plugins).collect()
 }
 
 #[cfg(test)]
 mod panel_tests {
+    use super::*;
+
     #[test]
-    fn snippets_and_agents_are_available_in_a_browser() {
-        let tabs = super::panel_tabs(true);
-        assert!(tabs.iter().map(|t| t.id).eq(["snippets", "agents"]));
+    fn snippets_agents_and_the_plugins_panels_are_available_in_a_browser() {
+        let stocks = PluginPanel { id: "stocks".into(), name: "Stocks".into(), icon: "chart-line".into() };
+        let tabs = panel_tabs(true, std::slice::from_ref(&stocks));
+        assert!(tabs.iter().map(|t| t.id.as_str()).eq(["snippets", "agents", "plugin:stocks"]));
         assert!(tabs.iter().all(|t| t.available));
-        let tabs = super::panel_tabs(false);
-        assert!(tabs.iter().map(|t| t.id).eq(["agents"]), "the plugin is off");
+        assert_eq!((tabs[2].label.as_str(), tabs[2].icon.as_str()), ("Stocks", "chart-line"));
+        let tabs = panel_tabs(false, &[]);
+        assert!(tabs.iter().map(|t| t.id.as_str()).eq(["agents"]), "the plugin is off");
+    }
+
+    #[test]
+    fn past_five_tabs_the_active_one_is_its_icon_alone() {
+        let panel = |id: &str| PluginPanel { id: id.into(), name: id.into(), icon: "chart-line".into() };
+        let three: Vec<PluginPanel> = ["a", "b", "c"].into_iter().map(panel).collect();
+        assert!(labeled(&panel_tabs(true, &three)), "five: named");
+        let four: Vec<PluginPanel> = ["a", "b", "c", "d"].into_iter().map(panel).collect();
+        assert!(!labeled(&panel_tabs(true, &four)), "six: no room");
     }
 }
 

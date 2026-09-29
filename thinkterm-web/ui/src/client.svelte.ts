@@ -15,11 +15,18 @@ export const views = $state({
     reveal: { edge: 6, dwell_ms: 150, retreat_ms: 250 }, footer: [], footer_label_min_width: 168,
   } as SidebarView,
   /** The right-hand panel's rows, whether it is on show or not. */
-  agents: { rows: [], summary: '', tabs: [], active: 'agents' } as AgentsView,
+  agents: { rows: [], summary: '', tabs: [], active: 'agents', labeled: true } as AgentsView,
   /** The right panel's Snippets tab; loading until it is first on show. */
   snippets: { state: 'loading', reason: null, rows: [], query: '', empty: '', answers: null, asked: 0, revision: 0 } as SnippetsView,
   /** The plugin list in Settings › Sidebar & Plugins. */
   plugins: { state: 'loading', status: '', rows: [], refused: null, revision: 0 } as PluginsView,
+  /** Changes when a plugin's panel is to be painted anew (PluginPanel). */
+  panelRevision: 0,
+  /** The same, for the panel's extended view. */
+  extendedRevision: 0,
+  /** The panel on show asks for room beside the right panel for its
+      extended view (PluginExtended). */
+  panelExtended: false,
   /** The page's own preferences, as the wasm holds them (settings.rs). */
   settings: {
     language: 'system',
@@ -69,6 +76,8 @@ export function attach(client: Client) {
   // The snippets can be long; their view is read only when it moved.
   let lastSnippets = -1;
   let lastPlugins = -1;
+  let lastPanel = -1;
+  let lastExtended = -1;
   let lastSettings = '';
   const read = () => {
     const strings = client.strings();
@@ -114,6 +123,17 @@ export function attach(client: Client) {
       lastPlugins = plugins;
       views.plugins = JSON.parse(client.plugins()) as PluginsView;
     }
+    const panel = client.plugin_panel_revision(false);
+    if (panel !== lastPanel) {
+      lastPanel = panel;
+      views.panelRevision = panel;
+    }
+    const extended = client.plugin_panel_revision(true);
+    if (extended !== lastExtended) {
+      lastExtended = extended;
+      views.extendedRevision = extended;
+    }
+    views.panelExtended = client.plugin_panel_extended();
     const settings = client.settings();
     if (settings !== lastSettings) {
       lastSettings = settings;

@@ -26,6 +26,7 @@ pub mod navbar;
 pub mod palette;
 pub mod platform;
 pub mod plugin_list;
+pub mod plugin_panel;
 pub mod plugins;
 pub mod raster;
 pub mod settings;

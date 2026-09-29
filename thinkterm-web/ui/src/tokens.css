@@ -8,8 +8,11 @@
   --text: #F2F2F7; --text2: #C7C7CC; --muted: #8E8E93; --accent: #0A84FF; --danger: #FF453A;
   --wash: rgba(242,242,247,.025); --ring: rgba(242,242,247,.12); --edge: rgba(242,242,247,.38); --shadow: 0 .5px 0 1px rgba(0,0,0,.12);
   --ui: -apple-system, "SF Pro Text", "Helvetica Neue", Roboto, system-ui, sans-serif;
-  --tabs: 40px; --side-w: 220px; --side-px: 220px; --agents-w: 0px; --keybar: 0px;
+  --tabs: 40px; --side-w: 220px; --side-px: 220px; --agents-w: 0px; --ext-w: 0px; --keybar: 0px;
   --done: #7CE5A2; --open: #61B8FF; --warn: #DB7320;
+  /* A plugin panel's added, removed and caution colours (plugin_panel.rs
+     on the desktop), which the chrome has no use for elsewhere. */
+  --plus: #3FB950; --minus: #F85149; --caution: #D29922;
   /* Measured off the desktop's own frames: its round buttons and pills
      (#262628), its selected row (#3E3E41), its settings card (#1D1D1F). */
   --btn: #262628; --btn-hover: #313134; --btn-border: rgba(118,118,128,.35);
@@ -22,12 +25,15 @@ body[data-side=off] { --side-w: 0px; }
    the mark on the body -- which the panel itself puts there -- nothing
    leaves room for it. */
 body:not([data-agents]) { --agents-w: 0px; }
+/* So is a plugin panel's extended view's, left of the panel. */
+body:not([data-agents]), body:not([data-extended]) { --ext-w: 0px; }
 [data-theme=light] {
   --bg: #EEEEF2; --side-bg: #E2E2E8; --sep: rgba(60,60,67,.18);
   --ctl: rgba(255,255,255,.94); --ctl-hover: rgba(247,247,250,.98); --ctl-pressed: rgba(232,242,255,.98); --ctl-border: rgba(60,60,67,.20);
   --text: #1C1C1E; --text2: #48484A; --muted: #8E8E93; --accent: #007AFF; --danger: #D7263D;
   --wash: rgba(28,28,30,.025); --ring: rgba(28,28,30,.12); --edge: rgba(28,28,30,.38); --shadow: 0 .5px 0 1px rgba(0,0,0,.04);
   --warn: #C05F14;
+  --plus: #1A7F37; --minus: #CF222E; --caution: #9A6700;
   --btn: rgba(255,255,255,.86); --btn-hover: #FFFFFF; --btn-border: rgba(60,60,67,.24);
   --row-hover: rgba(28,28,30,.06); --row-sel: rgba(255,255,255,.94);
   --card: rgba(255,255,255,.72); --card-border: rgba(60,60,67,.16); --card-line: rgba(60,60,67,.14);
@@ -40,7 +46,7 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text2)
 #app { display: contents; }
 svg { width: 16px; height: 16px; flex: none; }
 /* The window's tab row. Capsules never shrink; the row scrolls. */
-#tabs { position: absolute; left: var(--side-w); right: var(--agents-w); top: 0; height: var(--tabs); box-sizing: border-box; display: flex; align-items: center; gap: 9px; padding: 2px 8px 0 8px; background: var(--bg); overflow-x: auto; overflow-y: hidden; white-space: nowrap; user-select: none; scrollbar-width: none; }
+#tabs { position: absolute; left: var(--side-w); right: calc(var(--agents-w) + var(--ext-w)); top: 0; height: var(--tabs); box-sizing: border-box; display: flex; align-items: center; gap: 9px; padding: 2px 8px 0 8px; background: var(--bg); overflow-x: auto; overflow-y: hidden; white-space: nowrap; user-select: none; scrollbar-width: none; }
 #tabs::-webkit-scrollbar { display: none; }
 #tabs .tab { display: inline-flex; align-items: center; flex: 0 0 auto; width: 128px; height: 30px; box-sizing: border-box; padding: 0 9px; border-radius: 999px; border: 1px solid transparent; color: var(--text2); cursor: default; transition: var(--fade); }
 #tabs .tab:hover { background: var(--ctl-hover); }
@@ -57,12 +63,12 @@ svg { width: 16px; height: 16px; flex: none; }
 #tabs .follow { color: var(--muted); font-size: 12px; padding: 0 8px; height: 24px; line-height: 24px; border-radius: 999px; cursor: default; }
 #tabs .follow.on { color: var(--accent); }
 #tabs .follow:hover { background: var(--ctl-hover); }
-#term { position: absolute; inset: var(--tabs) var(--agents-w) 0 var(--side-w); width: calc(100% - var(--side-w) - var(--agents-w)); height: calc(100% - var(--tabs)); display: block; outline: none; }
+#term { position: absolute; inset: var(--tabs) calc(var(--agents-w) + var(--ext-w)) 0 var(--side-w); width: calc(100% - var(--side-w) - var(--agents-w) - var(--ext-w)); height: calc(100% - var(--tabs)); display: block; outline: none; }
 /* Its own layer: the sidebar's edge moves the canvas on every drag frame,
    and a promoted layer moves instead of being laid out again. */
 canvas#term { will-change: transform; }
 /* One bar over each pane, laid out from the canvas's cells. */
-#panes { position: absolute; inset: var(--tabs) var(--agents-w) 0 var(--side-w); pointer-events: none; overflow: hidden; }
+#panes { position: absolute; inset: var(--tabs) calc(var(--agents-w) + var(--ext-w)) 0 var(--side-w); pointer-events: none; overflow: hidden; }
 /* The desktop's left sidebar: Spaces, Projects, Threads. Every row's box
    spans the panel's 10px insets, so a trailing control's centre lands 25px
    from the right edge, round button or hover action alike. */
@@ -208,6 +214,13 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 #agents .mode { display: inline-flex; align-items: center; justify-content: center; gap: 6px; flex: 1 1 0; min-width: 0; box-sizing: border-box; border-radius: 999px; border: 1px solid transparent; color: var(--text2); font-size: 13px; cursor: default; transition: var(--fade); }
 #agents .mode svg { width: 15px; height: 15px; }
 #agents .mode.on { flex: 0 1 auto; padding: 0 11px; background: var(--ctl); border-color: var(--ctl-border); box-shadow: var(--shadow); color: var(--text); }
+/* Past five tabs, the active one is its icon alone, a share like the rest,
+   its pill a circle round the icon: 28px, the height the pill has with its
+   label (the selector's 34px less its padding and border), and no wider
+   than its share. */
+#agents .modes.icons .mode.on { flex: 1 1 0; padding: 0; position: relative; background: none; border-color: transparent; box-shadow: none; }
+#agents .modes.icons .mode.on::before { content: ''; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 28px; max-width: 100%; aspect-ratio: 1; box-sizing: border-box; border-radius: 50%; background: var(--ctl); border: 1px solid var(--ctl-border); box-shadow: var(--shadow); }
+#agents .modes.icons .mode.on svg { position: relative; }
 #agents .mode .ml { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Nothing to press: the tooltip is the whole answer, so no hover lift. */
 #agents .mode.off { color: var(--muted); opacity: .55; }
@@ -251,6 +264,20 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 #agents .sb-save { flex: none; height: 30px; padding: 0 14px; border-radius: 999px; background: var(--accent); border: 0; color: #fff; font: 600 13px var(--ui); }
 /* The toolbar line sits 6px lower than the summary it replaces. */
 #agents .list.snippets, #agents .list.snippet-editor { top: 122px; }
+/* A plugin's panel: its canvas under the selector, to the panel's edges;
+   the plugin draws its own margins. */
+#agents .plugin { position: absolute; inset: 86px 0 0 0; }
+#agents .plugin canvas, #extended .plugin canvas { display: block; touch-action: none; }
+#agents .plugin .msg, #extended .plugin .msg { position: absolute; left: 12px; right: 12px; top: 8px; color: var(--muted); font-size: 13px; }
+/* A plugin panel's extended view (PluginExtended): the wide area left of
+   the panel, the plugin's from its top, as the desktop's is. */
+#extended { position: absolute; right: var(--agents-w); top: 0; bottom: 0; width: var(--ext-w); box-sizing: border-box; background: var(--side-bg); border-left: 1px solid var(--sep); user-select: none; overflow: hidden; }
+#extended .handle { position: absolute; left: -2px; top: 0; bottom: 0; width: 4px; cursor: col-resize; z-index: 1; }
+#extended .plugin { position: absolute; inset: 8px 0 0 0; }
+#extended .plugin .msg { left: 44px; }
+#extended .close { position: absolute; display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box; padding: 0; border: 0; border-radius: 8px; background: transparent; color: var(--text2); cursor: pointer; transition: var(--fade); }
+#extended .close svg { width: 16px; height: 16px; }
+#extended .close:hover { background: var(--row-hover); color: var(--text); }
 #agents .list.snippets { gap: 8px; }
 #agents .sn { display: flex; flex-direction: column; gap: 6px; flex: none; box-sizing: border-box; padding: 10px 12px; border-radius: 14px; background: var(--btn); border: 1px solid var(--btn-border); transition: var(--fade); }
 #agents .sn:hover { background: var(--btn-hover); border-color: var(--ctl-border); }
@@ -291,7 +318,7 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 #card:not([hidden]) { animation: card-in .16s cubic-bezier(0,0,.2,1); }
 /* The desktop's opaque surface: the terminal area, nothing of the pane
    showing through, the text a little above centre as the desktop's is. */
-#card { position: absolute; inset: var(--tabs) var(--agents-w) 0 var(--side-w); z-index: 12; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; box-sizing: border-box; text-align: center; background: var(--bg); user-select: none; cursor: default; }
+#card { position: absolute; inset: var(--tabs) calc(var(--agents-w) + var(--ext-w)) 0 var(--side-w); z-index: 12; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; box-sizing: border-box; text-align: center; background: var(--bg); user-select: none; cursor: default; }
 #card[hidden] { display: none; }
 #card .eyes { font: 20px var(--ui); color: var(--text); letter-spacing: 2px; margin-bottom: 18px; }
 #card .title { font: 500 17px var(--ui); color: var(--text); }
@@ -429,7 +456,7 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
    takes the width, the two panels become drawers over it, and a key bar
    supplies the keys a soft keyboard has not got. */
 body[data-mobile] {
-  --side-w: 0px; --agents-w: 0px; --tabs: 46px;
+  --side-w: 0px; --agents-w: 0px; --ext-w: 0px; --tabs: 46px;
   /* What the notch, the rounded corners and the home indicator take. Zero
      everywhere the browser reports nothing, which is every desktop. */
   --safe-t: env(safe-area-inset-top, 0px);

@@ -6,10 +6,19 @@
 use futures::channel::oneshot;
 use serde_json::Value;
 use std::collections::HashMap;
-use thinkterm_plugin_channel::wire::{FromHost, ToHost};
+use thinkterm_plugin_channel::wire::{FromHost, PanelEvent, ToHost};
 
 /// A call's answer, or why there is none.
 pub type Answer = Result<Value, String>;
+
+/// A frame from the host that is not an answer.
+#[derive(Debug, PartialEq)]
+pub enum Heard {
+    /// A plugin's event: its name, and what it said.
+    Event(String, Value),
+    /// About the page's panel `.0`.
+    Panel(u64, PanelEvent),
+}
 
 #[derive(Debug, Default)]
 pub struct PluginCalls {
@@ -28,13 +37,14 @@ impl PluginCalls {
         (id, frame, rx)
     }
 
-    /// A frame from the host: the answer to a call, delivered, or an event,
-    /// handed back as the plugin's name and what it said.
-    pub fn heard(&mut self, frame: &[u8]) -> Option<(String, Value)> {
+    /// A frame from the host: the answer to a call, delivered, or what
+    /// else it is, handed back.
+    pub fn heard(&mut self, frame: &[u8]) -> Option<Heard> {
         match FromHost::decode(frame) {
             Ok(FromHost::Ok { id, body }) => self.answer(id, Ok(body)),
             Ok(FromHost::Error { id, message }) => self.answer(id, Err(message)),
-            Ok(FromHost::Event { plugin, body }) => return Some((plugin, body)),
+            Ok(FromHost::Event { plugin, body }) => return Some(Heard::Event(plugin, body)),
+            Ok(FromHost::Panel { view, event }) => return Some(Heard::Panel(view, event)),
             Ok(FromHost::Hello { .. }) => {}
             Err(err) => log::warn!("a frame from the plugin host that does not read: {err}"),
         }
@@ -92,7 +102,7 @@ mod tests {
         assert_eq!(answered(&mut first_rx), None, "still waiting");
 
         let event = FromHost::Event { plugin: "snippets".into(), body: json!({"event": "changed"}) }.encode();
-        assert_eq!(calls.heard(&event), Some(("snippets".into(), json!({"event": "changed"}))));
+        assert_eq!(calls.heard(&event), Some(Heard::Event("snippets".into(), json!({"event": "changed"}))));
 
         let reply = FromHost::Ok { id: first, body: json!([]) }.encode();
         calls.heard(&reply);

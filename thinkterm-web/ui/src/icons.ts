@@ -52,6 +52,20 @@ import trash2 from '../../../third_party/lucide/icons/trash-2.svg?raw';
 import x from '../../../third_party/lucide/icons/x.svg?raw';
 import zoomIn from '../../../third_party/lucide/icons/zoom-in.svg?raw';
 import zoomOut from '../../../third_party/lucide/icons/zoom-out.svg?raw';
+// What a plugin's panel is shown by in the selector (thinkterm-plugin-panel
+// ICONS), the puzzle piece for any other.
+import activity from '../../../third_party/lucide/icons/activity.svg?raw';
+import bug from '../../../third_party/lucide/icons/bug.svg?raw';
+import calendar from '../../../third_party/lucide/icons/calendar.svg?raw';
+import chartCandlestick from '../../../third_party/lucide/icons/chart-candlestick.svg?raw';
+import chartLine from '../../../third_party/lucide/icons/chart-line.svg?raw';
+import cpu from '../../../third_party/lucide/icons/cpu.svg?raw';
+import database from '../../../third_party/lucide/icons/database.svg?raw';
+import gauge from '../../../third_party/lucide/icons/gauge.svg?raw';
+import gitBranch from '../../../third_party/lucide/icons/git-branch.svg?raw';
+import gitCompare from '../../../third_party/lucide/icons/git-compare.svg?raw';
+import listTodo from '../../../third_party/lucide/icons/list-todo.svg?raw';
+import puzzle from '../../../third_party/lucide/icons/puzzle.svg?raw';
 // The two brand marks the Agents panel draws (simple-icons): a single
 // fill-less path, so they take their colour from CSS `fill: currentColor`
 // rather than from `stroke` as the lucide icons above do.
@@ -169,8 +183,23 @@ const BY_NAME: Record<string, string> = {
 
 /** A lucide icon by its name; nothing for a name the page has not inlined. */
 export function iconByName(name: string): string | undefined {
-  return BY_NAME[name];
+  return BY_NAME[name] ?? PANEL_ICONS[name];
 }
+
+const PANEL_ICONS: Record<string, string> = {
+  activity,
+  bug,
+  calendar,
+  'chart-candlestick': chartCandlestick,
+  'chart-line': chartLine,
+  cpu,
+  database,
+  gauge,
+  'git-branch': gitBranch,
+  'git-compare': gitCompare,
+  'list-todo': listTodo,
+  puzzle,
+};
 
 // An agent row names its mark the way `agents.rs` does: a brand when the
 // page has one, `bot` otherwise. Kept apart from `BY_NAME` above, which is

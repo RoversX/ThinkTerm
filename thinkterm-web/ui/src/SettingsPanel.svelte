@@ -101,6 +101,13 @@
     if (field instanceof HTMLInputElement) void handle.client?.plugin_set_enabled(id, field.checked);
   }
 
+  /** How long a plugin runs unused, as the desktop's settings offer it. */
+  const BACKGROUNDS = [
+    ['always', 'settings-plugins-background-always'],
+    ['briefly', 'settings-plugins-background-briefly'],
+    ['never', 'settings-plugins-background-never'],
+  ] as const;
+
   async function reloadPlugins() {
     reloading = true;
     try {
@@ -413,7 +420,15 @@
               {#if row.builtin}
                 <!-- Its switch is its panel's, above. -->
               {:else if row.switchable}
-                <label class="switch"><input type="checkbox" data-plugin-switch={row.id} checked={row.enabled} onchange={(ev) => onPlugin(row.id, ev)} /><span class="knob"></span></label>
+                <div class="ctl">
+                  {#if row.background}
+                    <!-- How long it runs unused, beside its switch. -->
+                    <select class="pillsel" data-plugin-background={row.id} title={row.background_detail} value={row.background} onchange={(ev) => void handle.client?.plugin_set_background(row.id, (ev.currentTarget as HTMLSelectElement).value)}>
+                      {#each BACKGROUNDS as [value, label] (value)}<option {value}>{s(label)}</option>{/each}
+                    </select>
+                  {/if}
+                  <label class="switch"><input type="checkbox" data-plugin-switch={row.id} checked={row.enabled} onchange={(ev) => onPlugin(row.id, ev)} /><span class="knob"></span></label>
+                </div>
               {:else}
                 <span class="pilltag">{s('settings-plugins-unusable')}</span>
               {/if}

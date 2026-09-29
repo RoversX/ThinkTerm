@@ -201,7 +201,9 @@ export type PanelTab = {
   tip: string;
 };
 
-export type AgentsView = { rows: AgentRow[]; summary: string; tabs: PanelTab[]; active: string };
+/** `labeled`: the active tab carries its label; past five tabs, none
+    does (`agents.rs` `LABELED_TABS`). */
+export type AgentsView = { rows: AgentRow[]; summary: string; tabs: PanelTab[]; active: string; labeled: boolean };
 
 // The right panel's Snippets tab (thinkterm-web/src/snippets.rs
 // `SnippetsView`): the snippets the plugin host keeps, filtered by the
@@ -242,6 +244,10 @@ export type PluginRow = {
   switchable: boolean;
   /** Built into ThinkTerm: its switch is its panel's, not in the list. */
   builtin: boolean;
+  /** How long an installed plugin that is on runs unused; none for others. */
+  background: 'always' | 'briefly' | 'never' | null;
+  /** What that choice means, and whether it is the plugin's own. */
+  background_detail: string;
 };
 
 export type PluginsView = {
@@ -253,6 +259,46 @@ export type PluginsView = {
   /** Why the last change asked here was refused. */
   refused: string | null;
   revision: number;
+};
+
+// A plugin's panel in the right panel (thinkterm-web/src/plugin_panel.rs
+// `PanelView`; its painting is thinkterm-plugin-panel's `Painting`): what to
+// paint, in CSS pixels from the panel's corner, each op cut to a region.
+// Colours are ThinkTerm's by name (`text`, `bg-hover`, `positive-bg`...),
+// or `#rrggbb[aa]`.
+
+export type PanelOp =
+  | { op: 'rect'; clip: number; x: number; y: number; w: number; h: number; fill?: string; border?: string; radius: number }
+  | {
+      op: 'text';
+      clip: number;
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      text: string;
+      color: string;
+      font: 'ui' | 'mono';
+      size: 'small' | 'body' | 'title';
+      bold: boolean;
+      align: 'left' | 'center' | 'right';
+    }
+  | { op: 'line'; clip: number; points: number[]; width: number; color: string }
+  | { op: 'area'; clip: number; points: number[]; base: number; color: string; fade: boolean }
+  | { op: 'thumb'; clip: number; x: number; y: number; w: number; h: number };
+
+export type Painting = {
+  /** Left, top, right, bottom. */
+  clips: [number, number, number, number][];
+  ops: PanelOp[];
+  cursor: 'pointer' | 'arrow' | null;
+};
+
+export type PanelView = {
+  state: 'starting' | 'open' | 'stopped';
+  /** Said instead of a painting: starting, or why it stopped. */
+  message: string | null;
+  painting: Painting | null;
 };
 
 // The page's own preferences (thinkterm-web/src/settings.rs `WebSettings`),

@@ -10,7 +10,7 @@
 use crate::plugins::Answer;
 use serde::Serialize;
 use thinkterm_i18n::{tr, tr_args};
-use thinkterm_plugin_channel::registry::{Info, State};
+use thinkterm_plugin_channel::registry::{Background, Info, State};
 
 /// What wants the list: Settings › Sidebar & Plugins, the right panel.
 pub type Want = &'static str;
@@ -35,6 +35,8 @@ pub struct PluginsModel {
     trouble: Option<String>,
     /// Switches flipped here whose change is on its way, and to what.
     switching: Vec<(String, bool)>,
+    /// How long plugins run unused, chosen here, on its way.
+    choosing: Vec<(String, Background)>,
     /// Why the host refused the last change asked of it here.
     refused: Option<String>,
     /// Times in a row the list could not be had, for the pause before the
@@ -76,6 +78,45 @@ pub struct PluginRow {
     /// Built into ThinkTerm: its switch is its panel's, among the panels,
     /// not in the list.
     pub builtin: bool,
+    /// How long it runs unused -- `always`, `briefly` or `never`, a choice on
+    /// its way included -- for an installed plugin that is on; none for any
+    /// other, which offers no choice.
+    pub background: Option<&'static str>,
+    /// What that choice means, and whether it is the plugin's own.
+    pub background_detail: String,
+}
+
+fn background_name(background: Background) -> &'static str {
+    match background {
+        Background::Always => "always",
+        Background::Briefly => "briefly",
+        Background::Never => "never",
+    }
+}
+
+/// What running `background` means, as the desktop's settings say it, and
+/// that it is the plugin's own when it is `default`.
+fn background_detail(background: Background, default: Background) -> String {
+    let meaning = tr(match background {
+        Background::Always => "settings-plugins-background-always-description",
+        Background::Briefly => "settings-plugins-background-briefly-description",
+        Background::Never => "settings-plugins-background-never-description",
+    });
+    if background == default {
+        format!("{meaning} · {}", tr("settings-plugins-background-default"))
+    } else {
+        meaning
+    }
+}
+
+/// The choice a page names, `always`, `briefly` or `never`.
+pub fn background_named(name: &str) -> Option<Background> {
+    match name {
+        "always" => Some(Background::Always),
+        "briefly" => Some(Background::Briefly),
+        "never" => Some(Background::Never),
+        _ => None,
+    }
 }
 
 fn with_reason(key: &str, reason: &str) -> String {
@@ -214,6 +255,7 @@ impl PluginsModel {
         self.followed = false;
         self.asking = false;
         self.switching.clear();
+        self.choosing.clear();
         self.changed();
     }
 
@@ -236,10 +278,62 @@ impl PluginsModel {
         self.changed();
     }
 
+    /// How long plugin `id` runs unused, chosen here, on its way to the
+    /// host.
+    pub fn choosing(&mut self, id: &str, background: Background) {
+        self.refused = None;
+        self.choosing.retain(|(choosing, _)| choosing != id);
+        self.choosing.push((id.to_string(), background));
+        self.changed();
+    }
+
+    /// The host's answer to a choice made here, as to a switch.
+    pub fn chose(&mut self, id: &str, answer: Result<(), String>) {
+        self.choosing.retain(|(choosing, _)| choosing != id);
+        if let Err(why) = answer {
+            self.refused = Some(why);
+        }
+        self.stale = true;
+        self.changed();
+    }
+
+    /// The manifest's choice for plugin `id`, as last heard.
+    pub fn background_default(&self, id: &str) -> Option<Background> {
+        self.plugins
+            .iter()
+            .flatten()
+            .find(|plugin| plugin.id == id && !plugin.builtin)
+            .map(|plugin| plugin.background_default)
+    }
+
     /// The host refused something asked of it here.
     pub fn refused(&mut self, why: String) {
         self.refused = Some(why);
         self.changed();
+    }
+
+    /// The panels plugins add to the right panel, as last heard: those of
+    /// the plugins that are on and not broken, in the list's order.
+    pub fn panels(&self) -> Vec<crate::agents::PluginPanel> {
+        let Some(plugins) = &self.plugins else {
+            return Vec::new();
+        };
+        plugins
+            .iter()
+            .filter(|plugin| plugin.usable())
+            .filter_map(|plugin| {
+                Some(crate::agents::PluginPanel {
+                    id: plugin.id.clone(),
+                    name: plugin.name.clone(),
+                    icon: plugin.panel.as_ref()?.icon.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Whether the list has been heard at all.
+    pub fn known(&self) -> bool {
+        self.plugins.is_some()
     }
 
     /// Whether plugin `id` is on and working, as last heard; `None` before
@@ -267,21 +361,37 @@ impl PluginsModel {
             .plugins
             .iter()
             .flatten()
-            .map(|plugin| PluginRow {
-                key: plugin.dir.clone().unwrap_or_else(|| plugin.id.clone()),
-                id: plugin.id.clone(),
-                name: plugin.name.clone(),
-                detail: detail(plugin),
-                enabled: self
+            .map(|plugin| {
+                let enabled = self
                     .switching
                     .iter()
                     .find(|(id, _)| *id == plugin.id)
-                    .map_or(plugin.enabled, |(_, enabled)| *enabled),
-                switchable: !matches!(
+                    .map_or(plugin.enabled, |(_, enabled)| *enabled);
+                let switchable = !matches!(
                     plugin.state,
                     State::Invalid { .. } | State::Unsupported { .. }
-                ),
-                builtin: plugin.builtin,
+                );
+                let background = self
+                    .choosing
+                    .iter()
+                    .find(|(id, _)| *id == plugin.id)
+                    .map_or(plugin.background, |(_, background)| *background);
+                let offered = !plugin.builtin && switchable && enabled;
+                PluginRow {
+                    key: plugin.dir.clone().unwrap_or_else(|| plugin.id.clone()),
+                    id: plugin.id.clone(),
+                    name: plugin.name.clone(),
+                    detail: detail(plugin),
+                    enabled,
+                    switchable,
+                    builtin: plugin.builtin,
+                    background: offered.then(|| background_name(background)),
+                    background_detail: if offered {
+                        background_detail(background, plugin.background_default)
+                    } else {
+                        String::new()
+                    },
+                }
             })
             .collect();
         PluginsView {
@@ -449,6 +559,36 @@ mod tests {
         assert!(view.rows[0].enabled, "went back");
         assert!(view.refused.unwrap().contains("cannot save"));
         assert!(model.next_list("en-US").is_some(), "asked again either way");
+    }
+
+    #[test]
+    fn a_plugin_that_is_on_offers_how_long_it_runs_unused() {
+        let mut model = PluginsModel::default();
+        model.want("settings", true);
+        let mut kept = plugin("a", true, json!({"kind": "running"}));
+        kept["background"] = json!("always");
+        kept["background_default"] = json!("always");
+        listed(
+            &mut model,
+            json!([
+                plugin("snippets", true, json!({"kind": "idle"})),
+                kept,
+                plugin("b", false, json!({"kind": "off"})),
+            ]),
+        );
+        let view = model.view();
+        assert_eq!(view.rows[1].background, Some("always"));
+        assert!(view.rows[1].background_detail.contains("The plugin's default"));
+        assert_eq!(view.rows[2].background, None, "off: nothing to choose");
+        model.choosing("a", Background::Never);
+        let row = &model.view().rows[1];
+        assert_eq!(row.background, Some("never"), "the choice on its way");
+        assert!(!row.background_detail.contains("default"), "{}", row.background_detail);
+        model.chose("a", Err("cannot save".into()));
+        assert_eq!(model.view().rows[1].background, Some("always"), "went back");
+        assert_eq!(model.background_default("a"), Some(Background::Always));
+        assert_eq!(background_named("briefly"), Some(Background::Briefly));
+        assert_eq!(background_named("sometimes"), None);
     }
 
     #[test]

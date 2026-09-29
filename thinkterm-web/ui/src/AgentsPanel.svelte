@@ -2,8 +2,12 @@
   // The desktop's right-hand panel: its Agents tab, one row per pane a
   // coding agent runs in with its live state, as `agent_panel.rs` paints
   // it from the rows the wasm publishes (thinkterm-web/src/agents.rs), a
-  // click on a row bringing that pane on show; and its Snippets tab
-  // (SnippetsBar, SnippetsList).
+  // click on a row bringing that pane on show; its Snippets tab
+  // (SnippetsBar, SnippetsList); and the panels plugins draw
+  // (PluginPanel), with the extended view one asks for left of it
+  // (PluginExtended).
+  import PluginExtended from './PluginExtended.svelte';
+  import PluginPanel from './PluginPanel.svelte';
   import SnippetsBar from './SnippetsBar.svelte';
   import SnippetsList from './SnippetsList.svelte';
   import { handle } from './client';
@@ -15,6 +19,7 @@
   // (thinkterm-web/src/agents.rs `panel_tabs`); drawn here.
   const tabs = $derived(views.agents.tabs);
   const active = $derived(views.agents.active);
+  const plugin = $derived(active.startsWith('plugin:'));
   const heading = $derived(tabs.find((tab) => tab.id === active)?.label ?? s('web-agents-title'));
 
   const rows = $derived(views.agents.rows);
@@ -148,9 +153,10 @@
   <div class="handle"></div>
   <div class="hd">
     <span class="ti">{heading}</span>
-    <!-- The desktop's selector: four segments, the active one a filled pill
-         carrying its label, the rest icon-only. -->
-    <div class="modes" role="tablist">
+    <!-- The desktop's selector: a segment a tab, the active one a filled
+         pill carrying its label, the rest icon-only; past five tabs the
+         label has no room, and the active one is its icon too. -->
+    <div class="modes" class:icons={!views.agents.labeled} role="tablist">
       {#each tabs as tab (tab.id)}
         <span
           class="mode"
@@ -161,17 +167,21 @@
           aria-disabled={!tab.available}
           data-mode={tab.id}
           title={tab.tip}
-        >{@html iconByName(tab.icon) ?? ''}{#if tab.id === active}<span class="ml">{tab.label}</span>{/if}</span>
+        >{@html iconByName(tab.icon) ?? ''}{#if tab.id === active && views.agents.labeled}<span class="ml">{tab.label}</span>{/if}</span>
       {/each}
     </div>
     {#if active === 'snippets'}
       <SnippetsBar />
-    {:else}
+    {:else if !plugin}
       <span class="sum">{summary}</span>
     {/if}
   </div>
   {#if active === 'snippets'}
     <SnippetsList />
+  {:else if plugin}
+    {#key active}
+      <PluginPanel />
+    {/key}
   {:else}
   <div class="list">
     {#each rows as row (row.pane)}
@@ -193,3 +203,8 @@
   </div>
   {/if}
 </aside>
+{#if plugin && views.panelExtended}
+  {#key active}
+    <PluginExtended plugin={active.slice('plugin:'.length)} />
+  {/key}
+{/if}
