@@ -215,3 +215,40 @@ fn should_support_async_close(#[future] session: SessionWithSshd) {
             .expect("Failed to close file second time");
     })
 }
+
+#[rstest]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), ignore)]
+fn dir_left_open_should_be_closed_before_the_session_ends(#[future] session: SessionWithSshd) {
+    if !sshd_available() {
+        return;
+    }
+    // libssh closes an sftp handle through the sftp session it came from,
+    // which goes when the session loop ends: one closed after that reads
+    // freed memory. MallocScribble=1 (macOS) or MALLOC_PERTURB_=85 (glibc)
+    // makes such a read crash every time.
+    smol::block_on(async {
+        let session: SessionWithSshd = session.await;
+
+        let temp = TempDir::new().unwrap();
+        let sftp = session.sftp();
+        let remote_dir = sftp
+            .open_dir(temp.path().to_path_buf())
+            .await
+            .expect("Failed to open remote directory");
+        remote_dir
+            .read_dir()
+            .await
+            .expect("Failed to read remote directory");
+
+        // Any clone of a session tells the loop, as it goes, that the session
+        // was dropped: with no channel open, the loop ends with the
+        // directory still open.
+        drop(session.clone());
+        smol::Timer::after(std::time::Duration::from_secs(1)).await;
+        assert!(
+            sftp.symlink_metadata(temp.path().to_path_buf()).await.is_err(),
+            "the session should have ended"
+        );
+        drop(remote_dir);
+    })
+}

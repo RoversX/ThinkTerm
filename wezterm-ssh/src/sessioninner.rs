@@ -258,7 +258,9 @@ impl SessionInner {
         }
         sess.set_blocking(false);
         let mut sess = SessionWrap::with_libssh(sess);
-        self.request_loop(&mut sess)
+        let result = self.request_loop(&mut sess);
+        self.close_sftp_handles(&mut sess);
+        result
     }
 
     #[cfg(feature = "ssh2")]
@@ -322,7 +324,9 @@ impl SessionInner {
         sess.set_blocking(false);
 
         let mut sess = SessionWrap::with_ssh2(sess);
-        self.request_loop(&mut sess)
+        let result = self.request_loop(&mut sess);
+        self.close_sftp_handles(&mut sess);
+        result
     }
 
     /// Explicitly and directly connect to the requested host because
@@ -1230,6 +1234,16 @@ impl SessionInner {
                 Ok(sess.sftp.as_mut().expect("sftp should have been set above"))
             }
         }
+    }
+
+    /// Closes the SFTP files and directories still open as the loop ends,
+    /// while `sess` still holds the SFTP session they were opened on: libssh
+    /// closes one through that session, and it goes with `sess`. Blocking, as
+    /// a close the loop is asked for is.
+    fn close_sftp_handles(&mut self, sess: &mut SessionWrap) {
+        sess.set_blocking(true);
+        self.files.clear();
+        self.dirs.clear();
     }
 
     pub fn identity_agent(&self) -> Option<String> {
