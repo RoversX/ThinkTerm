@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="54 81 876 234" width="876" height="234">
+  <!-- The CloseX mark and wordmark, drawn as paths so no font is needed.
+       White on transparent: it is an alpha mask, tinted when drawn. -->
+  <defs>
+    <radialGradient id="hole" cx="170.5" cy="198" r="80.5" gradientUnits="userSpaceOnUse">
+      <stop offset="0.6273" stop-color="#fff" stop-opacity="0"/>
+      <stop offset="0.6894" stop-color="#fff" stop-opacity="0.008"/>
+      <stop offset="0.7516" stop-color="#fff" stop-opacity="0.047"/>
+      <stop offset="0.8012" stop-color="#fff" stop-opacity="0.118"/>
+      <stop offset="0.8509" stop-color="#fff" stop-opacity="0.22"/>
+      <stop offset="0.9006" stop-color="#fff" stop-opacity="0.345"/>
+      <stop offset="0.9503" stop-color="#fff" stop-opacity="0.463"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0.54"/>
+    </radialGradient>
+  </defs>
+  <!-- The ring, and the soft shade inside its hole. -->
+  <path fill="#fff" fill-rule="evenodd" d="M170.5 82.25A115.75 115.75 0 1 1 170.5 313.75A115.75 115.75 0 1 1 170.5 82.25ZM170.5 117.5A80.5 80.5 0 1 0 170.5 278.5A80.5 80.5 0 1 0 170.5 117.5Z"/>
+  <circle cx="170.5" cy="198" r="80.5" fill="url(#hole)"/>
+  <!-- "CloseX", one path per letter. -->
+  <g fill="#fff" fill-rule="evenodd">
+    <path d="M445.5 178.5C445.5 151.82 418.05 130 384.5 130C348.88 130 322 160.75 322 201.5C322 242.25 349.31 273 385.5 273C418.5 273 445.5 251.18 445.5 224.5L419.5 224.5C419.5 240.4 405.5 251 384.5 251C362.6 251 348 231.2 348 201.5C348 172.4 362.6 153 384.5 153C405.5 153 419.5 163.2 419.5 178.5Z"/>
+    <path d="M460 132H484V271H460Z"/>
+    <path d="M548 165C577 165 598 187.68 598 219C598 250.32 577 273 548 273C519 273 498 250.32 498 219C498 187.68 519 165 548 165ZM548 185C532.5 185 523 198.11 523 219.5C523 240.89 532.5 254 548 254C563.5 254 573 240.89 573 219.5C573 198.11 563.5 185 548 185Z"/>
+    <path d="M802 226.5L802 219C802 187.68 781.63 165 753.5 165C725.08 165 704.5 187.68 704.5 219C704.5 250.32 725.71 273 755 273C778 273 795 260 801.5 243.5L777 241.5C772 250 764 254.5 754 254.5C740 254.5 729.5 245 729.5 226.5ZM729.5 208.5L777.5 208.5C777.5 195 767 185 753.5 185C740 185 729.5 195 729.5 208.5Z"/>
+    <path d="M694.5 193.5C694.5 177.82 675.15 165 651.5 165C628.26 165 610 179.08 610 197C610 212 618 222 640 226.5C662 231 671.5 234 671.5 243C671.5 250 664 255 652 255C640 255 632 250 630.5 241L606.5 243.5C608 262 626 273 651.5 273C676.7 273 696.5 258.04 696.5 239C696.5 221 684 214 662 209.5C642 205.5 634 203 634 195.5C634 189 641 184.5 652 184.5C662 184.5 669 189 671 197Z"/>
+    <path d="M808.5 132L838.5 132L868.5 181.5L898.5 132L928.5 132L884 201.5L929.5 271L899 271L868.5 221.5L838 271L808 271L852.5 201.5Z"/>
+  </g>
+</svg>

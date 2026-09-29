@@ -592,6 +592,31 @@ pub fn rasterize_app_icon(size: usize) -> Result<Image> {
     Ok(Image::from_raw(size, size, data))
 }
 
+/// How far down the CloseX logo its wordmark's baseline sits, as a fraction
+/// of the logo's height: 190 of the SVG's 234 units.
+pub const CLOSEX_LOGO_BASELINE: f32 = 190.0 / 234.0;
+
+/// The CloseX logo at the foot of the About page, `height` pixels tall and as
+/// wide as its proportions make it. White on transparent like the Lucide set,
+/// so it is drawn as a tinted mask and follows the theme.
+pub fn rasterize_closex_logo(height: usize) -> Result<Image> {
+    let svg = include_bytes!("../../../../assets/icon/CloseX.svg");
+    let tree = resvg::usvg::Tree::from_data(svg, &resvg::usvg::Options::default())
+        .context("parsing the CloseX logo")?;
+    let svg_size = tree.size();
+    let height = height.max(1);
+    let scale = height as f32 / svg_size.height();
+    let width = ((svg_size.width() * scale).round() as usize).max(1);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width as u32, height as u32)
+        .with_context(|| format!("allocating {width}x{height}px logo pixmap"))?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    Ok(Image::from_raw(width, height, pixmap.take()))
+}
+
 fn rasterize_svg_str(svg: &str, size: usize, degrees: f32) -> Result<Image> {
     let size = size.max(1);
     let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
@@ -769,6 +794,17 @@ mod tests {
         let icon = material_file_icon_for_name("main.rs").unwrap();
         let data: Vec<u8> = icon.rasterize(24).unwrap().into();
         assert_eq!(data.len(), 24 * 24 * 4);
+        assert!(data.iter().any(|value| *value != 0));
+    }
+
+    #[test]
+    fn closex_logo_rasterizes_at_its_proportions() {
+        use window::BitmapImage;
+        let image = super::rasterize_closex_logo(32).unwrap();
+        let (width, height) = image.image_dimensions();
+        assert_eq!(height, 32);
+        assert_eq!(width, 120);
+        let data: Vec<u8> = image.into();
         assert!(data.iter().any(|value| *value != 0));
     }
 }

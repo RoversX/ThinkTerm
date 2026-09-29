@@ -60,6 +60,14 @@ const SIDEBAR_BRAND_FONT_SIZE: f64 = if cfg!(target_os = "macos") {
     12.75
 };
 const SIDEBAR_BRAND_FONT_WEIGHT: u16 = 750;
+// The copyright beside the About page's logo. A fixed size rather than the
+// settings font size: it belongs with the logo, which does not follow it.
+const LOGO_CAPTION_FONT_SIZE: f64 = if cfg!(target_os = "macos") {
+    11.0
+} else {
+    8.25
+};
+const LOGO_CAPTION_FONT_WEIGHT: u16 = 500;
 const CONTROL_HEIGHT: f32 = 56.0;
 const CONTROL_RADIUS: f32 = 14.0;
 const HERO_PADDING: f32 = 36.0;
@@ -2219,6 +2227,7 @@ struct SettingsWindow {
     body_font: Rc<LoadedFont>,
     title_font: Rc<LoadedFont>,
     sidebar_title_font: Rc<LoadedFont>,
+    logo_caption_font: Rc<LoadedFont>,
     metrics: RenderMetrics,
     render_state: Option<RenderState>,
     webgpu: Option<Rc<WebGpuState>>,
@@ -2297,6 +2306,10 @@ impl SettingsWindow {
             settings_font_size,
             settings_body_font_weight(settings_font_weight),
         )?;
+        let logo_caption_font = fonts.command_palette_font_with_size_and_weight(
+            LOGO_CAPTION_FONT_SIZE,
+            LOGO_CAPTION_FONT_WEIGHT,
+        )?;
         let metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
         let appearance = Connection::get()
             .map(|conn| conn.get_appearance())
@@ -2361,6 +2374,7 @@ impl SettingsWindow {
             body_font,
             title_font,
             sidebar_title_font,
+            logo_caption_font,
             metrics,
             render_state: None,
             webgpu: None,
@@ -3675,6 +3689,10 @@ impl SettingsWindow {
         self.body_font = self.fonts.command_palette_font_with_size_and_weight(
             settings_font_size,
             settings_body_font_weight(settings_font_weight),
+        )?;
+        self.logo_caption_font = self.fonts.command_palette_font_with_size_and_weight(
+            LOGO_CAPTION_FONT_SIZE,
+            LOGO_CAPTION_FONT_WEIGHT,
         )?;
         self.metrics = RenderMetrics::with_font_metrics(&self.ui_font.metrics());
         self.invalidate_shaped_text();
@@ -9063,6 +9081,46 @@ impl SettingsWindow {
         Ok(())
     }
 
+    /// The CloseX logo, `height` tall with its left edge at `x`, tinted like
+    /// an SVG icon so it reads black on light and white on dark. Returns the
+    /// width it took.
+    fn draw_closex_logo(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        height: f32,
+        color: LinearRgba,
+    ) -> anyhow::Result<f32> {
+        if height <= 0.0 {
+            return Ok(0.0);
+        }
+        let render_state = self.render_state.as_ref().unwrap();
+        let sprite = render_state
+            .glyph_cache
+            .borrow_mut()
+            .cached_closex_logo(height.round() as usize)?;
+        let width = sprite.coords.size.width as f32;
+        let height = sprite.coords.size.height as f32;
+        let x = x.round();
+        let mut quad = layers.allocate(2)?;
+        let left_offset = self.dimensions.pixel_width as f32 / 2.0;
+        let top_offset = self.dimensions.pixel_height as f32 / 2.0;
+        quad.set_position(
+            x - left_offset,
+            y - top_offset,
+            x + width - left_offset,
+            y + height - top_offset,
+        );
+        quad.set_texture(sprite.texture_coords());
+        quad.set_fg_color(color);
+        quad.set_alt_color_and_mix_value(color, 0.0);
+        quad.set_hsv(None);
+        quad.set_has_color(false);
+        quad.set_grayscale();
+        Ok(width)
+    }
+
     /// A wrapping row of pill buttons, the way LaunchNext and macOS put a
     /// page's outbound links along the bottom instead of one per row.
     /// Returns the height it consumed.
@@ -9794,9 +9852,43 @@ impl SettingsWindow {
         let button_y = card_y + card_height + gap;
         let button_height = self.paint_button_row(layers, x, button_y, max_width, &buttons)?;
 
+        // Who makes it, held to the foot of the window. Its margin is tighter
+        // than the page's usual one, so the extent uses the same margin: with
+        // the usual one a pinned logo would leave a few pixels to scroll.
+        let logo_height = self.ui_px(64.0);
+        let logo_margin = self.ui_px(44.0);
+        let logo_top = (button_y + scroll + button_height + self.ui_px(48.0))
+            .max(self.content_bottom() - logo_margin - logo_height)
+            .round();
+        let logo_width = self.draw_closex_logo(
+            layers,
+            x,
+            logo_top - scroll,
+            logo_height,
+            self.palette().text,
+        )?;
+        // The copyright just after it, small and sitting on the wordmark's
+        // baseline. `draw_text` puts a baseline this far below the y it is
+        // given, whatever the font.
+        let caption_font = Rc::clone(&self.logo_caption_font);
+        let caption_x = x + logo_width + self.ui_px(12.0);
+        let baseline =
+            logo_top - scroll + logo_height * crate::termwindow::ui::icons::CLOSEX_LOGO_BASELINE;
+        let baseline_offset =
+            self.metrics.cell_size.height as f32 + self.metrics.descender.get() as f32;
+        self.draw_text(
+            layers,
+            &caption_font,
+            caption_x,
+            (baseline - baseline_offset).round(),
+            "© 2026",
+            self.palette().muted_text,
+            (x + max_width - caption_x).max(0.0),
+        )?;
+
         self.ui.content_scroll.set_extents(
             self.content_viewport_extent(),
-            self.settings_content_extent(button_y + scroll + button_height),
+            (logo_top + logo_height + logo_margin).max(self.content_bottom()),
         );
         Ok(())
     }

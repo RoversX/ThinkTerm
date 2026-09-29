@@ -637,6 +637,8 @@ pub struct GlyphCache {
     /// The application icon, keyed by pixel size. One raster decode per
     /// size, reused for the life of the cache.
     pub app_icons: HashMap<u16, Sprite>,
+    /// The CloseX logo on About, keyed by pixel height, like `app_icons`.
+    pub closex_logos: HashMap<u16, Sprite>,
     pub material_icons: HashMap<SizedMaterialIconKey, Sprite>,
     pub cursor_glyphs: HashMap<(Option<CursorShape>, u8), Sprite>,
     pub color: HashMap<(RgbColor, NotNan<f32>), Sprite>,
@@ -718,6 +720,7 @@ impl GlyphCache {
             svg_icons: HashMap::new(),
             brand_icons: HashMap::new(),
             app_icons: HashMap::new(),
+            closex_logos: HashMap::new(),
             material_icons: HashMap::new(),
             rotated_svg_icons: HashMap::new(),
             shadows: HashMap::new(),
@@ -755,6 +758,7 @@ impl GlyphCache {
             svg_icons: HashMap::new(),
             brand_icons: HashMap::new(),
             app_icons: HashMap::new(),
+            closex_logos: HashMap::new(),
             material_icons: HashMap::new(),
             rotated_svg_icons: HashMap::new(),
             shadows: HashMap::new(),
@@ -1459,6 +1463,19 @@ impl GlyphCache {
         let image = crate::termwindow::ui::icons::rasterize_app_icon(size)?;
         let sprite = self.atlas.allocate(&image)?;
         self.app_icons.insert(key, sprite.clone());
+        Ok(sprite)
+    }
+
+    pub fn cached_closex_logo(&mut self, height: usize) -> anyhow::Result<Sprite> {
+        let height = height.max(1).min(u16::MAX as usize);
+        let key = height as u16;
+        if let Some(sprite) = self.closex_logos.get(&key) {
+            return Ok(sprite.clone());
+        }
+
+        let image = crate::termwindow::ui::icons::rasterize_closex_logo(height)?;
+        let sprite = self.atlas.allocate(&image)?;
+        self.closex_logos.insert(key, sprite.clone());
         Ok(sprite)
     }
 
