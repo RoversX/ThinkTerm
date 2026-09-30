@@ -828,16 +828,6 @@ fn thread_icon_name(entry: &ThreadSearchEntry) -> String {
     format!("tt_thread:{work}:{tone}")
 }
 
-/// `path` with the home directory folded back to `~`, for the header's
-/// right-hand detail. Three different projects are called "Home".
-fn abbreviate_home(path: &str) -> String {
-    let home = config::HOME_DIR.to_string_lossy().to_string();
-    match path.strip_prefix(&home) {
-        Some(rest) if !home.is_empty() => format!("~{rest}"),
-        _ => path.to_string(),
-    }
-}
-
 /// The searchable part of a project path. Matching the whole thing would
 /// let "users" or "documents" hit every local project; the tail names it,
 /// and for a remote root the user and host do.
@@ -1440,7 +1430,9 @@ impl crate::TermWindow {
             if open_project.as_ref() != Some(&project) {
                 items.push(PaletteItem::Header(PaletteHeader {
                     label: entry.project_name.clone(),
-                    detail: abbreviate_home(&entry.project_path),
+                    // The path with home folded back to `~`: three
+                    // different projects are called "Home".
+                    detail: crate::ui::home_relative(std::path::Path::new(&entry.project_path)),
                 }));
                 haystacks.push(String::new());
                 open_project = Some(project);
