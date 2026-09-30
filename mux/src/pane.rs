@@ -521,6 +521,13 @@ pub trait Pane: Downcast + Send + Sync {
         crate::agent_status::status_for_pane(self.pane_id())
     }
 
+    /// The program leading this pane's terminal, as observed by the mux
+    /// that owns it. Same shape as `agent_status`: locally-owned panes
+    /// answer from this process's observer, ClientPane from its server.
+    fn foreground_program(&self) -> Option<thinkterm_proto::ForegroundProgram> {
+        crate::foreground_program::program_for_pane(self.pane_id())
+    }
+
     /// OSC title/progress the application actually emitted, retained for
     /// agent detection. Deliberately not `get_title`/`get_progress`, which
     /// exist for display and substitute defaults (process basename, "4;0")

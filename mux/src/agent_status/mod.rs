@@ -343,7 +343,7 @@ fn publish_change(pane_id: PaneId) {
 /// tab Arc and releases the windows guard before the tab's own lock is
 /// touched, so this adds no new lock-order pairing. Consulted lazily,
 /// after the cheap throttle checks.
-fn pane_is_foreground(mux: &Mux, pane_id: PaneId) -> bool {
+pub(crate) fn pane_is_foreground(mux: &Mux, pane_id: PaneId) -> bool {
     mux.iter_windows().into_iter().any(|window_id| {
         mux.get_active_tab_for_window(window_id)
             .is_some_and(|tab| tab.contains_pane(pane_id))

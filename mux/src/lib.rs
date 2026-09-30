@@ -44,6 +44,7 @@ pub mod command_spec;
 pub mod connui;
 pub mod default_prog;
 pub mod domain;
+pub mod foreground_program;
 pub mod geometrytrace;
 pub mod localpane;
 pub mod pane;
@@ -71,6 +72,9 @@ pub enum MuxNotification {
     /// The mux that owns this pane re-classified its agent status; read
     /// the fresh value via `Pane::agent_status`.
     AgentStatusChanged(PaneId),
+    /// The program leading this pane's terminal changed, as seen by the mux
+    /// that owns it; read the fresh value via `Pane::foreground_program`.
+    ForegroundProgramChanged(PaneId),
     WindowCreated(WindowId),
     WindowRemoved(WindowId),
     WindowInvalidated(WindowId),

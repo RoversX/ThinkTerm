@@ -445,6 +445,7 @@ async fn async_run(
     // async_run is entered through SimpleExecutor, so promise's schedulers
     // are available before agent detection starts its safety tick.
     mux::agent_status::initialize_mux(&mux);
+    mux::foreground_program::initialize_mux(&mux);
     update_mux_domains_for_server(&config)?;
     mux::spawn_idle_image_sweeper();
 

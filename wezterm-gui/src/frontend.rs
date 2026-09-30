@@ -233,6 +233,7 @@ impl GuiFrontEnd {
         // the GUI executor. Connection::init above installs that executor;
         // initializing it while the mux is first assembled is too early.
         mux::agent_status::initialize_mux(&mux);
+        mux::foreground_program::initialize_mux(&mux);
         let client_id = mux.active_identity().expect("to have set my own id");
 
         let front_end = Rc::new(GuiFrontEnd {
@@ -323,6 +324,7 @@ impl GuiFrontEnd {
                 MuxNotification::WindowInvalidated(_) => {}
                 MuxNotification::PaneOutput(_) => {}
                 MuxNotification::AgentStatusChanged(_) => {}
+                MuxNotification::ForegroundProgramChanged(_) => {}
                 MuxNotification::PaneAdded(_) => {}
                 MuxNotification::Alert {
                     pane_id,
