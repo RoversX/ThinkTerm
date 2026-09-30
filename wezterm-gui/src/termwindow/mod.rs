@@ -5565,7 +5565,13 @@ impl TermWindow {
                         if let Some(win) = self.window.as_ref() {
                             win.invalidate();
                         }
+                    } else {
+                        // An agent starting or leaving changes its tab's icon.
+                        self.invalidate_if_pane_tab_shown(pane_id);
                     }
+                }
+                MuxNotification::ForegroundProgramChanged(pane_id) => {
+                    self.invalidate_if_pane_tab_shown(pane_id);
                 }
                 MuxNotification::WindowInvalidated(_) => {
                     window.invalidate();
@@ -6026,6 +6032,19 @@ impl TermWindow {
         Ok(())
     }
 
+    /// Repaint when the pane's tab could be on screen: its tab strip shows
+    /// every pane of the stack, so any pane of the active tab counts.
+    fn invalidate_if_pane_tab_shown(&self, pane_id: PaneId) {
+        let shown = Mux::get()
+            .get_active_tab_for_window(self.mux_window_id)
+            .is_some_and(|tab| tab.contains_pane(pane_id));
+        if shown {
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+        }
+    }
+
     fn schedule_status_update(&self) {
         if let Some(window) = self.window.as_ref() {
             window.notify(TermWindowNotif::EmitStatusUpdate);
@@ -6240,6 +6259,7 @@ impl TermWindow {
             | MuxNotification::PaneFocused(pane_id)
             | MuxNotification::PaneRemoved(pane_id)
             | MuxNotification::AgentStatusChanged(pane_id)
+            | MuxNotification::ForegroundProgramChanged(pane_id)
             | MuxNotification::PaneOutput(pane_id) => {
                 // Ideally we'd check to see if pane_id is part of this window,
                 // but overlays may not be 100% associated with the window

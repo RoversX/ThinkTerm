@@ -836,16 +836,26 @@ impl crate::TermWindow {
         )
         .context("window tab surface")?;
 
-        let icon_x = self.ui_px(TAB_CONTENT_INSET);
         let icon_y = row_y + (row_height.saturating_sub(icon_size) / 2);
-        self.paint_fancy_tab_icon(
-            layers,
-            SvgIcon::SquareTerminal,
-            icon_x,
-            icon_y,
-            icon_size,
-            foreground,
-        )?;
+        // With tab icons on, the terminal card's circle, as the pane tabs
+        // draw it; the tab's status keeps its own place after it either way.
+        let icon_right = match crate::tab_icons::resolve_window_tab() {
+            Some(icon) => {
+                self.paint_tab_circle_icon(layers, &icon, tab_surface_y, button_size, false)?
+            }
+            None => {
+                let icon_x = self.ui_px(TAB_CONTENT_INSET);
+                self.paint_fancy_tab_icon(
+                    layers,
+                    SvgIcon::SquareTerminal,
+                    icon_x,
+                    icon_y,
+                    icon_size,
+                    foreground,
+                )?;
+                icon_x + icon_size
+            }
+        };
 
         let close_x = self.tab_close_button_x(tab_width, button_size, icon_size);
         let close_y = row_y + (row_height.saturating_sub(button_size) / 2);
@@ -915,7 +925,7 @@ impl crate::TermWindow {
             )?;
         }
 
-        let mut text_x = icon_x + icon_size + self.ui_px(WINDOW_TAB_ICON_GAP);
+        let mut text_x = icon_right + self.ui_px(WINDOW_TAB_ICON_GAP);
         if let Some(status) = item.status {
             let status_x = text_x;
             self.paint_status_icon(layers, 2, status, status_x, icon_y, icon_size, foreground)

@@ -722,6 +722,37 @@ impl Default for NativeCommandPaletteSettings {
     }
 }
 
+/// How pane tabs are dressed: see `crate::tab_icons`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub(crate) struct NativeTabIconSettings {
+    /// Absent means on.
+    pub(crate) enabled: Option<bool>,
+    /// Built-in cards the user changed, and the user's own cards, in the
+    /// order they are shown.
+    pub(crate) cards: Vec<NativeTabIconCard>,
+}
+
+/// One card's settings. On a built-in card every field left `None` keeps
+/// the built-in value, so a future default still reaches whoever never
+/// touched it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub(crate) struct NativeTabIconCard {
+    /// A built-in card's id (`python`), or `custom-<n>` for the user's own.
+    pub(crate) id: String,
+    /// The user's own cards only; a built-in keeps its own name.
+    pub(crate) name: Option<String>,
+    /// Replaces the card's program list.
+    pub(crate) programs: Option<Vec<String>>,
+    /// An imported SVG, by the hex SHA-256 of its bytes, replacing the glyph.
+    pub(crate) svg: Option<String>,
+    /// `#RRGGBB`.
+    pub(crate) circle: Option<String>,
+    /// `#RRGGBB`.
+    pub(crate) glyph: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct ThinkTermNativeSettings {
@@ -737,6 +768,7 @@ pub(crate) struct ThinkTermNativeSettings {
     pub(crate) workspaces: NativeWorkspaceSettings,
     pub(crate) command_palette: NativeCommandPaletteSettings,
     pub(crate) web: NativeWebSettings,
+    pub(crate) tab_icons: NativeTabIconSettings,
 }
 
 impl Default for ThinkTermNativeSettings {
@@ -754,6 +786,7 @@ impl Default for ThinkTermNativeSettings {
             workspaces: NativeWorkspaceSettings::default(),
             command_palette: NativeCommandPaletteSettings::default(),
             web: NativeWebSettings::default(),
+            tab_icons: NativeTabIconSettings::default(),
         }
     }
 }

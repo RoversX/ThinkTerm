@@ -23,6 +23,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, LazyLock, MutexGuard};
 use std::time::{Duration, Instant};
+
+/// How long a tab glyph that could not be drawn is left alone before it is
+/// tried again.
+const TAB_GLYPH_RETRY: Duration = Duration::from_secs(10);
 use termwiz::color::RgbColor;
 use termwiz::image::{ImageData, ImageDataType};
 use termwiz::surface::CursorShape;
@@ -640,6 +644,15 @@ pub struct GlyphCache {
     /// The CloseX logo on About, keyed by pixel height, like `app_icons`.
     pub closex_logos: HashMap<u16, Sprite>,
     pub material_icons: HashMap<SizedMaterialIconKey, Sprite>,
+    /// Pane tab glyphs, white masks keyed by shape and pixel size. The
+    /// shapes are the tab icon cards', which are capped, so this stays
+    /// small until the atlas is rebuilt and it goes with it.
+    pub(crate) tab_glyphs: HashMap<(crate::tab_icons::GlyphKey, u16), Sprite>,
+    /// Tab glyphs whose shape could not be drawn (an imported SVG gone from
+    /// disk), and when that was found, so a missing file is not re-read
+    /// every frame for every tab showing it. Keyed like `tab_glyphs`, so
+    /// just as small, and gone with it.
+    tab_glyph_failures: HashMap<(crate::tab_icons::GlyphKey, u16), Instant>,
     pub cursor_glyphs: HashMap<(Option<CursorShape>, u8), Sprite>,
     pub color: HashMap<(RgbColor, NotNan<f32>), Sprite>,
     pub rotated_svg_icons: HashMap<SizedRotatedSvgIconKey, Sprite>,
@@ -722,6 +735,8 @@ impl GlyphCache {
             app_icons: HashMap::new(),
             closex_logos: HashMap::new(),
             material_icons: HashMap::new(),
+            tab_glyphs: HashMap::new(),
+            tab_glyph_failures: HashMap::new(),
             rotated_svg_icons: HashMap::new(),
             shadows: HashMap::new(),
             cursor_glyphs: HashMap::new(),
@@ -760,6 +775,8 @@ impl GlyphCache {
             app_icons: HashMap::new(),
             closex_logos: HashMap::new(),
             material_icons: HashMap::new(),
+            tab_glyphs: HashMap::new(),
+            tab_glyph_failures: HashMap::new(),
             rotated_svg_icons: HashMap::new(),
             shadows: HashMap::new(),
             cursor_glyphs: HashMap::new(),
@@ -1498,6 +1515,42 @@ impl GlyphCache {
         let sprite = self.atlas.allocate(&image)?;
         self.material_icons.insert(key, sprite.clone());
         Ok(sprite)
+    }
+
+    /// A tab icon card's glyph as a white mask `size` pixels square, or
+    /// `None` when its shape cannot be drawn. A failed shape is tried again
+    /// only after `TAB_GLYPH_RETRY`, in case its file comes back. Running
+    /// out of atlas space is an error, as for every other sprite, so that
+    /// the painter grows the atlas and paints again.
+    pub(crate) fn cached_tab_glyph(
+        &mut self,
+        glyph: &crate::tab_icons::GlyphKey,
+        size: usize,
+    ) -> anyhow::Result<Option<Sprite>> {
+        let size = size.max(1).min(u16::MAX as usize) as u16;
+        let key = (glyph.clone(), size);
+        if let Some(sprite) = self.tab_glyphs.get(&key) {
+            return Ok(Some(sprite.clone()));
+        }
+        if self
+            .tab_glyph_failures
+            .get(&key)
+            .is_some_and(|at| at.elapsed() < TAB_GLYPH_RETRY)
+        {
+            return Ok(None);
+        }
+        let image = match crate::tab_icons::rasterize_glyph(glyph, size as usize) {
+            Ok(image) => image,
+            Err(err) => {
+                log::warn!("tab icon glyph {glyph:?} cannot be drawn: {err:#}");
+                self.tab_glyph_failures.insert(key, Instant::now());
+                return Ok(None);
+            }
+        };
+        let sprite = self.atlas.allocate(&image)?;
+        self.tab_glyph_failures.remove(&key);
+        self.tab_glyphs.insert(key, sprite.clone());
+        Ok(Some(sprite))
     }
 
     pub fn cached_rotated_svg_icon(

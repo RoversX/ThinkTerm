@@ -12,12 +12,13 @@ use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::status_icon::{split_leading_legacy_progress_marker, UiStatusKind};
 use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, ICON_BUTTON_BORDER_WIDTH, PANE_NAV_ACTION_BUTTON_RADIUS,
-    PANE_NAV_BUTTON_GAP, PANE_NAV_ICON_GAP, PANE_NAV_INSET, PANE_NAV_TAB_GAP, PANE_NAV_TAB_RADIUS,
-    PANE_NAV_ACTION_ICON_SIZE, TAB_CLOSE_HOVER_INSET,
-    TAB_CLOSE_HOVER_RADIUS, TAB_CONTENT_INSET, TAB_ICON_SIZE,
+    PANE_NAV_ACTION_ICON_SIZE, PANE_NAV_BUTTON_GAP, PANE_NAV_ICON_GAP, PANE_NAV_INSET,
+    PANE_NAV_TAB_GAP, PANE_NAV_TAB_RADIUS, TAB_CLOSE_HOVER_INSET, TAB_CLOSE_HOVER_RADIUS,
+    TAB_CONTENT_INSET, TAB_ICON_CIRCLE_INSET, TAB_ICON_GLYPH_RATIO, TAB_ICON_SIZE,
     TAB_VERTICAL_PADDING,
 };
 use crate::termwindow::{PaneNavAction, ScrollHit, ScrollTrack, UIItem, UIItemType};
+use crate::ui::draw::DrawContext;
 use crate::utilsprites::RenderMetrics;
 use ::window::bitmaps::TextureRect;
 use ::window::{DeadKeyStatus, RectF};
@@ -557,7 +558,6 @@ impl crate::TermWindow {
             )
             .context("pane nav tab surface")?;
 
-            let title_icon_x = self.ui_px(TAB_CONTENT_INSET);
             let title_icon_y = tab_y + ((tab_height.saturating_sub(icon_size)) / 2);
             let raw_title = self.pane_nav_tab_title(tab.pane_id, &tab.title);
             let (title, status) =
@@ -569,26 +569,15 @@ impl crate::TermWindow {
                 } else {
                     (raw_title.as_str(), None)
                 };
-            if let Some(status) = status {
-                self.paint_status_icon(
-                    layers,
-                    2,
-                    status,
-                    title_icon_x,
-                    title_icon_y,
-                    icon_size,
-                    this_tab_fg,
-                )?;
-            } else {
-                self.paint_pane_nav_icon(
-                    layers,
-                    SvgIcon::SquareTerminal,
-                    title_icon_x,
-                    title_icon_y,
-                    icon_size,
-                    this_tab_fg,
-                )?;
-            }
+            let icon_right = self.paint_pane_tab_icon(
+                layers,
+                tab.pane_id,
+                tab_y,
+                tab_height,
+                icon_size,
+                status.is_some(),
+                this_tab_fg,
+            )?;
 
             let close_slot_reserved = !is_renaming_tab;
             // The button slides to stay inside the tab's visible sliver, so a
@@ -667,7 +656,7 @@ impl crate::TermWindow {
                 .title_font_with_size(crate::native_settings::pane_header_font_size())
                 .context("collapsed pane nav title font")?;
             let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
-            let text_x = title_icon_x + icon_size + self.ui_px(PANE_NAV_ICON_GAP);
+            let text_x = icon_right + self.ui_px(PANE_NAV_ICON_GAP);
             let text_right = if close_slot_reserved {
                 // The tab's own close slot, not the slid-out position. Letting
                 // the title chase the slide collapsed `text_right` below
@@ -956,7 +945,6 @@ impl crate::TermWindow {
             )
             .context("pane nav tab surface")?;
 
-            let title_icon_x = self.ui_px(TAB_CONTENT_INSET);
             let title_icon_y = tab_y + ((tab_height.saturating_sub(icon_size)) / 2);
             let raw_title = self.pane_nav_tab_title(tab.pane_id, &tab.title);
             let (title, status) =
@@ -968,26 +956,15 @@ impl crate::TermWindow {
                 } else {
                     (raw_title.as_str(), None)
                 };
-            if let Some(status) = status {
-                self.paint_status_icon(
-                    layers,
-                    2,
-                    status,
-                    title_icon_x,
-                    title_icon_y,
-                    icon_size,
-                    this_tab_fg,
-                )?;
-            } else {
-                self.paint_pane_nav_icon(
-                    layers,
-                    SvgIcon::SquareTerminal,
-                    title_icon_x,
-                    title_icon_y,
-                    icon_size,
-                    this_tab_fg,
-                )?;
-            }
+            let icon_right = self.paint_pane_tab_icon(
+                layers,
+                tab.pane_id,
+                tab_y,
+                tab_height,
+                icon_size,
+                status.is_some(),
+                this_tab_fg,
+            )?;
 
             let close_slot_reserved = !is_renaming_tab;
             // The button slides to stay inside the tab's visible sliver, so a
@@ -1066,7 +1043,7 @@ impl crate::TermWindow {
                 .title_font_with_size(crate::native_settings::pane_header_font_size())
                 .context("pane nav title font")?;
             let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
-            let text_x = title_icon_x + icon_size + self.ui_px(PANE_NAV_ICON_GAP);
+            let text_x = icon_right + self.ui_px(PANE_NAV_ICON_GAP);
             let text_right = if close_slot_reserved {
                 // The tab's own close slot, not the slid-out position. Letting
                 // the title chase the slide collapsed `text_right` below
@@ -1228,6 +1205,97 @@ impl crate::TermWindow {
 
         let text = self.ellipsize_ui_text(font, text, width)?;
         self.paint_ui_title_text(layers, font, &metrics, &text, x, y, width, foreground)
+    }
+
+    /// The icon heading a pane tab: the card dressing what the pane runs,
+    /// a circle concentric with the pill's rounded left end whose glyph gives
+    /// way to the spinner while the pane works. With tab icons turned off
+    /// (or no pane to ask) the plain terminal mark, or the spinner, as ever.
+    /// Returns where the icon ends, for the title to follow.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_pane_tab_icon(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        pane_id: PaneId,
+        tab_y: usize,
+        tab_height: usize,
+        icon_size: usize,
+        running: bool,
+        color: LinearRgba,
+    ) -> anyhow::Result<usize> {
+        let icon = Mux::get()
+            .get_pane(pane_id)
+            .and_then(|pane| crate::tab_icons::resolve(pane.as_ref()));
+        let Some(icon) = icon else {
+            let x = self.ui_px(TAB_CONTENT_INSET);
+            let y = tab_y + (tab_height.saturating_sub(icon_size)) / 2;
+            if running {
+                self.paint_status_icon(layers, 2, UiStatusKind::Running, x, y, icon_size, color)?;
+            } else {
+                self.paint_pane_nav_icon(layers, SvgIcon::SquareTerminal, x, y, icon_size, color)?;
+            }
+            return Ok(x + icon_size);
+        };
+        self.paint_tab_circle_icon(layers, &icon, tab_y, tab_height, running)
+    }
+
+    /// A tab icon's circle, concentric with the rounded left end of the pill
+    /// at `tab_y` that is `tab_height` tall (drawn from x = 0), and the icon's
+    /// glyph inside it -- or the spinner, while `running`. Returns where the
+    /// circle ends. Shared by the pane tabs and the window tabs.
+    pub(crate) fn paint_tab_circle_icon(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        icon: &crate::tab_icons::ResolvedIcon,
+        tab_y: usize,
+        tab_height: usize,
+        running: bool,
+    ) -> anyhow::Result<usize> {
+        let inset = self.ui_px(TAB_ICON_CIRCLE_INSET).min(tab_height / 4);
+        let diameter = tab_height.saturating_sub(inset * 2).max(1);
+        let x = inset;
+        let y = tab_y + inset;
+        let dark = self.chrome().is_dark();
+        let gl_state = self.render_state.as_ref().unwrap();
+        let ctx = DrawContext::new(gl_state, self.dimensions, &self.render_metrics);
+        crate::tab_icons::draw_plate(
+            &ctx,
+            layers,
+            1,
+            x as f32,
+            y as f32,
+            diameter as f32,
+            icon.circle,
+            dark,
+        )
+        .context("tab icon circle")?;
+
+        let glyph = ((diameter as f32 * TAB_ICON_GLYPH_RATIO).round() as usize).max(1);
+        let glyph_x = x + (diameter - glyph.min(diameter)) / 2;
+        let glyph_y = y + (diameter - glyph.min(diameter)) / 2;
+        if running {
+            self.paint_status_icon(
+                layers,
+                2,
+                UiStatusKind::Running,
+                glyph_x,
+                glyph_y,
+                glyph,
+                icon.glyph_color.linear(),
+            )?;
+        } else {
+            crate::tab_icons::draw_glyph(
+                &ctx,
+                layers,
+                2,
+                &icon.glyph,
+                glyph_x as f32,
+                glyph_y as f32,
+                glyph as f32,
+                icon.glyph_color.linear(),
+            )?;
+        }
+        Ok(x + diameter)
     }
 
     fn paint_pane_nav_icon(

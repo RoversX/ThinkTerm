@@ -104,6 +104,13 @@ pub const TAB_CLOSE_HOVER_INSET: usize = 8;
 pub const TAB_CLOSE_HOVER_RADIUS: f32 = 999.0;
 pub const TAB_VERTICAL_PADDING: usize = 8;
 
+/// How far a pane tab's icon circle sits in from the pill's edges. The same
+/// distance from the left as from the top and bottom is what keeps the
+/// circle concentric with the pill's rounded end.
+pub const TAB_ICON_CIRCLE_INSET: usize = 6;
+/// A pane tab icon's glyph, as a share of its circle.
+pub const TAB_ICON_GLYPH_RATIO: f32 = 0.56;
+
 pub const PANE_NAV_INSET: usize = 10;
 pub const PANE_NAV_ICON_GAP: usize = 8;
 pub const PANE_NAV_BUTTON_GAP: usize = 4;
