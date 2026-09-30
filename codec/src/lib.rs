@@ -467,26 +467,30 @@ macro_rules! pdu {
 
             pub fn decode<R: std::io::Read>(r: R) -> Result<DecodedPdu, Error> {
                 let decoded = decode_raw(r).context("decoding a PDU")?;
+                // The arms only pick the variant's deserializer; see
+                // `decode_async` for why the value is not built in them.
+                let deserialize_variant: fn(&[u8], bool) -> Result<Pdu, Error>;
                 match decoded.ident {
                     $(
                         $vers => {
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
                             metrics::histogram!("pdu.size.rate", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
-                            Ok(DecodedPdu {
-                                serial: decoded.serial,
-                                pdu: Pdu::$name(deserialize(decoded.data.as_slice(), decoded.is_compressed)?).sanitize_agent_status()
-                            })
+                            deserialize_variant = |data, is_compressed| Ok(Pdu::$name(deserialize(data, is_compressed)?));
                         }
                     ,)*
                     _ => {
                         metrics::histogram!("pdu.size", "pdu" => "??").record(decoded.data.len() as f64);
                         metrics::histogram!("pdu.size.rate", "pdu" => "??").record(decoded.data.len() as f64);
-                        Ok(DecodedPdu {
+                        return Ok(DecodedPdu {
                             serial: decoded.serial,
                             pdu: Pdu::Invalid{ident:decoded.ident}
-                        })
+                        });
                     }
                 }
+                Ok(DecodedPdu {
+                    serial: decoded.serial,
+                    pdu: deserialize_variant(decoded.data.as_slice(), decoded.is_compressed)?.sanitize_agent_status()
+                })
             }
 
             pub async fn decode_async<R>(r: &mut R, max_serial: Option<u64>) -> Result<DecodedPdu, Error>
@@ -501,38 +505,47 @@ macro_rules! pdu {
                 // Instant, and the line is not worth a clock abstraction.
                 #[cfg(not(target_family = "wasm"))]
                 let read_took = started.elapsed();
-                match decoded.ident {
+                // The arms only pick the variant's deserializer. Built in the
+                // arms, every variant's value got a stack slot of its own in
+                // an unoptimized build: well over a megabyte in one frame,
+                // enough to overflow a connection thread.
+                let deserialize_variant: fn(&[u8], bool) -> Result<Pdu, Error>;
+                let name = match decoded.ident {
                     $(
                         $vers => {
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
-                            #[cfg(not(target_family = "wasm"))]
-                            let deserialize_started = std::time::Instant::now();
-                            let pdu = Pdu::$name(deserialize(decoded.data.as_slice(), decoded.is_compressed)?).sanitize_agent_status();
-                            #[cfg(not(target_family = "wasm"))]
-                            if decoded.data.len() > 64 * 1024 {
-                                log::debug!(
-                                    "decode {} serial {}: {} bytes read in {:?}, deserialized in {:?}",
-                                    stringify!($name),
-                                    decoded.serial,
-                                    decoded.data.len(),
-                                    read_took,
-                                    deserialize_started.elapsed()
-                                );
-                            }
-                            Ok(DecodedPdu {
-                                serial: decoded.serial,
-                                pdu,
-                            })
+                            deserialize_variant = |data, is_compressed| Ok(Pdu::$name(deserialize(data, is_compressed)?));
+                            stringify!($name)
                         }
                     ,)*
                     _ => {
                         metrics::histogram!("pdu.size", "pdu" => "??").record(decoded.data.len() as f64);
-                        Ok(DecodedPdu {
+                        return Ok(DecodedPdu {
                             serial: decoded.serial,
                             pdu: Pdu::Invalid{ident:decoded.ident}
-                        })
+                        });
                     }
+                };
+                #[cfg(not(target_family = "wasm"))]
+                let deserialize_started = std::time::Instant::now();
+                let pdu = deserialize_variant(decoded.data.as_slice(), decoded.is_compressed)?.sanitize_agent_status();
+                #[cfg(not(target_family = "wasm"))]
+                if decoded.data.len() > 64 * 1024 {
+                    log::debug!(
+                        "decode {} serial {}: {} bytes read in {:?}, deserialized in {:?}",
+                        name,
+                        decoded.serial,
+                        decoded.data.len(),
+                        read_took,
+                        deserialize_started.elapsed()
+                    );
                 }
+                #[cfg(target_family = "wasm")]
+                let _ = name;
+                Ok(DecodedPdu {
+                    serial: decoded.serial,
+                    pdu,
+                })
             }
         }
     }
