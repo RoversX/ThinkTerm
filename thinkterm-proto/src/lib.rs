@@ -18,6 +18,7 @@ pub mod command;
 pub mod keyassignment;
 pub mod layout;
 pub mod pane;
+pub mod program;
 pub mod renderable;
 pub mod split;
 
@@ -27,6 +28,7 @@ pub use command::{CommandSpec, EnvVar};
 pub use keyassignment::{PaneDirection, ScrollbackEraseMode, SpawnTabDomain};
 pub use layout::{PaneEntry, PaneNode, PaneStackEntry, SerdeUrl};
 pub use pane::{Pattern, SearchResult};
+pub use program::ForegroundProgram;
 pub use renderable::{RenderableDimensions, StableCursorPosition};
 pub use split::{SplitDirection, SplitDirectionAndSize, SplitRequest, SplitSize};
 

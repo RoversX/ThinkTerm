@@ -474,7 +474,7 @@ macro_rules! pdu {
                             metrics::histogram!("pdu.size.rate", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
                             Ok(DecodedPdu {
                                 serial: decoded.serial,
-                                pdu: Pdu::$name(deserialize(decoded.data.as_slice(), decoded.is_compressed)?).sanitize_agent_status()
+                                pdu: Pdu::$name(deserialize(decoded.data.as_slice(), decoded.is_compressed)?).sanitize_pane_metadata()
                             })
                         }
                     ,)*
@@ -507,7 +507,7 @@ macro_rules! pdu {
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
                             #[cfg(not(target_family = "wasm"))]
                             let deserialize_started = std::time::Instant::now();
-                            let pdu = Pdu::$name(deserialize(decoded.data.as_slice(), decoded.is_compressed)?).sanitize_agent_status();
+                            let pdu = Pdu::$name(deserialize(decoded.data.as_slice(), decoded.is_compressed)?).sanitize_pane_metadata();
                             #[cfg(not(target_family = "wasm"))]
                             if decoded.data.len() > 64 * 1024 {
                                 log::debug!(
@@ -580,7 +580,10 @@ macro_rules! pdu {
 /// 73: The plugin channel: a client reaches the plugin host on the server's
 ///     machine through its mux connection (PluginFrame), which the server
 ///     carries unread.
-pub const CODEC_VERSION: usize = 73;
+/// 74: The mux that owns a pane reports the program leading its terminal
+///     (ForegroundProgramChanged), with a request/response pair for
+///     cold-start delivery, so a client can show what a remote pane runs.
+pub const CODEC_VERSION: usize = 74;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -675,6 +678,9 @@ pdu! {
     DefaultPalette: 94,
     MoveTab: 95,
     PluginFrame: 96,
+    ForegroundProgramChanged: 100,
+    GetForegroundPrograms: 101,
+    GetForegroundProgramsResponse: 102,
 }
 
 impl Pdu {
@@ -788,6 +794,7 @@ impl Pdu {
             | Pdu::SetClipboard(SetClipboard { pane_id, .. })
             | Pdu::PaneFocused(PaneFocused { pane_id })
             | Pdu::AgentStatusChanged(AgentStatusChanged { pane_id, .. })
+            | Pdu::ForegroundProgramChanged(ForegroundProgramChanged { pane_id, .. })
             | Pdu::PaneRemoved(PaneRemoved { pane_id }) => Some(*pane_id),
             _ => None,
         }
@@ -1271,7 +1278,7 @@ impl Pdu {
     /// Discard invalid metadata after consuming its complete frame, so a
     /// malformed identity cannot terminate unrelated terminal traffic. Actual
     /// framing/deserialization errors and the decoder allocation limit remain fatal.
-    fn sanitize_agent_status(mut self) -> Self {
+    fn sanitize_pane_metadata(mut self) -> Self {
         match &mut self {
             Self::AgentStatusChanged(update) => {
                 if update
@@ -1286,6 +1293,20 @@ impl Pdu {
                 response
                     .statuses
                     .retain(|entry| entry.status.within_budget());
+            }
+            Self::ForegroundProgramChanged(update) => {
+                if update
+                    .program
+                    .as_ref()
+                    .is_some_and(|program| !program.within_budget())
+                {
+                    update.program = None;
+                }
+            }
+            Self::GetForegroundProgramsResponse(response) => {
+                response
+                    .programs
+                    .retain(|entry| entry.program.within_budget());
             }
             _ => {}
         }
@@ -1325,6 +1346,31 @@ pub struct AgentStatusEntry {
 #[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
 pub struct GetAgentStatusesResponse {
     pub statuses: Vec<AgentStatusEntry>,
+}
+
+/// Unilateral: the program leading `pane_id`'s terminal changed, as seen by
+/// the mux that owns the pane. `None` means it could not be told.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ForegroundProgramChanged {
+    pub pane_id: PaneId,
+    pub program: Option<thinkterm_proto::ForegroundProgram>,
+}
+
+/// Ask a mux for the foreground program of every pane it knows about, so a
+/// client that attaches late starts from the truth rather than from the
+/// next change.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug)]
+pub struct GetForegroundPrograms {}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct ForegroundProgramEntry {
+    pub pane_id: PaneId,
+    pub program: thinkterm_proto::ForegroundProgram,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug, Clone)]
+pub struct GetForegroundProgramsResponse {
+    pub programs: Vec<ForegroundProgramEntry>,
 }
 
 /// Select an existing authoritative Thread, or create the canonical
@@ -2581,7 +2627,7 @@ mod test {
         // The exact assertion is the tripwire: whoever bumps the codec must
         // come here, confirm the round-trips still cover the new version,
         // and advance it deliberately.
-        assert_eq!(CODEC_VERSION, 73);
+        assert_eq!(CODEC_VERSION, 74);
         use thinkterm_proto::{AgentEvidence, AgentState, AgentStatus};
 
         fn round_trip(pdu: Pdu) {
@@ -2617,6 +2663,87 @@ mod test {
                 workspace: "default".to_string(),
             }],
         }));
+    }
+
+    #[test]
+    fn foreground_program_protocol_round_trip_at_version_74() {
+        // Same tripwire as the agent-status test above.
+        assert_eq!(CODEC_VERSION, 74);
+        use thinkterm_proto::ForegroundProgram;
+
+        fn round_trip(pdu: &Pdu) -> Pdu {
+            let mut encoded = Vec::new();
+            pdu.encode(&mut encoded, 0x74).unwrap();
+            let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+            assert_eq!(decoded.serial, 0x74);
+            decoded.pdu
+        }
+
+        let program = ForegroundProgram {
+            executable: "node".to_string(),
+            runs: Some("npm".to_string()),
+        };
+        for pdu in [
+            Pdu::ForegroundProgramChanged(ForegroundProgramChanged {
+                pane_id: 7,
+                program: Some(program.clone()),
+            }),
+            Pdu::ForegroundProgramChanged(ForegroundProgramChanged {
+                pane_id: 7,
+                program: None,
+            }),
+            Pdu::GetForegroundPrograms(GetForegroundPrograms {}),
+            Pdu::GetForegroundProgramsResponse(GetForegroundProgramsResponse {
+                programs: vec![ForegroundProgramEntry {
+                    pane_id: 7,
+                    program: program.clone(),
+                }],
+            }),
+        ] {
+            assert_eq!(round_trip(&pdu), pdu);
+        }
+
+        // A name that is a path, not a file name, is dropped on arrival
+        // rather than handed to whoever draws it.
+        let smuggled = ForegroundProgram {
+            executable: "node".to_string(),
+            runs: Some("../../etc/passwd".to_string()),
+        };
+        assert_eq!(
+            round_trip(&Pdu::ForegroundProgramChanged(ForegroundProgramChanged {
+                pane_id: 7,
+                program: Some(smuggled.clone()),
+            })),
+            Pdu::ForegroundProgramChanged(ForegroundProgramChanged {
+                pane_id: 7,
+                program: None,
+            })
+        );
+        assert_eq!(
+            round_trip(&Pdu::GetForegroundProgramsResponse(
+                GetForegroundProgramsResponse {
+                    programs: vec![
+                        ForegroundProgramEntry {
+                            pane_id: 7,
+                            program: smuggled,
+                        },
+                        ForegroundProgramEntry {
+                            pane_id: 8,
+                            program
+                        },
+                    ],
+                }
+            )),
+            Pdu::GetForegroundProgramsResponse(GetForegroundProgramsResponse {
+                programs: vec![ForegroundProgramEntry {
+                    pane_id: 8,
+                    program: ForegroundProgram {
+                        executable: "node".to_string(),
+                        runs: Some("npm".to_string()),
+                    },
+                }],
+            })
+        );
     }
 
     #[test]
