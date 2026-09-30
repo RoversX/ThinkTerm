@@ -77,6 +77,23 @@ pub(crate) fn selected_quote(
     quotes.get(index).cloned()
 }
 
+/// The quote a terminal would show now, for Settings to preview. Unlike
+/// `selected_quote` it never writes: with no quotes file yet it picks from
+/// the shipped list, and leaves making the file to the terminal that shows
+/// one.
+pub(crate) fn preview_quote(
+    mode: NativeBottomQuoteMode,
+    interval_minutes: u32,
+) -> Option<BottomQuote> {
+    let quotes = if quotes_path().exists() {
+        load_quotes()
+    } else {
+        default_quotes()
+    };
+    let index = selected_index(mode, interval_minutes, quotes.len());
+    quotes.get(index).cloned()
+}
+
 pub(crate) fn next_rotation_delay(interval_minutes: u32) -> Duration {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)

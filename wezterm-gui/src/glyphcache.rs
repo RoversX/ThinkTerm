@@ -643,6 +643,9 @@ pub struct GlyphCache {
     pub app_icons: HashMap<u16, Sprite>,
     /// The CloseX logo on About, keyed by pixel height, like `app_icons`.
     pub closex_logos: HashMap<u16, Sprite>,
+    /// The app icons Appearance offers to switch between, from their small
+    /// copies; two icons at whatever size the page draws them.
+    pub(crate) app_icon_choices: HashMap<(crate::native_settings::NativeAppIcon, u16), Sprite>,
     pub material_icons: HashMap<SizedMaterialIconKey, Sprite>,
     /// Pane tab glyphs, white masks keyed by shape and pixel size. The
     /// shapes are the tab icon cards', which are capped, so this stays
@@ -734,6 +737,7 @@ impl GlyphCache {
             brand_icons: HashMap::new(),
             app_icons: HashMap::new(),
             closex_logos: HashMap::new(),
+            app_icon_choices: HashMap::new(),
             material_icons: HashMap::new(),
             tab_glyphs: HashMap::new(),
             tab_glyph_failures: HashMap::new(),
@@ -774,6 +778,7 @@ impl GlyphCache {
             brand_icons: HashMap::new(),
             app_icons: HashMap::new(),
             closex_logos: HashMap::new(),
+            app_icon_choices: HashMap::new(),
             material_icons: HashMap::new(),
             tab_glyphs: HashMap::new(),
             tab_glyph_failures: HashMap::new(),
@@ -1480,6 +1485,23 @@ impl GlyphCache {
         let image = crate::termwindow::ui::icons::rasterize_app_icon(size)?;
         let sprite = self.atlas.allocate(&image)?;
         self.app_icons.insert(key, sprite.clone());
+        Ok(sprite)
+    }
+
+    pub(crate) fn cached_app_icon_choice(
+        &mut self,
+        icon: crate::native_settings::NativeAppIcon,
+        size: usize,
+    ) -> anyhow::Result<Sprite> {
+        let size = size.max(1).min(u16::MAX as usize);
+        let key = (icon, size as u16);
+        if let Some(sprite) = self.app_icon_choices.get(&key) {
+            return Ok(sprite.clone());
+        }
+
+        let image = crate::termwindow::ui::icons::rasterize_png_icon(icon.thumbnail(), size)?;
+        let sprite = self.atlas.allocate(&image)?;
+        self.app_icon_choices.insert(key, sprite.clone());
         Ok(sprite)
     }
 

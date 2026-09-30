@@ -152,6 +152,17 @@ impl NativeAppIcon {
             Self::Classic => "ThinkTerm.icns",
         }
     }
+
+    pub(crate) const ALL: [Self; 2] = [Self::Simple, Self::Classic];
+
+    /// A 128px copy of the icon, for Settings to show as a choice: the
+    /// full-size art is megabytes of PNG to decode for a 44pt picture.
+    pub(crate) fn thumbnail(self) -> &'static [u8] {
+        match self {
+            Self::Simple => include_bytes!("../../assets/icon/ThinkTerm_simple_128.png"),
+            Self::Classic => include_bytes!("../../assets/icon/ThinkTerm_128.png"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -1153,6 +1164,29 @@ pub(crate) fn scheme_background(
         .and_then(|colors| colors.background)
         .or(scheme.background)
         .map(|color| color.to_linear())
+}
+
+/// The colours the terminal is painted in, resolved the way
+/// `terminal_ground` resolves its background: a scheme picked in the command
+/// palette counts, and `colors` in the configuration overlays whichever
+/// scheme is in force.
+pub(crate) fn terminal_palette(
+    settings: &ThinkTermNativeSettings,
+    config: &config::ConfigHandle,
+) -> wezterm_term::color::ColorPalette {
+    if let Some(name) = effective_color_scheme(settings, config) {
+        let picked = config
+            .color_schemes
+            .get(&name)
+            .or_else(|| config::COLOR_SCHEMES.get(&name));
+        if let Some(scheme) = picked {
+            return match &config.colors {
+                Some(colors) => scheme.overlay_with(colors).into(),
+                None => scheme.clone().into(),
+            };
+        }
+    }
+    config.resolved_palette.clone().into()
 }
 
 fn terminal_ground(config: &config::ConfigHandle) -> window::color::LinearRgba {

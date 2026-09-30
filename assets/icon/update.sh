@@ -28,6 +28,12 @@ if [ -f "$macos_icns" ]; then
   fi
   if command -v sips >/dev/null 2>&1 ; then
     sips -z 512 512 -s format png "$macos_icns" --out ThinkTerm.png
+    # The Appearance page's app icon choices, small so Settings never
+    # decodes the full-size art to show them.
+    sips -z 128 128 -s format png "$macos_icns" --out ThinkTerm_simple_128.png
+    if [ -f "$classic_macos_icns" ]; then
+      sips -z 128 128 -s format png "$classic_macos_icns" --out ThinkTerm_128.png
+    fi
   fi
 else
   png2icns ../macos/ThinkTerm.app/Contents/Resources/ThinkTerm_simple.icns icon_*px.png

@@ -99,6 +99,26 @@ pub enum SvgIcon {
     Terminal,
     Trash2,
     Unlink2,
+    ALargeSmall,
+    AppWindow,
+    Bold,
+    CircleStop,
+    Columns2,
+    Contrast,
+    FileCog,
+    MessageSquareQuote,
+    Mouse,
+    MoveVertical,
+    Power,
+    RotateCw,
+    Shuffle,
+    Timer,
+    Type,
+    Laptop,
+    QrCode,
+    Smartphone,
+    Upload,
+    Wifi,
     X,
     // Coding-agent brand marks whose logo is monochrome by design, from
     // lobe-icons rather than lucide (see third_party/lobe-icons/README).
@@ -320,6 +340,38 @@ impl SvgIcon {
             }
             Self::Terminal => include_bytes!("../../../../third_party/lucide/icons/terminal.svg"),
             Self::Trash2 => include_bytes!("../../../../third_party/lucide/icons/trash-2.svg"),
+            Self::ALargeSmall => {
+                include_bytes!("../../../../third_party/lucide/icons/a-large-small.svg")
+            }
+            Self::AppWindow => {
+                include_bytes!("../../../../third_party/lucide/icons/app-window.svg")
+            }
+            Self::Bold => include_bytes!("../../../../third_party/lucide/icons/bold.svg"),
+            Self::CircleStop => {
+                include_bytes!("../../../../third_party/lucide/icons/circle-stop.svg")
+            }
+            Self::Columns2 => include_bytes!("../../../../third_party/lucide/icons/columns-2.svg"),
+            Self::Contrast => include_bytes!("../../../../third_party/lucide/icons/contrast.svg"),
+            Self::FileCog => include_bytes!("../../../../third_party/lucide/icons/file-cog.svg"),
+            Self::MessageSquareQuote => {
+                include_bytes!("../../../../third_party/lucide/icons/message-square-quote.svg")
+            }
+            Self::Mouse => include_bytes!("../../../../third_party/lucide/icons/mouse.svg"),
+            Self::MoveVertical => {
+                include_bytes!("../../../../third_party/lucide/icons/move-vertical.svg")
+            }
+            Self::Power => include_bytes!("../../../../third_party/lucide/icons/power.svg"),
+            Self::RotateCw => include_bytes!("../../../../third_party/lucide/icons/rotate-cw.svg"),
+            Self::Shuffle => include_bytes!("../../../../third_party/lucide/icons/shuffle.svg"),
+            Self::Timer => include_bytes!("../../../../third_party/lucide/icons/timer.svg"),
+            Self::Type => include_bytes!("../../../../third_party/lucide/icons/type.svg"),
+            Self::Laptop => include_bytes!("../../../../third_party/lucide/icons/laptop.svg"),
+            Self::QrCode => include_bytes!("../../../../third_party/lucide/icons/qr-code.svg"),
+            Self::Smartphone => {
+                include_bytes!("../../../../third_party/lucide/icons/smartphone.svg")
+            }
+            Self::Upload => include_bytes!("../../../../third_party/lucide/icons/upload.svg"),
+            Self::Wifi => include_bytes!("../../../../third_party/lucide/icons/wifi.svg"),
             Self::X => include_bytes!("../../../../third_party/lucide/icons/x.svg"),
             Self::AgentCodex => include_bytes!("../../../../third_party/lobe-icons/openai.svg"),
             Self::AgentCursor => {
@@ -624,9 +676,15 @@ pub fn distro_to_icon(id: &str) -> Option<BrandIcon> {
 /// atlas stores premultiplied -- the multiply below is what stops the icon's
 /// soft edges from ringing bright against a dark card.
 pub fn rasterize_app_icon(size: usize) -> Result<Image> {
+    rasterize_png_icon(crate::termwindow::ICON_DATA, size)
+}
+
+/// `png` scaled to `size` square and premultiplied for the atlas, the way
+/// `rasterize_app_icon` does the About page's icon.
+pub fn rasterize_png_icon(png: &[u8], size: usize) -> Result<Image> {
     let size = size.max(1);
-    let decoded = image::load_from_memory(crate::termwindow::ICON_DATA)
-        .context("decoding the application icon")?
+    let decoded = image::load_from_memory(png)
+        .context("decoding an application icon")?
         .resize_exact(
             size as u32,
             size as u32,
