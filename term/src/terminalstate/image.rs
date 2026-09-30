@@ -25,6 +25,22 @@ pub struct PlacementInfo {
     pub alt_screen: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ImagePlacement {
+    pub info: PlacementInfo,
+    pub origin: Option<crate::kitty_relative::CellOrigin>,
+}
+
+/// Internal placement identities accompany the legacy handoff snapshot.
+#[cfg_attr(feature = "use_serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KittyPlacementSnapshot {
+    pub next_id: u64,
+    pub placements: Vec<(crate::kitty_relative::PlacementKey, PlacementInfo)>,
+    /// In snapshot image-cell order, before either screen trims scrollback.
+    pub cell_tags: [Vec<u64>; 2],
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct ImageAttachParams {
     /// Dimensions of the underlying ImageData, in pixels
@@ -56,6 +72,7 @@ pub struct ImageAttachParams {
 
     pub image_id: Option<u32>,
     pub placement_id: Option<u32>,
+    pub placement_tag: u64,
 
     pub style: ImageAttachStyle,
     pub do_not_move_cursor: bool,
@@ -74,7 +91,7 @@ impl TerminalState {
     pub(crate) fn assign_image_to_cells(
         &mut self,
         params: ImageAttachParams,
-    ) -> anyhow::Result<PlacementInfo> {
+    ) -> anyhow::Result<ImagePlacement> {
         let seqno = self.seqno;
         let physical_cols = self.screen().physical_cols;
         let physical_rows = self.screen().physical_rows;
@@ -190,6 +207,13 @@ impl TerminalState {
         );
 
         let mut remain_y = target_pixel_height;
+        if params.style == ImageAttachStyle::Kitty {
+            if let (Some(image_id), Some(placement_id)) =
+                (params.image_id, params.placement_id.filter(|id| *id != 0))
+            {
+                self.kitty_replace_placement(image_id, placement_id);
+            }
+        }
         for y in 0..height_in_cells {
             let padding_bottom = cell_pixel_height.saturating_sub(remain_y) as u16;
             let y_delta = (remain_y.min(cell_pixel_height) as f32) / y_delta_divisor as f32;
@@ -237,7 +261,7 @@ impl TerminalState {
                     padding_bottom,
                     params.image_id,
                     params.placement_id,
-                ));
+                ).with_placement_tag(params.placement_tag));
                 match params.style {
                     ImageAttachStyle::Kitty => cell.attrs_mut().attach_image(img),
                     ImageAttachStyle::Sixel | ImageAttachStyle::Iterm => {
@@ -279,11 +303,19 @@ impl TerminalState {
             }
         }
 
-        Ok(PlacementInfo {
-            first_row,
-            rows: height_in_cells,
-            cols: width_in_cells,
-            alt_screen: self.screen.is_alt_screen_active(),
+        Ok(ImagePlacement {
+            info: PlacementInfo {
+                first_row,
+                rows: height_in_cells,
+                cols: width_in_cells,
+                alt_screen: self.screen.is_alt_screen_active(),
+            },
+            origin: (x_delta_divisor > 0 && y_delta_divisor > 0).then(|| crate::kitty_relative::CellOrigin {
+                source: TextureCoordinate::new_f32(params.source_origin_x as f32 / params.image_width as f32,
+                    params.source_origin_y as f32 / params.image_height as f32),
+                step: TextureCoordinate::new_f32(cell_pixel_width as f32 / x_delta_divisor as f32,
+                    cell_pixel_height as f32 / y_delta_divisor as f32),
+            }),
         })
     }
 

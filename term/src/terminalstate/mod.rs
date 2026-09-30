@@ -38,6 +38,7 @@ mod sixel;
 #[cfg(feature = "use_serde")]
 mod snapshot;
 use crate::terminalstate::image::*;
+pub use crate::terminalstate::image::KittyPlacementSnapshot;
 use crate::terminalstate::kitty::*;
 #[cfg(feature = "use_serde")]
 pub use crate::terminalstate::snapshot::*;

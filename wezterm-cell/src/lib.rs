@@ -533,6 +533,41 @@ impl CellAttributes {
         self.deallocate_fat_attributes_if_none();
     }
 
+    /// Remove matching attachments while preserving shared rows and z order.
+    pub fn detach_images(&mut self, matches: impl Fn(&ImageCell) -> bool) -> bool {
+        if !self.image_attachments().any(&matches) {
+            return false;
+        }
+        self.update_fat(|fat| {
+            fat.update_images(|images| images.retain(|image| !matches(image)))
+        });
+        self.deallocate_fat_attributes_if_none();
+        true
+    }
+
+    /// Rebind one image's attachments without changing their order or geometry.
+    pub fn replace_image_data(
+        &mut self,
+        image_id: u32,
+        old: &Arc<image::ImageData>,
+        new: &Arc<image::ImageData>,
+    ) -> bool {
+        let matches = |image: &ImageCell| {
+            image.image_id() == Some(image_id) && Arc::ptr_eq(image.image_data(), old)
+        };
+        if !self.image_attachments().any(matches) {
+            return false;
+        }
+        self.update_fat(|fat| {
+            fat.update_images(|images| {
+                for image in images.iter_mut().filter(|image| matches(image)) {
+                    image.set_image_data(Arc::clone(new));
+                }
+            });
+        });
+        true
+    }
+
     /// Add an image attachement, preserving any existing attachments.
     /// The list of images is maintained in z-index order
     pub fn attach_image(&mut self, image: Box<ImageCell>) -> &mut Self {
@@ -636,6 +671,14 @@ impl CellAttributes {
         self.fat
             .as_ref()
             .is_some_and(|fat| !fat.images().is_empty())
+    }
+
+    /// Borrow attachments without allocating a list or cloning their pixels' Arcs.
+    #[cfg(feature = "use_image")]
+    pub fn image_attachments(&self) -> impl Iterator<Item = &ImageCell> {
+        self.fat
+            .iter()
+            .flat_map(|fat| fat.images().iter().map(Box::as_ref))
     }
 
     pub fn underline_color(&self) -> ColorAttribute {

@@ -95,17 +95,17 @@ impl Write for Tap {
 impl Tap {
     /// `TerminalState` hands replies to a `BufWriter<ThreadedWriter>`, so they
     /// arrive on a worker thread rather than during `advance_bytes`. Wait for
-    /// `needle` to show up instead of guessing at a delay: replies are written
-    /// in order, so once it appears everything sent before it is here too. On
-    /// deadline the buffer is returned as-is so the caller's assertion can
-    /// print it.
-    fn read_until(&self, needle: &str) -> String {
+    /// the requested occurrence of `needle` instead of guessing at a delay.
+    /// Replies are written in order, so everything before that barrier has
+    /// arrived too. An earlier drain's barrier cannot satisfy a later one.
+    fn read_until(&self, needle: &str, count: usize) -> String {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let buf = String::from_utf8_lossy(&self.0.lock().unwrap()).to_string();
-            if buf.contains(needle) || std::time::Instant::now() >= deadline {
+            if buf.matches(needle).count() >= count {
                 return buf;
             }
+            assert!(std::time::Instant::now() < deadline, "terminal reply barrier timed out");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
@@ -124,11 +124,12 @@ const SENTINEL: &str = "987654321";
 /// The sentinel is a Query, which aborts a chunked transfer in progress —
 /// only drain once the transfer under test has completed or been abandoned.
 fn drain(term: &mut Terminal, tap: &Tap) -> String {
+    let reply = format!("\x1b_Gi={SENTINEL};OK\x1b\\");
+    let count = String::from_utf8_lossy(&tap.0.lock().unwrap()).matches(&reply).count() + 1;
     term.advance_bytes(format!(
         "\x1b_Ga=q,i={SENTINEL},f=32,s=1,v=1;AAAAAA==\x1b\\"
     ));
-    tap.read_until(&format!("i={SENTINEL}"))
-        .replace(&format!("\x1b_Gi={SENTINEL};OK\x1b\\"), "")
+    tap.read_until(&reply, count).replace(&reply, "")
 }
 
 fn term_with_tap(pixel_width: usize, pixel_height: usize) -> (Terminal, Tap) {
@@ -208,6 +209,55 @@ fn kitty_placement_still_works_on_a_normal_pane() {
         .images()
         .expect("a placement should attach an image to the cell it covers");
     assert!(!images.is_empty());
+}
+
+#[test]
+fn kitty_image_only_rows_survive_resizing_a_blank_bottom_margin() {
+    for alternate in [false, true] {
+        for compressed in [false, true] {
+            for columns in [90, 100] {
+                let mut terminal = term(1000, 550, true);
+                let size = TerminalSize {
+                    rows: 25,
+                    cols: 100,
+                    pixel_width: 1000,
+                    pixel_height: 550,
+                    dpi: 96,
+                };
+                terminal.resize(size);
+                if alternate {
+                    terminal.advance_bytes("\x1b[?1049h");
+                }
+                terminal.advance_bytes(XMIT_2X2);
+                terminal.advance_bytes("\x1b[3;5H\x1b_Ga=p,i=1,p=1,c=8,r=4,C=1,q=2\x1b\\");
+                if compressed {
+                    for row in 2..6 {
+                        terminal.screen_mut().line_mut(row).compress_for_scrollback();
+                    }
+                }
+                let image_cells = |terminal: &Terminal| {
+                    terminal
+                        .screen()
+                        .all_lines()
+                        .iter()
+                        .flat_map(|line| line.visible_cells())
+                        .filter(|cell| cell.attrs().has_images())
+                        .count()
+                };
+                assert_eq!(image_cells(&terminal), 32);
+                terminal.resize(TerminalSize {
+                    rows: 22,
+                    cols: columns,
+                    pixel_width: columns * 10,
+                    pixel_height: 484,
+                    ..size
+                });
+                assert_eq!(image_cells(&terminal), 32, "all four image rows survive");
+                terminal.resize(size);
+                assert_eq!(image_cells(&terminal), 32, "growing preserves the image");
+            }
+        }
+    }
 }
 
 #[test]
@@ -352,6 +402,239 @@ fn a_chunked_transfer_reassembles() {
         cell.attrs().images().is_some(),
         "the two chunks should have reassembled into a placeable image"
     );
+}
+
+#[test]
+fn animation_controls_leave_legacy_images_and_transfers_unchanged() {
+    let (mut term, tap) = term_with_tap(640, 384);
+    term.advance_bytes(XMIT_2X2);
+    term.advance_bytes("\x1b_Ga=f,i=1,f=32,s=2,v=2,z=70;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+    term.advance_bytes("\x1b_Ga=p,i=1\x1b\\");
+    let before = animation_at_origin(&mut term).unwrap();
+    let image = term.kitty_image_data_for_id(1).unwrap();
+    let generation = image.generation();
+    let cursor = term.cursor_pos();
+    term.advance_bytes(format!("\x1b_Ga=t,i=9,f=32,s=2,v=2,m=1;{HALF_2X2}\x1b\\"));
+    for control in ["c=2", "r=2,z=-1", "s=1", "s=2,v=1", "s=3,v=3"] {
+        term.advance_bytes(format!("\x1b_Ga=a,i=1,{control}\x1b\\"));
+    }
+    term.advance_bytes(format!("\x1b_Gm=0;{HALF_2X2}\x1b\\"));
+    assert_eq!(animation_at_origin(&mut term).unwrap(), before);
+    assert_eq!(image.generation(), generation);
+    assert_eq!(term.cursor_pos(), cursor);
+    assert!(term.kitty_image_data_for_id(9).is_some());
+    let reply = drain(&mut term, &tap);
+    assert!(!reply.contains("EINVAL"), "{reply}");
+    assert!(reply.contains("i=9;OK"), "{reply}");
+}
+
+#[test]
+fn frame_selections_are_validated_and_released_with_the_image() {
+    let mut term = term(640, 384, true);
+    term.advance_bytes(XMIT_2X2);
+    term.advance_bytes("\x1b_Ga=f,i=1,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+    term.advance_bytes("\x1b_Ga=a,i=1,c=2\x1b\\");
+    let (revision, selected) = term.kitty_frame_selections(None).unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].image_id, 1);
+    assert_eq!(selected[0].animation.frame, 1);
+    for command in ["i=1,c=2", "i=1,c=99", "i=9,c=2", "i=1,c=0"] {
+        term.advance_bytes(format!("\x1b_Ga=a,{command}\x1b\\"));
+        assert!(term.kitty_frame_selections(Some(revision)).is_none());
+    }
+    term.advance_bytes("\x1b_Ga=a,i=1,c=1\x1b\\");
+    assert_eq!(term.kitty_frame_selections(Some(revision)).unwrap().1[0].animation.frame, 0);
+    term.advance_bytes("\x1b_Ga=a,i=1,c=2\x1b\\");
+    let before_delete = term.kitty_frame_selections(None).unwrap().0;
+    term.advance_bytes("\x1b_Ga=d,d=I,i=1\x1b\\");
+    assert!(term.kitty_frame_selections(Some(before_delete)).unwrap().1.is_empty());
+    term.advance_bytes(XMIT_2X2);
+    let root = term.kitty_frame_selections(None).unwrap().1;
+    assert_eq!(root.len(), 1);
+    assert_eq!(root[0].animation.frame, 0);
+    assert_eq!(root[0].animation.frame_ends, [0]);
+    assert!(term.snapshot_kitty_playback().selections.is_empty());
+}
+
+#[test]
+fn frame_selection_resolves_image_numbers_and_reset_releases_it() {
+    let mut term = term(640, 384, true);
+    term.advance_bytes("\x1b_Ga=t,I=12,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+    term.advance_bytes("\x1b_Ga=f,I=12,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+    term.advance_bytes("\x1b_Ga=a,I=12,c=2\x1b\\");
+    assert_eq!(term.kitty_frame_selections(None).unwrap().1[0].animation.frame, 1);
+    term.advance_bytes("\x1bc");
+    assert!(term.kitty_frame_selections(None).unwrap().1.is_empty());
+}
+
+#[test]
+fn kitty_number_resolves_previous_image_after_delete_and_failed_transmissions() {
+    let (mut terminal, tap) = term_with_tap(640, 384);
+    for _ in 0..3 {
+        terminal.advance_bytes("\x1b_Ga=t,I=12,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+    }
+    assert_eq!(terminal.snapshot_kitty_graphics().image_numbers, [(12, 1), (12, 2), (12, 3)]);
+    // Replacing and editing an older id must not reorder numbered images.
+    terminal.advance_bytes(XMIT_2X2);
+    terminal.advance_bytes("\x1b_Ga=f,i=2,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+    for failed in [
+        "a=t,I=12,f=32,s=2,v=2;AA==",
+        "a=t,I=12,f=100;AAAAAA==",
+        "a=t,I=12,f=32,s=2,v=2,o=z;AAAAAA==",
+        "a=t,I=12,f=32,s=2,v=2;!",
+        "a=f,I=99,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==",
+    ] {
+        terminal.advance_bytes(format!("\x1b_G{failed}\x1b\\"));
+        assert_eq!(terminal.snapshot_kitty_graphics().image_numbers, [(12, 1), (12, 2), (12, 3)]);
+        assert_eq!(terminal.kitty_image_stats().0, 3);
+    }
+    for id in [3, 2, 1] {
+        terminal.advance_bytes("\x1b[1;1H\x1b_Ga=p,I=12,p=7,c=2,r=2,C=1\x1b\\");
+        assert_eq!(kitty_placement_keys(&terminal, false), [(id, Some(7))].into());
+        if id == 2 {
+            terminal.advance_bytes("\x1b_Ga=a,I=12,c=2\x1b\\");
+            assert_eq!(terminal.kitty_frame_selections(None).unwrap().1.into_iter()
+                .find(|entry| entry.image_id == 2).unwrap().animation.frame, 1);
+            terminal.advance_bytes("\x1b_Ga=d,d=f,I=12,r=2\x1b\\");
+            assert_eq!(terminal.kitty_image_data_for_id(2).unwrap().len(), 16);
+        }
+        terminal.advance_bytes("\x1b_Ga=d,d=N,I=12\x1b\\");
+        assert!(terminal.kitty_image_data_for_id(id).is_none());
+    }
+    assert!(terminal.snapshot_kitty_graphics().image_numbers.is_empty());
+    terminal.advance_bytes("\x1b_Ga=t,I=99,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+    assert_eq!(terminal.snapshot_kitty_graphics().image_numbers, [(99, 4)]);
+    let reply = drain(&mut terminal, &tap);
+    assert!(reply.contains("I=99;ENOENT"));
+    assert!(reply.contains("I=99,i=4;OK"));
+    terminal.advance_bytes("\x1bc");
+    assert!(terminal.snapshot_kitty_graphics().image_numbers.is_empty());
+}
+
+#[test]
+fn kitty_number_history_is_released_with_evicted_images() {
+    let mut terminal = term_with_budget(640, 384, true, 32);
+    for value in 1..20u8 {
+        let pixels = base64_of(&[value; 16]);
+        terminal.advance_bytes(format!("\x1b_Ga=t,I=12,f=32,s=2,v=2;{pixels}\x1b\\"));
+        let history = terminal.snapshot_kitty_graphics().image_numbers;
+        assert!(history.len() <= 2);
+        assert_eq!(history.last(), Some(&(12, u32::from(value))));
+        assert!(history.iter().all(|(_, id)| terminal.kitty_image_data_for_id(*id).is_some()));
+    }
+    terminal.advance_bytes("\x1b_Ga=d,d=N,I=12\x1b\\");
+    assert_eq!(terminal.snapshot_kitty_graphics().image_numbers, [(12, 18)]);
+    terminal.advance_bytes("\x1b_Ga=d,d=R,x=1,y=99\x1b\\");
+    assert!(terminal.snapshot_kitty_graphics().image_numbers.is_empty());
+    assert_eq!(terminal.kitty_used_memory(), 0);
+}
+
+#[test]
+#[cfg(feature = "use_serde")]
+fn kitty_number_history_survives_restore_and_validates_before_replacing() {
+    let mut original = term(640, 384, true);
+    for _ in 0..3 {
+        original.advance_bytes("\x1b_Ga=t,I=12,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+    }
+    let history = original.snapshot_kitty_graphics().image_numbers;
+    let mut restored = term(640, 384, true);
+    restored.restore(original.snapshot()).unwrap();
+    assert_eq!(restored.snapshot_kitty_graphics().image_numbers, [(12, 3)]);
+    for invalid in [vec![], vec![(12, 1)], vec![(12, 3), (12, 3)],
+        vec![(13, 1), (12, 3)], vec![(12, 3), (12, 4)]] {
+        assert!(restored.restore_kitty_numbers(invalid).is_err());
+        assert_eq!(restored.snapshot_kitty_graphics().image_numbers, [(12, 3)]);
+    }
+    restored.restore_kitty_numbers(history.clone()).unwrap();
+    assert_eq!(restored.snapshot_kitty_graphics().image_numbers, history);
+    assert_eq!(restored.snapshot(), original.snapshot());
+    for id in [3, 2, 1] {
+        restored.advance_bytes("\x1b_Ga=d,d=N,I=12\x1b\\");
+        assert!(restored.kitty_image_data_for_id(id).is_none());
+        assert_eq!(restored.kitty_image_stats().0, id as usize - 1);
+    }
+}
+
+#[test]
+fn animation_pixel_edits_publish_versions_without_changing_playback() {
+    let mut term = term(640, 384, true);
+    term.advance_bytes(XMIT_2X2);
+    term.advance_bytes(FRAME_2X2);
+    for command in [
+        "\x1b_Ga=f,i=1,f=32,s=2,v=2,r=1;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\",
+        "\x1b_Ga=c,i=1,r=2,c=1,w=1,h=1\x1b\\",
+    ] {
+        let (revision, before) = term.kitty_frame_selections(None).unwrap();
+        term.advance_bytes(command);
+        let (_, after) = term.kitty_frame_selections(Some(revision)).expect("pixel edit publishes metadata");
+        assert_eq!(after[0].data_hash, before[0].data_hash);
+        assert!(after[0].data_generation > before[0].data_generation);
+        assert_eq!(after[0].animation, before[0].animation);
+    }
+}
+
+#[test]
+fn static_pixel_edits_publish_versions_and_release_them_with_the_image() {
+    let mut term = term(640, 384, true);
+    let initial = term.kitty_frame_selections(None).unwrap().0;
+    term.advance_bytes(XMIT_2X2);
+    let (revision, before) = term.kitty_frame_selections(Some(initial)).unwrap();
+    term.advance_bytes("\x1b_Ga=f,i=1,f=32,s=2,v=2,r=1;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+    let (edited, after) = term.kitty_frame_selections(Some(revision)).unwrap();
+    assert!(after[0].data_generation > before[0].data_generation);
+    assert_eq!(after[0].animation, before[0].animation);
+    assert!(term.snapshot_kitty_playback().selections.is_empty());
+    term.advance_bytes("\x1b_Ga=d,d=I,i=1\x1b\\");
+    assert!(term.kitty_frame_selections(Some(edited)).unwrap().1.is_empty());
+}
+
+#[test]
+fn web_animation_gaps_and_controls_do_not_rewrite_legacy_frame_durations() {
+    use crate::kitty_animation::Playback;
+    use wezterm_cell::image::ImageDataType;
+    let mut term = term(640, 384, true);
+    term.advance_bytes(XMIT_2X2);
+    term.advance_bytes("\x1b_Ga=f,i=1,f=32,s=2,v=2,z=70;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+    term.advance_bytes("\x1b_Ga=f,i=1,f=32,s=2,v=2,z=-1;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+    term.advance_bytes("\x1b_Ga=a,i=1,r=1,z=30,s=2,v=3\x1b\\");
+    let state = term.kitty_frame_selections(None).unwrap().1.remove(0).animation;
+    assert_eq!(state.frame_ends, [30, 100, 100]);
+    assert_eq!(state.mode, Playback::Loading);
+    assert_eq!(state.max_loops, 2);
+    term.advance_bytes("\x1b_Ga=f,i=1,f=32,s=2,v=2,r=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+    assert_eq!(term.kitty_frame_selections(None).unwrap().1[0].animation.frame_ends, state.frame_ends);
+    let image = term.kitty_image_data_for_id(1).unwrap();
+    let data = image.data();
+    let ImageDataType::AnimRgba8 { durations, .. } = &*data else { panic!("not animated"); };
+    assert_eq!(durations.iter().map(|gap| gap.as_millis()).collect::<Vec<_>>(), [0, 70, 40]);
+}
+
+#[test]
+#[cfg(feature = "use_serde")]
+fn playback_companion_restores_selection_and_rejects_mismatched_images_atomically() {
+    let mut original = term(640, 384, true);
+    original.advance_bytes(XMIT_2X2);
+    original.advance_bytes("\x1b_Ga=f,i=1,f=32,s=2,v=2,z=70;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+    original.advance_bytes("\x1b_Ga=a,i=1,c=2,r=1,z=30\x1b\\");
+    let playback = original.snapshot_kitty_playback();
+    let mut copy = term(640, 384, true);
+    copy.restore(original.snapshot()).unwrap();
+    copy.restore_kitty_playback(playback.clone()).unwrap();
+    assert_eq!(copy.snapshot(), original.snapshot());
+    let (revision, selections) = copy.kitty_frame_selections(None).unwrap();
+    assert_eq!(selections[0].animation.frame, 1);
+    assert_eq!(selections[0].animation.frame_ends, [30, 100]);
+    for kind in 0..4 {
+        let mut invalid = playback.clone();
+        match kind {
+            0 => invalid.selections[0].image_id = 999,
+            1 => invalid.selections[0].data_hash[0] ^= 1,
+            2 => invalid.selections[0].animation.frame_ends.pop().map(|_| ()).unwrap(),
+            _ => invalid.selections.push(invalid.selections[0].clone()),
+        }
+        assert!(copy.restore_kitty_playback(invalid).is_err());
+        assert!(copy.kitty_frame_selections(Some(revision)).is_none());
+    }
 }
 
 #[test]
@@ -625,6 +908,90 @@ fn a_virtual_placement_draws_nothing_and_leaves_the_cursor_alone() {
         !attached,
         "a virtual placement must not attach an image to any cell"
     );
+}
+
+#[test]
+fn virtual_grids_publish_replace_and_delete_without_attaching_desktop_cells() {
+    use crate::kitty_virtual::VirtualPlacement;
+    let mut term = term(640, 384, true);
+    term.advance_bytes(XMIT_2X2);
+    let (before, _) = term.kitty_frame_selections(None).unwrap();
+    term.advance_bytes("\x1b_Ga=p,i=1,U=1,p=3,c=20,r=10\x1b\\");
+    let (revision, selections) = term.kitty_frame_selections(Some(before)).unwrap();
+    assert_eq!(selections[0].virtual_placements, [VirtualPlacement {
+        placement_id: 3, columns: 20, rows: 10,
+    }]);
+    term.advance_bytes("\x1b_Ga=p,i=1,U=1,p=3,c=20,r=10\x1b\\");
+    assert!(term.kitty_frame_selections(Some(revision)).is_none());
+    term.advance_bytes("\x1b_Ga=p,i=1,U=1,p=3,c=7,r=4\x1b\\");
+    let (revision, selections) = term.kitty_frame_selections(Some(revision)).unwrap();
+    assert_eq!(selections[0].virtual_placements[0].columns, 7);
+    term.advance_bytes("\x1b_Ga=d,d=a\x1b\\");
+    assert!(term.kitty_frame_selections(Some(revision)).is_none());
+    term.advance_bytes("\x1b_Ga=d,d=i,i=1,p=3\x1b\\");
+    let (_, selections) = term.kitty_frame_selections(Some(revision)).unwrap();
+    assert!(selections[0].virtual_placements.is_empty());
+    assert!(term.kitty_image_data_for_id(1).is_some());
+    assert_eq!((term.cursor_pos().x, term.cursor_pos().y), (0, 0));
+    assert!(!term.screen_mut().line_mut(0).has_images());
+}
+
+#[test]
+fn virtual_grids_cannot_survive_replaced_or_deleted_image_data() {
+    let mut term = term(640, 384, true);
+    term.advance_bytes(XMIT_2X2);
+    term.advance_bytes("\x1b_Ga=p,i=1,U=1,c=20,r=10\x1b\\");
+    term.advance_bytes(XMIT_2X2);
+    assert!(term.kitty_frame_selections(None).unwrap().1[0].virtual_placements.is_empty());
+    term.advance_bytes("\x1b_Ga=p,i=1,U=1,c=20,r=10\x1b\\");
+    term.advance_bytes("\x1b_Ga=d,d=I,i=1\x1b\\");
+    assert!(term.kitty_frame_selections(None).unwrap().1.is_empty());
+    term.advance_bytes("\x1b_Ga=p,i=1,U=1,c=20,r=10\x1b\\");
+    assert!(term.kitty_frame_selections(None).unwrap().1.is_empty());
+}
+
+#[test]
+#[cfg(feature = "use_serde")]
+fn virtual_companion_restores_grids_and_rejects_invalid_state_atomically() {
+    use crate::kitty_virtual::{VirtualImage, VirtualPlacement, MAX_VIRTUAL_PLACEMENTS};
+    let mut original = term(640, 384, true);
+    original.advance_bytes(XMIT_2X2);
+    original.advance_bytes("\x1b_Ga=p,i=1,U=1,p=3,c=20,r=10\x1b\\");
+    original.advance_bytes("\x1b_Ga=p,i=1,U=1,p=5,c=7,r=4\x1b\\");
+    original.advance_bytes("\x1b[38;5;1m\u{10eeee}\u{305}\u{305}\x1b[0m");
+    let grids = original.snapshot_kitty_virtual();
+    let snapshot = original.snapshot();
+    let mut copy = term(640, 384, true);
+    copy.restore(original.snapshot()).unwrap();
+    assert!(copy.snapshot_kitty_virtual().is_empty());
+    copy.restore_kitty_virtual(grids.clone()).unwrap();
+    assert_eq!(copy.snapshot(), snapshot);
+    assert_eq!(copy.snapshot_kitty_virtual(), grids);
+    let (revision, _) = copy.kitty_frame_selections(None).unwrap();
+    for kind in 0..7 {
+        let mut invalid = grids.clone();
+        match kind {
+            0 => invalid[0].image_id = 999,
+            1 => invalid[0].data_hash[0] ^= 1,
+            2 => invalid[0].placements.clear(),
+            3 => { let duplicate = invalid[0].placements[0]; invalid[0].placements.push(duplicate); },
+            4 => invalid[0].placements.reverse(),
+            5 => invalid.push(invalid[0].clone()),
+            _ => invalid[0].placements = (0..=MAX_VIRTUAL_PLACEMENTS as u32)
+                .map(|placement_id| VirtualPlacement { placement_id, columns: 1, rows: 1 }).collect(),
+        }
+        assert!(copy.restore_kitty_virtual(invalid).is_err());
+        assert!(copy.kitty_frame_selections(Some(revision)).is_none());
+        assert_eq!(copy.snapshot_kitty_virtual(), grids);
+        assert_eq!(copy.snapshot(), snapshot);
+    }
+    let oversized: Vec<VirtualImage> = std::iter::repeat(grids[0].clone())
+        .take(MAX_VIRTUAL_PLACEMENTS + 1).collect();
+    assert!(copy.restore_kitty_virtual(oversized).is_err());
+    assert!(copy.kitty_frame_selections(Some(revision)).is_none());
+    copy.restore_kitty_virtual(Vec::new()).unwrap();
+    assert!(copy.snapshot_kitty_virtual().is_empty());
+    assert_eq!(copy.snapshot(), snapshot);
 }
 
 #[test]
@@ -945,7 +1312,7 @@ fn transmit_and_display_is_not_acknowledged_until_it_displays() {
 fn converting_a_real_placement_to_virtual_erases_it() {
     let mut term = term(640, 384, true);
     term.advance_bytes(XMIT_2X2);
-    term.advance_bytes("\x1b_Ga=p,i=1\x1b\\");
+    term.advance_bytes("\x1b_Ga=p,i=1,p=1\x1b\\");
     assert!(
         term.screen_mut()
             .line_mut(0)
@@ -956,7 +1323,7 @@ fn converting_a_real_placement_to_virtual_erases_it() {
     );
 
     let (before_x, before_y) = (term.cursor_pos().x, term.cursor_pos().y);
-    term.advance_bytes("\x1b_Ga=p,i=1,U=1,c=20,r=10\x1b\\");
+    term.advance_bytes("\x1b_Ga=p,i=1,p=1,U=1,c=20,r=10\x1b\\");
     let (after_x, after_y) = (term.cursor_pos().x, term.cursor_pos().y);
 
     assert!(
@@ -1321,6 +1688,8 @@ fn a_frame_moves_the_image_generation_but_not_its_hash() {
     term.advance_bytes("\x1b[H");
     term.advance_bytes(XMIT_2X2);
     term.advance_bytes("\x1b_Ga=p,i=1\x1b\\");
+    // The first mutation detaches from immutable content deduplication.
+    term.advance_bytes(FRAME_2X2);
     let image = term
         .screen()
         .lines_in_phys_range(0..1)
@@ -1410,4 +1779,674 @@ fn security_kitty_reply_filters_control_bytes_for_all_transmits() {
 #[test]
 fn security_kitty_placement_caps_wire_cell_counts() {
     kitty(640, 384, "\x1b_Ga=p,i=1,c=4294967295,r=4294967295\x1b\\");
+}
+
+
+#[test]
+fn kitty_mutations_do_not_alias_other_ids_or_the_content_cache() {
+    use wezterm_cell::image::ImageDataType;
+    for alternate in [false, true] {
+        let mut terminal = term(640, 384, true);
+        terminal.advance_bytes(XMIT_2X2);
+        terminal.advance_bytes("\x1b_Ga=t,i=2,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+        let original = terminal.kitty_image_data_for_id(1).unwrap();
+        assert!(Arc::ptr_eq(&original, &terminal.kitty_image_data_for_id(2).unwrap()));
+        terminal.advance_bytes("\x1b_Ga=p,i=1,p=1,c=2,r=2,C=1,z=-2\x1b\\");
+        terminal.advance_bytes("\x1b_Ga=p,i=2,p=1,c=2,r=2,C=1,z=3\x1b\\");
+        let cached_row = terminal.screen().lines_in_phys_range(0..1).remove(0);
+        terminal.screen_mut().line_mut(0).compress_for_scrollback();
+        if alternate {
+            terminal.advance_bytes("\x1b[?1049h");
+        }
+        let before = terminal.current_seqno();
+        terminal.advance_bytes("\x1b_Ga=f,i=1,f=32,s=1,v=1,r=1;/////w==\x1b\\");
+        let edited = terminal.kitty_image_data_for_id(1).unwrap();
+        assert_ne!(edited.hash(), original.hash());
+        assert!(ImageDataType::is_nonce_key(&edited.hash()));
+        assert_eq!(edited.generation(), 1);
+        assert_eq!(terminal.kitty_used_memory(), 32, "detached pixels count separately");
+        {
+            let pixels = original.data();
+            let ImageDataType::Rgba8 { data, .. } = &*pixels else { panic!("static image"); };
+            assert!(data.iter().all(|byte| *byte == 0));
+        }
+        assert_eq!(original.generation(), 0);
+        assert!(Arc::ptr_eq(&original, &terminal.kitty_image_data_for_id(2).unwrap()));
+        if alternate {
+            assert!(dirty_phys_rows(terminal.screen(), before).is_empty());
+            terminal.advance_bytes("\x1b[?1049l");
+        }
+        let live_row = terminal.screen().lines_in_phys_range(0..1).remove(0);
+        let live = live_row.get_cell(0).unwrap().attrs().images().unwrap().remove(0);
+        let cached = cached_row.get_cell(0).unwrap().attrs().images().unwrap().remove(0);
+        assert!(Arc::ptr_eq(live.image_data(), &edited));
+        assert!(live_row.get_cell(0).unwrap().attrs().image_attachments()
+            .any(|im| im.image_id() == Some(2) && Arc::ptr_eq(im.image_data(), &original)));
+        assert!(Arc::ptr_eq(cached.image_data(), &original), "retained line clones are immutable");
+        assert_eq!(live.z_index(), cached.z_index());
+        assert_eq!(live.top_left(), cached.top_left());
+        assert_eq!(live.bottom_right(), cached.bottom_right());
+        assert_eq!(live.padding(), cached.padding());
+        assert_eq!(live.placement_id(), cached.placement_id());
+        assert!(live_row.current_seqno() > before);
+        // Later edits and composition reuse the private image, without copying.
+        terminal.advance_bytes("\x1b_Ga=f,i=1,f=32,s=1,v=1,r=1;AQIDBA==\x1b\\");
+        terminal.advance_bytes("\x1b_Ga=c,i=1,r=1,c=1,x=1,y=1,w=1,h=1,C=1\x1b\\");
+        assert!(Arc::ptr_eq(&edited, &terminal.kitty_image_data_for_id(1).unwrap()));
+        assert_eq!(edited.generation(), 3);
+        terminal.advance_bytes("\x1b_Ga=d,d=I,i=1\x1b\\");
+        terminal.advance_bytes("\x1b_Ga=t,i=3,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+        assert!(Arc::ptr_eq(&original, &terminal.kitty_image_data_for_id(3).unwrap()));
+        assert_eq!(terminal.kitty_used_memory(), 16);
+    }
+}
+
+#[test]
+fn kitty_first_composition_detaches_and_invalid_edits_do_not_change_identity() {
+    let mut terminal = term(640, 384, true);
+    terminal.advance_bytes("\x1b_Ga=t,i=1,f=32,s=2,v=1;/////wAAAAA=\x1b\\");
+    terminal.advance_bytes("\x1b_Ga=t,i=2,f=32,s=2,v=1;/////wAAAAA=\x1b\\");
+    let original = terminal.kitty_image_data_for_id(1).unwrap();
+    terminal.advance_bytes("\x1b_Ga=f,i=1,f=32,s=1,v=1,r=99;AQIDBA==\x1b\\");
+    terminal.advance_bytes("\x1b_Ga=c,i=1,r=99,c=1,w=1,h=1\x1b\\");
+    assert!(Arc::ptr_eq(&original, &terminal.kitty_image_data_for_id(1).unwrap()));
+    assert_eq!(original.generation(), 0);
+    terminal.advance_bytes("\x1b_Ga=c,i=1,r=1,c=1,x=1,w=1,h=1,C=1\x1b\\");
+    let edited = terminal.kitty_image_data_for_id(1).unwrap();
+    assert_ne!(original.hash(), edited.hash());
+    assert_eq!(edited.generation(), 1);
+    assert!(Arc::ptr_eq(&original, &terminal.kitty_image_data_for_id(2).unwrap()));
+    assert_eq!(terminal.kitty_used_memory(), 16);
+}
+
+#[test]
+fn kitty_images_with_equal_bytes_but_different_dimensions_do_not_alias() {
+    let mut terminal = term(640, 384, true);
+    terminal.advance_bytes("\x1b_Ga=t,i=1,f=32,s=2,v=1;AAAAAAAAAAA=\x1b\\");
+    terminal.advance_bytes("\x1b_Ga=t,i=2,f=32,s=1,v=2;AAAAAAAAAAA=\x1b\\");
+    let a = terminal.kitty_image_data_for_id(1).unwrap();
+    let b = terminal.kitty_image_data_for_id(2).unwrap();
+    assert_ne!(a.hash(), b.hash());
+    assert_eq!(a.data().dimensions().unwrap(), (2, 1));
+    assert_eq!(b.data().dimensions().unwrap(), (1, 2));
+}
+
+#[test]
+#[cfg(feature = "use_serde")]
+fn kitty_detached_identity_survives_snapshot_restore() {
+    let mut original = term(640, 384, true);
+    original.advance_bytes(XMIT_2X2);
+    original.advance_bytes("\x1b_Ga=t,i=2,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+    original.advance_bytes("\x1b_Ga=p,i=1,p=1,c=2,r=2,C=1\x1b\\");
+    original.advance_bytes("\x1b_Ga=f,i=1,f=32,s=1,v=1,r=1;/////w==\x1b\\");
+    let mut restored = term(640, 384, true);
+    restored.restore(original.snapshot()).unwrap();
+    let edited = restored.kitty_image_data_for_id(1).unwrap();
+    let other = restored.kitty_image_data_for_id(2).unwrap();
+    assert_ne!(edited.hash(), other.hash());
+    let row = restored.screen().lines_in_phys_range(0..1).remove(0);
+    assert_eq!(row.get_cell(0).unwrap().attrs().image_attachments().count(), 1);
+    assert!(row.get_cell(0).unwrap().attrs().image_attachments().all(|im| Arc::ptr_eq(im.image_data(), &edited)));
+    restored.advance_bytes(FRAME_2X2);
+    assert!(Arc::ptr_eq(&edited, &restored.kitty_image_data_for_id(1).unwrap()));
+    assert_eq!(other.len(), 16);
+    assert_eq!(restored.kitty_used_memory(), 48);
+}
+
+#[test]
+fn kitty_detaching_shared_pixels_enforces_the_image_budget() {
+    for compose in [false, true] {
+        let mut terminal = term_with_budget(640, 384, true, 16);
+        terminal.advance_bytes(XMIT_2X2);
+        terminal.advance_bytes("\x1b_Ga=t,i=2,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+        assert_eq!(terminal.kitty_used_memory(), 16);
+        terminal.advance_bytes(if compose {
+            "\x1b_Ga=c,i=1,r=1,c=1,w=1,h=1\x1b\\"
+        } else {
+            "\x1b_Ga=f,i=1,f=32,s=1,v=1,r=1;/////w==\x1b\\"
+        });
+        assert!(terminal.kitty_image_data_for_id(1).is_some());
+        assert!(terminal.kitty_image_data_for_id(2).is_none());
+        assert_eq!(terminal.kitty_used_memory(), 16);
+    }
+}
+
+fn kitty_placement_keys(term: &Terminal, alternate: bool) -> std::collections::BTreeSet<(u32, Option<u32>)> {
+    let mut keys = std::collections::BTreeSet::new();
+    term.screen_for_alt(alternate).for_each_phys_line(|_, line| {
+        if line.has_images() {
+            for cell in line.visible_cells() {
+                for image in cell.attrs().image_attachments() {
+                    if let Some(id) = image.image_id() {
+                        keys.insert((id, image.placement_id()));
+                    }
+                }
+            }
+        }
+    });
+    keys
+}
+
+fn place_kitty_for_delete(term: &mut Terminal, id: u32, placement: u32, row: usize, col: usize, z: i32) {
+    term.advance_bytes(format!("\x1b[{row};{col}H\x1b_Ga=p,i={id},p={placement},c=2,r=2,C=1,z={z}\x1b\\"));
+}
+
+#[test]
+fn kitty_spatial_deletion_selects_whole_placements_from_actual_cells() {
+    let cases: &[(&str, &[u32])] = &[
+        ("a", &[1, 2, 3]), ("c", &[1, 2]), ("p,x=4,y=2", &[1, 2]),
+        ("q,x=4,y=2,z=-2", &[1]), ("x,x=9", &[3]), ("y,y=6", &[3]),
+        ("z,z=-2", &[1, 3]), ("r,x=1,y=2", &[1, 2]),
+        ("p,x=0,y=2", &[]), ("r,x=3,y=1", &[]),
+    ];
+    for &(selector, removed) in cases {
+        for uppercase in [false, true] {
+            for compressed in [false, true] {
+                let mut term = term(640, 384, true);
+                for id in 1..=3 {
+                    term.advance_bytes(XMIT_2X2.replace("i=1", &format!("i={id}")));
+                }
+                place_kitty_for_delete(&mut term, 1, 1, 2, 3, -2);
+                place_kitty_for_delete(&mut term, 2, 1, 2, 4, 3);
+                place_kitty_for_delete(&mut term, 3, 1, 6, 9, -2);
+                term.advance_bytes("\x1b[2;4H");
+                if compressed {
+                    term.screen_mut().for_each_phys_line_mut(|_, line| line.compress_for_scrollback());
+                }
+                let cursor = term.cursor_pos();
+                let selector = if uppercase {
+                    format!("{}{}", selector[..1].to_uppercase(), &selector[1..])
+                } else { selector.to_string() };
+                term.advance_bytes(format!("\x1b_Ga=d,d={selector}\x1b\\"));
+                let expected = (1..=3).filter(|id| !removed.contains(id)).map(|id| (id, Some(1))).collect();
+                assert_eq!(kitty_placement_keys(&term, false), expected, "{selector}");
+                assert_eq!(term.cursor_pos(), cursor);
+                for id in 1..=3 {
+                    assert_eq!(term.kitty_image_data_for_id(id).is_some(), !uppercase || !removed.contains(&id), "{selector} id={id}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn kitty_uppercase_delete_retains_virtual_and_other_placement_references() {
+    for selector in ["A", "C", "P,x=1,y=1", "Q,x=1,y=1,z=0", "X,x=1", "Y,y=1", "Z,z=0", "I,i=1,p=2"] {
+        let mut term = term(640, 384, true);
+        term.advance_bytes(XMIT_2X2);
+        place_kitty_for_delete(&mut term, 1, 2, 1, 1, 0);
+        term.advance_bytes("\x1b_Ga=p,i=1,U=1,p=3,c=2,r=2\x1b\\");
+        term.advance_bytes(format!("\x1b_Ga=d,d={selector}\x1b\\"));
+        assert!(kitty_placement_keys(&term, false).is_empty(), "{selector}");
+        assert!(term.kitty_image_data_for_id(1).is_some(), "{selector}");
+        assert_eq!(term.snapshot_kitty_virtual()[0].placements[0].placement_id, 3);
+        term.advance_bytes("\x1b_Ga=d,d=I,i=1,p=999\x1b\\");
+        assert!(term.kitty_image_data_for_id(1).is_some());
+        term.advance_bytes("\x1b_Ga=d,d=I,i=1,p=0\x1b\\");
+        assert!(term.kitty_image_data_for_id(1).is_none());
+        assert!(term.snapshot_kitty_virtual().is_empty());
+    }
+    let mut term = term(640, 384, true);
+    term.advance_bytes(XMIT_2X2);
+    place_kitty_for_delete(&mut term, 1, 2, 1, 1, 0);
+    place_kitty_for_delete(&mut term, 1, 3, 4, 1, 0);
+    term.advance_bytes("\x1b_Ga=d,d=I,i=1,p=2\x1b\\");
+    assert_eq!(kitty_placement_keys(&term, false), [(1, Some(3))].into());
+    assert!(term.kitty_image_data_for_id(1).is_some());
+}
+
+#[test]
+fn kitty_delete_all_preserves_scrollback_inactive_screen_and_unplaced_data() {
+    let mut term = term(640, 384, true);
+    for id in 1..=3 { term.advance_bytes(XMIT_2X2.replace("i=1", &format!("i={id}"))); }
+    place_kitty_for_delete(&mut term, 1, 1, 1, 1, 0);
+    term.advance_bytes("\x1b[24;1H\n\n\n");
+    place_kitty_for_delete(&mut term, 1, 2, 4, 1, 0);
+    term.advance_bytes("\x1b_Ga=d,d=A\x1b\\");
+    assert_eq!(kitty_placement_keys(&term, false), [(1, Some(1))].into());
+    assert!(term.kitty_image_data_for_id(1).is_some());
+    assert!(term.kitty_image_data_for_id(2).is_some());
+    term.advance_bytes("\x1b[?1049h");
+    place_kitty_for_delete(&mut term, 3, 1, 1, 1, 0);
+    term.advance_bytes("\x1b_Ga=d,d=A\x1b\\");
+    assert!(kitty_placement_keys(&term, true).is_empty());
+    assert_eq!(kitty_placement_keys(&term, false), [(1, Some(1))].into());
+    assert!(term.kitty_image_data_for_id(3).is_none());
+    term.advance_bytes("\x1b_Ga=d,d=R,x=1,y=2\x1b\\");
+    assert!(kitty_placement_keys(&term, false).is_empty());
+    assert_eq!(term.kitty_used_memory(), 0);
+}
+
+#[test]
+fn kitty_delete_by_id_finds_reflowed_cells_and_preserves_shared_rows() {
+    let mut term = term(640, 384, true);
+    term.advance_bytes(XMIT_2X2);
+    place_kitty_for_delete(&mut term, 1, 1, 1, 75, -2);
+    term.advance_bytes("\x1b[1;80HX");
+    let size = TerminalSize { rows: 24, cols: 20, pixel_width: 160, pixel_height: 384, dpi: 96 };
+    term.resize(size);
+    let saved: Vec<_> = (0..6).map(|row| term.screen_mut().line_mut(row).clone()).collect();
+    assert!(saved.iter().skip(2).any(|line| line.has_images()));
+    term.advance_bytes("\x1b_Ga=d,d=I,i=1\x1b\\");
+    assert!(kitty_placement_keys(&term, false).is_empty());
+    assert!(saved.iter().any(|line| line.has_images()));
+    assert!(term.kitty_image_data_for_id(1).is_none());
+}
+
+#[test]
+fn kitty_number_and_range_delete_select_virtual_and_unplaced_images() {
+    let mut term = term(640, 384, true);
+    term.advance_bytes(XMIT_2X2);
+    term.advance_bytes("\x1b_Ga=t,I=7,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+    let id = term.kitty_frame_selections(None).unwrap().1.iter().map(|s| s.image_id).max().unwrap();
+    term.advance_bytes("\x1b_Ga=p,I=7,U=1,p=4,c=2,r=2\x1b\\");
+    term.advance_bytes("\x1b_Ga=d,d=n,I=7,p=4\x1b\\");
+    assert!(term.snapshot_kitty_virtual().is_empty());
+    assert!(term.kitty_image_data_for_id(id).is_some());
+    term.advance_bytes("\x1b_Ga=d,d=N,I=7\x1b\\");
+    assert!(term.kitty_image_data_for_id(id).is_none());
+    assert!(term.kitty_image_data_for_id(1).is_some());
+    term.advance_bytes("\x1b_Ga=p,i=1,U=1,p=4,c=2,r=2\x1b\\");
+    term.advance_bytes("\x1b_Ga=d,d=r,x=1,y=1\x1b\\");
+    assert!(term.snapshot_kitty_virtual().is_empty());
+    assert!(term.kitty_image_data_for_id(1).is_some());
+    term.advance_bytes("\x1b_Ga=d,d=R,x=1,y=1\x1b\\");
+    assert_eq!(term.kitty_used_memory(), 0);
+}
+
+#[test]
+fn kitty_frame_deletion_replaces_identity_and_keeps_remaining_frames_and_timeline() {
+    use wezterm_cell::image::ImageDataType;
+    let mut term = term(640, 384, true);
+    term.advance_bytes("\x1b_Ga=t,i=1,f=32,s=1,v=1;/wAA/w==\x1b\\");
+    term.advance_bytes("\x1b_Ga=f,i=1,f=32,s=1,v=1,z=30;AP8A/w==\x1b\\");
+    term.advance_bytes("\x1b_Ga=f,i=1,f=32,s=1,v=1,z=40;AAD//w==\x1b\\");
+    term.advance_bytes("\x1b_Ga=a,i=1,r=1,z=20,c=3,s=1\x1b\\");
+    place_kitty_for_delete(&mut term, 1, 1, 1, 1, 0);
+    term.advance_bytes("\x1b_Ga=p,i=1,U=1,p=2,c=2,r=2\x1b\\");
+    let old = term.kitty_image_data_for_id(1).unwrap();
+    term.advance_bytes("\x1b_Ga=d,d=f,i=1,r=0\x1b\\");
+    let image = term.kitty_image_data_for_id(1).unwrap();
+    assert_ne!(old.hash(), image.hash());
+    assert_eq!(image.generation(), old.generation() + 1);
+    assert_eq!(term.kitty_used_memory(), 8);
+    assert!(matches!(&*old.data(), ImageDataType::AnimRgba8 { frames, .. } if frames.len() == 3));
+    match &*image.data() {
+        ImageDataType::AnimRgba8 { frames, .. } => assert_eq!(frames, &[vec![0, 255, 0, 255], vec![0, 0, 255, 255]]),
+        _ => panic!("expected remaining animation"),
+    }
+    let selection = &term.kitty_frame_selections(None).unwrap().1[0];
+    assert_eq!(selection.animation.frame_ends, [30, 70]);
+    assert_eq!(selection.animation.frame, 1);
+    assert_eq!(selection.virtual_placements.len(), 1);
+    assert_eq!(kitty_placement_keys(&term, false), [(1, Some(1))].into());
+    term.advance_bytes("\x1b_Ga=d,d=f,i=1,r=999\x1b\\");
+    let image = term.kitty_image_data_for_id(1).unwrap();
+    assert!(matches!(&*image.data(), ImageDataType::Rgba8 { data, .. } if data == &[0, 255, 0, 255]));
+    term.advance_bytes("\x1b_Ga=d,d=f,i=1\x1b\\");
+    assert!(Arc::ptr_eq(&image, &term.kitty_image_data_for_id(1).unwrap()));
+    term.advance_bytes("\x1b_Ga=d,d=F,i=1\x1b\\");
+    assert!(kitty_placement_keys(&term, false).is_empty());
+    assert!(term.snapshot_kitty_virtual().is_empty());
+    assert_eq!(term.kitty_used_memory(), 0);
+}
+
+#[test]
+fn kitty_frame_deletion_on_a_nonce_keyed_picture_still_changes_identity() {
+    use wezterm_cell::image::ImageDataType;
+    // Past the content-hash limit a frame is keyed by a nonce. Dropping the
+    // second frame left the first frame's nonce, which was the animation's
+    // own identity too, and a remote copy never took the shorter list.
+    let mut term = term(640, 384, true);
+    let (width, height) = (1024, 257);
+    let first = base64_of(&vec![1u8; width * height * 4]);
+    let second = base64_of(&vec![2u8; width * height * 4]);
+    term.advance_bytes(format!("\x1b_Ga=t,i=1,f=32,s={width},v={height};{first}\x1b\\"));
+    term.advance_bytes(format!("\x1b_Ga=f,i=1,f=32,s={width},v={height},z=40;{second}\x1b\\"));
+    let old = term.kitty_image_data_for_id(1).unwrap();
+    assert!(matches!(&*old.data(), ImageDataType::AnimRgba8 { frames, .. } if frames.len() == 2));
+    term.advance_bytes("\x1b_Ga=d,d=f,i=1,r=2\x1b\\");
+    let image = term.kitty_image_data_for_id(1).unwrap();
+    assert_ne!(old.hash(), image.hash());
+    assert!(matches!(&*image.data(), ImageDataType::Rgba8 { data, .. } if data.iter().all(|byte| *byte == 1)));
+}
+
+fn kitty_internal_keys(term: &Terminal, alternate: bool) -> std::collections::BTreeSet<(u32, u64)> {
+    let mut keys = std::collections::BTreeSet::new();
+    term.screen_for_alt(alternate).for_each_phys_line(|_, line| {
+        if !line.has_images() { return; }
+        for cell in line.visible_cells() {
+            for image in cell.attrs().image_attachments() {
+                if let Some(id) = image.image_id() { keys.insert((id, image.placement_tag())); }
+            }
+        }
+    });
+    keys
+}
+
+#[test]
+fn anonymous_placements_coexist_and_spatial_deletion_preserves_siblings() {
+    for p in ["", ",p=0"] {
+        for compressed in [false, true] {
+            let mut terminal = term(640, 384, true);
+            terminal.advance_bytes(XMIT_2X2);
+            for row in [2, 7] {
+                terminal.advance_bytes(format!("\x1b[{row};4H\x1b_Ga=p,i=1{p},c=2,r=2,C=1\x1b\\"));
+            }
+            place_kitty_for_delete(&mut terminal, 1, u32::MAX, 12, 4, 0);
+            let before = kitty_internal_keys(&terminal, false);
+            assert_eq!(before.len(), 3);
+            assert_eq!(before.iter().filter(|(_, tag)| *tag > u64::from(u32::MAX)).count(), 2);
+            if compressed { terminal.screen_mut().for_each_phys_line_mut(|_, line| line.compress_for_scrollback()); }
+            let retained = terminal.screen_mut().line_mut(1).clone();
+            terminal.advance_bytes("\x1b_Ga=d,d=P,x=4,y=2\x1b\\");
+            let after = kitty_internal_keys(&terminal, false);
+            assert_eq!(after.len(), 2);
+            assert!(after.is_subset(&before));
+            assert!(retained.has_images());
+            assert!(terminal.kitty_image_data_for_id(1).is_some());
+            terminal.advance_bytes("\x1b_Ga=d,d=I,i=1,p=0\x1b\\");
+            assert!(kitty_internal_keys(&terminal, false).is_empty());
+            assert_eq!(terminal.kitty_image_stats(), (0, 0, 0));
+        }
+    }
+}
+
+#[test]
+fn named_replacement_preserves_anonymous_siblings_and_invalid_replacement_keeps_pixels() {
+    let mut terminal = term(640, 384, true);
+    terminal.advance_bytes(XMIT_2X2);
+    place_kitty_for_delete(&mut terminal, 1, 0, 2, 4, 0);
+    place_kitty_for_delete(&mut terminal, 1, 8, 7, 4, 0);
+    let before = kitty_internal_keys(&terminal, false);
+    let retained = terminal.screen_mut().line_mut(6).clone();
+    terminal.advance_bytes("\x1b[12;4H\x1b_Ga=p,i=1,p=8,x=2,c=2,r=2,C=1\x1b\\");
+    assert_eq!(terminal.screen_mut().line_mut(6), &retained);
+    assert_eq!(kitty_internal_keys(&terminal, false), before);
+    place_kitty_for_delete(&mut terminal, 1, 8, 12, 4, 0);
+    assert!(!terminal.screen_mut().line_mut(6).has_images());
+    assert!(terminal.screen_mut().line_mut(11).has_images());
+    assert!(terminal.screen_mut().line_mut(1).has_images());
+    assert_eq!(kitty_internal_keys(&terminal, false), before);
+    assert!(retained.has_images());
+}
+
+#[test]
+fn anonymous_placements_survive_reflow_and_active_screen_deletion() {
+    let mut terminal = term(640, 384, true);
+    terminal.advance_bytes(XMIT_2X2);
+    place_kitty_for_delete(&mut terminal, 1, 0, 1, 75, 0);
+    terminal.advance_bytes("\x1b[1;80HX");
+    let primary = kitty_internal_keys(&terminal, false);
+    terminal.resize(TerminalSize { rows: 24, cols: 20, pixel_width: 160, pixel_height: 384, dpi: 96 });
+    assert_eq!(kitty_internal_keys(&terminal, false), primary);
+    terminal.advance_bytes("\x1b[?1049h");
+    place_kitty_for_delete(&mut terminal, 1, 0, 1, 1, 0);
+    assert_eq!(kitty_internal_keys(&terminal, true).len(), 1);
+    assert_ne!(kitty_internal_keys(&terminal, true), primary);
+    terminal.advance_bytes("\x1b_Ga=d,d=A\x1b\\");
+    assert_eq!(kitty_internal_keys(&terminal, false), primary);
+    assert!(kitty_internal_keys(&terminal, true).is_empty());
+    assert!(terminal.kitty_image_data_for_id(1).is_some());
+    terminal.advance_bytes("\x1b_Ga=d,d=I,i=1\x1b\\");
+    assert!(kitty_internal_keys(&terminal, false).is_empty());
+    assert_eq!(terminal.kitty_image_stats(), (0, 0, 0));
+}
+
+#[test]
+#[cfg(feature = "use_serde")]
+fn anonymous_handoff_restores_tags_before_trimming_and_validates_before_mutation() {
+    use serde::{Deserialize, Serialize};
+    let mut original = term(640, 384, true);
+    original.advance_bytes(XMIT_2X2);
+    place_kitty_for_delete(&mut original, 1, 0, 1, 1, 0);
+    original.advance_bytes("\x1b[24;1H\n\n\n");
+    // Equal z values and overlapping anonymous placements exercise attachment ordering.
+    for _ in 0..2 { place_kitty_for_delete(&mut original, 1, 0, 3, 1, 0); }
+    original.advance_bytes("\x1b[?1049h");
+    place_kitty_for_delete(&mut original, 1, 0, 2, 1, 0);
+    let state = original.snapshot_kitty_graphics().placements.unwrap();
+    let mut bytes = Vec::new();
+    original.snapshot().serialize(&mut varbincode::Serializer::new(&mut bytes)).unwrap();
+    let snapshot = || crate::TerminalSnapshot::deserialize(&mut varbincode::Deserializer::new(&mut &bytes[..])).unwrap();
+    let mut restored = term(640, 384, true);
+    restored.restore_with_kitty_placements(snapshot(), Some(state.clone())).unwrap();
+    for alternate in [false, true] {
+        assert_eq!(kitty_internal_keys(&restored, alternate), kitty_internal_keys(&original, alternate));
+    }
+    // A second handoff must carry the tags in the restored attachment order.
+    let again = restored.snapshot_kitty_graphics().placements.unwrap();
+    let mut second = term(640, 384, true);
+    second.restore_with_kitty_placements(restored.snapshot(), Some(again)).unwrap();
+    assert_eq!(kitty_internal_keys(&second, false), kitty_internal_keys(&original, false));
+    place_kitty_for_delete(&mut second, 1, 0, 7, 1, 0);
+    let new_tag = *kitty_internal_keys(&second, true).iter().next_back().unwrap();
+    assert!(new_tag.1 > state.next_id);
+    second.advance_bytes("\x1b_Ga=d,d=P,x=1,y=2\x1b\\");
+    assert_eq!(kitty_internal_keys(&second, true), [new_tag].into());
+    for kind in 0..6 {
+        let mut invalid = state.clone();
+        match kind {
+            0 => invalid.cell_tags[0].pop().map(|_| ()).unwrap(),
+            1 => invalid.cell_tags[0][0] = u64::MAX,
+            2 => invalid.placements.push(invalid.placements[0]),
+            3 => invalid.placements[0].1.alt_screen = true,
+            4 => invalid.next_id = 0,
+            _ => invalid.placements[0].0.image_id = 99,
+        }
+        let before = second.snapshot();
+        assert!(second.restore_with_kitty_placements(snapshot(), Some(invalid)).is_err());
+        assert_eq!(second.snapshot(), before);
+    }
+    #[derive(Debug)]
+    struct NoHistory;
+    impl TerminalConfiguration for NoHistory {
+        fn scrollback_size(&self) -> usize { 0 }
+        fn color_palette(&self) -> ColorPalette { ColorPalette::default() }
+        fn enable_kitty_graphics(&self) -> bool { true }
+    }
+    let mut trimmed = Terminal::new(original.get_size(), Arc::new(NoHistory), "ThinkTerm", "test", Box::new(Vec::new()));
+    trimmed.restore_with_kitty_placements(snapshot(), Some(state.clone())).unwrap();
+    assert_eq!(kitty_internal_keys(&trimmed, false).len(), 2);
+    assert_eq!(trimmed.snapshot_kitty_graphics().placements.unwrap().placements.len(), 3);
+    assert_eq!(kitty_internal_keys(&trimmed, true), kitty_internal_keys(&original, true));
+    trimmed.advance_bytes("\x1b[?1049l\x1b_Ga=d,d=P,x=1,y=3\x1b\\");
+    assert!(kitty_internal_keys(&trimmed, false).is_empty());
+    assert_eq!(kitty_internal_keys(&trimmed, true).len(), 1);
+}
+
+#[test]
+fn anonymous_virtual_placement_does_not_replace_an_ordinary_placement() {
+    let mut terminal = term(640, 384, true);
+    terminal.advance_bytes(XMIT_2X2);
+    place_kitty_for_delete(&mut terminal, 1, 0, 1, 1, 0);
+    let before = kitty_internal_keys(&terminal, false);
+    terminal.advance_bytes("\x1b_Ga=p,i=1,U=1,c=20,r=10\x1b\\");
+    assert_eq!(kitty_internal_keys(&terminal, false), before);
+    assert_eq!(terminal.snapshot_kitty_virtual()[0].placements.len(), 1);
+}
+
+#[test]
+#[cfg(feature = "use_serde")]
+fn internal_placement_identity_does_not_change_image_cell_wire_bytes_or_shape() {
+    use serde::Serialize;
+    use std::hash::Hasher;
+    use wezterm_cell::image::{ImageCell, ImageData, ImageDataType, TextureCoordinate};
+    let cell = ImageCell::new(TextureCoordinate::new_f32(0.0, 0.0), TextureCoordinate::new_f32(1.0, 1.0),
+        Arc::new(ImageData::with_data(ImageDataType::new_single_frame(1, 1, vec![0; 4]))));
+    let tagged = cell.clone().with_placement_tag(u64::from(u32::MAX) + 1);
+    let mut old = Vec::new();
+    let mut new = Vec::new();
+    cell.serialize(&mut varbincode::Serializer::new(&mut old)).unwrap();
+    tagged.serialize(&mut varbincode::Serializer::new(&mut new)).unwrap();
+    assert_eq!(old, new);
+    let mut first = std::collections::hash_map::DefaultHasher::new();
+    let mut second = std::collections::hash_map::DefaultHasher::new();
+    cell.compute_shape_hash(&mut first);
+    tagged.compute_shape_hash(&mut second);
+    assert_eq!(first.finish(), second.finish());
+    // Storage equality still distinguishes them so scrollback compression
+    // cannot merge adjacent, visually identical anonymous placements.
+    assert_ne!(cell, tagged);
+}
+
+fn relative_views(terminal: &mut Terminal, id: u32) -> Vec<crate::kitty_relative::RelativeView> {
+    terminal.kitty_frame_selections(None).unwrap().1.into_iter()
+        .find(|s| s.image_id == id).map(|s| s.relative_placements).unwrap_or_default()
+}
+
+fn relative_images(terminal: &mut Terminal) {
+    for id in 1..=3 { terminal.advance_bytes(XMIT_2X2.replace("i=1", &format!("i={id}"))); }
+}
+
+#[test]
+fn relative_metadata_tracks_position_updates_without_resending_for_unrelated_text() {
+    let mut terminal = term(640, 384, true);
+    relative_images(&mut terminal);
+    place_kitty_for_delete(&mut terminal, 1, 1, 2, 4, 0);
+    terminal.advance_bytes("\x1b_Ga=p,i=2,p=5,P=1,Q=1,H=3,V=2,c=2,r=2\x1b\\");
+    let initial = relative_views(&mut terminal, 2)[0];
+    assert_eq!(initial.source_seqno, terminal.current_seqno() as u64);
+    let revision = terminal.kitty_frame_selections(None).unwrap().0;
+    terminal.advance_bytes("\x1b[20;1Hunrelated text");
+    assert_eq!(relative_views(&mut terminal, 2)[0], initial);
+    assert!(terminal.kitty_frame_selections(Some(revision)).is_none());
+    place_kitty_for_delete(&mut terminal, 1, 1, 3, 4, 0);
+    let moved = relative_views(&mut terminal, 2)[0];
+    assert_eq!(moved.source_seqno, terminal.current_seqno() as u64);
+    assert!(moved.source_seqno > initial.source_seqno);
+    assert_eq!(moved.anchor.row, initial.anchor.row + 1);
+}
+
+#[test]
+fn relative_placements_follow_named_parents_and_chains_without_moving_the_cursor() {
+    let mut terminal = term(640, 384, true);
+    relative_images(&mut terminal);
+    place_kitty_for_delete(&mut terminal, 1, 1, 2, 4, 0);
+    terminal.advance_bytes("\x1b[15;20H");
+    let cursor = terminal.cursor_pos();
+    terminal.advance_bytes("\x1b_Ga=p,i=2,p=5,P=1,Q=1,H=3,V=-1,c=4,r=2,C=0\x1b\\");
+    assert_eq!((terminal.cursor_pos().x, terminal.cursor_pos().y), (cursor.x, cursor.y));
+    assert_eq!(relative_views(&mut terminal, 2)[0].anchor, crate::kitty_relative::Anchor { column: 6, row: 0, alt_screen: false });
+    assert!(kitty_internal_keys(&terminal, false).iter().all(|(id, _)| *id == 1));
+    terminal.advance_bytes("\x1b_Ga=p,i=3,p=6,P=2,Q=5,H=-2,V=5,c=1,r=1\x1b\\");
+    assert_eq!(relative_views(&mut terminal, 3)[0].anchor, crate::kitty_relative::Anchor { column: 4, row: 5, alt_screen: false });
+    place_kitty_for_delete(&mut terminal, 1, 1, 8, 10, 0);
+    assert_eq!(relative_views(&mut terminal, 3)[0].anchor, crate::kitty_relative::Anchor { column: 10, row: 11, alt_screen: false });
+    // A cycle must retain the ordinary root and both relative placements.
+    terminal.advance_bytes("\x1b_Ga=p,i=1,p=1,P=3,Q=6,c=2,r=2\x1b\\");
+    assert_eq!(kitty_internal_keys(&terminal, false), [(1, 1)].into());
+    assert_eq!(relative_views(&mut terminal, 3)[0].anchor.column, 10);
+    terminal.advance_bytes("\x1b_Ga=d,d=i,i=1,p=1\x1b\\");
+    assert!(relative_views(&mut terminal, 2).is_empty());
+    assert!(terminal.kitty_image_data_for_id(2).is_none());
+    assert!(terminal.kitty_image_data_for_id(3).is_none());
+    assert!(terminal.kitty_image_data_for_id(1).is_some());
+}
+
+#[test]
+fn relative_parent_selection_is_stable_for_anonymous_siblings() {
+    let mut terminal = term(640, 384, true);
+    relative_images(&mut terminal);
+    place_kitty_for_delete(&mut terminal, 1, 0, 2, 4, 0);
+    place_kitty_for_delete(&mut terminal, 1, 0, 7, 4, 0);
+    terminal.advance_bytes("\x1b_Ga=p,i=2,P=1,H=2,V=1,c=2,r=2\x1b\\");
+    let view = relative_views(&mut terminal, 2);
+    assert_eq!(view[0].anchor.row, 2);
+    terminal.advance_bytes("\x1b_Ga=d,d=p,x=4,y=7\x1b\\");
+    assert_eq!(relative_views(&mut terminal, 2), view);
+    terminal.advance_bytes("\x1b_Ga=d,d=p,x=4,y=2\x1b\\");
+    assert!(terminal.kitty_image_data_for_id(2).is_none());
+}
+
+#[test]
+fn virtual_parent_can_hide_and_reappear_without_deleting_relative_children() {
+    let mut terminal = term(640, 384, true);
+    relative_images(&mut terminal);
+    terminal.advance_bytes("\x1b_Ga=p,i=1,p=5,U=1,c=1,r=1\x1b\\");
+    terminal.advance_bytes("\x1b_Ga=p,i=2,p=7,P=1,Q=5,H=-1,V=2,c=2,r=2\x1b\\");
+    assert!(relative_views(&mut terminal, 2).is_empty());
+    assert!(terminal.kitty_image_data_for_id(2).is_some());
+    terminal.advance_bytes("\x1b[4;10H\x1b[38;2;0;0;1;58;2;0;0;5m\u{10eeee}\x1b[0m");
+    assert_eq!(relative_views(&mut terminal, 2)[0].anchor, crate::kitty_relative::Anchor { column: 8, row: 5, alt_screen: false });
+    terminal.advance_bytes("\x1b[4;1H\x1b[2K");
+    assert!(relative_views(&mut terminal, 2).is_empty());
+    assert!(terminal.kitty_image_data_for_id(2).is_some());
+    terminal.advance_bytes("\x1b[2;8H\x1b[38;2;0;0;1;58;2;0;0;5m\u{10eeee}\x1b[0m");
+    assert_eq!(relative_views(&mut terminal, 2)[0].anchor.column, 6);
+    terminal.advance_bytes("\x1b_Ga=d,d=i,i=1,p=5\x1b\\");
+    assert!(terminal.kitty_image_data_for_id(2).is_none());
+}
+
+#[test]
+fn relative_deletion_selects_the_current_rectangle_and_releases_descendants() {
+    for selector in ["p,x=7,y=4", "q,x=7,y=4,z=-2", "x,x=7", "y,y=4", "z,z=-2"] {
+        let mut terminal = term(640, 384, true);
+        relative_images(&mut terminal);
+        place_kitty_for_delete(&mut terminal, 1, 1, 2, 4, 0);
+        terminal.advance_bytes("\x1b_Ga=p,i=2,p=5,P=1,Q=1,H=3,V=2,c=4,r=2,z=-2\x1b\\");
+        terminal.advance_bytes("\x1b_Ga=p,i=3,p=6,P=2,Q=5,V=4,c=2,r=2\x1b\\");
+        terminal.advance_bytes(format!("\x1b_Ga=d,d={selector}\x1b\\"));
+        assert!(terminal.kitty_image_data_for_id(2).is_none());
+        assert!(terminal.kitty_image_data_for_id(3).is_none());
+        assert_eq!(kitty_internal_keys(&terminal, false), [(1, 1)].into());
+    }
+}
+
+#[test]
+fn relative_roots_follow_reflow_and_can_stay_outside_the_viewport() {
+    let mut terminal = term(640, 384, true);
+    relative_images(&mut terminal);
+    place_kitty_for_delete(&mut terminal, 1, 1, 1, 75, 0);
+    terminal.advance_bytes("\x1b[1;80HX\x1b_Ga=p,i=2,p=5,P=1,Q=1,H=-1,V=4,c=2,r=2\x1b\\");
+    terminal.resize(TerminalSize { rows: 24, cols: 20, pixel_width: 160, pixel_height: 384, dpi: 96 });
+    let view = relative_views(&mut terminal, 2)[0];
+    assert_eq!(view.anchor.column, 13);
+    assert_eq!(view.anchor.row, 7);
+    terminal.advance_bytes("\x1b[24;1H\n\n\n\n\n");
+    assert_eq!(relative_views(&mut terminal, 2)[0], view);
+    terminal.advance_bytes("\x1b[?1049h");
+    assert!(!relative_views(&mut terminal, 2)[0].anchor.alt_screen);
+    terminal.advance_bytes("\x1b[?1049l\x1b[2J\x1b[3J");
+    assert!(terminal.kitty_image_data_for_id(2).is_none());
+}
+
+#[test]
+fn relative_errors_keep_existing_placements_and_replies_identify_the_placement() {
+    let (mut terminal, tap) = term_with_tap(640, 384);
+    relative_images(&mut terminal);
+    place_kitty_for_delete(&mut terminal, 1, 1, 2, 4, 0);
+    terminal.advance_bytes("\x1b_Ga=p,i=2,p=5,P=1,Q=1,c=2,r=2\x1b\\");
+    let view = relative_views(&mut terminal, 2);
+    drain(&mut terminal, &tap);
+    for (keys, code) in [("P=99", "ENOPARENT"), ("P=2,Q=5", "ECYCLE"), ("P=1,Q=1,U=1", "EINVAL")] {
+        terminal.advance_bytes(format!("\x1b_Ga=p,i=2,p=5,{keys},c=2,r=2\x1b\\"));
+        let reply = drain(&mut terminal, &tap);
+        assert!(reply.contains(&format!("i=2,p=5;{code}:")), "unexpected reply: {:?}", reply);
+        assert_eq!(relative_views(&mut terminal, 2), view);
+    }
+    terminal.advance_bytes("\x1b_Ga=p,i=1,I=9,p=1\x1b\\");
+    assert!(drain(&mut terminal, &tap).contains("EINVAL:"));
+}
+
+#[test]
+#[cfg(feature = "use_serde")]
+fn relative_graph_and_cell_origins_survive_repeated_restore_and_image_retransmission() {
+    let mut original = term(640, 384, true);
+    relative_images(&mut original);
+    place_kitty_for_delete(&mut original, 1, 0, 2, 4, 0);
+    original.advance_bytes("\x1b_Ga=p,i=2,P=1,H=3,V=2,c=2,r=2\x1b\\");
+    let expected = relative_views(&mut original, 2);
+    for _ in 0..2 {
+        let state = original.snapshot_kitty_graphics();
+        let mut next = term(640, 384, true);
+        next.restore_with_kitty_placements(original.snapshot(), state.placements).unwrap();
+        next.restore_kitty_relatives(state.relatives.unwrap()).unwrap();
+        assert_eq!(relative_views(&mut next, 2), expected);
+        original = next;
+    }
+    original.advance_bytes(XMIT_2X2);
+    assert!(kitty_internal_keys(&original, false).is_empty());
+    assert!(relative_views(&mut original, 2).is_empty());
+    assert!(original.kitty_image_data_for_id(2).is_none());
 }

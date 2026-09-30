@@ -249,7 +249,11 @@ impl Screen {
         // real information off the top of the scrollback
         let capacity = physical_rows + self.scrollback_size();
         while self.lines.len() > capacity
-            && self.lines.back().map(Line::is_whitespace).unwrap_or(false)
+            && self
+                .lines
+                .back()
+                .map(|line| line.is_whitespace() && !line.has_images())
+                .unwrap_or(false)
         {
             self.lines.pop_back();
         }
@@ -286,7 +290,12 @@ impl Screen {
         // maximized states.
         let cursor_phys = self.phys_row(cursor.y);
         for _ in cursor_phys + 1..self.lines.len() {
-            if self.lines.back().map(Line::is_whitespace).unwrap_or(false) {
+            if self
+                .lines
+                .back()
+                .map(|line| line.is_whitespace() && !line.has_images())
+                .unwrap_or(false)
+            {
                 self.lines.pop_back();
             }
         }

@@ -20,7 +20,7 @@ use super::{
 };
 use crate::color::ColorPalette;
 use crate::screen::Screen;
-use crate::terminalstate::image::PlacementInfo;
+use crate::terminalstate::image::{KittyPlacementSnapshot, PlacementInfo};
 use crate::{CursorPosition, Progress, TerminalSize};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -401,6 +401,17 @@ impl TerminalState {
     /// oldest end, with the stable row offset advanced to match, so stable
     /// row indices keep their meaning.
     pub fn restore(&mut self, snapshot: TerminalSnapshot) -> anyhow::Result<()> {
+        self.restore_with_kitty_placements(snapshot, None)
+    }
+
+    pub fn restore_with_kitty_placements(
+        &mut self,
+        snapshot: TerminalSnapshot,
+        placements: Option<KittyPlacementSnapshot>,
+    ) -> anyhow::Result<()> {
+        if let Some(placements) = &placements {
+            validate_kitty_placements(&snapshot, placements)?;
+        }
         anyhow::ensure!(
             snapshot.version == SNAPSHOT_VERSION,
             "terminal snapshot version {} cannot be restored by a terminal that speaks version {}",
@@ -428,8 +439,10 @@ impl TerminalState {
             })
             .collect();
 
-        restore_screen(&mut self.screen.screen, snapshot.screen, &images)?;
-        restore_screen(&mut self.screen.alt_screen, snapshot.alt_screen, &images)?;
+        restore_screen(&mut self.screen.screen, snapshot.screen, &images,
+            placements.as_ref().map(|p| p.cell_tags[0].as_slice()))?;
+        restore_screen(&mut self.screen.alt_screen, snapshot.alt_screen, &images,
+            placements.as_ref().map(|p| p.cell_tags[1].as_slice()))?;
         self.screen.alt_screen_is_active = snapshot.alt_screen_is_active;
 
         self.pixel_width = snapshot.size.pixel_width;
@@ -509,6 +522,12 @@ impl TerminalState {
             .collect();
 
         self.kitty_img.restore(snapshot.kitty, &images)?;
+        if let Some(placements) = placements {
+            self.kitty_img.next_placement_id = placements.next_id;
+            self.kitty_img.placements = placements.placements.into_iter().map(|(key, info)|
+                (key, super::image::ImagePlacement { info, origin: None })).collect();
+            self.kitty_prune_placements();
+        }
 
         self.seqno = snapshot.seqno;
         self.lost_focus_seqno = snapshot.seqno;
@@ -518,6 +537,34 @@ impl TerminalState {
         self.accumulating_title = None;
         Ok(())
     }
+}
+
+fn validate_kitty_placements(snapshot: &TerminalSnapshot, state: &KittyPlacementSnapshot) -> anyhow::Result<()> {
+    use crate::kitty_relative::PlacementKey;
+    anyhow::ensure!(state.placements.len() <= super::kitty::MAX_PLACEMENTS, "too many Kitty placements");
+    anyhow::ensure!(state.next_id >= u64::from(u32::MAX), "invalid Kitty placement counter");
+    let mut placements = BTreeMap::new();
+    for &(key, info) in &state.placements {
+        anyhow::ensure!(key.placement_id <= state.next_id && snapshot.kitty.id_to_hash.contains_key(&key.image_id),
+            "invalid Kitty placement identity");
+        anyhow::ensure!(placements.insert(key, info).is_none(), "duplicate Kitty placement identity");
+    }
+    for (index, screen) in [&snapshot.screen, &snapshot.alt_screen].iter().enumerate() {
+        let tags = &state.cell_tags[index];
+        anyhow::ensure!(tags.len() == screen.image_cells.len(), "Kitty placement cell count mismatch");
+        for (&tag, cell) in tags.iter().zip(&screen.image_cells) {
+            let Some(image_id) = cell.image_id else {
+                anyhow::ensure!(tag == 0, "non-Kitty image has a placement identity");
+                continue;
+            };
+            let key = PlacementKey { image_id, placement_id: tag };
+            anyhow::ensure!(key.protocol_id() == cell.placement_id.filter(|id| *id != 0),
+                "Kitty placement identity does not match its protocol id");
+            let info = placements.get(&key).ok_or_else(|| anyhow::anyhow!("unknown Kitty placement identity"))?;
+            anyhow::ensure!(info.alt_screen == (index == 1), "Kitty placement is on the wrong screen");
+        }
+    }
+    Ok(())
 }
 
 /// Clones the screen's lines with their pictures detached into `images`.
@@ -583,6 +630,7 @@ fn restore_screen(
     screen: &mut Screen,
     snapshot: ScreenSnapshot,
     images: &HashMap<[u8; 32], Arc<ImageData>>,
+    tags: Option<&[u64]>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         snapshot.physical_rows == screen.physical_rows
@@ -601,7 +649,7 @@ fn restore_screen(
     );
 
     let mut lines = snapshot.lines;
-    for image_cell in snapshot.image_cells {
+    for (index, image_cell) in snapshot.image_cells.into_iter().enumerate() {
         let data = images.get(&image_cell.hash).ok_or_else(|| {
             anyhow::anyhow!(
                 "line {} cell {} refers to a picture the snapshot does not carry",
@@ -634,7 +682,10 @@ fn restore_screen(
                 image_cell.padding_bottom,
                 image_cell.image_id,
                 image_cell.placement_id,
-            )));
+            ).with_placement_tag(tags.map_or(0, |tags| {
+                // Named placements derive their identity from their external id.
+                if tags[index] > u64::from(u32::MAX) { tags[index] } else { 0 }
+            }))));
     }
 
     // The oldest scrollback goes first when this process allows less of

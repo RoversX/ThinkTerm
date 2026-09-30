@@ -117,7 +117,8 @@ fn a_restored_terminal_is_the_same_terminal() {
     assert!(snapshot.alt_screen_is_active);
     assert!(!snapshot.kitty.transmission_in_progress);
 
-    let mut copy = restored(original.snapshot(), 100);
+    let mut copy = terminal(100);
+    copy.restore_with_kitty_placements(original.snapshot(), original.snapshot_kitty_graphics().placements).unwrap();
     assert_eq!(copy.snapshot(), snapshot, "a snapshot of the restore");
     for alt in [false, true] {
         assert_eq!(
@@ -259,7 +260,8 @@ fn a_smaller_scrollback_keeps_the_newest_lines() {
     let offset = snapshot.screen.stable_row_index_offset;
     assert!(carried > 24 + 4, "the script scrolled {carried} lines");
 
-    let copy = restored(snapshot, 4);
+    let mut copy = terminal(4);
+    copy.restore_with_kitty_placements(snapshot, original.snapshot_kitty_graphics().placements).unwrap();
     let screen = copy.screen();
     assert_eq!(screen.lines().len(), 24 + 4, "visible rows plus the allowance");
     assert_eq!(

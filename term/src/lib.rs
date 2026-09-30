@@ -29,6 +29,32 @@ pub use config::TerminalConfiguration;
 
 pub mod input;
 pub use crate::input::*;
+pub mod kitty_animation;
+pub mod kitty_placeholder;
+pub mod kitty_relative;
+pub mod kitty_virtual;
+
+/// Graphics state carried alongside the unchanged legacy terminal snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KittyGraphicsSnapshot {
+    pub playback: kitty_animation::KittyPlaybackSnapshot,
+    pub virtual_images: Vec<kitty_virtual::VirtualImage>,
+    pub image_numbers: Vec<(u32, u32)>,
+    pub placements: Option<KittyPlacementSnapshot>,
+    pub relatives: Option<kitty_relative::RelativeSnapshot>,
+}
+
+/// Web/mobile frame selection, independent of the legacy desktop animator.
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KittyFrameSelection {
+    pub image_id: u32,
+    pub data_generation: u64,
+    pub data_hash: [u8; 32],
+    pub animation: kitty_animation::KittyAnimation,
+    pub virtual_placements: Vec<kitty_virtual::VirtualPlacement>,
+    pub relative_placements: Vec<kitty_relative::RelativeView>,
+}
 
 pub use wezterm_cell::*;
 pub use wezterm_surface::line::*;

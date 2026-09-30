@@ -959,6 +959,12 @@ pub struct KittyImagePlacement {
     /// Give an explicit placement id to this placement.
     /// p=...
     pub placement_id: Option<u32>,
+    /// Parent image and placement, P/Q. Q=0 chooses a placement of P.
+    pub parent_image_id: Option<u32>,
+    pub parent_placement_id: Option<u32>,
+    /// Signed cell offsets from the parent's top-left cell, H/V.
+    pub horizontal_offset: Option<i32>,
+    pub vertical_offset: Option<i32>,
     /// z=...
     pub z_index: Option<i32>,
     /// A virtual placement draws nothing by itself. It registers that the
@@ -980,6 +986,10 @@ impl KittyImagePlacement {
             columns: geti(keys, "c"),
             rows: geti(keys, "r"),
             placement_id: geti(keys, "p"),
+            parent_image_id: geti(keys, "P"),
+            parent_placement_id: geti(keys, "Q"),
+            horizontal_offset: geti(keys, "H"),
+            vertical_offset: geti(keys, "V"),
             do_not_move_cursor: match get(keys, "C") {
                 None | Some("0") => false,
                 Some("1") => true,
@@ -1004,6 +1014,10 @@ impl KittyImagePlacement {
         set(keys, "c", &self.columns);
         set(keys, "r", &self.rows);
         set(keys, "p", &self.placement_id);
+        set(keys, "P", &self.parent_image_id);
+        set(keys, "Q", &self.parent_placement_id);
+        set(keys, "H", &self.horizontal_offset);
+        set(keys, "V", &self.vertical_offset);
 
         if self.do_not_move_cursor {
             keys.insert("C", "1".to_string());
@@ -1043,6 +1057,8 @@ pub enum KittyImageDelete {
         placement_id: Option<u32>,
         delete: bool,
     },
+    /// d='r' or d='R', inclusive image id bounds from x and y.
+    ByImageIdRange { first: u32, last: u32, delete: bool },
 
     /// d='c' or d='C'
     /// Delete all placements that intersect with the current
@@ -1051,7 +1067,12 @@ pub enum KittyImageDelete {
 
     /// d='f' or d='F'
     /// Delete animation frames
-    AnimationFrames { delete: bool },
+    AnimationFrames {
+        image_id: Option<u32>,
+        image_number: Option<u32>,
+        frame_number: Option<u32>,
+        delete: bool,
+    },
 
     /// d='p' or d='P'
     /// Delete all placements that intersect the specified
@@ -1101,8 +1122,18 @@ impl KittyImageDelete {
                 placement_id: geti(keys, "p"),
                 delete,
             }),
+            'r' | 'R' => Some(Self::ByImageIdRange {
+                first: geti(keys, "x")?,
+                last: geti(keys, "y")?,
+                delete,
+            }),
             'c' | 'C' => Some(Self::AtCursorPosition { delete }),
-            'f' | 'F' => Some(Self::AnimationFrames { delete }),
+            'f' | 'F' => Some(Self::AnimationFrames {
+                image_id: geti(keys, "i"),
+                image_number: geti(keys, "I"),
+                frame_number: geti(keys, "r"),
+                delete,
+            }),
             'p' | 'P' => Some(Self::DeleteAt {
                 x: geti(keys, "x")?,
                 y: geti(keys, "y")?,
@@ -1164,8 +1195,16 @@ impl KittyImageDelete {
             Self::AtCursorPosition { delete } => {
                 keys.insert("d", d('c', delete));
             }
-            Self::AnimationFrames { delete } => {
+            Self::ByImageIdRange { first, last, delete } => {
+                keys.insert("d", d('r', delete));
+                keys.insert("x", first.to_string());
+                keys.insert("y", last.to_string());
+            }
+            Self::AnimationFrames { image_id, image_number, frame_number, delete } => {
                 keys.insert("d", d('f', delete));
+                set(keys, "i", image_id);
+                set(keys, "I", image_number);
+                set(keys, "r", frame_number);
             }
             Self::DeleteAt { x, y, delete } => {
                 keys.insert("d", d('p', delete));
@@ -1173,7 +1212,7 @@ impl KittyImageDelete {
                 keys.insert("y", y.to_string());
             }
             Self::DeleteAtZ { x, y, z, delete } => {
-                keys.insert("d", d('p', delete));
+                keys.insert("d", d('q', delete));
                 keys.insert("x", x.to_string());
                 keys.insert("y", y.to_string());
                 keys.insert("z", z.to_string());
@@ -1317,6 +1356,8 @@ pub struct KittyImageFrame {
     /// Zero or omitted values are interpreted as 40ms.
     /// z=...
     pub duration_ms: Option<u32>,
+    /// A negative z, retained separately from the legacy unsigned duration.
+    pub gapless: bool,
 
     /// Composition mode.
     /// Default is AlphaBlending
@@ -1346,6 +1387,7 @@ impl KittyImageFrame {
                 None | Some(0) => None,
                 n => n,
             },
+            gapless: geti::<i32>(keys, "z").is_some_and(|gap| gap < 0),
             composition_mode: match geti(keys, "X") {
                 None | Some(0) => KittyFrameCompositionMode::AlphaBlending,
                 Some(1) => KittyFrameCompositionMode::Overwrite,
@@ -1361,6 +1403,7 @@ impl KittyImageFrame {
         set(keys, "c", &self.base_frame);
         set(keys, "r", &self.frame_number);
         set(keys, "z", &self.duration_ms);
+        if self.gapless { keys.insert("z", "-1".to_string()); }
         match &self.composition_mode {
             KittyFrameCompositionMode::AlphaBlending => {}
             KittyFrameCompositionMode::Overwrite => {
@@ -1368,6 +1411,75 @@ impl KittyImageFrame {
             }
         }
         set(keys, "Y", &self.background_pixel);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "use_serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum KittyAnimationState {
+    Stopped,
+    Loading,
+    Running,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KittyImageAnimationControl {
+    pub image_id: Option<u32>,
+    pub image_number: Option<u32>,
+    /// c: the one-based frame to display now.
+    pub current_frame: Option<u32>,
+    /// r: the one-based frame whose gap is being changed.
+    pub frame_number: Option<u32>,
+    pub state: Option<KittyAnimationState>,
+    /// v: 1 means infinite; otherwise the number of loops plus one.
+    pub loops: Option<u32>,
+    /// z: negative gaps skip the frame; zero leaves its gap unchanged.
+    pub gap_ms: Option<i32>,
+}
+
+impl KittyImageAnimationControl {
+    fn from_keys(keys: &BTreeMap<&str, &str>) -> Option<Self> {
+        fn number<T: core::str::FromStr>(
+            keys: &BTreeMap<&str, &str>,
+            key: &str,
+        ) -> Option<Option<T>> {
+            get(keys, key).map(str::parse).transpose().ok()
+        }
+        Some(Self {
+            image_id: number(keys, "i")?.filter(|n| *n != 0),
+            image_number: number(keys, "I")?.filter(|n| *n != 0),
+            current_frame: number(keys, "c")?.filter(|n| *n != 0),
+            frame_number: number(keys, "r")?.filter(|n| *n != 0),
+            state: match number::<u32>(keys, "s")? {
+                None | Some(0) => None,
+                Some(1) => Some(KittyAnimationState::Stopped),
+                Some(2) => Some(KittyAnimationState::Loading),
+                Some(3) => Some(KittyAnimationState::Running),
+                _ => return None,
+            },
+            loops: number(keys, "v")?.filter(|n| *n != 0),
+            gap_ms: number(keys, "z")?.filter(|n| *n != 0),
+        })
+    }
+
+    fn to_keys(&self, keys: &mut BTreeMap<&'static str, String>) {
+        set(keys, "i", &self.image_id);
+        set(keys, "I", &self.image_number);
+        set(keys, "c", &self.current_frame);
+        set(keys, "r", &self.frame_number);
+        set(keys, "v", &self.loops);
+        set(keys, "z", &self.gap_ms);
+        if let Some(state) = self.state {
+            keys.insert(
+                "s",
+                match state {
+                    KittyAnimationState::Stopped => "1",
+                    KittyAnimationState::Loading => "2",
+                    KittyAnimationState::Running => "3",
+                }
+                .to_string(),
+            );
+        }
     }
 }
 
@@ -1412,6 +1524,11 @@ pub enum KittyImage {
         frame: KittyImageFrameCompose,
         verbosity: KittyImageVerbosity,
     },
+    /// a='a'
+    ControlAnimation {
+        control: KittyImageAnimationControl,
+        verbosity: KittyImageVerbosity,
+    },
 }
 
 impl KittyImage {
@@ -1425,7 +1542,10 @@ impl KittyImage {
                 | Self::TransmitDataAndDisplay { transmit, .. }
                 | Self::Query { transmit, .. }
                 | Self::TransmitFrame { transmit, .. } => &transmit.data,
-                Self::Display { .. } | Self::Delete { .. } | Self::ComposeFrame { .. } => {
+                Self::Display { .. }
+                | Self::Delete { .. }
+                | Self::ComposeFrame { .. }
+                | Self::ControlAnimation { .. } => {
                     return false;
                 }
             };
@@ -1462,7 +1582,8 @@ impl KittyImage {
             | Self::TransmitFrame { .. }
             | Self::Display { .. }
             | Self::Delete { .. }
-            | Self::ComposeFrame { .. } => None,
+            | Self::ComposeFrame { .. }
+            | Self::ControlAnimation { .. } => None,
         }
     }
 
@@ -1475,7 +1596,10 @@ impl KittyImage {
             | Self::TransmitFrame { transmit, .. } => {
                 transmit.data.discard_external_source(reason);
             }
-            Self::Display { .. } | Self::Delete { .. } | Self::ComposeFrame { .. } => {}
+            Self::Display { .. }
+            | Self::Delete { .. }
+            | Self::ComposeFrame { .. }
+            | Self::ControlAnimation { .. } => {}
         }
         #[cfg(not(feature = "kitty-shm"))]
         {
@@ -1492,7 +1616,10 @@ impl KittyImage {
                 | Self::TransmitDataAndDisplay { transmit, .. }
                 | Self::Query { transmit, .. }
                 | Self::TransmitFrame { transmit, .. } => transmit.data.materialized_len(),
-                Self::Display { .. } | Self::Delete { .. } | Self::ComposeFrame { .. } => 0,
+                Self::Display { .. }
+                | Self::Delete { .. }
+                | Self::ComposeFrame { .. }
+                | Self::ControlAnimation { .. } => 0,
             }
         }
         #[cfg(not(feature = "kitty-shm"))]
@@ -1513,7 +1640,10 @@ impl KittyImage {
             | Self::TransmitFrame { transmit, .. } => {
                 transmit.data.materialize_external_source();
             }
-            Self::Display { .. } | Self::Delete { .. } | Self::ComposeFrame { .. } => {}
+            Self::Display { .. }
+            | Self::Delete { .. }
+            | Self::ComposeFrame { .. }
+            | Self::ControlAnimation { .. } => {}
         }
     }
 
@@ -1540,6 +1670,7 @@ impl KittyImage {
             Self::Delete { verbosity, .. } => *verbosity,
             Self::TransmitFrame { verbosity, .. } => *verbosity,
             Self::ComposeFrame { verbosity, .. } => *verbosity,
+            Self::ControlAnimation { verbosity, .. } => *verbosity,
         }
     }
 
@@ -1590,6 +1721,10 @@ impl KittyImage {
                 frame: KittyImageFrame::from_keys(&keys)?,
                 verbosity,
             }),
+            "a" => Some(Self::ControlAnimation {
+                control: KittyImageAnimationControl::from_keys(&keys)?,
+                verbosity,
+            }),
             "c" => Some(Self::ComposeFrame {
                 frame: KittyImageFrameCompose::from_keys(&keys)?,
                 verbosity,
@@ -1621,7 +1756,7 @@ impl KittyImage {
                 verbosity,
                 placement,
             } => {
-                keys.insert("a", "Q".to_string());
+                keys.insert("a", "T".to_string());
                 verbosity.to_keys(keys);
                 placement.to_keys(keys);
                 transmit.to_keys(keys);
@@ -1655,6 +1790,11 @@ impl KittyImage {
                 keys.insert("a", "f".to_string());
                 transmit.to_keys(keys);
                 frame.to_keys(keys);
+                verbosity.to_keys(keys);
+            }
+            Self::ControlAnimation { control, verbosity } => {
+                keys.insert("a", "a".to_string());
+                control.to_keys(keys);
                 verbosity.to_keys(keys);
             }
             Self::ComposeFrame { frame, verbosity } => {
@@ -1699,6 +1839,126 @@ impl Display for KittyImage {
 mod test {
     use super::*;
     use k9::assert_equal as assert_eq;
+
+    #[test]
+    fn kitty_commands_keep_all_keys_when_forwarded() {
+        for command in [
+            "Ga=T,i=9,f=32,s=1,v=1,p=3,C=1;/wAA/w==",
+            "Ga=d,d=q,x=3,y=4,z=-2", "Ga=d,d=Q,x=3,y=4,z=-2",
+            "Ga=d,d=r,x=7,y=19", "Ga=d,d=R,x=7,y=19",
+            "Ga=d,d=f,i=9,I=7,r=3", "Ga=d,d=F,I=7,r=0",
+            "Ga=d,d=n,I=7,p=3", "Ga=d,d=N,I=7,p=0",
+        ] {
+            let parsed = KittyImage::parse_apc(command.as_bytes()).unwrap();
+            let encoded = parsed.to_string();
+            assert_eq!(KittyImage::parse_apc(&encoded.as_bytes()[2..]), Some(parsed), "{command}");
+        }
+        assert!(matches!(
+            KittyImage::parse_apc(b"Ga=d,d=R,x=7,y=19"),
+            Some(KittyImage::Delete { what: KittyImageDelete::ByImageIdRange { first: 7, last: 19, delete: true }, .. })
+        ));
+        assert!(matches!(
+            KittyImage::parse_apc(b"Ga=d,d=f,i=9,r=3"),
+            Some(KittyImage::Delete { what: KittyImageDelete::AnimationFrames { image_id: Some(9), frame_number: Some(3), .. }, .. })
+        ));
+    }
+
+    #[test]
+    fn kitty_relative_placements_keep_parent_and_signed_offsets() {
+        for action in ["p", "T"] {
+            let command = format!("Ga={action},i=9,p=3,P=8,Q=2,H=-2147483648,V=2147483647,C=0,x=1,y=2,w=3,h=4,X=5,Y=6,c=7,r=8,z=-9,f=32,s=1,v=1;/wAA/w==");
+            let parsed = KittyImage::parse_apc(command.as_bytes()).unwrap();
+            let placement = match &parsed {
+                KittyImage::Display { placement, .. }
+                | KittyImage::TransmitDataAndDisplay { placement, .. } => placement,
+                other => panic!("unexpected command: {:?}", other),
+            };
+            assert_eq!(placement.parent_image_id, Some(8));
+            assert_eq!(placement.parent_placement_id, Some(2));
+            assert_eq!(placement.horizontal_offset, Some(i32::MIN));
+            assert_eq!(placement.vertical_offset, Some(i32::MAX));
+            assert!(!placement.do_not_move_cursor);
+            let encoded = parsed.to_string();
+            assert_eq!(KittyImage::parse_apc(&encoded.as_bytes()[2..]), Some(parsed));
+        }
+        let Some(KittyImage::Display { placement, .. }) = KittyImage::parse_apc(b"Ga=p,i=9,P=8") else { panic!("expected placement") };
+        assert_eq!(placement.parent_image_id, Some(8));
+        assert_eq!(placement.parent_placement_id, None);
+        assert_eq!(placement.horizontal_offset, None);
+        assert_eq!(placement.vertical_offset, None);
+    }
+
+    #[test]
+    fn kitty_animation_controls_keep_signed_gaps_and_round_trip() {
+        for (state, value) in [
+            (KittyAnimationState::Stopped, 1),
+            (KittyAnimationState::Loading, 2),
+            (KittyAnimationState::Running, 3),
+        ] {
+            let parsed = KittyImage::parse_apc(
+                format!("Ga=a,i=9,I=7,c=3,r=2,s={value},v=5,z=-1,q=2").as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(
+                parsed,
+                KittyImage::ControlAnimation {
+                    control: KittyImageAnimationControl {
+                        image_id: Some(9),
+                        image_number: Some(7),
+                        current_frame: Some(3),
+                        frame_number: Some(2),
+                        state: Some(state),
+                        loops: Some(5),
+                        gap_ms: Some(-1),
+                    },
+                    verbosity: KittyImageVerbosity::Quiet,
+                }
+            );
+            let encoded = parsed.to_string();
+            assert_eq!(
+                KittyImage::parse_apc(&encoded.as_bytes()[2..]),
+                Some(parsed.clone())
+            );
+            assert_eq!(parsed.replacing_transmit_image_id(), None);
+            assert!(!parsed.has_external_data_source());
+            assert_eq!(parsed.materialized_len(), 0);
+        }
+    }
+
+    #[test]
+    fn kitty_animation_control_zero_means_unspecified() {
+        assert_eq!(
+            KittyImage::parse_apc(b"Ga=a,i=0,I=0,c=0,r=0,s=0,v=0,z=0"),
+            KittyImage::parse_apc(b"Ga=a")
+        );
+        let Some(KittyImage::ControlAnimation { control, .. }) =
+            KittyImage::parse_apc(b"Ga=a,i=1,v=1,z=2147483647")
+        else {
+            panic!("valid animation control")
+        };
+        assert_eq!(control.loops, Some(1));
+        assert_eq!(control.gap_ms, Some(i32::MAX));
+    }
+
+    #[test]
+    fn kitty_animation_controls_reject_invalid_numbers() {
+        for field in [
+            "s=4",
+            "s=-1",
+            "v=-1",
+            "c=-1",
+            "r=4294967296",
+            "i=invalid",
+            "I=-1",
+            "z=2147483648",
+            "z=-2147483649",
+        ] {
+            assert!(
+                KittyImage::parse_apc(format!("Ga=a,{field}").as_bytes()).is_none(),
+                "{field}"
+            );
+        }
+    }
 
     #[cfg(feature = "kitty-shm")]
     #[test]
@@ -1855,6 +2115,7 @@ mod test {
                     composition_mode: KittyFrameCompositionMode::Overwrite,
                     background_pixel: None,
                     duration_ms: None,
+                    gapless: false,
                 },
             }
         );
