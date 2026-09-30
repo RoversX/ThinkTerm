@@ -1003,8 +1003,12 @@ impl Line {
                 if end > cells.len() {
                     cells.resize_with(end, Cell::blank);
                 }
-                for (offset, byte) in text.bytes().enumerate().skip(1) {
-                    cells.set_cell(idx + offset, Cell::new(byte as char, attr.clone()), false);
+                // Printable ASCII (checked above) is one column wide in every
+                // Unicode version; don't look the width up per character.
+                for offset in 1..text.len() {
+                    let cell =
+                        Cell::new_grapheme_with_width(&text[offset..offset + 1], 1, attr.clone());
+                    cells.set_cell(idx + offset, cell, false);
                 }
             }
             _ => {
