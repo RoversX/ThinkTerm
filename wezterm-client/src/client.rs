@@ -326,12 +326,17 @@ async fn process_unilateral_inner_async(
     // never publishes an eviction status (its PaneRemoved handler is
     // evict-only), and a retained entry would seed a *reused* remote pane
     // id with the dead pane's agent.
+    // Foreground programs are retained the same way, for the same reason.
     match &decoded.pdu {
         Pdu::AgentStatusChanged(codec::AgentStatusChanged { pane_id, status }) => {
             client_domain.record_remote_agent_status(*pane_id, status.clone());
         }
+        Pdu::ForegroundProgramChanged(codec::ForegroundProgramChanged { pane_id, program }) => {
+            client_domain.record_remote_foreground_program(*pane_id, program.clone());
+        }
         Pdu::PaneRemoved(_) => {
             client_domain.record_remote_agent_status(pane_id, None);
+            client_domain.record_remote_foreground_program(pane_id, None);
         }
         _ => {}
     }
@@ -342,12 +347,16 @@ async fn process_unilateral_inner_async(
     let local_pane_id = match client_domain.remote_to_local_pane_id(pane_id) {
         Some(p) => p,
         None => {
-            // Not for agent status though: the server publishes those for
-            // every pane it owns, other workspaces included, so unmapped
-            // is routine and implies no topology change worth a resync.
-            // The status was recorded into the snapshot above; the mirror
-            // seeds from it whenever it materializes.
-            if matches!(decoded.pdu, Pdu::AgentStatusChanged(_)) {
+            // Not for agent status or foreground programs though: the
+            // server publishes those for every pane it owns, other
+            // workspaces included, so unmapped is routine and implies no
+            // topology change worth a resync. The value was recorded into
+            // the snapshot above; the mirror seeds from it whenever it
+            // materializes.
+            if matches!(
+                decoded.pdu,
+                Pdu::AgentStatusChanged(_) | Pdu::ForegroundProgramChanged(_)
+            ) {
                 return Ok(());
             }
             log::debug!("got {decoded:?}, pane not found locally, resync");
@@ -2375,6 +2384,11 @@ impl Client {
         get_agent_statuses,
         GetAgentStatuses = (),
         GetAgentStatusesResponse
+    );
+    rpc!(
+        get_foreground_programs,
+        GetForegroundPrograms = (),
+        GetForegroundProgramsResponse
     );
     rpc!(spawn_v2, SpawnV2, SpawnResponse);
     rpc!(split_pane, SplitPane, SpawnResponse);

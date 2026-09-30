@@ -74,6 +74,8 @@ impl SessionEvents for Events {
         }
     }
     fn agent_status_changed(&self, _pane: HostPaneId) {}
+    // The page draws no tab icons yet.
+    fn foreground_program_changed(&self, _pane: HostPaneId) {}
     fn pane_removed(&self, pane: HostPaneId) {
         self.mark(pane);
     }

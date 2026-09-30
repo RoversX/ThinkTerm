@@ -78,6 +78,7 @@ pub struct ClientPane {
     unseen_output: Mutex<bool>,
     progress: Mutex<Progress>,
     agent_status: Mutex<Option<thinkterm_proto::AgentStatus>>,
+    foreground_program: Mutex<Option<thinkterm_proto::ForegroundProgram>>,
 }
 
 impl ClientPane {
@@ -86,6 +87,11 @@ impl ClientPane {
     /// whether a repaint is warranted.
     pub fn set_agent_status(&self, status: Option<thinkterm_proto::AgentStatus>) {
         *self.agent_status.lock() = status.filter(|s| s.within_budget());
+    }
+
+    /// The same, for the foreground program.
+    pub fn set_foreground_program(&self, program: Option<thinkterm_proto::ForegroundProgram>) {
+        *self.foreground_program.lock() = program.filter(|program| program.within_budget());
     }
 
     /// Ask the (single) sender worker to bring the server to `palette`.
@@ -267,6 +273,7 @@ impl ClientPane {
             // existed, and nothing re-delivers it until the agent next
             // changes state.
             agent_status: Mutex::new(client.remote_agent_status(remote_pane_id)),
+            foreground_program: Mutex::new(client.remote_foreground_program(remote_pane_id)),
         }
     }
 
@@ -373,6 +380,25 @@ impl ClientPane {
                     self.host.events().agent_status_changed(self.local_pane_id);
                 }
             }
+            Pdu::ForegroundProgramChanged(codec::ForegroundProgramChanged { program, .. }) => {
+                let program = program.filter(|program| program.within_budget());
+                // Coalesced at send time like the agent status: only a real
+                // change is worth a repaint, or a forward one hop on.
+                let changed = {
+                    let mut slot = self.foreground_program.lock();
+                    if *slot == program {
+                        false
+                    } else {
+                        *slot = program;
+                        true
+                    }
+                };
+                if changed {
+                    self.host
+                        .events()
+                        .foreground_program_changed(self.local_pane_id);
+                }
+            }
             Pdu::PaneRemoved(PaneRemoved { pane_id }) => {
                 log::trace!("remote pane {} has been removed", pane_id);
                 self.session.set_dead(true);
@@ -380,6 +406,7 @@ impl ClientPane {
                 // the windows lock contended); the dead mirror must not
                 // keep reporting an agent to the panel meanwhile.
                 *self.agent_status.lock() = None;
+                *self.foreground_program.lock() = None;
                 self.host.events().pane_removed(self.local_pane_id);
             }
             Pdu::PaneFocused(PaneFocused { pane_id }) => {
@@ -712,6 +739,10 @@ impl Pane for ClientPane {
 
     fn agent_status(&self) -> Option<thinkterm_proto::AgentStatus> {
         self.agent_status.lock().clone()
+    }
+
+    fn foreground_program(&self) -> Option<thinkterm_proto::ForegroundProgram> {
+        self.foreground_program.lock().clone()
     }
 
     fn send_paste(&self, text: &str) -> anyhow::Result<()> {

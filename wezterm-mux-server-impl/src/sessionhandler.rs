@@ -1095,6 +1095,7 @@ fn web_peer_may_send(pdu: &Pdu) -> bool {
             | Pdu::SetClientView(_)
             | Pdu::SetFrontendAccessMode(_)
             | Pdu::GetAgentStatuses(_)
+            | Pdu::GetForegroundPrograms(_)
             | Pdu::PluginFrame(_)
     )
 }
@@ -1518,6 +1519,33 @@ impl SessionHandler {
                             Ok(Pdu::GetAgentStatusesResponse(GetAgentStatusesResponse {
                                 statuses,
                             }))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
+            Pdu::GetForegroundPrograms(GetForegroundPrograms {}) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            // iter_panes rather than the observer's own
+                            // registry: a chained mux reports what it
+                            // mirrors as well as what it observes itself.
+                            let programs = Mux::get()
+                                .iter_panes()
+                                .into_iter()
+                                .filter_map(|pane| {
+                                    let program = pane.foreground_program()?;
+                                    Some(ForegroundProgramEntry {
+                                        pane_id: pane.pane_id(),
+                                        program,
+                                    })
+                                })
+                                .collect();
+                            Ok(Pdu::GetForegroundProgramsResponse(
+                                GetForegroundProgramsResponse { programs },
+                            ))
                         },
                         send_response,
                     )
@@ -2612,6 +2640,8 @@ impl SessionHandler {
             Pdu::Pong(_) => {}
             Pdu::AgentStatusChanged { .. }
             | Pdu::GetAgentStatusesResponse { .. }
+            | Pdu::ForegroundProgramChanged { .. }
+            | Pdu::GetForegroundProgramsResponse { .. }
             | Pdu::ListPanesResponse { .. }
             | Pdu::SetApplicationPalette { .. }
             | Pdu::DefaultPalette { .. }

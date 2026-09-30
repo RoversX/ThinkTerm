@@ -185,6 +185,10 @@ impl SessionEvents for MuxEvents {
         Mux::get().notify(MuxNotification::AgentStatusChanged(pane));
     }
 
+    fn foreground_program_changed(&self, pane: HostPaneId) {
+        Mux::get().notify(MuxNotification::ForegroundProgramChanged(pane));
+    }
+
     fn pane_removed(&self, _pane: HostPaneId) {
         let mux = Mux::get();
         mux.prune_dead_windows();

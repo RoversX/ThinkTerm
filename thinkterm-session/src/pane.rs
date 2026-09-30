@@ -1368,6 +1368,7 @@ mod tests {
         }
         fn alert(&self, _pane: HostPaneId, _alert: wezterm_term::Alert) {}
         fn agent_status_changed(&self, _pane: HostPaneId) {}
+        fn foreground_program_changed(&self, _pane: HostPaneId) {}
         fn pane_removed(&self, _pane: HostPaneId) {}
         fn pane_focused(&self, _pane: HostPaneId) {}
         fn input_recorded(&self) {}

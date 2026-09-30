@@ -119,6 +119,8 @@ pub trait SessionEvents {
     fn alert(&self, pane: HostPaneId, alert: Alert);
     /// The agent status the server tracks for the pane changed.
     fn agent_status_changed(&self, pane: HostPaneId);
+    /// The program the server sees leading the pane's terminal changed.
+    fn foreground_program_changed(&self, pane: HostPaneId);
     /// The server removed the pane; its mirror is dead.
     fn pane_removed(&self, pane: HostPaneId);
     /// The server moved focus to the pane.

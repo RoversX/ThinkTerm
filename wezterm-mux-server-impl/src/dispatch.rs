@@ -638,6 +638,16 @@ fn item_for_notification(n: MuxNotification) -> Option<Item> {
                 status,
             }))
         }
+        MuxNotification::ForegroundProgramChanged(pane_id) => {
+            // Read at send time, as the agent status is: a backlog of
+            // queued notifications then all carry the current program.
+            let program = Mux::get()
+                .get_pane(pane_id)
+                .and_then(|p| p.foreground_program());
+            write(Pdu::ForegroundProgramChanged(
+                codec::ForegroundProgramChanged { pane_id, program },
+            ))
+        }
         MuxNotification::AssignClipboard {
             pane_id,
             selection,

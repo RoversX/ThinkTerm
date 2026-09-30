@@ -855,6 +855,8 @@ pub struct ClientInner {
     /// cold-start fetch ran before the panes existed and the push path
     /// had nothing to deliver to — each side assumed the other covered it.
     remote_agent_statuses: Mutex<HashMap<PaneId, thinkterm_proto::AgentStatus>>,
+    /// The same, for the program leading each remote pane's terminal.
+    remote_foreground_programs: Mutex<HashMap<PaneId, thinkterm_proto::ForegroundProgram>>,
     /// Remote panes whose KillPane is on its way. A resync that lands in
     /// between must not mirror them back: the local mirror is gone already,
     /// and a fresh one would get a window of its own.
@@ -1142,6 +1144,36 @@ impl ClientInner {
             .cloned()
     }
 
+    /// Record one foreground program into the remote-keyed snapshot, on
+    /// the same terms as [`Self::record_remote_agent_status`].
+    pub fn record_remote_foreground_program(
+        &self,
+        remote_pane_id: PaneId,
+        program: Option<thinkterm_proto::ForegroundProgram>,
+    ) {
+        let mut map = self.remote_foreground_programs.lock().unwrap();
+        match program.filter(|program| program.within_budget()) {
+            Some(program) => {
+                map.insert(remote_pane_id, program);
+            }
+            None => {
+                map.remove(&remote_pane_id);
+            }
+        }
+    }
+
+    /// The last foreground program the server reported for a remote pane.
+    pub fn remote_foreground_program(
+        &self,
+        remote_pane_id: PaneId,
+    ) -> Option<thinkterm_proto::ForegroundProgram> {
+        self.remote_foreground_programs
+            .lock()
+            .unwrap()
+            .get(&remote_pane_id)
+            .cloned()
+    }
+
     pub fn remote_to_local_pane_id(&self, remote_pane_id: PaneId) -> Option<TabId> {
         let mut pane_map = self.remote_to_local_pane.lock().unwrap();
         let remote_server_id = self.client.remote_server_id();
@@ -1313,6 +1345,7 @@ impl ClientInner {
         self.remote_to_local_stack.lock().unwrap().clear();
         self.reported_viewports.lock().unwrap().clear();
         self.remote_agent_statuses.lock().unwrap().clear();
+        self.remote_foreground_programs.lock().unwrap().clear();
     }
 
     /// Kill every local mirror of this domain: the terminals they showed
@@ -1385,8 +1418,10 @@ impl ClientInner {
         // The replacement server allocates pane ids from scratch, so the
         // retained statuses describe panes that no longer exist. Left in
         // place they would seed the replacement's mirrors (created before
-        // the post-replacement fetch) with the dead server's agents.
+        // the post-replacement fetch) with the dead server's agents, and
+        // its programs.
         self.remote_agent_statuses.lock().unwrap().clear();
+        self.remote_foreground_programs.lock().unwrap().clear();
         mirrors
     }
 
@@ -1672,6 +1707,7 @@ impl ClientInner {
             remote_to_local_tab: Mutex::new(HashMap::new()),
             remote_to_local_pane: Mutex::new(HashMap::new()),
             remote_agent_statuses: Mutex::new(HashMap::new()),
+            remote_foreground_programs: Mutex::new(HashMap::new()),
             pending_kills: Mutex::new(HashSet::new()),
             remote_viewports: Mutex::new(HashMap::new()),
             remote_access: Mutex::new(None),
@@ -2469,6 +2505,17 @@ impl ClientDomain {
         }
     }
 
+    /// See [`ClientInner::record_remote_foreground_program`].
+    pub fn record_remote_foreground_program(
+        &self,
+        remote_pane_id: PaneId,
+        program: Option<thinkterm_proto::ForegroundProgram>,
+    ) {
+        if let Some(inner) = self.inner() {
+            inner.record_remote_foreground_program(remote_pane_id, program);
+        }
+    }
+
     pub fn remote_to_local_window_id(&self, remote_window_id: WindowId) -> Option<WindowId> {
         let inner = self.inner()?;
         inner.remote_to_local_window(remote_window_id)
@@ -2945,6 +2992,9 @@ impl ClientDomain {
         if let Err(err) = client.fetch_agent_statuses().await {
             log::warn!("failed to fetch agent statuses on reattach: {err:#}");
         }
+        if let Err(err) = client.fetch_foreground_programs().await {
+            log::warn!("failed to fetch foreground programs on reattach: {err:#}");
+        }
 
         if server_replaced && !host_replaced {
             let active_remote_tabs = replacement_session
@@ -3275,6 +3325,15 @@ impl ClientDomain {
                     );
                 }
             }
+            // The same for tab icons, on their own switch.
+            if mux::foreground_program::enabled() {
+                if let Err(err) = self.fetch_foreground_programs().await {
+                    log::warn!(
+                        "failed to refresh foreground programs from {}: {err:#}",
+                        self.config.name()
+                    );
+                }
+            }
             return Ok(ResyncOutcome::Applied);
         }
         Ok(ResyncOutcome::NoClient)
@@ -3359,6 +3418,54 @@ impl ClientDomain {
         // subscriber callback, so notifying here is safe.
         for pane_id in changed {
             Mux::notify_from_any_thread(MuxNotification::AgentStatusChanged(pane_id));
+        }
+        Ok(())
+    }
+
+    /// Reconcile the mirrored foreground programs with the server's, on the
+    /// same terms as [`Self::fetch_agent_statuses`]: the snapshot is kept by
+    /// remote pane id for mirrors not yet made, and is authoritative both
+    /// ways for the ones that exist. It converges against live pushes for
+    /// the same reason: every change the server publishes is followed by
+    /// its own ForegroundProgramChanged on the same channel.
+    pub async fn fetch_foreground_programs(&self) -> anyhow::Result<()> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let response = inner.client.get_foreground_programs().await?;
+        let remote: std::collections::HashMap<PaneId, thinkterm_proto::ForegroundProgram> =
+            response
+                .programs
+                .into_iter()
+                .map(|entry| (entry.pane_id, entry.program))
+                .collect();
+        *inner.remote_foreground_programs.lock().unwrap() = remote.clone();
+        let mut desired: std::collections::HashMap<PaneId, thinkterm_proto::ForegroundProgram> =
+            remote
+                .into_iter()
+                .filter_map(|(remote_pane, program)| {
+                    inner
+                        .remote_to_local_pane_id(remote_pane)
+                        .map(|local| (local, program))
+                })
+                .collect();
+        let mux = Mux::get();
+        let mut changed = Vec::new();
+        for pane in mux.iter_panes() {
+            if pane.domain_id() != self.local_domain_id {
+                continue;
+            }
+            let Some(client_pane) = pane.downcast_ref::<ClientPane>() else {
+                continue;
+            };
+            let target = desired.remove(&pane.pane_id());
+            if pane.foreground_program() != target {
+                client_pane.set_foreground_program(target);
+                changed.push(pane.pane_id());
+            }
+        }
+        for pane_id in changed {
+            Mux::notify_from_any_thread(MuxNotification::ForegroundProgramChanged(pane_id));
         }
         Ok(())
     }
@@ -5921,6 +6028,12 @@ impl ClientDomain {
         if let Err(err) = self.fetch_agent_statuses().await {
             log::warn!(
                 "failed to fetch agent statuses from {}: {err:#}",
+                self.config.name()
+            );
+        }
+        if let Err(err) = self.fetch_foreground_programs().await {
+            log::warn!(
+                "failed to fetch foreground programs from {}: {err:#}",
                 self.config.name()
             );
         }
