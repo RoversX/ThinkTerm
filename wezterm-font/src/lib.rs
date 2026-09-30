@@ -734,6 +734,27 @@ impl FontConfigInner {
         override_italic: bool,
     ) -> anyhow::Result<Rc<LoadedFont>> {
         let config = self.config.borrow();
+        self.make_entity_font_from(
+            myself,
+            &config,
+            entity,
+            override_font_size,
+            override_weight,
+            override_italic,
+        )
+    }
+
+    /// `make_entity_font_impl` from `config` rather than the configuration
+    /// this was last handed.
+    fn make_entity_font_from(
+        &self,
+        myself: &Rc<Self>,
+        config: &ConfigHandle,
+        entity: Entity,
+        override_font_size: Option<f64>,
+        override_weight: Option<config::FontWeight>,
+        override_italic: bool,
+    ) -> anyhow::Result<Rc<LoadedFont>> {
         let make_bold = entity != Entity::CommandPalette;
         let (sys_font, sys_size) = self.compute_title_font(&config, make_bold);
 
@@ -775,13 +796,25 @@ impl FontConfigInner {
             text_style
         };
 
+        self.build_font(myself, &config, text_style, font_size)
+    }
+
+    /// `text_style` at `font_size` points, as a new font owned by the
+    /// caller; nothing here keeps it.
+    fn build_font(
+        &self,
+        myself: &Rc<Self>,
+        config: &ConfigHandle,
+        text_style: &TextStyle,
+        font_size: f64,
+    ) -> anyhow::Result<Rc<LoadedFont>> {
         let dpi = *self.dpi.borrow() as u32;
         let pixel_size = (font_size * dpi as f64 / 72.0) as u16;
 
         let attributes = text_style.font_with_fallback();
         let (handles, _loaded) = self.resolve_font_helper_impl(&attributes, pixel_size)?;
 
-        let shaper = new_shaper(&*config, &handles)?;
+        let shaper = new_shaper(config, &handles)?;
 
         let metrics = shaper.metrics(font_size, dpi).with_context(|| {
             format!(
@@ -1326,6 +1359,42 @@ impl FontConfiguration {
 
     pub fn pane_select_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
         self.inner.pane_select_font(&self.inner)
+    }
+
+    /// The terminal's font at `font_size` points as `config` describes it,
+    /// built for the caller and not cached here: a preview decides how long
+    /// it lives. `config` rather than the one this holds, which is as old
+    /// as the window that made it.
+    pub fn terminal_font_uncached(
+        &self,
+        config: &ConfigHandle,
+        font_size: f64,
+    ) -> anyhow::Result<Rc<LoadedFont>> {
+        self.inner.build_font(
+            &self.inner,
+            config,
+            &config.font,
+            font_size.clamp(6.0, 72.0),
+        )
+    }
+
+    /// `command_palette_font_with_size_and_weight` as `config` describes it,
+    /// built for the caller and not cached here, like
+    /// `terminal_font_uncached`.
+    pub fn command_palette_font_uncached(
+        &self,
+        config: &ConfigHandle,
+        font_size: f64,
+        font_weight: u16,
+    ) -> anyhow::Result<Rc<LoadedFont>> {
+        self.inner.make_entity_font_from(
+            &self.inner,
+            config,
+            Entity::CommandPalette,
+            Some(font_size.clamp(6.0, 72.0)),
+            (font_weight > 0).then(|| config::FontWeight::from_opentype_weight(font_weight)),
+            false,
+        )
     }
 
     pub fn char_select_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
