@@ -2,10 +2,11 @@ use super::*;
 use crate::connection::ConnectionOps;
 use crate::parameters::{self, Parameters};
 use crate::{
-    Appearance, Clipboard, ClipboardContents, DeadKeyStatus, Dimensions, FolderPickerOptions,
-    Handled, KeyCode, KeyEvent, Modifiers, MouseButtons, MouseCursor, MouseEvent, MouseEventKind,
-    MousePress, Point, RawKeyEvent, Rect, RequestedWindowGeometry, ResolvedGeometry, ScreenPoint,
-    ScreenRect, ULength, WindowDecorations, WindowEvent, WindowEventSender, WindowOps, WindowState,
+    Appearance, Clipboard, ClipboardContents, DeadKeyStatus, Dimensions, FilePickerOptions,
+    FolderPickerOptions, Handled, KeyCode, KeyEvent, Modifiers, MouseButtons, MouseCursor,
+    MouseEvent, MouseEventKind, MousePress, Point, RawKeyEvent, Rect, RequestedWindowGeometry,
+    ResolvedGeometry, ScreenPoint, ScreenRect, ULength, WindowDecorations, WindowEvent,
+    WindowEventSender, WindowOps, WindowState,
 };
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
@@ -268,7 +269,10 @@ unsafe fn pick_folder_dialog(
     result
 }
 
-unsafe fn pick_app_dialog(hwnd: HWND) -> anyhow::Result<Option<PathBuf>> {
+unsafe fn pick_file_dialog(
+    hwnd: HWND,
+    picker_options: &FilePickerOptions,
+) -> anyhow::Result<Option<PathBuf>> {
     let coinit = CoInitializeEx(
         null_mut(),
         COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
@@ -291,10 +295,13 @@ unsafe fn pick_app_dialog(hwnd: HWND) -> anyhow::Result<Option<PathBuf>> {
             "CoCreateInstance(FileOpenDialog)",
         )?;
 
-        let title = wide_null("Choose Application");
-        let choose = wide_null("Choose");
-        let filter_name = wide_null("Applications (*.exe)");
-        let filter_spec = wide_null("*.exe");
+        let title = wide_null(&picker_options.title);
+        let choose = wide_null(&picker_options.prompt);
+        let filter_name = wide_null(&format!(
+            "{} (*.{})",
+            picker_options.kind, picker_options.extension
+        ));
+        let filter_spec = wide_null(&format!("*.{}", picker_options.extension));
         let filters = [COMDLG_FILTERSPEC {
             pszName: filter_name.as_ptr(),
             pszSpec: filter_spec.as_ptr(),
@@ -1327,13 +1334,30 @@ impl WindowOps for Window {
     }
 
     fn pick_app_async(&self, callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
+        self.pick_file_async_with_options(
+            FilePickerOptions {
+                title: "Choose Application".to_string(),
+                prompt: "Choose".to_string(),
+                extension: "exe".to_string(),
+                kind: "Applications".to_string(),
+                directory: None,
+            },
+            callback,
+        );
+    }
+
+    fn pick_file_async_with_options(
+        &self,
+        options: FilePickerOptions,
+        callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>,
+    ) {
         let hwnd = self.0 .0;
         promise::spawn::spawn(async move {
             let path = unsafe {
-                match pick_app_dialog(hwnd) {
+                match pick_file_dialog(hwnd, &options) {
                     Ok(path) => path,
                     Err(err) => {
-                        log::warn!("failed to show app picker: {err:#}");
+                        log::warn!("failed to show file picker: {err:#}");
                         None
                     }
                 }

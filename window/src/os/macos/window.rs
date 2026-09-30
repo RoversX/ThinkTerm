@@ -10,11 +10,12 @@ use crate::os::macos::menu::{Menu, MenuItem, RepresentedItem};
 use crate::parameters::{Border, Parameters, TitleBar};
 use crate::{
     Clipboard, ClipboardContents, Connection, ContextMenuItem, DeadKeyStatus, Dimensions,
-    FolderPickerOptions, Handled, Image, KeyCode, KeyEvent, Modifiers, MouseButtons, MouseCursor,
-    MouseEvent, MouseEventKind, MousePress, NativeTextInputSnapshot, Point, PreciseScrollDelta,
-    RawKeyEvent, Rect, RequestedWindowGeometry, ResizeIncrement, ResolvedGeometry, ScreenPoint,
-    ScrollPhase, Size, TextCheckCapabilities, TextCheckIssue, TextCheckRequest, TextCheckResponse,
-    ULength, WindowDecorations, WindowEvent, WindowEventSender, WindowOps, WindowState,
+    FilePickerOptions, FolderPickerOptions, Handled, Image, KeyCode, KeyEvent, Modifiers,
+    MouseButtons, MouseCursor, MouseEvent, MouseEventKind, MousePress, NativeTextInputSnapshot,
+    Point, PreciseScrollDelta, RawKeyEvent, Rect, RequestedWindowGeometry, ResizeIncrement,
+    ResolvedGeometry, ScreenPoint, ScrollPhase, Size, TextCheckCapabilities, TextCheckIssue,
+    TextCheckRequest, TextCheckResponse, ULength, WindowDecorations, WindowEvent,
+    WindowEventSender, WindowOps, WindowState,
 };
 use anyhow::{anyhow, bail, ensure};
 use async_trait::async_trait;
@@ -1238,6 +1239,23 @@ impl WindowOps for Window {
     }
 
     fn pick_app_async(&self, callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
+        self.pick_file_async_with_options(
+            FilePickerOptions {
+                title: "Choose Application".to_string(),
+                prompt: "Choose".to_string(),
+                extension: "app".to_string(),
+                kind: "Application".to_string(),
+                directory: Some(PathBuf::from("/Applications")),
+            },
+            callback,
+        );
+    }
+
+    fn pick_file_async_with_options(
+        &self,
+        options: FilePickerOptions,
+        callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>,
+    ) {
         unsafe {
             let _pool = NSAutoreleasePool::new(nil);
             let panel: id = msg_send![class!(NSOpenPanel), openPanel];
@@ -1246,15 +1264,21 @@ impl WindowOps for Window {
             let () = msg_send![*panel, setCanChooseDirectories: NO];
             let () = msg_send![*panel, setAllowsMultipleSelection: NO];
             let () = msg_send![*panel, setResolvesAliases: YES];
-            let app_type = nsstring("app");
-            let types: id = msg_send![class!(NSArray), arrayWithObject: *app_type];
+            let file_type = nsstring(&options.extension);
+            let types: id = msg_send![class!(NSArray), arrayWithObject: *file_type];
             let () = msg_send![*panel, setAllowedFileTypes: types];
-            let applications_dir = nsstring("/Applications");
-            let dir_url: id =
-                msg_send![class!(NSURL), fileURLWithPath: *applications_dir isDirectory: YES];
-            let () = msg_send![*panel, setDirectoryURL: dir_url];
-            let title = nsstring("Choose Application");
-            let prompt = nsstring("Choose");
+            // Bound to a local so the NSString outlives the NSURL made from
+            // it, as in the folder picker.
+            if let Some(directory) = options.directory.as_ref().and_then(|dir| dir.to_str()) {
+                let directory = nsstring(directory);
+                let dir_url: id =
+                    msg_send![class!(NSURL), fileURLWithPath: *directory isDirectory: YES];
+                if dir_url != nil {
+                    let () = msg_send![*panel, setDirectoryURL: dir_url];
+                }
+            }
+            let title = nsstring(&options.title);
+            let prompt = nsstring(&options.prompt);
             let () = msg_send![*panel, setTitle: *title];
             let () = msg_send![*panel, setPrompt: *prompt];
 

@@ -258,6 +258,11 @@ pub fn pick_folder_async_with_options(
 /// File picker used to choose an application (a .desktop entry or an
 /// executable); the caller normalizes the selection.
 pub async fn pick_app() -> anyhow::Result<Option<PathBuf>> {
+    pick_file("Choose Application", None).await
+}
+
+/// Open-file picker. Unfiltered: the caller checks what it was given.
+pub async fn pick_file(title: &str, accept_label: Option<&str>) -> anyhow::Result<Option<PathBuf>> {
     let connection = zbus::ConnectionBuilder::session()?.build().await?;
     let proxy = PortalFileChooserProxy::new(&connection)
         .await
@@ -265,19 +270,22 @@ pub async fn pick_app() -> anyhow::Result<Option<PathBuf>> {
 
     let mut options = HashMap::new();
     options.insert("modal", Value::from(true));
+    if let Some(label) = accept_label {
+        options.insert("accept_label", Value::from(label));
+    }
 
     let handle = proxy
-        .OpenFile("", "Choose Application", options)
+        .OpenFile("", title, options)
         .or(async {
             async_io::Timer::after(std::time::Duration::from_secs(1)).await;
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                "Timed out opening xdg-desktop-portal app picker",
+                "Timed out opening xdg-desktop-portal file picker",
             )
             .into())
         })
         .await
-        .context("Opening xdg-desktop-portal app picker")?;
+        .context("Opening xdg-desktop-portal file picker")?;
 
     let request = PortalRequestProxy::builder(&connection)
         .path(handle)?
@@ -295,13 +303,30 @@ pub async fn pick_app() -> anyhow::Result<Option<PathBuf>> {
             None
         })
         .await
-        .ok_or_else(|| anyhow::anyhow!("Timed out waiting for app picker response"))?;
-    let args = signal.args().context("decode app picker response")?;
+        .ok_or_else(|| anyhow::anyhow!("Timed out waiting for file picker response"))?;
+    let args = signal.args().context("decode file picker response")?;
     if args.response != 0 {
         return Ok(None);
     }
 
     first_file_uri_to_path(&args.results)
+}
+
+pub fn pick_file_async_with_options(
+    options: crate::FilePickerOptions,
+    callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>,
+) {
+    promise::spawn::spawn(async move {
+        let path = match pick_file(&options.title, Some(options.prompt.as_str())).await {
+            Ok(path) => path,
+            Err(err) => {
+                log::warn!("failed to show xdg-desktop-portal file picker: {err:#}");
+                None
+            }
+        };
+        callback(path);
+    })
+    .detach();
 }
 
 pub fn pick_app_async(callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {

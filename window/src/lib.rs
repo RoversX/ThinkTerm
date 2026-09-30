@@ -277,6 +277,20 @@ impl Default for FolderPickerOptions {
     }
 }
 
+/// What a file picker offers and how it is worded: one kind of file, named
+/// by its extension.
+#[derive(Debug, Clone)]
+pub struct FilePickerOptions {
+    pub title: String,
+    pub prompt: String,
+    /// The one extension on offer, without its dot: `svg`.
+    pub extension: String,
+    /// What that kind of file is called, where a platform labels its filter.
+    pub kind: String,
+    /// Where the picker opens; best-effort, as for folders.
+    pub directory: Option<PathBuf>,
+}
+
 impl ContextMenuIcon {
     pub fn sf_symbol_name(self) -> &'static str {
         match self {
@@ -796,6 +810,15 @@ pub trait WindowOps {
     /// Show a native picker for choosing an application (macOS: .app bundle,
     /// Windows: .exe, Linux: .desktop entry or executable).
     fn pick_app_async(&self, callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>) {
+        callback(None);
+    }
+
+    /// Show a native picker for one file of the kind `options` names.
+    fn pick_file_async_with_options(
+        &self,
+        _options: FilePickerOptions,
+        callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>,
+    ) {
         callback(None);
     }
 
