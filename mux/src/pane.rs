@@ -24,6 +24,12 @@ use wezterm_term::{
 static PANE_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub use thinkterm_proto::{PaneId, Pattern, SearchResult};
 
+/// Keeps optional frame metadata flowing while a downstream viewer needs it.
+/// Dropping the last subscription releases the upstream subscription and cache.
+pub trait KittyFrameSubscription: std::fmt::Debug + Send + Sync {}
+
+pub type KittyImageFuture = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<thinkterm_proto::image::GetImageCellResponse>> + Send>>;
+
 pub fn alloc_pane_id() -> PaneId {
     PANE_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
 }
@@ -378,6 +384,15 @@ pub trait Pane: Downcast + Send + Sync {
     /// (images, placements, bytes) of pictures this pane holds, for logs.
     fn image_stats(&self) -> (usize, usize, usize) {
         (0, 0, 0)
+    }
+    fn kitty_frame_selections(&self, known: Option<u64>) -> Option<(u64, u64, Vec<wezterm_term::KittyFrameSelection>)> {
+        (known != Some(0)).then(|| (0, 0, Vec::new()))
+    }
+    fn get_kitty_image(&self, _request: thinkterm_proto::image::GetKittyImage) -> KittyImageFuture {
+        Box::pin(async { anyhow::bail!("pane does not provide canonical Kitty images") })
+    }
+    fn subscribe_kitty_frames(&self) -> Option<Box<dyn KittyFrameSubscription>> {
+        None
     }
     fn palette(&self) -> ColorPalette;
     /// Palette state explicitly established by the application. `None`

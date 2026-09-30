@@ -9,11 +9,11 @@ use codec::{DecodedPdu, Pdu};
 use futures::channel::oneshot;
 use futures::io::{AsyncRead, AsyncWrite};
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 use thinkterm_session::connection::{Answer, SerialTable};
+use thinkterm_session::byte_queue::ByteQueue;
 use thinkterm_session::host::{LinkError, PduLink};
 use thinkterm_session::input::PaneLink;
 use wasm_bindgen::prelude::*;
@@ -23,10 +23,15 @@ use web_sys::{BinaryType, MessageEvent, WebSocket};
 pub const SUBPROTOCOL: &str = "thinkterm.v1";
 pub const TOKEN_PROTOCOL_PREFIX: &str = "tt-token.";
 
+// Allow one maximum codec payload plus its three varint header fields.
+// Independent chunk accounting bounds overhead for tiny WebSocket messages.
+const MAX_RECEIVE_BYTES: usize = codec::MAX_PDU_PAYLOAD + 30;
+const MAX_RECEIVE_CHUNKS: usize = 4096;
+
 /// The socket's bytes, in order, as the codec's async reader wants them.
 struct Socket {
     ws: WebSocket,
-    incoming: RefCell<VecDeque<u8>>,
+    incoming: RefCell<ByteQueue>,
     waker: RefCell<Option<Waker>>,
     open: Cell<bool>,
     closed: Cell<bool>,
@@ -50,6 +55,7 @@ impl Socket {
         self.ws.set_onclose(None);
         self.ws.set_onerror(None);
         self._closures.borrow_mut().clear();
+        self.incoming.borrow_mut().clear();
         self.closed.set(true);
         // Nothing is listening any more, so a socket still open is a socket
         // the server is holding a session for. 1000 is a normal close.
@@ -78,6 +84,9 @@ impl AsyncRead for SocketReader {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
         let mut queue = self.0.incoming.borrow_mut();
         if queue.is_empty() {
             if self.0.closed.get() {
@@ -86,11 +95,7 @@ impl AsyncRead for SocketReader {
             *self.0.waker.borrow_mut() = Some(cx.waker().clone());
             return Poll::Pending;
         }
-        let n = queue.len().min(buf.len());
-        for (dst, src) in buf.iter_mut().zip(queue.drain(..n)) {
-            *dst = src;
-        }
-        Poll::Ready(Ok(n))
+        Poll::Ready(Ok(queue.read(buf)))
     }
 }
 
@@ -172,7 +177,7 @@ impl WsLink {
         ws.set_binary_type(BinaryType::Arraybuffer);
         let socket = Rc::new(Socket {
             ws,
-            incoming: RefCell::new(VecDeque::new()),
+            incoming: RefCell::new(ByteQueue::new(MAX_RECEIVE_BYTES, MAX_RECEIVE_CHUNKS)),
             waker: RefCell::new(None),
             open: Cell::new(false),
             closed: Cell::new(false),
@@ -188,10 +193,21 @@ impl WsLink {
         {
             let s = socket.clone();
             let c = Closure::<dyn FnMut(JsValue)>::new(move |ev: JsValue| {
+                if s.closed.get() { return; }
                 let ev: MessageEvent = ev.unchecked_into();
                 if let Ok(buf) = ev.data().dyn_into::<js_sys::ArrayBuffer>() {
-                    let bytes = js_sys::Uint8Array::new(&buf).to_vec();
-                    s.incoming.borrow_mut().extend(bytes);
+                    let accepted = s.incoming.borrow_mut().push_with(buf.byte_length() as usize, || {
+                        js_sys::Uint8Array::new(&buf).to_vec()
+                    });
+                    if let Err(err) = accepted {
+                        *s.close_reason.borrow_mut() = err.to_string();
+                        s.closed.set(true);
+                        s.incoming.borrow_mut().clear();
+                        // Browser close() permits 1000 or application codes
+                        // 3000..4999. The reader retires closures after this
+                        // callback returns and reports the explicit reason.
+                        let _ = s.ws.close_with_code(4009);
+                    }
                     wake(&s);
                 }
             });
@@ -286,6 +302,7 @@ impl WsLink {
         // serials.
         self.0.serials.borrow_mut().drain();
         self.0.closed_early.borrow_mut().take();
+        *self.0.pending_pushes.borrow_mut() = Vec::new();
         let old = std::mem::replace(&mut *self.0.socket.borrow_mut(), socket);
         old.retire();
         self.spawn_reader();
@@ -300,6 +317,7 @@ impl WsLink {
     /// as the tab is open -- a session nobody is watching.
     pub fn shutdown(&self) {
         self.0.serials.borrow_mut().drain();
+        *self.0.pending_pushes.borrow_mut() = Vec::new();
         self.0.socket.borrow().retire();
     }
 
@@ -381,6 +399,7 @@ impl WsLink {
                             if r.is_empty() { format!("{err:#}") } else { r }
                         };
                         socket.closed.set(true);
+                        socket.retire();
                         // A reconnect already replaced this socket: its
                         // reader is live and this one is just retiring, so
                         // it must not drain the new socket's serials or
@@ -391,6 +410,7 @@ impl WsLink {
                         // Every request still waiting fails now; the
                         // senders drop and the receivers see Canceled.
                         link.0.serials.borrow_mut().drain();
+                        *link.0.pending_pushes.borrow_mut() = Vec::new();
                         // Taken out before it is called and put back
                         // after: the handler reaches straight back into
                         // this link to start reconnecting, so the borrow

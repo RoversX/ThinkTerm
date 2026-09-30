@@ -27,9 +27,24 @@ use thinkterm_proto::{PaneId, RenderableDimensions, StableCursorPosition};
 use url::Url;
 use wezterm_term::{KeyCode, KeyModifiers, Line, MouseEvent, StableRowIndex, TerminalSize};
 
+type SceneImageKey = (crate::host::ImageDomainKey, [u8; 32]);
+
+/// How long a scene picture that could not be fetched waits before it is
+/// asked for again, unless its metadata changes first. A busy pane or a
+/// dropped link is not the last word, and a static placement's metadata
+/// may never change.
+const SCENE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[derive(Default)]
+struct SceneImages {
+    pending: std::collections::HashSet<SceneImageKey>,
+    failed: Vec<(SceneImageKey, (u64, u64), crate::clock::Timestamp)>,
+}
+
 pub struct PaneSession<H: SessionHost> {
     host: Arc<H>,
     images: Arc<Lock<ImageStore>>,
+    scene_images: Lock<SceneImages>,
     state: Lock<PaneState>,
     render_deltas: Lock<RenderDeltaQueue>,
     /// Everything this pane was given and the server has not answered,
@@ -91,6 +106,7 @@ impl<H: SessionHost> PaneSession<H> {
         Arc::new(Self {
             host,
             images,
+            scene_images: Default::default(),
             state: Lock::new(state),
             render_deltas: Lock::new(RenderDeltaQueue::default()),
             inputs: Default::default(),
@@ -106,6 +122,59 @@ impl<H: SessionHost> PaneSession<H> {
 
     fn now(&self) -> crate::clock::Timestamp {
         self.host.clock().now()
+    }
+
+    /// Canonical pictures used by scene placements outside the row cache.
+    /// Four outstanding requests per pane bound work; each completion wakes
+    /// the painter, which asks for any visible pictures still missing.
+    pub fn scene_image(self: &Arc<Self>, image_id: u32, hash: [u8; 32], generation: u64, revision: u64) -> Option<Arc<termwiz::image::ImageData>> {
+        let domain = self.host.image_domain();
+        let held = {
+            let mut images = self.images.lock();
+            images.touch(self.now());
+            images.get(&(domain, hash))
+        };
+        if held.as_ref().is_some_and(|data| data.generation() >= generation) || self.is_dead() { return held; }
+        let request = codec::GetImageCell { pane_id: self.remote_pane_id, line_idx: 0, cell_idx: 0,
+            data_hash: hash, data_generation: generation,
+            have_frames: held.as_ref().map_or(0, |data| crate::images::frame_count(&data.data())) };
+        if !matches!(self.host.image_request(request.clone(), Some(image_id)), Pdu::GetKittyImage(_)) { return held; }
+        {
+            let now = self.now();
+            let mut pending = self.scene_images.lock();
+            pending.failed.retain(|(key, g, at)| key.0 == domain && (*key != (domain, hash) || *g == (generation, revision))
+                && now.saturating_duration_since(*at) < SCENE_RETRY_AFTER);
+            if pending.failed.iter().any(|(key, g, _)| *key == (domain, hash) && *g == (generation, revision))
+                || pending.pending.len() >= 4 || !pending.pending.insert((domain, hash)) { return held; }
+        }
+        let host = Arc::clone(&self.host);
+        let weak = Arc::downgrade(self);
+        let pending = PendingSceneImage { pane: weak.clone(), key: (domain, hash) };
+        let old = held.clone();
+        self.host.spawner().spawn_detached(Box::pin(async move {
+            if host.image_domain() != domain || weak.upgrade().is_none_or(|pane| pane.is_dead()) { return; }
+            let data = crate::hydrate::fetch_image(&*host, old, request, Some(image_id)).await;
+            let pane = weak.upgrade();
+            if let Some(pane) = &pane {
+                if host.image_domain() == domain && !pane.is_dead() {
+                    let wanted = data.as_ref().is_some_and(|data| data.hash() == hash && data.generation() >= generation);
+                    // A newer picture than the one asked for is kept as well:
+                    // the metadata naming it is on its way.
+                    if let Some(data) = data.filter(|data| data.hash() != hash || data.generation() >= generation) {
+                        crate::images::file_image(&pane.images, domain, data);
+                    }
+                    if !wanted {
+                        let now = pane.now();
+                        let mut state = pane.scene_images.lock();
+                        if state.failed.len() == crate::images::MAX_IMAGES { state.failed.remove(0); }
+                        state.failed.push(((domain, hash), (generation, revision), now));
+                    }
+                }
+            }
+            drop(pending);
+            if let Some(pane) = pane { host.events().pane_output(pane.host_pane_id); }
+        }));
+        held
     }
 
     pub fn remote_pane_id(&self) -> PaneId {
@@ -731,9 +800,9 @@ impl<H: SessionHost> PaneSession<H> {
             !has_newer,
         )
         .await;
-        // Rows are only left out when pictures were not fetched, which only
-        // happens with a newer push queued behind this one.
-        debug_assert!(has_newer || left_out.is_empty());
+        // A newer push can supersede image rows, and an image-domain change
+        // during hydration can discard them even without another push. In
+        // either case, recover any rows that the queue does not already carry.
         if !left_out.is_empty() {
             let carried = self.render_deltas.lock().rows_carried();
             for row in left_out {
@@ -1248,6 +1317,22 @@ impl<H: SessionHost> PaneSession<H> {
 /// dropped without finishing cannot leave every later push waiting.
 struct DrainingDeltas<H: SessionHost>(Weak<PaneSession<H>>);
 
+struct PendingSceneImage<H: SessionHost> {
+    pane: Weak<PaneSession<H>>,
+    key: SceneImageKey,
+}
+
+impl<H: SessionHost> Drop for PendingSceneImage<H> {
+    fn drop(&mut self) {
+        if let Some(pane) = self.pane.upgrade() {
+            let mut pending = pane.scene_images.lock();
+            pending.pending.remove(&self.key);
+            if pending.pending.is_empty() { pending.pending = Default::default(); }
+            if pending.failed.is_empty() { pending.failed = Vec::new(); }
+        }
+    }
+}
+
 impl<H: SessionHost> Drop for DrainingDeltas<H> {
     fn drop(&mut self) {
         if let Some(pane) = self.0.upgrade() {
@@ -1412,6 +1497,7 @@ mod tests {
         rows_asked: Cell<usize>,
         image: RefCell<Option<Arc<ImageData>>>,
         image_frames_from: Cell<u32>,
+        refuse_by_id: Cell<bool>,
         line_reply_ready: RefCell<Option<Rc<Cell<bool>>>>,
         image_reply_ready: RefCell<Option<Rc<Cell<bool>>>>,
     }
@@ -1421,7 +1507,7 @@ mod tests {
             self.asked.borrow_mut().push(pdu.pdu_name());
             let ready = match &pdu {
                 Pdu::GetLines(_) => self.line_reply_ready.borrow().clone(),
-                Pdu::GetImageCell(_) => self.image_reply_ready.borrow().clone(),
+                Pdu::GetImageCell(_) | Pdu::GetKittyImage(_) => self.image_reply_ready.borrow().clone(),
                 _ => None,
             };
             let answer = match pdu {
@@ -1468,6 +1554,14 @@ mod tests {
                     pane_id: req.pane_id,
                     is_alive: true,
                 }),
+                Pdu::GetKittyImage(_) if self.refuse_by_id.get() => Pdu::ErrorResponse(codec::ErrorResponse {
+                    reason: "unknown request".to_string(),
+                }),
+                Pdu::GetKittyImage(req) => Pdu::GetImageCellResponse(GetImageCellResponse {
+                    pane_id: req.pane_id, data: self.image.borrow().clone(),
+                    data_generation: self.image.borrow().as_ref().map_or(0, |image| image.generation()),
+                    frames_from: self.image_frames_from.get(),
+                }),
                 Pdu::GetImageCell(req) => Pdu::GetImageCellResponse(GetImageCellResponse {
                     pane_id: req.pane_id,
                     data: self.image.borrow().clone(),
@@ -1505,6 +1599,8 @@ mod tests {
     }
 
     struct TestHost {
+        canonical_images: Cell<bool>,
+        image_domain: Cell<usize>,
         clock: TestClock,
         spawner: TestSpawner,
         events: TestEvents,
@@ -1532,9 +1628,139 @@ mod tests {
         fn config(&self) -> &TestConfig {
             &self.config
         }
-        fn image_domain(&self) -> crate::host::ImageDomainKey {
-            1
+        fn image_request(&self, request: codec::GetImageCell, image_id: Option<u32>) -> Pdu {
+            if let Some(image_id) = image_id.filter(|_| self.canonical_images.get()) {
+                return Pdu::GetKittyImage(codec::GetKittyImage {
+                    pane_id: request.pane_id, image_id, data_hash: request.data_hash,
+                    have_frames: request.have_frames, image_epoch: None,
+                });
+            }
+            Pdu::GetImageCell(request)
         }
+        fn image_domain(&self) -> crate::host::ImageDomainKey {
+            self.image_domain.get()
+        }
+    }
+
+    fn scene_picture(pixel: u8) -> Arc<ImageData> {
+        Arc::new(ImageData::with_data(termwiz::image::ImageDataType::new_single_frame_content_hashed(1, 1, vec![pixel; 4])))
+    }
+
+    #[test]
+    fn scene_fetches_share_pixels_bound_pending_work_and_release_cancelled_requests() {
+        let (host, pane) = session(&[]);
+        let picture = scene_picture(7);
+        *host.link.image.borrow_mut() = Some(picture.clone());
+        assert!(pane.scene_image(2, picture.hash(), 0, 1).is_none());
+        assert!(host.spawner.0.borrow().is_empty(), "legacy peers cannot fetch a scene image by cell zero");
+        host.canonical_images.set(true);
+        for _ in 0..10 { assert!(pane.scene_image(2, picture.hash(), 0, 1).is_none()); }
+        assert_eq!(host.spawner.0.borrow().len(), 1);
+        host.spawner.run_all();
+        let held = pane.scene_image(2, picture.hash(), 0, 1).unwrap();
+        assert!(Arc::ptr_eq(&picture, &held));
+        assert_eq!(host.events.outputs.get(), 1);
+        assert_eq!(pane.scene_images.lock().pending.capacity(), 0);
+        for id in 10..20 { pane.scene_image(id, [id as u8; 32], 0, 1); }
+        assert_eq!(host.spawner.0.borrow().len(), 4);
+        assert_eq!(pane.scene_images.lock().pending.len(), 4);
+        host.spawner.0.borrow_mut().clear();
+        assert_eq!(pane.scene_images.lock().pending.capacity(), 0);
+        pane.scene_image(10, [10; 32], 0, 1);
+        assert_eq!(host.spawner.0.borrow().len(), 1);
+    }
+
+    #[test]
+    fn absent_or_wrong_scene_pixels_wait_before_they_are_fetched_again() {
+        for response in [None, Some(scene_picture(8))] {
+            let (host, pane) = session(&[]);
+            host.canonical_images.set(true);
+            let picture = scene_picture(7);
+            *host.link.image.borrow_mut() = response.clone();
+            pane.scene_image(2, picture.hash(), 0, 1);
+            host.spawner.run_all();
+            let requests = host.link.asked.borrow().len();
+            for _ in 0..10 { assert!(pane.scene_image(2, picture.hash(), 0, 1).is_none()); }
+            assert!(host.spawner.0.borrow().is_empty());
+            assert_eq!(host.link.asked.borrow().len(), requests);
+            if let Some(newer) = &response {
+                assert!(pane.images.lock().get(&(host.image_domain(), newer.hash())).is_some());
+            }
+            // Not for good: a failure is asked about again after a while.
+            host.clock.0.set(SCENE_RETRY_AFTER.as_micros() as u64);
+            pane.scene_image(2, picture.hash(), 0, 1);
+            assert_eq!(host.spawner.0.borrow().len(), 1);
+            host.spawner.run_all();
+            *host.link.image.borrow_mut() = Some(picture.clone());
+            pane.scene_image(2, picture.hash(), 0, 2);
+            host.spawner.run_all();
+            assert!(pane.scene_image(2, picture.hash(), 0, 2).is_some());
+            assert_eq!(pane.scene_images.lock().failed.capacity(), 0);
+        }
+    }
+
+    #[test]
+    fn a_refused_fetch_by_id_asks_by_the_cell() {
+        let (host, pane) = session(&[]);
+        host.canonical_images.set(true);
+        host.link.refuse_by_id.set(true);
+        let picture = scene_picture(7);
+        *host.link.image.borrow_mut() = Some(picture.clone());
+        let request = codec::GetImageCell { pane_id: 0, line_idx: 0, cell_idx: 0, data_hash: picture.hash(), data_generation: 0, have_frames: 0 };
+        let fetched = spin_on(crate::hydrate::fetch_image(&*host, None, request, Some(2)));
+        assert!(fetched.is_some_and(|data| data.hash() == picture.hash()));
+        let asked = host.link.asked.borrow();
+        assert_eq!(asked[asked.len() - 2..], ["GetKittyImage", "GetImageCell"]);
+        drop(asked);
+        drop(pane);
+    }
+
+    #[test]
+    fn old_scene_work_cannot_start_or_install_pixels_after_reconnect_or_pane_drop() {
+        for start in [false, true] {
+            for dropped in [false, true] {
+                let (host, pane) = session(&[]);
+                host.canonical_images.set(true);
+                let picture = scene_picture(7);
+                *host.link.image.borrow_mut() = Some(picture.clone());
+                let ready = Rc::new(Cell::new(false));
+                *host.link.image_reply_ready.borrow_mut() = Some(ready.clone());
+                pane.scene_image(2, picture.hash(), 0, 1);
+                let mut task = host.spawner.0.borrow_mut().pop().unwrap();
+                if start { assert!(task.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending()); }
+                let images = pane.images.clone();
+                let weak = Arc::downgrade(&pane);
+                if dropped { drop(pane); assert!(weak.upgrade().is_none()); }
+                else { host.image_domain.set(2); }
+                ready.set(true);
+                spin_on(task);
+                assert!(images.lock().get(&(1, picture.hash())).is_none());
+                assert!(images.lock().get(&(2, picture.hash())).is_none());
+                if !start { assert!(host.link.asked.borrow().is_empty()); }
+                if let Some(pane) = weak.upgrade() { assert_eq!(pane.scene_images.lock().pending.capacity(), 0); }
+            }
+        }
+    }
+
+    #[test]
+    fn a_late_canonical_image_reply_cannot_rewind_pixels_and_legacy_fetch_behavior_is_unchanged() {
+        use termwiz::image::ImageDataType;
+        let (host, _) = session(&[]);
+        let held = Arc::new(ImageData::with_data(ImageDataType::new_single_frame_content_hashed(1, 1, vec![1; 4])));
+        held.set_generation(9);
+        let fresh = Arc::new(ImageData::with_data_and_hash(ImageDataType::new_single_frame_content_hashed(1, 1, vec![2; 4]), held.hash()));
+        fresh.set_generation(8);
+        *host.link.image.borrow_mut() = Some(fresh);
+        let request = codec::GetImageCell { pane_id: 9, line_idx: 0, cell_idx: 0, data_hash: held.hash(), data_generation: 8, have_frames: 0 };
+        host.canonical_images.set(true);
+        let result = spin_on(crate::hydrate::fetch_image(&*host, Some(held.clone()), request.clone(), Some(4))).unwrap();
+        assert!(Arc::ptr_eq(&held, &result));
+        assert_eq!(held.generation(), 9);
+        assert!(matches!(&*held.data(), ImageDataType::Rgba8 { data, .. } if data == &[1; 4]));
+        host.canonical_images.set(false);
+        spin_on(crate::hydrate::fetch_image(&*host, Some(held.clone()), request, Some(4))).unwrap();
+        assert_eq!(held.generation(), 8);
+        assert!(matches!(&*held.data(), ImageDataType::Rgba8 { data, .. } if data == &[2; 4]));
     }
 
     fn dims() -> RenderableDimensions {
@@ -1570,6 +1796,8 @@ mod tests {
         scrollback_lines: usize,
     ) -> (Arc<TestHost>, Arc<PaneSession<TestHost>>) {
         let host = Arc::new(TestHost {
+            canonical_images: Cell::new(false),
+            image_domain: Cell::new(1),
             clock: TestClock(Cell::new(0)),
             spawner: TestSpawner::default(),
             events: TestEvents::default(),
@@ -1732,7 +1960,7 @@ mod tests {
                 }, held.hash(),
             )));
             host.link.image_frames_from.set(from);
-            let fetched = spin_on(crate::hydrate::fetch_image(&*host, Some(held.clone()), request.clone())).unwrap();
+            let fetched = spin_on(crate::hydrate::fetch_image(&*host, Some(held.clone()), request.clone(), None)).unwrap();
             assert!(Arc::ptr_eq(&held, &fetched));
             assert_eq!(crate::images::frame_count(&held.data()), 2);
         }
@@ -1742,7 +1970,7 @@ mod tests {
         ));
         *host.link.image.borrow_mut() = Some(bad);
         host.link.image_frames_from.set(0);
-        assert!(spin_on(crate::hydrate::fetch_image(&*host, Some(held.clone()), request)).is_none());
+        assert!(spin_on(crate::hydrate::fetch_image(&*host, Some(held.clone()), request, None)).is_none());
         assert!(held.data().is_well_formed());
     }
 
@@ -1944,6 +2172,57 @@ mod tests {
             Some(LineEntry::Line(_))
         ));
         assert_eq!(host.events.outputs.get(), 1);
+    }
+
+    #[test]
+    fn an_image_reply_from_before_reconnect_cannot_repopulate_the_store() {
+        let (host, session) = image_session();
+        let image_ready = Rc::new(Cell::new(false));
+        *host.link.image_reply_ready.borrow_mut() = Some(Rc::clone(&image_ready));
+        let (mut task, ready) = pending_image_line_fetch(&host, &session);
+        ready.set(true);
+        assert!(task.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        assert_eq!(*host.link.asked.borrow(), ["GetLines", "GetImageCell"]);
+        host.image_domain.set(2);
+        session.images.lock().clear();
+        image_ready.set(true);
+        spin_on(task);
+        assert_eq!(session.images.lock().footprint(), (0, 0));
+        assert!(!matches!(session.state().lines.peek(&0), Some(LineEntry::Line(_))));
+    }
+
+    #[test]
+    fn image_domain_change_during_a_push_recovers_rows_and_keeps_the_drain_running() {
+        let (host, session) = image_session();
+        let ready = Rc::new(Cell::new(false));
+        *host.link.image_reply_ready.borrow_mut() = Some(Rc::clone(&ready));
+        let mut line = Line::from_text("image", &CellAttributes::default(), 1, None);
+        line.cells_mut()[0].attrs_mut().attach_image(Box::new(ImageCell::new(
+            TextureCoordinate::new_f32(0., 0.),
+            TextureCoordinate::new_f32(1., 1.),
+            host.link.image.borrow().as_ref().unwrap().clone(),
+        )));
+        let mut update = delta(1, false, false);
+        update.bonus_lines = vec![(0, line)].into();
+        session.queue_render_delta(update);
+        let mut task = host.spawner.0.borrow_mut().pop().unwrap();
+        assert!(task.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        host.image_domain.set(2);
+        ready.set(true);
+        spin_on(task);
+        assert_eq!(session.current_seqno(), 1);
+        assert_eq!(session.images.lock().footprint(), (0, 0));
+        host.spawner.run_all();
+        assert_eq!(*host.link.asked.borrow(), ["GetImageCell", "GetLines", "GetImageCell"]);
+        assert!(matches!(session.state().lines.peek(&0), Some(LineEntry::Line(line))
+            if line.visible_cells().next().unwrap().attrs().images().is_some()));
+        session.queue_render_delta(delta(2, false, true));
+        host.spawner.run_all();
+        assert_eq!(session.current_seqno(), 2);
+        assert!(session.is_mouse_grabbed());
+        session.get_lines(0..1);
+        assert!(!session.render_looks_stalled_in(0..1));
+        assert!(host.spawner.0.borrow().is_empty(), "no repeated fetch after recovery");
     }
 
     /// S12: the screen switch, the mouse grab and the cache flush land in

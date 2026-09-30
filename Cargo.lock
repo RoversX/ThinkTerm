@@ -8712,6 +8712,7 @@ dependencies = [
  "thinkterm-proto",
  "thiserror 1.0.69",
  "url",
+ "wezterm-blob-leases 0.1.1",
  "wezterm-term",
 ]
 
@@ -8812,6 +8813,7 @@ dependencies = [
  "console_error_panic_hook",
  "euclid",
  "futures",
+ "guillotiere",
  "js-sys",
  "log",
  "nucleo-matcher",

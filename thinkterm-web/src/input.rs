@@ -78,6 +78,12 @@ fn wheel_input(ev: &WheelEvent) -> WheelInput {
 }
 
 pub fn install(app: Rc<WebApp>, canvas: &HtmlCanvasElement, textarea: &HtmlTextAreaElement) {
+    if let Some(document) = web_sys::window().and_then(|window| window.document()) {
+        app.visibility_changed(!document.hidden());
+        let app = Rc::clone(&app);
+        let target = document.clone();
+        listen::<Event>(&target, "visibilitychange", move |_| app.visibility_changed(!document.hidden()));
+    }
     let window = web_sys::window().expect("window");
 
     {

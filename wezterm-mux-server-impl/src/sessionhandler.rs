@@ -107,6 +107,11 @@ pub(crate) struct PerPane {
     /// Images already sent for this pane, so a fetch can be answered even
     /// after the cell they were attached to has moved on.
     sent_images: crate::sent_images::SentImages,
+    frame_control: bool,
+    frame_revision: Option<u64>,
+    scene_seqno: u64,
+    frame_epoch: u64,
+    frame_subscription: Option<Box<dyn mux::pane::KittyFrameSubscription>>,
     /// A push task exists for this pane and has not yet read the pane.
     push_scheduled: bool,
     /// Terminal input from this connection for this pane, in the order it
@@ -183,6 +188,17 @@ struct InputSource {
 }
 
 impl PerPane {
+    fn set_frame_control(&mut self, subscribe: bool) -> u64 {
+        self.frame_control = subscribe;
+        self.frame_revision = None;
+        self.scene_seqno = 0;
+        self.frame_epoch += 1;
+        if !subscribe {
+            self.frame_subscription = None;
+        }
+        self.frame_epoch
+    }
+
     /// Claim the one push slot; false when a push is already on its way,
     /// which will carry whatever the caller wanted sent.
     fn claim_push(&mut self) -> bool {
@@ -356,6 +372,7 @@ fn read_pane_changes(
     pane: &Arc<dyn Pane>,
     last: &LastSent,
     force_with_input_serial: Option<InputSerial>,
+    scene_seqno: u64,
 ) -> Option<PaneReading> {
     let mut changed = false;
     let mouse_grabbed = pane.is_mouse_grabbed();
@@ -402,23 +419,27 @@ fn read_pane_changes(
         changed = true;
     }
 
-    if !changed && !force_with_input_serial.is_some() {
-        return None;
-    }
+    let sequence_only = !changed && force_with_input_serial.is_none();
+    if sequence_only && !((last.seqno as u64) < scene_seqno && seqno as u64 >= scene_seqno) { return None; }
 
-    // Figure out what we're going to send as dirty lines vs bonus lines
-    let viewport_range =
-        dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex;
+    let bonus_lines = if sequence_only {
+        // A relative placement can move without touching text or the cursor.
+        // Acknowledge its terminal sequence without copying unchanged rows.
+        Vec::new()
+    } else {
+        let viewport_range =
+            dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex;
+        let (first_line, lines) = pane.get_lines(viewport_range);
+        let mut bonus_lines = select_dirty_lines(first_line, lines, &mut all_dirty_lines);
 
-    let (first_line, lines) = pane.get_lines(viewport_range);
-    let mut bonus_lines = select_dirty_lines(first_line, lines, &mut all_dirty_lines);
-
-    // Always send the cursor's row, as that tends to the busiest and we don't
-    // have a sequencing concept for our idea of the remote state.
-    let (cursor_line_idx, mut lines) = pane.get_lines(cursor_position.y..cursor_position.y + 1);
-    let mut cursor_line = lines.remove(0);
-    cursor_line.compress_for_scrollback();
-    bonus_lines.push((cursor_line_idx, cursor_line));
+        // Always send the cursor's row with ordinary changes, as that tends
+        // to be the busiest row.
+        let (cursor_line_idx, mut lines) = pane.get_lines(cursor_position.y..cursor_position.y + 1);
+        let mut cursor_line = lines.remove(0);
+        cursor_line.compress_for_scrollback();
+        bonus_lines.push((cursor_line_idx, cursor_line));
+        bonus_lines
+    };
 
     Some(PaneReading {
         mouse_grabbed,
@@ -751,6 +772,11 @@ fn apply_pane_input(
     Ok(Pdu::UnitResponse(UnitResponse {}))
 }
 
+fn relative_scene_seqno(selections: &[wezterm_term::KittyFrameSelection]) -> u64 {
+    selections.iter().flat_map(|image| &image.relative_placements)
+        .map(|placement| placement.source_seqno).max().unwrap_or(0)
+}
+
 /// Read `pane` and push what changed. Nothing of the pane is read while
 /// `per_pane` is locked (see `LastSent`); this runs on the main thread,
 /// where every writer of a `PerPane`'s state runs, so what is read out of
@@ -766,11 +792,14 @@ fn maybe_push_pane_changes(
     // palette from taking over client rendering. Send it before line changes
     // so a real application override is installed before those lines paint.
     let application_palette = pane.palette_override();
-    let (needs_palette, last) = {
+    let (needs_palette, last, frame_control, frame_revision, mut scene_seqno) = {
         let per_pane = per_pane.lock().unwrap();
         (
             per_pane.needs_application_palette(&application_palette),
             per_pane.last_sent(),
+            per_pane.frame_control,
+            per_pane.frame_revision,
+            per_pane.scene_seqno,
         )
     };
     if needs_palette {
@@ -787,7 +816,21 @@ fn maybe_push_pane_changes(
             .record_application_palette(application_palette);
     }
 
-    let reading = read_pane_changes(pane, &last, force_with_input_serial);
+    if frame_control {
+        if let Some((revision, image_epoch, selections)) = pane.kitty_frame_selections(frame_revision) {
+            scene_seqno = relative_scene_seqno(&selections);
+            sender.send(DecodedPdu {
+                pdu: Pdu::KittyFrameSelections(KittyFrameSelections {
+                    pane_id: pane.pane_id(), image_epoch, now_ms: wezterm_term::kitty_animation::monotonic_ms(), revision, selections,
+                }.fitted()),
+                serial: 0,
+            })?;
+            let mut per_pane = per_pane.lock().unwrap();
+            per_pane.frame_revision = Some(revision);
+            per_pane.scene_seqno = scene_seqno;
+        }
+    }
+    let reading = read_pane_changes(pane, &last, force_with_input_serial, scene_seqno);
     let mut per_pane = per_pane.lock().unwrap();
     if let Some(reading) = reading {
         let resp = per_pane.commit_changes(pane.pane_id(), reading);
@@ -1068,6 +1111,8 @@ fn web_peer_may_send(pdu: &Pdu) -> bool {
             | Pdu::GetPaneRenderChanges(_)
             | Pdu::GetPaneRenderableDimensions(_)
             | Pdu::GetImageCell(_)
+            | Pdu::GetKittyFrameSelections(_)
+            | Pdu::GetKittyImage(_)
             | Pdu::SearchScrollbackRequest(_)
             | Pdu::EraseScrollbackRequest(_)
             | Pdu::SetPalette(_)
@@ -1116,6 +1161,9 @@ pub struct SessionHandler {
 
 impl Drop for SessionHandler {
     fn drop(&mut self) {
+        for pane in self.per_pane.values() {
+            pane.lock().unwrap().set_frame_control(false);
+        }
         if let Some(session_id) = self.palette_session_id.take() {
             schedule_palette_session_cleanup(session_id, "client disconnect");
         }
@@ -1198,7 +1246,9 @@ impl SessionHandler {
     /// above all, which otherwise outlived every pane this connection ever
     /// saw.
     pub(crate) fn forget_pane(&mut self, pane_id: PaneId) {
-        self.per_pane.remove(&pane_id);
+        if let Some(pane) = self.per_pane.remove(&pane_id) {
+            pane.lock().unwrap().set_frame_control(false);
+        }
     }
 
     pub(crate) fn per_pane(&mut self, pane_id: PaneId) -> Arc<Mutex<PerPane>> {
@@ -2218,6 +2268,54 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::GetKittyFrameSelections(GetKittyFrameSelections { pane_id, subscribe }) => {
+                let per_pane = self.per_pane(pane_id);
+                let epoch = per_pane.lock().unwrap().set_frame_control(subscribe);
+                if !subscribe {
+                    send_response(Ok(Pdu::UnitResponse(UnitResponse {})));
+                    return;
+                }
+                let sender = self.to_write_tx.clone();
+                spawn_into_main_thread(async move {
+                    let pane = match pane_when_free(pane_id, &sender, "frame selection", Some(PUSH_DEFERRAL_LIMIT)).await {
+                        Ok(Some(pane)) => pane,
+                        Ok(None) => { send_response(Err(anyhow!("pane {pane_id} is busy"))); return; }
+                        Err(err) => { send_response(Err(err)); return; }
+                    };
+                    // The pane is read with per_pane unlocked, as everywhere
+                    // else: the snapshot waits for the terminal lock.
+                    let subscribe = {
+                        let state = per_pane.lock().unwrap();
+                        if state.frame_epoch != epoch || !state.frame_control {
+                            send_response(Err(anyhow!("frame subscription superseded")));
+                            return;
+                        }
+                        state.frame_subscription.is_none()
+                    };
+                    let subscription = if subscribe { pane.subscribe_kitty_frames() } else { None };
+                    let snapshot = pane.kitty_frame_selections(None).unwrap_or_default();
+                    let (revision, image_epoch, selections, synchronize_scene) = {
+                        let mut state = per_pane.lock().unwrap();
+                        if state.frame_epoch != epoch || !state.frame_control {
+                            send_response(Err(anyhow!("frame subscription superseded")));
+                            return;
+                        }
+                        if state.frame_subscription.is_none() {
+                            state.frame_subscription = subscription;
+                        }
+                        state.frame_revision = Some(snapshot.0);
+                        state.scene_seqno = relative_scene_seqno(&snapshot.2);
+                        (snapshot.0, snapshot.1, snapshot.2, state.scene_seqno != 0)
+                    };
+                    send_response(Ok(Pdu::KittyFrameSelections(KittyFrameSelections { pane_id, image_epoch, now_ms: wezterm_term::kitty_animation::monotonic_ms(), revision, selections }.fitted())));
+                    if synchronize_scene {
+                        if let Err(err) = maybe_push_pane_changes(&pane, sender, per_pane, None) {
+                            log::debug!("unable to synchronize the Kitty scene: {err:#}");
+                        }
+                    }
+                }).detach();
+            }
+
             Pdu::GetLines(GetLines { pane_id, lines }) => {
                 let per_pane = self.per_pane(pane_id);
                 let sender = self.to_write_tx.clone();
@@ -2269,6 +2367,18 @@ impl SessionHandler {
                     )
                 })
                 .detach();
+            }
+
+            Pdu::GetKittyImage(request) => {
+                let sender = self.to_write_tx.clone();
+                spawn_into_main_thread(async move {
+                    let result = match pane_when_free(request.pane_id, &sender, "Kitty image", Some(PUSH_DEFERRAL_LIMIT)).await {
+                        Ok(Some(pane)) => pane.get_kitty_image(request).await.map(Pdu::GetImageCellResponse),
+                        Ok(None) => Err(anyhow!("pane is busy")),
+                        Err(err) => Err(err),
+                    };
+                    send_response(result);
+                }).detach();
             }
 
             Pdu::GetImageCell(GetImageCell {
@@ -2667,6 +2777,7 @@ impl SessionHandler {
             | Pdu::PaneFocused { .. }
             | Pdu::TabResized { .. }
             | Pdu::GetImageCellResponse { .. }
+            | Pdu::KittyFrameSelections { .. }
             | Pdu::MovePaneToNewTabResponse { .. }
             | Pdu::TabAddedToWindow { .. }
             | Pdu::GetPaneRenderableDimensionsResponse { .. }
@@ -3043,6 +3154,40 @@ mod tests {
     use std::sync::Arc;
     use wezterm_term::color::ColorPalette;
     use wezterm_term::TerminalSize;
+
+    #[test]
+    fn frame_subscriptions_end_even_when_a_deferred_task_still_holds_the_pane_state() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct Subscription(Arc<AtomicUsize>);
+        impl mux::pane::KittyFrameSubscription for Subscription {}
+        impl Drop for Subscription {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for forget in [false, true] {
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let mut handler = super::SessionHandler::new(super::PduSender::new(|_| Ok(())));
+            let deferred = handler.per_pane(7);
+            let epoch = {
+                let mut state = deferred.lock().unwrap();
+                let epoch = state.set_frame_control(true);
+                state.frame_subscription = Some(Box::new(Subscription(Arc::clone(&dropped))));
+                epoch
+            };
+            if forget {
+                handler.forget_pane(7);
+            }
+            drop(handler);
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            let state = deferred.lock().unwrap();
+            assert!(!state.frame_control);
+            assert_ne!(state.frame_epoch, epoch);
+            assert!(state.frame_subscription.is_none());
+        }
+    }
 
     #[test]
     fn selecting_dirty_lines_preserves_content_and_outside_invalidation() {

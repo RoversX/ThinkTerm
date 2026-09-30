@@ -4,6 +4,7 @@
 //! exactly as it does for the desktop's already-sRGB surface.
 
 use anyhow::{anyhow, Result};
+use std::rc::Rc;
 use std::sync::Arc;
 use thinkterm_render::pipeline::{
     centred_projection, quad_indices, srgb_format, view_as, AtlasBindGroups, GpuTexture, Pipeline,
@@ -29,7 +30,7 @@ pub struct Gpu {
     index_quads: usize,
     /// Bind groups per atlas texture, by identity: a page with panes at
     /// their own font sizes draws from several atlases each frame.
-    atlas_bind_groups: Vec<(usize, AtlasBindGroups)>,
+    atlas_bind_groups: Vec<(usize, Rc<AtlasBindGroups>)>,
     scratch: Vec<Vertex>,
     pub adapter_info: wgpu::AdapterInfo,
 }
@@ -256,18 +257,41 @@ impl Gpu {
         self.device.limits().max_texture_dimension_2d
     }
 
-    fn atlas_groups(&mut self, atlas: &GpuTexture) -> usize {
+    pub(crate) fn forget_texture(&mut self, identity: usize) {
+        self.atlas_bind_groups.retain(|(id, _)| *id != identity);
+    }
+
+    fn atlas_groups(&mut self, atlas: &GpuTexture) -> Rc<AtlasBindGroups> {
         let identity = atlas.id();
         if let Some(i) = self.atlas_bind_groups.iter().position(|(id, _)| *id == identity) {
-            return i;
+            return Rc::clone(&self.atlas_bind_groups[i].1);
         }
-        // A handful at a time is the most a page has; old ones go.
-        if self.atlas_bind_groups.len() >= 8 {
+        // Image textures join the font atlases. Draws own their groups so an
+        // eviction cannot invalidate an earlier batch in the same frame.
+        if self.atlas_bind_groups.len() >= 128 {
             self.atlas_bind_groups.remove(0);
         }
-        let groups = self.pipeline.atlas_bind_groups(&self.device, &atlas.view());
-        self.atlas_bind_groups.push((identity, groups));
-        self.atlas_bind_groups.len() - 1
+        let groups = Rc::new(self.pipeline.atlas_bind_groups(&self.device, &atlas.view()));
+        self.atlas_bind_groups.push((identity, Rc::clone(&groups)));
+        groups
+    }
+
+    fn prepare_batches(&mut self, batches: &[(&[Vertex], &GpuTexture)]) -> Vec<(u32, u32, Rc<AtlasBindGroups>)> {
+        // Bind groups retain their textures, including deleted images.
+        self.atlas_bind_groups.retain(|(id, _)| batches.iter().any(|(_, texture)| texture.id() == *id));
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.clear();
+        let mut ranges = Vec::with_capacity(batches.len());
+        for (vertices, atlas) in batches {
+            if vertices.is_empty() { continue; }
+            let start = scratch.len() / 4;
+            scratch.extend_from_slice(vertices);
+            let end = scratch.len() / 4;
+            ranges.push((start as u32, end as u32, self.atlas_groups(atlas)));
+        }
+        self.upload_vertices(&scratch);
+        self.scratch = scratch;
+        ranges
     }
 
     /// One frame from several batches, each from its own atlas: one pass,
@@ -289,20 +313,7 @@ impl Gpu {
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
-        let mut scratch = std::mem::take(&mut self.scratch);
-        scratch.clear();
-        let mut ranges = Vec::with_capacity(batches.len());
-        for (vertices, atlas) in batches {
-            let start = scratch.len() / 4;
-            scratch.extend_from_slice(vertices);
-            let end = scratch.len() / 4;
-            let group = self.atlas_groups(atlas);
-            if end > start {
-                ranges.push((start as u32, end as u32, group));
-            }
-        }
-        self.upload_vertices(&scratch);
-        self.scratch = scratch;
+        let ranges = self.prepare_batches(batches);
 
         let Some(surface) = &self.surface else {
             // Nothing to draw on: the quads were built for nothing, which
@@ -348,8 +359,7 @@ impl Gpu {
                 pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
                 pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                for (start, end, group) in ranges {
-                    let groups = &self.atlas_bind_groups[group].1;
+                for (start, end, groups) in &ranges {
                     pass.set_bind_group(1, &groups.linear, &[]);
                     pass.set_bind_group(2, &groups.nearest, &[]);
                     pass.draw_indexed(start * 6..end * 6, 0, 0..1);
@@ -361,13 +371,21 @@ impl Gpu {
         Ok(())
     }
 
-    /// Render one frame of `vertices` and read back the pixel at (x, y) as
-    /// the 8-bit value the canvas holds. The check the smoke test runs:
-    /// a known linear colour must come back sRGB-encoded.
+    /// Render through the production pipeline in the canvas's format. Some
+    /// swapchains prohibit copying, so probes read an offscreen target.
     pub async fn draw_and_read_pixel(
         &mut self,
         vertices: &[Vertex],
         atlas: &GpuTexture,
+        x: u32,
+        y: u32,
+    ) -> Result<[u8; 4]> {
+        self.draw_batches_and_read_pixel(&[(vertices, atlas)], x, y).await
+    }
+
+    pub async fn draw_batches_and_read_pixel(
+        &mut self,
+        batches: &[(&[Vertex], &GpuTexture)],
         x: u32,
         y: u32,
     ) -> Result<[u8; 4]> {
@@ -381,14 +399,16 @@ impl Gpu {
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
-        let quads = self.upload_vertices(vertices);
-        let group = self.atlas_groups(atlas);
-
-        let surface = self.surface.as_ref().ok_or_else(|| anyhow!("no surface"))?;
-        let frame = surface
-            .get_current_texture()
-            .map_err(|e| anyhow!("acquiring the canvas frame: {e}"))?;
-        let view = view_as(&frame.texture, self.view_format);
+        let ranges = self.prepare_batches(batches);
+        let target = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("pixel probe"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format: self.view_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
         let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size: 256,
@@ -399,7 +419,6 @@ impl Gpu {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("check") });
         {
-            let groups = &self.atlas_bind_groups[group].1;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("check"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -416,15 +435,17 @@ impl Gpu {
             });
             pass.set_pipeline(&self.pipeline.render_pipeline);
             pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            pass.set_bind_group(1, &groups.linear, &[]);
-            pass.set_bind_group(2, &groups.nearest, &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..(quads * 6) as u32, 0, 0..1);
+            for (start, end, groups) in &ranges {
+                pass.set_bind_group(1, &groups.linear, &[]);
+                pass.set_bind_group(2, &groups.nearest, &[]);
+                pass.draw_indexed(start * 6..end * 6, 0, 0..1);
+            }
         }
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &frame.texture,
+                texture: &target,
                 mip_level: 0,
                 origin: wgpu::Origin3d { x, y, z: 0 },
                 aspect: wgpu::TextureAspect::All,
@@ -444,7 +465,6 @@ impl Gpu {
             },
         );
         self.queue.submit(Some(encoder.finish()));
-        frame.present();
 
         let slice = readback.slice(..);
         let (tx, rx) = futures::channel::oneshot::channel();

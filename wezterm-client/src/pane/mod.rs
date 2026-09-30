@@ -3,5 +3,6 @@ pub use clientpane::ClientPane;
 
 mod clientpane;
 mod events;
+mod kitty;
 pub(crate) use events::forget_images_for_domain;
 pub use events::remote_image_footprint;

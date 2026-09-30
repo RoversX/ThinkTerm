@@ -533,6 +533,41 @@ impl CellAttributes {
         self.deallocate_fat_attributes_if_none();
     }
 
+    /// Remove matching attachments while preserving shared rows and z order.
+    pub fn detach_images(&mut self, matches: impl Fn(&ImageCell) -> bool) -> bool {
+        if !self.image_attachments().any(&matches) {
+            return false;
+        }
+        self.update_fat(|fat| {
+            fat.update_images(|images| images.retain(|image| !matches(image)))
+        });
+        self.deallocate_fat_attributes_if_none();
+        true
+    }
+
+    /// Rebind one image's attachments without changing their order or geometry.
+    pub fn replace_image_data(
+        &mut self,
+        image_id: u32,
+        old: &Arc<image::ImageData>,
+        new: &Arc<image::ImageData>,
+    ) -> bool {
+        let matches = |image: &ImageCell| {
+            image.image_id() == Some(image_id) && Arc::ptr_eq(image.image_data(), old)
+        };
+        if !self.image_attachments().any(matches) {
+            return false;
+        }
+        self.update_fat(|fat| {
+            fat.update_images(|images| {
+                for image in images.iter_mut().filter(|image| matches(image)) {
+                    image.set_image_data(Arc::clone(new));
+                }
+            });
+        });
+        true
+    }
+
     /// Add an image attachement, preserving any existing attachments.
     /// The list of images is maintained in z-index order
     pub fn attach_image(&mut self, image: Box<ImageCell>) -> &mut Self {
@@ -629,11 +664,21 @@ impl CellAttributes {
     }
 
     /// Test for image attachments without cloning the attachment list.
+    /// Checked before every cell write in a repeated range.
     #[cfg(feature = "use_image")]
+    #[inline]
     pub fn has_images(&self) -> bool {
         self.fat
             .as_ref()
             .is_some_and(|fat| !fat.images().is_empty())
+    }
+
+    /// Borrow attachments without allocating a list or cloning their pixels' Arcs.
+    #[cfg(feature = "use_image")]
+    pub fn image_attachments(&self) -> impl Iterator<Item = &ImageCell> {
+        self.fat
+            .iter()
+            .flat_map(|fat| fat.images().iter().map(Box::as_ref))
     }
 
     pub fn underline_color(&self) -> ColorAttribute {
@@ -842,7 +887,12 @@ impl TeenyString {
     }
 }
 
+// Every cell write drops one of these and copies another. Without LTO (the
+// release profile that Linux and Windows ship) each was a call across crates
+// per cell, a large share of filling or erasing a row; the inline-string
+// checks are small enough to inline.
 impl Drop for TeenyString {
+    #[inline]
     fn drop(&mut self) {
         if !Self::is_marker_bit_set(self.0) {
             let vec = unsafe { Box::from_raw(self.0 as *mut usize as *mut TeenyStringHeap) };
@@ -852,11 +902,23 @@ impl Drop for TeenyString {
 }
 
 impl core::clone::Clone for TeenyString {
+    #[inline]
     fn clone(&self) -> Self {
         if Self::is_marker_bit_set(self.0) {
             Self(self.0)
         } else {
             Self::from_str(self.str(), None, None)
+        }
+    }
+
+    /// An inline string is a plain word: overwriting one frees nothing and
+    /// copying one allocates nothing.
+    #[inline]
+    fn clone_from(&mut self, source: &Self) {
+        if Self::is_marker_bit_set(self.0) && Self::is_marker_bit_set(source.0) {
+            self.0 = source.0;
+        } else {
+            *self = source.clone();
         }
     }
 }
@@ -1131,6 +1193,38 @@ pub fn grapheme_column_width(s: &str, version: Option<&UnicodeVersion>) -> usize
         return version.wcwidth(s.as_bytes()[0] as char);
     }
 
+    // Decomposed Latin text (NFD, as in many macOS file names) is a
+    // printable ASCII character followed by combining diacritical marks,
+    // U+0300..=U+036F. Those marks have no width and select no emoji
+    // presentation in any Unicode version, so the base decides: one cell.
+    // Configured cell widths may say otherwise, so they take the general
+    // path. `decomposed_latin_matches_the_general_path` checks this.
+    #[cfg(feature = "std")]
+    let custom_widths = version.cell_widths.is_some();
+    #[cfg(not(feature = "std"))]
+    let custom_widths = false;
+    if !custom_widths && is_ascii_with_combining_diacritics(s.as_bytes()) {
+        return 1;
+    }
+
+    general_column_width(s, version)
+}
+
+/// A printable ASCII character followed by at least one combining
+/// diacritical mark, U+0300..=U+036F (UTF-8 `CC 80..=BF` or `CD 80..=AF`).
+fn is_ascii_with_combining_diacritics(bytes: &[u8]) -> bool {
+    let Some((base, marks)) = bytes.split_first() else {
+        return false;
+    };
+    (b' '..=b'~').contains(base)
+        && !marks.is_empty()
+        && marks.len() % 2 == 0
+        && marks
+            .chunks_exact(2)
+            .all(|mark| matches!(mark, [0xcc, 0x80..=0xbf] | [0xcd, 0x80..=0xaf]))
+}
+
+fn general_column_width(s: &str, version: &UnicodeVersion) -> usize {
     // Slow path: `s.chars()` will dominate and pull up the minimum
     // runtime to ~20ns
     if version.version >= 14 {
@@ -1189,6 +1283,64 @@ mod test {
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
+    }
+
+    #[test]
+    fn decomposed_latin_matches_the_general_path() {
+        let mut versions = vec![];
+        for version in [8, 9, 14] {
+            for ambiguous_are_wide in [false, true] {
+                let mut v = UnicodeVersion::new(version);
+                v.ambiguous_are_wide = ambiguous_are_wide;
+                versions.push(v);
+            }
+        }
+        let check = |s: &str| {
+            assert!(is_ascii_with_combining_diacritics(s.as_bytes()), "{s:?}");
+            for version in &versions {
+                assert_eq!(
+                    grapheme_column_width(s, Some(version)),
+                    general_column_width(s, version),
+                    "{s:?} in Unicode {} (ambiguous wide: {})",
+                    version.version,
+                    version.ambiguous_are_wide
+                );
+            }
+        };
+        for base in b' '..=b'~' {
+            for mark in '\u{300}'..='\u{36f}' {
+                for count in 1..=3 {
+                    let s: String = core::iter::once(base as char)
+                        .chain(core::iter::repeat(mark).take(count))
+                        .collect();
+                    check(&s);
+                }
+            }
+        }
+        for base in ['a', ' '] {
+            for first in '\u{300}'..='\u{36f}' {
+                for second in '\u{300}'..='\u{36f}' {
+                    check(&[base, first, second].iter().collect::<String>());
+                }
+            }
+        }
+        // Neighbouring text keeps the general path.
+        for s in [
+            "a",
+            "ab",
+            "\u{7f}\u{301}",
+            "\u{1f}\u{301}",
+            "a\u{2ff}",
+            "a\u{36f}\u{370}",
+            "a\u{301}\u{fe0f}",
+            "\u{e9}\u{301}",
+        ] {
+            assert!(!is_ascii_with_combining_diacritics(s.as_bytes()), "{s:?}");
+        }
+        // Configured widths still apply to the marks.
+        let mut custom = UnicodeVersion::new(14);
+        custom.cell_widths = Some(Arc::new([(0x301, 1u8)].into_iter().collect()));
+        assert_eq!(grapheme_column_width("a\u{301}", Some(&custom)), 2);
     }
 
     #[test]

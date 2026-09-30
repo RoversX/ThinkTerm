@@ -86,6 +86,21 @@ pub trait SessionHost: 'static {
     fn link(&self) -> &Self::Link;
     fn config(&self) -> &Self::Config;
     fn image_domain(&self) -> ImageDomainKey;
+    fn image_generation(&self, _pane: HostPaneId, image: &codec::SerializedImageCell) -> u64 {
+        image.data_generation
+    }
+    fn image_request(&self, request: codec::GetImageCell, _image_id: Option<u32>) -> Pdu {
+        Pdu::GetImageCell(request)
+    }
+    /// A renderer may resolve text-backed images before the ordinary hydration
+    /// pass. The desktop keeps its original cell-backed representation.
+    fn resolve_image_cells(
+        &self,
+        _pane: HostPaneId,
+        _lines: &mut [(wezterm_term::StableRowIndex, wezterm_term::Line)],
+        _images: &mut Vec<codec::SerializedImageCell>,
+    ) {
+    }
 }
 
 /// The host's identity for a pane: what its notifications name. The

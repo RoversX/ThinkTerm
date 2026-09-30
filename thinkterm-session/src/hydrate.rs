@@ -26,7 +26,8 @@ pub async fn hydrate_lines<H: SessionHost>(
     serialized_lines: SerializedLines,
     fetch_images: bool,
 ) -> (Vec<(StableRowIndex, Line)>, Vec<StableRowIndex>) {
-    let (mut lines, image_cells) = serialized_lines.extract_data();
+    let (mut lines, mut image_cells) = serialized_lines.extract_data();
+    host.resolve_image_cells(pane_id, &mut lines, &mut image_cells);
 
     if image_cells.is_empty() {
         return (lines, vec![]);
@@ -42,7 +43,7 @@ pub async fn hydrate_lines<H: SessionHost>(
             // A copy at or past the generation the cell was sent with is
             // current. An animation grows behind an unchanging hash, so
             // the hash alone would say "have it" forever.
-            Some(data) if data.generation() >= im.data_generation => {
+            Some(data) if data.generation() >= host.image_generation(pane_id, im) => {
                 data_by_hash.insert(im.data_hash, data);
             }
             held => {
@@ -53,12 +54,13 @@ pub async fn hydrate_lines<H: SessionHost>(
                         .unwrap_or(0);
                     (
                         held,
+                        im.image_id,
                         GetImageCell {
                             pane_id,
                             line_idx: im.line_idx,
                             cell_idx: im.cell_idx,
                             data_hash: im.data_hash,
-                            data_generation: im.data_generation,
+                            data_generation: host.image_generation(pane_id, im),
                             have_frames,
                         },
                     )
@@ -82,18 +84,24 @@ pub async fn hydrate_lines<H: SessionHost>(
     // Concurrently, not one at a time: these are independent round trips, so
     // awaiting them serially cost a line with N distinct images N times the
     // latency.
-    let asked: Vec<([u8; 32], Option<Arc<ImageData>>, GetImageCell)> = requests
+    let asked: Vec<([u8; 32], Option<Arc<ImageData>>, Option<u32>, GetImageCell)> = requests
         .into_iter()
-        .map(|(hash, (held, request))| (hash, held, request))
+        .map(|(hash, (held, image_id, request))| (hash, held, image_id, request))
         .collect();
     let fetched = futures_util::future::join_all(
         asked
             .iter()
-            .map(|(_, held, request)| fetch_image(host, held.clone(), request.clone())),
+            .map(|(_, held, image_id, request)| fetch_image(host, held.clone(), request.clone(), *image_id)),
     )
     .await;
 
-    for ((asked_for, _, _), data) in asked.into_iter().zip(fetched) {
+    // A reconnect can finish while these requests are in flight. Its new
+    // image domain must not inherit the predecessor's pixels or generation.
+    if host.image_domain() != domain {
+        return (Vec::new(), lines.iter().map(|(idx, _)| *idx).collect());
+    }
+
+    for ((asked_for, _, _, _), data) in asked.into_iter().zip(fetched) {
         let Some(data) = data else { continue };
         let data = file_image(images, domain, data);
         // Filed under the hash the cell named as well: the server may have
@@ -135,12 +143,23 @@ pub async fn hydrate_lines<H: SessionHost>(
 async fn get_image_cell<H: SessionHost>(
     host: &H,
     req: GetImageCell,
+    image_id: Option<u32>,
 ) -> anyhow::Result<GetImageCellResponse> {
-    request(host.link(), Pdu::GetImageCell(req), |pdu| match pdu {
+    let pdu = host.image_request(req.clone(), image_id);
+    let canonical = matches!(pdu, Pdu::GetKittyImage(_));
+    let extract = |pdu| match pdu {
         Pdu::GetImageCellResponse(response) => Ok(response),
         other => Err(other),
-    })
-    .await
+    };
+    match request(host.link(), pdu, extract).await {
+        // The cell can answer where the image id could not: a proxy whose
+        // upstream predates fetching by id refuses every such request.
+        Err(err) if canonical => {
+            log::debug!("fetching an image by id failed ({err:#}); asking by its cell");
+            request(host.link(), Pdu::GetImageCell(req), extract).await
+        }
+        answer => answer,
+    }
 }
 
 /// Fetch the image `request` names and bring `held`, the copy already
@@ -155,14 +174,17 @@ pub(crate) async fn fetch_image<H: SessionHost>(
     host: &H,
     held: Option<Arc<ImageData>>,
     request: GetImageCell,
+    image_id: Option<u32>,
 ) -> Option<Arc<ImageData>> {
     use crate::clock::Clock;
     let whole = GetImageCell {
         have_frames: 0,
         ..request
     };
+    let domain = host.image_domain();
+    let canonical = matches!(host.image_request(whole.clone(), image_id), Pdu::GetKittyImage(_));
     let asked_at = host.clock().now();
-    let mut response = get_image_cell(host, request).await;
+    let mut response = get_image_cell(host, request, image_id).await;
     if log::log_enabled!(log::Level::Debug) {
         let bytes = match &response {
             Ok(GetImageCellResponse {
@@ -178,6 +200,7 @@ pub(crate) async fn fetch_image<H: SessionHost>(
     }
     let mut asked_for_whole = false;
     loop {
+        if host.image_domain() != domain { return None; }
         match response {
             Ok(GetImageCellResponse {
                 data: Some(fresh),
@@ -211,6 +234,9 @@ pub(crate) async fn fetch_image<H: SessionHost>(
                     fresh.set_generation(data_generation);
                     return Some(fresh);
                 }
+                if canonical && held.as_ref().is_some_and(|data| data.generation() > data_generation) {
+                    return held;
+                }
                 match &held {
                     None if frames_from == 0 => {
                         fresh.set_generation(data_generation);
@@ -224,7 +250,7 @@ pub(crate) async fn fetch_image<H: SessionHost>(
                 if !asked_for_whole {
                     asked_for_whole = true;
                     log::debug!("image delta did not fit the copy held; fetching the whole image");
-                    response = get_image_cell(host, GetImageCell { ..whole }).await;
+                    response = get_image_cell(host, GetImageCell { ..whole }, image_id).await;
                     continue;
                 }
                 // The copy stays, and is marked as current as the server's:

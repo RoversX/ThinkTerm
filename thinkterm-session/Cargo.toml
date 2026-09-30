@@ -29,6 +29,7 @@ textwrap.workspace = true
 thinkterm-proto.workspace = true
 thiserror.workspace = true
 url.workspace = true
+wezterm-blob-leases.workspace = true
 wezterm-term = { workspace = true, features = ["use_serde"] }
 
 [dev-dependencies]

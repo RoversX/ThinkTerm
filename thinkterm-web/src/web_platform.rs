@@ -2,8 +2,9 @@
 //! canvas as the viewport, the textarea as the keyboard's field, the
 //! document title and clipboard.
 
-use crate::platform::{LocalFuture, Platform, Viewport};
-use std::cell::RefCell;
+use crate::platform::{LocalFuture, Platform, Timeout, Viewport};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -88,6 +89,29 @@ impl Platform for WebPlatform {
                 closure.forget();
             }
         }
+    }
+
+    fn cancellable_timeout(&self, delay_ms: f64, cb: Box<dyn FnOnce()>) -> Timeout {
+        let Some(window) = web_sys::window() else { return Timeout::default() };
+        let pending = Rc::new(Cell::new(None));
+        let fired = Rc::clone(&pending);
+        let closure = Closure::once(move || {
+            fired.set(None);
+            cb();
+        });
+        match window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            closure.as_ref().unchecked_ref(),
+            delay_ms.clamp(0.0, i32::MAX as f64) as i32,
+        ) {
+            Ok(id) => pending.set(Some(id)),
+            Err(_) => return Timeout::default(),
+        }
+        Timeout::new(move || {
+            if let Some(id) = pending.take() {
+                window.clear_timeout_with_handle(id);
+            }
+            drop(closure);
+        })
     }
 
     fn set_frame_handler(&self, cb: Box<dyn Fn()>) {

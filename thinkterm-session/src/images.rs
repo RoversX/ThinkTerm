@@ -284,6 +284,10 @@ impl ImageStore {
         if self.images.is_empty() || now.saturating_duration_since(self.last_touch) < idle_after {
             return 0;
         }
+        self.clear()
+    }
+
+    pub fn clear(&mut self) -> usize {
         let released = self.bytes;
         self.images.clear();
         self.bytes = 0;
@@ -346,6 +350,7 @@ pub fn file_image(
     domain: crate::host::ImageDomainKey,
     data: Arc<ImageData>,
 ) -> Arc<ImageData> {
+    let data = crate::blobs::owned(data);
     let key = (domain, data.hash());
     let existing = store.lock().get(&key);
     let filed = match existing {

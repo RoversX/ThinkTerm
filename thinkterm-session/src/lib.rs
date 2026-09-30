@@ -6,6 +6,8 @@
 //! a socket, a thread or a system clock directly.
 
 pub mod clock;
+pub mod blobs;
+pub mod byte_queue;
 pub mod connection;
 pub mod decide;
 pub mod delta_queue;

@@ -13,6 +13,7 @@
 //! deliberately; they are per-session counters and never get near that.
 
 pub mod agent;
+pub mod image;
 pub mod client;
 pub mod command;
 pub mod keyassignment;

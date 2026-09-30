@@ -174,6 +174,7 @@ impl Terminal {
                     ParsedAction::Print(text) => performer.print_text(text),
                 });
         }
+        self.state.kitty_scene_refresh();
         self.trigger_unseen_output_notif();
     }
 
@@ -191,6 +192,7 @@ impl Terminal {
                 performer.perform(action);
             }
         }
+        self.state.kitty_scene_refresh();
         self.trigger_unseen_output_notif();
     }
 }

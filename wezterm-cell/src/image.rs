@@ -98,6 +98,9 @@ pub struct ImageCell {
 
     image_id: Option<u32>,
     placement_id: Option<u32>,
+    /// Internal identity for anonymous Kitty placements; external p stays zero.
+    #[cfg_attr(feature = "use_serde", serde(skip))]
+    placement_tag: u64,
 }
 
 impl ImageCell {
@@ -145,6 +148,7 @@ impl ImageCell {
             padding_bottom,
             image_id,
             placement_id,
+            placement_tag: 0,
         }
     }
 
@@ -164,6 +168,19 @@ impl ImageCell {
         self.placement_id
     }
 
+    pub fn placement_tag(&self) -> u64 {
+        if self.placement_tag == 0 {
+            u64::from(self.placement_id.unwrap_or(0))
+        } else {
+            self.placement_tag
+        }
+    }
+
+    pub fn with_placement_tag(mut self, tag: u64) -> Self {
+        self.placement_tag = tag;
+        self
+    }
+
     pub fn top_left(&self) -> TextureCoordinate {
         self.top_left
     }
@@ -174,6 +191,10 @@ impl ImageCell {
 
     pub fn image_data(&self) -> &Arc<ImageData> {
         &self.data
+    }
+
+    pub(crate) fn set_image_data(&mut self, data: Arc<ImageData>) {
+        self.data = data;
     }
 
     /// negative z_index is rendered beneath the text layer.
@@ -401,7 +422,7 @@ impl ImageDataType {
     /// marker || per-process random salt || counter. The salt keeps keys
     /// minted by different processes (this GUI, every mux server) from
     /// colliding in the client- and GPU-side caches that mix all sources.
-    fn nonce_key() -> [u8; 32] {
+    pub fn nonce_key() -> [u8; 32] {
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::sync::OnceLock;
         static SALT: OnceLock<[u8; 16]> = OnceLock::new();
@@ -466,7 +487,7 @@ impl ImageDataType {
         match self {
             ImageDataType::EncodedFile(data) => hasher.update(data),
             ImageDataType::EncodedLease(lease) => return lease.content_id().as_hash_bytes(),
-            ImageDataType::Rgba8 { data, hash, .. } => {
+            ImageDataType::Rgba8 { data, hash, width, height } => {
                 // The stored key is authoritative: the constructors compute
                 // it and every in-place pixel edit refreshes it (see
                 // terminalstate/kitty.rs), so full-frame payloads are not
@@ -476,18 +497,25 @@ impl ImageDataType {
                 // future forgotten refresh into a loud test failure instead
                 // of a stale-image glitch; nonce keys are identity-only and
                 // have nothing to re-derive.
-                if !Self::is_nonce_key(hash) {
-                    debug_assert_eq!(
-                        *hash,
-                        Self::hash_bytes(data),
-                        "Rgba8 hash field is stale; a pixel mutation forgot to refresh it"
-                    );
+                if Self::is_nonce_key(hash) {
+                    return *hash;
                 }
-                return *hash;
+                debug_assert_eq!(
+                    *hash,
+                    Self::hash_bytes(data),
+                    "Rgba8 hash field is stale; a pixel mutation forgot to refresh it"
+                );
+                hasher.update(b"rgba8");
+                hasher.update(width.to_le_bytes());
+                hasher.update(height.to_le_bytes());
+                hasher.update(hash);
             }
             ImageDataType::AnimRgba8 {
-                hashes, durations, ..
+                hashes, durations, width, height, ..
             } => {
+                hasher.update(b"anim-rgba8");
+                hasher.update(width.to_le_bytes());
+                hasher.update(height.to_le_bytes());
                 // Fold the per-frame keys instead of re-hashing every
                 // frame's pixels: the keys already identify the frame
                 // content (or are unique nonces), and hashing 32 bytes per
@@ -743,10 +771,9 @@ impl ImageData {
         Self::with_data_and_hash(ImageDataType::EncodedFile(data).decode(), hash)
     }
 
-    /// `hash` must equal `data.compute_hash()`; the caller supplies it to
-    /// avoid re-hashing image payloads that were already hashed for cache
-    /// lookup (a full-frame SHA-256 per kitty transmission otherwise runs
-    /// twice on the pty read thread while it holds the terminal lock).
+    /// Use an existing identity without hashing the payload again. Immutable
+    /// images use `data.compute_hash()`; mutable copies and frame deltas retain
+    /// an identity independent of their current pixels.
     pub fn with_data_and_hash(data: ImageDataType, hash: [u8; 32]) -> Self {
         Self {
             data: Mutex::new(data),
@@ -762,6 +789,14 @@ impl ImageData {
             hash,
             generation: AtomicU64::new(0),
         }
+    }
+
+    /// A private mutable copy with an independent, stable cache identity.
+    pub fn copy_for_mutation(&self) -> Self {
+        let data = self.data();
+        let copy = Self::with_data_and_hash(data.clone(), ImageDataType::nonce_key());
+        copy.set_generation(self.generation());
+        copy
     }
 
     /// How many in-place changes `data` has seen. See the field.
@@ -864,5 +899,19 @@ mod tests {
         // Different per-frame keys must change the identity.
         let c = mk(vec![vec![0, 0, 0, 0xff]; 2], vec![[1u8; 32], [3u8; 32]]);
         assert_ne!(a.compute_hash(), c.compute_hash());
+    }
+
+    #[test]
+    fn decoded_image_identity_includes_shape() {
+        let a = ImageDataType::new_single_frame(1, 2, vec![7; 8]);
+        let b = ImageDataType::new_single_frame(2, 1, vec![7; 8]);
+        assert_ne!(a.compute_hash(), b.compute_hash());
+        assert_eq!(a.compute_hash(), a.clone().compute_hash());
+        let animation = |width, height| ImageDataType::AnimRgba8 {
+            width, height, frames: vec![vec![7; 8]],
+            hashes: vec![ImageDataType::content_key(&[7; 8])],
+            durations: vec![Duration::ZERO],
+        };
+        assert_ne!(animation(1, 2).compute_hash(), animation(2, 1).compute_hash());
     }
 }
