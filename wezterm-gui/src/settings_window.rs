@@ -31,10 +31,10 @@ use wezterm_font::{FontConfiguration, LoadedFont};
 use window::bitmaps::atlas::OutOfTextureSpace;
 use window::color::LinearRgba;
 use window::{
-    Appearance, Clipboard, Connection, ConnectionOps, Dimensions, FolderPickerOptions,
-    IntegratedTitleButton, IntegratedTitleButtonStyle, KeyCode, KeyEvent, Modifiers, MouseButtons,
-    MouseCursor, MouseEvent, MouseEventKind, MousePress, RequestedWindowGeometry, Window,
-    WindowDecorations, WindowEvent, WindowOps, WindowState,
+    Appearance, Clipboard, Connection, ConnectionOps, Dimensions, FilePickerOptions,
+    FolderPickerOptions, IntegratedTitleButton, IntegratedTitleButtonStyle, KeyCode, KeyEvent,
+    Modifiers, MouseButtons, MouseCursor, MouseEvent, MouseEventKind, MousePress,
+    RequestedWindowGeometry, Window, WindowDecorations, WindowEvent, WindowOps, WindowState,
 };
 
 use crate::native_settings::{
@@ -99,6 +99,26 @@ const SIDEBAR_LIST_TOP: f32 = 222.0;
 const SIDEBAR_LIST_FADE_HEIGHT: f32 = 24.0;
 const CONTENT_TITLE_Y: f32 = 82.0;
 const CONTENT_SECTION_Y: f32 = 168.0;
+/// The tab icons page's margin to the window's edges. Its editor is the
+/// page's side panel, so it runs nearer the right edge than other pages'
+/// content (still clear of the scrollbar), and keeps the same distance
+/// from the top and bottom while pinned.
+const TAB_ICONS_EDGE_MARGIN: f32 = 24.0;
+/// The tab icon editor's measures, in design pixels: its padding, the icon
+/// heading it, the space above each group of rows, a row's padding, the
+/// gap from a row's label to its value, between the items and the lines a
+/// value wraps into, and the colour presets' size and their distance below
+/// their row's field.
+const TAB_ICON_EDITOR_PAD: f32 = 32.0;
+const TAB_ICON_EDITOR_HEAD: f32 = 80.0;
+const TAB_ICON_EDITOR_SECTION_GAP: f32 = 28.0;
+const TAB_ICON_EDITOR_ROW_PAD_X: f32 = 24.0;
+const TAB_ICON_EDITOR_ROW_PAD_Y: f32 = 20.0;
+const TAB_ICON_EDITOR_LABEL_GAP: f32 = 24.0;
+const TAB_ICON_EDITOR_ITEM_GAP: f32 = 12.0;
+const TAB_ICON_EDITOR_LINE_GAP: f32 = 12.0;
+const TAB_ICON_EDITOR_SWATCH: f32 = 36.0;
+const TAB_ICON_EDITOR_SWATCH_GAP: f32 = 16.0;
 const CONTENT_RULE_Y: f32 = 202.0;
 const SETTINGS_WINDOW_CHROME_HEIGHT: f32 = 74.0;
 const SETTINGS_WINDOW_CHROME_FADE_HEIGHT: usize = 18;
@@ -339,6 +359,7 @@ fn format_last_checked(when: SystemTime) -> String {
 enum SettingsSection {
     General,
     Appearance,
+    TabIcons,
     Sidebar,
     Terminal,
     Workspaces,
@@ -359,6 +380,7 @@ enum SettingsSection {
 const BASE_SECTIONS: &[SettingsSection] = &[
     SettingsSection::General,
     SettingsSection::Appearance,
+    SettingsSection::TabIcons,
     SettingsSection::Sidebar,
     SettingsSection::Terminal,
     SettingsSection::Workspaces,
@@ -423,6 +445,7 @@ fn initial_section() -> SettingsSection {
     let section = match name.as_str() {
         "general" => SettingsSection::General,
         "appearance" => SettingsSection::Appearance,
+        "tabicons" | "tab-icons" | "tab_icons" => SettingsSection::TabIcons,
         "sidebar" => SettingsSection::Sidebar,
         "terminal" => SettingsSection::Terminal,
         "workspaces" => SettingsSection::Workspaces,
@@ -456,6 +479,7 @@ impl SettingsSection {
         match self {
             Self::General => crate::i18n::tr("settings-section-general"),
             Self::Appearance => crate::i18n::tr("settings-section-appearance"),
+            Self::TabIcons => crate::i18n::tr("settings-section-tab-icons"),
             Self::Sidebar => crate::i18n::tr("settings-section-sidebar"),
             Self::Terminal => crate::i18n::tr("settings-section-terminal"),
             Self::Workspaces => crate::i18n::tr("settings-section-workspaces"),
@@ -478,6 +502,7 @@ impl SettingsSection {
         match self {
             Self::General => SettingsIcon::General,
             Self::Appearance => SettingsIcon::Appearance,
+            Self::TabIcons => SettingsIcon::TabIcons,
             Self::Sidebar => SettingsIcon::Sidebar,
             Self::Terminal => SettingsIcon::Terminal,
             Self::Workspaces => SettingsIcon::Workspaces,
@@ -526,6 +551,16 @@ impl SettingsSection {
                 "HTTP",
                 "Port",
                 "Listener",
+            ],
+            Self::TabIcons => &[
+                "Tab Icons",
+                "Tab Icon",
+                "Icons",
+                "Icon",
+                "SVG",
+                "Program",
+                "Logo",
+                "Agent",
             ],
             Self::Appearance => &[
                 "Theme Mode",
@@ -1099,6 +1134,55 @@ enum SettingsAction {
     SidebarResize,
     SidebarScrollArea,
     ContentScrollArea,
+    ToggleTabIcons,
+    /// A card, by its place in `tab_icon_cards` as last painted.
+    TabIconSelect(u16),
+    TabIconNew,
+    /// A program of the selected card, by its place in `tab_icon_programs`.
+    TabIconRemoveProgram(u16),
+    TabIconProgramInput,
+    TabIconNameInput,
+    TabIconCircleInput,
+    TabIconGlyphColorInput,
+    TabIconCirclePreset(u8),
+    TabIconGlyphPreset(u8),
+    TabIconChooseSvg,
+    TabIconClearSvg,
+    TabIconReset,
+    TabIconDelete,
+    /// The field that narrows the cards to those a query finds.
+    TabIconSearchInput,
+    ClearTabIconSearch,
+}
+
+/// Where an SVG dragged over the tab icons page would land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabIconDropTarget {
+    /// A card, by its place in `tab_icon_cards` as last painted.
+    Card(usize),
+    /// The preview heading the editor: the card open there, which the
+    /// search may be keeping out of the grid.
+    Editor,
+    /// The tile that makes a new card.
+    NewCard,
+}
+
+/// Where the tab icon editor's parts go, worked out before it is drawn.
+struct TabIconEditorLayout {
+    height: f32,
+    /// The widest row label, which sets where the rows' values start.
+    label_width: f32,
+    /// Each program chip: where it starts in the value column, its line,
+    /// its width and the program.
+    chips: Vec<(f32, usize, f32, String)>,
+    /// The field that adds a program, under the chips: start, line, width.
+    add_field: (f32, usize, f32),
+    programs_row: f32,
+    /// The Shape row's buttons: start, line, width, label and action.
+    shape_buttons: Vec<(f32, usize, f32, String, SettingsAction)>,
+    shape_row: f32,
+    /// Each colour's row.
+    color_row: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1629,6 +1713,28 @@ struct SettingsUiState {
     version_info_copied_until: Option<Instant>,
     sidebar_scrollbar_visible_until: Option<Instant>,
     content_scrollbar_visible_until: Option<Instant>,
+    /// Tab icons: the card being edited, by id.
+    tab_icon_selected: Option<String>,
+    /// What the cards are narrowed to, by name or program.
+    tab_icon_search: TextInputState,
+    /// The cards as last painted, so a click acts on the card that was
+    /// under the pointer.
+    tab_icon_cards: Vec<String>,
+    /// The selected card's programs as last painted, for the same reason.
+    tab_icon_programs: Vec<String>,
+    /// Where an SVG could be dropped, as last painted.
+    tab_icon_drop_rects: Vec<(window::RectF, TabIconDropTarget)>,
+    /// The drop target under an SVG being dragged, lit while it is.
+    tab_icon_drop_target: Option<TabIconDropTarget>,
+    tab_icon_program_input: TextInputState,
+    tab_icon_name_input: TextInputState,
+    tab_icon_name_input_dirty: bool,
+    tab_icon_circle_input: TextInputState,
+    tab_icon_circle_input_dirty: bool,
+    tab_icon_glyph_input: TextInputState,
+    tab_icon_glyph_input_dirty: bool,
+    /// Two-step delete: the card whose Delete was clicked once.
+    confirm_delete_tab_icon: Option<String>,
 }
 
 impl SettingsUiState {
@@ -1674,8 +1780,68 @@ impl SettingsUiState {
             version_info_copied_until: None,
             sidebar_scrollbar_visible_until: None,
             content_scrollbar_visible_until: None,
+            tab_icon_selected: None,
+            tab_icon_search: TextInputState::new(),
+            tab_icon_cards: Vec::new(),
+            tab_icon_programs: Vec::new(),
+            tab_icon_drop_rects: Vec::new(),
+            tab_icon_drop_target: None,
+            tab_icon_program_input: TextInputState::new(),
+            tab_icon_name_input: TextInputState::new(),
+            tab_icon_name_input_dirty: false,
+            tab_icon_circle_input: TextInputState::new(),
+            tab_icon_circle_input_dirty: false,
+            tab_icon_glyph_input: TextInputState::new(),
+            tab_icon_glyph_input_dirty: false,
+            confirm_delete_tab_icon: None,
         }
     }
+}
+
+/// Where a panel `height` tall goes beside a scrolling column that ends at
+/// `column_bottom`, when unpinned it would be at `natural_y` and the view
+/// runs from `top` to `bottom`: with the page until it reaches `top`, held
+/// there, and carried off with the column's end. A panel taller than the
+/// view is held by its bottom edge at `bottom` instead.
+fn pinned_beside_column(
+    natural_y: f32,
+    column_bottom: f32,
+    height: f32,
+    top: f32,
+    bottom: f32,
+) -> f32 {
+    let pinned = if height <= bottom - top {
+        top
+    } else {
+        bottom - height
+    };
+    natural_y
+        .max(pinned)
+        .min((column_bottom - height).max(natural_y))
+}
+
+/// Lay out items `widths` wide in lines no wider than `max`, `gap` apart,
+/// each line pushed against the right edge. Returns where each item starts
+/// and its line, and how many lines there are (at least one).
+fn flow_right(widths: &[f32], max: f32, gap: f32) -> (Vec<(f32, usize)>, usize) {
+    let mut places = Vec::with_capacity(widths.len());
+    let mut line_widths = Vec::new();
+    let (mut x, mut line) = (0.0f32, 0usize);
+    for &width in widths {
+        if x > 0.0 && x + width > max {
+            line_widths.push(x - gap);
+            x = 0.0;
+            line += 1;
+        }
+        places.push((x, line));
+        x += width + gap;
+    }
+    line_widths.push((x - gap).max(0.0));
+    let places = places
+        .into_iter()
+        .map(|(start, line)| (start + (max - line_widths[line]).max(0.0), line))
+        .collect();
+    (places, line_widths.len())
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1886,6 +2052,82 @@ TOTAL                              94.4M      19.3M      19.3M         0K       
         );
         assert_eq!(parsed.malloc_resident, Some(192 * 1024));
         assert_eq!(parsed.text_resident, parse_vmmap_size("421.4M"));
+    }
+}
+
+#[cfg(test)]
+mod flow_right_tests {
+    use super::flow_right;
+
+    #[test]
+    fn items_wrap_and_each_line_sits_against_the_right_edge() {
+        let (places, lines) = flow_right(&[100.0, 100.0, 100.0], 250.0, 10.0);
+        assert_eq!(places, vec![(40.0, 0), (150.0, 0), (150.0, 1)]);
+        assert_eq!(lines, 2);
+    }
+
+    #[test]
+    fn an_item_wider_than_a_line_gets_a_line_of_its_own() {
+        let (places, lines) = flow_right(&[300.0, 50.0], 250.0, 10.0);
+        assert_eq!(places, vec![(0.0, 0), (200.0, 1)]);
+        assert_eq!(lines, 2);
+    }
+
+    #[test]
+    fn nothing_to_lay_out_is_still_one_line() {
+        assert_eq!(flow_right(&[], 250.0, 10.0), (Vec::new(), 1));
+    }
+}
+
+#[cfg(test)]
+mod pinned_panel_tests {
+    use super::pinned_beside_column;
+
+    // A view from 50 to 1000, a 600-tall panel, a column ending at 3000
+    // when the page is not scrolled.
+    const TOP: f32 = 50.0;
+    const BOTTOM: f32 = 1000.0;
+
+    #[test]
+    fn the_panel_scrolls_with_the_page_until_it_reaches_the_top() {
+        assert_eq!(
+            pinned_beside_column(400.0, 3000.0, 600.0, TOP, BOTTOM),
+            400.0
+        );
+        assert_eq!(
+            pinned_beside_column(-900.0, 1700.0, 600.0, TOP, BOTTOM),
+            TOP
+        );
+    }
+
+    #[test]
+    fn the_column_ending_carries_the_panel_off() {
+        // The column ends at 500: the panel's bottom goes with it.
+        assert_eq!(
+            pinned_beside_column(-2100.0, 500.0, 600.0, TOP, BOTTOM),
+            -100.0
+        );
+    }
+
+    #[test]
+    fn a_column_shorter_than_the_panel_never_pins_it() {
+        assert_eq!(
+            pinned_beside_column(-300.0, 0.0, 600.0, TOP, BOTTOM),
+            -300.0
+        );
+    }
+
+    #[test]
+    fn a_panel_taller_than_the_view_is_held_by_its_bottom() {
+        // 1500 tall in a 950 view: held once its bottom reaches 1000.
+        assert_eq!(
+            pinned_beside_column(-200.0, 5000.0, 1500.0, TOP, BOTTOM),
+            -200.0
+        );
+        assert_eq!(
+            pinned_beside_column(-900.0, 5000.0, 1500.0, TOP, BOTTOM),
+            -500.0
+        );
     }
 }
 
@@ -2373,6 +2615,10 @@ struct SettingsWindow {
     metrics: RenderMetrics,
     render_state: Option<RenderState>,
     webgpu: Option<Rc<WebGpuState>>,
+    /// The last paint ran out of passes while the frame was still outgrowing
+    /// its atlas or quad buffers, and kept the previous frame instead: paint
+    /// again straight away rather than wait for the next event.
+    repaint_after_growth: bool,
     /// Last system appearance seen. Not used for painting -- see
     /// `effective_appearance` -- only to notice that a repaint is due.
     appearance: Appearance,
@@ -2520,6 +2766,7 @@ impl SettingsWindow {
             metrics,
             render_state: None,
             webgpu: None,
+            repaint_after_growth: false,
             appearance,
             chrome_palette: crate::native_settings::chrome_palette(
                 native_settings.appearance.theme_mode,
@@ -2736,6 +2983,40 @@ impl SettingsWindow {
                 window.invalidate();
                 Ok(true)
             }
+            WindowEvent::DraggedFile { coords, .. } => {
+                let target =
+                    coords.and_then(|at| self.tab_icon_drop_target_at(at.x as f32, at.y as f32));
+                if self.ui.tab_icon_drop_target != target {
+                    self.ui.tab_icon_drop_target = target;
+                    window.invalidate();
+                }
+                Ok(true)
+            }
+            WindowEvent::DragLeave => {
+                if self.ui.tab_icon_drop_target.take().is_some() {
+                    window.invalidate();
+                }
+                Ok(true)
+            }
+            WindowEvent::DroppedFile { paths, coords } => {
+                let target =
+                    coords.and_then(|at| self.tab_icon_drop_target_at(at.x as f32, at.y as f32));
+                self.ui.tab_icon_drop_target = None;
+                if let (Some(target), Some(path)) = (target, paths.first()) {
+                    let card = match target {
+                        TabIconDropTarget::Card(index) => {
+                            self.ui.tab_icon_cards.get(index).cloned()
+                        }
+                        TabIconDropTarget::Editor => self.ui.tab_icon_selected.clone(),
+                        TabIconDropTarget::NewCard => None,
+                    };
+                    if card.is_some() || target == TabIconDropTarget::NewCard {
+                        self.import_tab_icon_svg(card, path.clone());
+                    }
+                }
+                window.invalidate();
+                Ok(true)
+            }
             _ => Ok(true),
         }
     }
@@ -2798,7 +3079,12 @@ impl SettingsWindow {
                     Some(
                         SettingsAction::SearchInput
                         | SettingsAction::FontFamilyInput
-                        | SettingsAction::RemoteDropDestinationInput,
+                        | SettingsAction::RemoteDropDestinationInput
+                        | SettingsAction::TabIconProgramInput
+                        | SettingsAction::TabIconNameInput
+                        | SettingsAction::TabIconCircleInput
+                        | SettingsAction::TabIconGlyphColorInput
+                        | SettingsAction::TabIconSearchInput,
                     ) => {
                         self.set_focused_input(action);
                         self.ui.open_dropdown = None;
@@ -3116,6 +3402,10 @@ impl SettingsWindow {
             KeyCode::Char('\u{8}') | KeyCode::Char('\u{7f}') => {
                 self.backspace_focused_input(focused)
             }
+            KeyCode::Char('\r') if focused == SettingsAction::TabIconProgramInput => {
+                self.commit_tab_icon_input(focused);
+                true
+            }
             KeyCode::Char('\u{1b}') | KeyCode::Char('\r') => {
                 self.set_focused_input(None);
                 true
@@ -3204,6 +3494,11 @@ impl SettingsWindow {
             SettingsAction::SearchInput => Some(&self.ui.search),
             SettingsAction::FontFamilyInput => Some(&self.ui.font_family_input),
             SettingsAction::RemoteDropDestinationInput => Some(&self.ui.remote_drop_input),
+            SettingsAction::TabIconProgramInput => Some(&self.ui.tab_icon_program_input),
+            SettingsAction::TabIconNameInput => Some(&self.ui.tab_icon_name_input),
+            SettingsAction::TabIconCircleInput => Some(&self.ui.tab_icon_circle_input),
+            SettingsAction::TabIconGlyphColorInput => Some(&self.ui.tab_icon_glyph_input),
+            SettingsAction::TabIconSearchInput => Some(&self.ui.tab_icon_search),
             _ => None,
         }
     }
@@ -3248,6 +3543,29 @@ impl SettingsWindow {
             SettingsAction::RemoteDropDestinationInput => {
                 f(&mut self.ui.remote_drop_input);
                 self.ui.remote_drop_input_dirty = true;
+                true
+            }
+            SettingsAction::TabIconProgramInput => {
+                f(&mut self.ui.tab_icon_program_input);
+                true
+            }
+            SettingsAction::TabIconNameInput => {
+                f(&mut self.ui.tab_icon_name_input);
+                self.ui.tab_icon_name_input_dirty = true;
+                true
+            }
+            SettingsAction::TabIconCircleInput => {
+                f(&mut self.ui.tab_icon_circle_input);
+                self.ui.tab_icon_circle_input_dirty = true;
+                true
+            }
+            SettingsAction::TabIconGlyphColorInput => {
+                f(&mut self.ui.tab_icon_glyph_input);
+                self.ui.tab_icon_glyph_input_dirty = true;
+                true
+            }
+            SettingsAction::TabIconSearchInput => {
+                f(&mut self.ui.tab_icon_search);
                 true
             }
             _ => false,
@@ -3353,6 +3671,9 @@ impl SettingsWindow {
         }
         if self.ui.interaction.focused == Some(SettingsAction::RemoteDropDestinationInput) {
             self.commit_remote_drop_destination_from_ui();
+        }
+        if let Some(focused) = self.ui.interaction.focused {
+            self.commit_tab_icon_input(focused);
         }
     }
 
@@ -4948,6 +5269,92 @@ impl SettingsWindow {
                     }
                 }
             }
+            SettingsAction::ToggleTabIcons => {
+                let enabled = !crate::tab_icons::catalog().enabled;
+                let result = crate::tab_icons::set_enabled(enabled);
+                self.after_tab_icon_change(result);
+            }
+            SettingsAction::TabIconSelect(index) => {
+                if let Some(id) = self.ui.tab_icon_cards.get(index as usize).cloned() {
+                    self.select_tab_icon(id);
+                }
+            }
+            SettingsAction::TabIconNew => match crate::tab_icons::create_card(None) {
+                Ok(Some(id)) => {
+                    // A query would keep the new card out of the grid.
+                    self.ui.tab_icon_search.clear();
+                    self.select_tab_icon(id);
+                    self.after_tab_icon_change(Ok(()));
+                    self.set_focused_input(Some(SettingsAction::TabIconNameInput));
+                }
+                Ok(None) => {
+                    self.status = settings_tr(
+                        "settings-status-tab-icons-too-many",
+                        &[("count", crate::tab_icons::MAX_CUSTOM_CARDS.to_string())],
+                    );
+                }
+                Err(err) => self.after_tab_icon_change(Err(err)),
+            },
+            SettingsAction::TabIconRemoveProgram(index) => {
+                let program = self.ui.tab_icon_programs.get(index as usize).cloned();
+                if let (Some(id), Some(program)) = (self.selected_tab_icon(), program) {
+                    let result = crate::tab_icons::remove_program(&id, &program);
+                    self.after_tab_icon_change(result);
+                }
+            }
+            SettingsAction::TabIconProgramInput
+            | SettingsAction::TabIconNameInput
+            | SettingsAction::TabIconCircleInput
+            | SettingsAction::TabIconGlyphColorInput
+            | SettingsAction::TabIconSearchInput => {
+                // Focused on press; there is nothing more to do on release.
+            }
+            SettingsAction::ClearTabIconSearch => {
+                self.ui.tab_icon_search.clear();
+                self.set_focused_input(Some(SettingsAction::TabIconSearchInput));
+            }
+            SettingsAction::TabIconCirclePreset(index) => {
+                let preset = crate::tab_icons::CIRCLE_PRESETS
+                    .get(index as usize)
+                    .copied();
+                if let (Some(id), Some(color)) = (self.selected_tab_icon(), preset) {
+                    let result = crate::tab_icons::set_card_circle(&id, color);
+                    self.after_tab_icon_change(result);
+                }
+            }
+            SettingsAction::TabIconGlyphPreset(index) => {
+                let preset = crate::tab_icons::GLYPH_PRESETS.get(index as usize).copied();
+                if let (Some(id), Some(color)) = (self.selected_tab_icon(), preset) {
+                    let result = crate::tab_icons::set_card_glyph_color(&id, color);
+                    self.after_tab_icon_change(result);
+                }
+            }
+            SettingsAction::TabIconChooseSvg => self.choose_tab_icon_svg(),
+            SettingsAction::TabIconClearSvg => {
+                if let Some(id) = self.selected_tab_icon() {
+                    let result = crate::tab_icons::clear_card_svg(&id);
+                    self.after_tab_icon_change(result);
+                }
+            }
+            SettingsAction::TabIconReset => {
+                if let Some(id) = self.selected_tab_icon() {
+                    let result = crate::tab_icons::reset_card(&id);
+                    self.after_tab_icon_change(result);
+                }
+            }
+            SettingsAction::TabIconDelete => {
+                let Some(id) = self.selected_tab_icon() else {
+                    return;
+                };
+                if self.ui.confirm_delete_tab_icon.as_deref() == Some(id.as_str()) {
+                    let result = crate::tab_icons::delete_card(&id);
+                    self.ui.tab_icon_selected = None;
+                    self.ui.confirm_delete_tab_icon = None;
+                    self.after_tab_icon_change(result);
+                } else {
+                    self.ui.confirm_delete_tab_icon = Some(id);
+                }
+            }
             SettingsAction::ToggleAgentDetails(agent_id) => {
                 self.ui.open_dropdown = None;
                 self.agents_expanded = if self.agents_expanded == Some(agent_id) {
@@ -5390,7 +5797,7 @@ impl SettingsWindow {
         match result {
             Ok(ok) => {
                 crate::perf::log_duration("settings_paint", paint_start);
-                if animating {
+                if animating || std::mem::take(&mut self.repaint_after_growth) {
                     window.invalidate();
                 }
                 ok
@@ -5430,13 +5837,18 @@ impl SettingsWindow {
     }
 
     fn prepare_paint(&mut self) -> anyhow::Result<bool> {
+        let mut growing = false;
         for _ in 0..3 {
+            growing = false;
             let paint_pass_start = crate::perf::now();
             match self.paint_pass() {
                 Ok(()) => {
                     crate::perf::log_duration("settings_paint_pass", paint_pass_start);
                     match self.render_state.as_mut().unwrap().allocated_more_quads() {
-                        Ok(true) => continue,
+                        Ok(true) => {
+                            growing = true;
+                            continue;
+                        }
                         Ok(false) => break,
                         Err(err) => {
                             log::error!("settings window quad allocation failed: {err:#}");
@@ -5492,6 +5904,7 @@ impl SettingsWindow {
                             log::error!("settings window texture atlas resize failed: {err:#}");
                             break;
                         }
+                        growing = true;
                         continue;
                     }
                     log::error!("settings window paint failed: {err:#}");
@@ -5500,6 +5913,14 @@ impl SettingsWindow {
             }
         }
 
+        if growing {
+            // Every pass found the frame bigger than the room made for it --
+            // a page of icons grows the atlas twice and the quad buffers once
+            // on its first paint -- so the layers hold part of a frame. Keep
+            // the previous one on screen and come straight back.
+            self.repaint_after_growth = true;
+            return Ok(false);
+        }
         Ok(true)
     }
 
@@ -6209,6 +6630,7 @@ impl SettingsWindow {
 
         match self.selected {
             SettingsSection::Appearance => self.paint_appearance(layers, x, max_width)?,
+            SettingsSection::TabIcons => self.paint_tab_icons(layers, x, max_width)?,
             SettingsSection::Compatibility => self.paint_compatibility(layers, x, max_width)?,
             SettingsSection::General => self.paint_general(layers, x, max_width)?,
             SettingsSection::Terminal => self.paint_terminal(layers, x, max_width)?,
@@ -7736,6 +8158,1279 @@ impl SettingsWindow {
             prev_expanded = expanded;
         }
         Ok(())
+    }
+
+    /// Tab icons: the switch, a card for every look a pane tab can take but
+    /// the fixed terminal one, and the editor for the card picked. Cards sit
+    /// beside the editor where the page is wide enough, above it where it is
+    /// not; beside them, the editor stays in view while they scroll.
+    fn paint_tab_icons(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        let max_width =
+            (self.dimensions.pixel_width as f32 - self.ui_px(TAB_ICONS_EDGE_MARGIN) - x)
+                .max(max_width);
+        let palette = self.palette();
+        let body_font = Rc::clone(&self.body_font);
+        let scroll = self.ui.content_scroll.offset;
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
+        let line_height = self.metrics.cell_size.height as f32;
+        let catalog = crate::tab_icons::catalog();
+        let editable = |card: &&crate::tab_icons::Card| card.id != crate::tab_icons::TERMINAL_CARD;
+        if self
+            .ui
+            .tab_icon_selected
+            .as_deref()
+            .and_then(|id| catalog.card(id))
+            .filter(editable)
+            .is_none()
+        {
+            if let Some(first) = catalog.cards.iter().find(editable) {
+                self.select_tab_icon(first.id.clone());
+            }
+        }
+
+        let (switch_card_y, switch_row_y) = self.settings_card_geometry(section_y, 1);
+        let switch_card_height = self.settings_card_height(1);
+        let card_padding = self.ui_px(36.0);
+        self.paint_group_card(layers, x, switch_card_y, max_width, switch_card_height)?;
+        self.paint_toggle_setting_row(
+            layers,
+            x + card_padding,
+            switch_row_y,
+            max_width - card_padding * 2.0,
+            &crate::i18n::tr("settings-tab-icons-enabled"),
+            &crate::i18n::tr("settings-tab-icons-enabled-description"),
+            catalog.enabled,
+            SettingsAction::ToggleTabIcons,
+            false,
+        )?;
+
+        let heading_y = switch_card_y + switch_card_height + self.settings_section_card_gap();
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            heading_y,
+            &crate::i18n::tr("settings-tab-icons-cards-heading"),
+            palette.muted_text,
+            max_width,
+        )?;
+        let note_y = heading_y + line_height + self.ui_px(8.0);
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            note_y,
+            &crate::i18n::tr("settings-tab-icons-cards-note"),
+            palette.secondary_text,
+            max_width,
+        )?;
+        let area_y = note_y + line_height + self.ui_px(28.0);
+
+        let gap = self.ui_px(18.0);
+        let editor_width = self.ui_px(640.0).min(max_width);
+        let min_tile_width = self.ui_px(168.0);
+        let side_by_side = max_width >= editor_width + gap + (min_tile_width + gap) * 3.0;
+        let grid_width = if side_by_side {
+            max_width - editor_width - gap
+        } else {
+            max_width
+        };
+
+        // The search heads the cards' column; the cards are what it finds.
+        let search_height = self.ui.tokens.control_height;
+        self.paint_tab_icon_search(layers, rect(x, area_y, grid_width, search_height))?;
+        let grid_y = area_y + search_height + gap;
+        let query = self.ui.tab_icon_search.text().trim().to_lowercase();
+        let shown: Vec<&crate::tab_icons::Card> = catalog
+            .cards
+            .iter()
+            .filter(editable)
+            .filter(|card| card.matches(&query))
+            .collect();
+        // Nothing found: a line saying so, then the new-card tile as ever.
+        let empty_note = if shown.is_empty() {
+            self.draw_text(
+                layers,
+                &body_font,
+                x,
+                grid_y,
+                &crate::i18n::tr("settings-tab-icons-no-matches"),
+                palette.secondary_text,
+                grid_width,
+            )?;
+            line_height + gap
+        } else {
+            0.0
+        };
+
+        let columns = (((grid_width + gap) / (min_tile_width + gap)).floor() as usize).max(1);
+        let tile_width = (grid_width - gap * (columns - 1) as f32) / columns as f32;
+        let tile_height = self.ui_px(196.0);
+        let tile_count = shown.len() + 1;
+        let rows = tile_count.div_ceil(columns);
+        let tiles_y = grid_y + empty_note;
+        let grid_bottom = tiles_y + rows as f32 * tile_height + rows.saturating_sub(1) as f32 * gap;
+
+        self.ui.tab_icon_cards = shown.iter().map(|card| card.id.clone()).collect();
+        self.ui.tab_icon_drop_rects.clear();
+        for index in 0..tile_count {
+            let tile = rect(
+                x + (index % columns) as f32 * (tile_width + gap),
+                tiles_y + (index / columns) as f32 * (tile_height + gap),
+                tile_width,
+                tile_height,
+            );
+            match shown.get(index) {
+                Some(card) => self.paint_tab_icon_tile(layers, tile, index, card)?,
+                None => self.paint_tab_icon_new_tile(layers, tile)?,
+            }
+        }
+
+        let selected = self
+            .ui
+            .tab_icon_selected
+            .as_deref()
+            .and_then(|id| catalog.card(id))
+            .cloned();
+        let mut bottom = grid_bottom;
+        if let Some(card) = selected {
+            let layout = self.tab_icon_editor_layout(&card, editor_width);
+            let (editor_x, natural_y) = if side_by_side {
+                (x + grid_width + gap, area_y)
+            } else {
+                (x, grid_bottom + gap)
+            };
+            let editor_y = if side_by_side {
+                self.pinned_tab_icon_editor_y(natural_y, grid_bottom, layout.height)
+            } else {
+                natural_y
+            };
+            self.paint_tab_icon_editor(layers, editor_x, editor_y, editor_width, &card, &layout)?;
+            // The page ends where the editor would, left unpinned.
+            bottom = bottom.max(natural_y + layout.height);
+        }
+        self.ui.content_scroll.set_extents(
+            self.content_viewport_extent(),
+            self.settings_content_extent(bottom + scroll),
+        );
+        Ok(())
+    }
+
+    /// Where the editor beside the cards goes: down the page with them until
+    /// it reaches the top of the view, pinned there while they scroll on, and
+    /// carried off again where they end. One taller than the view pins its
+    /// bottom edge instead, so all of it can still be scrolled to.
+    fn pinned_tab_icon_editor_y(&self, natural_y: f32, cards_bottom: f32, height: f32) -> f32 {
+        pinned_beside_column(
+            natural_y,
+            cards_bottom,
+            height,
+            self.content_scroll_area_top() + self.ui_px(TAB_ICONS_EDGE_MARGIN),
+            self.content_bottom() - self.ui_px(TAB_ICONS_EDGE_MARGIN),
+        )
+    }
+
+    /// The field heading the cards, shaped like the sidebar's search: a
+    /// pill with a magnifier, and a clear button once there is a query.
+    fn paint_tab_icon_search(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        field: window::RectF,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let query = self.ui.tab_icon_search.text().to_string();
+        self.paint_text_input(
+            layers,
+            0,
+            TextInputSpec {
+                placeholder: &crate::i18n::tr("settings-tab-icons-search-placeholder"),
+                text: &query,
+                rect: field,
+                focused: self.ui.interaction.focused == Some(SettingsAction::TabIconSearchInput),
+                selected_all: self.ui.tab_icon_search.selected_all,
+                action: SettingsAction::TabIconSearchInput,
+            },
+        )?;
+        let icon_size = self.sidebar_icon_size();
+        self.draw_svg_icon(
+            layers,
+            SettingsIcon::Search.svg(),
+            field.origin.x + self.ui_px(15.0),
+            field.origin.y + (field.size.height - icon_size) / 2.0,
+            icon_size,
+            palette.muted_text,
+        )?;
+        if query.is_empty() {
+            return Ok(());
+        }
+        let clear_size = self.ui_px(34.0);
+        let clear_icon_size = self.ui_px(24.0);
+        let clear_rect = rect(
+            field.origin.x + field.size.width - clear_size - self.ui_px(10.0),
+            field.origin.y + (field.size.height - clear_size) / 2.0,
+            clear_size,
+            clear_size,
+        );
+        self.ui_context.push(
+            clear_rect,
+            WidgetKind::Button,
+            SettingsAction::ClearTabIconSearch,
+        );
+        if self.ui.interaction.hovered == Some(SettingsAction::ClearTabIconSearch)
+            || self.ui.interaction.pressed == Some(SettingsAction::ClearTabIconSearch)
+        {
+            // Above the field's own fill, which is on layer 0.
+            self.draw_rounded_rect(
+                layers,
+                1,
+                clear_rect.origin.x,
+                clear_rect.origin.y,
+                clear_rect.size.width,
+                clear_rect.size.height,
+                palette.control_hover_bg,
+                self.ui_px(14.0),
+            )?;
+        }
+        self.draw_svg_icon(
+            layers,
+            SettingsIcon::Clear.svg(),
+            clear_rect.origin.x + (clear_rect.size.width - clear_icon_size) / 2.0,
+            clear_rect.origin.y + (clear_rect.size.height - clear_icon_size) / 2.0,
+            clear_icon_size,
+            palette.secondary_text,
+        )?;
+        Ok(())
+    }
+
+    fn paint_tab_icon_tile(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        tile: window::RectF,
+        index: usize,
+        card: &crate::tab_icons::Card,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let action = SettingsAction::TabIconSelect(index.min(u16::MAX as usize) as u16);
+        let selected = self.ui.tab_icon_selected.as_deref() == Some(card.id.as_str());
+        let target = TabIconDropTarget::Card(index);
+        self.paint_tab_icon_tile_frame(layers, tile, action, selected, target)?;
+        self.ui.tab_icon_drop_rects.push((tile, target));
+
+        let diameter = self.ui_px(88.0);
+        let icon_y = tile.origin.y + self.ui_px(26.0);
+        self.draw_tab_icon(
+            layers,
+            card.circle,
+            &card.glyph,
+            card.glyph_color.linear(),
+            tile.origin.x + (tile.size.width - diameter) / 2.0,
+            icon_y,
+            diameter,
+        )?;
+        let name_width = (tile.size.width - self.ui_px(24.0)).max(0.0);
+        let name = self.text_with_ellipsis(&ui_font, &card.name, name_width);
+        let name_x = tile.origin.x
+            + ((tile.size.width - self.measure_text_width(&ui_font, &name)) / 2.0).max(0.0);
+        self.draw_text(
+            layers,
+            &ui_font,
+            name_x,
+            icon_y + diameter + self.ui_px(20.0),
+            &name,
+            palette.text,
+            name_width,
+        )?;
+        Ok(())
+    }
+
+    fn paint_tab_icon_new_tile(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        tile: window::RectF,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let action = SettingsAction::TabIconNew;
+        let target = TabIconDropTarget::NewCard;
+        self.paint_tab_icon_tile_frame(layers, tile, action, false, target)?;
+        self.ui.tab_icon_drop_rects.push((tile, target));
+
+        let icon = self.ui_px(40.0);
+        let icon_y = tile.origin.y + self.ui_px(50.0);
+        self.draw_svg_icon(
+            layers,
+            SvgIcon::Plus,
+            tile.origin.x + (tile.size.width - icon) / 2.0,
+            icon_y,
+            icon,
+            palette.secondary_text,
+        )?;
+        let label = crate::i18n::tr("settings-tab-icons-new");
+        let label_width = (tile.size.width - self.ui_px(24.0)).max(0.0);
+        let label_x = tile.origin.x
+            + ((tile.size.width - self.measure_text_width(&ui_font, &label)) / 2.0).max(0.0);
+        self.draw_text(
+            layers,
+            &ui_font,
+            label_x,
+            icon_y + icon + self.ui_px(44.0),
+            &label,
+            palette.secondary_text,
+            label_width,
+        )?;
+        Ok(())
+    }
+
+    /// A tile's surface: lifted while hovered or selected, ringed while an
+    /// SVG is dragged over it.
+    fn paint_tab_icon_tile_frame(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        tile: window::RectF,
+        action: SettingsAction,
+        selected: bool,
+        target: TabIconDropTarget,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let hovered = self.ui.interaction.hovered == Some(action);
+        let pressed = self.ui.interaction.pressed == Some(action);
+        let dropping = self.ui.tab_icon_drop_target == Some(target);
+        let fill = if pressed {
+            palette.control_pressed_bg
+        } else if selected || hovered || dropping {
+            palette.control_hover_bg
+        } else {
+            palette.card_bg
+        };
+        let border = if dropping {
+            palette.text
+        } else if selected {
+            palette.muted_text
+        } else {
+            palette.separator
+        };
+        let radius = self.ui_px(28.0);
+        self.draw_rounded_frame(
+            layers,
+            0,
+            tile.origin.x,
+            tile.origin.y,
+            tile.size.width,
+            tile.size.height,
+            fill,
+            border,
+            radius,
+        )?;
+        if selected || dropping {
+            // A second hairline inside the first: one pixel of border does
+            // not tell the selected tile from its neighbours at a glance.
+            let inset = self.ui_px(1.0).max(1.0);
+            self.draw_rounded_frame(
+                layers,
+                0,
+                tile.origin.x + inset,
+                tile.origin.y + inset,
+                tile.size.width - inset * 2.0,
+                tile.size.height - inset * 2.0,
+                fill,
+                border,
+                radius - inset,
+            )?;
+        }
+        self.ui_context.push(tile, WidgetKind::Button, action);
+        Ok(())
+    }
+
+    /// Where the editor's parts go for `card` at `width`, worked out before
+    /// anything is drawn: its card needs the height first, and so does the
+    /// place a pinned editor is kept at.
+    fn tab_icon_editor_layout(
+        &self,
+        card: &crate::tab_icons::Card,
+        width: f32,
+    ) -> TabIconEditorLayout {
+        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
+        let inner = (width - self.ui_px(TAB_ICON_EDITOR_PAD) * 2.0).max(0.0);
+        let label_width = [
+            crate::i18n::tr("settings-tab-icons-programs"),
+            crate::i18n::tr("settings-tab-icons-glyph"),
+        ]
+        .iter()
+        .map(|label| self.measure_text_width(&body_font, label))
+        .fold(0.0, f32::max);
+        let value_width = (inner
+            - self.ui_px(TAB_ICON_EDITOR_ROW_PAD_X) * 2.0
+            - label_width
+            - self.ui_px(TAB_ICON_EDITOR_LABEL_GAP))
+        .max(0.0);
+        let gap = self.ui_px(TAB_ICON_EDITOR_ITEM_GAP);
+
+        // The Programs row: a chip per program, wrapping right-aligned, and
+        // under them the field that adds one, across the whole column. The
+        // Shape row: its buttons, wrapping the same way.
+        let chip_close = self.ui_px(40.0);
+        let program_widths: Vec<f32> = card
+            .programs
+            .iter()
+            .map(|program| {
+                (self.measure_text_width(&ui_font, program) + self.ui_px(28.0) + chip_close)
+                    .min(value_width)
+            })
+            .collect();
+        let (program_places, chip_lines) = flow_right(&program_widths, value_width, gap);
+        let add_line = if card.programs.is_empty() {
+            0
+        } else {
+            chip_lines
+        };
+        let program_lines = add_line + 1;
+
+        let mut shape_buttons = vec![(
+            crate::i18n::tr("settings-tab-icons-choose-svg"),
+            SettingsAction::TabIconChooseSvg,
+        )];
+        if matches!(card.glyph, crate::tab_icons::GlyphKey::Svg(_)) {
+            shape_buttons.push((
+                crate::i18n::tr("settings-tab-icons-clear-svg"),
+                SettingsAction::TabIconClearSvg,
+            ));
+        }
+        let shape_widths: Vec<f32> = shape_buttons
+            .iter()
+            .map(|(label, _)| self.button_width_for_label(label, 0.0).min(value_width))
+            .collect();
+        let (shape_places, shape_lines) = flow_right(&shape_widths, value_width, gap);
+
+        let lines = |count: usize| {
+            self.ui_px(CONTROL_HEIGHT) * count as f32
+                + self.ui_px(TAB_ICON_EDITOR_LINE_GAP) * count.saturating_sub(1) as f32
+        };
+        let row_pad_y = self.ui_px(TAB_ICON_EDITOR_ROW_PAD_Y);
+        let programs_row = row_pad_y * 2.0 + lines(program_lines);
+        let shape_row = row_pad_y * 2.0 + lines(shape_lines);
+        let color_row = row_pad_y * 2.0
+            + self.ui_px(CONTROL_HEIGHT)
+            + self.ui_px(TAB_ICON_EDITOR_SWATCH_GAP)
+            + self.ui_px(TAB_ICON_EDITOR_SWATCH);
+        let hairline = self.ui_px(1.0).max(1.0);
+        let height = self.ui_px(TAB_ICON_EDITOR_PAD) * 2.0
+            + self.ui_px(TAB_ICON_EDITOR_HEAD)
+            + self.ui_px(TAB_ICON_EDITOR_SECTION_GAP) * 2.0
+            + programs_row
+            + hairline
+            + shape_row
+            + color_row * 2.0
+            + hairline;
+
+        let chips = card
+            .programs
+            .iter()
+            .zip(program_places.iter().zip(program_widths.iter()))
+            .map(|(program, (&(chip_x, line), &chip_width))| {
+                (chip_x, line, chip_width, program.clone())
+            })
+            .collect();
+        let add_field = (0.0, add_line, value_width);
+        let shape_buttons = shape_buttons
+            .into_iter()
+            .zip(shape_places.into_iter().zip(shape_widths))
+            .map(|((label, action), ((button_x, line), button_width))| {
+                (button_x, line, button_width, label, action)
+            })
+            .collect();
+        TabIconEditorLayout {
+            height,
+            label_width,
+            chips,
+            add_field,
+            programs_row,
+            shape_buttons,
+            shape_row,
+            color_row,
+        }
+    }
+
+    /// The selected card's editor, laid out by `tab_icon_editor_layout`: a
+    /// header with the icon, its name and what may be undone, then the
+    /// settings in two groups of rows -- which programs and which shape,
+    /// then the two colours.
+    fn paint_tab_icon_editor(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        card: &crate::tab_icons::Card,
+        layout: &TabIconEditorLayout,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
+        let line_height = self.metrics.cell_size.height as f32;
+        let pad = self.ui_px(TAB_ICON_EDITOR_PAD);
+        let inner_x = x + pad;
+        let inner_width = (width - pad * 2.0).max(0.0);
+        let control_height = self.ui_px(CONTROL_HEIGHT);
+        let row_pad_x = self.ui_px(TAB_ICON_EDITOR_ROW_PAD_X);
+        let row_pad_y = self.ui_px(TAB_ICON_EDITOR_ROW_PAD_Y);
+        let line_gap = self.ui_px(TAB_ICON_EDITOR_LINE_GAP);
+        let hairline = self.ui_px(1.0).max(1.0);
+
+        // An SVG dropped anywhere on the editor goes to the card it shows.
+        let bounds = rect(x, y, width, layout.height);
+        self.ui
+            .tab_icon_drop_rects
+            .push((bounds, TabIconDropTarget::Editor));
+        let dropping = self.ui.tab_icon_drop_target == Some(TabIconDropTarget::Editor);
+        self.draw_rounded_frame(
+            layers,
+            0,
+            x,
+            y,
+            width,
+            layout.height,
+            palette.card_bg,
+            if dropping {
+                palette.text
+            } else {
+                palette.separator
+            },
+            self.ui_px(34.0),
+        )?;
+
+        // Header: the icon, the name, and Reset or Delete when there is one.
+        let head = self.ui_px(TAB_ICON_EDITOR_HEAD);
+        let head_y = y + pad;
+        self.draw_tab_icon(
+            layers,
+            card.circle,
+            &card.glyph,
+            card.glyph_color.linear(),
+            inner_x,
+            head_y,
+            head,
+        )?;
+        let text_x = inner_x + head + self.ui_px(24.0);
+        let mut text_right = inner_x + inner_width;
+        let header_button = if !card.builtin {
+            if self.ui.confirm_delete_tab_icon.as_deref() == Some(card.id.as_str()) {
+                Some((
+                    crate::i18n::tr("settings-tab-icons-delete-confirm"),
+                    SettingsAction::TabIconDelete,
+                ))
+            } else {
+                Some((
+                    crate::i18n::tr("settings-tab-icons-delete"),
+                    SettingsAction::TabIconDelete,
+                ))
+            }
+        } else if card.changed {
+            Some((
+                crate::i18n::tr("settings-tab-icons-reset"),
+                SettingsAction::TabIconReset,
+            ))
+        } else {
+            None
+        };
+        if let Some((label, action)) = header_button {
+            let button_width = self
+                .button_width_for_label(&label, 0.0)
+                .min((text_right - text_x).max(0.0));
+            text_right -= button_width;
+            self.draw_button(
+                layers,
+                text_right,
+                head_y + (head - control_height) / 2.0,
+                button_width,
+                &label,
+                action,
+            )?;
+            text_right -= self.ui_px(16.0);
+        }
+        let text_width = (text_right - text_x).max(0.0);
+        if card.builtin {
+            let kind = crate::i18n::tr(if card.changed {
+                "settings-tab-icons-kind-changed"
+            } else {
+                "settings-tab-icons-kind-builtin"
+            });
+            let lines_y = head_y + (head - line_height * 2.0 - self.ui_px(4.0)) / 2.0;
+            self.draw_text(
+                layers,
+                &ui_font,
+                text_x,
+                lines_y,
+                &card.name,
+                palette.text,
+                text_width,
+            )?;
+            self.draw_text(
+                layers,
+                &body_font,
+                text_x,
+                lines_y + line_height + self.ui_px(4.0),
+                &kind,
+                palette.muted_text,
+                text_width,
+            )?;
+        } else {
+            let value = self.ui.tab_icon_name_input.text().to_string();
+            self.paint_value_input_box(
+                layers,
+                rect(
+                    text_x,
+                    head_y + (head - control_height) / 2.0,
+                    text_width,
+                    control_height,
+                ),
+                SettingsAction::TabIconNameInput,
+                &value,
+                &crate::i18n::tr("settings-tab-icons-name-placeholder"),
+            )?;
+        }
+
+        // The first group: Programs, then Shape.
+        let group_fill = self.chrome_palette.group_bg;
+        let group_radius = self.ui_px(24.0);
+        let group_y = head_y + head + self.ui_px(TAB_ICON_EDITOR_SECTION_GAP);
+        let group_height = layout.programs_row + hairline + layout.shape_row;
+        self.draw_rounded_rect(
+            layers,
+            0,
+            inner_x,
+            group_y,
+            inner_width,
+            group_height,
+            group_fill,
+            group_radius,
+        )?;
+        let label_x = inner_x + row_pad_x;
+        let value_x = label_x + layout.label_width + self.ui_px(TAB_ICON_EDITOR_LABEL_GAP);
+        let line_top =
+            |row_y: f32, line: usize| row_y + row_pad_y + line as f32 * (control_height + line_gap);
+
+        let row_y = group_y;
+        self.draw_text(
+            layers,
+            &body_font,
+            label_x,
+            self.control_text_y(line_top(row_y, 0), control_height),
+            &crate::i18n::tr("settings-tab-icons-programs"),
+            palette.text,
+            layout.label_width,
+        )?;
+        self.ui.tab_icon_programs = card.programs.clone();
+        let chip_height = self.ui_px(48.0);
+        let chip_close = self.ui_px(40.0);
+        for (index, (chip_x, line, chip_width, program)) in layout.chips.iter().enumerate() {
+            let chip_left = value_x + chip_x;
+            let chip_top = line_top(row_y, *line) + (control_height - chip_height) / 2.0;
+            self.draw_rounded_rect(
+                layers,
+                0,
+                chip_left,
+                chip_top,
+                *chip_width,
+                chip_height,
+                palette.control_bg,
+                chip_height / 2.0,
+            )?;
+            let text_width = (chip_width - self.ui_px(14.0) - chip_close).max(0.0);
+            let text = self.text_with_ellipsis(&ui_font, program, text_width);
+            self.draw_text(
+                layers,
+                &ui_font,
+                chip_left + self.ui_px(14.0),
+                self.control_text_y(chip_top, chip_height),
+                &text,
+                palette.text,
+                text_width,
+            )?;
+            let action = SettingsAction::TabIconRemoveProgram(index.min(u16::MAX as usize) as u16);
+            let close = rect(
+                chip_left + chip_width - chip_close,
+                chip_top,
+                chip_close,
+                chip_height,
+            );
+            self.ui_context.push(close, WidgetKind::Button, action);
+            let hovered = self.ui.interaction.hovered == Some(action);
+            if hovered {
+                let ring = chip_height - self.ui_px(16.0);
+                self.draw_rounded_rect(
+                    layers,
+                    1,
+                    close.origin.x + (chip_close - ring) / 2.0 - self.ui_px(4.0),
+                    chip_top + (chip_height - ring) / 2.0,
+                    ring,
+                    ring,
+                    palette.control_hover_bg,
+                    ring / 2.0,
+                )?;
+            }
+            let glyph = self.ui_px(20.0);
+            self.draw_svg_icon(
+                layers,
+                SvgIcon::X,
+                close.origin.x + (chip_close - glyph) / 2.0 - self.ui_px(4.0),
+                chip_top + (chip_height - glyph) / 2.0,
+                glyph,
+                if hovered {
+                    palette.text
+                } else {
+                    palette.secondary_text
+                },
+            )?;
+        }
+        let (field_x, field_line, field_width) = layout.add_field;
+        let program_value = self.ui.tab_icon_program_input.text().to_string();
+        self.paint_value_input_box(
+            layers,
+            rect(
+                value_x + field_x,
+                line_top(row_y, field_line),
+                field_width,
+                control_height,
+            ),
+            SettingsAction::TabIconProgramInput,
+            &program_value,
+            &crate::i18n::tr("settings-tab-icons-program-placeholder"),
+        )?;
+
+        let rule_y = row_y + layout.programs_row;
+        self.draw_rect(
+            layers,
+            0,
+            label_x,
+            rule_y,
+            inner_x + inner_width - label_x,
+            hairline,
+            palette.separator,
+        )?;
+        let row_y = rule_y + hairline;
+        self.draw_text(
+            layers,
+            &body_font,
+            label_x,
+            self.control_text_y(line_top(row_y, 0), control_height),
+            &crate::i18n::tr("settings-tab-icons-glyph"),
+            palette.text,
+            layout.label_width,
+        )?;
+        for (button_x, line, button_width, label, action) in &layout.shape_buttons {
+            self.draw_button(
+                layers,
+                value_x + button_x,
+                line_top(row_y, *line),
+                *button_width,
+                label,
+                *action,
+            )?;
+        }
+
+        // The second group: the two colours.
+        let group_y = group_y + group_height + self.ui_px(TAB_ICON_EDITOR_SECTION_GAP);
+        self.draw_rounded_rect(
+            layers,
+            0,
+            inner_x,
+            group_y,
+            inner_width,
+            layout.color_row * 2.0 + hairline,
+            group_fill,
+            group_radius,
+        )?;
+        let circle_value = self.ui.tab_icon_circle_input.text().to_string();
+        self.paint_tab_icon_color_row(
+            layers,
+            inner_x,
+            group_y,
+            inner_width,
+            &crate::i18n::tr("settings-tab-icons-circle-color"),
+            card.circle,
+            &circle_value,
+            SettingsAction::TabIconCircleInput,
+            crate::tab_icons::CIRCLE_PRESETS,
+            SettingsAction::TabIconCirclePreset,
+        )?;
+        let rule_y = group_y + layout.color_row;
+        self.draw_rect(
+            layers,
+            0,
+            label_x,
+            rule_y,
+            inner_x + inner_width - label_x,
+            hairline,
+            palette.separator,
+        )?;
+        let glyph_value = self.ui.tab_icon_glyph_input.text().to_string();
+        self.paint_tab_icon_color_row(
+            layers,
+            inner_x,
+            rule_y + hairline,
+            inner_width,
+            &crate::i18n::tr("settings-tab-icons-glyph-color"),
+            card.glyph_color,
+            &glyph_value,
+            SettingsAction::TabIconGlyphColorInput,
+            crate::tab_icons::GLYPH_PRESETS,
+            SettingsAction::TabIconGlyphPreset,
+        )?;
+        Ok(())
+    }
+
+    /// One colour's row: its label with the `#RRGGBB` field and a sample of
+    /// the colour in use across from it, and the presets to pick from under
+    /// them.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_tab_icon_color_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        label: &str,
+        current: crate::tab_icons::Rgb,
+        value: &str,
+        input: SettingsAction,
+        presets: &[crate::tab_icons::Rgb],
+        preset_action: fn(u8) -> SettingsAction,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let body_font = Rc::clone(&self.body_font);
+        let control_height = self.ui_px(CONTROL_HEIGHT);
+        let row_pad_x = self.ui_px(TAB_ICON_EDITOR_ROW_PAD_X);
+        let top = y + self.ui_px(TAB_ICON_EDITOR_ROW_PAD_Y);
+        let left = x + row_pad_x;
+        let right = x + width - row_pad_x;
+
+        let field_width = self.ui_px(200.0).min((right - left) / 2.0);
+        let field_x = right - field_width;
+        self.draw_text(
+            layers,
+            &body_font,
+            left,
+            self.control_text_y(top, control_height),
+            label,
+            palette.text,
+            (field_x - left).max(0.0),
+        )?;
+        self.paint_value_input_box(
+            layers,
+            rect(field_x, top, field_width, control_height),
+            input,
+            value,
+            "#RRGGBB",
+        )?;
+        let sample = control_height - self.ui_px(28.0);
+        self.draw_tab_icon_swatch(
+            layers,
+            field_x - self.ui_px(12.0) - sample,
+            top + (control_height - sample) / 2.0,
+            sample,
+            current.linear(),
+            false,
+        )?;
+
+        let swatch = self.ui_px(TAB_ICON_EDITOR_SWATCH);
+        let swatch_gap = self.ui_px(TAB_ICON_EDITOR_ITEM_GAP);
+        let presets_y = top + control_height + self.ui_px(TAB_ICON_EDITOR_SWATCH_GAP);
+        for (index, preset) in presets.iter().enumerate() {
+            let preset_x = left + index as f32 * (swatch + swatch_gap);
+            if preset_x + swatch > right {
+                break;
+            }
+            let action = preset_action(index.min(u8::MAX as usize) as u8);
+            let hovered = self.ui.interaction.hovered == Some(action);
+            self.draw_tab_icon_swatch(
+                layers,
+                preset_x,
+                presets_y,
+                swatch,
+                preset.linear(),
+                *preset == current || hovered,
+            )?;
+            self.ui_context.push(
+                rect(preset_x, presets_y, swatch, swatch),
+                WidgetKind::Button,
+                action,
+            );
+        }
+        Ok(())
+    }
+
+    /// A round colour sample with a hairline, so white and near-background
+    /// colours keep an edge; `marked` rings it as the one in use.
+    fn draw_tab_icon_swatch(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        size: f32,
+        color: LinearRgba,
+        marked: bool,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let edge = self.ui_px(2.0).max(1.0);
+        if marked {
+            let ring = self.ui_px(4.0);
+            self.draw_rounded_rect(
+                layers,
+                0,
+                x - ring,
+                y - ring,
+                size + ring * 2.0,
+                size + ring * 2.0,
+                palette.text.mul_alpha(0.55),
+                size / 2.0 + ring,
+            )?;
+            self.draw_rounded_rect(
+                layers,
+                0,
+                x - ring + edge,
+                y - ring + edge,
+                size + (ring - edge) * 2.0,
+                size + (ring - edge) * 2.0,
+                palette.card_bg,
+                size / 2.0 + ring - edge,
+            )?;
+        }
+        self.draw_rounded_rect(
+            layers,
+            1,
+            x,
+            y,
+            size,
+            size,
+            palette.text.mul_alpha(0.18),
+            size / 2.0,
+        )?;
+        self.draw_rounded_rect(
+            layers,
+            1,
+            x + edge,
+            y + edge,
+            size - edge * 2.0,
+            size - edge * 2.0,
+            color,
+            size / 2.0 - edge,
+        )
+    }
+
+    /// A tab icon as the pane tabs draw it: the lit circle and its glyph.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_tab_icon(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        circle: crate::tab_icons::Rgb,
+        glyph: &crate::tab_icons::GlyphKey,
+        glyph_color: LinearRgba,
+        x: f32,
+        y: f32,
+        diameter: f32,
+    ) -> anyhow::Result<()> {
+        let ctx = crate::ui::draw::DrawContext::new(
+            self.render_state.as_ref().unwrap(),
+            self.dimensions,
+            &self.metrics,
+        );
+        crate::tab_icons::draw_plate(
+            &ctx,
+            layers,
+            1,
+            x,
+            y,
+            diameter,
+            circle,
+            self.chrome_palette.is_dark(),
+        )?;
+        let size = (diameter * crate::termwindow::ui::tokens::TAB_ICON_GLYPH_RATIO).round();
+        crate::tab_icons::draw_glyph(
+            &ctx,
+            layers,
+            2,
+            glyph,
+            x + (diameter - size) / 2.0,
+            y + (diameter - size) / 2.0,
+            size,
+            glyph_color,
+        )
+    }
+
+    /// Make `id` the card being edited, and show its values in the fields.
+    fn select_tab_icon(&mut self, id: String) {
+        if self.ui.tab_icon_selected.as_deref() != Some(id.as_str()) {
+            self.ui.tab_icon_program_input.clear();
+        }
+        self.ui.tab_icon_selected = Some(id);
+        self.ui.confirm_delete_tab_icon = None;
+        self.sync_tab_icon_inputs();
+    }
+
+    /// The fields show the selected card as saved. A field being typed into
+    /// is left alone: the user is not done with it.
+    fn sync_tab_icon_inputs(&mut self) {
+        let catalog = crate::tab_icons::catalog();
+        let Some(card) = self
+            .ui
+            .tab_icon_selected
+            .as_deref()
+            .and_then(|id| catalog.card(id))
+        else {
+            return;
+        };
+        let focused = self.ui.interaction.focused;
+        if focused != Some(SettingsAction::TabIconNameInput) {
+            // The name as stored: an unnamed card shows the placeholder, not
+            // the stand-in name the catalog gives it, which typing would
+            // otherwise extend.
+            let name = self
+                .native_settings
+                .tab_icons
+                .cards
+                .iter()
+                .find(|stored| stored.id == card.id)
+                .and_then(|stored| stored.name.clone())
+                .unwrap_or_default();
+            self.ui.tab_icon_name_input.set_text_end(name);
+            self.ui.tab_icon_name_input_dirty = false;
+        }
+        if focused != Some(SettingsAction::TabIconCircleInput) {
+            self.ui
+                .tab_icon_circle_input
+                .set_text_end(card.circle.to_hex());
+            self.ui.tab_icon_circle_input_dirty = false;
+        }
+        if focused != Some(SettingsAction::TabIconGlyphColorInput) {
+            self.ui
+                .tab_icon_glyph_input
+                .set_text_end(card.glyph_color.to_hex());
+            self.ui.tab_icon_glyph_input_dirty = false;
+        }
+    }
+
+    /// After any change to the cards: take the saved settings back (this
+    /// window keeps a copy it writes whole, which must not overwrite the
+    /// change later), repaint every terminal window, and say how it went.
+    fn after_tab_icon_change(&mut self, result: anyhow::Result<()>) {
+        match result {
+            Ok(()) => {
+                self.set_native_settings(crate::native_settings::load());
+                if let Some(front_end) = crate::frontend::try_front_end() {
+                    front_end.invalidate_all_windows();
+                }
+                self.sync_tab_icon_inputs();
+                self.status = crate::i18n::tr("settings-status-tab-icons-saved");
+            }
+            Err(err) => {
+                log::error!("failed to save tab icons: {err:#}");
+                self.status = settings_tr(
+                    "settings-status-tab-icons-error",
+                    &[("error", format!("{err:#}"))],
+                );
+            }
+        }
+    }
+
+    fn selected_tab_icon(&self) -> Option<String> {
+        self.ui.tab_icon_selected.clone()
+    }
+
+    /// Commit a tab icon field on its way out of focus, or on Return in the
+    /// program field (which stays focused for the next name).
+    fn commit_tab_icon_input(&mut self, focused: SettingsAction) {
+        let Some(id) = self.selected_tab_icon() else {
+            return;
+        };
+        match focused {
+            SettingsAction::TabIconProgramInput => {
+                let program = self.ui.tab_icon_program_input.text().trim().to_string();
+                if program.is_empty() {
+                    return;
+                }
+                if crate::tab_icons::normalize_program_name(&program).is_none() {
+                    self.status = crate::i18n::tr("settings-status-tab-icons-bad-program");
+                    return;
+                }
+                match crate::tab_icons::add_program(&id, &program) {
+                    Ok(moved_from) => {
+                        self.ui.tab_icon_program_input.clear();
+                        self.after_tab_icon_change(Ok(()));
+                        if let Some(from) = moved_from {
+                            self.status = settings_tr(
+                                "settings-status-tab-icons-program-moved",
+                                &[("program", program.to_lowercase()), ("from", from)],
+                            );
+                        }
+                    }
+                    Err(err) => self.after_tab_icon_change(Err(err)),
+                }
+            }
+            SettingsAction::TabIconNameInput if self.ui.tab_icon_name_input_dirty => {
+                self.ui.tab_icon_name_input_dirty = false;
+                let name = self.ui.tab_icon_name_input.text().to_string();
+                let result = crate::tab_icons::rename_card(&id, &name);
+                self.after_tab_icon_change(result);
+            }
+            SettingsAction::TabIconCircleInput | SettingsAction::TabIconGlyphColorInput => {
+                let (input, dirty) = if focused == SettingsAction::TabIconCircleInput {
+                    (
+                        self.ui.tab_icon_circle_input.text().to_string(),
+                        std::mem::take(&mut self.ui.tab_icon_circle_input_dirty),
+                    )
+                } else {
+                    (
+                        self.ui.tab_icon_glyph_input.text().to_string(),
+                        std::mem::take(&mut self.ui.tab_icon_glyph_input_dirty),
+                    )
+                };
+                if !dirty {
+                    return;
+                }
+                // `#` is optional to type: `3776ab` means what it says.
+                let spelled = if input.trim().starts_with('#') {
+                    input.trim().to_string()
+                } else {
+                    format!("#{}", input.trim())
+                };
+                match crate::tab_icons::Rgb::parse(&spelled) {
+                    Some(color) => {
+                        let result = if focused == SettingsAction::TabIconCircleInput {
+                            crate::tab_icons::set_card_circle(&id, color)
+                        } else {
+                            crate::tab_icons::set_card_glyph_color(&id, color)
+                        };
+                        // The field is still focused here; let it show the
+                        // colour as saved once focus moves on.
+                        self.after_tab_icon_change(result);
+                    }
+                    None => {
+                        self.status = crate::i18n::tr("settings-status-tab-icons-bad-color");
+                        self.sync_tab_icon_inputs();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The drop target under a point, on the tab icons page only.
+    fn tab_icon_drop_target_at(&self, x: f32, y: f32) -> Option<TabIconDropTarget> {
+        // Cards scrolled up under the window's chrome are out of view.
+        if self.selected != SettingsSection::TabIcons || y < self.content_scroll_area_top() {
+            return None;
+        }
+        self.ui
+            .tab_icon_drop_rects
+            .iter()
+            .find(|(area, _)| area.contains(euclid::point2(x, y)))
+            .map(|(_, target)| *target)
+    }
+
+    /// Take an SVG onto card `card`, or onto a new one for `None`. The copy
+    /// is made off the UI thread (the file may sit on a slow or synced
+    /// disk) and applied when it comes back.
+    fn import_tab_icon_svg(&mut self, card: Option<String>, path: PathBuf) {
+        let instance_id = self.instance_id;
+        let window = self.window.clone();
+        promise::spawn::spawn(async move {
+            let imported = promise::spawn::spawn_into_new_thread(move || {
+                Ok::<_, anyhow::Error>(crate::tab_icons::import_svg(&path))
+            })
+            .await;
+            promise::spawn::spawn_into_main_thread(async move {
+                let Some(settings) = settings_window_for_instance(instance_id) else {
+                    return;
+                };
+                let mut settings = settings.borrow_mut();
+                match imported {
+                    Ok(Ok(svg)) => settings.apply_imported_tab_icon_svg(card, svg),
+                    Ok(Err(err)) => {
+                        if let crate::tab_icons::ImportError::Io(io) = &err {
+                            log::warn!("tab icon import failed: {io:#}");
+                        }
+                        settings.status = err.message();
+                    }
+                    Err(err) => {
+                        log::warn!("tab icon import failed: {err:#}");
+                        settings.status = crate::i18n::tr("tab-icons-import-failed");
+                    }
+                }
+                if let Some(window) = window {
+                    window.invalidate();
+                }
+            })
+            .detach();
+        })
+        .detach();
+    }
+
+    fn apply_imported_tab_icon_svg(&mut self, card: Option<String>, svg: String) {
+        // The selection is about to move to the card this lands on. A field
+        // being typed into belongs to the card it was opened for, so commit
+        // it there first.
+        if card.as_deref() != self.ui.tab_icon_selected.as_deref() {
+            self.set_focused_input(None);
+        }
+        let (id, result) = match card {
+            Some(id) => {
+                let result = crate::tab_icons::set_card_svg(&id, svg);
+                (id, result)
+            }
+            None => match crate::tab_icons::create_card(Some(svg)) {
+                Ok(Some(id)) => {
+                    self.ui.tab_icon_search.clear();
+                    (id, Ok(()))
+                }
+                Ok(None) => {
+                    self.status = settings_tr(
+                        "settings-status-tab-icons-too-many",
+                        &[("count", crate::tab_icons::MAX_CUSTOM_CARDS.to_string())],
+                    );
+                    return;
+                }
+                Err(err) => return self.after_tab_icon_change(Err(err)),
+            },
+        };
+        self.select_tab_icon(id);
+        self.after_tab_icon_change(result);
+    }
+
+    fn choose_tab_icon_svg(&mut self) {
+        let Some(id) = self.selected_tab_icon() else {
+            return;
+        };
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let instance_id = self.instance_id;
+        window.pick_file_async_with_options(
+            FilePickerOptions {
+                title: crate::i18n::tr("settings-tab-icons-svg-picker-title"),
+                prompt: crate::i18n::tr("common-choose"),
+                extension: "svg".to_string(),
+                kind: "SVG".to_string(),
+                directory: None,
+            },
+            Box::new(move |path| {
+                let Some(path) = path else {
+                    return;
+                };
+                promise::spawn::spawn_into_main_thread(async move {
+                    if let Some(settings) = settings_window_for_instance(instance_id) {
+                        settings.borrow_mut().import_tab_icon_svg(Some(id), path);
+                    }
+                })
+                .detach();
+            }),
+        );
     }
 
     fn paint_terminal(
@@ -11439,6 +13134,42 @@ impl SettingsWindow {
         let control_x = x + width - control_width;
         let control_y = y + self.ui_px(4.0);
         let text_width = (control_x - x - self.ui_px(24.0)).max(width * 0.45);
+        let control_rect = rect(
+            control_x,
+            control_y,
+            control_width,
+            self.ui_px(CONTROL_HEIGHT),
+        );
+
+        self.draw_text(layers, &ui_font, x, y, label, palette.text, text_width)?;
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            self.settings_row_description_y(y),
+            description,
+            palette.secondary_text,
+            text_width,
+        )?;
+        self.paint_value_input_box(layers, control_rect, action, value, placeholder)
+    }
+
+    /// A one-line value field: frame, text or placeholder, selection and
+    /// caret. The setting rows that carry one draw it through here, and so
+    /// do pages that place their fields themselves.
+    fn paint_value_input_box(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        control_rect: window::RectF,
+        action: SettingsAction,
+        value: &str,
+        placeholder: &str,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let control_x = control_rect.origin.x;
+        let control_y = control_rect.origin.y;
+        let control_width = control_rect.size.width;
         let focused = self.ui.interaction.focused == Some(action);
         let hovered = self.ui.interaction.hovered == Some(action);
         let pressed = self.ui.interaction.pressed == Some(action);
@@ -11456,32 +13187,15 @@ impl SettingsWindow {
         } else {
             palette.control_border
         };
-        let control_rect = rect(
-            control_x,
-            control_y,
-            control_width,
-            self.ui_px(CONTROL_HEIGHT),
-        );
-
         self.ui_context
             .push(control_rect, WidgetKind::TextInput, action);
-        self.draw_text(layers, &ui_font, x, y, label, palette.text, text_width)?;
-        self.draw_text(
-            layers,
-            &body_font,
-            x,
-            self.settings_row_description_y(y),
-            description,
-            palette.secondary_text,
-            text_width,
-        )?;
         self.draw_rounded_frame(
             layers,
             0,
             control_x,
             control_y,
             control_width,
-            self.ui_px(CONTROL_HEIGHT),
+            control_rect.size.height,
             bg,
             border,
             self.ui_px(CONTROL_RADIUS),
@@ -12597,10 +14311,13 @@ impl SettingsWindow {
         } else {
             palette.search_border
         };
-        // The search field is a pill; the value inputs keep the control radius,
-        // so the one you type a query into is shaped unlike the ones you type
-        // a setting into.
-        let radius = if spec.action == SettingsAction::SearchInput {
+        // The search fields are pills; the value inputs keep the control
+        // radius, so the one you type a query into is shaped unlike the ones
+        // you type a setting into.
+        let radius = if matches!(
+            spec.action,
+            SettingsAction::SearchInput | SettingsAction::TabIconSearchInput
+        ) {
             spec.rect.size.height / 2.0
         } else {
             self.ui.tokens.control_radius

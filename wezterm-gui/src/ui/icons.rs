@@ -4,6 +4,7 @@ pub(crate) use crate::termwindow::ui::icons::{BrandIcon, SvgIcon};
 pub(crate) enum SettingsIcon {
     General,
     Appearance,
+    TabIcons,
     Sidebar,
     Terminal,
     Workspaces,
@@ -29,6 +30,7 @@ impl SettingsIcon {
         match self {
             Self::General => SvgIcon::SlidersHorizontal,
             Self::Appearance => SvgIcon::Palette,
+            Self::TabIcons => SvgIcon::Grid2x2,
             Self::Sidebar => SvgIcon::PanelRightOpen,
             Self::Terminal => SvgIcon::Terminal,
             Self::Workspaces => SvgIcon::FolderOpen,
