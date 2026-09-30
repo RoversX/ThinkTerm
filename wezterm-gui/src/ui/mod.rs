@@ -9,6 +9,7 @@ pub(crate) mod keys;
 pub(crate) mod primitives;
 pub(crate) mod shadow;
 pub(crate) mod state;
+pub(crate) mod tile;
 pub(crate) mod tokens;
 pub(crate) mod widgets;
 

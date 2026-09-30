@@ -14,6 +14,7 @@
 use crate::native_settings::{self, NativeTabIconCard, NativeTabIconSettings};
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::ui::draw::DrawContext;
+use crate::ui::tile::{draw_tile, TileStyle};
 use anyhow::{anyhow, bail, Context, Result};
 use mux::pane::Pane;
 use std::cell::RefCell;
@@ -187,18 +188,6 @@ impl Rgb {
         LinearRgba::with_srgba(self.0, self.1, self.2, 255)
     }
 
-    /// This colour taken `amount` of the way to `other`, blended in sRGB the
-    /// way a designer's tool blends.
-    pub(crate) fn mix(self, other: Self, amount: f32) -> Self {
-        let channel =
-            |from: u8, to: u8| (from as f32 + (to as f32 - from as f32) * amount).round() as u8;
-        Self(
-            channel(self.0, other.0),
-            channel(self.1, other.1),
-            channel(self.2, other.2),
-        )
-    }
-
     /// Perceived brightness, 0..=255.
     fn luma(self) -> f32 {
         0.2126 * self.0 as f32 + 0.7152 * self.1 as f32 + 0.0722 * self.2 as f32
@@ -216,7 +205,6 @@ impl Rgb {
 }
 
 const WHITE: Rgb = Rgb(0xFF, 0xFF, 0xFF);
-const BLACK: Rgb = Rgb(0x00, 0x00, 0x00);
 const INK: Rgb = Rgb(0x11, 0x11, 0x11);
 /// Brands whose own colour is black sit on a light circle instead: a black
 /// circle would sink into the dark chrome.
@@ -1183,23 +1171,24 @@ fn remove_unreferenced_svgs(settings: &NativeTabIconSettings) {
 // Drawing, shared by the pane tabs and the settings page so both show the
 // same icon.
 
-/// How the circle is lit: the fill lightens toward white at the top and
-/// darkens toward black at the bottom, and the rim does the same more
-/// strongly, so the edge reads as a bevel in the circle's own colour.
-const FILL_TOP_LIGHTEN: f32 = 0.18;
-const FILL_BOTTOM_DARKEN: f32 = 0.13;
-const RIM_TOP_LIGHTEN: f32 = 0.42;
-const RIM_BOTTOM_DARKEN: f32 = 0.25;
-/// The rim against the diameter: one point on a 25pt tab icon.
-const RIM_PER_DIAMETER: f32 = 1.0 / 25.0;
-/// The shadow's softness and drop, in design pixels.
-const SHADOW_SIGMA: f32 = 3.5;
-const SHADOW_DROP: f32 = 2.5;
+/// How a tab icon's circle is lit: the fill lightens toward white at the
+/// top and darkens toward black at the bottom, and the rim -- one point on
+/// a 25pt icon -- does the same more strongly, so the edge reads as a bevel
+/// in the circle's own colour. The shadow is in its hue too.
+const PLATE: TileStyle = TileStyle {
+    fill_top_lighten: 0.18,
+    fill_bottom_darken: 0.13,
+    rim_top_lighten: 0.42,
+    rim_bottom_darken: 0.25,
+    rim_per_side: 1.0 / 25.0,
+    shadow_darken: 0.55,
+    shadow_alpha_dark: 0.5,
+    shadow_alpha_light: 0.32,
+    shadow_sigma: 3.5,
+    shadow_drop: 2.5,
+};
 
-/// The circle a glyph sits on: a soft shadow in the circle's own hue, a
-/// bevelled rim and a fill lit from above. `dark` is the chrome's
-/// appearance: the same shadow shows far more on a light bar, so it is
-/// fainter there.
+/// The circle a glyph sits on. `dark` is the chrome's appearance.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_plate(
     ctx: &DrawContext,
@@ -1211,37 +1200,17 @@ pub(crate) fn draw_plate(
     circle: Rgb,
     dark: bool,
 ) -> Result<()> {
-    let bounds = euclid::rect(x, y, diameter, diameter);
-    let shadow = circle
-        .mix(BLACK, 0.55)
-        .linear()
-        .mul_alpha(if dark { 0.5 } else { 0.32 });
-    ctx.draw_shadow(
+    draw_tile(
+        ctx,
         layers,
         layer,
-        bounds,
+        x,
+        y,
+        diameter,
         diameter / 2.0,
-        ctx.px(SHADOW_SIGMA),
-        ctx.px(SHADOW_DROP),
-        shadow,
-    )?;
-    ctx.draw_rounded_rect_vertical_gradient(
-        layers,
-        layer,
-        bounds,
-        diameter / 2.0,
-        circle.mix(WHITE, RIM_TOP_LIGHTEN).linear(),
-        circle.mix(BLACK, RIM_BOTTOM_DARKEN).linear(),
-    )?;
-    let rim = (diameter * RIM_PER_DIAMETER).round().max(1.0);
-    let inner = (diameter - rim * 2.0).max(0.0);
-    ctx.draw_rounded_rect_vertical_gradient(
-        layers,
-        layer,
-        euclid::rect(x + rim, y + rim, inner, inner),
-        inner / 2.0,
-        circle.mix(WHITE, FILL_TOP_LIGHTEN).linear(),
-        circle.mix(BLACK, FILL_BOTTOM_DARKEN).linear(),
+        circle.linear(),
+        dark,
+        &PLATE,
     )
 }
 
@@ -1614,13 +1583,6 @@ mod tests {
         assert_eq!(found("kubectl"), vec!["kubernetes"]);
         assert!(found("no such program").is_empty());
         assert_eq!(found("").len(), catalog.cards.len());
-    }
-
-    #[test]
-    fn colours_mix_in_srgb() {
-        assert_eq!(BLACK.mix(WHITE, 0.5), Rgb(0x80, 0x80, 0x80));
-        assert_eq!(Rgb(0x37, 0x76, 0xAB).mix(BLACK, 0.0), Rgb(0x37, 0x76, 0xAB));
-        assert_eq!(Rgb(0x37, 0x76, 0xAB).mix(WHITE, 1.0), WHITE);
     }
 
     #[test]
