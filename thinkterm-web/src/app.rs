@@ -273,6 +273,9 @@ pub struct Inner<P: Platform, L: Link> {
     /// by the server's pushes, so switching back shows them at once with
     /// their lines, cursor and colours rather than a blank round trip.
     parked: std::collections::BTreeMap<PaneId, PaneCell<P, L>>,
+    frame_control: std::collections::BTreeMap<PaneId, (u64, Option<u64>)>,
+    frame_control_epoch: u64,
+    animation_clock: crate::graphics::AnimationClock,
     focused_pane: PaneId,
     host: Arc<AppHost<P, L>>,
     /// One per connection, shared by every session: a picture one pane
@@ -365,6 +368,8 @@ pub struct Inner<P: Platform, L: Link> {
     connected_since: Option<f64>,
     quads: HeapQuadAllocator,
     vertices: Vec<Vertex>,
+    ground: HeapQuadAllocator,
+    graphics: crate::graphics::Graphics,
     /// Where a row that hangs over the edge of its pane's content box is
     /// recorded before being replayed cropped. One row at a time, emptied
     /// and refilled: at most two rows per pane per frame go through it,
@@ -455,6 +460,7 @@ struct PaneFont {
     glyphs: GlyphCache,
     quads: HeapQuadAllocator,
     vertices: Vec<Vertex>,
+    vertex_layers: [std::ops::Range<usize>; 3],
 }
 
 /// Continuation of a take-over that an interaction started.
@@ -490,12 +496,14 @@ pub struct App<P: Platform, L: Link> {
     pub platform: Rc<P>,
     inner: RefCell<Inner<P, L>>,
     frame_requested: Cell<bool>,
+    /// A layout/input repaint must survive coalescing with parked-pane output.
+    repaint_requested: Cell<bool>,
     /// The atlas backoff's own wake-up. Everything else here is driven by
     /// input or by output; this is the one thing that has to happen on a
     /// still screen.
-    retry_pending: Cell<bool>,
-    /// When the pending timer is due, so a nearer one can replace it.
-    retry_due: Cell<f64>,
+    retry: RefCell<Option<(f64, crate::platform::Timeout)>>,
+    animation_wake: RefCell<Option<(f64, crate::platform::Timeout)>>,
+    animations_visible: Cell<bool>,
     /// When a timer set to come back to the plugin panel is due, while
     /// one is: to tell its plugin a size, or to open it again.
     panel_wake: Cell<Option<f64>>,
@@ -612,6 +620,9 @@ impl<P: Platform, L: Link> App<P, L> {
             platform: Rc::clone(&setup.platform),
             panes,
             parked: std::collections::BTreeMap::new(),
+            frame_control: std::collections::BTreeMap::new(),
+            frame_control_epoch: 0,
+            animation_clock: crate::graphics::AnimationClock::default(),
             focused_pane: setup.pane_id,
             host: setup.host,
             images: setup.images,
@@ -661,6 +672,8 @@ impl<P: Platform, L: Link> App<P, L> {
             published_bg: None,
             quads: HeapQuadAllocator::default(),
             vertices: Vec::new(),
+            ground: HeapQuadAllocator::default(),
+            graphics: crate::graphics::Graphics::default(),
             scratch: HeapQuadAllocator::default(),
             pane_fonts: Default::default(),
             layout: None,
@@ -700,8 +713,10 @@ impl<P: Platform, L: Link> App<P, L> {
             platform: setup.platform,
             inner: RefCell::new(inner),
             frame_requested: Cell::new(false),
-            retry_pending: Cell::new(false),
-            retry_due: Cell::new(0.0),
+            repaint_requested: Cell::new(false),
+            retry: RefCell::new(None),
+            animation_wake: RefCell::new(None),
+            animations_visible: Cell::new(true),
             panel_wake: Cell::new(None),
             retired: Cell::new(false),
         });
@@ -709,9 +724,10 @@ impl<P: Platform, L: Link> App<P, L> {
         app.platform.set_frame_handler(Box::new(move || {
             if let Some(app) = weak.upgrade() {
                 app.frame_requested.set(false);
-                app.frame();
+                app.frame_if_needed(false);
             }
         }));
+        app.sync_frame_control();
         app
     }
 
@@ -741,33 +757,69 @@ impl<P: Platform, L: Link> App<P, L> {
         // not: dropping a nearer deadline on the floor is how a recovery
         // that should have taken a second takes eight.
         let due = self.platform.monotonic_ms() + delay_ms;
-        if self.retry_pending.get() && self.retry_due.get() <= due {
+        if self.retry.borrow().as_ref().is_some_and(|(at, _)| *at <= due) {
             return;
         }
+        let previous = self.retry.borrow_mut().take();
+        drop(previous);
         let weak = Rc::downgrade(self);
-        self.platform.set_timeout(
+        let timeout = self.platform.cancellable_timeout(
             delay_ms.max(0.0),
             Box::new(move || {
                 if let Some(app) = weak.upgrade() {
-                    app.retry_pending.set(false);
+                    let expired = app.retry.borrow_mut().take();
+                    drop(expired);
                     app.request_frame();
                 }
             }),
         );
-        self.retry_pending.set(true);
-        self.retry_due.set(due);
+        *self.retry.borrow_mut() = Some((due, timeout));
+    }
+
+    fn schedule_animation(self: &Rc<Self>, due: Option<f64>) {
+        let due = due.filter(|_| self.animations_visible.get() && !self.retired.get());
+        if self.animation_wake.borrow().as_ref().map(|(at, _)| *at) == due { return; }
+        let previous = self.animation_wake.borrow_mut().take();
+        drop(previous);
+        let Some(due) = due else { return; };
+        let weak = Rc::downgrade(self);
+        let timeout = self.platform.cancellable_timeout(
+            (due - self.platform.monotonic_ms()).max(0.0),
+            Box::new(move || {
+                if let Some(app) = weak.upgrade().filter(|app| !app.retired.get()) {
+                    let expired = app.animation_wake.borrow_mut().take();
+                    drop(expired);
+                    app.request_frame();
+                }
+            }),
+        );
+        *self.animation_wake.borrow_mut() = Some((due, timeout));
+    }
+
+    pub fn visibility_changed(self: &Rc<Self>, visible: bool) {
+        self.animations_visible.set(visible);
+        if visible {
+            self.request_frame();
+        } else {
+            self.schedule_animation(None);
+        }
     }
 
     pub fn wake(self: &Rc<Self>) -> Rc<dyn Fn()> {
         let weak = Rc::downgrade(self);
         Rc::new(move || {
             if let Some(app) = weak.upgrade() {
-                app.request_frame();
+                app.schedule_frame();
             }
         })
     }
 
     pub fn request_frame(&self) {
+        self.repaint_requested.set(true);
+        self.schedule_frame();
+    }
+
+    fn schedule_frame(&self) {
         if self.frame_requested.get() {
             return;
         }
@@ -1181,10 +1233,96 @@ impl<P: Platform, L: Link> App<P, L> {
         Self::layout_json(&self.inner.borrow())
     }
 
+    fn apply_frame_selections(&self, state: codec::KittyFrameSelections, sent: Option<f64>) {
+        let mut inner = self.inner.borrow_mut();
+        let Some((_, known)) = inner.frame_control.get(&state.pane_id) else { return };
+        if let Err(err) = state.validate() {
+            log::warn!("ignoring invalid Kitty metadata: {err}");
+            return;
+        }
+        let stale = known.is_some_and(|revision| revision > state.revision);
+        let received = inner.platform.monotonic_ms();
+        inner.animation_clock.observe(state.now_ms, received, sent);
+        if !stale {
+            let (reset, rows_changed) = inner.host.image_versions.borrow_mut().observe(state.pane_id, state.image_epoch, &state.selections);
+            if reset {
+                inner.images.lock().clear();
+                let inner = &mut *inner;
+                inner.graphics.clear_images(&mut inner.gpu);
+                for cell in inner.panes.values().chain(inner.parked.values()) {
+                    cell.session.make_all_stale();
+                }
+            } else if rows_changed {
+                if let Some(cell) = inner.panes.get(&state.pane_id) { cell.session.make_all_stale(); }
+            }
+            inner.frame_control.get_mut(&state.pane_id).unwrap().1 = Some(state.revision);
+            inner.graphics.set_selections(state.pane_id, &state.selections);
+        }
+        drop(inner);
+        self.request_frame();
+    }
+
+    fn sync_frame_control(self: &Rc<Self>) {
+        let (link, requests) = {
+            let mut inner = self.inner.borrow_mut();
+            let removed: Vec<PaneId> = inner.frame_control.keys().filter(|id| !inner.panes.contains_key(id)).copied().collect();
+            let added: Vec<PaneId> = inner.panes.keys().filter(|id| !inner.frame_control.contains_key(id)).copied().collect();
+            let mut requests = Vec::new();
+            for pane_id in removed {
+                inner.frame_control.remove(&pane_id);
+                inner.host.image_versions.borrow_mut().forget(pane_id);
+                inner.graphics.set_selections(pane_id, &[]);
+                requests.push((pane_id, false, 0));
+            }
+            for pane_id in added {
+                inner.frame_control_epoch += 1;
+                let epoch = inner.frame_control_epoch;
+                inner.frame_control.insert(pane_id, (epoch, None));
+                requests.push((pane_id, true, epoch));
+            }
+            (inner.link.clone(), requests)
+        };
+        for (pane_id, subscribe, epoch) in requests {
+            let link = link.clone();
+            let weak = Rc::downgrade(self);
+            self.spawn(async move {
+                let Some(start) = weak.upgrade().map(|app| app.platform.monotonic_ms()) else { return; };
+                let result = thinkterm_session::host::request(
+                    &link, Pdu::GetKittyFrameSelections(codec::GetKittyFrameSelections { pane_id, subscribe }),
+                    |pdu| match pdu {
+                        Pdu::KittyFrameSelections(state) => Ok(Some(state)),
+                        Pdu::UnitResponse(_) => Ok(None),
+                        other => Err(other),
+                    },
+                ).await;
+                if !subscribe { return; }
+                let Some(app) = weak.upgrade().filter(|app| !app.retired.get()) else { return };
+                if !app.inner.borrow().frame_control.get(&pane_id).is_some_and(|(current, _)| *current == epoch) { return; }
+                match result {
+                    Ok(Some(state)) if state.pane_id == pane_id => app.apply_frame_selections(state, Some(start)),
+                    _ => {
+                        // Older peers do not provide this extension. Pixel
+                        // delivery still works through the existing protocol.
+                        let mut inner = app.inner.borrow_mut();
+                        if let Some((_, revision)) = inner.frame_control.get_mut(&pane_id) {
+                            if revision.is_none() { *revision = Some(0); }
+                        }
+                        drop(inner);
+                        app.request_frame();
+                    }
+                }
+            });
+        }
+    }
+
     /// The server pushed something for us.
     pub fn on_push(self: &Rc<Self>, pdu: Pdu) {
         let inner = self.inner.borrow();
         match pdu {
+            Pdu::KittyFrameSelections(state) => {
+                drop(inner);
+                self.apply_frame_selections(state, None);
+            }
             // Every pane on the server pushes to every client; only the
             // ones on this page are wanted, and the rest are simply not
             // ours (never a reason to re-list: there are many).
@@ -1471,7 +1609,7 @@ impl<P: Platform, L: Link> App<P, L> {
     /// The socket is back. Everything on screen was fetched from a server
     /// that has since forgotten us, so none of it may be trusted: the rows
     /// go stale and are asked for again.
-    fn reconnected(&self) {
+    fn reconnected(self: &Rc<Self>) {
         {
             let mut inner = self.inner.borrow_mut();
             inner.disconnected = None;
@@ -1484,6 +1622,16 @@ impl<P: Platform, L: Link> App<P, L> {
             // connection has proved it can carry a frame.
             inner.connected_since = Some(inner.platform.monotonic_ms());
             inner.session_refresh_pending = false;
+            inner.images.lock().clear();
+            inner.host.image_versions.borrow_mut().reset();
+            {
+                let inner = &mut *inner;
+                inner.graphics.clear(&mut inner.gpu);
+            }
+            let owners: Vec<PaneId> = inner.frame_control.keys().copied().collect();
+            for pane in owners { inner.graphics.set_selections(pane, &[]); }
+            inner.frame_control.clear();
+            inner.animation_clock = crate::graphics::AnimationClock::default();
             for cell in inner.panes.values() {
                 cell.session.set_dead(false);
                 cell.session.make_all_stale();
@@ -1504,6 +1652,7 @@ impl<P: Platform, L: Link> App<P, L> {
             // silently, unless another device took it meanwhile.
             inner.auto_claimed = None;
         }
+        self.sync_frame_control();
         self.refresh_status();
         self.request_frame();
     }
@@ -2527,7 +2676,7 @@ impl<P: Platform, L: Link> App<P, L> {
             self.step_font(step);
             return true;
         }
-        let max = max_scroll(&session.dimensions());
+        let max = max_scroll(&session.dimensions(), rows_shown);
         if smooth {
             // Down the page (a positive delta) is towards the newest row,
             // which is the way `normalize_scroll_px` counts. A trackpad or
@@ -2599,7 +2748,12 @@ impl<P: Platform, L: Link> App<P, L> {
         // Where the focused pane is in its scrollback: rows above the
         // bottom, and rows there are to scroll through.
         if let Some(cell) = inner.panes.get(&inner.focused_pane) {
-            let max = max_scroll(&cell.session.dimensions());
+            let rows = match &inner.tab_layout {
+                Some(layout) => layout.panes.iter().find(|place| place.pane_id == inner.focused_pane)
+                    .map(|place| Self::shown_in(inner, place).1),
+                None => Self::focused_placement(inner).as_ref().map(|place| Self::shown_in(inner, place).1),
+            }.unwrap_or(inner.rows);
+            let max = max_scroll(&cell.session.dimensions(), rows);
             // With the fraction of a row a smooth scroll is part way
             // through, so a bar following it moves as the rows do rather
             // than a row at a time.
@@ -3393,10 +3547,11 @@ impl<P: Platform, L: Link> App<P, L> {
             }
         }
         let tab_id = layout.tab_id;
-        let (fresh, changed) = {
+        let (fresh, changed, first_layout) = {
             let mut inner = self.inner.borrow_mut();
             inner.tree.apply_panes(&list);
             inner.layout = Some(list);
+            let first_layout = inner.tab_layout.is_none();
             let before = (inner.focused_pane, inner.tab_layout.clone());
             let fresh = Self::apply_layout(&mut inner, layout, want);
             // What a keystroke would claim follows the drawn layout.
@@ -3410,7 +3565,7 @@ impl<P: Platform, L: Link> App<P, L> {
                 || !fresh.is_empty()
                 || before.0 != inner.focused_pane
                 || before.1 != inner.tab_layout;
-            if tab_changed {
+            if tab_changed || first_layout {
                 inner.selecting = false;
                 inner.ime_anchor = None;
                 // Every showing claims afresh: the desktop may have taken
@@ -3422,10 +3577,11 @@ impl<P: Platform, L: Link> App<P, L> {
             }
             inner.platform.set_title(inner.title());
             Self::render_strip(&inner);
-            (fresh, changed)
+            (fresh, changed, first_layout)
         };
         // A pane's first push comes when something asks after it: one
         // liveness poll each, and the answer is not waited for.
+        self.sync_frame_control();
         for pane_id in fresh {
             let link = link.clone();
             self.spawn(async move {
@@ -3440,7 +3596,7 @@ impl<P: Platform, L: Link> App<P, L> {
                 .await;
             });
         }
-        if tab_changed {
+        if tab_changed || first_layout {
             self.match_desktop_cell();
             self.resize();
         }
@@ -5505,7 +5661,12 @@ impl<P: Platform, L: Link> App<P, L> {
     /// reach the App afterwards do nothing.
     pub fn retire(&self) {
         self.retired.set(true);
-        let inner = self.inner.borrow();
+        let animation = self.animation_wake.borrow_mut().take();
+        drop(animation);
+        let retry = self.retry.borrow_mut().take();
+        drop(retry);
+        let inner = &mut *self.inner.borrow_mut();
+        inner.graphics.clear(&mut inner.gpu);
         inner.link.set_push_handler(Box::new(|_| {}));
         inner.link.set_close_handler(Box::new(|_| {}));
         inner.link.shutdown();
@@ -5683,7 +5844,7 @@ impl<P: Platform, L: Link> App<P, L> {
                     Ok(glyphs) => {
                         inner.pane_fonts.insert(
                             pane_id,
-                            PaneFont { scale, glyphs, quads: HeapQuadAllocator::default(), vertices: Vec::new() },
+                            PaneFont { scale, glyphs, quads: HeapQuadAllocator::default(), vertices: Vec::new(), vertex_layers: std::array::from_fn(|_| 0..0) },
                         );
                     }
                     Err(err) => {
@@ -5839,7 +6000,10 @@ impl<P: Platform, L: Link> App<P, L> {
             let fitting = {
                 let mut lease = inner.link.lease_mut();
                 lease.reported = Some(size);
-                lease.owns_viewport() && !inner.panel_drag
+                // Before the first listing there is no split layout to
+                // reserve the bars in. Claiming a bare grid here would
+                // resize twice and can discard image rows in between.
+                lease.owns_viewport() && !inner.panel_drag && inner.tab_layout.is_some()
             };
             if fitting {
                 // Pane by pane, at frames scaled to the new grid: one
@@ -5875,6 +6039,11 @@ impl<P: Platform, L: Link> App<P, L> {
     /// Paint. Lines the session does not have yet come back blank and are
     /// fetched; their arrival marks the page dirty again.
     pub fn frame(self: &Rc<Self>) {
+        self.frame_if_needed(true);
+    }
+
+    fn frame_if_needed(self: &Rc<Self>, immediate: bool) {
+        let requested = self.repaint_requested.replace(false) || immediate;
         let mut inner = self.inner.borrow_mut();
         // A connection that has carried frames for a while has earned the
         // short delay back. Done here rather than on connect, because
@@ -5889,7 +6058,7 @@ impl<P: Platform, L: Link> App<P, L> {
         // Output in a parked tab keeps its cell current but changes
         // nothing on screen: no paint for it alone.
         let dirty = inner.host.events.take_dirty();
-        if !dirty.is_empty() && dirty.iter().all(|pane| !inner.panes.contains_key(pane)) {
+        if !requested && !dirty.is_empty() && dirty.iter().all(|pane| !inner.panes.contains_key(pane)) {
             return;
         }
         let title = inner.focused().session.title();
@@ -6001,7 +6170,7 @@ impl<P: Platform, L: Link> App<P, L> {
             // stall like any other; asking about the range that was painted
             // is what keeps a dropped `GetLines` for it being retried.
             let visible =
-                visible_rows_px(&dims, Self::shown(&place).1, cell.scroll_from_bottom, cell.scroll_px);
+                visible_rows_px(&dims, Self::shown_in(&inner, &place).1, cell.scroll_from_bottom, cell.scroll_px);
             stalled |= cell.session.render_looks_stalled_in(visible);
         }
         let mut again = owed > 0 || stalled;
@@ -6038,12 +6207,18 @@ impl<P: Platform, L: Link> App<P, L> {
             inner.capacity.drew_everything();
         }
 
+        let animation_at = painted.then(|| inner.graphics.next_animation_at()).flatten()
+            .map(|at| inner.animation_clock.local_time(at));
         drop(inner);
+        self.schedule_animation(animation_at);
         if again {
             self.request_frame();
         }
         if let Some(delay) = retry_in {
             self.schedule_retry(delay);
+        } else if painted && !again {
+            let retry = self.retry.borrow_mut().take();
+            drop(retry);
         }
     }
 
@@ -6139,6 +6314,9 @@ impl<P: Platform, L: Link> App<P, L> {
     /// Returns what this frame owes: glyphs the budget put off, and sprites
     /// a full atlas declined.
     fn paint(inner: &mut Inner<P, L>, budget: &mut FallbackBudget) -> Result<(u32, u32)> {
+        let now = inner.animation_clock.server_now(inner.platform.monotonic_ms());
+        inner.graphics.begin_frame(now);
+        inner.ground.recycle();
         let frozen = inner.capacity.frozen();
         inner.glyphs.begin_frame(frozen);
         for font in inner.pane_fonts.values_mut() {
@@ -6167,7 +6345,7 @@ impl<P: Platform, L: Link> App<P, L> {
             };
             let session = Arc::clone(&cell.session);
             let dims = session.dimensions();
-            let max = max_scroll(&dims);
+            let max = max_scroll(&dims, rows_shown);
             if cell.scroll_from_bottom > max {
                 cell.scroll_from_bottom = max;
                 cell.scroll_px = 0.0;
@@ -6253,7 +6431,7 @@ impl<P: Platform, L: Link> App<P, L> {
             };
             crate::emit::fill_rect(
                 glyphs,
-                quads,
+                &mut inner.ground,
                 0,
                 surface,
                 (x0, y0),
@@ -6285,6 +6463,28 @@ impl<P: Platform, L: Link> App<P, L> {
                 }
             }
             let last = lines.len().saturating_sub(1);
+            if let Some(revision) = inner.frame_control.get(&place.pane_id).and_then(|(_, revision)| *revision) {
+                let viewport = crate::graphics::RelativeViewport {
+                    seqno: session.current_seqno() as u64,
+                    first: first as i64, alternate: session.is_alt_screen(), origin,
+                    cell: (cell_w, cell_h),
+                    source_cell: ((dims.pixel_width / dims.cols.max(1)) as u32,
+                        (dims.pixel_height / dims.viewport_rows.max(1)) as u32),
+                    clip: [frame_origin.0, content_top, frame_origin.0 + clip.0, content_top + clip.1],
+                };
+                let versions = inner.host.image_versions.borrow();
+                for (id, hash, generation, views) in versions.relative_images(place.pane_id) {
+                    let mut image = None;
+                    for view in views {
+                        let Some(slice) = crate::graphics::relative_slice(view, &viewport) else { continue };
+                        if image.is_none() { image = session.scene_image(id, hash, generation, revision); }
+                        let Some(image) = &image else { break };
+                        let hsv = hsv.unwrap_or_default();
+                        inner.graphics.collect_relative(&mut inner.gpu, place.pane_id, image, id, view,
+                            slice, [hsv.hue, hsv.saturation, hsv.brightness])?;
+                    }
+                }
+            }
             for (i, line) in lines.iter().enumerate() {
                 let row = first + i as StableRowIndex;
                 let sel_range = match &selection {
@@ -6314,12 +6514,24 @@ impl<P: Platform, L: Link> App<P, L> {
                     cursor_hidden: inner.settings.cursor_blink && !inner.blink_shown,
                     min_contrast: inner.settings.min_contrast,
                 };
-                if px > 0.0 && (i == 0 || i == last) {
-                    // Only the two rows that hang over the content box are
-                    // worth cropping quad by quad: the clip does a bilerp
-                    // and a box per quad, which no interior row needs. The
-                    // scratch buffer is the one kept on `Inner`, emptied
-                    // rather than allocated.
+                if line.has_images() && inner.frame_control.get(&place.pane_id).is_some_and(|(_, revision)| revision.is_some()) {
+                    inner.graphics.collect_line(
+                        &mut inner.gpu,
+                        place.pane_id,
+                        &params,
+                        (cell_w, cell_h),
+                        (
+                            if dims.pixel_width > 0 { cell_w * dims.cols as f32 / dims.pixel_width as f32 } else { 1.0 },
+                            if dims.pixel_height > 0 { cell_h * dims.viewport_rows as f32 / dims.pixel_height as f32 } else { 1.0 },
+                        ),
+                        [frame_origin.0, content_top, frame_origin.0 + clip.0, content_top + clip.1],
+                    )?;
+                }
+                let edge = i == 0 || i == last || (line.is_double_height_top() && i + 1 == last);
+                if edge && (px > 0.0 || placements.len() > 1) {
+                    // Fractional scrolling clips the partial rows. A split
+                    // also clips glyph overhang so drawing pane grounds first
+                    // cannot expose pixels in a neighbouring pane.
                     scratch.recycle();
                     crate::emit::emit_line(glyphs, scratch, budget, &params)?;
                     scratch.apply_to_clipped_at(&mut *quads, 0.0, 0.0, content_clip, 1.0)?;
@@ -6380,11 +6592,14 @@ impl<P: Platform, L: Link> App<P, L> {
             }
         }
         inner.vertices.clear();
-        inner.quads.extract_vertices(&mut inner.vertices);
+        inner.ground.extract_vertices(&mut inner.vertices);
+        let ground_end = inner.vertices.len();
+        let vertex_layers = inner.quads.extract_layer_vertices(&mut inner.vertices);
+        inner.graphics.finish_frame(&mut inner.gpu, surface);
         let mut declined = inner.glyphs.declined();
         for font in inner.pane_fonts.values_mut() {
             font.vertices.clear();
-            font.quads.extract_vertices(&mut font.vertices);
+            font.vertex_layers = font.quads.extract_layer_vertices(&mut font.vertices);
             declined += font.glyphs.declined();
         }
         // The cleared ground, for anyone reading the canvas from the page:
@@ -6396,9 +6611,21 @@ impl<P: Platform, L: Link> App<P, L> {
         }
         let bg = focused_palette.background.to_linear().tuple();
         let millis = (inner.platform.wall_ms() % (u32::MAX as f64)) as u32;
-        let mut batches: Vec<(&[Vertex], &GpuTexture)> = vec![(&inner.vertices, inner.glyphs.texture())];
-        for font in inner.pane_fonts.values() {
-            batches.push((&font.vertices, font.glyphs.texture()));
+        let mut batches: Vec<(&[Vertex], &GpuTexture)> = Vec::new();
+        if inner.graphics.is_empty() {
+            batches.push((&inner.vertices, inner.glyphs.texture()));
+            for font in inner.pane_fonts.values() {
+                batches.push((&font.vertices, font.glyphs.texture()));
+            }
+        } else {
+            batches.push((&inner.vertices[..ground_end], inner.glyphs.texture()));
+            for layer in 0..3 {
+                inner.graphics.append_batches(layer, &mut batches);
+                batches.push((&inner.vertices[vertex_layers[layer].clone()], inner.glyphs.texture()));
+                for font in inner.pane_fonts.values() {
+                    batches.push((&font.vertices[font.vertex_layers[layer].clone()], font.glyphs.texture()));
+                }
+            }
         }
         inner.gpu.draw_batches(&batches, [bg.0, bg.1, bg.2, bg.3], millis)?;
         Ok((budget.deferred(), declined))

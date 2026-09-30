@@ -55,10 +55,14 @@ pub fn visible_rows(
     top..top + rows as StableRowIndex
 }
 
-/// How far up the view may go: everything above the screen that the
-/// server remembers.
-pub fn max_scroll(dims: &RenderableDimensions) -> usize {
-    (dims.physical_top - dims.scrollback_top).max(0) as usize
+/// How far up this view may go, including screen rows hidden by a shorter
+/// client viewport as well as the server's scrollback.
+pub fn max_scroll(dims: &RenderableDimensions, rows: usize) -> usize {
+    dims.physical_top
+        .saturating_add(dims.viewport_rows as StableRowIndex)
+        .saturating_sub(rows as StableRowIndex)
+        .saturating_sub(dims.scrollback_top)
+        .max(0) as usize
 }
 
 /// The rows a fractionally scrolled view draws: `visible_rows` with one
@@ -168,12 +172,23 @@ mod tests {
     fn scrolling_moves_up_and_stops_at_the_oldest_row() {
         assert_eq!(visible_rows(&dims(100, 0, 24), 24, 10), 90..114);
         assert_eq!(visible_rows(&dims(100, 95, 24), 24, 10), 95..119);
-        assert_eq!(max_scroll(&dims(100, 95, 24)), 5);
+        assert_eq!(max_scroll(&dims(100, 95, 24), 24), 5);
     }
 
     #[test]
     fn a_shorter_page_still_shows_the_bottom_of_the_screen() {
         assert_eq!(visible_rows(&dims(100, 0, 24), 10, 0), 114..124);
+    }
+
+    #[test]
+    fn a_shorter_view_can_reach_hidden_screen_rows_without_server_scrollback() {
+        let server = dims(0, 0, 25);
+        assert_eq!(visible_rows(&server, 22, 0), 3..25);
+        assert_eq!(max_scroll(&server, 22), 3);
+        assert_eq!(visible_rows(&server, 22, max_scroll(&server, 22)), 0..22);
+        assert_eq!(max_scroll(&server, 30), 0);
+        assert_eq!(max_scroll(&dims(100, 0, 24), 10), 114);
+        assert_eq!(max_scroll(&dims(100, 95, 24), 30), 0);
     }
 
     #[test]

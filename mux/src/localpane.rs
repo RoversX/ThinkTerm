@@ -509,6 +509,31 @@ impl Pane for LocalPane {
         self.terminal.lock().kitty_image_stats()
     }
 
+    fn kitty_frame_selections(&self, known: Option<u64>) -> Option<(u64, u64, Vec<wezterm_term::KittyFrameSelection>)> {
+        self.terminal.lock().kitty_frame_selections(known).map(|(revision, selections)| (revision, 0, selections))
+    }
+
+    fn get_kitty_image(&self, request: thinkterm_proto::image::GetKittyImage) -> crate::pane::KittyImageFuture {
+        // A program streaming frames replaces its picture before a fetch for
+        // the previous one lands, which left the row blank, so a named image
+        // answers with its newer picture, sent whole. Id 0 holds only the
+        // newest anonymous image; any older one would be the wrong picture.
+        let data = self.terminal.lock().kitty_image(request.image_id)
+            .filter(|data| request.image_id != 0 || data.hash() == request.data_hash);
+        Box::pin(async move {
+            anyhow::ensure!(request.image_epoch.is_none_or(|epoch| epoch == 0), "Kitty image epoch changed");
+            let (data_generation, data, frames_from) = match data {
+                Some(data) => {
+                    let have_frames = if data.hash() == request.data_hash { request.have_frames } else { 0 };
+                    let (generation, payload, from) = thinkterm_proto::image::image_reply(&data, have_frames);
+                    (generation, Some(payload), from)
+                }
+                None => (0, None, 0),
+            };
+            Ok(thinkterm_proto::image::GetImageCellResponse { pane_id: request.pane_id, data, data_generation, frames_from })
+        })
+    }
+
     fn is_dead(&self) -> bool {
         let mut proc = self.process.lock();
 
@@ -1424,13 +1449,13 @@ impl LocalPane {
 
     /// Everything the terminal remembers. Take it with the reader paused
     /// (`crate::pause_pane_reader`), or it is a moment behind the pty.
-    pub fn snapshot_terminal(&self) -> wezterm_term::TerminalSnapshot {
+    pub fn snapshot_terminal(&self) -> (wezterm_term::TerminalSnapshot, wezterm_term::KittyGraphicsSnapshot) {
         let mut term = self.terminal.lock();
         // A resize, configuration or focus noted while the parser held
         // the terminal is the parser's to apply; with the reader parked it
         // never will, so apply it here or the snapshot lags the pty.
         self.apply_pending_and_store(&mut term);
-        term.snapshot()
+        (term.snapshot(), term.snapshot_kitty_graphics())
     }
 
     pub fn new(

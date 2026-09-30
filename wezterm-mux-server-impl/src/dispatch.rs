@@ -25,11 +25,34 @@ impl AsRawDesc for AsyncSslStream {}
 enum Item {
     Notif(MuxNotification),
     WritePdu(DecodedPdu),
+    KittyFrames,
     Readable,
     LivenessTick,
     /// The accept layer withdrew this connection's admission (a web token
     /// was revoked).
     Shutdown,
+}
+
+fn enqueue_pdu(
+    items: &smol::channel::Sender<Item>,
+    kitty: &codec::kitty_queue::KittyFrameMailboxHandle,
+    decoded: DecodedPdu,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(!items.is_closed(), "connection closed");
+    if decoded.serial == 0 {
+        if let Pdu::KittyFrameSelections(snapshot) = decoded.pdu {
+            return match kitty.post(snapshot) {
+                Ok(false) => Ok(()),
+                Ok(true) => items.try_send(Item::KittyFrames)
+                    .map_err(|_| anyhow::anyhow!("connection closed")),
+                Err(err) => {
+                    items.close();
+                    Err(err)
+                }
+            };
+        }
+    }
+    items.try_send(Item::WritePdu(decoded)).map_err(|_| anyhow::anyhow!("connection closed"))
 }
 
 /// A client's byte stream as the connection loop sees it: async reads and
@@ -205,15 +228,14 @@ async fn process_async_with_peer<S: ConnectionStream>(
     };
 
     let (item_tx, item_rx) = smol::channel::unbounded::<Item>();
+    let kitty_frames = codec::kitty_queue::KittyFrameMailbox::default();
+    let kitty_pending = kitty_frames.handle();
 
     let pdu_sender = PduSender::with_closed(
         {
             let item_tx = item_tx.clone();
-            move |pdu| {
-                item_tx
-                    .try_send(Item::WritePdu(pdu))
-                    .map_err(|e| anyhow::anyhow!("{:?}", e))
-            }
+            let kitty_pending = kitty_pending.clone();
+            move |pdu| enqueue_pdu(&item_tx, &kitty_pending, pdu)
         },
         {
             let item_tx = item_tx.clone();
@@ -322,10 +344,18 @@ async fn process_async_with_peer<S: ConnectionStream>(
                     Ok(Item::Readable)
                 }
             },
+            Ok(Item::KittyFrames) => {
+                let Some(snapshot) = kitty_pending.next() else { continue };
+                // Keep one consumer scheduled through the write. Posts during
+                // a slow write replace snapshots rather than adding tasks.
+                let _ = item_tx.try_send(Item::KittyFrames);
+                Ok(Item::WritePdu(DecodedPdu { serial: 0, pdu: Pdu::KittyFrameSelections(snapshot) }))
+            }
             other => other,
         };
 
         match item {
+            Ok(Item::KittyFrames) => unreachable!("drained above"),
             Ok(Item::Readable) => {
                 // A client that dies with a PDU part-way through leaves
                 // the read waiting for the rest with no clock running;
@@ -725,6 +755,34 @@ mod tests {
     use std::sync::Arc;
 
     const S: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn kitty_pushes_coalesce_while_replies_and_legacy_messages_keep_their_order() {
+        let owner = codec::kitty_queue::KittyFrameMailbox::default();
+        let kitty = owner.handle();
+        let (tx, rx) = smol::channel::unbounded();
+        let snapshot = |revision| Pdu::KittyFrameSelections(codec::KittyFrameSelections {
+            pane_id: 1, image_epoch: 0, now_ms: 0, revision, selections: vec![],
+        });
+        for revision in 1..1000 {
+            enqueue_pdu(&tx, &kitty, DecodedPdu { serial: 0, pdu: snapshot(revision) }).unwrap();
+        }
+        enqueue_pdu(&tx, &kitty, DecodedPdu { serial: 7, pdu: snapshot(2) }).unwrap();
+        enqueue_pdu(&tx, &kitty, DecodedPdu { serial: 0, pdu: Pdu::Ping(codec::Ping {}) }).unwrap();
+        assert_eq!(rx.len(), 3, "one wake, one RPC reply, one legacy message");
+        assert!(matches!(rx.try_recv().unwrap(), Item::KittyFrames));
+        assert_eq!(kitty.next().unwrap().revision, 999);
+        assert!(matches!(rx.try_recv().unwrap(), Item::WritePdu(DecodedPdu {
+            serial: 7, pdu: Pdu::KittyFrameSelections(codec::KittyFrameSelections { revision: 2, .. }),
+        })));
+        assert!(matches!(rx.try_recv().unwrap(), Item::WritePdu(DecodedPdu {
+            serial: 0, pdu: Pdu::Ping(_),
+        })));
+        assert!(kitty.next().is_none());
+        drop(owner);
+        assert!(enqueue_pdu(&tx, &kitty, DecodedPdu { serial: 0, pdu: snapshot(1000) }).is_err());
+        assert!(tx.is_closed());
+    }
 
     #[test]
     fn a_quiet_client_is_probed_and_then_dropped() {

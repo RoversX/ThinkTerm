@@ -3844,6 +3844,7 @@ impl ClientDomain {
                                         // structural resyncs do not need the
                                         // extra RPC.
                                         client_pane.resend_palette_to_server();
+                                        client_pane.reconnect_kitty_frames();
                                     }
                                 }
                                 pane

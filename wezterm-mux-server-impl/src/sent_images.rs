@@ -19,7 +19,9 @@
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use termwiz::image::{ImageData, ImageDataType};
+use termwiz::image::ImageData;
+#[cfg(test)]
+use termwiz::image::ImageDataType;
 use termwiz::surface::Line;
 use wezterm_term::StableRowIndex;
 
@@ -142,41 +144,7 @@ impl SentImages {
 /// the ones it holds, plus the durations and hashes of every frame so it
 /// can verify the ones in front are still the same. Anything else, or a
 /// client holding nothing, gets the whole image.
-pub(crate) fn reply_for(image: &Arc<ImageData>, have_frames: u32) -> (u64, Arc<ImageData>, u32) {
-    // Payload and generation under the one guard: the terminal bumps the
-    // generation while it still holds the data lock, so what is read here
-    // is a matching pair.
-    let data = image.data();
-    let generation = image.generation();
-    if have_frames > 0 {
-        if let ImageDataType::AnimRgba8 {
-            width,
-            height,
-            durations,
-            frames,
-            hashes,
-        } = &*data
-        {
-            let have = (have_frames as usize).min(frames.len());
-            // A client holding every frame (its generation was merely
-            // behind) gets an empty tail: the hashes let it confirm its
-            // frames are still the ones here, at no pixel cost.
-            let tail = ImageDataType::AnimRgba8 {
-                width: *width,
-                height: *height,
-                durations: durations.clone(),
-                frames: frames[have..].to_vec(),
-                hashes: hashes.clone(),
-            };
-            // Carries the original's hash although it is only part of
-            // it: the client files it under that hash, and never
-            // re-derives the hash from a delta.
-            let delta = Arc::new(ImageData::with_data_and_hash(tail, image.hash()));
-            return (generation, delta, have as u32);
-        }
-    }
-    (generation, Arc::clone(image), 0)
-}
+pub(crate) use codec::image_reply as reply_for;
 
 #[cfg(test)]
 mod tests {

@@ -404,6 +404,7 @@ fn process_unilateral(
     local_domain_id: Option<DomainId>,
     connection_generation: u64,
     decoded: DecodedPdu,
+    kitty_pending: &codec::kitty_queue::KittyFrameMailboxHandle,
 ) -> anyhow::Result<()> {
     let local_domain_id = match local_domain_id {
         Some(id) => id,
@@ -418,6 +419,24 @@ fn process_unilateral(
             return Ok(());
         }
     };
+    if let Pdu::KittyFrameSelections(snapshot) = decoded.pdu {
+        if kitty_pending.post(snapshot)? {
+            let pending = kitty_pending.clone();
+            promise::spawn::spawn_into_main_thread(async move {
+                while let Some(snapshot) = pending.next() {
+                    let pane = snapshot.pane_id;
+                    let decoded = DecodedPdu { serial: 0, pdu: Pdu::KittyFrameSelections(snapshot) };
+                    if let Err(err) = process_unilateral_inner_async(
+                        pane, local_domain_id, connection_generation, decoded,
+                    ).await {
+                        log::error!("processing Kitty snapshot: {err:#}");
+                    }
+                    smol::future::yield_now().await;
+                }
+            }).detach();
+        }
+        return Ok(());
+    }
     match &decoded.pdu {
         Pdu::WindowWorkspaceChanged(WindowWorkspaceChanged {
             window_id,
@@ -710,6 +729,9 @@ async fn client_thread_async(
     let mut next_serial = 1u64;
     let mut registration = PduRegistrationBarrier::new();
     let mut deferred_unilateral = VecDeque::<DecodedPdu>::new();
+    let mut deferred_kitty: Option<codec::kitty_queue::KittyFrameMailbox> = None;
+    let kitty_frames = codec::kitty_queue::KittyFrameMailbox::default();
+    let kitty_pending = kitty_frames.handle();
 
     struct Promises {
         map: HashMap<u64, Sender<anyhow::Result<Pdu>>>,
@@ -788,8 +810,16 @@ async fn client_thread_async(
                     continue;
                 }
                 while let Some(decoded) = deferred_unilateral.pop_front() {
-                    process_unilateral(local_domain_id, connection_generation, decoded)
+                    process_unilateral(local_domain_id, connection_generation, decoded, &kitty_pending)
                         .context("processing unilateral PDU buffered during registration")?;
+                }
+                if let Some(deferred) = deferred_kitty.take() {
+                    let pending = deferred.handle();
+                    while let Some(snapshot) = pending.next() {
+                        process_unilateral(local_domain_id, connection_generation,
+                            DecodedPdu { serial: 0, pdu: Pdu::KittyFrameSelections(snapshot) },
+                            &kitty_pending)?;
+                    }
                 }
                 for (pdu, promise) in registration.complete() {
                     let serial = next_serial;
@@ -872,14 +902,20 @@ async fn client_thread_async(
                             keepalive_deadline = std::time::Instant::now() + KEEPALIVE_INTERVAL;
                         } else if decoded.serial == 0 {
                             if registration.is_complete() {
-                                process_unilateral(local_domain_id, connection_generation, decoded)
+                                process_unilateral(local_domain_id, connection_generation, decoded, &kitty_pending)
                                     .context("processing unilateral PDU from server")
                                     .map_err(|e| {
                                         log::error!("process_unilateral: {:?}", e);
                                         e
                                     })?;
                             } else {
-                                deferred_unilateral.push_back(decoded);
+                                match decoded.pdu {
+                                    Pdu::KittyFrameSelections(snapshot) => {
+                                        deferred_kitty.get_or_insert_with(Default::default)
+                                            .handle().post(snapshot)?;
+                                    }
+                                    _ => deferred_unilateral.push_back(decoded),
+                                }
                             }
                         } else if let Some(promise) = promises.map.remove(&decoded.serial) {
                             if promise.try_send(Ok(decoded.pdu)).is_err() {

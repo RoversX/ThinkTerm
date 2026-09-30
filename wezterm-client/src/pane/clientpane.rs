@@ -78,6 +78,7 @@ pub struct ClientPane {
     unseen_output: Mutex<bool>,
     progress: Mutex<Progress>,
     agent_status: Mutex<Option<thinkterm_proto::AgentStatus>>,
+    kitty_relay: Mutex<Option<Arc<super::kitty::Relay>>>,
 }
 
 impl ClientPane {
@@ -86,6 +87,13 @@ impl ClientPane {
     /// whether a repaint is warranted.
     pub fn set_agent_status(&self, status: Option<thinkterm_proto::AgentStatus>) {
         *self.agent_status.lock() = status.filter(|s| s.within_budget());
+    }
+
+    pub fn reconnect_kitty_frames(&self) {
+        let relay = self.kitty_relay.lock().clone();
+        if let Some(relay) = relay {
+            relay.reconnected();
+        }
     }
 
     /// Ask the (single) sender worker to bring the server to `palette`.
@@ -267,11 +275,18 @@ impl ClientPane {
             // existed, and nothing re-delivers it until the agent next
             // changes state.
             agent_status: Mutex::new(client.remote_agent_status(remote_pane_id)),
+            kitty_relay: Mutex::new(None),
         }
     }
 
     pub async fn process_unilateral(&self, pdu: Pdu) -> anyhow::Result<()> {
         match pdu {
+            Pdu::KittyFrameSelections(state) => {
+                let relay = self.kitty_relay.lock().clone();
+                if let Some(relay) = relay {
+                    relay.receive(state)?;
+                }
+            }
             Pdu::GetPaneRenderChangesResponse(delta) => {
                 // Queued, and applied one at a time in arrival order by a
                 // single task. Each push used to be its own task that
@@ -640,6 +655,29 @@ impl ClientPane {
 
 #[async_trait(?Send)]
 impl Pane for ClientPane {
+    fn subscribe_kitty_frames(&self) -> Option<Box<dyn mux::pane::KittyFrameSubscription>> {
+        let relay = Arc::clone(self.kitty_relay.lock().get_or_insert_with(|| super::kitty::Relay::new(
+            &self.client, self.local_pane_id, self.remote_pane_id,
+        )));
+        Some(relay.subscribe())
+    }
+
+    fn kitty_frame_selections(&self, known: Option<u64>) -> Option<(u64, u64, Vec<wezterm_term::KittyFrameSelection>)> {
+        match self.kitty_relay.lock().as_ref() {
+            Some(relay) => relay.snapshot(known),
+            None => (known != Some(0)).then(|| (0, 0, Vec::new())),
+        }
+    }
+
+    fn get_kitty_image(&self, request: codec::GetKittyImage) -> mux::pane::KittyImageFuture {
+        let relay = self.kitty_relay.lock().clone();
+        let client = Arc::clone(&self.client);
+        let remote_pane = self.remote_pane_id;
+        Box::pin(async move {
+            super::kitty::fetch_image(client, relay, remote_pane, request).await
+        })
+    }
+
     fn pane_id(&self) -> PaneId {
         self.local_pane_id
     }

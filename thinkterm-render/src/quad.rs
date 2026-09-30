@@ -874,6 +874,17 @@ impl HeapQuadAllocator {
         }
     }
 
+    /// Keep the layer boundaries when a compositor interleaves other textures.
+    pub fn extract_layer_vertices(&self, out: &mut Vec<Vertex>) -> [std::ops::Range<usize>; 3] {
+        self.layers().map(|(_, quads)| {
+            let start = out.len();
+            for quad in quads {
+                out.extend_from_slice(&quad.to_vertices());
+            }
+            start..out.len()
+        })
+    }
+
     /// Remove covered pixels before a recorded surface is faded. Merely fading
     /// an opaque cover and the glyph beneath it separately reveals the glyph.
     ///

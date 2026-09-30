@@ -16,6 +16,11 @@ impl std::fmt::Display for LeaseId {
 impl LeaseId {
     pub fn new() -> Self {
         let uuid = Uuid::new_v4();
+        // A browser page has no process id (std::process::id panics there)
+        // and is the only user of its own store.
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let pid = 0;
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let pid = std::process::id();
         Self { uuid, pid }
     }

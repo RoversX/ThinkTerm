@@ -32,7 +32,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use termwiz::escape::csi::KittyKeyboardFlags;
 use termwiz::hyperlink::Hyperlink;
-use termwiz::image::{ImageData, TextureCoordinate};
+use termwiz::image::TextureCoordinate;
+#[cfg(test)]
+use termwiz::image::ImageData;
+pub use thinkterm_proto::image::{image_reply, GetImageCellResponse, GetKittyImage};
 use termwiz::input::KeyboardEncoding;
 use termwiz::surface::{Line, SequenceNo};
 use thiserror::Error;
@@ -40,6 +43,8 @@ use wezterm_term::color::ColorPalette;
 use wezterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
 
 pub mod thinkterm_tree;
+pub mod kitty_queue;
+pub mod kitty_metadata;
 pub use thinkterm_tree::{
     apply_op, ensure_unique_thread_names, ThinkTermTree, TreeOp, TtProject, TtProjectId, TtSpace,
     TtSpaceId, TtThread, TtThreadId,
@@ -688,6 +693,9 @@ pdu! {
     DefaultPalette: 94,
     MoveTab: 95,
     PluginFrame: 96,
+    GetKittyFrameSelections: 97,
+    KittyFrameSelections: 98,
+    GetKittyImage: 99,
 }
 
 impl Pdu {
@@ -797,6 +805,7 @@ impl Pdu {
             Pdu::GetPaneRenderChangesResponse(GetPaneRenderChangesResponse { pane_id, .. })
             | Pdu::SetPalette(SetPalette { pane_id, .. })
             | Pdu::SetApplicationPalette(SetApplicationPalette { pane_id, .. })
+            | Pdu::KittyFrameSelections(KittyFrameSelections { pane_id, .. })
             | Pdu::NotifyAlert(NotifyAlert { pane_id, .. })
             | Pdu::SetClipboard(SetClipboard { pane_id, .. })
             | Pdu::PaneFocused(PaneFocused { pane_id })
@@ -1942,17 +1951,20 @@ pub struct GetImageCell {
     pub have_frames: u32,
 }
 
+/// Subscribe to frame-control metadata without changing legacy render PDUs.
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
-pub struct GetImageCellResponse {
+pub struct GetKittyFrameSelections {
     pub pane_id: PaneId,
-    pub data: Option<Arc<ImageData>>,
-    /// The generation `data` was taken from.
-    pub data_generation: u64,
-    /// 0: `data` is the whole image. Otherwise `data` is an AnimRgba8
-    /// holding only the frames from this index on, together with the
-    /// durations and per-frame hashes of *every* frame, so the client can
-    /// check the frames it holds are still the ones in front.
-    pub frames_from: u32,
+    pub subscribe: bool,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct KittyFrameSelections {
+    pub pane_id: PaneId,
+    pub image_epoch: u64,
+    pub now_ms: u64,
+    pub revision: u64,
+    pub selections: Vec<wezterm_term::KittyFrameSelection>,
 }
 
 #[cfg(test)]
@@ -2641,6 +2653,37 @@ mod test {
             let decoded = Pdu::decode(encoded.as_slice()).unwrap();
             assert_eq!(decoded.serial, 0x73);
             assert_eq!(decoded.pdu, pdu);
+        }
+    }
+
+    #[test]
+    fn shared_image_response_keeps_the_legacy_positional_shape() {
+        let response = GetImageCellResponse { pane_id: 3, data: None, data_generation: 5, frames_from: 0 };
+        let mut bytes = Vec::new();
+        response.serialize(&mut varbincode::Serializer::new(&mut bytes)).unwrap();
+        assert_eq!(bytes, [3, 0, 5, 0]);
+    }
+
+    #[test]
+    fn frame_control_extension_round_trips_without_changing_legacy_version() {
+        assert_eq!(CODEC_VERSION, 73);
+        for pdu in [
+            Pdu::GetKittyImage(GetKittyImage { pane_id: 3, image_id: 7, data_hash: [9; 32], have_frames: 2, image_epoch: Some(4) }),
+            Pdu::GetKittyFrameSelections(GetKittyFrameSelections { pane_id: 3, subscribe: true }),
+            Pdu::GetKittyFrameSelections(GetKittyFrameSelections { pane_id: 3, subscribe: false }),
+            Pdu::KittyFrameSelections(KittyFrameSelections {
+                pane_id: 3, image_epoch: 0, now_ms: 100, revision: 5,
+                selections: vec![wezterm_term::KittyFrameSelection { relative_placements: Vec::new(), virtual_placements: Vec::new(), data_generation: 0, image_id: 7, data_hash: [9; 32], animation: wezterm_term::kitty_animation::KittyAnimation::new([0, 40, 70], 100) }],
+            }),
+        ] {
+            let mut encoded = Vec::new();
+            pdu.encode(&mut encoded, 17).unwrap();
+            let decoded = Pdu::decode(encoded.as_slice()).unwrap();
+            assert_eq!(decoded.serial, 17);
+            assert_eq!(decoded.pdu, pdu);
+            if matches!(pdu, Pdu::KittyFrameSelections(_)) {
+                assert_eq!(decoded.pdu.pane_id(), Some(3));
+            }
         }
     }
 

@@ -24,6 +24,27 @@ use wezterm_term::KeyModifiers;
 
 pub type LocalFuture<T> = Pin<Box<dyn Future<Output = T> + 'static>>;
 
+/// Dropping the handle cancels the wake and releases its callback captures.
+#[derive(Default)]
+#[must_use]
+pub struct Timeout {
+    cancel: Option<Box<dyn FnOnce()>>,
+}
+
+impl Timeout {
+    pub fn new(cancel: impl FnOnce() + 'static) -> Self {
+        Self { cancel: Some(Box::new(cancel)) }
+    }
+}
+
+impl Drop for Timeout {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel();
+        }
+    }
+}
+
 /// The box the terminal is drawn in, as the platform sees it: its
 /// position and size in the platform's own units (CSS px on a page,
 /// points on a phone) and the device pixels per unit.
@@ -93,6 +114,8 @@ pub trait Platform: 'static {
     fn spawn(&self, fut: LocalFuture<()>);
     /// Call `cb` once, `delay_ms` from now, on the App's thread.
     fn set_timeout(&self, delay_ms: f64, cb: Box<dyn FnOnce()>);
+    /// A single wake owned by the caller, cancelled when its handle is dropped.
+    fn cancellable_timeout(&self, delay_ms: f64, cb: Box<dyn FnOnce()>) -> Timeout;
     /// Call `cb` every `every_ms`, for the life of the platform.
     fn set_interval(&self, every_ms: f64, cb: Box<dyn FnMut()>);
 

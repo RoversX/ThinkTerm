@@ -2,7 +2,8 @@
 //! `render_screen_line` (wezterm-gui/src/termwindow/render/screen_line.rs):
 //! backgrounds, underlines, the selection, the cursor, then glyphs sliced
 //! into strips wherever the cursor or the selection changes their colour.
-//! No images, no bidi, no hyperlink hover, no blink.
+//! Images are emitted separately by `graphics`; bidi and hyperlink hover
+//! are not handled here.
 
 use crate::fallback::FallbackBudget;
 use crate::glyphs::{CachedGlyph, GlyphCache};
@@ -333,7 +334,7 @@ pub fn emit_line(
         if let Some((tex, color)) = &item.underline {
             for i in 0..item.width {
                 let x = gl_x + (item.first_cell + i) as f32 * cell_width;
-                let mut quad = layers.allocate(0).context("allocate")?;
+                let mut quad = layers.allocate(1).context("allocate")?;
                 quad.set_position(x, pos_y, x + cell_width, pos_y + cell_height);
                 quad.set_hsv(p.hsv);
                 quad.set_has_color(false);
@@ -363,14 +364,10 @@ pub fn emit_line(
         } else {
             (cursor_shape, cursor_bg)
         };
-        let layer = match shape {
-            CursorShape::BlinkingBar | CursorShape::SteadyBar => 2,
-            _ => 0,
-        };
         let width_cells = (cursor_range.end - cursor_range.start).max(1) as u8;
         let sprite = cache.cursor_sprite(Some(shape), width_cells)?;
         let x = gl_x + cursor_range_pixels.start;
-        let mut quad = layers.allocate(layer).context("allocate")?;
+        let mut quad = layers.allocate(2).context("allocate")?;
         quad.set_hsv(p.hsv);
         quad.set_has_color(false);
         quad.set_position(x, pos_y, x + width_cells as f32 * cell_width, pos_y + cell_height);
@@ -392,8 +389,11 @@ pub fn emit_line(
                     break;
                 }
                 let adjust = (glyph.x_offset + glyph.bearing_x).get() as f32;
-                let texture_range = pos_x + adjust
-                    ..pos_x + adjust + texture.coords.size.width as f32 * width_scale;
+                let texture_range = intersection(
+                    &(pos_x + adjust
+                        ..pos_x + adjust + texture.coords.size.width as f32 * width_scale),
+                    &(0.0..pixel_width),
+                );
                 let (left, mid, right) = range3(&texture_range, &cursor_range_pixels);
                 let (la, lb, lc) = range3(&left, &selection_pixels);
                 let (ra, rb, rc) = range3(&right, &selection_pixels);
@@ -424,7 +424,7 @@ pub fn emit_line(
                         texture.coords.size.height,
                     );
                     let texture_rect = texture.texture.to_texture_coords(pixel_rect);
-                    let mut quad = layers.allocate(1).context("allocate")?;
+                    let mut quad = layers.allocate(if is_cursor && filled_cursor { 2 } else { 1 }).context("allocate")?;
                     quad.set_position(
                         gl_x + range.start,
                         pos_y + top,
