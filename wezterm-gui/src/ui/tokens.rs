@@ -43,6 +43,11 @@ pub(crate) struct UiPalette {
     /// Fill for a grouped card floating on `window_bg`. Translucent on
     /// purpose: it picks up whatever the page paints behind it.
     pub card_bg: LinearRgba,
+    /// Fill for a group of rows inside a card, the way System Settings
+    /// groups them: a step off `card_bg`, below `control_bg` so the
+    /// controls in the rows still stand out. A concrete colour, for the
+    /// reason the sidebar row ramp gives.
+    pub group_bg: LinearRgba,
     pub text: LinearRgba,
     pub secondary_text: LinearRgba,
     pub muted_text: LinearRgba,
@@ -68,7 +73,7 @@ pub(crate) struct UiPalette {
 /// moves them cannot disagree. The accent family and the text slots are
 /// deliberately absent: accents are kept as designed, and text is moved and
 /// then held to a contrast floor, which is a different rule.
-const SURFACE_SLOTS: [fn(&mut UiPalette) -> &mut LinearRgba; 18] = [
+const SURFACE_SLOTS: [fn(&mut UiPalette) -> &mut LinearRgba; 19] = [
     |p| &mut p.window_bg,
     |p| &mut p.sidebar_bg,
     |p| &mut p.workspace_sidebar_bg,
@@ -86,6 +91,7 @@ const SURFACE_SLOTS: [fn(&mut UiPalette) -> &mut LinearRgba; 18] = [
     |p| &mut p.sidebar_row_active_border,
     |p| &mut p.track_off,
     |p| &mut p.card_bg,
+    |p| &mut p.group_bg,
     |p| &mut p.scrollbar_thumb,
 ];
 
@@ -314,6 +320,7 @@ impl UiPalette {
                 danger: rgb(215, 38, 61),
                 track_off: rgba(220, 220, 226, 1.0),
                 card_bg: rgba(255, 255, 255, 0.72),
+                group_bg: rgb(242, 242, 245),
                 text: rgb(28, 28, 30),
                 secondary_text: rgb(72, 72, 74),
                 muted_text: rgb(142, 142, 147),
@@ -346,6 +353,7 @@ impl UiPalette {
                 danger: rgb(255, 69, 58),
                 track_off: rgba(78, 78, 82, 1.0),
                 card_bg: rgba(30, 30, 32, 0.78),
+                group_bg: rgb(37, 37, 39),
                 text: rgb(242, 242, 247),
                 secondary_text: rgb(199, 199, 204),
                 muted_text: rgb(142, 142, 147),

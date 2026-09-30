@@ -27,6 +27,7 @@ use crate::utilsprites::RenderMetrics;
 use std::rc::Rc;
 use wezterm_bidi::Direction;
 use wezterm_font::LoadedFont;
+use window::bitmaps::TextureRect;
 use window::color::LinearRgba;
 use window::{Dimensions, RectF};
 
@@ -504,6 +505,95 @@ impl<'a> DrawContext<'a> {
         Ok(())
     }
 
+    /// A rounded rectangle filled from `top` at its top edge to `bottom` at
+    /// its bottom one. It is drawn in the same pieces as `draw_rounded_rect`;
+    /// each piece takes the colours of the rows it spans, so the GPU's
+    /// interpolation joins them into one ramp.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draw_rounded_rect_vertical_gradient(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        rect: RectF,
+        radius: f32,
+        top: LinearRgba,
+        bottom: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let Some(PixelSnappedRoundedRect {
+            x,
+            y,
+            width,
+            height,
+            radius,
+        }) = pixel_snap_rounded_rect(
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height,
+            radius,
+        )
+        else {
+            return Ok(());
+        };
+        let at = |row: f32| {
+            let t = ((row - y) / height).clamp(0.0, 1.0);
+            LinearRgba::with_components(
+                top.0 + (bottom.0 - top.0) * t,
+                top.1 + (bottom.1 - top.1) * t,
+                top.2 + (bottom.2 - top.2) * t,
+                top.3 + (bottom.3 - top.3) * t,
+            )
+        };
+
+        let lower = y + height - radius;
+        if radius > 0.0 {
+            let size = euclid::size2(radius, radius);
+            let left_offset = self.dimensions.pixel_width as f32 / 2.0;
+            let top_offset = self.dimensions.pixel_height as f32 / 2.0;
+            for (polys, corner_x, corner_y) in [
+                (TOP_LEFT_ROUNDED_CORNER, x, y),
+                (TOP_RIGHT_ROUNDED_CORNER, x + width - radius, y),
+                (BOTTOM_LEFT_ROUNDED_CORNER, x, lower),
+                (BOTTOM_RIGHT_ROUNDED_CORNER, x + width - radius, lower),
+            ] {
+                let sprite = self.corner_sprite(polys, size)?;
+                let mut quad = layers.allocate(layer_num)?;
+                quad.set_position(
+                    corner_x - left_offset,
+                    corner_y - top_offset,
+                    corner_x + radius - left_offset,
+                    corner_y + radius - top_offset,
+                );
+                quad.set_texture(sprite);
+                quad.set_vertical_gradient(at(corner_y), at(corner_y + radius));
+                quad.set_alt_color_and_mix_value(at(corner_y), 0.0);
+                quad.set_hsv(None);
+                quad.set_has_color(false);
+                quad.set_grayscale();
+            }
+        }
+
+        // The column between the corners runs the full height; the bands
+        // beside it only between them. Empty ones draw nothing.
+        self.draw_vertical_gradient(
+            layers,
+            layer_num,
+            euclid::rect(x + radius, y, width - radius * 2.0, height),
+            top,
+            bottom,
+        )?;
+        for band_x in [x, x + width - radius] {
+            self.draw_vertical_gradient(
+                layers,
+                layer_num,
+                euclid::rect(band_x, y + radius, radius, lower - (y + radius)),
+                at(y + radius),
+                at(lower),
+            )?;
+        }
+        Ok(())
+    }
+
     /// A grouped card: the translucent surface a panel's contents sit on.
     /// One call, so every page groups things the same way.
     pub(crate) fn draw_card(
@@ -554,19 +644,7 @@ impl<'a> DrawContext<'a> {
         size: euclid::Size2D<f32, window::PixelUnit>,
         color: LinearRgba,
     ) -> anyhow::Result<()> {
-        let render_state = self.render_state;
-        let sprite = render_state
-            .glyph_cache
-            .borrow_mut()
-            .cached_block(
-                BlockKey::PolyWithCustomMetrics {
-                    polys,
-                    underline_height: self.metrics.underline_height,
-                    cell_size: euclid::size2(size.width as isize, size.height as isize),
-                },
-                self.metrics,
-            )?
-            .texture_coords();
+        let sprite = self.corner_sprite(polys, size)?;
 
         let mut quad = layers.allocate(layer_num)?;
         let left_offset = self.dimensions.pixel_width as f32 / 2.0;
@@ -584,6 +662,27 @@ impl<'a> DrawContext<'a> {
         quad.set_has_color(false);
         quad.set_grayscale();
         Ok(())
+    }
+
+    /// A rounded corner's coverage in the atlas, `size` pixels square.
+    fn corner_sprite(
+        &self,
+        polys: &'static [Poly],
+        size: euclid::Size2D<f32, window::PixelUnit>,
+    ) -> anyhow::Result<TextureRect> {
+        Ok(self
+            .render_state
+            .glyph_cache
+            .borrow_mut()
+            .cached_block(
+                BlockKey::PolyWithCustomMetrics {
+                    polys,
+                    underline_height: self.metrics.underline_height,
+                    cell_size: euclid::size2(size.width as isize, size.height as isize),
+                },
+                self.metrics,
+            )?
+            .texture_coords())
     }
 
     pub(crate) fn draw_svg_icon(

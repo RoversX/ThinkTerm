@@ -1181,6 +1181,7 @@ pub(crate) fn apply_ui_colors(
     apply_color!(danger);
     apply_color!(track_off);
     apply_color!(card_bg);
+    apply_color!(group_bg);
     apply_color!(text);
     apply_color!(secondary_text);
     apply_color!(muted_text);

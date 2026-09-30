@@ -77,7 +77,7 @@ for every other option.
 **Surfaces** -- `window_bg` (the ground behind everything), `sidebar_bg`,
 `workspace_sidebar_bg` (the Spaces strip, recessed from the sidebar),
 `header_bg` (the strip above the tabs), `card_bg` (a grouped card floating on
-`window_bg`).
+`window_bg`), `group_bg` (a group of rows inside a card).
 
 **Controls** -- `control_bg` at rest, `control_hover_bg` under the pointer,
 `control_pressed_bg` while held, `control_border` for the hairline outline,

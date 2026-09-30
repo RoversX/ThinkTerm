@@ -449,6 +449,10 @@ pub struct UiColors {
     #[dynamic(default)]
     pub card_bg: Option<RgbaColor>,
 
+    /// A group of rows inside a card.
+    #[dynamic(default)]
+    pub group_bg: Option<RgbaColor>,
+
     /// Primary text.
     #[dynamic(default)]
     pub text: Option<RgbaColor>,
