@@ -301,8 +301,8 @@ impl TerminalState {
             let data = data.swap_out()?;
             return Ok(Arc::new(ImageData::with_data_and_hash(data, key)));
         }
-        if let Some(item) = self.image_cache.get(&key) {
-            Ok(Arc::clone(item))
+        if let Some(item) = self.image_cache.get(&key).and_then(std::sync::Weak::upgrade) {
+            Ok(item)
         } else {
             // swap_out preserves the key byte-for-byte (Rgba8/AnimRgba8
             // pass through; EncodedFile becomes an EncodedLease whose
@@ -311,7 +311,7 @@ impl TerminalState {
             // hashing the full payload a second time.
             let data = data.swap_out()?;
             let image_data = Arc::new(ImageData::with_data_and_hash(data, key));
-            self.image_cache.put(key, Arc::clone(&image_data));
+            self.image_cache.put(key, Arc::downgrade(&image_data));
             Ok(image_data)
         }
     }
@@ -425,5 +425,22 @@ mod tests {
         let s2 = term.raw_image_to_image_data(frame(4, 4, 1)).unwrap();
         assert!(Arc::ptr_eq(&s1, &s2));
         assert_eq!(term.image_cache.len(), 1);
+    }
+
+    #[test]
+    fn the_dedup_cache_keeps_no_pixels_alive() {
+        let mut term = test_term();
+        let first = term.raw_image_to_image_data(frame(4, 4, 7)).unwrap();
+        let key = first.hash();
+        let released = Arc::downgrade(&first);
+        drop(first);
+        assert!(released.upgrade().is_none(), "unused pixels are freed at once");
+
+        // The same content arriving later gets the same key, and dedups
+        // again while it is in use.
+        let again = term.raw_image_to_image_data(frame(4, 4, 7)).unwrap();
+        let repeat = term.raw_image_to_image_data(frame(4, 4, 7)).unwrap();
+        assert_eq!(again.hash(), key);
+        assert!(Arc::ptr_eq(&again, &repeat));
     }
 }

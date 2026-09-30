@@ -426,7 +426,10 @@ pub struct TerminalState {
 
     writer: BufWriter<ThreadedWriter>,
 
-    image_cache: lru::LruCache<[u8; 32], Arc<ImageData>>,
+    /// Dedup for small images that are still shown or stored. A weak
+    /// reference: pixels nothing uses any more are freed at once, not kept
+    /// until sixteen newer images push them out.
+    image_cache: lru::LruCache<[u8; 32], std::sync::Weak<ImageData>>,
     sixel_scrolls_right: bool,
 
     user_vars: HashMap<String, String>,
