@@ -2772,99 +2772,6 @@ pub fn show() {
     }
 }
 
-async fn create_settings_renderer<T>(
-    requested: NativeRendererBackend,
-    webgpu: impl std::future::Future<Output = anyhow::Result<T>>,
-    opengl: impl std::future::Future<Output = anyhow::Result<T>>,
-) -> anyhow::Result<T> {
-    if requested == NativeRendererBackend::OpenGL {
-        return opengl.await.context("OpenGL initialization failed");
-    }
-    match webgpu.await {
-        Ok(renderer) => Ok(renderer),
-        Err(webgpu_error) => {
-            log::warn!("settings WebGPU initialization failed: {webgpu_error:#}; trying OpenGL");
-            opengl.await.map_err(|opengl_error| {
-                anyhow::anyhow!(
-                    "WebGPU initialization failed: {webgpu_error:#}; \
-                     OpenGL initialization failed: {opengl_error:#}"
-                )
-            })
-        }
-    }
-}
-
-#[cfg(test)]
-mod renderer_tests {
-    use super::*;
-
-    #[test]
-    fn opengl_selection_never_initializes_webgpu() {
-        let result = smol::block_on(create_settings_renderer(
-            NativeRendererBackend::OpenGL,
-            async { panic!("WebGPU must not be polled") },
-            async { Ok("OpenGL") },
-        ));
-        assert_eq!(result.unwrap(), "OpenGL");
-    }
-
-    #[test]
-    fn webgpu_success_does_not_initialize_opengl() {
-        let result = smol::block_on(create_settings_renderer(
-            NativeRendererBackend::WebGpu,
-            async { Ok("WebGPU") },
-            async { panic!("OpenGL must not be polled") },
-        ));
-        assert_eq!(result.unwrap(), "WebGPU");
-    }
-
-    #[test]
-    fn webgpu_failure_falls_back_to_opengl() {
-        let attempts = RefCell::new(Vec::new());
-        let result = smol::block_on(create_settings_renderer(
-            NativeRendererBackend::WebGpu,
-            async {
-                attempts.borrow_mut().push("WebGPU");
-                anyhow::bail!("adapter unavailable")
-            },
-            async {
-                attempts.borrow_mut().push("OpenGL");
-                Ok("OpenGL")
-            },
-        ));
-        assert_eq!(result.unwrap(), "OpenGL");
-        assert_eq!(*attempts.borrow(), vec!["WebGPU", "OpenGL"]);
-    }
-
-    #[test]
-    fn both_renderer_failures_keep_both_causes() {
-        let error = smol::block_on(create_settings_renderer::<()>(
-            NativeRendererBackend::WebGpu,
-            async { Err(anyhow::anyhow!("adapter unavailable").context("device creation")) },
-            async { Err(anyhow::anyhow!("shader compilation failed")) },
-        ))
-        .unwrap_err();
-        let message = format!("{error:#}");
-        assert!(message
-            .contains("WebGPU initialization failed: device creation: adapter unavailable"));
-        assert!(message.contains("OpenGL initialization failed: shader compilation failed"));
-    }
-
-    #[test]
-    fn explicit_opengl_failure_reports_the_backend() {
-        let error = smol::block_on(create_settings_renderer::<()>(
-            NativeRendererBackend::OpenGL,
-            async { panic!("WebGPU must not be polled") },
-            async { anyhow::bail!("context creation failed") },
-        ))
-        .unwrap_err();
-        assert_eq!(
-            format!("{error:#}"),
-            "OpenGL initialization failed: context creation failed"
-        );
-    }
-}
-
 /// One string, shaped and glyph-resolved once for one font.
 ///
 /// `width` is the same sum the painter walks, so a measurement and the paint
@@ -3123,8 +3030,9 @@ impl SettingsWindow {
         .await?;
 
         window.set_title(&title);
-        let render_state = create_settings_renderer(
+        let render_state = crate::renderer_choice::bring_up(
             active_main_renderer,
+            config.front_end != config::FrontEndSelection::Software,
             async {
                 let webgpu = Rc::new(WebGpuState::new(&window, dimensions, &config).await?);
                 let settings = settings.borrow();

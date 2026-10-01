@@ -3989,31 +3989,15 @@ impl TermWindow {
         }
     }
 
-    fn created(&mut self, ctx: RenderContext) -> anyhow::Result<()> {
-        self.render_state = None;
-
-        let render_info = ctx.renderer_info();
-        self.opengl_info.replace(render_info.clone());
-
-        match RenderState::new(ctx, &self.fonts, &self.render_metrics, ATLAS_SIZE) {
-            Ok(render_state) => {
-                log::debug!(
-                    "OpenGL initialized! {} wezterm version: {}",
-                    render_info,
-                    config::wezterm_version(),
-                );
-                self.render_state.replace(render_state);
-            }
-            Err(err) => {
-                log::error!("failed to create RenderState: {}", err);
-            }
-        }
-
-        if self.render_state.is_none() {
-            panic!("No OpenGL");
-        }
-
-        Ok(())
+    fn created(&mut self, render_state: RenderState) {
+        let render_info = render_state.context.renderer_info();
+        log::debug!(
+            "OpenGL initialized! {} wezterm version: {}",
+            render_info,
+            config::wezterm_version(),
+        );
+        self.opengl_info.replace(render_info);
+        self.render_state.replace(render_state);
     }
 }
 
@@ -4684,43 +4668,45 @@ impl TermWindow {
             }
         });
 
-        // Try WebGpu first when it is the selection, but never let its failure
-        // be fatal: a machine with no usable Vulkan/DX12/Metal adapter would
-        // otherwise get a window that never opens *and* no way back, because
-        // the settings window is built the same way and would fail with it.
-        // Falling back costs a log line; not falling back costs the app.
-        let mut effective_renderer = main_renderer;
-        let mut webgpu = None;
-        if matches!(
+        // The selected renderer goes first and, unless the configuration asks
+        // for software rendering, the other one is the fallback: a machine with
+        // no usable Vulkan/DX12/Metal adapter, or with an OpenGL too old for
+        // our shaders, would otherwise get a window that never opens *and* no
+        // way back, because the settings window is built the same way. Each
+        // attempt runs through RenderState, where the shaders are compiled.
+        let render_state = crate::renderer_choice::bring_up(
             main_renderer,
-            crate::native_settings::NativeRendererBackend::WebGpu
-        ) {
-            gpu_debug(format!(
-                "create WebGpu main_window size={}x{} dpi={}",
-                dimensions.pixel_width, dimensions.pixel_height, dimensions.dpi
-            ));
-            match WebGpuState::new(&window, dimensions, &config).await {
-                Ok(state) => webgpu = Some(Rc::new(state)),
-                Err(err) => {
-                    log::error!("WebGpu is unavailable ({err:#}); falling back to OpenGL");
-                    gpu_debug(format!(
-                        "WebGpu unavailable: {err:#}; falling back to OpenGL"
-                    ));
-                    effective_renderer = crate::native_settings::NativeRendererBackend::OpenGL;
-                }
-            }
-        }
-
-        let gl = match effective_renderer {
-            crate::native_settings::NativeRendererBackend::WebGpu => None,
-            crate::native_settings::NativeRendererBackend::OpenGL => {
+            config.front_end != config::FrontEndSelection::Software,
+            async {
+                gpu_debug(format!(
+                    "create WebGpu main_window size={}x{} dpi={}",
+                    dimensions.pixel_width, dimensions.pixel_height, dimensions.dpi
+                ));
+                let webgpu = Rc::new(WebGpuState::new(&window, dimensions, &config).await?);
+                let myself = tw.borrow();
+                RenderState::new(
+                    RenderContext::WebGpu(webgpu),
+                    &myself.fonts,
+                    &myself.render_metrics,
+                    ATLAS_SIZE,
+                )
+            },
+            async {
                 gpu_debug(format!(
                     "enable OpenGL main_window size={}x{} dpi={}",
                     dimensions.pixel_width, dimensions.pixel_height, dimensions.dpi
                 ));
-                Some(window.enable_opengl().await?)
-            }
-        };
+                let gl = window.enable_opengl().await?;
+                let myself = tw.borrow();
+                RenderState::new(
+                    RenderContext::Glium(gl),
+                    &myself.fonts,
+                    &myself.render_metrics,
+                    ATLAS_SIZE,
+                )
+            },
+        )
+        .await?;
 
         {
             let mut myself = tw.borrow_mut();
@@ -4741,19 +4727,25 @@ impl TermWindow {
                 );
             }
 
-            if let Some(gl) = gl {
-                myself.gl.replace(Rc::clone(&gl));
-                myself.created(RenderContext::Glium(Rc::clone(&gl)))?;
+            match &render_state.context {
+                RenderContext::Glium(gl) => {
+                    myself.gl.replace(Rc::clone(gl));
+                }
+                RenderContext::WebGpu(webgpu) => {
+                    myself.webgpu.replace(Rc::clone(webgpu));
+                    // A resize or DPI change can arrive while the renderer is
+                    // coming up -- for longer when a failed OpenGL attempt went
+                    // first -- and the surface was configured from dimensions
+                    // taken before the window existed.
+                    webgpu.resize(myself.dimensions);
+                    // Seed the swapchain latency from the current focus: a
+                    // window spawned in the background starts at the reduced
+                    // latency and only pays for the third drawable once it is
+                    // actually focused.
+                    webgpu.set_desired_frame_latency(if myself.focused.is_some() { 2 } else { 1 });
+                }
             }
-            if let Some(webgpu) = webgpu {
-                myself.webgpu.replace(Rc::clone(&webgpu));
-                // Seed the swapchain latency from the current focus: a
-                // window spawned in the background starts at the reduced
-                // latency and only pays for the third drawable once it is
-                // actually focused.
-                webgpu.set_desired_frame_latency(if myself.focused.is_some() { 2 } else { 1 });
-                myself.created(RenderContext::WebGpu(Rc::clone(&webgpu)))?;
-            }
+            myself.created(render_state);
             myself.apply_native_terminal_settings();
             myself.apply_workspace_thread_font_scales();
             myself.load_os_parameters();

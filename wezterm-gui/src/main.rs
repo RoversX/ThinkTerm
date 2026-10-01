@@ -57,6 +57,7 @@ mod overlay;
 mod perf;
 mod plugins;
 mod quad;
+mod renderer_choice;
 mod renderstate;
 mod resize_increment_calculator;
 mod scripting;

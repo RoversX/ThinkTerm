@@ -6,8 +6,10 @@ pub enum FrontEndSelection {
     OpenGL,
     /// The default since the main window learned to fall back: wgpu asks for
     /// every backend it has (Metal, then DX12/Vulkan/GL depending on the
-    /// platform), and if none of them can be brought up the window quietly
-    /// opens on OpenGL instead of failing to open at all.
+    /// platform; on Windows GL is left out where OpenGL would be Mesa), and
+    /// if none of them can be brought up the window quietly opens on OpenGL
+    /// instead of failing to open at all. OpenGL falls back to WebGpu the same
+    /// way; Software never falls back.
     #[default]
     WebGpu,
     Software,
