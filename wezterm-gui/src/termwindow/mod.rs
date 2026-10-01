@@ -238,6 +238,9 @@ pub(crate) struct RemoteConnectState {
     pub orphan_candidate_window_id: Option<MuxWindowId>,
     /// `(domain_name, host_id)` to run OS detection on once connected.
     pub detect_os: Option<(String, String)>,
+    /// `(domain_name, host_id, install)` when the host's shell integration
+    /// setting waits on this connection (`ssh_hosts::pending_shell_integration`).
+    pub shell_integration: Option<(String, String, bool)>,
 }
 
 /// An in-flight Mosh connection started from a `RemoteThreadView`. Mosh does

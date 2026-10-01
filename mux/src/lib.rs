@@ -51,6 +51,7 @@ pub mod pane;
 mod parse_watchdog;
 pub mod renderable;
 pub mod session_server;
+pub mod shell_integration;
 pub mod ssh;
 pub mod ssh_agent;
 pub mod tab;

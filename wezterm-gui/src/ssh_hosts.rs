@@ -10,6 +10,7 @@ use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::SshDomain;
 use filedescriptor::FileDescriptor;
 use mux::domain::Domain;
+use mux::shell_integration::{NotConnected, ShellIntegrationOutcome, UnwritableStartupFile};
 use mux::ssh::RemoteSshDomain;
 use mux::Mux;
 use parking_lot::Mutex;
@@ -22,8 +23,8 @@ use std::sync::Arc;
 use wezterm_ssh::{Session, SessionEvent};
 
 pub use thinkterm_core::ssh_hosts::{
-    default_mosh_server_command, SshHostEntry, SshHostId, SshHostSource, SshHostSpec,
-    DEFAULT_MOSH_SERVER_COMMAND,
+    default_mosh_server_command, ShellIntegrationFailure, SshHostEntry, SshHostId, SshHostSource,
+    SshHostSpec, DEFAULT_MOSH_SERVER_COMMAND,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -219,7 +220,7 @@ fn upsert_host(spec: SshHostSpec) -> Result<(SshHostId, SshHostSpec)> {
 /// the host to a different `user@host:port` has to re-key the record or it
 /// stops matching its own spec. `None` means there was no such editable
 /// record.
-pub fn try_update_host(host_id: &str, spec: SshHostSpec) -> Result<Option<SshHostId>> {
+pub fn try_update_host(host_id: &str, mut spec: SshHostSpec) -> Result<Option<SshHostId>> {
     if is_system_host_id(host_id) {
         return Ok(None);
     }
@@ -235,6 +236,18 @@ pub fn try_update_host(host_id: &str, spec: SshHostSpec) -> Result<Option<SshHos
     let Some(record) = store.hosts.iter_mut().find(|record| record.id == host_id) else {
         return Ok(None);
     };
+    // What connections found on the host is the record's to keep, not the
+    // copy the form took when it opened -- unless the host moved to another
+    // endpoint, which ThinkTerm has set nothing up on yet.
+    if new_id == host_id {
+        spec.shell_integration_applied = record.spec.shell_integration_applied;
+        spec.shell_integration_unsupported = record.spec.shell_integration_unsupported.clone();
+        spec.shell_integration_failure = record.spec.shell_integration_failure.clone();
+    } else {
+        spec.shell_integration_applied = false;
+        spec.shell_integration_unsupported = None;
+        spec.shell_integration_failure = None;
+    }
     record.id = new_id.clone();
     record.spec = spec;
     save_ssh_host_store(&store)?;
@@ -284,6 +297,129 @@ pub fn set_host_distro(host_id: &str, distro_id: &str) -> bool {
         log::warn!("failed to persist SSH host distro for {host_id}: {err:#}");
     }
     true
+}
+
+/// The shell integration change a host's settings still wait on: `Some`
+/// with whether to install it, when the setting and what was last carried
+/// out differ. Only a direct ssh connection can carry it out; ThinkTerm
+/// Connect sees the host's processes itself, and Mosh has no session for it.
+pub fn pending_shell_integration(spec: &SshHostSpec) -> Option<bool> {
+    (!spec.use_mosh
+        && !spec.multiplexing
+        && spec.shell_integration != spec.shell_integration_applied)
+        .then_some(spec.shell_integration)
+}
+
+/// Record what setting up the host's shell integration came to, so the next
+/// connection does not carry it out again. Returns whether the record
+/// changed.
+pub fn record_shell_integration(host_id: &str, outcome: &ShellIntegrationOutcome) -> bool {
+    if is_system_host_id(host_id) {
+        return false;
+    }
+    let Ok(mut store) = host_store() else {
+        return false;
+    };
+    let Some(record) = store.hosts.iter_mut().find(|record| record.id == host_id) else {
+        return false;
+    };
+    // A shell without hooks counts as carried out too: nothing was left on
+    // the host, and the next connection would only find the same shell.
+    let (applied, unsupported) = match outcome {
+        ShellIntegrationOutcome::Installed(_) => (true, None),
+        ShellIntegrationOutcome::Removed => (false, None),
+        ShellIntegrationOutcome::Unsupported(shell) => (true, Some(shell.clone())),
+    };
+    if record.spec.shell_integration_applied == applied
+        && record.spec.shell_integration_unsupported == unsupported
+        && record.spec.shell_integration_failure.is_none()
+    {
+        return false;
+    }
+    record.spec.shell_integration_applied = applied;
+    record.spec.shell_integration_unsupported = unsupported;
+    record.spec.shell_integration_failure = None;
+    if let Err(err) = save_ssh_host_store(&store) {
+        log::warn!("failed to persist SSH host shell integration for {host_id}: {err:#}");
+    }
+    true
+}
+
+/// Record why carrying out the host's shell integration setting failed, for
+/// its settings to show until a connection gets it done. Returns whether the
+/// record changed.
+pub fn record_shell_integration_failure(host_id: &str, err: &anyhow::Error) -> bool {
+    if is_system_host_id(host_id) {
+        return false;
+    }
+    let Some(failure) = shell_integration_failure(err) else {
+        return false;
+    };
+    let Ok(mut store) = host_store() else {
+        return false;
+    };
+    let Some(record) = store.hosts.iter_mut().find(|record| record.id == host_id) else {
+        return false;
+    };
+    if record.spec.shell_integration_failure.as_ref() == Some(&failure) {
+        return false;
+    }
+    record.spec.shell_integration_failure = Some(failure);
+    if let Err(err) = save_ssh_host_store(&store) {
+        log::warn!("failed to persist SSH host shell integration for {host_id}: {err:#}");
+    }
+    true
+}
+
+/// How a failed setup is kept: a file the host would not let it write as
+/// such, anything else in one line short enough for a few lines of the form.
+/// Nothing when it never ran -- a host that never connected has nothing to
+/// show for it.
+fn shell_integration_failure(err: &anyhow::Error) -> Option<ShellIntegrationFailure> {
+    if err.downcast_ref::<NotConnected>().is_some() {
+        return None;
+    }
+    if let Some(file) = err.downcast_ref::<UnwritableStartupFile>() {
+        return Some(ShellIntegrationFailure::Unwritable(file.0.clone()));
+    }
+    let message = format!("{err:#}")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut short: String = message.chars().take(240).collect();
+    if short.len() < message.len() {
+        short.push('…');
+    }
+    Some(ShellIntegrationFailure::Other(short))
+}
+
+/// What connections have found about a host's shell integration so far, as
+/// `record_shell_integration` and `record_shell_integration_failure` keep it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShellIntegrationRecord {
+    /// The setting as last carried out.
+    pub applied: bool,
+    /// The login shell the integration has no hooks for.
+    pub unsupported: Option<String>,
+    /// Why the last connection could not carry the setting out.
+    pub failure: Option<ShellIntegrationFailure>,
+}
+
+/// What setting up the host's shell integration has come to so far.
+pub fn shell_integration_record(host_id: &str) -> ShellIntegrationRecord {
+    let Ok(store) = host_store() else {
+        return ShellIntegrationRecord::default();
+    };
+    store
+        .hosts
+        .iter()
+        .find(|record| record.id == host_id)
+        .map(|record| ShellIntegrationRecord {
+            applied: record.spec.shell_integration_applied,
+            unsupported: record.spec.shell_integration_unsupported.clone(),
+            failure: record.spec.shell_integration_failure.clone(),
+        })
+        .unwrap_or_default()
 }
 
 pub fn is_system_host_id(host_id: &str) -> bool {
@@ -651,6 +787,10 @@ fn parse_system_ssh_config_str(content: &str) -> Vec<SshHostEntry> {
                 detected_distro: None,
                 use_mosh: false,
                 mosh_server_command: default_mosh_server_command(),
+                shell_integration: false,
+                shell_integration_applied: false,
+                shell_integration_unsupported: None,
+                shell_integration_failure: None,
             };
             out.push(SshHostEntry {
                 id: system_host_id(&alias),
@@ -838,6 +978,63 @@ Host prod *.internal
         );
     }
 
+    #[test]
+    fn a_connection_that_never_came_up_is_no_failure_of_the_setup() {
+        let refused = anyhow::Error::new(NotConnected("connection refused".to_string()));
+        assert_eq!(shell_integration_failure(&refused), None);
+    }
+
+    #[test]
+    fn a_failed_setup_is_kept_as_the_file_or_in_one_short_line() {
+        let unwritable = anyhow::Error::new(UnwritableStartupFile("~/.zshrc".to_string()));
+        assert_eq!(
+            shell_integration_failure(&unwritable),
+            Some(ShellIntegrationFailure::Unwritable("~/.zshrc".to_string()))
+        );
+        // Still the file under a context.
+        let wrapped = unwritable.context("setting up example");
+        assert_eq!(
+            shell_integration_failure(&wrapped),
+            Some(ShellIntegrationFailure::Unwritable("~/.zshrc".to_string()))
+        );
+
+        let lost = anyhow::anyhow!("the setup on the host failed:\n  Exited with code 2");
+        assert_eq!(
+            shell_integration_failure(&lost),
+            Some(ShellIntegrationFailure::Other(
+                "the setup on the host failed: Exited with code 2".to_string()
+            ))
+        );
+        let long = anyhow::anyhow!("{}", "x".repeat(300));
+        match shell_integration_failure(&long) {
+            Some(ShellIntegrationFailure::Other(text)) => {
+                assert_eq!(text.chars().count(), 241);
+                assert!(text.ends_with('…'));
+            }
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn only_a_changed_setting_on_plain_ssh_waits_on_a_connection() {
+        let mut spec = spec_with_options(HashMap::new());
+        assert_eq!(pending_shell_integration(&spec), None);
+        spec.shell_integration = true;
+        assert_eq!(pending_shell_integration(&spec), Some(true));
+        spec.shell_integration_applied = true;
+        assert_eq!(pending_shell_integration(&spec), None);
+        spec.shell_integration = false;
+        assert_eq!(pending_shell_integration(&spec), Some(false));
+
+        // Connect sees the host's processes itself, and Mosh has no session
+        // to carry the change out on.
+        spec.multiplexing = true;
+        assert_eq!(pending_shell_integration(&spec), None);
+        spec.multiplexing = false;
+        spec.use_mosh = true;
+        assert_eq!(pending_shell_integration(&spec), None);
+    }
+
     fn spec_with_options(ssh_options: HashMap<String, String>) -> SshHostSpec {
         SshHostSpec {
             label: "t".to_string(),
@@ -853,6 +1050,10 @@ Host prod *.internal
             detected_distro: None,
             use_mosh: false,
             mosh_server_command: default_mosh_server_command(),
+            shell_integration: false,
+            shell_integration_applied: false,
+            shell_integration_unsupported: None,
+            shell_integration_failure: None,
         }
     }
 

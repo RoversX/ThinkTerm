@@ -7,9 +7,10 @@
 //! [`SshViewOutcome`] so `TermWindow` integration stays minimal.
 
 use crate::quad::{HeapQuadAllocator, QuadClipRect, TripleLayerQuadAllocator};
-use crate::ssh_hosts::{self, SshHostEntry, SshHostSource, SshHostSpec};
+use crate::ssh_hosts::{self, ShellIntegrationFailure, SshHostEntry, SshHostSource, SshHostSpec};
 use crate::termwindow::content_view::{ContentView, ContentViewResponse, RemoteHostCommand};
 use crate::termwindow::ui::icons::{distro_to_icon, SvgIcon};
+use crate::termwindow::ui::right_sidebar::wrap_snippet_text_for_width;
 use crate::termwindow::TermWindow;
 use crate::ui::anim::Easing;
 use crate::ui::{
@@ -149,6 +150,7 @@ enum SshViewAction {
     ToggleDetect,
     ToggleMosh,
     ToggleMux,
+    ToggleShellIntegration,
     RevealPassword,
     Save,
     SaveAndConnect,
@@ -184,6 +186,7 @@ struct HostForm {
     detect_os: bool,
     use_mosh: bool,
     multiplexing: bool,
+    shell_integration: bool,
     error: Option<String>,
 }
 
@@ -353,6 +356,7 @@ impl SshHostsView {
         let detect_os = spec.detect_os;
         let use_mosh = spec.use_mosh;
         let multiplexing = spec.multiplexing;
+        let shell_integration = spec.shell_integration;
         // Sorted so the rows keep a stable order between opens.
         let mut option_pairs: Vec<(String, String)> = spec
             .ssh_options
@@ -374,6 +378,7 @@ impl SshHostsView {
             detect_os,
             use_mosh,
             multiplexing,
+            shell_integration,
             error: None,
         });
         self.focus = Focus::Field(FIELD_HOST);
@@ -435,6 +440,10 @@ impl SshHostsView {
             detected_distro: None,
             use_mosh: false,
             mosh_server_command: ssh_hosts::DEFAULT_MOSH_SERVER_COMMAND.to_string(),
+            shell_integration: false,
+            shell_integration_applied: false,
+            shell_integration_unsupported: None,
+            shell_integration_failure: None,
         });
         spec.label = label;
         spec.host = host;
@@ -461,6 +470,7 @@ impl SshHostsView {
         spec.detect_os = form.detect_os;
         spec.use_mosh = form.use_mosh;
         spec.multiplexing = form.multiplexing;
+        spec.shell_integration = form.shell_integration;
         let mosh_server_command = form.fields[FIELD_MOSH_SERVER].text().trim();
         if spec.use_mosh && mosh_server_command.is_empty() {
             form.error = Some(crate::i18n::tr("ssh-error-mosh-command"));
@@ -718,6 +728,12 @@ impl SshHostsView {
                 }
                 ContentViewResponse::Redraw
             }
+            SshViewAction::ToggleShellIntegration => {
+                if let Some(form) = self.form.as_mut() {
+                    form.shell_integration = !form.shell_integration;
+                }
+                ContentViewResponse::Redraw
+            }
             SshViewAction::Save => {
                 self.persist_form();
                 ContentViewResponse::Redraw
@@ -853,6 +869,7 @@ impl SshHostsView {
             form.detect_os = spec.detect_os;
             form.use_mosh = spec.use_mosh;
             form.multiplexing = spec.multiplexing;
+            form.shell_integration = spec.shell_integration;
             form.options = spec
                 .ssh_options
                 .iter()
@@ -2061,6 +2078,81 @@ impl SshHostsView {
         Ok(y + height)
     }
 
+    /// The lines under the shell integration toggle: where it works, then
+    /// what the next connection will do about it, what the last one found,
+    /// or why it failed.
+    fn shell_integration_note(
+        ctx: &DrawContext,
+        font: &Rc<LoadedFont>,
+        editing: Option<&str>,
+        on: bool,
+        width: f32,
+    ) -> Vec<String> {
+        if width <= 0.0 {
+            return Vec::new();
+        }
+        let record = editing
+            .map(ssh_hosts::shell_integration_record)
+            .unwrap_or_default();
+        [
+            crate::i18n::tr("ssh-shell-integration-note"),
+            Self::shell_integration_status(on, record),
+        ]
+        .iter()
+        .flat_map(|text| {
+            wrap_snippet_text_for_width(text, 5, false, |segment| {
+                ctx.measure_text_width(font, segment) / width
+            })
+        })
+        .collect()
+    }
+
+    /// The line under the note: what the next connection will do about the
+    /// setting, what the last one found, or why it failed.
+    fn shell_integration_status(on: bool, record: ssh_hosts::ShellIntegrationRecord) -> String {
+        // A failure counts only while the change still waits on a
+        // connection: turned back, nothing is left to fail.
+        if on != record.applied {
+            if let Some(failure) = &record.failure {
+                return Self::shell_integration_failure_text(failure, on);
+            }
+        }
+        match (on, record.applied, record.unsupported) {
+            (true, true, Some(shell)) => {
+                let mut args = FluentArgs::new();
+                args.set("shell", shell);
+                crate::i18n::tr_args("ssh-shell-integration-unsupported", &args)
+            }
+            (true, true, None) => crate::i18n::tr("ssh-shell-integration-installed"),
+            (false, true, None) => crate::i18n::tr("ssh-shell-integration-remove"),
+            _ => crate::i18n::tr("ssh-shell-integration-install"),
+        }
+    }
+
+    /// Why the last connection could not carry the setting out, and that the
+    /// next one tries again.
+    fn shell_integration_failure_text(
+        failure: &ShellIntegrationFailure,
+        installing: bool,
+    ) -> String {
+        let reason = match failure {
+            ShellIntegrationFailure::Unwritable(path) => {
+                let mut args = FluentArgs::new();
+                args.set("path", path.clone());
+                crate::i18n::tr_args("ssh-shell-integration-unwritable", &args)
+            }
+            ShellIntegrationFailure::Other(message) => message.clone(),
+        };
+        let mut args = FluentArgs::new();
+        args.set("reason", reason);
+        let id = if installing {
+            "ssh-shell-integration-failed-install"
+        } else {
+            "ssh-shell-integration-failed-remove"
+        };
+        crate::i18n::tr_args(id, &args)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn paint_inspector(
         &mut self,
@@ -2083,6 +2175,7 @@ impl SshHostsView {
         let detect_os = form.detect_os;
         let use_mosh = form.use_mosh;
         let multiplexing = form.multiplexing;
+        let shell_integration = form.shell_integration;
         let advanced_open = form.advanced_open;
         let error = form.error.clone();
         let fields = form.fields.clone();
@@ -2302,9 +2395,25 @@ impl SshHostsView {
             y += auth_h + card_gap;
 
             // ---- Session
+            // Only plain ssh needs the shell to report what runs: Connect
+            // sees the host's processes itself, and Mosh does not pass the
+            // reports on.
+            let integration_note = (!use_mosh && !multiplexing).then(|| {
+                Self::shell_integration_note(
+                    ctx,
+                    font,
+                    editing.as_deref(),
+                    shell_integration,
+                    inner,
+                )
+            });
             let mut session_rows = vec![field_h, toggle_h, toggle_h, toggle_h];
             if use_mosh {
                 session_rows.push(field_h);
+            }
+            if let Some(lines) = &integration_note {
+                // The toggle and the note under it are one row.
+                session_rows.push(toggle_h + lines.len() as f32 * line_h);
             }
             let session_h = Self::inspector_card_height(ctx, section_h, &session_rows);
             let mut fy = Self::paint_inspector_card(
@@ -2367,6 +2476,33 @@ impl SshHostsView {
                 fy,
                 inner,
             )? + gap;
+            if let Some(lines) = &integration_note {
+                fy = self.paint_toggle_row(
+                    ctx,
+                    &mut body_layers,
+                    font,
+                    palette,
+                    &crate::i18n::tr("ssh-shell-integration"),
+                    shell_integration,
+                    SshViewAction::ToggleShellIntegration,
+                    x + pad,
+                    fy,
+                    inner,
+                )?;
+                for line in lines {
+                    ctx.draw_text(
+                        &mut body_layers,
+                        font,
+                        x + pad,
+                        fy,
+                        line,
+                        palette.muted_text,
+                        inner,
+                    )?;
+                    fy += line_h;
+                }
+                fy += gap;
+            }
             if use_mosh {
                 let mosh = fields[FIELD_MOSH_SERVER].text().to_string();
                 let text_pad = ctx.px(12.0);
@@ -2801,7 +2937,33 @@ mod tests {
             detected_distro: None,
             use_mosh: false,
             mosh_server_command: super::ssh_hosts::DEFAULT_MOSH_SERVER_COMMAND.to_string(),
+            shell_integration: false,
+            shell_integration_applied: false,
+            shell_integration_unsupported: None,
+            shell_integration_failure: None,
         }
+    }
+
+    #[test]
+    fn a_failure_shows_only_while_the_change_still_waits() {
+        use crate::ssh_hosts::{ShellIntegrationFailure, ShellIntegrationRecord};
+        let failed = |failure| ShellIntegrationRecord {
+            applied: false,
+            unsupported: None,
+            failure: Some(failure),
+        };
+        let unwritable = || ShellIntegrationFailure::Unwritable("~/.zshrc".to_string());
+
+        // Turned on, and the last connection could not write the file.
+        let text = SshHostsView::shell_integration_status(true, failed(unwritable()));
+        assert!(text.contains("~/.zshrc"), "{}", text);
+        let other = ShellIntegrationFailure::Other("Exited with code 2".to_string());
+        let text = SshHostsView::shell_integration_status(true, failed(other));
+        assert!(text.contains("Exited with code 2"), "{}", text);
+
+        // Turned back off: nothing waits, so nothing has failed.
+        let text = SshHostsView::shell_integration_status(false, failed(unwritable()));
+        assert!(!text.contains("~/.zshrc"), "{}", text);
     }
 
     #[test]

@@ -7134,9 +7134,12 @@ impl super::TermWindow {
             return;
         }
         let mut detect_remote_os = None;
+        let mut shell_integration = None;
         let (initial_cwd, default_domain) = if let Some(spec) = remote_spec.as_ref() {
             match crate::ssh_hosts::ensure_ssh_domain_registered(spec) {
                 Ok(domain_name) => {
+                    shell_integration = crate::ssh_hosts::pending_shell_integration(spec)
+                        .map(|install| (domain_name.clone(), remote_host_id.clone(), install));
                     if spec.detect_os {
                         detect_remote_os = Some((domain_name.clone(), remote_host_id));
                     }
@@ -7228,6 +7231,7 @@ impl super::TermWindow {
                         orphan_candidate_window_id,
                         cleanup_workspaces,
                         detect_remote_os,
+                        shell_integration,
                     );
                 })));
             }
@@ -7329,6 +7333,7 @@ impl super::TermWindow {
         orphan_candidate_window_id: Option<MuxWindowId>,
         workspaces_to_kill_after_adopt: Vec<String>,
         detect_remote_os: Option<(String, String)>,
+        shell_integration: Option<(String, String, bool)>,
     ) {
         let is_current = self.local_thread_activation.as_ref().is_some_and(|state| {
             local_thread_activation_matches(
@@ -7411,6 +7416,9 @@ impl super::TermWindow {
         reconcile_workspace_layout_after_materialize(self.window.clone());
         self.invalidate_window();
 
+        if let Some((domain_name, host_id, install)) = shell_integration {
+            set_up_remote_shell_integration(domain_name, host_id, install, self.window.clone());
+        }
         if let Some((detect_domain, detect_project)) = detect_remote_os {
             let detect_window = self.window.clone();
             promise::spawn::spawn(async move {
@@ -7622,6 +7630,8 @@ impl super::TermWindow {
                 domain_name: domain_name.clone(),
                 started: Instant::now(),
                 orphan_candidate_window_id,
+                shell_integration: crate::ssh_hosts::pending_shell_integration(&spec)
+                    .map(|install| (domain_name.clone(), remote_host_id.clone(), install)),
                 detect_os: spec
                     .detect_os
                     .then(|| (domain_name.clone(), remote_host_id)),
@@ -7744,6 +7754,9 @@ impl super::TermWindow {
         let detect = state.detect_os;
         let orphan_candidate_window_id = state.orphan_candidate_window_id;
         let window = self.window.as_ref().cloned();
+        if let Some((domain_name, host_id, install)) = state.shell_integration {
+            set_up_remote_shell_integration(domain_name, host_id, install, window.clone());
+        }
         let reveal_now = self.active_content_view_id == Some(view_id);
         self.close_content_view_by_id(view_id);
         if reveal_now {
@@ -9227,6 +9240,42 @@ mod blocked_pointer_tests {
             assert_eq!(window_drag.is_none(), left_released);
         }
     }
+}
+
+/// Carry out a change of a host's shell integration setting on the
+/// connection just made to it (`mux::shell_integration`), and record it so
+/// the next connection does not repeat it -- or why it failed, for the host's
+/// settings to show.
+fn set_up_remote_shell_integration(
+    domain_name: String,
+    host_id: String,
+    install: bool,
+    window: Option<::window::Window>,
+) {
+    promise::spawn::spawn(async move {
+        let Some(domain) = Mux::get().get_domain_by_name(&domain_name) else {
+            return;
+        };
+        let Some(ssh) = domain.as_ref().downcast_ref::<RemoteSshDomain>() else {
+            return;
+        };
+        let changed = match ssh.set_up_shell_integration(install).await {
+            Ok(outcome) => {
+                log::info!("shell integration on {domain_name}: {outcome:?}");
+                crate::ssh_hosts::record_shell_integration(&host_id, &outcome)
+            }
+            Err(err) => {
+                log::warn!("shell integration on {domain_name}: {err:#}");
+                crate::ssh_hosts::record_shell_integration_failure(&host_id, &err)
+            }
+        };
+        if changed {
+            if let Some(window) = window {
+                window.invalidate();
+            }
+        }
+    })
+    .detach();
 }
 
 /// After a thread has finished materializing its saved layout, the materialize

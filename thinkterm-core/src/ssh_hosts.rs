@@ -36,6 +36,35 @@ pub struct SshHostSpec {
     pub use_mosh: bool,
     #[serde(default = "default_mosh_server_command")]
     pub mosh_server_command: String,
+    /// Whether the host's shell should report each command it runs, so a tab
+    /// can show it over plain ssh: ThinkTerm installs its shell integration
+    /// there (`mux::shell_integration`).
+    #[serde(default)]
+    pub shell_integration: bool,
+    /// The `shell_integration` setting as last carried out on the host: a
+    /// change is made at the next connection and only recorded here once it
+    /// has been.
+    #[serde(default)]
+    pub shell_integration_applied: bool,
+    /// The login shell that setup found the integration has no hooks for, in
+    /// which case it left nothing on the host.
+    #[serde(default)]
+    pub shell_integration_unsupported: Option<String>,
+    /// Why the last connection could not carry `shell_integration` out, kept
+    /// until one does; the next connection tries again.
+    #[serde(default)]
+    pub shell_integration_failure: Option<ShellIntegrationFailure>,
+}
+
+/// Why setting a host's shell integration up failed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellIntegrationFailure {
+    /// A startup file the host would not let it write, from the home as
+    /// `~/...` when it is in there.
+    Unwritable(String),
+    /// Anything else, as the error put it.
+    Other(String),
 }
 
 pub fn default_true() -> bool {
@@ -157,6 +186,10 @@ pub fn parse_system_ssh_config(content: &str) -> Vec<SshHostEntry> {
                     detected_distro: None,
                     use_mosh: false,
                     mosh_server_command: default_mosh_server_command(),
+                    shell_integration: false,
+                    shell_integration_applied: false,
+                    shell_integration_unsupported: None,
+                    shell_integration_failure: None,
                 },
             });
         }
@@ -324,6 +357,10 @@ mod tests {
             detected_distro: None,
             use_mosh: false,
             mosh_server_command: default_mosh_server_command(),
+            shell_integration: false,
+            shell_integration_applied: false,
+            shell_integration_unsupported: None,
+            shell_integration_failure: None,
         };
         assert_eq!(ssh_domain_name(&spec), "ssh:root@example.test");
         assert_eq!(build_ssh_domain(&spec).remote_address, "example.test:22");

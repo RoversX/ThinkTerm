@@ -349,6 +349,36 @@ impl RemoteSshDomain {
         parse_os_release_id(&text)
     }
 
+    /// Install (`true`) or remove the shell integration that lets a tab show
+    /// what runs on this host (`crate::shell_integration`). Waits while the
+    /// session is still connecting: a password or a host key may be waiting
+    /// on the user.
+    pub async fn set_up_shell_integration(
+        &self,
+        install: bool,
+    ) -> anyhow::Result<crate::shell_integration::ShellIntegrationOutcome> {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let session = loop {
+            match self.connection_status() {
+                SshConnectionStatus::Connected => {
+                    if let Some(session) = self.session.lock().unwrap().as_ref().cloned() {
+                        break session;
+                    }
+                }
+                SshConnectionStatus::Failed(message) => {
+                    return Err(crate::shell_integration::NotConnected(message).into());
+                }
+                SshConnectionStatus::Connecting | SshConnectionStatus::Authenticating => {}
+            }
+            if Instant::now() >= deadline {
+                let waited = "still connecting after five minutes".to_string();
+                return Err(crate::shell_integration::NotConnected(waited).into());
+            }
+            smol::Timer::after(Duration::from_millis(500)).await;
+        };
+        crate::shell_integration::set_up(&session, install).await
+    }
+
     pub fn ssh_config(&self) -> anyhow::Result<ConfigMap> {
         ssh_domain_to_ssh_config(&self.dom)
     }
