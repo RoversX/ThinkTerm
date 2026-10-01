@@ -92,6 +92,9 @@ __pycache__/
 # Keep the contributor agreement visible in new pull requests.
 !/.github/pull_request_template.md
 
+# Keep the security policy where GitHub looks for it.
+!/SECURITY.md
+
 # Keep ThinkTerm-specific design documentation under version control.
 !/docs/
 /docs/*
