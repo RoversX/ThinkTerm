@@ -50,6 +50,7 @@ thinkterm-proto.workspace = true
 
 [target."cfg(unix)".dependencies]
 passfd.workspace = true
+nix = { workspace = true, features = ["socket"] }
 
 [target."cfg(windows)".dependencies]
 winapi = { workspace=true, features = [ "winuser" ]}

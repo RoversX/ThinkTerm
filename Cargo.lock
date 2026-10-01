@@ -10742,6 +10742,7 @@ dependencies = [
  "lru",
  "metrics",
  "mux",
+ "nix 0.29.0",
  "passfd",
  "portable-pty",
  "promise",

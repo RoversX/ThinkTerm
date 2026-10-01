@@ -1193,6 +1193,18 @@ impl SessionHandler {
         }
     }
 
+    /// The pid of the client registered on this connection, when it
+    /// registered itself on the unix socket: not relayed by a `cli proxy`,
+    /// not a browser. `None` before it registers.
+    pub(crate) fn direct_client_pid(&self) -> Option<u32> {
+        match self.peer {
+            ConnectionPeer::Local if self.proxy_client_id.is_none() => {
+                self.client_id.as_ref().map(|id| id.pid)
+            }
+            _ => None,
+        }
+    }
+
     /// Tell a client that has just registered where the frontend lease
     /// stands: the access mode and every tab's ownership.
     ///
@@ -3154,6 +3166,32 @@ mod tests {
     use std::sync::Arc;
     use wezterm_term::color::ColorPalette;
     use wezterm_term::TerminalSize;
+
+    #[test]
+    fn only_a_client_registered_on_the_socket_itself_is_direct() {
+        let id = |pid| ClientId {
+            hostname: "devbox".to_string(),
+            username: "user".to_string(),
+            pid,
+            epoch: 0,
+            id: 0,
+            ssh_auth_sock: None,
+        };
+        let mut handler = super::SessionHandler::new(super::PduSender::new(|_| Ok(())));
+        assert_eq!(handler.direct_client_pid(), None, "not registered yet");
+        handler.client_id = Some(Arc::new(id(42)));
+        assert_eq!(handler.direct_client_pid(), Some(42));
+        // A proxy registers itself before relaying its client's identity.
+        handler.proxy_client_id = Some(id(7));
+        assert_eq!(handler.direct_client_pid(), None);
+
+        let mut tls = super::SessionHandler::for_peer(
+            super::PduSender::new(|_| Ok(())),
+            super::ConnectionPeer::Tls,
+        );
+        tls.client_id = Some(Arc::new(id(42)));
+        assert_eq!(tls.direct_client_pid(), None);
+    }
 
     #[test]
     fn frame_subscriptions_end_even_when_a_deferred_task_still_holds_the_pane_state() {

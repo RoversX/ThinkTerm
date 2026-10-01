@@ -192,8 +192,12 @@ where
     T: async_io::IoSafe,
     T: Send + Sync,
 {
+    let local = match peer {
+        ConnectionPeer::Local => LocalSocket::of(&stream),
+        ConnectionPeer::Tls | ConnectionPeer::Web(_) => None,
+    };
     let stream = smol::Async::new(stream)?;
-    process_stream(stream, peer).await
+    process_stream_on(stream, peer, local).await
 }
 
 pub async fn process_async<S: ConnectionStream>(stream: S) -> anyhow::Result<()> {
@@ -206,26 +210,121 @@ pub async fn process_stream<S: ConnectionStream>(
     stream: S,
     peer: ConnectionPeer,
 ) -> anyhow::Result<()> {
-    process_async_with_peer(stream, Liveness::new(Instant::now()), peer).await
+    process_stream_on(stream, peer, None).await
+}
+
+/// What `process` and `process_stream` share; `local` is the unix socket's
+/// own end, when the accept layer has one.
+async fn process_stream_on<S: ConnectionStream>(
+    stream: S,
+    peer: ConnectionPeer,
+    local: Option<LocalSocket>,
+) -> anyhow::Result<()> {
+    process_async_with_peer(stream, Liveness::new(Instant::now()), peer, local).await
 }
 
 pub(crate) async fn process_async_with<S: ConnectionStream>(
     stream: S,
     liveness: Liveness,
 ) -> anyhow::Result<()> {
-    process_async_with_peer(stream, liveness, ConnectionPeer::Local).await
+    process_async_with_peer(stream, liveness, ConnectionPeer::Local, None).await
+}
+
+/// A unix-socket connection's own end, kept from accept until its client
+/// registers. A client that is the process at the other end of the socket
+/// -- on this machine, reading it itself -- gets payloads uncompressed and
+/// a wide send buffer: macOS starts a unix socket at 8 KiB, and a 20 MiB
+/// picture crosses that in thousands of writes that cost the kernel more
+/// than the copy. Anything else -- a `cli proxy` relaying a remote client,
+/// a relay that does not say so -- keeps compression and the narrow
+/// buffer: what queues there waits on a network link.
+#[cfg(unix)]
+struct LocalSocket {
+    /// A duplicate of the connection's descriptor, closed once the client
+    /// has registered.
+    fd: std::os::fd::OwnedFd,
+    peer_pid: u32,
+}
+
+/// Elsewhere the peer's pid is not read, so no client is taken to be on
+/// this machine.
+#[cfg(not(unix))]
+enum LocalSocket {}
+
+#[cfg(unix)]
+impl LocalSocket {
+    const SEND_BUFFER: usize = 4 * 1024 * 1024;
+
+    fn of(stream: &impl std::os::fd::AsFd) -> Option<Self> {
+        let fd = stream.as_fd();
+        Some(Self {
+            peer_pid: peer_pid(fd)?,
+            fd: fd.try_clone_to_owned().ok()?,
+        })
+    }
+
+    fn peer_pid(&self) -> u32 {
+        self.peer_pid
+    }
+
+    fn widen(self) {
+        use nix::sys::socket::{setsockopt, sockopt};
+        if let Err(err) = setsockopt(&self.fd, sockopt::SndBuf, &Self::SEND_BUFFER) {
+            log::debug!("could not widen a local client's send buffer: {err}");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl LocalSocket {
+    fn of<T>(_: &T) -> Option<Self> {
+        None
+    }
+
+    fn peer_pid(&self) -> u32 {
+        match *self {}
+    }
+
+    fn widen(self) {
+        match self {}
+    }
+}
+
+/// The pid of the process at the other end of a unix socket.
+#[cfg(target_os = "macos")]
+fn peer_pid(fd: std::os::fd::BorrowedFd) -> Option<u32> {
+    use nix::sys::socket::{getsockopt, sockopt};
+    use std::convert::TryFrom;
+    u32::try_from(getsockopt(&fd, sockopt::LocalPeerPid).ok()?).ok()
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn peer_pid(fd: std::os::fd::BorrowedFd) -> Option<u32> {
+    use nix::sys::socket::{getsockopt, sockopt};
+    use std::convert::TryFrom;
+    u32::try_from(getsockopt(&fd, sockopt::PeerCredentials).ok()?.pid()).ok()
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "linux", target_os = "android"))
+))]
+fn peer_pid(_: std::os::fd::BorrowedFd) -> Option<u32> {
+    None
 }
 
 async fn process_async_with_peer<S: ConnectionStream>(
     mut stream: S,
     mut liveness: Liveness,
     peer: ConnectionPeer,
+    mut local: Option<LocalSocket>,
 ) -> anyhow::Result<()> {
     log::trace!("process_async called");
     let revoked = match &peer {
         ConnectionPeer::Web(web) => Some(web.revoked.clone()),
         ConnectionPeer::Local | ConnectionPeer::Tls => None,
     };
+    let mut client_link = codec::Link::Network;
 
     let (item_tx, item_rx) = smol::channel::unbounded::<Item>();
     let kitty_frames = codec::kitty_queue::KittyFrameMailbox::default();
@@ -415,7 +514,19 @@ async fn process_async_with_peer<S: ConnectionStream>(
                     return Ok(());
                 }
                 liveness.heard(Instant::now());
+                let registers = matches!(decoded.pdu, Pdu::SetClientId(_));
                 handler.process_one(decoded);
+                // The first registration settles it. A proxy registers
+                // itself before relaying anyone, which is not registering
+                // directly.
+                if registers {
+                    if let Some(socket) = local.take() {
+                        if handler.direct_client_pid() == Some(socket.peer_pid()) {
+                            client_link = codec::Link::SameMachine;
+                            socket.widen();
+                        }
+                    }
+                }
             }
             Ok(Item::LivenessTick) => unreachable!("handled above"),
             Ok(Item::Shutdown) => {
@@ -433,6 +544,7 @@ async fn process_async_with_peer<S: ConnectionStream>(
                 // A revocation also stops a transfer mid-way: pane contents
                 // must not go on streaming to a browser whose token is gone.
                 let moved = AtomicU64::new(0);
+                let link = client_link;
                 let written = smol::future::or(
                     smol::future::or(
                         async {
@@ -442,7 +554,7 @@ async fn process_async_with_peer<S: ConnectionStream>(
                             };
                             decoded
                                 .pdu
-                                .encode_async(&mut counted, decoded.serial)
+                                .encode_async_over(&mut counted, decoded.serial, link)
                                 .await
                                 .map_err(WriteFailure::Encode)?;
                             counted.flush().await.map_err(WriteFailure::Flush)
@@ -766,6 +878,28 @@ mod tests {
 
     const S: Duration = Duration::from_secs(1);
 
+    #[cfg(unix)]
+    #[test]
+    fn a_local_socket_knows_its_peer_and_widens_its_send_buffer() {
+        use nix::sys::socket::{getsockopt, sockopt};
+        let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let narrow = getsockopt(&ours, sockopt::SndBuf).unwrap();
+        let Some(socket) = LocalSocket::of(&ours) else {
+            assert!(
+                cfg!(not(any(target_os = "macos", target_os = "linux", target_os = "android"))),
+                "the peer's pid is readable here"
+            );
+            return;
+        };
+        assert_eq!(socket.peer_pid(), std::process::id());
+        socket.widen();
+        let wide = getsockopt(&ours, sockopt::SndBuf).unwrap();
+        // Linux caps the request at net.core.wmem_max.
+        assert!(wide >= narrow, "{} -> {}", narrow, wide);
+        #[cfg(target_os = "macos")]
+        assert_eq!(wide, LocalSocket::SEND_BUFFER);
+    }
+
     #[test]
     fn kitty_pushes_coalesce_while_replies_and_legacy_messages_keep_their_order() {
         let owner = codec::kitty_queue::KittyFrameMailbox::default();
@@ -897,7 +1031,7 @@ mod tests {
         });
         let outcome = smol::block_on(smol::future::or(
             async {
-                process_async_with_peer(stream, Liveness::new(Instant::now()), peer).await?;
+                process_async_with_peer(stream, Liveness::new(Instant::now()), peer, None).await?;
                 Ok(true)
             },
             async {
@@ -961,7 +1095,7 @@ mod tests {
         });
         let outcome = smol::block_on(smol::future::or(
             async {
-                process_async_with_peer(stream, Liveness::new(Instant::now()), peer).await?;
+                process_async_with_peer(stream, Liveness::new(Instant::now()), peer, None).await?;
                 Ok(true)
             },
             async {
