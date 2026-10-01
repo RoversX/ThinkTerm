@@ -3,7 +3,9 @@
 # corrupt or hostile length costs only the bytes actually present in the
 # stream instead of aborting the process on allocation failure; and values
 # may nest only so deep, so a stream of nested tags cannot run the decoder
-# off its stack; aggregate decoded allocation is also bounded.
+# off its stack; aggregate decoded allocation is also bounded; and large
+# byte strings grow into fresh allocations rather than by realloc (`reserve`),
+# or are read whole when the input is known to hold them (`with_input_bound`).
 [package]
 name = "varbincode"
 version = "0.1.0"

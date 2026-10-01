@@ -12,6 +12,38 @@ mod test;
 pub use de::Deserializer;
 pub use ser::Serializer;
 
+/// Growth to this size or past it moves to a fresh allocation; see
+/// `reserve`.
+pub const LARGE_GROWTH: usize = 1024 * 1024;
+
+/// Make room in `buf` for `additional` more bytes, growing as `Vec` would
+/// (doubling, at least 8) but never past `limit`, which callers that know
+/// the final size pass. Growth to `LARGE_GROWTH` or more moves the bytes to
+/// a fresh allocation instead of `realloc` extending the block: macOS keeps
+/// the large blocks such a `realloc` leaves behind rather than reusing
+/// them, and picture frames decoded that way held over a gigabyte of freed
+/// memory in each process. Doubling still means a buffer is copied about as
+/// many bytes as it ends up holding.
+pub fn reserve(buf: &mut Vec<u8>, additional: usize, limit: usize) {
+    let needed = buf.len().saturating_add(additional);
+    if needed <= buf.capacity() {
+        return;
+    }
+    let capacity = buf
+        .capacity()
+        .saturating_mul(2)
+        .max(needed)
+        .max(8)
+        .min(limit.max(needed));
+    if capacity < LARGE_GROWTH {
+        buf.reserve_exact(capacity - buf.len());
+        return;
+    }
+    let mut grown = Vec::with_capacity(capacity);
+    grown.extend_from_slice(buf);
+    *buf = grown;
+}
+
 /// A convenience function for serializing a value as a byte vector
 /// See also `ser::Serializer`.
 pub fn serialize<T: serde::Serialize>(t: &T) -> Result<Vec<u8>, error::Error> {

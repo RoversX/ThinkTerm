@@ -13,11 +13,22 @@ pub struct Deserializer<'a> {
     reader: &'a mut std::io::Read,
     depth: usize,
     remaining_bytes: usize,
+    /// The most the input can hold, when the caller knows it: an input
+    /// already in memory. See `with_input_bound`.
+    input_bound: Option<usize>,
 }
 
 impl<'a> Deserializer<'a> {
     pub fn new(reader: &'a mut std::io::Read) -> Self {
-        Self { reader, depth: 0, remaining_bytes: MAX_DECODED_BYTES }
+        Self { reader, depth: 0, remaining_bytes: MAX_DECODED_BYTES, input_bound: None }
+    }
+
+    /// For an input of at most `bound` bytes that is already in memory: a
+    /// byte string the input could hold is read whole into a buffer of its
+    /// own size, rather than grown as it arrives, since its bytes are
+    /// already there to bound it.
+    pub fn with_input_bound(reader: &'a mut std::io::Read, bound: usize) -> Self {
+        Self { input_bound: Some(bound), ..Self::new(reader) }
     }
 
     fn charge(&mut self, bytes: usize) -> Result<()> {
@@ -51,6 +62,15 @@ impl<'a> Deserializer<'a> {
     fn read_vec(&mut self) -> Result<Vec<u8>> {
         let len: usize = serde::Deserialize::deserialize(&mut *self)?;
         self.charge(len)?;
+        if self.input_bound.is_some_and(|bound| len <= bound) {
+            use std::io::Read;
+            let mut result = Vec::with_capacity(len);
+            (&mut *self.reader).take(len as u64).read_to_end(&mut result)?;
+            if result.len() < len {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            return Ok(result);
+        }
         // Grow as the bytes arrive rather than trusting the declared
         // length: the stream, not the header, bounds the allocation.
         const STEP: usize = 64 * 1024;
@@ -59,6 +79,7 @@ impl<'a> Deserializer<'a> {
         while remaining > 0 {
             let chunk = remaining.min(STEP);
             let start = result.len();
+            crate::reserve(&mut result, chunk, len);
             result.resize(start + chunk, 0);
             self.reader.read_exact(&mut result[start..])?;
             remaining -= chunk;

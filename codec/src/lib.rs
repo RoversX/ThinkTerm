@@ -2406,6 +2406,47 @@ mod test {
         assert_eq!(back, payload);
     }
 
+    // varbincode is vendored outside the workspace, so what the codec
+    // relies on from its `reserve` is tested here.
+    #[test]
+    fn large_growth_stops_at_the_known_size() {
+        const STEP: usize = 64 * 1024;
+        let limit = 3 * 1024 * 1024 + 5;
+        let mut buf = Vec::with_capacity(STEP);
+        let mut fill = 0u8;
+        while buf.len() < limit {
+            let chunk = (limit - buf.len()).min(STEP);
+            varbincode::reserve(&mut buf, chunk, limit);
+            assert!(buf.capacity() <= limit, "grew past the known size: {}", buf.capacity());
+            buf.extend(std::iter::repeat(fill).take(chunk));
+            fill = fill.wrapping_add(1);
+        }
+        assert_eq!(buf.capacity(), limit);
+        for (n, chunk) in buf.chunks(STEP).enumerate() {
+            assert!(chunk.iter().all(|&b| b == n as u8), "chunk {} survived the moves", n);
+        }
+    }
+
+    #[test]
+    fn unbounded_growth_still_doubles() {
+        let mut buf = vec![1u8; 2 * 1024 * 1024];
+        varbincode::reserve(&mut buf, 1, usize::MAX);
+        assert!(buf.capacity() >= 4 * 1024 * 1024, "{}", buf.capacity());
+        assert!(buf.iter().all(|&b| b == 1));
+    }
+
+    #[test]
+    fn small_growth_stops_at_the_known_size_too() {
+        let limit = 600 * 1000;
+        let mut buf = Vec::with_capacity(64 * 1024);
+        while buf.len() < limit {
+            let chunk = (limit - buf.len()).min(64 * 1024);
+            varbincode::reserve(&mut buf, chunk, limit);
+            buf.extend(std::iter::repeat(3u8).take(chunk));
+        }
+        assert_eq!(buf.capacity(), limit);
+    }
+
     /// The wasm client's receive path: a native server compresses with the
     /// zstd C library, the wasm side decodes with pure-Rust ruzstd. Proven
     /// here on native, where both libraries are available.
