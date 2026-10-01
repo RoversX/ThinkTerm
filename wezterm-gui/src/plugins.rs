@@ -662,14 +662,15 @@ fn follow_snippets_switch(plugins: &[Info]) {
         return;
     };
     let enabled = snippets.enabled;
-    let mut settings = crate::native_settings::load();
-    let chrome = &mut settings.chrome;
+    let settings = crate::native_settings::load_shared();
+    let chrome = &settings.chrome;
     // The panel was turned off in Settings › Sidebar before it was a
     // plugin: that choice becomes the plugin's switch, once.
     if chrome.right_sidebar_snippets_enabled == Some(false) {
-        chrome.right_sidebar_snippets_enabled = None;
-        chrome.snippets_plugin_enabled = Some(false);
-        if let Err(err) = crate::native_settings::save(&settings) {
+        if let Err(err) = crate::native_settings::update_ui_state(|settings| {
+            settings.chrome.right_sidebar_snippets_enabled = None;
+            settings.chrome.snippets_plugin_enabled = Some(false);
+        }) {
             log::warn!("saving the Snippets switch: {err:#}");
         }
         crate::settings_window::refresh_open_settings_window_chrome();
@@ -685,8 +686,9 @@ fn follow_snippets_switch(plugins: &[Info]) {
     if chrome.snippets_plugin_enabled == Some(enabled) {
         return;
     }
-    chrome.snippets_plugin_enabled = Some(enabled);
-    if let Err(err) = crate::native_settings::save(&settings) {
+    if let Err(err) = crate::native_settings::update_ui_state(|settings| {
+        settings.chrome.snippets_plugin_enabled = Some(enabled)
+    }) {
         log::warn!("saving the Snippets switch: {err:#}");
     }
     // An open settings window holds the settings as they were, and would
@@ -719,19 +721,20 @@ fn follow_panels(plugins: &[Info]) {
             })
         })
         .collect();
-    let mut settings = crate::native_settings::load();
     // The width kept for a plugin's extended view goes with the plugin.
-    let widths = settings.chrome.plugin_extended_widths.len();
-    settings
-        .chrome
-        .plugin_extended_widths
-        .retain(|id, _| plugins.iter().any(|plugin| plugin.id == *id));
-    let forgotten = settings.chrome.plugin_extended_widths.len() != widths;
+    let listed = |id: &String| plugins.iter().any(|plugin| plugin.id == *id);
+    let settings = crate::native_settings::load_shared();
+    let forgotten = !settings.chrome.plugin_extended_widths.keys().all(listed);
     if settings.chrome.plugin_panels == panels && !forgotten {
         return;
     }
-    settings.chrome.plugin_panels = panels;
-    if let Err(err) = crate::native_settings::save(&settings) {
+    if let Err(err) = crate::native_settings::update_ui_state(|settings| {
+        settings
+            .chrome
+            .plugin_extended_widths
+            .retain(|id, _| listed(id));
+        settings.chrome.plugin_panels = panels;
+    }) {
         log::warn!("saving the plugins' panels: {err:#}");
     }
     crate::settings_window::refresh_open_settings_window_chrome();

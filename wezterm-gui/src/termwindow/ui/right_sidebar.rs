@@ -2148,6 +2148,11 @@ impl crate::TermWindow {
             // Source keeps nothing of the rendering.
             self.right_sidebar_markdown_preview = None;
         }
+        // The choice is every window's: one showing a Markdown file switches
+        // when it repaints.
+        if let Some(front_end) = crate::frontend::try_front_end() {
+            front_end.invalidate_all_windows();
+        }
     }
 
     /// Build the rendered surface for the previewed text, unless the one

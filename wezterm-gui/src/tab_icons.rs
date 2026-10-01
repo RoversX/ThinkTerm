@@ -1267,20 +1267,21 @@ pub(crate) fn draw_glyph(
 // up through `catalog`, which notices the settings were replaced.
 
 fn edit(change: impl FnOnce(&mut NativeTabIconSettings)) -> Result<()> {
-    let mut settings = native_settings::load();
-    change(&mut settings.tab_icons);
-    // A built-in card whose every field went back to the default no longer
-    // needs an entry, and the terminal card never has one that counts.
-    settings.tab_icons.cards.retain(|card| {
-        is_custom_id(&card.id)
-            || (card.id != TERMINAL_CARD
-                && *card
-                    != NativeTabIconCard {
-                        id: card.id.clone(),
-                        ..Default::default()
-                    })
-    });
-    native_settings::save(&settings)?;
+    let settings = native_settings::update(|settings| {
+        change(&mut settings.tab_icons);
+        // A built-in card whose every field went back to the default no
+        // longer needs an entry, and the terminal card never has one that
+        // counts.
+        settings.tab_icons.cards.retain(|card| {
+            is_custom_id(&card.id)
+                || (card.id != TERMINAL_CARD
+                    && *card
+                        != NativeTabIconCard {
+                            id: card.id.clone(),
+                            ..Default::default()
+                        })
+        });
+    })?;
     remove_unreferenced_svgs(&settings.tab_icons);
     Ok(())
 }

@@ -225,6 +225,7 @@ impl GuiFrontEnd {
     pub fn try_new() -> anyhow::Result<Rc<GuiFrontEnd>> {
         let connection = Connection::init()?;
         connection.set_event_handler(Self::app_event_handler);
+        config::set_reload_filter(crate::native_settings::watched_change_needs_reload);
         crate::native_settings::apply_to_app(&crate::native_settings::load());
         spawn_malloc_pressure_relief_thread();
 

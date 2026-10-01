@@ -6156,7 +6156,11 @@ impl super::TermWindow {
         if let Err(err) = crate::native_settings::save_workspace_sidebar_hidden_statuses(hidden) {
             log::warn!("failed to save sidebar status filter: {err:#}");
         }
-        self.invalidate_window();
+        // Every window draws and hit-tests its sidebar through the filter as
+        // it is now, so every window repaints, not only this one.
+        if let Some(front_end) = crate::frontend::try_front_end() {
+            front_end.invalidate_all_windows();
+        }
     }
 
     /// The notification bell: pending finished/attention threads across every

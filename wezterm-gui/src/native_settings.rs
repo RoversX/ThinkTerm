@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use window::{Appearance, Connection, ConnectionOps, WindowOps};
 
@@ -839,11 +839,12 @@ pub(crate) fn effective_remote_download_directory() -> Option<PathBuf> {
 }
 
 pub(crate) fn set_remote_download_directory(path: Option<PathBuf>) -> anyhow::Result<()> {
-    let mut settings = load();
-    settings.workspaces.remote_download_directory = path
-        .map(|path| path.to_string_lossy().to_string())
-        .unwrap_or_default();
-    save(&settings)
+    update(|settings| {
+        settings.workspaces.remote_download_directory = path
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default();
+    })
+    .map(drop)
 }
 
 /// Default landing folder for files dropped onto a remote terminal. Visible
@@ -868,52 +869,74 @@ pub(crate) fn remote_drop_destination() -> String {
 }
 
 pub(crate) fn set_remote_drop_destination(value: &str) -> anyhow::Result<()> {
-    let mut settings = load();
     let trimmed = value.trim();
     // Storing the default as emptiness keeps the file clean and lets a future
     // default change reach everyone who never made a choice.
-    settings.workspaces.remote_drop_destination =
-        if trimmed.is_empty() || trimmed == DEFAULT_REMOTE_DROP_DESTINATION {
-            String::new()
-        } else {
-            trimmed.to_string()
-        };
-    save(&settings)
+    let destination = if trimmed.is_empty() || trimmed == DEFAULT_REMOTE_DROP_DESTINATION {
+        String::new()
+    } else {
+        trimmed.to_string()
+    };
+    update(|settings| settings.workspaces.remote_drop_destination = destination).map(drop)
 }
 
 pub(crate) fn settings_path() -> PathBuf {
-    config::HOME_DIR
-        .join(".config")
-        .join("thinkterm")
-        .join("settings.json")
+    config::native_settings_path()
 }
 
-static SETTINGS_CACHE: OnceLock<Mutex<Arc<ThinkTermNativeSettings>>> = OnceLock::new();
+/// The settings in use, and the ledger that keeps them in step with the
+/// file. Made together, from one read of the file.
+struct SettingsStore {
+    settings: Mutex<Arc<ThinkTermNativeSettings>>,
+    ledger: Mutex<WriteLedger>,
+}
+
+static SETTINGS_STORE: OnceLock<SettingsStore> = OnceLock::new();
+
+fn settings_store() -> &'static SettingsStore {
+    SETTINGS_STORE.get_or_init(|| {
+        let (settings, known) = load_from_disk();
+        SettingsStore {
+            settings: Mutex::new(Arc::new(settings)),
+            ledger: Mutex::new(WriteLedger {
+                known,
+                reload_owed: false,
+            }),
+        }
+    })
+}
 
 fn settings_cache() -> &'static Mutex<Arc<ThinkTermNativeSettings>> {
-    SETTINGS_CACHE.get_or_init(|| Mutex::new(Arc::new(load_from_disk())))
+    &settings_store().settings
 }
 
-fn load_from_disk() -> ThinkTermNativeSettings {
+/// The settings on disk, and the fingerprint of the file they were read
+/// from.
+fn load_from_disk() -> (ThinkTermNativeSettings, Option<u64>) {
     let path = settings_path();
-    match fs::read_to_string(&path) {
-        Ok(data) => match serde_json::from_str(&data) {
-            Ok(settings) => settings,
-            Err(err) => {
-                log::warn!(
-                    "Unable to parse ThinkTerm native settings {}: {err:#}",
-                    path.display()
-                );
-                ThinkTermNativeSettings::default()
-            }
-        },
-        Err(err) if err.kind() == io::ErrorKind::NotFound => ThinkTermNativeSettings::for_new_install(),
+    match fs::read(&path) {
+        Ok(data) => {
+            let settings = match serde_json::from_slice(&data) {
+                Ok(settings) => settings,
+                Err(err) => {
+                    log::warn!(
+                        "Unable to parse ThinkTerm native settings {}: {err:#}",
+                        path.display()
+                    );
+                    ThinkTermNativeSettings::default()
+                }
+            };
+            (settings, Some(fingerprint(&data)))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            (ThinkTermNativeSettings::for_new_install(), None)
+        }
         Err(err) => {
             log::warn!(
                 "Unable to read ThinkTerm native settings {}: {err:#}",
                 path.display()
             );
-            ThinkTermNativeSettings::default()
+            (ThinkTermNativeSettings::default(), None)
         }
     }
 }
@@ -936,23 +959,289 @@ pub(crate) fn should_show_onboarding(settings: &ThinkTermNativeSettings) -> bool
     settings.onboarding.seen_version < ONBOARDING_VERSION
 }
 
+/// The settings in use, after taking in settings.json if it was changed
+/// outside ThinkTerm. For the Settings window as it opens.
 pub(crate) fn reload_from_disk() -> ThinkTermNativeSettings {
-    let settings = load_from_disk();
-    *settings_cache().lock() = Arc::new(settings.clone());
-    settings
+    take_in_disk_changes(&mut write_ledger().lock(), &settings_path());
+    load()
 }
 
+/// Save a whole copy of the settings, such as the one the Settings window
+/// keeps. The config watcher sees the file change and reloads the
+/// configuration, as it always has for a setting. One setting is better
+/// changed with `update`, which cannot write an older copy over an edit
+/// made outside ThinkTerm.
 pub(crate) fn save(settings: &ThinkTermNativeSettings) -> anyhow::Result<()> {
+    let mut ledger = write_ledger().lock();
+    if write_locked(&mut ledger, settings.clone())?.is_some() {
+        ledger.reload_owed = true;
+    }
+    Ok(())
+}
+
+/// Change a setting and save it. The change is made to the latest settings:
+/// an edit made outside ThinkTerm that the config watcher has not got to
+/// yet is taken in first, not written over. Returns the settings saved.
+pub(crate) fn update(
+    edit: impl FnOnce(&mut ThinkTermNativeSettings),
+) -> anyhow::Result<Arc<ThinkTermNativeSettings>> {
+    update_with(edit, true)
+}
+
+/// Change and save state the app keeps for itself rather than a setting:
+/// where a sidebar edge was dropped, whether a panel is open, where the
+/// window is, what the plugin host reported. Made to the latest settings,
+/// as `update` is.
+/// The window that changed it has applied it already and nothing a
+/// configuration reload does reads it, so the config watcher does not reload
+/// for it. A reload drops every loaded font, and CJK text drew as
+/// missing-glyph boxes until the fallback fonts were found again; it also
+/// closed the command palette and reset key tables. That was every sidebar
+/// toggle.
+pub(crate) fn update_ui_state(edit: impl FnOnce(&mut ThinkTermNativeSettings)) -> anyhow::Result<()> {
+    update_with(edit, false).map(drop)
+}
+
+fn update_with(
+    edit: impl FnOnce(&mut ThinkTermNativeSettings),
+    setting: bool,
+) -> anyhow::Result<Arc<ThinkTermNativeSettings>> {
+    let mut ledger = write_ledger().lock();
+    take_in_disk_changes(&mut ledger, &settings_path());
+    let mut settings = load();
+    edit(&mut settings);
+    match write_locked(&mut ledger, settings)? {
+        Some(saved) => {
+            ledger.reload_owed |= setting;
+            Ok(saved)
+        }
+        None => Ok(load_shared()),
+    }
+}
+
+/// Write `settings` and make them the settings in use, with the ledger held
+/// so the watcher never compares the file with a write it has no record of.
+/// `None` when the file holds them already and nothing was written.
+fn write_locked(
+    ledger: &mut WriteLedger,
+    settings: ThinkTermNativeSettings,
+) -> anyhow::Result<Option<Arc<ThinkTermNativeSettings>>> {
     let path = settings_path();
+    let data = serde_json::to_vec_pretty(&settings)?;
+    let written = Some(fingerprint(&data));
+    if written == ledger.known {
+        return Ok(None);
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let data = serde_json::to_vec_pretty(settings)?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, data)?;
+    fs::write(&tmp, &data)?;
     fs::rename(tmp, path)?;
-    *settings_cache().lock() = Arc::new(settings.clone());
-    Ok(())
+    ledger.known = written;
+    let settings = Arc::new(settings);
+    *settings_cache().lock() = Arc::clone(&settings);
+    Ok(Some(settings))
+}
+
+/// Where the settings in use stand against settings.json, so a change to
+/// the file by this process can be told from anybody else's. Every read and
+/// write of the file holds it.
+struct WriteLedger {
+    /// The fingerprint of the file as this process last wrote or read it.
+    known: Option<u64>,
+    /// A setting was saved, or taken in from the file, since the watcher
+    /// last looked, and is owed the configuration reload a setting has
+    /// always had.
+    reload_owed: bool,
+}
+
+fn write_ledger() -> &'static Mutex<WriteLedger> {
+    &settings_store().ledger
+}
+
+fn fingerprint(data: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The config watcher's reload filter (`config::set_reload_filter`).
+///
+/// A change to anything but settings.json reloads, as before. A write of
+/// settings.json by this process reloads only if it saved a setting rather
+/// than state of its own. A write by anybody else (an editor, another
+/// process) is taken in first: without that the settings in use stayed the
+/// old ones until the Settings window was opened, and the next save here
+/// wrote them back over the edit.
+pub(crate) fn watched_change_needs_reload(paths: &[PathBuf]) -> bool {
+    let settings = settings_path();
+    let ours = paths
+        .iter()
+        .filter(|path| config::is_native_settings_file(path, &settings))
+        .count();
+    let mut ledger = write_ledger().lock();
+    let (reload, external) = watched_change(ours > 0, ours < paths.len(), &settings, &mut ledger);
+    if let Some(data) = external {
+        take_in_external_settings(&data);
+    }
+    reload
+}
+
+/// Whether a watched change calls for a reload: `settings` was among the
+/// changed files or not, and other files were or not. Also the new contents
+/// of `settings` when somebody other than this process wrote it.
+fn watched_change(
+    settings_changed: bool,
+    others_changed: bool,
+    settings: &Path,
+    ledger: &mut WriteLedger,
+) -> (bool, Option<Vec<u8>>) {
+    if !settings_changed {
+        return (others_changed, None);
+    }
+    let external = external_change(ledger, settings);
+    (
+        others_changed || std::mem::take(&mut ledger.reload_owed),
+        external,
+    )
+}
+
+/// The contents of `settings` if somebody other than this process changed
+/// it since this process last wrote or read it. The change becomes known,
+/// and is owed the configuration reload a setting has; a file that is gone
+/// has nothing to take in but is owed the reload too.
+fn external_change(ledger: &mut WriteLedger, settings: &Path) -> Option<Vec<u8>> {
+    let data = fs::read(settings).ok();
+    let known = data.as_deref().map(fingerprint);
+    if known == ledger.known {
+        return None;
+    }
+    ledger.known = known;
+    ledger.reload_owed = true;
+    data
+}
+
+fn take_in_disk_changes(ledger: &mut WriteLedger, settings: &Path) {
+    if let Some(data) = external_change(ledger, settings) {
+        take_in_external_settings(&data);
+    }
+}
+
+/// Settings written by somebody else become the ones in use, and the app is
+/// brought in line with them on the GUI thread. A file that does not parse
+/// leaves the settings in use alone. Called with the ledger held.
+fn take_in_external_settings(data: &[u8]) {
+    let after: ThinkTermNativeSettings = match serde_json::from_slice(data) {
+        Ok(settings) => settings,
+        Err(err) => {
+            log::warn!(
+                "{} changed but cannot be read; keeping the settings in use: {err:#}",
+                settings_path().display()
+            );
+            return;
+        }
+    };
+    let before = std::mem::replace(&mut *settings_cache().lock(), Arc::new(after));
+    log::info!("{} changed outside ThinkTerm; applying it", settings_path().display());
+    promise::spawn::spawn_into_main_thread(async move {
+        // Against the settings in use by the time this runs: a save made in
+        // between was applied by whoever made it, and is what stays.
+        apply_external_change(&before, &load_shared());
+    })
+    .detach();
+}
+
+/// Bring the running app in line with settings that changed on disk, the
+/// way the Settings window does for each change it makes; the configuration
+/// reload a setting is owed follows, as it does for a save there. Most
+/// settings are read where they are used and only need a repaint.
+/// `local_sessions_via_mux` and `main_renderer` take effect at the next
+/// start, as they do from the Settings window. Window state (sidebar widths
+/// and the like) is picked up by the next window, as it is when another
+/// window changes it.
+fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNativeSettings) {
+    let language = before.localization.language != after.localization.language
+        || before.onboarding.language != after.onboarding.language;
+    if language
+        || before.appearance.theme_mode != after.appearance.theme_mode
+        || before.appearance.app_icon != after.appearance.app_icon
+        || before.appearance.color_scheme != after.appearance.color_scheme
+    {
+        // Language, theme, colour scheme, chrome and app icon.
+        apply_to_app(after);
+    }
+    crate::settings_window::follow_open_settings_window(before, after);
+
+    let font_size = (before.terminal.font_size != after.terminal.font_size)
+        .then_some(after.terminal.font_size);
+    let contrast = before.terminal.text_contrast != after.terminal.text_contrast;
+    let before_chrome = &before.chrome;
+    let after_chrome = &after.chrome;
+    let panels = before_chrome.right_sidebar_files_enabled != after_chrome.right_sidebar_files_enabled
+        || before_chrome.right_sidebar_notes_enabled != after_chrome.right_sidebar_notes_enabled
+        || before_chrome.right_sidebar_snippets_enabled
+            != after_chrome.right_sidebar_snippets_enabled
+        || before_chrome.snippets_plugin_enabled != after_chrome.snippets_plugin_enabled
+        || before_chrome.agent_panel_enabled != after_chrome.agent_panel_enabled
+        || before_chrome.plugin_panels != after_chrome.plugin_panels;
+    if before_chrome.agent_panel_enabled != after_chrome.agent_panel_enabled {
+        mux::agent_status::refresh_enabled();
+    }
+    if let Some(front_end) = crate::frontend::try_front_end() {
+        for gui_window in front_end.gui_windows() {
+            gui_window
+                .window
+                .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                    move |term_window| {
+                        if let Some(font_size) = font_size {
+                            // As the Settings window applies it; no size is
+                            // the configured one.
+                            let base = term_window.config.font_size;
+                            let font_size = font_size.unwrap_or(base);
+                            if font_size.is_finite() && font_size > 0.0 && base > 0.0 {
+                                let font_scale = (font_size / base).clamp(0.25, 4.0);
+                                if let Some(window) = term_window.window.as_ref().cloned() {
+                                    term_window.adjust_font_scale(font_scale, &window);
+                                }
+                            }
+                        }
+                        if contrast {
+                            term_window.refresh_text_min_contrast();
+                        }
+                        if panels {
+                            term_window.right_sidebar_panels_changed();
+                        }
+                        if language {
+                            term_window.dismiss_fallback_context_menu();
+                        }
+                    },
+                )));
+        }
+        front_end.invalidate_all_windows();
+    }
+
+    if before.web.reachable != after.web.reachable {
+        crate::web_settings::follow_reachable();
+    }
+    if before_chrome.snippets_plugin_enabled != after_chrome.snippets_plugin_enabled {
+        if let Some(enabled) = after_chrome.snippets_plugin_enabled {
+            crate::plugins::set_enabled(thinkterm_snippets::wire::PLUGIN, enabled);
+        }
+    }
+    if before.workspaces.remote_sftp_idle_minutes != after.workspaces.remote_sftp_idle_minutes {
+        crate::termwindow::remote_files::update_remote_connection_idle_timeout(
+            after.workspaces.remote_sftp_idle_minutes,
+        );
+    }
+    if before.workspaces.remote_update_keeps_sessions
+        != after.workspaces.remote_update_keeps_sessions
+    {
+        wezterm_client::remote_update::set_keep_sessions_on_update(
+            after.workspaces.remote_update_keeps_sessions,
+        );
+    }
 }
 
 /// Where the main window should reopen, or `None` if nothing has been
@@ -977,12 +1266,12 @@ pub(crate) fn restore_main_window_frame_enabled() -> bool {
 /// into one call, and a drag that ends where it started should not rewrite
 /// the file.
 pub(crate) fn save_main_window_placement(placement: NativeMainWindowPlacement) {
-    let mut settings = load();
-    if settings.window.main_window_placement == Some(placement) {
+    if load_shared().window.main_window_placement == Some(placement) {
         return;
     }
-    settings.window.main_window_placement = Some(placement);
-    if let Err(err) = save(&settings) {
+    if let Err(err) =
+        update_ui_state(|settings| settings.window.main_window_placement = Some(placement))
+    {
         log::warn!("failed to save main window placement: {err:#}");
     }
 }
@@ -990,12 +1279,10 @@ pub(crate) fn save_main_window_placement(placement: NativeMainWindowPlacement) {
 /// Persist the palette-picked color scheme so new windows and the next
 /// launch start with it. A no-op when the stored value already matches.
 pub(crate) fn save_color_scheme(name: Option<String>) {
-    let mut settings = load();
-    if settings.appearance.color_scheme == name {
+    if load_shared().appearance.color_scheme == name {
         return;
     }
-    settings.appearance.color_scheme = name;
-    if let Err(err) = save(&settings) {
+    if let Err(err) = update(|settings| settings.appearance.color_scheme = name) {
         log::error!("failed to save color scheme choice: {err:#}");
     }
 }
@@ -1401,9 +1688,7 @@ pub(crate) fn workspace_sidebar_width() -> Option<usize> {
 }
 
 pub(crate) fn save_workspace_sidebar_width(width: usize) -> anyhow::Result<()> {
-    let mut settings = load();
-    settings.chrome.workspace_sidebar_width = Some(width);
-    save(&settings)
+    update_ui_state(|settings| settings.chrome.workspace_sidebar_width = Some(width))
 }
 
 /// Remember whether the workspace sidebar is open, so a new window starts the
@@ -1414,12 +1699,12 @@ pub(crate) fn save_workspace_sidebar_width(width: usize) -> anyhow::Result<()> {
 /// sidebar was forgotten on the next window, and the setting had no home once
 /// the wizard stopped asking about it.
 pub(crate) fn save_workspace_sidebar_shown(shown: bool) {
-    let mut settings = load();
-    if settings.onboarding.show_left_sidebar_by_default == shown {
+    if load_shared().onboarding.show_left_sidebar_by_default == shown {
         return;
     }
-    settings.onboarding.show_left_sidebar_by_default = shown;
-    if let Err(err) = save(&settings) {
+    if let Err(err) =
+        update_ui_state(|settings| settings.onboarding.show_left_sidebar_by_default = shown)
+    {
         log::warn!("failed to save workspace sidebar visibility: {err:#}");
     }
 }
@@ -1501,9 +1786,7 @@ pub(crate) fn workspace_sidebar_hidden_statuses() -> Vec<String> {
 }
 
 pub(crate) fn save_workspace_sidebar_hidden_statuses(hidden: Vec<String>) -> anyhow::Result<()> {
-    let mut settings = load();
-    settings.chrome.workspace_sidebar_hidden_statuses = hidden;
-    save(&settings)
+    update_ui_state(|settings| settings.chrome.workspace_sidebar_hidden_statuses = hidden)
 }
 
 pub(crate) fn force_fallback_context_menu() -> bool {
@@ -1512,15 +1795,11 @@ pub(crate) fn force_fallback_context_menu() -> bool {
 }
 
 pub(crate) fn save_right_sidebar_width(width: usize) -> anyhow::Result<()> {
-    let mut settings = load();
-    settings.chrome.right_sidebar_width = Some(width);
-    save(&settings)
+    update_ui_state(|settings| settings.chrome.right_sidebar_width = Some(width))
 }
 
 pub(crate) fn save_right_sidebar_file_preview_width(width: usize) -> anyhow::Result<()> {
-    let mut settings = load();
-    settings.chrome.right_sidebar_file_preview_width = Some(width);
-    save(&settings)
+    update_ui_state(|settings| settings.chrome.right_sidebar_file_preview_width = Some(width))
 }
 
 pub(crate) fn right_sidebar_markdown_preview_rendered() -> bool {
@@ -1531,9 +1810,9 @@ pub(crate) fn right_sidebar_markdown_preview_rendered() -> bool {
 }
 
 pub(crate) fn save_right_sidebar_markdown_preview_rendered(rendered: bool) -> anyhow::Result<()> {
-    let mut settings = load();
-    settings.chrome.right_sidebar_markdown_preview_rendered = Some(rendered);
-    save(&settings)
+    update_ui_state(|settings| {
+        settings.chrome.right_sidebar_markdown_preview_rendered = Some(rendered)
+    })
 }
 
 /// How wide the user made plugin `plugin`'s extended view.
@@ -1546,30 +1825,24 @@ pub(crate) fn plugin_extended_width(plugin: &str) -> Option<usize> {
 }
 
 pub(crate) fn save_plugin_extended_width(plugin: &str, width: usize) -> anyhow::Result<()> {
-    let mut settings = load();
-    settings
-        .chrome
-        .plugin_extended_widths
-        .insert(plugin.to_string(), width);
-    save(&settings)
+    update_ui_state(|settings| {
+        settings
+            .chrome
+            .plugin_extended_widths
+            .insert(plugin.to_string(), width);
+    })
 }
 
 pub(crate) fn save_right_sidebar_note_pane_width(width: usize) -> anyhow::Result<()> {
-    let mut settings = load();
-    settings.chrome.right_sidebar_note_pane_width = Some(width);
-    save(&settings)
+    update_ui_state(|settings| settings.chrome.right_sidebar_note_pane_width = Some(width))
 }
 
 pub(crate) fn save_right_sidebar_note_pane_expanded(expanded: bool) -> anyhow::Result<()> {
-    let mut settings = load();
-    settings.chrome.right_sidebar_note_pane_expanded = Some(expanded);
-    save(&settings)
+    update_ui_state(|settings| settings.chrome.right_sidebar_note_pane_expanded = Some(expanded))
 }
 
 pub(crate) fn save_right_sidebar_open_with_app(app: NativeOpenWithApp) -> anyhow::Result<()> {
-    let mut settings = load();
-    settings.chrome.right_sidebar_open_with_app = Some(app);
-    save(&settings)
+    update_ui_state(|settings| settings.chrome.right_sidebar_open_with_app = Some(app))
 }
 
 pub(crate) fn right_sidebar_custom_open_with_apps() -> Vec<NativeOpenWithApp> {
@@ -1579,14 +1852,14 @@ pub(crate) fn right_sidebar_custom_open_with_apps() -> Vec<NativeOpenWithApp> {
 const MAX_CUSTOM_OPEN_WITH_APPS: usize = 20;
 
 pub(crate) fn add_right_sidebar_custom_open_with_app(app: NativeOpenWithApp) -> anyhow::Result<()> {
-    let mut settings = load();
-    let apps = &mut settings.chrome.right_sidebar_custom_open_with_apps;
-    apps.retain(|existing| existing.id != app.id);
-    apps.push(app);
-    while apps.len() > MAX_CUSTOM_OPEN_WITH_APPS {
-        apps.remove(0);
-    }
-    save(&settings)
+    update_ui_state(|settings| {
+        let apps = &mut settings.chrome.right_sidebar_custom_open_with_apps;
+        apps.retain(|existing| existing.id != app.id);
+        apps.push(app);
+        while apps.len() > MAX_CUSTOM_OPEN_WITH_APPS {
+            apps.remove(0);
+        }
+    })
 }
 
 pub(crate) fn mark_onboarding_seen(settings: &mut ThinkTermNativeSettings) {
@@ -2054,5 +2327,91 @@ mod tests {
             decoded.onboarding.language,
             NativeLanguagePreference::Japanese
         );
+    }
+
+    fn ledger(known: &[u8], reload_owed: bool) -> WriteLedger {
+        WriteLedger {
+            known: Some(fingerprint(known)),
+            reload_owed,
+        }
+    }
+
+    /// A sidebar toggle rewrites settings.json: the watcher must not reload
+    /// for that, must reload once for a setting, and must hand over an edit
+    /// made by anybody else.
+    #[test]
+    fn the_watcher_reloads_for_settings_and_edits_but_not_for_window_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        fs::write(&settings, b"ours").unwrap();
+
+        let mut state = ledger(b"ours", false);
+        assert_eq!(
+            watched_change(true, false, &settings, &mut state),
+            (false, None),
+            "window state written here"
+        );
+
+        let mut state = ledger(b"ours", true);
+        assert_eq!(
+            watched_change(true, false, &settings, &mut state),
+            (true, None),
+            "a setting saved here"
+        );
+        assert_eq!(
+            watched_change(true, false, &settings, &mut state),
+            (false, None),
+            "reloaded for once"
+        );
+        assert_eq!(
+            watched_change(true, true, &settings, &mut state),
+            (true, None),
+            "the config file changing alongside"
+        );
+        assert_eq!(watched_change(false, true, &settings, &mut state), (true, None));
+
+        fs::write(&settings, b"theirs").unwrap();
+        assert_eq!(
+            watched_change(true, false, &settings, &mut state),
+            (true, Some(b"theirs".to_vec())),
+            "an edit made elsewhere"
+        );
+        assert_eq!(
+            watched_change(true, false, &settings, &mut state),
+            (false, None),
+            "and known once taken in"
+        );
+
+        fs::remove_file(&settings).unwrap();
+        assert_eq!(
+            watched_change(true, false, &settings, &mut state),
+            (true, None),
+            "a file that is gone reloads and leaves the settings in use"
+        );
+    }
+
+    /// A setting saved here and window state saved right after it land in
+    /// one watcher batch; the setting's reload must not be lost.
+    #[test]
+    fn a_setting_and_window_state_in_one_batch_still_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        fs::write(&settings, b"window state on top of a setting").unwrap();
+        let mut state = ledger(b"window state on top of a setting", true);
+        assert_eq!(watched_change(true, false, &settings, &mut state), (true, None));
+    }
+
+    /// An edit made elsewhere can be taken in before the watcher gets to it,
+    /// by a save here or by the Settings window opening. It is taken in
+    /// once, and the reload it is owed still comes when the watcher looks.
+    #[test]
+    fn an_edit_taken_in_before_the_watcher_looks_still_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        fs::write(&settings, b"theirs").unwrap();
+        let mut state = ledger(b"ours", false);
+        assert_eq!(external_change(&mut state, &settings), Some(b"theirs".to_vec()));
+        assert_eq!(external_change(&mut state, &settings), None, "taken in once");
+        assert_eq!(watched_change(true, false, &settings, &mut state), (true, None));
     }
 }

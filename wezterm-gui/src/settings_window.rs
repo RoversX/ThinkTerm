@@ -341,6 +341,24 @@ pub(crate) fn refresh_open_settings_window_chrome() {
     });
 }
 
+/// Bring the open settings window up to settings that changed outside it
+/// (settings.json edited by hand): its copy, as
+/// `refresh_open_settings_window_chrome` does, and what it holds beside
+/// that copy -- the fields it filled when it opened, the fonts it paints
+/// with and its title.
+pub(crate) fn follow_open_settings_window(
+    before: &ThinkTermNativeSettings,
+    after: &ThinkTermNativeSettings,
+) {
+    SETTINGS_WINDOW.with(|slot| {
+        if let SettingsWindowSlot::Open { settings, .. } = &*slot.borrow() {
+            if let Ok(mut settings) = settings.try_borrow_mut() {
+                settings.follow_settings_changed_elsewhere(before, after);
+            }
+        }
+    });
+}
+
 fn settings_window_for_instance(instance_id: u64) -> Option<Rc<RefCell<SettingsWindow>>> {
     SETTINGS_WINDOW.with(|slot| match &*slot.borrow() {
         SettingsWindowSlot::Open {
@@ -4682,6 +4700,73 @@ impl SettingsWindow {
         self.refresh_chrome();
     }
 
+    /// See `follow_open_settings_window`. A field the user is typing into
+    /// is left alone.
+    fn follow_settings_changed_elsewhere(
+        &mut self,
+        before: &ThinkTermNativeSettings,
+        after: &ThinkTermNativeSettings,
+    ) {
+        self.set_native_settings(crate::native_settings::load());
+        let terminal = (&before.terminal, &after.terminal);
+        if terminal.0.font_size != terminal.1.font_size {
+            // The size steps from this field, so a stale one would put the
+            // old size back on the next click.
+            let size = terminal.1.font_size.unwrap_or_else(|| configuration().font_size);
+            self.ui.font_size_input.set_text_end(format!("{size:.1}"));
+        }
+        if terminal.0.font_family != terminal.1.font_family && !self.ui.font_family_input_dirty {
+            self.ui.font_family_input.set_text_end(
+                terminal
+                    .1
+                    .font_family
+                    .clone()
+                    .unwrap_or_else(|| Self::effective_font_family(&configuration())),
+            );
+        }
+        if before.workspaces.remote_drop_destination != after.workspaces.remote_drop_destination
+            && !self.ui.remote_drop_input_dirty
+        {
+            self.ui
+                .remote_drop_input
+                .set_text_end(crate::native_settings::remote_drop_destination());
+        }
+        if terminal.0.default_shell != terminal.1.default_shell {
+            self.refresh_shell_catalog();
+        }
+        if terminal.0.bottom_quote_enabled != terminal.1.bottom_quote_enabled
+            || terminal.0.bottom_quote_mode != terminal.1.bottom_quote_mode
+            || terminal.0.bottom_quote_interval_minutes != terminal.1.bottom_quote_interval_minutes
+            || terminal.0.bottom_quote_font_size != terminal.1.bottom_quote_font_size
+        {
+            self.ui.quote_preview = quote_preview_text(&self.native_settings);
+        }
+        if before.tab_icons != after.tab_icons {
+            self.sync_tab_icon_inputs();
+        }
+        if before.chrome.settings_font_size != after.chrome.settings_font_size
+            || before.chrome.settings_font_weight != after.chrome.settings_font_weight
+        {
+            if let Err(err) = self.reload_settings_fonts() {
+                log::warn!("settings window fonts after an outside change: {err:#}");
+            }
+        }
+        if before.localization.language != after.localization.language
+            || before.onboarding.language != after.onboarding.language
+        {
+            // As choosing a language here does; `apply_to_app` has switched
+            // it already.
+            self.ui.sidebar_scroll.reset();
+            self.sync_selected_section_with_search();
+            if let Some(window) = self.window.as_ref() {
+                window.set_title(&crate::i18n::tr("settings-window-title"));
+            }
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
     /// Every field reads a `UiPalette` token, so Settings tracks the main
     /// window by construction. It stopped doing that once: two arms that
     /// differed only in a hand-written `card_bg`, which was the token's value
@@ -4819,25 +4904,10 @@ impl SettingsWindow {
     /// Where the listener binds: every address when the page is to be
     /// reachable from other devices, else the configured or default one.
     fn web_bind_address(&self) -> String {
-        // The address the listener is up on comes first: one started by
-        // the CLI on another port is what the switch must keep.
-        let state = crate::web_settings::state();
-        let configured = state
-            .status
-            .as_ref()
-            .and_then(|status| status.listening.first().or(status.configured.first()).cloned())
-            .unwrap_or_else(|| config::WebServer::default().bind_address);
-        let port = configured.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).unwrap_or(8088);
-        let wildcard = configured.starts_with("0.0.0.0:") || configured.starts_with("[::]:");
-        if self.native_settings.web.reachable {
-            format!("0.0.0.0:{port}")
-        } else if wildcard {
-            // Off means off the network: a listener found on the wildcard
-            // goes back to loopback on the same port.
-            format!("127.0.0.1:{port}")
-        } else {
-            configured
-        }
+        crate::web_settings::bind_address(
+            crate::web_settings::state().status.as_ref(),
+            self.native_settings.web.reachable,
+        )
     }
 
     fn enter_section(&mut self, section: SettingsSection) {

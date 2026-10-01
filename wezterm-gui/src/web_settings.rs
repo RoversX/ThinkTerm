@@ -331,12 +331,6 @@ pub fn restart(window: Window, bind_address: String) {
         return;
     };
     promise::spawn::spawn_into_main_thread(async move {
-        // Off and on are two requests, and the second can be refused after
-        // the first has already succeeded: the server will not open a
-        // non-loopback listener for a client that reached it over TLS, and
-        // any address can fail to bind. Either would leave the listener off
-        // with nothing to say so. What was listening is asked for first, so
-        // a refused "on" puts it back before the error is shown.
         let before = match client.get_web_server_status().await {
             Ok(status) => status.listening,
             Err(err) => {
@@ -344,16 +338,7 @@ pub fn restart(window: Window, bind_address: String) {
                 return;
             }
         };
-        let off = client
-            .set_web_server(codec::SetWebServer { enabled: false, bind_address: None })
-            .await;
-        let outcome = match off {
-            Ok(_) => client
-                .set_web_server(codec::SetWebServer { enabled: true, bind_address: Some(bind_address) })
-                .await,
-            Err(err) => Err(err),
-        };
-        match outcome {
+        match move_listener(&client, before, bind_address).await {
             Ok(status) => {
                 with_state(|s| {
                     s.status = Some(status);
@@ -363,24 +348,137 @@ pub fn restart(window: Window, bind_address: String) {
                 finish(&window, None, Gate::Action);
                 refresh(window);
             }
-            Err(err) => {
-                let mut restored = Ok(());
-                for address in before {
-                    let put_back = client
-                        .set_web_server(codec::SetWebServer { enabled: true, bind_address: Some(address) })
-                        .await;
-                    if let Err(err) = put_back {
-                        restored = Err(err);
-                    }
-                }
-                let message = match restored {
-                    Ok(()) => format!("{err:#}"),
-                    Err(restore_err) => format!("{err:#}; and putting the previous listener back failed: {restore_err:#}"),
-                };
+            Err(message) => {
                 finish(&window, Some(message), Gate::Action);
                 refresh(window);
             }
         }
+    })
+    .detach();
+}
+
+/// Off, then on at `bind_address`; the new status, or what went wrong.
+///
+/// Off and on are two requests, and the second can be refused after the
+/// first has already succeeded: the server will not open a non-loopback
+/// listener for a client that reached it over TLS, and any address can fail
+/// to bind. Either would leave the listener off with nothing to say so. So
+/// a refused "on" puts back what was listening (`before`) before the error
+/// is shown.
+async fn move_listener(
+    client: &Client,
+    before: Vec<String>,
+    bind_address: String,
+) -> Result<WebServerStatus, String> {
+    let off = client
+        .set_web_server(codec::SetWebServer { enabled: false, bind_address: None })
+        .await;
+    let outcome = match off {
+        Ok(_) => client
+            .set_web_server(codec::SetWebServer { enabled: true, bind_address: Some(bind_address) })
+            .await,
+        Err(err) => Err(err),
+    };
+    let err = match outcome {
+        Ok(status) => return Ok(status),
+        Err(err) => err,
+    };
+    let mut restored = Ok(());
+    for address in before {
+        let put_back = client
+            .set_web_server(codec::SetWebServer { enabled: true, bind_address: Some(address) })
+            .await;
+        if let Err(err) = put_back {
+            restored = Err(err);
+        }
+    }
+    Err(match restored {
+        Ok(()) => format!("{err:#}"),
+        Err(restore_err) => format!("{err:#}; and putting the previous listener back failed: {restore_err:#}"),
+    })
+}
+
+/// Where the listener binds by the "reachable from other devices" switch:
+/// every address when it is on, else the configured or default one. The
+/// address the listener is up on comes first: one started by the CLI on
+/// another port is what the switch must keep.
+pub fn bind_address(status: Option<&WebServerStatus>, reachable: bool) -> String {
+    let configured = status
+        .and_then(|status| status.listening.first().or(status.configured.first()).cloned())
+        .unwrap_or_else(|| config::WebServer::default().bind_address);
+    let port = configured.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).unwrap_or(8088);
+    let wildcard = configured.starts_with("0.0.0.0:") || configured.starts_with("[::]:");
+    if reachable {
+        format!("0.0.0.0:{port}")
+    } else if wildcard {
+        // Off means off the network: a listener found on the wildcard
+        // goes back to loopback on the same port.
+        format!("127.0.0.1:{port}")
+    } else {
+        configured
+    }
+}
+
+/// Move a listener that is up to where the "reachable from other devices"
+/// switch now says, after settings.json changed it outside the settings
+/// window (whose own switch goes through `restart`). A listener that is off
+/// stays off: the switch only says where it listens.
+pub fn follow_reachable() {
+    follow_reachable_within(10);
+}
+
+fn follow_reachable_within(tries: u32) {
+    if with_state(|s| std::mem::replace(&mut s.busy, true)) {
+        // A request from the settings window is out; once it is answered,
+        // the switch as it stands then is what counts.
+        if tries == 0 {
+            log::warn!("web settings: still busy; the listener keeps its address");
+            return;
+        }
+        promise::spawn::spawn_into_main_thread(async move {
+            smol::Timer::after(Duration::from_millis(500)).await;
+            follow_reachable_within(tries - 1);
+        })
+        .detach();
+        return;
+    }
+    let Some(client) = client() else {
+        with_state(|s| s.busy = false);
+        return;
+    };
+    let reachable = crate::native_settings::load_shared().web.reachable;
+    promise::spawn::spawn_into_main_thread(async move {
+        let outcome = async {
+            let status = client
+                .get_web_server_status()
+                .await
+                .map_err(|err| format!("{err:#}"))?;
+            let address = bind_address(Some(&status), reachable);
+            if status.listening.is_empty() || status.listening.contains(&address) {
+                return Ok(None);
+            }
+            log::info!("web settings: moving the listener to {address}, as settings.json now says");
+            move_listener(&client, status.listening, address).await.map(Some)
+        }
+        .await;
+        with_state(|s| {
+            s.busy = false;
+            s.generation += 1;
+            match outcome {
+                Ok(Some(status)) => {
+                    s.status = Some(status);
+                    s.qr = None;
+                    s.qr_url = None;
+                    s.error = None;
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    log::warn!("web settings: following settings.json: {message}");
+                    s.error = Some(message);
+                }
+            }
+        });
+        crate::settings_window::invalidate_open_settings_window();
     })
     .detach();
 }
@@ -587,5 +685,33 @@ mod certificate_display_tests {
         assert_eq!(state.displayed_certificates().len(), 1);
         state.status = None;
         assert!(state.displayed_certificates().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod bind_address_tests {
+    use super::*;
+
+    fn listening(addresses: &[&str]) -> WebServerStatus {
+        WebServerStatus {
+            listening: addresses.iter().map(|address| address.to_string()).collect(),
+            urls: vec![],
+            configured: vec![],
+            certificates: vec![],
+        }
+    }
+
+    /// The switch moves a listener between every address and loopback on
+    /// the port it is on, and leaves one on a named address where it is.
+    #[test]
+    fn the_reachable_switch_keeps_the_port_and_picks_the_address() {
+        let wildcard = listening(&["0.0.0.0:9001"]);
+        assert_eq!(bind_address(Some(&wildcard), false), "127.0.0.1:9001");
+        assert_eq!(bind_address(Some(&wildcard), true), "0.0.0.0:9001");
+        let loopback = listening(&["127.0.0.1:9001"]);
+        assert_eq!(bind_address(Some(&loopback), true), "0.0.0.0:9001");
+        assert_eq!(bind_address(Some(&loopback), false), "127.0.0.1:9001");
+        let named = listening(&["192.0.2.7:9001"]);
+        assert_eq!(bind_address(Some(&named), false), "192.0.2.7:9001");
     }
 }
