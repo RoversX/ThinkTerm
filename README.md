@@ -41,6 +41,13 @@ ThinkTerm is an open-source **terminal with a built-in multiplexer, written in R
 
 ## A multiplexer at the core
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg">
+    <img src="assets/architecture-light.svg" alt="ThinkTerm simplified architecture: the desktop app, TUI and CLI, browser, and phone apps attach to a mux server on each machine; machines can reach each other, and the desktop app also reaches plain SSH and Mosh hosts" width="100%">
+  </picture>
+</p>
+
 A terminal multiplexer manages multiple terminal sessions and lets clients attach to them. In ThinkTerm, **the mux server owns the sessions, tabs, and split panes**. The client displays them and sends your input.
 
 - **Detach and return.** Disconnecting a client leaves its server-held sessions running. Reconnect later to continue the same shell, build, or agent task. Explicitly closing a pane is a separate action.

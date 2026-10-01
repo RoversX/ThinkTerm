@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 670" width="1000" height="670" role="img" aria-labelledby="t d">
+<title id="t">ThinkTerm Simplified Architecture</title>
+<desc id="d">Four clients, the desktop app, the TUI and CLI, a browser and the phone apps, all show the same workspace. Below them, every machine runs the same ThinkTerm mux server with its own plugins and keeps its own sessions; any client can attach to any of them, machines can reach each other, and the desktop app also reaches plain SSH and Mosh hosts. There is no cloud and no central server.</desc>
+<defs>
+<linearGradient id="mux" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#173462"/><stop offset="1" stop-color="#0f2445"/></linearGradient>
+<linearGradient id="plug" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#45290d"/><stop offset="1" stop-color="#311d09"/></linearGradient>
+<filter id="lift" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="4" stdDeviation="7" flood-color="#000" flood-opacity="0.35"/></filter>
+</defs>
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #f5f5f7; }
+.headline { font-size: 32px; font-weight: 700; letter-spacing: -0.6px; }
+.subhead { font-size: 16px; fill: #a1a1a6; }
+.caption { font-size: 13.5px; font-weight: 500; fill: #8e8e93; }
+.label { font-size: 15px; font-weight: 600; }
+.machine { font-size: 14px; font-weight: 600; fill: #a1a1a6; }
+.tile-title { font-size: 16px; font-weight: 600; letter-spacing: -0.2px; }
+.tile-sub { font-size: 12.5px; fill: #a1a1a6; }
+.chip-t { font-size: 13px; font-weight: 600; fill: #ffa53d; }
+.frame { fill: #3a3a3c; stroke: #58585c; filter: url(#lift); }
+.base { fill: #58585c; }
+.app { fill: #3a3a3c; stroke: #58585c; filter: url(#lift); }
+.app-ink { stroke: #f5f5f7; }
+.phone { fill: #000000; stroke: #58585c; filter: url(#lift); }
+.button { fill: #58585c; }
+.status { font-size: 3.9px; font-weight: 600; fill: #f5f5f7; }
+.url { fill: #2c2c2e; }
+.platter { fill: #2c2c2e; stroke: #3a3a3c; }
+.plain { fill: #3a3a3c; stroke: #6e6e73; stroke-dasharray: 5 4; }
+.mux-edge { stroke: #2b5592; }
+.plug-edge { stroke: #7d4f1d; }
+.pill { fill: #232325; stroke: #4a4a4e; }
+.pill-t { font-size: 11.5px; font-weight: 500; fill: #c7c7cc; }
+.glyph { fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.mux-ink { stroke: #4da3ff; }
+.plug-ink { stroke: #ffa53d; }
+.plain-ink { stroke: #a1a1a6; }
+.weave { fill: none; stroke: #55555a; stroke-width: 1.2; stroke-linecap: round; }
+.dashed { stroke-dasharray: 5 5; }
+</style>
+<rect x="0.5" y="0.5" width="999" height="669" rx="28" fill="#1c1c1e" stroke="#3a3a3c"/>
+<text x="500" y="62" class="headline" text-anchor="middle">ThinkTerm Simplified Architecture</text>
+<text x="500" y="92" class="subhead" text-anchor="middle">macOS · Linux · Windows · Web · iOS · Android</text>
+<g transform="translate(0 -20)">
+<text x="500" y="150" class="caption" text-anchor="middle">The same workspace on every client</text>
+<path class="weave" d="M155 306C155 368 140 368 140 430M155 306C155 368 380 368 380 430M155 306C155 368 620 368 620 430M385 306C385 368 140 368 140 430M385 306C385 368 380 368 380 430M385 306C385 368 620 368 620 430M615 306C615 368 140 368 140 430M615 306C615 368 380 368 380 430M615 306C615 368 620 368 620 430M845 306C845 368 140 368 140 430M845 306C845 368 380 368 380 430M845 306C845 368 620 368 620 430"/>
+<path class="weave dashed" d="M845 306C845 368 860 368 860 430"/>
+<path class="weave" d="M140 610C140 652 380 652 380 610M380 610C380 652 620 652 620 610M140 610C140 694 620 694 620 610"/>
+<path class="weave dashed" d="M620 610C620 652 860 652 860 610"/>
+<rect x="123" y="186" width="64" height="64" rx="16" class="app"/>
+<g class="glyph app-ink" transform="translate(140 203) scale(1.25)"><rect x="2.5" y="4" width="19" height="16" rx="3.5"/><path d="M7 9.5l3 2.5-3 2.5M12.5 15h4.5"/></g>
+<text x="155" y="276" class="label" text-anchor="middle">TUI · CLI</text>
+<rect x="133.5" y="286" width="43" height="20" rx="10" class="pill"/>
+<text x="155" y="300" class="pill-t" text-anchor="middle">Rust</text>
+<rect x="353" y="186" width="64" height="64" rx="16" class="app"/>
+<g class="glyph app-ink" transform="translate(370 203) scale(1.25)"><circle cx="12" cy="12" r="9.5"/><path d="M15.5 8.5l-2 5-5 2 2-5z"/></g>
+<text x="385" y="276" class="label" text-anchor="middle">Browser</text>
+<rect x="319.5" y="286" width="131" height="20" rx="10" class="pill"/>
+<text x="385" y="300" class="pill-t" text-anchor="middle">Rust/wasm · WebGPU</text>
+<rect x="583" y="186" width="64" height="64" rx="16" class="app"/>
+<g class="glyph app-ink" transform="translate(600 203) scale(1.25)"><rect x="6.5" y="2.5" width="11" height="19" rx="2.8"/><path d="M10.5 5.3h3"/></g>
+<text x="615" y="276" class="label" text-anchor="middle">iPhone · Android</text>
+<rect x="521.5" y="286" width="75" height="20" rx="10" class="pill"/>
+<text x="559" y="300" class="pill-t" text-anchor="middle">Rust core</text>
+<rect x="602.5" y="286" width="106" height="20" rx="10" class="pill"/>
+<text x="655.5" y="300" class="pill-t" text-anchor="middle">in development</text>
+<rect x="813" y="186" width="64" height="64" rx="16" class="app"/>
+<g class="glyph app-ink" transform="translate(830 203) scale(1.25)"><rect x="3.5" y="5" width="17" height="11.5" rx="1.8"/><path d="M1.5 19.5h21"/></g>
+<text x="845" y="276" class="label" text-anchor="middle">Desktop app</text>
+<rect x="804.5" y="286" width="81" height="20" rx="10" class="pill"/>
+<text x="845" y="300" class="pill-t" text-anchor="middle">Rust · GPU</text>
+<rect x="35" y="430" width="210" height="180" rx="22" class="platter"/>
+<rect x="49" y="444" width="182" height="84" rx="16" fill="url(#mux)" class="mux-edge"/>
+<g class="glyph mux-ink" transform="translate(63 472) scale(1.1666666666666667)"><rect x="3.5" y="9" width="17" height="11" rx="2.2"/><path d="M5.8 6h12.4M8.2 3h7.6"/></g>
+<text x="101" y="484" class="tile-title">mux server</text>
+<text x="101" y="503" class="tile-sub">your sessions</text>
+<rect x="49" y="538" width="182" height="38" rx="12" fill="url(#plug)" class="plug-edge"/>
+<g class="glyph plug-ink" transform="translate(63 547) scale(0.8333333333333334)"><path d="M4 8h3.6a2.4 2.4 0 1 1 4.8 0H16v4.1a2.4 2.4 0 1 1 0 4.8V21H4z"/></g>
+<text x="91" y="562" class="chip-t">plugins</text>
+<text x="140" y="598" class="machine" text-anchor="middle">This computer</text>
+<rect x="275" y="430" width="210" height="180" rx="22" class="platter"/>
+<rect x="289" y="444" width="182" height="84" rx="16" fill="url(#mux)" class="mux-edge"/>
+<g class="glyph mux-ink" transform="translate(303 472) scale(1.1666666666666667)"><rect x="3.5" y="9" width="17" height="11" rx="2.2"/><path d="M5.8 6h12.4M8.2 3h7.6"/></g>
+<text x="341" y="484" class="tile-title">mux server</text>
+<text x="341" y="503" class="tile-sub">your sessions</text>
+<rect x="289" y="538" width="182" height="38" rx="12" fill="url(#plug)" class="plug-edge"/>
+<g class="glyph plug-ink" transform="translate(303 547) scale(0.8333333333333334)"><path d="M4 8h3.6a2.4 2.4 0 1 1 4.8 0H16v4.1a2.4 2.4 0 1 1 0 4.8V21H4z"/></g>
+<text x="331" y="562" class="chip-t">plugins</text>
+<text x="380" y="598" class="machine" text-anchor="middle">Linux server</text>
+<rect x="515" y="430" width="210" height="180" rx="22" class="platter"/>
+<rect x="529" y="444" width="182" height="84" rx="16" fill="url(#mux)" class="mux-edge"/>
+<g class="glyph mux-ink" transform="translate(543 472) scale(1.1666666666666667)"><rect x="3.5" y="9" width="17" height="11" rx="2.2"/><path d="M5.8 6h12.4M8.2 3h7.6"/></g>
+<text x="581" y="484" class="tile-title">mux server</text>
+<text x="581" y="503" class="tile-sub">your sessions</text>
+<rect x="529" y="538" width="182" height="38" rx="12" fill="url(#plug)" class="plug-edge"/>
+<g class="glyph plug-ink" transform="translate(543 547) scale(0.8333333333333334)"><path d="M4 8h3.6a2.4 2.4 0 1 1 4.8 0H16v4.1a2.4 2.4 0 1 1 0 4.8V21H4z"/></g>
+<text x="571" y="562" class="chip-t">plugins</text>
+<text x="620" y="598" class="machine" text-anchor="middle">Dev box</text>
+<rect x="755" y="430" width="210" height="180" rx="22" class="plain"/>
+<g class="glyph plain-ink" transform="translate(846 464) scale(1.1666666666666667)"><rect x="3.5" y="4" width="17" height="7" rx="1.8"/><rect x="3.5" y="13" width="17" height="7" rx="1.8"/><path d="M7 7.5h.01M7 16.5h.01"/></g>
+<text x="860" y="516" class="tile-title" text-anchor="middle">SSH · Mosh</text>
+<text x="860" y="536" class="tile-sub" text-anchor="middle">nothing to install</text>
+<text x="860" y="598" class="machine" text-anchor="middle">Any SSH host</text>
+</g>
+</svg>
