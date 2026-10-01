@@ -431,6 +431,18 @@ pub struct DecodedPdu {
 #[cfg(not(target_family = "wasm"))]
 const COMPRESS_THRESH: usize = 32;
 
+/// Where a PDU is going, which decides whether it is compressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Link {
+    /// Anything that may leave this machine.
+    Network,
+    /// A client on this machine reading the socket itself. Payloads go as
+    /// they are (see `goes_raw`): compressing a frame and inflating it
+    /// again cost the two processes more than moving it, and the cells
+    /// that place a picture cost level 3 on every push.
+    SameMachine,
+}
+
 /// Room left after a write of `varbincode::LARGE_GROWTH` or more for the
 /// fields that follow it.
 const TRAILING_ROOM: usize = 4096;
@@ -472,6 +484,10 @@ impl std::io::Write for PduBuffer {
 }
 
 fn serialize<T: serde::Serialize>(t: &T) -> Result<(Vec<u8>, bool), Error> {
+    serialize_over(t, Link::Network)
+}
+
+fn serialize_over<T: serde::Serialize>(t: &T, link: Link) -> Result<(Vec<u8>, bool), Error> {
     let mut buffer = PduBuffer(Vec::new());
     let mut encode = varbincode::Serializer::new(&mut buffer);
     t.serialize(&mut encode)?;
@@ -482,12 +498,16 @@ fn serialize<T: serde::Serialize>(t: &T) -> Result<(Vec<u8>, bool), Error> {
     // client is mostly keystrokes, so there is nothing worth compressing.
     #[cfg(target_family = "wasm")]
     {
+        let _ = link;
         Ok((uncompressed, false))
     }
 
     #[cfg(not(target_family = "wasm"))]
     {
         if uncompressed.len() <= COMPRESS_THRESH {
+            return Ok((uncompressed, false));
+        }
+        if goes_raw(uncompressed.len(), link) {
             return Ok((uncompressed, false));
         }
         // Compress the bytes already produced rather than serializing a
@@ -520,6 +540,14 @@ fn serialize<T: serde::Serialize>(t: &T) -> Result<(Vec<u8>, bool), Error> {
 /// Payloads beyond this size are compressed at the fastest zstd level.
 #[cfg(not(target_family = "wasm"))]
 const LARGE_PAYLOAD: usize = 1024 * 1024;
+
+/// Whether `len` serialized bytes go to `link` uncompressed. Past
+/// MAX_PDU_PAYLOAD the receiver would refuse them raw, while compressed
+/// they may still fit.
+#[cfg(not(target_family = "wasm"))]
+fn goes_raw(len: usize, link: Link) -> bool {
+    link == Link::SameMachine && len <= MAX_PDU_PAYLOAD
+}
 
 fn deserialize<T: serde::de::DeserializeOwned, R: std::io::Read>(
     mut r: R,
@@ -586,11 +614,16 @@ macro_rules! pdu {
             }
 
             pub async fn encode_async<W: Unpin + AsyncWriteExt>(&self, w: &mut W, serial: u64) -> Result<(), Error> {
+                self.encode_async_over(w, serial, Link::Network).await
+            }
+
+            /// `encode_async` for a connection whose `Link` is known.
+            pub async fn encode_async_over<W: Unpin + AsyncWriteExt>(&self, w: &mut W, serial: u64, link: Link) -> Result<(), Error> {
                 match self {
                     Pdu::Invalid{..} => bail!("attempted to serialize Pdu::Invalid"),
                     $(
                         Pdu::$name(s) => {
-                            let (data, is_compressed) = serialize(s)?;
+                            let (data, is_compressed) = serialize_over(s, link)?;
                             let encoded_size = encode_raw_async($vers, serial, &data, is_compressed, w).await?;
                             log::debug!("encode_async {} size={encoded_size}", stringify!($name));
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(encoded_size as f64);
@@ -2549,6 +2582,36 @@ mod test {
     }
 
     #[test]
+    fn payloads_go_uncompressed_only_to_the_same_machine() {
+        let picture = serde_bytes::ByteBuf::from("thinkterm ".repeat(200_000).into_bytes());
+        let (raw, is_compressed) = serialize_over(&picture, Link::SameMachine).unwrap();
+        assert!(!is_compressed);
+        let (packed, is_compressed) = serialize_over(&picture, Link::Network).unwrap();
+        assert!(is_compressed);
+        assert!(packed.len() < raw.len() / 10);
+        for (bytes, is_compressed) in [(raw, false), (packed, true)] {
+            let back: serde_bytes::ByteBuf = deserialize(bytes.as_slice(), is_compressed).unwrap();
+            assert_eq!(back, picture);
+        }
+
+        let small = "thinkterm ".repeat(100);
+        assert!(!serialize_over(&small, Link::SameMachine).unwrap().1);
+        assert!(serialize_over(&small, Link::Network).unwrap().1);
+    }
+
+    #[test]
+    fn only_what_the_receiver_accepts_goes_raw() {
+        assert!(goes_raw(COMPRESS_THRESH + 1, Link::SameMachine));
+        assert!(goes_raw(MAX_PDU_PAYLOAD, Link::SameMachine));
+        assert!(
+            !goes_raw(MAX_PDU_PAYLOAD + 1, Link::SameMachine),
+            "refused raw, but may fit compressed"
+        );
+        assert!(!goes_raw(COMPRESS_THRESH + 1, Link::Network));
+        assert!(!goes_raw(MAX_PDU_PAYLOAD, Link::Network));
+    }
+
+    #[test]
     fn the_fields_after_a_picture_fit_its_allocation() {
         #[derive(Serialize)]
         struct Frame {
@@ -2629,12 +2692,12 @@ mod test {
     #[test]
     fn a_decoded_picture_holds_no_more_than_its_bytes() {
         let picture = serde_bytes::ByteBuf::from(vec![9u8; 3 * 1024 * 1024 + 3]);
-        let raw = varbincode::serialize(&picture).unwrap();
-        for (bytes, is_compressed) in [(raw, false), serialize(&picture).unwrap()] {
+        for link in [Link::SameMachine, Link::Network] {
+            let (bytes, is_compressed) = serialize_over(&picture, link).unwrap();
             let back: serde_bytes::ByteBuf =
                 deserialize_payload(&payload_of(&bytes), is_compressed).unwrap();
             assert_eq!(back, picture);
-            assert_eq!(back.into_vec().capacity(), picture.len(), "compressed: {}", is_compressed);
+            assert_eq!(back.into_vec().capacity(), picture.len(), "{link:?}");
         }
     }
 
