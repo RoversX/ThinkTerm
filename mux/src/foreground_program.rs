@@ -12,6 +12,12 @@
 //!
 //! Nothing is polled. A pane is looked at when it prints or retitles, and
 //! once more after that burst settles; a pane doing nothing costs nothing.
+//!
+//! A pane whose terminal is on another machine -- an ssh domain's channel,
+//! which has no local leader, or `ssh` run in a local pane -- runs whatever
+//! that machine's shell says it runs. Shell integration reports it as the
+//! `WEZTERM_PROG` user var before each command and clears it at the prompt;
+//! without it the far side stays unknown.
 
 use crate::pane::{CachePolicy, Pane, PaneId};
 use crate::{Mux, MuxNotification};
@@ -44,6 +50,12 @@ const CONFIRM: Duration = Duration::from_millis(500);
 const FRESH_LOOKS_PER_DRAIN: usize = 8;
 /// How deep launchers may nest (`sudo env FOO=1 nice vim`).
 const MAX_UNWRAP_DEPTH: usize = 4;
+/// Clients whose terminal is on another machine: while one leads, what
+/// that machine's shell reports outranks the client itself.
+const REMOTE_SESSION_CLIENTS: &[&str] = &["ssh", "autossh", "mosh", "mosh-client", "et"];
+/// The user var shell integration sets to the command line it is about to
+/// run, and empties at the prompt (`assets/shell-integration/wezterm.sh`).
+const REPORTED_PROGRAM_VAR: &str = "WEZTERM_PROG";
 
 #[derive(Default)]
 struct Record {
@@ -141,6 +153,11 @@ pub fn initialize_mux(mux: &Mux) {
                     | wezterm_term::Alert::TabTitleChanged(_)
                     | wezterm_term::Alert::IconTitleChanged(_),
             } => mark_dirty(pane_id),
+            // So does a remote shell reporting it (see `choose`).
+            MuxNotification::Alert {
+                pane_id,
+                alert: wezterm_term::Alert::SetUserVar { name, .. },
+            } if name == REPORTED_PROGRAM_VAR => mark_dirty(pane_id),
             // Forget only, never publish: this runs inside Mux::notify, and
             // clients learn of the pane's end from PaneRemoved itself.
             MuxNotification::PaneRemoved(pane_id) => {
@@ -336,6 +353,65 @@ fn observe(record: &mut Record, observed: Option<ForegroundProgram>, now: Instan
 }
 
 fn probe(pane: &dyn Pane, policy: CachePolicy) -> Option<ForegroundProgram> {
+    choose(process_program(pane, policy), || {
+        pane.copy_user_vars()
+            .remove(REPORTED_PROGRAM_VAR)
+            .and_then(|command| command_line_program(&command))
+    })
+}
+
+/// The program to publish, from the local leader and what the pane's shell
+/// reports. The report counts only where the terminal is on another
+/// machine: no local leader, or a remote session client leading. Anywhere
+/// else a stale report -- left by a connection that dropped before its
+/// prompt came back -- must not outrank what is really running.
+fn choose(
+    local: Option<ForegroundProgram>,
+    reported: impl FnOnce() -> Option<ForegroundProgram>,
+) -> Option<ForegroundProgram> {
+    match &local {
+        Some(program) if !is_remote_session_client(program) => local,
+        _ => reported().or(local),
+    }
+}
+
+fn is_remote_session_client(program: &ForegroundProgram) -> bool {
+    let name = program.runs.as_deref().unwrap_or(&program.executable);
+    REMOTE_SESSION_CLIENTS.contains(&name)
+}
+
+/// The program a command line typed at a shell starts: its first word
+/// after any `NAME=value` assignments, unwrapped as a leader's argv is
+/// (`sudo vim` runs `vim`). `None` for an empty line, which is the prompt.
+fn command_line_program(command: &str) -> Option<ForegroundProgram> {
+    let words = shell_words::split(command)
+        .unwrap_or_else(|_| command.split_whitespace().map(str::to_string).collect());
+    let start = words.iter().position(|word| !is_assignment(word))?;
+    let argv = &words[start..];
+    let executable = file_name(&argv[0])?.to_string();
+    let runs = if unwraps(&executable) {
+        run_target(&executable, argv, 0)
+    } else {
+        None
+    };
+    let program = ForegroundProgram { executable, runs };
+    program.within_budget().then_some(program)
+}
+
+/// `NAME=value`, which a shell takes as an assignment before the command.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && !name.starts_with(|ch: char| ch.is_ascii_digit())
+            && name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    })
+}
+
+/// The executable leading the pane's terminal here, on this machine, and
+/// what it runs.
+fn process_program(pane: &dyn Pane, policy: CachePolicy) -> Option<ForegroundProgram> {
     let path = pane
         .get_foreground_process_name(policy)
         .map(crate::agent_status::identify::normalize_executable_path)?;
@@ -970,6 +1046,54 @@ mod tests {
             executable: executable.to_string(),
             runs: None,
         })
+    }
+
+    fn names(program: Option<ForegroundProgram>) -> Option<(String, Option<String>)> {
+        program.map(|program| (program.executable, program.runs))
+    }
+
+    fn named(executable: &str, runs: Option<&str>) -> Option<(String, Option<String>)> {
+        Some((executable.to_string(), runs.map(str::to_string)))
+    }
+
+    #[test]
+    fn a_reported_command_line_names_its_program() {
+        let named_by = |command: &str| names(command_line_program(command));
+        assert_eq!(named_by("vim notes.txt"), named("vim", None));
+        assert_eq!(named_by("/usr/bin/htop"), named("htop", None));
+        assert_eq!(named_by("sudo vim /etc/hosts"), named("sudo", Some("vim")));
+        assert_eq!(named_by("FOO=1 BAR=x nvim"), named("nvim", None));
+        assert_eq!(
+            named_by("python3 -m pytest -x"),
+            named("python3", Some("pytest"))
+        );
+        assert_eq!(named_by("git log | less"), named("git", None));
+        // An unbalanced quote still yields the first word.
+        assert_eq!(named_by("echo 'oops"), named("echo", None));
+        // The prompt, where the shell empties the var.
+        assert_eq!(named_by(""), None);
+        assert_eq!(named_by("   "), None);
+        assert_eq!(named_by("A=1"), None);
+    }
+
+    #[test]
+    fn a_report_counts_only_where_the_terminal_is_remote() {
+        let reported = || program("vim");
+        // No local leader: an ssh domain's channel.
+        assert_eq!(choose(None, reported), program("vim"));
+        // ssh leading a local pane, or run through a launcher.
+        assert_eq!(choose(program("ssh"), reported), program("vim"));
+        assert_eq!(choose(program("mosh-client"), reported), program("vim"));
+        let sudo_ssh = Some(ForegroundProgram {
+            executable: "sudo".to_string(),
+            runs: Some("ssh".to_string()),
+        });
+        assert_eq!(choose(sudo_ssh, reported), program("vim"));
+        // At the remote prompt the client itself shows.
+        assert_eq!(choose(program("ssh"), || None), program("ssh"));
+        // A local program is never overridden by a stale report.
+        assert_eq!(choose(program("zsh"), reported), program("zsh"));
+        assert_eq!(choose(program("top"), reported), program("top"));
     }
 
     #[test]

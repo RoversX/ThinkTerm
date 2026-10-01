@@ -537,7 +537,8 @@ const BUILTIN_CARDS: &[BuiltinCard] = &[
         circle: Rgb(0x33, 0x41, 0x55),
         glyph_color: WHITE,
         agents: &[],
-        programs: &["ssh", "mosh", "autossh", "et", "telnet"],
+        // mosh execs mosh-client once connected.
+        programs: &["ssh", "mosh", "mosh-client", "autossh", "et", "telnet"],
     },
     BuiltinCard {
         id: "tmux",
