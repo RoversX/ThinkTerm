@@ -612,8 +612,18 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
-          path: dist
-          merge-multiple: true
+          path: artifacts
+
+      # web-bundle is the browser client the packages were built with, not a
+      # download of its own: merged in with them, its directories and loose
+      # files land in dist/ and the upload refuses a directory. Each artifact
+      # arrives in its own directory, so it is left out by name.
+      - name: Gather the packages
+        run: |
+          set -eu
+          rm -rf artifacts/web-bundle
+          mkdir -p artifacts dist
+          find artifacts -type f -exec mv -t dist {} +
 
       # No checksum files are published. GitHub records a sha256 for every
       # release asset as it is uploaded -- including the macOS zip attached by
