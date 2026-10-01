@@ -1289,7 +1289,20 @@ impl Tab {
     }
 
     pub fn activate_pane_in_stack(&self, pane_id: PaneId) -> anyhow::Result<usize> {
-        self.inner.lock().activate_pane_in_stack(pane_id)
+        self.activate_pane_in_stack_sized(pane_id, None)
+    }
+
+    /// As `activate_pane_in_stack`. In a zoomed stack the page switched to
+    /// covers the whole tab; `zoomed_size` is the size its frontend gave it
+    /// there, when known, and takes the place of the raw tab size.
+    pub fn activate_pane_in_stack_sized(
+        &self,
+        pane_id: PaneId,
+        zoomed_size: Option<TerminalSize>,
+    ) -> anyhow::Result<usize> {
+        self.inner
+            .lock()
+            .activate_pane_in_stack(pane_id, zoomed_size)
     }
 
     /// Assigns the root pane.
@@ -3137,9 +3150,13 @@ impl TabInner {
         }
     }
 
-    fn activate_pane_in_stack(&mut self, pane_id: PaneId) -> anyhow::Result<usize> {
+    fn activate_pane_in_stack(
+        &mut self,
+        pane_id: PaneId,
+        zoomed_size: Option<TerminalSize>,
+    ) -> anyhow::Result<usize> {
         if self.zoomed.is_some() {
-            return self.activate_zoomed_pane_in_stack(pane_id);
+            return self.activate_zoomed_pane_in_stack(pane_id, zoomed_size);
         }
 
         let prior = self.get_active_pane();
@@ -3158,7 +3175,11 @@ impl TabInner {
         Ok(pane_index)
     }
 
-    fn activate_zoomed_pane_in_stack(&mut self, pane_id: PaneId) -> anyhow::Result<usize> {
+    fn activate_zoomed_pane_in_stack(
+        &mut self,
+        pane_id: PaneId,
+        zoomed_size: Option<TerminalSize>,
+    ) -> anyhow::Result<usize> {
         let prior = self.get_active_pane();
         let Some(zoomed_pane_id) = prior.as_ref().map(|pane| pane.pane_id()) else {
             anyhow::bail!("cannot switch pane tab while zoomed");
@@ -3199,8 +3220,15 @@ impl TabInner {
                 prior.set_zoomed(false);
             }
             target_pane.set_zoomed(true);
-            if let Err(err) = target_pane.resize(self.size) {
-                log::error!("failed to resize zoomed pane: {err:#}");
+            // As in toggle_zoom: a remote mirror is sized by its frontend,
+            // which takes off its own nav bar and font scale. The raw tab
+            // size is not this pane's, and a mirror would send it on as a
+            // Resize the server then keeps. Where that frontend's size for
+            // the page is known, it is used instead of the raw one.
+            if !target_pane.is_remote_mirror() {
+                if let Err(err) = target_pane.resize(zoomed_size.unwrap_or(self.size)) {
+                    log::error!("failed to resize zoomed pane: {err:#}");
+                }
             }
         }
         self.zoomed.replace(target_pane);
@@ -4333,6 +4361,66 @@ mod test {
         assert_eq!(dimensions.viewport_rows, pane_size.rows);
         assert_eq!(tab.iter_panes()[0].width, tab_size.cols);
         assert_eq!(tab.iter_panes()[0].height, tab_size.rows);
+    }
+
+    #[test]
+    fn switching_a_zoomed_stack_does_not_raw_resize_a_remote_mirror() {
+        let _mux = install_mux();
+        let tab_size = test_size();
+        let pane_size = TerminalSize {
+            rows: 11,
+            cols: 39,
+            pixel_width: 390,
+            pixel_height: 275,
+            dpi: 96,
+        };
+        let tab = Tab::new(&tab_size);
+        let first = FakePane::remote_mirror(1, pane_size);
+        tab.assign_pane(&first);
+        tab.add_pane_to_stack(1, FakePane::remote_mirror(2, pane_size))
+            .unwrap();
+        tab.set_zoomed(true);
+
+        tab.activate_pane_in_stack(1).unwrap();
+
+        assert_eq!(tab.get_zoomed_pane().unwrap().pane_id(), 1);
+        let dimensions = first.get_dimensions();
+        assert_eq!(dimensions.cols, pane_size.cols);
+        assert_eq!(dimensions.viewport_rows, pane_size.rows);
+    }
+
+    #[test]
+    fn switching_a_zoomed_stack_gives_the_page_its_frontend_size() {
+        let _mux = install_mux();
+        let tab_size = test_size();
+        let tab = Tab::new(&tab_size);
+        let first = FakePane::new(1, tab_size);
+        let second = FakePane::new(2, tab_size);
+        tab.assign_pane(&first);
+        tab.add_pane_to_stack(1, Arc::clone(&second)).unwrap();
+        tab.set_zoomed(true);
+        let frontend_size = TerminalSize {
+            rows: 11,
+            cols: 39,
+            pixel_width: 390,
+            pixel_height: 275,
+            dpi: 96,
+        };
+
+        tab.activate_pane_in_stack_sized(1, Some(frontend_size))
+            .unwrap();
+        let dimensions = first.get_dimensions();
+        assert_eq!(dimensions.cols, frontend_size.cols);
+        assert_eq!(dimensions.viewport_rows, frontend_size.rows);
+
+        second.resize(frontend_size).unwrap();
+        tab.activate_pane_in_stack(2).unwrap();
+        let dimensions = second.get_dimensions();
+        assert_eq!(
+            (dimensions.cols, dimensions.viewport_rows),
+            (tab_size.cols, tab_size.rows),
+            "without one the page still gets the whole tab"
+        );
     }
 
     #[test]

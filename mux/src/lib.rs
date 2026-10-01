@@ -283,6 +283,31 @@ fn is_sole_live_renderer(
     })
 }
 
+/// The size the frontend driving `tab_id` last gave `pane_id` over the whole
+/// tab, `root` as it is now: a page of a zoomed stack, which that frontend
+/// sizes before it is shown. None when nobody drives the tab, the driver
+/// reports cells rather than panes, or its layout no longer fits the tab.
+fn driving_frontend_size_over_root(
+    lease: &FrontendLeaseState,
+    tab_id: TabId,
+    pane_id: PaneId,
+    root: wezterm_term::TerminalSize,
+) -> Option<wezterm_term::TerminalSize> {
+    let state = lease.tabs.get(&tab_id)?;
+    let driver = match lease.access_mode {
+        FrontendAccessMode::TmuxLatest => state.owner.as_ref(),
+        FrontendAccessMode::Handoff => lease.handoff_owner.as_ref(),
+    }?;
+    let FrontendViewport::Native { panes, .. } = state.viewports.get(driver)? else {
+        return None;
+    };
+    panes
+        .iter()
+        .find(|pane| pane.pane_id == pane_id)
+        .filter(|pane| pane.frame.cols == root.cols && pane.frame.rows == root.rows)
+        .map(|pane| pane.size)
+}
+
 struct FrontendLeaseState {
     tabs: HashMap<TabId, TabFrontendLease>,
     access_mode: FrontendAccessMode,
@@ -3182,7 +3207,18 @@ impl Mux {
         let tab = self
             .get_tab(tab_id)
             .ok_or_else(|| anyhow!("tab_id {} invalid", tab_id))?;
-        tab.activate_pane_in_stack(pane_id)?;
+        // A zoomed stack gives the page it switches to the whole tab. The
+        // frontend driving the tab has already sized every page for that,
+        // with each page's own font scale and nav bar; the raw tab size was
+        // only put back by that frontend later, the page meanwhile drawn at
+        // the wrong width.
+        let zoomed_size = driving_frontend_size_over_root(
+            &self.frontend_lease.lock(),
+            tab_id,
+            pane_id,
+            tab.get_size(),
+        );
+        tab.activate_pane_in_stack_sized(pane_id, zoomed_size)?;
         Ok(())
     }
 
@@ -3958,6 +3994,86 @@ mod tests {
         let tab = Arc::new(Tab::new(&frontend_test_size(80, 24)));
         mux.add_tab_no_panes(&tab);
         tab.tab_id()
+    }
+
+    #[test]
+    fn a_zoomed_page_takes_the_size_its_driving_frontend_gave_it() {
+        let driver = client_id(90);
+        let other = client_id(91);
+        let root = frontend_test_size(120, 34);
+        let page = FrontendPaneViewport {
+            pane_id: 7,
+            size: frontend_test_size(97, 26),
+            frame: root,
+        };
+        let beside = FrontendPaneViewport {
+            pane_id: 8,
+            size: frontend_test_size(50, 30),
+            frame: frontend_test_size(60, 34),
+        };
+        let tab = TabFrontendLease {
+            owner: Some(driver.clone()),
+            viewports: HashMap::from([
+                (
+                    driver.clone(),
+                    FrontendViewport::Native {
+                        size: root,
+                        panes: vec![page, beside],
+                    },
+                ),
+                (
+                    other.clone(),
+                    FrontendViewport::Native {
+                        size: root,
+                        panes: vec![FrontendPaneViewport {
+                            size: frontend_test_size(10, 5),
+                            ..page
+                        }],
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let mut lease = FrontendLeaseState {
+            tabs: HashMap::from([(3, tab)]),
+            handoff_owner: Some(driver.clone()),
+            ..Default::default()
+        };
+
+        assert_eq!(driving_frontend_size_over_root(&lease, 3, 7, root), Some(page.size));
+        assert_eq!(
+            driving_frontend_size_over_root(&lease, 3, 8, root),
+            None,
+            "a pane that does not cover the tab is not a zoomed page"
+        );
+        assert_eq!(
+            driving_frontend_size_over_root(&lease, 3, 7, frontend_test_size(130, 34)),
+            None,
+            "a layout for a tab of another size"
+        );
+        assert_eq!(driving_frontend_size_over_root(&lease, 3, 9, root), None);
+        assert_eq!(driving_frontend_size_over_root(&lease, 4, 7, root), None);
+
+        lease.handoff_owner = Some(other.clone());
+        assert_eq!(
+            driving_frontend_size_over_root(&lease, 3, 7, root),
+            Some(frontend_test_size(10, 5)),
+            "only the driving frontend's sizes count"
+        );
+        lease.handoff_owner = None;
+        assert_eq!(driving_frontend_size_over_root(&lease, 3, 7, root), None);
+
+        lease.access_mode = FrontendAccessMode::TmuxLatest;
+        assert_eq!(
+            driving_frontend_size_over_root(&lease, 3, 7, root),
+            Some(page.size),
+            "TmuxLatest drives each tab on its own"
+        );
+        lease.tabs.get_mut(&3).unwrap().viewports.insert(
+            driver.clone(),
+            FrontendViewport::CellGrid { size: root },
+        );
+        assert_eq!(driving_frontend_size_over_root(&lease, 3, 7, root), None);
     }
 
     #[test]
