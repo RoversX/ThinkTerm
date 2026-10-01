@@ -4,6 +4,7 @@
 //! and predictive echo. Pure over the host's `Timestamp`; the session in
 //! `pane.rs` does the talking.
 use crate::clock::{RateLimiter, Timestamp};
+use crate::decide::GeometryRepair;
 use crate::lines::*;
 use crate::SessionConfig;
 use codec::InputSerial;
@@ -52,6 +53,9 @@ pub struct PaneState {
     /// line contents, but cannot bounce the visible surface back to an older
     /// grid between mouse-move frames.
     pub(crate) frontend_preview: Option<FrontendPreviewGeometry>,
+    /// A server size that disagrees with the one the frontend settled on,
+    /// and when the frontend last said its own again.
+    pub(crate) geometry_repair: GeometryRepair,
 
     pub(crate) lines: LruCache<StableRowIndex, LineEntry>,
     pub(crate) line_cache_epoch: u64,
@@ -110,6 +114,7 @@ impl PaneState {
             keyboard_encoding: KeyboardEncoding::Xterm,
             server_dimensions: dimensions,
             frontend_preview: None,
+            geometry_repair: GeometryRepair::default(),
             lines: LruCache::new(NonZeroUsize::new(config.scrollback_lines.max(128)).unwrap()),
             line_cache_epoch: 0,
             warmed_epoch: None,
@@ -338,6 +343,14 @@ impl PaneState {
     pub(crate) fn invalidate_line_cache(&mut self, preserve_lines: bool) {
         self.line_cache_epoch = self.line_cache_epoch.wrapping_add(1);
         invalidate_line_entries(&mut self.lines, preserve_lines);
+    }
+
+    /// Like `apply_local_resize`, for a width the server reported: keep the
+    /// cached rows drawable, normalized to `cols` and stale, until the
+    /// refetch replaces them.
+    pub(crate) fn invalidate_line_cache_for_width(&mut self, cols: usize) {
+        self.line_cache_epoch = self.line_cache_epoch.wrapping_add(1);
+        resize_stale_line_entries(&mut self.lines, cols);
     }
 
     /// Converge the locally rendered surface to the geometry requested by the

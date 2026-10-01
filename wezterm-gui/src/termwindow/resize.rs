@@ -2505,7 +2505,11 @@ impl super::TermWindow {
         }
     }
 
-    fn sync_positioned_pane_font_size(&self, pos: &PositionedPane) -> anyhow::Result<()> {
+    fn sync_positioned_pane_font_size(
+        &self,
+        pos: &PositionedPane,
+        settled: bool,
+    ) -> anyhow::Result<()> {
         let pane_id = pos.pane.pane_id();
         let font_scale = self.pane_font_scale(pane_id);
         let render_metrics = if font_scale.to_bits() == self.fonts.get_font_scale().to_bits() {
@@ -2558,6 +2562,17 @@ impl super::TermWindow {
             }
         }
 
+        // Adoption above is local only. A size the server changed on its own
+        // (a zoomed stack switching pages) is otherwise never put back. The
+        // pane may have stopped drawing, so a pending check owes a frame.
+        if settled {
+            if let Some(client) = pos.pane.downcast_ref::<ClientPane>() {
+                if let Some(recheck_in) = client.resend_frontend_geometry_if_ignored(target_size) {
+                    self.update_next_frame_time(Some(Instant::now() + recheck_in));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -2573,12 +2588,15 @@ impl super::TermWindow {
         let Some(tab) = Mux::get().get_active_tab_for_window(self.mux_window_id) else {
             return;
         };
+        // A geometry epoch or a divider preview is still taking the server
+        // to these sizes; only a settled tab is checked for one it kept.
+        let settled = !self.frontend_geometry_phases.contains_key(&tab.tab_id());
         for positioned in self.get_panes_to_render() {
             let Some(members) = self.positioned_panes_for_stack(&tab, &positioned) else {
                 continue;
             };
             for pos in members {
-                if let Err(err) = self.sync_positioned_pane_font_size(&pos) {
+                if let Err(err) = self.sync_positioned_pane_font_size(&pos, settled) {
                     log::error!(
                         "failed to sync font-scaled pane size for pane {}: {:#}",
                         pos.pane.pane_id(),

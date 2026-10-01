@@ -576,6 +576,50 @@ impl ClientPane {
         changed
     }
 
+    /// Send `size` again, as a plain per-pane Resize, once the server has
+    /// kept this pane at another size for a while. Returns how long until
+    /// the caller should check again while that is pending: a pane that
+    /// stopped drawing may not paint by itself.
+    ///
+    /// Adoption only reshapes the local surface and leaves the server to the
+    /// viewport report, which the server skips when it repeats the last one.
+    /// A size the server changed on its own since was then never put back,
+    /// and each push and paint flipped the surface between the two sizes.
+    pub fn resend_frontend_geometry_if_ignored(
+        &self,
+        size: TerminalSize,
+    ) -> Option<std::time::Duration> {
+        let (resend, recheck_in) = self.session.server_geometry_repair(size);
+        if !resend {
+            return recheck_in;
+        }
+        let client = Arc::clone(&self.client);
+        let remote_pane_id = self.remote_pane_id;
+        let remote_tab_id = self.remote_tab_id();
+        log::info!(
+            "the server kept pane {} at another size than {}x{}; sending it again",
+            self.local_pane_id,
+            size.cols,
+            size.rows
+        );
+        promise::spawn::spawn(async move {
+            if let Err(err) = client
+                .client
+                .resize(Resize {
+                    containing_tab_id: remote_tab_id,
+                    pane_id: remote_pane_id,
+                    size,
+                })
+                .await
+            {
+                log::warn!("resending the size of remote pane {remote_pane_id}: {err:#}");
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach();
+        recheck_in
+    }
+
     /// Pin the local render surface to a divider preview epoch. Unlike a
     /// normal adoption this deliberately preserves cached rows and ignores
     /// older server dimensions until the final full viewport is confirmed.

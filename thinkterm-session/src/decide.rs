@@ -1,6 +1,8 @@
 //! Pure decisions a pane makes about resizing, palettes and its watchdog,
 //! off the network so the ordering rules are unit-testable. Moved from the
 //! desktop client's `clientpane.rs`; every client makes these the same way.
+use crate::clock::Timestamp;
+use std::time::Duration;
 use thinkterm_proto::RenderableDimensions;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::TerminalSize;
@@ -198,6 +200,82 @@ pub fn finish_preview_request(
     }
 }
 
+/// How long the server may keep a pane at another size than the one its
+/// frontend settled on before the frontend says it again: long enough for a
+/// viewport report still on its way (debounced, then a round trip) to land.
+pub const GEOMETRY_REPAIR_GRACE: Duration = Duration::from_millis(500);
+/// How long a resent size gets to land before it is sent again.
+pub const GEOMETRY_REPAIR_RETRY: Duration = Duration::from_secs(2);
+/// How often one size is resent before the frontend stops insisting on it.
+pub const GEOMETRY_REPAIR_ATTEMPTS: u32 = 3;
+
+/// A pane whose size on the server disagrees with the one its frontend
+/// settled on.
+///
+/// Viewport reports carry the frontend's sizes, and the server skips a
+/// report identical to the last one. A size the server changed on its own
+/// since (a zoomed pane stack switching pages gives the new page the whole
+/// tab, before the pane's font scale and nav bar) was therefore never put
+/// back: the frontend reshaped only its own copy on every paint, every push
+/// restored the server's, and for a different width that blanked the whole
+/// pane each time.
+#[derive(Debug, Default)]
+pub struct GeometryRepair {
+    target: Option<TerminalSize>,
+    since: Timestamp,
+    sent_at: Option<Timestamp>,
+    attempts: u32,
+}
+
+impl GeometryRepair {
+    /// Whether to resend `target` now, given the dimensions the server last
+    /// reported. The disagreement has to outlast `GEOMETRY_REPAIR_GRACE` for
+    /// the same target; a new target starts the wait over, so a window that
+    /// is still being dragged sends nothing until it holds still.
+    pub fn should_resend(
+        &mut self,
+        server: RenderableDimensions,
+        target: TerminalSize,
+        now: Timestamp,
+    ) -> bool {
+        if render_dimensions_match_size(server, target) {
+            *self = Self::default();
+            return false;
+        }
+        if self.target != Some(target) {
+            *self = Self {
+                target: Some(target),
+                since: now,
+                ..Self::default()
+            };
+            return false;
+        }
+        let due = self.due().is_some_and(|due| now >= due);
+        if due {
+            self.sent_at = Some(now);
+            self.attempts += 1;
+        }
+        due
+    }
+
+    /// How long until `should_resend` could say yes. A pane that stopped
+    /// drawing may not paint again by itself, so the caller has to look
+    /// again then. None when nothing is pending.
+    pub fn next_check_in(&self, now: Timestamp) -> Option<Duration> {
+        self.due().map(|due| due.saturating_duration_since(now))
+    }
+
+    fn due(&self) -> Option<Timestamp> {
+        if self.target.is_none() || self.attempts >= GEOMETRY_REPAIR_ATTEMPTS {
+            return None;
+        }
+        Some(match self.sent_at {
+            None => self.since + GEOMETRY_REPAIR_GRACE,
+            Some(sent_at) => sent_at + GEOMETRY_REPAIR_RETRY,
+        })
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -391,6 +469,105 @@ mod test {
     fn dead_panes_do_not_run_the_render_watchdog() {
         assert!(render_watchdog_should_run(false));
         assert!(!render_watchdog_should_run(true));
+    }
+
+    fn at(ms: u64) -> Timestamp {
+        Timestamp::from_micros(ms * 1000)
+    }
+
+    #[test]
+    fn a_server_left_at_another_size_is_told_again_after_the_grace() {
+        let target = size(97, 26, 144);
+        let server = dimensions(size(118, 34, 144));
+        let mut repair = GeometryRepair::default();
+
+        assert!(!repair.should_resend(server, target, at(0)));
+        assert!(
+            !repair.should_resend(server, target, at(400)),
+            "a report still on its way gets the grace to land"
+        );
+        assert!(repair.should_resend(server, target, at(500)));
+        assert!(
+            !repair.should_resend(server, target, at(600)),
+            "one resend at a time"
+        );
+    }
+
+    #[test]
+    fn a_server_that_agrees_is_left_alone_and_clears_the_repair() {
+        let target = size(97, 26, 144);
+        let mut repair = GeometryRepair::default();
+
+        assert!(!repair.should_resend(dimensions(target), target, at(0)));
+        assert!(!repair.should_resend(dimensions(size(118, 34, 144)), target, at(1000)));
+        assert!(!repair.should_resend(dimensions(target), target, at(1400)));
+        assert!(
+            !repair.should_resend(dimensions(size(118, 34, 144)), target, at(1600)),
+            "agreement in between starts the grace over"
+        );
+        assert!(repair.should_resend(dimensions(size(118, 34, 144)), target, at(2100)));
+    }
+
+    #[test]
+    fn a_target_that_keeps_moving_is_not_resent() {
+        let server = dimensions(size(118, 34, 144));
+        let mut repair = GeometryRepair::default();
+
+        for step in 0..10 {
+            assert!(
+                !repair.should_resend(server, size(80 + step, 26, 144), at(step as u64 * 300)),
+                "a window being dragged is not chased"
+            );
+        }
+    }
+
+    #[test]
+    fn resends_are_spaced_and_end_after_a_few_attempts() {
+        let target = size(97, 26, 144);
+        let server = dimensions(size(118, 34, 144));
+        let mut repair = GeometryRepair::default();
+
+        assert!(!repair.should_resend(server, target, at(0)));
+        assert!(repair.should_resend(server, target, at(500)));
+        assert!(!repair.should_resend(server, target, at(2000)));
+        assert!(repair.should_resend(server, target, at(2500)));
+        assert!(repair.should_resend(server, target, at(4500)));
+        assert!(
+            !repair.should_resend(server, target, at(60_000)),
+            "a server that never takes the size is not asked forever"
+        );
+        assert!(!repair.should_resend(server, size(98, 26, 144), at(60_000)));
+        assert!(
+            repair.should_resend(server, size(98, 26, 144), at(60_500)),
+            "a new target is worth trying again"
+        );
+    }
+
+    #[test]
+    fn a_pending_repair_says_when_to_look_again() {
+        let target = size(97, 26, 144);
+        let server = dimensions(size(118, 34, 144));
+        let mut repair = GeometryRepair::default();
+        assert_eq!(repair.next_check_in(at(0)), None, "nothing pending");
+
+        repair.should_resend(server, target, at(0));
+        assert_eq!(
+            repair.next_check_in(at(100)),
+            Some(Duration::from_millis(400)),
+            "an idle pane is looked at again when the grace ends"
+        );
+        assert!(repair.should_resend(server, target, at(500)));
+        assert_eq!(
+            repair.next_check_in(at(500)),
+            Some(GEOMETRY_REPAIR_RETRY),
+            "and again when a resend that did not land may be retried"
+        );
+        assert!(repair.should_resend(server, target, at(2500)));
+        assert!(repair.should_resend(server, target, at(4500)));
+        assert_eq!(repair.next_check_in(at(4500)), None, "given up");
+
+        repair.should_resend(dimensions(target), target, at(5000));
+        assert_eq!(repair.next_check_in(at(5000)), None, "settled");
     }
 }
 

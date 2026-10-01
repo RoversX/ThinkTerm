@@ -366,6 +366,18 @@ impl<H: SessionHost> PaneSession<H> {
         self.state().server_geometry_matches(size)
     }
 
+    /// Whether the server has kept this pane at another size than `target`
+    /// for long enough that the frontend should send `target` again, and
+    /// how long until it should look again while that is pending; see
+    /// `GeometryRepair`.
+    pub fn server_geometry_repair(&self, target: TerminalSize) -> (bool, Option<Duration>) {
+        let now = self.now();
+        let mut st = self.state();
+        let server = st.server_dimensions;
+        let resend = st.geometry_repair.should_resend(server, target, now);
+        (resend, st.geometry_repair.next_check_in(now))
+    }
+
     /// Which fields or render rows block a takeover from settling on `size`.
     pub fn frontend_geometry_mismatch(&self, size: TerminalSize) -> Option<String> {
         let mut st = self.state();
@@ -928,10 +940,15 @@ impl<H: SessionHost> PaneSession<H> {
             st.frontend_preview.is_some(),
         );
         st.dimensions = visible_dimensions;
-        if let Some(preserve_lines) = invalidate {
+        match invalidate {
             // During a preview, retain old rows while marking them stale. This
             // prevents a blank flash as a full-screen application redraws.
-            st.invalidate_line_cache(preserve_lines);
+            Some(true) => st.invalidate_line_cache(true),
+            // A width this surface did not have keeps them too: clearing them
+            // blanked the whole pane until the refetch landed, on every push
+            // while the server and the frontend disagreed about the width.
+            Some(false) => st.invalidate_line_cache_for_width(visible_dimensions.cols),
+            None => {}
         }
         // Retaining rows is not enough when the resize rewrapped the
         // scrollback: the viewport's stable range moved and the retained
@@ -2242,6 +2259,39 @@ mod tests {
             session.state().line_cache_epoch > epoch_before,
             "the other screen's rows are stale"
         );
+    }
+
+    /// A push carrying a width this surface did not have keeps the cached
+    /// rows drawable: clearing them blanked the whole pane on every push
+    /// while the server and the frontend disagreed about the width.
+    #[test]
+    fn a_push_with_another_width_keeps_the_rows_drawable() {
+        let (host, session) = session(&[(0, "kept")]);
+        session.queue_render_delta(delta(1, false, false));
+        host.spawner.run_all();
+        let _ = session.get_lines(0..1);
+        host.spawner.run_all();
+        session.apply_local_resize(TerminalSize {
+            cols: 60,
+            pixel_width: 600,
+            ..size()
+        });
+
+        session.queue_render_delta(delta(2, false, false));
+        host.spawner.run_all();
+
+        let st = session.state();
+        assert_eq!(st.dimensions.cols, 80, "the server's width is shown");
+        match st.lines.peek(&0) {
+            Some(LineEntry::Stale(line)) => {
+                assert_eq!(line.as_str().trim_end(), "kept");
+                assert_eq!(line.len(), 80, "normalized to the new width");
+            }
+            other => panic!(
+                "row 0 must stay drawable, found {:?}",
+                other.map(|entry| entry.kind())
+            ),
+        }
     }
 
     fn rows_requested(host: &TestHost) -> usize {
