@@ -12,6 +12,7 @@ use url::Url;
 pub mod bitmaps;
 pub use wezterm_color_types as color;
 mod configuration;
+pub use configuration::in_remote_session;
 pub mod connection;
 pub mod os;
 pub mod screen;

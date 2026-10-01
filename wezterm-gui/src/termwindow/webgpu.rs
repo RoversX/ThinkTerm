@@ -435,6 +435,20 @@ pub fn adapter_info_to_gpu_info(info: wgpu::AdapterInfo) -> GpuInfo {
     }
 }
 
+/// The backends a WebGpu instance asks for. Where OpenGL would be Mesa -- a
+/// remote session, or `software` (front_end = "Software") -- Windows leaves
+/// GL out: there it is WGL on opengl32.dll, and once anything has loaded that
+/// DLL the OpenGL renderer can no longer reach the Mesa copy (see
+/// wezterm-gui/build.rs). DX12 and Vulkan still cover WebGpu in those
+/// sessions. Reads no configuration itself; the caller passes `software`.
+pub fn instance_backends(software: bool) -> wgpu::Backends {
+    if cfg!(windows) && (software || window::in_remote_session()) {
+        wgpu::Backends::all().difference(wgpu::Backends::GL)
+    } else {
+        wgpu::Backends::all()
+    }
+}
+
 fn compute_compatibility_list(
     instance: &wgpu::Instance,
     backends: wgpu::Backends,
@@ -470,7 +484,7 @@ impl WebGpuState {
         dimensions: Dimensions,
         config: &ConfigHandle,
     ) -> anyhow::Result<Self> {
-        let backends = wgpu::Backends::all();
+        let backends = instance_backends(config.front_end == config::FrontEndSelection::Software);
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends,
             ..Default::default()

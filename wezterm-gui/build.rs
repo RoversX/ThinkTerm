@@ -20,6 +20,19 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     generate_material_icons().expect("generate material file icon lookup tables");
 
+    // wgpu's GL backend imports opengl32.dll, so the loader used to map the
+    // system copy at process start -- before window/src/os/windows/wgl.rs
+    // could send a remote session to the bundled Mesa copy, and a DLL already
+    // loaded under that name is what every later load gets. Delay-loaded, it
+    // is first loaded by whoever first calls into it. The target, not the
+    // host, decides: this is a linker flag for the binary being built.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        println!("cargo:rustc-link-arg-bins=/DELAYLOAD:opengl32.dll");
+        println!("cargo:rustc-link-arg-bins=delayimp.lib");
+    }
+
     #[cfg(windows)]
     {
         use anyhow::Context as _;

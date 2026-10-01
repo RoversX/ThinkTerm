@@ -81,7 +81,10 @@ pub fn register(lua: &Lua) -> anyhow::Result<()> {
     window_mod.set(
         "enumerate_gpus",
         lua.create_function(|_, _: ()| {
-            let backends = wgpu::Backends::all();
+            // This runs while the configuration is being evaluated, so its
+            // front_end is not known yet -- and asking the global
+            // configuration would wait forever on the lock that holds.
+            let backends = crate::termwindow::webgpu::instance_backends(false);
             let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
                 backends,
                 ..Default::default()
