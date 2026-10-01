@@ -71,36 +71,57 @@ fn encoded_length(value: u64) -> usize {
 
 const COMPRESSED_MASK: u64 = 1 << 63;
 
+/// The frame header (see `encode_raw`), in a buffer with room for `room`
+/// more bytes after it.
+fn encode_header(
+    ident: u64,
+    serial: u64,
+    data_len: usize,
+    is_compressed: bool,
+    room: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let len = data_len + encoded_length(ident) + encoded_length(serial);
+    let masked_len = if is_compressed {
+        (len as u64) | COMPRESSED_MASK
+    } else {
+        len as u64
+    };
+    let mut buffer = Vec::with_capacity(len - data_len + encoded_length(masked_len) + room);
+    leb128::write::unsigned(&mut buffer, masked_len).context("writing pdu len")?;
+    leb128::write::unsigned(&mut buffer, serial).context("writing pdu serial")?;
+    leb128::write::unsigned(&mut buffer, ident).context("writing pdu ident")?;
+    Ok(buffer)
+}
+
+fn record_encoded_size(size: usize, is_compressed: bool) {
+    if is_compressed {
+        metrics::histogram!("pdu.encode.compressed.size").record(size as f64);
+    } else {
+        metrics::histogram!("pdu.encode.size").record(size as f64);
+    }
+}
+
 fn encode_raw_as_vec(
     ident: u64,
     serial: u64,
     data: &[u8],
     is_compressed: bool,
 ) -> anyhow::Result<Vec<u8>> {
-    let len = data.len() + encoded_length(ident) + encoded_length(serial);
-    let masked_len = if is_compressed {
-        (len as u64) | COMPRESSED_MASK
-    } else {
-        len as u64
-    };
-
     // Double-buffer the data; since we run with nodelay enabled, it is
     // desirable for the write to be a single packet (or at least, for
     // the header portion to go out in a single packet)
-    let mut buffer = Vec::with_capacity(len + encoded_length(masked_len));
-
-    leb128::write::unsigned(&mut buffer, masked_len).context("writing pdu len")?;
-    leb128::write::unsigned(&mut buffer, serial).context("writing pdu serial")?;
-    leb128::write::unsigned(&mut buffer, ident).context("writing pdu ident")?;
+    let mut buffer = encode_header(ident, serial, data.len(), is_compressed, data.len())?;
     buffer.extend_from_slice(data);
-
-    if is_compressed {
-        metrics::histogram!("pdu.encode.compressed.size").record(buffer.len() as f64);
-    } else {
-        metrics::histogram!("pdu.encode.size").record(buffer.len() as f64);
-    }
-
+    record_encoded_size(buffer.len(), is_compressed);
     Ok(buffer)
+}
+
+/// A payload this large follows its header in a write of its own instead
+/// of being copied in behind it, which cost a whole copy of every picture.
+/// The header then goes out alone, which only TCP notices, and not at this
+/// size.
+fn written_after_header(data: &[u8]) -> bool {
+    data.len() >= varbincode::LARGE_GROWTH
 }
 
 /// Encode a frame.  If the data is compressed, the high bit of the length
@@ -116,6 +137,13 @@ fn encode_raw<W: std::io::Write>(
     is_compressed: bool,
     mut w: W,
 ) -> anyhow::Result<usize> {
+    if written_after_header(data) {
+        let header = encode_header(ident, serial, data.len(), is_compressed, 0)?;
+        w.write_all(&header).context("writing pdu header")?;
+        w.write_all(data).context("writing pdu data")?;
+        record_encoded_size(header.len() + data.len(), is_compressed);
+        return Ok(header.len() + data.len());
+    }
     let buffer = encode_raw_as_vec(ident, serial, data, is_compressed)?;
     w.write_all(&buffer).context("writing pdu data buffer")?;
     Ok(buffer.len())
@@ -128,6 +156,13 @@ async fn encode_raw_async<W: Unpin + AsyncWriteExt>(
     is_compressed: bool,
     w: &mut W,
 ) -> anyhow::Result<usize> {
+    if written_after_header(data) {
+        let header = encode_header(ident, serial, data.len(), is_compressed, 0)?;
+        w.write_all(&header).await.context("writing pdu header")?;
+        w.write_all(data).await.context("writing pdu data")?;
+        record_encoded_size(header.len() + data.len(), is_compressed);
+        return Ok(header.len() + data.len());
+    }
     let buffer = encode_raw_as_vec(ident, serial, data, is_compressed)?;
     w.write_all(&buffer)
         .await
@@ -177,8 +212,63 @@ fn read_u64<R: std::io::Read>(mut r: R) -> anyhow::Result<u64> {
 struct Decoded {
     ident: u64,
     serial: u64,
-    data: Vec<u8>,
+    data: Payload,
     is_compressed: bool,
+}
+
+/// A payload as it was read, in pieces of at most `PAYLOAD_READ_STEP`. The
+/// declared length is a peer's claim and must not cost anything before the
+/// bytes do, so each piece is allocated as it arrives; kept apart, the
+/// pieces are never copied to make them contiguous, and a picture's bytes
+/// are copied once, into the byte string they belong to.
+#[derive(Debug, Default)]
+struct Payload {
+    pieces: Vec<Vec<u8>>,
+    len: usize,
+}
+
+impl Payload {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn push(&mut self, piece: Vec<u8>) {
+        self.len += piece.len();
+        self.pieces.push(piece);
+    }
+
+    fn reader(&self) -> PayloadReader<'_> {
+        PayloadReader {
+            pieces: &self.pieces,
+            at: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn to_vec(&self) -> Vec<u8> {
+        self.pieces.concat()
+    }
+}
+
+struct PayloadReader<'a> {
+    pieces: &'a [Vec<u8>],
+    at: usize,
+}
+
+impl std::io::Read for PayloadReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while let Some((piece, rest)) = self.pieces.split_first() {
+            if self.at < piece.len() {
+                let n = buf.len().min(piece.len() - self.at);
+                buf[..n].copy_from_slice(&piece[self.at..self.at + n]);
+                self.at += n;
+                return Ok(n);
+            }
+            self.pieces = rest;
+            self.at = 0;
+        }
+        Ok(0)
+    }
 }
 
 /// The largest payload a PDU may declare. Nothing legitimate comes near
@@ -256,20 +346,17 @@ async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
         metrics::histogram!("pdu.decode.size").record(data_len as f64);
     }
 
-    // Grown as the bytes arrive: the declared length is a peer's claim,
-    // and must not cost anything before the bytes do.
-    let mut data = Vec::with_capacity(data_len.min(PAYLOAD_READ_STEP));
+    let mut data = Payload::default();
     while data.len() < data_len {
-        let start = data.len();
-        let chunk = (data_len - start).min(PAYLOAD_READ_STEP);
-        data.resize(start + chunk, 0);
-        r.read_exact(&mut data[start..]).await.with_context(|| {
+        let mut piece = vec![0; (data_len - data.len()).min(PAYLOAD_READ_STEP)];
+        r.read_exact(&mut piece).await.with_context(|| {
             format!(
                 "decode_raw_async failed to read {} bytes of data \
                 for PDU of length {} with serial={} ident={}",
                 data_len, len, serial, ident
             )
         })?;
+        data.push(piece);
     }
     Ok(Decoded {
         ident,
@@ -315,17 +402,16 @@ fn decode_raw<R: std::io::Read>(mut r: R) -> anyhow::Result<Decoded> {
         metrics::histogram!("pdu.decode.size").record(data_len as f64);
     }
 
-    let mut data = Vec::with_capacity(data_len.min(PAYLOAD_READ_STEP));
+    let mut data = Payload::default();
     while data.len() < data_len {
-        let start = data.len();
-        let chunk = (data_len - start).min(PAYLOAD_READ_STEP);
-        data.resize(start + chunk, 0);
-        r.read_exact(&mut data[start..]).with_context(|| {
+        let mut piece = vec![0; (data_len - data.len()).min(PAYLOAD_READ_STEP)];
+        r.read_exact(&mut piece).with_context(|| {
             format!(
                 "reading {} bytes of data for PDU of length {} with serial={} ident={}",
                 data_len, len, serial, ident
             )
         })?;
+        data.push(piece);
     }
     Ok(Decoded {
         ident,
@@ -345,10 +431,51 @@ pub struct DecodedPdu {
 #[cfg(not(target_family = "wasm"))]
 const COMPRESS_THRESH: usize = 32;
 
+/// Room left after a write of `varbincode::LARGE_GROWTH` or more for the
+/// fields that follow it.
+const TRAILING_ROOM: usize = 4096;
+
+/// What a PDU is serialized into, grown through `varbincode::reserve`.
+/// A picture's pixels arrive as one large write; the few fields after
+/// them get room along with it, which spares doubling the buffer again for
+/// a handful of bytes.
+struct PduBuffer(Vec<u8>);
+
+impl PduBuffer {
+    fn append(&mut self, bytes: &[u8]) {
+        if self.0.capacity() - self.0.len() < bytes.len() {
+            let room = if bytes.len() >= varbincode::LARGE_GROWTH {
+                bytes.len() + TRAILING_ROOM
+            } else {
+                bytes.len()
+            };
+            varbincode::reserve(&mut self.0, room, usize::MAX);
+        }
+        self.0.extend_from_slice(bytes);
+    }
+}
+
+impl std::io::Write for PduBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.append(bytes);
+        Ok(bytes.len())
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.append(bytes);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn serialize<T: serde::Serialize>(t: &T) -> Result<(Vec<u8>, bool), Error> {
-    let mut uncompressed = Vec::new();
-    let mut encode = varbincode::Serializer::new(&mut uncompressed);
+    let mut buffer = PduBuffer(Vec::new());
+    let mut encode = varbincode::Serializer::new(&mut buffer);
     t.serialize(&mut encode)?;
+    let uncompressed = buffer.0;
 
     // No zstd on wasm, so a wasm sender never compresses. The receiving side
     // handles both forms regardless, and the outbound traffic of a thin
@@ -416,6 +543,21 @@ fn deserialize<T: serde::de::DeserializeOwned, R: std::io::Read>(
     }
 }
 
+/// `deserialize` for a payload read off the wire. Raw, the payload is the
+/// whole input and already in memory, so a byte string it could hold is
+/// read straight into a buffer of its own size.
+fn deserialize_payload<T: serde::de::DeserializeOwned>(
+    payload: &Payload,
+    is_compressed: bool,
+) -> Result<T, Error> {
+    if is_compressed {
+        return deserialize(payload.reader(), true);
+    }
+    let mut reader = payload.reader();
+    let mut decode = varbincode::Deserializer::with_input_bound(&mut reader, payload.len());
+    serde::Deserialize::deserialize(&mut decode).map_err(Into::into)
+}
+
 macro_rules! pdu {
     ($( $name:ident:$vers:expr),* $(,)?) => {
         #[derive(PartialEq, Debug)]
@@ -474,13 +616,13 @@ macro_rules! pdu {
                 let decoded = decode_raw(r).context("decoding a PDU")?;
                 // The arms only pick the variant's deserializer; see
                 // `decode_async` for why the value is not built in them.
-                let deserialize_variant: fn(&[u8], bool) -> Result<Pdu, Error>;
+                let deserialize_variant: fn(&Payload, bool) -> Result<Pdu, Error>;
                 match decoded.ident {
                     $(
                         $vers => {
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
                             metrics::histogram!("pdu.size.rate", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
-                            deserialize_variant = |data, is_compressed| Ok(Pdu::$name(deserialize(data, is_compressed)?));
+                            deserialize_variant = |data, is_compressed| Ok(Pdu::$name(deserialize_payload(data, is_compressed)?));
                         }
                     ,)*
                     _ => {
@@ -494,7 +636,7 @@ macro_rules! pdu {
                 }
                 Ok(DecodedPdu {
                     serial: decoded.serial,
-                    pdu: deserialize_variant(decoded.data.as_slice(), decoded.is_compressed)?.sanitize_pane_metadata()
+                    pdu: deserialize_variant(&decoded.data, decoded.is_compressed)?.sanitize_pane_metadata()
                 })
             }
 
@@ -514,12 +656,12 @@ macro_rules! pdu {
                 // arms, every variant's value got a stack slot of its own in
                 // an unoptimized build: well over a megabyte in one frame,
                 // enough to overflow a connection thread.
-                let deserialize_variant: fn(&[u8], bool) -> Result<Pdu, Error>;
+                let deserialize_variant: fn(&Payload, bool) -> Result<Pdu, Error>;
                 let name = match decoded.ident {
                     $(
                         $vers => {
                             metrics::histogram!("pdu.size", "pdu" => stringify!($name)).record(decoded.data.len() as f64);
-                            deserialize_variant = |data, is_compressed| Ok(Pdu::$name(deserialize(data, is_compressed)?));
+                            deserialize_variant = |data, is_compressed| Ok(Pdu::$name(deserialize_payload(data, is_compressed)?));
                             stringify!($name)
                         }
                     ,)*
@@ -533,7 +675,7 @@ macro_rules! pdu {
                 };
                 #[cfg(not(target_family = "wasm"))]
                 let deserialize_started = std::time::Instant::now();
-                let pdu = deserialize_variant(decoded.data.as_slice(), decoded.is_compressed)?.sanitize_pane_metadata();
+                let pdu = deserialize_variant(&decoded.data, decoded.is_compressed)?.sanitize_pane_metadata();
                 #[cfg(not(target_family = "wasm"))]
                 if decoded.data.len() > 64 * 1024 {
                     log::debug!(
@@ -2406,6 +2548,35 @@ mod test {
         assert_eq!(back, payload);
     }
 
+    #[test]
+    fn the_fields_after_a_picture_fit_its_allocation() {
+        #[derive(Serialize)]
+        struct Frame {
+            #[serde(with = "serde_bytes")]
+            pixels: Vec<u8>,
+            width: u32,
+            height: u32,
+            hash: [u8; 32],
+        }
+        let frame = Frame {
+            pixels: vec![7; 3 * 1024 * 1024],
+            width: 1920,
+            height: 1080,
+            hash: [3; 32],
+        };
+        let mut buffer = PduBuffer(Vec::new());
+        frame
+            .serialize(&mut varbincode::Serializer::new(&mut buffer))
+            .unwrap();
+        let bytes = buffer.0;
+        assert!(
+            bytes.capacity() <= bytes.len() + TRAILING_ROOM,
+            "doubled for the trailing fields: {} bytes held for {}",
+            bytes.capacity(),
+            bytes.len()
+        );
+    }
+
     // varbincode is vendored outside the workspace, so what the codec
     // relies on from its `reserve` is tested here.
     #[test]
@@ -2445,6 +2616,71 @@ mod test {
             buf.extend(std::iter::repeat(3u8).take(chunk));
         }
         assert_eq!(buf.capacity(), limit);
+    }
+
+    fn payload_of(bytes: &[u8]) -> Payload {
+        let mut payload = Payload::default();
+        for piece in bytes.chunks(PAYLOAD_READ_STEP) {
+            payload.push(piece.to_vec());
+        }
+        payload
+    }
+
+    #[test]
+    fn a_decoded_picture_holds_no_more_than_its_bytes() {
+        let picture = serde_bytes::ByteBuf::from(vec![9u8; 3 * 1024 * 1024 + 3]);
+        let raw = varbincode::serialize(&picture).unwrap();
+        for (bytes, is_compressed) in [(raw, false), serialize(&picture).unwrap()] {
+            let back: serde_bytes::ByteBuf =
+                deserialize_payload(&payload_of(&bytes), is_compressed).unwrap();
+            assert_eq!(back, picture);
+            assert_eq!(back.into_vec().capacity(), picture.len(), "compressed: {}", is_compressed);
+        }
+    }
+
+    #[test]
+    fn a_byte_string_longer_than_the_payload_is_refused() {
+        // Claims 1000 bytes, carries 3.
+        let mut bytes = Vec::new();
+        leb128::write::unsigned(&mut bytes, 1000).unwrap();
+        bytes.extend_from_slice(b"abc");
+        let refused: Result<serde_bytes::ByteBuf, _> = deserialize_payload(&payload_of(&bytes), false);
+        assert!(refused.is_err());
+    }
+
+    #[test]
+    fn a_large_payload_is_read_in_pieces_and_never_put_together() {
+        let payload: Vec<u8> = (0..3 * 1024 * 1024 + 11).map(|n| n as u8).collect();
+        let mut encoded = Vec::new();
+        encode_raw(0x81, 1, &payload, false, &mut encoded).unwrap();
+        let mut encoded_async = futures_lite::io::Cursor::new(Vec::new());
+        futures_lite::future::block_on(encode_raw_async(0x81, 1, &payload, false, &mut encoded_async))
+            .unwrap();
+        assert_eq!(encoded_async.into_inner(), encoded, "both writers frame it the same");
+        assert_eq!(
+            encoded,
+            encode_raw_as_vec(0x81, 1, &payload, false).unwrap(),
+            "the same bytes as one buffer would hold"
+        );
+
+        let check = |decoded: Decoded| {
+            assert_eq!(decoded.data.len(), payload.len());
+            for piece in &decoded.data.pieces {
+                assert!(piece.len() <= PAYLOAD_READ_STEP);
+                assert_eq!(piece.capacity(), piece.len());
+            }
+            let mut back = Vec::new();
+            std::io::Read::read_to_end(&mut decoded.data.reader(), &mut back).unwrap();
+            assert_eq!(back, payload);
+        };
+        check(decode_raw(encoded.as_slice()).unwrap());
+        check(
+            futures_lite::future::block_on(decode_raw_async(
+                &mut futures_lite::io::Cursor::new(encoded),
+                None,
+            ))
+            .unwrap(),
+        );
     }
 
     /// The wasm client's receive path: a native server compresses with the
@@ -2488,7 +2724,7 @@ mod test {
         let decoded = decode_raw(encoded.as_slice()).unwrap();
         assert_eq!(decoded.ident, 0x81);
         assert_eq!(decoded.serial, 0x42);
-        assert_eq!(decoded.data, b"hello");
+        assert_eq!(decoded.data.to_vec(), b"hello");
     }
 
     #[test]
@@ -2502,7 +2738,7 @@ mod test {
             let decoded = decode_raw(encoded.as_slice()).unwrap();
             assert_eq!(decoded.ident, 0x42);
             assert_eq!(decoded.serial, serial);
-            assert_eq!(decoded.data, payload);
+            assert_eq!(decoded.data.to_vec(), payload);
             serial += 1;
         }
     }
