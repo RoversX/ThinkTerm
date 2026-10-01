@@ -1043,6 +1043,7 @@ fn init_config(opts: &Opt) -> anyhow::Result<ConfigHandle> {
         opts.skip_config,
     )
     .context("config::common_init")?;
+    config::ignore_native_settings_changes();
     let config = config::configuration();
     config.update_ulimit()?;
     if let Some(value) = &config.default_ssh_auth_sock {

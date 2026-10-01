@@ -132,6 +132,7 @@ fn run() -> anyhow::Result<()> {
         &opts.config_override,
         opts.skip_config,
     )?;
+    config::ignore_native_settings_changes();
 
     let config = config::configuration();
 

@@ -86,6 +86,73 @@ lazy_static! {
     pub static ref COLOR_SCHEMES: HashMap<String, Palette> = build_default_schemes();
 }
 
+type ReloadFilter = Arc<dyn Fn(&[PathBuf]) -> bool + Send + Sync>;
+
+static RELOAD_FILTER: Mutex<Option<ReloadFilter>> = Mutex::new(None);
+
+/// Let the process decide which changes seen by the config watcher reload
+/// the configuration. Without a filter every change in a watched directory
+/// does. A process that keeps its own files next to the config file uses
+/// this to tell its own bookkeeping writes apart; it must answer true for
+/// anything it does not recognise.
+pub fn set_reload_filter(filter: impl Fn(&[PathBuf]) -> bool + Send + Sync + 'static) {
+    *RELOAD_FILTER.lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::new(filter));
+}
+
+fn reload_wanted(paths: &[PathBuf]) -> bool {
+    // Run outside the lock: the GUI's filter reads and takes in its settings.
+    let filter = RELOAD_FILTER.lock().unwrap_or_else(|err| err.into_inner()).clone();
+    let Some(filter) = filter else {
+        return true;
+    };
+    // A panic would end the watcher thread, and with it every reload after.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| filter(paths))).unwrap_or_else(|_| {
+        log::error!("the config reload filter panicked; reloading for {paths:?}");
+        true
+    })
+}
+
+/// Where the GUI keeps the settings its Settings window edits: next to the
+/// config file, in the folder the config watcher watches.
+pub fn native_settings_path() -> PathBuf {
+    HOME_DIR
+        .join(".config")
+        .join("thinkterm")
+        .join("settings.json")
+}
+
+/// Whether `path`, as the config watcher reported it, is the settings file
+/// `settings` or the temporary file it is written through. The watcher
+/// reports paths with symlinks resolved, so a path that is not literally
+/// one of them is compared by its folder.
+pub fn is_native_settings_file(path: &Path, settings: &Path) -> bool {
+    let tmp = settings.with_extension("json.tmp");
+    if path == settings || path == tmp {
+        return true;
+    }
+    let named = path.file_name() == settings.file_name() || path.file_name() == tmp.file_name();
+    named
+        && match (path.parent(), settings.parent()) {
+            (Some(a), Some(b)) => match (a.canonicalize(), b.canonicalize()) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => false,
+            },
+            _ => false,
+        }
+}
+
+/// For a process that never reads the GUI's settings.json. The GUI rewrites
+/// it as sidebars and windows move, and a change to it alone does not
+/// reload the configuration and the Lua state here.
+pub fn ignore_native_settings_changes() {
+    set_reload_filter(|paths| {
+        let settings = native_settings_path();
+        !paths
+            .iter()
+            .all(|path| is_native_settings_file(path, &settings))
+    });
+}
+
 thread_local! {
     static LUA_CONFIG: RefCell<Option<LuaConfigState>> = RefCell::new(None);
 }
@@ -558,7 +625,6 @@ impl ConfigInner {
             let (tx, rx) = std::sync::mpsc::channel();
             const DELAY: Duration = Duration::from_millis(200);
             let watcher = notify::recommended_watcher(tx).unwrap();
-            let path = path.clone();
 
             std::thread::spawn(move || {
                 // block until we get an event
@@ -587,8 +653,12 @@ impl ConfigInner {
                                 }
                                 paths.sort();
                                 paths.dedup();
-                                log::debug!("paths {:?} changed, reload config", path);
-                                reload();
+                                if reload_wanted(&paths) {
+                                    log::debug!("paths {:?} changed, reload config", paths);
+                                    reload();
+                                } else {
+                                    log::debug!("paths {:?} changed, no reload wanted", paths);
+                                }
                             }
                         }
                         Err(_) => {
@@ -925,6 +995,48 @@ mod runtime_file_name_tests {
             assert_ne!(debug, scoped_runtime_file_name(base, false));
             assert_eq!(debug, format!("{base}-debug"));
         }
+    }
+}
+
+#[cfg(test)]
+mod reload_filter_tests {
+    use super::{is_native_settings_file, reload_wanted, set_reload_filter, RELOAD_FILTER};
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_reload_filter_decides_which_watched_changes_reload() {
+        let lua = PathBuf::from("/devbox/.config/thinkterm/thinkterm.lua");
+        let settings = PathBuf::from("/devbox/.config/thinkterm/settings.json");
+        assert!(reload_wanted(&[settings.clone()]), "without a filter everything reloads");
+
+        set_reload_filter(|paths| !paths.iter().all(|path| path.ends_with("settings.json")));
+        assert!(!reload_wanted(&[settings.clone()]));
+        assert!(reload_wanted(&[settings.clone(), lua]));
+
+        set_reload_filter(|_| panic!("a broken filter"));
+        assert!(reload_wanted(&[settings]), "a filter that panics reloads");
+
+        *RELOAD_FILTER.lock().unwrap() = None;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_settings_file_is_recognised_through_a_symlinked_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let settings = link.join("settings.json");
+
+        assert!(is_native_settings_file(&settings, &settings));
+        assert!(is_native_settings_file(&real.join("settings.json"), &settings));
+        assert!(is_native_settings_file(&real.join("settings.json.tmp"), &settings));
+        assert!(!is_native_settings_file(&real.join("thinkterm.lua"), &settings));
+        assert!(
+            !is_native_settings_file(&dir.path().join("settings.json"), &settings),
+            "a settings.json in another folder"
+        );
     }
 }
 
