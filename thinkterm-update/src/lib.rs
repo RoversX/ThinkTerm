@@ -10,7 +10,9 @@
 
 use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub mod manifest;
 pub mod method;
@@ -102,25 +104,177 @@ impl Asset {
     }
 }
 
-/// Download one release asset and verify it against GitHub's digest when
-/// there is one. A missing digest is reported, not treated as a failure.
-pub fn download_asset(asset: &Asset) -> anyhow::Result<(Vec<u8>, bool)> {
+/// How far an install has got, for whoever is showing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallProgress {
+    /// Fetching the release archive or the Windows installer: bytes so far,
+    /// of the size GitHub recorded for the asset.
+    Downloading { done: u64, total: u64 },
+    /// The download is in and verified; the installer has taken over.
+    Installing,
+}
+
+/// The longest a download goes without telling its watcher how far it is.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// "63.1 MB": binary megabytes, or gigabytes past 1024 of them, the way
+/// Settings shows every size.
+pub fn format_size(bytes: u64) -> String {
+    let mib = bytes as f64 / 1024.0 / 1024.0;
+    if mib >= 1024.0 {
+        format!("{:.2} GB", mib / 1024.0)
+    } else {
+        format!("{mib:.1} MB")
+    }
+}
+
+/// Where a GET's body goes. A redirect's own body is thrown away, so the
+/// sink has to be able to start over.
+trait BodySink: Write {
+    fn restart(&mut self) -> std::io::Result<()>;
+}
+
+impl BodySink for Vec<u8> {
+    fn restart(&mut self) -> std::io::Result<()> {
+        self.clear();
+        Ok(())
+    }
+}
+
+/// A download on its way to disk, hashed and counted as it arrives, with
+/// the count reported at most every `interval`.
+struct DownloadSink<'a> {
+    file: std::fs::File,
+    hasher: sha2::Sha256,
+    done: u64,
+    total: u64,
+    progress: &'a mut dyn FnMut(u64, u64),
+    interval: Duration,
+    reported: Option<Instant>,
+}
+
+impl Write for DownloadSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        self.file.write_all(buf)?;
+        self.hasher.update(buf);
+        self.done += buf.len() as u64;
+        if self
+            .reported
+            .map_or(true, |at| at.elapsed() >= self.interval)
+        {
+            self.reported = Some(Instant::now());
+            (self.progress)(self.done, self.total);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl BodySink for DownloadSink<'_> {
+    fn restart(&mut self) -> std::io::Result<()> {
+        use sha2::Digest;
+        use std::io::{Seek, SeekFrom};
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.hasher = sha2::Sha256::new();
+        self.done = 0;
+        self.reported = None;
+        Ok(())
+    }
+}
+
+/// How many times a download is tried before giving up, as curl's --retry
+/// did when install.sh fetched the archive itself.
+const DOWNLOAD_ATTEMPTS: u64 = 3;
+
+/// Download one release asset to `dest`, reporting `(bytes so far, size)`
+/// as it arrives, and verify it against GitHub's digest when there is one.
+/// Returns whether it was verified: a missing digest is reported, not
+/// treated as a failure. A failed or mismatched download leaves no file.
+pub fn download_asset_to(
+    asset: &Asset,
+    dest: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+) -> anyhow::Result<bool> {
     use sha2::Digest;
-    let body = http_get(&asset.browser_download_url)
-        .with_context(|| format!("downloading {}", asset.name))?;
+    // With a token the repository may be private, and then only the API
+    // serves the bytes; install.sh downloads from there in that case too.
+    let (url, accept) = match update_token() {
+        Some(_) => (asset.url.as_str(), Some("application/octet-stream")),
+        None => (asset.browser_download_url.as_str(), None),
+    };
+    let file =
+        std::fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
+    let mut sink = DownloadSink {
+        file,
+        hasher: sha2::Sha256::new(),
+        done: 0,
+        total: asset.size as u64,
+        progress,
+        interval: PROGRESS_INTERVAL,
+        reported: None,
+    };
+    let mut attempt = 1;
+    let fetched = loop {
+        let mut result = http_get_into(url, accept, &mut sink);
+        if result.is_ok() {
+            result = sink.flush().map_err(anyhow::Error::from);
+        }
+        // http_req ends a body at the first read error instead of failing,
+        // so a dropped connection arrives as a short file: count the bytes.
+        if result.is_ok() && sink.total > 0 && sink.done != sink.total {
+            result = Err(anyhow!(
+                "the download stopped at {} of {} bytes",
+                sink.done,
+                sink.total
+            ));
+        }
+        match result {
+            Err(err)
+                if attempt < DOWNLOAD_ATTEMPTS
+                    && !err.chain().any(|cause| cause.is::<Refused>()) =>
+            {
+                log::warn!("downloading {} (attempt {attempt}): {err:#}", asset.name);
+                std::thread::sleep(Duration::from_secs(attempt));
+                attempt += 1;
+                if let Err(err) = sink.restart() {
+                    break Err(err.into());
+                }
+            }
+            result => break result,
+        }
+    }
+    .with_context(|| format!("downloading {}", asset.name));
+    let DownloadSink {
+        hasher,
+        done,
+        total,
+        progress,
+        ..
+    } = sink;
+    if let Err(err) = fetched {
+        let _ = std::fs::remove_file(dest);
+        return Err(err);
+    }
+    progress(done, total);
     match asset.sha256() {
         Some(expected) => {
-            let got = hex::encode(sha2::Sha256::digest(&body));
+            let got = hex::encode(hasher.finalize());
             if got != expected {
+                let _ = std::fs::remove_file(dest);
                 anyhow::bail!(
                     "checksum mismatch for {}: expected {expected}, got {got}; \
                      the download is corrupt or has been tampered with",
                     asset.name
                 );
             }
-            Ok((body, true))
+            Ok(true)
         }
-        None => Ok((body, false)),
+        None => Ok(false),
     }
 }
 
@@ -132,7 +286,10 @@ pub fn download_asset(asset: &Asset) -> anyhow::Result<(Vec<u8>, bool)> {
 /// skips the "this will install" prompt; the two APPLICATIONS switches let
 /// the installer stop and restart a running ThinkTerm rather than fail on a
 /// locked file. Elevation is the installer's own UAC prompt.
-pub fn run_windows_installer(release: &Release) -> anyhow::Result<()> {
+pub fn run_windows_installer(
+    release: &Release,
+    progress: &mut dyn FnMut(InstallProgress),
+) -> anyhow::Result<()> {
     let version = release.tag_name.trim_start_matches('v');
     let wanted = format!("ThinkTerm-{version}-setup.exe");
     let asset = release
@@ -141,16 +298,16 @@ pub fn run_windows_installer(release: &Release) -> anyhow::Result<()> {
         .find(|a| a.name.eq_ignore_ascii_case(&wanted))
         .ok_or_else(|| anyhow!("release {version} has no {wanted}; see {}", release.html_url))?;
 
-    println!("downloading {} ({} bytes)...", asset.name, asset.size);
-    let (body, verified) = download_asset(asset)?;
-    if !verified {
-        println!("note: GitHub recorded no checksum for this asset; the download was not verified");
-    }
-
     let dir = std::env::temp_dir().join("thinkterm-update");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(&asset.name);
-    std::fs::write(&path, &body).with_context(|| format!("writing {}", path.display()))?;
+    let verified = download_asset_to(asset, &path, &mut |done, total| {
+        progress(InstallProgress::Downloading { done, total })
+    })?;
+    if !verified {
+        println!("note: GitHub recorded no checksum for this asset; the download was not verified");
+    }
+    progress(InstallProgress::Installing);
 
     println!("starting the installer: {}", path.display());
     std::process::Command::new(&path)
@@ -168,40 +325,128 @@ fn get_github_release_info(uri: &str) -> anyhow::Result<Release> {
 }
 
 /// One HTTP GET, whole body in memory. The releases API answers are small
-/// and the installer script is a few dozen kilobytes; nothing here streams.
+/// and the installer script is a few dozen kilobytes; downloads of release
+/// assets go through `download_asset_to` instead.
 pub fn http_get(uri: &str) -> anyhow::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    http_get_into(uri, None, &mut body)?;
+    Ok(body)
+}
+
+/// A token lifts the anonymous API rate limit and is what makes a private
+/// repository reachable at all. It has to be one meant for this: the GUI
+/// runs its check on its own, and a GITHUB_TOKEN the user exported for
+/// other tools must not be sent anywhere by it.
+fn update_token() -> Option<String> {
+    std::env::var("THINKTERM_UPDATE_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
+/// How many redirects a GET follows. GitHub sends every asset download
+/// through one, to signed storage; http_req does not follow them itself.
+const MAX_REDIRECTS: usize = 5;
+
+fn http_get_into<S: BodySink>(
+    uri: &str,
+    accept: Option<&str>,
+    sink: &mut S,
+) -> anyhow::Result<()> {
     use http_req::request::{HttpVersion, Request};
     use http_req::uri::Uri;
     use std::convert::TryFrom;
 
-    let parsed = Uri::try_from(uri)?;
-    let mut body = Vec::new();
-    let mut request = Request::new(&parsed);
-    request
-        .version(HttpVersion::Http10)
-        .header("User-Agent", &format!("thinkterm/{}", config::wezterm_version()));
-    // A token lifts the anonymous API rate limit and is what makes a
-    // private repository reachable at all. It has to be one meant for
-    // this: the GUI runs this check on its own, and a GITHUB_TOKEN the
-    // user exported for other tools must not be sent anywhere by it.
-    let auth = std::env::var("THINKTERM_UPDATE_TOKEN")
+    let auth = update_token().map(|token| format!("Bearer {token}"));
+
+    let mut current = uri.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        // Name the host that answered when a redirect led to another one.
+        let what = match host_of(&current).filter(|_| !same_host(uri, &current)) {
+            Some(host) => format!("{uri} (redirected to {host})"),
+            None => uri.to_string(),
+        };
+        let parsed = Uri::try_from(current.as_str())?;
+        let mut request = Request::new(&parsed);
+        request
+            .version(HttpVersion::Http10)
+            .header("User-Agent", &format!("thinkterm/{}", config::wezterm_version()));
+        if let Some(accept) = accept {
+            request.header("Accept", accept);
+        }
+        // Only to the host the token was meant for: the storage a download
+        // is redirected to is signed already and must not see it.
+        if let Some(auth) = auth.as_ref().filter(|_| same_host(uri, &current)) {
+            request.header("Authorization", auth);
+        }
+        let res = request
+            .send(sink)
+            .map_err(|e| anyhow!("fetching {what}: {e}"))?;
+        let status = res.status_code();
+        if status.is_redirect() {
+            let Some(location) = res.headers().get("Location") else {
+                return Err(Refused(format!("fetching {what}: HTTP {status} without a Location")).into());
+            };
+            current = redirect_target(&current, location)
+                .map_err(|err| Refused(format!("fetching {what}: {err:#}")))?;
+            sink.restart()?;
+            continue;
+        }
+        if !status.is_success() {
+            let message = format!("fetching {what}: HTTP {status} {}", res.reason());
+            // A timeout or a rate limit is worth another try; no other 4xx is.
+            let lasting = status.is_client_err() && !matches!(u16::from(status), 408 | 429);
+            return Err(if lasting {
+                Refused(message).into()
+            } else {
+                anyhow!(message)
+            });
+        }
+        return Ok(());
+    }
+    Err(Refused(format!("fetching {uri}: more than {MAX_REDIRECTS} redirects")).into())
+}
+
+/// An answer that asking again will not change: a 4xx other than a timeout
+/// or a rate limit, or a redirect this does not follow. Anything else -- the
+/// network, a 5xx, a short body -- may come out differently the next time.
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+fn host_of(uri: &str) -> Option<String> {
+    use http_req::uri::Uri;
+    use std::convert::TryFrom;
+    Uri::try_from(uri)
         .ok()
-        .filter(|t| !t.trim().is_empty())
-        .map(|t| format!("Bearer {}", t.trim()));
-    if let Some(auth) = &auth {
-        request.header("Authorization", auth);
+        .and_then(|uri| uri.host().map(str::to_ascii_lowercase))
+}
+
+fn same_host(a: &str, b: &str) -> bool {
+    matches!((host_of(a), host_of(b)), (Some(a), Some(b)) if a == b)
+}
+
+/// Where a redirect from `current` to `location` leads. Only https is
+/// followed: a download that finished over plain http could have been
+/// swapped on the way.
+fn redirect_target(current: &str, location: &str) -> anyhow::Result<String> {
+    let location = location.trim();
+    if location.starts_with("https://") {
+        return Ok(location.to_string());
     }
-    let res = request
-        .send(&mut body)
-        .map_err(|e| anyhow!("fetching {uri}: {e}"))?;
-    if !res.status_code().is_success() {
-        anyhow::bail!(
-            "fetching {uri}: HTTP {} {}",
-            res.status_code(),
-            res.reason()
-        );
+    if location.starts_with('/') && !location.starts_with("//") && current.starts_with("https://") {
+        let rest = &current["https://".len()..];
+        let origin_len = "https://".len() + rest.find('/').unwrap_or(rest.len());
+        return Ok(format!("{}{location}", &current[..origin_len]));
     }
-    Ok(body)
+    anyhow::bail!("refusing to follow a redirect to {location:?}")
 }
 
 pub fn get_latest_release_info() -> anyhow::Result<Release> {
@@ -322,39 +567,119 @@ pub fn takeover_command() -> String {
         .to_string()
 }
 
+/// The release archive `install.sh` installs for `variant` on this machine,
+/// named exactly as its `asset_name` names it; None where it has no build.
+pub fn install_asset_name(variant: &str, version: &str) -> Option<String> {
+    asset_name_for(std::env::consts::OS, std::env::consts::ARCH, variant, version)
+}
+
+fn asset_name_for(os: &str, arch: &str, variant: &str, version: &str) -> Option<String> {
+    match (os, arch, variant) {
+        ("linux", "x86_64" | "aarch64", "desktop") => {
+            Some(format!("thinkterm-{version}-linux-{arch}.tar.gz"))
+        }
+        ("linux", "x86_64" | "aarch64", "server") => {
+            Some(format!("thinkterm-server-{version}-linux-{arch}.tar.gz"))
+        }
+        // One bundle serves both variants, named the way uname -m names
+        // the architecture there.
+        ("macos", "aarch64", _) => Some(format!("ThinkTerm-macos-arm64-{version}.zip")),
+        ("macos", "x86_64", _) => Some(format!("ThinkTerm-macos-x86_64-{version}.zip")),
+        _ => None,
+    }
+}
+
 /// Run `install.sh` on this machine for the install the manifest describes,
-/// asking it for release `tag`. The script is fetched fresh and fed to `sh`
-/// on stdin, exactly as the documented `curl | sh` does, so there is one
-/// installer to keep correct rather than two.
+/// installing `release`. The script is fetched fresh and fed to `sh` on
+/// stdin, exactly as the documented `curl | sh` does, so there is one
+/// installer to keep correct rather than two. The release archive is
+/// downloaded here first, so `progress` can follow it, and handed to the
+/// script with `--from`.
 ///
 /// Returns once the script has finished; its own output goes straight to the
 /// terminal, which is where a person running `thinkterm update` is looking.
-pub fn run_local_installer(manifest: &InstallManifest, tag: &str) -> anyhow::Result<()> {
-    run_installer(manifest, tag, false).map(|_| ())
+pub fn run_local_installer(
+    manifest: &InstallManifest,
+    release: &Release,
+    progress: &mut dyn FnMut(InstallProgress),
+) -> anyhow::Result<()> {
+    run_installer(manifest, release, false, progress).map(|_| ())
 }
 
 /// The same, with the installer's output collected and returned instead of
 /// written to the terminal: what a GUI that has no terminal shows in its
 /// own window. On failure the output is in the error's message.
-pub fn run_local_installer_captured(manifest: &InstallManifest, tag: &str) -> anyhow::Result<String> {
-    run_installer(manifest, tag, true)
+pub fn run_local_installer_captured(
+    manifest: &InstallManifest,
+    release: &Release,
+    progress: &mut dyn FnMut(InstallProgress),
+) -> anyhow::Result<String> {
+    run_installer(manifest, release, true, progress)
 }
 
-fn run_installer(manifest: &InstallManifest, tag: &str, capture: bool) -> anyhow::Result<String> {
-    use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
-
+fn run_installer(
+    manifest: &InstallManifest,
+    release: &Release,
+    capture: bool,
+    progress: &mut dyn FnMut(InstallProgress),
+) -> anyhow::Result<String> {
     let script = http_get(INSTALL_SCRIPT_URL)
         .with_context(|| format!("downloading the installer from {INSTALL_SCRIPT_URL}"))?;
+
+    // Only an archive GitHub recorded a checksum for is fetched here: it is
+    // checked against that before the script sees it, and the script checks
+    // nothing it is handed with --from. Without one, or without an archive
+    // under the name the script would fetch, the script finds, downloads and
+    // judges it itself, as it always has -- just without a progress report.
+    let version = release.tag_name.trim_start_matches('v');
+    let asset = install_asset_name(&manifest.variant, version)
+        .and_then(|name| release.assets.iter().find(|asset| asset.name == name))
+        .filter(|asset| asset.sha256().is_some());
+    // The directory, and the archive in it, go when this returns.
+    let staged = match asset {
+        Some(asset) => {
+            let dir = tempfile::Builder::new()
+                .prefix("thinkterm-update-")
+                .tempdir()
+                .context("creating a directory to download into")?;
+            let path = dir.path().join(&asset.name);
+            download_asset_to(asset, &path, &mut |done, total| {
+                progress(InstallProgress::Downloading { done, total })
+            })?;
+            Some((dir, path))
+        }
+        None => None,
+    };
+    progress(InstallProgress::Installing);
+    run_install_script(
+        manifest,
+        &release.tag_name,
+        staged.as_ref().map(|(_, path)| path.as_path()),
+        &script,
+        capture,
+    )
+}
+
+fn run_install_script(
+    manifest: &InstallManifest,
+    tag: &str,
+    from: Option<&Path>,
+    script: &[u8],
+    capture: bool,
+) -> anyhow::Result<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
 
     let mut cmd = Command::new("sh");
     cmd.arg("-s")
         .arg("--")
-        .arg(format!("--{}", manifest.variant))
-        .arg("--version")
-        .arg(tag)
-        .arg("--prefix")
-        .arg(&manifest.prefix);
+        .arg(format!("--{}", manifest.variant));
+    if let Some(archive) = from {
+        cmd.arg("--from").arg(archive);
+    }
+    // With --from the script looks nothing up; the version still names the
+    // install in the manifest it writes.
+    cmd.arg("--version").arg(tag).arg("--prefix").arg(&manifest.prefix);
     if let Some(app) = &manifest.app {
         if let Some(dir) = Path::new(app).parent() {
             cmd.arg("--app-dir").arg(dir);
@@ -447,6 +772,109 @@ mod tests {
             "Info.plist version {version:?} must parse as semver, or macOS \
              builds cannot be compared against a release tag"
         );
+    }
+
+    #[test]
+    fn redirects_are_followed_only_to_https() {
+        assert_eq!(
+            redirect_target(
+                "https://github.com/o/r/releases/download/1.0/a.zip",
+                "https://objects.example.com/a?sig=1"
+            )
+            .unwrap(),
+            "https://objects.example.com/a?sig=1"
+        );
+        assert_eq!(
+            redirect_target("https://api.github.com/repos/o/r/releases/latest", "/repositories/1/releases/latest")
+                .unwrap(),
+            "https://api.github.com/repositories/1/releases/latest"
+        );
+        assert!(redirect_target("https://github.com/a", "http://example.com/a").is_err());
+        assert!(redirect_target("https://github.com/a", "//example.com/a").is_err());
+        assert!(redirect_target("https://github.com/a", "a.zip").is_err());
+    }
+
+    #[test]
+    fn the_token_stays_on_its_own_host() {
+        assert!(same_host(
+            "https://api.github.com/repos/o/r/releases/latest",
+            "https://API.github.com/repositories/1/releases/latest"
+        ));
+        assert!(!same_host(
+            "https://github.com/o/r/releases/download/1.0/a.zip",
+            "https://objects.example.com/a?sig=1"
+        ));
+    }
+
+    #[test]
+    fn a_download_counts_hashes_and_starts_over() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asset");
+        let mut reports = Vec::new();
+        let mut progress = |done: u64, total: u64| reports.push((done, total));
+        let mut sink = DownloadSink {
+            file: std::fs::File::create(&path).unwrap(),
+            hasher: sha2::Sha256::new(),
+            done: 0,
+            total: 11,
+            progress: &mut progress,
+            // Long enough that no pause in a busy test run reaches it.
+            interval: Duration::from_secs(3600),
+            reported: None,
+        };
+        sink.write_all(b"redirected").unwrap();
+        sink.restart().unwrap();
+        sink.write_all(b"hello ").unwrap();
+        sink.write_all(b"world").unwrap();
+        sink.flush().unwrap();
+        let DownloadSink { hasher, done, .. } = sink;
+        assert_eq!(done, 11);
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
+        assert_eq!(
+            hex::encode(hasher.finalize()),
+            hex::encode(sha2::Sha256::digest(b"hello world"))
+        );
+        // The first write reports at once, and so does the first after
+        // starting over; the rest wait out the interval.
+        assert_eq!(reports, vec![(10, 11), (6, 11)]);
+    }
+
+    /// The archive downloaded here is handed to install.sh by name, so the
+    /// names have to be the ones its own `asset_name` would fetch.
+    #[cfg(unix)]
+    #[test]
+    fn asset_names_match_the_installer() {
+        let script = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../install.sh"),
+        )
+        .unwrap();
+        let start = script.find("asset_name() {").expect("install.sh defines asset_name");
+        let end = start + script[start..].find("\n}\n").expect("asset_name ends") + 3;
+        let function = &script[start..end];
+        // (Rust's os and arch, install.sh's os and arch, variant)
+        let cases = [
+            ("linux", "x86_64", "linux", "x86_64", "desktop"),
+            ("linux", "aarch64", "linux", "aarch64", "server"),
+            ("macos", "aarch64", "macos", "arm64", "desktop"),
+            ("macos", "x86_64", "macos", "x86_64", "server"),
+        ];
+        for (os, arch, sh_os, sh_arch, variant) in cases {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "{function}os={sh_os}; arch={sh_arch}; variant={variant}; asset_name 1.2.3"
+                ))
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            assert_eq!(
+                asset_name_for(os, arch, variant, "1.2.3").as_deref(),
+                Some(String::from_utf8_lossy(&out.stdout).trim()),
+                "{os}/{arch}/{variant}"
+            );
+        }
+        assert_eq!(asset_name_for("windows", "x86_64", "desktop", "1.2.3"), None);
     }
 
     #[test]

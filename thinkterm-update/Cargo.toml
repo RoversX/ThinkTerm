@@ -14,9 +14,7 @@ sha2.workspace = true
 hex.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 plist.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

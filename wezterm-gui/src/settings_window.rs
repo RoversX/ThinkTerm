@@ -359,15 +359,85 @@ pub(crate) fn follow_open_settings_window(
     });
 }
 
-fn settings_window_for_instance(instance_id: u64) -> Option<Rc<RefCell<SettingsWindow>>> {
+thread_local! {
+    /// The install started from Settings. Kept apart from any one Settings
+    /// window: closing and reopening Settings must not forget that it runs,
+    /// or a second press would start another installer over it.
+    static UPDATE_INSTALL: RefCell<Option<UpdateInstall>> = const { RefCell::new(None) };
+    /// A Check for Updates press, kept the same way for the same reason.
+    static UPDATE_CHECK: RefCell<Option<UpdateCheck>> = const { RefCell::new(None) };
+}
+
+fn update_install() -> Option<UpdateInstall> {
+    UPDATE_INSTALL.with(|install| install.borrow().clone())
+}
+
+fn set_update_install(install: Option<UpdateInstall>) {
+    UPDATE_INSTALL.with(|slot| *slot.borrow_mut() = install);
+}
+
+fn update_check() -> Option<UpdateCheck> {
+    UPDATE_CHECK.with(|check| check.borrow().clone())
+}
+
+fn set_update_check(check: Option<UpdateCheck>) {
+    UPDATE_CHECK.with(|slot| *slot.borrow_mut() = check);
+}
+
+/// Whichever Settings window is open now, of any instance: the one an
+/// install started from may have been closed and another opened since.
+fn open_settings_window() -> Option<Rc<RefCell<SettingsWindow>>> {
+    open_settings_window_with_id().map(|(_, settings)| settings)
+}
+
+fn open_settings_window_with_id() -> Option<(u64, Rc<RefCell<SettingsWindow>>)> {
     SETTINGS_WINDOW.with(|slot| match &*slot.borrow() {
         SettingsWindowSlot::Open {
-            instance_id: current_id,
+            instance_id,
             settings,
-        } if *current_id == instance_id => Some(Rc::clone(settings)),
+        } => Some((*instance_id, Rc::clone(settings))),
         SettingsWindowSlot::Closed | SettingsWindowSlot::Opening(_) => None,
-        SettingsWindowSlot::Open { .. } => None,
     })
+}
+
+/// Whether restarting ends terminals: a shell this process runs itself -- in
+/// process, or over a direct SSH session -- goes with it, where one in the
+/// session server or another mux server is kept for the next GUI.
+fn restart_ends_terminals() -> bool {
+    let Some(mux) = mux::Mux::try_get() else {
+        return false;
+    };
+    mux.iter_panes().iter().any(|pane| {
+        mux.get_domain(pane.domain_id()).is_some_and(|domain| {
+            domain.downcast_ref::<mux::domain::LocalDomain>().is_some()
+                || domain.downcast_ref::<mux::ssh::RemoteSshDomain>().is_some()
+        })
+    })
+}
+
+/// Repaint the open Settings window for a change to the install. With
+/// `refresh`, first reread what the page knows about the installed copy,
+/// which a finished install has just changed.
+fn repaint_open_settings(refresh: bool) {
+    let Some(settings) = open_settings_window() else {
+        return;
+    };
+    let Ok(mut settings) = settings.try_borrow_mut() else {
+        return;
+    };
+    if refresh {
+        settings.ui.update_status = Some(crate::update::cached_update_status());
+        settings.ui.update_method = Some(thinkterm_update::InstallMethod::detect());
+    }
+    if let Some(window) = settings.window.as_ref() {
+        window.invalidate();
+    }
+}
+
+fn settings_window_for_instance(instance_id: u64) -> Option<Rc<RefCell<SettingsWindow>>> {
+    open_settings_window_with_id()
+        .filter(|(current_id, _)| *current_id == instance_id)
+        .map(|(_, settings)| settings)
 }
 
 fn settings_window_pixel_size(
@@ -410,14 +480,33 @@ enum HeroBadge {
 /// An install run from the Update page, from the click to its outcome.
 #[derive(Debug, Clone)]
 enum UpdateInstall {
+    /// `progress` is None until the installer first reports;
+    /// `download_started` is when the first download report came in, which
+    /// the time-left estimate counts from.
+    Running {
+        version: String,
+        progress: Option<thinkterm_update::InstallProgress>,
+        download_started: Option<Instant>,
+    },
+    Installed {
+        version: String,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+/// A Check for Updates press still asking GitHub, or how it went wrong.
+#[derive(Debug, Clone)]
+enum UpdateCheck {
     Running,
-    Installed { version: String },
     Failed { error: String },
 }
 
-/// What the Update page's status card can say. Derived from the on-disk
-/// check cache rather than from a live query, which is why "up to date" is
-/// only ever claimed for a build that actually carries a release tag.
+/// What the last check found, as the Update page's status card says it.
+/// Read from the on-disk check cache, which the background checker and
+/// Check for Updates both write; "up to date" is only ever claimed for a
+/// build that actually carries a release tag.
 #[derive(Debug, Clone)]
 enum UpdateHero {
     /// No usable result on disk: either no check has run, or the cache is
@@ -430,18 +519,6 @@ enum UpdateHero {
     /// A commit-stamped build from a plain checkout. It has no ordering
     /// against any release tag, so releases simply do not apply to it.
     LocalBuild,
-}
-
-/// Semantic accents for the status badges. They stay local rather than
-/// joining UiPalette because nothing else in the chrome carries a success or
-/// neutral status color, and a token would imply a system that does not
-/// exist. The action tint is not here: that one *is* the accent, so it reads
-/// `palette.accent`.
-fn status_tint_positive(appearance: Appearance) -> LinearRgba {
-    match appearance {
-        Appearance::Light | Appearance::LightHighContrast => rgba(52, 199, 89, 1.0),
-        Appearance::Dark | Appearance::DarkHighContrast => rgba(48, 209, 88, 1.0),
-    }
 }
 
 /// Secondary text sits a step below the label. Clamped at 350 so a user who
@@ -475,6 +552,27 @@ fn format_check_interval(seconds: u64) -> String {
             &[("count", (s.max(60) / 60).to_string())],
         ),
     }
+}
+
+/// "about 12 s left", from the average rate since the download started;
+/// None until it has run for a second, when the rate means little.
+fn download_time_left(started: Instant, done: u64, total: u64) -> Option<String> {
+    let elapsed = started.elapsed().as_secs_f64();
+    if elapsed < 1.0 || done == 0 || done >= total {
+        return None;
+    }
+    let left = (total - done) as f64 / (done as f64 / elapsed);
+    Some(if left < 60.0 {
+        settings_tr(
+            "settings-update-seconds-left",
+            &[("count", (left.ceil() as u64).max(1).to_string())],
+        )
+    } else {
+        settings_tr(
+            "settings-update-minutes-left",
+            &[("count", ((left / 60.0).ceil() as u64).to_string())],
+        )
+    })
 }
 
 /// "just now" / "N minutes ago" / "N hours ago" / a local date. The recent
@@ -1906,8 +2004,8 @@ struct SettingsUiState {
     confirm_stop_server: bool,
     input_diagnostics_copied_until: Option<Instant>,
     /// The Update page's view of the on-disk check cache. Read when the
-    /// section is entered and when Check Now is clicked, never while
-    /// painting: it stats and reads a file, and the paint path must not.
+    /// section is entered and when a check from the page finishes, never
+    /// while painting: it stats and reads a file, and the paint path must not.
     update_status: Option<crate::update::CachedUpdateStatus>,
     /// Set briefly after Check Now so the button can report that it ran even
     /// when the cached answer is unchanged.
@@ -1916,9 +2014,6 @@ struct SettingsUiState {
     /// install an update itself or only say who can. Read with the status:
     /// it looks at the filesystem, so never on the paint path.
     update_method: Option<thinkterm_update::InstallMethod>,
-    /// The install started from this page, if any. Runs on its own thread
-    /// and reports back through the instance id.
-    update_install: Option<UpdateInstall>,
     version_info_copied_until: Option<Instant>,
     sidebar_scrollbar_visible_until: Option<Instant>,
     content_scrollbar_visible_until: Option<Instant>,
@@ -2010,7 +2105,6 @@ impl SettingsUiState {
             update_status: None,
             update_checked_until: None,
             update_method: None,
-            update_install: None,
             version_info_copied_until: None,
             sidebar_scrollbar_visible_until: None,
             content_scrollbar_visible_until: None,
@@ -2138,12 +2232,7 @@ impl RowCursor {
 }
 
 fn format_bytes(bytes: u64) -> String {
-    let mib = bytes as f64 / 1024.0 / 1024.0;
-    if mib >= 1024.0 {
-        format!("{:.2} GB", mib / 1024.0)
-    } else {
-        format!("{mib:.1} MB")
-    }
+    thinkterm_update::format_size(bytes)
 }
 
 fn capture_memory_snapshot(detailed: bool) -> MemorySnapshot {
@@ -4846,6 +4935,11 @@ impl SettingsWindow {
             // another section.
             self.ui.update_status = Some(crate::update::cached_update_status());
             self.ui.update_method = Some(thinkterm_update::InstallMethod::detect());
+            // A failed check from an earlier visit says nothing about the
+            // cache just read, which a later check may have refreshed.
+            if matches!(update_check(), Some(UpdateCheck::Failed { .. })) {
+                set_update_check(None);
+            }
         }
     }
 
@@ -5152,6 +5246,11 @@ impl SettingsWindow {
             }
             SettingsAction::RestartApplication => {
                 self.ui.open_dropdown = None;
+                // Not while an install from the Update page runs: quitting
+                // would cut the installer off half way through its work.
+                if matches!(update_install(), Some(UpdateInstall::Running { .. })) {
+                    return;
+                }
                 match Self::restart_application() {
                     Ok(()) => {
                         self.status = crate::i18n::tr("settings-status-restarting");
@@ -5715,19 +5814,51 @@ impl SettingsWindow {
             }
             SettingsAction::CheckForUpdates => {
                 self.ui.open_dropdown = None;
-                // The live query is not wired up yet. Re-reading the cache the
-                // background checker maintains is the same answer a check that
-                // found nothing new would produce, and it costs one stat plus
-                // one small read rather than a blocking HTTP request on the UI
-                // thread. The live check replaces this call, not the button.
-                self.ui.update_status = Some(crate::update::cached_update_status());
-            self.ui.update_method = Some(thinkterm_update::InstallMethod::detect());
-                self.ui.update_checked_until = Some(Instant::now() + Duration::from_millis(1400));
-                self.schedule_copied_state_clear(window);
+                if matches!(update_check(), Some(UpdateCheck::Running)) {
+                    return;
+                }
+                set_update_check(Some(UpdateCheck::Running));
+                // A new check is the next attempt after a failed install.
+                if matches!(update_install(), Some(UpdateInstall::Failed { .. })) {
+                    set_update_install(None);
+                }
+                window.invalidate();
+
+                // A live query to GitHub: off the UI thread, with the answer
+                // posted back to whichever Settings window is open by then.
+                let spawned = std::thread::Builder::new()
+                    .name("thinkterm-update-check".into())
+                    .spawn(move || {
+                        let result = crate::update::check_now();
+                        promise::spawn::spawn_into_main_thread(async move {
+                            let checked = result.is_ok();
+                            set_update_check(result.err().map(|err| UpdateCheck::Failed {
+                                error: format!("{err:#}"),
+                            }));
+                            repaint_open_settings(true);
+                            // Let the button say it ran, even when the answer
+                            // is the one already showing.
+                            if let Some(settings) = open_settings_window().filter(|_| checked) {
+                                if let Ok(mut settings) = settings.try_borrow_mut() {
+                                    settings.ui.update_checked_until =
+                                        Some(Instant::now() + Duration::from_millis(1400));
+                                    if let Some(window) = settings.window.clone() {
+                                        settings.schedule_copied_state_clear(&window);
+                                    }
+                                }
+                            }
+                        })
+                        .detach();
+                    });
+                if let Err(err) = spawned {
+                    set_update_check(Some(UpdateCheck::Failed {
+                        error: err.to_string(),
+                    }));
+                }
             }
             SettingsAction::InstallUpdate => {
                 self.ui.open_dropdown = None;
-                if matches!(self.ui.update_install, Some(UpdateInstall::Running)) {
+                if matches!(update_install(), Some(UpdateInstall::Running { .. })) {
                     return;
                 }
                 let Some(release) = self
@@ -5743,25 +5874,77 @@ impl SettingsWindow {
                     .update_method
                     .clone()
                     .unwrap_or_else(thinkterm_update::InstallMethod::detect);
-                self.ui.update_install = Some(UpdateInstall::Running);
+                let version = release.tag_name.trim_start_matches('v').to_string();
+                set_update_install(Some(UpdateInstall::Running {
+                    version: version.clone(),
+                    progress: None,
+                    download_started: None,
+                }));
+                if matches!(update_check(), Some(UpdateCheck::Failed { .. })) {
+                    set_update_check(None);
+                }
                 window.invalidate();
 
                 // The installer downloads and replaces files: off the UI
-                // thread, with the outcome posted back to whichever settings
-                // window instance asked, if it is still open.
-                let instance_id = self.instance_id;
-                let window = window.clone();
-                std::thread::Builder::new()
+                // thread, with its progress and outcome posted back to
+                // whichever Settings window is open by then.
+                let spawned = std::thread::Builder::new()
                     .name("thinkterm-update-install".into())
                     .spawn(move || {
-                        let version = release.tag_name.trim_start_matches('v').to_string();
+                        // A cache written by a build that did not keep
+                        // GitHub's checksums lacks them: ask for the release
+                        // again then, and settle for the cache if that fails.
+                        let release = if release.assets.iter().any(|a| a.sha256().is_none()) {
+                            thinkterm_update::get_release_by_tag(&release.tag_name)
+                                .unwrap_or(release)
+                        } else {
+                            release
+                        };
+                        let mut progress = |progress| {
+                            promise::spawn::spawn_into_main_thread(async move {
+                                // Never over the outcome, should a report
+                                // land after it.
+                                let reported = UPDATE_INSTALL.with(|install| {
+                                    let mut install = install.borrow_mut();
+                                    let Some(UpdateInstall::Running {
+                                        progress: current,
+                                        download_started,
+                                        ..
+                                    }) = &mut *install
+                                    else {
+                                        return false;
+                                    };
+                                    use thinkterm_update::InstallProgress;
+                                    if let InstallProgress::Downloading { done, .. } = progress {
+                                        // A retry, or a redirect's body thrown
+                                        // away, starts the count over, and the
+                                        // rate is timed from there.
+                                        let restarted = matches!(
+                                            current,
+                                            Some(InstallProgress::Downloading { done: before, .. })
+                                                if done < *before
+                                        );
+                                        if download_started.is_none() || restarted {
+                                            *download_started = Some(Instant::now());
+                                        }
+                                    }
+                                    *current = Some(progress);
+                                    true
+                                });
+                                if reported {
+                                    repaint_open_settings(false);
+                                }
+                            })
+                            .detach();
+                        };
                         let result = if cfg!(windows) {
-                            thinkterm_update::run_windows_installer(&release).map(|_| ())
+                            thinkterm_update::run_windows_installer(&release, &mut progress)
                         } else {
                             match method.manifest_for_install() {
                                 Some(manifest) => thinkterm_update::run_local_installer_captured(
                                     &manifest,
-                                    &release.tag_name,
+                                    &release,
+                                    &mut progress,
                                 )
                                 .map(|_| ()),
                                 None => Err(anyhow::anyhow!("{}", method.how_to_update())),
@@ -5774,19 +5957,16 @@ impl SettingsWindow {
                             },
                         };
                         promise::spawn::spawn_into_main_thread(async move {
-                            if let Some(settings) = settings_window_for_instance(instance_id) {
-                                let mut settings = settings.borrow_mut();
-                                settings.ui.update_install = Some(outcome);
-                                settings.ui.update_status =
-                                    Some(crate::update::cached_update_status());
-                                settings.ui.update_method =
-                                    Some(thinkterm_update::InstallMethod::detect());
-                                window.invalidate();
-                            }
+                            set_update_install(Some(outcome));
+                            repaint_open_settings(true);
                         })
                         .detach();
-                    })
-                    .ok();
+                    });
+                if let Err(err) = spawned {
+                    set_update_install(Some(UpdateInstall::Failed {
+                        error: err.to_string(),
+                    }));
+                }
             }
             SettingsAction::OpenLatestRelease => {
                 self.ui.open_dropdown = None;
@@ -13134,9 +13314,8 @@ impl SettingsWindow {
         Ok(cursor_y + height - y)
     }
 
-    /// What the Update hero is currently able to say. Derived entirely from
-    /// the cache the background checker writes; a live check will produce
-    /// these same states once one is wired up.
+    /// What the last check found, from the cache every check writes. An
+    /// install or a check in flight is said over it; see `paint_update`.
     fn update_hero(&self) -> UpdateHero {
         let Some(status) = self.ui.update_status.as_ref() else {
             return UpdateHero::Unknown;
@@ -13201,6 +13380,7 @@ impl SettingsWindow {
         badge: HeroBadge,
         headline: &str,
         subline: &str,
+        progress: Option<f32>,
         button: Option<(String, SettingsAction)>,
     ) -> anyhow::Result<f32> {
         let palette = self.palette();
@@ -13237,7 +13417,15 @@ impl SettingsWindow {
         let text_x = mark_x + mark + self.ui_px(24.0);
         let text_width = (text_right - text_x).max(self.ui_px(120.0));
         let line_gap = self.ui_px(12.0);
-        let text_y = y + (height - (cell * 2.0 + line_gap)) / 2.0;
+        // A progress bar goes between the two lines, with air either side;
+        // the card keeps its height.
+        let bar_height = self.ui_px(6.0);
+        let bar_gap = self.ui_px(14.0);
+        let block = match progress {
+            Some(_) => cell * 2.0 + bar_gap * 2.0 + bar_height,
+            None => cell * 2.0 + line_gap,
+        };
+        let text_y = y + (height - block) / 2.0;
         self.draw_text(
             layers,
             &title_font,
@@ -13247,11 +13435,41 @@ impl SettingsWindow {
             palette.title,
             text_width,
         )?;
+        let subline_y = match progress {
+            Some(fraction) => {
+                let bar_y = text_y + cell + bar_gap;
+                let radius = bar_height / 2.0;
+                self.draw_rounded_rect(
+                    layers,
+                    0,
+                    text_x,
+                    bar_y,
+                    text_width,
+                    bar_height,
+                    palette.track_off,
+                    radius,
+                )?;
+                if fraction > 0.0 {
+                    self.draw_rounded_rect(
+                        layers,
+                        0,
+                        text_x,
+                        bar_y,
+                        (text_width * fraction.min(1.0)).max(bar_height),
+                        bar_height,
+                        self.chrome_palette.accent,
+                        radius,
+                    )?;
+                }
+                bar_y + bar_height + bar_gap
+            }
+            None => text_y + cell + line_gap,
+        };
         self.draw_text(
             layers,
             &body_font,
             text_x,
-            text_y + cell + line_gap,
+            subline_y,
             subline,
             palette.secondary_text,
             text_width,
@@ -13931,7 +14149,6 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let body_font = Rc::clone(&self.body_font);
-        let appearance = self.effective_appearance();
         let scroll = self.ui.content_scroll.offset;
         let card_padding = self.ui_px(HERO_PADDING);
         let row_x = x + card_padding;
@@ -13940,8 +14157,8 @@ impl SettingsWindow {
 
         let hero = self.update_hero();
         let version = self.running_version_label();
-        // The app icon, as on About: the page is about ThinkTerm, and the
-        // state is already in the headline.
+        // What the last check found; an install or a check in flight
+        // outranks it below.
         let (headline, subline) = match &hero {
             UpdateHero::UpToDate => (
                 crate::i18n::tr("settings-update-current"),
@@ -13971,31 +14188,135 @@ impl SettingsWindow {
             .ui
             .update_checked_until
             .is_some_and(|until| Instant::now() < until);
-        let check_label = if checked_recently {
+        let check = update_check();
+        let check_label = if matches!(check, Some(UpdateCheck::Running)) {
+            crate::i18n::tr("settings-update-checking")
+        } else if checked_recently {
             crate::i18n::tr("settings-update-checked")
         } else {
             crate::i18n::tr("settings-update-check-now")
         };
 
         // The one button on the hero: install when there is something to
-        // install and this copy is ours to replace, check otherwise. While
-        // an install runs there is nothing to click.
+        // install and this copy is ours to replace, restart once it has been
+        // replaced, check otherwise. While an install runs there is nothing
+        // to click, and the Windows installer restarts ThinkTerm itself.
         let self_updatable = self
             .ui
             .update_method
             .as_ref()
             .is_some_and(|method| method.self_updatable() || cfg!(windows));
-        let hero_button = match (&hero, &self.ui.update_install) {
-            (_, Some(UpdateInstall::Running)) => None,
-            (UpdateHero::Available { .. }, Some(UpdateInstall::Installed { .. })) => {
-                Some((check_label, SettingsAction::CheckForUpdates))
+        let install = update_install();
+        let hero_button = match (&hero, &install) {
+            (_, Some(UpdateInstall::Running { .. })) => None,
+            // Restart only where it ends no terminal: shells this process
+            // runs itself would go with it, so there the person quits and
+            // reopens when ready. The Windows installer restarts by itself.
+            (_, Some(UpdateInstall::Installed { .. }))
+                if !cfg!(windows) && !restart_ends_terminals() =>
+            {
+                Some((
+                    crate::i18n::tr("settings-restart"),
+                    SettingsAction::RestartApplication,
+                ))
             }
+            (_, Some(UpdateInstall::Installed { .. })) => None,
             (UpdateHero::Available { .. }, _) if self_updatable => Some((
                 crate::i18n::tr("settings-update-install"),
                 SettingsAction::InstallUpdate,
             )),
             _ => Some((check_label, SettingsAction::CheckForUpdates)),
         };
+
+        // The card says what is happening now: an install or a check in
+        // flight, or how one went, before what the last check found.
+        use thinkterm_update::InstallProgress;
+        let (headline, subline, progress) =
+            match (&install, &check) {
+                (
+                    Some(UpdateInstall::Running {
+                        version,
+                        progress: Some(InstallProgress::Downloading { done, total }),
+                        download_started,
+                    }),
+                    _,
+                ) => {
+                    let fraction = if *total > 0 {
+                        (*done as f32 / *total as f32).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let mut detail = settings_tr(
+                        "settings-update-download-progress",
+                        &[
+                            ("done", format_bytes(*done)),
+                            ("total", format_bytes(*total)),
+                            ("percent", ((fraction * 100.0).floor() as u32).to_string()),
+                        ],
+                    );
+                    if let Some(left) = download_started
+                        .and_then(|started| download_time_left(started, *done, *total))
+                    {
+                        detail = format!("{detail} · {left}");
+                    }
+                    (
+                        settings_tr("settings-update-downloading", &[("version", version.clone())]),
+                        detail,
+                        Some(fraction),
+                    )
+                }
+                // Looking the release up, fetching install.sh: nothing is
+                // being installed yet.
+                (
+                    Some(UpdateInstall::Running {
+                        version,
+                        progress: None,
+                        ..
+                    }),
+                    _,
+                ) => (
+                    settings_tr("settings-update-preparing", &[("version", version.clone())]),
+                    crate::i18n::tr("settings-update-installing"),
+                    None,
+                ),
+                (Some(UpdateInstall::Running { version, .. }), _) => (
+                    settings_tr(
+                        "settings-update-installing-title",
+                        &[("version", version.clone())],
+                    ),
+                    crate::i18n::tr("settings-update-installing"),
+                    None,
+                ),
+                (Some(UpdateInstall::Installed { version }), _) if cfg!(windows) => (
+                    crate::i18n::tr("settings-update-installer-started"),
+                    settings_tr(
+                        "settings-update-installer-started-detail",
+                        &[("version", version.clone())],
+                    ),
+                    None,
+                ),
+                (Some(UpdateInstall::Installed { version }), _) => (
+                    settings_tr("settings-update-installed", &[("version", version.clone())]),
+                    crate::i18n::tr("settings-update-installed-detail"),
+                    None,
+                ),
+                (Some(UpdateInstall::Failed { .. }), _) => (
+                    crate::i18n::tr("settings-update-install-failed-title"),
+                    crate::i18n::tr("settings-update-failed-detail"),
+                    None,
+                ),
+                (None, Some(UpdateCheck::Running)) => (
+                    crate::i18n::tr("settings-update-checking-title"),
+                    subline,
+                    None,
+                ),
+                (None, Some(UpdateCheck::Failed { .. })) => (
+                    crate::i18n::tr("settings-update-check-failed"),
+                    crate::i18n::tr("settings-update-failed-detail"),
+                    None,
+                ),
+                (None, None) => (headline, subline, None),
+            };
 
         let hero_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
         let hero_height = self.paint_hero(
@@ -14006,6 +14327,7 @@ impl SettingsWindow {
             HeroBadge::AppIcon,
             &headline,
             &subline,
+            progress,
             hero_button,
         )?;
 
@@ -14014,6 +14336,8 @@ impl SettingsWindow {
         let config = configuration();
         let rows = [
             (
+                SvgIcon::RefreshCw,
+                TileColor::Green,
                 crate::i18n::tr("settings-update-automatic"),
                 if config.check_for_updates {
                     crate::i18n::tr("common-on")
@@ -14022,10 +14346,14 @@ impl SettingsWindow {
                 },
             ),
             (
+                SvgIcon::Calendar,
+                TileColor::Orange,
                 crate::i18n::tr("settings-update-frequency"),
                 format_check_interval(config.check_for_updates_interval_seconds),
             ),
             (
+                SvgIcon::Timer,
+                TileColor::Blue,
                 crate::i18n::tr("settings-update-last-checked"),
                 self.ui
                     .update_status
@@ -14040,27 +14368,32 @@ impl SettingsWindow {
         let row_step = self.compact_row_step();
         let first_row_y = card_y + self.ui_px(12.0);
         self.paint_group_card(layers, x, card_y, max_width, card_height)?;
-        for (index, (label, value)) in rows.iter().enumerate() {
-            self.paint_compact_row(
-                layers,
-                row_x,
-                first_row_y + row_step * index as f32,
-                row_width,
-                label,
-                value,
-                index > 0,
-            )?;
+        for (index, (icon, color, label, value)) in rows.iter().enumerate() {
+            let row_y = first_row_y + row_step * index as f32;
+            let (tx, tw) =
+                self.paint_band_tile(layers, row_x, row_y, row_step, row_width, *icon, *color)?;
+            self.paint_compact_row(layers, tx, row_y, tw, label, value, index > 0)?;
         }
 
         // One choice: what updating a remote server does to its sessions.
         let toggle_card_y = card_y + card_height + gap;
         let toggle_card_height = self.compact_card_height(1);
         self.paint_group_card(layers, x, toggle_card_y, max_width, toggle_card_height)?;
-        self.paint_toggle_setting_row_with_hint(
+        let toggle_row_y = toggle_card_y + self.ui_px(12.0);
+        let (tx, tw) = self.paint_band_tile(
             layers,
             row_x,
-            toggle_card_y + self.ui_px(12.0),
+            toggle_row_y,
+            row_step,
             row_width,
+            SvgIcon::Server,
+            TileColor::Slate,
+        )?;
+        self.paint_toggle_setting_row_with_hint(
+            layers,
+            tx,
+            toggle_row_y,
+            tw,
             self.compact_row_step(),
             &crate::i18n::tr("settings-remote-update-keep-sessions"),
             "settings-remote-update-keep-sessions-description",
@@ -14068,30 +14401,25 @@ impl SettingsWindow {
             SettingsAction::ToggleRemoteUpdateKeepsSessions,
         )?;
 
-        // Under the facts: what an install would do here, or why this page
-        // cannot do one, and the outcome of the install just run.
+        // Under the facts: what went wrong, if something did -- the card
+        // above only has room to say that it did -- then what an install
+        // would do here, or why this page cannot do one.
         let note_y = toggle_card_y + toggle_card_height + gap;
         let line_step = self.metrics.cell_size.height as f32 + self.ui_px(6.0);
         let mut notes: Vec<(String, LinearRgba)> = Vec::new();
-        match &self.ui.update_install {
-            Some(UpdateInstall::Running) => {
-                notes.push((crate::i18n::tr("settings-update-installing"), palette.text));
-            }
-            Some(UpdateInstall::Installed { version }) => notes.push((
-                settings_tr("settings-update-installed", &[("version", version.clone())]),
-                status_tint_positive(appearance),
-            )),
-            Some(UpdateInstall::Failed { error }) => notes.push((
-                settings_tr("settings-update-install-failed", &[("error", error.clone())]),
-                self.chrome_palette.danger,
-            )),
-            None => {}
+        let failure = match (&install, &check) {
+            (Some(UpdateInstall::Failed { error }), _) => Some(error),
+            (None, Some(UpdateCheck::Failed { error })) => Some(error),
+            _ => None,
+        };
+        if let Some(error) = failure {
+            notes.push((error.clone(), self.chrome_palette.danger));
         }
         notes.push((
             self.update_method_note(),
             palette.secondary_text,
         ));
-        if self_updatable && !matches!(self.ui.update_install, Some(UpdateInstall::Installed { .. })) {
+        if self_updatable && !matches!(install, Some(UpdateInstall::Installed { .. })) {
             notes.push((
                 crate::i18n::tr("settings-update-install-note"),
                 palette.secondary_text,
@@ -14171,21 +14499,36 @@ impl SettingsWindow {
                 "settings-about-version-line",
                 &[("version", version.clone())],
             ),
+            None,
             Some((copy_label, SettingsAction::CopyVersionInfo)),
         )?;
 
         // Build only earns a line when it says something Version does not: a
         // release binary stamps both from the same tag.
         let build = config::wezterm_version();
-        let mut rows = vec![(crate::i18n::tr("settings-about-version"), version.clone())];
+        let mut rows = vec![(
+            SvgIcon::Package,
+            TileColor::Blue,
+            crate::i18n::tr("settings-about-version"),
+            version.clone(),
+        )];
         if build != version {
-            rows.push((crate::i18n::tr("settings-about-build"), build.to_string()));
+            rows.push((
+                SvgIcon::GitBranch,
+                TileColor::Indigo,
+                crate::i18n::tr("settings-about-build"),
+                build.to_string(),
+            ));
         }
         rows.push((
+            SvgIcon::Cpu,
+            TileColor::Teal,
             crate::i18n::tr("settings-about-platform"),
             config::wezterm_target_triple().to_string(),
         ));
         rows.push((
+            SvgIcon::Scale,
+            TileColor::Orange,
             crate::i18n::tr("settings-about-license"),
             // Must match what the packages declare -- ci/deploy.sh and
             // ci/make-winget-pr.sh both say GPL-3.0-only. "or-later" is a
@@ -14199,16 +14542,11 @@ impl SettingsWindow {
         let row_step = self.compact_row_step();
         let first_row_y = card_y + self.ui_px(12.0);
         self.paint_group_card(layers, x, card_y, max_width, card_height)?;
-        for (index, (label, value)) in rows.iter().enumerate() {
-            self.paint_compact_row(
-                layers,
-                row_x,
-                first_row_y + row_step * index as f32,
-                row_width,
-                label,
-                value,
-                index > 0,
-            )?;
+        for (index, (icon, color, label, value)) in rows.iter().enumerate() {
+            let row_y = first_row_y + row_step * index as f32;
+            let (tx, tw) =
+                self.paint_band_tile(layers, row_x, row_y, row_step, row_width, *icon, *color)?;
+            self.paint_compact_row(layers, tx, row_y, tw, label, value, index > 0)?;
         }
 
         // Everything outbound sits in one wrapping row along the bottom
@@ -17497,9 +17835,20 @@ return config
 
     fn restart_application() -> anyhow::Result<()> {
         let exe = std::env::current_exe().context("resolve current executable")?;
+        // Once an update has replaced the binary, Linux names the running
+        // one "<path> (deleted)"; the new one is at the path itself.
+        #[cfg(target_os = "linux")]
+        let exe = match exe.to_str().and_then(|path| path.strip_suffix(" (deleted)")) {
+            Some(path) => PathBuf::from(path),
+            None => exe,
+        };
         let args = std::env::args_os().skip(1).collect::<Vec<_>>();
         let mut command = Command::new(exe);
         command.args(args);
+        // The replacement starts while this process is still on its way
+        // out; told so, it publishes itself instead of handing this one the
+        // window to open, which would lose both.
+        command.env(crate::RESTARTED_ENV, "1");
         if let Ok(cwd) = std::env::current_dir() {
             command.current_dir(cwd);
         }

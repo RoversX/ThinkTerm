@@ -842,7 +842,10 @@ impl UpdateCommand {
                     return Ok(());
                 }
             }
-            thinkterm_update::run_windows_installer(&target)?;
+            {
+                let mut progress = CliInstallProgress::new();
+                thinkterm_update::run_windows_installer(&target, &mut |p| progress.report(p))?;
+            }
             println!("The installer is running; it finishes on its own.");
             return Ok(());
         }
@@ -882,7 +885,11 @@ impl UpdateCommand {
             }
         }
 
-        if let Err(err) = thinkterm_update::run_local_installer(&manifest, &target.tag_name) {
+        let installed = {
+            let mut progress = CliInstallProgress::new();
+            thinkterm_update::run_local_installer(&manifest, &target, &mut |p| progress.report(p))
+        };
+        if let Err(err) = installed {
             println!();
             println!("The installer failed ({err:#}); nothing was changed.");
             println!("If it refused this machine (glibc, musl, architecture), a release binary cannot run here.");
@@ -892,6 +899,75 @@ impl UpdateCommand {
         println!();
         println!("Installed {target_version}. A running thinkterm-mux-server or GUI keeps the old build until it is restarted.");
         Ok(())
+    }
+}
+
+/// Download progress for `thinkterm update`: one line rewritten in place when
+/// a person is watching the terminal, the size once otherwise. The line is
+/// ended once the download is in, and when this is dropped with the line
+/// still open, so nothing printed afterwards -- a note, an error -- lands on
+/// the end of it.
+struct CliInstallProgress {
+    watched: bool,
+    announced: bool,
+    line_open: bool,
+    completed: bool,
+}
+
+impl CliInstallProgress {
+    fn new() -> Self {
+        use std::io::IsTerminal;
+        Self {
+            watched: std::io::stderr().is_terminal(),
+            announced: false,
+            line_open: false,
+            completed: false,
+        }
+    }
+
+    fn report(&mut self, progress: thinkterm_update::InstallProgress) {
+        use thinkterm_update::{format_size, InstallProgress};
+        match progress {
+            InstallProgress::Downloading { done, total } => {
+                if self.watched {
+                    // The last report repeats the one that finished the line.
+                    if done >= total && self.completed {
+                        return;
+                    }
+                    // Cleared first: a retry restarts the count, and a
+                    // shorter line would leave the old one's tail behind.
+                    eprint!(
+                        "\r\x1b[Kdownloading: {} of {}",
+                        format_size(done),
+                        format_size(total)
+                    );
+                    self.line_open = true;
+                    self.completed = done >= total;
+                    if self.completed {
+                        self.end_line();
+                    }
+                } else if !self.announced {
+                    eprintln!("downloading {}...", format_size(total));
+                }
+                self.announced = true;
+            }
+            InstallProgress::Installing => {
+                self.end_line();
+                eprintln!("installing...");
+            }
+        }
+    }
+
+    fn end_line(&mut self) {
+        if std::mem::take(&mut self.line_open) {
+            eprintln!();
+        }
+    }
+}
+
+impl Drop for CliInstallProgress {
+    fn drop(&mut self) {
+        self.end_line();
     }
 }
 

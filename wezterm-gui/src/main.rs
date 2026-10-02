@@ -1118,6 +1118,13 @@ impl Publish {
             return Self::NoConnectNoPublish;
         }
 
+        if RESTARTED.load(std::sync::atomic::Ordering::Relaxed) {
+            // Restarted from Settings, so the GUI found running is the one
+            // on its way out: handing it the window would lose both. Publish
+            // over it instead; it removes only a name still pointing at it.
+            return Self::NoConnectButPublish;
+        }
+
         match wezterm_client::discovery::resolve_gui_sock_path(
             &crate::termwindow::get_window_class(),
         ) {
@@ -1530,9 +1537,21 @@ fn terminate_with_error(err: anyhow::Error) -> ! {
     terminate_with_error_message(&err_text)
 }
 
+/// Set by a restart from Settings on the process it starts, which comes up
+/// while the old one is still quitting.
+pub(crate) const RESTARTED_ENV: &str = "THINKTERM_RESTARTED";
+static RESTARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn main() {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
+
+    // Read and cleared before any thread starts, so that the shells this
+    // process runs do not inherit it.
+    if std::env::var_os(RESTARTED_ENV).is_some() {
+        std::env::remove_var(RESTARTED_ENV);
+        RESTARTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 
     config::designate_this_as_the_main_thread();
     config::assign_error_callback(mux::connui::show_configuration_error_message);

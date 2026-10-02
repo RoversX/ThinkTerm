@@ -33,8 +33,9 @@ pub fn update_available() -> bool {
 }
 
 /// Record the flag; when it changes, ask every window to repaint so the dot
-/// appears or goes away. Only the checker thread calls this: it runs once
-/// the GUI is up, and spawning onto the main thread needs its scheduler.
+/// appears or goes away. Only the checker thread and a check asked for from
+/// Settings call this: both run once the GUI is up, and spawning onto the
+/// main thread needs its scheduler.
 fn set_update_available(available: bool) {
     let was = UPDATE_AVAILABLE.swap(available, Ordering::Relaxed);
     if was != available {
@@ -140,6 +141,36 @@ mod update_version_tests {
 
 }
 
+/// Ask GitHub now, as the background checker does on its schedule: record
+/// the answer where Settings reads it and set the dot. Blocks on the
+/// network, so callers run it off the UI thread. No toast: whoever asked is
+/// looking at the answer.
+pub fn check_now() -> anyhow::Result<()> {
+    let latest = get_latest_release_info()?;
+    let newer = is_newer_release(&latest.tag_name, &running_release_version());
+    set_update_available(newer || always_show_update_ui());
+    // Settings shows what it reads back from the cache: an answer that could
+    // not be kept there is, as far as the page can tell, no answer.
+    record_latest_release(&latest)
+}
+
+/// Persist the newest release seen; the file's mtime is the time of the
+/// check. Written beside it and renamed over it, so a reader -- Settings, or
+/// the other of the two threads that check -- never sees half a file.
+fn record_latest_release(latest: &Release) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let update_file_name = config::DATA_DIR.join("check_update");
+    let dir = config::DATA_DIR.as_path();
+    let saved = config::create_user_owned_dirs(dir)
+        .and_then(|()| Ok(tempfile::NamedTempFile::new_in(dir)?))
+        .and_then(|mut file| {
+            serde_json::to_writer_pretty(&mut file, latest)?;
+            file.persist(&update_file_name)?;
+            Ok(())
+        });
+    saved.with_context(|| format!("saving the update check to {}", update_file_name.display()))
+}
+
 /// Returns true if the provided socket path is dead.
 fn update_checker() {
     // Compute how long we should sleep for;
@@ -198,16 +229,8 @@ fn update_checker() {
                     }
                 }
 
-                config::create_user_owned_dirs(update_file_name.parent().unwrap()).ok();
-
-                // Record the time of this check
-                if let Ok(f) = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&update_file_name)
-                {
-                    serde_json::to_writer_pretty(f, &latest).ok();
+                if let Err(err) = record_latest_release(&latest) {
+                    log::warn!("{err:#}");
                 }
             }
         }
