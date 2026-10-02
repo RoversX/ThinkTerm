@@ -5246,18 +5246,21 @@ impl TermWindow {
                 self.dimensions.pixel_height as u32,
             ),
         );
-        let outcome = match self.paint_impl(&mut RenderFrame::Glium(&mut frame)) {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                log::error!("failed to draw OpenGL frame: {err:#}");
+        let painted = self.paint_impl(&mut RenderFrame::Glium(&mut frame));
+        let outcome = match painted {
+            Ok(outcome) if outcome.draw_submitted => outcome,
+            painted => {
+                if let Err(err) = painted {
+                    log::error!("failed to draw OpenGL frame: {err:#}");
+                }
+                // glium panics when an unfinished Frame is dropped.
+                if let Err(err) = window.finish_frame(frame) {
+                    log::error!("failed to present OpenGL frame: {err:#}");
+                }
                 self.discard_unpresented_pane_output();
                 return false;
             }
         };
-        if !outcome.draw_submitted {
-            self.discard_unpresented_pane_output();
-            return false;
-        }
         let presented = window.finish_frame(frame).is_ok();
         if frame_can_acknowledge_output(outcome, presented) {
             self.acknowledge_presented_pane_output();
