@@ -5239,23 +5239,21 @@ impl TermWindow {
             return false;
         }
 
-        let mut frame = glium::Frame::new(
-            Rc::clone(&gl),
-            (
-                self.dimensions.pixel_width as u32,
-                self.dimensions.pixel_height as u32,
-            ),
-        );
+        // Created by the draw: a paint that gives up leaves it None, nothing
+        // is swapped, and the previous frame stays on screen.
+        let mut frame = None;
         let painted = self.paint_impl(&mut RenderFrame::Glium(&mut frame));
-        let outcome = match painted {
-            Ok(outcome) if outcome.draw_submitted => outcome,
-            painted => {
+        let (outcome, frame) = match (painted, frame) {
+            (Ok(outcome), Some(frame)) if outcome.draw_submitted => (outcome, frame),
+            (painted, frame) => {
                 if let Err(err) = painted {
                     log::error!("failed to draw OpenGL frame: {err:#}");
                 }
                 // glium panics when an unfinished Frame is dropped.
-                if let Err(err) = window.finish_frame(frame) {
-                    log::error!("failed to present OpenGL frame: {err:#}");
+                if let Some(frame) = frame {
+                    if let Err(err) = window.finish_frame(frame) {
+                        log::error!("failed to present OpenGL frame: {err:#}");
+                    }
                 }
                 self.discard_unpresented_pane_output();
                 return false;

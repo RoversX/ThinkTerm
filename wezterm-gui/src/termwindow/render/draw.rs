@@ -11,7 +11,9 @@ use ::window::glium::uniforms::{
 };
 use ::window::glium::{BlendingFunction, LinearBlendingFactor, Surface};
 use ::window::{Appearance, Dimensions, WindowDecorations, WindowState};
+use anyhow::Context;
 use config::FreeTypeLoadTarget;
+use std::rc::Rc;
 
 const LINUX_WINDOW_CORNER_RADIUS: f32 = 16.0;
 const LINUX_WINDOW_BORDER_WIDTH: f32 = 1.0;
@@ -680,7 +682,15 @@ pub(crate) fn draw_opengl_layers(
 impl crate::TermWindow {
     pub fn call_draw(&mut self, frame: &mut RenderFrame) -> anyhow::Result<()> {
         match frame {
-            RenderFrame::Glium(ref mut frame) => self.call_draw_glium(frame),
+            RenderFrame::Glium(frame) => {
+                let gl = Rc::clone(self.gl.as_ref().context("OpenGL context missing")?);
+                let size = (
+                    self.dimensions.pixel_width as u32,
+                    self.dimensions.pixel_height as u32,
+                );
+                let frame = frame.get_or_insert_with(|| glium::Frame::new(gl, size));
+                self.call_draw_glium(frame)
+            }
             RenderFrame::WebGpu => self.call_draw_webgpu(),
         }
     }

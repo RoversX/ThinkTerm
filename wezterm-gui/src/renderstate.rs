@@ -100,7 +100,9 @@ pub enum RenderContext {
 }
 
 pub enum RenderFrame<'a> {
-    Glium(&'a mut glium::Frame),
+    /// Created by the draw: a paint that gives up never makes one, so
+    /// nothing is swapped and the previous frame stays on screen.
+    Glium(&'a mut Option<glium::Frame>),
     WebGpu,
 }
 
@@ -514,7 +516,15 @@ impl TripleVertexBuffer {
     }
 
     pub fn vertex_index_count(&self) -> (usize, usize) {
-        let num_quads = *self.next_quad.borrow();
+        let next = *self.next_quad.borrow();
+        // A pass that gave up before allocated_more_quads could grow the
+        // buffers leaves the count past their end. Such frames are not
+        // drawn; should one get here anyway, draw only what the buffers
+        // hold, and count it.
+        if next > self.capacity {
+            crate::perf::log_counter("draw_quads_clamped", next - self.capacity);
+        }
+        let num_quads = next.min(self.capacity);
         (num_quads * VERTICES_PER_CELL, num_quads * INDICES_PER_CELL)
     }
 

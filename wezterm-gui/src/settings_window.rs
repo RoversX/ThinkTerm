@@ -6111,7 +6111,9 @@ impl SettingsWindow {
                         Ok(false) => break,
                         Err(err) => {
                             log::error!("settings window quad allocation failed: {err:#}");
-                            break;
+                            // The layers hold a pass that ran out of quads:
+                            // keep the previous frame rather than draw it.
+                            return Ok(false);
                         }
                     }
                 }

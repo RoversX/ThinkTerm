@@ -1089,9 +1089,10 @@ impl crate::TermWindow {
         // couple of frames until the requested repaint lands -- a visible
         // black flash on every font-size change. Skipping the present keeps
         // the previous complete frame on screen instead, which nobody can
-        // see. Only WebGpu can skip: the glium frame was created by do_paint
-        // and will be swapped regardless, so an unpainted frame there would
-        // present undefined content, which is worse than a partial one.
+        // see. Both renderers skip: glium creates its frame in the draw, so
+        // a frame that is not drawn is never swapped. Not even a partial
+        // frame is left once a pass runs out of quads: every one past the
+        // end is written over the first, the window background.
         let mut present_frame = true;
         let mut frame_complete = false;
         // Held outside the loop so the memory counters can be emitted on
@@ -1119,6 +1120,9 @@ impl crate::TermWindow {
                     }
                     Err(err) => {
                         log::error!("{:#}", err);
+                        // The pass ran out of quads and they could not grow:
+                        // keep the previous frame, as the arms below do.
+                        present_frame = false;
                         break 'pass;
                     }
                 },
@@ -1303,7 +1307,7 @@ impl crate::TermWindow {
         if let Some(render_state) = self.render_state.as_ref() {
             render_state.dedicated_images.borrow_mut().end_frame();
         }
-        let draw_result = if present_frame || !matches!(frame, RenderFrame::WebGpu) {
+        let draw_result = if present_frame {
             self.call_draw(frame).map(|_| true)
         } else {
             Ok(false)
