@@ -290,6 +290,17 @@ if [ -z "$from" ]; then
     printf '%s' "$release_json" | grep -qF "\"name\": \"$asset\"" \
       || die "release $version has no $asset; see https://github.com/$repo/releases/tag/$tag"
   fi
+else
+  # No release lookup, so the version comes from --version, or else from the
+  # name the release gave the archive. The manifest needs one: without it the
+  # next update no longer recognises this install as the script's own.
+  if [ -n "$tag" ]; then
+    version="${tag#v}"
+  else
+    version=$(basename "$from" | sed -n \
+      -e 's/^ThinkTerm-macos-[^-]*-\([0-9A-Za-z][0-9A-Za-z.+-]*\)\.zip$/\1/p' \
+      -e 's/^thinkterm-\(server-\)\{0,1\}\([0-9A-Za-z][0-9A-Za-z.+-]*\)-linux-[^-]*\.tar\.gz$/\2/p')
+  fi
 fi
 
 say "ThinkTerm $variant${version:+ $version} for $os-$arch"
@@ -372,7 +383,7 @@ case "$os" in
     # directory name ci/deploy.sh gave the tarball:
     # thinkterm[-server]-<ver>-linux-<arch>.
     if [ -z "$version" ]; then
-      version=$(basename "$root" | sed -n 's/^thinkterm-\(server-\)\{0,1\}\(.*\)-linux-[^-]*$/\2/p')
+      version=$(basename "$root" | sed -n 's/^thinkterm-\(server-\)\{0,1\}\([0-9A-Za-z][0-9A-Za-z.+-]*\)-linux-[^-]*$/\2/p')
     fi
     ;;
   macos)
@@ -382,10 +393,17 @@ case "$os" in
     root=$(find "$tmp/x" -maxdepth 2 -name ThinkTerm.app -type d | head -n1)
     [ -n "$root" ] && [ -x "$root/Contents/MacOS/thinkterm" ] || die "unexpected zip layout: no ThinkTerm.app inside"
     if [ -z "$version" ]; then
-      version=$(basename "$(dirname "$root")" | sed -n 's/^ThinkTerm-macos-\(arm64\|x86_64\)-\(.*\)$/\2/p')
+      version=$(basename "$(dirname "$root")" | sed -n 's/^ThinkTerm-macos-[^-]*-\([0-9A-Za-z][0-9A-Za-z.+-]*\)$/\1/p')
     fi
     ;;
 esac
+# The manifest names the install by its version, and the next update
+# rejects one without: a version this script could not tell goes in as
+# unknown.
+if [ -z "$version" ]; then
+  warn "could not tell which version $archive is; recording it as unknown (pass --version to name it)"
+  version=unknown
+fi
 
 # ---- GUI library preflight (Linux) -----------------------------------------
 
