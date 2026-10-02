@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::max;
 use std::convert::TryInto;
 use std::io::Read;
@@ -378,6 +378,7 @@ impl WaylandWindow {
 
         let appearance = conn.get_appearance();
 
+        let presented_since_frame_request = Rc::new(Cell::new(false));
         let inner = Rc::new(RefCell::new(WaylandWindowInner {
             events: WindowEventSender::new(event_handler),
             surface_factor: 1.0,
@@ -405,6 +406,11 @@ impl WaylandWindow {
 
             pending_first_configure: Some(pending_first_configure),
             frame_callback: None,
+            presented_since_frame_request: Rc::clone(&presented_since_frame_request),
+            unpresented_retry_armed: false,
+            unpresented_retry_generation: 0,
+            unpresented_retries: 0,
+            window_id,
 
             text_cursor: None,
             appearance,
@@ -432,6 +438,12 @@ impl WaylandWindow {
         };
 
         wait_configure.recv().await?;
+
+        // Nothing presents before the first configure, and a window that
+        // never got one leaves no flag behind.
+        conn.frame_presented_flags
+            .borrow_mut()
+            .insert(window_id, presented_since_frame_request);
 
         Ok(window_handle)
     }
@@ -504,6 +516,23 @@ impl WindowOps for WaylandWindow {
             inner.invalidate();
             Ok(())
         });
+    }
+
+    fn finish_frame(&self, frame: glium::Frame) -> anyhow::Result<()> {
+        frame.finish()?;
+        self.frame_presented();
+        Ok(())
+    }
+
+    fn frame_presented(&self) {
+        // Set right away, not through with_window_inner: the window's state
+        // is borrowed by the repaint reporting this. A closed window has no
+        // flag left to set.
+        if let Some(conn) = WaylandConnection::get() {
+            if let Some(flag) = conn.wayland().frame_presented_flags.borrow().get(&self.0) {
+                flag.set(true);
+            }
+        }
     }
 
     fn set_text_cursor_position(&self, cursor: Rect) {
@@ -743,6 +772,19 @@ pub struct WaylandWindowInner {
     pub(super) pending_mouse: Arc<Mutex<PendingMouse>>,
     pending_first_configure: Option<async_channel::Sender<()>>,
     frame_callback: Option<WlCallback>,
+    /// Set by WindowOps::frame_presented and cleared when do_paint asks for
+    /// a frame callback: until it is set again, no commit has applied that
+    /// request and the callback cannot fire.
+    presented_since_frame_request: Rc<Cell<bool>>,
+    /// A retry of a repaint that presented nothing is on its way; see
+    /// schedule_unpresented_retry.
+    unpresented_retry_armed: bool,
+    /// Identifies the armed retry, so that one disowned when a present got
+    /// through does nothing when its timer fires.
+    unpresented_retry_generation: u64,
+    /// Retries since the last present; each one doubles the next delay.
+    unpresented_retries: u32,
+    window_id: usize,
     invalidated: bool,
     // font_config: Rc<FontConfiguration>,
     text_cursor: Option<Rect>,
@@ -762,6 +804,12 @@ impl WaylandWindowInner {
     fn close(&mut self) {
         self.events.dispatch(WindowEvent::Destroyed);
         self.window.take();
+        WaylandConnection::get()
+            .unwrap()
+            .wayland()
+            .frame_presented_flags
+            .borrow_mut()
+            .remove(&self.window_id);
     }
 
     fn show(&mut self) {
@@ -1306,10 +1354,6 @@ impl WaylandWindowInner {
     }
 
     fn invalidate(&mut self) {
-        if self.frame_callback.is_some() {
-            self.invalidated = true;
-            return;
-        }
         self.do_paint().unwrap();
     }
 
@@ -1394,6 +1438,12 @@ impl WaylandWindowInner {
             // remember that we need to be painted so that when
             // the compositor is ready for us, we can paint then.
             self.invalidated = true;
+            if !self.presented_since_frame_request.get() {
+                // Unless nothing has presented since the callback was
+                // asked for: only a commit lets it fire, and only a
+                // repaint that presents makes one.
+                self.schedule_unpresented_retry();
+            }
             return Ok(());
         }
 
@@ -1408,6 +1458,8 @@ impl WaylandWindowInner {
 
         log::trace!("do_paint - callback: {:?}", callback);
         self.frame_callback.replace(callback);
+        // Uncommitted until the repaint below reports a present.
+        self.presented_since_frame_request.set(false);
 
         // The repaint has the side of effect of committing the surface,
         // which is necessary for the frame callback to get triggered.
@@ -1420,6 +1472,57 @@ impl WaylandWindowInner {
         Ok(())
     }
 
+    const MAX_UNPRESENTED_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+    /// Repaint again when nothing has presented since the frame callback
+    /// was asked for, since waiting for that callback would wait forever.
+    /// The first retry comes one frame interval later, soon enough that a
+    /// kept frame goes unnoticed; each further one without a present
+    /// doubles the delay, so a renderer failing every frame settles at one
+    /// attempt a second instead of spinning.
+    fn schedule_unpresented_retry(&mut self) {
+        if self.unpresented_retry_armed {
+            return;
+        }
+        self.unpresented_retry_armed = true;
+        self.unpresented_retry_generation = self.unpresented_retry_generation.wrapping_add(1);
+        let generation = self.unpresented_retry_generation;
+        let frame = Duration::from_secs_f64(1.0 / self.config.max_fps.max(1) as f64);
+        let delay = frame
+            .saturating_mul(1 << self.unpresented_retries.min(20))
+            .clamp(Duration::from_millis(1), Self::MAX_UNPRESENTED_RETRY_DELAY);
+        let window_id = self.window_id;
+        promise::spawn::spawn(async move {
+            Timer::after(delay).await;
+            let Some(conn) = WaylandConnection::get() else {
+                return;
+            };
+            if let Some(handle) = conn.wayland().window_by_id(window_id) {
+                handle.borrow_mut().retry_unpresented(generation);
+            }
+        })
+        .detach();
+    }
+
+    fn retry_unpresented(&mut self, generation: u64) {
+        if !self.unpresented_retry_armed || generation != self.unpresented_retry_generation {
+            // Disowned: a present got through after this one was armed.
+            return;
+        }
+        self.unpresented_retry_armed = false;
+        // Armed only while a callback is pending and a repaint is owed, and
+        // both outlast the arming: what can change is a close, or a present
+        // from show() or a resize completing.
+        if self.window.is_none() || self.presented_since_frame_request.get() {
+            return;
+        }
+        self.unpresented_retries = self.unpresented_retries.saturating_add(1);
+        self.invalidated = false;
+        // The callback already asked for rides along with this repaint's
+        // commit; asking for another would have it fire twice.
+        self.events.dispatch(WindowEvent::NeedRepaint);
+    }
+
     fn surface(&self) -> &WlSurface {
         self.window
             .as_ref()
@@ -1429,6 +1532,10 @@ impl WaylandWindowInner {
 
     pub(crate) fn next_frame_is_ready(&mut self) {
         self.frame_callback.take();
+        // A present got through: start over at one frame interval. An armed
+        // retry still on its long delay must not hold back the next one.
+        self.unpresented_retries = 0;
+        self.unpresented_retry_armed = false;
         if self.invalidated {
             self.do_paint().ok();
         }

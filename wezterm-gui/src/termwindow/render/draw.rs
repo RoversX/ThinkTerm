@@ -534,7 +534,7 @@ pub(crate) fn draw_webgpu_layers(
             }
         }
     }
-    output.present();
+    webgpu.present(output);
     crate::perf::log_duration("webgpu_submit_present", submit_start);
 
     Ok(())

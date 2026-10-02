@@ -827,6 +827,13 @@ pub trait WindowOps {
     /// be repainted shortly
     fn invalidate(&self);
 
+    /// Advise the window that a frame was presented. Wayland waits for a
+    /// frame callback before painting again, and only the commit a present
+    /// makes lets it fire: until it hears of one, it retries on a timer
+    /// instead of waiting. Its finish_frame reports OpenGL presents itself;
+    /// renderers that present on their own, as WebGpu does, call this.
+    fn frame_presented(&self) {}
+
     /// Change the titlebar text for the window
     fn set_title(&self, title: &str);
 

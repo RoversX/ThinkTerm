@@ -409,6 +409,14 @@ impl WindowOps for Window {
         }
     }
 
+    fn frame_presented(&self) {
+        match self {
+            Self::X11(x) => x.frame_presented(),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(w) => w.frame_presented(),
+        }
+    }
+
     fn set_resize_increments(&self, incr: ResizeIncrement) {
         match self {
             Self::X11(x11) => x11.set_resize_increments(incr),

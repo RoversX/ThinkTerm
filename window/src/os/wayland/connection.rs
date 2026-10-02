@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
@@ -25,6 +25,10 @@ pub struct WaylandConnection {
     pub(super) connection: WConnection,
     pub(super) event_queue: RefCell<EventQueue<WaylandState>>,
     pub(super) wayland_state: RefCell<WaylandState>,
+    /// Each open window's presented_since_frame_request, reached through
+    /// here because a present is reported while the window's own state is
+    /// borrowed by the repaint making it.
+    pub(super) frame_presented_flags: RefCell<HashMap<usize, Rc<Cell<bool>>>>,
 }
 
 impl WaylandConnection {
@@ -41,6 +45,7 @@ impl WaylandConnection {
             gl_connection: RefCell::new(None),
             event_queue: RefCell::new(event_queue),
             wayland_state: RefCell::new(wayland_state),
+            frame_presented_flags: RefCell::new(HashMap::new()),
         };
 
         Ok(wayland_connection)

@@ -9,7 +9,7 @@ use window::raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
     RawWindowHandle, WindowHandle,
 };
-use window::{BitmapImage, Dimensions, Rect, Window};
+use window::{BitmapImage, Dimensions, Rect, Window, WindowOps};
 
 fn gpu_debug_enabled() -> bool {
     std::env::var_os("THINKTERM_GPU_DEBUG").is_some()
@@ -83,6 +83,8 @@ pub struct WebGpuState {
     /// at most two frames of uploads alive.
     in_flight_submissions: RefCell<std::collections::VecDeque<wgpu::SubmissionIndex>>,
     pub handle: RawHandlePair,
+    /// Told of every present by WebGpuState::present.
+    window: Window,
 }
 
 /// How many frames may be submitted ahead of the device before the paint
@@ -475,15 +477,15 @@ impl WebGpuState {
         dimensions: Dimensions,
         config: &ConfigHandle,
     ) -> anyhow::Result<Self> {
-        let handle = RawHandlePair::new(window);
-        Self::new_impl(handle, dimensions, config).await
+        Self::new_impl(window.clone(), dimensions, config).await
     }
 
     pub async fn new_impl(
-        handle: RawHandlePair,
+        window: Window,
         dimensions: Dimensions,
         config: &ConfigHandle,
     ) -> anyhow::Result<Self> {
+        let handle = RawHandlePair::new(&window);
         let backends = instance_backends(config.front_end == config::FrontEndSelection::Software);
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends,
@@ -682,6 +684,7 @@ impl WebGpuState {
             dimensions: RefCell::new(dimensions),
             render_pipeline: pipeline.render_pipeline,
             handle,
+            window,
             shader_uniform_bind_group_layout: pipeline.uniform_layout,
             texture_bind_group_layout: pipeline.texture_layout,
             texture_nearest_sampler: pipeline.nearest_sampler,
@@ -693,6 +696,13 @@ impl WebGpuState {
                 MAX_FRAMES_IN_FLIGHT + 1,
             )),
         })
+    }
+
+    /// Present a frame and tell the window, which wgpu does not: on Wayland
+    /// the window paces its repaints by it (WindowOps::frame_presented).
+    pub fn present(&self, output: wgpu::SurfaceTexture) {
+        output.present();
+        self.window.frame_presented();
     }
 
     /// Block until the device has finished the oldest frame still in flight,
