@@ -13226,51 +13226,61 @@ impl SettingsWindow {
         let import_label = crate::i18n::tr("settings-import-selected");
         let open_wezterm_label = crate::i18n::tr("settings-open-wezterm-source");
         let open_thinkterm_label = crate::i18n::tr("settings-open-thinkterm-config");
-        self.draw_button(
+        // Without a WezTerm configuration there is nothing to review, import
+        // or open, and until one is reviewed nothing to select: those buttons
+        // are greyed out instead of answering a click with an error.
+        let has_source = wezterm_source_path.is_some();
+        let has_fields = field_count > 0;
+        self.draw_button_enabled(
             layers,
             x,
             buttons_y,
             self.button_width_for_label(&load_label, 290.0),
             &load_label,
             SettingsAction::LoadWezTermSource,
+            has_source,
         )?;
         let second_x = x + self.button_width_for_label(&load_label, 290.0) + self.ui_px(16.0);
-        self.draw_button(
+        self.draw_button_enabled(
             layers,
             second_x,
             buttons_y,
             self.button_width_for_label(&select_all_label, 180.0),
             &select_all_label,
             SettingsAction::SelectAllImportFields,
+            has_fields,
         )?;
         let third_x =
             second_x + self.button_width_for_label(&select_all_label, 180.0) + self.ui_px(16.0);
-        self.draw_button(
+        self.draw_button_enabled(
             layers,
             third_x,
             buttons_y,
             self.button_width_for_label(&clear_label, 150.0),
             &clear_label,
             SettingsAction::ClearImportFields,
+            has_fields,
         )?;
         let fourth_x =
             third_x + self.button_width_for_label(&clear_label, 150.0) + self.ui_px(16.0);
-        self.draw_button(
+        self.draw_button_enabled(
             layers,
             fourth_x,
             buttons_y,
             self.button_width_for_label(&import_label, 260.0),
             &import_label,
             SettingsAction::ImportSelectedFields,
+            has_source,
         )?;
         let open_buttons_y = buttons_y + self.ui_px(CONTROL_HEIGHT) + 14.0;
-        self.draw_button(
+        self.draw_button_enabled(
             layers,
             x,
             open_buttons_y,
             self.button_width_for_label(&open_wezterm_label, 300.0),
             &open_wezterm_label,
             SettingsAction::OpenWezTermConfigFile,
+            has_source,
         )?;
         let fifth_x =
             x + self.button_width_for_label(&open_wezterm_label, 300.0) + self.ui_px(16.0);
@@ -17197,6 +17207,23 @@ impl SettingsWindow {
         label: &str,
         action: SettingsAction,
     ) -> anyhow::Result<()> {
+        self.draw_button_enabled(layers, x, y, width, label, action, true)
+    }
+
+    /// `draw_button`, or with `enabled` false the same button greyed out and
+    /// taking no clicks: for an action with nothing to act on, which would
+    /// otherwise answer only with an error.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_button_enabled(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        label: &str,
+        action: SettingsAction,
+        enabled: bool,
+    ) -> anyhow::Result<()> {
         // The width given is the width drawn. This used to be
         // `width.max(button_width_for_label(..))` -- a button whose label did
         // not fit grew to the right and out of whatever was holding it, which
@@ -17208,7 +17235,9 @@ impl SettingsWindow {
             label,
             action,
             rect: rect(x, y, width, self.ui_px(CONTROL_HEIGHT)),
-            state: if self.ui.interaction.pressed == Some(action) {
+            state: if !enabled {
+                ControlState::Disabled
+            } else if self.ui.interaction.pressed == Some(action) {
                 ControlState::Pressed
             } else if self.ui.interaction.hovered == Some(action) {
                 ControlState::Hovered
@@ -17220,8 +17249,10 @@ impl SettingsWindow {
             // state's colours, so the variant is inert here.
             variant: ButtonVariant::Secondary,
         };
-        self.ui_context
-            .push(button.rect, button.kind, button.action);
+        if enabled {
+            self.ui_context
+                .push(button.rect, button.kind, button.action);
+        }
 
         let palette = self.palette();
         let ui_palette = self.chrome_palette;
@@ -17253,7 +17284,11 @@ impl SettingsWindow {
             text_x,
             self.control_text_y(y, self.ui_px(CONTROL_HEIGHT)),
             button.label,
-            palette.text,
+            if enabled {
+                palette.text
+            } else {
+                palette.muted_text
+            },
             (x + width - self.ui_px(12.0) - text_x).max(0.0),
         )?;
         Ok(())
