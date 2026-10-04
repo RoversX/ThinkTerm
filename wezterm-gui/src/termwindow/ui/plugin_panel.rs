@@ -1606,28 +1606,20 @@ impl TermWindow {
         if !spend(budget, showing) {
             return Ok(());
         }
-        match text.font {
-            Font::Ui => self.paint_cached_ui_shape_clipped(
-                layers,
-                metrics,
-                &shaped,
-                left,
-                top,
-                clip_left,
-                clip_right,
-                |_| color,
-            ),
-            Font::Mono => self.paint_cached_ui_shape_pixel_clipped(
-                layers,
-                metrics,
-                &shaped,
-                left,
-                top,
-                clip_left,
-                clip_right,
-                |_| color,
-            ),
-        }
+        // The panel is a real clip -- lines scroll under its edges -- so text
+        // of either font is cut there by pixel and never drawn past it,
+        // whatever ink a glyph has beyond its advance. What shows is what
+        // was charged above.
+        self.paint_cached_ui_shape_pixel_clipped(
+            layers,
+            metrics,
+            &shaped,
+            left,
+            top,
+            clip_left,
+            clip_right,
+            |_| color,
+        )
         .map(drop)
     }
 

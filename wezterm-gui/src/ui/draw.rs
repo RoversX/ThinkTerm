@@ -803,12 +803,8 @@ impl<'a> DrawContext<'a> {
 
         for info in infos {
             let glyph = glyph_cache.cached_glyph(&info, style, false, font, self.metrics, 1)?;
-            // Whether a glyph fits is a question for its advance, as it is
-            // for `measure_text_width` and the ellipsis. The ink a glyph
-            // draws past its advance -- rounding on a 1x screen, a heavier
-            // face -- is no reason to drop it, and a box sized to the
-            // measured text lost its last glyph to exactly that.
-            if pos_x + glyph.x_advance.get() as f32 > right_edge + 0.5 {
+            let advance = glyph.x_advance.get() as f32;
+            if !glyph_fits(pos_x, advance, right_edge) {
                 break;
             }
             if let Some(texture) = glyph.texture.as_ref() {
@@ -830,10 +826,7 @@ impl<'a> DrawContext<'a> {
                 quad.set_fg_color(color);
                 quad.set_hsv(None);
             }
-            pos_x += glyph.x_advance.get() as f32;
-            if pos_x > right_edge {
-                break;
-            }
+            pos_x += advance;
         }
 
         Ok(())
@@ -904,12 +897,51 @@ impl<'a> DrawContext<'a> {
             }
         }
 
-        format!("{}{}", text[..boundaries[best]].trim_end(), ellipsis)
+        fit_ellipsized(text, boundaries[best], max_width, |candidate| {
+            self.measure_text_width(font, candidate)
+        })
     }
 }
 
 fn color_with_alpha(color: LinearRgba, alpha: f32) -> LinearRgba {
     LinearRgba(color.0, color.1, color.2, alpha.clamp(0.0, 1.0))
+}
+
+/// Whether a glyph that starts at `pos_x` and moves the pen by `advance`
+/// fits text that ends at `right_edge`.
+///
+/// Decided by the advance alone, as `measure_text_width` and the ellipsis
+/// decide, so a box sized to its measured text keeps its last glyph: some
+/// fonts draw a pixel or two of ink past their advance, and that ink is
+/// drawn into the box's padding. Half a pixel of slack absorbs rounding
+/// between measuring and drawing. Every whole-glyph painter of UI text
+/// decides this way; a surface that must not draw past its edge clips by
+/// pixel instead.
+pub(crate) fn glyph_fits(pos_x: f32, advance: f32, right_edge: f32) -> bool {
+    pos_x + advance <= right_edge + 0.5
+}
+
+/// The last step every ellipsizer shares: `text` cut at byte `end`, trailing
+/// spaces dropped, "..." after it, measured whole as it will be drawn --
+/// kerning at the join can make the two wider together than measured apart
+/// -- and stepped back a character at a time until it fits `max_width`,
+/// with the half pixel `glyph_fits` allows. `end` is a character boundary.
+pub(crate) fn fit_ellipsized(
+    text: &str,
+    mut end: usize,
+    max_width: f32,
+    mut measure: impl FnMut(&str) -> f32,
+) -> String {
+    loop {
+        let candidate = format!("{}...", text[..end].trim_end());
+        if end == 0 || measure(&candidate) <= max_width + 0.5 {
+            return candidate;
+        }
+        end = text[..end]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(idx, _)| idx);
+    }
 }
 
 /// Rounded corners are rasterized as separate integer-sized sprites. Keep the
@@ -1131,7 +1163,37 @@ impl RoundedFramePainter for DrawContext<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::pixel_snap_rounded_rect;
+    use super::{fit_ellipsized, glyph_fits, pixel_snap_rounded_rect};
+
+    #[test]
+    fn an_ellipsized_string_is_checked_whole() {
+        // Each character one wide, but "x." kerns two wider at the join: the
+        // cut made on separate measurements does not fit and steps back.
+        let kerned = |s: &str| s.chars().count() as f32 + if s.contains("x.") { 2.0 } else { 0.0 };
+        assert_eq!(fit_ellipsized("abcxyz", 4, 8.0, kerned), "abc...");
+        // Trailing spaces go before the ellipsis does.
+        assert_eq!(
+            fit_ellipsized("ab  cd", 4, 8.0, |s: &str| s.len() as f32),
+            "ab..."
+        );
+        // Nothing left of the text: the ellipsis alone.
+        assert_eq!(
+            fit_ellipsized("abc", 0, 1.0, |s: &str| s.len() as f32),
+            "..."
+        );
+    }
+
+    #[test]
+    fn the_last_glyph_of_measured_text_is_kept() {
+        // A label measured to end at 100: its last glyph is kept whatever ink
+        // it draws past that, and so is rounding between the two passes.
+        assert!(glyph_fits(92.0, 8.0, 100.0));
+        assert!(glyph_fits(92.3, 8.0, 100.0));
+        // An advance that does not fit is left out.
+        assert!(!glyph_fits(93.0, 8.0, 100.0));
+        // A mark with no advance at the edge stays with the glyph it marks.
+        assert!(glyph_fits(100.0, 0.0, 100.0));
+    }
 
     #[test]
     fn fractional_dpi_pill_keeps_a_filled_center_strip() {

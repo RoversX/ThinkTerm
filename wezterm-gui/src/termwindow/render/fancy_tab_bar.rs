@@ -1574,7 +1574,10 @@ impl crate::TermWindow {
     /// Draw a cached glyph run starting at pixel `start_x` (which may be left of
     /// `clip_left`, e.g. for a horizontally-scrolled line), clipping to
     /// `[clip_left, clip_right]`: glyphs fully left of `clip_left` advance the
-    /// pen but draw nothing, and drawing stops at `clip_right`. With
+    /// pen but draw nothing, and drawing stops at the first whole glyph whose
+    /// advance does not fit before `clip_right` (see `glyph_fits`). The last
+    /// glyph's ink may reach a pixel or two past it; a surface that must not
+    /// be drawn past uses `paint_cached_ui_shape_pixel_clipped`. With
     /// `start_x == clip_left` this is identical to the previous fixed-origin
     /// painter, so existing callers are unaffected.
     #[allow(clippy::too_many_arguments)]
@@ -1615,7 +1618,7 @@ impl crate::TermWindow {
             let color = color_for(info);
 
             if let Some(key) = info.block_key {
-                if x_pos + advance > clip_right {
+                if !crate::ui::draw::glyph_fits(x_pos, advance, clip_right) {
                     break;
                 }
                 let sprite = glyph_cache.cached_block(key, metrics)?;
@@ -1635,7 +1638,9 @@ impl crate::TermWindow {
             }
 
             let glyph = &info.glyph;
-            if x_pos + advance > clip_right {
+            // By advance, so a label sized to its measured width keeps its
+            // last glyph; see `glyph_fits`.
+            if !crate::ui::draw::glyph_fits(x_pos, advance, clip_right) {
                 break;
             }
 
@@ -1644,9 +1649,6 @@ impl crate::TermWindow {
                 let glyph_y = y - (glyph.y_offset + glyph.bearing_y).get() as f32 + baseline;
                 let glyph_width = texture.coords.size.width as f32 * glyph.scale as f32;
                 let glyph_height = texture.coords.size.height as f32 * glyph.scale as f32;
-                if glyph_x + glyph_width > clip_right {
-                    break;
-                }
                 let mut quad = layers.allocate(2)?;
                 quad.set_position(
                     glyph_x + left_offset,

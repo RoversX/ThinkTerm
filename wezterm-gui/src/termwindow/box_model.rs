@@ -632,7 +632,9 @@ impl super::TermWindow {
                         .next()
                         .ok_or_else(|| anyhow!("info.cluster didn't map into string"))?;
                     if let Some(key) = BlockKey::from_str(grapheme) {
-                        if pixel_width + context.width.pixel_cell >= max_x {
+                        // From the pen, as for text glyphs: `max_x` is where
+                        // the element may end, not a width.
+                        if !crate::ui::draw::glyph_fits(x_pos, context.width.pixel_cell, max_x) {
                             break;
                         }
                         pixel_width += context.width.pixel_cell;
@@ -652,13 +654,10 @@ impl super::TermWindow {
                             num_cells as u8,
                         )?;
 
-                        if let Some(texture) = glyph.texture.as_ref() {
-                            let x_pos = x_pos + (glyph.x_offset + glyph.bearing_x).get() as f32;
-                            let width = texture.coords.size.width as f32 * glyph.scale as f32;
-                            if x_pos + width >= max_x {
-                                break;
-                            }
-                        } else if x_pos + glyph.x_advance.get() as f32 >= max_x {
+                        // By advance, so text laid out to its measured width
+                        // keeps its last glyph; see `glyph_fits`.
+                        if !crate::ui::draw::glyph_fits(x_pos, glyph.x_advance.get() as f32, max_x)
+                        {
                             break;
                         }
 
@@ -893,17 +892,18 @@ impl super::TermWindow {
         match &element.content {
             ComputedElementContent::Text(cells) => {
                 let mut pos_x = element.content_rect.min_x();
+                // Each cell is fitted by its advance, as layout fitted it
+                // (see `glyph_fits`), so a mark with no advance at the edge
+                // stays with its glyph.
+                let max_x = element.content_rect.max_x();
                 for cell in cells {
-                    if pos_x >= element.content_rect.max_x() {
-                        break;
-                    }
                     match cell {
                         ElementCell::Sprite(sprite) => {
                             let width = sprite.coords.width();
                             let height = sprite.coords.height();
                             let pos_y = top + element.content_rect.min_y();
 
-                            if pos_x + width as f32 > element.content_rect.max_x() {
+                            if !crate::ui::draw::glyph_fits(pos_x, width as f32, max_x) {
                                 break;
                             }
 
@@ -925,9 +925,11 @@ impl super::TermWindow {
                                     - (glyph.y_offset + glyph.bearing_y).get() as f32
                                     + element.baseline;
 
-                                if pos_x + glyph.x_advance.get() as f32
-                                    > element.content_rect.max_x()
-                                {
+                                if !crate::ui::draw::glyph_fits(
+                                    pos_x,
+                                    glyph.x_advance.get() as f32,
+                                    max_x,
+                                ) {
                                     break;
                                 }
                                 let pos_x = pos_x + (glyph.x_offset + glyph.bearing_x).get() as f32;

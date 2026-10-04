@@ -3675,10 +3675,14 @@ impl crate::TermWindow {
             .collect();
         let cut_byte = ellipsize_cut_byte(&glyphs, text.len(), budget).min(text.len());
 
-        let mut output = String::with_capacity(cut_byte + ELLIPSIS.len());
-        output.push_str(&text[..cut_byte]);
-        output.push_str(ELLIPSIS);
-        Ok(Cow::Owned(output))
+        // Checked whole, as it will be drawn; a run that cannot be measured
+        // keeps the cut as made.
+        Ok(Cow::Owned(crate::ui::draw::fit_ellipsized(
+            text,
+            cut_byte,
+            max_width,
+            |candidate| self.sidebar_text_width(font, candidate).unwrap_or(0.0),
+        )))
     }
 
     pub(crate) fn sidebar_text_width(

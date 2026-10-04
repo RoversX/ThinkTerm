@@ -8388,16 +8388,15 @@ impl SettingsWindow {
             text_width,
         )?;
         let note_y = self.settings_row_description_y(y) + self.description_line_step() + extra;
-        self.draw_text(
-            layers,
-            &body_font,
-            x,
-            note_y,
-            &crate::i18n::tr("settings-app-icon-note"),
-            palette.muted_text,
-            text_width,
-        )?;
-        let bottom = (note_y + cell_height).max(label_y + cell_height) + self.ui_px(6.0);
+        let last_note_y = note_y
+            + self.draw_row_note(
+                layers,
+                x,
+                note_y,
+                &crate::i18n::tr("settings-app-icon-note"),
+                text_width,
+            )?;
+        let bottom = (last_note_y + cell_height).max(label_y + cell_height) + self.ui_px(6.0);
         Ok((bottom - (y + self.settings_row_visual_height())).max(0.0))
     }
 
@@ -9296,20 +9295,10 @@ impl SettingsWindow {
                     lines.push(chunk.join(":"));
                 }
             }
-            let step = self.description_line_step();
             let top = bottom + self.ui_px(20.0);
-            for (index, line) in lines.iter().enumerate() {
-                self.draw_text(
-                    layers,
-                    &body_font,
-                    x,
-                    top + step * index as f32,
-                    line,
-                    palette.text,
-                    width,
-                )?;
-            }
-            bottom = top + step * (lines.len() - 1) as f32 + cell_height;
+            bottom = top
+                + self.draw_text_lines(layers, &body_font, x, top, &lines, palette.text, width)?
+                + cell_height;
         }
         Ok((bottom + self.ui_px(6.0) - (y + self.settings_row_visual_height())).max(extra))
     }
@@ -14876,19 +14865,50 @@ impl SettingsWindow {
     ) -> anyhow::Result<f32> {
         let palette = self.palette();
         let body_font = Rc::clone(&self.body_font);
-        let y = self.settings_row_description_y(label_y);
-        let step = self.description_line_step();
         let lines = self.description_lines(&body_font, description, width);
+        self.draw_text_lines(
+            layers,
+            &body_font,
+            x,
+            self.settings_row_description_y(label_y),
+            &lines,
+            palette.secondary_text,
+            width,
+        )
+    }
+
+    /// A row's note under its description, wrapped as the description is:
+    /// one line in English is often two in French or German.
+    fn draw_row_note(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        note: &str,
+        width: f32,
+    ) -> anyhow::Result<f32> {
+        let palette = self.palette();
+        let body_font = Rc::clone(&self.body_font);
+        let lines = self.description_lines(&body_font, note, width);
+        self.draw_text_lines(layers, &body_font, x, y, &lines, palette.muted_text, width)
+    }
+
+    /// `lines` one under another from `y`, a description line apart. Returns
+    /// how far below `y` the last of them starts.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text_lines(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        font: &Rc<LoadedFont>,
+        x: f32,
+        y: f32,
+        lines: &[String],
+        color: LinearRgba,
+        width: f32,
+    ) -> anyhow::Result<f32> {
+        let step = self.description_line_step();
         for (index, line) in lines.iter().enumerate() {
-            self.draw_text(
-                layers,
-                &body_font,
-                x,
-                y + step * index as f32,
-                line,
-                palette.secondary_text,
-                width,
-            )?;
+            self.draw_text(layers, font, x, y + step * index as f32, line, color, width)?;
         }
         Ok(step * lines.len().saturating_sub(1) as f32)
     }
@@ -15542,15 +15562,23 @@ impl SettingsWindow {
         let center_y = control_y + control_height / 2.0;
         let knob = self.ui_px(22.0);
         let groove = self.ui_px(4.0);
-        // As wide as the widest value it can show, with a gap from the knob:
-        // a fixed width cut "Default" short in English and longer in French.
-        let value_width = [window_opacity_label(None), window_opacity_label(Some(100))]
+        // The value beside the track is as wide as the widest it can show --
+        // a fixed width cut "Default" short in English, and more in French --
+        // with a gap from the knob, but never takes the track below its
+        // least, where the knob at opaque would run into it; then it is cut.
+        let value_gap = self.ui_px(12.0);
+        let track_least = self.ui_px(48.0);
+        let widest_value = [window_opacity_label(None), window_opacity_label(Some(100))]
             .iter()
             .map(|label| self.measure_text_width(&ui_font, label))
-            .fold(self.ui_px(60.0), f32::max)
-            + self.ui_px(12.0);
+            .fold(self.ui_px(60.0), f32::max);
+        let value_width =
+            (widest_value + value_gap).min((column_width - knob - track_least).max(0.0));
+        let value_room = (value_width - value_gap).max(0.0);
         let track_left = control_x + knob / 2.0;
-        let track_width = (column_width - value_width - knob).max(self.ui_px(48.0));
+        // Never past the column either, however narrow it gets.
+        let track_width = (column_width - value_width - knob)
+            .max(track_least.min((column_width - knob).max(0.0)));
         let along =
             f32::from(percent - WINDOW_OPACITY_LEAST) / f32::from(100 - WINDOW_OPACITY_LEAST);
         let knob_x = track_left + track_width * along;
@@ -15591,8 +15619,10 @@ impl SettingsWindow {
             palette.control_border,
             knob / 2.0,
         )?;
-        let value = window_opacity_label(chosen);
-        let value_text_width = self.measure_text_width(&ui_font, &value).min(value_width);
+        // Cut first and then measured, so a value that had to be cut still
+        // sits flush right with the others.
+        let value = self.text_with_ellipsis(&ui_font, &window_opacity_label(chosen), value_room);
+        let value_text_width = self.measure_text_width(&ui_font, &value);
         self.draw_text(
             layers,
             &ui_font,
@@ -15604,7 +15634,7 @@ impl SettingsWindow {
             } else {
                 palette.secondary_text
             },
-            value_width,
+            value_room,
         )?;
         if supported {
             self.ui.window_opacity_track = Some((track_left, track_width));
@@ -15644,23 +15674,16 @@ impl SettingsWindow {
         }
 
         // Where the slider is not offered, and where it is not yet reliable,
-        // said plainly, as the app icon's row says where it works. Wrapped as
-        // the description is: in French and German it outgrows one line.
+        // said plainly, as the app icon's row says where it works.
         let note_y = self.settings_row_description_y(y) + step + description_extra;
-        let note = crate::i18n::tr("settings-window-opacity-platforms");
-        let note_lines = self.description_lines(&body_font, &note, text_width);
-        for (index, line) in note_lines.iter().enumerate() {
-            self.draw_text(
+        let last_note_y = note_y
+            + self.draw_row_note(
                 layers,
-                &body_font,
                 x,
-                note_y + step * index as f32,
-                line,
-                palette.muted_text,
+                note_y,
+                &crate::i18n::tr("settings-window-opacity-platforms"),
                 text_width,
             )?;
-        }
-        let last_note_y = note_y + step * note_lines.len().saturating_sub(1) as f32;
         let cell_height = self.metrics.cell_size.height as f32;
         let bottom = (last_note_y + cell_height).max(control_bottom) + self.ui_px(6.0);
         Ok((bottom - (y + self.settings_row_visual_height())).max(0.0))
@@ -17667,9 +17690,8 @@ impl SettingsWindow {
         let right_edge = x + max_width;
 
         for glyph in &shaped.glyphs {
-            // Fitted by advance, as the measurement and the ellipsis are; see
-            // `DrawContext::draw_text_on_layer`.
-            if pos_x + glyph.x_advance.get() as f32 > right_edge + 0.5 {
+            let advance = glyph.x_advance.get() as f32;
+            if !crate::ui::draw::glyph_fits(pos_x, advance, right_edge) {
                 break;
             }
             if let Some(texture) = glyph.texture.as_ref() {
@@ -17691,10 +17713,7 @@ impl SettingsWindow {
                 quad.set_fg_color(color);
                 quad.set_hsv(None);
             }
-            pos_x += glyph.x_advance.get() as f32;
-            if pos_x > right_edge {
-                break;
-            }
+            pos_x += advance;
         }
 
         Ok(())
@@ -17853,7 +17872,11 @@ impl SettingsWindow {
             end = idx + text[idx..].chars().next().map_or(0, char::len_utf8);
         }
 
-        format!("{}{}", text[..end].trim_end(), ellipsis)
+        // Checked whole, as it is drawn -- a string `draw_text` shapes anyway,
+        // so the check leaves nothing extra in the cache unless it steps back.
+        crate::ui::draw::fit_ellipsized(text, end, max_width, |candidate| {
+            self.measure_text_width(font, candidate)
+        })
     }
 
     fn native_settings_path() -> PathBuf {
