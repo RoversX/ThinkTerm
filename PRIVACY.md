@@ -76,10 +76,14 @@ they take the permissions of the directory they land in, which for a
 default user profile is you, SYSTEM and the Administrators group, and
 nobody else. An administrator of the machine can therefore read them --
 though an administrator can read the terminals themselves and does not
-need either file to do it. That directory is the roaming half of the
-Windows profile: on a standalone machine it stays where it is, but on a
-domain that has roaming profiles turned on, Windows copies it to the
-profile server at sign-out, and both files go with it.
+need either file to do it. The certificate is kept in the local half of
+the Windows profile, which a domain with roaming profiles does not copy
+to its profile server, so the private key stays on this machine. A copy
+an earlier version left in the roaming half is moved out of it -- unless
+the two copies differ: then both are kept where they are, and the
+listener does not start until one of them is removed. The token file is
+wherever `token_file` points, and roams only if that is inside the
+roaming half (`%APPDATA%`).
 
 The first is the tokens, and only if a `token_file` is configured: unset
 means memory only, and restarting the server forgets every token. What is
@@ -93,8 +97,9 @@ than who used it.
 
 The second is a self-signed certificate and its private key, under
 `web-tls/` in ThinkTerm's data directory (`~/.local/share/thinkterm` on
-Linux, `~/Library/Application Support/thinkterm` on macOS,
-`%APPDATA%\thinkterm` on Windows). It is made
+Linux, `~/Library/Application Support/thinkterm` on macOS) -- on Windows
+in its local data directory, `%LOCALAPPDATA%\thinkterm`, rather than the
+roaming one. It is made
 only when you bind a listener off loopback without supplying a certificate
 of your own, and it names the machine's hostname and every non-loopback
 address it has, so that a browser reaching it by any of them lands in a

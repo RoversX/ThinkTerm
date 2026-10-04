@@ -91,9 +91,11 @@ $ thinkterm cli --prefer-mux web-token mint
 ```
 
 -- and the server makes itself a certificate: self-signed, for the
-machine's hostname and every address it has, kept under
-`~/.local/share/thinkterm/web-tls/` and remade only when an address it
-does not name appears. `mint` then prints one URL per address, Tailscale
+machine's hostname and every address it has, kept in `web-tls/` --
+`~/.local/share/thinkterm/web-tls/` on Linux,
+`~/Library/Application Support/thinkterm/web-tls/` on macOS,
+`%LOCALAPPDATA%\thinkterm\web-tls\` on Windows -- and remade only when an
+address it does not name appears. `mint` then prints one URL per address, Tailscale
 ones first, and `--url-only` picks the first that another device can use.
 Before accepting a self-signed certificate warning, compare the browser certificate’s
 SHA-256 fingerprint with Settings → Web or the full `web-token mint` output.
