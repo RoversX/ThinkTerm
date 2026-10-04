@@ -163,11 +163,14 @@ pub(crate) struct PreviewGeometryKey {
     dpi: usize,
 }
 
+// The pane, its grid in the preview, the clip, its masks, and the ground a
+// mask that follows the pane's background takes there.
 type PreviewRecordingRegion = (
     mux::pane::PaneId,
     RectF,
     RectF,
     crate::termwindow::ui::recording_overlay::PaneRecordingLayer,
+    LinearRgba,
 );
 
 /// One card's thumbnail, kept between frames.
@@ -2244,9 +2247,9 @@ impl crate::TermWindow {
             mask_regions,
             ..
         } = partial;
-        for (_, grid, clip, masks) in &mask_regions {
-            let rects = masks.preview_rects(*grid, *clip);
-            self.occlude_recording_masks(&mut heap, &rects)?;
+        for (_, grid, clip, masks, ground) in &mask_regions {
+            let rects = masks.preview_rects(*grid, *clip, *ground);
+            self.occlude_recording_masks(&mut heap, &rects, None)?;
         }
         // Each rebuild slice reads the live layer. Never publish a recording
         // whose masks changed while the earlier slices were being authored.
@@ -2677,7 +2680,7 @@ impl crate::TermWindow {
             let grid_height = pane_height * (1.0 - nav_fraction);
             if mask_regions
                 .last()
-                .is_none_or(|(id, _, _, _)| *id != pane.pane_id)
+                .is_none_or(|(id, _, _, _, _)| *id != pane.pane_id)
             {
                 let masks = pane.recording_layer.clone();
                 mask_regions.push((
@@ -2685,6 +2688,7 @@ impl crate::TermWindow {
                     euclid::rect(pane_rect.min_x(), grid_top, pane_width, grid_height),
                     pane_bounds,
                     masks,
+                    palette.resolve_bg(ColorAttribute::Default).to_linear(),
                 ));
             }
 
@@ -4222,7 +4226,7 @@ impl crate::TermWindow {
                 }
                 self.paint_pane(&pos, &mut layers).context("paint_pane")?;
                 if let Ok(frame) = self.pane_mask_frame(&pos) {
-                    self.paint_pane_recording_masks(pos.pane.pane_id(), frame, &mut layers)?;
+                    self.paint_pane_recording_masks(&pos, frame, &mut layers)?;
                 }
             }
 

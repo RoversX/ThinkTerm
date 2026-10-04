@@ -1,6 +1,6 @@
 use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
 use crate::termwindow::render::{
-    resolve_fg_color_attr, same_hyperlink, update_next_frame_time, ClusterStyleCache,
+    cell_fg_bg, resolve_fg_color_attr, same_hyperlink, update_next_frame_time, ClusterStyleCache,
     ComputeCellFgBgParams, ComputeCellFgBgResult, LineToElementParams, LineToElementShape,
     RenderScreenLineParams, RenderScreenLineResult,
 };
@@ -790,26 +790,16 @@ impl crate::TermWindow {
                         &params.render_metrics,
                     )?
                     .texture_coords();
-                let bg_is_default = attrs.background() == ColorAttribute::Default;
-                let bg_color = params.palette.resolve_bg(attrs.background()).to_linear();
-
-                let fg_color = resolve_fg_color_attr(
-                    &attrs,
-                    attrs.foreground(),
-                    &params.palette,
-                    &params.config,
-                    style,
-                );
                 let (fg_color, bg_color, bg_is_default) = {
-                    let mut fg = fg_color;
-                    let mut bg = bg_color;
-                    let mut bg_default = bg_is_default;
-
-                    // Check the line reverse_video flag and flip.
-                    if attrs.reverse() == !params.reverse_video {
-                        std::mem::swap(&mut fg, &mut bg);
-                        bg_default = false;
-                    }
+                    let (fg, bg, bg_default) = cell_fg_bg(
+                        &attrs,
+                        &params.palette,
+                        &params.config,
+                        style,
+                        params.reverse_video,
+                    );
+                    let mut fg = fg.to_linear();
+                    let bg = bg.to_linear();
 
                     // Check for blink, and if this is the "not-visible"
                     // part of blinking then set fg = bg.  This is a cheap

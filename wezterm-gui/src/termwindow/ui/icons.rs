@@ -71,6 +71,7 @@ pub enum SvgIcon {
     Pencil,
     Pin,
     PinOff,
+    Pipette,
     Plus,
     Puzzle,
     RotateCcw,
@@ -287,6 +288,7 @@ impl SvgIcon {
             Self::Package => include_bytes!("../../../../third_party/lucide/icons/package.svg"),
             Self::Pin => include_bytes!("../../../../third_party/lucide/icons/pin.svg"),
             Self::PinOff => include_bytes!("../../../../third_party/lucide/icons/pin-off.svg"),
+            Self::Pipette => include_bytes!("../../../../third_party/lucide/icons/pipette.svg"),
             Self::Unlink2 => include_bytes!("../../../../third_party/lucide/icons/unlink-2.svg"),
             Self::Plus => include_bytes!("../../../../third_party/lucide/icons/plus.svg"),
             Self::RotateCcw => {
@@ -790,6 +792,7 @@ mod tests {
             SvgIcon::PanelRightOpen,
             SvgIcon::Pin,
             SvgIcon::PinOff,
+            SvgIcon::Pipette,
             SvgIcon::Plus,
             SvgIcon::Unlink2,
             SvgIcon::RotateCcw,

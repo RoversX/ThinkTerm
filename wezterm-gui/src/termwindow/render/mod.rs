@@ -1384,6 +1384,43 @@ fn resolve_fg_color_attr(
     config: &ConfigHandle,
     style: &config::TextStyle,
 ) -> LinearRgba {
+    resolve_fg_color_attr_srgb(attrs, fg, palette, config, style).to_linear()
+}
+
+/// A cell's colours as the line renderer draws them, before blinking: its
+/// foreground resolved as text is -- bold brightening, a font rule's colour
+/// -- and the two swapped where the cell's reverse attribute and the
+/// screen's reverse video disagree. The flag says the background is the
+/// pane's own ground.
+pub(crate) fn cell_fg_bg(
+    attrs: &CellAttributes,
+    palette: &ColorPalette,
+    config: &ConfigHandle,
+    style: &config::TextStyle,
+    reverse_video: bool,
+) -> (
+    wezterm_term::color::SrgbaTuple,
+    wezterm_term::color::SrgbaTuple,
+    bool,
+) {
+    let bg_is_default = attrs.background() == ColorAttribute::Default;
+    let bg = palette.resolve_bg(attrs.background());
+    let fg = resolve_fg_color_attr_srgb(attrs, attrs.foreground(), palette, config, style);
+    // Check the line reverse_video flag and flip.
+    if attrs.reverse() == !reverse_video {
+        (bg, fg, false)
+    } else {
+        (fg, bg, bg_is_default)
+    }
+}
+
+fn resolve_fg_color_attr_srgb(
+    attrs: &CellAttributes,
+    fg: ColorAttribute,
+    palette: &ColorPalette,
+    config: &ConfigHandle,
+    style: &config::TextStyle,
+) -> wezterm_term::color::SrgbaTuple {
     match fg {
         wezterm_term::color::ColorAttribute::Default => {
             if let Some(fg) = style.foreground {
@@ -1408,7 +1445,6 @@ fn resolve_fg_color_attr(
         }
         _ => palette.resolve_fg(fg),
     }
-    .to_linear()
 }
 
 fn update_next_frame_time(storage: &mut Option<Instant>, next_due: Option<Instant>) {
