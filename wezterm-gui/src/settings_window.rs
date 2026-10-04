@@ -15486,7 +15486,7 @@ impl SettingsWindow {
 
     /// The window's opacity: a slider from `WINDOW_OPACITY_LEAST` to opaque
     /// and its value -- "Default" while the configuration decides, the knob
-    /// then showing what that decided -- with a note that Linux has none.
+    /// then showing what that decided -- with a note on where it works.
     fn paint_window_opacity_row(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -15637,15 +15637,15 @@ impl SettingsWindow {
             control_bottom = reset_y + step;
         }
 
-        // The one place the slider is not offered, said plainly, as the app
-        // icon's row says where it works.
+        // Where the slider is not offered, and where it is not yet reliable,
+        // said plainly, as the app icon's row says where it works.
         let note_y = self.settings_row_description_y(y) + step + description_extra;
         self.draw_text(
             layers,
             &body_font,
             x,
             note_y,
-            &crate::i18n::tr("settings-window-opacity-linux"),
+            &crate::i18n::tr("settings-window-opacity-platforms"),
             palette.muted_text,
             text_width,
         )?;

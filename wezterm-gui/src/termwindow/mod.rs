@@ -8409,19 +8409,16 @@ impl TermWindow {
     pub(crate) fn preview_window_opacity(&mut self, percent: Option<u8>) {
         let config = match percent {
             Some(percent) => {
-                let (opacity, blur, backdrop) =
-                    crate::native_settings::window_opacity_preview(percent);
+                let (opacity, blur) = crate::native_settings::window_opacity_preview(percent);
                 // A step that shows what is shown already copies nothing.
                 if self.config.window_background_opacity == opacity
                     && self.config.macos_window_background_blur == blur
-                    && self.config.win32_system_backdrop == backdrop
                 {
                     return;
                 }
                 self.configured_config.adjusted(|config| {
                     config.window_background_opacity = opacity;
                     config.macos_window_background_blur = blur;
-                    config.win32_system_backdrop = backdrop;
                 })
             }
             None => self.configured_config.clone(),

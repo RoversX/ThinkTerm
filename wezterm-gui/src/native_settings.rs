@@ -396,34 +396,30 @@ const WINDOW_BLUR_RADIUS: i64 = 20;
 /// what. `None` removes a key, so that the configuration decides again.
 pub(crate) fn window_opacity_overrides(
     settings: &ThinkTermNativeSettings,
-) -> [(&'static str, Option<wezterm_dynamic::Value>); 3] {
+) -> [(&'static str, Option<wezterm_dynamic::Value>); 2] {
     use wezterm_dynamic::ToDynamic;
     let changes = window_opacity_changes(settings.appearance.window_opacity);
-    let [opacity, blur, backdrop] = WINDOW_OPACITY_KEYS;
+    let [opacity, blur] = WINDOW_OPACITY_KEYS;
     [
         (opacity, changes.opacity.map(|opacity| opacity.to_dynamic())),
         (blur, changes.blur.map(|blur| blur.to_dynamic())),
-        (
-            backdrop,
-            changes.backdrop.map(|backdrop| backdrop.to_dynamic()),
-        ),
     ]
 }
 
 /// The configuration keys Settings' window opacity overrides in a window.
-pub(crate) const WINDOW_OPACITY_KEYS: [&str; 3] = [
-    "window_background_opacity",
-    "macos_window_background_blur",
-    "win32_system_backdrop",
-];
+pub(crate) const WINDOW_OPACITY_KEYS: [&str; 2] =
+    ["window_background_opacity", "macos_window_background_blur"];
 
 /// What a window opacity of `percent` changes in a window's configuration:
-/// the opacity, and while it is see-through the blur or backdrop the
+/// the opacity, and while it is see-through on macOS the blur the
 /// configuration file does not ask for itself. `None` changes nothing.
+///
+/// Windows is given no backdrop: with this window frame any
+/// `win32_system_backdrop` turns a see-through window opaque (see
+/// wezterm#6265), so that stays the configuration's to choose.
 struct WindowOpacityChanges {
     opacity: Option<f64>,
     blur: Option<i64>,
-    backdrop: Option<config::SystemBackdrop>,
 }
 
 fn window_opacity_changes(percent: Option<u8>) -> WindowOpacityChanges {
@@ -438,18 +434,13 @@ fn window_opacity_changes(percent: Option<u8>) -> WindowOpacityChanges {
             && cfg!(target_os = "macos")
             && config.macos_window_background_blur == 0)
             .then_some(WINDOW_BLUR_RADIUS),
-        // Acrylic is the backdrop Windows 10 and 11 both have.
-        backdrop: (see_through
-            && cfg!(windows)
-            && config.win32_system_backdrop == config::SystemBackdrop::Auto)
-            .then_some(config::SystemBackdrop::Acrylic),
     }
 }
 
 /// What `window_opacity_overrides` for a window opacity of `percent` leaves
-/// in a window's configuration -- its opacity, blur and backdrop -- without
-/// the reload applying them takes. What the slider previews while dragged.
-pub(crate) fn window_opacity_preview(percent: u8) -> (f32, i64, config::SystemBackdrop) {
+/// in a window's configuration -- its opacity and blur -- without the reload
+/// applying them takes. What the slider previews while dragged.
+pub(crate) fn window_opacity_preview(percent: u8) -> (f32, i64) {
     let changes = window_opacity_changes(Some(percent));
     let file = config::configuration();
     (
@@ -457,7 +448,6 @@ pub(crate) fn window_opacity_preview(percent: u8) -> (f32, i64, config::SystemBa
             .opacity
             .map_or(file.window_background_opacity, |opacity| opacity as f32),
         changes.blur.unwrap_or(file.macos_window_background_blur),
-        changes.backdrop.unwrap_or(file.win32_system_backdrop),
     )
 }
 
@@ -2130,19 +2120,17 @@ mod tests {
     fn window_opacity_overrides_the_opacity_and_asks_for_a_blur() {
         use wezterm_dynamic::ToDynamic;
         let mut settings = ThinkTermNativeSettings::default();
-        let [opacity, blur, backdrop] = window_opacity_overrides(&settings);
+        let [opacity, blur] = window_opacity_overrides(&settings);
         assert_eq!(opacity, ("window_background_opacity", None));
         assert_eq!(blur, ("macos_window_background_blur", None));
-        assert_eq!(backdrop, ("win32_system_backdrop", None));
         settings.appearance.window_opacity = Some(80);
-        let [opacity, blur, backdrop] = window_opacity_overrides(&settings);
+        let [opacity, blur] = window_opacity_overrides(&settings);
         if window_opacity_supported() {
             assert_eq!(opacity.1, Some(0.8f64.to_dynamic()));
         } else {
             assert_eq!(opacity.1, None);
         }
         assert_eq!(blur.1.is_some(), cfg!(target_os = "macos"));
-        assert_eq!(backdrop.1.is_some(), cfg!(windows));
         // Below the least is the least; opaque needs no blur.
         settings.appearance.window_opacity = Some(5);
         let [opacity, ..] = window_opacity_overrides(&settings);
@@ -2150,9 +2138,10 @@ mod tests {
             assert_eq!(opacity.1, Some(0.3f64.to_dynamic()));
         }
         settings.appearance.window_opacity = Some(100);
-        let [_, blur, backdrop] = window_opacity_overrides(&settings);
+        let [_, blur] = window_opacity_overrides(&settings);
         assert_eq!(blur.1, None);
-        assert_eq!(backdrop.1, None);
+        // The Windows backdrop is never Settings' to set.
+        assert!(!WINDOW_OPACITY_KEYS.contains(&"win32_system_backdrop"));
     }
 
     use config::UiColors;
