@@ -15542,7 +15542,13 @@ impl SettingsWindow {
         let center_y = control_y + control_height / 2.0;
         let knob = self.ui_px(22.0);
         let groove = self.ui_px(4.0);
-        let value_width = self.ui_px(72.0);
+        // As wide as the widest value it can show, with a gap from the knob:
+        // a fixed width cut "Default" short in English and longer in French.
+        let value_width = [window_opacity_label(None), window_opacity_label(Some(100))]
+            .iter()
+            .map(|label| self.measure_text_width(&ui_font, label))
+            .fold(self.ui_px(60.0), f32::max)
+            + self.ui_px(12.0);
         let track_left = control_x + knob / 2.0;
         let track_width = (column_width - value_width - knob).max(self.ui_px(48.0));
         let along =
@@ -15638,19 +15644,25 @@ impl SettingsWindow {
         }
 
         // Where the slider is not offered, and where it is not yet reliable,
-        // said plainly, as the app icon's row says where it works.
+        // said plainly, as the app icon's row says where it works. Wrapped as
+        // the description is: in French and German it outgrows one line.
         let note_y = self.settings_row_description_y(y) + step + description_extra;
-        self.draw_text(
-            layers,
-            &body_font,
-            x,
-            note_y,
-            &crate::i18n::tr("settings-window-opacity-platforms"),
-            palette.muted_text,
-            text_width,
-        )?;
+        let note = crate::i18n::tr("settings-window-opacity-platforms");
+        let note_lines = self.description_lines(&body_font, &note, text_width);
+        for (index, line) in note_lines.iter().enumerate() {
+            self.draw_text(
+                layers,
+                &body_font,
+                x,
+                note_y + step * index as f32,
+                line,
+                palette.muted_text,
+                text_width,
+            )?;
+        }
+        let last_note_y = note_y + step * note_lines.len().saturating_sub(1) as f32;
         let cell_height = self.metrics.cell_size.height as f32;
-        let bottom = (note_y + cell_height).max(control_bottom) + self.ui_px(6.0);
+        let bottom = (last_note_y + cell_height).max(control_bottom) + self.ui_px(6.0);
         Ok((bottom - (y + self.settings_row_visual_height())).max(0.0))
     }
 
