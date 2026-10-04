@@ -4,6 +4,7 @@
 use crate::cli::CliOutputFormatKind;
 use anyhow::{anyhow, bail};
 use clap::Parser;
+use std::io::Write;
 use tabout::{tabulate_output, Alignment, Column};
 use wezterm_client::client::Client;
 
@@ -207,8 +208,8 @@ impl ListCommand {
                         live_connections: t.live_connections,
                     })
                     .collect();
-                serde_json::to_writer_pretty(out.lock(), &items)?;
-                println!();
+                serde_json::to_writer_pretty(out.lock(), &items).map_err(crate::stdout_error)?;
+                writeln!(out.lock()).map_err(crate::stdout_error)?;
             }
             CliOutputFormatKind::Table => {
                 let columns = [
@@ -235,7 +236,7 @@ impl ListCommand {
                         ]
                     })
                     .collect();
-                tabulate_output(&columns, &rows, &mut out.lock())?;
+                tabulate_output(&columns, &rows, &mut out.lock()).map_err(crate::stdout_error)?;
             }
         }
         Ok(())

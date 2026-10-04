@@ -1,5 +1,6 @@
 use clap::Parser;
 use mux::pane::PaneId;
+use std::io::Write;
 use termwiz_funcs::lines_to_escapes;
 use wezterm_client::client::Client;
 use wezterm_term::{ScrollbackOrVisibleRowIndex, StableRowIndex};
@@ -83,11 +84,14 @@ impl GetText {
             .map(|(_idx, line)| line)
             .collect();
 
-        if self.escapes {
-            println!("{}", lines_to_escapes(lines)?);
+        let mut out = std::io::stdout().lock();
+        let written = if self.escapes {
+            writeln!(out, "{}", lines_to_escapes(lines)?)
         } else {
-            lines.iter().for_each(|line| println!("{}", line.as_str()));
-        }
-        Ok(())
+            lines
+                .iter()
+                .try_for_each(|line| writeln!(out, "{}", line.as_str()))
+        };
+        written.map_err(crate::stdout_error)
     }
 }

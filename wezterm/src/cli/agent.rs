@@ -88,7 +88,7 @@ impl AgentListCommand {
                     title: entry.title,
                 });
                 let mut writer = serde_json::Serializer::pretty(out.lock());
-                writer.collect_seq(items)?;
+                writer.collect_seq(items).map_err(crate::stdout_error)?;
             }
             CliOutputFormatKind::Table => {
                 let now = SystemTime::now()
@@ -144,7 +144,7 @@ impl AgentListCommand {
                         ]
                     })
                     .collect::<Vec<_>>();
-                tabulate_output(&cols, &data, &mut out.lock())?;
+                tabulate_output(&cols, &data, &mut out.lock()).map_err(crate::stdout_error)?;
             }
         }
         Ok(())

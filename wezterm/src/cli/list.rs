@@ -47,7 +47,9 @@ impl ListCommand {
         match self.format {
             CliOutputFormatKind::Json => {
                 let mut writer = serde_json::Serializer::pretty(out.lock());
-                writer.collect_seq(output_items.iter())?;
+                writer
+                    .collect_seq(output_items.iter())
+                    .map_err(crate::stdout_error)?;
             }
             CliOutputFormatKind::Table => {
                 let cols = vec![
@@ -94,7 +96,8 @@ impl ListCommand {
                         ]
                     })
                     .collect::<Vec<_>>();
-                tabulate_output(&cols, &data, &mut std::io::stdout().lock())?;
+                tabulate_output(&cols, &data, &mut std::io::stdout().lock())
+                    .map_err(crate::stdout_error)?;
             }
         }
         Ok(())

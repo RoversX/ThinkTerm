@@ -1004,6 +1004,7 @@ impl ListFilesCommand {
             deadline,
             &mut out,
         )
+        .map_err(stdout_error)
         .with_context(|| format!("listing {}", self.root.display()))
     }
 }
@@ -1099,8 +1100,72 @@ fn terminate_with_error_message(err: &str) -> ! {
     std::process::exit(1);
 }
 
+/// A write to stdout found its reader gone: `| head` has the lines it
+/// wanted. Only the command's own output is marked this way, so a broken
+/// pipe anywhere else -- the installer an update feeds, say -- still fails.
+#[derive(Debug)]
+struct StdoutClosed;
+
+impl std::fmt::Display for StdoutClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stdout was closed")
+    }
+}
+
+impl std::error::Error for StdoutClosed {}
+
+/// For the `?` on a write to stdout.
+fn stdout_error(err: impl Into<std::io::Error>) -> anyhow::Error {
+    let err = err.into();
+    if err.kind() == std::io::ErrorKind::BrokenPipe {
+        StdoutClosed.into()
+    } else {
+        err.into()
+    }
+}
+
+fn reader_closed(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<StdoutClosed>())
+}
+
 fn terminate_with_error(err: anyhow::Error) -> ! {
+    // The reader being done is not this command failing.
+    if reader_closed(&err) {
+        std::process::exit(0);
+    }
     terminate_with_error_message(&format!("{:#}", err));
+}
+
+#[cfg(test)]
+mod stdout_closed_tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    struct ClosedPipe;
+
+    impl Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn only_a_closed_stdout_ends_quietly() {
+        let closed = stdout_error(Error::from(ErrorKind::BrokenPipe));
+        assert!(reader_closed(&closed));
+        assert!(reader_closed(&closed.context("listing /home/user")));
+        // The same error from anywhere else -- an installer that quit before
+        // reading its script -- is still a failure.
+        assert!(!reader_closed(&Error::from(ErrorKind::BrokenPipe).into()));
+        let denied = Error::from(ErrorKind::PermissionDenied);
+        assert!(!reader_closed(&stdout_error(denied)));
+        // serde_json hands the io error back.
+        let json = serde_json::to_writer(ClosedPipe, &[1, 2, 3]).unwrap_err();
+        assert!(reader_closed(&stdout_error(json)));
+    }
 }
 
 fn main() {
@@ -1167,7 +1232,9 @@ fn run() -> anyhow::Result<()> {
         ),
         SubCommand::ShellCompletion { shell } => {
             let rendered = render_shell_completion(shell)?;
-            std::io::stdout().write_all(rendered.as_bytes())?;
+            std::io::stdout()
+                .write_all(rendered.as_bytes())
+                .map_err(stdout_error)?;
             Ok(())
         }
     }

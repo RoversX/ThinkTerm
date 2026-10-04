@@ -25,7 +25,7 @@ impl ListClientsCommand {
                     .cloned()
                     .map(CliListClientsResultItem::from);
                 let mut writer = serde_json::Serializer::pretty(out.lock());
-                writer.collect_seq(clients)?;
+                writer.collect_seq(clients).map_err(crate::stdout_error)?;
             }
             CliOutputFormatKind::Table => {
                 let cols = vec![
@@ -107,7 +107,7 @@ impl ListClientsCommand {
                     ]);
                 }
 
-                tabulate_output(&cols, &data, &mut out.lock())?;
+                tabulate_output(&cols, &data, &mut out.lock()).map_err(crate::stdout_error)?;
             }
         }
         Ok(())

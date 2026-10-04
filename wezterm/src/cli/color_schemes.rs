@@ -8,6 +8,7 @@
 use clap::Parser;
 use config::ColorSchemeFile;
 use serde::Serialize;
+use std::io::Write;
 use wezterm_term::color::ColorPalette;
 
 #[derive(Debug, Parser, Clone)]
@@ -60,13 +61,20 @@ impl ColorSchemesCommand {
                 Err(err) => log::warn!("color scheme {name:?} did not parse: {err:#}"),
             }
         }
+        self.print(&schemes).map_err(crate::stdout_error)
+    }
+
+    fn print(&self, schemes: &[Scheme]) -> std::io::Result<()> {
+        // Buffered: the plain list is a thousand short lines.
+        let mut out = std::io::BufWriter::new(std::io::stdout().lock());
         if self.json {
-            println!("{}", serde_json::to_string(&schemes)?);
+            serde_json::to_writer(&mut out, schemes)?;
+            writeln!(out)?;
         } else {
-            for scheme in &schemes {
-                println!("{}", scheme.name);
+            for scheme in schemes {
+                writeln!(out, "{}", scheme.name)?;
             }
         }
-        Ok(())
+        out.flush()
     }
 }

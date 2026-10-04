@@ -51,7 +51,7 @@ impl PluginCommand {
             Sub::List => {
                 let listed = manage(&session, api::Request::List { locale: locale() })?;
                 let listed: Vec<Info> = serde_json::from_value(listed)?;
-                print_list(&listed);
+                print_list(&listed).map_err(crate::stdout_error)?;
             }
             Sub::Enable { id } | Sub::Disable { id } => {
                 let enabled = matches!(self.sub, Sub::Enable { .. });
@@ -131,14 +131,20 @@ fn state_label(info: &Info) -> &'static str {
     }
 }
 
-fn print_list(listed: &[Info]) {
+fn print_list(listed: &[Info]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
     let id_width = listed
         .iter()
         .map(|info| info.id.chars().count())
         .max()
         .unwrap_or(0)
         .max(2);
-    println!("{:id_width$}  {:11}  {:10}  NAME", "ID", "STATE", "VERSION");
+    writeln!(
+        out,
+        "{:id_width$}  {:11}  {:10}  NAME",
+        "ID", "STATE", "VERSION"
+    )?;
     for info in listed {
         let version = if info.builtin {
             "built in"
@@ -147,17 +153,19 @@ fn print_list(listed: &[Info]) {
         } else {
             &info.version
         };
-        println!(
+        writeln!(
+            out,
             "{:id_width$}  {:11}  {:10}  {}",
             info.id,
             state_label(info),
             version,
             info.name
-        );
+        )?;
         if let Some(reason) = info.state.reason() {
-            println!("{:id_width$}  {reason}", "");
+            writeln!(out, "{:id_width$}  {reason}", "")?;
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
