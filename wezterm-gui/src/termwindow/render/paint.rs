@@ -11,7 +11,7 @@ use ::window::RectF;
 use ::window::WindowOps;
 use anyhow::Context;
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
-use mux::tab::{SplitDirection, TabId};
+use mux::tab::{PositionedPane, SplitDirection, TabId};
 use smol::Timer;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
@@ -47,6 +47,9 @@ const MAX_PREVIEW_FILL: f32 = 1.5;
 /// Height of the pane layer divider the tab bar draws below itself, in the same
 /// device pixels the divider quad uses. Kept in step with `fancy_tab_bar`.
 const TAB_BAR_SEAM_HEIGHT: f32 = 1.0;
+/// The largest recording buffer the see-through left sidebar keeps for the
+/// next frame.
+const WORKSPACE_SIDEBAR_SCRATCH_KEEP_BYTES: usize = 8 << 20;
 
 /// How many cards may rebuild their recorded quads in one frame.
 ///
@@ -1502,39 +1505,16 @@ impl crate::TermWindow {
     /// last stretch is spent fading, because what it lands on is the card's
     /// own thumbnail of the same terminal drawn from the same snapshot -- near
     /// enough to blend into, not near enough to cut to.
-    fn paint_content_view_flight(&self) -> anyhow::Result<()> {
-        let now = Instant::now();
+    fn paint_content_view_flight(&self, now: Instant) -> anyhow::Result<()> {
         let Some(fade) = self.content_view_fade.as_ref() else {
             return Ok(());
         };
         let Some(flight) = fade.flight.as_ref() else {
             return Ok(());
         };
-        if flight.recording_revision
-            != crate::termwindow::ui::recording_overlay::recording_mask_revision()
-        {
+        let Some((source, target)) = self.content_view_flight_rects(now) else {
             return Ok(());
-        }
-        // The terminal grid is what travels, and the card's own thumbnail is
-        // what it lands on, so both ends of the journey are the same picture.
-        //
-        // The source is the one recorded with the surface, not the terminal's
-        // rectangle now: these quads hold the positions they were authored at.
-        let source = flight.source;
-        // The destination, on the other hand, is re-asked every frame. An
-        // arriving overview keeps laying itself out while the terminal crosses
-        // the window -- closing a card reflows the grid underneath it -- and a
-        // rectangle sampled once meant landing on where the card used to be
-        // and then jumping to where it is.
-        let destination = flight
-            .tab_id
-            .and_then(|tab_id| {
-                self.active_content_view()
-                    .and_then(|view| view.terminal_landing_rect(tab_id))
-            })
-            .unwrap_or(flight.destination);
-        let travel = fade.travel.value(now);
-        let target = crate::termwindow::content_view::flight_rect_at(source, destination, travel);
+        };
         // Opaque for all of the journey but the landing.
         //
         // An earlier version faded over the last tenth of the *distance*, and
@@ -1565,6 +1545,102 @@ impl crate::TermWindow {
         )
     }
 
+    /// Where the recorded terminal was recorded, and where its travel has
+    /// taken it now; `None` while there is no flight to paint.
+    fn content_view_flight_rects(&self, now: Instant) -> Option<(RectF, RectF)> {
+        let fade = self.content_view_fade.as_ref()?;
+        let flight = fade.flight.as_ref()?;
+        if flight.recording_revision
+            != crate::termwindow::ui::recording_overlay::recording_mask_revision()
+        {
+            return None;
+        }
+        // The terminal grid is what travels, and the card's own thumbnail is
+        // what it lands on, so both ends of the journey are the same picture.
+        //
+        // The source is the one recorded with the surface, not the terminal's
+        // rectangle now: these quads hold the positions they were authored at.
+        let source = flight.source;
+        // The destination, on the other hand, is re-asked every frame. An
+        // arriving overview keeps laying itself out while the terminal crosses
+        // the window -- closing a card reflows the grid underneath it -- and a
+        // rectangle sampled once meant landing on where the card used to be
+        // and then jumping to where it is.
+        let destination = flight
+            .tab_id
+            .and_then(|tab_id| {
+                self.active_content_view()
+                    .and_then(|view| view.terminal_landing_rect(tab_id))
+            })
+            .unwrap_or(flight.destination);
+        let travel = fade.travel.value(now);
+        let target = crate::termwindow::content_view::flight_rect_at(source, destination, travel);
+        Some((source, target))
+    }
+
+    /// The terminal's ground under a transition, wherever neither the
+    /// travelling terminal nor the departing window frame is.
+    ///
+    /// Opaque, the window's background is painted across the whole window
+    /// every frame, so a view fades in and out against it. See-through, that
+    /// is left to the panes -- and while a transition runs, the panes are a
+    /// recording on its way into a card: the gaps it and the sliding frame
+    /// leave would show the desktop through the half-faded view.
+    fn paint_content_view_transition_ground(
+        &self,
+        now: Instant,
+        ground: LinearRgba,
+    ) -> anyhow::Result<()> {
+        if !self.window_background.is_empty() || self.config.window_background_opacity >= 1.0 {
+            return Ok(());
+        }
+        let Some(fade) = self.content_view_fade.as_ref() else {
+            return Ok(());
+        };
+        let window = self.window_rect();
+        let mut covered = Vec::with_capacity(4);
+        if let Some((_, target)) = self.content_view_flight_rects(now) {
+            covered.push(self.clip_of(target));
+        }
+        if fade.chrome.is_some() {
+            // Where `paint_content_view_chrome` slides each piece to.
+            for piece in self.content_view_frame_pieces(fade.chrome_travel.value(now)) {
+                covered.push(self.clip_of(piece));
+            }
+        }
+        let mut gaps = HeapQuadAllocator::default();
+        self.filled_rectangle(
+            &mut TripleLayerQuadAllocator::Heap(&mut gaps),
+            0,
+            window,
+            ground,
+        )
+        .context("content view transition ground")?;
+        gaps.occlude(&covered);
+
+        let gl_state = self.render_state.as_ref().unwrap();
+        let layer = gl_state
+            .layer_for_zindex(0)
+            .context("content view transition ground layer")?;
+        let mut layers = layer.quad_allocator();
+        gaps.apply_to(&mut layers)
+    }
+
+    /// The terminal's ground across the window, as see-through as the window
+    /// is: the dark interface's, a lone pane's own, or the palette's.
+    fn window_terminal_ground(&mut self, panes: &[PositionedPane]) -> LinearRgba {
+        let ground = if let Some(ground) = self.dark_terminal_ground() {
+            ground
+        } else if panes.len() == 1 {
+            // If we're the only pane, use the pane's palette
+            // to draw the padding background
+            panes[0].pane.palette().background.to_linear()
+        } else {
+            self.palette().background.to_linear()
+        };
+        ground.mul_alpha(self.config.window_background_opacity)
+    }
+
     /// Record the window frame in three pieces, one per edge it can leave by.
     fn record_content_view_chrome(&mut self) -> anyhow::Result<()> {
         let mut chrome = crate::termwindow::content_view::ContentViewChrome::default();
@@ -1593,19 +1669,36 @@ impl crate::TermWindow {
     /// Anchored motion rather than a fade: a panel that lives against the left
     /// edge reads as leaving when it goes left, and as merely disappearing
     /// when it dissolves in place.
-    fn paint_content_view_chrome(&self) -> anyhow::Result<()> {
-        let now = Instant::now();
+    fn paint_content_view_chrome(&self, now: Instant) -> anyhow::Result<()> {
         let Some(fade) = self.content_view_fade.as_ref() else {
             return Ok(());
         };
         let Some(chrome) = fade.chrome.as_ref() else {
             return Ok(());
         };
-        let gone = fade.chrome_travel.value(now).clamp(0.0, 1.0);
+        let window = self.window_rect();
+        let home = self.content_view_frame_pieces(0.0);
+        let pieces = self.content_view_frame_pieces(fade.chrome_travel.value(now));
+
+        let gl_state = self.render_state.as_ref().unwrap();
+        let layer = gl_state
+            .layer_for_zindex(crate::termwindow::CONTENT_VIEW_FLIGHT_ZINDEX)
+            .context("content view chrome layer")?;
+        let mut layers = layer.quad_allocator();
+        let full = self.clip_of(window);
+        let surfaces = [&chrome.left, &chrome.right, &chrome.top];
+        for ((surface, piece), home) in surfaces.iter().zip(pieces).zip(home) {
+            let shifted = window.translate(piece.origin - home.origin);
+            surface.apply_to_scaled(&mut layers, full, self.clip_of(shifted), full, 1.0)?;
+        }
+        Ok(())
+    }
+
+    /// Where the window frame's three pieces are once `gone` of the way off
+    /// their edges; see `content_view::frame_pieces_at`.
+    fn content_view_frame_pieces(&self, gone: f32) -> [RectF; 3] {
         let window = self.window_rect();
         let terminal = self.terminal_content_rect();
-        let left_width = terminal.min_x() - window.min_x();
-        let right_width = window.max_x() - terminal.max_x();
         // The tab bar paints one row past its own band. The pane layer divider
         // in `fancy_tab_bar` sits at the seam -- `row_y + row_height`, which is
         // the terminal's first row, not the tab bar's last -- so sliding by the
@@ -1614,22 +1707,7 @@ impl crate::TermWindow {
         // hides most of it; fullscreen has no corners and it reads as a
         // hairline that never leaves.
         let top_height = terminal.min_y() - window.min_y() + TAB_BAR_SEAM_HEIGHT;
-
-        let gl_state = self.render_state.as_ref().unwrap();
-        let layer = gl_state
-            .layer_for_zindex(crate::termwindow::CONTENT_VIEW_FLIGHT_ZINDEX)
-            .context("content view chrome layer")?;
-        let mut layers = layer.quad_allocator();
-        let full = self.clip_of(window);
-        for (surface, dx, dy) in [
-            (&chrome.left, -left_width * gone, 0.0),
-            (&chrome.right, right_width * gone, 0.0),
-            (&chrome.top, 0.0, -top_height * gone),
-        ] {
-            let shifted = window.translate(euclid::vec2(dx, dy));
-            surface.apply_to_scaled(&mut layers, full, self.clip_of(shifted), full, 1.0)?;
-        }
-        Ok(())
+        crate::termwindow::content_view::frame_pieces_at(window, terminal, top_height, gone)
     }
 
     /// Work out where the terminal is heading and hand it the recorded frame.
@@ -3555,11 +3633,14 @@ impl crate::TermWindow {
         };
         let ui_items_before = self.ui_items.len();
         let mut panel_frame = HeapQuadAllocator::default();
+        // Solid while it floats, as the left one is.
+        let floating = std::mem::replace(&mut self.painting_floating_chrome, true);
         let result = {
             let mut panel_layers = TripleLayerQuadAllocator::Heap(&mut panel_frame);
             self.paint_right_sidebar(&mut panel_layers)
                 .and_then(|_| self.paint_right_sidebar_hover_shadow(&mut panel_layers))
         };
+        self.painting_floating_chrome = floating;
         result.context("record hover-revealed right sidebar")?;
         let mut items: Vec<UIItem> = self.ui_items.drain(ui_items_before..).collect();
         if !self.right_sidebar_hover.is_fully_presented(now) {
@@ -3670,11 +3751,15 @@ impl crate::TermWindow {
         };
         let ui_items_before = self.ui_items.len();
         let mut sidebar_frame = HeapQuadAllocator::default();
+        // Floating over the terminal, the panel is solid; only docked is it
+        // as see-through as the window.
+        let floating = std::mem::replace(&mut self.painting_floating_chrome, true);
         let result = {
             let mut sidebar_layers = TripleLayerQuadAllocator::Heap(&mut sidebar_frame);
             self.paint_workspace_sidebar(&mut sidebar_layers)
                 .and_then(|_| self.paint_workspace_sidebar_hover_shadow(&mut sidebar_layers))
         };
+        self.painting_floating_chrome = floating;
         // The marks describe `sidebar_frame`, which the swipe composite below
         // may still split; nobody downstream of this fn may.
         let live_list = self.workspace_sidebar_list_quads;
@@ -4012,9 +4097,14 @@ impl crate::TermWindow {
             &mut self.workspace_sidebar_scroll_offset,
             preview_scroll_offset,
         );
+        // Collapsed, the panel is on screen only as a hover reveal, which is
+        // solid: so is the neighbour sliding into it.
+        let floating = self.painting_floating_chrome;
+        self.painting_floating_chrome |= self.workspace_sidebar_collapsed;
         let mut layers = TripleLayerQuadAllocator::Heap(&mut quads);
         let painted = self.paint_workspace_sidebar(&mut layers);
         drop(layers);
+        self.painting_floating_chrome = floating;
         self.workspace_sidebar_scroll_offset = live_scroll_offset;
         self.workspace_sidebar_preview_space_id = None;
         // This paint laid out hit targets for a Space the window has not
@@ -4124,23 +4214,7 @@ impl crate::TermWindow {
 
         if paint_terminal_background {
             // Regular window background color
-            let background = if let Some(ground) = self.dark_terminal_ground() {
-                ground.mul_alpha(self.config.window_background_opacity)
-            } else if panes.len() == 1 {
-                // If we're the only pane, use the pane's palette
-                // to draw the padding background
-                panes[0]
-                    .pane
-                    .palette()
-                    .background
-                    .to_linear()
-                    .mul_alpha(self.config.window_background_opacity)
-            } else {
-                self.palette()
-                    .background
-                    .to_linear()
-                    .mul_alpha(self.config.window_background_opacity)
-            };
+            let background = self.window_terminal_ground(&panes);
 
             self.filled_rectangle(
                 &mut layers,
@@ -4158,13 +4232,15 @@ impl crate::TermWindow {
 
         let border = self.get_os_border();
         let header_height = border.top.get() as f32;
-        if header_height > 0.0 {
+        // `paint_window_borders` paints this band as well; in a see-through
+        // window the second coat would show.
+        if header_height > 0.0 && !self.chrome_see_through() {
             let chrome = self.chrome();
             self.filled_rectangle(
                 &mut layers,
                 0,
                 euclid::rect(0.0, 0.0, self.dimensions.pixel_width as f32, header_height),
-                chrome.sidebar_bg,
+                self.chrome_surface(chrome.sidebar_bg),
             )
             .context("filled_rectangle for chrome header background")?;
         }
@@ -4179,6 +4255,9 @@ impl crate::TermWindow {
         // closing view is already gone by now, so its side of the transition
         // is a recorded frame rather than a live paint.
         let fading_content_view = self.content_view_fade.is_some();
+        // What `paint_content_view_transition_ground` fills the gaps with,
+        // taken while the panes are still to hand.
+        let transition_ground = fading_content_view.then(|| self.window_terminal_ground(&panes));
         // While a transition runs the terminal is a recording: drawn once into
         // `flight_capture` on the opening frame, replayed thereafter.
         //
@@ -4483,10 +4562,20 @@ impl crate::TermWindow {
                     }
                 }
             } else if capture_space_source {
-                let mut sidebar_layers = layer.tee_quad_allocator(&mut sidebar_frame);
-                self.paint_workspace_sidebar(&mut sidebar_layers)
-                    .context("capture source workspace sidebar")?;
-                drop(sidebar_layers);
+                // See-through, the sidebar's list is cut to its viewport, which
+                // takes a recording: record, then draw what was recorded.
+                if self.chrome_see_through() {
+                    let mut sidebar_layers = TripleLayerQuadAllocator::Heap(&mut sidebar_frame);
+                    self.paint_workspace_sidebar(&mut sidebar_layers)
+                        .context("capture source workspace sidebar")?;
+                    drop(sidebar_layers);
+                    sidebar_frame.apply_to(&mut layer.quad_allocator())?;
+                } else {
+                    let mut sidebar_layers = layer.tee_quad_allocator(&mut sidebar_frame);
+                    self.paint_workspace_sidebar(&mut sidebar_layers)
+                        .context("capture source workspace sidebar")?;
+                    drop(sidebar_layers);
+                }
 
                 self.workspace_space_swipe_source_frame =
                     Some(crate::termwindow::CapturedSidebar {
@@ -4504,6 +4593,23 @@ impl crate::TermWindow {
                         )));
                     }
                 }
+            } else if self.chrome_see_through() {
+                // As above: the list is cut in a recording, one whose buffer
+                // is kept from frame to frame.
+                let mut recorded = std::mem::take(&mut self.workspace_sidebar_scratch);
+                recorded.recycle();
+                let mut sidebar_layers = TripleLayerQuadAllocator::Heap(&mut recorded);
+                let painted = self.paint_workspace_sidebar(&mut sidebar_layers);
+                drop(sidebar_layers);
+                // The marks describe a buffer about to be reused.
+                self.workspace_sidebar_list_quads = None;
+                let applied = painted
+                    .context("paint_workspace_sidebar")
+                    .and_then(|()| recorded.apply_to(&mut layer.quad_allocator()));
+                if recorded.resident_bytes() <= WORKSPACE_SIDEBAR_SCRATCH_KEEP_BYTES {
+                    self.workspace_sidebar_scratch = recorded;
+                }
+                applied?;
             } else {
                 let mut sidebar_layers = layer.quad_allocator();
                 self.paint_workspace_sidebar(&mut sidebar_layers)
@@ -4612,9 +4718,15 @@ impl crate::TermWindow {
             self.resolve_content_view_flight(flight_capture);
         }
         if fading_content_view {
-            self.paint_content_view_chrome()
+            // One moment for all three, or the gaps cut for the frame and
+            // the terminal would trail where they are painted.
+            let now = Instant::now();
+            if let Some(ground) = transition_ground {
+                self.paint_content_view_transition_ground(now, ground)?;
+            }
+            self.paint_content_view_chrome(now)
                 .context("paint content view chrome")?;
-            self.paint_content_view_flight()
+            self.paint_content_view_flight(now)
                 .context("paint content view flight")?;
         }
 

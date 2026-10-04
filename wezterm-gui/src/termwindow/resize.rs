@@ -2740,6 +2740,11 @@ impl super::TermWindow {
         self.quad_generation += 1;
         if last_state != self.window_state {
             self.load_os_parameters();
+            if last_state.contains(WindowState::FULL_SCREEN)
+                != window_state.contains(WindowState::FULL_SCREEN)
+            {
+                self.window_state_changed_config();
+            }
         }
 
         if let Some(webgpu) = self.webgpu.as_mut() {

@@ -335,6 +335,183 @@ pub(crate) struct NativeAppearanceSettings {
     /// Color scheme picked in the command palette; overrides the config's
     /// `color_scheme` for every window. `None` follows the configuration.
     pub(crate) color_scheme: Option<String>,
+    /// The window's opacity in percent, over the configuration's
+    /// `window_background_opacity`. `None` follows the configuration.
+    #[serde(deserialize_with = "window_opacity_or_default")]
+    pub(crate) window_opacity: Option<u8>,
+}
+
+/// The window opacity, whatever shape a hand edit gave it. One field that
+/// fails to parse loses the whole file to the defaults, and the next save
+/// writes them over everything, so: a fraction such as 0.8 is read as 80, a
+/// percentage out of range is brought into it, and anything else is no
+/// setting at all.
+fn window_opacity_or_default<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(match raw.as_f64() {
+        Some(number) if number.is_finite() => {
+            let percent = if number > 0.0 && number <= 1.0 {
+                number * 100.0
+            } else {
+                number
+            };
+            Some(
+                percent
+                    .round()
+                    .clamp(f64::from(WINDOW_OPACITY_LEAST), 100.0) as u8,
+            )
+        }
+        _ => {
+            if !raw.is_null() {
+                log::warn!(
+                    "unknown window_opacity {raw} in the settings; following the configuration"
+                );
+            }
+            None
+        }
+    })
+}
+
+/// The least window opacity Settings offers, in percent, and the step of its
+/// slider. Below the least the terminal's text is hard to read.
+pub(crate) const WINDOW_OPACITY_LEAST: u8 = 30;
+pub(crate) const WINDOW_OPACITY_STEP: u8 = 5;
+
+/// Whether Settings can make the window see-through here, with what is
+/// behind it blurred. Linux has no blur most desktops offer, so the slider
+/// is not offered there; the configuration still is.
+pub(crate) fn window_opacity_supported() -> bool {
+    cfg!(any(target_os = "macos", windows))
+}
+
+/// The blur behind a window Settings made see-through, unless the
+/// configuration names one: see-through alone shows the desktop sharp behind
+/// the text, and what the setting is for is the frosted kind.
+const WINDOW_BLUR_RADIUS: i64 = 20;
+
+/// The configuration keys the window-opacity setting overrides, and with
+/// what. `None` removes a key, so that the configuration decides again.
+pub(crate) fn window_opacity_overrides(
+    settings: &ThinkTermNativeSettings,
+) -> [(&'static str, Option<wezterm_dynamic::Value>); 3] {
+    use wezterm_dynamic::ToDynamic;
+    let changes = window_opacity_changes(settings.appearance.window_opacity);
+    let [opacity, blur, backdrop] = WINDOW_OPACITY_KEYS;
+    [
+        (opacity, changes.opacity.map(|opacity| opacity.to_dynamic())),
+        (blur, changes.blur.map(|blur| blur.to_dynamic())),
+        (
+            backdrop,
+            changes.backdrop.map(|backdrop| backdrop.to_dynamic()),
+        ),
+    ]
+}
+
+/// The configuration keys Settings' window opacity overrides in a window.
+pub(crate) const WINDOW_OPACITY_KEYS: [&str; 3] = [
+    "window_background_opacity",
+    "macos_window_background_blur",
+    "win32_system_backdrop",
+];
+
+/// What a window opacity of `percent` changes in a window's configuration:
+/// the opacity, and while it is see-through the blur or backdrop the
+/// configuration file does not ask for itself. `None` changes nothing.
+struct WindowOpacityChanges {
+    opacity: Option<f64>,
+    blur: Option<i64>,
+    backdrop: Option<config::SystemBackdrop>,
+}
+
+fn window_opacity_changes(percent: Option<u8>) -> WindowOpacityChanges {
+    let opacity = percent
+        .filter(|_| window_opacity_supported())
+        .map(|percent| f64::from(percent.clamp(WINDOW_OPACITY_LEAST, 100)) / 100.0);
+    let see_through = opacity.is_some_and(|opacity| opacity < 1.0);
+    let config = config::configuration();
+    WindowOpacityChanges {
+        opacity,
+        blur: (see_through
+            && cfg!(target_os = "macos")
+            && config.macos_window_background_blur == 0)
+            .then_some(WINDOW_BLUR_RADIUS),
+        // Acrylic is the backdrop Windows 10 and 11 both have.
+        backdrop: (see_through
+            && cfg!(windows)
+            && config.win32_system_backdrop == config::SystemBackdrop::Auto)
+            .then_some(config::SystemBackdrop::Acrylic),
+    }
+}
+
+/// What `window_opacity_overrides` for a window opacity of `percent` leaves
+/// in a window's configuration -- its opacity, blur and backdrop -- without
+/// the reload applying them takes. What the slider previews while dragged.
+pub(crate) fn window_opacity_preview(percent: u8) -> (f32, i64, config::SystemBackdrop) {
+    let changes = window_opacity_changes(Some(percent));
+    let file = config::configuration();
+    (
+        changes
+            .opacity
+            .map_or(file.window_background_opacity, |opacity| opacity as f32),
+        changes.blur.unwrap_or(file.macos_window_background_blur),
+        changes.backdrop.unwrap_or(file.win32_system_backdrop),
+    )
+}
+
+/// Every configuration key Settings overrides in a window -- the colour
+/// scheme, the window's opacity and what goes with it -- and with what.
+/// `None` removes a key. New windows seed their overrides from this and open
+/// ones are brought to it, so both always agree.
+pub(crate) fn settings_config_overrides(
+    settings: &ThinkTermNativeSettings,
+    config: &ConfigHandle,
+) -> Vec<(&'static str, Option<wezterm_dynamic::Value>)> {
+    use wezterm_dynamic::ToDynamic;
+    let scheme = effective_color_scheme(settings, config);
+    let mut overrides = vec![("color_scheme", scheme.map(|scheme| scheme.to_dynamic()))];
+    overrides.extend(window_opacity_overrides(settings));
+    overrides
+}
+
+/// Bring every window to the window opacity `settings` asks for: all a
+/// change of it needs of `apply_to_app`. A window still showing a preview
+/// goes back to what it loaded, since applying reloads only a window whose
+/// overrides changed.
+pub(crate) fn apply_window_opacity_to_app(settings: &ThinkTermNativeSettings) {
+    let overrides = window_opacity_overrides(settings).to_vec();
+    if let Some(front_end) = crate::frontend::try_front_end() {
+        for gui_window in front_end.gui_windows() {
+            let overrides = overrides.clone();
+            gui_window
+                .window
+                .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                    move |term_window| {
+                        term_window.apply_settings_overrides(&overrides);
+                        term_window.preview_window_opacity(None);
+                    },
+                )));
+        }
+    }
+}
+
+/// Show a window opacity of `percent` in every window, without saving it:
+/// the Settings slider calls this while it is dragged. `None` ends the
+/// preview, each window going back to its configuration as loaded.
+pub(crate) fn preview_window_opacity(percent: Option<u8>) {
+    if let Some(front_end) = crate::frontend::try_front_end() {
+        for gui_window in front_end.gui_windows() {
+            gui_window
+                .window
+                .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                    move |term_window| {
+                        term_window.preview_window_opacity(percent);
+                    },
+                )));
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -1168,8 +1345,9 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
         || before.appearance.theme_mode != after.appearance.theme_mode
         || before.appearance.app_icon != after.appearance.app_icon
         || before.appearance.color_scheme != after.appearance.color_scheme
+        || before.appearance.window_opacity != after.appearance.window_opacity
     {
-        // Language, theme, colour scheme, chrome and app icon.
+        // Language, theme, colour scheme, opacity, chrome and app icon.
         apply_to_app(after);
     }
     crate::settings_window::follow_open_settings_window(before, after);
@@ -1582,15 +1760,16 @@ pub(crate) fn apply_to_app(settings: &ThinkTermNativeSettings) {
     // it, not just repainted. Applying a scheme the window already has is a
     // no-op, so the common case -- a mode change that does not move the
     // default -- costs nothing.
-    let scheme = effective_color_scheme(settings, &config::configuration());
+    // All at once, so a window reloads its configuration once for them.
+    let overrides = settings_config_overrides(settings, &config::configuration());
     if let Some(front_end) = crate::frontend::try_front_end() {
         for gui_window in front_end.gui_windows() {
-            let scheme = scheme.clone();
+            let overrides = overrides.clone();
             gui_window
                 .window
                 .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
                     move |term_window| {
-                        term_window.apply_color_scheme_override(scheme);
+                        term_window.apply_settings_overrides(&overrides);
                         term_window.refresh_chrome();
                     },
                 )));
@@ -1923,6 +2102,58 @@ pub(crate) fn main_window_renderer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hand_edited_window_opacity_never_costs_the_file() {
+        for (written, read) in [
+            ("80", Some(80)),
+            ("0.8", Some(80)),
+            ("150", Some(100)),
+            ("5", Some(WINDOW_OPACITY_LEAST)),
+            ("\"half\"", None),
+            ("null", None),
+        ] {
+            let json =
+                format!(r#"{{"appearance":{{"theme_mode":"dark","window_opacity":{written}}}}}"#);
+            let settings: ThinkTermNativeSettings = serde_json::from_str(&json).unwrap();
+            assert_eq!(settings.appearance.window_opacity, read, "{written}");
+            // The rest of the file still counts.
+            assert_eq!(
+                settings.appearance.theme_mode,
+                NativeThemeMode::Dark,
+                "{written}"
+            );
+        }
+    }
+
+    #[test]
+    fn window_opacity_overrides_the_opacity_and_asks_for_a_blur() {
+        use wezterm_dynamic::ToDynamic;
+        let mut settings = ThinkTermNativeSettings::default();
+        let [opacity, blur, backdrop] = window_opacity_overrides(&settings);
+        assert_eq!(opacity, ("window_background_opacity", None));
+        assert_eq!(blur, ("macos_window_background_blur", None));
+        assert_eq!(backdrop, ("win32_system_backdrop", None));
+        settings.appearance.window_opacity = Some(80);
+        let [opacity, blur, backdrop] = window_opacity_overrides(&settings);
+        if window_opacity_supported() {
+            assert_eq!(opacity.1, Some(0.8f64.to_dynamic()));
+        } else {
+            assert_eq!(opacity.1, None);
+        }
+        assert_eq!(blur.1.is_some(), cfg!(target_os = "macos"));
+        assert_eq!(backdrop.1.is_some(), cfg!(windows));
+        // Below the least is the least; opaque needs no blur.
+        settings.appearance.window_opacity = Some(5);
+        let [opacity, ..] = window_opacity_overrides(&settings);
+        if window_opacity_supported() {
+            assert_eq!(opacity.1, Some(0.3f64.to_dynamic()));
+        }
+        settings.appearance.window_opacity = Some(100);
+        let [_, blur, backdrop] = window_opacity_overrides(&settings);
+        assert_eq!(blur.1, None);
+        assert_eq!(backdrop.1, None);
+    }
 
     use config::UiColors;
     use std::convert::TryFrom;

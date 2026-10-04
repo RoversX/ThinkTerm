@@ -267,6 +267,9 @@ impl crate::TermWindow {
             self.workspace_sidebar_collapsed = collapsed;
             crate::native_settings::save_workspace_sidebar_shown(shown);
         }
+        if collapsed {
+            self.workspace_sidebar_scratch = Default::default();
+        }
         // Either way the hover machine must not act on the pointer still
         // sitting where it was: collapsing must not instantly re-reveal, and
         // docking makes the reveal moot. The native titlebar button also
@@ -1087,7 +1090,8 @@ impl crate::TermWindow {
 
         let chrome = self.chrome();
         let foreground = chrome.text;
-        let sidebar_bg = chrome.workspace_sidebar_bg;
+        let sidebar_bg = self.chrome_surface(chrome.workspace_sidebar_bg);
+        let see_through = self.chrome_see_through();
         let sidebar_separator = chrome.separator;
         let selected_bg = chrome.sidebar_row_active_bg;
         let selected_border = chrome.sidebar_row_active_border;
@@ -1110,13 +1114,17 @@ impl crate::TermWindow {
         let settings_footer_height = layout.settings_footer_height;
 
         if rect.y > 0 {
-            self.filled_rectangle(
-                layers,
-                0,
-                euclid::rect(rect.x as f32, 0.0, rect.width as f32, rect.y as f32),
-                sidebar_bg,
-            )
-            .context("sidebar header background")?;
+            // See-through, `paint_window_borders` paints this band, and a
+            // second coat would show.
+            if !see_through {
+                self.filled_rectangle(
+                    layers,
+                    0,
+                    euclid::rect(rect.x as f32, 0.0, rect.width as f32, rect.y as f32),
+                    sidebar_bg,
+                )
+                .context("sidebar header background")?;
+            }
             self.ui_items.push(UIItem {
                 x: rect.x,
                 y: 0,
@@ -2634,10 +2642,33 @@ impl crate::TermWindow {
             }
         }
 
+        // See-through, a row scrolled under the header or the footer is cut
+        // off there: the covers painted over it opaque would show as darker
+        // bands. Only a recording can be cut, so the see-through callers
+        // record; anything else keeps the covers.
+        let list_cut = match (see_through, list_quads_start, &mut *layers) {
+            (true, Some(start), TripleLayerQuadAllocator::Heap(heap)) => {
+                heap.clip_after(
+                    &start,
+                    crate::quad::QuadClipRect::from_top_left_pixels(
+                        panel_x as f32,
+                        list_top_f,
+                        (panel_x + panel_width) as f32,
+                        content_bottom_f,
+                        &self.dimensions,
+                    ),
+                );
+                true
+            }
+            _ => false,
+        };
         self.workspace_sidebar_list_quads = list_quads_start.zip(layers.heap_mark());
 
         let header_mask_height = list_top.saturating_sub(panel_y);
-        if header_mask_height > 0 {
+        // Covers what the list left under the header, then paints the header
+        // again over that. Not once the list is cut: the header painted first
+        // is then the one in view, and a second coat of it would show.
+        if header_mask_height > 0 && !list_cut {
             self.filled_rectangle(
                 layers,
                 2,
@@ -2856,7 +2887,7 @@ impl crate::TermWindow {
             }
         }
 
-        if max_scroll > 0.0 && scroll_offset > 0.0 {
+        if max_scroll > 0.0 && scroll_offset > 0.0 && !list_cut {
             let fade_height = self
                 .ui_px(SIDEBAR_TOP_FADE_HEIGHT)
                 .min(content_bottom.saturating_sub(list_top));
@@ -2881,7 +2912,7 @@ impl crate::TermWindow {
         let bottom_mask_height = panel_y
             .saturating_add(panel_height)
             .saturating_sub(content_bottom);
-        if bottom_mask_height > 0 {
+        if bottom_mask_height > 0 && !list_cut {
             self.filled_rectangle(
                 layers,
                 2,
@@ -2901,7 +2932,7 @@ impl crate::TermWindow {
                 .ui_px(SIDEBAR_SETTINGS_FADE_HEIGHT)
                 .min(settings_footer_y.saturating_sub(panel_y))
                 .min(content_bottom.saturating_sub(panel_y));
-            if max_scroll > 0.0 && fade_height > 0 {
+            if max_scroll > 0.0 && fade_height > 0 && !list_cut {
                 for step in 0..fade_height {
                     let progress = (step + 1) as f32 / fade_height as f32;
                     self.filled_rectangle(
@@ -2919,18 +2950,20 @@ impl crate::TermWindow {
                 }
             }
 
-            self.filled_rectangle(
-                layers,
-                2,
-                euclid::rect(
-                    panel_x as f32,
-                    settings_footer_y as f32,
-                    panel_width as f32,
-                    settings_footer_height as f32,
-                ),
-                sidebar_bg,
-            )
-            .context("sidebar settings footer background")?;
+            if !list_cut {
+                self.filled_rectangle(
+                    layers,
+                    2,
+                    euclid::rect(
+                        panel_x as f32,
+                        settings_footer_y as f32,
+                        panel_width as f32,
+                        settings_footer_height as f32,
+                    ),
+                    sidebar_bg,
+                )
+                .context("sidebar settings footer background")?;
+            }
 
             let settings_row_x = item_x + self.ui_px(SIDEBAR_SETTINGS_ROW_SIDE_PADDING);
             let settings_row_y = (settings_footer_y + self.ui_px(SIDEBAR_SETTINGS_ROW_TOP_PADDING))
@@ -3214,7 +3247,7 @@ impl crate::TermWindow {
                         ring,
                         ring,
                     ),
-                    chrome.workspace_sidebar_bg,
+                    self.chrome_surface(chrome.workspace_sidebar_bg),
                     ring / 2.0,
                 )
                 .context("sidebar update dot ring")?;

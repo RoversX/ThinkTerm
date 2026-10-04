@@ -6,7 +6,9 @@ use crate::markdown_editor::{
     NoteSpellingIssue, ProjectedCodeBlock, ProjectedObject, SaveState, SourceSelection,
     TableAlignment, VisualDocument, VisualLineKind,
 };
-use crate::quad::{QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait};
+use crate::quad::{
+    QuadClipRect, QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait,
+};
 use crate::termwindow::remote_files::{
     download_name_candidates, invalidate_remote_connection, invalidate_remote_connection_if_dead,
     local_path_is_occupied, remote_connection_key, remote_connection_manager,
@@ -81,6 +83,9 @@ const RIGHT_SIDEBAR_WIDTH_CELLS: usize = 40;
 const RIGHT_SIDEBAR_MIN_WIDTH: usize = 340;
 const RIGHT_SIDEBAR_MAX_WIDTH: usize = 900;
 const RIGHT_SIDEBAR_TOP_BAR_HEIGHT: usize = 82;
+/// The largest recording buffer `paint_right_sidebar_contents` keeps for the
+/// next frame: a long note or preview at a small font.
+const RIGHT_SIDEBAR_SCRATCH_KEEP_BYTES: usize = 8 << 20;
 const RIGHT_SIDEBAR_CLOSE_BUTTON_SIZE: usize = 58;
 const RIGHT_SIDEBAR_CLOSE_ICON_SIZE: usize = 27;
 const RIGHT_SIDEBAR_CLOSE_BUTTON_X_ADJUST: usize = 8;
@@ -1798,6 +1803,7 @@ impl crate::TermWindow {
         self.right_sidebar_hover_was_presented = false;
         self.right_sidebar_collapsed = !self.right_sidebar_collapsed;
         if self.right_sidebar_collapsed {
+            self.right_sidebar_contents_scratch.clear();
             if self.right_sidebar_mode == RightSidebarMode::Tasks {
                 self.clear_right_sidebar_text_focus();
             }
@@ -7229,7 +7235,8 @@ impl crate::TermWindow {
         let chrome = self.chrome();
         let foreground = chrome.text;
         let muted_fg = chrome.secondary_text;
-        let sidebar_bg = chrome.workspace_sidebar_bg;
+        let sidebar_bg = self.chrome_surface(chrome.workspace_sidebar_bg);
+        let see_through = self.chrome_see_through();
         let settings = crate::native_settings::load();
         let base_font_size = crate::native_settings::right_sidebar_font_size(&settings);
         let ui_font = self
@@ -7266,8 +7273,9 @@ impl crate::TermWindow {
 
         if let Some(pane_rect) = self.right_sidebar_note_pane_rect() {
             // Chrome only; paint_note_sidebar paints the editor into this
-            // rect later in the frame.
-            if pane_rect.y > 0 {
+            // rect later in the frame. The band above it is the window
+            // border's, which see-through must not get a second coat.
+            if pane_rect.y > 0 && !see_through {
                 self.filled_rectangle(
                     layers,
                     0,
@@ -7317,14 +7325,19 @@ impl crate::TermWindow {
         // A plugin's extended view: its ground and edge here, what the
         // plugin draws in it with the panel's, below.
         if let Some(extended_rect) = self.right_sidebar_plugin_extended_rect() {
+            // From the window's top, but for the border's band see-through.
+            let ground_top = if see_through { extended_rect.y } else { 0 };
             self.filled_rectangle(
                 layers,
                 0,
                 euclid::rect(
                     extended_rect.x as f32,
-                    0.0,
+                    ground_top as f32,
                     extended_rect.width as f32,
-                    extended_rect.y.saturating_add(extended_rect.height) as f32,
+                    extended_rect
+                        .y
+                        .saturating_add(extended_rect.height)
+                        .saturating_sub(ground_top) as f32,
                 ),
                 sidebar_bg,
             )
@@ -7350,7 +7363,7 @@ impl crate::TermWindow {
             .context("right sidebar plugin extended view left separator")?;
         }
 
-        if rect.y > 0 {
+        if rect.y > 0 && !see_through {
             self.filled_rectangle(
                 layers,
                 0,
@@ -7719,6 +7732,44 @@ impl crate::TermWindow {
         if !matches!(self.right_sidebar_mode, RightSidebarMode::Plugin(_)) {
             self.close_plugin_panel();
         }
+        let panel_bottom = rect.y.saturating_add(rect.height);
+        self.paint_right_sidebar_contents(layers, |this, layers| {
+            this.paint_right_sidebar_panel(
+                layers,
+                &ui_font,
+                ui_metrics,
+                chrome,
+                foreground,
+                muted_fg,
+                rect,
+                content_x,
+                content_top,
+                content_width,
+                panel_bottom,
+                base_font_size,
+                icon_size,
+            )
+        })
+    }
+
+    /// The open mode's panel, under the mode selector.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_right_sidebar_panel(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        rect: RightSidebarRect,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        panel_bottom: usize,
+        base_font_size: f64,
+        icon_size: usize,
+    ) -> anyhow::Result<()> {
         match self.right_sidebar_mode {
             RightSidebarMode::Chat => {
                 let file_font_size = self.right_sidebar_file_preview_font_size();
@@ -7739,7 +7790,7 @@ impl crate::TermWindow {
                     content_x,
                     content_top,
                     content_width,
-                    rect.y.saturating_add(rect.height),
+                    panel_bottom,
                     file_icon_size,
                 )?;
                 return Ok(());
@@ -7748,7 +7799,7 @@ impl crate::TermWindow {
                 let stage = crate::input_diagnostics::StageTimer::begin("snippet_paint");
                 let result = self.paint_snippets_sidebar(
                     layers,
-                    &ui_font,
+                    ui_font,
                     ui_metrics,
                     chrome,
                     foreground,
@@ -7756,7 +7807,7 @@ impl crate::TermWindow {
                     content_x,
                     content_top,
                     content_width,
-                    rect.y.saturating_add(rect.height),
+                    panel_bottom,
                     icon_size,
                 );
                 stage.finish(result.is_ok());
@@ -7767,7 +7818,7 @@ impl crate::TermWindow {
                 let stage = crate::input_diagnostics::StageTimer::begin("note_paint");
                 let result = self.paint_note_sidebar(
                     layers,
-                    &ui_font,
+                    ui_font,
                     ui_metrics,
                     chrome,
                     foreground,
@@ -7775,7 +7826,7 @@ impl crate::TermWindow {
                     content_x,
                     content_top,
                     content_width,
-                    rect.y.saturating_add(rect.height),
+                    panel_bottom,
                     base_font_size,
                 );
                 stage.finish(result.is_ok());
@@ -7789,7 +7840,7 @@ impl crate::TermWindow {
                 }
                 self.paint_agents_sidebar(
                     layers,
-                    &ui_font,
+                    ui_font,
                     ui_metrics,
                     chrome,
                     foreground,
@@ -7797,7 +7848,7 @@ impl crate::TermWindow {
                     content_x,
                     content_top,
                     content_width,
-                    rect.y.saturating_add(rect.height),
+                    panel_bottom,
                 )?;
                 return Ok(());
             }
@@ -7813,13 +7864,13 @@ impl crate::TermWindow {
                         layers,
                         &panel.id,
                         &paint,
-                        &ui_font,
+                        ui_font,
                         ui_metrics,
                         chrome,
                         rect.x + self.ui_px(SIDEBAR_INSET),
                         content_top,
                         rect.width.saturating_sub(self.ui_px(SIDEBAR_INSET) * 2),
-                        rect.y.saturating_add(rect.height),
+                        panel_bottom,
                     )?;
                     // Its extended view from the top, as the file preview
                     // is, with the preview's close button where the preview
@@ -7839,7 +7890,7 @@ impl crate::TermWindow {
                     self.paint_plugin_panel_extended(
                         layers,
                         &paint,
-                        &ui_font,
+                        ui_font,
                         ui_metrics,
                         chrome,
                         extended_rect.x + self.ui_px(SIDEBAR_INSET),
@@ -8105,103 +8156,127 @@ impl crate::TermWindow {
             visible_height,
             row_metrics.row_height,
         );
-        let selected = self
-            .right_sidebar_note
-            .document
-            .as_ref()
-            .map(|document| document.relative_path.as_str());
-        for index in range {
-            let row = &rows[index];
-            let y = tree_top as f32 + (index * row_metrics.row_height) as f32
-                - self.right_sidebar_note_tree_scroll_offset;
-            let y = y.floor().max(tree_top as f32) as usize;
-            let height = row_metrics.row_height.min(tree_bottom.saturating_sub(y));
-            if height == 0 {
-                continue;
-            }
-            let active = !row.is_dir && selected == Some(row.relative_path.as_str());
-            let hovered = self.is_pointer_over_ui_rect(content_x, y, content_width, height);
-            if active || hovered {
-                self.fill_rounded_rectangle(
-                    layers,
-                    1,
-                    euclid::rect(
-                        content_x as f32,
-                        y as f32,
-                        content_width as f32,
-                        height as f32,
-                    ),
-                    if active {
-                        chrome.selected_bg.mul_alpha(0.46)
-                    } else {
-                        chrome.sidebar_button_hover_bg
-                    },
-                    self.ui_f32(SIDEBAR_ROW_RADIUS),
-                )?;
-            }
-            self.ui_items.push(UIItem {
-                x: content_x,
-                y,
-                width: content_width,
-                height,
-                item_type: UIItemType::RightSidebarNoteTreeRow(row.relative_path.clone()),
-            });
-            let indent = row
-                .depth
-                .saturating_mul(row_metrics.indent_step)
-                .min(content_width.saturating_sub(24));
-            let icon_x = content_x + self.ui_px(SIDEBAR_INSET) + indent;
-            let icon_y = y + height.saturating_sub(row_metrics.icon_size) / 2;
-            if row.is_dir {
-                self.paint_sidebar_icon(
-                    layers,
-                    if self
-                        .right_sidebar_note_tree_expanded
-                        .contains(&row.relative_path)
-                    {
-                        SvgIcon::FolderOpen
-                    } else {
-                        SvgIcon::Folder
-                    },
-                    icon_x,
-                    icon_y,
-                    row_metrics.icon_size,
-                    muted_fg,
-                )?;
-            } else {
-                if let Some(icon) = material_file_icon_for_name(&row.name) {
-                    self.paint_sidebar_material_icon(
+        let see_through = self.chrome_see_through();
+        self.paint_right_sidebar_contents(layers, |this, layers| {
+            let selected = this
+                .right_sidebar_note
+                .document
+                .as_ref()
+                .map(|document| document.relative_path.as_str());
+            for index in range {
+                let row = &rows[index];
+                let y = tree_top as f32 + (index * row_metrics.row_height) as f32
+                    - this.right_sidebar_note_tree_scroll_offset;
+                // Opaque, a row scrolled part-way out stays whole at the top,
+                // under the fade. See-through has no fade, so the row keeps its
+                // place and what is above the list is cut away after the loop.
+                let y = y
+                    .floor()
+                    .max(if see_through { 0.0 } else { tree_top as f32 })
+                    as usize;
+                let height = row_metrics.row_height.min(tree_bottom.saturating_sub(y));
+                // What is hovered and clicked: the part inside the list.
+                let hit_y = y.max(tree_top);
+                let hit_height = (y + height).saturating_sub(hit_y);
+                if hit_height == 0 {
+                    continue;
+                }
+                let active = !row.is_dir && selected == Some(row.relative_path.as_str());
+                let hovered =
+                    this.is_pointer_over_ui_rect(content_x, hit_y, content_width, hit_height);
+                if active || hovered {
+                    this.fill_rounded_rectangle(
                         layers,
-                        icon,
-                        icon_x,
-                        icon_y,
-                        row_metrics.icon_size,
-                    )?;
-                } else {
-                    self.paint_sidebar_icon(
-                        layers,
-                        SvgIcon::FileText,
-                        icon_x,
-                        icon_y,
-                        row_metrics.icon_size,
-                        if active { foreground } else { muted_fg },
+                        1,
+                        euclid::rect(
+                            content_x as f32,
+                            y as f32,
+                            content_width as f32,
+                            height as f32,
+                        ),
+                        if active {
+                            chrome.selected_bg.mul_alpha(0.46)
+                        } else {
+                            chrome.sidebar_button_hover_bg
+                        },
+                        this.ui_f32(SIDEBAR_ROW_RADIUS),
                     )?;
                 }
+                this.ui_items.push(UIItem {
+                    x: content_x,
+                    y: hit_y,
+                    width: content_width,
+                    height: hit_height,
+                    item_type: UIItemType::RightSidebarNoteTreeRow(row.relative_path.clone()),
+                });
+                let indent = row
+                    .depth
+                    .saturating_mul(row_metrics.indent_step)
+                    .min(content_width.saturating_sub(24));
+                let icon_x = content_x + this.ui_px(SIDEBAR_INSET) + indent;
+                let icon_y = y + height.saturating_sub(row_metrics.icon_size) / 2;
+                if row.is_dir {
+                    this.paint_sidebar_icon(
+                        layers,
+                        if this
+                            .right_sidebar_note_tree_expanded
+                            .contains(&row.relative_path)
+                        {
+                            SvgIcon::FolderOpen
+                        } else {
+                            SvgIcon::Folder
+                        },
+                        icon_x,
+                        icon_y,
+                        row_metrics.icon_size,
+                        muted_fg,
+                    )?;
+                } else {
+                    if let Some(icon) = material_file_icon_for_name(&row.name) {
+                        this.paint_sidebar_material_icon(
+                            layers,
+                            icon,
+                            icon_x,
+                            icon_y,
+                            row_metrics.icon_size,
+                        )?;
+                    } else {
+                        this.paint_sidebar_icon(
+                            layers,
+                            SvgIcon::FileText,
+                            icon_x,
+                            icon_y,
+                            row_metrics.icon_size,
+                            if active { foreground } else { muted_fg },
+                        )?;
+                    }
+                }
+                let text_x = icon_x + row_metrics.icon_size + row_metrics.icon_gap;
+                this.paint_sidebar_text(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    &row.name,
+                    text_x,
+                    y + height.saturating_sub(ui_metrics.cell_size.height as usize) / 2,
+                    content_x
+                        .saturating_add(content_width)
+                        .saturating_sub(text_x + this.ui_px(SIDEBAR_INSET)),
+                    if active { foreground } else { muted_fg },
+                )?;
             }
-            let text_x = icon_x + row_metrics.icon_size + row_metrics.icon_gap;
-            self.paint_sidebar_text(
-                layers,
-                ui_font,
-                ui_metrics,
-                &row.name,
-                text_x,
-                y + height.saturating_sub(ui_metrics.cell_size.height as usize) / 2,
-                content_x
-                    .saturating_add(content_width)
-                    .saturating_sub(text_x + self.ui_px(SIDEBAR_INSET)),
-                if active { foreground } else { muted_fg },
-            )?;
-        }
+            if see_through {
+                this.paint_right_sidebar_file_mask(
+                    layers,
+                    chrome,
+                    content_x,
+                    content_top,
+                    content_width,
+                    tree_top.saturating_sub(content_top),
+                )?;
+            }
+            Ok(())
+        })?;
 
         if self.right_sidebar_note_tree_scroll_offset > 0.0 {
             self.paint_right_sidebar_file_top_fade(
@@ -10943,8 +11018,9 @@ impl crate::TermWindow {
         muted_fg: LinearRgba,
         rect: RightSidebarRect,
     ) -> anyhow::Result<()> {
-        let sidebar_bg = chrome.workspace_sidebar_bg;
-        if rect.y > 0 {
+        let sidebar_bg = self.chrome_surface(chrome.workspace_sidebar_bg);
+        // See-through, the band above is the window border's alone.
+        if rect.y > 0 && !self.chrome_see_through() {
             self.filled_rectangle(
                 layers,
                 0,
@@ -10997,18 +11073,20 @@ impl crate::TermWindow {
         let content_width = rect.width.saturating_sub(self.ui_px(SIDEBAR_INSET) * 4);
         let content_top = rect.y + self.ui_px(SIDEBAR_INSET) * 2;
         let content_bottom = rect.y.saturating_add(rect.height);
-        self.paint_files_preview(
-            layers,
-            ui_font,
-            ui_metrics,
-            chrome,
-            foreground,
-            muted_fg,
-            content_x,
-            content_top,
-            content_width,
-            content_bottom,
-        )
+        self.paint_right_sidebar_contents(layers, |this, layers| {
+            this.paint_files_preview(
+                layers,
+                ui_font,
+                ui_metrics,
+                chrome,
+                foreground,
+                muted_fg,
+                content_x,
+                content_top,
+                content_width,
+                content_bottom,
+            )
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -16164,7 +16242,7 @@ impl crate::TermWindow {
         width: usize,
         height: usize,
     ) -> anyhow::Result<()> {
-        if width == 0 || height == 0 {
+        if width == 0 || height == 0 || self.chrome_see_through() {
             return Ok(());
         }
         let opaque_height = self.ui_px(12).min(height);
@@ -16191,15 +16269,57 @@ impl crate::TermWindow {
         if width == 0 || height == 0 {
             return Ok(());
         }
+        if self.right_sidebar_recording_contents {
+            if let TripleLayerQuadAllocator::Heap(contents) = layers {
+                contents.occlude(&[QuadClipRect::from_top_left_pixels(
+                    x as f32,
+                    y as f32,
+                    (x + width) as f32,
+                    (y + height) as f32,
+                    &self.dimensions,
+                )]);
+                return Ok(());
+            }
+        }
 
         self.filled_rectangle(
             layers,
             2,
             euclid::rect(x as f32, y as f32, width as f32, height as f32),
-            chrome.workspace_sidebar_bg,
+            self.chrome_surface(chrome.workspace_sidebar_bg),
         )
         .context("right sidebar file scroll mask")?;
         Ok(())
+    }
+
+    /// Paints `contents` -- what a panel holds, over the ground it has
+    /// already painted -- into `layers`. See-through, they are recorded on
+    /// their own first, so that the scroll masks painted among them cut what
+    /// they cover out of what `contents` painted before them: painting the
+    /// ground over it again, as an opaque window does, would show as a darker
+    /// band. Nested, the inner block's masks cut only the inner block.
+    pub(crate) fn paint_right_sidebar_contents(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        contents: impl FnOnce(&mut Self, &mut TripleLayerQuadAllocator) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        if !self.chrome_see_through() {
+            return contents(self, layers);
+        }
+        let mut recorded = self
+            .right_sidebar_contents_scratch
+            .pop()
+            .unwrap_or_default();
+        recorded.recycle();
+        let outer = std::mem::replace(&mut self.right_sidebar_recording_contents, true);
+        let result = contents(self, &mut TripleLayerQuadAllocator::Heap(&mut recorded));
+        self.right_sidebar_recording_contents = outer;
+        let applied = result.and_then(|()| recorded.apply_to(layers));
+        // Kept for the next frame, unless a long note made it large.
+        if recorded.resident_bytes() <= RIGHT_SIDEBAR_SCRATCH_KEEP_BYTES {
+            self.right_sidebar_contents_scratch.push(recorded);
+        }
+        applied
     }
 
     pub(crate) fn paint_right_sidebar_file_top_fade(
@@ -16211,7 +16331,9 @@ impl crate::TermWindow {
         width: usize,
         height: usize,
     ) -> anyhow::Result<()> {
-        if width == 0 || height == 0 {
+        // See-through, the list is cut where the mask begins instead: a fade
+        // of the ground over it would darken the ground.
+        if width == 0 || height == 0 || self.chrome_see_through() {
             return Ok(());
         }
 
@@ -16222,7 +16344,8 @@ impl crate::TermWindow {
                 layers,
                 2,
                 euclid::rect(x as f32, (y + step) as f32, width as f32, 1.0),
-                chrome.workspace_sidebar_bg.mul_alpha(alpha),
+                self.chrome_surface(chrome.workspace_sidebar_bg)
+                    .mul_alpha(alpha),
             )
             .context("right sidebar file top fade")?;
         }

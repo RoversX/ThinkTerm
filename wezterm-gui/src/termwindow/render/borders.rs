@@ -19,9 +19,18 @@ impl crate::TermWindow {
             let width = self.dimensions.pixel_width as f32;
             // The window frame is ThinkTerm's chrome, whatever `window_frame`
             // asks for: Lua configures the terminal area only.
-            let chrome_border_color = self.chrome().sidebar_bg;
+            let chrome_border_color = self.chrome_surface(self.chrome().sidebar_bg);
 
             let border_top = border_dimensions.top.get() as f32;
+            let border_bottom = border_dimensions.bottom.get() as f32;
+            // Opaque, the sides overlap the top and bottom at the corners
+            // unseen. See-through, the overlap would show darker, so the
+            // sides stop where those begin.
+            let (side_top, side_height) = if self.chrome_see_through() {
+                (border_top, (height - border_top - border_bottom).max(0.0))
+            } else {
+                (0.0, height)
+            };
             if border_top > 0.0 {
                 self.filled_rectangle(
                     layers,
@@ -36,12 +45,11 @@ impl crate::TermWindow {
                 self.filled_rectangle(
                     layers,
                     1,
-                    euclid::rect(0.0, 0.0, border_left, height),
+                    euclid::rect(0.0, side_top, border_left, side_height),
                     chrome_border_color,
                 )?;
             }
 
-            let border_bottom = border_dimensions.bottom.get() as f32;
             if border_bottom > 0.0 {
                 self.filled_rectangle(
                     layers,
@@ -56,7 +64,7 @@ impl crate::TermWindow {
                 self.filled_rectangle(
                     layers,
                     1,
-                    euclid::rect(width - border_right, 0.0, border_right, height),
+                    euclid::rect(width - border_right, side_top, border_right, side_height),
                     chrome_border_color,
                 )?;
             }

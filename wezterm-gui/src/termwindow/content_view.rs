@@ -158,6 +158,57 @@ mod flight_rect_tests {
 }
 
 #[cfg(test)]
+mod frame_piece_tests {
+    use super::*;
+
+    fn window() -> RectF {
+        euclid::rect(0.0, 0.0, 1000.0, 600.0)
+    }
+
+    // Sidebars 200 wide either side, a tab bar 80 tall over the terminal.
+    fn terminal() -> RectF {
+        euclid::rect(200.0, 80.0, 600.0, 520.0)
+    }
+
+    fn covered(rects: &[RectF], x: f32, y: f32) -> bool {
+        rects.iter().any(|rect| rect.contains(euclid::point2(x, y)))
+    }
+
+    #[test]
+    fn in_place_the_pieces_and_the_terminal_leave_no_gap() {
+        // Nothing for the transition's ground to fill on its first frame, so
+        // that frame looks exactly like the window it starts from.
+        let mut rects = frame_pieces_at(window(), terminal(), 81.0, 0.0).to_vec();
+        rects.push(terminal());
+        for y in (0..600).step_by(5) {
+            for x in (0..1000).step_by(5) {
+                assert!(
+                    covered(&rects, x as f32 + 0.5, y as f32 + 0.5),
+                    "{},{}",
+                    x,
+                    y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gone_the_pieces_are_off_the_window() {
+        for piece in frame_pieces_at(window(), terminal(), 81.0, 1.0) {
+            assert!(!piece.intersects(&window()), "{:?}", piece);
+        }
+    }
+
+    #[test]
+    fn halfway_each_piece_has_left_half_of_itself_behind() {
+        let [left, right, top] = frame_pieces_at(window(), terminal(), 81.0, 0.5);
+        assert_eq!(left.min_x(), -100.0);
+        assert_eq!(right.min_x(), 900.0);
+        assert_eq!(top.min_y(), -40.5);
+    }
+}
+
+#[cfg(test)]
 mod transition_input_tests {
     use super::*;
 
@@ -270,6 +321,41 @@ pub(crate) fn flight_rect_at(source: RectF, destination: RectF, travel: f32) -> 
         lerp(source.size.width, destination.size.width),
         lerp(source.size.height, destination.size.height),
     )
+}
+
+/// Where the three pieces of the window frame have slid to once they are
+/// `gone` of the way off the edges they leave by: the left sidebar, the right
+/// one, and the tab bar between them, `top_height` tall. In place, they and
+/// `terminal` cover `window` whole.
+pub(crate) fn frame_pieces_at(
+    window: RectF,
+    terminal: RectF,
+    top_height: f32,
+    gone: f32,
+) -> [RectF; 3] {
+    let gone = gone.clamp(0.0, 1.0);
+    let left_width = terminal.min_x() - window.min_x();
+    let right_width = window.max_x() - terminal.max_x();
+    [
+        euclid::rect(
+            window.min_x() - left_width * gone,
+            window.min_y(),
+            left_width,
+            window.height(),
+        ),
+        euclid::rect(
+            terminal.max_x() + right_width * gone,
+            window.min_y(),
+            right_width,
+            window.height(),
+        ),
+        euclid::rect(
+            terminal.min_x(),
+            window.min_y() - top_height * gone,
+            terminal.width(),
+            top_height,
+        ),
+    ]
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

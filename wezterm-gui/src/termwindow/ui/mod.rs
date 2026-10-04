@@ -137,6 +137,11 @@ impl crate::TermWindow {
     ) -> anyhow::Result<()> {
         use crate::ui::anim::Easing;
         use anyhow::Context;
+        // The tabs are clipped at the viewport already; over a see-through
+        // bar this fade would only darken a band of it.
+        if self.chrome_see_through() {
+            return Ok(());
+        }
 
         if row_height == 0 || viewport_right <= viewport_left {
             return Ok(());

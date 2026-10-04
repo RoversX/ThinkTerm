@@ -942,6 +942,18 @@ impl ConfigHandle {
         }
     }
 
+    /// This configuration with `change` made to a copy of it, under the
+    /// same generation: for what a window derives from its configuration
+    /// without reloading it.
+    pub fn adjusted(&self, change: impl FnOnce(&mut Config)) -> Self {
+        let mut config = (*self.config).clone();
+        change(&mut config);
+        Self {
+            config: Arc::new(config),
+            generation: self.generation,
+        }
+    }
+
     pub fn unicode_version(&self) -> UnicodeVersion {
         UnicodeVersion {
             version: self.config.unicode_version,
@@ -975,6 +987,21 @@ fn default_one_point_oh() -> f32 {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod config_handle_tests {
+    use super::*;
+
+    #[test]
+    fn an_adjusted_handle_changes_only_its_own_copy() {
+        let handle = ConfigHandle::default_config();
+        let adjusted = handle.adjusted(|config| config.window_background_opacity = 0.5);
+        assert_eq!(adjusted.window_background_opacity, 0.5);
+        assert_eq!(handle.window_background_opacity, 1.0);
+        // Nothing keyed on the generation is told to rebuild.
+        assert_eq!(adjusted.generation(), handle.generation());
+    }
 }
 
 #[cfg(test)]

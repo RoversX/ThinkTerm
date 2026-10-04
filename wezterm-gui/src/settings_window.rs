@@ -29,7 +29,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wezterm_bidi::Direction;
 use wezterm_dynamic::{ToDynamic, Value};
-use wezterm_font::{FontConfiguration, LoadedFont};
+use wezterm_font::{FontConfiguration, FontMetrics, LoadedFont};
 use window::bitmaps::atlas::OutOfTextureSpace;
 use window::color::LinearRgba;
 use window::{
@@ -849,6 +849,9 @@ impl SettingsSection {
                 "Theme Mode",
                 "Effective Color Scheme",
                 "App Icon",
+                "Window Opacity",
+                "Transparency",
+                "Blur",
                 "Settings UI Font Size",
                 "Workspace Sidebar Font Size",
                 "Tab Bar Font Size",
@@ -1030,6 +1033,10 @@ impl SettingsSection {
                 && crate::i18n::tr("settings-language")
                     .to_lowercase()
                     .contains(query))
+            || (self == Self::Appearance
+                && crate::i18n::tr("settings-window-opacity")
+                    .to_lowercase()
+                    .contains(query))
     }
 }
 
@@ -1042,6 +1049,45 @@ mod settings_search_tests {
         assert!(SettingsSection::General.matches_search("language"));
         let localized_label = crate::i18n::tr("settings-language").to_lowercase();
         assert!(SettingsSection::General.matches_search(&localized_label));
+    }
+}
+
+/// How often a drag of the window-opacity slider shows itself in the windows:
+/// about once a frame.
+const WINDOW_OPACITY_PREVIEW_INTERVAL: Duration = Duration::from_millis(16);
+
+/// The opacity the slider's knob stands for at `x`, on a track from `left`
+/// across `width`: the nearest step from the least to opaque.
+fn window_opacity_at(x: f32, left: f32, width: f32) -> u8 {
+    use crate::native_settings::{WINDOW_OPACITY_LEAST, WINDOW_OPACITY_STEP};
+    let along = ((x - left) / width.max(1.0)).clamp(0.0, 1.0);
+    let steps = f32::from((100 - WINDOW_OPACITY_LEAST) / WINDOW_OPACITY_STEP);
+    WINDOW_OPACITY_LEAST + (along * steps).round() as u8 * WINDOW_OPACITY_STEP
+}
+
+#[cfg(test)]
+mod window_opacity_slider_tests {
+    use super::window_opacity_at;
+
+    #[test]
+    fn the_knob_lands_on_steps_from_the_least_to_opaque() {
+        assert_eq!(window_opacity_at(100.0, 100.0, 140.0), 30);
+        assert_eq!(window_opacity_at(240.0, 100.0, 140.0), 100);
+        assert_eq!(window_opacity_at(170.0, 100.0, 140.0), 65);
+        // Between steps it takes the nearer one; off the ends, the end.
+        assert_eq!(window_opacity_at(104.0, 100.0, 140.0), 30);
+        assert_eq!(window_opacity_at(106.0, 100.0, 140.0), 35);
+        assert_eq!(window_opacity_at(-50.0, 100.0, 140.0), 30);
+        assert_eq!(window_opacity_at(900.0, 100.0, 140.0), 100);
+    }
+}
+
+/// How Settings names a window-opacity choice: the configuration's own, or a
+/// percentage.
+fn window_opacity_label(choice: Option<u8>) -> String {
+    match choice {
+        None => crate::i18n::tr("settings-window-opacity-default"),
+        Some(percent) => format!("{percent}%"),
     }
 }
 
@@ -1385,6 +1431,8 @@ enum SettingsAction {
     ToggleLanguageMenu,
     SetLanguage(&'static str),
     SetAppIcon(NativeAppIcon),
+    SetWindowOpacity(Option<u8>),
+    WindowOpacitySlider,
     ToggleMainRendererMenu,
     SetMainRenderer(NativeRendererBackend),
     /// Swallows clicks that land in an open dropdown's padding or row
@@ -1496,7 +1544,13 @@ struct TabIconEditorLayout {
 
 #[derive(Debug, Clone, Copy)]
 enum SettingsDrag {
-    SidebarResize { start_x: f32, start_width: f32 },
+    SidebarResize {
+        start_x: f32,
+        start_width: f32,
+    },
+    /// The window-opacity slider's knob: previewed while it moves, saved
+    /// when it is let go.
+    WindowOpacity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1964,6 +2018,11 @@ struct SettingsUiState {
     remote_drop_input_dirty: bool,
     interaction: InteractionState<SettingsAction>,
     drag: Option<SettingsDrag>,
+    /// The window-opacity slider's track as last painted: its left edge and
+    /// width, for turning the pointer's x into a value.
+    window_opacity_track: Option<(f32, f32)>,
+    /// When a drag of that slider last showed its value in the windows.
+    window_opacity_previewed: Option<Instant>,
     open_dropdown: Option<SettingsDropdown>,
     /// The ⓘ under the pointer this frame: its i18n key and where the icon
     /// was painted, for the bubble the overlay pass draws.
@@ -2086,6 +2145,8 @@ impl SettingsUiState {
             remote_drop_input_dirty: false,
             interaction: InteractionState::default(),
             drag: None,
+            window_opacity_track: None,
+            window_opacity_previewed: None,
             open_dropdown: None,
             hint: None,
             memory_monitoring: false,
@@ -3196,6 +3257,11 @@ impl SettingsWindow {
         }
         self.cleaned_up = true;
         self.commit_focused_input();
+        // Closed mid-drag: what the windows are previewing is what is kept.
+        if matches!(self.ui.drag, Some(SettingsDrag::WindowOpacity)) {
+            self.ui.drag = None;
+            self.commit_window_opacity();
+        }
         self.ui.memory_monitoring = false;
         self.ui.memory_monitor_generation = self.ui.memory_monitor_generation.wrapping_add(1);
         self.render_state.take();
@@ -3274,6 +3340,9 @@ impl SettingsWindow {
             WindowEvent::MouseLeave => {
                 self.ui.interaction.hovered = None;
                 self.ui.interaction.pressed = None;
+                if matches!(self.ui.drag, Some(SettingsDrag::WindowOpacity)) {
+                    self.commit_window_opacity();
+                }
                 self.ui.drag = None;
                 window.set_cursor(Some(MouseCursor::Arrow));
                 window.invalidate();
@@ -3356,6 +3425,11 @@ impl SettingsWindow {
                     window.invalidate();
                     return;
                 }
+                if let Some(SettingsDrag::WindowOpacity) = self.ui.drag {
+                    self.drag_window_opacity(x);
+                    window.invalidate();
+                    return;
+                }
 
                 if self.ui.interaction.hovered != action {
                     self.ui.interaction.hovered = action;
@@ -3399,6 +3473,12 @@ impl SettingsWindow {
                         });
                         self.ui.open_dropdown = None;
                     }
+                    Some(SettingsAction::WindowOpacitySlider) => {
+                        self.set_focused_input(None);
+                        self.ui.open_dropdown = None;
+                        self.ui.drag = Some(SettingsDrag::WindowOpacity);
+                        self.drag_window_opacity(x);
+                    }
                     Some(
                         SettingsAction::SetThemeMode(_)
                         | SettingsAction::ToggleLanguageMenu
@@ -3435,6 +3515,9 @@ impl SettingsWindow {
             }
             MouseEventKind::Release(MousePress::Left) => {
                 let pressed = self.ui.interaction.pressed.take();
+                if matches!(self.ui.drag, Some(SettingsDrag::WindowOpacity)) {
+                    self.commit_window_opacity();
+                }
                 self.ui.drag = None;
                 self.ui.interaction.hovered = action;
                 if pressed.is_some() && pressed == action {
@@ -4488,6 +4571,72 @@ impl SettingsWindow {
         }
     }
 
+    /// Move the window-opacity knob to `x` and show the result in every
+    /// window, without saving it yet.
+    fn drag_window_opacity(&mut self, x: f32) {
+        let Some((left, width)) = self.ui.window_opacity_track else {
+            return;
+        };
+        let percent = window_opacity_at(x, left, width);
+        if self.native_settings.appearance.window_opacity == Some(percent) {
+            return;
+        }
+        self.native_settings.appearance.window_opacity = Some(percent);
+        // Each preview repaints every window, so a fast drag shows some of
+        // the steps; letting go shows the last.
+        let due = self
+            .ui
+            .window_opacity_previewed
+            .is_none_or(|at| at.elapsed() >= WINDOW_OPACITY_PREVIEW_INTERVAL);
+        if due {
+            self.ui.window_opacity_previewed = Some(Instant::now());
+            crate::native_settings::preview_window_opacity(Some(percent));
+        }
+    }
+
+    fn commit_window_opacity(&mut self) {
+        self.ui.window_opacity_previewed = None;
+        let opacity = self.native_settings.appearance.window_opacity;
+        // Let go where it started: nothing to save, only a preview to end.
+        if crate::native_settings::load().appearance.window_opacity == opacity {
+            crate::native_settings::preview_window_opacity(None);
+            return;
+        }
+        self.apply_window_opacity(opacity);
+    }
+
+    fn apply_window_opacity(&mut self, opacity: Option<u8>) {
+        self.ui.open_dropdown = None;
+        // Merged into the freshest settings, as `apply_text_contrast` does:
+        // this window's copy can be older than what other windows saved.
+        let mut merged = crate::native_settings::load();
+        merged.appearance.window_opacity = opacity;
+        self.set_native_settings(merged);
+        let setting = crate::i18n::tr("settings-window-opacity");
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                crate::native_settings::apply_window_opacity_to_app(&self.native_settings);
+                self.status = settings_tr(
+                    "settings-status-value-now",
+                    &[
+                        ("setting", setting),
+                        ("value", window_opacity_label(opacity)),
+                    ],
+                );
+            }
+            Err(err) => {
+                // Not kept: the slider and the windows go back to the
+                // opacity that is.
+                self.set_native_settings(crate::native_settings::load());
+                crate::native_settings::preview_window_opacity(None);
+                self.status = settings_tr(
+                    "settings-status-save-error",
+                    &[("setting", setting), ("error", format!("{err:#}"))],
+                );
+            }
+        }
+    }
+
     fn apply_scroll_mode(&mut self, mode: crate::native_settings::NativeScrollMode) {
         self.ui.open_dropdown = None;
         self.native_settings.terminal.scroll_mode = mode;
@@ -5340,6 +5489,9 @@ impl SettingsWindow {
                 }
             }
             SettingsAction::SetScrollMode(mode) => self.apply_scroll_mode(mode),
+            SettingsAction::SetWindowOpacity(opacity) => self.apply_window_opacity(opacity),
+            // Handled as a drag, on press and release.
+            SettingsAction::WindowOpacitySlider => {}
             SettingsAction::SetTextContrast(mode) => self.apply_text_contrast(mode),
             SettingsAction::SetRemotePaneResizeMode(mode) => {
                 self.apply_remote_pane_resize_mode(mode)
@@ -7627,6 +7779,27 @@ impl SettingsWindow {
             self.paint_card_as(layers, x, card_y, max_width, layout, |this, layers, top| {
                 this.paint_typography_rows(layers, row_x, top, row_width)
             })?;
+
+        let card_y = self.paint_card_heading(
+            layers,
+            x,
+            bottom,
+            max_width,
+            &crate::i18n::tr("settings-appearance-window-heading"),
+        )?;
+        let bottom = self.paint_card(layers, x, card_y, max_width, |this, layers, top| {
+            let mut rows = RowCursor::new(top, this);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Contrast,
+                TileColor::Blue,
+            )?;
+            rows.add(this.paint_window_opacity_row(layers, tx, rows.y, tw, rows.rule())?);
+            Ok(rows.bottom)
+        })?;
 
         self.ui.content_scroll.set_extents(
             self.content_viewport_extent(),
@@ -15299,6 +15472,228 @@ impl SettingsWindow {
             segment_x += segment_width;
         }
         Ok(extra)
+    }
+
+    /// The window's opacity: a slider from `WINDOW_OPACITY_LEAST` to opaque
+    /// and its value -- "Default" while the configuration decides, the knob
+    /// then showing what that decided -- with a note that Linux has none.
+    fn paint_window_opacity_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<f32> {
+        use crate::native_settings::WINDOW_OPACITY_LEAST;
+        let palette = self.palette();
+        let accent = self.chrome_palette.accent;
+        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
+        if draw_top_rule {
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
+        }
+        let supported = crate::native_settings::window_opacity_supported();
+        let chosen = self
+            .native_settings
+            .appearance
+            .window_opacity
+            .filter(|_| supported)
+            .map(|percent| percent.clamp(WINDOW_OPACITY_LEAST, 100));
+        let percent = chosen
+            .unwrap_or_else(|| {
+                (configuration().window_background_opacity.clamp(0.0, 1.0) * 100.0).round() as u8
+            })
+            .clamp(WINDOW_OPACITY_LEAST, 100);
+
+        let column_width = self.settings_control_width(width);
+        let control_x = x + width - column_width;
+        let text_width = (control_x - x - self.ui_px(24.0)).max(width * 0.45);
+        let title = crate::i18n::tr("settings-window-opacity");
+        self.draw_text(layers, &ui_font, x, y, &title, palette.text, text_width)?;
+        let title_width = self.measure_text_width(&ui_font, &title).min(text_width);
+        self.paint_beta_badge(
+            layers,
+            x + title_width + self.ui_px(14.0),
+            y,
+            x + text_width,
+        )?;
+        let description_extra = self.draw_row_description(
+            layers,
+            x,
+            y,
+            &crate::i18n::tr("settings-window-opacity-description"),
+            text_width,
+        )?;
+
+        // A groove, the part of it up to the knob, the knob, and the value.
+        let control_y = y + self.ui_px(4.0);
+        let control_height = self.ui_px(CONTROL_HEIGHT);
+        let center_y = control_y + control_height / 2.0;
+        let knob = self.ui_px(22.0);
+        let groove = self.ui_px(4.0);
+        let value_width = self.ui_px(72.0);
+        let track_left = control_x + knob / 2.0;
+        let track_width = (column_width - value_width - knob).max(self.ui_px(48.0));
+        let along =
+            f32::from(percent - WINDOW_OPACITY_LEAST) / f32::from(100 - WINDOW_OPACITY_LEAST);
+        let knob_x = track_left + track_width * along;
+        let set = chosen.is_some();
+        self.draw_rounded_rect(
+            layers,
+            0,
+            track_left,
+            center_y - groove / 2.0,
+            track_width,
+            groove,
+            palette.track_off,
+            groove / 2.0,
+        )?;
+        self.draw_rounded_rect(
+            layers,
+            0,
+            track_left,
+            center_y - groove / 2.0,
+            knob_x - track_left,
+            groove,
+            if set { accent } else { palette.muted_text },
+            groove / 2.0,
+        )?;
+        let knob_fill = if supported {
+            LinearRgba::with_components(1.0, 1.0, 1.0, 1.0)
+        } else {
+            palette.control_hover_bg
+        };
+        self.draw_rounded_frame(
+            layers,
+            0,
+            knob_x - knob / 2.0,
+            center_y - knob / 2.0,
+            knob,
+            knob,
+            knob_fill,
+            palette.control_border,
+            knob / 2.0,
+        )?;
+        let value = window_opacity_label(chosen);
+        let value_text_width = self.measure_text_width(&ui_font, &value).min(value_width);
+        self.draw_text(
+            layers,
+            &ui_font,
+            x + width - value_text_width,
+            self.control_text_y(control_y, control_height),
+            &value,
+            if set {
+                palette.text
+            } else {
+                palette.secondary_text
+            },
+            value_width,
+        )?;
+        if supported {
+            self.ui.window_opacity_track = Some((track_left, track_width));
+            self.ui_context.push(
+                rect(control_x, control_y, track_width + knob, control_height),
+                WidgetKind::Button,
+                SettingsAction::WindowOpacitySlider,
+            );
+        } else {
+            self.ui.window_opacity_track = None;
+        }
+        let step = self.description_line_step();
+        let mut control_bottom = control_y + control_height;
+        // Back to the configuration's, once Settings has one of its own.
+        if set {
+            let reset = crate::i18n::tr("settings-window-opacity-reset");
+            let reset_width = self.measure_text_width(&body_font, &reset);
+            let reset_x = x + width - reset_width;
+            let reset_y = control_bottom + self.ui_px(6.0);
+            let action = SettingsAction::SetWindowOpacity(None);
+            let hovered = self.ui.interaction.hovered == Some(action);
+            self.draw_text(
+                layers,
+                &body_font,
+                reset_x,
+                reset_y,
+                &reset,
+                if hovered { palette.text } else { accent },
+                reset_width,
+            )?;
+            self.ui_context.push(
+                rect(reset_x, reset_y, reset_width, step),
+                WidgetKind::Button,
+                action,
+            );
+            control_bottom = reset_y + step;
+        }
+
+        // The one place the slider is not offered, said plainly, as the app
+        // icon's row says where it works.
+        let note_y = self.settings_row_description_y(y) + step + description_extra;
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            note_y,
+            &crate::i18n::tr("settings-window-opacity-linux"),
+            palette.muted_text,
+            text_width,
+        )?;
+        let cell_height = self.metrics.cell_size.height as f32;
+        let bottom = (note_y + cell_height).max(control_bottom) + self.ui_px(6.0);
+        Ok((bottom - (y + self.settings_row_visual_height())).max(0.0))
+    }
+
+    /// A small "Beta" capsule starting at `x` after a title drawn at
+    /// `title_y`, centred on the title's capitals. Left out when it would
+    /// run past `right_edge`.
+    fn paint_beta_badge(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        title_y: f32,
+        right_edge: f32,
+    ) -> anyhow::Result<()> {
+        let font = Rc::clone(&self.logo_caption_font);
+        let label = crate::i18n::tr("settings-badge-beta");
+        let pad = self.ui_px(12.0);
+        let width = (self.measure_text_width(&font, &label) + pad * 2.0).round();
+        if x + width > right_edge {
+            return Ok(());
+        }
+        let cap_height = |metrics: FontMetrics| {
+            metrics
+                .cap_height
+                .map(|cap| cap.get() as f32)
+                .unwrap_or(metrics.cell_height.get() as f32 * 0.58)
+        };
+        // `draw_text` puts the baseline this far below the y it is given,
+        // whatever the font.
+        let baseline_offset =
+            self.metrics.cell_size.height as f32 + self.metrics.descender.get() as f32;
+        let center_y = title_y + baseline_offset - cap_height(self.ui_font.metrics()) / 2.0;
+        let label_cap = cap_height(font.metrics());
+        let height = (label_cap + self.ui_px(16.0)).round();
+        let accent = self.chrome_palette.accent;
+        self.draw_rounded_rect(
+            layers,
+            0,
+            x,
+            (center_y - height / 2.0).round(),
+            width,
+            height,
+            accent.mul_alpha(0.16),
+            height / 2.0,
+        )?;
+        self.draw_text(
+            layers,
+            &font,
+            x + pad,
+            (center_y + label_cap / 2.0 - baseline_offset).round(),
+            &label,
+            accent,
+            width - pad,
+        )
     }
 
     /// The closed face of a dropdown: a pill wide enough for its current

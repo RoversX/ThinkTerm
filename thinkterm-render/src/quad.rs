@@ -887,21 +887,37 @@ impl HeapQuadAllocator {
 
     /// Remove covered pixels before a recorded surface is faded. Merely fading
     /// an opaque cover and the glyph beneath it separately reveals the glyph.
+    /// Also what a see-through panel's scroll masks do instead of covering:
+    /// a cover there would show as a darker band.
     ///
     /// The scratch rectangles are reused for all quads; unchanged quads move
-    /// without cloning. Axis-aligned mask edges partition a quad into at most
+    /// without cloning, and those before the first one a mask touches do not
+    /// move at all. Axis-aligned mask edges partition a quad into at most
     /// (2*n + 1)^2 cells, so overlapping masks cannot cause exponential growth.
-    /// Callers bound n (recording masks allow 64 per pane) and run this only
-    /// while rebuilding a cache or capturing a transition, never on replay.
+    /// Callers bound n: recording masks allow 64 per pane, a panel's scroll
+    /// masks are two or three.
     pub fn occlude(&mut self, masks: &[QuadClipRect]) {
         if masks.is_empty() {
             return;
         }
+        let touches = |quad: &BoxedQuad| {
+            let (left, top, right, bottom) = quad.position;
+            masks.iter().any(|mask| {
+                left.max(mask.left) < right.min(mask.right)
+                    && top.max(mask.top) < bottom.min(mask.bottom)
+            })
+        };
         let mut visible = Vec::new();
         let mut next = Vec::new();
         for layer in [&mut self.layer0, &mut self.layer1, &mut self.layer2] {
-            let mut output = Vec::with_capacity(layer.len());
-            for quad in layer.drain(..) {
+            // Most of a surface lies clear of the masks: everything before
+            // the first quad one touches stays where it is, unmoved.
+            let Some(first) = layer.iter().position(|quad| touches(quad)) else {
+                continue;
+            };
+            let rest: Vec<BoxedQuad> = layer.drain(first..).collect();
+            let mut output = std::mem::take(layer);
+            for quad in rest {
                 let (left, top, right, bottom) = quad.position;
                 let original = QuadClipRect {
                     left,
@@ -949,6 +965,27 @@ impl HeapQuadAllocator {
                 }
             }
             *layer = output;
+        }
+    }
+
+    /// Crop what was recorded from `mark` on to `clip`, in place; quads
+    /// wholly outside it are dropped. For a stretch that scrolls under chrome
+    /// it may not be covered by, as in a see-through window.
+    pub fn clip_after(&mut self, mark: &HeapQuadMark, clip: QuadClipRect) {
+        for (layer_num, layer) in [
+            (0, &mut self.layer0),
+            (1, &mut self.layer1),
+            (2, &mut self.layer2),
+        ] {
+            let begin = Self::layer_bounds(mark, layer_num).min(layer.len());
+            let mut kept = begin;
+            for index in begin..layer.len() {
+                if let Some(clipped) = layer[index].translated_clipped(0.0, 0.0, clip) {
+                    layer[kept] = clipped;
+                    kept += 1;
+                }
+            }
+            layer.truncate(kept);
         }
     }
 
@@ -1777,5 +1814,44 @@ mod recording_occlusion_tests {
             .sum();
         assert_eq!(area, 80.0 * 60.0);
         assert_eq!(heap.quad_count(), 4);
+    }
+
+    #[test]
+    fn occlusion_keeps_the_recorded_order_around_what_it_cuts() {
+        // Later quads draw over earlier ones in a layer: a cut piece moved
+        // to the end would land on top of what came after it.
+        let mut heap = HeapQuadAllocator::default();
+        for x in [0.0, 100.0, 200.0] {
+            heap.allocate(1)
+                .unwrap()
+                .set_position(x, 0.0, x + 50.0, 50.0);
+        }
+        heap.occlude(&[rect(100.0, 0.0, 150.0, 25.0)]);
+        let lefts: Vec<f32> = heap.layer1.iter().map(|q| q.position.0).collect();
+        assert_eq!(lefts, vec![0.0, 100.0, 200.0]);
+        assert_eq!(heap.layer1[1].position, (100.0, 25.0, 150.0, 50.0));
+    }
+
+    #[test]
+    fn clipping_after_a_mark_leaves_what_came_before_whole() {
+        let mut heap = HeapQuadAllocator::default();
+        heap.allocate(0)
+            .unwrap()
+            .set_position(0.0, 0.0, 100.0, 100.0);
+        let mark = heap.mark();
+        for top in [-20.0, 40.0, 120.0] {
+            heap.allocate(0)
+                .unwrap()
+                .set_position(0.0, top, 100.0, top + 30.0);
+        }
+        heap.clip_after(&mark, rect(0.0, 0.0, 100.0, 100.0));
+        let tops: Vec<(f32, f32)> = heap
+            .layer0
+            .iter()
+            .map(|q| (q.position.1, q.position.3))
+            .collect();
+        // The ground is untouched, the row above is cut at the top, the row
+        // below is gone.
+        assert_eq!(tops, vec![(0.0, 100.0), (0.0, 10.0), (40.0, 70.0)]);
     }
 }

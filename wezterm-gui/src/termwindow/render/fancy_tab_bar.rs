@@ -55,7 +55,7 @@ impl crate::TermWindow {
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
         let tab_width = self.window_tab_width_pixels().ceil() as usize;
 
-        let background = chrome.header_bg;
+        let background = self.chrome_surface(chrome.header_bg);
         let foreground = chrome.text;
         let muted_fg = chrome.secondary_text;
 
@@ -259,7 +259,7 @@ impl crate::TermWindow {
         // Establish a hard paint boundary before the trailing actions. Tab
         // surfaces and glyphs are already geometrically clipped, but this mask
         // also protects the action area from shader and texture overhang.
-        if viewport_right < row_right {
+        if viewport_right < row_right && !self.chrome_see_through() {
             self.filled_rectangle(
                 layers,
                 2,
@@ -778,6 +778,9 @@ impl crate::TermWindow {
             chrome.active_tab_surface()
         } else if is_hovered && !is_renaming {
             chrome.control_hover_bg
+        } else if self.chrome_see_through() {
+            // The bar's own ground: a second coat would show as a darker pill.
+            LinearRgba::TRANSPARENT
         } else {
             background
         };
@@ -811,13 +814,17 @@ impl crate::TermWindow {
         let mut content_layers = TripleLayerQuadAllocator::Heap(&mut content);
         let layers = &mut content_layers;
 
-        self.filled_rectangle(
-            layers,
-            1,
-            euclid::rect(0.0, row_y as f32, tab_width as f32, row_height as f32),
-            background,
-        )
-        .context("window tab background")?;
+        // The bar's own ground under the tab. Over a see-through bar a second
+        // coat of it would show as a darker block.
+        if !self.chrome_see_through() {
+            self.filled_rectangle(
+                layers,
+                1,
+                euclid::rect(0.0, row_y as f32, tab_width as f32, row_height as f32),
+                background,
+            )
+            .context("window tab background")?;
+        }
 
         self.paint_tab_capsule(
             layers,
@@ -1022,6 +1029,9 @@ impl crate::TermWindow {
             chrome.active_tab_surface()
         } else if is_hovered {
             chrome.control_hover_bg
+        } else if self.chrome_see_through() {
+            // As the window tabs: no second coat of the bar's ground.
+            LinearRgba::TRANSPARENT
         } else {
             background
         };
@@ -1042,13 +1052,16 @@ impl crate::TermWindow {
         let mut content_layers = TripleLayerQuadAllocator::Heap(&mut content);
         let layers = &mut content_layers;
 
-        self.filled_rectangle(
-            layers,
-            1,
-            euclid::rect(0.0, row_y as f32, tab_width as f32, row_height as f32),
-            background,
-        )
-        .context("content view tab background")?;
+        // As for a window tab: no second coat of a see-through bar.
+        if !self.chrome_see_through() {
+            self.filled_rectangle(
+                layers,
+                1,
+                euclid::rect(0.0, row_y as f32, tab_width as f32, row_height as f32),
+                background,
+            )
+            .context("content view tab background")?;
+        }
         self.paint_tab_capsule(
             layers,
             1,

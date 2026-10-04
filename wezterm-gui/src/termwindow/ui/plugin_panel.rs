@@ -73,6 +73,10 @@ const ENV_EVERY: Duration = Duration::from_millis(100);
 /// The most quads a painting is recorded with: a glyph each, a column for
 /// each pixel a line or an area crosses. What is beyond it is left out.
 const QUAD_LIMIT: usize = 100_000;
+/// The most rectangles of the panel's ground a see-through painting cuts out
+/// of what was drawn before them, each a pass over all of that. Any after
+/// these are painted, as an opaque painting paints them.
+const GROUND_CUT_LIMIT: usize = 64;
 /// The most a plugin's ask brings back from another machine: with the
 /// answer carried as base64, it fits in a frame to the plugin.
 const ASK_BYTES: usize = 8 * 1024 * 1024;
@@ -212,6 +216,8 @@ struct PaintKey {
     /// Bumped when the glyphs the quads point into may have moved.
     shapes: usize,
     chrome: UiPalette,
+    /// See-through, grounds are cut out rather than painted.
+    see_through: bool,
     sizes: [f64; 3],
     mono_size: f64,
 }
@@ -1213,6 +1219,7 @@ impl TermWindow {
             window: (self.dimensions.pixel_width, self.dimensions.pixel_height),
             shapes: self.shape_generation,
             chrome: *chrome,
+            see_through: self.chrome_see_through(),
             sizes: fonts.sizes,
             mono_size: fonts.mono_size,
         };
@@ -1241,15 +1248,79 @@ impl TermWindow {
     ) -> anyhow::Result<Vec<(Bounds, HeapQuadAllocator)>> {
         let mut regions: Vec<(Bounds, HeapQuadAllocator)> = Vec::new();
         let mut budget = QUAD_LIMIT;
+        let mut cuts = GROUND_CUT_LIMIT;
         for draw in &shown.player.draw() {
+            // A rectangle of the panel's own ground covers what was drawn
+            // before it. See-through it is not painted, since a second coat
+            // would show, so what it covers is cut out instead.
+            let mut ground_cut = false;
+            if cuts > 0 {
+                let cover = self.plugin_ground_cover(shown, draw);
+                if !cover.is_empty() {
+                    for (_, heap) in regions.iter_mut() {
+                        heap.occlude(&cover);
+                    }
+                    cuts -= 1;
+                    ground_cut = true;
+                }
+            }
             if regions.last().is_none_or(|(clip, _)| *clip != draw.clip) {
                 regions.push((draw.clip, HeapQuadAllocator::default()));
             }
             let (_, heap) = regions.last_mut().expect("pushed above");
             let mut recorded = TripleLayerQuadAllocator::Heap(heap);
-            self.paint_plugin_panel_draw(&mut recorded, shown, draw, fonts, chrome, &mut budget)?;
+            self.paint_plugin_panel_draw(
+                &mut recorded,
+                shown,
+                draw,
+                fonts,
+                chrome,
+                &mut budget,
+                ground_cut,
+            )?;
         }
         Ok(regions)
+    }
+
+    /// Where, see-through, `draw` is a rectangle of the panel's own ground,
+    /// the part of the window it covers. Rounded, that is less its corners:
+    /// a band across and a band down, the corners' content left standing.
+    fn plugin_ground_cover(&self, shown: &Shown, draw: &Draw<'_>) -> Vec<QuadClipRect> {
+        let Drawn::Rect(rect) = draw.what else {
+            return Vec::new();
+        };
+        if rect.fill != Some(Color::Token(Token::Bg)) || !self.chrome_see_through() {
+            return Vec::new();
+        }
+        let (x, y, scale) = (shown.origin.0, shown.origin.1, shown.scale);
+        let left = x + (rect.x + draw.dx) * scale;
+        let top = y + (rect.y + draw.dy) * scale;
+        let right = left + rect.w.max(0.0) * scale;
+        let bottom = top + rect.h.max(0.0) * scale;
+        let radius = (rect.radius * scale)
+            .max(0.0)
+            .min((right - left) / 2.0)
+            .min((bottom - top) / 2.0);
+        let bands = if radius > 0.0 {
+            vec![
+                (left, top + radius, right, bottom - radius),
+                (left + radius, top, right - radius, bottom),
+            ]
+        } else {
+            vec![(left, top, right, bottom)]
+        };
+        bands
+            .into_iter()
+            .filter_map(|(left, top, right, bottom)| {
+                let left = left.max(x + draw.clip.left * scale);
+                let top = top.max(y + draw.clip.top * scale);
+                let right = right.min(x + draw.clip.right * scale);
+                let bottom = bottom.min(y + draw.clip.bottom * scale);
+                (right > left && bottom > top).then(|| {
+                    QuadClipRect::from_top_left_pixels(left, top, right, bottom, &self.dimensions)
+                })
+            })
+            .collect()
     }
 
     fn lay_plugin_panel_heap(
@@ -1270,6 +1341,7 @@ impl TermWindow {
         heap.apply_to_clipped(layers, clip, 1.0)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn paint_plugin_panel_draw(
         &self,
         layers: &mut TripleLayerQuadAllocator,
@@ -1278,6 +1350,7 @@ impl TermWindow {
         fonts: &PanelFonts,
         chrome: &UiPalette,
         budget: &mut usize,
+        ground_cut: bool,
     ) -> anyhow::Result<()> {
         let scale = shown.scale;
         // What of the window the draw shows in, across.
@@ -1311,7 +1384,10 @@ impl TermWindow {
                 radius,
                 border,
             }) => {
-                let fill = fill.map(|fill| color(chrome, fill));
+                // A ground cut out of what came before it in
+                // `record_plugin_panel` is not painted: see-through, a second
+                // coat of the panel's ground would show as a darker block.
+                let fill = fill.filter(|_| !ground_cut).map(|fill| color(chrome, fill));
                 let border = border.map(|border| color(chrome, border));
                 self.paint_panel_rect(layers, place(*x, *y, *w, *h), fill, border, radius * scale)
             }

@@ -304,6 +304,114 @@ impl crate::TermWindow {
         ))
     }
 
+    /// The pane's own background: out to half way across the splits beside
+    /// it, and to the edges of the terminal area along them.
+    pub(crate) fn pane_background_rect(&self, pos: &PositionedPane) -> RectF {
+        let (padding_left, padding_top) = self.padding_left_top();
+        let (top_bar_height, _) = self.pane_area_insets();
+        let border = self.get_os_border();
+        let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
+        let cell_width = self.render_metrics.cell_size.width as f32;
+        let cell_height = self.render_metrics.cell_size.height as f32;
+        // We want to fill out to the edges of the splits
+        let (x, width_delta) = if pos.left == 0 {
+            // See-through, the sidebar shows its own ground only: this
+            // one under it as well would darken it below the tab bar.
+            let left = if self.chrome_see_through() {
+                self.tab_bar_left_edge() as f32
+            } else {
+                0.
+            };
+            (
+                left,
+                padding_left + border.left.get() as f32 + (cell_width / 2.0) - left,
+            )
+        } else {
+            (
+                padding_left + border.left.get() as f32 - (cell_width / 2.0)
+                    + (pos.left as f32 * cell_width),
+                cell_width,
+            )
+        };
+
+        let (y, height_delta) = if pos.top == 0 {
+            (
+                (top_pixel_y - padding_top),
+                padding_top + (cell_height / 2.0),
+            )
+        } else {
+            (
+                top_pixel_y + (pos.top as f32 * cell_height) - (cell_height / 2.0),
+                cell_height,
+            )
+        };
+        let candidate_right = if pos.left + pos.width >= self.terminal_size.cols as usize {
+            self.terminal_viewport_right()
+        } else {
+            x + (pos.width as f32 * cell_width) + width_delta
+        };
+        let (x, width) =
+            clamp_pane_horizontal_span(x, candidate_right, self.terminal_viewport_right());
+        euclid::rect(
+            x,
+            y,
+            width,
+            // Go all the way to the bottom if we're bottom-most
+            if pos.top + pos.height >= self.terminal_size.rows as usize {
+                self.pane_area_bottom() - y
+            } else {
+                (pos.height as f32 * cell_height) + height_delta as f32
+            },
+        )
+    }
+
+    /// Where the pane's own background goes: all of `pane_background_rect`,
+    /// but, see-through, not the band its nav bar takes -- collapsed, its
+    /// whole frame. Chrome there is painted over nothing, as see-through as
+    /// the tab strip beside it; over the pane's ground it would come out
+    /// tinted by it.
+    fn pane_ground_rects(&self, pos: &PositionedPane) -> anyhow::Result<Vec<RectF>> {
+        let ground = self.pane_background_rect(pos);
+        if !self.chrome_see_through() {
+            return Ok(vec![ground]);
+        }
+        let chrome = if self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id) {
+            self.pane_frame_rect(pos)?
+        } else {
+            let nav_height = self.pane_nav_bar_height_for_pane(pos) as f32;
+            if nav_height <= 0.0 {
+                return Ok(vec![ground]);
+            }
+            let (_, pane_y) = self.pane_content_origin(pos)?;
+            euclid::rect(
+                ground.min_x(),
+                pane_y - self.pane_nav_lift(pos),
+                ground.width(),
+                nav_height,
+            )
+        };
+        let mut rects = Vec::with_capacity(2);
+        let above = chrome.min_y().min(ground.max_y());
+        if above > ground.min_y() {
+            rects.push(euclid::rect(
+                ground.min_x(),
+                ground.min_y(),
+                ground.width(),
+                above - ground.min_y(),
+            ));
+        }
+        let below = chrome.max_y().max(ground.min_y());
+        if ground.max_y() > below {
+            rects.push(euclid::rect(
+                ground.min_x(),
+                below,
+                ground.width(),
+                ground.max_y() - below,
+            ));
+        }
+        Ok(rects)
+    }
+
     /// The pane's rectangle without that lift. Recording masks are kept as
     /// fractions of it, so it has to move with the pane's rows when a
     /// terminal bar comes or goes, as the whole frame did before the lift.
@@ -329,7 +437,7 @@ impl crate::TermWindow {
         let foreground = chrome.text;
         let muted_fg = chrome.secondary_text;
 
-        self.filled_rectangle(layers, 0, pane_rect, chrome.sidebar_bg)
+        self.filled_rectangle(layers, 0, pane_rect, self.chrome_surface(chrome.sidebar_bg))
             .context("collapsed pane background")?;
 
         self.ui_items.push(UIItem {
@@ -715,7 +823,7 @@ impl crate::TermWindow {
         // sliced in half.
         self.paint_tab_row_fades(
             layers,
-            chrome.sidebar_bg,
+            self.chrome_surface(chrome.sidebar_bg),
             tab_y,
             tab_height,
             tab_start,
@@ -776,7 +884,8 @@ impl crate::TermWindow {
         // terminal's header rather than to the sidebar -- same reasoning as
         // the tab strip itself. `header_bg` is the chrome's own colour in a
         // dark interface, so nothing moves there.
-        let background = chrome.header_bg;
+        // Over nothing see-through: the pane's ground stops below it.
+        let background = self.chrome_surface(chrome.header_bg);
         let foreground = chrome.text;
         let muted_fg = chrome.secondary_text;
         let tab_fg = if pos.is_active { foreground } else { muted_fg };
@@ -1575,72 +1684,27 @@ impl crate::TermWindow {
                 config.text_background_opacity
             });
 
-        let cell_width = self.render_metrics.cell_size.width as f32;
-        let cell_height = self.render_metrics.cell_size.height as f32;
-        let background_rect = {
-            // We want to fill out to the edges of the splits
-            let (x, width_delta) = if pos.left == 0 {
-                (
-                    0.,
-                    padding_left + border.left.get() as f32 + (cell_width / 2.0),
-                )
-            } else {
-                (
-                    padding_left + border.left.get() as f32 - (cell_width / 2.0)
-                        + (pos.left as f32 * cell_width),
-                    cell_width,
-                )
-            };
-
-            let (y, height_delta) = if pos.top == 0 {
-                (
-                    (top_pixel_y - padding_top),
-                    padding_top + (cell_height / 2.0),
-                )
-            } else {
-                (
-                    top_pixel_y + (pos.top as f32 * cell_height) - (cell_height / 2.0),
-                    cell_height,
-                )
-            };
-            let candidate_right = if pos.left + pos.width >= self.terminal_size.cols as usize {
-                self.terminal_viewport_right()
-            } else {
-                x + (pos.width as f32 * cell_width) + width_delta
-            };
-            let (x, width) =
-                clamp_pane_horizontal_span(x, candidate_right, self.terminal_viewport_right());
-            euclid::rect(
-                x,
-                y,
-                width,
-                // Go all the way to the bottom if we're bottom-most
-                if pos.top + pos.height >= self.terminal_size.rows as usize {
-                    self.pane_area_bottom() - y
-                } else {
-                    (pos.height as f32 * cell_height) + height_delta as f32
-                },
-            )
-        };
+        let ground_rects = self.pane_ground_rects(pos)?;
 
         if self.window_background.is_empty() {
             // Per-pane, palette-specified background
-
-            let mut quad = self
-                .filled_rectangle(
-                    layers,
-                    0,
-                    background_rect,
-                    dark_chrome_background
-                        .unwrap_or_else(|| palette.background.to_linear())
-                        .mul_alpha(config.window_background_opacity),
-                )
-                .context("filled_rectangle")?;
-            quad.set_hsv(if pos.is_active {
-                None
-            } else {
-                Some(config.inactive_pane_hsb_for_background(palette.background))
-            });
+            for background_rect in &ground_rects {
+                let mut quad = self
+                    .filled_rectangle(
+                        layers,
+                        0,
+                        *background_rect,
+                        dark_chrome_background
+                            .unwrap_or_else(|| palette.background.to_linear())
+                            .mul_alpha(config.window_background_opacity),
+                    )
+                    .context("filled_rectangle")?;
+                quad.set_hsv(if pos.is_active {
+                    None
+                } else {
+                    Some(config.inactive_pane_hsb_for_background(palette.background))
+                });
+            }
         }
 
         {
@@ -1680,15 +1744,17 @@ impl crate::TermWindow {
                 };
                 log::trace!("bell color is {:?}", background);
 
-                let mut quad = self
-                    .filled_rectangle(layers, 0, background_rect, background)
-                    .context("filled_rectangle")?;
+                for background_rect in &ground_rects {
+                    let mut quad = self
+                        .filled_rectangle(layers, 0, *background_rect, background)
+                        .context("filled_rectangle")?;
 
-                quad.set_hsv(if pos.is_active {
-                    None
-                } else {
-                    Some(config.inactive_pane_hsb_for_background(palette.background))
-                });
+                    quad.set_hsv(if pos.is_active {
+                        None
+                    } else {
+                        Some(config.inactive_pane_hsb_for_background(palette.background))
+                    });
+                }
             }
         }
 

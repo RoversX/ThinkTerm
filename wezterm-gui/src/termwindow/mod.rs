@@ -2076,6 +2076,120 @@ fn frame_can_acknowledge_output(outcome: PaintOutcome, presented: bool) -> bool 
     presented && outcome.draw_submitted && outcome.frame_complete
 }
 
+/// How solid the chrome is in a window whose terminal has `window_opacity`:
+/// a quarter of the way from that to opaque. Enough to read as the frame
+/// around the terminal and still let the window behind through; an opaque
+/// window keeps opaque chrome.
+/// What Settings' `changes` come to in a window whose overrides are
+/// `current`. `owned` holds the window opacity overrides Settings put there
+/// before, and is brought up to date: a window opacity key Settings no
+/// longer sets is taken out only while it still holds Settings' value.
+fn settings_override_changes(
+    changes: &[(&'static str, Option<wezterm_dynamic::Value>)],
+    owned: &mut HashMap<&'static str, wezterm_dynamic::Value>,
+    current: &wezterm_dynamic::Value,
+) -> Vec<(&'static str, Option<wezterm_dynamic::Value>)> {
+    use wezterm_dynamic::{ToDynamic, Value};
+    let mut applied = Vec::with_capacity(changes.len());
+    for (key, value) in changes {
+        if !crate::native_settings::WINDOW_OPACITY_KEYS.contains(key) {
+            applied.push((*key, value.clone()));
+            continue;
+        }
+        match value {
+            Some(value) => {
+                owned.insert(key, value.clone());
+                applied.push((*key, Some(value.clone())));
+            }
+            None => {
+                let Some(ours) = owned.remove(key) else {
+                    continue;
+                };
+                let still_ours = match current {
+                    Value::Object(map) => map.get(&key.to_dynamic()) == Some(&ours),
+                    _ => false,
+                };
+                if still_ours {
+                    applied.push((*key, None));
+                }
+            }
+        }
+    }
+    applied
+}
+
+fn chrome_opacity(window_opacity: f32) -> f32 {
+    let window = window_opacity.clamp(0.0, 1.0);
+    window + (1.0 - window) / 4.0
+}
+
+#[cfg(test)]
+mod chrome_opacity_tests {
+    use super::chrome_opacity;
+
+    #[test]
+    fn chrome_is_a_step_more_solid_than_the_terminal() {
+        assert_eq!(chrome_opacity(1.0), 1.0);
+        assert!((chrome_opacity(0.8) - 0.85).abs() < 1e-6);
+        assert_eq!(chrome_opacity(0.0), 0.25);
+        // Out of range configurations do not make it more than opaque.
+        assert_eq!(chrome_opacity(1.5), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod settings_override_tests {
+    use super::settings_override_changes;
+    use std::collections::HashMap;
+    use wezterm_dynamic::{ToDynamic, Value};
+
+    const OPACITY: &str = "window_background_opacity";
+
+    fn overrides(entries: &[(&str, f64)]) -> Value {
+        let mut map = wezterm_dynamic::Object::default();
+        for (key, value) in entries {
+            map.insert(key.to_dynamic(), value.to_dynamic());
+        }
+        Value::Object(map)
+    }
+
+    #[test]
+    fn a_scripts_opacity_survives_settings_that_set_none() {
+        let mut owned = HashMap::new();
+        let current = overrides(&[(OPACITY, 0.6)]);
+        let changes = settings_override_changes(&[(OPACITY, None)], &mut owned, &current);
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn settings_take_out_only_what_they_put_in() {
+        let mut owned = HashMap::new();
+        let set = settings_override_changes(
+            &[(OPACITY, Some(0.8.to_dynamic()))],
+            &mut owned,
+            &Value::Null,
+        );
+        assert_eq!(set, vec![(OPACITY, Some(0.8.to_dynamic()))]);
+        // Still Settings' value: back to the configuration, it comes out.
+        let current = overrides(&[(OPACITY, 0.8)]);
+        let reset = settings_override_changes(&[(OPACITY, None)], &mut owned.clone(), &current);
+        assert_eq!(reset, vec![(OPACITY, None)]);
+        // A script has set its own since: that one stays.
+        let current = overrides(&[(OPACITY, 0.6)]);
+        let reset = settings_override_changes(&[(OPACITY, None)], &mut owned, &current);
+        assert!(reset.is_empty());
+        assert!(owned.is_empty());
+    }
+
+    #[test]
+    fn other_keys_pass_through_as_given() {
+        let mut owned = HashMap::new();
+        let changes =
+            settings_override_changes(&[("color_scheme", None)], &mut owned, &Value::Null);
+        assert_eq!(changes, vec![("color_scheme", None)]);
+    }
+}
+
 #[cfg(test)]
 mod stale_viewport_tests {
     use super::TermWindow;
@@ -2457,7 +2571,13 @@ const RESTORED_FRAME_SETTLE_TIME: Duration = Duration::from_secs(3);
 pub struct TermWindow {
     pub window: Option<Window>,
     pub config: ConfigHandle,
+    /// `config` as loaded, before the window's state has its say: full
+    /// screen is opaque. See `config_for_window_state`.
+    configured_config: ConfigHandle,
     pub config_overrides: wezterm_dynamic::Value,
+    /// The window opacity overrides Settings has put in `config_overrides`,
+    /// so that it takes out only those. See `apply_settings_overrides`.
+    settings_opacity_overrides: HashMap<&'static str, wezterm_dynamic::Value>,
     os_parameters: Option<parameters::Parameters>,
     /// When we most recently received keyboard focus
     pub focused: Option<Instant>,
@@ -2860,6 +2980,10 @@ pub struct TermWindow {
     /// entry and sets it around the row loop, so it describes that paint and
     /// no other; a paint that bailed out before the list leaves it `None`.
     workspace_sidebar_list_quads: Option<(HeapQuadMark, HeapQuadMark)>,
+    /// The see-through left sidebar's recording buffer, kept from frame to
+    /// frame: no larger than `WORKSPACE_SIDEBAR_SCRATCH_KEEP_BYTES`, let go
+    /// when the sidebar collapses.
+    workspace_sidebar_scratch: HeapQuadAllocator,
     workspace_sidebar_scrollbar_visible_until: Option<Instant>,
     /// Presentation-only hover reveal of the collapsed sidebar. This never
     /// touches `workspace_sidebar_collapsed` or `workspace_sidebar_width`:
@@ -2946,6 +3070,17 @@ pub struct TermWindow {
     /// reading `load_error`, which a later transient would overwrite.
     right_sidebar_note_vault_failure: Option<ui::right_sidebar::NoteVaultFailure>,
     right_sidebar_note_tree_scroll_offset: f32,
+    /// A right sidebar panel's contents are being recorded on their own,
+    /// see-through: its scroll masks cut out what they cover rather than
+    /// paint over it. See `paint_right_sidebar_contents`.
+    right_sidebar_recording_contents: bool,
+    /// A sidebar revealed by hovering is being painted: it floats over the
+    /// terminal and is solid. See `chrome_window_opacity`.
+    painting_floating_chrome: bool,
+    /// Those recordings' buffers, kept from frame to frame: one per level of
+    /// nesting, none larger than `RIGHT_SIDEBAR_SCRATCH_KEEP_BYTES`, all let
+    /// go when the sidebar closes.
+    right_sidebar_contents_scratch: Vec<HeapQuadAllocator>,
     right_sidebar_note_tree_expanded: HashSet<String>,
     right_sidebar_note_vault_tree_collapsed: bool,
     right_sidebar_note_wide_layout: bool,
@@ -4037,35 +4172,47 @@ impl TermWindow {
     ) -> anyhow::Result<()> {
         let config = configuration();
         let native_settings = crate::native_settings::load();
-        // A palette-picked color scheme applies from the first frame; seeding
+        // What Settings overrides -- a palette-picked color scheme, the
+        // window's opacity -- applies from the first frame; seeding
         // config_overrides here is what makes it stick for new windows.
-        let (config, config_overrides) = match crate::native_settings::effective_color_scheme(
-            &native_settings,
-            &config,
-        ) {
-            Some(scheme) => {
-                use wezterm_dynamic::ToDynamic;
+        let mut seeded = wezterm_dynamic::Object::default();
+        let settings_overrides =
+            crate::native_settings::settings_config_overrides(&native_settings, &config);
+        let settings_opacity_overrides: HashMap<&'static str, wezterm_dynamic::Value> =
+            settings_overrides
+                .iter()
+                .filter(|(key, _)| crate::native_settings::WINDOW_OPACITY_KEYS.contains(key))
+                .filter_map(|(key, value)| Some((*key, value.clone()?)))
+                .collect();
+        for (key, value) in settings_overrides {
+            use wezterm_dynamic::ToDynamic;
+            let Some(value) = value else {
+                continue;
+            };
+            if key == "color_scheme" {
                 // Deliberately louder than trace: this silently overrides
                 // `color_scheme` from the config file, and "why doesn't my
                 // config change do anything" needs a breadcrumb.
                 log::info!(
-                    "color scheme overridden to {scheme:?} -- either picked in the command \
+                    "color scheme overridden to {value:?} -- either picked in the command \
                      palette or in Settings, or the light default that goes with a light \
                      interface; pick \"Use configured default\" in the palette to follow the \
                      config file again"
                 );
-                let mut obj = wezterm_dynamic::Object::default();
-                obj.insert("color_scheme".to_dynamic(), scheme.to_dynamic());
-                let overrides = wezterm_dynamic::Value::Object(obj);
-                match config::overridden_config(&overrides) {
-                    Ok(config) => (config, overrides),
-                    Err(err) => {
-                        log::warn!("failed to apply saved color scheme: {err:#}");
-                        (config, wezterm_dynamic::Value::default())
-                    }
+            }
+            seeded.insert(key.to_dynamic(), value);
+        }
+        let (config, config_overrides) = if seeded.is_empty() {
+            (config, wezterm_dynamic::Value::default())
+        } else {
+            let overrides = wezterm_dynamic::Value::Object(seeded);
+            match config::overridden_config(&overrides) {
+                Ok(config) => (config, overrides),
+                Err(err) => {
+                    log::warn!("failed to apply the overrides from Settings: {err:#}");
+                    (config, wezterm_dynamic::Value::default())
                 }
             }
-            None => (config, wezterm_dynamic::Value::default()),
         };
         let main_renderer =
             crate::native_settings::main_window_renderer(&native_settings, config.front_end);
@@ -4225,7 +4372,9 @@ impl TermWindow {
             window: None,
             window_background,
             config: config.clone(),
+            configured_config: config.clone(),
             config_overrides,
+            settings_opacity_overrides,
             palette: None,
             focused: None,
             occluded: None,
@@ -4420,6 +4569,7 @@ impl TermWindow {
             workspace_space_swipe_target_frame: None,
             workspace_space_swipe_tracked: false,
             workspace_sidebar_list_quads: None,
+            workspace_sidebar_scratch: HeapQuadAllocator::default(),
             workspace_space_swipe_push_active: false,
             workspace_space_swipe_direction: 0.0,
             workspace_space_swipe_pending_commit: None,
@@ -4462,6 +4612,9 @@ impl TermWindow {
             right_sidebar_note_open_failure: None,
             right_sidebar_note_vault_failure: None,
             right_sidebar_note_tree_scroll_offset: 0.0,
+            right_sidebar_recording_contents: false,
+            painting_floating_chrome: false,
+            right_sidebar_contents_scratch: Vec::new(),
             right_sidebar_note_tree_expanded: HashSet::new(),
             right_sidebar_note_vault_tree_collapsed: false,
             right_sidebar_note_wide_layout: false,
@@ -5387,14 +5540,16 @@ impl TermWindow {
                     .context("send GetTerminalSize response")?;
             }
             TermWindowNotif::GetEffectiveConfig(tx) => {
+                // As loaded: what full screen makes of it is the window's
+                // business, and a script deciding from it would be misled.
                 let tab_bar = self
-                    .config
+                    .configured_config
                     .resolved_palette
                     .tab_bar
                     .is_none()
                     .then(|| self.theme_aligned_tab_bar_colors());
                 tx.try_send(crate::tabbar::config_for_lua(
-                    &self.config,
+                    &self.configured_config,
                     tab_bar.as_ref(),
                 ))
                 .map_err(chan_err)
@@ -6952,18 +7107,47 @@ impl TermWindow {
     /// already run. Callers about to reload anyway can use that to not do it
     /// twice -- a reload re-runs the Lua configuration from disk.
     pub(crate) fn apply_color_scheme_override(&mut self, name: Option<String>) -> bool {
+        use wezterm_dynamic::ToDynamic;
+        self.apply_config_overrides(&[("color_scheme", name.map(|scheme| scheme.to_dynamic()))])
+    }
+
+    /// Set (`Some`) or clear (`None`) keys in this window's configuration
+    /// overrides, as `apply_color_scheme_override` does for the scheme, and
+    /// reload once if anything moved. True when it did.
+    /// Settings' overrides, as `apply_config_overrides` takes them -- but a
+    /// window opacity key Settings has stopped setting comes out only while
+    /// it still holds what Settings put in: one a script set with
+    /// `window:set_config_overrides` is the script's.
+    pub(crate) fn apply_settings_overrides(
+        &mut self,
+        changes: &[(&'static str, Option<wezterm_dynamic::Value>)],
+    ) -> bool {
+        let applied = settings_override_changes(
+            changes,
+            &mut self.settings_opacity_overrides,
+            &self.config_overrides,
+        );
+        self.apply_config_overrides(&applied)
+    }
+
+    pub(crate) fn apply_config_overrides(
+        &mut self,
+        changes: &[(&str, Option<wezterm_dynamic::Value>)],
+    ) -> bool {
         use wezterm_dynamic::{ToDynamic, Value};
         let mut map = match &self.config_overrides {
             Value::Object(obj) => obj.clone(),
             _ => Default::default(),
         };
-        let key = "color_scheme".to_dynamic();
-        match &name {
-            Some(scheme) => {
-                map.insert(key, scheme.to_dynamic());
-            }
-            None => {
-                map.remove(&key);
+        for (key, value) in changes {
+            let key = key.to_dynamic();
+            match value {
+                Some(value) => {
+                    map.insert(key, value.clone());
+                }
+                None => {
+                    map.remove(&key);
+                }
             }
         }
         let next = Value::Object(map);
@@ -7112,6 +7296,8 @@ impl TermWindow {
                 configuration()
             }
         };
+        self.configured_config = config.clone();
+        let config = self.config_for_window_state(config);
         self.config = config.clone();
         self.palette.take();
         // One place for all three ways the chrome's colours can move: a
@@ -8165,6 +8351,112 @@ impl TermWindow {
             ::window::Appearance::Dark | ::window::Appearance::DarkHighContrast
         )
         .then(|| self.chrome().sidebar_bg)
+    }
+
+    /// `color` as a surface of the chrome paints it. In a see-through window
+    /// the sidebars, the tab strip and the pane bars let the window behind
+    /// through as well, but less than the terminal does, so that they still
+    /// read as the frame around it.
+    pub(crate) fn chrome_surface(&self, color: LinearRgba) -> LinearRgba {
+        color.mul_alpha(chrome_opacity(self.chrome_window_opacity()))
+    }
+
+    /// Whether the window is see-through, and its chrome with it. Covering
+    /// one thing by painting the ground over it shows there, as a darker
+    /// band and as what it was meant to hide, so such covers are left out.
+    pub(crate) fn chrome_see_through(&self) -> bool {
+        self.chrome_window_opacity() < 1.0
+    }
+
+    /// The window opacity the chrome is painted for: the window's, but a
+    /// panel floating over the terminal -- a hover-revealed sidebar -- is
+    /// solid.
+    fn chrome_window_opacity(&self) -> f32 {
+        if self.painting_floating_chrome {
+            1.0
+        } else {
+            self.config.window_background_opacity
+        }
+    }
+
+    /// What `config` is for this window in its present state. Full screen
+    /// on macOS is opaque and unblurred: native full screen has nothing of
+    /// the user's behind it to see through to, and simple full screen makes
+    /// the window opaque outright, under which see-through comes out wrong.
+    /// Elsewhere full screen keeps the configured opacity, as it always has.
+    fn config_for_window_state(&self, config: ConfigHandle) -> ConfigHandle {
+        if !cfg!(target_os = "macos")
+            || !self.window_state.contains(WindowState::FULL_SCREEN)
+            || config.window_background_opacity >= 1.0
+        {
+            return config;
+        }
+        config.adjusted(|config| {
+            config.window_background_opacity = 1.0;
+            config.macos_window_background_blur = 0;
+        })
+    }
+
+    /// Full screen came or went: derive the window's configuration from the
+    /// loaded one again, without reloading it.
+    pub(crate) fn window_state_changed_config(&mut self) {
+        self.use_derived_config(self.configured_config.clone());
+    }
+
+    /// Show a window opacity of `percent` -- the Settings slider's, while it
+    /// is dragged -- without the reload applying it as an override takes.
+    /// `None` goes back to the configuration as loaded.
+    pub(crate) fn preview_window_opacity(&mut self, percent: Option<u8>) {
+        let config = match percent {
+            Some(percent) => {
+                let (opacity, blur, backdrop) =
+                    crate::native_settings::window_opacity_preview(percent);
+                // A step that shows what is shown already copies nothing.
+                if self.config.window_background_opacity == opacity
+                    && self.config.macos_window_background_blur == blur
+                    && self.config.win32_system_backdrop == backdrop
+                {
+                    return;
+                }
+                self.configured_config.adjusted(|config| {
+                    config.window_background_opacity = opacity;
+                    config.macos_window_background_blur = blur;
+                    config.win32_system_backdrop = backdrop;
+                })
+            }
+            None => self.configured_config.clone(),
+        };
+        self.use_derived_config(config);
+    }
+
+    /// Make `config` -- the loaded configuration, changed only in how
+    /// see-through the window is -- this window's. The platform window hears
+    /// of it only when what it does changes: whether the window is opaque,
+    /// and its blur or backdrop.
+    fn use_derived_config(&mut self, config: ConfigHandle) {
+        let config = self.config_for_window_state(config);
+        let before = &self.config;
+        let platform_changed = (config.window_background_opacity >= 1.0)
+            != (before.window_background_opacity >= 1.0)
+            || config.macos_window_background_blur != before.macos_window_background_blur
+            || config.win32_system_backdrop != before.win32_system_backdrop;
+        if !platform_changed && config.window_background_opacity == before.window_background_opacity
+        {
+            return;
+        }
+        // Cached line quads carry the cells' background alpha, which is
+        // whether the window is see-through.
+        if (config.window_background_opacity != 1.0) != (before.window_background_opacity != 1.0) {
+            self.quad_generation += 1;
+        }
+        self.config = config;
+        self.invalidate_fancy_tab_bar();
+        if let Some(window) = self.window.as_ref() {
+            if platform_changed {
+                window.config_did_change(&self.config);
+            }
+            window.invalidate();
+        }
     }
 
     /// The terminal's default background as painted.
