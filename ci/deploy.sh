@@ -56,6 +56,14 @@ case $OSTYPE in
     rm -rf "$zipdir" "$zipname"
     mkdir "$zipdir"
     cp -r assets/macos/ThinkTerm.app "$zipdir/"
+    # The version the app reports to its update check, when the caller names
+    # one: ci/macos-package.sh passes the release's, so that a release need
+    # not bump the repository's Info.plist first. Written into this copy,
+    # before signing seals it.
+    if [[ -n "${MACOS_BUNDLE_VERSION:-}" ]] ; then
+      plutil -replace CFBundleShortVersionString -string "$MACOS_BUNDLE_VERSION" \
+        "$zipdir/ThinkTerm.app/Contents/Info.plist"
+    fi
     # Omit MetalANGLE for now; it's a bit laggy compared to CGL,
     # and on M1/Big Sur, CGL is implemented in terms of Metal anyway
     rm $zipdir/ThinkTerm.app/*.dylib

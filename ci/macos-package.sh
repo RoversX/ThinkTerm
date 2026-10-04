@@ -35,11 +35,14 @@ usage: ci/macos-package.sh [--build] [--arch arm64|x86_64|both]
                 the whole thing twice, which is what a release wants.
   --upload      Attach the finished archives to the release named by the
                 tag, which has to exist already -- the draft the release
-                workflow leaves behind.
+                workflow leaves behind.  A published release is asked
+                about first.
   adhoc         Self-signed.  Fast and offline, but Gatekeeper rejects the
                 result everywhere except the machine that built it.
   developerid   Developer ID signature, notarization and stapling.  Needs
                 network and an Apple Developer account; opens on any Mac.
+  tag           The version to package, which the app is stamped with.
+                Prompted for, the newest draft release is the default.
 
 Every argument is optional -- you are prompted for whatever is missing.
 EOT
@@ -194,6 +197,15 @@ esac
 INFO_PLIST=assets/macos/ThinkTerm.app/Contents/Info.plist
 bundle_version=$(plutil -extract CFBundleShortVersionString raw "$INFO_PLIST")
 
+# The newest draft release named for a version rather than a build timestamp,
+# or nothing: without gh, signed out or offline, or with no such draft.
+draft_release_tag() {
+  command -v gh >/dev/null 2>&1 || return 0
+  gh release list --limit 30 --json tagName,isDraft,createdAt --jq '
+    [.[] | select(.isDraft and (.tagName | test("^v?[0-9]+\\.[0-9]+")))]
+    | sort_by(.createdAt) | last | .tagName // empty' 2>/dev/null || true
+}
+
 if [[ -z "$TAG" ]]; then
   # The tag names the archive, and ci/wezterm-homebrew-macos.rb.template builds
   # its download URL out of it, so it has to match the GitHub release tag byte
@@ -201,7 +213,10 @@ if [[ -z "$TAG" ]]; then
   # one and Homebrew wants a bare version.
   # Deliberately not ci/tag-name.sh's build timestamp -- that identifies a build
   # rather than a release, and `thinkterm --version` already reports it.
-  suggested="$bundle_version"
+  # Offered first is the draft the release workflow has just left for this
+  # archive to join; failing that, the version the repository's bundle says.
+  suggested=$(draft_release_tag)
+  suggested=${suggested:-$bundle_version}
   printf "Version tag [%s]: " "$suggested"
   read -r TAG || { echo; exit 1; }
   TAG=${TAG:-$suggested}
@@ -217,20 +232,50 @@ if [[ ! "$TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
   exit 2
 fi
 
-# The bundle's version is what the shipped app reports to the update check, and
-# the tag is what it gets compared against.  A mismatch ships an app that
-# announces an update to the version it already is, on every launch, because
-# installing that update cannot change what the binary claims about itself.
-if [[ "${TAG#v}" != "$bundle_version" ]]; then
-  echo "Tag $TAG does not match the bundle version $bundle_version." >&2
-  echo "Bump CFBundleShortVersionString in $INFO_PLIST first," >&2
-  echo "or package the version the bundle already declares." >&2
+# A leading v is tolerated here and dropped, the same as the Run workflow form
+# does, so that typing one out of habit cannot produce a release page carrying
+# both ThinkTerm-macos-arm64-v0.1.0.zip and thinkterm-0.1.0.Ubuntu22.04.deb.
+version="${TAG#v}"
+
+# The updater compares semantic versions. Refuse incomplete versions and
+# leading zeroes, including in numeric prerelease identifiers.
+version_number='(0|[1-9][0-9]*)'
+prerelease_id="($version_number|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+version_pattern="^$version_number\\.$version_number\\.$version_number(-$prerelease_id(\\.$prerelease_id)*)?$"
+if [[ ! "$version" =~ $version_pattern ]]; then
+  echo "Invalid release version: $TAG" >&2
+  echo "Use a semantic version such as 0.2.1 or 0.2.1-rc.1, optionally prefixed with v." >&2
   exit 2
+fi
+
+# --upload attaches to a release that has to exist already -- the draft the
+# release workflow leaves -- so it is looked up now, not found missing after a
+# build and a notarization. A published release takes the archive only when
+# asked: --clobber would replace the one people are downloading.
+if [[ "$UPLOAD" == yes && "${MACOS_UPLOAD_CHECKED:-}" != "$version" ]]; then
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "gh is not installed, so --upload cannot attach anything." >&2
+    exit 1
+  fi
+  if ! is_draft=$(gh release view "$version" --json isDraft --jq .isDraft); then
+    echo "No release $version to attach to: run the release workflow for it first." >&2
+    exit 1
+  fi
+  if [[ "$is_draft" != true ]]; then
+    printf "Release %s is already published. Replace its macOS archive? [y/N]: " "$version"
+    read -r reply || { echo; exit 1; }
+    if [[ "$reply" != [yY]* ]]; then
+      echo "Nothing packaged; release $version is left as it is."
+      exit 1
+    fi
+  fi
+  export MACOS_UPLOAD_CHECKED="$version"
 fi
 
 # Both is one run per architecture rather than one pass producing two, so that
 # half a release and a single-architecture run go through the same code. The
-# tag is resolved above first, so the second run does not prompt for it again.
+# tag and the release are settled above first, so the second run asks about
+# neither again.
 if [[ "$ARCH" == both ]]; then
   extra=()
   if [[ "$BUILD" == yes ]]; then extra+=(--build); fi
@@ -391,14 +436,15 @@ else
   fi
 fi
 
-# A leading v is tolerated here and dropped, the same as the Run workflow form
-# does, so that typing one out of habit cannot produce a release page carrying
-# both ThinkTerm-macos-arm64-v0.1.0.zip and thinkterm-0.1.0.Ubuntu22.04.deb.
-version="${TAG#v}"
-
 echo
 echo "==> Packaging $ARCH as $TAG in $MODE mode"
-TAG_NAME="$version" MACOS_SIGNING_MODE="$MODE" bash ci/deploy.sh
+# The bundle's version is what the shipped app reports to the update check, and
+# the tag is what it gets compared against: an app whose bundle disagrees with
+# its tag announces an update to the version it already is, on every launch.
+# So the app takes the tag's version as it is packaged, whatever the
+# repository's Info.plist still says.
+TAG_NAME="$version" MACOS_BUNDLE_VERSION="$version" MACOS_SIGNING_MODE="$MODE" \
+  bash ci/deploy.sh
 
 # deploy.sh derives both names the same way; keep them in sync with it.
 zipdir="ThinkTerm-macos${MACOS_ARCH:+-$MACOS_ARCH}-$version"
@@ -430,10 +476,10 @@ if [[ "$UPLOAD" == yes ]]; then
     echo "gh is not installed, so $zipname has to be attached by hand." >&2
     exit 1
   fi
-  echo "==> Attaching to release $TAG"
+  echo "==> Attaching to release $version"
   # --clobber so that re-packaging after a fix replaces the archive rather
   # than failing because the name is already taken.
-  gh release upload --clobber "$TAG" "$zipname"
+  gh release upload --clobber "$version" "$zipname"
 else
   echo "Attach to the release:"
   echo "    $PWD/$zipname"
