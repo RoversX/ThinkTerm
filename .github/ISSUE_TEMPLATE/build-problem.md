@@ -2,7 +2,7 @@
 name: Build Problem
 about: Having problems building from source?
 title: ''
-labels: [bug, needs:triage]
+labels: [bug]
 assignees: ''
 
 ---

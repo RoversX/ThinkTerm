@@ -1,6 +1,6 @@
 name: Bug Report Form
 description: Create a report to help us improve
-labels: [bug, needs:triage]
+labels: [bug]
 assignees: []
 body:
   - type: dropdown
@@ -13,8 +13,6 @@ body:
         - Linux X11
         - Linux Wayland
         - macOS
-        - FreeBSD X11
-        - FreeBSD Wayland
     validations:
       required: true
   - type: textarea
@@ -26,26 +24,20 @@ body:
         Windows and macOS typically can leave this blank, but if you are using additional window
         management software on top of the standard for those systems, please indicate that here.
       placeholder: "ex: Sway, Mutter, wayfire, i3."
-  - type: input
+  - type: textarea
     id: version
     attributes:
       label: ThinkTerm version
       description: |
-        Please run `thinkterm -V` and include its output here.
-        If you installed the flatpak version of ThinkTerm, please consider trying
-        the native package format for your system and comparing the behavior,
-        as flatpak runs in an isolated sandbox that can prevent some functionality
-        from working fully.
-      placeholder: "ex: 20210816-085256-935c1f48"
-    validations:
-      required: true
-  - type: dropdown
-    id: triednightly
-    attributes:
-      label: Did you try the latest nightly build to see if the issue is better (or worse!) than your current version?
-      options:
-        - Yes, and I updated the version box above to show the version of the nightly that I tried
-        - No, and I'll explain why below
+        Open Settings → About, click Copy Info and paste it here. Delete its
+        Config and Data lines first: they show your home folder.
+        If ThinkTerm will not open, run `thinkterm -V` and paste its output instead.
+      placeholder: |
+        ThinkTerm 0.1.1
+        Build: 0.1.1
+        Target: x86_64-pc-windows-msvc
+        OS: windows
+      render: text
     validations:
       required: true
   - type: textarea
@@ -69,8 +61,8 @@ body:
     attributes:
       label: Configuration
       description: |
-        Please include the relevant section(s) of your `thinkterm.lua` configuration file.
-        You can enter "no config" if the issue happens without you having made a config file.    
+        What you changed in Settings, and the relevant section(s) of your `thinkterm.lua`
+        configuration file if you have one. You can enter "defaults" if you changed neither.
     validations:
       required: true
   - type: textarea
@@ -86,10 +78,11 @@ body:
         If possible, activate the Debug Overlay by pressing CTRL-SHIFT-L and then copy
         and paste the log lines in here. If you launched ThinkTerm from
         the command line, copy and paste that output here.
-        You can also find log files in `$XDG_RUNTIME_DIR/thinkterm` on unix systems,
-        or `$HOME/.local/share/thinkterm` on macOS and Windows systems.
-      placeholder: |
-        09:27:26.703 INFO wezterm_gui::termwindow > OpenGL initialized! NVIDIA GeForce GT 1030/PCIe/SSE2 4.6.0 NVIDIA 470.57.02 is_context_loss_possible=false wezterm version: 20210816-085256-935c1f48
+        You can also find log files, named `thinkterm-gui-log-<pid>.txt`, in
+        `$XDG_RUNTIME_DIR/thinkterm` on Linux, `~/.local/share/thinkterm` on macOS
+        and `%USERPROFILE%\.local\share\thinkterm` on Windows.
+        If ThinkTerm crashed on macOS, attach the crash report from
+        `~/Library/Logs/DiagnosticReports` whose name starts with `thinkterm-gui`.
   - type: textarea
     id: other
     attributes:

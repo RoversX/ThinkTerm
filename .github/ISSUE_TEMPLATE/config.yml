@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
-  - name: GitHub Discussions
-    url: https://github.com/RoversX/thinkterm/discussions
+  - name: Questions and help
+    url: https://github.com/RoversX/ThinkTerm/discussions/categories/q-a
     about: When you have questions that are not bug reports or feature requests
+  - name: Report a security vulnerability
+    url: https://github.com/RoversX/ThinkTerm/security/advisories/new
+    about: Report it privately, please, rather than in a public issue

@@ -17,8 +17,6 @@ body:
         - Linux X11
         - Linux Wayland
         - macOS
-        - FreeBSD X11
-        - FreeBSD Wayland
     validations:
       required: true
   - type: textarea
@@ -30,17 +28,20 @@ body:
         Windows and macOS typically can leave this blank, but if you are using additional window
         management software on top of the standard for those systems, please indicate that here.
       placeholder: "ex: Sway, Mutter, wayfire, i3."
-  - type: input
+  - type: textarea
     id: version
     attributes:
       label: ThinkTerm version
       description: |
-        Please run `thinkterm -V` and include its output here.
-        If you installed the flatpak version of ThinkTerm, please consider trying
-        the native package format for your system and comparing the behavior,
-        as flatpak runs in an isolated sandbox that can prevent some functionality
-        from working fully.
-      placeholder: "ex: 20210816-085256-935c1f48"
+        Open Settings → About, click Copy Info and paste it here. Delete its
+        Config and Data lines first: they show your home folder.
+        If ThinkTerm will not open, run `thinkterm -V` and paste its output instead.
+      placeholder: |
+        ThinkTerm 0.1.1
+        Build: 0.1.1
+        Target: x86_64-pc-windows-msvc
+        OS: windows
+      render: text
     validations:
       required: true
   - type: textarea
