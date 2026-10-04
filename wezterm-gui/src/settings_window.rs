@@ -17667,16 +17667,17 @@ impl SettingsWindow {
         let right_edge = x + max_width;
 
         for glyph in &shaped.glyphs {
+            // Fitted by advance, as the measurement and the ellipsis are; see
+            // `DrawContext::draw_text_on_layer`.
+            if pos_x + glyph.x_advance.get() as f32 > right_edge + 0.5 {
+                break;
+            }
             if let Some(texture) = glyph.texture.as_ref() {
                 let glyph_x = (pos_x + (glyph.x_offset + glyph.bearing_x).get() as f32).round();
                 let glyph_y =
                     (y - (glyph.y_offset + glyph.bearing_y).get() as f32 + baseline).round();
                 let width = texture.coords.size.width as f32 * glyph.scale as f32;
                 let height = texture.coords.size.height as f32 * glyph.scale as f32;
-
-                if glyph_x + width > right_edge {
-                    break;
-                }
 
                 let mut quad = layers.allocate(layer_num)?;
                 quad.set_position(

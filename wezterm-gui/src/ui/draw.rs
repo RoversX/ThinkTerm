@@ -803,16 +803,20 @@ impl<'a> DrawContext<'a> {
 
         for info in infos {
             let glyph = glyph_cache.cached_glyph(&info, style, false, font, self.metrics, 1)?;
+            // Whether a glyph fits is a question for its advance, as it is
+            // for `measure_text_width` and the ellipsis. The ink a glyph
+            // draws past its advance -- rounding on a 1x screen, a heavier
+            // face -- is no reason to drop it, and a box sized to the
+            // measured text lost its last glyph to exactly that.
+            if pos_x + glyph.x_advance.get() as f32 > right_edge + 0.5 {
+                break;
+            }
             if let Some(texture) = glyph.texture.as_ref() {
                 let glyph_x = (pos_x + (glyph.x_offset + glyph.bearing_x).get() as f32).round();
                 let glyph_y =
                     (y - (glyph.y_offset + glyph.bearing_y).get() as f32 + baseline).round();
                 let width = texture.coords.size.width as f32 * glyph.scale as f32;
                 let height = texture.coords.size.height as f32 * glyph.scale as f32;
-
-                if glyph_x + width > right_edge {
-                    break;
-                }
 
                 let mut quad = layers.allocate(layer_num)?;
                 quad.set_position(
