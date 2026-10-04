@@ -661,7 +661,7 @@ pub struct GlyphCache {
     pub rotated_svg_icons: HashMap<SizedRotatedSvgIconKey, Sprite>,
     /// Blurred rounded-rectangle silhouettes, one per corner radius and
     /// blur, drawn as nine slices under elevated surfaces.
-    pub shadows: HashMap<crate::ui::shadow::ShadowKey, Sprite>,
+    pub(crate) shadows: HashMap<crate::ui::shadow::ShadowKey, Sprite>,
     min_frame_duration: Duration,
 }
 
@@ -1445,7 +1445,7 @@ impl GlyphCache {
         Ok(sprite)
     }
 
-    pub fn cached_shadow(
+    pub(crate) fn cached_shadow(
         &mut self,
         key: crate::ui::shadow::ShadowKey,
     ) -> anyhow::Result<Sprite> {
