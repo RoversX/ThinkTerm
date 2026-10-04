@@ -18,6 +18,21 @@ install -Dm644 assets/wezterm.desktop AppDir/usr/share/applications/com.roversx.
 install -Dm644 assets/wezterm.appdata.xml AppDir/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
 install -Dm644 assets/wezterm-nautilus.py AppDir/usr/share/nautilus-python/extensions/wezterm-nautilus.py
 install -Dm644 NOTICE AppDir/usr/share/doc/thinkterm/NOTICE
+# The browser client, where the server looks for it: <exe>/../share/thinkterm/web.
+if [[ -f thinkterm-web/www/pkg/thinkterm_web.js ]] ; then
+  install -Dpm644 -t AppDir/usr/share/thinkterm/web thinkterm-web/www/index.html thinkterm-web/www/schemes.json
+  for gz in thinkterm-web/www/*.gz ; do
+    if [[ -f "$gz" ]] ; then
+      install -Dpm644 -t AppDir/usr/share/thinkterm/web "$gz"
+    fi
+  done
+  install -Dpm644 -t AppDir/usr/share/thinkterm/web/assets thinkterm-web/www/assets/*
+  install -Dpm644 -t AppDir/usr/share/thinkterm/web/pkg thinkterm-web/www/pkg/*
+  install -Dpm644 -t AppDir/usr/share/thinkterm/web/fonts thinkterm-web/www/fonts/*
+elif [[ -n "${CI:-}" ]] ; then
+  echo "error: no browser bundle in thinkterm-web/www; ci/build-web.sh did not run before appimage.sh" >&2
+  exit 1
+fi
 # Both license texts, not just the NOTICE that points at them: AUR and
 # linuxbrew unpack this AppImage for their own license dirs, so leaving
 # them out here leaves them out of every downstream Linux package.

@@ -17,6 +17,25 @@ require_web_bundle() {
   echo "warning: no browser bundle in thinkterm-web/www (run ci/build-web.sh); packaging without the web client" >&2
   return 1
 }
+
+# Put the browser client in directory $1, when ci/build-web.sh ran before
+# this. Linux packages put it where the server looks, <exe>/../share/
+# thinkterm/web: share/thinkterm/web in the tarball, /usr/share/thinkterm/web
+# in the deb and rpm. -p keeps the modification times the .gz freshness
+# check reads.
+install_web_bundle() {
+  local dest=$1 gz
+  require_web_bundle || return 0
+  install -Dpm644 -t "$dest" thinkterm-web/www/index.html thinkterm-web/www/schemes.json
+  for gz in thinkterm-web/www/*.gz ; do
+    if [[ -f "$gz" ]] ; then
+      install -Dpm644 -t "$dest" "$gz"
+    fi
+  done
+  install -Dpm644 -t "$dest/assets" thinkterm-web/www/assets/*
+  install -Dpm644 -t "$dest/pkg" thinkterm-web/www/pkg/*
+  install -Dpm644 -t "$dest/fonts" thinkterm-web/www/fonts/*
+}
 set -e
 
 TARGET_DIR=${1:-${CARGO_TARGET_DIR:-target}}
@@ -352,6 +371,19 @@ BUILDEOFEOF
         #
         # Files the two share are listed under both: rpm allows it within a
         # spec, and the Conflicts guarantee they are never installed together.
+        # Both packages run the server that serves the browser client;
+        # %install copies it in from where it is staged here. A source RPM
+        # carries only tracked sources, so it goes without the bundle.
+        rm -rf pkg/rpm-web
+        if test -z "${COPR_SRPM}" ; then
+          install_web_bundle pkg/rpm-web/web
+        fi
+        RPM_WEB_INSTALL=
+        RPM_WEB_FILES=
+        if [[ -d pkg/rpm-web/web ]] ; then
+          RPM_WEB_INSTALL="mkdir -p %{buildroot}/usr/share/thinkterm && cp -Rp pkg/rpm-web/web %{buildroot}/usr/share/thinkterm/web"
+          RPM_WEB_FILES=/usr/share/thinkterm/web
+        fi
         cat > thinkterm.spec <<EOF
 Name: thinkterm
 Version: ${THINKTERM_RPM_VERSION}
@@ -418,6 +450,7 @@ install -Dm644 LICENSE-MIT %{buildroot}/usr/share/licenses/thinkterm/LICENSE-MIT
 install -Dm644 NOTICE %{buildroot}/usr/share/licenses/thinkterm-server/NOTICE
 install -Dm644 LICENSE.md %{buildroot}/usr/share/licenses/thinkterm-server/LICENSE.md
 install -Dm644 LICENSE-MIT %{buildroot}/usr/share/licenses/thinkterm-server/LICENSE-MIT
+${RPM_WEB_INSTALL}
 
 %files
 /usr/bin/thinkterm
@@ -439,6 +472,7 @@ install -Dm644 LICENSE-MIT %{buildroot}/usr/share/licenses/thinkterm-server/LICE
 /usr/share/applications/com.roversx.thinkterm.desktop
 /usr/share/metainfo/com.roversx.thinkterm.appdata.xml
 /usr/share/nautilus-python/extensions/wezterm-nautilus.py*
+${RPM_WEB_FILES}
 
 %files -n thinkterm-server
 /usr/bin/thinkterm
@@ -453,6 +487,7 @@ install -Dm644 LICENSE-MIT %{buildroot}/usr/share/licenses/thinkterm-server/LICE
 /etc/bash_completion.d/thinkterm
 /etc/bash_completion.d/wezterm
 /etc/profile.d/*
+${RPM_WEB_FILES}
 
 %changelog
 * Fri Sep 4 2026 RoversX
@@ -594,6 +629,8 @@ EOF
           install -Dm644 NOTICE $root/usr/share/doc/$pkgname/NOTICE
           install -Dm644 LICENSE.md $root/usr/share/doc/$pkgname/LICENSE.md
           install -Dm644 LICENSE-MIT $root/usr/share/doc/$pkgname/LICENSE-MIT
+          # Both packages run the server that serves the browser client.
+          install_web_bundle $root/usr/share/thinkterm/web
 
           fakeroot dpkg-deb --build $root $debname.deb
 
@@ -643,18 +680,7 @@ EOF
           install -Dm644 -t "$tardir/share/shell-completion" assets/shell-completion/*
           install -Dm644 -t "$tardir/share/shell-integration" assets/shell-integration/*
           install -Dm644 -t "$tardir" NOTICE LICENSE.md LICENSE-MIT
-          # The browser client, when ci/build-web.sh ran before this: the
-          # server finds it at <exe>/../share/thinkterm/web.
-          if require_web_bundle ; then
-            # -p keeps the modification times the .gz freshness check reads.
-            install -Dpm644 -t "$tardir/share/thinkterm/web" thinkterm-web/www/index.html thinkterm-web/www/schemes.json
-            for gz in thinkterm-web/www/*.gz ; do
-              [[ -f "$gz" ]] && install -Dpm644 -t "$tardir/share/thinkterm/web" "$gz"
-            done
-            install -Dpm644 -t "$tardir/share/thinkterm/web/assets" thinkterm-web/www/assets/*
-            install -Dpm644 -t "$tardir/share/thinkterm/web/pkg" thinkterm-web/www/pkg/*
-            install -Dpm644 -t "$tardir/share/thinkterm/web/fonts" thinkterm-web/www/fonts/*
-          fi
+          install_web_bundle "$tardir/share/thinkterm/web"
           if [[ "$variant" == thinkterm ]] ; then
             install -Dm755 -t "$tardir/bin" assets/open-thinkterm-here assets/open-wezterm-here
             install -Dm644 assets/wezterm.desktop "$tardir/share/applications/com.roversx.thinkterm.desktop"
