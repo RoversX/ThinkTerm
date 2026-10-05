@@ -242,6 +242,8 @@ export type PluginRow = {
   enabled: boolean;
   /** Whether a switch could do anything for it. */
   switchable: boolean;
+  /** Never let run: a button lets it, rather than a switch. */
+  new: boolean;
   /** Built into ThinkTerm: its switch is its panel's, not in the list. */
   builtin: boolean;
   /** How long an installed plugin that is on runs unused; none for others. */

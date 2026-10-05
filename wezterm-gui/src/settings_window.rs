@@ -1323,6 +1323,7 @@ fn plugin_row_description(plugin: &thinkterm_plugin_channel::registry::Info) -> 
     };
     let state = match &plugin.state {
         State::Off | State::Idle => None,
+        State::New => Some(crate::i18n::tr("settings-plugins-new")),
         State::Starting => Some(crate::i18n::tr("settings-plugins-starting")),
         State::Running => Some(crate::i18n::tr("settings-plugins-running")),
         State::Crashed { reason } => Some(settings_tr(
@@ -1339,7 +1340,14 @@ fn plugin_row_description(plugin: &thinkterm_plugin_channel::registry::Info) -> 
         )),
         State::Unsupported { .. } => Some(crate::i18n::tr("settings-plugins-unsupported")),
     };
-    vec![Some(origin), state, Some(plugin.description.clone())]
+    // A new one says where it is: that is what allowing it lets run.
+    let place = plugin
+        .target
+        .as_deref()
+        .or(plugin.dir.as_deref())
+        .filter(|_| plugin.state == State::New)
+        .map(|dir| crate::ui::home_relative(std::path::Path::new(dir)));
+    vec![Some(origin), state, place, Some(plugin.description.clone())]
         .into_iter()
         .flatten()
         .filter(|part| !part.is_empty())
@@ -1381,6 +1389,8 @@ enum SettingsAction {
     /// Turn a plugin on or off. Carries `plugin_key(id)`, as RevokeWebToken
     /// carries its token's: the list can change between press and release.
     TogglePlugin(u64),
+    /// Let a new plugin run, from where it is, keyed as TogglePlugin.
+    AllowPlugin(u64),
     /// How long a plugin runs unused, keyed as TogglePlugin: the menu of the
     /// choices, and one chosen.
     TogglePluginBackgroundMenu(u64),
@@ -5738,6 +5748,19 @@ impl SettingsWindow {
                     .cloned();
                 if let Some((_, id, enabled)) = switch {
                     crate::plugins::set_enabled(&id, !enabled);
+                }
+                window.invalidate();
+            }
+            SettingsAction::AllowPlugin(key) => {
+                self.ui.open_dropdown = None;
+                let new = self
+                    .ui
+                    .plugin_switches
+                    .iter()
+                    .find(|(shown, _, _)| *shown == key)
+                    .cloned();
+                if let Some((_, id, _)) = new {
+                    crate::plugins::set_enabled(&id, true);
                 }
                 window.invalidate();
             }
@@ -14022,6 +14045,25 @@ impl SettingsWindow {
                     continue;
                 }
                 let key = plugin_key(&plugin.id);
+                if plugin.state == State::New && crate::plugins::switching(&plugin.id).is_none() {
+                    // Never let run: a button, not a switch, so that it
+                    // takes a press made for it.
+                    this.ui
+                        .plugin_switches
+                        .push((key, plugin.id.clone(), false));
+                    rows.add(this.paint_action_setting_row(
+                        layers,
+                        tx,
+                        rows.y,
+                        tw,
+                        &plugin.name,
+                        &description,
+                        &crate::i18n::tr("settings-plugins-allow"),
+                        SettingsAction::AllowPlugin(key),
+                        rows.rule(),
+                    )?);
+                    continue;
+                }
                 let enabled = crate::plugins::switching(&plugin.id).unwrap_or(plugin.enabled);
                 this.ui
                     .plugin_switches

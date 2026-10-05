@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{host_in, next_notice, session, spawn, spawn_with_env, stop, wait_until, WAIT};
+use common::{allow, host_in, next_notice, session, spawn, spawn_with_env, stop, wait_until, WAIT};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -56,13 +56,28 @@ fn set_enabled(session: &Session, id: &str, enabled: bool) -> Answer {
     )
 }
 
-/// Installs a plugin: a directory `name` in the host's plugins directory,
-/// holding `manifest`.
+/// Installs a plugin, and lets it run, as the user turning it on does: a
+/// directory `name` in the host's plugins directory, holding `manifest`.
 fn install(host: &Host, name: &str, manifest: &str) -> PathBuf {
+    let dir = place(host, name, manifest);
+    if let Some(id) = id_of(manifest) {
+        allow(host, &id, &dir);
+    }
+    dir
+}
+
+/// Installs a plugin the user has not let run yet.
+fn place(host: &Host, name: &str, manifest: &str) -> PathBuf {
     let dir = host.data_dir.join("plugins").join(name);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("plugin.toml"), manifest).unwrap();
     dir
+}
+
+/// The id a manifest gives, when it reads.
+fn id_of(manifest: &str) -> Option<String> {
+    let value: toml::Value = toml::from_str(manifest).ok()?;
+    Some(value.get("id")?.as_str()?.to_string())
 }
 
 /// Snippets installed again under another id, as a program of its own:
@@ -215,13 +230,15 @@ fn a_manifest_that_cannot_be_used_is_listed_with_why() {
     let copy = snippets_copy(&host);
     install(&host, "copy", &copy);
     let broken = install(&host, "broken", "id = \n");
-    install(&host, "twin", &copy);
-    install(
+    // Not used whether let run or not: placed, as installed and never
+    // turned on.
+    place(&host, "twin", &copy);
+    place(
         &host,
         "clash",
         &copy.replace("\"snippets-copy\"", "\"snippets\""),
     );
-    install(&host, "future", &copy.replace("api = 1", "api = 99"));
+    place(&host, "future", &copy.replace("api = 1", "api = 99"));
     std::fs::create_dir_all(host.data_dir.join("plugins/empty")).unwrap();
     let (session, _notices) = session(&host);
 
@@ -270,6 +287,12 @@ fn a_manifest_that_cannot_be_used_is_listed_with_why() {
         copy.replace("snippets-copy", "mended"),
     )
     .unwrap();
+    assert_eq!(
+        info(&session, "mended").state,
+        State::New,
+        "another plugin now, which waits to be let run"
+    );
+    set_enabled(&session, "mended", true).unwrap();
     assert_eq!(info(&session, "mended").state, State::Idle);
     drop(session);
     stop(&host);
@@ -373,13 +396,120 @@ program = "plugin.sh"
         install_script_in(host, "shell", script)
     }
 
-    /// The same plugin, id "shell", installed in directory `name`.
+    /// The same plugin, id "shell", installed in directory `name`, and let
+    /// run.
     fn install_script_in(host: &Host, name: &str, script: &str) -> PathBuf {
-        let dir = install(host, name, MANIFEST);
+        let program = place_script(host, name, script);
+        allow(host, "shell", program.parent().unwrap());
+        program
+    }
+
+    /// [`install_script_in`], never let run.
+    fn place_script(host: &Host, name: &str, script: &str) -> PathBuf {
+        let dir = place(host, name, MANIFEST);
         let program = dir.join("plugin.sh");
         std::fs::write(&program, script).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         program
+    }
+
+    #[test]
+    fn a_new_plugin_runs_only_once_turned_on_and_only_from_where_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_in(dir.path());
+        let program = place_script(&host, "shell", WELL_BEHAVED);
+        let (session, _notices) = session(&host);
+        let shell = info(&session, "shell");
+        assert_eq!((shell.state, shell.enabled), (State::New, false));
+        let switches: Value =
+            serde_json::from_slice(&std::fs::read(host.data_dir.join("plugins.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            switches["plugins"]["shell"],
+            json!({"enabled": false, "held": true}),
+            "written in as off, for a build that does not know to wait"
+        );
+        let why = call(&session, "shell", json!({"op": "pid"})).unwrap_err();
+        assert!(why.contains("is new"), "{why}");
+        let why = set_background(&session, "shell", Some(api::Background::Always)).unwrap_err();
+        assert!(why.contains("turn it on first"), "{why}");
+
+        set_enabled(&session, "shell", true).unwrap();
+        assert_eq!(info(&session, "shell").state, State::Idle);
+        let first = pid(call(&session, "shell", json!({"op": "pid"})));
+
+        // Its link pointed at another copy: it is stopped, and that one
+        // waits to be let run, as a plugin of its own.
+        let plugin = program.parent().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::rename(plugin, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, plugin).unwrap();
+        assert_eq!(info(&session, "shell").state, State::New);
+        wait_until("the run let from where it was to stop", || !alive(first));
+        let why = call(&session, "shell", json!({"op": "pid"})).unwrap_err();
+        assert!(why.contains("is new"), "{why}");
+
+        // Put back where it was let run from: on again, with no new say.
+        std::fs::remove_file(plugin).unwrap();
+        std::fs::rename(&elsewhere, plugin).unwrap();
+        let back = info(&session, "shell");
+        assert_eq!((back.state, back.enabled), (State::Idle, true), "on again");
+        let second = pid(call(&session, "shell", json!({"op": "pid"})));
+        assert_ne!(second, first);
+
+        // Elsewhere again, and let run from there.
+        std::fs::rename(plugin, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, plugin).unwrap();
+        assert_eq!(info(&session, "shell").state, State::New);
+        wait_until("the second run to stop", || !alive(second));
+        set_enabled(&session, "shell", true).unwrap();
+        assert_ne!(pid(call(&session, "shell", json!({"op": "pid"}))), second);
+        drop(session);
+        stop(&host);
+    }
+
+    #[test]
+    fn a_new_plugin_that_runs_always_waits_to_be_let_run_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_in(dir.path());
+        let program = place_script(&host, "shell", WELL_BEHAVED);
+        let manifest = program.with_file_name("plugin.toml");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::write(
+            &manifest,
+            text.replace(
+                "program = \"plugin.sh\"",
+                "program = \"plugin.sh\"\nbackground = \"always\"",
+            ),
+        )
+        .unwrap();
+        let mut child = spawn(&host, &[]);
+        wait_until("the host to listen", || host.socket.exists());
+        let mut keeper = host.connect().unwrap();
+        keeper
+            .send(&ToHost::Call {
+                id: 1,
+                plugin: api::PLUGIN.into(),
+                body: json!({"op": "keep"}),
+            })
+            .unwrap();
+        let (session, _notices) = session(&host);
+        // Kept, and looked at: not started.
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(info(&session, "shell").state, State::New);
+        let always = thinkterm_plugin_channel::paths::always_in(&host.data_dir);
+        assert!(!always.exists(), "nothing to keep the host up for");
+
+        set_enabled(&session, "shell", true).unwrap();
+        wait_until("it to start by itself", || {
+            info(&session, "shell").state == State::Running
+        });
+        assert_eq!(std::fs::read_to_string(&always).unwrap(), "shell\n");
+        drop(session);
+        keeper.shutdown();
+        drop(keeper);
+        stop(&host);
+        wait_until("the host to quit", || child.try_wait().unwrap().is_some());
     }
 
     fn pid(answer: Answer) -> u64 {
@@ -764,6 +894,10 @@ printf '%s' "$$" > "$THINKTERM_PLUGIN_DATA/state"
         // plugin's to answer.
         let why = call(&session, "shell", json!({"op": "pid"})).unwrap_err();
         assert!(why.contains("no plugin named"), "{why}");
+        // Under another id it is another plugin, which waits to be let run.
+        let why = call(&session, "renamed", json!({"op": "pid"})).unwrap_err();
+        assert!(why.contains("is new"), "{why}");
+        set_enabled(&session, "renamed", true).unwrap();
         // The old run is on its way out under the old id; the new id has
         // nothing to wait for.
         let second = pid(call(&session, "renamed", json!({"op": "pid"})));
@@ -781,12 +915,12 @@ printf '%s' "$$" > "$THINKTERM_PLUGIN_DATA/state"
         let running = pid(call(&session, "shell", json!({"op": "pid"})));
 
         // Another host -- a debug build's -- turns it off in the file they
-        // share; then a switch is set here.
-        std::fs::write(
-            host.data_dir.join("plugins.json"),
-            r#"{"plugins":{"shell":{"enabled":false}}}"#,
-        )
-        .unwrap();
+        // share, keeping where it was let run from; then a switch is set
+        // here.
+        let path = host.data_dir.join("plugins.json");
+        let mut switches: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        switches["plugins"]["shell"]["enabled"] = json!(false);
+        std::fs::write(&path, switches.to_string()).unwrap();
         set_enabled(&session, "snippets", false).unwrap();
         wait_until("the plugin turned off elsewhere to stop", || {
             !alive(running)

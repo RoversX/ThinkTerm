@@ -19,7 +19,8 @@ pub struct PluginCommand {
 enum Sub {
     /// List the plugins and their states
     List,
-    /// Turn a plugin on
+    /// Turn a plugin on. A new one is let run from where it is installed,
+    /// which nothing else does
     Enable { id: String },
     /// Turn a plugin off
     Disable { id: String },
@@ -120,6 +121,7 @@ fn locale() -> String {
 
 fn state_label(info: &Info) -> &'static str {
     match info.state {
+        State::New => "new",
         State::Off => "off",
         State::Idle => "idle",
         State::Starting => "starting",
@@ -163,6 +165,13 @@ fn print_list(listed: &[Info]) -> std::io::Result<()> {
         )?;
         if let Some(reason) = info.state.reason() {
             writeln!(out, "{:id_width$}  {reason}", "")?;
+        }
+        if info.state == State::New {
+            writeln!(
+                out,
+                "{:id_width$}  never let run: `thinkterm plugin enable {}` lets it",
+                "", info.id
+            )?;
         }
     }
     Ok(())

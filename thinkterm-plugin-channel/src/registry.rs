@@ -54,8 +54,8 @@ pub enum Request {
         #[serde(default)]
         locale: String,
     },
-    /// Turn a plugin on or off. Answered with `null`; the change is
-    /// announced.
+    /// Turn a plugin on or off. On lets a new one run, from where it is
+    /// installed. Answered with `null`; the change is announced.
     SetEnabled { id: String, enabled: bool },
     /// Choose how long a plugin runs unused; `None` goes back to what its
     /// manifest says. Answered with `null`; the change is announced.
@@ -91,9 +91,14 @@ pub struct Info {
     pub version: String,
     #[serde(default)]
     pub builtin: bool,
-    /// Where an installed plugin lives.
+    /// Where an installed plugin lives: its own directory in the plugins
+    /// directory.
     #[serde(default)]
     pub dir: Option<String>,
+    /// Where `dir` leads, links followed, when that is elsewhere: what the
+    /// user lets run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     pub enabled: bool,
     pub state: State,
     /// The panel it adds to the right sidebar, if it adds one.
@@ -130,6 +135,9 @@ impl Info {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum State {
+    /// Installed, and never let run from where it is: nothing starts it
+    /// until the user turns it on, which lets it.
+    New,
     /// Turned off.
     Off,
     /// On, and not running: started when something uses it.
@@ -162,7 +170,11 @@ impl State {
     pub fn usable(&self) -> bool {
         !matches!(
             self,
-            Self::Off | Self::Failed { .. } | Self::Invalid { .. } | Self::Unsupported { .. }
+            Self::New
+                | Self::Off
+                | Self::Failed { .. }
+                | Self::Invalid { .. }
+                | Self::Unsupported { .. }
         )
     }
 
@@ -173,7 +185,7 @@ impl State {
             | Self::Failed { reason }
             | Self::Invalid { reason }
             | Self::Unsupported { reason } => Some(reason),
-            Self::Off | Self::Idle | Self::Starting | Self::Running => None,
+            Self::New | Self::Off | Self::Idle | Self::Starting | Self::Running => None,
         }
     }
 }
@@ -249,6 +261,7 @@ mod tests {
             version: String::new(),
             builtin: false,
             dir: None,
+            target: None,
             enabled: true,
             state: State::Idle,
             panel: None,
@@ -261,5 +274,8 @@ mod tests {
         };
         assert!(!info.usable());
         assert_eq!(info.state.reason(), Some("no"));
+        info.state = State::New;
+        assert!(!info.usable(), "not until it is let run");
+        assert_eq!(to_value(State::New).unwrap(), json!({"kind": "new"}));
     }
 }

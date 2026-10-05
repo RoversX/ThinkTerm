@@ -181,6 +181,7 @@ pub const STRING_KEYS: &[&str] = &[
     "settings-plugins-reload-description",
     "settings-plugins-reload-button",
     "settings-plugins-unusable",
+    "settings-plugins-allow",
     "settings-plugins-background-always",
     "settings-plugins-background-briefly",
     "settings-plugins-background-never",

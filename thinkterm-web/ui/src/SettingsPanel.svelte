@@ -419,6 +419,9 @@
               <div class="tx"><div class="lab">{row.name}</div><div class="desc">{row.detail}</div></div>
               {#if row.builtin}
                 <!-- Its switch is its panel's, above. -->
+              {:else if row.new}
+                <!-- Never let run: a press made for it lets it, from where it is. -->
+                <button class="pillbtn" type="button" data-plugin-allow={row.id} onclick={() => void handle.client?.plugin_set_enabled(row.id, true)}>{s('settings-plugins-allow')}</button>
               {:else if row.switchable}
                 <div class="ctl">
                   {#if row.background}

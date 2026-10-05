@@ -75,6 +75,9 @@ pub struct PluginRow {
     pub enabled: bool,
     /// Whether a switch could do anything for it.
     pub switchable: bool,
+    /// Never let run: offered a button that lets it, which takes a press
+    /// made for it, rather than a switch.
+    pub new: bool,
     /// Built into ThinkTerm: its switch is its panel's, among the panels,
     /// not in the list.
     pub builtin: bool,
@@ -140,6 +143,7 @@ fn detail(plugin: &Info) -> String {
     };
     let state = match &plugin.state {
         State::Off | State::Idle => None,
+        State::New => Some(tr("settings-plugins-new")),
         State::Starting => Some(tr("settings-plugins-starting")),
         State::Running => Some(tr("settings-plugins-running")),
         State::Crashed { reason } => Some(with_reason("settings-plugins-crashed", reason)),
@@ -147,7 +151,14 @@ fn detail(plugin: &Info) -> String {
         State::Invalid { reason } => Some(with_reason("settings-plugins-invalid", reason)),
         State::Unsupported { .. } => Some(tr("settings-plugins-unsupported")),
     };
-    [Some(origin), state, Some(plugin.description.clone())]
+    // A new one says where it is, on the server's machine: that is what
+    // allowing it lets run.
+    let place = plugin
+        .target
+        .clone()
+        .or_else(|| plugin.dir.clone())
+        .filter(|_| plugin.state == State::New);
+    [Some(origin), state, place, Some(plugin.description.clone())]
         .into_iter()
         .flatten()
         .filter(|part| !part.is_empty())
@@ -384,6 +395,8 @@ impl PluginsModel {
                     detail: detail(plugin),
                     enabled,
                     switchable,
+                    new: plugin.state == State::New
+                        && !self.switching.iter().any(|(id, _)| *id == plugin.id),
                     builtin: plugin.builtin,
                     background: offered.then(|| background_name(background)),
                     background_detail: if offered {

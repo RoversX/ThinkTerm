@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::{host_in, next_notice, session, stop, wait_until};
+use common::{allow, host_in, next_notice, session, stop, wait_until};
 use serde_json::{json, Value};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -70,6 +70,7 @@ fn install_panel(host: &Host) -> PathBuf {
     let program = dir.join("plugin.sh");
     std::fs::write(&program, PANEL).unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    allow(host, "panel", &dir);
     dir
 }
 
@@ -203,6 +204,31 @@ fn a_panel_is_listed_opened_drawn_and_closed() {
     wait_until("the plugin hears the panel closed", || {
         closed_views(&host) == "1\n"
     });
+    drop(session);
+    stop(&host);
+}
+
+#[test]
+fn the_panel_of_a_plugin_never_let_run_does_not_start_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = host_in(dir.path());
+    let plugin = install_panel(&host);
+    std::fs::remove_file(host.data_dir.join("plugins.json")).unwrap();
+    let (session, notices) = session(&host);
+    open(&session, 7);
+    let PanelEvent::Closed { reason, again } = heard(&notices, 7) else {
+        panic!("not refused")
+    };
+    assert!(reason.contains("is new"), "{reason}");
+    assert!(!again, "nothing comes of opening it again");
+    assert!(
+        !host.data_dir.join("plugin-data/panel").exists(),
+        "its program never ran"
+    );
+    // Let run, it opens.
+    allow(&host, "panel", &plugin);
+    open(&session, 8);
+    assert_eq!(drawn(heard(&notices, 8)), "open");
     drop(session);
     stop(&host);
 }

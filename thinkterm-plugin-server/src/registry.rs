@@ -4,7 +4,9 @@
 //!
 //! The directory is looked at again whenever the list is asked for, and a
 //! plugin's manifest and program whenever it is used, so installing,
-//! removing, editing and rebuilding a plugin need no restart. A plugin's
+//! removing, editing and rebuilding a plugin need no restart. Nothing of
+//! an installed plugin runs until the user lets it, from where it is
+//! (`switches`): before that it is new, and nothing starts it. A plugin's
 //! program starts when a client uses the plugin -- or, for one that runs
 //! always, while ThinkTerm keeps the host -- and stops once it has gone
 //! unused for as long as the plugin may run so ([`Background`]). No program
@@ -82,6 +84,9 @@ struct Queued {
 /// What starting an installed plugin's program takes, once it may start.
 struct Launch {
     id: String,
+    /// Where it was let run from, links followed, as just looked at: what
+    /// runs, and where, so that a link turned since starts nothing new.
+    dir: PathBuf,
     program: Result<(PathBuf, Vec<String>), String>,
     program_stamp: Option<Stamp>,
 }
@@ -90,6 +95,9 @@ struct Installed {
     dir: PathBuf,
     /// What a plugin whose manifest does not read is known by.
     dir_name: String,
+    /// Where `dir` really is, links followed: what the user lets it run
+    /// from.
+    real_dir: String,
     manifest: Result<Manifest, String>,
     manifest_stamp: Option<Stamp>,
     /// Why it is not used although its manifest reads: another plugin has
@@ -124,6 +132,7 @@ enum Run {
 impl Installed {
     fn new(dir_name: String, dir: PathBuf) -> Self {
         let mut installed = Self {
+            real_dir: real_dir(&dir),
             dir,
             dir_name,
             manifest: Err(String::new()),
@@ -158,6 +167,17 @@ impl Installed {
     /// Whether calls addressed to `id` are this plugin's.
     fn answers_to(&self, id: &str) -> bool {
         self.shadowed.is_none() && self.id() == Some(id)
+    }
+
+    /// Whether the user let it run from where it is.
+    fn allowed(&self, switches: &Switches) -> bool {
+        self.id()
+            .is_some_and(|id| switches.allowed(id, &self.real_dir))
+    }
+
+    /// Whether it may run: let, and turned on.
+    fn runs(&self, switches: &Switches) -> bool {
+        self.allowed(switches) && self.id().is_some_and(|id| switches.enabled(id))
     }
 
     /// Stops its program, if it runs, handing its unanswered calls to
@@ -275,7 +295,10 @@ impl Registry {
                 .iter()
                 .position(|installed| installed.dir_name == name)
             {
-                Some(index) => self.refresh_manifest(index, fallout),
+                Some(index) => {
+                    self.follow_real_dir(index, fallout);
+                    self.refresh_manifest(index, fallout);
+                }
                 None => {
                     log::info!("found plugin {}", dir.display());
                     self.installed.push(Installed::new(name, dir));
@@ -287,6 +310,53 @@ impl Registry {
         }
         self.installed.sort_by(|a, b| a.dir_name.cmp(&b.dir_name));
         self.resolve_ids(fallout);
+        self.hold_new(fallout);
+    }
+
+    /// Notices that a plugin's directory is somewhere else now -- a link
+    /// pointed elsewhere: it was let run from where it was, not from here,
+    /// and is stopped.
+    fn follow_real_dir(&mut self, index: usize, fallout: &mut Fallout) {
+        let installed = &mut self.installed[index];
+        let now = real_dir(&installed.dir);
+        if now == installed.real_dir {
+            return;
+        }
+        installed.real_dir = now;
+        installed.reset("it is somewhere else now", fallout);
+        fallout.changed = true;
+    }
+
+    /// Writes the plugins not let run from where they are -- new ones, and
+    /// ones somewhere else now -- in as off, so that a build that does not
+    /// know to wait leaves them off too; and those held so that are back
+    /// where they were let run from in as on again. What another host
+    /// changed in the switches is taken in first.
+    fn hold_new(&mut self, fallout: &mut Fallout) {
+        self.follow_switches(fallout);
+        let mut waiting = Vec::new();
+        let mut back = Vec::new();
+        for installed in self
+            .installed
+            .iter()
+            .filter(|installed| installed.shadowed.is_none())
+        {
+            let Some(id) = installed.id() else {
+                continue;
+            };
+            if !installed.allowed(&self.switches) {
+                if self.switches.enabled(id) {
+                    waiting.push(id.to_string());
+                }
+            } else if self.switches.held(id) {
+                back.push(id.to_string());
+            }
+        }
+        match self.switches.hold(&waiting, &back) {
+            Ok(true) => fallout.changed = true,
+            Ok(false) => {}
+            Err(err) => log::warn!("cannot keep new plugins off for other builds: {err:#}"),
+        }
     }
 
     /// The plugin directories, by name: not hidden, at most [`DIR_LIMIT`].
@@ -298,8 +368,7 @@ impl Registry {
         }
         fallout.changed = true;
         for installed in &mut self.installed {
-            let off = installed.id().is_some_and(|id| !self.switches.enabled(id));
-            if off {
+            if installed.id().is_some() && !installed.runs(&self.switches) {
                 installed.reset("it was turned off", fallout);
             }
         }
@@ -402,6 +471,7 @@ impl Registry {
             version: String::new(),
             builtin: true,
             dir: None,
+            target: None,
             enabled,
             state: if enabled { State::Idle } else { State::Off },
             panel: None,
@@ -419,7 +489,11 @@ impl Registry {
     }
 
     fn installed_info(&self, installed: &Installed, locale: &str) -> Info {
-        let dir = Some(installed.dir.display().to_string());
+        let dir = installed.dir.display().to_string();
+        // Where it really is, when a link leads elsewhere: what the user
+        // lets run.
+        let target = linked(&installed.dir).then(|| shown(&installed.real_dir));
+        let dir = Some(dir);
         let manifest = match &installed.manifest {
             Ok(manifest) => manifest,
             Err(reason) => {
@@ -430,6 +504,7 @@ impl Registry {
                     version: String::new(),
                     builtin: false,
                     dir,
+                    target,
                     enabled: self.switches.enabled(&installed.dir_name),
                     state: State::Invalid {
                         reason: reason.clone(),
@@ -440,7 +515,8 @@ impl Registry {
                 }
             }
         };
-        let enabled = self.switches.enabled(&manifest.id);
+        let allowed = installed.allowed(&self.switches);
+        let enabled = installed.runs(&self.switches);
         let state = if let Some(reason) = &installed.shadowed {
             State::Invalid {
                 reason: reason.clone(),
@@ -453,6 +529,8 @@ impl Registry {
                     std::env::consts::OS
                 ),
             }
+        } else if !allowed {
+            State::New
         } else if !enabled {
             State::Off
         } else {
@@ -477,6 +555,7 @@ impl Registry {
             version: manifest.version.clone(),
             builtin: false,
             dir,
+            target,
             enabled,
             state,
             panel: manifest.panel.clone(),
@@ -544,10 +623,18 @@ impl Registry {
         // The file is written over what it says now, so what another host
         // changed in it is acted on first, not just carried along.
         self.follow_switches(fallout);
-        let moved = self
-            .switches
-            .set(id, enabled)
-            .map_err(|err| format!("cannot save the switch: {err:#}"))?;
+        // Turned on, an installed plugin is let run from where it is now.
+        let lets = self
+            .installed
+            .iter()
+            .find(|installed| installed.answers_to(id))
+            .map(|installed| installed.real_dir.clone())
+            .filter(|_| enabled);
+        let moved = match &lets {
+            Some(dir) => self.switches.allow(id, dir),
+            None => self.switches.set(id, enabled),
+        }
+        .map_err(|err| format!("cannot save the switch: {err:#}"))?;
         if !moved {
             return Ok(());
         }
@@ -593,6 +680,15 @@ impl Registry {
             return Err(why);
         }
         self.follow_switches(fallout);
+        // How long it runs is asked of one that runs: a new one is let run
+        // first, by turning it on.
+        let allowed = self
+            .installed
+            .iter()
+            .any(|installed| installed.answers_to(id) && installed.allowed(&self.switches));
+        if !allowed {
+            return Err(format!("{id:?} is new: turn it on first, to let it run"));
+        }
         let moved = self
             .switches
             .set_background(id, background)
@@ -648,12 +744,12 @@ impl Registry {
             };
             let id = manifest.id.clone();
             let background = self.background(manifest);
-            // One that cannot run -- turned off, or not for this system --
-            // is not tried each time.
+            // One that cannot run -- new, turned off, or not for this
+            // system -- is not tried each time.
             let always = kept
                 && background == Background::Always
                 && manifest.supported()
-                && self.switches.enabled(&id);
+                && installed.runs(&self.switches);
             let in_use = |installed: &Installed| match &installed.run {
                 Run::Running(process) => {
                     always || process.busy() || !installed.queued.is_empty() || used(&id)
@@ -694,12 +790,9 @@ impl Registry {
                         // Started once it is gone: word of that runs this again.
                         continue;
                     }
-                    let Ok(launch) = self.launchable(index, fallout) else {
+                    let Ok(launch) = self.launchable(index, Some(&id), fallout) else {
                         continue;
                     };
-                    if launch.id != id {
-                        continue;
-                    }
                     log::info!("starting plugin {id}: it runs always");
                     if let Err(why) = self.start(index, launch, listener, fallout) {
                         log::warn!("plugin {id} runs always, and cannot start: {why}");
@@ -721,11 +814,10 @@ impl Registry {
             .iter()
             .filter(|installed| installed.shadowed.is_none())
             .filter(|installed| !matches!(installed.run, Run::Failed { .. }))
+            .filter(|installed| installed.runs(&self.switches))
             .filter_map(|installed| installed.manifest.as_ref().ok())
             .filter(|manifest| {
-                manifest.supported()
-                    && self.switches.enabled(&manifest.id)
-                    && self.background(manifest) == Background::Always
+                manifest.supported() && self.background(manifest) == Background::Always
             })
             .map(|manifest| manifest.id.clone())
             .collect();
@@ -794,12 +886,7 @@ impl Registry {
         listener: &Arc<dyn Listener>,
         fallout: &mut Fallout,
     ) -> Result<(), String> {
-        let launch = self.launchable(index, fallout)?;
-        // Its manifest, read again, may name another id now: the call is
-        // not for that plugin.
-        if launch.id != id {
-            return Err(format!("there is no plugin named {id:?}"));
-        }
+        let launch = self.launchable(index, Some(id), fallout)?;
         let installed = &mut self.installed[index];
         if let Run::Running(process) = &installed.run {
             if stamp(&process.program) != process.program_stamp {
@@ -842,10 +929,9 @@ impl Registry {
             reason,
             again: false,
         };
-        let launch = self.launchable(index, fallout).map_err(for_good)?;
-        if launch.id != id {
-            return Err(for_good(format!("there is no plugin named {id:?}")));
-        }
+        let launch = self
+            .launchable(index, Some(id), fallout)
+            .map_err(for_good)?;
         let installed = &mut self.installed[index];
         let Ok(manifest) = &installed.manifest else {
             return Err(for_good(format!("there is no plugin named {id:?}")));
@@ -958,7 +1044,7 @@ impl Registry {
             }
             // A manifest read again here answers the calls it no longer
             // takes: the plugin is reset.
-            let launch = match self.launchable(index, fallout) {
+            let launch = match self.launchable(index, None, fallout) {
                 Ok(launch) => launch,
                 Err(why) => {
                     let calls = std::mem::take(&mut self.installed[index].queued);
@@ -976,23 +1062,51 @@ impl Registry {
         }
     }
 
-    /// Whether the installed plugin at `index` may run now, reading its
-    /// manifest again if it changed, and what starting it takes.
-    fn launchable(&mut self, index: usize, fallout: &mut Fallout) -> Result<Launch, String> {
+    /// Whether the installed plugin at `index` may run now -- as `id`, when
+    /// it is for that -- reading its manifest again if it changed, and what
+    /// starting it takes.
+    fn launchable(
+        &mut self,
+        index: usize,
+        id: Option<&str>,
+        fallout: &mut Fallout,
+    ) -> Result<Launch, String> {
+        // The switches as they are now: another host may have turned it
+        // off, or on, since they were last read.
+        self.follow_switches(fallout);
         self.refresh_manifest(index, fallout);
         let installed = &self.installed[index];
         let manifest = installed.manifest.as_ref().map_err(Clone::clone)?;
+        // Its manifest, read again, may name another id now: what was meant
+        // for the old one is not for that plugin.
+        if let Some(id) = id.filter(|id| *id != manifest.id) {
+            return Err(format!("there is no plugin named {id:?}"));
+        }
         if let Some(reason) = &installed.shadowed {
             return Err(reason.clone());
         }
         if !manifest.supported() {
             return Err(format!("{} does not run on this system", manifest.name));
         }
+        // Looked at again here, where it is about to run: a link pointed
+        // elsewhere since the last look is not where it was let run from.
+        self.follow_real_dir(index, fallout);
+        let installed = &self.installed[index];
+        let Ok(manifest) = installed.manifest.as_ref() else {
+            unreachable!("read above");
+        };
+        if !installed.allowed(&self.switches) {
+            return Err(format!(
+                "{} is new: it runs once you turn it on",
+                manifest.name
+            ));
+        }
         if !self.switches.enabled(&manifest.id) {
             return Err(format!("{} is turned off", manifest.name));
         }
         let id = manifest.id.clone();
-        let program = manifest.program(&installed.dir);
+        let dir = PathBuf::from(&installed.real_dir);
+        let program = manifest.program(&dir);
         let program_stamp = program.as_ref().ok().and_then(|(path, _)| stamp(path));
 
         let installed = &mut self.installed[index];
@@ -1012,6 +1126,7 @@ impl Registry {
         }
         Ok(Launch {
             id,
+            dir,
             program,
             program_stamp,
         })
@@ -1076,6 +1191,7 @@ impl Registry {
     ) -> Result<(), String> {
         let Launch {
             id,
+            dir,
             program,
             program_stamp,
         } = launch;
@@ -1099,7 +1215,7 @@ impl Registry {
             generation: self.generation,
             program: &path,
             args: &args,
-            dir: &installed.dir,
+            dir: &dir,
             data_dir: &data_dir,
             ready_within: self.ready_within,
         };
@@ -1278,6 +1394,30 @@ impl Registry {
     }
 }
 
+/// Where `dir` really is, links followed, as the switches keep it: itself,
+/// when that cannot be found.
+fn real_dir(dir: &Path) -> String {
+    std::fs::canonicalize(dir)
+        .unwrap_or_else(|_| dir.to_path_buf())
+        .display()
+        .to_string()
+}
+
+/// Whether plugin directory `dir` is a link to one elsewhere.
+fn linked(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+/// `path` as a person writes it: without the `\\?\` Windows puts before
+/// a path it resolved.
+fn shown(path: &str) -> String {
+    match path.strip_prefix(r"\\?\") {
+        Some(unc) if unc.starts_with("UNC\\") => format!(r"\\{}", &unc[4..]),
+        Some(local) => local.to_string(),
+        None => path.to_string(),
+    }
+}
+
 /// Writes `text` to `path` whole, or not at all.
 fn write_whole(path: &Path, text: String) -> anyhow::Result<()> {
     use std::io::Write;
@@ -1289,4 +1429,22 @@ fn write_whole(path: &Path, text: String) -> anyhow::Result<()> {
     file.write_all(text.as_bytes())?;
     file.persist(path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_resolved_windows_path_is_shown_as_it_is_written() {
+        assert_eq!(
+            shown(r"\\?\C:\Users\user\plugins\foo"),
+            r"C:\Users\user\plugins\foo"
+        );
+        assert_eq!(
+            shown(r"\\?\UNC\server-a\share\foo"),
+            r"\\server-a\share\foo"
+        );
+        assert_eq!(shown("/home/user/plugins/foo"), "/home/user/plugins/foo");
+    }
 }
