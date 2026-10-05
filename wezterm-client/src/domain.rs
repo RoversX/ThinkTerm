@@ -3497,6 +3497,48 @@ impl ClientDomain {
         Ok(state)
     }
 
+    /// A fresh attach mirrors each server window with its first tab
+    /// selected. The server knows which tab each one had -- the last that
+    /// any client focused there -- and its session view says which; select
+    /// those, as the recovery of a replacement runtime does. A window no
+    /// Thread owns is not in that view and keeps its first tab, and so does
+    /// `primary_window_id`: a frontend may be showing that one already, and
+    /// has sized the tab it was showing, not the one this would pick.
+    async fn select_server_active_tabs(
+        &self,
+        primary_window_id: Option<WindowId>,
+    ) -> anyhow::Result<()> {
+        let inner = self
+            .inner()
+            .ok_or_else(|| anyhow!("domain is not attached"))?;
+        let state = inner.client.get_thinkterm_session_state().await?;
+        let mux = Mux::get();
+        for tab in state
+            .projects
+            .iter()
+            .flat_map(|project| &project.threads)
+            .flat_map(|thread| &thread.tabs)
+            .filter(|tab| tab.is_active)
+        {
+            let Some(local_tab_id) = inner.remote_to_local_tab_id(tab.tab_id) else {
+                continue;
+            };
+            let Some(window_id) = mux.window_containing_tab(local_tab_id) else {
+                continue;
+            };
+            if Some(window_id) == primary_window_id {
+                continue;
+            }
+            let Some(mut window) = mux.get_window_mut(window_id) else {
+                continue;
+            };
+            if let Some(index) = window.idx_by_id(local_tab_id) {
+                window.set_active_without_saving(index);
+            }
+        }
+        Ok(())
+    }
+
     /// Ask the authoritative mux server to choose (or create) a landing
     /// Thread and ensure that its workspace contains a live terminal.  The
     /// following resync installs the remote-to-local tab and pane mappings so
@@ -6019,6 +6061,14 @@ impl ClientDomain {
         if let Err(err) = self.fetch_thinkterm_tree().await {
             log::warn!(
                 "failed to fetch the ThinkTerm tree from {}: {err:#}",
+                self.config.name()
+            );
+        }
+        // Before the attach returns, so a window opened on these mirrors
+        // opens on that tab; failing, they stay on their first one.
+        if let Err(err) = self.select_server_active_tabs(window_id).await {
+            log::warn!(
+                "failed to select the active tabs of {}: {err:#}",
                 self.config.name()
             );
         }
