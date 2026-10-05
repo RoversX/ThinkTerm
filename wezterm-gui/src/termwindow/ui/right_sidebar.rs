@@ -7311,6 +7311,7 @@ impl crate::TermWindow {
             // Chrome only; paint_note_sidebar paints the editor into this
             // rect later in the frame. The band above it is the window
             // border's, which see-through must not get a second coat.
+            let pane_top = if see_through { pane_rect.y } else { 0 };
             if pane_rect.y > 0 && !see_through {
                 self.filled_rectangle(
                     layers,
@@ -7349,9 +7350,12 @@ impl crate::TermWindow {
                 1,
                 euclid::rect(
                     pane_rect.x as f32,
-                    pane_rect.y as f32,
+                    pane_top as f32,
                     1.0,
-                    pane_rect.height as f32,
+                    pane_rect
+                        .y
+                        .saturating_add(pane_rect.height)
+                        .saturating_sub(pane_top) as f32,
                 ),
                 chrome.separator,
             )
@@ -7390,15 +7394,22 @@ impl crate::TermWindow {
                 1,
                 euclid::rect(
                     extended_rect.x as f32,
-                    extended_rect.y as f32,
+                    ground_top as f32,
                     1.0,
-                    extended_rect.height as f32,
+                    extended_rect
+                        .y
+                        .saturating_add(extended_rect.height)
+                        .saturating_sub(ground_top) as f32,
                 ),
                 chrome.separator,
             )
             .context("right sidebar plugin extended view left separator")?;
         }
 
+        // The panel's ground runs from the window's top -- over the tab bar,
+        // too, where a hover-revealed one off macOS keeps below it -- and its
+        // edge with it; but for the border's band see-through.
+        let ground_top = if see_through { rect.y } else { 0 };
         if rect.y > 0 && !see_through {
             self.filled_rectangle(
                 layers,
@@ -7430,7 +7441,14 @@ impl crate::TermWindow {
         self.filled_rectangle(
             layers,
             1,
-            euclid::rect(rect.x as f32, rect.y as f32, 1.0, rect.height as f32),
+            euclid::rect(
+                rect.x as f32,
+                ground_top as f32,
+                1.0,
+                rect.y
+                    .saturating_add(rect.height)
+                    .saturating_sub(ground_top) as f32,
+            ),
             chrome.separator,
         )
         .context("right sidebar separator")?;
