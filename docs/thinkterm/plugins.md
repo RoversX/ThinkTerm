@@ -3,11 +3,15 @@
 **Status:** Version 2. A plugin provides data and functions: it answers
 calls, and tells the clients that watch it when something changed. It can
 also add a panel to the right sidebar, which it draws by hand: rectangles,
-text, lines and filled areas, and the places a click reaches it (see
-[Panels](#panels)). The desktop and the browser offer the panel in the
-sidebar's selector, list the plugin in Settings › Sidebar & Plugins, and
-show nothing else of it; nothing of a plugin shows outside the sidebar.
-`thinkterm plugin call` calls one from the command line.
+text, lines and filled areas, the places a click reaches it, and fields to
+type in; and it can be given the keyboard (see [Panels](#panels)). The
+desktop and the browser offer the panel in the sidebar's selector, list
+the plugin in Settings › Sidebar & Plugins, and show nothing else of it;
+nothing of a plugin shows outside the sidebar. `thinkterm plugin call`
+calls one from the command line.
+
+A plugin you install does not run until you let it: see [New
+plugins](#new-plugins).
 
 Snippets is a built-in plugin that provides a panel: its switch is that
 panel's, among the panels in Settings › Sidebar & Plugins, and its row in
@@ -52,10 +56,29 @@ Put the directory under the plugins directory:
 | Linux   | `~/.local/share/ThinkTerm/plugins`                |
 | Windows | `%APPDATA%\ThinkTerm\plugins`                     |
 
-`thinkterm plugin dir` prints the directory. There is no install step and no
-restart. ThinkTerm finds a new plugin the next time it looks: when Settings ›
-Sidebar opens, or when you run `thinkterm plugin list`. Deleting the
-directory uninstalls the plugin.
+`thinkterm plugin dir` prints the directory. There is no restart. ThinkTerm
+finds a new plugin the next time it looks: when Settings › Sidebar opens, or
+when you run `thinkterm plugin list`. It lists it as new, and runs nothing
+of it until you let it: press Allow beside it in Settings › Sidebar &
+Plugins, on the desktop or in the browser, or run `thinkterm plugin enable
+<id>`. Deleting the directory uninstalls the plugin.
+
+### New plugins
+
+ThinkTerm starts a plugin's program only once you let it run, from the
+directory it is in then. Until you do it is `new`: its panel is not
+offered, calls to it are refused, and one whose manifest says it runs
+always is not started. Allowing it is turning it on; `plugins.json` keeps
+where you let it run from, with links followed.
+
+It is new again when it is anywhere else -- moved, a link pointed at
+another copy, another plugin under its id, its manifest giving it another
+id -- and a running one is stopped. A plugin's own updates in place, and
+rebuilding one you work on through a link, ask nothing again. A new plugin
+is written in `plugins.json` as off, so that a ThinkTerm older than this,
+sharing the file, does not run it either; one turned off so only because
+it was somewhere else is on again once it is back where you let it run
+from. A plugin you turned off yourself stays off.
 
 A plugin's directory can be a symbolic link. That is the easiest way to work
 on one: link your source directory in, and rebuild. ThinkTerm restarts the
@@ -121,6 +144,9 @@ sorts first is used, and the other is shown as invalid.
 - **A panel.** A plugin whose manifest has a `[panel]` draws one in the
   right sidebar, on the desktop and in the browser alike. See
   [Panels](#panels).
+- **Typing and keys.** A panel can have fields to type in, and be sent the
+  keys it takes while the user gives it the keyboard. See [Fields and the
+  keyboard](#fields-and-the-keyboard).
 - **Another machine's files.** When the terminal beside its panel runs on
   another machine reached over SSH, a plugin has ThinkTerm run programs and
   read files there. See [A terminal on another
@@ -137,7 +163,8 @@ a plugin shows outside the sidebar.
 A panel is drawn by hand. The plugin sends a *frame*: a list of items,
 painted in order, in the panel's own units -- CSS pixels, points on a Mac --
 from its top left corner. There are no widgets: a button is a rounded
-rectangle, its label, and a hit over both. Every ThinkTerm client paints a
+rectangle, its label, and a hit over both. The one exception is a field,
+which the client draws and edits itself. Every ThinkTerm client paints a
 frame with the same *player* (`thinkterm-plugin-panel`), with its own
 renderer and fonts and in ThinkTerm's colours, so a panel looks alike on the
 desktop and in a browser without the plugin knowing which it is on.
@@ -169,6 +196,7 @@ the rest are drawn.
 | `hit`    | `id`, `x`, `y`, `w`, `h`; `hover` (a colour to tint it with while the pointer is over it); `radius` (0, the tint's corners); `cursor` (`pointer`, `arrow`) |
 | `scroll` | `id`, `x`, `y`, `w`, `h`, `height` (of what scrolls), `items` (in its own units); `top`                  |
 | `list`   | `id`, `x`, `y`, `w`, `h`, `count`, `row` (a row's height), `key`; `version` (0); `width`, `fixed` (0); `top` |
+| `field`  | `id`, `x`, `y`, `w`, `h`; `kind` (`line`, `lines`, `secret`); `value`, `seq` (0); `placeholder`; `font` (`ui` or `mono`); `max` (0: as many as a field holds); `focus`; `icon` (`search`, `plus` or `pencil`); `clear` |
 
 - Text is one line, centred in its box's height and cut to its width: with
   an ellipsis in the `ui` font, at the edge in the `mono` font, whose
@@ -186,12 +214,16 @@ the rest are drawn.
   the new ones come. So they are when the panel's size or fonts change,
   which rows are drawn for, and when the plugin starts again. `top`,
   `{"to": 12, "seq": 1}`, scrolls a list to a row (a scroll area to a
-  height) once for each new `seq`.
+  height) once for each new `seq`; with `"through": 13` it scrolls only as
+  far as it takes to show from `to` to there, which keeps a row picked
+  with the keys in view.
 - A list whose rows are `width` wide, wider than it, scrolls sideways too:
   with a trackpad, or the wheel with Shift. What starts within `fixed` of a
   row's left edge stays put -- line numbers beside lines of code -- and what
   starts past it moves, cut where the fixed part ends.
 - Scroll areas and lists do not go inside one another, or inside a row.
+  Nor does a field go in either; of two fields with one id the first is
+  kept. See [Fields and the keyboard](#fields-and-the-keyboard).
 
 Colours are ThinkTerm's own, by name, which follow its theme: `text`,
 `text-muted`, `text-faint`, `bg`, `bg-raised`, `bg-hover`, `bg-selected`,
@@ -222,8 +254,11 @@ how tall one is), whether the theme is dark, the language ThinkTerm speaks
 pane in focus in its window -- when that terminal runs on the machine the
 plugin runs on, and left out when there is none or it does not; `remote`
 when it runs on another machine instead (see [A terminal on another
-machine](#a-terminal-on-another-machine)); and `can_extend` (see [The
-extended view](#the-extended-view)). It comes with `open` and again when any of it
+machine](#a-terminal-on-another-machine)); `can_extend` (see [The
+extended view](#the-extended-view)); and `features`, what the client does
+besides drawing and sending clicks: `fields` when it shows fields, `keys`
+when it gives a panel the keyboard on the user's key (see [Fields and the
+keyboard](#fields-and-the-keyboard)). It comes with `open` and again when any of it
 changes -- no more than ten times a second while a window is resized, the
 last always -- and the `rows` asked for after it are drawn for it. A click's
 `x` and `y` are within the hit. A `version` or a `layout` of 0, and a
@@ -289,6 +324,76 @@ Pressed, it closes the view at once, whatever the plugin does, and sends it
 
 for the plugin to stop asking: the panel is given no other extended view
 until its frames have stopped asking for one, and ask again.
+
+### Fields and the keyboard
+
+A `field` is a box the user types in. The client draws it -- the box, the
+text, the caret and what is selected, in ThinkTerm's font and colours --
+and edits it without waiting for the plugin, input methods included. What
+it holds is the client's while it shows: `value` is taken when the field
+first comes, and again for each new `seq`, so the frames drawn while the
+user types do not undo it. A plugin empties a field after a submit by
+sending `""` with the next `seq`. `lines` takes several lines, and Return
+starts a new one; `secret` shows dots, cannot be copied or cut out of, and
+is sent only when submitted. A field on one line is round at its ends, as
+the sidebar's search is; `icon` puts one before its text -- `search`,
+`plus` or `pencil` -- and `"clear": true` a button at its end that empties
+it, which the client draws and does itself.
+
+```json
+{"type":"frame","view":3,"frame":{"items":[{"field":{"id":"add","x":12,"y":40,"w":296,"h":28,"placeholder":"Add a symbol","max":24,"icon":"plus"}}],"keys":["ArrowUp","ArrowDown"]}}
+{"type":"input","view":3,"input":{"focus":{"id":"add"}}}
+{"type":"input","view":3,"input":{"text":{"id":"add","text":"TS"}}}
+{"type":"input","view":3,"input":{"submit":{"id":"add","text":"TSM"}}}
+{"type":"input","view":3,"input":{"key":{"key":"ArrowDown","mods":{}}}}
+{"type":"input","view":3,"input":"blur"}
+```
+
+`text` comes as what the field holds changes -- typed, pasted, cut, never
+the half of a word an input method is still composing -- and `submit` when
+the user presses Return, Command-Return (Ctrl+Return off a Mac) in a field
+of `lines`. Both say the `seq` of the text it was typed over, when that is
+not 0: one that is not the plugin's latest was typed before its text came,
+and the field holds the plugin's, so the plugin keeps that (`FieldText`
+does). `focus` says the panel has the keyboard, in the field `id` or,
+without one, in none of them; `blur` that it went.
+
+The keyboard is the terminal's until the user gives it to a panel:
+
+- **Pressing in a field** gives it the keyboard there. A press anywhere
+  else in a panel leaves the keyboard where it is: a click is a click.
+- **The user's key for the panel.** The desktop has an action for it,
+  which you bind in your configuration; it opens the right sidebar on the
+  panel, and gives it the keyboard in its first field -- or, without
+  fields, in none, outlined -- and pressed again gives it back:
+
+  ```lua
+  config.keys = {
+    { key = 'S', mods = 'CMD|SHIFT', action = wezterm.action.FocusPluginPanel 'stocks' },
+  }
+  ```
+
+  A browser offers no such key: there a panel has the keyboard through
+  its fields.
+
+While a panel has it, the keys its frame names in `keys` go to the plugin
+as `key`, named as a browser names them (`KeyboardEvent.key`: `ArrowDown`,
+`Enter`, `j`), with whether Shift was held. The field with the keyboard
+keeps the keys it edits with; any other -- and any pressed with Ctrl, Alt
+or Command, which are never a panel's -- is left to the app's own keys,
+and never reaches the terminal. Escape gives the keyboard back to the
+terminal, and Tab moves it between the panel's fields; neither is sent.
+
+The user gives the keyboard back with Escape or a press on the terminal.
+The plugin can move it between its own fields -- `focus`, once for each
+new seq -- and let go of it with the frame's `release`, once for each new
+seq, but only while its panel has it already: it can never take it from
+the terminal, nor give it to the terminal. When the panel loses it without
+the user -- a `release`, the field it is in going from the frame, the
+panel going off show, its plugin stopped or started again -- what the user
+types next was meant for the panel, and goes nowhere until they press
+Escape or press somewhere. What a stopped plugin, or one starting again,
+last drew takes no typing: a press in its field gives it no keyboard.
 
 ### A terminal on another machine
 
@@ -441,6 +546,14 @@ fn main() -> std::io::Result<()> {
   `rows` answers a list's rows, at once; `closed` says a view went. The
   items are in `thinkterm_plugin_sdk::panel`, with builders:
   `Rect::new(x, y, w, h).fill(Token::BgRaised).radius(6.0)`.
+- A field is `Field::new(id, x, y, w, h)`, kept with a `FieldText`: it
+  takes what an `Input::Text` or `Input::Submit` says with `heard` --
+  unless it was typed over text the plugin has put there since -- and
+  `set` or `clear` put text there, which its `field(id, x, y, w, h)` sends
+  with the next `seq`. `frame.keys(&["ArrowDown"])` names the keys the panel
+  takes, and `view.focus` says where the keyboard is in the view while it
+  has it. `Input` will grow: match the inputs a plugin knows, and let the
+  rest be.
 - A panel asks for its extended view with `frame.extend(true)`, and the
   same `draw` draws that, with `view.extended()` true. `view.panel()` names
   the panel either belongs to, for what the two share; a panel's
@@ -484,13 +597,18 @@ installed the same way:
   through ThinkTerm, and does not count the lines of new files, which would
   cost a trip each. While it runs, it keeps what it found in the last few
   directories, and the file picked in each: a panel shown again -- after the
-  sidebar went to another of its panels, say -- shows them at once.
+  sidebar went to another of its panels, say -- shows them at once. A field
+  above the files filters them by name; with the keyboard in the panel,
+  up and down pick the file before or after, and Return in the filter the
+  first it leaves.
 - `thinkterm-plugin-stocks` (`stocks`): a watchlist of quotes from Yahoo
   Finance with each symbol's day as a line, and a chart of the one picked
   over a range. It fetches on a thread of its own while a panel is on show,
-  and keeps its watchlist in its data directory:
-  `thinkterm plugin call stocks '{"op":"add","symbol":"TSM"}'`. Yahoo's
-  chart API is not an official one, and may refuse or change.
+  and keeps its watchlist in its data directory: a symbol typed in the
+  field at the panel's top is added to it, and so is one called for,
+  `thinkterm plugin call stocks '{"op":"add","symbol":"TSM"}'`; with the
+  keyboard in the panel, up and down pick the symbol before or after.
+  Yahoo's chart API is not an official one, and may refuse or change.
 
 ## Lifecycle
 
@@ -499,6 +617,7 @@ Sidebar shows the reason for a failed state.
 
 | State         | Meaning                                                    | Leaves it when                                  |
 |---------------|------------------------------------------------------------|-------------------------------------------------|
+| `new`         | Installed, and never let run from where it is              | turned on, which lets it                        |
 | `off`         | Turned off                                                 | turned on                                       |
 | `idle`        | On, and not running. Built-in plugins are always `idle`.   | it is used                                      |
 | `starting`    | The program started and has not said `ready` yet           | `ready`, exit, or 10 seconds pass               |
@@ -509,7 +628,8 @@ Sidebar shows the reason for a failed state.
 | `unsupported` | `platforms` does not include this system                   | the manifest changes                            |
 
 A client that uses a plugin starts it: a call from the command line, or a
-panel on show. Only a plugin that runs always starts without one. Calls that
+panel on show. Only a plugin that runs always starts without one. Nothing
+starts a `new` plugin. Calls that
 are waiting when a plugin stops are answered with an error. Nothing is
 retried on the plugin's behalf, but a plugin that runs always is started
 again 2 seconds after it stopped by itself, until it is `failed`.
@@ -573,11 +693,14 @@ treats what it last saw as current once the connection is gone.
 | Plugin list, states, calls  | memory                                               | the plugin server   |
 | What a client shows         | memory, per window or page                           | that client         |
 
-`<data>` is the parent of the plugins directory. A plugin that is not listed
-in `plugins.json` is on, and runs as its manifest says. Turning a plugin off,
-or choosing how long it runs unused, is written there, and the entry stays
-when the plugin is removed, so reinstalling it keeps it as it was. Builds
-share the file: what one does not know, a newer one's, it keeps as written.
+`<data>` is the parent of the plugins directory. An installed plugin runs
+only once `plugins.json` says you let it run from where it is (`allowed`,
+its directory); one that is not listed is new, and is written in as off.
+Turning a plugin on, which lets it, turning it off, and choosing how long it
+runs unused are written there, and the entry stays when the plugin is
+removed, so reinstalling it where it was keeps it as it was. A built-in
+plugin is ThinkTerm's own: it is on unless turned off. Builds share the
+file: what one does not know, a newer one's, it keeps as written.
 
 ### What a client keeps
 
@@ -608,7 +731,7 @@ of its windows, and a browser page keeps one through the mux.
 
 ```
 thinkterm plugin list                        plugins and their states
-thinkterm plugin enable <id>
+thinkterm plugin enable <id>                 turn on; lets a new one run
 thinkterm plugin disable <id>
 thinkterm plugin reload [<id>]
 thinkterm plugin call <id> <json>
@@ -621,9 +744,23 @@ A plugin is a program you installed, and it runs as you, with your
 permissions. `platforms` in the manifest only decides where it runs; it does
 not restrict what it can do. ThinkTerm shows nothing for a plugin, but that
 does not stop the program itself from, say, showing a system notification or
-running `thinkterm cli`: only a sandbox would. ThinkTerm starts a plugin on
-its own only when its manifest, or you, say it runs always; otherwise it
-runs when a client uses it. Nothing downloads or installs plugins for you.
+running `thinkterm cli`: only a sandbox would. ThinkTerm runs nothing of a
+plugin until you let it run, from the directory it is in: one that turns up
+in the plugins directory without you -- left by an installer, unpacked
+there -- does not run. Once let, it starts on its own only when its
+manifest, or you, say it runs always; otherwise it runs when a client uses
+it. Nothing downloads or installs plugins for you.
+
+A panel never takes the keyboard: you give it, by pressing in its field
+or with your key for it, and it goes back on Escape or a press on the
+terminal. Nor can it hand what you type to the terminal: if it lets go of
+the keyboard, or stops, while you type, your keys go nowhere until you
+press Escape or click. While a panel has it, its plugin hears only the
+keys it named and what its fields hold; never a key pressed with Ctrl, Alt
+or Command, never a field's text while an input method composes it, and a
+secret field's only when you submit it. Nothing can be copied out of a secret
+field, and the clipboard reaches a plugin only as what you paste into its
+field.
 
 Beside a terminal on another machine, a plugin can have ThinkTerm run
 programs and read files there, as you, over ThinkTerm's own connection --
@@ -650,3 +787,5 @@ show.
 | Rows a list keeps                        | 2,048      |
 | Characters of one text drawn             | 2,000      |
 | Numbers in one line or area              | 8,192      |
+| Characters a field holds                 | 16,384     |
+| Keys a frame names, and one name's length | 64, 32 characters |
