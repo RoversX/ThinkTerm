@@ -235,6 +235,34 @@ pub(crate) fn is_host_domain_id(id: mux::domain::DomainId) -> bool {
         .is_some_and(|domain| domain.domain_name() == host)
 }
 
+/// Attach the host again if the last window closing detached it (see
+/// `GuiFrontEnd::forget_known_window`) and the process lived on. A window
+/// opened then has to find the host's terminals mirrored before it decides
+/// what to spawn, as the first window does: deciding first took a live
+/// thread for a cold one and spawned its saved layout beside the terminals
+/// the spawn's own attach then brought back. A failure is left to that
+/// spawn, which attaches by itself.
+pub(crate) async fn attach_host_if_detached() {
+    let Some(name) = host_domain_name() else {
+        return;
+    };
+    let Some(domain) = Mux::get().get_domain_by_name(&name) else {
+        return;
+    };
+    let Some(client) = domain.downcast_ref::<ClientDomain>() else {
+        return;
+    };
+    if client.state() == mux::domain::DomainState::Attached {
+        return;
+    }
+    if let Err(err) = client
+        .attach_with_ui(None, mux::connui::ConnectionUI::new_headless())
+        .await
+    {
+        log::warn!("local sessions: attaching the session server for a new window: {err:#}");
+    }
+}
+
 /// The host could not be attached at launch: run this launch in process.
 /// The domain stays registered but detached; nothing retries it, since a
 /// host attached later would find windows already classified as local.

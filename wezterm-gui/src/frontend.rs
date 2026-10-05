@@ -817,6 +817,9 @@ impl GuiFrontEnd {
     async fn materialize_space_window_for_app(
         space_id: &str,
     ) -> anyhow::Result<(MuxWindowId, bool)> {
+        // With no window left the host was detached, and the thread asked
+        // for may be live in it still.
+        crate::local_sessions::attach_host_if_detached().await;
         let mux = Mux::get();
         let thread_id = crate::workspace_threads::ensure_active_thread_for_space(space_id)
             .ok_or_else(|| anyhow!("failed to ensure active thread for Space {space_id}"))?;
