@@ -151,6 +151,8 @@ enum SshViewAction {
     ToggleMosh,
     ToggleMux,
     ToggleShellIntegration,
+    /// The Files panel connects to the host by itself.
+    ToggleFilesAutoConnect,
     RevealPassword,
     Save,
     SaveAndConnect,
@@ -187,6 +189,7 @@ struct HostForm {
     use_mosh: bool,
     multiplexing: bool,
     shell_integration: bool,
+    files_auto_connect: bool,
     error: Option<String>,
 }
 
@@ -357,6 +360,7 @@ impl SshHostsView {
         let use_mosh = spec.use_mosh;
         let multiplexing = spec.multiplexing;
         let shell_integration = spec.shell_integration;
+        let files_auto_connect = spec.files_auto_connect;
         // Sorted so the rows keep a stable order between opens.
         let mut option_pairs: Vec<(String, String)> = spec
             .ssh_options
@@ -379,6 +383,7 @@ impl SshHostsView {
             use_mosh,
             multiplexing,
             shell_integration,
+            files_auto_connect,
             error: None,
         });
         self.focus = Focus::Field(FIELD_HOST);
@@ -444,6 +449,7 @@ impl SshHostsView {
             shell_integration_applied: false,
             shell_integration_unsupported: None,
             shell_integration_failure: None,
+            files_auto_connect: false,
         });
         spec.label = label;
         spec.host = host;
@@ -471,6 +477,7 @@ impl SshHostsView {
         spec.use_mosh = form.use_mosh;
         spec.multiplexing = form.multiplexing;
         spec.shell_integration = form.shell_integration;
+        spec.files_auto_connect = form.files_auto_connect;
         let mosh_server_command = form.fields[FIELD_MOSH_SERVER].text().trim();
         if spec.use_mosh && mosh_server_command.is_empty() {
             form.error = Some(crate::i18n::tr("ssh-error-mosh-command"));
@@ -734,6 +741,12 @@ impl SshHostsView {
                 }
                 ContentViewResponse::Redraw
             }
+            SshViewAction::ToggleFilesAutoConnect => {
+                if let Some(form) = self.form.as_mut() {
+                    form.files_auto_connect = !form.files_auto_connect;
+                }
+                ContentViewResponse::Redraw
+            }
             SshViewAction::Save => {
                 self.persist_form();
                 ContentViewResponse::Redraw
@@ -870,6 +883,7 @@ impl SshHostsView {
             form.use_mosh = spec.use_mosh;
             form.multiplexing = spec.multiplexing;
             form.shell_integration = spec.shell_integration;
+            form.files_auto_connect = spec.files_auto_connect;
             form.options = spec
                 .ssh_options
                 .iter()
@@ -2176,6 +2190,7 @@ impl SshHostsView {
         let use_mosh = form.use_mosh;
         let multiplexing = form.multiplexing;
         let shell_integration = form.shell_integration;
+        let files_auto_connect = form.files_auto_connect;
         let advanced_open = form.advanced_open;
         let error = form.error.clone();
         let fields = form.fields.clone();
@@ -2407,7 +2422,7 @@ impl SshHostsView {
                     inner,
                 )
             });
-            let mut session_rows = vec![field_h, toggle_h, toggle_h, toggle_h];
+            let mut session_rows = vec![field_h, toggle_h, toggle_h, toggle_h, toggle_h];
             if use_mosh {
                 session_rows.push(field_h);
             }
@@ -2472,6 +2487,18 @@ impl SshHostsView {
                 &crate::i18n::tr("ssh-use-mux"),
                 multiplexing,
                 SshViewAction::ToggleMux,
+                x + pad,
+                fy,
+                inner,
+            )? + gap;
+            fy = self.paint_toggle_row(
+                ctx,
+                &mut body_layers,
+                font,
+                palette,
+                &crate::i18n::tr("ssh-files-auto-connect"),
+                files_auto_connect,
+                SshViewAction::ToggleFilesAutoConnect,
                 x + pad,
                 fy,
                 inner,
@@ -2941,6 +2968,7 @@ mod tests {
             shell_integration_applied: false,
             shell_integration_unsupported: None,
             shell_integration_failure: None,
+            files_auto_connect: false,
         }
     }
 

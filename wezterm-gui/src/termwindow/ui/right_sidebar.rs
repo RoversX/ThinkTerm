@@ -11252,6 +11252,15 @@ impl crate::TermWindow {
             if changed {
                 self.clear_right_sidebar_text_focus();
                 self.right_sidebar_remote_file_tree_scroll_offset = 0.0;
+                // A host whose setting says so is connected as though
+                // Connect were pressed.
+                if Self::remote_files_auto_connect(&target) {
+                    crate::termwindow::remote_files::authorize_remote_source(
+                        &crate::termwindow::remote_files::RemoteFilesState::source_key(
+                            &target.source,
+                        ),
+                    );
+                }
             }
             let effects = self
                 .right_sidebar_remote_files
@@ -12314,6 +12323,25 @@ impl crate::TermWindow {
             .entry("serveraliveinterval".to_string())
             .or_insert_with(|| Self::REMOTE_FILES_KEEPALIVE_SECS.to_string());
         Ok(domain)
+    }
+
+    /// Whether the Files panel connects by itself to the machine `target`
+    /// names: a saved host -- reached directly, or through a mux domain it is
+    /// connected under -- whose setting says to.
+    fn remote_files_auto_connect(target: &workspace_threads::RemoteFilesTarget) -> bool {
+        match &target.source {
+            workspace_threads::RemoteFilesSource::SshHost(host_id) => {
+                crate::ssh_hosts::host_spec(host_id).is_some_and(|spec| spec.files_auto_connect)
+            }
+            workspace_threads::RemoteFilesSource::ClientDomain(domain) => {
+                crate::ssh_hosts::list_all_hosts().into_iter().any(|entry| {
+                    entry.spec.files_auto_connect
+                        && crate::ssh_hosts::domain_names_for_host(&entry.spec)
+                            .iter()
+                            .any(|name| name == domain)
+                })
+            }
+        }
     }
 
     fn ssh_config_for_remote_files_source(

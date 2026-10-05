@@ -791,6 +791,7 @@ fn parse_system_ssh_config_str(content: &str) -> Vec<SshHostEntry> {
                 shell_integration_applied: false,
                 shell_integration_unsupported: None,
                 shell_integration_failure: None,
+                files_auto_connect: false,
             };
             out.push(SshHostEntry {
                 id: system_host_id(&alias),
@@ -1054,6 +1055,7 @@ Host prod *.internal
             shell_integration_applied: false,
             shell_integration_unsupported: None,
             shell_integration_failure: None,
+            files_auto_connect: false,
         }
     }
 

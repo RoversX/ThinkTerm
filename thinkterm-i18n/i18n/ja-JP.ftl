@@ -481,6 +481,7 @@ ssh-group-session = セッション
 ssh-detect-os = OS を検出
 ssh-use-mosh = Mosh で接続
 ssh-use-mux = ThinkTerm Connect
+ssh-files-auto-connect = ファイルパネルを自動で接続
 ssh-shell-integration = リモートのプログラムを識別
 ssh-shell-integration-note = SSH 接続で有効：タブのアイコンがこのサーバーで動いているプログラムを表示します。
 ssh-shell-integration-install = オンにすると、次回の接続時にサーバーの bash / zsh の起動ファイルへ 1 行追加します。

@@ -54,6 +54,11 @@ pub struct SshHostSpec {
     /// until one does; the next connection tries again.
     #[serde(default)]
     pub shell_integration_failure: Option<ShellIntegrationFailure>,
+    /// Whether the right sidebar's Files panel connects to this host by
+    /// itself, beside a terminal there, rather than once the user presses
+    /// Connect.
+    #[serde(default)]
+    pub files_auto_connect: bool,
 }
 
 /// Why setting a host's shell integration up failed.
@@ -190,6 +195,7 @@ pub fn parse_system_ssh_config(content: &str) -> Vec<SshHostEntry> {
                     shell_integration_applied: false,
                     shell_integration_unsupported: None,
                     shell_integration_failure: None,
+                    files_auto_connect: false,
                 },
             });
         }
@@ -339,6 +345,10 @@ mod tests {
         let hosts = list_saved_hosts_from_path(&path).unwrap();
         assert_eq!(hosts[0].spec.label, "AM2");
         assert!(hosts[0].spec.multiplexing);
+        assert!(
+            !hosts[0].spec.files_auto_connect,
+            "saved before there was one: Files waits to be asked"
+        );
     }
 
     #[test]
@@ -361,6 +371,7 @@ mod tests {
             shell_integration_applied: false,
             shell_integration_unsupported: None,
             shell_integration_failure: None,
+            files_auto_connect: false,
         };
         assert_eq!(ssh_domain_name(&spec), "ssh:root@example.test");
         assert_eq!(build_ssh_domain(&spec).remote_address, "example.test:22");

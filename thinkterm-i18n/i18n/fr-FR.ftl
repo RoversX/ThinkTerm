@@ -490,6 +490,7 @@ ssh-group-session = Session
 ssh-detect-os = Détecter le système
 ssh-use-mosh = Se connecter avec Mosh
 ssh-use-mux = ThinkTerm Connect
+ssh-files-auto-connect = Connecter Fichiers automatiquement
 ssh-shell-integration = Détecter les programmes distants
 ssh-shell-integration-note = Fonctionne en SSH : l’icône de l’onglet montre ce qui tourne sur ce serveur.
 ssh-shell-integration-install = Une fois activé, la prochaine connexion ajoute une ligne aux fichiers de démarrage bash ou zsh du serveur.

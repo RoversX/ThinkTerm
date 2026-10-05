@@ -481,6 +481,7 @@ ssh-group-session = 会话
 ssh-detect-os = 检测操作系统
 ssh-use-mosh = 使用 Mosh 连接
 ssh-use-mux = ThinkTerm Connect
+ssh-files-auto-connect = 文件面板自动连接
 ssh-shell-integration = 识别远端程序
 ssh-shell-integration-note = SSH 连接时起作用：tab 图标显示这台服务器上正在运行的程序。
 ssh-shell-integration-install = 开启后，下次连接时会在服务器的 bash / zsh 启动文件里加一行。
