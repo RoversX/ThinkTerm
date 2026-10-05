@@ -522,8 +522,21 @@ types it does not know, and so should the program.
 
 ## Rust SDK
 
-`thinkterm-plugin-sdk` implements the protocol. A plugin implements `Plugin`
-and hands it to `run`:
+`thinkterm-plugin-sdk` implements the protocol. It is not on crates.io: a
+plugin takes it from this repository, at the tag of a release, since what
+it offers still changes from one release to the next:
+
+```toml
+[dependencies]
+thinkterm-plugin-sdk = { git = "https://github.com/RoversX/ThinkTerm", tag = "0.1.2" }
+```
+
+What came after the release a plugin was built for -- fields and keys came
+after 0.1.2 -- it uses only where the view's `env` says the client has it,
+`view.env.has(panel::feature::FIELDS)`, and so it runs on an older
+ThinkTerm too.
+
+A plugin implements `Plugin` and hands it to `run`:
 
 ```rust
 use serde_json::{json, Value};
