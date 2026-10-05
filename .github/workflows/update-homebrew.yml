@@ -1,0 +1,37 @@
+# Once a release is published -- from the web UI, which is what creates its
+# tag -- asks the Homebrew tap to move its cask to it. The tap's own workflow
+# downloads both macOS archives and takes their sha256: no checksum is sent.
+# Needs the TAP_TOKEN secret, a token that may run the tap's Actions.
+name: Update Homebrew tap
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+jobs:
+  update-homebrew:
+    # A prerelease is not what `brew install` should give.
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ask the tap to update its cask
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${TAP_TOKEN}" ]]; then
+            echo "TAP_TOKEN is not configured; skipping the Homebrew tap."
+            exit 0
+          fi
+
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${TAP_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/RoversX/homebrew-tap/actions/workflows/update-formula.yml/dispatches \
+            -d "{\"ref\":\"main\",\"inputs\":{\"formula\":\"thinkterm\",\"tag\":\"${TAG}\",\"repository\":\"RoversX/thinkterm\"}}"

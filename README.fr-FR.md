@@ -6,6 +6,8 @@
 
 **[Télécharger ici](https://github.com/RoversX/ThinkTerm/releases)** - Obtenir la dernière version
 
+🍺 **Homebrew** (macOS) : `brew install --cask roversx/tap/thinkterm`
+
 🌐 **Site web**: [closex.org/thinkterm](https://closex.org/thinkterm/)
 
 📚 **Documentation**: [docs.closex.org/thinkterm](https://docs.closex.org/thinkterm/)
