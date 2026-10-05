@@ -72,7 +72,7 @@ Rust 支撑着 ThinkTerm 的终端核心、mux 服务端、桌面客户端和 TU
 - **远程会话。** 可选择 SSH、Mosh，或通过 ThinkTerm Connect 使用持久 mux 会话。远程 mux 会话支持标签页、分屏、调整大小和重连；预测式本地回显可减轻高延迟连接下的输入迟滞感。
 - **终端旁的文件。** 浏览项目文件，预览带语法高亮的源码，并用外部编辑器打开。远程文件通过 SFTP 访问，支持上传、下载和拖放传输。
 - **笔记。** 在兼容 Obsidian 的 Vault 中编辑 Markdown，支持表格、代码块和自动保存。文件仍是普通 Markdown，存放在你选择的目录中。
-- **片段与插件。** 内置 Snippets。插件可向桌面端和浏览器端添加侧边栏面板；仓库中包含 [Diff 插件](plugins/diff)，用于查看旁边终端所在 Git 仓库的改动。你也可以使用 [ThinkTerm SDK](docs/thinkterm/plugins.md#rust-sdk)，用 Rust 开发自己的插件。安装和开发方式见[插件指南](docs/thinkterm/plugins.md)。
+- **片段与插件。** 内置 Snippets。插件可向桌面端和浏览器端添加侧边栏面板；仓库中包含 [Diff 插件](plugins/diff)，用于查看旁边终端所在 Git 仓库的改动。你也可以使用 [ThinkTerm SDK](docs/thinkterm/plugins.md#rust-sdk)，用 Rust 开发自己的插件。别人分享的插件可以在 GitHub 话题 [`thinkterm-plugin`](https://github.com/topics/thinkterm-plugin) 下找到。安装和开发方式见[插件指南](docs/thinkterm/plugins.md)。
 - **完整的终端核心。** 字体连字、彩色 Emoji、真彩色、超链接、内嵌图片、复制模式和 Shell 集成均继承自 WezTerm。 更多终端特性可参考 [WezTerm 功能文档](https://wezterm.org/features.html)。
 - **原生桌面设置。** 调整主题、界面字号、终端选项和渲染后端。主窗口与设置窗口均支持 WebGPU 和 OpenGL；WebGPU 初始化失败时会回退到 OpenGL。
 - **五种界面语言。** English、简体中文、日本語、Français 和 Deutsch。

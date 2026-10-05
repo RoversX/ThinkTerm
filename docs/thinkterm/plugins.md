@@ -84,6 +84,17 @@ A plugin's directory can be a symbolic link. That is the easiest way to work
 on one: link your source directory in, and rebuild. ThinkTerm restarts the
 plugin the next time it is used after its program changes.
 
+### Finding and sharing plugins
+
+Plugins people share are repositories on GitHub with the topic
+[`thinkterm-plugin`](https://github.com/topics/thinkterm-plugin). To share
+yours, give its repository that topic and keep its `plugin.toml` at the
+repository's root, so that the repository cloned into the plugins
+directory is the plugin; its README says how to build or get its program.
+
+A plugin is a program that runs as you, and reaches what you can: install
+only one you trust. However it came, ThinkTerm runs it only once you let it.
+
 ## `plugin.toml`
 
 ```toml
