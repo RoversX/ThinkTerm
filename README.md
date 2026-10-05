@@ -15,6 +15,8 @@ brew install --cask roversx/tap/thinkterm
 
 📚 **Documentation**: [docs.closex.org/thinkterm](https://docs.closex.org/thinkterm/)
 
+⭐ Consider starring [ThinkTerm](https://github.com/RoversX/ThinkTerm)!
+
 **Your machines fuse into one.**
 
 ThinkTerm is an open-source **terminal with a built-in multiplexer, written in Rust**, built on [WezTerm](https://github.com/wezterm/wezterm). Its mux server runs your shells, tools, and coding agents; desktop, TUI, and browser clients connect to those sessions. Bring local and remote work into one workspace, and return to it from another device.
