@@ -5,7 +5,9 @@
 //! There are no widgets. A button is a rounded rectangle, its label and a
 //! hit over both; the player draws what it is given and nothing else, so a
 //! panel looks the same wherever it is shown. Colours are ThinkTerm's own,
-//! by name, so a panel follows the theme without being told of it.
+//! by name, so a panel follows the theme without being told of it. The one
+//! exception is a [`Field`]: text is edited where it is typed, without
+//! waiting on the plugin, so the client draws the field itself.
 //!
 //! An item that does not read -- a coordinate a plugin wrote as `null`, a
 //! kind a newer ThinkTerm knows and this one does not -- is left out, and
@@ -28,6 +30,19 @@ pub struct Frame {
     /// nothing.
     #[serde(default, skip_serializing_if = "is_default")]
     pub extend: bool,
+    /// The keys the panel takes while it has the keyboard, named as a
+    /// browser names them (`KeyboardEvent.key`): "ArrowDown", "Enter", "j".
+    /// Only these are sent, and only without Ctrl, Alt or Command, which
+    /// are the app's; Escape and Tab never are (see [`Input::Key`]).
+    ///
+    /// [`Input::Key`]: crate::wire::Input::Key
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
+    /// Lets go of the keyboard, once for each new seq: what the user types
+    /// next goes nowhere until they press Escape, or somewhere -- never to
+    /// the terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<u32>,
 }
 
 /// A list of items, keeping the ones that read. JSON only: an item is read
@@ -50,6 +65,7 @@ pub enum Item {
     Hit(Hit),
     Scroll(Scroll),
     List(List),
+    Field(Field),
 }
 
 /// A filled rectangle, with rounded corners and a one-unit border when
@@ -181,11 +197,83 @@ pub struct List {
 
 /// Scrolls a region to `to` -- a row of a list, a height in a scroll area
 /// -- once for each new `seq`, so a plugin that sends it in every frame
-/// does not keep pulling the region back.
+/// does not keep pulling the region back. With `through`, it scrolls only
+/// as far as it takes to show from `to` to there: a row picked with the
+/// keys is kept in view.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Jump {
     pub to: f32,
     pub seq: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub through: Option<f32>,
+}
+
+/// A box the user types in, which the client draws -- the box, the text,
+/// the caret and what is selected -- in its own font and colours. A click
+/// in it gives it the keyboard. What it holds goes to the plugin as it
+/// changes, and again when the user presses Return ([`Input::Text`],
+/// [`Input::Submit`]).
+///
+/// What it holds is the client's while the field shows: `value` is taken
+/// when it first comes, and again for each new `seq`, so the frames that
+/// follow do not undo what is typed meanwhile -- a plugin empties it after
+/// a submit by sending `""` with the next seq ([`FieldText`] keeps count).
+/// `focus` moves the keyboard to it once for each new seq, but only while
+/// its panel has the keyboard already: a plugin never takes it from the
+/// terminal. A field does not go in a scroll area or a list's rows, and of
+/// two with one id the first is kept. One on one line is drawn rounded at
+/// its ends, as the sidebar's search is, with an icon before its text when
+/// it names one.
+///
+/// [`Input::Text`]: crate::wire::Input::Text
+/// [`Input::Submit`]: crate::wire::Input::Submit
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Field {
+    pub id: String,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub kind: FieldKind,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub value: String,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub seq: u32,
+    /// Shown, faint, while it is empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub placeholder: String,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub font: Font,
+    /// The most characters it holds; 0 for as many as any field holds
+    /// ([`FIELD_LIMIT`](crate::player::FIELD_LIMIT)).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub max: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<u32>,
+    /// Shown before its text, on one line: one of
+    /// [`FIELD_ICONS`](crate::FIELD_ICONS) -- `search`, say -- by name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// A button at its end, on one line, that empties it while it holds
+    /// something. The client draws it and empties the field itself, which
+    /// the plugin hears as text like any other.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub clear: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldKind {
+    /// One line: Return submits it.
+    #[default]
+    Line,
+    /// Lines: Return starts a new one, and Command-Return -- Ctrl+Return
+    /// off a Mac -- submits them.
+    Lines,
+    /// One line shown as dots. The plugin is sent what it holds only when
+    /// it is submitted, and nothing can be copied or cut out of it.
+    Secret,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +312,8 @@ pub enum Cursor {
     Pointer,
     /// The arrow: a region that answers clicks without looking like it.
     Arrow,
+    /// The I-beam: text is typed there. A field has it.
+    Text,
 }
 
 /// A colour: one of ThinkTerm's by name, which follow its theme, or a fixed
@@ -385,6 +475,16 @@ impl Frame {
     /// Asks for the panel's extended view, or stops asking.
     pub fn extend(&mut self, extend: bool) {
         self.extend = extend;
+    }
+
+    /// The keys the panel takes while it has the keyboard.
+    pub fn keys(&mut self, keys: &[&str]) {
+        self.keys = keys.iter().map(|key| key.to_string()).collect();
+    }
+
+    /// Lets go of the keyboard: once for each new `seq`.
+    pub fn release(&mut self, seq: u32) {
+        self.release = Some(seq);
     }
 }
 
@@ -597,6 +697,125 @@ impl List {
     }
 }
 
+impl Field {
+    pub fn new(id: impl Into<String>, x: f32, y: f32, w: f32, h: f32) -> Self {
+        Self {
+            id: id.into(),
+            x,
+            y,
+            w,
+            h,
+            kind: FieldKind::Line,
+            value: String::new(),
+            seq: 0,
+            placeholder: String::new(),
+            font: Font::Ui,
+            max: 0,
+            focus: None,
+            icon: None,
+            clear: false,
+        }
+    }
+
+    /// Lines rather than one.
+    pub fn lines(mut self) -> Self {
+        self.kind = FieldKind::Lines;
+        self
+    }
+
+    /// Shown as dots, and sent only when submitted.
+    pub fn secret(mut self) -> Self {
+        self.kind = FieldKind::Secret;
+        self
+    }
+
+    /// What it holds, taken once for each new `seq`.
+    pub fn value(mut self, value: impl Into<String>, seq: u32) -> Self {
+        self.value = value.into();
+        self.seq = seq;
+        self
+    }
+
+    pub fn placeholder(mut self, placeholder: impl Into<String>) -> Self {
+        self.placeholder = placeholder.into();
+        self
+    }
+
+    /// In the terminal's font.
+    pub fn mono(mut self) -> Self {
+        self.font = Font::Mono;
+        self
+    }
+
+    pub fn max(mut self, max: u32) -> Self {
+        self.max = max;
+        self
+    }
+
+    /// Moves the keyboard here, once for each new `seq`, while the panel
+    /// has it.
+    pub fn focus(mut self, seq: u32) -> Self {
+        self.focus = Some(seq);
+        self
+    }
+
+    /// The icon before its text, on one line: one of
+    /// [`FIELD_ICONS`](crate::FIELD_ICONS).
+    pub fn icon(mut self, icon: impl Into<String>) -> Self {
+        self.icon = Some(icon.into());
+        self
+    }
+
+    /// A button at its end, on one line, that empties it.
+    pub fn clear(mut self) -> Self {
+        self.clear = true;
+        self
+    }
+}
+
+/// A field's text as its plugin keeps it: what the field last said it
+/// holds, and how many times the plugin put text in it, which
+/// [`field`](Self::field) sends as its `seq`. So what the plugin puts there
+/// is taken once, and frames drawn while the user types do not undo it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FieldText {
+    text: String,
+    seq: u32,
+}
+
+impl FieldText {
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// What the field said it holds -- an `Input::Text`'s or an
+    /// `Input::Submit`'s -- unless it was typed over text this has put
+    /// there since: the field takes that text, and says what it holds
+    /// again. True when it was taken.
+    pub fn heard(&mut self, typed: &crate::wire::Typed) -> bool {
+        if typed.seq != self.seq {
+            return false;
+        }
+        self.text = typed.text.clone();
+        true
+    }
+
+    /// Puts `text` in the field, over what was typed.
+    pub fn set(&mut self, text: impl Into<String>) {
+        self.text = text.into();
+        self.seq = self.seq.wrapping_add(1);
+    }
+
+    pub fn clear(&mut self) {
+        self.set(String::new());
+    }
+
+    /// The field holding it, at its place.
+    pub fn field(&self, id: impl Into<String>, x: f32, y: f32, w: f32, h: f32) -> Field {
+        Field::new(id, x, y, w, h).value(self.text.clone(), self.seq)
+    }
+}
+
 macro_rules! into_item {
     ($($kind:ident),*) => {
         $(impl From<$kind> for Item {
@@ -607,7 +826,7 @@ macro_rules! into_item {
     };
 }
 
-into_item!(Rect, Text, Line, Area, Hit, Scroll, List);
+into_item!(Rect, Text, Line, Area, Hit, Scroll, List, Field);
 
 impl Color {
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
@@ -641,6 +860,7 @@ impl Item {
             Self::Hit(hit) => Bounds::new(hit.x, hit.y, hit.w, hit.h),
             Self::Scroll(scroll) => Bounds::new(scroll.x, scroll.y, scroll.w, scroll.h),
             Self::List(list) => Bounds::new(list.x, list.y, list.w, list.h),
+            Self::Field(field) => Bounds::new(field.x, field.y, field.w, field.h),
             Self::Line(line) => points_bounds(&line.points, None).grow(line.width / 2.0),
             Self::Area(area) => points_bounds(&area.points, Some(area.base)),
         }
@@ -813,6 +1033,67 @@ mod tests {
         assert!(extending.extend);
         extending.extend(false);
         assert_eq!(to_value(&extending).unwrap(), json!({"items": []}));
+    }
+
+    #[test]
+    fn a_field_and_the_keys_a_frame_takes_are_json_too() {
+        let frame = read(json!({
+            "items": [
+                {"field": {"id": "add", "x": 8, "y": 4, "w": 200, "h": 26, "placeholder": "Symbol", "icon": "plus"}},
+                {"field": {"id": "note", "x": 8, "y": 40, "w": 200, "h": 80, "kind": "lines", "value": "a\nb", "seq": 2, "focus": 1}}
+            ],
+            "keys": ["ArrowDown", "j"],
+            "release": 3
+        }));
+        let Item::Field(add) = &frame.items[0] else {
+            panic!("{frame:?}")
+        };
+        assert_eq!(
+            (add.kind, add.seq, add.font, add.max, add.focus),
+            (FieldKind::Line, 0, Font::Ui, 0, None)
+        );
+        assert_eq!(add.icon.as_deref(), Some("plus"));
+        let Item::Field(note) = &frame.items[1] else {
+            panic!("{frame:?}")
+        };
+        assert_eq!(
+            (note.kind, note.value.as_str(), note.seq, note.focus),
+            (FieldKind::Lines, "a\nb", 2, Some(1))
+        );
+        assert_eq!(frame.keys, ["ArrowDown", "j"]);
+        assert_eq!(frame.release, Some(3));
+        assert_eq!(
+            to_value(Field::new("pass", 0.0, 0.0, 10.0, 10.0).secret()).unwrap(),
+            json!({"id": "pass", "x": 0.0, "y": 0.0, "w": 10.0, "h": 10.0, "kind": "secret"}),
+            "what is the default is left out"
+        );
+        let mut plain = Frame::default();
+        plain.keys(&[]);
+        assert_eq!(to_value(&plain).unwrap(), json!({"items": []}));
+    }
+
+    #[test]
+    fn a_field_s_text_is_sent_again_only_when_the_plugin_puts_some_there() {
+        let mut text = FieldText::default();
+        let first = text.field("add", 0.0, 0.0, 10.0, 10.0);
+        let typed = |text: &str, seq: u32| crate::wire::Typed {
+            id: "add".into(),
+            text: text.into(),
+            seq,
+        };
+        assert!(text.heard(&typed("TS", first.seq)));
+        let shown = text.field("add", 0.0, 0.0, 10.0, 10.0);
+        assert_eq!((shown.value.as_str(), shown.seq), ("TS", first.seq));
+        text.clear();
+        let cleared = text.field("add", 0.0, 0.0, 10.0, 10.0);
+        assert_eq!((cleared.value.as_str(), cleared.seq), ("", first.seq + 1));
+        assert_eq!(text.text(), "");
+        // Typed over the text before it was emptied: the field takes the
+        // empty one, so the plugin keeps it too.
+        assert!(!text.heard(&typed("TSx", first.seq)));
+        assert_eq!(text.text(), "");
+        assert!(text.heard(&typed("x", first.seq + 1)));
+        assert_eq!(text.text(), "x");
     }
 
     #[test]

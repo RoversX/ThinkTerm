@@ -287,13 +287,40 @@ export type PanelOp =
     }
   | { op: 'line'; clip: number; points: number[]; width: number; color: string }
   | { op: 'area'; clip: number; points: number[]; base: number; color: string; fade: boolean }
-  | { op: 'thumb'; clip: number; x: number; y: number; w: number; h: number };
+  | { op: 'thumb'; clip: number; x: number; y: number; w: number; h: number }
+  // A field's box: the page paints it, and puts a field of its own over
+  // it, which takes `text` whenever `revision` moves -- the plugin put text
+  // there -- and leaves `covered` (x, y, w, h) to the painting.
+  | {
+      op: 'field';
+      clip: number;
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      id: string;
+      kind: 'line' | 'lines' | 'secret';
+      placeholder: string;
+      font: 'ui' | 'mono';
+      limit: number;
+      focused: boolean;
+      text: string;
+      revision: number;
+      // Where its text goes, after its icon if it shows one.
+      inside: [number, number, number, number];
+      icon?: { name: string; x: number; y: number; size: number };
+      // Its button that empties it, shown while it holds something.
+      clear?: { name: string; x: number; y: number; size: number };
+      covered?: [number, number, number, number][];
+    };
 
 export type Painting = {
   /** Left, top, right, bottom. */
   clips: [number, number, number, number][];
   ops: PanelOp[];
-  cursor: 'pointer' | 'arrow' | null;
+  cursor: 'pointer' | 'arrow' | 'text' | null;
+  /** The panel has the keyboard, in none of its fields. */
+  focused: boolean;
 };
 
 export type PanelView = {
@@ -301,6 +328,9 @@ export type PanelView = {
   /** Said instead of a painting: starting, or why it stopped. */
   message: string | null;
   painting: Painting | null;
+  /** Whether its fields take typing: what a plugin starting again last
+      drew takes none. */
+  live: boolean;
 };
 
 // The page's own preferences (thinkterm-web/src/settings.rs `WebSettings`),

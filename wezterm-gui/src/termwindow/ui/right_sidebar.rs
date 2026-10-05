@@ -1906,7 +1906,8 @@ impl crate::TermWindow {
             // the docked panel collapsed must not stop the next reveal.
             || (self.right_sidebar_hover.is_presented()
                 && (self.right_sidebar_focused_input().is_some()
-                    || self.right_sidebar_note.view.focused));
+                    || self.right_sidebar_note.view.focused
+                    || self.plugin_panel_has_keyboard()));
         HoverInput {
             eligible,
             pointer,
@@ -2395,15 +2396,23 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn right_sidebar_has_text_focus(&self) -> bool {
+        // Held from the terminal, whatever the sidebar shows now.
+        if self.plugin_panel_keys_held {
+            return true;
+        }
         match self.right_sidebar_mode {
             RightSidebarMode::Chat => self.right_sidebar_file_focus.is_some(),
             RightSidebarMode::Snippets => self.right_sidebar_snippet_focus.is_some(),
             RightSidebarMode::Tasks => self.right_sidebar_note.view.focused,
-            RightSidebarMode::Agents | RightSidebarMode::Plugin(_) => false,
+            // Given only by the user: a press in one of its fields, or
+            // their key for it.
+            RightSidebarMode::Plugin(_) => self.plugin_panel_has_keyboard(),
+            RightSidebarMode::Agents => false,
         }
     }
 
     pub(crate) fn clear_right_sidebar_text_focus(&mut self) {
+        self.release_plugin_panel_keyboard();
         let note_was_focused = self.right_sidebar_note.view.focused;
         self.right_sidebar_snippet_focus = None;
         self.right_sidebar_file_focus = None;
@@ -2455,6 +2464,12 @@ impl crate::TermWindow {
     /// is. All four can be off at once -- that is how you get rid of the
     /// right sidebar -- and then there is nothing to move to, so we stay put.
     pub(crate) fn fall_back_to_an_enabled_panel(&mut self) {
+        // The panel with the keyboard went from under the user.
+        if matches!(self.right_sidebar_mode, RightSidebarMode::Plugin(_))
+            && self.plugin_panel_has_keyboard()
+        {
+            self.hold_plugin_panel_keys();
+        }
         if let Some(first) = RightSidebarMode::enabled_panels().first().copied() {
             self.right_sidebar_mode = first;
         }
@@ -4357,7 +4372,13 @@ impl crate::TermWindow {
         });
     }
 
-    pub(crate) fn copy_right_sidebar_focused_input(&self, destination: ClipboardCopyDestination) {
+    pub(crate) fn copy_right_sidebar_focused_input(
+        &mut self,
+        destination: ClipboardCopyDestination,
+    ) {
+        if let RightSidebarMode::Plugin(_) = self.right_sidebar_mode {
+            return self.plugin_panel_copy(destination);
+        }
         if self.right_sidebar_mode == RightSidebarMode::Tasks {
             let Some(session) = self.right_sidebar_note.session.as_ref() else {
                 return;
@@ -4962,6 +4983,9 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn clear_right_sidebar_focused_input_selection(&mut self) {
+        if let RightSidebarMode::Plugin(_) = self.right_sidebar_mode {
+            return self.plugin_panel_clear_selection();
+        }
         if self.right_sidebar_mode == RightSidebarMode::Tasks {
             let focus = self.right_sidebar_note.view.selection.focus;
             self.right_sidebar_note.view.selection = SourceSelection {
@@ -4984,6 +5008,9 @@ impl crate::TermWindow {
         if !self.right_sidebar_has_text_focus() {
             return false;
         }
+        if self.plugin_panel_keys_held {
+            return self.plugin_panel_held_key(key, mods);
+        }
 
         // Resolved once, platform-normalized: ⌘ on macOS, Ctrl on
         // Windows/Linux. Testing raw modifiers here is what left these inputs
@@ -4994,6 +5021,9 @@ impl crate::TermWindow {
 
         if self.right_sidebar_mode == RightSidebarMode::Tasks {
             return self.handle_right_sidebar_note_key(key, mods);
+        }
+        if let RightSidebarMode::Plugin(_) = self.right_sidebar_mode {
+            return self.plugin_panel_key(key, mods);
         }
 
         // Clipboard and select-all. Deliberately falls through rather than
@@ -5206,6 +5236,12 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn push_right_sidebar_text(&mut self, text: &str) -> bool {
+        if self.plugin_panel_keys_held {
+            return true;
+        }
+        if let RightSidebarMode::Plugin(_) = self.right_sidebar_mode {
+            return self.plugin_panel_text(text);
+        }
         if self.right_sidebar_mode == RightSidebarMode::Tasks {
             self.right_sidebar_note.begin_live_editing();
             let Some(session) = self.right_sidebar_note.session.clone() else {
@@ -7205,7 +7241,7 @@ impl crate::TermWindow {
                 .is_some_and(|until| until > Instant::now())
     }
 
-    fn right_sidebar_snippet_cursor_on(&self) -> bool {
+    pub(crate) fn right_sidebar_snippet_cursor_on(&self) -> bool {
         let blink_ms = (self.config.cursor_blink_rate as u64).max(100);
         self.update_next_frame_time(Some(Instant::now() + Duration::from_millis(blink_ms)));
         let ms = std::time::SystemTime::now()

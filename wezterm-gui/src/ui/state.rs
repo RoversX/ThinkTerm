@@ -402,6 +402,34 @@ impl TextInputState {
         idx
     }
 
+    /// Selects the word the caret is in or before -- a run of characters
+    /// that are not spaces -- or, between words, the spaces there, within
+    /// its line.
+    pub(crate) fn caret_select_word(&mut self) {
+        let chars: Vec<char> = self.text.chars().collect();
+        let at = self.cursor.min(chars.len());
+        let probe = if at < chars.len() && chars[at] != '\n' {
+            at
+        } else if at > 0 && chars[at - 1] != '\n' {
+            at - 1
+        } else {
+            return;
+        };
+        let space = chars[probe].is_whitespace();
+        let alike = |ch: char| ch != '\n' && ch.is_whitespace() == space;
+        let mut start = probe;
+        while start > 0 && alike(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = probe + 1;
+        while end < chars.len() && alike(chars[end]) {
+            end += 1;
+        }
+        self.selection_anchor = Some(start);
+        self.cursor = end;
+        self.sync_selected_all();
+    }
+
     pub(crate) fn caret_word_left(&mut self, extend: bool) {
         let target = self.prev_word_boundary();
         self.caret_set(target, extend);
@@ -689,6 +717,31 @@ mod text_input_tests {
         i.caret_delete_word_back();
         assert_eq!(i.text, "foo baz");
         assert_eq!(i.cursor, 4);
+    }
+
+    #[test]
+    fn a_word_is_selected_within_its_line() {
+        let mut i = input("one two\nthree");
+        i.caret_set(5, false);
+        i.caret_select_word();
+        assert_eq!(i.caret_selected_text().as_deref(), Some("two"));
+        i.caret_set(3, false);
+        i.caret_select_word();
+        assert_eq!(
+            i.caret_selected_text().as_deref(),
+            Some(" "),
+            "the spaces between"
+        );
+        i.caret_set(7, false);
+        i.caret_select_word();
+        assert_eq!(
+            i.caret_selected_text().as_deref(),
+            Some("two"),
+            "not past the line"
+        );
+        let mut empty = input("");
+        empty.caret_select_word();
+        assert!(empty.caret_selection_range().is_none());
     }
 
     #[test]

@@ -267,7 +267,24 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 /* A plugin's panel: its canvas under the selector, to the panel's edges;
    the plugin draws its own margins. */
 #agents .plugin { position: absolute; inset: 86px 0 0 0; }
-#agents .plugin canvas, #extended .plugin canvas { display: block; touch-action: none; }
+#agents .plugin canvas, #extended .plugin canvas { display: block; touch-action: none; outline: none; }
+/* A plugin's field: the page's own input over the canvas, as the sidebar's
+   own fields look. */
+#agents .plugin, #extended .plugin { overflow: hidden; }
+/* See-through: the canvas paints the box under it, and what is drawn over it. */
+.plugin .pfield { position: absolute; box-sizing: border-box; margin: 0; background: transparent; border: 1px solid transparent; color: var(--text); font: 400 14px var(--ui); outline: none; user-select: text; -webkit-user-select: text; }
+.plugin textarea.pfield { line-height: 20px; resize: none; }
+/* A field's icon, before its text: the player says where. */
+.plugin .picon { position: absolute; display: flex; pointer-events: none; color: var(--muted); }
+.plugin .picon svg { width: 100%; height: 100%; }
+.plugin .pclear { position: absolute; display: flex; align-items: center; justify-content: center; margin: 0; padding: 0; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+.plugin .pclear[hidden] { display: none; }
+.plugin .pclear:hover { color: var(--text); }
+.plugin .pclear svg { width: 100%; height: 100%; }
+.plugin .pfield::placeholder { color: var(--muted); }
+/* Taking no typing for the moment a plugin starts again: looking the same. */
+.plugin .pfield:disabled { color: var(--text); -webkit-text-fill-color: var(--text); opacity: 1; }
+.plugin .pfield[data-font="mono"] { font: 400 13px "ThinkTerm Panel Mono", ui-monospace, Menlo, monospace; }
 #agents .plugin .msg, #extended .plugin .msg { position: absolute; left: 12px; right: 12px; top: 8px; color: var(--muted); font-size: 13px; }
 /* A plugin panel's extended view (PluginExtended): the wide area left of
    the panel, the plugin's from its top, as the desktop's is. */

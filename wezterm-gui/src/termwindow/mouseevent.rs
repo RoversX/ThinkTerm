@@ -1900,6 +1900,7 @@ impl super::TermWindow {
 
     pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         log::trace!("{:?}", event);
+        self.plugin_panel_saw_button(&event.kind);
         if self.recording_overlay_mouse(&event, context) {
             return;
         }

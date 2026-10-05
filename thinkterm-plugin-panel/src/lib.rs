@@ -11,7 +11,10 @@
 //! it at once; a click is sent to the plugin, which answers with a new
 //! frame when it is ready. A long list is drawn a page of rows at a time,
 //! as the player asks for them, so a plugin with ten thousand rows sends
-//! the few dozen that show.
+//! the few dozen that show. Text is typed in a [`Field`], which the client
+//! draws and edits itself, and the plugin is sent what it holds. A panel
+//! has the keyboard only when the user gives it ([`Keyboard`]): then it is
+//! sent the keys it takes, and nothing else.
 //!
 //! A panel whose frame asks for it (`Frame::extend`) gets an extended view
 //! as well: a wide area beside the sidebar, which the client opens as a
@@ -44,12 +47,18 @@ pub const ICONS: [&str; 12] = [
     "list-todo",
 ];
 
-pub use player::{Draw, Drawn, Op, Painting, Player};
+/// The Lucide icons a field can have at its start ([`Field::icon`]);
+/// every client has these, and shows none for another.
+///
+/// [`Field::icon`]: scene::Field::icon
+pub const FIELD_ICONS: [&str; 3] = ["search", "plus", "pencil"];
+
+pub use player::{Draw, Drawn, FieldIcon, FieldPart, Keyboard, Op, Painting, Player};
 pub use scene::{
-    Align, Area, Bounds, Color, Cursor, Font, Frame, Hit, Item, Jump, Line, List, Rect, Scroll,
-    Size, Text, Token,
+    Align, Area, Bounds, Color, Cursor, Field, FieldKind, FieldText, Font, Frame, Hit, Item, Jump,
+    Line, List, Rect, Scroll, Size, Text, Token,
 };
 pub use wire::{
-    Answer, Ask, Button, Bytes, Click, CloseButton, Entry, EntryKind, Env, Input, Mods,
-    MonoMetrics, Remote, Rows, RowsWanted, TextMetrics,
+    feature, Answer, Ask, Button, Bytes, Click, CloseButton, Entry, EntryKind, Env, Focus, Input,
+    Key, Mods, MonoMetrics, Remote, Rows, RowsWanted, TextMetrics, Typed,
 };

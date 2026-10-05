@@ -12,8 +12,8 @@ use std::io::{self, Read, Write};
 /// one that finds a newer host leaves it alone. 2 added the host's own API
 /// (`registry`) and installed plugins; 3 took commands and notifications
 /// out of it; 4 added plugins' panels; 5 what a panel's plugin asks of
-/// another machine, and how long plugins run unused; 6 plugins that wait
-/// for the user to let them run.
+/// another machine, and how long plugins run unused; 6 what is typed and
+/// pressed in a panel, and plugins that wait for the user to let them run.
 pub const PROTOCOL: u32 = 6;
 
 /// The largest frame either side sends or accepts, so a confused peer

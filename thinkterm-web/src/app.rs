@@ -4357,6 +4357,9 @@ impl<P: Platform, L: Link> App<P, L> {
             let inner = &mut *self.inner.borrow_mut();
             env.locale = thinkterm_i18n::current_locale().to_string();
             env.cwd = Self::focused_cwd(inner);
+            // Its fields are the page's own; the keyboard comes to a panel
+            // through them, and no key of the page's gives it.
+            env.features = vec![thinkterm_plugin_panel::feature::FIELDS.to_string()];
             if extended {
                 env.can_extend = false;
                 inner.plugin_extended_env = Some(env.clone());
@@ -4545,6 +4548,92 @@ impl<P: Platform, L: Link> App<P, L> {
         let sent = !sends.is_empty();
         self.send_panel_frames(sends, extended);
         sent
+    }
+
+    /// Whether the plugin panel, or its extended view, has the keyboard: one
+    /// of its fields is the page's field with it.
+    pub fn plugin_panel_has_keyboard(&self, extended: bool) -> bool {
+        Self::plugin_view(&self.inner.borrow(), extended).is_some_and(|panel| panel.has_keyboard())
+    }
+
+    /// The user put the keyboard in field `id` of the plugin panel, or its
+    /// extended view: pressed in it, or tabbed to it. The other view lets go
+    /// of it.
+    pub fn plugin_panel_field_focus(self: &Rc<Self>, extended: bool, id: &str) {
+        let (sends, others) = {
+            let mut inner = self.inner.borrow_mut();
+            let others = match Self::plugin_view_mut(&mut inner, !extended) {
+                Some(other) if other.has_keyboard() => other.blur(),
+                _ => Vec::new(),
+            };
+            let sends = match Self::plugin_view_mut(&mut inner, extended) {
+                Some(panel) => panel.focus_field(id),
+                None => Vec::new(),
+            };
+            (sends, others)
+        };
+        self.send_panel_frames(others, !extended);
+        self.send_panel_frames(sends, extended);
+    }
+
+    /// What field `id` of the plugin panel, or its extended view, holds now
+    /// the user edited it: what the page's field is to hold instead, when
+    /// the panel's takes less.
+    pub fn plugin_panel_field_text(self: &Rc<Self>, extended: bool, id: &str, text: &str) -> Option<String> {
+        let (sends, held) = {
+            let mut inner = self.inner.borrow_mut();
+            match Self::plugin_view_mut(&mut inner, extended) {
+                Some(panel) => panel.edit_field(id, text),
+                None => return None,
+            }
+        };
+        self.send_panel_frames(sends, extended);
+        held
+    }
+
+    /// The user submitted field `id` of the plugin panel, or its extended
+    /// view.
+    pub fn plugin_panel_field_submit(self: &Rc<Self>, extended: bool, id: &str) {
+        let sends = {
+            let mut inner = self.inner.borrow_mut();
+            match Self::plugin_view_mut(&mut inner, extended) {
+                Some(panel) => panel.submit_field(id),
+                None => return,
+            }
+        };
+        self.send_panel_frames(sends, extended);
+    }
+
+    /// The keyboard went from the plugin panel, or its extended view.
+    pub fn plugin_panel_blur(self: &Rc<Self>, extended: bool) {
+        let sends = {
+            let mut inner = self.inner.borrow_mut();
+            match Self::plugin_view_mut(&mut inner, extended) {
+                Some(panel) if panel.has_keyboard() => panel.blur(),
+                _ => return,
+            }
+        };
+        self.send_panel_frames(sends, extended);
+    }
+
+    /// A key the page's field with the keyboard does not use, in the plugin
+    /// panel or its extended view, named as the browser names it: true when
+    /// it was the panel's, for the page to keep it to itself.
+    pub fn plugin_panel_key(
+        self: &Rc<Self>,
+        extended: bool,
+        key: &str,
+        mods: thinkterm_plugin_panel::Mods,
+    ) -> bool {
+        let (taken, sends) = {
+            let mut inner = self.inner.borrow_mut();
+            match Self::plugin_view_mut(&mut inner, extended) {
+                Some(panel) => panel.key(key, mods),
+                None => return false,
+            }
+        };
+        self.send_panel_frames(sends, extended);
+        taken
     }
 
     /// The wheel over the plugin panel, or its extended view, `dy` of its

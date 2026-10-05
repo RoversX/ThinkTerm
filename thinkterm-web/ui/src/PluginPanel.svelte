@@ -5,12 +5,21 @@
   // plugin_panel.rs), painted on a canvas with the page's own fonts and
   // colours, as the desktop paints it with its own. The pointer and the
   // wheel go back to the wasm, which says whether to paint again; what the
-  // plugin draws anew arrives as a new revision.
+  // plugin draws anew arrives as a new revision. Each of its fields is an
+  // input of the page's own, which the browser edits, over the box the
+  // canvas paints in order: see-through, and cut away where what answers a
+  // press is drawn over it. What it holds and where the keyboard goes go
+  // back to the wasm, whose player
+  // decides what the plugin hears. The panel has the keyboard only through
+  // them, and one that loses it without the user leaves it on the canvas,
+  // never the terminal (`hold`).
   import { handle } from './client';
   import { refreshViews, s, views } from './client.svelte';
   import { canExtend } from './extended';
-  import { x as closeIcon } from './icons';
+  import { iconByName, x as closeIcon } from './icons';
+  import { focusTerminal } from './mobile.svelte';
   import type { PanelOp, PanelView, Painting } from './model';
+  import { onMac } from './palette.svelte';
 
   let { extended = false }: { extended?: boolean } = $props();
 
@@ -33,6 +42,12 @@
   const MONO_FACE = 'ThinkTerm Panel Mono';
   const MONO_FAMILY = `"${MONO_FACE}", ui-monospace, Menlo, monospace`;
   const ELLIPSIS = '...';
+  // A field of lines' corners (thinkterm-plugin-panel `FIELD_RADIUS`); one
+  // on one line is round at its ends, as the panel's search is.
+  const FIELD_RADIUS = 6;
+  // How long after an input method put its text in a Return marked 229 is
+  // still its own, in milliseconds: Safari sends the one that ended it then.
+  const ENDED_COMPOSING = 500;
 
   let host: HTMLDivElement;
   let canvas: HTMLCanvasElement;
@@ -66,6 +81,11 @@
     warning: '--caution',
     thumb: '--muted',
   };
+  // The page's own, for a field's box.
+  const FIELD_SOURCES: Record<string, string> = {
+    field: '--btn',
+    'field-border': '--btn-border',
+  };
 
   function parse(css: string): Rgba {
     const m = css.match(/rgba?\(([^)]+)\)/);
@@ -79,7 +99,7 @@
     probe.style.display = 'none';
     host.appendChild(probe);
     const out: Record<string, Rgba> = {};
-    for (const [name, variable] of Object.entries(SOURCES)) {
+    for (const [name, variable] of Object.entries({ ...SOURCES, ...FIELD_SOURCES })) {
       probe.style.color = `var(${variable})`;
       out[name] = parse(getComputedStyle(probe).color);
     }
@@ -275,7 +295,227 @@
         ctx.fill();
         return;
       }
+      // The box, in order with what is drawn over it; the page's own
+      // input over it, see-through, holds the text.
+      case 'field': {
+        if (op.w <= 0 || op.h <= 0) return;
+        const radius = Math.min(fieldRadius(op), op.w / 2);
+        ctx.fillStyle = css(rgba('field'));
+        ctx.beginPath();
+        ctx.roundRect(op.x, op.y, op.w, op.h, radius);
+        ctx.fill();
+        ctx.strokeStyle = css(rgba(op.focused ? 'accent' : 'field-border'));
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.roundRect(op.x + 0.5, op.y + 0.5, op.w - 1, op.h - 1, Math.max(0, radius - 0.5));
+        ctx.stroke();
+        return;
+      }
     }
+  }
+
+  type FieldOp = Extract<PanelOp, { op: 'field' }>;
+
+  function fieldRadius(op: FieldOp): number {
+    return Math.max(0, op.kind === 'lines' ? Math.min(FIELD_RADIUS, op.h / 2) : op.h / 2);
+  }
+  /** The panel's fields, each with an input of the page's own over it. */
+  const fields = $derived(
+    (view?.painting?.ops ?? []).filter((op): op is FieldOp => op.op === 'field'),
+  );
+
+  /** Whether a field of `kind` leaves `ev`'s key to the panel: Escape and
+      Tab, the function keys, and on one line the keys that move up and
+      down. A key it uses is the field's; one with Ctrl, Alt or Command is
+      the field's, the page's or the browser's, never the panel's. */
+  function leaves(kind: FieldOp['kind'], ev: KeyboardEvent): boolean {
+    if (ev.ctrlKey || ev.altKey || ev.metaKey) return false;
+    if (ev.key === 'Escape' || ev.key === 'Tab' || /^F\d{1,2}$/.test(ev.key)) return true;
+    return kind !== 'lines' && ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown'].includes(ev.key);
+  }
+
+  /** The keyboard left a field without the user -- the plugin let go of
+      it, or the field went -- while they may be typing in it: what they
+      type next was meant for the panel, and goes nowhere. It waits on the
+      canvas, where Escape gives it to the terminal; a press anywhere puts
+      it where it was pressed. */
+  function hold() {
+    if (canvas?.isConnected) canvas.focus({ preventScroll: true });
+    else if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  }
+
+  /** What of its box a field's input takes: all of it but where what
+      answers a press -- a button at its end -- is drawn over it, which
+      shows there, and is pressed there. */
+  function uncovered(op: FieldOp): string {
+    if (!op.covered?.length) return '';
+    // The box one way round and the pieces, which do not overlap, the
+    // other: they are left out.
+    let path = `M0 0H${op.w}V${op.h}H0Z`;
+    for (const [x, y, w, h] of op.covered) path += `M${x - op.x} ${y - op.y}v${h}h${w}v${-h}Z`;
+    return `path('${path}')`;
+  }
+
+  function onCanvasKey(ev: KeyboardEvent) {
+    if (ev.key !== 'Escape' || ev.ctrlKey || ev.altKey || ev.metaKey) return;
+    ev.preventDefault();
+    focusTerminal();
+  }
+
+  /** Keeps an input in step with the panel's field it is over: in its
+      place, holding what the plugin last put there, and with the keyboard
+      when the player says the field has it -- moved there by the plugin,
+      or by Tab -- and not when it says it has not. */
+  function field(node: HTMLInputElement | HTMLTextAreaElement, op: FieldOp) {
+    let taken = -1;
+    let current = op;
+    // Its button that empties it, where it has one: shown while it holds
+    // something, and never taking the keyboard from it.
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.tabIndex = -1;
+    clear.className = 'pclear';
+    clear.innerHTML = closeIcon;
+    node.after(clear);
+    const showClear = () => {
+      clear.hidden = !current.clear || node.value === '' || node.disabled;
+    };
+    // What the panel's field takes of what the page's holds: less, it
+    // holds that instead.
+    const tell = () => {
+      const held = handle.client?.plugin_panel_field_text(extended, current.id, node.value);
+      if (typeof held === 'string' && held !== node.value) node.value = held;
+      showClear();
+    };
+    const follow = (op: FieldOp) => {
+      current = op;
+      node.style.left = `${op.x}px`;
+      node.style.top = `${op.y}px`;
+      node.style.width = `${op.w}px`;
+      node.style.height = `${op.h}px`;
+      const [ix, iy, iw, ih] = op.inside;
+      node.style.padding = `${iy - op.y}px ${op.x + op.w - ix - iw}px ${op.y + op.h - iy - ih}px ${ix - op.x}px`;
+      node.style.borderRadius = `${fieldRadius(op)}px`;
+      node.style.clipPath = uncovered(op);
+      // The browser counts in UTF-16 and the panel in characters, which
+      // may be two of those: the panel's field cuts what is over.
+      node.maxLength = op.limit * 2;
+      node.placeholder = op.placeholder;
+      node.dataset.font = op.font;
+      if (op.revision !== taken) {
+        taken = op.revision;
+        if (node.value !== op.text) node.value = op.text;
+      }
+      if (op.clear) {
+        clear.style.left = `${op.clear.x}px`;
+        clear.style.top = `${op.clear.y}px`;
+        clear.style.width = `${op.clear.size}px`;
+        clear.style.height = `${op.clear.size}px`;
+      }
+      const live = view?.live ?? false;
+      if (op.focused && live && document.activeElement !== node) {
+        node.focus({ preventScroll: true });
+      } else if (
+        !op.focused &&
+        document.activeElement === node &&
+        // To another of its fields, which takes it as it follows.
+        !handle.client?.plugin_panel_has_keyboard(extended)
+      ) {
+        hold();
+      }
+      // What a plugin starting again last drew takes no typing: nobody
+      // would hear it.
+      node.disabled = !live;
+      showClear();
+    };
+    follow(op);
+    // The canvas outlines the box with the keyboard.
+    const onFocus = () => {
+      handle.client?.plugin_panel_field_focus(extended, current.id);
+      queueMicrotask(() => refresh());
+    };
+    const onBlur = (ev: FocusEvent) => {
+      // To another of the panel's fields: the keyboard stays in it. Nor
+      // does it go with the window: the browser gives this field it back.
+      const to = ev.relatedTarget;
+      if (to instanceof HTMLElement && to.classList.contains('pfield') && host.contains(to)) return;
+      if (!document.hasFocus()) return;
+      handle.client?.plugin_panel_blur(extended);
+      queueMicrotask(() => refresh());
+    };
+    // What a field holds is told once composed: never the half of a word
+    // an input method is still putting together.
+    const onInput = (ev: Event) => {
+      if ((ev as InputEvent).isComposing) return;
+      tell();
+    };
+    // When an input method last put its text in.
+    let composed = -Infinity;
+    const onComposed = (ev: CompositionEvent) => {
+      composed = ev.timeStamp;
+      tell();
+    };
+    const onClearDown = (ev: MouseEvent) => ev.preventDefault();
+    const onClear = () => {
+      node.value = '';
+      if (document.activeElement !== node) node.focus({ preventScroll: true });
+      tell();
+    };
+    const onKey = (ev: KeyboardEvent) => {
+      // Keys pressed while composing are the input method's: marked so, a
+      // printable one marked 229 (Chrome on macOS), or the one that ended
+      // a composition just now (Safari). An input method on but idle -- an
+      // Android keyboard -- marks every key 229, and Return still submits.
+      if (ev.isComposing) return;
+      if (ev.keyCode === 229) {
+        if (Array.from(ev.key).length === 1) return;
+        if (ev.timeStamp - composed < ENDED_COMPOSING) {
+          composed = -Infinity;
+          return;
+        }
+      }
+      // The terminal's keys are not this field's to hear.
+      ev.stopPropagation();
+      const command = onMac() ? ev.metaKey && !ev.ctrlKey : ev.ctrlKey && !ev.metaKey;
+      if (ev.key === 'Enter' && !ev.altKey && (current.kind === 'lines' ? command : !ev.ctrlKey && !ev.metaKey)) {
+        ev.preventDefault();
+        handle.client?.plugin_panel_field_submit(extended, current.id);
+        return;
+      }
+      if (!leaves(current.kind, ev)) return;
+      const taken = handle.client?.plugin_panel_key(extended, ev.key, ev.shiftKey, ev.ctrlKey, ev.altKey, ev.metaKey);
+      if (!taken) return;
+      ev.preventDefault();
+      // The keyboard may have moved to another field, or gone back.
+      refresh();
+      if (!handle.client?.plugin_panel_has_keyboard(extended) && document.activeElement === node) {
+        node.blur();
+        focusTerminal();
+      }
+    };
+    // Typed as one element, for its events' types to be known.
+    const el: HTMLElement = node;
+    el.addEventListener('focus', onFocus);
+    el.addEventListener('blur', onBlur);
+    el.addEventListener('input', onInput);
+    el.addEventListener('compositionend', onComposed);
+    el.addEventListener('keydown', onKey);
+    clear.addEventListener('mousedown', onClearDown);
+    clear.addEventListener('click', onClear);
+    return {
+      update: follow,
+      destroy() {
+        if (document.activeElement === node) hold();
+        el.removeEventListener('focus', onFocus);
+        el.removeEventListener('blur', onBlur);
+        el.removeEventListener('input', onInput);
+        el.removeEventListener('compositionend', onComposed);
+        el.removeEventListener('keydown', onKey);
+        clear.removeEventListener('mousedown', onClearDown);
+        clear.removeEventListener('click', onClear);
+        clear.remove();
+      },
+    };
   }
 
   /** Reads the panel as the wasm has it, and paints it: when it changed
@@ -476,19 +716,25 @@
 
   function onMouseDown(ev: MouseEvent) {
     const { x, y } = local(ev);
+    // A press on the panel leaves the keyboard where it is -- in one of its
+    // fields, or the terminal -- but for keys held on the canvas, which the
+    // terminal has again: a press is the user's.
+    ev.preventDefault();
+    if (document.activeElement === canvas) focusTerminal();
     const heard = handle.client?.plugin_panel_click(
       extended, x, y, ev.button, Math.max(1, ev.detail), ev.shiftKey, ev.ctrlKey, ev.altKey, ev.metaKey,
     );
-    if (heard) {
-      ev.preventDefault();
-      refresh();
-    }
+    if (heard) refresh();
   }
 </script>
 
 <div class="plugin" class:extended bind:this={host}>
+  <!-- Focused only to hold the keyboard from the terminal (`hold`). -->
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
   <canvas
     bind:this={canvas}
+    tabindex="-1"
+    onkeydown={onCanvasKey}
     onpointerdown={onPointerDown}
     onpointermove={onPointerMove}
     onpointerup={onPointerUp}
@@ -496,6 +742,16 @@
     onpointerleave={onPointerLeave}
     onmousedown={onMouseDown}
   ></canvas>
+  {#each fields as op (op.id)}
+    {#if op.kind === 'lines'}
+      <textarea class="pfield" spellcheck="false" use:field={op}></textarea>
+    {:else}
+      <input class="pfield" type={op.kind === 'secret' ? 'password' : 'text'} autocomplete="off" spellcheck="false" use:field={op} />
+    {/if}
+    {#if op.icon}
+      <span class="picon" style="left: {op.icon.x}px; top: {op.icon.y}px; width: {op.icon.size}px; height: {op.icon.size}px">{@html iconByName(op.icon.name) ?? ''}</span>
+    {/if}
+  {/each}
   {#if view?.message}
     <div class="msg">{view.message}</div>
   {/if}

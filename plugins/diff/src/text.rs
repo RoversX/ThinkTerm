@@ -19,6 +19,10 @@ pub struct Words {
     pub mode: &'static str,
     pub unchanged: &'static str,
     pub cut: &'static str,
+    /// What the empty filter says.
+    pub filter: &'static str,
+    /// No file's path has what the filter holds.
+    pub no_match: &'static str,
 }
 
 /// The words for `locale`, a tag such as `zh-CN`.
@@ -55,6 +59,8 @@ static ENGLISH: Words = Words {
     mode: "Only the file's mode changed.",
     unchanged: "Renamed, without changes.",
     cut: "Too long: the rest is not shown.",
+    filter: "Filter files",
+    no_match: "No file matches",
 };
 
 static CHINESE: Words = Words {
@@ -73,6 +79,8 @@ static CHINESE: Words = Words {
     mode: "只改了文件权限。",
     unchanged: "只改了名字，内容没变。",
     cut: "太长了，后面的不显示。",
+    filter: "筛选文件",
+    no_match: "没有匹配的文件",
 };
 
 static JAPANESE: Words = Words {
@@ -91,6 +99,8 @@ static JAPANESE: Words = Words {
     mode: "ファイルのモードだけが変わりました。",
     unchanged: "名前だけが変わり、内容は同じです。",
     cut: "長すぎるため、以降は表示しません。",
+    filter: "ファイルを絞り込む",
+    no_match: "一致するファイルはありません",
 };
 
 static GERMAN: Words = Words {
@@ -115,6 +125,8 @@ static GERMAN: Words = Words {
     mode: "Nur der Dateimodus wurde geändert.",
     unchanged: "Umbenannt, ohne Änderungen.",
     cut: "Zu lang: Der Rest wird nicht angezeigt.",
+    filter: "Dateien filtern",
+    no_match: "Keine Datei passt",
 };
 
 static FRENCH: Words = Words {
@@ -140,6 +152,8 @@ static FRENCH: Words = Words {
     mode: "Seul le mode du fichier a changé.",
     unchanged: "Renommé sans modification.",
     cut: "Trop long : la suite n'est pas affichée.",
+    filter: "Filtrer les fichiers",
+    no_match: "Aucun fichier ne correspond",
 };
 
 #[cfg(test)]

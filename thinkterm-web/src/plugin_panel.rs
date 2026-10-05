@@ -11,6 +11,11 @@
 //! A panel's extended view, beside the right panel, is a model of its own,
 //! opened as the extended view of the panel's opening: the app opens it
 //! while the panel's frames ask for one.
+//!
+//! The page puts a field of its own over each field the player paints,
+//! which the browser edits; what it holds, and where the keyboard goes,
+//! come back here for the player to decide what the plugin hears. A panel
+//! has the keyboard through its fields only: the page offers no key for it.
 
 use serde::Serialize;
 use thinkterm_plugin_channel::wire::{PanelEvent, PanelRequest, Raw, ToHost};
@@ -36,6 +41,9 @@ pub struct PanelView {
     pub message: Option<String>,
     /// What to paint; none before the plugin first drew.
     pub painting: Option<Painting>,
+    /// Whether its fields take typing: its program drew it on this
+    /// opening. What one starting again last drew takes none.
+    pub live: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -168,6 +176,7 @@ impl PanelModel {
             state,
             message,
             painting: (state != "stopped" && self.player.shown()).then(|| self.player.painting()),
+            live: self.status == Status::Open,
         }
     }
 
@@ -222,6 +231,8 @@ impl PanelModel {
                     }
                     Err(err) => log::warn!("plugin panel {}: a frame that does not read: {err}", self.plugin),
                 }
+                // The keyboard may have moved with it, or gone with a field.
+                sends.extend(self.told());
             }
             PanelEvent::Rows { rows } => match rows.read::<Rows>() {
                 Ok(rows) => self.player.rows(rows),
@@ -234,6 +245,7 @@ impl PanelModel {
                     log::info!("plugin panel {}: {reason}", self.plugin);
                     Status::Stopped(reason)
                 };
+                self.let_go_of_keyboard();
             }
             // The page never says its terminal runs on another machine: a
             // plugin asking of one anyway is told so.
@@ -257,6 +269,7 @@ impl PanelModel {
             self.status = Status::Again(at);
             self.changed();
         }
+        self.let_go_of_keyboard();
     }
 
     /// Something sent for it did not reach the host, for `why` -- one that
@@ -274,6 +287,7 @@ impl PanelModel {
         let delay = 1000.0 * f64::from(1u32 << self.failures.min(5)).min(30.0);
         self.status = Status::Again(now + delay);
         self.trouble = Some(why.to_string());
+        self.let_go_of_keyboard();
         self.changed();
         Some(delay)
     }
@@ -325,6 +339,86 @@ impl PanelModel {
         };
         self.changed();
         vec![self.frame(PanelRequest::Input { input: Raw::new(&input) })]
+    }
+
+    /// Whether the panel has the keyboard: one of its fields is the page's
+    /// field with it.
+    pub fn has_keyboard(&self) -> bool {
+        self.player.has_keyboard()
+    }
+
+    /// The user put the keyboard in field `id`, pressing in it or tabbing
+    /// to it.
+    pub fn focus_field(&mut self, id: &str) -> Sends {
+        if self.status != Status::Open {
+            return Vec::new();
+        }
+        self.player.focus_field(id);
+        self.changed();
+        self.told()
+    }
+
+    /// What field `id`, with the keyboard, holds now the user edited it:
+    /// what the plugin is to hear, and what the field is to hold instead,
+    /// when it takes less -- fewer characters, one line.
+    pub fn edit_field(&mut self, id: &str, text: &str) -> (Sends, Option<String>) {
+        if self.status != Status::Open {
+            return (Vec::new(), None);
+        }
+        self.player.edit_field(id, text);
+        self.changed();
+        let held = self
+            .player
+            .field_text(id)
+            .map(|(held, _)| held)
+            .filter(|held| *held != text)
+            .map(str::to_string);
+        (self.told(), held)
+    }
+
+    /// The user submitted field `id`.
+    pub fn submit_field(&mut self, id: &str) -> Sends {
+        if self.status != Status::Open {
+            return Vec::new();
+        }
+        self.player.submit(id);
+        self.told()
+    }
+
+    /// The keyboard went from the panel: to the terminal, or elsewhere on
+    /// the page.
+    pub fn blur(&mut self) -> Sends {
+        self.player.blur();
+        self.changed();
+        self.told()
+    }
+
+    /// A key the page's field with the keyboard does not use, named as the
+    /// browser names it: whether it was the panel's, and what the plugin is
+    /// to hear.
+    pub fn key(&mut self, key: &str, mods: Mods) -> (bool, Sends) {
+        if self.status != Status::Open {
+            return (false, Vec::new());
+        }
+        let taken = self.player.key(key, mods);
+        self.changed();
+        (taken, self.told())
+    }
+
+    /// The panel is not served: the keyboard goes back, and the plugin,
+    /// whose view is gone, is told nothing of it.
+    fn let_go_of_keyboard(&mut self) {
+        self.player.blur();
+        self.player.told();
+    }
+
+    /// What the player decided the plugin is to hear, as frames.
+    fn told(&mut self) -> Sends {
+        self.player
+            .told()
+            .into_iter()
+            .map(|input| self.frame(PanelRequest::Input { input: Raw::new(&input) }))
+            .collect()
     }
 
     /// The wheel turned: what scrolled is painted again, and the rows it
@@ -386,6 +480,7 @@ mod tests {
             remote: None,
             can_extend: false,
             close: None,
+            features: Vec::new(),
         }
     }
 
@@ -509,6 +604,48 @@ mod tests {
         assert_eq!(panel.unsent(why, 0.0), Some(2_000.0), "counted afresh");
         panel.heard(PanelEvent::Closed { reason: "turned off".into(), again: false }, 0.0);
         assert_eq!(panel.unsent(why, 0.0), None, "stopped stays stopped");
+    }
+
+    #[test]
+    fn a_field_has_the_keyboard_only_as_the_user_gives_it_and_tells_the_plugin() {
+        let (mut panel, _) = PanelModel::open("stocks", 1, None, env(), 0.0);
+        let frame = json!({"items": [
+            {"field": {"id": "add", "x": 8, "y": 8, "w": 200, "h": 26, "focus": 1}}
+        ], "keys": ["ArrowDown"]});
+        let sends = panel.heard(PanelEvent::Frame { frame: Raw::new(&frame) }, 0.0);
+        assert!(!requests(&sends).iter().any(|asked| asked.get("input").is_some()), "not given");
+        assert!(!panel.has_keyboard());
+        let view = panel.view_json();
+        let painted = serde_json::to_value(view.painting.unwrap()).unwrap();
+        assert_eq!(painted["ops"][0]["op"], "field", "for the page to put its own over");
+
+        let focused = requests(&panel.focus_field("add"));
+        assert_eq!(focused[0]["input"]["input"], json!({"focus": {"id": "add"}}));
+        let (typed, held) = panel.edit_field("add", "TSM");
+        assert_eq!(held, None, "all of it taken");
+        let typed = requests(&typed);
+        assert_eq!(typed[0]["input"]["input"], json!({"text": {"id": "add", "text": "TSM"}}));
+        let (taken, keyed) = panel.key("ArrowDown", Mods::default());
+        assert!(taken);
+        assert_eq!(requests(&keyed)[0]["input"]["input"]["key"]["key"], "ArrowDown");
+        assert_eq!(panel.edit_field("add", "TS\tM").1.as_deref(), Some("TSM"), "one line");
+        let submitted = requests(&panel.submit_field("add"));
+        assert_eq!(submitted[0]["input"]["input"]["submit"]["text"], "TSM");
+        let (_, escaped) = panel.key("Escape", Mods::default());
+        assert_eq!(requests(&escaped)[0]["input"]["input"], json!("blur"));
+        assert!(!panel.has_keyboard());
+
+        // A panel the host lets go of lets go of the keyboard, saying nothing.
+        panel.focus_field("add");
+        panel.heard(PanelEvent::Closed { reason: "restarting".into(), again: true }, 0.0);
+        assert!(!panel.has_keyboard());
+        // What it last drew stays on show meanwhile, and takes no typing.
+        let view = panel.view_json();
+        assert!(view.painting.is_some() && !view.live);
+        assert!(panel.focus_field("add").is_empty());
+        assert!(!panel.has_keyboard());
+        assert!(panel.edit_field("add", "x").0.is_empty());
+        assert!(panel.submit_field("add").is_empty());
     }
 
     #[test]

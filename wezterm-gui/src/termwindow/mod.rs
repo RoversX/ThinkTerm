@@ -3036,6 +3036,18 @@ pub struct TermWindow {
     right_sidebar_snippet_listing: thinkterm_snippets::view::Listing,
     /// The plugin panel on show in this window, while one is.
     pub(crate) right_sidebar_plugin: Option<ui::plugin_panel::PluginPanel>,
+    /// The user's key asked for this plugin's panel to have the keyboard
+    /// before the panel was open: it is given it as it opens, and holds
+    /// the keyboard meanwhile.
+    plugin_panel_focus_asked: Option<String>,
+    /// The plugin panel lost the keyboard without the user while they may
+    /// have been typing in it: what they press is nobody's -- never the
+    /// terminal's -- until they press Escape or somewhere, or leave the
+    /// window.
+    plugin_panel_keys_held: bool,
+    /// What the system was last shown of the plugin field with the
+    /// keyboard, on a Mac.
+    plugin_field_snapshot: Option<ui::plugin_panel::FieldSnapshot>,
     /// Whether each domain whose panes the plugin panel was beside runs
     /// them on this machine: `None` while a look off this thread finds out.
     /// The answer is the domain's, so another pane of one looked at already
@@ -4074,6 +4086,7 @@ impl TermWindow {
             self.clear_workspace_space_swipe_frame_transition();
             self.right_sidebar_note.native_text_input_snapshot_key = None;
             window.set_native_text_input_snapshot(None);
+            self.plugin_panel_window_blurred();
             self.right_sidebar_note.freeze_live_source();
             self.save_right_sidebar_note_now();
             self.last_mouse_click = None;
@@ -4597,6 +4610,9 @@ impl TermWindow {
             right_sidebar_snippet_scrollbar_visible_until: None,
             right_sidebar_snippet_listing: Default::default(),
             right_sidebar_plugin: None,
+            plugin_panel_focus_asked: None,
+            plugin_panel_keys_held: false,
+            plugin_field_snapshot: None,
             plugin_panel_domains: Vec::new(),
             plugin_panel_reach: None,
             right_sidebar_snippet_saving: false,
@@ -5181,6 +5197,8 @@ impl TermWindow {
                             self.note_did_edit();
                         }
                     }
+                } else {
+                    self.plugin_field_replace(token, revision, source_range, &text);
                 }
                 window.invalidate();
                 Ok(true)
@@ -10928,6 +10946,7 @@ impl TermWindow {
             OpenSettings => {
                 crate::settings_window::show_from(self.mux_window_id);
             }
+            FocusPluginPanel(plugin) => self.focus_plugin_panel(plugin),
             QuitAndStopSessionServer => {
                 // The stop happens after the loop ends; the quit itself
                 // goes through the same confirmation as any quit.

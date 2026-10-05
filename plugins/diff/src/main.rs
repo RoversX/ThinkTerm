@@ -6,9 +6,12 @@
 //! asks git again every two seconds while a panel is on show, and sends a
 //! file's lines only as they are asked for, so a file of ten thousand
 //! changed lines costs what shows. A terminal on another machine has git
-//! asked there, through ThinkTerm's connection to it.
+//! asked there, through ThinkTerm's connection to it. Where a client has
+//! fields, one above the files filters them by name; with the keyboard in
+//! the panel, up and down pick the file before or after, and Return in
+//! the filter the first it leaves.
 //!
-//! It draws by hand, with the SDK's items and nothing else.
+//! It draws by hand, with the SDK's items and one field.
 //! docs/thinkterm/plugins.md says how to install it.
 
 mod git;
@@ -17,11 +20,13 @@ mod watch;
 
 use git::{Change, FileDiff, Kind, Line, Note, Status};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use text::Words;
 use thinkterm_plugin_sdk::panel::{
-    Align, Click, Env, Frame, Hit, Input, Item, List, Rect, RowsWanted, Size, Text, Token,
+    feature, Align, Click, Env, FieldText, Frame, Hit, Input, Item, Jump, Key, List, Rect,
+    RowsWanted, Size, Text, Token,
 };
 use thinkterm_plugin_sdk::{Cx, Plugin, View};
 use unicode_width::UnicodeWidthChar;
@@ -38,16 +43,26 @@ const BADGE: f32 = 16.0;
 const ROW_RADIUS: f32 = 6.0;
 /// Room kept at a list's right edge for its scrollbar.
 const THUMB_ROOM: f32 = 8.0;
+/// The field the files are filtered with.
+const FILTER: &str = "filter";
 
 struct DiffPanel {
     shared: Shared,
+    /// What each panel's filter holds, by the panel's view.
+    filters: HashMap<u64, FieldText>,
+    /// How many times each panel's file was picked with the keys: its list
+    /// keeps the last in view, once for each.
+    reveals: HashMap<u64, u32>,
 }
 
 /// Where things go in a panel of one size, listing `files` rows: the
 /// picked file's lines below them when it shows those itself (`inside`),
-/// the files alone down to its foot when its extended view does.
+/// the files alone down to its foot when its extended view does. A client
+/// with fields has the filter above the files.
 struct Layout {
     width: f32,
+    /// Where the filter goes, and how tall it is: none without fields.
+    filter: Option<(f32, f32)>,
     header: f32,
     file_row: f32,
     files_height: f32,
@@ -60,7 +75,13 @@ struct Layout {
 
 impl Layout {
     fn of(env: &Env, files: usize, inside: bool) -> Self {
-        let header = 10.0 + env.title.line + env.small.line + 10.0;
+        let mut header = 10.0 + env.title.line + env.small.line + 10.0;
+        let filter = env.has(feature::FIELDS).then(|| {
+            let tall = env.body.line + 10.0;
+            let top = header - 2.0;
+            header += tall + 6.0;
+            (top, tall)
+        });
         let file_row = env.body.line + env.small.line + 12.0;
         let wanted = files as f32 * file_row;
         let room = (env.height - header).max(0.0);
@@ -76,6 +97,7 @@ impl Layout {
         let diff_top = diff_header_top + diff_header;
         Self {
             width: env.width,
+            filter,
             header,
             file_row,
             files_height,
@@ -161,8 +183,13 @@ impl Plugin for DiffPanel {
             Some(Place::Failed(why)) => say(frame, env, PAD, PAD, words.failed, Some(why)),
             Some(Place::Repo(repo)) => {
                 frame.extend(state.picked(view.id, repo).is_some());
+                // Up and down pick the file before or after, while the
+                // panel has the keyboard.
+                frame.keys(&["ArrowUp", "ArrowDown"]);
                 let shown = state.shown(view.id, repo);
-                draw_repo(frame, env, words, &dir, repo, shown, inside);
+                let filter = self.filters.entry(view.id).or_default();
+                let reveal = self.reveals.get(&view.id).copied();
+                draw_repo(frame, env, words, &dir, repo, shown, inside, filter, reveal);
             }
         }
     }
@@ -188,11 +215,13 @@ impl Plugin for DiffPanel {
             false => state.shown(panel, repo),
         };
         let (from, to) = (wanted.from as usize, wanted.to as usize);
+        let filter = self.filters.get(&panel).map_or("", FieldText::text);
         match wanted.list.as_str() {
-            "files" if !view.extended() && wanted.key == files_key(&dir) => {
-                let files = &repo.snapshot.files;
-                let at = Layout::of(env, rows_of(repo), want.inside);
-                (from..to.min(rows_of(repo)))
+            "files" if !view.extended() && wanted.key == files_key(&dir, filter) => {
+                let files = listed(repo, filter);
+                let count = rows_of(repo, filter);
+                let at = Layout::of(env, count, want.inside);
+                (from..to.min(count))
                     .map(|row| match files.get(row) {
                         Some(file) => {
                             let marked = shown.is_some_and(|shown| shown.path == file.path);
@@ -223,15 +252,38 @@ impl Plugin for DiffPanel {
     }
 
     fn input(&mut self, view: &View, input: Input, _cx: &mut Cx) {
+        let panel = view.panel();
         match input {
             Input::Click(Click { id, .. }) => {
                 if let Some(path) = id.strip_prefix("file:") {
-                    watch::pick(&self.shared, view.panel(), Some(path.to_string()));
+                    watch::pick(&self.shared, panel, Some(path.to_string()));
                 }
             }
             // The extended view was closed: the file is put down, and the
             // panel stops asking for it.
-            Input::Close => watch::pick(&self.shared, view.panel(), None),
+            Input::Close => watch::pick(&self.shared, panel, None),
+            Input::Text(typed) if typed.id == FILTER => {
+                self.filters.entry(panel).or_default().heard(&typed);
+            }
+            // Return in the filter picks the first file it leaves.
+            Input::Submit(typed) if typed.id == FILTER => {
+                self.filters.entry(panel).or_default().heard(&typed);
+                self.pick_listed(panel, |_, _| 0);
+                *self.reveals.entry(panel).or_default() += 1;
+            }
+            Input::Key(Key { key, .. }) => {
+                match key.as_str() {
+                    "ArrowUp" => {
+                        self.pick_listed(panel, |at, _| at.map_or(0, |at| at.saturating_sub(1)))
+                    }
+                    "ArrowDown" => self.pick_listed(panel, |at, count| {
+                        at.map_or(0, |at| (at + 1).min(count - 1))
+                    }),
+                    _ => return,
+                }
+                *self.reveals.entry(panel).or_default() += 1;
+            }
+            _ => {}
         }
     }
 
@@ -239,11 +291,39 @@ impl Plugin for DiffPanel {
         // The panel an extended view leaves keeps what it wants.
         if !view.extended() {
             watch::close(&self.shared, view.id);
+            self.filters.remove(&view.id);
+            self.reveals.remove(&view.id);
         }
     }
 }
 
 impl DiffPanel {
+    /// Picks the file of panel `panel`'s list -- as its filter leaves it --
+    /// that `next` says, from where the one it shows is in it, if it is, and
+    /// how many there are.
+    fn pick_listed(&self, panel: u64, next: impl FnOnce(Option<usize>, usize) -> usize) {
+        let path = {
+            let state = watch::lock(&self.shared);
+            let Some(dir) = state.views.get(&panel).and_then(|want| want.dir.clone()) else {
+                return;
+            };
+            let Some(Place::Repo(repo)) = state.places.get(&dir) else {
+                return;
+            };
+            let filter = self.filters.get(&panel).map_or("", FieldText::text);
+            let files = listed(repo, filter);
+            if files.is_empty() {
+                return;
+            }
+            let shown = state.shown(panel, repo);
+            let at = shown.and_then(|shown| files.iter().position(|file| file.path == shown.path));
+            files[next(at, files.len()).min(files.len() - 1)]
+                .path
+                .clone()
+        };
+        watch::pick(&self.shared, panel, Some(path));
+    }
+
     /// The extended view: the lines of the file its panel picked.
     fn draw_extended(&self, view: &View, frame: &mut Frame) {
         let env = &view.env;
@@ -263,9 +343,21 @@ impl DiffPanel {
     }
 }
 
-/// The key of the files list of the panels in `dir`.
-fn files_key(dir: &Dir) -> String {
-    dir.key()
+/// The key of the files list of the panels in `dir`, filtered by `filter`:
+/// another filter, other rows.
+fn files_key(dir: &Dir, filter: &str) -> String {
+    format!("{}\n{filter}", dir.key())
+}
+
+/// The files of `repo` whose paths have `filter` in them, whatever their
+/// case: all of them for none.
+fn listed<'a>(repo: &'a Repo, filter: &str) -> Vec<&'a Change> {
+    let filter = filter.trim().to_lowercase();
+    repo.snapshot
+        .files
+        .iter()
+        .filter(|file| filter.is_empty() || file.path.to_lowercase().contains(&filter))
+        .collect()
 }
 
 /// The key of the list of `path`'s lines, in `dir`.
@@ -273,14 +365,16 @@ fn diff_key(dir: &Dir, path: &str) -> String {
     format!("{}\n{path}", dir.key())
 }
 
-/// Rows the files list has: one a file, and one saying how many more there
-/// are when not all are listed.
-fn rows_of(repo: &Repo) -> usize {
-    repo.snapshot.files.len() + usize::from(repo.snapshot.more > 0)
+/// Rows the files list has, as `filter` leaves it: one a file, and, with no
+/// filter, one saying how many more there are when not all are listed.
+fn rows_of(repo: &Repo, filter: &str) -> usize {
+    let more = filter.trim().is_empty() && repo.snapshot.more > 0;
+    listed(repo, filter).len() + usize::from(more)
 }
 
-/// The repository's name, branch and changes, and the files: with the
-/// lines of the one `shown` below them, `inside` the panel.
+/// The repository's name, branch and changes, the filter, and the files:
+/// with the lines of the one `shown` below them, `inside` the panel.
+#[allow(clippy::too_many_arguments)]
 fn draw_repo(
     frame: &mut Frame,
     env: &Env,
@@ -289,9 +383,12 @@ fn draw_repo(
     repo: &Repo,
     shown: Option<&Change>,
     inside: bool,
+    filter: &FieldText,
+    reveal: Option<u32>,
 ) {
     let snapshot = &repo.snapshot;
-    let at = Layout::of(env, rows_of(repo), inside);
+    let rows = rows_of(repo, filter.text());
+    let at = Layout::of(env, rows, inside);
     let name = snapshot
         .root
         .rsplit('/')
@@ -337,25 +434,45 @@ fn draw_repo(
     );
     frame.push(about.size(Size::Small).color(Token::TextMuted));
     if snapshot.files.is_empty() {
-        say(frame, env, PAD, at.header, words.clean, None);
+        // Where the filter would be: there is nothing to filter.
+        let top = at.filter.map_or(at.header, |(top, _)| top);
+        say(frame, env, PAD, top, words.clean, None);
         return;
     }
 
+    if let Some((top, tall)) = at.filter {
+        let field = filter.field(FILTER, PAD, top, at.width - PAD * 2.0, tall);
+        frame.push(field.placeholder(words.filter).icon("search").clear());
+    }
+    let listed = listed(repo, filter.text());
+    if listed.is_empty() {
+        say(frame, env, PAD, at.header, words.no_match, None);
+    }
     let version = {
         let mut hasher = DefaultHasher::new();
         (repo.revision, shown.map(|file| &file.path), inside).hash(&mut hasher);
         hasher.finish() as u32
     };
-    let files = List::new(
+    let mut files = List::new(
         "files",
         0.0,
         at.header,
         at.width,
         at.files_height,
-        rows_of(repo) as u32,
+        rows as u32,
         at.file_row,
-        files_key(dir),
+        files_key(dir, filter.text()),
     );
+    // The file picked with the keys, kept in view.
+    let picked = shown.and_then(|file| listed.iter().position(|row| row.path == file.path));
+    if let (Some(seq), Some(at)) = (reveal, picked) {
+        let at = at as f32;
+        files = files.top(Jump {
+            to: at,
+            seq,
+            through: Some(at + 1.0),
+        });
+    }
     frame.push(files.version(version));
     if !inside {
         return;
@@ -787,7 +904,11 @@ fn main() -> std::io::Result<()> {
         if let Err(err) = started {
             eprintln!("diff: cannot start looking: {err}");
         }
-        DiffPanel { shared }
+        DiffPanel {
+            shared,
+            filters: HashMap::new(),
+            reveals: HashMap::new(),
+        }
     })
 }
 
@@ -822,6 +943,7 @@ mod tests {
             remote: None,
             can_extend: false,
             close: None,
+            features: Vec::new(),
         }
     }
 
@@ -882,7 +1004,11 @@ mod tests {
             );
             state.views.insert(1, Want::default());
         }
-        DiffPanel { shared }
+        DiffPanel {
+            shared,
+            filters: HashMap::new(),
+            reveals: HashMap::new(),
+        }
     }
 
     fn texts(player: &Player) -> Vec<String> {
@@ -948,6 +1074,79 @@ mod tests {
             player.extend(),
             "asked for, for a client that has room after all"
         );
+    }
+
+    #[test]
+    fn the_filter_leaves_the_files_it_names_and_the_keys_pick_among_them() {
+        let mut panel = panel();
+        let with_fields = Env {
+            features: vec![feature::FIELDS.into(), feature::KEYS.into()],
+            ..env()
+        };
+        let view = View::new(1, with_fields.clone());
+        let mut player = Player::new(with_fields);
+        show(&mut panel, &view, &mut player);
+        assert_eq!(player.fields().count(), 1, "the filter");
+        let picked = |panel: &DiffPanel| watch::lock(&panel.shared).views[&1].picked.clone();
+        let key = |name: &str| {
+            Input::Key(Key {
+                key: name.into(),
+                mods: Mods::default(),
+            })
+        };
+        // Down from the first shown below the files.
+        panel.input(&view, key("ArrowDown"), &mut Cx::new());
+        assert_eq!(picked(&panel).as_deref(), Some("src/long.rs"));
+        panel.input(&view, key("ArrowDown"), &mut Cx::new());
+        panel.input(&view, key("ArrowDown"), &mut Cx::new());
+        assert_eq!(
+            picked(&panel).as_deref(),
+            Some("src/new.rs"),
+            "no further than the last"
+        );
+        panel.input(&view, key("ArrowUp"), &mut Cx::new());
+        assert_eq!(picked(&panel).as_deref(), Some("src/long.rs"));
+
+        // The list follows the pick made with the keys.
+        let mut frame = Frame::default();
+        panel.draw(&view, &mut frame);
+        let top = frame.items.iter().find_map(|item| match item {
+            Item::List(list) if list.id == "files" => list.top,
+            _ => None,
+        });
+        assert_eq!(
+            top.and_then(|jump| jump.through),
+            Some(2.0),
+            "row 1, in view"
+        );
+
+        let typed = |text: &str| thinkterm_plugin_sdk::panel::Typed {
+            id: FILTER.into(),
+            text: text.into(),
+            seq: 0,
+        };
+        panel.input(&view, Input::Text(typed("READ")), &mut Cx::new());
+        show(&mut panel, &view, &mut player);
+        let shown = texts(&player);
+        assert!(shown.contains(&"README.md".to_string()), "{shown:?}");
+        assert!(
+            !shown.contains(&"new.rs".to_string()),
+            "filtered out: {shown:?}"
+        );
+        panel.input(&view, Input::Submit(typed("READ")), &mut Cx::new());
+        assert_eq!(
+            picked(&panel).as_deref(),
+            Some("README.md"),
+            "the first it leaves"
+        );
+        // The client empties it with its button: a field that asks for one.
+        assert!(player.fields().next().is_some_and(|field| field.clear));
+        panel.input(&view, Input::Text(typed("zzz")), &mut Cx::new());
+        show(&mut panel, &view, &mut player);
+        let words = text::words("en-US");
+        assert!(texts(&player).contains(&words.no_match.to_string()));
+        panel.closed(&view);
+        assert!(panel.filters.is_empty() && panel.reveals.is_empty());
     }
 
     #[test]

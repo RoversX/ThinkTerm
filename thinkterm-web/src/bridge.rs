@@ -212,6 +212,49 @@ impl Client {
         self.app.plugin_panel_wheel(extended, x, y, dx, dy)
     }
 
+    /// Whether the plugin panel, or its extended view, has the keyboard.
+    pub fn plugin_panel_has_keyboard(&self, extended: bool) -> bool {
+        self.app.plugin_panel_has_keyboard(extended)
+    }
+
+    /// The page's field over the panel's field `id` got the keyboard.
+    pub fn plugin_panel_field_focus(&self, extended: bool, id: String) {
+        self.app.plugin_panel_field_focus(extended, &id);
+    }
+
+    /// What the page's field over the panel's field `id` holds now: what
+    /// it is to hold instead, when the panel's takes less.
+    pub fn plugin_panel_field_text(&self, extended: bool, id: String, text: String) -> Option<String> {
+        self.app.plugin_panel_field_text(extended, &id, &text)
+    }
+
+    /// Return in the page's field over the panel's field `id`.
+    pub fn plugin_panel_field_submit(&self, extended: bool, id: String) {
+        self.app.plugin_panel_field_submit(extended, &id);
+    }
+
+    /// The keyboard went from the panel's fields to elsewhere on the page.
+    pub fn plugin_panel_blur(&self, extended: bool) {
+        self.app.plugin_panel_blur(extended);
+    }
+
+    /// A key the page's field with the keyboard does not use, as
+    /// `KeyboardEvent.key` names it: true when it was the panel's, and the
+    /// page is to keep it to itself.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plugin_panel_key(
+        &self,
+        extended: bool,
+        key: String,
+        shift: bool,
+        ctrl: bool,
+        alt: bool,
+        meta: bool,
+    ) -> bool {
+        let mods = thinkterm_plugin_panel::Mods { shift, ctrl, alt, cmd: meta };
+        self.app.plugin_panel_key(extended, &key, mods)
+    }
+
     /// The Snippets tab: JSON `SnippetsView`.
     pub fn snippets(&self) -> String {
         json(&self.app.snippets_view())

@@ -2075,6 +2075,9 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             icon: None,
         },
         DisableDefaultAssignment => return None,
+        // A plugin's panel shows in the sidebar and nowhere else: not in the
+        // palette, whatever key the user gave it.
+        FocusPluginPanel(_) => return None,
         SelectTextAtMouseCursor(mode) => CommandDef {
             brief: format!(
                 "Selects text at the mouse cursor \

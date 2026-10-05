@@ -24,6 +24,14 @@
 //! there: over the connection Files reaches that machine with, and only
 //! once the user has let ThinkTerm connect to it -- in Files, or with the
 //! button the panel shows in place of what the plugin drew until then.
+//!
+//! The panel's fields are edited here (`field`), and it has the keyboard
+//! only when the user gives it: a press in one of its fields, or the key
+//! the user chose for it (`FocusPluginPanel`).
+
+mod field;
+
+pub(crate) use field::FieldSnapshot;
 
 use crate::plugins::{self, PanelNews};
 use crate::quad::{HeapQuadAllocator, QuadClipRect, QuadTrait, TripleLayerQuadAllocator};
@@ -37,7 +45,7 @@ use crate::termwindow::render::corners::{
     TOP_LEFT_ROUNDED_CORNER_OUTLINE, TOP_RIGHT_ROUNDED_CORNER_OUTLINE,
 };
 use crate::termwindow::{TermWindow, TermWindowNotif, UIItem, UIItemType};
-use crate::ui::UiPalette;
+use crate::ui::{SvgIcon, UiPalette};
 use crate::utilsprites::RenderMetrics;
 use crate::workspace_threads;
 use anyhow::Context;
@@ -51,10 +59,13 @@ use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use thinkterm_plugin_channel::wire::{PanelRequest, Raw};
+use thinkterm_plugin_panel::player::{
+    field_clear_at, field_icon, field_radius, FIELD_ICON, FIELD_INSET,
+};
 use thinkterm_plugin_panel::{
-    Align, Answer, Area, Ask, Bounds, Button, Bytes, CloseButton, Color, Cursor, Draw, Drawn,
-    Entry, EntryKind, Env, Font, Input, Line, Mods, MonoMetrics, Player, Rect, Remote, Size, Text,
-    TextMetrics, Token,
+    feature, Align, Answer, Area, Ask, Bounds, Button, Bytes, CloseButton, Color, Cursor, Draw,
+    Drawn, Entry, EntryKind, Env, FieldPart, Font, Input, Line, Mods, MonoMetrics, Player, Rect,
+    Remote, Size, Text, TextMetrics, Token,
 };
 use url::Url;
 use wezterm_font::LoadedFont;
@@ -101,6 +112,9 @@ pub(crate) struct PluginPanel {
     /// The user closed the extended view with its close button: it is not
     /// opened again until the panel's frames have stopped asking for it.
     dismissed: bool,
+    /// A field text is being selected in by dragging: in the extended view
+    /// or the panel, and which.
+    selecting: Option<(bool, String)>,
 }
 
 /// A view the host serves this window -- a panel, or its extended view --
@@ -123,6 +137,11 @@ struct Shown {
     /// Its plugin asked something of the machine beside it, which ThinkTerm
     /// may not connect to yet: shown instead of what it drew.
     connect: Option<Connect>,
+    /// Its fields as they are edited here, by id; one for each field the
+    /// player has, and let go with it.
+    editors: std::collections::HashMap<String, field::Editor>,
+    /// Counts edits and caret moves, which what was recorded is painted for.
+    edits: u64,
 }
 
 /// A machine a plugin needs ThinkTerm connected to, and the source Files
@@ -172,6 +191,8 @@ impl Shown {
             env_told: Instant::now(),
             env_due: false,
             connect: None,
+            editors: std::collections::HashMap::new(),
+            edits: 0,
         }
     }
 
@@ -198,6 +219,15 @@ impl PluginPanel {
             && !self.dismissed
             && !matches!(self.shown.status, Status::Stopped(_))
     }
+
+    /// Whether the panel or its extended view has the keyboard.
+    pub(crate) fn has_keyboard(&self) -> bool {
+        self.shown.player.has_keyboard()
+            || self
+                .extended
+                .as_ref()
+                .is_some_and(|(extended, _)| extended.player.has_keyboard())
+    }
 }
 
 /// A painting recorded as quads, a heap for each region it is cut to.
@@ -210,6 +240,8 @@ struct Painted {
 #[derive(PartialEq)]
 struct PaintKey {
     revision: u64,
+    /// What was typed, and where the caret is.
+    edits: u64,
     origin: (f32, f32),
     scale: f32,
     window: (usize, usize),
@@ -407,17 +439,19 @@ impl TermWindow {
             return Ok(());
         };
         let area = (content_x, content_top, content_width);
-        let painted = self.paint_plugin_view(
-            layers,
-            &mut panel.shown,
-            false,
-            area,
-            scale,
-            ui_font,
-            ui_metrics,
-            fonts,
-            &chrome,
-        );
+        let painted = self
+            .paint_plugin_view(
+                layers,
+                &mut panel.shown,
+                false,
+                area,
+                scale,
+                ui_font,
+                ui_metrics,
+                fonts,
+                &chrome,
+            )
+            .and_then(|()| self.paint_plugin_view_ring(layers, &panel.shown, &chrome));
         self.right_sidebar_plugin = Some(panel);
         painted
     }
@@ -473,9 +507,11 @@ impl TermWindow {
         };
         let area = (content_x, content_top, content_width);
         let painted = match panel.extended.as_mut() {
-            Some((extended, _)) => self.paint_plugin_view(
-                layers, extended, true, area, scale, ui_font, ui_metrics, fonts, &chrome,
-            ),
+            Some((extended, _)) => self
+                .paint_plugin_view(
+                    layers, extended, true, area, scale, ui_font, ui_metrics, fonts, &chrome,
+                )
+                .and_then(|()| self.paint_plugin_view_ring(layers, extended, &chrome)),
             None => Ok(()),
         };
         self.right_sidebar_plugin = Some(panel);
@@ -604,12 +640,24 @@ impl TermWindow {
     /// changed, the last of those within [`ENV_EVERY`]; and opens a panel
     /// the host closed again once it is time.
     fn follow_plugin_panel(&mut self, plugin: &str, env: Env) {
+        // The user's key asked for another plugin's panel, which is not on
+        // show: that ask is gone.
+        if self
+            .plugin_panel_focus_asked
+            .as_deref()
+            .is_some_and(|asked| asked != plugin)
+        {
+            self.plugin_panel_focus_asked = None;
+        }
         if self
             .right_sidebar_plugin
             .as_ref()
             .is_some_and(|panel| panel.plugin != plugin)
         {
+            // Another plugin's: the ask for this one stays, for it to open with.
+            let asked = self.plugin_panel_focus_asked.take();
             self.close_plugin_panel();
+            self.plugin_panel_focus_asked = asked;
         }
         let Some(panel) = self.right_sidebar_plugin.as_mut() else {
             let Some(window) = self.window.clone() else {
@@ -620,13 +668,21 @@ impl TermWindow {
                 plugin,
                 self.dimensions.dpi,
             );
+            let mut shown = Shown::new(view, Player::new(env));
+            // The user's key asked for it before it was open.
+            if self.plugin_panel_focus_asked.as_deref() == Some(plugin) {
+                self.plugin_panel_focus_asked = None;
+                shown.player.focus_panel();
+                shown.tell();
+            }
             self.right_sidebar_plugin = Some(PluginPanel {
                 plugin: plugin.to_string(),
-                shown: Shown::new(view, Player::new(env)),
+                shown,
                 opening: 0,
                 extended: None,
                 extended_width,
                 dismissed: false,
+                selecting: None,
             });
             return;
         };
@@ -634,6 +690,9 @@ impl TermWindow {
         let shown = &mut panel.shown;
         if let Status::Again(at) = shown.status {
             if now >= at {
+                // Given the keyboard meanwhile -- the user's key for it --
+                // it loses it as it opens again, without the user.
+                let lost = shown.player.has_keyboard();
                 shown.player.set_env(env);
                 shown.player.restarted();
                 shown.status = Status::Opening;
@@ -641,6 +700,9 @@ impl TermWindow {
                 shown.env_due = false;
                 panel.opening = panel.opening.wrapping_add(1);
                 plugins::reopen_panel(shown.view, &panel.plugin, shown.player.env());
+                if lost {
+                    self.hold_plugin_panel_keys();
+                }
             } else {
                 self.update_next_frame_time(Some(at));
             }
@@ -663,6 +725,7 @@ impl TermWindow {
             return;
         };
         let opening = panel.opening;
+        let mut lost = false;
         match panel.extended.as_mut() {
             Some((extended, on)) if *on == opening => {
                 if let Some(due) = tell_env(extended, env, Instant::now()) {
@@ -675,6 +738,7 @@ impl TermWindow {
                     Some((stale, _)) => {
                         plugins::close_panel(stale.view);
                         let mut player = stale.player;
+                        lost = player.has_keyboard();
                         player.set_env(env);
                         player.restarted();
                         player
@@ -689,6 +753,9 @@ impl TermWindow {
                 );
                 panel.extended = Some((Shown::new(view, player), opening));
             }
+        }
+        if lost {
+            self.hold_plugin_panel_keys();
         }
     }
 
@@ -718,6 +785,8 @@ impl TermWindow {
     /// Lets go of the panel on show, if one is, and of its extended view:
     /// the plugin is told, and what they held is freed.
     pub(crate) fn close_plugin_panel(&mut self) {
+        self.plugin_panel_focus_asked = None;
+        self.forget_plugin_field_snapshot();
         if let Some(panel) = self.right_sidebar_plugin.take() {
             if let Some((extended, _)) = panel.extended {
                 plugins::close_panel(extended.view);
@@ -741,6 +810,7 @@ impl TermWindow {
             let input = Raw::new(&Input::Close);
             plugins::tell_panel(extended.view, PanelRequest::Input { input });
             plugins::close_panel(extended.view);
+            self.forget_plugin_field_snapshot_of(extended.view);
         }
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
@@ -748,7 +818,8 @@ impl TermWindow {
         self.reflow_right_sidebar_if_width_changed(before);
     }
 
-    /// Lets go of the extended view of the panel on show, if it has one.
+    /// Lets go of the extended view of the panel on show, if it has one:
+    /// nothing asks for it, or there is no room for it.
     fn close_plugin_extended(&mut self) {
         let extended = self
             .right_sidebar_plugin
@@ -756,6 +827,10 @@ impl TermWindow {
             .and_then(|panel| panel.extended.take());
         if let Some((extended, _)) = extended {
             plugins::close_panel(extended.view);
+            self.forget_plugin_field_snapshot_of(extended.view);
+            if extended.player.has_keyboard() {
+                self.hold_plugin_panel_keys();
+            }
         }
     }
 
@@ -1031,8 +1106,17 @@ impl TermWindow {
 
     /// What the host said about the view `view`: the panel on show, or its
     /// extended view. The terminal is laid out again when the sidebar's
-    /// width changed with it.
+    /// width changed with it. A view that lost the keyboard with it lost it
+    /// without the user.
     pub(crate) fn plugin_panel_heard(&mut self, view: u64, news: PanelNews) {
+        let had = self.plugin_panel_has_keyboard();
+        self.plugin_panel_hear(view, news);
+        if had && !self.plugin_panel_has_keyboard() {
+            self.hold_plugin_panel_keys();
+        }
+    }
+
+    fn plugin_panel_hear(&mut self, view: u64, news: PanelNews) {
         let news = match news {
             PanelNews::Remote { id, machine, ask } => {
                 if self.plugin_view_numbered(view).is_none() {
@@ -1090,6 +1174,10 @@ impl TermWindow {
         context: &dyn WindowOps,
         extended: bool,
     ) {
+        // A press in a field, or a drag selecting in one, is the field's.
+        if self.plugin_field_mouse(&event, context, extended) {
+            return;
+        }
         let Some(shown) = self.plugin_view_mut(extended) else {
             context.set_cursor(Some(MouseCursor::Arrow));
             return;
@@ -1121,11 +1209,17 @@ impl TermWindow {
                 repaint = true;
             }
         }
-        let cursor = self
-            .plugin_view_mut(extended)
-            .and_then(|shown| shown.player.cursor());
+        let (px, py) = (event.coords.x as f32, event.coords.y as f32);
+        let cursor = self.plugin_view_mut(extended).and_then(|shown| {
+            // The button at a field's end is a button.
+            match shown.clear_under(px, py) {
+                Some(_) => Some(Cursor::Pointer),
+                None => shown.player.cursor(),
+            }
+        });
         context.set_cursor(Some(match cursor {
             Some(Cursor::Pointer) => MouseCursor::Hand,
+            Some(Cursor::Text) => MouseCursor::Text,
             Some(Cursor::Arrow) | None => MouseCursor::Arrow,
         }));
         if repaint {
@@ -1137,6 +1231,10 @@ impl TermWindow {
     /// its extended view, whichever the pointer is over. True when
     /// something in it scrolled.
     pub(crate) fn plugin_panel_wheel(&mut self, event: &MouseEvent, dx: f32, dy: f32) -> bool {
+        // Over a field of lines, its lines scroll.
+        if let Some(moved) = self.plugin_field_wheel(event, dy) {
+            return moved;
+        }
         let Some(panel) = self.right_sidebar_plugin.as_mut() else {
             return false;
         };
@@ -1212,8 +1310,12 @@ impl TermWindow {
         fonts: &PanelFonts,
         chrome: &UiPalette,
     ) -> anyhow::Result<()> {
+        // The fields as the player has them now, before what they are
+        // painted for is known.
+        shown.sync_editors();
         let key = PaintKey {
             revision: shown.player.revision(),
+            edits: shown.edits,
             origin: shown.origin,
             scale: shown.scale,
             window: (self.dimensions.pixel_width, self.dimensions.pixel_height),
@@ -1230,6 +1332,7 @@ impl TermWindow {
         {
             // Let go of the last before the next is recorded.
             shown.painted = None;
+            self.lay_out_plugin_fields(shown, fonts)?;
             let regions = self.record_plugin_panel(shown, fonts, chrome)?;
             shown.painted = Some(Painted { key, regions });
         }
@@ -1237,6 +1340,9 @@ impl TermWindow {
         for (clip, heap) in &painted.regions {
             self.lay_plugin_panel_heap(layers, heap, shown, *clip)?;
         }
+        // Blinking, and the text being composed: painted on top each time.
+        self.paint_plugin_field_caret(layers, shown, fonts, chrome)?;
+        self.sync_plugin_field_snapshot(shown);
         Ok(())
     }
 
@@ -1359,8 +1465,13 @@ impl TermWindow {
             shown.origin.0 + draw.clip.right * scale,
         );
         let spent = match draw.what {
-            Drawn::Rect(_) | Drawn::Hover(_) | Drawn::Thumb(_) => spend(budget, 1),
-            Drawn::Text(_) | Drawn::Line(_) | Drawn::Area(_) => true,
+            Drawn::Rect(_)
+            | Drawn::Hover(_)
+            | Drawn::Thumb(_)
+            | Drawn::Field(_, FieldPart::Box { .. }) => spend(budget, 1),
+            Drawn::Text(_) | Drawn::Line(_) | Drawn::Area(_) | Drawn::Field(_, FieldPart::Text) => {
+                true
+            }
         };
         if !spent {
             return Ok(());
@@ -1453,6 +1564,45 @@ impl TermWindow {
                 // A thumb across is as round as one down.
                 let radius = area.width().min(area.height()) / 2.0;
                 self.paint_panel_rect(layers, area, Some(chrome.scrollbar_thumb), None, radius)
+            }
+            // A field looks as the sidebar's search does -- round at its
+            // ends, its border and its icon before its text as that one's --
+            // but for the accent outlining the one with the keyboard: where
+            // typing goes must be plain to see.
+            Drawn::Field(field, FieldPart::Box { focused, hovered }) => {
+                let area = place(field.x, field.y, field.w, field.h);
+                let border = if focused {
+                    chrome.accent
+                } else if hovered {
+                    chrome.separator
+                } else {
+                    chrome.control_border
+                };
+                let radius = field_radius(field) * scale;
+                self.paint_panel_rect(layers, area, Some(chrome.control_bg), Some(border), radius)?;
+                let square = |x: f32, y: f32, size: f32| {
+                    let at = place(x, y, size, size);
+                    (
+                        at.min_x().round().max(0.0) as usize,
+                        at.min_y().round().max(0.0) as usize,
+                        at.width().round().max(1.0) as usize,
+                    )
+                };
+                if let Some(icon) = field_icon(field).and_then(SvgIcon::for_field) {
+                    let y = field.y + (field.h - FIELD_ICON) / 2.0;
+                    let (x, y, side) = square(field.x + FIELD_INSET, y, FIELD_ICON);
+                    self.paint_sidebar_icon(layers, icon, x, y, side, chrome.secondary_text)?;
+                }
+                // The button that empties it, while it holds something.
+                let holds = shown.editors_hold(&field.id);
+                if let Some((x, y, size)) = field_clear_at(field).filter(|_| holds) {
+                    let (x, y, side) = square(x, y, size);
+                    self.paint_sidebar_icon(layers, SvgIcon::X, x, y, side, chrome.secondary_text)?;
+                }
+                Ok(())
+            }
+            Drawn::Field(field, FieldPart::Text) => {
+                self.paint_plugin_field_text(layers, shown, field, fonts, chrome, budget)
             }
         }
     }
@@ -1809,6 +1959,7 @@ fn panel_env(fonts: &PanelFonts, chrome: &UiPalette, width: f32, height: f32, sc
         remote: None,
         can_extend: false,
         close: None,
+        features: vec![feature::FIELDS.to_string(), feature::KEYS.to_string()],
     }
 }
 
@@ -1854,6 +2005,8 @@ fn heard(shown: &mut Shown, plugin: &str, news: PanelNews) {
             shown.player.frame(frame);
             shown.status = Status::Open;
             plugins::tell_panel(shown.view, PanelRequest::Shown);
+            // The keyboard may have moved with it, or left with a field.
+            shown.tell();
             send_wanted(shown);
         }
         PanelNews::Rows(rows) => {
@@ -1867,9 +2020,11 @@ fn heard(shown: &mut Shown, plugin: &str, news: PanelNews) {
                 log::info!("plugin panel {plugin}: {reason}");
                 Status::Stopped(reason)
             };
+            shown.let_go_of_keyboard();
         }
         PanelNews::Unreachable(why) => {
             shown.status = Status::Lost(why);
+            shown.let_go_of_keyboard();
         }
         // An extended view's: it goes with its panel, which is opened again.
         PanelNews::Reconnected => {}

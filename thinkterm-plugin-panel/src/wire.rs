@@ -47,6 +47,28 @@ pub struct Env {
     /// row up with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close: Option<CloseButton>,
+    /// What the client does besides drawing and sending clicks
+    /// ([`feature`]): a plugin draws for what it has. One that does not
+    /// say `fields` leaves fields out, and one that does not say `keys`
+    /// never gives the panel the keyboard but through a field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+}
+
+/// The names of what a client can do, in [`Env::features`].
+pub mod feature {
+    /// It shows fields, and sends what is typed in them.
+    pub const FIELDS: &str = "fields";
+    /// It gives a panel the keyboard when the user asks, and sends the keys
+    /// the panel takes.
+    pub const KEYS: &str = "keys";
+}
+
+impl Env {
+    /// Whether the client says it does `feature`.
+    pub fn has(&self, feature: &str) -> bool {
+        self.features.iter().any(|has| has == feature)
+    }
 }
 
 /// The other machine the terminal beside a panel runs on.
@@ -190,9 +212,11 @@ pub struct MonoMetrics {
 }
 
 /// Something the user did in the panel. Hovering and scrolling are not
-/// among them: the player does both without asking.
+/// among them: the player does both without asking. More may come: a
+/// plugin lets be what it does not know.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Input {
     /// A press on a hit, at `x`, `y` within it.
     Click(Click),
@@ -200,6 +224,54 @@ pub enum Input {
     /// whatever the plugin does, and its panel gets no other until its
     /// frames have stopped asking for one: this is for the plugin to stop.
     Close,
+    /// What a field holds changed: typed, pasted or cut. Not sent for a
+    /// secret field.
+    Text(Typed),
+    /// The user pressed Return in a field, Command-Return in one of lines:
+    /// what it holds.
+    Submit(Typed),
+    /// The panel has the keyboard: in its field `id`, or in none of them.
+    Focus(Focus),
+    /// The keyboard went from the panel: where the user put it, or nowhere
+    /// until they do.
+    Blur,
+    /// One of the keys the panel takes ([`Frame::keys`]), pressed while it
+    /// has the keyboard. Escape gives the keyboard back, and Tab moves it
+    /// between the panel's fields: neither is sent. Nor is a key pressed
+    /// with Ctrl, Alt or Command, which are the app's, or what the field
+    /// with the keyboard uses itself.
+    ///
+    /// [`Frame::keys`]: crate::scene::Frame::keys
+    Key(Key),
+}
+
+/// A field, by its id, what it holds, and the `seq` of the text it was
+/// typed over: one the plugin has put other text in since was typed over
+/// what is gone ([`FieldText::heard`]).
+///
+/// [`FieldText::heard`]: crate::scene::FieldText::heard
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Typed {
+    pub id: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub seq: u32,
+}
+
+/// Where in a panel with the keyboard it is: in the field `id`, or none.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Focus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+/// A key, named as a browser names it, and whether Shift was held -- the
+/// one modifier sent with one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Key {
+    pub key: String,
+    #[serde(default)]
+    pub mods: Mods,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -332,6 +404,66 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<Input>(json!("close")).unwrap(),
             Input::Close
+        );
+
+        let typed = Typed {
+            id: "add".into(),
+            text: "TSM".into(),
+            seq: 0,
+        };
+        assert_eq!(
+            to_value(Input::Submit(typed.clone())).unwrap(),
+            json!({"submit": {"id": "add", "text": "TSM"}})
+        );
+        let over = Typed {
+            seq: 2,
+            ..typed.clone()
+        };
+        assert_eq!(
+            to_value(Input::Text(over)).unwrap(),
+            json!({"text": {"id": "add", "text": "TSM", "seq": 2}}),
+            "typed over the text the plugin put there the second time"
+        );
+        assert_eq!(
+            to_value(Input::Text(typed)).unwrap(),
+            json!({"text": {"id": "add", "text": "TSM"}})
+        );
+        assert_eq!(
+            to_value(Input::Focus(Focus::default())).unwrap(),
+            json!({"focus": {}}),
+            "the panel, in none of its fields"
+        );
+        assert_eq!(to_value(Input::Blur).unwrap(), json!("blur"));
+        let key: Input = serde_json::from_value(json!({"key": {"key": "ArrowDown"}})).unwrap();
+        assert_eq!(
+            key,
+            Input::Key(Key {
+                key: "ArrowDown".into(),
+                mods: Mods::default()
+            })
+        );
+    }
+
+    #[test]
+    fn an_env_says_what_its_client_does() {
+        let env: Env = serde_json::from_value(json!({
+            "width": 300, "height": 500, "scale": 2, "dark": true,
+            "small": {"size": 11, "line": 15},
+            "body": {"size": 13, "line": 18},
+            "title": {"size": 15, "line": 20},
+            "mono": {"size": 12, "line": 17, "advance": 7},
+            "features": ["fields", "someday"]
+        }))
+        .unwrap();
+        assert!(env.has(feature::FIELDS));
+        assert!(!env.has(feature::KEYS));
+        let older = Env {
+            features: Vec::new(),
+            ..env
+        };
+        assert!(
+            to_value(&older).unwrap().get("features").is_none(),
+            "a client that does none of it says nothing"
         );
     }
 

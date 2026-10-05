@@ -135,6 +135,17 @@ pub enum SvgIcon {
 }
 
 impl SvgIcon {
+    /// The icon a plugin's field names: one of those
+    /// `thinkterm_plugin_panel::FIELD_ICONS` lists.
+    pub fn for_field(name: &str) -> Option<Self> {
+        match name {
+            "search" => Some(Self::Search),
+            "plus" => Some(Self::Plus),
+            "pencil" => Some(Self::Pencil),
+            _ => None,
+        }
+    }
+
     /// The icon a plugin's panel names: one of those
     /// `thinkterm_plugin_panel::ICONS` lists, else the puzzle piece.
     pub fn for_panel(name: &str) -> Self {

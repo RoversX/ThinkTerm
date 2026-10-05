@@ -144,7 +144,7 @@ export function storedPicks(): string[] {
 /** Cmd on a Mac, Ctrl everywhere else. `navigator.platform` is deprecated
     but still the only thing every browser answers; the newer field wins
     where there is one. */
-function onMac(): boolean {
+export function onMac(): boolean {
   const data = (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData;
   return /mac|iphone|ipad|ipod/i.test(data?.platform || navigator.platform || '');
 }

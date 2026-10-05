@@ -43,6 +43,12 @@
 //! }
 //! ```
 //!
+//! Text is typed in a [`Field`](panel::Field), which ThinkTerm draws and
+//! edits itself: the plugin is sent what it holds as it changes, and when
+//! the user presses Return, and keeps it with a
+//! [`FieldText`](panel::FieldText). A panel the user gives the keyboard to
+//! is sent the keys its frame says it takes ([`Frame::keys`](panel::Frame::keys())).
+//!
 //! A panel with more to show than a sidebar has room for asks for its
 //! extended view, a wide area beside the sidebar that the user sizes, with
 //! [`Frame::extend`](panel::Frame::extend()). It comes as a view of its own,
@@ -62,7 +68,7 @@ pub mod protocol;
 pub use thinkterm_plugin_panel as panel;
 
 use anyhow::anyhow;
-use panel::{Answer, Ask, Env, Frame, Input, Item, Rows, RowsWanted};
+use panel::{Answer, Ask, Env, Focus, Frame, Input, Item, Rows, RowsWanted};
 use protocol::{FromPlugin, ToPlugin};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -100,10 +106,11 @@ pub trait Plugin: Send {
         Vec::new()
     }
 
-    /// What the user did in `view`: a click, or, in an extended view, the
-    /// close button pressed -- the view goes, and the panel is to stop
-    /// asking for it. The panel is drawn again after it, and its extended
-    /// view with it.
+    /// What the user did in `view`: a click; in an extended view, the close
+    /// button pressed -- the view goes, and the panel is to stop asking for
+    /// it; text typed in a field, or submitted; the keyboard coming or
+    /// going (`view.focus` follows it); a key the panel takes. The panel is
+    /// drawn again after it, and its extended view with it.
     fn input(&mut self, view: &View, input: Input, cx: &mut Cx) {
         let _ = (view, input, cx);
     }
@@ -149,6 +156,10 @@ pub struct View {
     /// For a panel, its extended view while one is on show: the panel is
     /// drawn again when it comes and when it goes.
     pub extension: Option<u64>,
+    /// Where the keyboard is in the view while it has it -- in which of
+    /// its fields, if any -- as the last `Input::Focus` said; `None` while
+    /// it is elsewhere.
+    pub focus: Option<Focus>,
 }
 
 impl View {
@@ -159,6 +170,7 @@ impl View {
             env,
             extends: None,
             extension: None,
+            focus: None,
         }
     }
 
@@ -549,9 +561,15 @@ impl Runner {
                 }
             }
             ToPlugin::Input { view, input } => {
-                let Some(shown) = self.views.get(&view) else {
+                let Some(shown) = self.views.get_mut(&view) else {
                     return Ok(None);
                 };
+                match &input {
+                    Input::Focus(focus) => shown.view.focus = Some(focus.clone()),
+                    Input::Blur => shown.view.focus = None,
+                    _ => {}
+                }
+                let shown = &self.views[&view];
                 let panel = shown.view.panel();
                 let mut cx = Cx::new();
                 let handled = guard(|| {
@@ -1197,6 +1215,78 @@ mod tests {
             3,
             "drawn first, so they are there"
         );
+    }
+
+    /// Keeps a field's text, and draws where the keyboard is in its view.
+    #[derive(Default)]
+    struct Typing {
+        add: panel::FieldText,
+        submitted: Vec<String>,
+    }
+
+    impl Plugin for Typing {
+        fn draw(&mut self, view: &View, frame: &mut Frame) {
+            let focus = match &view.focus {
+                None => "away".to_string(),
+                Some(Focus { id: None }) => "panel".to_string(),
+                Some(Focus { id: Some(id) }) => id.clone(),
+            };
+            frame.push(Text::new(0.0, 0.0, 10.0, 10.0, focus));
+            frame.push(self.add.field("add", 0.0, 20.0, 100.0, 24.0));
+        }
+
+        fn input(&mut self, _view: &View, input: Input, _cx: &mut Cx) {
+            match input {
+                Input::Text(typed) => {
+                    self.add.heard(&typed);
+                }
+                Input::Submit(typed) => {
+                    self.submitted.push(typed.text);
+                    self.add.clear();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn a_view_knows_where_the_keyboard_is_and_a_submit_empties_its_field() {
+        let mut plugin = Typing::default();
+        let sent = serve_all(
+            &mut plugin,
+            lines(&[
+                json!({"type": "open", "view": 1, "env": env()}),
+                json!({"type": "input", "view": 1, "input": {"focus": {"id": "add"}}}),
+                json!({"type": "input", "view": 1, "input": {"text": {"id": "add", "text": "TSM"}}}),
+                json!({"type": "input", "view": 1, "input": {"submit": {"id": "add", "text": "TSM"}}}),
+                json!({"type": "input", "view": 1, "input": "blur"}),
+            ]),
+        );
+        let drawn: Vec<(String, String, u64)> = sent
+            .iter()
+            .map(|message| {
+                let items = &message["frame"]["items"];
+                (
+                    items[0]["text"]["text"].as_str().unwrap().to_string(),
+                    items[1]["field"]["value"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                    items[1]["field"]["seq"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect();
+        assert_eq!(
+            drawn,
+            [
+                ("away".to_string(), String::new(), 0),
+                ("add".to_string(), String::new(), 0),
+                ("add".to_string(), "TSM".to_string(), 0),
+                ("add".to_string(), String::new(), 1),
+                ("away".to_string(), String::new(), 1),
+            ]
+        );
+        assert_eq!(plugin.submitted, ["TSM"]);
     }
 
     #[test]

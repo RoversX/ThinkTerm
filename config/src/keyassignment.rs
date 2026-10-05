@@ -645,6 +645,10 @@ pub enum KeyAssignment {
     /// `OpenSshHosts`, which toggles the page: this one only ever opens.
     AddRemoteHost,
     ToggleLiveOverview,
+    /// Open the right sidebar on this plugin's panel and give it the
+    /// keyboard -- in its first field, if it has one. Pressed again while
+    /// the panel has it, the keyboard goes back to the terminal.
+    FocusPluginPanel(String),
     ActivateCommandPalette,
     /// Switch this window's color scheme. `None` reverts to the configured
     /// default. Applied through the window's config_overrides, the same

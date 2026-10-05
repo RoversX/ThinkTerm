@@ -5,9 +5,12 @@
 //! the panel is drawn anew as they come.
 //!
 //! The watchlist is kept in the plugin's data directory, one symbol a
-//! line, and changed with calls:
+//! line. A symbol is added by typing it in the field at the panel's top,
+//! where a client has fields, or with a call:
 //! `thinkterm plugin call stocks '{"op":"add","symbol":"TSM"}'`, and
-//! `"remove"` the same way. docs/thinkterm/plugins.md says how to install it.
+//! `"remove"` the same way. With the keyboard in the panel, up and down
+//! pick the symbol before or after. docs/thinkterm/plugins.md says how to
+//! install it.
 
 mod market;
 mod yahoo;
@@ -18,21 +21,29 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use thinkterm_plugin_sdk::panel::{
-    Align, Area, Click, Env, Frame, Hit, Input, Item, Line, Rect, Scroll, Size, Text, Token,
+    feature, Align, Area, Click, Env, FieldText, Frame, Hit, Input, Item, Jump, Key, Line, Rect,
+    Scroll, Size, Text, Token,
 };
 use thinkterm_plugin_sdk::{Cx, Plugin, View};
 use yahoo::{Chart, Day, Range};
 
 /// Room at the panel's sides.
 const PAD: f32 = 12.0;
+/// The field a symbol is typed in to add it.
+const ADD: &str = "add";
+/// The longest symbol a watchlist keeps.
+const SYMBOL_LIMIT: u32 = 24;
 /// Where the chart's prices go, to its right.
 const SCALE_WIDTH: f32 = 56.0;
 
-/// What one panel on show has picked.
+/// What one panel on show has picked, and how many times its symbol was
+/// picked with the keys: the watchlist keeps the last in view, once for
+/// each.
 #[derive(Clone, Copy)]
 struct Pick {
     symbol: usize,
     range: Range,
+    reveal: u32,
 }
 
 impl Default for Pick {
@@ -40,6 +51,7 @@ impl Default for Pick {
         Self {
             symbol: 0,
             range: Range::Day,
+            reveal: 0,
         }
     }
 }
@@ -47,6 +59,16 @@ impl Default for Pick {
 struct Stocks {
     market: Shared,
     picks: HashMap<u64, Pick>,
+    /// What each panel's field for adding a symbol holds.
+    adding: HashMap<u64, Adding>,
+}
+
+/// A panel's field for adding a symbol, and why the last symbol typed
+/// there was not added.
+#[derive(Default)]
+struct Adding {
+    text: FieldText,
+    refused: Option<String>,
 }
 
 impl Stocks {
@@ -66,7 +88,7 @@ impl Stocks {
         let symbol = body["symbol"]
             .as_str()
             .map(|symbol| symbol.trim().to_ascii_uppercase())
-            .filter(|symbol| !symbol.is_empty() && symbol.len() <= 24)
+            .filter(|symbol| !symbol.is_empty() && symbol.len() <= SYMBOL_LIMIT as usize)
             .context("a \"symbol\" is needed, such as \"TSM\"")?;
         let removed = {
             let mut market = lock(&self.market);
@@ -117,46 +139,111 @@ impl Plugin for Stocks {
             self.want();
         }
         let pick = self.picks[&view.id];
+        let adding = view
+            .env
+            .has(feature::FIELDS)
+            .then(|| self.adding.entry(view.id).or_default());
         let market = lock(&self.market);
-        draw(&market, pick, &view.env, frame);
+        draw(&market, pick, adding.as_deref(), &view.env, frame);
     }
 
-    fn input(&mut self, view: &View, input: Input, _cx: &mut Cx) {
-        let Input::Click(Click { id, .. }) = input else {
-            return;
-        };
-        let pick = self.picks.entry(view.id).or_default();
-        if let Some(symbol) = id.strip_prefix("quote:").and_then(|at| at.parse().ok()) {
-            pick.symbol = symbol;
-        } else if let Some(range) = id
-            .strip_prefix("range:")
-            .and_then(|label| Range::ALL.into_iter().find(|range| range.label() == label))
-        {
-            pick.range = range;
+    fn input(&mut self, view: &View, input: Input, cx: &mut Cx) {
+        match input {
+            Input::Click(Click { id, .. }) => {
+                let pick = self.picks.entry(view.id).or_default();
+                if let Some(symbol) = id.strip_prefix("quote:").and_then(|at| at.parse().ok()) {
+                    pick.symbol = symbol;
+                } else if let Some(range) = id
+                    .strip_prefix("range:")
+                    .and_then(|label| Range::ALL.into_iter().find(|range| range.label() == label))
+                {
+                    pick.range = range;
+                }
+            }
+            Input::Text(typed) if typed.id == ADD => {
+                let adding = self.adding.entry(view.id).or_default();
+                if adding.text.heard(&typed) {
+                    adding.refused = None;
+                }
+            }
+            Input::Submit(typed) if typed.id == ADD => {
+                let added = self.change_watchlist(&json!({"symbol": typed.text}), true);
+                let adding = self.adding.entry(view.id).or_default();
+                match added {
+                    Ok(_) => {
+                        adding.text.clear();
+                        adding.refused = None;
+                        // The symbol typed is picked, and every panel shows it.
+                        let symbol = typed.text.trim().to_ascii_uppercase();
+                        let at = lock(&self.market)
+                            .symbols
+                            .iter()
+                            .position(|kept| *kept == symbol);
+                        if let Some(at) = at {
+                            self.picks.entry(view.id).or_default().symbol = at;
+                        }
+                        cx.redraw();
+                    }
+                    Err(err) => {
+                        adding.text.heard(&typed);
+                        adding.refused = Some(format!("{err:#}"));
+                    }
+                }
+            }
+            Input::Key(Key { key, .. }) => {
+                let count = lock(&self.market).symbols.len();
+                let pick = self.picks.entry(view.id).or_default();
+                match key.as_str() {
+                    "ArrowUp" => pick.symbol = pick.symbol.saturating_sub(1),
+                    "ArrowDown" => pick.symbol = (pick.symbol + 1).min(count.saturating_sub(1)),
+                    _ => return,
+                }
+                pick.reveal += 1;
+            }
+            _ => return,
         }
         self.want();
     }
 
     fn closed(&mut self, view: &View) {
         self.picks.remove(&view.id);
+        self.adding.remove(&view.id);
         self.want();
     }
 }
 
-/// The whole panel: the watchlist above, the picked symbol's chart below.
-fn draw(market: &Market, pick: Pick, env: &Env, frame: &mut Frame) {
+/// The whole panel: the watchlist above -- with, where the client has
+/// fields, one to add a symbol with -- the picked symbol's chart below.
+fn draw(market: &Market, pick: Pick, adding: Option<&Adding>, env: &Env, frame: &mut Frame) {
     let width = env.width;
-    let header = env.title.line + 20.0;
+    let mut header = env.title.line + 20.0;
     frame.push(
         Text::new(PAD, 10.0, width * 0.5, env.title.line, "Watchlist")
             .size(Size::Title)
             .bold(),
     );
-    let (status, color) = match &market.trouble {
-        Some(trouble) => (trouble.as_str(), Token::Negative),
-        None if market.days.is_empty() => ("Loading\u{2026}", Token::TextMuted),
-        None => ("Yahoo Finance", Token::TextFaint),
+    // Up and down pick the symbol before and after, while the panel has
+    // the keyboard.
+    frame.keys(&["ArrowUp", "ArrowDown"]);
+    let refused = adding.and_then(|adding| adding.refused.as_deref());
+    let (status, color) = match (refused, &market.trouble) {
+        (Some(refused), _) => (refused, Token::Negative),
+        (None, Some(trouble)) => (trouble.as_str(), Token::Negative),
+        (None, None) if market.days.is_empty() => ("Loading\u{2026}", Token::TextMuted),
+        (None, None) => ("Yahoo Finance", Token::TextFaint),
     };
+    if let Some(adding) = adding {
+        let tall = env.body.line + 12.0;
+        let (x, y, w) = (PAD, header - 4.0, width - PAD * 2.0);
+        let add = adding.text.field(ADD, x, y, w, tall);
+        frame.push(
+            add.placeholder("Add a symbol, such as TSM")
+                .max(SYMBOL_LIMIT)
+                .icon("plus")
+                .clear(),
+        );
+        header += tall + 4.0;
+    }
     let status = Text::new(width * 0.4, 10.0, width * 0.6 - PAD, env.title.line, status);
     frame.push(status.size(Size::Small).color(color).align(Align::Right));
 
@@ -178,7 +265,7 @@ fn draw(market: &Market, pick: Pick, env: &Env, frame: &mut Frame) {
             row,
         );
     }
-    frame.push(Scroll::new(
+    let mut quotes = Scroll::new(
         "quotes",
         0.0,
         header,
@@ -186,7 +273,17 @@ fn draw(market: &Market, pick: Pick, env: &Env, frame: &mut Frame) {
         list_height,
         count as f32 * row,
         rows,
-    ));
+    );
+    // The symbol picked with the keys, kept in view.
+    if pick.reveal > 0 {
+        let at = pick.symbol as f32 * row;
+        quotes = quotes.top(Jump {
+            to: at,
+            seq: pick.reveal,
+            through: Some(at + row),
+        });
+    }
+    frame.push(quotes);
     let top = header + list_height;
     frame.push(Rect::new(0.0, top, width, 1.0).fill(Token::Border));
 
@@ -540,6 +637,7 @@ fn main() -> std::io::Result<()> {
         Stocks {
             market,
             picks: HashMap::new(),
+            adding: HashMap::new(),
         }
     })
 }
@@ -569,6 +667,7 @@ mod tests {
             remote: None,
             can_extend: false,
             close: None,
+            features: vec![feature::FIELDS.into(), feature::KEYS.into()],
         }
     }
 
@@ -602,6 +701,7 @@ mod tests {
         let mut stocks = Stocks {
             market: shared,
             picks: HashMap::new(),
+            adding: HashMap::new(),
         };
         let view = View::new(3, env());
         let mut frame = Frame::default();
@@ -613,9 +713,10 @@ mod tests {
 
         let mut player = Player::new(env());
         player.frame(frame);
-        // The second row of the watchlist.
+        // The second row of the watchlist, below the field to add one.
         let row = env().body.line + env().small.line + 14.0;
-        let y = env().title.line + 20.0 + row * 1.5;
+        let field = env().body.line + 12.0 + 4.0;
+        let y = env().title.line + 20.0 + field + row * 1.5;
         let input = player
             .click(40.0, y, Default::default(), 1, Default::default())
             .unwrap();
@@ -653,6 +754,86 @@ mod tests {
     }
 
     #[test]
+    fn a_symbol_typed_and_submitted_is_added_and_picked_and_the_keys_move_the_pick() {
+        let mut market = Market::load(None);
+        market.symbols = vec!["A".into(), "B".into()];
+        let shared: Shared = Arc::new((Mutex::new(market), Condvar::new()));
+        let mut stocks = Stocks {
+            market: shared,
+            picks: HashMap::new(),
+            adding: HashMap::new(),
+        };
+        let view = View::new(1, env());
+        let mut frame = Frame::default();
+        stocks.draw(&view, &mut frame);
+        assert!(
+            frame
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Field(field) if field.id == ADD)),
+            "a field to add one with"
+        );
+        let typed_over = |text: &str, seq: u32| thinkterm_plugin_sdk::panel::Typed {
+            id: ADD.into(),
+            text: text.into(),
+            seq,
+        };
+        let typed = |text: &str| typed_over(text, 0);
+        stocks.input(&view, Input::Text(typed("tsm")), &mut Cx::new());
+        let mut cx = Cx::new();
+        stocks.input(&view, Input::Submit(typed("tsm")), &mut cx);
+        assert_eq!(lock(&stocks.market).symbols, ["A", "B", "TSM"]);
+        assert_eq!(stocks.picks[&1].symbol, 2, "picked");
+        assert!(cx.finish().redraw, "every panel shows it");
+        let field = |stocks: &mut Stocks| {
+            let mut frame = Frame::default();
+            stocks.draw(&view, &mut frame);
+            frame.items.into_iter().find_map(|item| match item {
+                Item::Field(field) if field.id == ADD => Some(field),
+                _ => None,
+            })
+        };
+        let cleared = field(&mut stocks).expect("the field");
+        assert_eq!(
+            (cleared.value.as_str(), cleared.seq),
+            ("", 1),
+            "emptied, once"
+        );
+        assert!(cleared.clear, "with the client's button to empty it");
+        // Typed over the text before it was emptied: the field takes the
+        // empty one, and so does the plugin.
+        stocks.input(&view, Input::Text(typed("tsmx")), &mut Cx::new());
+        assert_eq!(field(&mut stocks).unwrap().value, "");
+        stocks.input(&view, Input::Text(typed_over("ns", 1)), &mut Cx::new());
+        assert_eq!(field(&mut stocks).unwrap().value, "ns");
+
+        let key = |name: &str| {
+            Input::Key(Key {
+                key: name.into(),
+                mods: Default::default(),
+            })
+        };
+        stocks.input(&view, key("ArrowUp"), &mut Cx::new());
+        assert_eq!(stocks.picks[&1].symbol, 1);
+        stocks.input(&view, key("ArrowDown"), &mut Cx::new());
+        stocks.input(&view, key("ArrowDown"), &mut Cx::new());
+        assert_eq!(stocks.picks[&1].symbol, 2, "no further than the last");
+        // The watchlist follows the pick made with the keys.
+        let mut frame = Frame::default();
+        stocks.draw(&view, &mut frame);
+        let top = frame.items.iter().find_map(|item| match item {
+            Item::Scroll(scroll) if scroll.id == "quotes" => scroll.top,
+            _ => None,
+        });
+        assert!(top.is_some_and(|jump| jump.seq == 3 && jump.through.is_some()));
+
+        stocks.input(&view, Input::Submit(typed("")), &mut Cx::new());
+        assert!(stocks.adding[&1].refused.is_some(), "says why");
+        stocks.closed(&view);
+        assert!(stocks.adding.is_empty());
+    }
+
+    #[test]
     fn a_symbol_taken_off_leaves_the_others_picked_and_nothing_of_itself() {
         let mut market = Market::load(None);
         market.symbols = vec!["A".into(), "B".into(), "C".into()];
@@ -670,6 +851,7 @@ mod tests {
         let mut stocks = Stocks {
             market: shared,
             picks: HashMap::new(),
+            adding: HashMap::new(),
         };
         // Two panels: one on B, one on C.
         for (view, symbol) in [(1, 1), (2, 2)] {
