@@ -60,6 +60,16 @@ impl<'a> Drop for Performer<'a> {
 }
 
 impl<'a> Performer<'a> {
+    fn kitty_keyboard_enabled(&self) -> bool {
+        // Restored terminals may have negotiated Kitty with another owner.
+        // Let that session update its flags until it pops the saved state.
+        self.config.enable_kitty_keyboard()
+            || matches!(
+                self.screen().keyboard_stack.last(),
+                Some(KeyboardEncoding::Kitty(_))
+            )
+    }
+
     pub fn new(state: &'a mut TerminalState) -> Self {
         Self {
             state,
@@ -677,7 +687,7 @@ impl<'a> Performer<'a> {
                     .replace(ParagraphDirectionHint::RightToLeft);
             }
             CSI::Keyboard(Keyboard::SetKittyState { flags, mode }) => {
-                if self.config.enable_kitty_keyboard() {
+                if self.kitty_keyboard_enabled() {
                     let current_flags = match self.screen().keyboard_stack.last() {
                         Some(KeyboardEncoding::Kitty(flags)) => *flags,
                         _ => KittyKeyboardFlags::NONE,
@@ -694,7 +704,7 @@ impl<'a> Performer<'a> {
                 }
             }
             CSI::Keyboard(Keyboard::PushKittyState { flags, mode }) => {
-                if self.config.enable_kitty_keyboard() {
+                if self.kitty_keyboard_enabled() {
                     let current_flags = match self.screen().keyboard_stack.last() {
                         Some(KeyboardEncoding::Kitty(flags)) => *flags,
                         _ => KittyKeyboardFlags::NONE,
@@ -717,7 +727,7 @@ impl<'a> Performer<'a> {
                 }
             }
             CSI::Keyboard(Keyboard::QueryKittySupport) => {
-                if self.config.enable_kitty_keyboard() {
+                if self.kitty_keyboard_enabled() {
                     let flags = match self.screen().keyboard_stack.last() {
                         Some(KeyboardEncoding::Kitty(flags)) => *flags,
                         _ => KittyKeyboardFlags::NONE,

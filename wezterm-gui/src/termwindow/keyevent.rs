@@ -11,6 +11,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use termwiz::input::KeyboardEncoding;
 
+fn encode_negotiated_kitty_input(encoding: KeyboardEncoding, key: &KeyEvent) -> Option<String> {
+    if let KeyboardEncoding::Kitty(flags) = encoding {
+        Some(key.encode_kitty(flags))
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct KeyTableStateEntry {
     name: String,
@@ -213,6 +221,30 @@ mod content_view_key_routing_tests {
             OnlyKeyBindings::No,
             false
         ));
+    }
+
+    #[test]
+    fn an_imported_keyboard_protocol_is_used_without_new_negotiation() {
+        use super::*;
+        let key = KeyEvent {
+            key: KeyCode::Char('a'),
+            modifiers: Modifiers::CTRL,
+            leds: KeyboardLedStatus::default(),
+            repeat_count: 1,
+            key_is_down: true,
+            raw: None,
+            #[cfg(windows)]
+            win32_uni_char: None,
+        };
+        let flags = termwiz::escape::csi::KittyKeyboardFlags::from_bits_truncate(3);
+        assert_eq!(
+            encode_negotiated_kitty_input(KeyboardEncoding::Kitty(flags), &key),
+            Some("\x1b[97;5u".into())
+        );
+        assert_eq!(
+            encode_negotiated_kitty_input(KeyboardEncoding::Xterm, &key),
+            None
+        );
     }
 }
 
@@ -434,14 +466,10 @@ impl super::TermWindow {
     }
 
     fn encode_kitty_input(&self, pane: &Arc<dyn Pane>, key: &KeyEvent) -> Option<String> {
-        if !self.config.enable_kitty_keyboard {
-            return None;
-        }
-        if let KeyboardEncoding::Kitty(flags) = pane.get_keyboard_encoding() {
-            Some(key.encode_kitty(flags))
-        } else {
-            None
-        }
+        // The owner gates negotiation with enable_kitty_keyboard. A program
+        // imported from another terminal has already negotiated its protocol;
+        // the frontend must honor that state until the program resets it.
+        encode_negotiated_kitty_input(pane.get_keyboard_encoding(), key)
     }
 
     fn lookup_key(
