@@ -53,7 +53,7 @@ dry_run=""
 
 usage() {
   cat <<'EOF'
-ThinkTerm installer for Linux and macOS.
+Install ThinkTerm on Linux or macOS.
 
   curl -fsSL https://raw.githubusercontent.com/RoversX/thinkterm/main/install.sh | sh
 
@@ -71,10 +71,42 @@ ThinkTerm installer for Linux and macOS.
 EOF
 }
 
+ui_color=""
+err_color=""
+if [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR:-}" ]; then
+  if [ -t 1 ]; then ui_color=1; fi
+  if [ -t 2 ]; then err_color=1; fi
+fi
+color() {
+  if [ -n "$1" ]; then
+    printf '\033[%sm' "$2"
+  fi
+}
+ui_reset=$(color "$ui_color" 0)
+ui_accent=$(color "$ui_color" 36)
+ui_bold=$(color "$ui_color" 1)
+ui_dim=$(color "$ui_color" 2)
+ui_success=$(color "$ui_color" 32)
+err_reset=$(color "$err_color" 0)
+err_warning=$(color "$err_color" 33)
+err_failure=$(color "$err_color" 31)
+
 say()  { printf '%s\n' "$*"; }
-warn() { printf 'install.sh: %s\n' "$*" >&2; }
-die()  { warn "$@"; exit 1; }
+step() { printf '  %s>%s %s\n' "$ui_accent" "$ui_reset" "$*"; }
+done_message() { printf '  %s+%s %s\n' "$ui_success" "$ui_reset" "$*"; }
+warn() { printf '  %s!%s install.sh: %s\n' "$err_warning" "$err_reset" "$*" >&2; }
+die()  { printf '  %sx%s install.sh: %s\n' "$err_failure" "$err_reset" "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+banner() {
+  say
+  printf '  %s.--------.%s\n' "$ui_accent" "$ui_reset"
+  printf '  %s|        |%s\n' "$ui_accent" "$ui_reset"
+  printf '  %s|  >_    |%s  %sThinkTerm%s\n' "$ui_accent" "$ui_reset" "$ui_bold" "$ui_reset"
+  printf '  %s|        |%s  %sinstaller%s\n' "$ui_accent" "$ui_reset" "$ui_dim" "$ui_reset"
+  printf "  %s'--------'%s\n" "$ui_accent" "$ui_reset"
+  say
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -89,7 +121,7 @@ while [ $# -gt 0 ]; do
     --from)     [ $# -ge 2 ] || die "--from needs a value"; from="$2"; shift ;;
     --from=*)   from="${1#--from=}" ;;
     --dry-run)  dry_run=1 ;;
-    -h|--help)  usage; exit 0 ;;
+    -h|--help)  banner; usage; exit 0 ;;
     *) die "unknown option '$1' (try --help)" ;;
   esac
   shift
@@ -98,6 +130,8 @@ done
 [ -n "$prefix" ] || die "--prefix needs a directory"
 bindir="$prefix/bin"
 sharedir="$prefix/share"
+
+banner
 
 # ---- platform --------------------------------------------------------------
 
@@ -117,6 +151,7 @@ case "$os/$arch" in
   macos/aarch64) arch=arm64 ;;
   *) die "no build for $os on '$arch'" ;;
 esac
+step "detected $os/$arch"
 [ "$os" = macos ] || [ -z "$app_dir_opt" ] || warn "--app-dir only applies on macOS; ignored"
 
 # ---- what is already here --------------------------------------------------
@@ -149,10 +184,11 @@ if [ -z "$variant" ]; then
     if [ -n "$prev_variant" ]; then
       printf '%s\n' "ThinkTerm $prev_variant${prev_version:+ $prev_version} is installed under $prefix." > /dev/tty
     fi
-    printf '%s\n' "Which ThinkTerm do you want on this machine?" \
-      "  1) desktop  GUI + CLI + TUI + mux server" \
-      "  2) server   CLI + TUI + mux server, no GUI (headless hosts, SSH targets)" > /dev/tty
-    printf '%s' "Choice [1/2]: " > /dev/tty
+    printf '\n%s\n' "  Which ThinkTerm do you want on this machine?" > /dev/tty
+    printf '%s\n' \
+      "    1) desktop  GUI + CLI + TUI + mux server" \
+      "    2) server   CLI + TUI + mux server, no GUI (headless hosts, SSH targets)" > /dev/tty
+    printf '%s' "  Choice [1/2]: " > /dev/tty
     read -r choice < /dev/tty || choice=""
     case "$choice" in
       1 | d | desktop) variant=desktop ;;
@@ -163,9 +199,11 @@ if [ -z "$variant" ]; then
     die "pass --desktop (GUI + CLI + TUI + mux server) or --server (the same without the GUI)"
   fi
 fi
+step "selected $variant"
 
 # ---- preflight -------------------------------------------------------------
 
+step "checking requirements..."
 if [ "$os" = linux ]; then
   # The binaries link against glibc; musl (Alpine) cannot run them at all,
   # and an older glibc fails at load time with a message that blames a
@@ -243,9 +281,11 @@ asset_name() {
 
 if [ -z "$from" ]; then
   if [ -n "$tag" ]; then
+    step "fetching release $tag..."
     release_json=$(fetch "$api/tags/$tag") \
       || die "release '$tag' not found at https://github.com/$repo/releases"
   else
+    step "fetching latest release..."
     release_json=$(fetch "$api/latest") \
       || die "could not look up the latest release (is the network up? does https://github.com/$repo have a release yet?)"
     tag=$(printf '%s' "$release_json" | sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
@@ -303,7 +343,7 @@ else
   fi
 fi
 
-say "ThinkTerm $variant${version:+ $version} for $os-$arch"
+step "ThinkTerm${version:+ $version} ($variant)"
 if [ -n "$prev_variant" ]; then
   case "$prev_variant/$variant" in
     server/desktop)  say "  was:    server${prev_version:+ $prev_version}; adding the GUI, everything else is kept" ;;
@@ -323,7 +363,8 @@ if [ -z "$from" ] && [ -z "$digest" ]; then
 fi
 
 if [ -n "$dry_run" ]; then
-  say "dry run: stopping here"
+  say
+  done_message "dry run complete. No files were changed."
   exit 0
 fi
 
@@ -348,13 +389,14 @@ if [ -n "$from" ]; then
   archive="$from"
 else
   archive="$tmp/$asset"
-  say "downloading..."
+  step "downloading${version:+ $version}..."
   if [ -n "$asset_api_url" ]; then
     fetch -H "Accept: application/octet-stream" -o "$archive" "$asset_api_url" || die "download failed: $asset_api_url"
   else
     fetch -o "$archive" "$url" || die "download failed: $url"
   fi
   if [ -n "$digest" ]; then
+    step "verifying SHA-256..."
     if got=$(sha256 "$archive"); then
       [ "$got" = "$digest" ] || die "checksum mismatch for $asset
   expected $digest
@@ -366,6 +408,7 @@ The download is corrupt or has been tampered with; nothing was installed."
   fi
 fi
 
+step "unpacking..."
 mkdir "$tmp/x"
 case "$os" in
   linux)
@@ -446,6 +489,7 @@ lib_package() {
 
 # ---- install ---------------------------------------------------------------
 
+step "installing files..."
 mkdir -p "$bindir" "$sharedir/thinkterm" \
   "$sharedir/bash-completion/completions" \
   "$sharedir/zsh/site-functions" \
@@ -467,9 +511,6 @@ case "$os" in
     src_doc="$root/Contents/Resources"
     ;;
 esac
-
-say
-say "installed:"
 
 if [ "$os" = macos ]; then
   # The bundle is moved whole so the signature and notarization ticket stay
@@ -657,4 +698,13 @@ if [ "$variant" = server ]; then
   if [ "$os" = linux ]; then
     say "To keep it running after you log out from SSH: \`loginctl enable-linger \$USER\`."
   fi
+fi
+
+say
+if [ -n "$missing_libs" ]; then
+  done_message "installed. The desktop app needs the libraries listed above."
+elif [ "$variant" = server ]; then
+  done_message "ready. Run 'thinkterm tui' to get started."
+else
+  done_message "ready. Run 'thinkterm' to get started."
 fi
