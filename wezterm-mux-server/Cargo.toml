@@ -16,6 +16,8 @@ path = "src/main.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+thinkterm-import-herdr.workspace = true
+thinkterm-import.workspace = true
 anyhow.workspace = true
 async_ossl.workspace = true
 clap.workspace = true

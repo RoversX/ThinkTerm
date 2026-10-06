@@ -2446,6 +2446,10 @@ impl Client {
         MutateThinkTermTree,
         ThinkTermTreeState
     );
+    rpc!(get_import_session_status, GetImportSessionStatus, GetImportSessionStatusResponse);
+    rpc!(import_session, ImportSessionRequest, ImportSessionResponse);
+    rpc!(list_import_sessions, ListImportSessions, ListImportSessionsResponse);
+    rpc!(preview_import_session, PreviewImportSession, PreviewImportSessionResponse);
     rpc!(
         get_thinkterm_session_state,
         GetThinkTermSessionState = (),

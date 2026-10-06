@@ -9,6 +9,8 @@ pub mod connections;
 pub mod dispatch;
 #[cfg(unix)]
 pub mod handoff;
+#[cfg(unix)]
+pub mod session_import;
 pub mod local;
 pub mod pki;
 mod plugin_relay;

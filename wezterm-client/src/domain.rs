@@ -3339,6 +3339,58 @@ impl ClientDomain {
         Ok(ResyncOutcome::NoClient)
     }
 
+    pub async fn list_import_sessions(
+        &self,
+        source: String,
+    ) -> anyhow::Result<codec::ListImportSessionsResponse> {
+        let inner = self.inner().ok_or_else(|| anyhow!("domain is not attached"))?;
+        inner
+            .client
+            .list_import_sessions(codec::ListImportSessions { source })
+            .await
+    }
+
+    pub async fn preview_import_session(
+        &self,
+        source: String,
+        session: String,
+    ) -> anyhow::Result<codec::PreviewImportSessionResponse> {
+        let inner = self.inner().ok_or_else(|| anyhow!("domain is not attached"))?;
+        inner
+            .client
+            .preview_import_session(codec::PreviewImportSession { source, session })
+            .await
+    }
+
+    pub async fn get_import_session_status(
+        &self,
+        request_id: String,
+    ) -> anyhow::Result<codec::ImportSessionStatus> {
+        let inner = self.inner().ok_or_else(|| anyhow!("domain is not attached"))?;
+        Ok(inner
+            .client
+            .get_import_session_status(codec::GetImportSessionStatus { request_id })
+            .await?
+            .status)
+    }
+
+    pub async fn import_session(
+        &self,
+        request: codec::ImportSessionRequest,
+    ) -> anyhow::Result<codec::ImportSessionResponse> {
+        let inner = self.inner().ok_or_else(|| anyhow!("domain is not attached"))?;
+        let response = inner.client.import_session(request).await?;
+        // A committed handoff is successful even if a subsequent refresh
+        // loses the connection. Reattaching recovers the owner's new panes.
+        if let Err(err) = self.fetch_thinkterm_tree().await {
+            log::warn!("refreshing the tree after session import: {err:#}");
+        }
+        if let Err(err) = self.resync_after_mutation().await {
+            log::warn!("refreshing panes after session import: {err:#}");
+        }
+        Ok(response)
+    }
+
     /// Send mutations of the server's ThinkTerm sidebar tree, hand the
     /// authoritative result to the sink and return it to the initiating
     /// workflow.  Returning the tree lets destructive callers wait for an

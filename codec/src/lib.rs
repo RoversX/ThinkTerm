@@ -43,6 +43,12 @@ use wezterm_term::color::ColorPalette;
 use wezterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
 
 pub mod thinkterm_tree;
+pub mod import;
+pub use import::{
+    GetImportSessionStatus, GetImportSessionStatusResponse, ImportSessionRequest,
+    ImportSessionResponse, ImportSessionStatus, ListImportSessions, ListImportSessionsResponse,
+    PreviewImportSession, PreviewImportSessionResponse,
+};
 pub mod kitty_queue;
 pub mod kitty_metadata;
 pub use thinkterm_tree::{
@@ -776,7 +782,11 @@ macro_rules! pdu {
 /// 74: The mux that owns a pane reports the program leading its terminal
 ///     (ForegroundProgramChanged), with a request/response pair for
 ///     cold-start delivery, so a client can show what a remote pane runs.
-pub const CODEC_VERSION: usize = 74;
+/// 75: Import a local session into the owning mux.
+/// 76: Source-independent session import requests with explicit import modes.
+/// 77: Discover and preview import sessions on their owning mux server.
+/// 78: Durable import request identities and reconnectable result queries.
+pub const CODEC_VERSION: usize = 78;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -877,6 +887,14 @@ pdu! {
     ForegroundProgramChanged: 100,
     GetForegroundPrograms: 101,
     GetForegroundProgramsResponse: 102,
+    ImportSessionRequest: 103,
+    ImportSessionResponse: 104,
+    ListImportSessions: 105,
+    ListImportSessionsResponse: 106,
+    PreviewImportSession: 107,
+    PreviewImportSessionResponse: 108,
+    GetImportSessionStatus: 109,
+    GetImportSessionStatusResponse: 110,
 }
 
 impl Pdu {
@@ -2992,7 +3010,7 @@ mod test {
         // The exact assertion is the tripwire: whoever bumps the codec must
         // come here, confirm the round-trips still cover the new version,
         // and advance it deliberately.
-        assert_eq!(CODEC_VERSION, 74);
+        assert_eq!(CODEC_VERSION, 78);
         use thinkterm_proto::{AgentEvidence, AgentState, AgentStatus};
 
         fn round_trip(pdu: Pdu) {
@@ -3033,7 +3051,7 @@ mod test {
     #[test]
     fn foreground_program_protocol_round_trip_at_version_74() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 74);
+        assert_eq!(CODEC_VERSION, 78);
         use thinkterm_proto::ForegroundProgram;
 
         fn round_trip(pdu: &Pdu) -> Pdu {
@@ -3135,7 +3153,7 @@ mod test {
     fn frame_control_extension_round_trips_without_changing_legacy_version() {
         // The extension is asked for, so it needed no bump of its own; 74
         // is the foreground program's, which a server sends unasked.
-        assert_eq!(CODEC_VERSION, 74);
+        assert_eq!(CODEC_VERSION, 78);
         for pdu in [
             Pdu::GetKittyImage(GetKittyImage { pane_id: 3, image_id: 7, data_hash: [9; 32], have_frames: 2, image_epoch: Some(4) }),
             Pdu::GetKittyFrameSelections(GetKittyFrameSelections { pane_id: 3, subscribe: true }),

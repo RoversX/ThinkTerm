@@ -1072,6 +1072,12 @@ pub enum ConnectionPeer {
     Web(WebPeer),
 }
 
+fn peer_may_import_sessions(peer: &ConnectionPeer) -> bool {
+    // SSH proxies reach the Unix socket as its user; mTLS identifies the
+    // same account. Web tokens retain their narrower RPC allowlist.
+    matches!(peer, ConnectionPeer::Local | ConnectionPeer::Tls)
+}
+
 /// A browser connection admitted by `web_auth`. The identity it presents
 /// in `SetClientId` is overwritten with this, so `cli list-clients` shows
 /// the token that let it in rather than whatever the page claimed.
@@ -2172,6 +2178,97 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::ListImportSessions(request) => {
+                if !peer_may_import_sessions(&self.peer) {
+                    send_response(Err(anyhow!(
+                        "Session import requires an authenticated desktop connection"
+                    )));
+                    return;
+                }
+                #[cfg(unix)]
+                smol::spawn(async move {
+                    let result = promise::spawn::spawn_into_new_thread(move || {
+                        crate::session_import::discover(request)
+                    })
+                    .await;
+                    send_response(result.map(Pdu::ListImportSessionsResponse));
+                })
+                .detach();
+                #[cfg(not(unix))]
+                {
+                    let _ = request;
+                    send_response(Err(anyhow!("Session import is supported on macOS and Linux")));
+                }
+            }
+
+            Pdu::PreviewImportSession(request) => {
+                if !peer_may_import_sessions(&self.peer) {
+                    send_response(Err(anyhow!(
+                        "Session import requires an authenticated desktop connection"
+                    )));
+                    return;
+                }
+                #[cfg(unix)]
+                smol::spawn(async move {
+                    let result = promise::spawn::spawn_into_new_thread(move || {
+                        crate::session_import::preview(request)
+                    })
+                    .await;
+                    send_response(result.map(Pdu::PreviewImportSessionResponse));
+                })
+                .detach();
+                #[cfg(not(unix))]
+                {
+                    let _ = request;
+                    send_response(Err(anyhow!("Session import is supported on macOS and Linux")));
+                }
+            }
+
+            Pdu::GetImportSessionStatus(request) => {
+                if !peer_may_import_sessions(&self.peer) {
+                    send_response(Err(anyhow!("Session import requires an authenticated desktop connection")));
+                    return;
+                }
+                #[cfg(unix)]
+                spawn_into_main_thread(async move {
+                    send_response(crate::session_import::status(&request.request_id).map(|status| {
+                        Pdu::GetImportSessionStatusResponse(codec::GetImportSessionStatusResponse { status })
+                    }));
+                }).detach();
+                #[cfg(not(unix))]
+                {
+                    let _ = request;
+                    send_response(Err(anyhow!("Session import is supported on macOS and Linux")));
+                }
+            }
+
+            Pdu::ImportSessionRequest(request) => {
+                if !peer_may_import_sessions(&self.peer) {
+                    send_response(Err(anyhow!(
+                        "Session import requires an authenticated desktop connection"
+                    )));
+                    return;
+                }
+                #[cfg(unix)]
+                spawn_into_main_thread(async move {
+                    promise::spawn::spawn(async move {
+                        let result = crate::session_import::execute(request, |tree, add, _layouts| {
+                            crate::thinkterm_tree::mutate(&crate::session_import::tree_ops(tree, add))
+                                .map(|_| ())
+                        })
+                        .await;
+                        send_response(result.map(Pdu::ImportSessionResponse));
+                    })
+                    .detach();
+                })
+                .detach();
+                #[cfg(not(unix))]
+                {
+                    let _ = request;
+                    send_response(Err(anyhow!("Session import is supported on macOS and Linux")));
+                }
+            }
+
             Pdu::MutateThinkTermTree(MutateThinkTermTree { ops }) => {
                 // mutate() broadcasts to every connection when the batch
                 // changed something; the direct response here is what lets the
@@ -2793,6 +2890,10 @@ impl SessionHandler {
             | Pdu::MovePaneToNewTabResponse { .. }
             | Pdu::TabAddedToWindow { .. }
             | Pdu::GetPaneRenderableDimensionsResponse { .. }
+            | Pdu::ListImportSessionsResponse { .. }
+            | Pdu::PreviewImportSessionResponse { .. }
+            | Pdu::ImportSessionResponse { .. }
+            | Pdu::GetImportSessionStatusResponse { .. }
             | Pdu::ThinkTermTreeState { .. }
             | Pdu::ThinkTermSessionState { .. }
             | Pdu::EnsureThinkTermThreadResponse { .. }
@@ -2825,13 +2926,15 @@ where
 }
 
 async fn ensure_thinkterm_thread(request: EnsureThinkTermThread) -> anyhow::Result<Pdu> {
-    let _materialize = THINKTERM_MATERIALIZE.lock().await;
     let mux = Mux::get();
     // No identity is installed here on purpose: every workspace name on this
     // path is explicit (`landing.workspace`), and a guard held across the
     // awaits below would leak the requesting identity to unrelated
     // main-thread work. See `Mux::with_identity`.
     let landing = crate::thinkterm_tree::ensure_landing(request.preferred_thread_id.as_deref())?;
+    #[cfg(unix)]
+    crate::session_import::wait_for_workspace(&landing.workspace).await?;
+    let _materialize = THINKTERM_MATERIALIZE.lock().await;
 
     let has_live_pane = mux
         .iter_windows_in_workspace(&landing.workspace)
@@ -3028,6 +3131,8 @@ async fn split_pane(split: SplitPane) -> anyhow::Result<Pdu> {
 }
 
 async fn domain_spawn_v2(spawn: SpawnV2) -> anyhow::Result<Pdu> {
+    #[cfg(unix)]
+    crate::session_import::ensure_not_pending(&spawn.workspace)?;
     let mux = Mux::get();
     // No identity: `spawn.workspace` is an explicit non-optional string on
     // the wire, so `spawn_tab_or_window` never falls back to the ambient

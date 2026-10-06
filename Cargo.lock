@@ -1137,6 +1137,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "termwiz 0.24.0",
+ "thinkterm-import",
  "thinkterm-proto",
  "thiserror 1.0.69",
  "varbincode",
@@ -8546,6 +8547,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkterm-import"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "thinkterm-import-herdr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "config",
+ "log",
+ "nix 0.29.0",
+ "rustix 1.1.2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thinkterm-import",
+ "uuid",
+ "wezterm-term",
+]
+
+[[package]]
 name = "thinkterm-mobile"
 version = "0.1.0"
 dependencies = [
@@ -10620,6 +10648,8 @@ dependencies = [
  "thinkterm-core",
  "thinkterm-file-index",
  "thinkterm-i18n",
+ "thinkterm-import",
+ "thinkterm-import-herdr",
  "thinkterm-plugin-channel",
  "thinkterm-plugin-panel",
  "thinkterm-proto",
@@ -10712,6 +10742,8 @@ dependencies = [
  "promise",
  "signal-hook",
  "smol",
+ "thinkterm-import",
+ "thinkterm-import-herdr",
  "umask",
  "wezterm-blob-leases 0.1.1",
  "wezterm-gui-subcommands",
@@ -10748,6 +10780,7 @@ dependencies = [
  "promise",
  "rangeset",
  "rcgen",
+ "rustix 1.1.2",
  "serde",
  "serde_json",
  "sha1 0.10.6",
@@ -10756,6 +10789,7 @@ dependencies = [
  "soketto",
  "tempfile",
  "termwiz 0.24.0",
+ "thinkterm-import",
  "thinkterm-plugin-channel",
  "thinkterm-proto",
  "url",

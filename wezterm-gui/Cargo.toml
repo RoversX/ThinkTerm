@@ -44,6 +44,8 @@ cc.workspace = true
 embed-resource.workspace = true
 
 [dependencies]
+thinkterm-import-herdr.workspace = true
+thinkterm-import.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 bitflags.workspace = true

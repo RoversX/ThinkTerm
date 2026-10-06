@@ -1,0 +1,22 @@
+[package]
+name = "thinkterm-import-herdr"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[target.'cfg(unix)'.dependencies]
+anyhow.workspace = true
+log.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thinkterm-import.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+rustix = { version = "1.1.2", features = ["net", "termios", "fs", "process"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true, features = ["term", "socket"] }
+
+config.workspace = true
+wezterm-term.workspace = true

@@ -92,6 +92,13 @@ struct Opt {
 }
 
 fn main() {
+    #[cfg(unix)]
+    {
+        thinkterm_import_herdr::register().expect("register built-in session importer");
+        if let Some(result) = thinkterm_import::maybe_run_helper() {
+            std::process::exit(if result.is_ok() { 0 } else { 1 });
+        }
+    }
     if let Err(err) = run() {
         wezterm_blob_leases::clear_storage();
         log::error!("{:#}", err);

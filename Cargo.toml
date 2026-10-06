@@ -11,6 +11,8 @@ members = [
   "thinkterm-font-core",
   "thinkterm-font-web",
   "thinkterm-i18n",
+  "thinkterm-import",
+  "thinkterm-import-herdr",
   "thinkterm-proto",
   "thinkterm-render",
   "thinkterm-mobile",
@@ -186,6 +188,8 @@ thinkterm-file-index = { path = "thinkterm-file-index" }
 thinkterm-font-core = { path = "thinkterm-font-core" }
 thinkterm-font-web = { path = "thinkterm-font-web" }
 thinkterm-i18n = { path = "thinkterm-i18n" }
+thinkterm-import = { path = "thinkterm-import" }
+thinkterm-import-herdr = { path = "thinkterm-import-herdr" }
 thinkterm-plugin-channel = { path = "thinkterm-plugin-channel", default-features = false }
 thinkterm-plugin-panel = { path = "thinkterm-plugin-panel" }
 thinkterm-plugin-sdk = { path = "thinkterm-plugin-sdk" }

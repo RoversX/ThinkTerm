@@ -1,0 +1,12 @@
+[package]
+name = "thinkterm-import"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+serde = { workspace = true, features = ["derive", "std"] }
+
+[dev-dependencies]
+serde_json.workspace = true
