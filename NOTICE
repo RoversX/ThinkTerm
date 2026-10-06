@@ -141,6 +141,12 @@ license is:
   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
   SOFTWARE.
 
+This product also embeds the Herdr logo from assets/logo.svg in the Herdr
+project, licensed under the Apache License, Version 2.0. The unmodified
+logo is included at third_party/herdr/logo.svg, and the full license at
+third_party/herdr/LICENSE. See third_party/herdr/README for the upstream
+commit.
+
 Brand marks and logos appearing in this product are trademarks of their
 respective owners. They are used solely to identify the corresponding
 product or service (nominative use) and imply no affiliation with or

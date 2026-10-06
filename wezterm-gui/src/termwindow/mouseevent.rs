@@ -5376,7 +5376,7 @@ impl super::TermWindow {
     ) {
         context.set_cursor(Some(MouseCursor::Hand));
         if event.kind == WMEK::Press(MousePress::Left) {
-            crate::settings_window::show();
+            crate::settings_window::show_from(self.mux_window_id, &self.active_space_id);
         }
     }
 

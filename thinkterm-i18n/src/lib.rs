@@ -247,6 +247,24 @@ pub fn native_name_for_locale(locale: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_import_strings_format_for_every_source_and_locale() {
+        let mut args = FluentArgs::new();
+        for (name, value) in [("source", "Example"), ("host", "server-a"), ("threads", "2"), ("tabs", "3"), ("panes", "4"), ("count", "4")] {
+            args.set(name, value);
+        }
+        for &locale in SUPPORTED_LOCALES {
+            for key in ["session-import-title", "session-import-done-live", "session-import-project-meta", "session-import-error-import", "session-import-location-local", "session-import-location-remote", "session-import-requirements-remote", "session-import-check-result", "session-import-still-running", "session-import-result-interrupted", "session-import-result-unavailable"] {
+                let catalog = &catalogs().locales[locale.index()];
+                let message = catalog.bundle.get_message(key).unwrap();
+                let mut errors = vec![];
+                let value = catalog.bundle.format_pattern(message.value().unwrap(), Some(&args), &mut errors);
+                assert!(errors.is_empty(), "{}: {}: {:?}", locale.code, key, errors);
+                assert!(!value.is_empty());
+            }
+        }
+    }
+
     use super::*;
     use std::collections::BTreeSet;
 

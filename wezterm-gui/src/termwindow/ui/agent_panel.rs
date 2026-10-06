@@ -525,7 +525,7 @@ impl TermWindow {
                 });
             }
             AgentPanelAction::OpenSettings => {
-                crate::settings_window::show();
+                crate::settings_window::show_from(self.mux_window_id, &self.active_space_id);
             }
             AgentPanelAction::Reveal(pane_id) => {
                 self.reveal_agent_pane(pane_id);

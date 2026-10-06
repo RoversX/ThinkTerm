@@ -1342,6 +1342,98 @@ pub fn create_space(name: Option<String>) -> SpaceId {
     id
 }
 
+#[cfg(unix)]
+pub(crate) fn persist_session_import(
+    tree: &codec::ThinkTermTree,
+    add: bool,
+    layouts: &[wezterm_mux_server_impl::session_import::ImportedThreadLayout],
+) -> Result<()> {
+    anyhow::ensure!(
+        !STORE_IS_UNREADABLE.load(Ordering::Acquire),
+        "The ThinkTerm workspace store could not be read"
+    );
+    let mut store = THREAD_STORE.lock();
+    let candidate = store_with_session_import(&store, tree, add, layouts)?;
+    let mut saved = Ok(());
+    THREAD_STORE_WRITES.write_if_newest(THREAD_STORE_WRITES.claim(), || {
+        saved = save_workspace_thread_store(&candidate);
+        saved.is_ok()
+    });
+    saved?;
+    *store = candidate;
+    drop(store);
+    publish_thinkterm_session_changed();
+    Ok(())
+}
+
+#[cfg(unix)]
+fn store_with_session_import(
+    store: &WorkspaceThreadStore,
+    tree: &codec::ThinkTermTree,
+    add: bool,
+    layouts: &[wezterm_mux_server_impl::session_import::ImportedThreadLayout],
+) -> Result<WorkspaceThreadStore> {
+    let mut candidate = store.clone();
+    if add {
+        anyhow::ensure!(
+            tree.spaces
+                .iter()
+                .all(|space| !candidate.has_space(&space.id)),
+            "Imported Space already exists"
+        );
+        candidate.ingest_host_tree(tree, None);
+        for project in &tree.projects {
+            for imported in &project.threads {
+                let layout = layouts
+                    .iter()
+                    .find(|layout| layout.thread_id == imported.id)
+                    .context("Imported thread layout is missing")?;
+                anyhow::ensure!(
+                    !layout.tabs.is_empty() && layout.active_tab < layout.tabs.len(),
+                    "Imported thread layout is invalid"
+                );
+                let snapshot = WorkspaceThreadLayoutSnapshot {
+                    active_tab: layout.active_tab,
+                    tabs: layout
+                        .tabs
+                        .iter()
+                        .map(serde_json::to_value)
+                        .collect::<Result<_, _>>()?,
+                    terminal_specs: layout
+                        .tabs
+                        .iter()
+                        .flat_map(|tab| tab.entries())
+                        .map(|entry| TerminalSpecEntry {
+                            pane_id: entry.pane_id,
+                            spec: TerminalSpawnSpec {
+                                cwd: working_dir_from_entry(entry),
+                                domain: Some("local".into()),
+                                title: entry.title.clone(),
+                            },
+                            font_scale: None,
+                        })
+                        .collect(),
+                    strict_cwd_spawns: true,
+                };
+                let thread = candidate
+                    .projects
+                    .iter_mut()
+                    .flat_map(|project| &mut project.threads)
+                    .find(|thread| thread.id == imported.id)
+                    .context("Imported thread is missing")?;
+                thread.layout = Some(snapshot);
+            }
+        }
+    } else {
+        let imported = |id: &str| tree.spaces.iter().any(|space| space.id == id);
+        candidate.spaces.retain(|space| !imported(&space.id));
+        candidate
+            .projects
+            .retain(|project| !imported(&project.space_id));
+    }
+    Ok(candidate)
+}
+
 pub fn add_thread_ref(collection_space_id: &str, thread_id: &str) -> bool {
     let mut store = THREAD_STORE.lock();
     store.normalize_after_load();
@@ -3009,6 +3101,8 @@ pub(crate) async fn materialize_thread(
     // *from* this materialization, and no window is worse than the wrong cwd.
     strict_project_cwd: bool,
 ) -> Result<ThreadMaterializationOutcome> {
+    #[cfg(unix)]
+    wezterm_mux_server_impl::session_import::wait_for_workspace(&workspace_name).await?;
     let mux = Mux::get();
     if !mux.iter_windows_in_workspace(&workspace_name).is_empty() {
         return Ok(ThreadMaterializationOutcome::AlreadyLive);
@@ -3221,6 +3315,8 @@ pub async fn materialize_thread_spawn(
     size: TerminalSize,
     term_config: Arc<dyn TerminalConfiguration>,
 ) -> Result<()> {
+    #[cfg(unix)]
+    wezterm_mux_server_impl::session_import::wait_for_workspace(&workspace_name).await?;
     let mux = Mux::get();
     if !mux.iter_windows_in_workspace(&workspace_name).is_empty() {
         return Ok(());
@@ -13189,6 +13285,156 @@ mod tests {
         }
         tree.revision = 3;
         tree
+    }
+
+    #[cfg(unix)]
+    fn import_layout_fixture() -> (
+        codec::ThinkTermTree,
+        Vec<wezterm_mux_server_impl::session_import::ImportedThreadLayout>,
+    ) {
+        let mut tree = codec::ThinkTermTree::default();
+        codec::apply_op(
+            &mut tree,
+            &codec::TreeOp::CreateSpace {
+                space_id: "imported-space".into(),
+                name: "Example".into(),
+            },
+        );
+        let mut layouts = Vec::new();
+        for project_index in 0..2 {
+            let project_id = format!("imported-project-{project_index}");
+            codec::apply_op(
+                &mut tree,
+                &codec::TreeOp::CreateProject {
+                    project_id: project_id.clone(),
+                    space_id: "imported-space".into(),
+                    name: "example".into(),
+                    path: "/home/user/example".into(),
+                },
+            );
+            for thread_index in 0..2 {
+                let thread_id = format!("imported-thread-{project_index}-{thread_index}");
+                let workspace = format!("thinkterm:{project_id}:{thread_id}");
+                codec::apply_op(
+                    &mut tree,
+                    &codec::TreeOp::CreateThread {
+                        thread_id: thread_id.clone(),
+                        project_id: project_id.clone(),
+                        name: "example".into(),
+                        workspace: Some(workspace.clone()),
+                        created_at: 1,
+                    },
+                );
+                let entry = |index: usize| PaneEntry {
+                    window_id: project_index * 2 + thread_index,
+                    tab_id: index / 2,
+                    pane_id: (project_index * 2 + thread_index) * 4 + index,
+                    title: format!("shell-{index}"),
+                    size: TerminalSize::default(),
+                    working_dir: Some(
+                        url::Url::parse(&format!("file:///home/user/example/pane-{index}"))
+                            .unwrap()
+                            .into(),
+                    ),
+                    is_active_pane: index == 3,
+                    is_zoomed_pane: index == 3,
+                    alt_screen: false,
+                    workspace: workspace.clone(),
+                    cursor_pos: Default::default(),
+                    physical_top: 0,
+                    top_row: 0,
+                    left_col: 0,
+                    tty_name: None,
+                };
+                layouts.push(
+                    wezterm_mux_server_impl::session_import::ImportedThreadLayout {
+                        thread_id,
+                        active_tab: 1,
+                        tabs: vec![
+                            PaneNode::Split {
+                                left: Box::new(PaneNode::Leaf(entry(0))),
+                                right: Box::new(PaneNode::Leaf(entry(1))),
+                                node: mux::tab::SplitDirectionAndSize {
+                                    direction: SplitDirection::Horizontal,
+                                    first: TerminalSize {
+                                        cols: 30,
+                                        ..TerminalSize::default()
+                                    },
+                                    second: TerminalSize {
+                                        cols: 89,
+                                        ..TerminalSize::default()
+                                    },
+                                },
+                            },
+                            PaneNode::Stack(PaneStackEntry {
+                                panes: vec![entry(2), entry(3)],
+                                active: 1,
+                                pane_stack_id: None,
+                            }),
+                        ],
+                    },
+                );
+            }
+        }
+        (tree, layouts)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn imported_import_appends_and_rolls_back_only_its_own_rows() {
+        let store = host_test_store();
+        let (tree, layouts) = import_layout_fixture();
+        let imported = store_with_session_import(&store, &tree, true, &layouts).unwrap();
+        assert_eq!(imported.spaces.len(), store.spaces.len() + 1);
+        assert_eq!(imported.projects.len(), store.projects.len() + 2);
+        assert!(store_with_session_import(&imported, &tree, true, &layouts).is_err());
+        assert!(store_with_session_import(&store, &tree, true, &layouts[..3]).is_err());
+        let rolled_back = store_with_session_import(&imported, &tree, false, &[]).unwrap();
+        assert_eq!(rolled_back, store);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unopened_imported_threads_keep_every_layout_after_reload() {
+        let (tree, layouts) = import_layout_fixture();
+        // No mux windows or GUI snapshots: quit immediately after import.
+        let imported =
+            store_with_session_import(&host_test_store(), &tree, true, &layouts).unwrap();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("workspace_threads.json");
+        save_workspace_thread_store_to_path(&path, &imported).unwrap();
+        let loaded = load_workspace_thread_store_from_path(&path).unwrap();
+        for expected in &layouts {
+            let thread = loaded
+                .projects
+                .iter()
+                .flat_map(|project| &project.threads)
+                .find(|thread| thread.id == expected.thread_id)
+                .unwrap();
+            let snapshot = thread
+                .layout
+                .as_ref()
+                .expect("unopened thread has a saved layout");
+            assert_eq!(snapshot.active_tab, 1);
+            assert!(snapshot.strict_cwd_spawns);
+            let tabs = decode_layout_tabs(
+                thread.materialized_workspace_name.as_deref().unwrap(),
+                snapshot,
+            )
+            .expect("restart can decode the saved tabs");
+            assert_eq!(
+                serde_json::to_value(&tabs).unwrap(),
+                serde_json::to_value(&expected.tabs).unwrap()
+            );
+            let entries: Vec<_> = expected.tabs.iter().flat_map(|tab| tab.entries()).collect();
+            assert_eq!(snapshot.terminal_specs.len(), 4);
+            for (spec, entry) in snapshot.terminal_specs.iter().zip(entries) {
+                assert_eq!(spec.pane_id, entry.pane_id);
+                assert_eq!(spec.spec.cwd, working_dir_from_entry(entry));
+                assert_eq!(spec.spec.domain.as_deref(), Some("local"));
+                assert_eq!(spec.spec.title, entry.title);
+            }
+        }
     }
 
     #[test]

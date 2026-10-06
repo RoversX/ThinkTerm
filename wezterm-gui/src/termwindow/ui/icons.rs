@@ -541,12 +541,14 @@ pub enum BrandIcon {
     Fedora,
     Git,
     GitHub,
+    Herdr,
     Linux,
     NixOS,
     Proxmox,
     RaspberryPi,
     RedHat,
     Ubuntu,
+    WezTerm,
 }
 
 /// Brand colors darker than this perceived luminance (0..=255) are rendered
@@ -582,6 +584,7 @@ impl BrandIcon {
             Self::Fedora => include_bytes!("../../../../third_party/simple-icons/icons/fedora.svg"),
             Self::Git => include_bytes!("../../../../third_party/simple-icons/icons/git.svg"),
             Self::GitHub => include_bytes!("../../../../third_party/simple-icons/icons/github.svg"),
+            Self::Herdr => include_bytes!("../../../../third_party/herdr/logo.svg"),
             Self::Linux => include_bytes!("../../../../third_party/simple-icons/icons/linux.svg"),
             Self::NixOS => include_bytes!("../../../../third_party/simple-icons/icons/nixos.svg"),
             Self::Proxmox => {
@@ -592,6 +595,7 @@ impl BrandIcon {
             }
             Self::RedHat => include_bytes!("../../../../third_party/simple-icons/icons/redhat.svg"),
             Self::Ubuntu => include_bytes!("../../../../third_party/simple-icons/icons/ubuntu.svg"),
+            Self::WezTerm => include_bytes!("../../../../assets/icon/wezterm-icon.svg"),
         }
     }
 
@@ -603,7 +607,7 @@ impl BrandIcon {
     fn has_embedded_color(self) -> bool {
         matches!(
             self,
-            Self::AgentClaude | Self::AgentCopilot | Self::AgentKimi
+            Self::AgentClaude | Self::AgentCopilot | Self::AgentKimi | Self::Herdr | Self::WezTerm
         )
     }
 
@@ -626,12 +630,14 @@ impl BrandIcon {
             Self::Fedora => (0x51, 0xA2, 0xDA),
             Self::Git => (0xF0, 0x3C, 0x2E),
             Self::GitHub => (0x18, 0x17, 0x17),
+            Self::Herdr => (0x30, 0x34, 0x38),
             Self::Linux => (0xFC, 0xC6, 0x24),
             Self::NixOS => (0x52, 0x77, 0xC3),
             Self::Proxmox => (0xE5, 0x70, 0x00),
             Self::RaspberryPi => (0xA2, 0x28, 0x46),
             Self::RedHat => (0xEE, 0x00, 0x00),
             Self::Ubuntu => (0xE9, 0x54, 0x20),
+            Self::WezTerm => (0x4E, 0x49, 0xEE),
         }
     }
 
@@ -648,6 +654,21 @@ impl BrandIcon {
 
     pub fn rasterize(self, size: usize) -> Result<Image> {
         let svg = std::str::from_utf8(self.bytes()).context("brand SVG asset is not UTF-8")?;
+        if matches!(self, Self::Herdr | Self::WezTerm) {
+            let root = svg.find("<svg").context("brand SVG root is missing")?;
+            let start = root
+                + svg[root..]
+                    .find('>')
+                    .context("brand SVG root is incomplete")?
+                + 1;
+            let end = svg.rfind("</svg>").context("brand SVG end is missing")?;
+            let clipped = format!(
+                r#"{}<defs><clipPath id="app-icon" clipPathUnits="objectBoundingBox"><rect width="1" height="1" rx="0.27"/></clipPath></defs><g clip-path="url(#app-icon)">{}</g></svg>"#,
+                &svg[..start],
+                &svg[start..end],
+            );
+            return rasterize_svg_str(&clipped, size, 0.0);
+        }
         if self.has_embedded_color() {
             return rasterize_svg_str(svg, size, 0.0);
         }
@@ -871,12 +892,14 @@ mod tests {
             BrandIcon::Fedora,
             BrandIcon::Git,
             BrandIcon::GitHub,
+            BrandIcon::Herdr,
             BrandIcon::Linux,
             BrandIcon::NixOS,
             BrandIcon::Proxmox,
             BrandIcon::RaspberryPi,
             BrandIcon::RedHat,
             BrandIcon::Ubuntu,
+            BrandIcon::WezTerm,
         ] {
             let data: Vec<u8> = icon.rasterize(24).unwrap().into();
             assert_eq!(data.len(), 24 * 24 * 4);

@@ -47,6 +47,11 @@ use crate::native_settings::{
 };
 use fluent_bundle::FluentArgs;
 
+#[cfg(unix)]
+mod session_import;
+mod import;
+use import::{ImportButton, ImportSource, ImportStep};
+
 // All chrome geometry below is authored in 2x macOS backing pixels.
 // settings_ui_scale_for_dpi maps it onto other platforms by treating the
 // design as a 192dpi surface, which halves everything at a 1x/96dpi
@@ -273,6 +278,7 @@ thread_local! {
     /// in the terminal the user was looking at rather than in whichever
     /// window happens to sort first.
     static OPENED_FROM: Cell<Option<MuxWindowId>> = const { Cell::new(None) };
+    static OPENED_FROM_SPACE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 enum SettingsWindowSlot {
@@ -616,7 +622,7 @@ enum SettingsSection {
     Archived,
     Keymap,
     CommandPalette,
-    Compatibility,
+    Import,
     Developer,
     UiKit,
     Memory,
@@ -637,7 +643,7 @@ const BASE_SECTIONS: &[SettingsSection] = &[
     SettingsSection::Archived,
     SettingsSection::Keymap,
     SettingsSection::CommandPalette,
-    SettingsSection::Compatibility,
+    SettingsSection::Import,
     SettingsSection::Developer,
     SettingsSection::Backup,
     SettingsSection::Update,
@@ -715,13 +721,15 @@ fn initial_section() -> SettingsSection {
         "archived" => SettingsSection::Archived,
         "keymap" => SettingsSection::Keymap,
         "commandpalette" => SettingsSection::CommandPalette,
-        "compatibility" => SettingsSection::Compatibility,
+        "import" | "compatibility" => SettingsSection::Import,
         "developer" => SettingsSection::Developer,
         "uikit" => SettingsSection::UiKit,
         "memory" => SettingsSection::Memory,
         "backup" => SettingsSection::Backup,
         "update" => SettingsSection::Update,
         "about" => SettingsSection::About,
+        #[cfg(unix)]
+        id if thinkterm_import::source(id).is_ok() => SettingsSection::Import,
         _ => SettingsSection::Appearance,
     };
     if section == SettingsSection::Agents {
@@ -747,7 +755,7 @@ impl SettingsSection {
             Self::Archived => crate::i18n::tr("settings-section-archived"),
             Self::Keymap => crate::i18n::tr("settings-section-keymap"),
             Self::CommandPalette => crate::i18n::tr("settings-section-command-palette"),
-            Self::Compatibility => crate::i18n::tr("settings-section-compatibility"),
+            Self::Import => crate::i18n::tr("settings-section-import"),
             Self::Developer => crate::i18n::tr("settings-section-developer"),
             Self::UiKit => "UI Kit".to_string(),
             Self::Memory => "Memory".to_string(),
@@ -770,7 +778,7 @@ impl SettingsSection {
             Self::Archived => SettingsIcon::Archived,
             Self::Keymap => SettingsIcon::Keymap,
             Self::CommandPalette => SettingsIcon::CommandPalette,
-            Self::Compatibility => SettingsIcon::Sync,
+            Self::Import => SettingsIcon::Import,
             Self::Developer => SettingsIcon::Developer,
             Self::UiKit => SettingsIcon::UiKit,
             Self::Memory => SettingsIcon::Memory,
@@ -795,7 +803,7 @@ impl SettingsSection {
             Self::Archived => TileColor::Indigo,
             Self::Keymap => TileColor::Gray,
             Self::CommandPalette => TileColor::Blue,
-            Self::Compatibility => TileColor::Green,
+            Self::Import => TileColor::Green,
             Self::Developer => TileColor::Gray,
             Self::UiKit => TileColor::Pink,
             Self::Memory => TileColor::Teal,
@@ -924,7 +932,10 @@ impl SettingsSection {
                 "Font Size",
                 "Theme Search",
             ],
-            Self::Compatibility => &[
+            Self::Import => &[
+                "Herdr",
+                "Import Session",
+                "导入",
                 "ThinkTerm Config",
                 "WezTerm Source",
                 "Copy WezTerm Config",
@@ -1366,6 +1377,22 @@ fn web_token_key(id: &str) -> u64 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsAction {
+    SelectImportSource(ImportSource),
+    ImportContinue,
+    ImportBack,
+    ImportStartOver,
+    #[cfg(unix)]
+    SessionImportDetect,
+    #[cfg(unix)]
+    SessionImportPreview(u64),
+    #[cfg(unix)]
+    SessionImportBack,
+    #[cfg(unix)]
+    SessionImportConfirm,
+    #[cfg(unix)]
+    SessionImportRecover,
+    #[cfg(unix)]
+    SessionImportOpen,
     WindowHide,
     WindowMaximize,
     WindowClose,
@@ -2016,6 +2043,11 @@ impl ChromeFontArea {
 
 #[derive(Debug, Clone)]
 struct SettingsUiState {
+    import_source: ImportSource,
+    import_step: ImportStep,
+    import_result: Option<String>,
+    #[cfg(unix)]
+    session_import: session_import::ImportUi,
     tokens: UiTokens,
     sidebar: ResizablePaneState,
     sidebar_scroll: ScrollState,
@@ -2139,6 +2171,22 @@ impl SettingsUiState {
     fn new(dpi: usize) -> Self {
         let tokens = UiTokens::for_dpi(dpi);
         Self {
+            #[cfg(unix)]
+            session_import: session_import::ImportUi::default(),
+            import_source: ImportSource::initial(),
+            import_step: {
+                #[cfg(unix)]
+                if session_import::remembered_source().is_some() {
+                    ImportStep::Review
+                } else {
+                    ImportStep::Source
+                }
+                #[cfg(not(unix))]
+                {
+                    ImportStep::Source
+                }
+            },
+            import_result: None,
             sidebar: ResizablePaneState::new(
                 tokens.sidebar_default_width,
                 tokens.sidebar_min_width,
@@ -2859,8 +2907,25 @@ pub fn show_update_page() {
 }
 
 /// Open Settings, remembering which window asked. See `OPENED_FROM`.
-pub fn show_from(mux_window_id: MuxWindowId) {
+pub fn show_from(mux_window_id: MuxWindowId, space_id: &str) {
     OPENED_FROM.with(|slot| slot.set(Some(mux_window_id)));
+    let changed = OPENED_FROM_SPACE
+        .with(|slot| slot.replace(Some(space_id.to_string())).as_deref() != Some(space_id));
+    #[cfg(unix)]
+    if changed {
+        SETTINGS_WINDOW.with(|slot| {
+            if let SettingsWindowSlot::Open { settings, .. } = &*slot.borrow() {
+                let mut settings = settings.borrow_mut();
+                // A preview is bound to its owner until that import finishes.
+                if !settings.ui.session_import.busy() {
+                    settings.ui.session_import = session_import::ImportUi::default();
+                    settings.ui.import_step = ImportStep::Source;
+                }
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = changed;
     show();
 }
 
@@ -2971,6 +3036,8 @@ struct SettingsWindow {
     /// weight for labels and explanations made the two read as equally
     /// important; macOS separates them by weight, not only by color.
     body_font: Rc<LoadedFont>,
+    import_body_font: Rc<LoadedFont>,
+    import_title_font: Rc<LoadedFont>,
     title_font: Rc<LoadedFont>,
     sidebar_title_font: Rc<LoadedFont>,
     logo_caption_font: Rc<LoadedFont>,
@@ -3060,6 +3127,14 @@ impl SettingsWindow {
             settings_font_size,
             settings_body_font_weight(settings_font_weight),
         )?;
+        let import_body_font = fonts.command_palette_font_with_size_and_weight(
+            (settings_font_size - 1.0).max(10.0),
+            (settings_font_weight as f32 * 0.67).round().max(350.0) as u16,
+        )?;
+        let import_title_font = fonts.title_font_with_size_and_weight(
+            settings_font_size + 10.0,
+            settings_font_weight,
+        )?;
         let logo_caption_font = fonts.command_palette_font_with_size_and_weight(
             LOGO_CAPTION_FONT_SIZE,
             LOGO_CAPTION_FONT_WEIGHT,
@@ -3131,6 +3206,8 @@ impl SettingsWindow {
             fonts: Rc::clone(&fonts),
             ui_font,
             body_font,
+            import_body_font,
+            import_title_font,
             title_font,
             sidebar_title_font,
             logo_caption_font,
@@ -3253,6 +3330,18 @@ impl SettingsWindow {
         if !installed {
             window.close();
             return Ok(());
+        }
+
+        #[cfg(debug_assertions)]
+        if std::env::var("THINKTERM_SETTINGS_EXPAND")
+            .is_ok_and(|value| value == "import-preview")
+        {
+            if let Some(settings) = settings_window_for_instance(instance_id) {
+                let mut settings = settings.borrow_mut();
+                if settings.selected == SettingsSection::Import {
+                    settings.perform_import_navigation(SettingsAction::ImportContinue, &window);
+                }
+            }
         }
 
         window.show();
@@ -4557,6 +4646,14 @@ impl SettingsWindow {
             settings_font_size,
             settings_body_font_weight(settings_font_weight),
         )?;
+        self.import_body_font = self.fonts.command_palette_font_with_size_and_weight(
+            (settings_font_size - 1.0).max(10.0),
+            (settings_font_weight as f32 * 0.67).round().max(350.0) as u16,
+        )?;
+        self.import_title_font = self.fonts.title_font_with_size_and_weight(
+            settings_font_size + 10.0,
+            settings_font_weight,
+        )?;
         self.logo_caption_font = self.fonts.command_palette_font_with_size_and_weight(
             LOGO_CAPTION_FONT_SIZE,
             LOGO_CAPTION_FONT_WEIGHT,
@@ -5131,6 +5228,26 @@ impl SettingsWindow {
 
     fn perform_action(&mut self, action: SettingsAction, window: &Window) {
         match action {
+            SettingsAction::SelectImportSource(source) => {
+                if self.import_busy() { return; }
+                #[cfg(unix)]
+                if self.ui.import_source != source {
+                    self.ui.session_import = session_import::ImportUi::default();
+                }
+                self.ui.import_source = source;
+                self.ui.content_scroll.reset();
+                self.ui.open_dropdown = None;
+            }
+            SettingsAction::ImportContinue
+            | SettingsAction::ImportBack
+            | SettingsAction::ImportStartOver => self.perform_import_navigation(action, window),
+            #[cfg(unix)]
+            SettingsAction::SessionImportDetect
+            | SettingsAction::SessionImportPreview(_)
+            | SettingsAction::SessionImportBack
+            | SettingsAction::SessionImportRecover
+            | SettingsAction::SessionImportConfirm
+            | SettingsAction::SessionImportOpen => self.perform_session_import_action(action),
             SettingsAction::WindowHide => {
                 self.ui.open_dropdown = None;
                 window.hide();
@@ -5188,6 +5305,7 @@ impl SettingsWindow {
             }
             SettingsAction::LoadWezTermSource => {
                 self.ui.open_dropdown = None;
+                self.compatibility_import = CompatibilityImportState::default();
                 match self.load_compatibility_source() {
                     Ok(()) => window.invalidate(),
                     Err(err) => {
@@ -5211,12 +5329,16 @@ impl SettingsWindow {
                             },
                             &[("count", count.to_string())],
                         );
+                        self.ui.import_result = Some(self.status.clone());
+                        self.ui.import_step = ImportStep::Result;
+                        self.ui.content_scroll.reset();
                     }
                     Err(err) => {
                         self.status = settings_tr(
                             "settings-status-import-error",
                             &[("error", format!("{err:#}"))],
                         );
+                        self.compatibility_import.error = Some(self.status.clone());
                     }
                 }
             }
@@ -7260,20 +7382,22 @@ impl SettingsWindow {
 
         let scroll = self.ui.content_scroll.offset;
         let selected_label = self.selected.label();
-        self.draw_text(
-            layers,
-            &title_font,
-            x,
-            self.ui_px(CONTENT_TITLE_Y) - scroll,
-            &selected_label,
-            palette.title,
-            max_width,
-        )?;
+        if self.selected != SettingsSection::Import {
+            self.draw_text(
+                layers,
+                &title_font,
+                x,
+                self.ui_px(CONTENT_TITLE_Y) - scroll,
+                &selected_label,
+                palette.title,
+                max_width,
+            )?;
+        }
 
         match self.selected {
             SettingsSection::Appearance => self.paint_appearance(layers, x, max_width)?,
             SettingsSection::TabIcons => self.paint_tab_icons(layers, x, max_width)?,
-            SettingsSection::Compatibility => self.paint_compatibility(layers, x, max_width)?,
+            SettingsSection::Import => self.paint_import(layers, x, max_width)?,
             SettingsSection::General => self.paint_general(layers, x, max_width)?,
             SettingsSection::Terminal => self.paint_terminal(layers, x, max_width)?,
             SettingsSection::Workspaces => self.paint_workspaces(layers, x, max_width)?,
@@ -12079,14 +12203,6 @@ impl SettingsWindow {
         let scroll = self.ui.content_scroll.offset;
         let row_step = self.settings_row_step();
         let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
-        let (card_y, first_row_y) = self.settings_card_geometry(section_y, 4);
-        let card_height = self.settings_card_height(4);
-        let button_y = card_y + card_height + self.settings_section_card_gap();
-        self.ui.content_scroll.set_extents(
-            self.content_viewport_extent(),
-            self.settings_content_extent(button_y + scroll + self.ui_px(CONTROL_HEIGHT)),
-        );
-
         self.draw_text(
             layers,
             &body_font,
@@ -12096,6 +12212,10 @@ impl SettingsWindow {
             palette.secondary_text,
             max_width,
         )?;
+
+        let (card_y, first_row_y) = self.settings_card_geometry(section_y, 4);
+        let card_height = self.settings_card_height(4);
+        let button_y = card_y + card_height + self.settings_section_card_gap();
 
         let card_padding = self.ui_px(36.0);
         let row_x = x + card_padding;
@@ -12157,6 +12277,16 @@ impl SettingsWindow {
             &show_onboarding_label,
             SettingsAction::ShowOnboardingNow,
         )?;
+
+        self.ui.content_scroll.set_extents(
+            self.content_viewport_extent(),
+            self.settings_content_extent(button_y + scroll + self.ui_px(CONTROL_HEIGHT)),
+        );
+        if self.ui.content_scroll.offset != scroll {
+            if let Some(window) = &self.window {
+                window.invalidate();
+            }
+        }
 
         Ok(())
     }
@@ -13110,201 +13240,6 @@ impl SettingsWindow {
                 true,
             )?;
         }
-        Ok(())
-    }
-
-    fn paint_compatibility(
-        &mut self,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        x: f32,
-        max_width: f32,
-    ) -> anyhow::Result<()> {
-        let palette = self.palette();
-        let body_font = Rc::clone(&self.body_font);
-        let scroll = self.ui.content_scroll.offset;
-        let row_step = self.settings_row_step();
-        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
-        let field_count = self.compatibility_import.fields.len();
-        let row_count = 3 + field_count;
-        let (card_y, first_row_y) = self.settings_card_geometry(section_y, row_count);
-        let card_height = self.settings_card_height(row_count);
-        let buttons_y = card_y + card_height + self.settings_section_card_gap();
-        self.ui.content_scroll.set_extents(
-            self.content_viewport_extent(),
-            self.settings_content_extent(
-                buttons_y + scroll + self.ui_px(CONTROL_HEIGHT) * 2.0 + 14.0,
-            ),
-        );
-        let thinkterm_path = Self::thinkterm_compatible_config_path();
-        let thinkterm_source = if thinkterm_path.exists() {
-            thinkterm_path.display().to_string()
-        } else {
-            let mut args = FluentArgs::new();
-            args.set("path", thinkterm_path.display().to_string());
-            crate::i18n::tr_args("settings-thinkterm-config-missing", &args)
-        };
-        let wezterm_source_path = self.selected_wezterm_source_path();
-        let wezterm_source = wezterm_source_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| crate::i18n::tr("settings-wezterm-source-missing"));
-        let thinkterm_status = if thinkterm_path.exists() {
-            crate::i18n::tr("settings-import-config-ready")
-        } else {
-            crate::i18n::tr("settings-import-config-will-create")
-        };
-        let wezterm_status = if wezterm_source_path.is_some() {
-            crate::i18n::tr("common-found")
-        } else {
-            crate::i18n::tr("common-missing")
-        };
-        let selected_count = self
-            .compatibility_import
-            .fields
-            .iter()
-            .filter(|field| field.lua_value.is_some() && self.import_field_selected(field.id))
-            .count();
-        let selection_status = if self.compatibility_import.error.is_some() {
-            crate::i18n::tr("common-error")
-        } else if field_count == 0 {
-            crate::i18n::tr("settings-not-loaded")
-        } else {
-            let mut args = FluentArgs::new();
-            args.set("selected", selected_count);
-            args.set("total", field_count);
-            crate::i18n::tr_args("settings-fields-selected", &args)
-        };
-        let selection_description = self
-            .compatibility_import
-            .error
-            .clone()
-            .unwrap_or_else(|| crate::i18n::tr("settings-import-selection-description"));
-
-        self.draw_text(
-            layers,
-            &body_font,
-            x,
-            section_y,
-            &crate::i18n::tr("settings-compatibility-description"),
-            palette.secondary_text,
-            max_width,
-        )?;
-        let card_padding = self.ui_px(36.0);
-        let row_x = x + card_padding;
-        let row_width = max_width - card_padding * 2.0;
-        self.paint_group_card(layers, x, card_y, max_width, card_height)?;
-        self.paint_setting_row(
-            layers,
-            row_x,
-            first_row_y,
-            row_width,
-            &crate::i18n::tr("settings-thinkterm-config"),
-            &thinkterm_source,
-            &thinkterm_status,
-            false,
-        )?;
-        self.paint_setting_row(
-            layers,
-            row_x,
-            first_row_y + row_step,
-            row_width,
-            &crate::i18n::tr("settings-wezterm-source"),
-            &wezterm_source,
-            &wezterm_status,
-            true,
-        )?;
-        self.paint_setting_row(
-            layers,
-            row_x,
-            first_row_y + row_step * 2.0,
-            row_width,
-            &crate::i18n::tr("settings-import-selection"),
-            &selection_description,
-            &selection_status,
-            true,
-        )?;
-
-        let mut row_y = first_row_y + row_step * 3.0;
-        if !self.compatibility_import.fields.is_empty() {
-            let fields = self.compatibility_import.fields.clone();
-            for field in fields {
-                self.paint_import_field_row(layers, row_x, row_y, row_width, &field, true)?;
-                row_y += row_step;
-            }
-        }
-        let load_label = crate::i18n::tr("settings-load-wezterm-source");
-        let select_all_label = crate::i18n::tr("common-select-all");
-        let clear_label = crate::i18n::tr("common-clear");
-        let import_label = crate::i18n::tr("settings-import-selected");
-        let open_wezterm_label = crate::i18n::tr("settings-open-wezterm-source");
-        let open_thinkterm_label = crate::i18n::tr("settings-open-thinkterm-config");
-        // Without a WezTerm configuration there is nothing to review, import
-        // or open, and until one is reviewed nothing to select: those buttons
-        // are greyed out instead of answering a click with an error.
-        let has_source = wezterm_source_path.is_some();
-        let has_fields = field_count > 0;
-        self.draw_button_enabled(
-            layers,
-            x,
-            buttons_y,
-            self.button_width_for_label(&load_label, 290.0),
-            &load_label,
-            SettingsAction::LoadWezTermSource,
-            has_source,
-        )?;
-        let second_x = x + self.button_width_for_label(&load_label, 290.0) + self.ui_px(16.0);
-        self.draw_button_enabled(
-            layers,
-            second_x,
-            buttons_y,
-            self.button_width_for_label(&select_all_label, 180.0),
-            &select_all_label,
-            SettingsAction::SelectAllImportFields,
-            has_fields,
-        )?;
-        let third_x =
-            second_x + self.button_width_for_label(&select_all_label, 180.0) + self.ui_px(16.0);
-        self.draw_button_enabled(
-            layers,
-            third_x,
-            buttons_y,
-            self.button_width_for_label(&clear_label, 150.0),
-            &clear_label,
-            SettingsAction::ClearImportFields,
-            has_fields,
-        )?;
-        let fourth_x =
-            third_x + self.button_width_for_label(&clear_label, 150.0) + self.ui_px(16.0);
-        self.draw_button_enabled(
-            layers,
-            fourth_x,
-            buttons_y,
-            self.button_width_for_label(&import_label, 260.0),
-            &import_label,
-            SettingsAction::ImportSelectedFields,
-            has_source,
-        )?;
-        let open_buttons_y = buttons_y + self.ui_px(CONTROL_HEIGHT) + 14.0;
-        self.draw_button_enabled(
-            layers,
-            x,
-            open_buttons_y,
-            self.button_width_for_label(&open_wezterm_label, 300.0),
-            &open_wezterm_label,
-            SettingsAction::OpenWezTermConfigFile,
-            has_source,
-        )?;
-        let fifth_x =
-            x + self.button_width_for_label(&open_wezterm_label, 300.0) + self.ui_px(16.0);
-        self.draw_button(
-            layers,
-            fifth_x,
-            open_buttons_y,
-            self.button_width_for_label(&open_thinkterm_label, 300.0),
-            &open_thinkterm_label,
-            SettingsAction::OpenThinkTermConfigFile,
-        )?;
-
         Ok(())
     }
 
@@ -15860,7 +15795,7 @@ impl SettingsWindow {
     ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
-        let body_font = Rc::clone(&self.body_font);
+        let body_font = Rc::clone(&self.import_body_font);
         let action = SettingsAction::ToggleImportField(field.id);
         let enabled = field.lua_value.is_some();
         let selected = enabled && self.import_field_selected(field.id);
@@ -15880,11 +15815,9 @@ impl SettingsWindow {
         if enabled {
             self.ui_context.push(row_rect, WidgetKind::Button, action);
         }
-        if selected || hovered || pressed {
+        if hovered || pressed {
             let bg = if pressed {
                 palette.control_pressed_bg
-            } else if selected {
-                rgba(10, 132, 255, 0.14)
             } else {
                 palette.control_hover_bg
             };
@@ -15900,18 +15833,18 @@ impl SettingsWindow {
             )?;
         }
 
-        let checkbox_size = 30.0;
+        let checkbox_size = self.ui_px(28.0);
         let checkbox_x = x;
         let checkbox_y = y + self.ui_px(6.0);
         let checkbox_fill = if selected {
-            palette.nav_selected_bg
+            self.chrome_palette.accent
         } else if hovered {
             palette.control_hover_bg
         } else {
             palette.control_bg
         };
         let checkbox_border = if selected || hovered {
-            palette.nav_selected_bg
+            self.chrome_palette.accent
         } else {
             palette.control_border
         };
@@ -15927,15 +15860,13 @@ impl SettingsWindow {
             self.ui_px(8.0),
         )?;
         if selected {
-            self.draw_rounded_rect(
+            self.draw_svg_icon(
                 layers,
-                1,
-                checkbox_x + self.ui_px(8.0),
-                checkbox_y + self.ui_px(8.0),
-                checkbox_size - self.ui_px(16.0),
-                checkbox_size - self.ui_px(16.0),
-                palette.selected_text,
-                self.ui_px(4.0),
+                SvgIcon::Check,
+                checkbox_x + self.ui_px(5.0),
+                checkbox_y + self.ui_px(5.0),
+                checkbox_size - self.ui_px(10.0),
+                palette.on_accent,
             )?;
         }
 
@@ -15947,13 +15878,13 @@ impl SettingsWindow {
         };
         let value_x = x + width - value_width;
         let text_width = (value_x - label_x - self.ui_px(28.0)).max(width * 0.42);
-        let title = format!("{} / {}", field.category, field.label);
+        let title = &field.label;
         self.draw_text(
             layers,
-            &body_font,
+            &ui_font,
             label_x,
             y,
-            &title,
+            title,
             if enabled {
                 palette.text
             } else {

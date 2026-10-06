@@ -10944,7 +10944,7 @@ impl TermWindow {
                 wezterm_open_url::open_url(link);
             }
             OpenSettings => {
-                crate::settings_window::show_from(self.mux_window_id);
+                crate::settings_window::show_from(self.mux_window_id, &self.active_space_id);
             }
             FocusPluginPanel(plugin) => self.focus_plugin_panel(plugin),
             QuitAndStopSessionServer => {

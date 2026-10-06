@@ -1543,6 +1543,13 @@ pub(crate) const RESTARTED_ENV: &str = "THINKTERM_RESTARTED";
 static RESTARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn main() {
+    #[cfg(unix)]
+    {
+        thinkterm_import_herdr::register().expect("register built-in session importer");
+        if let Some(result) = thinkterm_import::maybe_run_helper() {
+            std::process::exit(if result.is_ok() { 0 } else { 1 });
+        }
+    }
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
