@@ -154,6 +154,7 @@ impl SettingsWindow {
                 self.ui.import_result = None;
                 #[cfg(unix)]
                 {
+                    self.ui.session_import.abandon();
                     self.ui.session_import = session_import::ImportUi::default();
                 }
             }

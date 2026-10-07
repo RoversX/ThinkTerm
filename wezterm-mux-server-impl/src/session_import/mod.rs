@@ -244,8 +244,9 @@ fn make_tree(plan: &ImportPlan, name: &str) -> ThinkTermTree {
     tree
 }
 
-pub fn status(request_id: &str) -> Result<codec::ImportSessionStatus> {
-    receipt::Store::owner().status(request_id)
+/// Receipts take a file lock, so the lookup runs on a blocking thread.
+pub async fn status(request_id: String) -> Result<codec::ImportSessionStatus> {
+    smol::unblock(move || receipt::Store::owner().status(&request_id)).await
 }
 
 /// The owner persists the new rows and their layouts before committing the
@@ -256,14 +257,18 @@ where
     F: FnMut(&ThinkTermTree, bool, &[ImportedThreadLayout]) -> Result<()>,
 {
     let _import = IMPORT.lock().await;
-    let attempt = match receipt::Store::owner().start(request.clone())? {
+    let started = {
+        let request = request.clone();
+        smol::unblock(move || receipt::Store::owner().start(request)).await?
+    };
+    let attempt = match started {
         receipt::Started::Completed(result) => return Ok(result),
         receipt::Started::New(attempt) => attempt,
     };
     let result = execute_new(request.request, persist, &attempt).await;
     match result {
         Ok(result) => {
-            attempt.complete().context(
+            attempt.complete().await.context(
                 "Save completed import receipt; query the import result before retrying",
             )?;
             Ok(result)
@@ -271,6 +276,7 @@ where
         Err(err) => {
             attempt
                 .fail(&format!("{err:#}"))
+                .await
                 .context("Save failed import receipt; query the import result before retrying")?;
             Err(err)
         }
@@ -313,6 +319,7 @@ where
     };
     attempt
         .destination(response.clone())
+        .await
         .context("Save import destination before handoff")?;
 
     let mut panes: HashMap<u32, Arc<dyn Pane>> = HashMap::new();

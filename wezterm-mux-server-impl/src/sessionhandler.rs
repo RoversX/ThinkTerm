@@ -2231,7 +2231,7 @@ impl SessionHandler {
                 }
                 #[cfg(unix)]
                 spawn_into_main_thread(async move {
-                    send_response(crate::session_import::status(&request.request_id).map(|status| {
+                    send_response(crate::session_import::status(request.request_id).await.map(|status| {
                         Pdu::GetImportSessionStatusResponse(codec::GetImportSessionStatusResponse { status })
                     }));
                 }).detach();

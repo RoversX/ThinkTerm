@@ -5232,6 +5232,7 @@ impl SettingsWindow {
                 if self.import_busy() { return; }
                 #[cfg(unix)]
                 if self.ui.import_source != source {
+                    self.ui.session_import.abandon();
                     self.ui.session_import = session_import::ImportUi::default();
                 }
                 self.ui.import_source = source;

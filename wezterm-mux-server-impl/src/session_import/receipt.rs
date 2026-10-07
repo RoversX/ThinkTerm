@@ -65,10 +65,9 @@ fn issued_at(id: &str) -> Result<u64> {
             && timestamp.to_string() == time,
         "Invalid import request ID"
     );
-    ensure!(
-        timestamp <= now().saturating_add(300),
-        "Import request time is in the future; check the clocks on both machines"
-    );
+    // The time comes from the client's clock. A server whose clock is behind
+    // (a small board without NTP) still accepts it; the receipt starts to
+    // age once this clock passes that time.
     Ok(timestamp)
 }
 
@@ -194,11 +193,11 @@ impl Store {
     }
 }
 
-impl Attempt {
-    pub(super) fn destination(&self, result: ImportSessionResponse) -> Result<()> {
-        self.store.locked(|records| {
+impl Store {
+    fn set_destination(&self, id: &str, result: ImportSessionResponse) -> Result<()> {
+        self.locked(|records| {
             records
-                .get_mut(&self.request_id)
+                .get_mut(id)
                 .context("Import receipt is missing")?
                 .destination = Some(result);
             // Check the full result before touching the session and leave room
@@ -211,22 +210,43 @@ impl Attempt {
         })
     }
 
-    pub(super) fn complete(&self) -> Result<()> {
-        self.update(|receipt| receipt.outcome = Outcome::Completed)
-    }
-
-    pub(super) fn fail(&self, error: &str) -> Result<()> {
-        self.update(|receipt| receipt.outcome = Outcome::Failed(error.chars().take(1024).collect()))
-    }
-
-    fn update(&self, change: impl FnOnce(&mut Receipt)) -> Result<()> {
-        self.store.locked(|records| {
-            let receipt = records
-                .get_mut(&self.request_id)
-                .context("Import receipt is missing")?;
-            change(receipt);
+    fn set_outcome(&self, id: &str, outcome: Outcome) -> Result<()> {
+        self.locked(|records| {
+            records
+                .get_mut(id)
+                .context("Import receipt is missing")?
+                .outcome = outcome;
             Ok(((), true))
         })
+    }
+}
+
+impl Attempt {
+    pub(super) async fn destination(&self, result: ImportSessionResponse) -> Result<()> {
+        self.write(move |store, id| store.set_destination(id, result))
+            .await
+    }
+
+    pub(super) async fn complete(&self) -> Result<()> {
+        self.write(|store, id| store.set_outcome(id, Outcome::Completed))
+            .await
+    }
+
+    pub(super) async fn fail(&self, error: &str) -> Result<()> {
+        let outcome = Outcome::Failed(error.chars().take(1024).collect());
+        self.write(move |store, id| store.set_outcome(id, outcome))
+            .await
+    }
+
+    /// Receipt writes lock a file and wait for the disk. They run on a
+    /// blocking thread so the thread that serves terminals never waits.
+    async fn write(
+        &self,
+        write: impl FnOnce(&Store, &str) -> Result<()> + Send + 'static,
+    ) -> Result<()> {
+        let store = self.store.clone();
+        let id = self.request_id.clone();
+        smol::unblock(move || write(&store, &id)).await
     }
 }
 
@@ -289,8 +309,8 @@ mod tests {
             store.status(&request.request_id).unwrap(),
             ImportSessionStatus::Running
         );
-        attempt.destination(destination()).unwrap();
-        attempt.complete().unwrap();
+        smol::block_on(attempt.destination(destination())).unwrap();
+        smol::block_on(attempt.complete()).unwrap();
         drop(attempt);
         let reloaded = Store {
             path: store.path.clone(),
@@ -315,7 +335,7 @@ mod tests {
         };
         let interrupted = request(now());
         let attempt = begin(&store, interrupted.clone());
-        attempt.destination(destination()).unwrap();
+        smol::block_on(attempt.destination(destination())).unwrap();
         drop(attempt);
         assert_eq!(
             store.status(&interrupted.request_id).unwrap(),
@@ -326,7 +346,7 @@ mod tests {
         assert!(store.start(interrupted).is_err());
         let failed = request(now());
         let attempt = begin(&store, failed.clone());
-        attempt.fail("example prepare failure").unwrap();
+        smol::block_on(attempt.fail("example prepare failure")).unwrap();
         drop(attempt);
         assert_eq!(
             store.status(&failed.request_id).unwrap(),
@@ -369,6 +389,25 @@ mod tests {
             })
             .unwrap();
         assert!(store.start(old).is_err());
+    }
+
+    #[test]
+    fn a_server_clock_behind_the_client_still_accepts_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store {
+            path: dir.path().join("receipts.json"),
+        };
+        let ahead = request(now() + 24 * 60 * 60);
+        assert_eq!(
+            store.status(&ahead.request_id).unwrap(),
+            ImportSessionStatus::NotFound
+        );
+        let attempt = begin(&store, ahead.clone());
+        assert_eq!(
+            store.status(&ahead.request_id).unwrap(),
+            ImportSessionStatus::Running
+        );
+        drop(attempt);
     }
 
     #[test]

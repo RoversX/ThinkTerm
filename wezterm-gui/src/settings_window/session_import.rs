@@ -58,8 +58,17 @@ impl Default for ImportUi {
 }
 
 impl ImportUi {
+    /// An import whose outcome is unknown blocks the page until a recovery
+    /// attempt fails. Then the user may leave it behind (see `abandon`).
     pub(super) fn busy(&self) -> bool {
-        self.busy || self.pending.is_some()
+        self.busy || (self.pending.is_some() && !self.failed)
+    }
+
+    /// Stop tracking an import whose outcome could not be found out. Its
+    /// receipt on the owner still keeps that request from running twice.
+    pub(super) fn abandon(&mut self) {
+        self.pending = None;
+        UNRESOLVED.with(|slot| slot.borrow_mut().take());
     }
 
     pub(super) fn has_preview(&self) -> bool {
@@ -183,7 +192,7 @@ impl ImportTarget {
                 .get_import_session_status(request.request_id.clone())
                 .await?
         } else {
-            session_import::status(&request.request_id)?
+            session_import::status(request.request_id.clone()).await?
         };
         match status {
             codec::ImportSessionStatus::NotFound => self
@@ -399,7 +408,10 @@ impl SettingsWindow {
         if self.ui.session_import.pending.is_some()
             && !matches!(action, SettingsAction::SessionImportRecover)
         {
-            return;
+            if self.ui.session_import.busy() {
+                return;
+            }
+            self.ui.session_import.abandon();
         }
         let selected_source = self.ui.import_source;
         let Ok(provider) = selected_source.provider() else {
@@ -1231,6 +1243,28 @@ impl SettingsWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_recovery_can_be_left_behind() {
+        let mut state = ImportUi::default();
+        state.pending = Some(codec::ImportSessionRequest {
+            request_id: "1-example".into(),
+            request: thinkterm_import::ImportRequest {
+                source: "example".into(),
+                session: "development".into(),
+                mode: ImportMode::Layout,
+                fingerprint: "example-fingerprint".into(),
+                space_name: "Imported".into(),
+            },
+        });
+        assert!(state.busy());
+        state.failed = true;
+        assert!(!state.busy());
+        UNRESOLVED.with(|slot| *slot.borrow_mut() = Some(state.clone()));
+        state.abandon();
+        assert!(state.pending.is_none());
+        assert!(ImportUi::default().pending.is_none());
+    }
 
     #[test]
     fn import_follows_the_space_owner_and_never_falls_back_for_a_missing_space() {
