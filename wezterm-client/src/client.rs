@@ -1,8 +1,10 @@
+use crate::connection_io::{with_progress, write_pdu, Counted, IO_STALL_LIMIT};
 use crate::domain::{ClientDomain, ClientDomainConfig};
 use crate::pane::ClientPane;
 use anyhow::{anyhow, bail, Context};
 use async_ossl::AsyncSslStream;
 use async_trait::async_trait;
+use codec::deferred::DeferredPdu;
 use codec::*;
 use config::{configuration, SshDomain, TlsDomainClient, UnixDomain, UnixTarget};
 use filedescriptor::FileDescriptor;
@@ -30,14 +32,13 @@ use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, RawSocket};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::mpsc::channel;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 use thinkterm_session::connection::{
     describe_handshake_failure, describe_server_build_mismatch, leads_back_to_this_process,
-    ChannelSendError, RegistrationBarrier,
+    ChannelSendError,
 };
 use thiserror::Error;
 use wezterm_uds::UnixStream;
@@ -62,48 +63,89 @@ enum ReaderMessage {
     RegistrationComplete {
         connection_generation: u64,
     },
-    /// Tear down a generation whose transport connected but whose topology
-    /// could not be restored. The normal reconnect loop will make a fresh
-    /// transport and repeat the complete bootstrap.
-    AbortGeneration {
-        connection_generation: u64,
-        reason: String,
-    },
     Readable,
     /// The connection has been idle for a while: send a keepalive ping,
     /// or declare the transport dead if the previous ping went unanswered.
     KeepaliveTick,
 }
 
+const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(150);
+const REGISTRATION_BYTES: usize = 32 * 1024 * 1024;
+const REGISTRATION_MESSAGES: usize = 1024;
+const PENDING_REQUESTS: usize = 1024;
+/// A waiting request also keeps its reply channel alive: one allocation
+/// with a reply slot, counters and wakers.
+const DEFERRED_REQUEST_OVERHEAD: usize = std::mem::size_of::<anyhow::Result<Pdu>>() + 512;
+
+struct GenerationAbort {
+    reason: String,
+    retry: bool,
+}
+
+type AbortSlot = Arc<Mutex<Option<(u64, Sender<GenerationAbort>)>>>;
+
 struct PduRegistrationBarrier {
-    inner: RegistrationBarrier<(Pdu, Sender<anyhow::Result<Pdu>>)>,
+    complete: bool,
+    bytes: usize,
+    deferred: VecDeque<(DeferredPdu, Sender<anyhow::Result<Pdu>>)>,
 }
 
 impl PduRegistrationBarrier {
     fn new() -> Self {
         Self {
-            inner: RegistrationBarrier::new(),
+            complete: false,
+            bytes: 0,
+            deferred: VecDeque::new(),
         }
     }
 
+    /// A request that does not fit the budget fails on its own. The
+    /// connection and the requests already waiting are unaffected.
     fn submit(
         &mut self,
         item: (Pdu, Sender<anyhow::Result<Pdu>>),
         registration_required: bool,
     ) -> Option<(Pdu, Sender<anyhow::Result<Pdu>>)> {
-        self.inner.submit(item, registration_required)
+        if !registration_required || self.complete {
+            return Some(item);
+        }
+        let (pdu, promise) = item;
+        let budget = REGISTRATION_BYTES
+            .saturating_sub(self.bytes)
+            .saturating_sub(DEFERRED_REQUEST_OVERHEAD);
+        let deferred = pdu.defer(budget).and_then(|deferred| {
+            let bytes = deferred.retained_bytes();
+            anyhow::ensure!(
+                bytes <= budget,
+                "requests waiting for mux registration exceed byte budget"
+            );
+            Ok((deferred, bytes))
+        });
+        match deferred {
+            Ok((deferred, bytes)) => {
+                self.bytes += bytes + DEFERRED_REQUEST_OVERHEAD;
+                self.deferred.push_back((deferred, promise));
+            }
+            Err(err) => {
+                let _ = promise.try_send(Err(err));
+            }
+        }
+        None
     }
 
-    fn complete(&mut self) -> VecDeque<(Pdu, Sender<anyhow::Result<Pdu>>)> {
-        self.inner.complete()
+    fn complete(&mut self) -> VecDeque<(DeferredPdu, Sender<anyhow::Result<Pdu>>)> {
+        self.complete = true;
+        self.bytes = 0;
+        std::mem::take(&mut self.deferred)
     }
 
     fn is_complete(&self) -> bool {
-        self.inner.is_complete()
+        self.complete
     }
 
     fn fail_deferred(&mut self, reason: &str) {
-        for (_, promise) in self.inner.drain() {
+        self.bytes = 0;
+        for (_, promise) in std::mem::take(&mut self.deferred) {
             let _ = promise.try_send(Err(anyhow!(reason.to_string())));
         }
     }
@@ -118,6 +160,11 @@ impl Drop for PduRegistrationBarrier {
 #[derive(Clone)]
 pub struct Client {
     sender: Sender<ReaderMessage>,
+    // Only Client handles own this sender. Last drop and explicit close both
+    // wake the reader even while it is inside a partial read or a full write.
+    shutdown: Sender<()>,
+    abort: AbortSlot,
+    attached: Arc<AtomicBool>,
     local_domain_id: Option<DomainId>,
     pub client_id: ClientId,
     client_domain_config: ClientDomainConfig,
@@ -127,7 +174,7 @@ pub struct Client {
     /// becoming writable is not Ready: the mux identity and topology must be
     /// restored first.
     connection_phase: Arc<AtomicU8>,
-    resume_reconnect_tx: std::sync::mpsc::Sender<()>,
+    resume_reconnect_tx: Sender<()>,
     remote_server_id: Arc<RwLock<Option<String>>>,
     /// The distro id the server reported when we shook hands, if any.
     remote_os_release: Arc<RwLock<Option<String>>>,
@@ -169,7 +216,7 @@ impl Client {
 
     /// Wake a parked reconnect loop for another round of retries.
     pub fn resume_reconnect(&self) {
-        let _ = self.resume_reconnect_tx.send(());
+        let _ = self.resume_reconnect_tx.try_send(());
     }
 
     pub fn remote_server_id(&self) -> Option<String> {
@@ -186,7 +233,37 @@ impl Client {
     }
 
     pub(crate) fn mark_ready(&self) {
-        self.set_connection_phase(ClientConnectionPhase::Ready);
+        if self
+            .connection_phase
+            .compare_exchange(
+                ClientConnectionPhase::Syncing as u8,
+                ClientConnectionPhase::Ready as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            crate::domain::wake_thinkterm_frontend();
+        }
+    }
+
+    pub(crate) fn mark_attached(&self) -> anyhow::Result<()> {
+        self.attached.store(true, Ordering::Release);
+        anyhow::ensure!(
+            !self.shutdown.is_closed()
+                && !self.sender.is_closed()
+                && self.connection_phase() != ClientConnectionPhase::Detached,
+            "connection ended before its domain could attach"
+        );
+        Ok(())
+    }
+
+    /// Retire this client, including an initial attach waiting on an update
+    /// decision. A replacement must get a new client and registration.
+    pub(crate) fn close(&self) {
+        self.shutdown.close();
+        self.sender.close();
+        self.set_connection_phase(ClientConnectionPhase::Detached);
     }
 
     fn mark_registration_complete(&self) -> anyhow::Result<()> {
@@ -197,15 +274,27 @@ impl Client {
             })
             .map_err(|_| ChannelSendError)
             .context("marking mux client registration complete")?;
-        self.set_connection_phase(ClientConnectionPhase::Syncing);
+        self.connection_phase
+            .compare_exchange(
+                ClientConnectionPhase::Registering as u8,
+                ClientConnectionPhase::Syncing as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok();
+        crate::domain::wake_thinkterm_frontend();
         Ok(())
     }
 
     pub(crate) fn abort_connection_generation(&self, connection_generation: u64, reason: String) {
-        let _ = self.sender.try_send(ReaderMessage::AbortGeneration {
-            connection_generation,
-            reason,
-        });
+        if let Some((generation, sender)) = &*self.abort.lock().unwrap() {
+            if *generation == connection_generation {
+                let _ = sender.try_send(GenerationAbort {
+                    reason,
+                    retry: true,
+                });
+            }
+        }
     }
 }
 
@@ -434,15 +523,24 @@ fn process_unilateral(
             promise::spawn::spawn_into_main_thread(async move {
                 while let Some(snapshot) = pending.next() {
                     let pane = snapshot.pane_id;
-                    let decoded = DecodedPdu { serial: 0, pdu: Pdu::KittyFrameSelections(snapshot) };
+                    let decoded = DecodedPdu {
+                        serial: 0,
+                        pdu: Pdu::KittyFrameSelections(snapshot),
+                    };
                     if let Err(err) = process_unilateral_inner_async(
-                        pane, local_domain_id, connection_generation, decoded,
-                    ).await {
+                        pane,
+                        local_domain_id,
+                        connection_generation,
+                        decoded,
+                    )
+                    .await
+                    {
                         log::error!("processing Kitty snapshot: {err:#}");
                     }
                     smol::future::yield_now().await;
                 }
-            }).detach();
+            })
+            .detach();
         }
         return Ok(());
     }
@@ -699,6 +797,8 @@ fn process_unilateral(
 enum NotReconnectableError {
     #[error("Client was destroyed")]
     ClientWasDestroyed,
+    #[error("connection no longer owns its domain: {0}")]
+    DomainWasReplaced(String),
 }
 
 /// Did this failure come from the user dismissing an auth prompt rather than
@@ -720,13 +820,49 @@ fn client_thread(
     local_domain_id: Option<DomainId>,
     connection_generation: u64,
     rx: &mut Receiver<ReaderMessage>,
+    shutdown: &Receiver<()>,
+    abort: &Receiver<GenerationAbort>,
 ) -> anyhow::Result<()> {
-    block_on(client_thread_async(
-        reconnectable,
-        local_domain_id,
-        connection_generation,
-        rx,
+    block_on(run_generation(
+        client_thread_async(reconnectable, local_domain_id, connection_generation, rx),
+        shutdown,
+        abort,
     ))
+}
+
+async fn run_generation<T>(
+    session: impl std::future::Future<Output = anyhow::Result<T>>,
+    shutdown: &Receiver<()>,
+    abort: &Receiver<GenerationAbort>,
+) -> anyhow::Result<T> {
+    // Poll control before IO: a continuously readable peer cannot starve a
+    // cancellation. Dropping the losing future closes its partial frame.
+    smol::future::or(
+        async {
+            smol::future::or(
+                async {
+                    let _ = shutdown.recv().await;
+                    Err(NotReconnectableError::ClientWasDestroyed.into())
+                },
+                async {
+                    match abort.recv().await {
+                        Ok(GenerationAbort {
+                            reason,
+                            retry: true,
+                        }) => bail!("reattach failed: {reason}"),
+                        Ok(GenerationAbort {
+                            reason,
+                            retry: false,
+                        }) => Err(NotReconnectableError::DomainWasReplaced(reason).into()),
+                        Err(_) => std::future::pending().await,
+                    }
+                },
+            )
+            .await
+        },
+        session,
+    )
+    .await
 }
 
 async fn client_thread_async(
@@ -735,10 +871,55 @@ async fn client_thread_async(
     connection_generation: u64,
     rx: &mut Receiver<ReaderMessage>,
 ) -> anyhow::Result<()> {
+    client_thread_with_registration_timeout(
+        reconnectable,
+        local_domain_id,
+        connection_generation,
+        rx,
+        REGISTRATION_TIMEOUT,
+    )
+    .await
+}
+
+async fn client_thread_with_registration_timeout(
+    reconnectable: &mut Reconnectable,
+    local_domain_id: Option<DomainId>,
+    connection_generation: u64,
+    rx: &mut Receiver<ReaderMessage>,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let registered = AtomicBool::new(false);
+    smol::future::or(
+        async {
+            smol::Timer::after(timeout).await;
+            if registered.load(Ordering::Acquire) {
+                std::future::pending().await
+            } else {
+                bail!("mux registration did not complete within {timeout:?}")
+            }
+        },
+        client_thread_registered(
+            reconnectable,
+            local_domain_id,
+            connection_generation,
+            rx,
+            &registered,
+        ),
+    )
+    .await
+}
+
+async fn client_thread_registered(
+    reconnectable: &mut Reconnectable,
+    local_domain_id: Option<DomainId>,
+    connection_generation: u64,
+    rx: &mut Receiver<ReaderMessage>,
+    registered: &AtomicBool,
+) -> anyhow::Result<()> {
     let mut next_serial = 1u64;
     let mut registration = PduRegistrationBarrier::new();
-    let mut deferred_unilateral = VecDeque::<DecodedPdu>::new();
-    let mut deferred_kitty: Option<codec::kitty_queue::KittyFrameMailbox> = None;
+    let mut deferred_unilateral = VecDeque::<DeferredPdu>::new();
+    let mut deferred_bytes = 0usize;
     let kitty_frames = codec::kitty_queue::KittyFrameMailbox::default();
     let kitty_pending = kitty_frames.handle();
 
@@ -778,8 +959,24 @@ async fn client_thread_async(
     // never notice.
     let mut keepalive_deadline = std::time::Instant::now() + KEEPALIVE_INTERVAL;
 
+    let mut turns = 0usize;
     loop {
-        let rx_msg = rx.recv();
+        // A stream of immediately-ready frames must still let the outer
+        // registration deadline and cancellation futures run.
+        turns += 1;
+        if turns % 32 == 0 {
+            smol::future::yield_now().await;
+        }
+        // At the in-flight limit, new requests stay queued, in order, until
+        // replies free a slot.
+        let in_flight = promises.map.len();
+        let rx_msg = async {
+            if in_flight >= PENDING_REQUESTS {
+                std::future::pending().await
+            } else {
+                rx.recv().await
+            }
+        };
         let wait_for_read = stream
             .wait_for_readable()
             .map(|_| Ok(ReaderMessage::Readable));
@@ -788,7 +985,7 @@ async fn client_thread_async(
             Ok(ReaderMessage::KeepaliveTick)
         };
 
-        match smol::future::or(smol::future::or(rx_msg, wait_for_read), keepalive).await {
+        match smol::future::or(keepalive, smol::future::or(rx_msg, wait_for_read)).await {
             Ok(ReaderMessage::SendPdu {
                 pdu,
                 promise,
@@ -802,11 +999,7 @@ async fn client_thread_async(
                 let serial = next_serial;
                 next_serial += 1;
                 promises.map.insert(serial, promise);
-
-                pdu.encode_async(&mut stream, serial)
-                    .await
-                    .context("encoding a PDU to send to the server")?;
-                stream.flush().await.context("flushing PDU to server")?;
+                write_pdu(&mut *stream, &pdu, serial).await?;
             }
             Ok(ReaderMessage::RegistrationComplete {
                 connection_generation: completed_generation,
@@ -818,45 +1011,25 @@ async fn client_thread_async(
                     );
                     continue;
                 }
-                while let Some(decoded) = deferred_unilateral.pop_front() {
-                    process_unilateral(local_domain_id, connection_generation, decoded, &kitty_pending)
-                        .context("processing unilateral PDU buffered during registration")?;
+                registered.store(true, Ordering::Release);
+                deferred_bytes = 0;
+                for deferred in std::mem::take(&mut deferred_unilateral) {
+                    process_unilateral(
+                        local_domain_id,
+                        connection_generation,
+                        deferred.decode()?,
+                        &kitty_pending,
+                    )
+                    .context("processing unilateral PDU buffered during registration")?;
                 }
-                if let Some(deferred) = deferred_kitty.take() {
-                    let pending = deferred.handle();
-                    while let Some(snapshot) = pending.next() {
-                        process_unilateral(local_domain_id, connection_generation,
-                            DecodedPdu { serial: 0, pdu: Pdu::KittyFrameSelections(snapshot) },
-                            &kitty_pending)?;
-                    }
-                }
-                for (pdu, promise) in registration.complete() {
+                // The registration budget already bounds these. If they push
+                // the in-flight count past its limit, new requests wait.
+                for (deferred, promise) in registration.complete() {
                     let serial = next_serial;
                     next_serial += 1;
                     promises.map.insert(serial, promise);
-                    pdu.encode_async(&mut stream, serial)
-                        .await
-                        .context("encoding a deferred PDU after client registration")?;
+                    write_pdu(&mut *stream, &deferred.decode()?.pdu, serial).await?;
                 }
-                stream
-                    .flush()
-                    .await
-                    .context("flushing deferred PDUs after client registration")?;
-            }
-            Ok(ReaderMessage::AbortGeneration {
-                connection_generation: aborted_generation,
-                reason,
-            }) => {
-                if aborted_generation != connection_generation {
-                    log::debug!(
-                        "ignoring abort for generation {aborted_generation}; \
-                         current generation is {connection_generation}: {reason}"
-                    );
-                    continue;
-                }
-                promises.fail_all(&reason);
-                registration.fail_deferred(&reason);
-                anyhow::bail!("reattach failed for generation {connection_generation}: {reason}");
             }
             Ok(ReaderMessage::KeepaliveTick) => {
                 if let Some((serial, sent)) = pending_ping.take() {
@@ -872,15 +1045,49 @@ async fn client_thread_async(
                 next_serial += 1;
                 pending_ping = Some((serial, std::time::Instant::now()));
                 keepalive_deadline = std::time::Instant::now() + KEEPALIVE_INTERVAL;
-                Pdu::Ping(Ping {})
-                    .encode_async(&mut stream, serial)
-                    .await
-                    .context("encoding keepalive ping")?;
-                stream.flush().await.context("flushing keepalive ping")?;
+                write_pdu(&mut *stream, &Pdu::Ping(Ping {}), serial).await?;
             }
             Ok(ReaderMessage::Readable) => {
-                match Pdu::decode_async(&mut stream, Some(next_serial)).await {
-                    Ok(decoded) => {
+                let bytes = AtomicU64::new(0);
+                let mut counted = Counted {
+                    stream: &mut *stream,
+                    bytes: &bytes,
+                };
+                let read = with_progress(&bytes, IO_STALL_LIMIT, async {
+                    if registration.is_complete() {
+                        return Pdu::decode_async(&mut counted, Some(next_serial))
+                            .await
+                            .map(Some);
+                    }
+                    let deferred = DeferredPdu::read_async(
+                        &mut counted,
+                        Some(next_serial),
+                        REGISTRATION_BYTES.saturating_sub(deferred_bytes),
+                    )
+                    .await?;
+                    if !deferred.is_push() {
+                        return deferred.decode().map(Some);
+                    }
+                    anyhow::ensure!(
+                        deferred_unilateral.len() < REGISTRATION_MESSAGES,
+                        "too many pushes waiting for mux registration"
+                    );
+                    let cost = deferred.retained_bytes();
+                    anyhow::ensure!(
+                        cost <= REGISTRATION_BYTES.saturating_sub(deferred_bytes),
+                        "pushes waiting for mux registration exceed byte budget"
+                    );
+                    deferred_bytes += cost;
+                    deferred_unilateral.push_back(deferred);
+                    Ok(None)
+                })
+                .await;
+                if read.is_ok() && pending_ping.is_none() {
+                    keepalive_deadline = std::time::Instant::now() + KEEPALIVE_INTERVAL;
+                }
+                match read {
+                    Ok(None) => continue,
+                    Ok(Some(decoded)) => {
                         crate::domain::wake_thinkterm_frontend();
                         // Traffic postpones the next ping, but not the
                         // verdict on one already sent: a server that keeps
@@ -899,11 +1106,7 @@ async fn client_thread_async(
                         // thread, so a stalled GUI never looks like a dead
                         // client.
                         if matches!(decoded.pdu, Pdu::Ping(_)) && decoded.serial == 0 {
-                            Pdu::Pong(Pong {})
-                                .encode_async(&mut stream, 0)
-                                .await
-                                .context("encoding pong")?;
-                            stream.flush().await.context("flushing pong")?;
+                            write_pdu(&mut *stream, &Pdu::Pong(Pong {}), 0).await?;
                             continue;
                         }
                         if pending_ping.map_or(false, |(serial, _)| serial == decoded.serial) {
@@ -911,20 +1114,17 @@ async fn client_thread_async(
                             keepalive_deadline = std::time::Instant::now() + KEEPALIVE_INTERVAL;
                         } else if decoded.serial == 0 {
                             if registration.is_complete() {
-                                process_unilateral(local_domain_id, connection_generation, decoded, &kitty_pending)
-                                    .context("processing unilateral PDU from server")
-                                    .map_err(|e| {
-                                        log::error!("process_unilateral: {:?}", e);
-                                        e
-                                    })?;
-                            } else {
-                                match decoded.pdu {
-                                    Pdu::KittyFrameSelections(snapshot) => {
-                                        deferred_kitty.get_or_insert_with(Default::default)
-                                            .handle().post(snapshot)?;
-                                    }
-                                    _ => deferred_unilateral.push_back(decoded),
-                                }
+                                process_unilateral(
+                                    local_domain_id,
+                                    connection_generation,
+                                    decoded,
+                                    &kitty_pending,
+                                )
+                                .context("processing unilateral PDU from server")
+                                .map_err(|e| {
+                                    log::error!("process_unilateral: {:?}", e);
+                                    e
+                                })?;
                             }
                         } else if let Some(promise) = promises.map.remove(&decoded.serial) {
                             if promise.try_send(Ok(decoded.pdu)).is_err() {
@@ -1696,11 +1896,16 @@ impl Client {
         let is_reconnectable = reconnectable.reconnectable();
         let is_local = reconnectable.is_local();
         let (sender, mut receiver) = unbounded();
+        let (shutdown, shutdown_rx) = bounded(1);
+        let abort: AbortSlot = Arc::new(Mutex::new(None));
+        let reader_abort = Arc::clone(&abort);
+        let attached = Arc::new(AtomicBool::new(false));
+        let reader_attached = Arc::clone(&attached);
         let client_id = mux::client::generate_client_id();
         let reader_client_id = client_id.clone();
         let connection_phase = Arc::new(AtomicU8::new(ClientConnectionPhase::Registering as u8));
         let reader_connection_phase = Arc::clone(&connection_phase);
-        let (resume_reconnect_tx, resume_reconnect_rx) = channel::<()>();
+        let (resume_reconnect_tx, resume_reconnect_rx) = bounded::<()>(1);
         let remote_server_id = Arc::new(RwLock::new(None));
         let remote_os_release = Arc::new(RwLock::new(None));
         let connection_generation = Arc::new(AtomicU64::new(0));
@@ -1746,27 +1951,40 @@ impl Client {
 
             let mut pending_reattach_ui: Option<ConnectionUI> = None;
             'client: loop {
+                if shutdown_rx.is_closed() {
+                    break;
+                }
                 let session_started = std::time::Instant::now();
                 let generation = NEXT_CONNECTION_GENERATION.fetch_add(1, Ordering::AcqRel);
                 reader_connection_generation.store(generation, Ordering::Release);
+                let (abort_tx, abort_rx) = bounded(1);
+                *reader_abort.lock().unwrap() = Some((generation, abort_tx.clone()));
                 if let (Some(reattach_ui), Some(local_domain_id)) =
                     (pending_reattach_ui.take(), local_domain_id)
                 {
                     let phase = Arc::clone(&reader_connection_phase);
+                    let current_generation = Arc::clone(&reader_connection_generation);
+                    let original_client_id = reader_client_id.clone();
                     promise::spawn::spawn_into_main_thread(async move {
                         match ClientDomain::reattach(
                             local_domain_id,
                             generation,
                             reattach_ui.clone(),
                         )
+                        .or(async {
+                            smol::Timer::after(REGISTRATION_TIMEOUT).await;
+                            bail!("mux session restoration did not complete within {REGISTRATION_TIMEOUT:?}")
+                        })
                         .await
                         {
                             Ok(mark_ready) => {
+                                if current_generation.load(Ordering::Acquire) != generation { return; }
                                 if mark_ready {
-                                    phase.store(
+                                    phase.compare_exchange(
+                                        ClientConnectionPhase::Syncing as u8,
                                         ClientConnectionPhase::Ready as u8,
-                                        Ordering::Release,
-                                    );
+                                        Ordering::AcqRel, Ordering::Acquire,
+                                    ).ok();
                                     log::info!("Reconnected and restored generation {generation}");
                                 } else {
                                     log::info!(
@@ -1779,14 +1997,13 @@ impl Client {
                             }
                             Err(err) => {
                                 log::error!("reattach failed for generation {generation}: {err:#}");
-                                if let Ok(inner) =
-                                    ClientDomain::get_client_inner_for_domain(local_domain_id)
-                                {
-                                    inner.client.abort_connection_generation(
-                                        generation,
-                                        format!("{err:#}"),
-                                    );
-                                }
+                                let retry = ClientDomain::get_client_inner_for_domain(local_domain_id)
+                                    .is_ok_and(|inner| inner.client.client_id == original_client_id
+                                        && inner.client.connection_generation() == generation);
+                                // This sender addresses the failed reader itself. A missing or
+                                // replaced domain must not prevent its cancellation.
+                                let _ = abort_tx.try_send(GenerationAbort { reason: format!("{err:#}"), retry });
+                                reattach_ui.close();
                             }
                         }
                     })
@@ -1797,8 +2014,21 @@ impl Client {
                     local_domain_id,
                     generation,
                     &mut receiver,
+                    &shutdown_rx,
+                    &abort_rx,
                 ) {
-                    if !reconnectable.reconnectable() || local_domain_id.is_none() {
+                    *reader_abort.lock().unwrap() = None;
+                    log::warn!(
+                        "mux connection generation {generation} ended in {:?}: {e:#}",
+                        ClientConnectionPhase::from_u8(
+                            reader_connection_phase.load(Ordering::Acquire)
+                        )
+                    );
+                    if !reconnectable.reconnectable()
+                        || local_domain_id.is_none()
+                        || !reader_attached.load(Ordering::Acquire)
+                        || shutdown_rx.is_closed()
+                    {
                         log::debug!("client thread ended: {}", e);
                         break;
                     }
@@ -1879,6 +2109,9 @@ impl Client {
                     }
 
                     loop {
+                        if shutdown_rx.is_closed() {
+                            break 'client;
+                        }
                         // Reconnect silently. The outage is already on screen
                         // four ways — an opaque overlay across every pane of
                         // this domain, the orange sidebar Space icon, the
@@ -1943,6 +2176,9 @@ impl Client {
                             // answers a sleep with Ok.
                             suspend = Some("reconnect prompt dismissed".to_string());
                         } else {
+                            if shutdown_rx.is_closed() {
+                                break 'client;
+                            }
                             let initial = false;
                             // Normally a reconnect must not auto-start a
                             // server: during a network blip the server is
@@ -1998,12 +2234,19 @@ impl Client {
                             reader_connection_phase
                                 .store(ClientConnectionPhase::Suspended as u8, Ordering::Release);
                             crate::domain::wake_thinkterm_frontend();
-                            match resume_reconnect_rx.recv() {
+                            match block_on(smol::future::or(
+                                async {
+                                    let _ = shutdown_rx.recv().await;
+                                    Err(())
+                                },
+                                async { resume_reconnect_rx.recv().await.map_err(|_| ()) },
+                            )) {
                                 Ok(()) => {
                                     reader_connection_phase.store(
                                         ClientConnectionPhase::Reconnecting as u8,
                                         Ordering::Release,
                                     );
+                                    crate::domain::wake_thinkterm_frontend();
                                     *outage_started = std::time::Instant::now();
                                     backoff = BASE_INTERVAL;
                                     short_sessions = 0;
@@ -2028,7 +2271,10 @@ impl Client {
             // Whatever ended the loop (not reconnectable, or every Client
             // handle gone), don't leave the reconnect UI behind. The domain
             // detaches below, so we are no longer "reconnecting".
+            receiver.close();
+            *reader_abort.lock().unwrap() = None;
             reader_connection_phase.store(ClientConnectionPhase::Detached as u8, Ordering::Release);
+            crate::domain::wake_thinkterm_frontend();
             if let Some(ui) = reconnect_ui.take() {
                 ui.close();
             }
@@ -2051,7 +2297,7 @@ impl Client {
                     let owned = client_domain
                         .inner()
                         .map(|inner| inner.client.client_id == client_id)
-                        .unwrap_or(true);
+                        .unwrap_or(false);
                     if owned {
                         client_domain.perform_detach();
                     } else {
@@ -2075,6 +2321,9 @@ impl Client {
 
         Self {
             sender,
+            shutdown,
+            abort,
+            attached,
             local_domain_id,
             is_reconnectable,
             is_local,
@@ -2187,6 +2436,9 @@ impl Client {
                     version: info.version_string,
                     codec_vers: info.codec_vers,
                 };
+                if !self.attached.load(Ordering::Acquire) {
+                    self.close();
+                }
                 ui.output_str(&err.to_string());
                 log::error!("{:?}", err);
                 return Err(err.into());
@@ -2446,10 +2698,22 @@ impl Client {
         MutateThinkTermTree,
         ThinkTermTreeState
     );
-    rpc!(get_import_session_status, GetImportSessionStatus, GetImportSessionStatusResponse);
+    rpc!(
+        get_import_session_status,
+        GetImportSessionStatus,
+        GetImportSessionStatusResponse
+    );
     rpc!(import_session, ImportSessionRequest, ImportSessionResponse);
-    rpc!(list_import_sessions, ListImportSessions, ListImportSessionsResponse);
-    rpc!(preview_import_session, PreviewImportSession, PreviewImportSessionResponse);
+    rpc!(
+        list_import_sessions,
+        ListImportSessions,
+        ListImportSessionsResponse
+    );
+    rpc!(
+        preview_import_session,
+        PreviewImportSession,
+        PreviewImportSessionResponse
+    );
     rpc!(
         get_thinkterm_session_state,
         GetThinkTermSessionState = (),
@@ -2496,7 +2760,11 @@ impl Client {
     rpc!(web_token_mint, WebTokenMint, WebTokenMintResponse);
     rpc!(web_token_list, WebTokenList = (), WebTokenListResponse);
     rpc!(web_token_revoke, WebTokenRevoke, WebTokenRevokeResponse);
-    rpc!(get_web_server_status, GetWebServerStatus = (), WebServerStatus);
+    rpc!(
+        get_web_server_status,
+        GetWebServerStatus = (),
+        WebServerStatus
+    );
     rpc!(set_web_server, SetWebServer, WebServerStatus);
     rpc!(
         search_scrollback,
@@ -2556,7 +2824,12 @@ mod tests {
     fn a_short_refused_session_keeps_the_clock_running() {
         let old = Some(Instant::now() - Duration::from_secs(3600));
         assert_eq!(
-            outage_clock_after_session(old, false, Duration::from_secs(3), Duration::from_secs(120)),
+            outage_clock_after_session(
+                old,
+                false,
+                Duration::from_secs(3),
+                Duration::from_secs(120)
+            ),
             old
         );
     }
@@ -2651,8 +2924,291 @@ mod tests {
              Error: pane 9 is not contained by viewport tab 6"
         );
 
-        let dropped = anyhow::anyhow!("EOF while reading leb128 encoded value")
-            .context("decoding a PDU");
+        let dropped =
+            anyhow::anyhow!("EOF while reading leb128 encoded value").context("decoding a PDU");
         assert!(!super::RemoteRpcError::is_cause_of(&dropped));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod connection_regression_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn pair() -> (Reconnectable, Async<std::os::unix::net::UnixStream>) {
+        let (client, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = Async::new(client).unwrap();
+        let peer = Async::new(peer).unwrap();
+        (
+            Reconnectable::new(
+                ClientDomainConfig::Unix(UnixDomain::default()),
+                Some(Box::new(client)),
+            ),
+            peer,
+        )
+    }
+
+    async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
+        smol::future::or(future, async {
+            smol::Timer::after(Duration::from_secs(3)).await;
+            panic!("connection test timed out")
+        })
+        .await
+    }
+
+    #[test]
+    fn retaining_a_refused_client_does_not_retain_its_connection() {
+        block_on(async {
+            let (connection, mut peer) = pair();
+            let client = Client::new(None, connection);
+            let ui = ConnectionUI::new_headless();
+            let (result, ()) = within(smol::future::zip(
+                client.verify_version_compat(&ui),
+                async {
+                    let request = Pdu::decode_async(&mut peer, None).await.unwrap();
+                    assert!(matches!(request.pdu, Pdu::GetCodecVersion(_)));
+                    Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                        codec_vers: CODEC_VERSION - 1,
+                        version_string: "fixture-old".into(),
+                        server_id: "fixture".into(),
+                        executable_path: "/tmp/server".into(),
+                        config_file_path: None,
+                    })
+                    .encode_async(&mut peer, request.serial)
+                    .await
+                    .unwrap();
+                    let mut byte = [0];
+                    assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
+                },
+            ))
+            .await;
+            assert!(result.unwrap_err().is::<IncompatibleVersionError>());
+            assert_eq!(client.connection_phase(), ClientConnectionPhase::Detached);
+            // client is deliberately still owned at this point.
+            assert!(client.shutdown.is_closed());
+        });
+    }
+
+    #[test]
+    fn dropping_client_handles_cancels_a_partial_read() {
+        block_on(async {
+            let (mut connection, mut peer) = pair();
+            peer.write_all(&[0x80]).await.unwrap();
+            let (_sender, mut receiver) = bounded(1);
+            let (shutdown, shutdown_rx) = bounded(1);
+            let (_abort, abort_rx) = bounded(1);
+            let session = run_generation(
+                client_thread_async(&mut connection, None, 1, &mut receiver),
+                &shutdown_rx,
+                &abort_rx,
+            );
+            let (result, ()) = within(smol::future::zip(session, async {
+                smol::Timer::after(Duration::from_millis(20)).await;
+                drop(shutdown);
+            }))
+            .await;
+            assert!(result.unwrap_err().is::<NotReconnectableError>());
+            let mut byte = [0];
+            assert_eq!(within(peer.read(&mut byte)).await.unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn an_orphaned_generation_is_cancelled_without_a_domain_lookup() {
+        block_on(async {
+            let (mut connection, mut peer) = pair();
+            peer.write_all(&[0x80]).await.unwrap();
+            let (_sender, mut receiver) = bounded(1);
+            let (_shutdown, shutdown_rx) = bounded(1);
+            let (abort, abort_rx) = bounded(1);
+            let session = run_generation(
+                client_thread_async(&mut connection, None, 7, &mut receiver),
+                &shutdown_rx,
+                &abort_rx,
+            );
+            let (result, ()) = within(smol::future::zip(session, async {
+                smol::Timer::after(Duration::from_millis(20)).await;
+                abort
+                    .send(GenerationAbort {
+                        reason: "domain has no assigned client".into(),
+                        retry: false,
+                    })
+                    .await
+                    .unwrap();
+            }))
+            .await;
+            assert!(matches!(
+                result.unwrap_err().downcast_ref::<NotReconnectableError>(),
+                Some(NotReconnectableError::DomainWasReplaced(_))
+            ));
+            let mut byte = [0];
+            assert_eq!(within(peer.read(&mut byte)).await.unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn registration_expires_even_while_pushes_keep_arriving() {
+        block_on(async {
+            let (mut connection, mut peer) = pair();
+            let (_sender, mut receiver) = bounded(1);
+            let started = Instant::now();
+            let result = within(smol::future::or(
+                client_thread_with_registration_timeout(
+                    &mut connection,
+                    None,
+                    1,
+                    &mut receiver,
+                    Duration::from_millis(50),
+                ),
+                async {
+                    loop {
+                        if Pdu::WindowTitleChanged(WindowTitleChanged {
+                            window_id: 0,
+                            title: "output".into(),
+                        })
+                        .encode_async(&mut peer, 0)
+                        .await
+                        .is_err()
+                        {
+                            return std::future::pending().await;
+                        }
+                        smol::Timer::after(Duration::from_millis(1)).await;
+                    }
+                },
+            ))
+            .await;
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("registration did not complete"));
+            assert!(started.elapsed() < Duration::from_secs(2));
+        });
+    }
+
+    #[test]
+    fn requests_past_the_in_flight_limit_wait_instead_of_failing() {
+        block_on(async {
+            let (mut connection, mut peer) = pair();
+            let (sender, mut receiver) = unbounded();
+            sender
+                .try_send(ReaderMessage::RegistrationComplete {
+                    connection_generation: 1,
+                })
+                .unwrap();
+            let mut replies = Vec::new();
+            for _ in 0..=PENDING_REQUESTS {
+                let (promise, reply) = bounded(1);
+                sender
+                    .try_send(ReaderMessage::SendPdu {
+                        pdu: Pdu::Ping(Ping {}),
+                        promise,
+                        registration_required: true,
+                    })
+                    .unwrap();
+                replies.push(reply);
+            }
+            let reader = async {
+                let ended = client_thread_async(&mut connection, None, 1, &mut receiver).await;
+                panic!("connection ended: {:?}", ended);
+            };
+            let server = async {
+                let mut serials = Vec::new();
+                for _ in 0..PENDING_REQUESTS {
+                    serials.push(Pdu::decode_async(&mut peer, None).await.unwrap().serial);
+                }
+                let early = smol::future::or(
+                    async { Some(Pdu::decode_async(&mut peer, None).await.unwrap()) },
+                    async {
+                        smol::Timer::after(Duration::from_millis(100)).await;
+                        None
+                    },
+                )
+                .await;
+                assert!(early.is_none(), "a request beyond the limit was sent");
+                Pdu::Pong(Pong {})
+                    .encode_async(&mut peer, serials[0])
+                    .await
+                    .unwrap();
+                let last = Pdu::decode_async(&mut peer, None).await.unwrap();
+                assert!(matches!(last.pdu, Pdu::Ping(_)));
+                assert!(matches!(replies[0].recv().await.unwrap(), Ok(Pdu::Pong(_))));
+                assert!(replies[1..]
+                    .iter()
+                    .all(|reply| reply.is_empty() && !reply.is_closed()));
+            };
+            within(smol::future::or(reader, server)).await;
+        });
+    }
+
+    #[test]
+    fn registration_pushes_cannot_exceed_the_decompressed_byte_budget() {
+        block_on(async {
+            let (mut connection, mut peer) = pair();
+            let (_sender, mut receiver) = bounded(1);
+            let result = within(smol::future::or(
+                client_thread_async(&mut connection, None, 1, &mut receiver),
+                async {
+                    let pdu = Pdu::WindowTitleChanged(WindowTitleChanged {
+                        window_id: 0,
+                        title: "x".repeat(1024 * 1024),
+                    });
+                    for _ in 0..40 {
+                        if pdu.encode_async(&mut peer, 0).await.is_err() {
+                            break;
+                        }
+                    }
+                    std::future::pending().await
+                },
+            ))
+            .await;
+            assert!(format!("{:#}", result.unwrap_err()).contains("byte budget"));
+        });
+    }
+
+    #[test]
+    fn an_oversized_registration_request_fails_alone() {
+        let mut barrier = PduRegistrationBarrier::new();
+        let (promise, receiver) = bounded(1);
+        let pdu = Pdu::WindowTitleChanged(WindowTitleChanged {
+            window_id: 0,
+            title: "x".repeat(REGISTRATION_BYTES + 1),
+        });
+        assert!(barrier.submit((pdu, promise), true).is_none());
+        let refused = receiver.try_recv().unwrap().unwrap_err();
+        assert!(format!("{refused:#}").contains("byte budget"));
+        assert_eq!(barrier.bytes, 0);
+        let (promise, receiver) = bounded(1);
+        assert!(barrier.submit((Pdu::Ping(Ping {}), promise), true).is_none());
+        barrier.fail_deferred("cancelled");
+        assert_eq!(
+            receiver.try_recv().unwrap().unwrap_err().to_string(),
+            "cancelled"
+        );
+        assert_eq!(barrier.bytes, 0);
+        assert_eq!(barrier.deferred.capacity(), 0);
+    }
+
+    #[test]
+    fn registration_flush_preserves_request_order_and_releases_storage() {
+        let mut barrier = PduRegistrationBarrier::new();
+        for name in ["first", "second"] {
+            let (promise, _receiver) = bounded(1);
+            let pdu = Pdu::WindowTitleChanged(WindowTitleChanged {
+                window_id: 0,
+                title: name.into(),
+            });
+            assert!(barrier.submit((pdu, promise), true).is_none());
+        }
+        let names: Vec<_> = barrier
+            .complete()
+            .into_iter()
+            .map(|(pdu, _)| match pdu.decode().unwrap().pdu {
+                Pdu::WindowTitleChanged(title) => title.title,
+                _ => panic!("wrong PDU"),
+            })
+            .collect();
+        assert_eq!(names, ["first", "second"]);
+        assert!(barrier.is_complete());
+        assert_eq!(barrier.deferred.capacity(), 0);
     }
 }

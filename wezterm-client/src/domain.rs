@@ -23,6 +23,17 @@ use wezterm_term::TerminalSize;
 
 const MIN_PUSH_RESYNC_GAP: Duration = Duration::from_millis(500);
 
+async fn with_attach_timeout<T>(
+    operation: impl Future<Output = anyhow::Result<T>>,
+    timeout: Duration,
+) -> anyhow::Result<T> {
+    smol::future::or(operation, async {
+        smol::Timer::after(timeout).await;
+        bail!("mux attachment request did not complete within {timeout:?}")
+    })
+    .await
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResyncOutcome {
     Applied,
@@ -1369,6 +1380,7 @@ impl ClientInner {
             dead.len()
         );
         mux.domain_was_detached(self.local_domain_id);
+        wake_thinkterm_frontend();
     }
 
     /// Prepare to bind a fresh mux runtime into the local windows that were
@@ -2484,9 +2496,13 @@ impl ClientDomain {
 
     pub fn perform_detach(&self) {
         log::info!("detached domain {}", self.local_domain_id);
-        self.inner.lock().unwrap().take();
+        let inner = self.inner.lock().unwrap().take();
+        if let Some(inner) = inner {
+            inner.client.close();
+        }
         let mux = Mux::get();
         mux.domain_was_detached(self.local_domain_id);
+        wake_thinkterm_frontend();
     }
 
     pub fn remote_to_local_pane_id(&self, remote_pane_id: TabId) -> Option<TabId> {
@@ -4351,10 +4367,17 @@ impl ClientDomain {
                 );
                 return Ok(());
             }
+            inner.client.mark_attached()?;
             guard.replace(Arc::clone(&inner));
         }
 
-        Self::process_pane_list(Arc::clone(&inner), panes, primary_window_id, false, None)?;
+        if let Err(err) =
+            Self::process_pane_list(Arc::clone(&inner), panes, primary_window_id, false, None)
+        {
+            inner.client.close();
+            domain.perform_detach();
+            return Err(err);
+        }
 
         // What the server said about the lease before there was an inner
         // to hold it: applied now that the tabs it names exist here.
@@ -5897,6 +5920,7 @@ impl ClientDomain {
 
         let result = self.attach_with_ui_impl(window_id, ui).await;
         self.attaching.store(false, Ordering::SeqCst);
+        wake_thinkterm_frontend();
         result
     }
 
@@ -6058,6 +6082,9 @@ impl ClientDomain {
                     let (ClientDomainConfig::Ssh(ssh), Some(mismatch)) = (&config, mismatch) else {
                         return Err(err);
                     };
+                    // Updating can wait on a prompt indefinitely. Retire the
+                    // refused transport before opening that interaction.
+                    client.close();
                     let outcome = {
                         let ssh = ssh.clone();
                         let ui = ui.clone();
@@ -6084,7 +6111,8 @@ impl ClientDomain {
                 }
 
                 ui.output_str("Version check OK!  Requesting pane list...\n");
-                let panes = client.list_panes().await?;
+                let panes =
+                    with_attach_timeout(client.list_panes(), Duration::from_secs(150)).await?;
                 ui.output_str(&format!(
                     "Server has {} tabs.  Attaching to local UI...\n",
                     panes.tabs.len()
@@ -6110,7 +6138,9 @@ impl ClientDomain {
         // failing an otherwise-good attach over: without it the Space simply
         // shows no rows until the next push or reconnect. For the local
         // session host the fetch is what starts the mirror of the local Spaces.
-        if let Err(err) = self.fetch_thinkterm_tree().await {
+        if let Err(err) =
+            with_attach_timeout(self.fetch_thinkterm_tree(), Duration::from_secs(30)).await
+        {
             log::warn!(
                 "failed to fetch the ThinkTerm tree from {}: {err:#}",
                 self.config.name()
@@ -6118,7 +6148,12 @@ impl ClientDomain {
         }
         // Before the attach returns, so a window opened on these mirrors
         // opens on that tab; failing, they stay on their first one.
-        if let Err(err) = self.select_server_active_tabs(window_id).await {
+        if let Err(err) = with_attach_timeout(
+            self.select_server_active_tabs(window_id),
+            Duration::from_secs(30),
+        )
+        .await
+        {
             log::warn!(
                 "failed to select the active tabs of {}: {err:#}",
                 self.config.name()
@@ -6128,13 +6163,17 @@ impl ClientDomain {
         // Same failure policy: agent statuses are a nicety, not worth
         // failing an attach over; the push path catches us up on the
         // next state change regardless.
-        if let Err(err) = self.fetch_agent_statuses().await {
+        if let Err(err) =
+            with_attach_timeout(self.fetch_agent_statuses(), Duration::from_secs(30)).await
+        {
             log::warn!(
                 "failed to fetch agent statuses from {}: {err:#}",
                 self.config.name()
             );
         }
-        if let Err(err) = self.fetch_foreground_programs().await {
+        if let Err(err) =
+            with_attach_timeout(self.fetch_foreground_programs(), Duration::from_secs(30)).await
+        {
             log::warn!(
                 "failed to fetch foreground programs from {}: {err:#}",
                 self.config.name()
@@ -6263,5 +6302,28 @@ mod reattach_viewport_tests {
         assert_eq!(reattach_viewport_fallback(&paneless, &empty), None);
         let grid = codec::ClientViewport::CellGrid { size: size(24, 80) };
         assert_eq!(reattach_viewport_fallback(&grid, &empty), None);
+    }
+}
+
+#[cfg(test)]
+mod attach_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn an_unanswered_attach_request_cannot_hold_syncing_forever() {
+        smol::block_on(async {
+            let result: anyhow::Result<()> = with_attach_timeout(
+                std::future::pending(),
+                Duration::from_millis(10),
+            )
+            .await;
+            assert!(result.unwrap_err().to_string().contains("did not complete"));
+            assert_eq!(
+                with_attach_timeout(async { Ok(7) }, Duration::from_secs(1))
+                    .await
+                    .unwrap(),
+                7
+            );
+        });
     }
 }

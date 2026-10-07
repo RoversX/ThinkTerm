@@ -42,6 +42,7 @@ use thiserror::Error;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
 
+pub mod deferred;
 pub mod thinkterm_tree;
 pub mod import;
 pub use import::{
@@ -305,6 +306,14 @@ async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
     r: &mut R,
     max_serial: Option<u64>,
 ) -> anyhow::Result<Decoded> {
+    decode_raw_async_limited(r, max_serial, None).await
+}
+
+async fn decode_raw_async_limited<R: Unpin + AsyncRead + std::fmt::Debug>(
+    r: &mut R,
+    max_serial: Option<u64>,
+    push_budget: Option<usize>,
+) -> anyhow::Result<Decoded> {
     let len = read_u64_async(r)
         .await
         .context("decode_raw_async failed to read PDU length")?;
@@ -346,6 +355,11 @@ async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
         };
 
     check_payload_length(data_len, len, serial, ident)?;
+    if serial == 0 && ident != 1 {
+        if let Some(budget) = push_budget {
+            anyhow::ensure!(data_len <= budget, "registration push exceeds byte budget");
+        }
+    }
     if is_compressed {
         metrics::histogram!("pdu.decode.compressed.size").record(data_len as f64);
     } else {
@@ -640,6 +654,21 @@ macro_rules! pdu {
                 }
             }
 
+            /// Serialize a request for the bounded registration queue. The
+            /// ordinary registered send path does not take this extra pass.
+            pub fn defer(&self, budget: usize) -> Result<deferred::DeferredPdu, Error> {
+                let mut writer = deferred::LimitedWriter { data: Vec::new(), limit: budget };
+                let mut serializer = varbincode::Serializer::new(&mut writer);
+                let ident = match self {
+                    Pdu::Invalid { .. } => bail!("cannot defer an invalid PDU"),
+                    $( Pdu::$name(value) => {
+                        serde::Serialize::serialize(value, &mut serializer)?;
+                        $vers
+                    }, )*
+                };
+                Ok(deferred::DeferredPdu::from_payload(ident, writer.data))
+            }
+
             pub fn pdu_name(&self) -> &'static str {
                 match self {
                     Pdu::Invalid{..} => "Invalid",
@@ -653,6 +682,10 @@ macro_rules! pdu {
 
             pub fn decode<R: std::io::Read>(r: R) -> Result<DecodedPdu, Error> {
                 let decoded = decode_raw(r).context("decoding a PDU")?;
+                Self::from_decoded(decoded)
+            }
+
+            fn from_decoded(decoded: Decoded) -> Result<DecodedPdu, Error> {
                 // The arms only pick the variant's deserializer; see
                 // `decode_async` for why the value is not built in them.
                 let deserialize_variant: fn(&Payload, bool) -> Result<Pdu, Error>;
