@@ -179,3 +179,7 @@ Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before
 ThinkTerm is licensed under **GPL-3.0-only** — see [LICENSE.md](LICENSE.md). Code originating from WezTerm retains its original MIT license in [LICENSE-MIT](LICENSE-MIT). The agent detection manifests from herdr are licensed under **Apache-2.0**.
 
 See [NOTICE](NOTICE) and [licenses/README.md](licenses/README.md) for the full third-party attributions and licenses of bundled components and assets.
+
+
+
+![GitHub downloads](https://img.shields.io/github/downloads/RoversX/ThinkTerm/total)
