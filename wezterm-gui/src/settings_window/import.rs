@@ -43,6 +43,16 @@ impl ImportSource {
         Self::WezTerm
     }
 
+    /// Session imports take over another program's live terminals, which
+    /// is new enough to carry a Beta badge.
+    fn is_beta(self) -> bool {
+        match self {
+            Self::WezTerm => false,
+            #[cfg(unix)]
+            Self::Session(_) => true,
+        }
+    }
+
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::WezTerm => "WezTerm",
@@ -801,16 +811,32 @@ impl SettingsWindow {
                 )?;
             }
             let title_y = top + pad + icon + self.ui_px(24.0);
+            let title_width = self.measure_text_width(&heading, source.label());
+            // The title and its badge are centered as one line.
+            let badge_gap = self.ui_px(14.0);
+            let badge_width = if source.is_beta() {
+                badge_gap + self.beta_badge_width()
+            } else {
+                0.0
+            };
+            let title_x = left + ((card_width - title_width - badge_width) / 2.0).max(pad);
             self.draw_text(
                 layers,
                 &heading,
-                left + ((card_width - self.measure_text_width(&heading, source.label())) / 2.0)
-                    .max(pad),
+                title_x,
                 title_y,
                 source.label(),
                 palette.title,
                 text_width,
             )?;
+            if source.is_beta() {
+                self.paint_beta_badge(
+                    layers,
+                    title_x + title_width.min(text_width) + badge_gap,
+                    title_y,
+                    left + card_width - pad,
+                )?;
+            }
             for (row, line) in descriptions[index].iter().enumerate() {
                 self.draw_text(
                     layers,

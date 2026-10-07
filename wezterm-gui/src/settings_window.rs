@@ -15680,6 +15680,11 @@ impl SettingsWindow {
     /// A small "Beta" capsule starting at `x` after a title drawn at
     /// `title_y`, centred on the title's capitals. Left out when it would
     /// run past `right_edge`.
+    fn beta_badge_width(&self) -> f32 {
+        let label = crate::i18n::tr("settings-badge-beta");
+        (self.measure_text_width(&self.logo_caption_font, &label) + self.ui_px(12.0) * 2.0).round()
+    }
+
     fn paint_beta_badge(
         &self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -15690,7 +15695,7 @@ impl SettingsWindow {
         let font = Rc::clone(&self.logo_caption_font);
         let label = crate::i18n::tr("settings-badge-beta");
         let pad = self.ui_px(12.0);
-        let width = (self.measure_text_width(&font, &label) + pad * 2.0).round();
+        let width = self.beta_badge_width();
         if x + width > right_edge {
             return Ok(());
         }
