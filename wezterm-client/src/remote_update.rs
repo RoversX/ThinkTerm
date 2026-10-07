@@ -12,6 +12,7 @@
 //!
 //! - guess. It asks before installing anything and again before restarting
 //!   the server, because a restart ends every session the server holds.
+//! - reach GitHub on its own. It asks before looking the release up.
 //! - pick "the latest release". The server has to match *this* client, which
 //!   may not be the latest; a development build has no release to match at
 //!   all and is told so.
@@ -44,8 +45,8 @@ pub fn keep_sessions_on_update() -> bool {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RemoteUpdateOutcome {
-    /// Nothing was changed on the host: the person said no, or the client is
-    /// not a release build.
+    /// Nothing was changed on the host: the person said no, the client is
+    /// not a release build, or its release is not on GitHub.
     Declined,
     /// The new version is installed. `restarted` says whether the old mux
     /// server was stopped, so that the next connect starts the new one.
@@ -90,6 +91,39 @@ pub fn offer_remote_update(
         err.codec_vers,
         codec::CODEC_VERSION
     ));
+    let answer = ui.input(&format!(
+        "Look up ThinkTerm {local} on GitHub to install on {host}? [y/N] "
+    ));
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(err) => {
+            log::info!("remote update not offered: {err:#}");
+            return Ok(RemoteUpdateOutcome::Declined);
+        }
+    };
+    if !is_yes(&answer) {
+        ui.output_str(&format!(
+            "Not looking it up. To update {host} yourself, install ThinkTerm {local} \
+             there, or build a matching thinkterm-mux-server from the same source.\n"
+        ));
+        return Ok(RemoteUpdateOutcome::Declined);
+    }
+    if let Err(lookup) = thinkterm_update::get_release_by_tag(&local) {
+        if !is_not_published(&lookup) {
+            ui.output_str(&format!("Could not look up {local} on GitHub: {lookup:#}\n"));
+            return Ok(RemoteUpdateOutcome::Declined);
+        }
+        let latest = thinkterm_update::get_latest_release_info()
+            .map(|latest| format!(" (the latest is {})", latest.tag_name))
+            .unwrap_or_default();
+        ui.output_str(&format!(
+            "GitHub has no release {local} yet{latest}. Update {host} once it is \
+             released, or build a matching thinkterm-mux-server there from the same \
+             source now.\n"
+        ));
+        return Ok(RemoteUpdateOutcome::Declined);
+    }
+
     // The ssh session comes first: the host has to be asked what is
     // installed there before the question can say what will change. A
     // workstation with the desktop variant keeps its GUI; --server would
@@ -114,12 +148,23 @@ pub fn offer_remote_update(
 
     let variant = remote_variant(&session);
     let command = thinkterm_update::install_command(variant, &local);
+    // Uncommitted changes can include a newer protocol than the release
+    // that carries this version label.
+    let caveat = if config::wezterm_version().ends_with("-dirty") {
+        format!(
+            "This client was built with unreleased source changes (codec {}), so the \
+             released {local} may still not match it.\n",
+            codec::CODEC_VERSION
+        )
+    } else {
+        String::new()
+    };
 
     let answer = ui.input(&format!(
         "ThinkTerm can install {local} there now ({variant} variant, as the ssh user, \
          under ~/.local, with no root):\n  \
          {command}\n\
-         Install it? [y/N] ",
+         {caveat}Install it? [y/N] ",
     ));
     let answer = match answer {
         Ok(answer) => answer,
@@ -273,6 +318,13 @@ fn is_yes(answer: &str) -> bool {
     matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
 }
 
+/// Whether a release lookup failed because GitHub has no such release, as
+/// opposed to GitHub being unreachable. `thinkterm_update` reports HTTP
+/// errors as "fetching <uri>: HTTP <status> <reason>".
+fn is_not_published(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains(": HTTP 404 ")
+}
+
 /// Run `command` on the session, copying its stdout and stderr into the UI
 /// as they arrive, and return whether it exited successfully.
 fn run_and_relay(session: &Session, ui: &ConnectionUI, command: &str) -> anyhow::Result<bool> {
@@ -307,7 +359,7 @@ fn run_and_relay(session: &Session, ui: &ConnectionUI, command: &str) -> anyhow:
 
 #[cfg(test)]
 mod tests {
-    use super::is_yes;
+    use super::{is_not_published, is_yes};
 
     #[test]
     fn only_an_explicit_yes_counts() {
@@ -316,5 +368,22 @@ mod tests {
         assert!(!is_yes(""));
         assert!(!is_yes("n"));
         assert!(!is_yes("maybe"));
+    }
+
+    #[test]
+    fn only_a_404_means_the_release_is_not_out() {
+        let uri = "https://api.github.com/repos/o/r/releases/tags/9.9.9";
+        assert!(is_not_published(&anyhow::anyhow!(
+            "fetching {}: HTTP 404 Not Found",
+            uri
+        )));
+        assert!(!is_not_published(&anyhow::anyhow!(
+            "fetching {}: HTTP 403 Forbidden",
+            uri
+        )));
+        assert!(!is_not_published(&anyhow::anyhow!(
+            "fetching {}: failed to lookup address information",
+            uri
+        )));
     }
 }
