@@ -824,7 +824,7 @@ pub(crate) struct NativeLocalizationSettings {
 
 /// Chord that toggles the command palette, picked in Settings. The default
 /// bindings (⌘⇧P / ⌃⇧P) come from the keymap and always work; a non-default
-/// choice here is intercepted ahead of the keymap, so it also wins over
+/// choice joins the Keymap layer (`keymap_entries`), so it also wins over
 /// whatever the chord normally does (e.g. ⌘K's clear-scrollback).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -843,6 +843,17 @@ impl NativeCommandPaletteHotkey {
             Self::CmdP => "⌘ P",
             Self::CmdK => "⌘ K",
             Self::CtrlShiftP => "⌃ ⇧ P",
+        }
+    }
+
+    /// The chord a non-default choice adds to the Keymap layer.
+    pub(crate) fn picked_chord(self) -> Option<(window::Modifiers, char)> {
+        use window::Modifiers;
+        match self {
+            Self::CmdShiftP => None,
+            Self::CmdP => Some((Modifiers::SUPER, 'p')),
+            Self::CmdK => Some((Modifiers::SUPER, 'k')),
+            Self::CtrlShiftP => Some((Modifiers::CTRL | Modifiers::SHIFT, 'p')),
         }
     }
 }
@@ -900,6 +911,259 @@ impl Default for NativeCommandPaletteSettings {
     }
 }
 
+/// Shortcuts set in Settings → Keymap. They sit over the configuration
+/// file's `keys` and the built-in defaults -- a key bound here wins over
+/// both -- and the file itself is never rewritten.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub(crate) struct NativeKeymapSettings {
+    /// Each in the configuration file's own form, `{key, mods, action}`, as
+    /// JSON, its key read as the character typed; the action
+    /// "DisableDefaultAssignment" frees a key. An entry that does not parse
+    /// is kept as written and skipped.
+    pub(crate) keys: Vec<serde_json::Value>,
+}
+
+/// One shortcut of the Keymap layer, resolved as the configuration file's
+/// keys are.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct KeymapEntry {
+    pub(crate) key: window::KeyCode,
+    pub(crate) mods: window::Modifiers,
+    pub(crate) action: config::keyassignment::KeyAssignment,
+}
+
+/// The Keymap layer of `settings`. A palette hotkey picked under Command
+/// Palette is part of it, unless the layer binds the palette itself.
+pub(crate) fn keymap_entries(settings: &ThinkTermNativeSettings) -> Vec<KeymapEntry> {
+    use config::keyassignment::KeyAssignment;
+
+    let mut entries: Vec<KeymapEntry> = settings
+        .keymap
+        .keys
+        .iter()
+        .filter_map(|json| match parse_keymap_json(json) {
+            Ok(entry) => Some(entry),
+            Err(err) => {
+                log::warn!("skipping Keymap shortcut {json}: {err:#}");
+                None
+            }
+        })
+        .collect();
+
+    // The pick sits beside the palette's shortcuts set in Keymap, and gives
+    // way only to something Keymap set on its own chord.
+    if let Some(pick) = picked_palette_chord(settings) {
+        let taken = entries
+            .iter()
+            .any(|entry| (entry.key.clone(), entry.mods) == pick);
+        if !taken {
+            entries.push(KeymapEntry {
+                key: pick.0,
+                mods: pick.1,
+                action: KeyAssignment::ActivateCommandPalette,
+            });
+        }
+    }
+    entries
+}
+
+/// The chord the Command Palette page picked, when it is not the default.
+fn picked_palette_chord(
+    settings: &ThinkTermNativeSettings,
+) -> Option<(window::KeyCode, window::Modifiers)> {
+    let (mods, ch) = settings.command_palette.hotkey.picked_chord()?;
+    Some(crate::inputmap::canonical_chord(
+        &window::KeyCode::Char(ch),
+        mods,
+    ))
+}
+
+/// A Keymap entry as the key table holds it. The key is read as the
+/// character typed whatever `key_map_preference` says, as the page records
+/// and compares it; `phys:` still names a physical key.
+fn parse_keymap_json(json: &serde_json::Value) -> anyhow::Result<KeymapEntry> {
+    use wezterm_dynamic::{FromDynamic, FromDynamicOptions};
+    let value = config::json_to_dynamic(json);
+    let key = config::Key::from_dynamic(&value, FromDynamicOptions::default())?;
+    let (code, mods) = crate::inputmap::canonical_chord(
+        &key.key.key.resolve(config::KeyMapPreference::Mapped),
+        key.key.mods,
+    );
+    Ok(KeymapEntry {
+        key: code,
+        mods,
+        action: key.action,
+    })
+}
+
+/// A Keymap shortcut as settings.json keeps it: as typed, Shift spelled out
+/// on the key that types it, as a configuration file would write it.
+fn keymap_json(
+    key: &window::KeyCode,
+    mods: window::Modifiers,
+    action: &config::keyassignment::KeyAssignment,
+) -> serde_json::Value {
+    use wezterm_dynamic::ToDynamic;
+    let (key, mods) = crate::inputmap::typed_chord(key, mods);
+    serde_json::json!({
+        "key": crate::inputmap::config_key_name(&key),
+        "mods": mods.to_string(),
+        "action": config::dynamic_to_json(&action.to_dynamic()),
+    })
+}
+
+/// Change the Keymap layer and save it, then rebuild every window's key
+/// table from it. Nothing else reads the layer, so no configuration reload
+/// is owed: that would drop the loaded fonts and close the palette.
+pub(crate) fn update_keymap(edit: impl FnOnce(&mut ThinkTermNativeSettings)) -> anyhow::Result<()> {
+    update_with(edit, false)?;
+    apply_keymap_to_app();
+    Ok(())
+}
+
+/// Make the changes to the Keymap layer in one save: bind each chord to its
+/// action, or with `None` take back whatever the layer binds to it. A change
+/// to the palette pick's chord replaces the pick.
+pub(crate) fn set_keymap_shortcuts(
+    changes: &[(
+        (window::KeyCode, window::Modifiers),
+        Option<config::keyassignment::KeyAssignment>,
+    )],
+) -> anyhow::Result<()> {
+    let changes: Vec<_> = changes
+        .iter()
+        .map(|((key, mods), action)| (crate::inputmap::canonical_chord(key, *mods), action.clone()))
+        .collect();
+    update_keymap(|settings| {
+        if let Some(pick) = picked_palette_chord(settings) {
+            if changes.iter().any(|(chord, _)| *chord == pick) {
+                settings.command_palette.hotkey = NativeCommandPaletteHotkey::default();
+            }
+        }
+        for (chord, action) in &changes {
+            settings.keymap.keys.retain(|json| {
+                parse_keymap_json(json).map_or(true, |entry| (entry.key, entry.mods) != *chord)
+            });
+            if let Some(action) = action {
+                settings
+                    .keymap
+                    .keys
+                    .push(keymap_json(&chord.0, chord.1, action));
+            }
+        }
+    })
+}
+
+/// `set_keymap_shortcuts` for one chord.
+pub(crate) fn set_keymap_shortcut(
+    key: &window::KeyCode,
+    mods: window::Modifiers,
+    action: Option<&config::keyassignment::KeyAssignment>,
+) -> anyhow::Result<()> {
+    set_keymap_shortcuts(&[((key.clone(), mods), action.cloned())])
+}
+
+/// Forget every shortcut set in Settings, the palette pick included.
+pub(crate) fn reset_keymap() -> anyhow::Result<()> {
+    update_keymap(|settings| {
+        settings.keymap.keys.clear();
+        settings.command_palette.hotkey = NativeCommandPaletteHotkey::default();
+    })
+}
+
+/// The Command Palette page's pick, which gives the palette that chord
+/// outright: whatever Keymap set on it gives way -- on the default chords,
+/// when the pick is the default.
+pub(crate) fn set_palette_hotkey(hotkey: NativeCommandPaletteHotkey) -> anyhow::Result<()> {
+    use config::keyassignment::KeyAssignment;
+    let cleared = match hotkey.picked_chord() {
+        Some((mods, ch)) => vec![crate::inputmap::canonical_chord(
+            &window::KeyCode::Char(ch),
+            mods,
+        )],
+        None => crate::inputmap::default_chords(&KeyAssignment::ActivateCommandPalette),
+    };
+    update_keymap(|settings| {
+        settings.keymap.keys.retain(|json| {
+            parse_keymap_json(json)
+                .map_or(true, |entry| !cleared.contains(&(entry.key, entry.mods)))
+        });
+        settings.command_palette.hotkey = hotkey;
+    })
+}
+
+/// What the Command Palette page's Shortcut menu shows as picked: the chord
+/// of its menu that opens the palette -- the pick, unless Keymap took its
+/// chord; else one Keymap gave the palette; else the platform's default,
+/// unless Keymap took that. `None` when none of the menu's chords opens it.
+pub(crate) fn palette_hotkey_choice(
+    settings: &ThinkTermNativeSettings,
+) -> Option<NativeCommandPaletteHotkey> {
+    use config::keyassignment::KeyAssignment;
+    use NativeCommandPaletteHotkey as Hotkey;
+    let layer: Vec<KeymapEntry> = settings
+        .keymap
+        .keys
+        .iter()
+        .filter_map(|json| parse_keymap_json(json).ok())
+        .collect();
+    let taken = |chord: &(window::KeyCode, window::Modifiers)| {
+        layer
+            .iter()
+            .any(|entry| (&entry.key, entry.mods) == (&chord.0, chord.1))
+    };
+    if let Some(pick) = picked_palette_chord(settings) {
+        if !taken(&pick) {
+            return Some(settings.command_palette.hotkey);
+        }
+    }
+    let chord_of = |hotkey: Hotkey| {
+        hotkey
+            .picked_chord()
+            .map(|(mods, ch)| crate::inputmap::canonical_chord(&window::KeyCode::Char(ch), mods))
+    };
+    let set_here = [Hotkey::CmdP, Hotkey::CmdK, Hotkey::CtrlShiftP]
+        .iter()
+        .copied()
+        .find(|hotkey| {
+            chord_of(*hotkey).is_some_and(|chord| {
+                layer.iter().any(|entry| {
+                    entry.action == KeyAssignment::ActivateCommandPalette
+                        && (&entry.key, entry.mods) == (&chord.0, chord.1)
+                })
+            })
+        });
+    if set_here.is_some() {
+        return set_here;
+    }
+    let primary = if cfg!(target_os = "macos") {
+        window::Modifiers::SUPER
+    } else {
+        window::Modifiers::CTRL
+    };
+    let default_free = crate::inputmap::default_chords(&KeyAssignment::ActivateCommandPalette)
+        .iter()
+        .filter(|(_, mods)| mods.contains(primary))
+        .any(|chord| !taken(chord));
+    default_free.then_some(Hotkey::CmdShiftP)
+}
+
+/// Rebuild every window's key table and the menubar from the Keymap layer
+/// as it now stands.
+pub(crate) fn apply_keymap_to_app() {
+    if let Some(front_end) = crate::frontend::try_front_end() {
+        for gui_window in front_end.gui_windows() {
+            gui_window
+                .window
+                .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                    |term_window| term_window.rebuild_input_map(),
+                )));
+        }
+    }
+    crate::commands::CommandDef::recreate_menubar(&config::configuration());
+}
+
 /// How pane tabs are dressed: see `crate::tab_icons`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
@@ -945,6 +1209,7 @@ pub(crate) struct ThinkTermNativeSettings {
     pub(crate) window: NativeWindowSettings,
     pub(crate) workspaces: NativeWorkspaceSettings,
     pub(crate) command_palette: NativeCommandPaletteSettings,
+    pub(crate) keymap: NativeKeymapSettings,
     pub(crate) web: NativeWebSettings,
     pub(crate) tab_icons: NativeTabIconSettings,
 }
@@ -963,6 +1228,7 @@ impl Default for ThinkTermNativeSettings {
             window: NativeWindowSettings::default(),
             workspaces: NativeWorkspaceSettings::default(),
             command_palette: NativeCommandPaletteSettings::default(),
+            keymap: NativeKeymapSettings::default(),
             web: NativeWebSettings::default(),
             tab_icons: NativeTabIconSettings::default(),
         }
@@ -1339,6 +1605,11 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
     {
         // Language, theme, colour scheme, opacity, chrome and app icon.
         apply_to_app(after);
+    }
+    if before.keymap != after.keymap
+        || before.command_palette.hotkey != after.command_palette.hotkey
+    {
+        apply_keymap_to_app();
     }
     crate::settings_window::follow_open_settings_window(before, after);
 
@@ -2092,6 +2363,102 @@ pub(crate) fn main_window_renderer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keymap_entries_read_the_config_file_form_and_skip_bad_ones() {
+        use config::keyassignment::KeyAssignment;
+        let settings: ThinkTermNativeSettings = serde_json::from_str(
+            r#"{"keymap":{"keys":[
+                {"key":"p","mods":"SUPER","action":"OpenThreadSearch"},
+                {"key":"d","mods":"SUPER","action":"DisableDefaultAssignment"},
+                {"key":"t","mods":"SUPER","action":"NoSuchAction"}
+            ]}}"#,
+        )
+        .unwrap();
+        let entries = keymap_entries(&settings);
+        assert_eq!(
+            entries,
+            vec![
+                KeymapEntry {
+                    key: window::KeyCode::Char('p'),
+                    mods: window::Modifiers::SUPER,
+                    action: KeyAssignment::OpenThreadSearch,
+                },
+                KeymapEntry {
+                    key: window::KeyCode::Char('d'),
+                    mods: window::Modifiers::SUPER,
+                    action: KeyAssignment::DisableDefaultAssignment,
+                },
+            ]
+        );
+        // The bad entry is kept as written, not dropped on the next save.
+        assert_eq!(settings.keymap.keys.len(), 3);
+    }
+
+    #[test]
+    fn a_shifted_symbol_reads_back_as_the_key_that_types_it() {
+        let settings: ThinkTermNativeSettings = serde_json::from_str(
+            r#"{"keymap":{"keys":[{"key":"!","mods":"CTRL","action":"OpenThreadSearch"}]}}"#,
+        )
+        .unwrap();
+        let entries = keymap_entries(&settings);
+        assert_eq!(entries[0].key, window::KeyCode::Char('1'));
+        assert_eq!(
+            entries[0].mods,
+            window::Modifiers::CTRL | window::Modifiers::SHIFT
+        );
+    }
+
+    #[test]
+    fn a_picked_palette_hotkey_is_part_of_the_keymap_layer() {
+        use config::keyassignment::KeyAssignment;
+        let mut settings = ThinkTermNativeSettings::default();
+        assert!(keymap_entries(&settings).is_empty());
+
+        settings.command_palette.hotkey = NativeCommandPaletteHotkey::CmdK;
+        assert_eq!(
+            keymap_entries(&settings),
+            vec![KeymapEntry {
+                key: window::KeyCode::Char('k'),
+                mods: window::Modifiers::SUPER,
+                action: KeyAssignment::ActivateCommandPalette,
+            }]
+        );
+
+        // A palette shortcut set in Keymap sits beside the pick...
+        settings.keymap.keys = vec![serde_json::json!(
+            {"key": "j", "mods": "SUPER", "action": "ActivateCommandPalette"}
+        )];
+        assert_eq!(keymap_entries(&settings).len(), 2);
+        assert_eq!(
+            palette_hotkey_choice(&settings),
+            Some(NativeCommandPaletteHotkey::CmdK)
+        );
+
+        // ...and something Keymap set on the pick's chord replaces it.
+        settings.keymap.keys = vec![serde_json::json!(
+            {"key": "k", "mods": "SUPER", "action": "DisableDefaultAssignment"}
+        )];
+        let entries = keymap_entries(&settings);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action, KeyAssignment::DisableDefaultAssignment);
+        assert_eq!(
+            palette_hotkey_choice(&settings),
+            Some(NativeCommandPaletteHotkey::CmdShiftP)
+        );
+
+        // With the default chord freed too, the menu has nothing to show.
+        settings.command_palette.hotkey = NativeCommandPaletteHotkey::CmdShiftP;
+        let default = if cfg!(target_os = "macos") {
+            "SHIFT|SUPER"
+        } else {
+            "SHIFT|CTRL"
+        };
+        settings.keymap.keys = vec![serde_json::json!(
+            {"key": "p", "mods": default, "action": "DisableDefaultAssignment"}
+        )];
+        assert_eq!(palette_hotkey_choice(&settings), None);
+    }
 
     #[test]
     fn a_hand_edited_window_opacity_never_costs_the_file() {

@@ -861,24 +861,6 @@ impl super::TermWindow {
         if self.command_palette.is_some() || self.recording_overlay.owns_keyboard() {
             return;
         }
-        // The Settings-picked palette hotkey must also beat the RAW binding
-        // lookup: ⌘K's stock clear-scrollback binding would otherwise fire
-        // here, mark the event handled, and the cooked interception below
-        // would never see the chord. Swallow the raw form; the cooked
-        // KeyEvent that follows performs the toggle.
-        if key.key_is_down {
-            let cooked_key = match &key.key {
-                ::window::KeyCode::Physical(phys) => phys.to_key_code(),
-                other => other.clone(),
-            };
-            if crate::termwindow::ui::command_palette::settings_hotkey_matches(
-                &cooked_key,
-                key.modifiers.remove_positional_mods(),
-            ) {
-                return;
-            }
-        }
-
         let stage = crate::input_diagnostics::StageTimer::begin("get_active_pane");
         let pane = self.get_active_pane_or_overlay();
         stage.finish(pane.is_some());
@@ -1090,15 +1072,6 @@ impl super::TermWindow {
         if self.command_palette.is_some() {
             if window_key.key_is_down {
                 let mods = window_key.modifiers.remove_positional_mods();
-                // The Settings-picked hotkey closes the open palette too.
-                if crate::termwindow::ui::command_palette::settings_hotkey_matches(
-                    &window_key.key,
-                    mods,
-                ) {
-                    self.toggle_command_palette();
-                    context.invalidate();
-                    return;
-                }
                 // Whatever chord the user has bound to ActivateCommandPalette
                 // toggles it closed — the palette's own dispatch only knows
                 // the default chords, so a rebound key would otherwise open a
@@ -1123,19 +1096,6 @@ impl super::TermWindow {
                     Key::None => {}
                 }
             }
-            return;
-        }
-        // A non-default palette hotkey picked in Settings opens it from
-        // here, ahead of the keymap — that precedence is what lets ⌘K win
-        // over its stock clear-scrollback binding.
-        if window_key.key_is_down
-            && crate::termwindow::ui::command_palette::settings_hotkey_matches(
-                &window_key.key,
-                window_key.modifiers.remove_positional_mods(),
-            )
-        {
-            self.toggle_command_palette();
-            context.invalidate();
             return;
         }
         let mut input_trace = crate::input_diagnostics::KeyEventTrace::begin(

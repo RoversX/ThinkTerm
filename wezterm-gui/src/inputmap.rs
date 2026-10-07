@@ -17,15 +17,37 @@ pub struct InputMap {
 }
 
 impl InputMap {
+    /// The built-in defaults alone, for `wezterm.gui.default_keys()`: the
+    /// shortcuts set in Settings are not defaults, and a configuration that
+    /// copies these into its own keys must not copy them.
     pub fn default_input_map() -> Self {
         let config = ConfigHandle::default_config();
-        Self::new(&config)
+        Self::with_keymap(&config, &[])
     }
 
     pub fn new(config: &ConfigHandle) -> Self {
+        let keymap = crate::native_settings::keymap_entries(&crate::native_settings::load_shared());
+        Self::with_keymap(config, &keymap)
+    }
+
+    /// The input map with `keymap` -- the shortcuts set in Settings → Keymap
+    /// -- over the configuration file's keys, which sit over the defaults.
+    pub(crate) fn with_keymap(
+        config: &ConfigHandle,
+        keymap: &[crate::native_settings::KeymapEntry],
+    ) -> Self {
         let mut mouse = config.mouse_bindings();
 
         let mut keys = config.key_bindings();
+        for entry in keymap {
+            insert_in_every_form(
+                &mut keys.default,
+                &entry.key,
+                entry.mods,
+                &entry.action,
+                config.key_map_preference,
+            );
+        }
 
         let leader = config.leader.as_ref().map(|leader| {
             (
@@ -83,6 +105,34 @@ impl InputMap {
                 keys.default
                     .entry((code, mods))
                     .or_insert(KeyTableEntry { action });
+            }
+        }
+
+        // Every ThinkTerm action can be reached from the palette, so with
+        // the defaults disabled it keeps its own chords -- unless another
+        // chord opens it, or one of those was bound or freed on purpose.
+        if config.disable_default_key_bindings
+            && !keys
+                .default
+                .values()
+                .any(|entry| entry.action == KeyAssignment::ActivateCommandPalette)
+        {
+            let chords = default_chords(&KeyAssignment::ActivateCommandPalette);
+            let taken = chords.iter().any(|(code, mods)| {
+                chord_forms(code, *mods)
+                    .iter()
+                    .any(|form| keys.default.contains_key(form))
+            });
+            if !taken {
+                for (code, mods) in &chords {
+                    insert_in_every_form(
+                        &mut keys.default,
+                        code,
+                        *mods,
+                        &KeyAssignment::ActivateCommandPalette,
+                        config.key_map_preference,
+                    );
+                }
             }
         }
 
@@ -573,6 +623,178 @@ fn section_header(title: &str) {
     println!();
 }
 
+/// The shifted symbols of a US layout, by the key that types them.
+const US_SHIFTED: [(char, char); 21] = [
+    ('`', '~'),
+    ('1', '!'),
+    ('2', '@'),
+    ('3', '#'),
+    ('4', '$'),
+    ('5', '%'),
+    ('6', '^'),
+    ('7', '&'),
+    ('8', '*'),
+    ('9', '('),
+    ('0', ')'),
+    ('-', '_'),
+    ('=', '+'),
+    ('[', '{'),
+    (']', '}'),
+    ('\\', '|'),
+    (';', ':'),
+    ('\'', '"'),
+    (',', '<'),
+    ('.', '>'),
+    ('/', '?'),
+];
+
+/// A chord as it is typed: Shift spelled out, on the key that types it on a
+/// US layout. The key table keeps ⌘⇧P as ⌘ with "P"; this is ⌘⇧ with "p".
+/// ⌃ with "!" is ⌃⇧ with "1".
+pub(crate) fn typed_chord(key: &KeyCode, mods: Modifiers) -> (KeyCode, Modifiers) {
+    if let KeyCode::Char(c) = key {
+        if c.is_ascii_uppercase() {
+            return (
+                KeyCode::Char(c.to_ascii_lowercase()),
+                mods | Modifiers::SHIFT,
+            );
+        }
+        if let Some((base, _)) = US_SHIFTED.iter().find(|(_, shifted)| shifted == c) {
+            return (KeyCode::Char(*base), mods | Modifiers::SHIFT);
+        }
+    }
+    (key.clone(), mods)
+}
+
+/// The one form Settings → Keymap keeps a chord in and compares chords by:
+/// as typed, then normalized as the key table normalizes.
+pub(crate) fn canonical_chord(key: &KeyCode, mods: Modifiers) -> (KeyCode, Modifiers) {
+    let (key, mods) = typed_chord(key, mods.remove_positional_mods());
+    key.normalize_shift(mods)
+}
+
+/// The key that types `c` with Shift on a US layout: "!" for "1".
+pub(crate) fn us_shifted(c: char) -> Option<char> {
+    US_SHIFTED
+        .iter()
+        .find(|(base, _)| *base == c)
+        .map(|(_, shifted)| *shifted)
+}
+
+/// Every form the key table may be asked for a chord in: the canonical one;
+/// for a shifted symbol, the symbol with and without Shift, as platforms
+/// report it either way; and the physical key, whose bindings are looked up
+/// before the typed ones.
+pub(crate) fn chord_forms(key: &KeyCode, mods: Modifiers) -> Vec<(KeyCode, Modifiers)> {
+    let canonical = canonical_chord(key, mods);
+    let (typed_key, typed_mods) = typed_chord(&canonical.0, canonical.1);
+    let mut forms = vec![canonical];
+    if let KeyCode::Char(c) = typed_key {
+        if typed_mods.contains(Modifiers::SHIFT) {
+            if let Some(shifted) = us_shifted(c) {
+                forms.push((KeyCode::Char(shifted), typed_mods));
+                forms.push((KeyCode::Char(shifted), typed_mods - Modifiers::SHIFT));
+            }
+        }
+    }
+    if let Some(phys) = typed_key.to_phys() {
+        forms.push((KeyCode::Physical(phys), typed_mods));
+    }
+    forms
+}
+
+/// Bind `action` in `table` in every form a key event for the chord may be
+/// looked up in, so it wins over the shifted-symbol spellings of the same
+/// keys. The physical form is taken only where a physical binding would
+/// otherwise win: under `key_map_preference = "Physical"`, or where the
+/// table already binds it. Elsewhere it would take a key by its US position
+/// on a layout that types something else there.
+fn insert_in_every_form(
+    table: &mut config::keyassignment::KeyTable,
+    key: &KeyCode,
+    mods: Modifiers,
+    action: &KeyAssignment,
+    preference: config::KeyMapPreference,
+) {
+    for form in chord_forms(key, mods) {
+        let physical = matches!(form.0, KeyCode::Physical(_));
+        if physical
+            && preference != config::KeyMapPreference::Physical
+            && !table.contains_key(&form)
+        {
+            continue;
+        }
+        table.insert(
+            form,
+            KeyTableEntry {
+                action: action.clone(),
+            },
+        );
+    }
+}
+
+/// The chords `action` is bound to by default, as its definition writes
+/// them, one canonical form each.
+pub(crate) fn default_chords(action: &KeyAssignment) -> Vec<(KeyCode, Modifiers)> {
+    use std::convert::TryFrom;
+    crate::commands::derive_command_from_key_assignment(action)
+        .map(|def| {
+            def.keys
+                .iter()
+                .filter_map(|(mods, label)| {
+                    let key = config::DeferredKeyCode::try_from(label.as_str())
+                        .ok()?
+                        .resolve(config::KeyMapPreference::Mapped);
+                    Some(canonical_chord(&key, *mods))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A chord as the palette and Settings → Keymap show it: `⌘ ⇧ P` under
+/// AppleSymbols, `CTRL-SHIFT-P` otherwise.
+pub(crate) fn chord_label(
+    key: &KeyCode,
+    mods: Modifiers,
+    ui_key_cap_rendering: UIKeyCapRendering,
+) -> String {
+    let separator = if ui_key_cap_rendering == UIKeyCapRendering::AppleSymbols {
+        " "
+    } else {
+        "-"
+    };
+    let mut label = mods.to_string_with_separator(window::ModifierToStringArgs {
+        separator,
+        want_none: false,
+        ui_key_cap_rendering: Some(ui_key_cap_rendering),
+    });
+    if !label.is_empty() {
+        label.push_str(separator);
+    }
+    label.push_str(&ui_key(key, ui_key_cap_rendering));
+    label
+}
+
+/// `key` as the configuration file spells it: parsing the result gives
+/// `key` back. Settings → Keymap writes its shortcuts with it.
+pub(crate) fn config_key_name(key: &KeyCode) -> String {
+    match key {
+        KeyCode::Char('\u{8}') => "Backspace".to_string(),
+        KeyCode::Char('\t') => "Tab".to_string(),
+        KeyCode::Char('\r') => "Enter".to_string(),
+        KeyCode::Char('\u{1b}') => "Escape".to_string(),
+        KeyCode::Char('\u{7f}') => "Delete".to_string(),
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Function(n) => format!("F{n}"),
+        KeyCode::Numpad(n) => format!("Numpad{n}"),
+        KeyCode::Physical(phys) => format!("phys:{}", phys.to_string()),
+        KeyCode::RawCode(n) => format!("raw:{n}"),
+        // The named keys parse from their variant names: LeftArrow, Home...
+        other => format!("{other:?}"),
+    }
+}
+
 pub fn ui_key(key: &KeyCode, ui_key_cap_rendering: UIKeyCapRendering) -> String {
     match key {
         KeyCode::Char('\x1b') | KeyCode::Char('\x7f')
@@ -807,5 +1029,274 @@ fn show_key_table_as_lua(table: &config::keyassignment::KeyTable, indent: usize)
     for ((key, mods), entry) in ordered {
         let action = &entry.action;
         println!("{pad}{},", lua_key(key, *mods, action));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_settings::KeymapEntry;
+
+    fn entry(key: char, mods: Modifiers, action: KeyAssignment) -> KeymapEntry {
+        KeymapEntry {
+            key: KeyCode::Char(key),
+            mods,
+            action,
+        }
+    }
+
+    fn action_for(map: &InputMap, key: char, mods: Modifiers) -> Option<KeyAssignment> {
+        map.keys
+            .default
+            .get(&(KeyCode::Char(key), mods))
+            .map(|entry| entry.action.clone())
+    }
+
+    #[test]
+    fn the_keymap_layer_wins_over_the_defaults() {
+        let config = ConfigHandle::default_config();
+        let stock = InputMap::with_keymap(&config, &[]);
+        assert_ne!(
+            action_for(&stock, 'k', Modifiers::SUPER),
+            Some(KeyAssignment::ActivateCommandPalette)
+        );
+
+        let map = InputMap::with_keymap(
+            &config,
+            &[entry(
+                'k',
+                Modifiers::SUPER,
+                KeyAssignment::ActivateCommandPalette,
+            )],
+        );
+        assert_eq!(
+            action_for(&map, 'k', Modifiers::SUPER),
+            Some(KeyAssignment::ActivateCommandPalette)
+        );
+    }
+
+    #[test]
+    fn disabling_a_default_frees_its_key() {
+        let config = ConfigHandle::default_config();
+        assert!(action_for(&InputMap::with_keymap(&config, &[]), 't', Modifiers::SUPER).is_some());
+        let map = InputMap::with_keymap(
+            &config,
+            &[entry(
+                't',
+                Modifiers::SUPER,
+                KeyAssignment::DisableDefaultAssignment,
+            )],
+        );
+        assert_eq!(action_for(&map, 't', Modifiers::SUPER), None);
+    }
+
+    #[test]
+    fn the_palette_stays_reachable_with_the_defaults_disabled() {
+        let config = ConfigHandle::default_config()
+            .adjusted(|config| config.disable_default_key_bindings = true);
+        let map = InputMap::with_keymap(&config, &[]);
+        assert!(map
+            .keys
+            .default
+            .values()
+            .any(|entry| entry.action == KeyAssignment::ActivateCommandPalette));
+    }
+
+    #[test]
+    fn a_freed_palette_chord_stays_free() {
+        let primary = if cfg!(target_os = "macos") {
+            Modifiers::SUPER
+        } else {
+            Modifiers::CTRL
+        };
+        let (key, mods) = KeyCode::Char('p').normalize_shift(primary | Modifiers::SHIFT);
+        let map = InputMap::with_keymap(
+            &ConfigHandle::default_config(),
+            &[KeymapEntry {
+                key: key.clone(),
+                mods,
+                action: KeyAssignment::DisableDefaultAssignment,
+            }],
+        );
+        // No form of the chord opens the palette, so no menu offers it.
+        assert!(!map.keys.default.iter().any(|((code, m), entry)| {
+            entry.action == KeyAssignment::ActivateCommandPalette
+                && code.normalize_shift(*m) == (key.clone(), mods)
+        }));
+    }
+
+    #[test]
+    fn the_keymap_layer_reads_typed_keys_under_the_physical_preference() {
+        let config = ConfigHandle::default_config()
+            .adjusted(|config| config.key_map_preference = config::KeyMapPreference::Physical);
+        let map = InputMap::with_keymap(
+            &config,
+            &[entry(
+                'j',
+                Modifiers::SUPER,
+                KeyAssignment::OpenThreadSearch,
+            )],
+        );
+        assert_eq!(
+            map.lookup_key(&KeyCode::Char('j'), Modifiers::SUPER, None)
+                .map(|entry| entry.action),
+            Some(KeyAssignment::OpenThreadSearch)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn find_thread_takes_cmd_p_and_leaves_ctrl_shift_p_to_the_palette() {
+        let map = InputMap::with_keymap(&ConfigHandle::default_config(), &[]);
+        assert_eq!(
+            action_for(&map, 'p', Modifiers::SUPER),
+            Some(KeyAssignment::OpenThreadSearch)
+        );
+        assert_eq!(
+            action_for(&map, 'P', Modifiers::CTRL),
+            Some(KeyAssignment::ActivateCommandPalette)
+        );
+    }
+
+    #[test]
+    fn a_shifted_symbol_shortcut_covers_every_spelling() {
+        let config = ConfigHandle::default_config();
+        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        let spellings = [
+            (KeyCode::Char('1'), ctrl_shift),
+            (KeyCode::Char('!'), ctrl_shift),
+            (KeyCode::Char('!'), Modifiers::CTRL),
+        ];
+        let stock = InputMap::with_keymap(&config, &[]);
+        for (key, mods) in &spellings {
+            assert!(
+                stock.keys.default.contains_key(&(key.clone(), *mods)),
+                "{key:?}"
+            );
+        }
+
+        let (key, mods) = canonical_chord(&KeyCode::Char('!'), Modifiers::CTRL);
+        let freed = InputMap::with_keymap(
+            &config,
+            &[KeymapEntry {
+                key,
+                mods,
+                action: KeyAssignment::DisableDefaultAssignment,
+            }],
+        );
+        for (key, mods) in &spellings {
+            assert!(
+                !freed.keys.default.contains_key(&(key.clone(), *mods)),
+                "{key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_keymap_layer_wins_over_physical_bindings() {
+        let config = ConfigHandle::default_config()
+            .adjusted(|config| config.key_map_preference = config::KeyMapPreference::Physical);
+        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        let (key, mods) = canonical_chord(&KeyCode::Char('c'), ctrl_shift);
+        let map = InputMap::with_keymap(
+            &config,
+            &[KeymapEntry {
+                key,
+                mods,
+                action: KeyAssignment::ToggleWorkspaceSidebar,
+            }],
+        );
+        assert_eq!(
+            map.lookup_key(&KeyCode::Physical(PhysKeyCode::C), ctrl_shift, None)
+                .map(|entry| entry.action),
+            Some(KeyAssignment::ToggleWorkspaceSidebar)
+        );
+    }
+
+    #[test]
+    fn the_keymap_layer_wins_over_a_physical_binding_in_the_file() {
+        let config = ConfigHandle::default_config();
+        let mut map = InputMap::with_keymap(&config, &[]);
+        assert!(!map
+            .keys
+            .default
+            .contains_key(&(KeyCode::Physical(PhysKeyCode::K), Modifiers::SUPER)));
+        // As a `phys:K` binding in the file would put it.
+        map.keys.default.insert(
+            (KeyCode::Physical(PhysKeyCode::K), Modifiers::SUPER),
+            KeyTableEntry {
+                action: KeyAssignment::ClearScrollback(
+                    config::keyassignment::ScrollbackEraseMode::ScrollbackOnly,
+                ),
+            },
+        );
+        insert_in_every_form(
+            &mut map.keys.default,
+            &KeyCode::Char('k'),
+            Modifiers::SUPER,
+            &KeyAssignment::ActivateCommandPalette,
+            config.key_map_preference,
+        );
+        assert_eq!(
+            map.lookup_key(&KeyCode::Physical(PhysKeyCode::K), Modifiers::SUPER, None)
+                .map(|entry| entry.action),
+            Some(KeyAssignment::ActivateCommandPalette)
+        );
+        // And no physical form is taken where nothing bound one.
+        insert_in_every_form(
+            &mut map.keys.default,
+            &KeyCode::Char('j'),
+            Modifiers::SUPER,
+            &KeyAssignment::OpenThreadSearch,
+            config.key_map_preference,
+        );
+        assert!(!map
+            .keys
+            .default
+            .contains_key(&(KeyCode::Physical(PhysKeyCode::J), Modifiers::SUPER)));
+    }
+
+    #[test]
+    fn chords_read_as_typed() {
+        assert_eq!(
+            typed_chord(&KeyCode::Char('P'), Modifiers::SUPER),
+            (KeyCode::Char('p'), Modifiers::SUPER | Modifiers::SHIFT)
+        );
+        assert_eq!(
+            typed_chord(&KeyCode::Char('!'), Modifiers::CTRL),
+            (KeyCode::Char('1'), Modifiers::CTRL | Modifiers::SHIFT)
+        );
+        assert_eq!(
+            canonical_chord(&KeyCode::Char('p'), Modifiers::SUPER | Modifiers::SHIFT),
+            (KeyCode::Char('P'), Modifiers::SUPER)
+        );
+    }
+
+    #[test]
+    fn config_key_names_parse_back_to_their_key() {
+        use std::convert::TryFrom;
+        for key in [
+            KeyCode::Char('p'),
+            KeyCode::Char('P'),
+            KeyCode::Char(','),
+            KeyCode::Char('\\'),
+            KeyCode::Char(' '),
+            KeyCode::Char('\r'),
+            KeyCode::Char('\t'),
+            KeyCode::Char('\u{8}'),
+            KeyCode::Char('\u{1b}'),
+            KeyCode::Char('\u{7f}'),
+            KeyCode::Function(5),
+            KeyCode::LeftArrow,
+            KeyCode::PageUp,
+            KeyCode::Home,
+            KeyCode::Physical(PhysKeyCode::A),
+        ] {
+            let name = config_key_name(&key);
+            let parsed = config::DeferredKeyCode::try_from(name.as_str())
+                .unwrap()
+                .resolve(config::KeyMapPreference::Mapped);
+            assert_eq!(parsed, key, "{name:?}");
+        }
     }
 }

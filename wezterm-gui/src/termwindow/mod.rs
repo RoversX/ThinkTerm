@@ -7337,6 +7337,13 @@ impl TermWindow {
         }
     }
 
+    /// Take in a changed Settings → Keymap without a configuration reload:
+    /// only the key table reads it.
+    pub(crate) fn rebuild_input_map(&mut self) {
+        self.input_map = InputMap::new(&self.config);
+        self.leader_is_down = None;
+    }
+
     pub fn config_was_reloaded(&mut self) {
         log::debug!(
             "config was reloaded, overrides: {:?}",

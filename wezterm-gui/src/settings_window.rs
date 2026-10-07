@@ -50,6 +50,7 @@ use fluent_bundle::FluentArgs;
 #[cfg(unix)]
 mod session_import;
 mod import;
+mod keymap;
 use import::{ImportButton, ImportSource, ImportStep};
 
 // All chrome geometry below is authored in 2x macOS backing pixels.
@@ -1547,6 +1548,8 @@ enum SettingsAction {
     TabIconDelete,
     /// The field that narrows the cards to those a query finds.
     TabIconSearchInput,
+    KeymapSearchInput,
+    Keymap(keymap::KeymapAction),
     ClearTabIconSearch,
 }
 
@@ -2148,6 +2151,7 @@ struct SettingsUiState {
     tab_icon_selected: Option<String>,
     /// What the cards are narrowed to, by name or program.
     tab_icon_search: TextInputState,
+    keymap: keymap::KeymapUi,
     /// The cards as last painted, so a click acts on the card that was
     /// under the pointer.
     tab_icon_cards: Vec<String>,
@@ -2238,6 +2242,7 @@ impl SettingsUiState {
             confirm_reset_quotes: false,
             tab_icon_selected: None,
             tab_icon_search: TextInputState::new(),
+            keymap: keymap::KeymapUi::default(),
             tab_icon_cards: Vec::new(),
             tab_icon_programs: Vec::new(),
             tab_icon_drop_rects: Vec::new(),
@@ -3459,6 +3464,13 @@ impl SettingsWindow {
                 window.invalidate();
                 Ok(true)
             }
+            WindowEvent::FocusChanged(false) if self.ui.keymap.is_recording() => {
+                // Recording keeps every window's shortcuts from the menus on
+                // macOS, so it ends when Settings is left.
+                self.ui.keymap.stop_recording();
+                window.invalidate();
+                Ok(true)
+            }
             WindowEvent::AppearanceChanged(appearance) => {
                 self.appearance = appearance;
                 self.refresh_chrome();
@@ -3571,7 +3583,8 @@ impl SettingsWindow {
                         | SettingsAction::TabIconNameInput
                         | SettingsAction::TabIconCircleInput
                         | SettingsAction::TabIconGlyphColorInput
-                        | SettingsAction::TabIconSearchInput,
+                        | SettingsAction::TabIconSearchInput
+                        | SettingsAction::KeymapSearchInput,
                     ) => {
                         self.set_focused_input(action);
                         self.ui.open_dropdown = None;
@@ -3873,6 +3886,10 @@ impl SettingsWindow {
     }
 
     fn key_event(&mut self, event: KeyEvent, window: &Window) -> bool {
+        // A shortcut being recorded takes every key, modifiers and all.
+        if self.ui.keymap.is_recording() {
+            return self.keymap_record_key(&event);
+        }
         if !event.key_is_down {
             return false;
         }
@@ -3993,6 +4010,7 @@ impl SettingsWindow {
             SettingsAction::TabIconCircleInput => Some(&self.ui.tab_icon_circle_input),
             SettingsAction::TabIconGlyphColorInput => Some(&self.ui.tab_icon_glyph_input),
             SettingsAction::TabIconSearchInput => Some(&self.ui.tab_icon_search),
+            SettingsAction::KeymapSearchInput => Some(&self.ui.keymap.search),
             _ => None,
         }
     }
@@ -4060,6 +4078,10 @@ impl SettingsWindow {
             }
             SettingsAction::TabIconSearchInput => {
                 f(&mut self.ui.tab_icon_search);
+                true
+            }
+            SettingsAction::KeymapSearchInput => {
+                f(&mut self.ui.keymap.search);
                 true
             }
             _ => false,
@@ -5182,6 +5204,8 @@ impl SettingsWindow {
         // A code on screen carries a live token; it does not outlast the
         // section it was asked for in.
         crate::web_settings::hide_qr();
+        // The keyboard is built for its page and let go when another shows.
+        self.ui.keymap.enter(section == SettingsSection::Keymap);
         if section == SettingsSection::Agents {
             // Probe PATH on entry so painting never touches the filesystem.
             crate::agent_status::refresh_path_probe();
@@ -5991,9 +6015,11 @@ impl SettingsWindow {
             | SettingsAction::TabIconNameInput
             | SettingsAction::TabIconCircleInput
             | SettingsAction::TabIconGlyphColorInput
-            | SettingsAction::TabIconSearchInput => {
+            | SettingsAction::TabIconSearchInput
+            | SettingsAction::KeymapSearchInput => {
                 // Focused on press; there is nothing more to do on release.
             }
+            SettingsAction::Keymap(action) => self.perform_keymap_action(action),
             SettingsAction::ClearTabIconSearch => {
                 self.ui.tab_icon_search.clear();
                 self.set_focused_input(Some(SettingsAction::TabIconSearchInput));
@@ -6383,9 +6409,22 @@ impl SettingsWindow {
                     };
             }
             SettingsAction::SetCommandPaletteHotkey(hotkey) => {
-                self.native_settings.command_palette.hotkey = hotkey;
                 self.ui.open_dropdown = None;
-                self.save_command_palette_settings();
+                // The pick is a shortcut of the Keymap layer, saved and
+                // applied with it.
+                match crate::native_settings::set_palette_hotkey(hotkey) {
+                    Ok(()) => {
+                        self.set_native_settings(crate::native_settings::load());
+                        self.ui.keymap.refresh();
+                        self.status = crate::i18n::tr("settings-status-command-palette-saved");
+                    }
+                    Err(err) => {
+                        self.status = settings_tr(
+                            "settings-status-command-palette-error",
+                            &[("error", format!("{err:#}"))],
+                        );
+                    }
+                }
             }
             SettingsAction::DecreaseCommandPaletteRows => self.step_command_palette_rows(-1),
             SettingsAction::IncreaseCommandPaletteRows => self.step_command_palette_rows(1),
@@ -7372,7 +7411,6 @@ impl SettingsWindow {
             self.ui.confirm_reset_quotes = false;
         }
         let palette = self.palette();
-        let ui_font = Rc::clone(&self.ui_font);
         let title_font = Rc::clone(&self.title_font);
         let sidebar_width = self.ui.sidebar.width;
         let window_width = self.dimensions.pixel_width as f32;
@@ -7418,13 +7456,7 @@ impl SettingsWindow {
             SettingsSection::Agents => self.paint_agents(layers, x, max_width)?,
             SettingsSection::Web => self.paint_web(layers, x, max_width)?,
             SettingsSection::Archived => self.paint_archived(layers, x, max_width)?,
-            SettingsSection::Keymap => self.paint_placeholder(
-                layers,
-                &ui_font,
-                x,
-                &crate::i18n::tr("settings-keymap-description"),
-                max_width,
-            )?,
+            SettingsSection::Keymap => self.paint_keymap(layers, x, max_width)?,
             SettingsSection::CommandPalette => {
                 self.paint_command_palette_section(layers, x, max_width)?
             }
@@ -14807,40 +14839,6 @@ impl SettingsWindow {
         lines.join("\n")
     }
 
-    fn paint_placeholder(
-        &mut self,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        font: &Rc<LoadedFont>,
-        x: f32,
-        body: &str,
-        max_width: f32,
-    ) -> anyhow::Result<()> {
-        let palette = self.palette();
-        self.ui
-            .content_scroll
-            .set_extents(self.content_bottom(), self.ui_px(240.0));
-        let scroll = self.ui.content_scroll.offset;
-        self.draw_text(
-            layers,
-            font,
-            x,
-            self.ui_px(CONTENT_SECTION_Y) - scroll,
-            body,
-            palette.secondary_text,
-            max_width,
-        )?;
-        self.draw_rect(
-            layers,
-            0,
-            x,
-            self.ui_px(CONTENT_RULE_Y) - scroll,
-            max_width,
-            1.0,
-            palette.rule,
-        )?;
-        Ok(())
-    }
-
     /// A row that only tells: its label and its description, no control.
     /// A row's description under its label, in as many lines as the page
     /// allows (`row_description_lines`), the last ellipsised if the text
@@ -16456,7 +16454,11 @@ impl SettingsWindow {
         );
         let text_width = (control_x - x - self.ui_px(24.0)).max(width * 0.45);
         let action = SettingsAction::ToggleCommandPaletteHotkeyMenu;
-        let dropdown_label = (self.native_settings.command_palette.hotkey.label()).to_string();
+        let dropdown_label =
+            match crate::native_settings::palette_hotkey_choice(&self.native_settings) {
+                Some(hotkey) => hotkey.label().to_string(),
+                None => crate::i18n::tr("settings-command-palette-hotkey-keymap"),
+            };
         let control_rect =
             self.dropdown_pill_rect(control_x, control_y, control_width, &dropdown_label);
         let open = self.ui.open_dropdown == Some(SettingsDropdown::CommandPaletteHotkey);
@@ -16508,7 +16510,7 @@ impl SettingsWindow {
         width: f32,
     ) -> anyhow::Result<()> {
         use crate::native_settings::NativeCommandPaletteHotkey as Hotkey;
-        let current = self.native_settings.command_palette.hotkey;
+        let current = crate::native_settings::palette_hotkey_choice(&self.native_settings);
         let options: Vec<(String, SettingsAction, bool)> = [
             Hotkey::CmdShiftP,
             Hotkey::CmdP,
@@ -16521,7 +16523,7 @@ impl SettingsWindow {
             (
                 hotkey.label().to_string(),
                 SettingsAction::SetCommandPaletteHotkey(hotkey),
-                current == hotkey,
+                current == Some(hotkey),
             )
         })
         .collect();
@@ -17128,7 +17130,9 @@ impl SettingsWindow {
         // you type a setting into.
         let radius = if matches!(
             spec.action,
-            SettingsAction::SearchInput | SettingsAction::TabIconSearchInput
+            SettingsAction::SearchInput
+                | SettingsAction::TabIconSearchInput
+                | SettingsAction::KeymapSearchInput
         ) {
             spec.rect.size.height / 2.0
         } else {

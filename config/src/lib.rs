@@ -218,7 +218,7 @@ fn toml_to_dynamic(value: &toml::Value) -> Value {
     }
 }
 
-fn json_to_dynamic(value: &serde_json::Value) -> Value {
+pub fn json_to_dynamic(value: &serde_json::Value) -> Value {
     match value {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => b.to_dynamic(),
@@ -251,6 +251,35 @@ fn json_to_dynamic(value: &serde_json::Value) -> Value {
                 .map(|(k, v)| (Value::String(k.to_string()), json_to_dynamic(v)))
                 .collect::<BTreeMap<_, _>>()
                 .into(),
+        ),
+    }
+}
+
+/// The reverse of `json_to_dynamic`. JSON object keys are strings, so a
+/// number used as a key is written as its digits.
+pub fn dynamic_to_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Null => serde_json::Value::Null,
+        Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::String(s) => serde_json::Value::String(s.clone()),
+        Value::U64(n) => (*n).into(),
+        Value::I64(n) => (*n).into(),
+        Value::F64(n) => serde_json::Number::from_f64(n.into_inner())
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::Array(a) => serde_json::Value::Array(a.iter().map(dynamic_to_json).collect()),
+        Value::Object(o) => serde_json::Value::Object(
+            o.iter()
+                .map(|(k, v)| {
+                    let key = match k {
+                        Value::String(s) => s.clone(),
+                        Value::U64(n) => n.to_string(),
+                        Value::I64(n) => n.to_string(),
+                        other => dynamic_to_json(other).to_string(),
+                    };
+                    (key, dynamic_to_json(v))
+                })
+                .collect(),
         ),
     }
 }

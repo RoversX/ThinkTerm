@@ -58,6 +58,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use wezterm_font::FontConfiguration;
@@ -754,6 +755,15 @@ mod cglbits {
             self.gl_context.makeCurrentContext();
         }
     }
+}
+
+/// While set, a key equivalent goes to the key window as a key event rather
+/// than to the menus: a window recording a new shortcut sees ⌘W instead of
+/// the menu closing a pane with it.
+static CAPTURE_KEY_EQUIVALENTS: AtomicBool = AtomicBool::new(false);
+
+pub fn set_key_equivalents_captured(captured: bool) {
+    CAPTURE_KEY_EQUIVALENTS.store(captured, Ordering::Relaxed);
 }
 
 pub(crate) struct WindowInner {
@@ -4466,6 +4476,11 @@ impl WindowView {
             chars.escape_debug(),
             modifiers,
         );
+
+        if CAPTURE_KEY_EQUIVALENTS.load(Ordering::Relaxed) {
+            Self::key_common(this, nsevent, true);
+            return YES;
+        }
 
         if (chars == "." && modifiers == Modifiers::SUPER)
             || (chars == "\u{1b}" && modifiers == Modifiers::CTRL)

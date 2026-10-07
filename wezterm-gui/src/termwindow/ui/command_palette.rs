@@ -952,36 +952,6 @@ enum PaletteOutcome {
     Execute(ExpandedCommand),
 }
 
-/// Whether the pressed chord is the palette hotkey picked in Settings.
-/// Every choice — the default included — matches directly, so the chord
-/// keeps working when default key bindings are disabled or remapped, and a
-/// pick like ⌘K wins over its stock clear-scrollback binding (the caller
-/// intercepts ahead of both the raw and the cooked keymap lookups).
-pub(crate) fn settings_hotkey_matches(key: &::window::KeyCode, mods: Modifiers) -> bool {
-    use crate::native_settings::NativeCommandPaletteHotkey as Hotkey;
-    let hotkey = crate::native_settings::load_shared().command_palette.hotkey;
-    let (want_mods, want_char) = match hotkey {
-        // The platform default: ⌘⇧P on macOS, Ctrl+Shift+P elsewhere
-        // (SUPER belongs to the window manager off macOS).
-        Hotkey::CmdShiftP => {
-            if cfg!(target_os = "macos") {
-                (Modifiers::SUPER | Modifiers::SHIFT, 'p')
-            } else {
-                (Modifiers::CTRL | Modifiers::SHIFT, 'p')
-            }
-        }
-        Hotkey::CmdP => (Modifiers::SUPER, 'p'),
-        Hotkey::CmdK => (Modifiers::SUPER, 'k'),
-        Hotkey::CtrlShiftP => (Modifiers::CTRL | Modifiers::SHIFT, 'p'),
-    };
-    let chord =
-        mods & (Modifiers::CTRL | Modifiers::SHIFT | Modifiers::ALT | Modifiers::SUPER);
-    if chord != want_mods {
-        return false;
-    }
-    matches!(key, ::window::KeyCode::Char(c) if c.to_ascii_lowercase() == want_char)
-}
-
 impl crate::TermWindow {
     pub(crate) fn toggle_command_palette(&mut self) {
         if self.command_palette.is_some() {

@@ -207,25 +207,10 @@ pub(crate) fn format_key_label(command: &ExpandedCommand, config: &ConfigHandle)
         a_key.cmp(&b_key)
     });
 
-    let separator = if config.ui_key_cap_rendering == ::window::UIKeyCapRendering::AppleSymbols {
-        " "
-    } else {
-        "-"
-    };
-
     let mut keys = keys
         .into_iter()
         .map(|(mods, keycode)| {
-            let mut mod_string = mods.to_string_with_separator(::window::ModifierToStringArgs {
-                separator,
-                want_none: false,
-                ui_key_cap_rendering: Some(config.ui_key_cap_rendering),
-            });
-            if !mod_string.is_empty() {
-                mod_string.push_str(separator);
-            }
-            let keycode = crate::inputmap::ui_key(&keycode, config.ui_key_cap_rendering);
-            format!("{mod_string}{keycode}")
+            crate::inputmap::chord_label(&keycode, mods, config.ui_key_cap_rendering)
         })
         .collect::<Vec<_>>();
 
