@@ -416,11 +416,18 @@ where
     promise::spawn::spawn_into_main_thread(async move { schedule_with_lua(func).await }).await
 }
 
-fn default_config_with_overrides_applied() -> anyhow::Result<Config> {
+fn default_config_with_overrides_applied(
+    overrides: &wezterm_dynamic::Value,
+) -> anyhow::Result<Config> {
     // Cause the default config to be re-evaluated with the overrides applied
     let lua = lua::make_lua_context(Path::new("override")).context("make_lua_context")?;
     let table = mlua::Value::Table(lua.create_table()?);
     let config = Config::apply_overrides_to(&lua, table).context("apply_overrides_to")?;
+    // Then a window's own, as `try_load` applies them over a file. Settings'
+    // colour scheme and opacity are window overrides, and must apply with
+    // no config file too.
+    let config = Config::apply_overrides_obj_to(&lua, config, overrides)
+        .context("apply_overrides_obj_to")?;
 
     let dyn_config = luahelper::lua_value_to_dynamic(config)?;
 
@@ -515,7 +522,7 @@ pub fn set_config_file_override(path: &Path) {
 pub fn set_config_overrides(items: &[(String, String)]) -> anyhow::Result<()> {
     *CONFIG_OVERRIDES.lock().unwrap() = items.to_vec();
 
-    let _ = default_config_with_overrides_applied()?;
+    let _ = default_config_with_overrides_applied(&wezterm_dynamic::Value::default())?;
     Ok(())
 }
 

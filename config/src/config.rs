@@ -1199,7 +1199,7 @@ impl Config {
         std::env::remove_var("WEZTERM_CONFIG_FILE");
         std::env::remove_var("WEZTERM_CONFIG_DIR");
 
-        match Self::try_default() {
+        match Self::try_default_with_overrides(overrides) {
             Err(err) => LoadedConfig {
                 config: Err(err),
                 file_name: None,
@@ -1211,9 +1211,15 @@ impl Config {
     }
 
     pub fn try_default() -> anyhow::Result<LoadedConfig> {
+        Self::try_default_with_overrides(&wezterm_dynamic::Value::default())
+    }
+
+    fn try_default_with_overrides(
+        overrides: &wezterm_dynamic::Value,
+    ) -> anyhow::Result<LoadedConfig> {
         let (config, warnings) =
             wezterm_dynamic::Error::capture_warnings(|| -> anyhow::Result<Config> {
-                Ok(default_config_with_overrides_applied()?.compute_extra_defaults(None))
+                Ok(default_config_with_overrides_applied(overrides)?.compute_extra_defaults(None))
             });
 
         Ok(LoadedConfig {
@@ -2730,6 +2736,29 @@ return config
             std::env::var_os("WEZTERM_CONFIG_FILE").as_deref(),
             Some(thinkterm.as_os_str())
         );
+    }
+
+    #[test]
+    fn default_config_applies_window_overrides() {
+        use wezterm_dynamic::ToDynamic;
+        let mut overrides = wezterm_dynamic::Object::default();
+        overrides.insert(
+            "color_scheme".to_dynamic(),
+            "Builtin Solarized Light".to_dynamic(),
+        );
+        overrides.insert(
+            "window_background_opacity".to_dynamic(),
+            0.7f64.to_dynamic(),
+        );
+
+        let loaded =
+            Config::try_default_with_overrides(&wezterm_dynamic::Value::Object(overrides)).unwrap();
+        let config = loaded.config.unwrap();
+        assert_eq!(
+            config.color_scheme.as_deref(),
+            Some("Builtin Solarized Light")
+        );
+        assert_eq!(config.window_background_opacity, 0.7);
     }
 
     #[test]
