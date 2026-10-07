@@ -935,7 +935,6 @@ impl SettingsSection {
             Self::Import => &[
                 "Herdr",
                 "Import Session",
-                "导入",
                 "ThinkTerm Config",
                 "WezTerm Source",
                 "Copy WezTerm Config",
@@ -2908,6 +2907,18 @@ pub fn show_update_page() {
 
 /// Open Settings, remembering which window asked. See `OPENED_FROM`.
 pub fn show_from(mux_window_id: MuxWindowId, space_id: &str) {
+    remember_origin(mux_window_id, space_id);
+    show();
+}
+
+/// `show_update_page` asked from a terminal window. The Import page must
+/// target that window's Space, not the one Settings was last opened from.
+pub fn show_update_page_from(mux_window_id: MuxWindowId, space_id: &str) {
+    remember_origin(mux_window_id, space_id);
+    show_update_page();
+}
+
+fn remember_origin(mux_window_id: MuxWindowId, space_id: &str) {
     OPENED_FROM.with(|slot| slot.set(Some(mux_window_id)));
     let changed = OPENED_FROM_SPACE
         .with(|slot| slot.replace(Some(space_id.to_string())).as_deref() != Some(space_id));
@@ -2926,7 +2937,6 @@ pub fn show_from(mux_window_id: MuxWindowId, space_id: &str) {
     }
     #[cfg(not(unix))]
     let _ = changed;
-    show();
 }
 
 pub fn show() {

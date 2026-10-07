@@ -10959,7 +10959,10 @@ impl TermWindow {
                 return self.perform_key_assignment(pane, &QuitApplication);
             }
             CheckForUpdates => {
-                crate::settings_window::show_update_page();
+                crate::settings_window::show_update_page_from(
+                    self.mux_window_id,
+                    &self.active_space_id,
+                );
             }
             OpenSshHosts => {
                 self.toggle_ssh_hosts_view();
