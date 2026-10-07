@@ -1,36 +1,60 @@
+use std::path::Path;
+use std::process::Command;
+
+/// Cargo reruns this script on every build while a watched path is missing,
+/// which rebuilds and relinks everything that depends on this crate.
+fn watch(path: &Path) {
+    if path.exists() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
+fn watch_git_path(name: &str) {
+    if let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--git-path", name])
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout);
+            watch(Path::new(path.trim()));
+        }
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    // Release packaging writes this into a fresh checkout before building,
+    // and a fresh checkout reruns this script through the tracked files.
+    watch(Path::new("../.tag"));
+    let mut ci_tag = std::fs::read_to_string("../.tag")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
 
-    // If a file named `.tag` is present, we'll take its contents for the
-    // version number that we report in wezterm -h.
-    let mut ci_tag = String::new();
-    if let Ok(tag) = std::fs::read("../.tag") {
-        if let Ok(s) = String::from_utf8(tag) {
-            ci_tag = s.trim().to_string();
-            println!("cargo:rerun-if-changed=../.tag");
+    if let Ok(repo) = git2::Repository::discover(".") {
+        // HEAD can switch branches without changing the ref that the old
+        // build watched. Packed refs and worktree refs need their real paths.
+        for name in ["HEAD", "index", "packed-refs"] {
+            watch_git_path(name);
         }
-    } else {
-        // Otherwise we'll derive it from the git information
-
-        if let Ok(repo) = git2::Repository::discover(".") {
-            if let Ok(ref_head) = repo.find_reference("HEAD") {
-                let repo_path = repo.path().to_path_buf();
-
-                if let Ok(resolved) = ref_head.resolve() {
-                    if let Some(name) = resolved.name() {
-                        let path = repo_path.join(name);
-                        if path.exists() {
-                            println!(
-                                "cargo:rerun-if-changed={}",
-                                path.canonicalize().unwrap().display()
-                            );
-                        }
-                    }
+        if let Ok(head) = repo.head() {
+            if let Some(name) = head.name() {
+                watch_git_path(name);
+            }
+        }
+        // Index mtimes do not change for unstaged edits. Watch tracked inputs
+        // rather than the checkout directory (which contains target and logs).
+        if let (Some(workdir), Ok(index)) = (repo.workdir(), repo.index()) {
+            for entry in index.iter() {
+                if let Ok(path) = std::str::from_utf8(&entry.path) {
+                    watch(&workdir.join(Path::new(path)));
                 }
             }
+        }
 
-            if let Ok(output) = std::process::Command::new("git")
-                .args(&[
+        if ci_tag.is_empty() {
+            if let Ok(output) = Command::new("git")
+                .args([
                     "-c",
                     "core.abbrev=8",
                     "show",
@@ -40,14 +64,22 @@ fn main() {
                 ])
                 .output()
             {
-                let info = String::from_utf8_lossy(&output.stdout);
-                ci_tag = info.trim().to_string();
+                if output.status.success() {
+                    ci_tag = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                }
             }
+        }
+        let mut options = git2::StatusOptions::new();
+        options.include_untracked(false);
+        if repo
+            .statuses(Some(&mut options))
+            .is_ok_and(|statuses| !statuses.is_empty())
+        {
+            ci_tag.push_str("-dirty");
         }
     }
 
     let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
-
-    println!("cargo:rustc-env=WEZTERM_TARGET_TRIPLE={}", target);
-    println!("cargo:rustc-env=WEZTERM_CI_TAG={}", ci_tag);
+    println!("cargo:rustc-env=WEZTERM_TARGET_TRIPLE={target}");
+    println!("cargo:rustc-env=WEZTERM_CI_TAG={ci_tag}");
 }
