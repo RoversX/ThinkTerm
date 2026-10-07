@@ -4603,7 +4603,7 @@ impl super::TermWindow {
         }
     }
 
-    fn reflow_workspace_sidebar(&mut self, context: &dyn WindowOps) {
+    pub(crate) fn reflow_workspace_sidebar(&mut self, context: &dyn WindowOps) {
         if let Some(window) = self.window.as_ref().cloned() {
             let dimensions = self.dimensions;
             self.apply_dimensions(&dimensions, None, &window);
@@ -4611,7 +4611,7 @@ impl super::TermWindow {
         context.invalidate();
     }
 
-    fn reflow_right_sidebar(&mut self, context: &dyn WindowOps) {
+    pub(crate) fn reflow_right_sidebar(&mut self, context: &dyn WindowOps) {
         if let Some(window) = self.window.as_ref().cloned() {
             let dimensions = self.dimensions;
             self.apply_dimensions(&dimensions, None, &window);

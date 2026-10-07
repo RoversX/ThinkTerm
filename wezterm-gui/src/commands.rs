@@ -804,6 +804,68 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Shell"],
             icon: Some("cod_multiple_windows"),
         },
+        OpenThreadSearch => CommandDef {
+            brief: "Find Thread".into(),
+            doc: "Searches every saved thread and jumps to the one picked".into(),
+            keys: vec![
+                // Off macOS Ctrl+P is the shell's previous command, so the
+                // shortcut is macOS only. Its synthesized Ctrl+Shift+P
+                // variants lose to the palette's, which is registered first.
+                #[cfg(target_os = "macos")]
+                (Modifiers::SUPER, "p".into()),
+            ],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Shell"],
+            icon: Some("cod_search"),
+        },
+        ToggleWorkspaceSidebar => CommandDef {
+            brief: "Toggle Left Sidebar".into(),
+            doc: "Shows or hides the left sidebar".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["View"],
+            icon: Some("cod_layout_sidebar_left"),
+        },
+        ToggleRightSidebar => CommandDef {
+            brief: "Toggle Right Sidebar".into(),
+            doc: "Shows or hides the right sidebar".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["View"],
+            icon: Some("cod_layout_sidebar_right"),
+        },
+        CreateWorkspaceThreadInActiveProject => CommandDef {
+            brief: "New Thread".into(),
+            doc: "Starts a thread in the project the sidebar has active".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Shell"],
+            icon: Some("cod_add"),
+        },
+        ActivateSpaceRelative(-1) => CommandDef {
+            brief: "Previous Space".into(),
+            doc: "Moves this window to the Space before it, as a sidebar swipe does".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Window"],
+            icon: Some("md_chevron_left"),
+        },
+        ActivateSpaceRelative(1) => CommandDef {
+            brief: "Next Space".into(),
+            doc: "Moves this window to the Space after it, as a sidebar swipe does".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Window"],
+            icon: Some("md_chevron_right"),
+        },
+        ActivateSpaceRelative(n) => CommandDef {
+            brief: format!("Move {n} Spaces").into(),
+            doc: "Moves this window that many Spaces along, as sidebar swipes do".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &[],
+            icon: None,
+        },
         SpawnWindow => CommandDef {
             brief: "New Window".into(),
             doc: "Launches the default program into a new window".into(),
@@ -2395,6 +2457,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         QuitApplication,
         QuitAndStopSessionServer,
         // ----------------- Shell
+        CreateWorkspaceThreadInActiveProject,
         ToggleLiveOverview,
         OpenSshHosts,
         AddRemoteHost,
@@ -2428,7 +2491,11 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ActivateCopyMode,
         ClearKeyTableStack,
         ActivateCommandPalette,
+        // After the palette: its ⌘P's synthesized Ctrl+Shift+P must lose.
+        OpenThreadSearch,
         // ----------------- View
+        ToggleWorkspaceSidebar,
+        ToggleRightSidebar,
         DecreaseFontSize,
         IncreaseFontSize,
         ResetFontSize,
@@ -2496,6 +2563,8 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ActivateWindow(9),
         ActivateWindowRelative(-1),
         ActivateWindowRelative(1),
+        ActivateSpaceRelative(-1),
+        ActivateSpaceRelative(1),
         MoveTabRelative(-1),
         MoveTabRelative(1),
         AdjustPaneSize(PaneDirection::Left, 1),

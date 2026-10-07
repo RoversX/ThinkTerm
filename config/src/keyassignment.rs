@@ -645,6 +645,19 @@ pub enum KeyAssignment {
     /// `OpenSshHosts`, which toggles the page: this one only ever opens.
     AddRemoteHost,
     ToggleLiveOverview,
+    /// The sidebar's search button: the command palette, opened already
+    /// inside its thread group.
+    OpenThreadSearch,
+    /// Show or hide the left sidebar, as its toggle button does.
+    ToggleWorkspaceSidebar,
+    /// Show or hide the right sidebar, as its toggle button does.
+    ToggleRightSidebar,
+    /// Start a thread in the project the sidebar has active, as its New
+    /// Thread button does.
+    CreateWorkspaceThreadInActiveProject,
+    /// Move to the Space before (negative) or after this window's, in the
+    /// order a sidebar swipe moves through them.
+    ActivateSpaceRelative(isize),
     /// Open the right sidebar on this plugin's panel and give it the
     /// keyboard -- in its first field, if it has one. Pressed again while
     /// the panel has it, the keyboard goes back to the terminal.

@@ -6621,6 +6621,42 @@ impl TermWindow {
         self.switch_space_to_thread(space_id, None, window);
     }
 
+    /// Move `delta` Spaces along, stepping the way sidebar swipes do: a Space
+    /// a swipe would skip is skipped, and the walk stops at either end.
+    pub(crate) fn activate_space_relative(&mut self, delta: isize, window: &Window) {
+        let spaces = crate::workspace_threads::spaces_for_window(self.space_owner_id);
+        let mut target = self.active_space_id.clone();
+        for _ in 0..delta.unsigned_abs() {
+            let (previous, next) =
+                crate::workspace_threads::adjacent_swipe_space_ids(&spaces, &target);
+            match if delta < 0 { previous } else { next } {
+                Some(id) => target = id,
+                None => break,
+            }
+        }
+        if target != self.active_space_id {
+            self.switch_space(target, window);
+        }
+    }
+
+    /// The project the sidebar's New Thread button starts a thread in.
+    pub(crate) fn workspace_sidebar_active_project_id(&self) -> Option<String> {
+        let mux = Mux::get();
+        let active_workspace = self
+            .current_mux_workspace()
+            .unwrap_or_else(|| mux.active_workspace());
+        crate::workspace_threads::view_for_current_project(
+            self.workspace_sidebar_space_id(),
+            &active_workspace,
+            &mux.iter_workspaces(),
+            self.workspace_sidebar_show_archived,
+        )
+        .projects
+        .into_iter()
+        .find(|project| project.is_active)
+        .map(|project| project.id)
+    }
+
     /// Switch this window to another Space, activating `preferred_thread`
     /// when given (a notification jump) instead of the Space's recorded
     /// active thread — starting both activations can leave the window on the
@@ -10972,6 +11008,33 @@ impl TermWindow {
             }
             ToggleLiveOverview => {
                 self.toggle_live_overview_view();
+            }
+            OpenThreadSearch => {
+                self.open_thread_search();
+            }
+            ToggleWorkspaceSidebar => {
+                self.toggle_workspace_sidebar();
+                if let Some(window) = window.as_ref() {
+                    self.reflow_workspace_sidebar(window);
+                }
+            }
+            ToggleRightSidebar => {
+                self.toggle_right_sidebar();
+                if let Some(window) = window.as_ref() {
+                    self.reflow_right_sidebar(window);
+                }
+            }
+            CreateWorkspaceThreadInActiveProject => {
+                if let (Some(window), Some(project_id)) =
+                    (window.as_ref(), self.workspace_sidebar_active_project_id())
+                {
+                    self.create_workspace_thread(&project_id, window);
+                }
+            }
+            ActivateSpaceRelative(delta) => {
+                if let Some(window) = window.as_ref() {
+                    self.activate_space_relative(*delta, window);
+                }
             }
             ActivateCommandPalette => {
                 self.toggle_command_palette();
