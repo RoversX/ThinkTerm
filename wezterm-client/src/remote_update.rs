@@ -255,13 +255,18 @@ const STOP_HINT: &str = "pkill -f thinkterm-mux-server";
 const STOP_COMMAND: &str = "pkill -u \"$(id -u)\" -f '[t]hinkterm-mux-server' \
                             || pkill -u \"$(id -u)\" -f '[w]ezterm-mux-server'";
 
+const HOST_PROBE: &str =
+    "uname -s; uname -m; getconf GNU_LIBC_VERSION 2>/dev/null || ldd --version 2>&1 | head -n1";
+
+const VARIANT_READ: &str =
+    "sed -n 's/^variant=//p' \"$HOME/.local/share/thinkterm/install-manifest\" 2>/dev/null";
+
 /// Why the host cannot run a release binary, if it cannot: the same two
 /// checks `install.sh` makes first, made here so the answer comes before
 /// the question. An unreadable answer is not a refusal; the script will
 /// check again.
 fn host_cannot_take_a_release(session: &Session) -> Option<String> {
-    let probe = "uname -s; uname -m; getconf GNU_LIBC_VERSION 2>/dev/null || ldd --version 2>&1 | head -n1";
-    let out = run_capture(session, probe).ok()?;
+    let out = run_capture(session, HOST_PROBE).ok()?;
     let mut lines = out.lines().map(str::trim);
     let os = lines.next()?;
     let arch = lines.next()?;
@@ -292,8 +297,7 @@ fn host_cannot_take_a_release(session: &Session) -> Option<String> {
 /// Falls back to the server variant, which is the only one that makes sense
 /// on a host with no install to preserve.
 fn remote_variant(session: &Session) -> &'static str {
-    let read = "sed -n 's/^variant=//p' \"$HOME/.local/share/thinkterm/install-manifest\" 2>/dev/null";
-    match run_capture(session, read).as_deref().map(str::trim) {
+    match run_capture(session, VARIANT_READ).as_deref().map(str::trim) {
         Ok("desktop") => "desktop",
         _ => "server",
     }
@@ -302,16 +306,27 @@ fn remote_variant(session: &Session) -> &'static str {
 /// Run `command` and return its stdout, for the small questions asked of
 /// the host before anything is changed on it.
 fn run_capture(session: &Session, command: &str) -> anyhow::Result<String> {
-    let exec = smol::block_on(session.exec(command, None))
+    let exec = smol::block_on(session.exec(&without_input(command), None))
         .with_context(|| format!("running `{command}` over ssh"))?;
+    let stdin = exec.stdin;
     let mut stdout = exec.stdout;
+    let mut stderr = exec.stderr;
     let mut child = exec.child;
-    drop(exec.stdin);
-    drop(exec.stderr);
+    let drain = std::thread::spawn(move || std::io::copy(&mut stderr, &mut std::io::sink()));
     let mut out = Vec::new();
     stdout.read_to_end(&mut out)?;
+    let _ = drain.join();
     let _ = child.wait();
+    drop(stdin);
     Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Our end of a command's stdin stays open until it has finished: closing
+/// it closes the whole channel, which loses the output and, under libssh,
+/// hangs while the host still has output to send. So the command reads its
+/// input from /dev/null instead.
+fn without_input(command: &str) -> String {
+    format!("{{ {command}; }} </dev/null")
 }
 
 fn is_yes(answer: &str) -> bool {
@@ -328,12 +343,13 @@ fn is_not_published(err: &anyhow::Error) -> bool {
 /// Run `command` on the session, copying its stdout and stderr into the UI
 /// as they arrive, and return whether it exited successfully.
 fn run_and_relay(session: &Session, ui: &ConnectionUI, command: &str) -> anyhow::Result<bool> {
-    let exec = smol::block_on(session.exec(command, None))
+    let exec = smol::block_on(session.exec(&without_input(command), None))
         .with_context(|| format!("running `{command}` over ssh"))?;
+    // Held until the command has finished; see `without_input`.
+    let stdin = exec.stdin;
     let mut stdout = exec.stdout;
     let mut stderr = exec.stderr;
     let mut child = exec.child;
-    drop(exec.stdin);
 
     let ui_err = ui.clone();
     let stderr_thread = std::thread::spawn(move || {
@@ -353,13 +369,14 @@ fn run_and_relay(session: &Session, ui: &ConnectionUI, command: &str) -> anyhow:
         ui.output_str(&String::from_utf8_lossy(&buf[..len]));
     }
     let _ = stderr_thread.join();
-    let status = child.wait().with_context(|| format!("waiting for `{command}`"))?;
-    Ok(status.success())
+    let status = child.wait().with_context(|| format!("waiting for `{command}`"));
+    drop(stdin);
+    Ok(status?.success())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_not_published, is_yes};
+    use super::{is_not_published, is_yes, without_input};
 
     #[test]
     fn only_an_explicit_yes_counts() {
@@ -368,6 +385,49 @@ mod tests {
         assert!(!is_yes(""));
         assert!(!is_yes("n"));
         assert!(!is_yes("maybe"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_remote_command_still_parses_once_its_input_is_cut() {
+        for command in [
+            super::HOST_PROBE.to_string(),
+            super::VARIANT_READ.to_string(),
+            super::STOP_COMMAND.to_string(),
+            thinkterm_update::install_command("server", "9.9.9"),
+            thinkterm_update::takeover_command(),
+        ] {
+            let checked = std::process::Command::new("/bin/sh")
+                .args(["-n", "-c", &without_input(&command)])
+                .status()
+                .unwrap();
+            assert!(checked.success(), "does not parse: {}", command);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_does_not_wait_for_the_input_we_hold_open() {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &without_input("cat; echo done")])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Held open, as `run_capture` holds the ssh channel's stdin.
+        let _stdin = child.stdin.take();
+        let started = std::time::Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if started.elapsed() > std::time::Duration::from_secs(5) {
+                let _ = child.kill();
+                panic!("the command waited for input");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut out = String::new();
+        std::io::Read::read_to_string(child.stdout.as_mut().unwrap(), &mut out).unwrap();
+        assert_eq!(out, "done\n");
     }
 
     #[test]
