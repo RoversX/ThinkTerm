@@ -274,6 +274,9 @@ thread_local! {
     /// Updates opens Settings straight onto Software Update. Consumed by the
     /// next window to open, and only ever set when one is about to be.
     static PENDING_SECTION: Cell<Option<SettingsSection>> = const { Cell::new(None) };
+    /// The Import page's source to choose and start on, with PENDING_SECTION
+    /// set to Import: first-run setup's Import buttons open Settings there.
+    static PENDING_IMPORT: Cell<Option<ImportSource>> = const { Cell::new(None) };
     /// The window Settings was opened from. The colour-scheme row hands the
     /// choosing back to that window's command palette, and a preview belongs
     /// in the terminal the user was looking at rather than in whichever
@@ -2925,6 +2928,49 @@ pub fn show_update_page_from(mux_window_id: MuxWindowId, space_id: &str) {
     show_update_page();
 }
 
+/// Open Settings on the Import page, asked from a terminal window, with
+/// `source` (an import source's id, or `None` for WezTerm's settings)
+/// chosen and its first step taken.
+pub fn show_import_from(mux_window_id: MuxWindowId, space_id: &str, source: Option<&str>) {
+    remember_origin(mux_window_id, space_id);
+    let Some(source) = ImportSource::named(source) else {
+        show();
+        return;
+    };
+    let switched = SETTINGS_WINDOW.with(|slot| {
+        let slot = slot.borrow();
+        let SettingsWindowSlot::Open { settings, .. } = &*slot else {
+            return false;
+        };
+        let mut settings = settings.borrow_mut();
+        let Some(window) = settings.window.clone() else {
+            return false;
+        };
+        settings.enter_section(SettingsSection::Import);
+        settings.start_import(source, &window);
+        window.invalidate();
+        true
+    });
+    if !switched {
+        PENDING_SECTION.with(|pending| pending.set(Some(SettingsSection::Import)));
+        PENDING_IMPORT.with(|pending| pending.set(Some(source)));
+    }
+    show();
+}
+
+/// A window that failed to open takes the page it was asked for with it.
+/// Left set, the request would be acted on by the next, unrelated, opening:
+/// straight to that page, and an import started that nobody asked for.
+fn forget_pending_pages() {
+    PENDING_SECTION.with(|pending| pending.take());
+    PENDING_IMPORT.with(|pending| pending.take());
+}
+
+/// Whether a WezTerm configuration is there for the Import page to read.
+pub(crate) fn wezterm_config_found() -> bool {
+    SettingsWindow::first_wezterm_config_path().is_some()
+}
+
 fn remember_origin(mux_window_id: MuxWindowId, space_id: &str) {
     OPENED_FROM.with(|slot| slot.set(Some(mux_window_id)));
     let changed = OPENED_FROM_SPACE
@@ -2999,6 +3045,7 @@ pub fn show() {
                             *slot = SettingsWindowSlot::Closed;
                         }
                     });
+                    forget_pending_pages();
                     log::error!("failed to open settings window: {err:#}");
                     wezterm_toast_notification::persistent_toast_notification(
                         &crate::i18n::tr("settings-window-title"),
@@ -3346,7 +3393,26 @@ impl SettingsWindow {
         });
         if !installed {
             window.close();
+            forget_pending_pages();
             return Ok(());
+        }
+
+        // A page asked for while this window was still opening, after it had
+        // read PENDING_SECTION, is taken here. Left behind, it would be lost
+        // now and then send the next, unrelated, opening to that page.
+        let late_section = PENDING_SECTION.with(|pending| pending.take());
+        let pending_import = PENDING_IMPORT.with(|pending| pending.take());
+        if late_section.is_some() || pending_import.is_some() {
+            if let Some(settings) = settings_window_for_instance(instance_id) {
+                let mut settings = settings.borrow_mut();
+                if let Some(section) = late_section {
+                    settings.enter_section(section);
+                }
+                if let Some(source) = pending_import {
+                    settings.enter_section(SettingsSection::Import);
+                    settings.start_import(source, &window);
+                }
+            }
         }
 
         #[cfg(debug_assertions)]

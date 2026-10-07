@@ -675,6 +675,12 @@ onboarding-theme-light-note = 勇気ある選択です。ほとんどの端末�
 onboarding-privacy = 開いたものはこの端末の外に出ません。
 onboarding-skip = スキップ
 onboarding-start = 使ってみる
+onboarding-found-title = このコンピュータで見つかったもの
+onboarding-found-sessions = { $count } 個のセッション
+onboarding-found-sessions-running = { $count } 個のセッション（{ $running } 個が実行中）
+onboarding-found-wezterm = 設定ファイルがあります
+onboarding-found-import = インポート
+onboarding-found-import-settings = 設定をインポート
 
 # エージェント状態検出 + Agents パネル
 settings-agent-panel-description = ペインで動作するコーディングエージェント(Claude Code、Codex など)を検出し、右サイドバーに表示します。

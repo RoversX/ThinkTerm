@@ -24,9 +24,10 @@ use crate::termwindow::render::corners::{
 use crate::termwindow::ui::icons::{BrandIcon, SvgIcon};
 use crate::ui::{UiPalette, UiTokens};
 use crate::utilsprites::RenderMetrics;
+use std::collections::HashMap;
 use std::rc::Rc;
 use wezterm_bidi::Direction;
-use wezterm_font::LoadedFont;
+use wezterm_font::{GlyphInfo, LoadedFont, LoadedFontId};
 use window::bitmaps::TextureRect;
 use window::color::LinearRgba;
 use window::{Dimensions, RectF};
@@ -742,6 +743,38 @@ impl<'a> DrawContext<'a> {
             .borrow_mut()
             .cached_brand_icon(icon, size.round() as usize)?
             .texture_coords();
+        self.draw_full_color(layers, sprite, x, y, size)
+    }
+
+    /// The app's own icon, full colour. Like the file it comes from, it keeps
+    /// the macOS icon grid's clear margin inside `size`.
+    pub(crate) fn draw_app_icon(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        size: f32,
+    ) -> anyhow::Result<()> {
+        if size <= 0.0 {
+            return Ok(());
+        }
+        let sprite = self
+            .render_state
+            .glyph_cache
+            .borrow_mut()
+            .cached_app_icon(size.round() as usize)?
+            .texture_coords();
+        self.draw_full_color(layers, sprite, x, y, size)
+    }
+
+    fn draw_full_color(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        sprite: TextureRect,
+        x: f32,
+        y: f32,
+        size: f32,
+    ) -> anyhow::Result<()> {
         let mut quad = layers.allocate(2)?;
         let left_offset = self.dimensions.pixel_width as f32 / 2.0;
         let top_offset = self.dimensions.pixel_height as f32 / 2.0;
@@ -792,6 +825,23 @@ impl<'a> DrawContext<'a> {
         }
 
         let infos = font.blocking_shape(&display_text, None, Direction::LeftToRight, None, None)?;
+        self.draw_glyph_run(layers, layer_num, font, x, y, &infos, color, max_width)
+    }
+
+    /// Shaped text at `x`, cut at the first glyph that would pass
+    /// `x + max_width`.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_glyph_run(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        font: &Rc<LoadedFont>,
+        x: f32,
+        y: f32,
+        infos: &[GlyphInfo],
+        color: LinearRgba,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
         let render_state = self.render_state;
         let mut glyph_cache = render_state.glyph_cache.borrow_mut();
         let style = font.style();
@@ -802,7 +852,7 @@ impl<'a> DrawContext<'a> {
         let right_edge = x + max_width;
 
         for info in infos {
-            let glyph = glyph_cache.cached_glyph(&info, style, false, font, self.metrics, 1)?;
+            let glyph = glyph_cache.cached_glyph(info, style, false, font, self.metrics, 1)?;
             let advance = glyph.x_advance.get() as f32;
             if !glyph_fits(pos_x, advance, right_edge) {
                 break;
@@ -829,6 +879,109 @@ impl<'a> DrawContext<'a> {
             pos_x += advance;
         }
 
+        Ok(())
+    }
+
+    /// `measure_text_width`, shaping through `shaped`.
+    pub(crate) fn measure_text_width_shaped(
+        &self,
+        font: &Rc<LoadedFont>,
+        text: &str,
+        shaped: &mut ShapedText,
+    ) -> f32 {
+        let Ok(infos) = shaped.shape(font, text) else {
+            return 0.0;
+        };
+        let mut glyph_cache = self.render_state.glyph_cache.borrow_mut();
+        let style = font.style();
+        infos
+            .iter()
+            .filter_map(|info| {
+                glyph_cache
+                    .cached_glyph(info, style, false, font, self.metrics, 1)
+                    .ok()
+                    .map(|glyph| glyph.x_advance.get() as f32)
+            })
+            .sum()
+    }
+
+    /// `draw_text_on_layer`, shaping through `shaped`. Text too wide for
+    /// `max_width` is ellipsised the uncached way; that is the rare case.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draw_text_shaped_on_layer(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        font: &Rc<LoadedFont>,
+        x: f32,
+        y: f32,
+        text: &str,
+        color: LinearRgba,
+        max_width: f32,
+        shaped: &mut ShapedText,
+    ) -> anyhow::Result<()> {
+        if text.is_empty() || max_width <= 0.0 {
+            return Ok(());
+        }
+        if self.measure_text_width_shaped(font, text, shaped) > max_width {
+            return self.draw_text_on_layer(layers, layer_num, font, x, y, text, color, max_width);
+        }
+        let infos = shaped.shape(font, text)?;
+        self.draw_glyph_run(layers, layer_num, font, x, y, &infos, color, max_width)
+    }
+
+    /// Single characters, each at its own position and in its own colour:
+    /// text that is a pattern rather than a line. `shaped` holds what each
+    /// character shaped to in `font`; the caller keeps it while the font
+    /// stays, so a pattern redrawn every frame is shaped once. As with
+    /// [`Self::draw_text`], `y` is the top of the character's line.
+    pub(crate) fn draw_glyphs_on_layer(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        font: &Rc<LoadedFont>,
+        glyphs: &[(char, f32, f32, LinearRgba)],
+        shaped: &mut HashMap<char, Option<GlyphInfo>>,
+    ) -> anyhow::Result<()> {
+        let mut glyph_cache = self.render_state.glyph_cache.borrow_mut();
+        let style = font.style();
+        let baseline = self.metrics.cell_size.height as f32 + self.metrics.descender.get() as f32;
+        let left_offset = self.dimensions.pixel_width as f32 / 2.0;
+        let top_offset = self.dimensions.pixel_height as f32 / 2.0;
+        for (character, x, y, color) in glyphs {
+            if !shaped.contains_key(character) {
+                let infos = font.blocking_shape(
+                    &character.to_string(),
+                    None,
+                    Direction::LeftToRight,
+                    None,
+                    None,
+                )?;
+                shaped.insert(*character, infos.into_iter().next());
+            }
+            let Some(info) = &shaped[character] else {
+                continue;
+            };
+            let glyph = glyph_cache.cached_glyph(info, style, false, font, self.metrics, 1)?;
+            let Some(texture) = glyph.texture.as_ref() else {
+                continue;
+            };
+            let glyph_x = (x + (glyph.x_offset + glyph.bearing_x).get() as f32).round();
+            let glyph_y = (y - (glyph.y_offset + glyph.bearing_y).get() as f32 + baseline).round();
+            let width = texture.coords.size.width as f32 * glyph.scale as f32;
+            let height = texture.coords.size.height as f32 * glyph.scale as f32;
+            let mut quad = layers.allocate(layer_num)?;
+            quad.set_position(
+                glyph_x - left_offset,
+                glyph_y - top_offset,
+                glyph_x + width - left_offset,
+                glyph_y + height - top_offset,
+            );
+            quad.set_texture(texture.texture_coords());
+            quad.set_has_color(glyph.has_color);
+            quad.set_fg_color(*color);
+            quad.set_hsv(None);
+        }
         Ok(())
     }
 
@@ -917,6 +1070,36 @@ fn color_with_alpha(color: LinearRgba, alpha: f32) -> LinearRgba {
 /// between measuring and drawing. Every whole-glyph painter of UI text
 /// decides this way; a surface that must not draw past its edge clips by
 /// pixel instead.
+/// What strings shaped to, for a surface that draws the same text many
+/// times a second. Shaping is the costly part of drawing a label: a
+/// fallback font shared between sizes works out its metrics again each
+/// time it is asked for a different one. Keyed by the font's id, which no
+/// other font ever gets; cleared when full. The owner drops it with itself.
+#[derive(Default)]
+pub(crate) struct ShapedText {
+    entries: HashMap<(LoadedFontId, String), Rc<[GlyphInfo]>>,
+}
+
+/// More distinct strings than one page draws.
+const SHAPED_TEXT_LIMIT: usize = 256;
+
+impl ShapedText {
+    fn shape(&mut self, font: &Rc<LoadedFont>, text: &str) -> anyhow::Result<Rc<[GlyphInfo]>> {
+        let key = (font.id(), text.to_string());
+        if let Some(infos) = self.entries.get(&key) {
+            return Ok(Rc::clone(infos));
+        }
+        if self.entries.len() >= SHAPED_TEXT_LIMIT {
+            self.entries.clear();
+        }
+        let infos: Rc<[GlyphInfo]> = font
+            .blocking_shape(text, None, Direction::LeftToRight, None, None)?
+            .into();
+        self.entries.insert(key, Rc::clone(&infos));
+        Ok(infos)
+    }
+}
+
 pub(crate) fn glyph_fits(pos_x: f32, advance: f32, right_edge: f32) -> bool {
     pos_x + advance <= right_edge + 0.5
 }

@@ -675,6 +675,12 @@ onboarding-theme-light-note = 很有勇气 —— 大多数终端从不见光。
 onboarding-privacy = 你打开的一切都不会离开这台设备。
 onboarding-skip = 跳过
 onboarding-start = 开始使用
+onboarding-found-title = 在这台电脑上找到
+onboarding-found-sessions = { $count } 个会话
+onboarding-found-sessions-running = { $count } 个会话，{ $running } 个在运行
+onboarding-found-wezterm = 找到配置文件
+onboarding-found-import = 导入
+onboarding-found-import-settings = 导入设置
 
 # Agent 状态检测 + Agents 面板
 settings-agent-panel-description = 检测 pane 中运行的编码 Agent(Claude Code、Codex 等)并显示在右侧栏。

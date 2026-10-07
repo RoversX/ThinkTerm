@@ -1,32 +1,37 @@
 //! First-run setup: one page, no wizard.
 //!
-//! It asks two things — what language, and light or dark — and gets out of the
-//! way.
+//! It asks two things — what language, and light or dark — offers to bring
+//! in what this computer already has (see `found`), and gets out of the way.
 //!
-//! Every surface here is a `draw_rounded_frame` and every glyph a `SvgIcon`,
-//! which is the combination the rest of this crate already draws with. An
-//! earlier cut invented its own ornament — a bevelled slab with a phosphor-dot
-//! grid for the mark — by transcribing a CSS mock. Those primitives have no
-//! equivalent here (no blend modes, no clipping, no box-shadow) and the result
-//! did not render as designed. Prefer a plainer thing that is certainly right.
+//! Every surface here is a `draw_rounded_frame`, every glyph a `SvgIcon` and
+//! the mark the app's own icon, which is the combination the rest of this
+//! crate already draws with. An earlier cut invented its own ornament — a
+//! bevelled slab with a phosphor-dot grid for the mark — by transcribing a CSS
+//! mock. Those primitives have no equivalent here (no blend modes, no
+//! clipping, no box-shadow) and the result did not render as designed. Prefer
+//! a plainer thing that is certainly right.
 //!
 //! The palette is deliberately neutral. The user is choosing a theme on this
 //! screen, so an accent hue would compete with the very thing being judged;
 //! selection is carried by fill and border weight instead.
 
+mod found;
+
 use crate::i18n::{language_option_label, LANGUAGE_OPTIONS};
 use crate::native_settings::{mark_onboarding_seen, NativeThemeMode, ThinkTermNativeSettings};
 use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::content_view::{ContentView, ContentViewResponse};
-use crate::termwindow::ui::icons::SvgIcon;
+use crate::termwindow::ui::icons::{BrandIcon, SvgIcon};
 use crate::termwindow::TermWindow;
 use crate::ui::{
-    rect, ControlState, DrawContext, InteractionState, UiContext, UiPalette, WidgetKind,
+    rect, ControlState, DrawContext, InteractionState, ShapedText, UiContext, UiPalette, WidgetKind,
 };
 use crate::utilsprites::RenderMetrics;
+use fluent_bundle::FluentArgs;
+use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::Instant;
-use wezterm_font::LoadedFont;
+use std::time::{Duration, Instant};
+use wezterm_font::{GlyphInfo, LoadedFont};
 use wezterm_term::{KeyCode, KeyModifiers};
 use window::color::LinearRgba;
 use window::{MouseEventKind as WMEK, MousePress, RectF, WindowOps};
@@ -38,24 +43,63 @@ use window::{MouseEventKind as WMEK, MousePress, RectF, WindowOps};
 // should look 32pt tall is 64 here. Getting this wrong halves the whole layout
 // while leaving the text at full size, which reads as everything crushed
 // together and wrapping early.
-const COL_W: f32 = 1120.0;
+/// Every row spans the column, label at the left edge and control at the
+/// right, so the page lines up as one block under its centred heading.
+const COL_W: f32 = 880.0;
 /// Floor for the content column, so text never gets a zero width budget.
 const MIN_COL_W: f32 = 320.0;
 const SIDE_PAD: f32 = 64.0;
 const SECTION_GAP: f32 = 60.0;
 
-const MARK_SIZE: f32 = 128.0;
-const MARK_TO_TITLE: f32 = 52.0;
+/// The app icon, which keeps the macOS grid's clear margin inside this.
+const MARK_SIZE: f32 = 144.0;
+const MARK_TO_TITLE: f32 = 40.0;
 const TITLE_TO_SUB: f32 = 12.0;
 const LABEL_GAP: f32 = 24.0;
 
 const CHIP_PAD_X: f32 = 28.0;
 const CHIP_PAD_Y: f32 = 18.0;
-const CHIP_GAP: f32 = 16.0;
+/// The language pill's chevron, after its label.
+const CHEVRON: f32 = 28.0;
+const CHEVRON_GAP: f32 = 16.0;
+
+/// The open language menu.
+const MENU_GAP: f32 = 8.0;
+const MENU_PAD: f32 = 8.0;
+const MENU_ROW_PAD_Y: f32 = 14.0;
+const MENU_RADIUS: f32 = 20.0;
+
+/// The card listing what this computer has to bring in.
+const FOUND_PAD_X: f32 = 28.0;
+const FOUND_PAD_Y: f32 = 22.0;
+const FOUND_ICON: f32 = 48.0;
+const FOUND_ICON_GAP: f32 = 24.0;
+const FOUND_LINE_GAP: f32 = 4.0;
+const FOUND_RADIUS: f32 = 24.0;
+const FOUND_BTN_PAD_Y: f32 = 12.0;
+
+/// The side margins hang a faint curtain of code, as in The Matrix: columns
+/// of characters that stay where they are while strands of light fall
+/// through them, each brightest at its head and fading up its length, all
+/// thinning out towards the page so they never compete with it. It stays
+/// inside the margins: nothing here clips, and past the page it would paint
+/// over the sidebar.
+const CURTAIN_CLEAR: f32 = 40.0;
+/// Column spacing, in character widths.
+const CURTAIN_PITCH: f32 = 1.7;
+/// A strand moves a whole row at a time, so ten steps a second reads as
+/// falling; each step redraws the whole window, which is the curtain's
+/// real cost, so it takes no more than that.
+const CURTAIN_FRAME: Duration = Duration::from_millis(100);
+/// How long the page keeps asking whether found sessions are running.
+const FOUND_WAIT: Duration = Duration::from_secs(15);
+/// Characters every font has, so no strand ever shows a missing glyph.
+const CURTAIN_CHARS: &[u8] = b"0123456789ABCDEFHKMTXZ:=+*<>|";
 
 /// Appearance previews. Big enough to actually depict a light and a dark
 /// surface, because that is the one thing on this page that communicates
 /// without being read — the user may not have picked their language yet.
+/// They widen to fill the column when it has room.
 const TILE_W: f32 = 224.0;
 const TILE_H: f32 = 144.0;
 const TILE_GAP: f32 = 24.0;
@@ -99,11 +143,20 @@ fn pill_radius(area: RectF) -> f32 {
 enum OnboardingAction {
     Start,
     Skip,
-    /// Carries the stable preference string from [`LANGUAGE_OPTIONS`], which is
-    /// what `localization.language` persists, rather than the legacy
-    /// `NativeLanguagePreference` enum that cannot name every shipped locale.
+    /// The language pill, which opens and closes its menu.
+    LanguageMenu,
+    /// A row of the open language menu. Carries the stable preference string
+    /// from [`LANGUAGE_OPTIONS`], which is what `localization.language`
+    /// persists, rather than the legacy `NativeLanguagePreference` enum that
+    /// cannot name every shipped locale.
     Language(&'static str),
+    /// Anywhere outside the open menu: closes it without reaching what is
+    /// underneath.
+    CloseMenu,
     Appearance(NativeThemeMode),
+    /// An Import button: the sessions of the import source with this id, or
+    /// `None` for the WezTerm configuration.
+    Import(Option<&'static str>),
 }
 
 /// How far the discretionary space must shrink for the page to fit.
@@ -144,12 +197,10 @@ fn appearance_choices() -> Vec<(NativeThemeMode, String)> {
 
 /// Tab order. Keyboard users get the same reach as the mouse, which the
 /// multi-step version never offered — there, Tab switched steps and no control
-/// was reachable without pointing at it.
-fn focus_order() -> Vec<OnboardingAction> {
-    let mut order: Vec<OnboardingAction> = LANGUAGE_OPTIONS
-        .iter()
-        .map(|option| OnboardingAction::Language(option.preference))
-        .collect();
+/// was reachable without pointing at it. The languages are reached through
+/// their pill, whose menu takes the arrow keys.
+fn focus_order(found: &found::Found) -> Vec<OnboardingAction> {
+    let mut order = vec![OnboardingAction::LanguageMenu];
     order.extend(
         [
             NativeThemeMode::System,
@@ -158,9 +209,200 @@ fn focus_order() -> Vec<OnboardingAction> {
         ]
         .map(OnboardingAction::Appearance),
     );
+    order.extend(
+        found
+            .sessions
+            .iter()
+            .map(|sessions| OnboardingAction::Import(Some(sessions.id))),
+    );
+    if found.wezterm_config {
+        order.push(OnboardingAction::Import(None));
+    }
     order.push(OnboardingAction::Skip);
     order.push(OnboardingAction::Start);
     order
+}
+
+/// SplitMix64 over a pair: the curtain's fixed pattern.
+fn curtain_hash(a: u64, b: u64) -> u64 {
+    let mut z = a.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ b.wrapping_add(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// One strand of light falling down a column, round and round.
+struct Strand {
+    seed: u64,
+    /// Rows a second.
+    speed: f32,
+    /// Rows from one pass's head to the next: the page, the longest strand,
+    /// and a pause before it comes round again.
+    cycle: f32,
+    /// Where in its cycle it is at the start.
+    offset: f32,
+}
+
+struct CurtainColumn {
+    x: f32,
+    /// Fainter nearer the page.
+    outward: f32,
+    seed: u64,
+    strands: Vec<Strand>,
+}
+
+/// The curtain as laid out for the current page, column, font and theme,
+/// with this frame's characters and what they shaped to. Bounded by the
+/// window's size and the character set; it goes with the page.
+struct Curtain {
+    key: [u32; 15],
+    font: usize,
+    top: f32,
+    line_h: f32,
+    rows: usize,
+    ground: LinearRgba,
+    ink: LinearRgba,
+    columns: Vec<CurtainColumn>,
+    glyphs: Vec<(char, f32, f32, LinearRgba)>,
+    /// How lit each row of the column being laid out is: where two strands
+    /// cross, the brighter one wins rather than both being drawn.
+    lit_rows: Vec<f32>,
+    shaped: HashMap<char, Option<GlyphInfo>>,
+}
+
+impl Curtain {
+    /// Columns in both side margins, counted out from the page. The pattern
+    /// comes from each column's place: the same page lays out the same
+    /// curtain, and a wider window only adds columns at the outer edge. A
+    /// margin with room for fewer than two columns gets none.
+    #[allow(clippy::too_many_arguments)]
+    fn lay_out(
+        area: RectF,
+        col_x: f32,
+        col_w: f32,
+        clear: f32,
+        char_w: f32,
+        line_h: f32,
+        ground: LinearRgba,
+        ink: LinearRgba,
+    ) -> Self {
+        let mut curtain = Self {
+            key: [0; 15],
+            font: 0,
+            top: area.origin.y,
+            line_h,
+            rows: 0,
+            ground,
+            ink,
+            columns: Vec::new(),
+            glyphs: Vec::new(),
+            lit_rows: Vec::new(),
+            shaped: HashMap::new(),
+        };
+        if char_w <= 0.0 || line_h <= 0.0 {
+            return curtain;
+        }
+        let pitch = (char_w * CURTAIN_PITCH).round();
+        let rows = (area.size.height / line_h).floor() as i64;
+        let room = col_x - area.origin.x - clear - pitch / 2.0;
+        let count = (room / pitch).floor() as i64;
+        if count < 2 || rows < 2 {
+            return curtain;
+        }
+        for side in 0..2u64 {
+            for column in 0..count {
+                let x = if side == 0 {
+                    col_x - clear - (column + 1) as f32 * pitch
+                } else {
+                    col_x + col_w + clear + column as f32 * pitch
+                };
+                let seed = curtain_hash(side, column as u64);
+                // Now and then a column hangs nothing, so it reads as strands
+                // rather than as a wall of text.
+                if seed % 7 == 0 {
+                    continue;
+                }
+                let strands = (0..1 + (seed >> 8) % 3)
+                    .map(|strand| {
+                        let seed = curtain_hash(seed, strand + 1);
+                        let pause = (seed >> 24) % (rows as u64 / 2 + 1);
+                        let cycle = (rows as u64 + 32 + pause) as f32;
+                        Strand {
+                            seed,
+                            speed: 5.0 + (seed >> 40) as f32 % 8.0,
+                            cycle,
+                            offset: (seed >> 16) as f32 % cycle,
+                        }
+                    })
+                    .collect();
+                curtain.columns.push(CurtainColumn {
+                    x: x + (pitch - char_w) / 2.0,
+                    outward: 0.3 + 0.7 * (column as f32 / (count - 1) as f32),
+                    seed,
+                    strands,
+                });
+            }
+        }
+        curtain.rows = rows as usize;
+        curtain.lit_rows = vec![0.0; rows as usize];
+        curtain
+    }
+
+    /// The characters lit `elapsed` seconds in, rebuilt in place. Each
+    /// strand's head moves a whole row at a time and its length changes
+    /// from one pass to the next; now and then a character turns into
+    /// another, each on its own beat.
+    fn frame(&mut self, elapsed: f32) {
+        self.glyphs.clear();
+        let rows = self.rows as i64;
+        for column in &self.columns {
+            self.lit_rows.iter_mut().for_each(|lit| *lit = 0.0);
+            for strand in &column.strands {
+                let travelled = strand.offset + elapsed * strand.speed;
+                let pass = (travelled / strand.cycle).floor() as u64;
+                let head = (travelled % strand.cycle).floor() as i64;
+                let length = 8 + (curtain_hash(strand.seed, pass) % 24) as i64;
+                for step in 0..length {
+                    let row = head - step;
+                    if row < 0 || row >= rows {
+                        continue;
+                    }
+                    let fade = 1.0 - step as f32 / length as f32;
+                    let mut strength = 0.02 + 0.09 * fade.powf(1.5);
+                    if step == 0 {
+                        strength += 0.035;
+                    }
+                    let lit = &mut self.lit_rows[row as usize];
+                    *lit = lit.max(strength);
+                }
+            }
+            for (row, strength) in self.lit_rows.iter().enumerate() {
+                if *strength <= 0.0 {
+                    continue;
+                }
+                let place = curtain_hash(column.seed, row as u64);
+                let beat = (elapsed * 0.6 + (place >> 32) as f32 % 7.0).floor() as u64;
+                let pick = curtain_hash(place, beat) as usize % CURTAIN_CHARS.len();
+                let row = row as i64;
+                // Eased in at the top and bottom of the page rather than cut
+                // off by them.
+                let edge = (row.min(rows - 1 - row) as f32 / 3.0).min(1.0);
+                self.glyphs.push((
+                    CURTAIN_CHARS[pick] as char,
+                    column.x,
+                    self.top + row as f32 * self.line_h,
+                    mix(self.ground, self.ink, strength * column.outward * edge),
+                ));
+            }
+        }
+    }
+}
+
+fn language_index(preference: &str) -> usize {
+    LANGUAGE_OPTIONS
+        .iter()
+        .position(|option| option.preference == preference)
+        .unwrap_or(0)
 }
 
 pub(crate) struct OnboardingView {
@@ -175,10 +417,28 @@ pub(crate) struct OnboardingView {
     /// are clicked, so without these Skip would have nothing to undo and would
     /// be indistinguishable from Get Started — while still promising otherwise.
     opened_with: (&'static str, NativeThemeMode),
+    /// What this computer has to bring in.
+    found: found::Found,
+    /// The language menu while it is open: the row the keyboard is on.
+    menu: Option<usize>,
+    /// When the page opened, which bounds the wait for the running check.
+    opened: Instant,
+    curtain: Option<Curtain>,
+    /// What this page's strings shaped to. The curtain repaints the page
+    /// many times a second, and its text never changes in between.
+    shaped: ShapedText,
 }
 
 impl OnboardingView {
     pub(crate) fn new(initial_space_id: String, initial_space_name: String) -> Self {
+        Self::with_found(initial_space_id, initial_space_name, found::Found::look())
+    }
+
+    fn with_found(
+        initial_space_id: String,
+        initial_space_name: String,
+        found: found::Found,
+    ) -> Self {
         let settings = crate::native_settings::load();
         Self {
             widgets: UiContext::default(),
@@ -194,6 +454,11 @@ impl OnboardingView {
                 language_preference_for(&settings),
                 settings.appearance.theme_mode,
             ),
+            found,
+            menu: None,
+            opened: Instant::now(),
+            curtain: None,
+            shaped: ShapedText::default(),
         }
     }
 
@@ -227,6 +492,11 @@ impl OnboardingView {
             WMEK::Move => {
                 if self.interaction.hovered != hit {
                     self.interaction.hovered = hit;
+                    // The pointer and the arrow keys share one highlight.
+                    if let (Some(_), Some(OnboardingAction::Language(language))) = (self.menu, hit)
+                    {
+                        self.menu = Some(language_index(language));
+                    }
                     ContentViewResponse::Redraw
                 } else {
                     ContentViewResponse::Ignored
@@ -235,9 +505,14 @@ impl OnboardingView {
             WMEK::Press(MousePress::Left) => {
                 self.interaction.pressed = hit;
                 // Clicking also takes focus, so Tab continues from where the
-                // pointer left off rather than jumping back to the start.
-                if hit.is_some() {
-                    self.interaction.focused = hit;
+                // pointer left off rather than jumping back to the start. A
+                // language is reached through its pill.
+                match hit {
+                    Some(OnboardingAction::CloseMenu) | None => {}
+                    Some(OnboardingAction::Language(_)) => {
+                        self.interaction.focused = Some(OnboardingAction::LanguageMenu)
+                    }
+                    Some(action) => self.interaction.focused = Some(action),
                 }
                 ContentViewResponse::Redraw
             }
@@ -262,7 +537,20 @@ impl OnboardingView {
         match action {
             OnboardingAction::Start => self.finish_response(),
             OnboardingAction::Skip => self.skip_response(),
+            OnboardingAction::Import(source) => self.import_response(source),
+            OnboardingAction::LanguageMenu => {
+                self.menu = match self.menu {
+                    Some(_) => None,
+                    None => Some(language_index(self.selected_language)),
+                };
+                ContentViewResponse::Redraw
+            }
+            OnboardingAction::CloseMenu => {
+                self.menu = None;
+                ContentViewResponse::Redraw
+            }
             OnboardingAction::Language(language) => {
+                self.menu = None;
                 // Redraw, not Ignored: the press fill is derived from
                 // `state_of`, so skipping the repaint leaves the control stuck
                 // looking pressed after the button comes back up.
@@ -305,7 +593,8 @@ impl OnboardingView {
     }
 
     fn move_focus(&mut self, forward: bool) -> ContentViewResponse {
-        let order = focus_order();
+        self.menu = None;
+        let order = focus_order(&self.found);
         if order.is_empty() {
             return ContentViewResponse::Ignored;
         }
@@ -325,35 +614,81 @@ impl OnboardingView {
     }
 
     fn on_key_impl(&mut self, key: KeyCode, mods: KeyModifiers) -> ContentViewResponse {
+        if let Some(row) = self.menu {
+            let rows = LANGUAGE_OPTIONS.len();
+            return match (key, mods) {
+                // Escape closes the menu, not the page.
+                (KeyCode::Escape, _) => self.apply(OnboardingAction::CloseMenu),
+                (KeyCode::UpArrow, _) => {
+                    self.menu = Some((row + rows - 1) % rows);
+                    ContentViewResponse::Redraw
+                }
+                (KeyCode::DownArrow, _) => {
+                    self.menu = Some((row + 1) % rows);
+                    ContentViewResponse::Redraw
+                }
+                (KeyCode::Enter, _) | (KeyCode::Char(' '), _) => {
+                    self.apply(OnboardingAction::Language(LANGUAGE_OPTIONS[row].preference))
+                }
+                (KeyCode::Tab, KeyModifiers::NONE) => self.move_focus(true),
+                (KeyCode::Tab, KeyModifiers::SHIFT) => self.move_focus(false),
+                _ => ContentViewResponse::Ignored,
+            };
+        }
+        let focused = self.interaction.focused;
         match (key, mods) {
             (KeyCode::Escape, _) => self.skip_response(),
             (KeyCode::Tab, KeyModifiers::NONE) => self.move_focus(true),
             (KeyCode::Tab, KeyModifiers::SHIFT) => self.move_focus(false),
+            (KeyCode::DownArrow, _) | (KeyCode::UpArrow, _)
+                if focused == Some(OnboardingAction::LanguageMenu) =>
+            {
+                self.apply(OnboardingAction::LanguageMenu)
+            }
             // Space activates whatever is focused. Enter is the default
-            // action — it starts — except on Skip, which it honours. Focus on a
-            // chip does not change that: the chip is already applied the moment
-            // it is picked, so there is nothing left for Enter to confirm.
-            (KeyCode::Char(' '), _) => match self.interaction.focused {
+            // action — it starts — except on a control that has an action of
+            // its own: Skip, the language pill, an Import button. A theme
+            // is applied the moment it is picked, so there is nothing left
+            // for Enter to confirm there.
+            (KeyCode::Char(' '), _) => match focused {
                 Some(action) => self.apply(action),
                 None => ContentViewResponse::Ignored,
             },
-            (KeyCode::Enter, _) => match self.interaction.focused {
-                Some(OnboardingAction::Skip) => self.skip_response(),
+            (KeyCode::Enter, _) => match focused {
+                Some(
+                    action @ (OnboardingAction::Skip
+                    | OnboardingAction::LanguageMenu
+                    | OnboardingAction::Import(_)),
+                ) => self.apply(action),
                 _ => self.finish_response(),
             },
             _ => ContentViewResponse::Ignored,
         }
     }
 
-    fn finish_response(&self) -> ContentViewResponse {
-        let prefs = OnboardingPrefs {
+    fn prefs(&self) -> OnboardingPrefs {
+        OnboardingPrefs {
             space_name: self.space_name(),
             target_space_id: Some(self.target_space_id_for_choice()),
             language: self.selected_language,
             appearance: self.selected_appearance,
-        };
+        }
+    }
+
+    fn finish_response(&self) -> ContentViewResponse {
+        let prefs = self.prefs();
         ContentViewResponse::Run(Box::new(move |tw: &mut TermWindow| {
             finish_onboarding(tw, prefs);
+        }))
+    }
+
+    /// Import keeps what was picked here, as Get Started does, and goes on to
+    /// Settings' Import page with the source chosen and its first step taken.
+    fn import_response(&self, source: Option<&'static str>) -> ContentViewResponse {
+        let prefs = self.prefs();
+        ContentViewResponse::Run(Box::new(move |tw: &mut TermWindow| {
+            let space_id = finish_onboarding(tw, prefs);
+            crate::settings_window::show_import_from(tw.mux_window_id, &space_id, source);
         }))
     }
 
@@ -403,40 +738,6 @@ impl OnboardingView {
             .height as f32
     }
 
-    /// One chip's width: its label plus symmetric padding.
-    ///
-    /// Rounded up, because the label is then drawn into exactly
-    /// `width - padding * 2` and a chip sized to the measurement with no
-    /// slack loses its last glyph to any rounding in between -- "Français"
-    /// came out as "Françai". A whole pixel of headroom costs nothing and
-    /// removes the whole class of near-miss.
-    fn chip_w(ctx: &DrawContext, font: &Rc<LoadedFont>, label: &str) -> f32 {
-        (ctx.measure_text_width(font, label) + ctx.px(CHIP_PAD_X) * 2.0).ceil()
-    }
-
-    /// Wrap chips into rows that fit `max_w`. Returns one vector of indices per
-    /// row. Five languages fit on one row at 560px, but a narrow window (or a
-    /// locale with longer names) has to wrap rather than overflow.
-    fn chip_rows(widths: &[f32], gap: f32, max_w: f32) -> Vec<Vec<usize>> {
-        let mut rows: Vec<Vec<usize>> = Vec::new();
-        let mut row: Vec<usize> = Vec::new();
-        let mut used = 0.0f32;
-        for (index, width) in widths.iter().enumerate() {
-            let advance = if row.is_empty() { *width } else { gap + *width };
-            if !row.is_empty() && used + advance > max_w {
-                rows.push(std::mem::take(&mut row));
-                used = *width;
-            } else {
-                used += advance;
-            }
-            row.push(index);
-        }
-        if !row.is_empty() {
-            rows.push(row);
-        }
-        rows
-    }
-
     fn paint_impl(
         &mut self,
         ctx: &DrawContext,
@@ -446,6 +747,7 @@ impl OnboardingView {
         font: &Rc<LoadedFont>,
         title_font: &Rc<LoadedFont>,
         section_font: &Rc<LoadedFont>,
+        caption_font: &Rc<LoadedFont>,
     ) -> anyhow::Result<()> {
         self.widgets.clear();
         let skin = Skin::new(palette);
@@ -472,19 +774,29 @@ impl OnboardingView {
             .px(COL_W)
             .min((area.size.width - ctx.px(SIDE_PAD) * 2.0).max(ctx.px(MIN_COL_W)));
         let col_x = area.origin.x + ((area.size.width - col_w) / 2.0).max(0.0);
+        self.paint_curtain(ctx, layers, area, col_x, col_w, skin, caption_font)?;
 
         // --- measure everything first so the column can be centred vertically
-        let languages: Vec<(String, &'static str)> = LANGUAGE_OPTIONS
+        let languages: Vec<String> = LANGUAGE_OPTIONS
             .iter()
-            .map(|option| (language_option_label(*option), option.preference))
+            .map(|option| language_option_label(*option))
             .collect();
-        let chip_widths: Vec<f32> = languages
+        // As wide as the longest name, so the pill keeps its size whichever
+        // is chosen and the open menu lines up under it.
+        let pill_w = (languages
             .iter()
-            .map(|(label, _)| Self::chip_w(ctx, font, label))
-            .collect();
-        // Wrapping is settled at full scale: shrinking only ever buys room, so
-        // this is the conservative row count.
-        let rows = Self::chip_rows(&chip_widths, ctx.px(CHIP_GAP), col_w);
+            .map(|label| self.width(ctx, font, label))
+            .fold(0.0f32, f32::max)
+            + ctx.px(CHIP_PAD_X) * 2.0
+            + ctx.px(CHEVRON_GAP)
+            + ctx.px(CHEVRON))
+        .ceil()
+        .min(col_w);
+        let language_label = crate::i18n::tr("onboarding-language");
+        // A column too narrow for the label and the pill side by side puts
+        // the pill under its label instead.
+        let language_stacked =
+            self.width(ctx, section_font, &language_label) + ctx.px(LABEL_GAP) + pill_w > col_w;
 
         let modes = appearance_choices();
         // A preview is at least as wide as the widest caption. At the design
@@ -493,49 +805,91 @@ impl OnboardingView {
         // most needs whole.
         let widest_caption = modes
             .iter()
-            .map(|(_, label)| ctx.measure_text_width(font, label))
+            .map(|(_, label)| self.width(ctx, font, label))
             .fold(0.0f32, f32::max);
-        let tile_w_base = ctx
+        let tile_min = ctx
             .px(TILE_W)
             .max(widest_caption + ctx.px(TILE_CAPTION_PAD));
-        let tile_row_w = tile_w_base * modes.len() as f32
-            + ctx.px(TILE_GAP) * (modes.len().saturating_sub(1)) as f32;
-        let tiles_fit = tile_row_w <= col_w;
+        let tile_gap = ctx.px(TILE_GAP);
+        let tile_count = modes.len() as f32;
+        // The selected tile's ring is drawn outside it. Inset by its weight,
+        // the ring is what meets the column's edges, and the language menu,
+        // which ends at the right edge, covers it whole.
+        let tiles_x = col_x + ctx.px(RING_SELECTED);
+        let tiles_w = col_w - ctx.px(RING_SELECTED) * 2.0;
+        let tiles_fit = tile_min * tile_count + tile_gap * (tile_count - 1.0) <= tiles_w;
+        let tile_w = if tiles_fit {
+            (tiles_w - tile_gap * (tile_count - 1.0)) / tile_count
+        } else {
+            tile_min.min(tiles_w)
+        };
+
+        let show_found = !self.found.is_empty();
+        let found_rows =
+            (self.found.sessions.len() + usize::from(self.found.wezterm_config)) as f32;
+
+        let privacy = crate::i18n::tr("onboarding-privacy");
+        let start_label = crate::i18n::tr("onboarding-start");
+        let skip_label = crate::i18n::tr("onboarding-skip");
+        // Rounded up: a label drawn into exactly its measured width loses its
+        // last glyph to any rounding in between.
+        let start_w = (self.width(ctx, font, &start_label) + ctx.px(BTN_PAD_X) * 2.0).ceil();
+        let skip_w = (self.width(ctx, font, &skip_label) + ctx.px(BTN_PAD_X) * 2.0).ceil();
+        let buttons_w = skip_w + ctx.px(BTN_GAP) + start_w;
+        // The privacy line shares the buttons' row when it fits beside them.
+        let footer_inline = self.width(ctx, font, &privacy) + ctx.px(BTN_GAP) + buttons_w <= col_w;
 
         // Text cannot shrink; spacing and decoration can. Page height is
         // therefore linear in a single factor, so solve it rather than guess:
         // at the default 24-row window the content area is only ~700px tall and
         // the full-size layout runs ~340px past it — with no scrolling and no
         // wheel handler, that put "Get Started" off screen and out of reach.
-        let rows_n = rows.len() as f32;
-        let tile_rows = if tiles_fit { 1.0 } else { modes.len() as f32 };
-        let rigid = title_h
+        let tile_rows = if tiles_fit { 1.0 } else { tile_count };
+        let mut rigid = title_h
             + body_h
-            + label_h
-            + rows_n * body_h
+            + if language_stacked {
+                label_h + body_h
+            } else {
+                body_h
+            }
             + label_h
             + tile_rows * body_h
             + body_h
-            + body_h
             + body_h;
-        let flex = ctx.px(MARK_SIZE
-            + MARK_TO_TITLE
-            + TITLE_TO_SUB
-            + LABEL_GAP * 2.0
-            + rows_n * CHIP_PAD_Y * 2.0
-            + (rows_n - 1.0).max(0.0) * CHIP_GAP
+        let mut flex = TITLE_TO_SUB
+            + CHIP_PAD_Y * 2.0
+            + if language_stacked { LABEL_GAP } else { 0.0 }
+            + LABEL_GAP
             + tile_rows * (TILE_H + TILE_LABEL_GAP)
             + (tile_rows - 1.0).max(0.0) * TILE_GAP
             + TILE_LABEL_GAP
             + BTN_PAD_Y * 2.0
-            + SECTION_GAP * 4.0);
-        let fit = fit_factor(area.size.height - ctx.px(SIDE_PAD) * 2.0, rigid, flex);
+            + SECTION_GAP * 3.0;
+        if show_found {
+            rigid += label_h + found_rows * body_h * 2.0;
+            flex += LABEL_GAP + found_rows * (FOUND_LINE_GAP + FOUND_PAD_Y * 2.0) + SECTION_GAP;
+        }
+        if !footer_inline {
+            rigid += body_h;
+            flex += LABEL_GAP;
+        }
+        let available = area.size.height - ctx.px(SIDE_PAD) * 2.0;
+        // The mark is decoration: a window too short for the page even at its
+        // tightest spacing loses it before anything that can be clicked.
+        let show_mark = rigid + ctx.px(flex + MARK_SIZE + MARK_TO_TITLE) * FIT_MIN <= available;
+        if show_mark {
+            flex += MARK_SIZE + MARK_TO_TITLE;
+        }
+        let fit = fit_factor(available, rigid, ctx.px(flex));
         // Every discretionary dimension goes through this from here on.
         let fx = |value: f32| ctx.px(value) * fit;
 
         let chip_h = body_h + fx(CHIP_PAD_Y) * 2.0;
-        let chips_h = rows_n * chip_h + (rows_n - 1.0).max(0.0) * fx(CHIP_GAP);
-        let tile_w = tile_w_base * fit;
+        let language_h = if language_stacked {
+            label_h + fx(LABEL_GAP) + chip_h
+        } else {
+            label_h.max(chip_h)
+        };
         let tile_h = fx(TILE_H);
         // The light-theme footnote is only drawn for Follow System and Light,
         // but its room is reserved either way: the page is vertically centred,
@@ -544,40 +898,47 @@ impl OnboardingView {
         let note_h = fx(TILE_LABEL_GAP) + body_h;
         let tiles_h = tile_rows * (tile_h + fx(TILE_LABEL_GAP) + body_h)
             + (tile_rows - 1.0).max(0.0) * fx(TILE_GAP);
-        let modes_h = tiles_h + note_h;
-        let brand_h = fx(MARK_SIZE) + fx(MARK_TO_TITLE) + title_h + fx(TITLE_TO_SUB) + body_h;
-        let group_h = |controls: f32| label_h + fx(LABEL_GAP) + controls;
+        let modes_h = label_h + fx(LABEL_GAP) + tiles_h + note_h;
+        let found_row_h = body_h * 2.0 + fx(FOUND_LINE_GAP) + fx(FOUND_PAD_Y) * 2.0;
+        let found_h = label_h + fx(LABEL_GAP) + found_rows * found_row_h;
         let actions_h = body_h + fx(BTN_PAD_Y) * 2.0;
+        let footer_h = if footer_inline {
+            actions_h
+        } else {
+            body_h + fx(LABEL_GAP) + actions_h
+        };
+        let mark_h = if show_mark {
+            fx(MARK_SIZE) + fx(MARK_TO_TITLE)
+        } else {
+            0.0
+        };
+        let brand_h = mark_h + title_h + fx(TITLE_TO_SUB) + body_h;
 
         let gap = fx(SECTION_GAP);
         let total_h = brand_h
             + gap
-            + group_h(chips_h)
+            + language_h
             + gap
-            + group_h(modes_h)
+            + modes_h
             + gap
-            + body_h
-            + gap
-            + actions_h;
+            + if show_found { found_h + gap } else { 0.0 }
+            + footer_h;
 
         let mut y = area.origin.y + ((area.size.height - total_h) / 2.0).max(0.0);
 
         // --- brand
-        self.paint_mark(
-            ctx,
-            layers,
-            rect(
+        if show_mark {
+            ctx.draw_app_icon(
+                layers,
                 col_x + (col_w - fx(MARK_SIZE)) / 2.0,
                 y,
                 fx(MARK_SIZE),
-                fx(MARK_SIZE),
-            ),
-            skin,
-        )?;
-        y += fx(MARK_SIZE) + fx(MARK_TO_TITLE);
+            )?;
+            y += mark_h;
+        }
 
         let title = crate::i18n::tr("onboarding-title");
-        Self::draw_centered(
+        self.draw_centered(
             ctx,
             layers,
             title_font,
@@ -590,7 +951,7 @@ impl OnboardingView {
         y += title_h + fx(TITLE_TO_SUB);
 
         let subtitle = crate::i18n::tr("onboarding-subtitle");
-        Self::draw_centered(
+        self.draw_centered(
             ctx,
             layers,
             font,
@@ -602,42 +963,44 @@ impl OnboardingView {
         )?;
         y += body_h + gap;
 
-        // --- language
-        ctx.draw_text(
-            layers,
-            section_font,
-            col_x,
-            y,
-            &crate::i18n::tr("onboarding-language"),
-            skin.label,
-            col_w,
-        )?;
-        y += label_h + fx(LABEL_GAP);
-
-        for row in &rows {
-            let mut x = col_x;
-            for index in row {
-                let (label, preference) = &languages[*index];
-                let action = OnboardingAction::Language(preference);
-                self.paint_chip(
-                    ctx,
-                    layers,
-                    rect(x, y, chip_widths[*index], chip_h),
-                    skin,
-                    font,
-                    label,
-                    action,
-                    self.selected_language == *preference,
-                )?;
-                x += chip_widths[*index] + fx(CHIP_GAP);
-            }
-            y += chip_h + fx(CHIP_GAP);
-        }
-        y -= fx(CHIP_GAP);
-        y += gap;
+        // --- language: the label at the left, the pill at the right
+        let pill = if language_stacked {
+            self.text(
+                ctx,
+                layers,
+                section_font,
+                col_x,
+                y,
+                &language_label,
+                skin.label,
+                col_w,
+            )?;
+            rect(col_x, y + label_h + fx(LABEL_GAP), pill_w, chip_h)
+        } else {
+            self.text(
+                ctx,
+                layers,
+                section_font,
+                col_x,
+                y + (language_h - label_h) / 2.0,
+                &language_label,
+                skin.label,
+                col_w - pill_w - ctx.px(LABEL_GAP),
+            )?;
+            rect(
+                col_x + col_w - pill_w,
+                y + (language_h - chip_h) / 2.0,
+                pill_w,
+                chip_h,
+            )
+        };
+        let selected_language = &languages[language_index(self.selected_language)];
+        self.paint_language_pill(ctx, layers, pill, skin, font, selected_language)?;
+        y += language_h + gap;
 
         // --- appearance
-        ctx.draw_text(
+        self.text(
+            ctx,
             layers,
             section_font,
             col_x,
@@ -651,9 +1014,12 @@ impl OnboardingView {
         let tile_step = tile_h + fx(TILE_LABEL_GAP) + body_h + fx(TILE_GAP);
         for (index, (mode, label)) in modes.iter().enumerate() {
             let (tx, ty) = if tiles_fit {
-                (col_x + index as f32 * (tile_w + fx(TILE_GAP)), y)
+                (tiles_x + index as f32 * (tile_w + tile_gap), y)
             } else {
-                (col_x, y + index as f32 * tile_step)
+                (
+                    tiles_x + (tiles_w - tile_w) / 2.0,
+                    y + index as f32 * tile_step,
+                )
             };
             self.paint_theme_tile(
                 ctx,
@@ -672,44 +1038,75 @@ impl OnboardingView {
             self.selected_appearance,
             NativeThemeMode::System | NativeThemeMode::Light
         ) {
-            ctx.draw_text(
+            self.draw_centered(
+                ctx,
                 layers,
                 font,
                 col_x,
                 y + tiles_h + fx(TILE_LABEL_GAP),
+                col_w,
                 &crate::i18n::tr("onboarding-theme-light-note"),
+                palette.muted_text,
+            )?;
+        }
+        y += tiles_h + note_h + gap;
+
+        // --- what this computer has to bring in
+        if show_found {
+            self.text(
+                ctx,
+                layers,
+                section_font,
+                col_x,
+                y,
+                &crate::i18n::tr("onboarding-found-title"),
+                skin.label,
+                col_w,
+            )?;
+            y += label_h + fx(LABEL_GAP);
+            self.paint_found(
+                ctx,
+                layers,
+                rect(col_x, y, col_w, found_rows * found_row_h),
+                skin,
+                font,
+                found_row_h,
+                fit,
+            )?;
+            y += found_rows * found_row_h + gap;
+        }
+
+        // --- privacy footnote and the actions, right aligned
+        let buttons_y = if footer_inline {
+            self.text(
+                ctx,
+                layers,
+                font,
+                col_x,
+                y + (actions_h - body_h) / 2.0,
+                &privacy,
+                palette.muted_text,
+                col_w - buttons_w - ctx.px(BTN_GAP),
+            )?;
+            y
+        } else {
+            self.text(
+                ctx,
+                layers,
+                font,
+                col_x,
+                y,
+                &privacy,
                 palette.muted_text,
                 col_w,
             )?;
-        }
-
-        y += modes_h + gap;
-
-        // --- privacy footnote
-        ctx.draw_text(
-            layers,
-            font,
-            col_x,
-            y,
-            &crate::i18n::tr("onboarding-privacy"),
-            palette.muted_text,
-            col_w,
-        )?;
-        y += body_h + gap;
-
-        // --- actions, right aligned
-        let start_label = crate::i18n::tr("onboarding-start");
-        let skip_label = crate::i18n::tr("onboarding-skip");
-        // Rounded up for the same reason as `chip_w`.
-        let start_w =
-            (ctx.measure_text_width(font, &start_label) + ctx.px(BTN_PAD_X) * 2.0).ceil();
-        let skip_w = (ctx.measure_text_width(font, &skip_label) + ctx.px(BTN_PAD_X) * 2.0).ceil();
-
+            y + body_h + fx(LABEL_GAP)
+        };
         let start_x = col_x + col_w - start_w;
         self.paint_button(
             ctx,
             layers,
-            rect(start_x, y, start_w, actions_h),
+            rect(start_x, buttons_y, start_w, actions_h),
             skin,
             font,
             &start_label,
@@ -719,7 +1116,12 @@ impl OnboardingView {
         self.paint_button(
             ctx,
             layers,
-            rect(start_x - ctx.px(BTN_GAP) - skip_w, y, skip_w, actions_h),
+            rect(
+                start_x - ctx.px(BTN_GAP) - skip_w,
+                buttons_y,
+                skip_w,
+                actions_h,
+            ),
             skin,
             font,
             &skip_label,
@@ -727,22 +1129,231 @@ impl OnboardingView {
             false,
         )?;
 
+        // --- last, so it covers the page and takes its clicks
+        if let Some(highlight) = self.menu {
+            self.paint_language_menu(
+                ctx, layers, area, pill, skin, font, &languages, highlight, fit,
+            )?;
+        }
+
         Ok(())
     }
 
-    /// The ThinkTerm mark: a disc carrying the prompt chevron, and nothing
-    /// else. The app icon's gloss and phosphor grid are deliberately not
-    /// reproduced; there is no primitive here that gets them right, and an
-    /// approximation of them looks like a defect.
-    fn paint_mark(
-        &self,
+    /// The curtain in both side margins. Its columns are laid out again only
+    /// when something they depend on changes -- the page, the column, the
+    /// font or the theme; each frame only moves the strands along them.
+    fn paint_curtain(
+        &mut self,
+        ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        area: RectF,
+        col_x: f32,
+        col_w: f32,
+        skin: Skin,
+        font: &Rc<LoadedFont>,
+    ) -> anyhow::Result<()> {
+        let metrics = RenderMetrics::with_font_metrics(&font.metrics());
+        let ctx = ctx.with_metrics(&metrics);
+        let char_w = metrics.cell_size.width as f32;
+        let line_h = metrics.cell_size.height as f32;
+        let clear = ctx.px(CURTAIN_CLEAR);
+        let key = [
+            area.origin.x,
+            area.origin.y,
+            area.size.width,
+            area.size.height,
+            col_x,
+            col_w,
+            clear,
+            char_w,
+            line_h,
+            skin.ground.0,
+            skin.ground.1,
+            skin.ground.2,
+            skin.text.0,
+            skin.text.1,
+            skin.text.2,
+        ]
+        .map(f32::to_bits);
+        let font_id = font.id();
+        let current = self
+            .curtain
+            .as_ref()
+            .is_some_and(|curtain| curtain.key == key && curtain.font == font_id);
+        if !current {
+            // A new layout in the same font keeps what its characters shaped
+            // to; another font starts over.
+            let shaped = match self.curtain.take() {
+                Some(old) if old.font == font_id => old.shaped,
+                _ => HashMap::new(),
+            };
+            // A green that only shows as a tint at this strength.
+            let ink = mix(
+                skin.text,
+                LinearRgba::with_srgba(0x3D, 0xDC, 0x84, 255),
+                0.45,
+            );
+            let mut curtain =
+                Curtain::lay_out(area, col_x, col_w, clear, char_w, line_h, skin.ground, ink);
+            curtain.key = key;
+            curtain.font = font_id;
+            curtain.shaped = shaped;
+            self.curtain = Some(curtain);
+        }
+        let curtain = self.curtain.as_mut().unwrap();
+        curtain.frame(self.opened.elapsed().as_secs_f32());
+        ctx.draw_glyphs_on_layer(layers, 0, font, &curtain.glyphs, &mut curtain.shaped)
+    }
+
+    /// The closed language menu: the chosen language and a chevron.
+    fn paint_language_pill(
+        &mut self,
+        ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        area: RectF,
+        skin: Skin,
+        font: &Rc<LoadedFont>,
+        label: &str,
+    ) -> anyhow::Result<()> {
+        let open = self.menu.is_some();
+        let text = self.paint_chip_frame(
+            ctx,
+            layers,
+            area,
+            skin,
+            OnboardingAction::LanguageMenu,
+            open,
+        )?;
+        let chevron = ctx.px(CHEVRON);
+        self.text(
+            ctx,
+            layers,
+            font,
+            area.origin.x + ctx.px(CHIP_PAD_X),
+            area.origin.y + (area.size.height - Self::text_h(font)) / 2.0,
+            label,
+            text,
+            area.size.width - ctx.px(CHIP_PAD_X) * 2.0 - ctx.px(CHEVRON_GAP) - chevron,
+        )?;
+        ctx.draw_svg_icon(
+            layers,
+            SvgIcon::ChevronDown,
+            area.max_x() - ctx.px(CHIP_PAD_X) - chevron,
+            area.origin.y + (area.size.height - chevron) / 2.0,
+            chevron,
+            skin.secondary_text,
+        )
+    }
+
+    /// The open language menu, under its pill or above it when the page has
+    /// no room below. All of it is on the top layer, after everything else,
+    /// so the controls it covers neither show through nor take its clicks.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_language_menu(
+        &mut self,
+        ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        area: RectF,
+        pill: RectF,
+        skin: Skin,
+        font: &Rc<LoadedFont>,
+        languages: &[String],
+        highlight: usize,
+        fit: f32,
+    ) -> anyhow::Result<()> {
+        let fx = |value: f32| ctx.px(value) * fit;
+        let body_h = Self::text_h(font);
+        let pad = fx(MENU_PAD);
+        let row_h = body_h + fx(MENU_ROW_PAD_Y) * 2.0;
+        let menu_h = row_h * languages.len() as f32 + pad * 2.0;
+        let below = pill.max_y() + fx(MENU_GAP);
+        let menu_y = if below + menu_h <= area.max_y() {
+            below
+        } else {
+            (pill.origin.y - fx(MENU_GAP) - menu_h).max(area.origin.y)
+        };
+        let menu = rect(pill.origin.x, menu_y, pill.size.width, menu_h);
+
+        self.widgets
+            .push(area, WidgetKind::Button, OnboardingAction::CloseMenu);
+        ctx.draw_elevated_surface(
+            layers,
+            2,
+            menu,
+            skin.menu_bg,
+            skin.chip_border,
+            skin.shadow,
+            fx(MENU_RADIUS),
+        )?;
+        let chevron = ctx.px(CHEVRON);
+        for (index, label) in languages.iter().enumerate() {
+            let preference = LANGUAGE_OPTIONS[index].preference;
+            let action = OnboardingAction::Language(preference);
+            let row = rect(
+                menu.origin.x + pad,
+                menu.origin.y + pad + index as f32 * row_h,
+                menu.size.width - pad * 2.0,
+                row_h,
+            );
+            self.widgets.push(row, WidgetKind::Button, action);
+            if index == highlight {
+                ctx.draw_rounded_rect(
+                    layers,
+                    2,
+                    row.origin.x,
+                    row.origin.y,
+                    row.size.width,
+                    row.size.height,
+                    skin.chip_hover_bg,
+                    (fx(MENU_RADIUS) - pad).max(0.0),
+                )?;
+            }
+            let selected = self.selected_language == preference;
+            // Lined up with the pill's own label and chevron.
+            ctx.draw_text_shaped_on_layer(
+                layers,
+                2,
+                font,
+                pill.origin.x + ctx.px(CHIP_PAD_X),
+                row.origin.y + (row_h - body_h) / 2.0,
+                label,
+                if selected {
+                    skin.text
+                } else {
+                    skin.secondary_text
+                },
+                pill.size.width - ctx.px(CHIP_PAD_X) * 2.0 - ctx.px(CHEVRON_GAP) - chevron,
+                &mut self.shaped,
+            )?;
+            if selected {
+                ctx.draw_svg_icon(
+                    layers,
+                    SvgIcon::Check,
+                    pill.max_x() - ctx.px(CHIP_PAD_X) - chevron,
+                    row.origin.y + (row_h - chevron) / 2.0,
+                    chevron,
+                    skin.text,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One row per thing this computer has to bring in: its mark, what it
+    /// is, and a button that opens Settings' Import page on it.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_found(
+        &mut self,
         ctx: &DrawContext,
         layers: &mut TripleLayerQuadAllocator<'_>,
         card: RectF,
         skin: Skin,
+        font: &Rc<LoadedFont>,
+        row_h: f32,
+        fit: f32,
     ) -> anyhow::Result<()> {
-        // A radius of half the side is clamped to exactly that, giving a
-        // circle — the mark is square, so this is a disc rather than a stadium.
+        let fx = |value: f32| ctx.px(value) * fit;
+        let body_h = Self::text_h(font);
         ctx.draw_rounded_frame(
             layers,
             0,
@@ -750,19 +1361,103 @@ impl OnboardingView {
             card.origin.y,
             card.size.width,
             card.size.height,
-            skin.mark_bg,
-            skin.mark_border,
-            card.size.width / 2.0,
+            skin.chip_bg,
+            skin.chip_border,
+            fx(FOUND_RADIUS),
         )?;
-        let glyph = card.size.width * 0.5;
-        ctx.draw_svg_icon(
-            layers,
-            SvgIcon::ChevronRight,
-            card.origin.x + (card.size.width - glyph) / 2.0,
-            card.origin.y + (card.size.height - glyph) / 2.0,
-            glyph,
-            skin.text,
-        )
+
+        let mut rows: Vec<(Option<BrandIcon>, String, String, String, OnboardingAction)> = self
+            .found
+            .sessions
+            .iter()
+            .map(|sessions| {
+                let mut args = FluentArgs::new();
+                args.set("count", sessions.count as i64);
+                let detail = match sessions.running() {
+                    Some(running) if running > 0 => {
+                        args.set("running", running as i64);
+                        crate::i18n::tr_args("onboarding-found-sessions-running", &args)
+                    }
+                    _ => crate::i18n::tr_args("onboarding-found-sessions", &args),
+                };
+                (
+                    sessions.icon,
+                    sessions.name.to_string(),
+                    detail,
+                    crate::i18n::tr("onboarding-found-import"),
+                    OnboardingAction::Import(Some(sessions.id)),
+                )
+            })
+            .collect();
+        if self.found.wezterm_config {
+            rows.push((
+                Some(BrandIcon::WezTerm),
+                "WezTerm".to_string(),
+                crate::i18n::tr("onboarding-found-wezterm"),
+                crate::i18n::tr("onboarding-found-import-settings"),
+                OnboardingAction::Import(None),
+            ));
+        }
+
+        let pad_x = fx(FOUND_PAD_X);
+        let icon = fx(FOUND_ICON);
+        for (index, (brand, name, detail, button, action)) in rows.iter().enumerate() {
+            let top = card.origin.y + index as f32 * row_h;
+            if index > 0 {
+                ctx.draw_rect(
+                    layers,
+                    0,
+                    card.origin.x + pad_x,
+                    top,
+                    card.size.width - pad_x * 2.0,
+                    ctx.px(2.0).max(1.0),
+                    skin.chip_border,
+                )?;
+            }
+            let icon_x = card.origin.x + pad_x;
+            let icon_y = top + (row_h - icon) / 2.0;
+            match brand {
+                Some(brand) => ctx.draw_brand_icon(layers, *brand, icon_x, icon_y, icon)?,
+                None => ctx.draw_svg_icon(
+                    layers,
+                    SvgIcon::Terminal,
+                    icon_x,
+                    icon_y,
+                    icon,
+                    skin.secondary_text,
+                )?,
+            }
+
+            let button_w = (self.width(ctx, font, button) + ctx.px(BTN_PAD_X) * 2.0).ceil();
+            let button_h = body_h + fx(FOUND_BTN_PAD_Y) * 2.0;
+            let button_x = card.max_x() - pad_x - button_w;
+            self.paint_button(
+                ctx,
+                layers,
+                rect(button_x, top + (row_h - button_h) / 2.0, button_w, button_h),
+                skin,
+                font,
+                button,
+                *action,
+                false,
+            )?;
+
+            let text_x = icon_x + icon + fx(FOUND_ICON_GAP);
+            let text_w = (button_x - fx(FOUND_ICON_GAP) - text_x).max(1.0);
+            let text_y = top + (row_h - body_h * 2.0 - fx(FOUND_LINE_GAP)) / 2.0;
+            self.text(ctx, layers, font, text_x, text_y, name, skin.text, text_w)?;
+            self.text(
+                ctx,
+                layers,
+                font,
+                text_x,
+                text_y + body_h + fx(FOUND_LINE_GAP),
+                detail,
+                skin.secondary_text,
+                text_w,
+            )?;
+        }
+        Ok(())
     }
 
     /// An appearance preview: a framed card holding one light face, one dark
@@ -868,8 +1563,9 @@ impl OnboardingView {
             }
         }
 
-        let text_w = ctx.measure_text_width(font, label).min(tile.size.width);
-        ctx.draw_text(
+        let text_w = self.width(ctx, font, label).min(tile.size.width);
+        self.text(
+            ctx,
             layers,
             font,
             tile.origin.x + ((tile.size.width - text_w) / 2.0).max(0.0),
@@ -945,7 +1641,39 @@ impl OnboardingView {
         Ok(())
     }
 
+    /// `ctx.measure_text_width` through this page's shaping cache.
+    fn width(&mut self, ctx: &DrawContext, font: &Rc<LoadedFont>, text: &str) -> f32 {
+        ctx.measure_text_width_shaped(font, text, &mut self.shaped)
+    }
+
+    /// `ctx.draw_text` through this page's shaping cache.
+    #[allow(clippy::too_many_arguments)]
+    fn text(
+        &mut self,
+        ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        font: &Rc<LoadedFont>,
+        x: f32,
+        y: f32,
+        text: &str,
+        color: LinearRgba,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        ctx.draw_text_shaped_on_layer(
+            layers,
+            1,
+            font,
+            x,
+            y,
+            text,
+            color,
+            max_width,
+            &mut self.shaped,
+        )
+    }
+
     fn draw_centered(
+        &mut self,
         ctx: &DrawContext,
         layers: &mut TripleLayerQuadAllocator<'_>,
         font: &Rc<LoadedFont>,
@@ -955,8 +1683,9 @@ impl OnboardingView {
         text: &str,
         color: LinearRgba,
     ) -> anyhow::Result<()> {
-        let text_w = ctx.measure_text_width(font, text).min(width);
-        ctx.draw_text(
+        let text_w = self.width(ctx, font, text).min(width);
+        self.text(
+            ctx,
             layers,
             font,
             x + ((width - text_w) / 2.0).max(0.0),
@@ -964,30 +1693,6 @@ impl OnboardingView {
             text,
             color,
             width,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn paint_chip(
-        &mut self,
-        ctx: &DrawContext,
-        layers: &mut TripleLayerQuadAllocator<'_>,
-        area: RectF,
-        skin: Skin,
-        font: &Rc<LoadedFont>,
-        label: &str,
-        action: OnboardingAction,
-        selected: bool,
-    ) -> anyhow::Result<()> {
-        let text = self.paint_chip_frame(ctx, layers, area, skin, action, selected)?;
-        ctx.draw_text(
-            layers,
-            font,
-            area.origin.x + ctx.px(CHIP_PAD_X),
-            area.origin.y + ctx.px(CHIP_PAD_Y),
-            label,
-            text,
-            area.size.width - ctx.px(CHIP_PAD_X) * 2.0,
         )
     }
 
@@ -1075,12 +1780,13 @@ impl OnboardingView {
             border,
             pill_radius(area),
         )?;
-        let text_w = ctx.measure_text_width(font, label).min(area.size.width);
-        ctx.draw_text(
+        let text_w = self.width(ctx, font, label).min(area.size.width);
+        self.text(
+            ctx,
             layers,
             font,
             area.origin.x + ((area.size.width - text_w) / 2.0).max(0.0),
-            area.origin.y + ctx.px(BTN_PAD_Y),
+            area.origin.y + (area.size.height - Self::text_h(font)) / 2.0,
             label,
             text,
             area.size.width,
@@ -1133,8 +1839,8 @@ impl OnboardingView {
 }
 
 /// The neutral skin. Everything is derived from [`UiPalette`] so both themes
-/// stay correct, except the mark and the theme tiles, which depict physical
-/// things and look the same either way.
+/// stay correct, except the theme tiles, which depict physical things and
+/// look the same either way.
 #[derive(Debug, Clone, Copy)]
 struct Skin {
     text: LinearRgba,
@@ -1150,8 +1856,9 @@ struct Skin {
     /// Opaque page colour, for controls that should read as outline-only.
     ground: LinearRgba,
     face_border: LinearRgba,
-    mark_bg: LinearRgba,
-    mark_border: LinearRgba,
+    /// The open language menu, a step off the page so it reads as above it.
+    menu_bg: LinearRgba,
+    shadow: LinearRgba,
     primary_bg: LinearRgba,
     primary_text: LinearRgba,
     focus: LinearRgba,
@@ -1177,8 +1884,8 @@ impl Skin {
             chip_selected_border: mix(ground, palette.text, 0.62),
             ground,
             face_border: mix(ground, palette.text, 0.24),
-            mark_bg: mix(ground, palette.text, 0.10),
-            mark_border: mix(ground, palette.text, 0.20),
+            menu_bg: mix(ground, palette.text, 0.05),
+            shadow: LinearRgba::with_components(0.0, 0.0, 0.0, 0.35),
             // The mono inversion: the primary action is the highest-contrast
             // thing on the page without introducing a hue.
             primary_bg: palette.text,
@@ -1242,7 +1949,8 @@ struct OnboardingPrefs {
     appearance: NativeThemeMode,
 }
 
-fn finish_onboarding(tw: &mut TermWindow, prefs: OnboardingPrefs) {
+/// Returns the Space the window was left on.
+fn finish_onboarding(tw: &mut TermWindow, prefs: OnboardingPrefs) -> String {
     let mut settings = crate::native_settings::load();
     apply_onboarding_preferences(&mut settings, &prefs);
     if let Err(err) = crate::native_settings::save(&settings) {
@@ -1260,12 +1968,13 @@ fn finish_onboarding(tw: &mut TermWindow, prefs: OnboardingPrefs) {
 
     if let Some(window) = tw.window.as_ref().cloned() {
         if tw.active_space_id != space_id {
-            tw.switch_space(space_id, &window);
+            tw.switch_space(space_id.clone(), &window);
         } else {
             window.invalidate();
         }
     }
     tw.close_content_view();
+    space_id
 }
 
 fn apply_onboarding_preferences(settings: &mut ThinkTermNativeSettings, prefs: &OnboardingPrefs) {
@@ -1309,8 +2018,20 @@ impl ContentView for OnboardingView {
         false
     }
 
+    /// The curtain's next step while it is up. Otherwise this polls the
+    /// running check behind the found rows until it answers, or until
+    /// FOUND_WAIT: a source wedged past that leaves its row saying how many
+    /// sessions there are, and the page goes back to being still.
     fn next_frame_time(&self) -> Option<Instant> {
-        None
+        let curtain_up = self
+            .curtain
+            .as_ref()
+            .is_some_and(|curtain| !curtain.columns.is_empty());
+        if curtain_up {
+            return Some(Instant::now() + CURTAIN_FRAME);
+        }
+        (self.found.pending() && self.opened.elapsed() < FOUND_WAIT)
+            .then(|| Instant::now() + Duration::from_millis(250))
     }
 
     fn paint(
@@ -1322,10 +2043,19 @@ impl ContentView for OnboardingView {
         font: &Rc<LoadedFont>,
         title_font: &Rc<LoadedFont>,
         section_font: &Rc<LoadedFont>,
-        _caption_font: &Rc<LoadedFont>,
+        caption_font: &Rc<LoadedFont>,
         _cursor_on: bool,
     ) -> anyhow::Result<()> {
-        self.paint_impl(ctx, layers, area, palette, font, title_font, section_font)
+        self.paint_impl(
+            ctx,
+            layers,
+            area,
+            palette,
+            font,
+            title_font,
+            section_font,
+            caption_font,
+        )
     }
 
     fn on_mouse(&mut self, x: f32, y: f32, kind: WMEK) -> ContentViewResponse {
@@ -1367,9 +2097,13 @@ mod tests {
         }
     }
 
+    fn view(found: found::Found) -> OnboardingView {
+        OnboardingView::with_found("space-default".to_string(), "Default".to_string(), found)
+    }
+
     #[test]
     fn target_space_uses_initial_space() {
-        let view = OnboardingView::new("space-default".to_string(), "Default".to_string());
+        let view = view(found::Found::default());
         assert_eq!(view.space_name(), "Default");
         assert_eq!(view.target_space_id_for_choice(), "space-default");
     }
@@ -1434,13 +2168,11 @@ mod tests {
     /// none: Tab switched steps, so the pills and the toggle were mouse-only.
     #[test]
     fn focus_order_covers_every_control() {
-        let order = focus_order();
-        assert_eq!(order.len(), LANGUAGE_OPTIONS.len() + 3 + 2);
+        let order = focus_order(&found::Found::default());
+        assert_eq!(order.len(), 1 + 3 + 2);
+        assert!(order.contains(&OnboardingAction::LanguageMenu));
         assert!(order.contains(&OnboardingAction::Start));
         assert!(order.contains(&OnboardingAction::Skip));
-        for option in LANGUAGE_OPTIONS {
-            assert!(order.contains(&OnboardingAction::Language(option.preference)));
-        }
         for mode in [
             NativeThemeMode::System,
             NativeThemeMode::Light,
@@ -1448,25 +2180,115 @@ mod tests {
         ] {
             assert!(order.contains(&OnboardingAction::Appearance(mode)));
         }
+
+        let found = found::Found {
+            sessions: vec![found::FoundSessions::for_test("example", 2, Some(1))],
+            wezterm_config: true,
+        };
+        let order = focus_order(&found);
+        assert!(order.contains(&OnboardingAction::Import(Some("example"))));
+        assert!(order.contains(&OnboardingAction::Import(None)));
+        // Found rows come before the page's own buttons, as they are drawn.
+        assert_eq!(
+            order[order.len() - 2..],
+            [OnboardingAction::Skip, OnboardingAction::Start]
+        );
     }
 
-    /// Five chips fit one row at the design width but must wrap rather than
-    /// overflow when the column is narrow or a locale has long names.
+    /// The language menu takes the arrow keys and Escape while it is open, and
+    /// gives Escape back to the page once it is shut.
     #[test]
-    fn chips_wrap_instead_of_overflowing() {
-        let widths = [100.0f32, 100.0, 100.0, 100.0, 100.0];
+    fn the_language_menu_keeps_its_keys_while_open() {
+        let mut view = view(found::Found::default());
+        view.interaction.focused = Some(OnboardingAction::LanguageMenu);
+        view.on_key_impl(KeyCode::Enter, KeyModifiers::NONE);
+        let opened = view.menu.expect("Enter on the pill opens the menu");
+        assert_eq!(opened, language_index(view.selected_language));
 
-        let one_row = OnboardingView::chip_rows(&widths, 8.0, 560.0);
-        assert_eq!(one_row.len(), 1);
+        view.on_key_impl(KeyCode::DownArrow, KeyModifiers::NONE);
+        assert_eq!(view.menu, Some((opened + 1) % LANGUAGE_OPTIONS.len()));
+        view.on_key_impl(KeyCode::UpArrow, KeyModifiers::NONE);
+        view.on_key_impl(KeyCode::UpArrow, KeyModifiers::NONE);
+        assert_eq!(
+            view.menu,
+            Some((opened + LANGUAGE_OPTIONS.len() - 1) % LANGUAGE_OPTIONS.len())
+        );
 
-        let narrow = OnboardingView::chip_rows(&widths, 8.0, 220.0);
-        assert!(narrow.len() > 1, "expected wrapping, got {:?}", narrow);
-        assert_eq!(narrow.iter().map(Vec::len).sum::<usize>(), widths.len());
-        for row in &narrow {
-            let used: f32 = row.iter().map(|index| widths[*index]).sum::<f32>()
-                + (row.len().saturating_sub(1)) as f32 * 8.0;
-            assert!(used <= 220.0, "row overflows: {}", used);
+        assert!(matches!(
+            view.on_key_impl(KeyCode::Escape, KeyModifiers::NONE),
+            ContentViewResponse::Redraw
+        ));
+        assert_eq!(view.menu, None);
+        // Shut, Escape is Skip again.
+        assert!(matches!(
+            view.on_key_impl(KeyCode::Escape, KeyModifiers::NONE),
+            ContentViewResponse::Run(_)
+        ));
+    }
+
+    /// The curtain is drawn in whatever the caption font is, on every
+    /// platform; a character outside ASCII would show as a missing glyph
+    /// wherever that font lacks it.
+    #[test]
+    fn the_curtain_keeps_to_characters_every_font_has() {
+        assert!(CURTAIN_CHARS.is_ascii());
+        assert!(CURTAIN_CHARS.iter().all(|c| c.is_ascii_graphic()));
+        // A fixed pattern: the same place gives the same strand every frame.
+        assert_eq!(curtain_hash(1, 7), curtain_hash(1, 7));
+        assert_ne!(curtain_hash(0, 7), curtain_hash(1, 7));
+    }
+
+    /// Nothing here clips, so a character past a margin would paint over
+    /// the sidebar on the left or the page in the middle -- at any moment.
+    #[test]
+    fn the_curtain_stays_inside_the_side_margins() {
+        let area = rect(400.0, 60.0, 2000.0, 1200.0);
+        let (col_w, clear, char_w, line_h) = (880.0, 40.0, 14.0, 30.0);
+        let col_x = area.origin.x + (area.size.width - col_w) / 2.0;
+        let black = LinearRgba::with_components(0.0, 0.0, 0.0, 1.0);
+        let white = LinearRgba::with_components(1.0, 1.0, 1.0, 1.0);
+        let lay_out = || Curtain::lay_out(area, col_x, col_w, clear, char_w, line_h, black, white);
+        let mut curtain = lay_out();
+        for elapsed in [0.0, 1.7, 30.0, 600.5] {
+            curtain.frame(elapsed);
+            assert!(curtain.glyphs.len() > 100, "a wide window hangs a curtain");
+            for (_, x, y, _) in &curtain.glyphs {
+                let left = *x >= area.origin.x && x + char_w <= col_x - clear;
+                let right = *x >= col_x + col_w + clear && x + char_w <= area.max_x();
+                assert!(left || right, "a character at x={x} left the margins");
+                assert!(*y >= area.origin.y && y + line_h <= area.max_y());
+            }
         }
+        // The same moment of the same page is the same picture, and the
+        // strands do move.
+        curtain.frame(3.0);
+        let mut again = lay_out();
+        again.frame(3.0);
+        assert_eq!(curtain.glyphs, again.glyphs);
+        again.frame(3.5);
+        assert_ne!(curtain.glyphs, again.glyphs);
+        // A margin too narrow for two columns hangs nothing, so nothing
+        // keeps the page redrawing.
+        let narrow = rect(0.0, 0.0, col_w + 120.0, 600.0);
+        let mut none = Curtain::lay_out(narrow, 60.0, col_w, clear, char_w, line_h, black, white);
+        none.frame(1.0);
+        assert!(none.columns.is_empty() && none.glyphs.is_empty());
+    }
+
+    #[test]
+    fn a_session_count_waits_for_the_running_check() {
+        let found = found::Found {
+            sessions: vec![found::FoundSessions::for_test("example", 2, None)],
+            wezterm_config: false,
+        };
+        assert!(found.pending());
+        assert!(!found.is_empty());
+        let found = found::Found {
+            sessions: vec![found::FoundSessions::for_test("example", 2, Some(0))],
+            wezterm_config: false,
+        };
+        assert!(!found.pending());
+        assert!(found::Found::default().is_empty());
     }
 
     /// The constants above are design pixels, which are *half* a logical
@@ -1484,8 +2306,8 @@ mod tests {
         );
 
         // The design surface is 2x, so halving gives the intended point size.
-        assert_eq!(MARK_SIZE / 2.0, 64.0, "mark should read as 64pt");
-        assert_eq!(COL_W / 2.0, 560.0, "column should read as 560pt");
+        assert_eq!(MARK_SIZE / 2.0, 72.0, "mark should read as 72pt");
+        assert_eq!(COL_W / 2.0, 440.0, "column should read as 440pt");
         assert_eq!(TILE_W / 2.0, 112.0);
         assert_eq!(TILE_H / 2.0, 72.0);
         assert_eq!(SECTION_GAP / 2.0, 30.0);
@@ -1558,7 +2380,7 @@ mod tests {
                 ("chip_pressed_bg", skin.chip_pressed_bg),
                 ("chip_selected_bg", skin.chip_selected_bg),
                 ("ground", skin.ground),
-                ("mark_bg", skin.mark_bg),
+                ("menu_bg", skin.menu_bg),
             ];
             for (name, fill) in fills {
                 assert_eq!(fill.3, 1.0, "{} is translucent on {:?}", name, appearance);
@@ -1610,23 +2432,13 @@ mod tests {
             let skin = Skin::new(palette);
             let luma =
                 |c: LinearRgba| (srgb_encode(c.0) + srgb_encode(c.1) + srgb_encode(c.2)) / 3.0;
-            let to_ground = (luma(skin.mark_bg) - luma(skin.ground)).abs();
-            let to_text = (luma(skin.mark_bg) - luma(skin.text)).abs();
+            let to_ground = (luma(skin.menu_bg) - luma(skin.ground)).abs();
+            let to_text = (luma(skin.menu_bg) - luma(skin.text)).abs();
             assert!(
                 to_ground < to_text,
-                "mark on {:?} sits closer to the text than to the page",
+                "menu on {:?} sits closer to the text than to the page",
                 appearance
             );
         }
-    }
-
-    /// A chip wider than the column still gets its own row rather than being
-    /// dropped.
-    #[test]
-    fn an_overlong_chip_still_gets_a_row() {
-        let rows = OnboardingView::chip_rows(&[900.0, 40.0], 8.0, 200.0);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], vec![0]);
-        assert_eq!(rows[1], vec![1]);
     }
 }

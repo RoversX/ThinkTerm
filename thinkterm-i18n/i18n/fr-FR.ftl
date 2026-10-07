@@ -684,6 +684,18 @@ onboarding-theme-light-note = Choix audacieux — la plupart des terminaux ne vo
 onboarding-privacy = Rien de ce que vous ouvrez ne quitte cet appareil.
 onboarding-skip = Ignorer
 onboarding-start = Commencer
+onboarding-found-title = Trouvé sur cet ordinateur
+onboarding-found-sessions = { $count ->
+        [one] 1 session
+       *[other] { $count } sessions
+    }
+onboarding-found-sessions-running = { $count ->
+        [one] 1 session
+       *[other] { $count } sessions
+    }, dont { $running } en cours
+onboarding-found-wezterm = Un fichier de configuration
+onboarding-found-import = Importer
+onboarding-found-import-settings = Importer les réglages
 
 # Détection d'état des agents + panneau Agents
 settings-agent-panel-description = Détecter les agents de codage (Claude Code, Codex, …) dans les panneaux et les afficher dans la barre latérale droite.

@@ -26,6 +26,21 @@ impl ImportSource {
         sources
     }
 
+    /// The source a caller outside Settings names: an import source's id, or
+    /// `None` for WezTerm's settings.
+    pub(super) fn named(id: Option<&str>) -> Option<Self> {
+        match id {
+            None => Some(Self::WezTerm),
+            #[cfg(unix)]
+            Some(id) => thinkterm_import::sources()
+                .into_iter()
+                .find(|source| source.id == id)
+                .map(|source| Self::Session(source.id)),
+            #[cfg(not(unix))]
+            Some(_) => None,
+        }
+    }
+
     pub(super) fn initial() -> Self {
         #[cfg(unix)]
         if let Some(source) = session_import::remembered_source() {
@@ -75,10 +90,9 @@ impl ImportSource {
         match self {
             Self::WezTerm => Some(BrandIcon::WezTerm),
             #[cfg(unix)]
-            Self::Session(id) => match thinkterm_import::source(id).ok()?.info().icon {
-                "herdr" => Some(BrandIcon::Herdr),
-                _ => None,
-            },
+            Self::Session(id) => {
+                BrandIcon::for_import_source(thinkterm_import::source(id).ok()?.info().icon)
+            }
         }
     }
 
@@ -126,6 +140,16 @@ impl SettingsWindow {
             return self.ui.session_import.busy();
         }
         false
+    }
+
+    /// Choose `source` and take the page's first step, as clicking it and
+    /// Continue would. An import in flight keeps the page.
+    pub(super) fn start_import(&mut self, source: ImportSource, window: &Window) {
+        if self.import_busy() {
+            return;
+        }
+        self.perform_action(SettingsAction::SelectImportSource(source), window);
+        self.perform_import_navigation(SettingsAction::ImportContinue, window);
     }
 
     pub(super) fn perform_import_navigation(&mut self, action: SettingsAction, window: &Window) {

@@ -684,6 +684,18 @@ onboarding-theme-light-note = Mutige Wahl — die meisten Terminals sehen nie Ta
 onboarding-privacy = Nichts, was Sie öffnen, verlässt diesen Rechner.
 onboarding-skip = Überspringen
 onboarding-start = Loslegen
+onboarding-found-title = Auf diesem Computer gefunden
+onboarding-found-sessions = { $count ->
+        [one] 1 Sitzung
+       *[other] { $count } Sitzungen
+    }
+onboarding-found-sessions-running = { $count ->
+        [one] 1 Sitzung
+       *[other] { $count } Sitzungen
+    }, { $running } aktiv
+onboarding-found-wezterm = Eine Konfigurationsdatei
+onboarding-found-import = Importieren
+onboarding-found-import-settings = Einstellungen importieren
 
 # Agent-Statuserkennung + Agents-Panel
 settings-agent-panel-description = Erkennt Coding-Agents (Claude Code, Codex, …), die in Panes laufen, und zeigt sie in der rechten Seitenleiste.
