@@ -220,6 +220,16 @@ pub(crate) fn host_domain_name() -> Option<String> {
     HOST.get().cloned().flatten()
 }
 
+/// The connection that serves a Space. Local Spaces keep their local
+/// identity even when their terminals are hosted by the background mux.
+pub(crate) fn connection_domain_for_space(space_id: &str) -> Option<String> {
+    space_connection_domain(crate::workspace_threads::client_domain_for_space(space_id), host_domain_name())
+}
+
+fn space_connection_domain(remote: Option<String>, local_host: Option<String>) -> Option<String> {
+    remote.or(local_host)
+}
+
 /// Whether `name` is the host domain of this launch.
 pub(crate) fn is_host_domain_name(name: &str) -> bool {
     host_domain_name().as_deref() == Some(name)
@@ -490,5 +500,17 @@ mod tests {
         // Off: nothing is rewritten.
         assert_eq!(alias_for("local", None), None);
         assert_eq!(alias_for("unix", None), None);
+    }
+}
+
+#[cfg(test)]
+mod connection_state_tests {
+    use super::space_connection_domain;
+
+    #[test]
+    fn local_spaces_follow_their_session_host_without_overriding_remote_spaces() {
+        assert_eq!(space_connection_domain(None, Some("unix".into())), Some("unix".into()));
+        assert_eq!(space_connection_domain(Some("server-a".into()), Some("unix".into())), Some("server-a".into()));
+        assert_eq!(space_connection_domain(None, None), None);
     }
 }

@@ -2941,6 +2941,9 @@ pub struct TermWindow {
     /// sidebar Reconnect button); suppresses double-clicks and drives the
     /// row's "Connecting…" label.
     space_reconnects_in_flight: HashSet<String>,
+    /// The sidebar Space's connection state at the last status heartbeat.
+    watched_space_connection_state:
+        Option<crate::termwindow::ui::sidebar::SpaceConnectionState>,
     workspace_layout_structure_fingerprint: Option<u64>,
     workspace_sidebar_width: usize,
     workspace_sidebar_pending_thread_selection: Option<String>,
@@ -4569,6 +4572,7 @@ impl TermWindow {
             active_space_id,
             dies_with_mux_window,
             space_reconnects_in_flight: HashSet::new(),
+            watched_space_connection_state: None,
             workspace_layout_structure_fingerprint,
             workspace_sidebar_width,
             workspace_sidebar_pending_thread_selection: None,
@@ -5851,6 +5855,7 @@ impl TermWindow {
                 self.schedule_next_status_update();
                 self.emit_status_event();
                 self.refresh_all_thread_work();
+                self.watch_space_connection_state();
                 self.terminal_render_watchdog();
                 self.maybe_release_occluded_memory();
                 self.maybe_release_idle_preview_cache();
@@ -6066,7 +6071,7 @@ impl TermWindow {
     /// fresh, registering it from the SSH host store when needed.
     pub(crate) fn reconnect_space_domain(&mut self) {
         let Some(domain_name) =
-            crate::workspace_threads::client_domain_for_space(&self.active_space_id)
+            crate::local_sessions::connection_domain_for_space(&self.active_space_id)
         else {
             return;
         };

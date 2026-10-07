@@ -26,7 +26,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
-use window::{MouseEventKind as WMEK, RectF};
+use window::{MouseEventKind as WMEK, RectF, WindowOps};
 
 const SIDEBAR_SCROLLBAR_VISIBLE_MS: u64 = 900;
 const SIDEBAR_SETTINGS_FOOTER_HEIGHT: usize = 72;
@@ -77,7 +77,8 @@ const NOTIFICATION_BADGE_FRAME_MS: u64 = 33;
 const SIDEBAR_SECTION_ACTION_ICON_INSET: usize = 6;
 
 /// Connection health of the active Space's mux client domain, as shown by
-/// the sidebar indicator. Local Spaces are always Connected.
+/// the sidebar indicator. A local Space reports its link to the session
+/// host, and is always Connected without one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpaceConnectionState {
     Connected,
@@ -558,15 +559,21 @@ impl crate::TermWindow {
     /// Connection health of a client-domain Space. While the Space is
     /// remote we keep a slow self-driven repaint tick going: a dead
     /// connection produces no output, so nothing else would repaint the
-    /// indicator when the state flips.
+    /// indicator when the state flips. A local Space's link to the session
+    /// host is checked by the status heartbeat instead (see
+    /// `watch_space_connection_state`), so idle local windows stay idle.
     pub(crate) fn space_connection_state(&self, space_id: &str) -> SpaceConnectionState {
         const SUSTAINED_LAG_MS: u64 = 5000;
-        let Some(domain_name) = workspace_threads::client_domain_for_space(space_id) else {
+        let remote = workspace_threads::client_domain_for_space(space_id);
+        let is_remote = remote.is_some();
+        let Some(domain_name) = remote.or_else(crate::local_sessions::host_domain_name) else {
             return SpaceConnectionState::Connected;
         };
-        self.update_next_frame_time(Some(
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-        ));
+        if is_remote {
+            self.update_next_frame_time(Some(
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ));
+        }
         let mux = Mux::get();
         let Some(domain) = mux.get_domain_by_name(&domain_name) else {
             // Not even registered: never connected in this session.
@@ -601,6 +608,12 @@ impl crate::TermWindow {
         if domain.state() != mux::domain::DomainState::Attached {
             return SpaceConnectionState::Disconnected;
         }
+        // Pane lag below measures the network to a server. One busy local
+        // pane is not a broken link to the session host, and must not mark
+        // every local Space as reconnecting.
+        if !is_remote {
+            return SpaceConnectionState::Connected;
+        }
         // Attached but silent despite outstanding requests: transport not
         // (yet) declared dead. Panes report tardy after ~3s, which ordinary
         // latency spikes trip all the time; require a longer sustained
@@ -614,6 +627,22 @@ impl crate::TermWindow {
             SpaceConnectionState::Reconnecting
         } else {
             SpaceConnectionState::Connected
+        }
+    }
+
+    /// Called from the status heartbeat: repaint only when the sidebar
+    /// Space's connection state has changed since the last check. Remote
+    /// Spaces already tick while their indicator is painted.
+    pub(crate) fn watch_space_connection_state(&mut self) {
+        let space_id = self.workspace_sidebar_space_id();
+        if workspace_threads::client_domain_for_space(space_id).is_some() {
+            return;
+        }
+        let state = self.space_connection_state(space_id);
+        if self.watched_space_connection_state.replace(state) != Some(state) {
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
         }
     }
 
@@ -1004,7 +1033,7 @@ impl crate::TermWindow {
         // local set still bridges the click-to-spawn gap for the button.
         let reconnect_in_flight = self.space_connection_state(self.workspace_sidebar_space_id())
             == SpaceConnectionState::Connecting
-            || workspace_threads::client_domain_for_space(self.workspace_sidebar_space_id())
+            || crate::local_sessions::connection_domain_for_space(self.workspace_sidebar_space_id())
                 .map_or(false, |name| {
                     self.space_reconnects_in_flight.contains(&name)
                 });
