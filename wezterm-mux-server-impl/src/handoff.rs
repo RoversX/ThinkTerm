@@ -842,8 +842,19 @@ fn install(
     Ok(())
 }
 
+/// A session imported from another program keeps that program's O_NONBLOCK
+/// until the next handoff. Ordinary panes read and write blocking.
+fn ensure_blocking(fd: &OwnedFd) -> anyhow::Result<()> {
+    let flags = rustix::fs::fcntl_getfl(fd)?;
+    if flags.contains(rustix::fs::OFlags::NONBLOCK) {
+        rustix::fs::fcntl_setfl(fd, flags.difference(rustix::fs::OFlags::NONBLOCK))?;
+    }
+    Ok(())
+}
+
 fn adopt_pane(item: Received, domain_id: DomainId) -> anyhow::Result<Arc<dyn Pane>> {
     let Received { pane, fd, snapshot, mut graphics } = item;
+    ensure_blocking(&fd).context("making an adopted pty blocking")?;
     let master = portable_pty::unix::master_from_raw_fd(fd, pane.tty_name.map(PathBuf::from))?;
     let writer = master.take_writer()?;
     let snapshot_size = snapshot.size;
@@ -985,6 +996,16 @@ pub fn wait_for_predecessor_exit(mut stream: UnixStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_adopted_nonblocking_descriptor_becomes_blocking() {
+        let (end, _peer) = UnixStream::pair().unwrap();
+        end.set_nonblocking(true).unwrap();
+        let fd = OwnedFd::from(end);
+        ensure_blocking(&fd).unwrap();
+        let flags = rustix::fs::fcntl_getfl(&fd).unwrap();
+        assert!(!flags.contains(rustix::fs::OFlags::NONBLOCK));
+    }
     use thinkterm_proto::{PaneEntry, PaneStackEntry, SplitDirection, SplitDirectionAndSize};
 
     fn entry(pane_id: PaneId) -> PaneEntry {

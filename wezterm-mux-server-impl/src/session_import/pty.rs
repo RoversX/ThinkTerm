@@ -9,6 +9,7 @@ use std::sync::Mutex;
 
 /// Duplicates are reserved before commit; dropping them only closes them.
 /// Unlike UnixMasterWriter, these files never inject EOF when dropped.
+/// They keep the source's O_NONBLOCK; a later live handoff clears it.
 #[derive(Debug)]
 pub struct ImportedPty {
     master: OwnedFd,
