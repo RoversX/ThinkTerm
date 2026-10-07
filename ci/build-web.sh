@@ -30,6 +30,7 @@ wasm-bindgen --target web --out-dir "$OUT/pkg" "$WASM"
 if command -v wasm-opt >/dev/null 2>&1 && [ "$PROFILE" = release ]; then
   wasm-opt -Oz -o "$OUT/pkg/thinkterm_web_bg.wasm" "$OUT/pkg/thinkterm_web_bg.wasm"
 fi
+node ci/check-web-wasm.mjs "$OUT/pkg/thinkterm_web_bg.wasm"
 # The colour-scheme table the picker fetches. Compiled into the binary, so
 # this is a build step and not a file in the tree.
 cargo build -p wezterm --bin thinkterm $CARGO_FLAGS

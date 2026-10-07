@@ -207,11 +207,13 @@ jobs:
       # exactly (ci/build-web.sh refuses any other), so its version is read
       # from Cargo.toml rather than written here twice. The prebuilt binary
       # takes seconds where `cargo install` takes minutes. binaryen is
-      # wasm-opt, which takes a quarter off the wasm.
+      # wasm-opt, which takes a quarter off the wasm. It is pinned to an
+      # upstream release rather than taken from apt: Ubuntu 24.04's binaryen
+      # 108 points the __wbindgen_externrefs export at the fixed-size funcref
+      # table, and the page then fails to start.
       #
       # Retried, because this job gates all three packaging jobs: a GitHub
-      # release 502 or an apt mirror hiccup would otherwise take the whole
-      # release with it.
+      # release 502 would otherwise take the whole release with it.
       - name: Install wasm-bindgen and wasm-opt
         run: |
           set -euo pipefail
@@ -220,8 +222,10 @@ jobs:
           bash ci/retry.sh bash -c "curl -sSfL \
             'https://github.com/rustwasm/wasm-bindgen/releases/download/${version}/${dir}.tar.gz' \
             | tar -xz -C \"\$HOME/.cargo/bin\" --strip-components=1 '${dir}/wasm-bindgen'"
-          bash ci/retry.sh sudo apt-get update
-          bash ci/retry.sh sudo apt-get install -y --no-install-recommends binaryen
+          binaryen=version_133
+          bash ci/retry.sh bash -c "curl -sSfL \
+            'https://github.com/WebAssembly/binaryen/releases/download/${binaryen}/binaryen-${binaryen}-x86_64-linux.tar.gz' \
+            | tar -xz -C \"\$HOME/.cargo/bin\" --strip-components=2 'binaryen-${binaryen}/bin/wasm-opt'"
           wasm-bindgen --version
           wasm-opt --version
 
