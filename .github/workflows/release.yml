@@ -44,14 +44,12 @@ on:
         description: Linux x86_64 (deb + rpm + AppImage + tarballs)
         type: boolean
         default: true
-      # arm64 hosted runners are free on public repos only. Ticking this on a
-      # private repo fails the leg, and the publish gate below refuses to ship
-      # a release with any failed job -- so it would build everything and
-      # publish nothing. Turn it on once the repo is public.
+      # arm64 hosted runners are free on public repos only; a fork that is
+      # private fails this leg, and the publish gate below then ships nothing.
       linux_arm64:
-        description: Linux arm64 (public repos only -- leave off while private)
+        description: Linux arm64 (deb + rpm + AppImage + tarballs)
         type: boolean
-        default: false
+        default: true
       publish:
         description: Publish to a GitHub Release (otherwise artifacts only)
         type: boolean
