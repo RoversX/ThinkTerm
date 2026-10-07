@@ -188,7 +188,7 @@ pub fn receive(dir: &Path, exe: &Path) -> Result<Transfer> {
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     writeln!(stream, "{}", relay.token).context("Authorize Herdr handoff")?;
     let manifest: Manifest =
-        serde_json::from_slice(&source::read_line(&mut stream, source::MAX_BYTES)?)?;
+        serde_json::from_slice(&source::read_large_line(&mut stream, source::MAX_BYTES)?)?;
     manifest.validate()?;
     stream.write_all(b"validated\n")?;
     let fds =

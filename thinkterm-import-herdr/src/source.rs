@@ -3,6 +3,7 @@ use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
+use rustix::net::RecvFlags;
 use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
@@ -96,6 +97,34 @@ pub fn read_line(stream: &mut UnixStream, limit: usize) -> Result<Vec<u8>> {
     }
 }
 
+/// `read_line` for replies that can run to megabytes: a chunk at a time
+/// instead of a read per byte. It peeks first and consumes only through the
+/// newline, so whatever follows (descriptors on a handoff) stays queued.
+pub fn read_large_line(stream: &mut UnixStream, limit: usize) -> Result<Vec<u8>> {
+    let mut line = Vec::new();
+    let mut chunk = vec![0; limit.saturating_add(1).min(64 * 1024)];
+    loop {
+        let room = (limit + 1 - line.len()).min(chunk.len());
+        let peeked = match rustix::net::recv(&*stream, &mut chunk[..room], RecvFlags::PEEK) {
+            Ok((peeked, _)) => peeked,
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(err) => return Err(std::io::Error::from(err).into()),
+        };
+        ensure!(
+            peeked > 0,
+            std::io::Error::from(std::io::ErrorKind::UnexpectedEof)
+        );
+        let newline = chunk[..peeked].iter().position(|&byte| byte == b'\n');
+        let take = newline.map_or(peeked, |at| at + 1);
+        stream.read_exact(&mut chunk[..take])?;
+        line.extend_from_slice(&chunk[..newline.unwrap_or(take)]);
+        ensure!(line.len() <= limit, "Herdr response exceeds the size limit");
+        if newline.is_some() {
+            return Ok(line);
+        }
+    }
+}
+
 fn connect(path: &Path, timeout: Duration) -> Result<UnixStream> {
     let metadata = fs::symlink_metadata(path)?;
     ensure!(
@@ -115,7 +144,7 @@ pub fn request(dir: &Path, method: &str, params: Value, timeout: Duration) -> Re
         &json!({ "id": "thinkterm:import", "method": method, "params": params }),
     )?;
     stream.write_all(b"\n")?;
-    let response: Value = serde_json::from_slice(&read_line(&mut stream, MAX_BYTES)?)?;
+    let response: Value = serde_json::from_slice(&read_large_line(&mut stream, MAX_BYTES)?)?;
     if let Some(error) = response.get("error") {
         bail!(
             "Herdr: {}",

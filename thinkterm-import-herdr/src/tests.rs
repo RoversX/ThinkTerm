@@ -385,3 +385,30 @@ fn known_failures_are_localized_through_error_contexts() {
         assert_eq!(HERDR.error_key(&format!("{error:#}")), Some(key));
     }
 }
+
+#[test]
+fn a_large_line_is_read_whole_and_what_follows_stays_queued() {
+    let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+    let long = "x".repeat(200 * 1024);
+    let writer = std::thread::spawn(move || {
+        sender.write_all(long.as_bytes()).unwrap();
+        sender.write_all(b"\nnext").unwrap();
+        sender
+    });
+    let line = crate::source::read_large_line(&mut receiver, 300 * 1024).unwrap();
+    assert_eq!(line.len(), 200 * 1024);
+    drop(writer.join().unwrap());
+    let mut rest = Vec::new();
+    receiver.read_to_end(&mut rest).unwrap();
+    assert_eq!(rest, b"next");
+}
+
+#[test]
+fn a_large_line_over_its_limit_is_refused() {
+    let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+    sender.write_all(b"12345\n").unwrap();
+    assert!(crate::source::read_large_line(&mut receiver, 4).is_err());
+    let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+    sender.write_all(b"1234\n").unwrap();
+    assert_eq!(crate::source::read_large_line(&mut receiver, 4).unwrap(), b"1234");
+}
