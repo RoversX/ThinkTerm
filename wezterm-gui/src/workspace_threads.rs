@@ -45,8 +45,28 @@ pub struct WorkspaceThreadStore {
     /// is per-device by nature and never travels to the server.
     #[serde(default)]
     pub last_space_per_domain: HashMap<String, SpaceId>,
+    /// Sessions imported from other programs, so the Import page can say a
+    /// session was brought in already. Per-device, like the field above;
+    /// an entry counts only while its Space is here on the same connection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imported_sessions: Vec<ImportedSession>,
     pub projects: Vec<Project>,
 }
+
+/// One session the Import page brought in, and the Space it became.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportedSession {
+    pub source: String,
+    pub session: String,
+    /// The connection the import ran on; `None` for this machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub space_id: SpaceId,
+}
+
+/// The most imports remembered; the oldest go first.
+#[cfg(unix)]
+const MAX_IMPORTED_SESSIONS: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Space {
@@ -1783,6 +1803,30 @@ pub enum SpaceRemoval {
 /// Every mux domain this device currently mirrors Spaces from.
 pub fn remote_space_domains() -> Vec<String> {
     THREAD_STORE.lock().remote_space_domains()
+}
+
+/// Remember that `session` of `source`, imported on `host`, became
+/// `space_id`.
+#[cfg(unix)]
+pub fn note_imported_session(source: &str, session: &str, host: Option<&str>, space_id: &str) {
+    let mut store = THREAD_STORE.lock();
+    store.note_imported_session(ImportedSession {
+        source: source.to_string(),
+        session: session.to_string(),
+        host: host.map(str::to_string),
+        space_id: space_id.to_string(),
+    });
+    schedule_workspace_thread_store_persist();
+}
+
+/// The name of the Space `session` of `source` on `host` was imported
+/// into, while that Space is still here.
+#[cfg(unix)]
+pub fn imported_session_space(source: &str, session: &str, host: Option<&str>) -> Option<String> {
+    THREAD_STORE
+        .lock()
+        .imported_session_space(source, session, host)
+        .map(|space| space.name.clone())
 }
 
 /// The Spaces this device mirrored from a mux server it reaches under any of
@@ -5964,6 +6008,41 @@ impl WorkspaceThreadStore {
             }
         }
         domains
+    }
+
+    /// The newest import of a session replaces older ones. A local entry
+    /// whose Space is gone was deleted with it; a remote one may only be
+    /// missing until its host connects again, so it waits for the cap.
+    #[cfg(unix)]
+    fn note_imported_session(&mut self, imported: ImportedSession) {
+        let spaces = &self.spaces;
+        self.imported_sessions.retain(|known| {
+            !(known.source == imported.source
+                && known.session == imported.session
+                && known.host == imported.host)
+                && (known.host.is_some() || spaces.iter().any(|space| space.id == known.space_id))
+        });
+        self.imported_sessions.push(imported);
+        let excess = self
+            .imported_sessions
+            .len()
+            .saturating_sub(MAX_IMPORTED_SESSIONS);
+        self.imported_sessions.drain(..excess);
+    }
+
+    #[cfg(unix)]
+    fn imported_session_space(
+        &self,
+        source: &str,
+        session: &str,
+        host: Option<&str>,
+    ) -> Option<&Space> {
+        let imported = self.imported_sessions.iter().find(|known| {
+            known.source == source && known.session == session && known.host.as_deref() == host
+        })?;
+        self.spaces
+            .iter()
+            .find(|space| space.id == imported.space_id && space.client_domain.as_deref() == host)
     }
 
     #[cfg(test)]
@@ -12958,6 +13037,90 @@ mod tests {
             folder_order: Vec::new(),
         });
         store
+    }
+
+    #[cfg(unix)]
+    fn imported(source: &str, session: &str, host: Option<&str>, space: &str) -> ImportedSession {
+        ImportedSession {
+            source: source.to_string(),
+            session: session.to_string(),
+            host: host.map(str::to_string),
+            space_id: space.to_string(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_imported_session_is_known_only_while_its_space_is_on_that_connection() {
+        let mut store = remote_test_store("server-a");
+        let local = store.spaces[0].id.clone();
+        store.note_imported_session(imported("example", "default", None, &local));
+        store.note_imported_session(imported(
+            "example",
+            "work",
+            Some("server-a"),
+            "space-remote",
+        ));
+        let name = |store: &WorkspaceThreadStore, session, host| {
+            store
+                .imported_session_space("example", session, host)
+                .map(|space| space.name.clone())
+        };
+        assert_eq!(
+            name(&store, "default", None),
+            Some(store.spaces[0].name.clone())
+        );
+        let remote = store
+            .spaces
+            .iter()
+            .find(|space| space.id == "space-remote")
+            .map(|space| space.name.clone());
+        assert!(remote.is_some());
+        assert_eq!(name(&store, "work", Some("server-a")), remote);
+        // The same name on another machine, or from another source, is
+        // another session.
+        assert_eq!(name(&store, "default", Some("server-a")), None);
+        assert_eq!(name(&store, "work", None), None);
+        assert!(store
+            .imported_session_space("other", "default", None)
+            .is_none());
+        // A Space that is gone takes the mark with it.
+        store.spaces.retain(|space| space.id != "space-remote");
+        assert_eq!(name(&store, "work", Some("server-a")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn imported_sessions_keep_the_newest_and_stay_bounded() {
+        let mut store = remote_test_store("server-a");
+        let local = store.spaces[0].id.clone();
+        store.note_imported_session(imported("example", "default", None, "space-deleted"));
+        store.note_imported_session(imported(
+            "example",
+            "work",
+            Some("server-a"),
+            "space-offline",
+        ));
+        store.note_imported_session(imported("example", "default", None, &local));
+        // The re-import replaced the first entry; the deleted local Space
+        // went with it, while the remote one waits for its host.
+        assert_eq!(
+            store.imported_sessions,
+            vec![
+                imported("example", "work", Some("server-a"), "space-offline"),
+                imported("example", "default", None, &local),
+            ]
+        );
+        for n in 0..MAX_IMPORTED_SESSIONS {
+            store.note_imported_session(imported(
+                "example",
+                &format!("session-{n}"),
+                Some("server-a"),
+                "space-remote",
+            ));
+        }
+        assert_eq!(store.imported_sessions.len(), MAX_IMPORTED_SESSIONS);
+        assert_eq!(store.imported_sessions[0].session, "session-0");
     }
 
     fn tree_thread(id: &str, project_id: &str, name: &str) -> codec::TtThread {

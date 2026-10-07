@@ -1385,6 +1385,8 @@ enum SettingsAction {
     #[cfg(unix)]
     SessionImportPreview(u64),
     #[cfg(unix)]
+    SessionImportHost(u64),
+    #[cfg(unix)]
     SessionImportBack,
     #[cfg(unix)]
     SessionImportConfirm,
@@ -5255,6 +5257,7 @@ impl SettingsWindow {
             #[cfg(unix)]
             SettingsAction::SessionImportDetect
             | SettingsAction::SessionImportPreview(_)
+            | SettingsAction::SessionImportHost(_)
             | SettingsAction::SessionImportBack
             | SettingsAction::SessionImportRecover
             | SettingsAction::SessionImportConfirm
@@ -15681,8 +15684,7 @@ impl SettingsWindow {
     /// `title_y`, centred on the title's capitals. Left out when it would
     /// run past `right_edge`.
     fn beta_badge_width(&self) -> f32 {
-        let label = crate::i18n::tr("settings-badge-beta");
-        (self.measure_text_width(&self.logo_caption_font, &label) + self.ui_px(12.0) * 2.0).round()
+        self.badge_width(&crate::i18n::tr("settings-badge-beta"))
     }
 
     fn paint_beta_badge(
@@ -15692,10 +15694,28 @@ impl SettingsWindow {
         title_y: f32,
         right_edge: f32,
     ) -> anyhow::Result<()> {
-        let font = Rc::clone(&self.logo_caption_font);
         let label = crate::i18n::tr("settings-badge-beta");
+        let accent = self.chrome_palette.accent;
+        self.paint_badge(layers, &label, accent, x, title_y, right_edge)
+    }
+
+    fn badge_width(&self, label: &str) -> f32 {
+        (self.measure_text_width(&self.logo_caption_font, label) + self.ui_px(12.0) * 2.0).round()
+    }
+
+    /// The capsule `paint_beta_badge` draws, with any label and color.
+    fn paint_badge(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        label: &str,
+        accent: LinearRgba,
+        x: f32,
+        title_y: f32,
+        right_edge: f32,
+    ) -> anyhow::Result<()> {
+        let font = Rc::clone(&self.logo_caption_font);
         let pad = self.ui_px(12.0);
-        let width = self.beta_badge_width();
+        let width = self.badge_width(label);
         if x + width > right_edge {
             return Ok(());
         }
@@ -15712,7 +15732,6 @@ impl SettingsWindow {
         let center_y = title_y + baseline_offset - cap_height(self.ui_font.metrics()) / 2.0;
         let label_cap = cap_height(font.metrics());
         let height = (label_cap + self.ui_px(16.0)).round();
-        let accent = self.chrome_palette.accent;
         self.draw_rounded_rect(
             layers,
             0,
@@ -15728,7 +15747,7 @@ impl SettingsWindow {
             &font,
             x + pad,
             (center_y + label_cap / 2.0 - baseline_offset).round(),
-            &label,
+            label,
             accent,
             width - pad,
         )

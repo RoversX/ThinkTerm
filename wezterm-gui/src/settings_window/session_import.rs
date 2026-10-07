@@ -83,18 +83,28 @@ enum ImportTarget {
 }
 
 impl ImportTarget {
+    /// The machine of the Space Settings was opened from.
     fn current() -> anyhow::Result<Self> {
         let space_id = OPENED_FROM_SPACE.with(|slot| slot.borrow().clone());
         let Some(space_id) = space_id else {
             return Ok(Self::Local);
         };
         let store = crate::workspace_threads::workspace_thread_store_snapshot();
-        let Some(name) = origin_domain(&store, &space_id)? else {
+        Self::for_host(origin_domain(&store, &space_id)?)
+    }
+
+    /// This machine for `None`, else the connection named `host`. A host
+    /// not connected since launch is registered the way its Space would
+    /// register it; `owner` connects it.
+    fn for_host(host: Option<String>) -> anyhow::Result<Self> {
+        let Some(name) = host else {
             return Ok(Self::Local);
         };
-        let domain = mux::Mux::get()
-            .get_domain_by_name(&name)
-            .context("The import connection is no longer available")?;
+        let domain = match mux::Mux::get().get_domain_by_name(&name) {
+            Some(domain) => domain,
+            None => crate::connect_domain_from_ssh_host(&name)
+                .context("The import connection is no longer available")?,
+        };
         anyhow::ensure!(
             domain
                 .downcast_ref::<wezterm_client::domain::ClientDomain>()
@@ -102,9 +112,16 @@ impl ImportTarget {
             "Session import requires a ThinkTerm connection"
         );
         Ok(Self::Remote {
-            name: name.clone(),
+            name,
             domain_id: domain.domain_id(),
         })
+    }
+
+    fn host(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::Remote { name, .. } => Some(name),
+        }
     }
 
     fn location(&self, source: ImportSource) -> String {
@@ -216,6 +233,53 @@ impl ImportTarget {
         } else {
             session_import::execute(request, crate::workspace_threads::persist_session_import).await
         }
+    }
+}
+
+/// The machines an import can run on: this one, then each host a remote
+/// Space comes from.
+fn import_hosts() -> Vec<Option<String>> {
+    std::iter::once(None)
+        .chain(
+            crate::workspace_threads::remote_space_domains()
+                .into_iter()
+                .map(Some),
+        )
+        .collect()
+}
+
+/// Domain names are never empty, so "" can stand for this machine.
+fn host_key(host: Option<&str>) -> u64 {
+    web_token_key(host.unwrap_or(""))
+}
+
+fn host_connected(name: &str) -> bool {
+    mux::Mux::get()
+        .get_domain_by_name(name)
+        .is_some_and(|domain| domain.state() == DomainState::Attached)
+}
+
+fn source_id(source: ImportSource) -> Option<&'static str> {
+    match source {
+        ImportSource::Session(id) => Some(id),
+        ImportSource::WezTerm => None,
+    }
+}
+
+/// Note a finished import where the Import page will find it, whether or
+/// not Settings is still open to show the result.
+fn remember_import(
+    target: &ImportTarget,
+    request: &codec::ImportSessionRequest,
+    status: &anyhow::Result<codec::ImportSessionStatus>,
+) {
+    if let Ok(codec::ImportSessionStatus::Completed(result)) = status {
+        crate::workspace_threads::note_imported_session(
+            &request.request.source,
+            &request.request.session,
+            target.host(),
+            &result.space_id,
+        );
     }
 }
 
@@ -488,6 +552,28 @@ impl SettingsWindow {
                 })
                 .detach();
             }
+            SettingsAction::SessionImportHost(key) => {
+                let Some(host) = import_hosts()
+                    .into_iter()
+                    .find(|host| host_key(host.as_deref()) == key)
+                else {
+                    return;
+                };
+                match ImportTarget::for_host(host) {
+                    Ok(target) => {
+                        self.ui.session_import.target = Some(target);
+                        self.perform_session_import_action(SettingsAction::SessionImportDetect);
+                    }
+                    Err(err) => {
+                        self.ui.session_import.failed = true;
+                        self.ui.session_import.message = localized_error(
+                            selected_source,
+                            &format!("{err:#}"),
+                            "session-import-error-inspect",
+                        );
+                    }
+                }
+            }
             SettingsAction::SessionImportPreview(key) => {
                 let Some(target) = self.ui.session_import.target.clone() else {
                     return;
@@ -592,8 +678,9 @@ impl SettingsWindow {
                 promise::spawn::spawn(async move {
                     let imported = match target.import(request.clone()).await {
                         Ok(result) => Ok(codec::ImportSessionStatus::Completed(result)),
-                        Err(_) => target.recover(request).await,
+                        Err(_) => target.recover(request.clone()).await,
                     };
+                    remember_import(&target, &request, &imported);
                     if let Some(settings) = settings_window_for_instance(instance_id) {
                         let mut settings = settings.borrow_mut();
                         if settings.ui.import_source != selected_source {
@@ -616,7 +703,8 @@ impl SettingsWindow {
                 };
                 self.ui.session_import.busy = true;
                 promise::spawn::spawn(async move {
-                    let status = target.recover(request).await;
+                    let status = target.recover(request.clone()).await;
+                    remember_import(&target, &request, &status);
                     if let Some(settings) = settings_window_for_instance(instance_id) {
                         let mut settings = settings.borrow_mut();
                         settings.apply_import_status(selected_source, status);
@@ -693,7 +781,24 @@ impl SettingsWindow {
                 "session-import-select-session"
             }),
         )? + self.ui_px(24.0);
-        if let Some(target) = &state.target {
+        // The machine is chosen before a preview; an import in flight keeps
+        // the one it was sent to.
+        let hosts = if state.preview.is_none() && state.pending.is_none() {
+            import_hosts()
+        } else {
+            Vec::new()
+        };
+        if hosts.len() > 1 {
+            top = self.paint_import_hosts(
+                layers,
+                left,
+                top,
+                inner,
+                &hosts,
+                state.target.as_ref(),
+                !state.busy,
+            )? + gap;
+        } else if let Some(target) = &state.target {
             top = self.paint_import_copy(
                 layers,
                 left,
@@ -703,6 +808,13 @@ impl SettingsWindow {
                 palette.secondary_text,
             )? + gap;
         }
+        let imported_into = |session: &str| {
+            crate::workspace_threads::imported_session_space(
+                source_id(selected_source)?,
+                session,
+                state.target.as_ref()?.host(),
+            )
+        };
         if let Some(preview) = &state.preview {
             let status = selected_source.text(if preview.live {
                 "session-import-status-live"
@@ -763,6 +875,17 @@ impl SettingsWindow {
         }
 
         if let Some(preview) = &state.preview {
+            if let Some(space) = imported_into(&preview.session) {
+                top = self.paint_import_notice(
+                    layers,
+                    left,
+                    top,
+                    inner,
+                    &selected_source
+                        .text_args("session-import-already-imported", &[("name", space)]),
+                    true,
+                )? + gap;
+            }
             let destination = selected_source.text_args(
                 "session-import-destination",
                 &[(
@@ -945,15 +1068,32 @@ impl SettingsWindow {
                     palette.muted_text,
                 )?;
                 let name_x = left + cell + self.ui_px(12.0);
+                let name_y = self.control_text_y(top, height);
+                let name_width =
+                    (inner - (name_x - left) - button_width - self.ui_px(16.0)).max(1.0);
                 self.draw_text(
                     layers,
                     &title,
                     name_x,
-                    self.control_text_y(top, height),
+                    name_y,
                     &session.name,
                     palette.text,
-                    (inner - (name_x - left) - button_width - self.ui_px(16.0)).max(1.0),
+                    name_width,
                 )?;
+                if imported_into(&session.name).is_some() {
+                    self.paint_badge(
+                        layers,
+                        &selected_source.text("session-import-imported"),
+                        TileColor::Teal.linear(),
+                        name_x
+                            + self
+                                .measure_text_width(&title, &session.name)
+                                .min(name_width)
+                            + self.ui_px(14.0),
+                        name_y,
+                        name_x + name_width,
+                    )?;
+                }
                 self.paint_import_actions(
                     layers,
                     left + inner - button_width,
@@ -1106,6 +1246,108 @@ impl SettingsWindow {
                 enabled: !state.busy,
             }],
         )
+    }
+
+    /// One row per machine an import can run on. Choosing one detects the
+    /// sessions there; the imported terminals stay on that machine.
+    fn paint_import_hosts(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        hosts: &[Option<String>],
+        chosen: Option<&ImportTarget>,
+        enabled: bool,
+    ) -> anyhow::Result<f32> {
+        let selected_source = self.ui.import_source;
+        let palette = self.palette();
+        let font = Rc::clone(&self.ui_font);
+        let cell = self.metrics.cell_size.height as f32;
+        let height = self.ui_px(CONTROL_HEIGHT);
+        let pad = self.ui_px(14.0);
+        let mut top = self.paint_import_copy(
+            layers,
+            x,
+            y,
+            width,
+            &selected_source.text("session-import-hosts"),
+            palette.text,
+        )? + self.ui_px(8.0);
+        for host in hosts {
+            let action = SettingsAction::SessionImportHost(host_key(host.as_deref()));
+            let selected = chosen.is_some_and(|target| target.host() == host.as_deref());
+            if enabled {
+                self.ui_context
+                    .push(rect(x, top, width, height), WidgetKind::Button, action);
+            }
+            let bg = if selected {
+                Some(palette.nav_selected_bg)
+            } else if enabled && self.ui.interaction.pressed == Some(action) {
+                Some(palette.control_pressed_bg)
+            } else if enabled && self.ui.interaction.hovered == Some(action) {
+                Some(palette.control_hover_bg)
+            } else {
+                None
+            };
+            if let Some(bg) = bg {
+                self.draw_rounded_rect(layers, 0, x, top, width, height, bg, self.ui_px(9.0))?;
+            }
+            let (text, secondary) = if selected {
+                (palette.selected_text, palette.selected_text)
+            } else {
+                (palette.text, palette.secondary_text)
+            };
+            let (icon, name, status) = match host {
+                None => (
+                    SvgIcon::Laptop,
+                    selected_source.text("session-import-host-local"),
+                    String::new(),
+                ),
+                Some(name) => (
+                    SvgIcon::Server,
+                    name.clone(),
+                    selected_source.text(if host_connected(name) {
+                        "session-import-host-connected"
+                    } else {
+                        "session-import-host-disconnected"
+                    }),
+                ),
+            };
+            self.draw_svg_icon(
+                layers,
+                icon,
+                x + pad,
+                top + (height - cell) / 2.0,
+                cell,
+                secondary,
+            )?;
+            let name_x = x + pad + cell + self.ui_px(12.0);
+            let status_width = self.measure_text_width(&font, &status).min(width * 0.5);
+            let status_x = x + width - pad - status_width;
+            self.draw_text(
+                layers,
+                &font,
+                name_x,
+                self.control_text_y(top, height),
+                &name,
+                text,
+                (status_x - name_x - self.ui_px(16.0)).max(1.0),
+            )?;
+            if !status.is_empty() {
+                self.draw_text(
+                    layers,
+                    &font,
+                    status_x,
+                    self.control_text_y(top, height),
+                    &status,
+                    secondary,
+                    status_width,
+                )?;
+            }
+            top += height + self.ui_px(4.0);
+        }
+        Ok(top)
     }
 
     fn paint_session_notes(
@@ -1285,6 +1527,27 @@ mod tests {
             Some("Local")
         );
         assert!(origin_domain(&store, "missing").is_err());
+    }
+
+    #[test]
+    fn this_machine_and_each_host_are_told_apart() {
+        let keys = [
+            host_key(None),
+            host_key(Some("server-a")),
+            host_key(Some("server-b")),
+        ];
+        assert_ne!(keys[0], keys[1]);
+        assert_ne!(keys[1], keys[2]);
+        assert_eq!(host_key(Some("server-a")), keys[1]);
+        assert_eq!(ImportTarget::Local.host(), None);
+        assert_eq!(
+            ImportTarget::Remote {
+                name: "server-a".into(),
+                domain_id: 7,
+            }
+            .host(),
+            Some("server-a")
+        );
     }
 
     #[test]

@@ -1095,6 +1095,12 @@ session-import-notes-title = Import notes
 session-import-location-local = Import location: this computer
 session-import-location-remote = Import location: { $host } · remote processes stay on this server
 session-import-requirements-remote = Use a session owned by the remote connection’s account. Terminals and working directories stay on that server.
+session-import-hosts = Which machine to import from
+session-import-host-local = This computer
+session-import-host-connected = Connected
+session-import-host-disconnected = Not connected · connects when chosen
+session-import-imported = Imported
+session-import-already-imported = This session was already imported into { $name }. Importing it again creates another Space.
 
 session-import-check-result = Check import result
 session-import-still-running = The import is still running on the target. Check again to retrieve its result.

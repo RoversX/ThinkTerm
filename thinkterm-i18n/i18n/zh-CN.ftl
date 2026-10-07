@@ -1073,6 +1073,12 @@ session-import-notes-title = 导入须知
 session-import-location-local = 导入位置：本机
 session-import-location-remote = 导入位置：{ $host } · 远程进程仍在这台服务器上运行
 session-import-requirements-remote = 使用远程连接账号拥有的会话。终端进程和工作目录保留在该服务器上。
+session-import-hosts = 从哪台机器导入
+session-import-host-local = 本机
+session-import-host-connected = 已连接
+session-import-host-disconnected = 未连接 · 选中后会先连接
+session-import-imported = 已导入
+session-import-already-imported = 这个会话已经导入到 { $name }。再导入会另建一个 Space。
 
 session-import-check-result = 检查导入结果
 session-import-still-running = 目标机器仍在导入。稍后再次检查，即可取回本次结果。

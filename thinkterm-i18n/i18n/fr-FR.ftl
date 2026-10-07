@@ -1092,6 +1092,12 @@ session-import-notes-title = À savoir avant l’importation
 session-import-location-local = Emplacement de l’importation : cet ordinateur
 session-import-location-remote = Emplacement de l’importation : { $host } · les processus restent sur ce serveur
 session-import-requirements-remote = Utilisez une session appartenant au compte de la connexion distante. Les terminaux et leurs répertoires de travail restent sur ce serveur.
+session-import-hosts = Machine d’où importer
+session-import-host-local = Cet ordinateur
+session-import-host-connected = Connecté
+session-import-host-disconnected = Non connecté · connexion lors du choix
+session-import-imported = Importé
+session-import-already-imported = Cette session a déjà été importée dans { $name }. L’importer à nouveau crée un autre espace.
 
 session-import-check-result = Vérifier le résultat
 session-import-still-running = L’importation est toujours en cours sur la machine cible. Vérifiez à nouveau son résultat dans un instant.

@@ -1073,6 +1073,12 @@ session-import-notes-title = インポートの注意事項
 session-import-location-local = インポート先：このコンピュータ
 session-import-location-remote = インポート先：{ $host } · リモートプロセスはこのサーバーで実行を続けます
 session-import-requirements-remote = リモート接続のアカウントが所有するセッションを使用してください。端末プロセスと作業ディレクトリはサーバーに残ります。
+session-import-hosts = インポート元のマシン
+session-import-host-local = このコンピュータ
+session-import-host-connected = 接続済み
+session-import-host-disconnected = 未接続 · 選択すると接続します
+session-import-imported = インポート済み
+session-import-already-imported = このセッションは { $name } にインポート済みです。もう一度インポートすると別の Space が作成されます。
 
 session-import-check-result = インポート結果を確認
 session-import-still-running = 対象のマシンでインポートを実行中です。後でもう一度結果を確認してください。
