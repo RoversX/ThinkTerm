@@ -307,6 +307,23 @@ enum CapState {
     },
 }
 
+/// What a shortcut set here does to the ones beneath it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangeKind {
+    Added,
+    Changed,
+    Removed,
+}
+
+/// One row of the list of shortcuts set here.
+#[derive(Debug, Clone, PartialEq)]
+struct Change {
+    chord: (KeyCode, Modifiers),
+    kind: ChangeKind,
+    /// What it runs, or for a removed one what it ran.
+    action: KeyAssignment,
+}
+
 /// What the page shows: built when it is entered and after each change.
 struct KeymapView {
     /// Every action the palette and the menus offer, with its name.
@@ -438,9 +455,7 @@ impl KeymapView {
 
     /// Whether the file or the defaults bind `chord` in any of its forms.
     fn bound_beneath(&self, chord: &(KeyCode, Modifiers)) -> bool {
-        crate::inputmap::chord_forms(&chord.0, chord.1)
-            .iter()
-            .any(|form| self.beneath.keys.default.contains_key(form))
+        self.action_beneath(chord).is_some()
     }
 
     fn name_of(&self, chord: &(KeyCode, Modifiers), action: &KeyAssignment) -> String {
@@ -448,6 +463,65 @@ impl KeymapView {
             .get(chord)
             .cloned()
             .unwrap_or_else(|| action_name(&self.actions, action))
+    }
+
+    /// What the file or the defaults bind to `chord`, in any of its forms.
+    fn action_beneath(&self, chord: &(KeyCode, Modifiers)) -> Option<KeyAssignment> {
+        crate::inputmap::chord_forms(&chord.0, chord.1)
+            .iter()
+            .find_map(|form| self.beneath.keys.default.get(form))
+            .map(|entry| entry.action.clone())
+    }
+
+    /// The shortcuts set here that differ from what lies beneath, in the
+    /// order of their keys. One that changes nothing is left out.
+    fn changes(&self) -> Vec<Change> {
+        let mut changes: Vec<(String, Change)> = self
+            .set_here
+            .iter()
+            .filter_map(|(chord, action)| {
+                let beneath = self.action_beneath(chord);
+                let (kind, action) = match (action, beneath) {
+                    (KeyAssignment::DisableDefaultAssignment, Some(beneath)) => {
+                        (ChangeKind::Removed, beneath)
+                    }
+                    (KeyAssignment::DisableDefaultAssignment, None) => return None,
+                    (action, Some(beneath)) if *action == beneath => return None,
+                    (action, Some(_)) => (ChangeKind::Changed, action.clone()),
+                    (action, None) => (ChangeKind::Added, action.clone()),
+                };
+                let change = Change {
+                    chord: chord.clone(),
+                    kind,
+                    action,
+                };
+                Some((chord_text(chord, self.rendering), change))
+            })
+            .collect();
+        changes.sort_by(|a, b| a.0.cmp(&b.0));
+        changes.into_iter().map(|(_, change)| change).collect()
+    }
+
+    /// The key `chord` is drawn on and the modifiers to show it under.
+    fn locate(&self, chord: &(KeyCode, Modifiers)) -> Option<(u8, Modifiers)> {
+        let (_, mods) = crate::inputmap::typed_chord(&chord.0, chord.1);
+        let mods = mods.remove_positional_mods();
+        // Shown only under modifiers the switches can turn off again.
+        let switches = Modifiers::SUPER | Modifiers::SHIFT | Modifiers::ALT | Modifiers::CTRL;
+        if !switches.contains(mods) {
+            return None;
+        }
+        let index = rows()
+            .iter()
+            .flat_map(|row| row.iter())
+            .position(|cap| match &cap.kind {
+                CapKind::Key(key) => {
+                    let canonical = crate::inputmap::canonical_chord(key, mods);
+                    canonical == *chord || self.set_here_chord(&canonical).as_ref() == Some(chord)
+                }
+                _ => false,
+            })?;
+        Some((std::convert::TryFrom::try_from(index).ok()?, mods))
     }
 
     /// The chords that run `action`, as the palette shows them.
@@ -543,6 +617,10 @@ pub(super) enum KeymapAction {
     Assign,
     /// A row of the search list, by its place in the list.
     Row(u16),
+    /// A row of the list of shortcuts set here: show its key.
+    Changed(u16),
+    /// Take a row of that list back out of the layer set here.
+    Revert(u16),
     Replace,
     Cancel,
     ResetAll,
@@ -558,6 +636,12 @@ pub(super) struct KeymapUi {
     mode: Mode,
     /// The actions the search list showed, in order, for its row buttons.
     rows: Vec<usize>,
+    /// The chords the list of shortcuts set here showed, in order.
+    changes: Vec<(KeyCode, Modifiers)>,
+    /// When a row of that list was last taken out. The row below then
+    /// moves up under the pointer, and the second click of a double-click
+    /// must not take that one too.
+    reverted: Option<std::time::Instant>,
     /// The font the keys' names are set in, with the caption font it was
     /// made beside: a new scale or DPI remakes that, and then this.
     name_font: Option<(Rc<LoadedFont>, Rc<LoadedFont>)>,
@@ -573,6 +657,8 @@ impl Clone for KeymapUi {
             view: None,
             mode: Mode::Idle,
             rows: Vec::new(),
+            changes: Vec::new(),
+            reverted: None,
             name_font: None,
         }
     }
@@ -604,6 +690,7 @@ impl KeymapUi {
         self.view = entered.then(KeymapView::build);
         if !entered {
             self.rows = Vec::new();
+            self.changes = Vec::new();
             self.selected = None;
             self.name_font = None;
         }
@@ -1011,7 +1098,7 @@ impl SettingsWindow {
                 palette.muted_text,
                 max_width,
             )?;
-            return self.paint_keymap_reset_all(layers, x, y + line * 2.0, max_width);
+            return self.paint_keymap_changes(layers, x, y + line * 2.0, max_width);
         };
         let CapKind::Key(key) = &cap.kind else {
             unreachable!("filtered above")
@@ -1163,17 +1250,169 @@ impl SettingsWindow {
             )?;
             button_x += width + self.ui_px(12.0);
         }
-        self.paint_keymap_reset_all(layers, x, y + card_height + self.ui_px(28.0), max_width)
+        self.paint_keymap_changes(layers, x, y + card_height + self.ui_px(28.0), max_width)
     }
 
-    /// Reset All, while anything is set here.
-    fn paint_keymap_reset_all(
+    /// The shortcuts set here, each with a button that takes it back out;
+    /// a click on a row shows its key. Under them, Reset All, while
+    /// anything is set here.
+    fn paint_keymap_changes(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
         x: f32,
-        y: f32,
-        _max_width: f32,
+        mut y: f32,
+        max_width: f32,
     ) -> anyhow::Result<f32> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let body_font = Rc::clone(&self.body_font);
+        let line = self.measure_line_height(&ui_font);
+        let rows: Vec<(String, String, ChangeKind, bool)> = {
+            let view = self.ui.keymap.view.as_ref().expect("built before painting");
+            let changes = view.changes();
+            self.ui.keymap.changes = changes.iter().map(|change| change.chord.clone()).collect();
+            changes
+                .iter()
+                .map(|change| {
+                    (
+                        chord_text(&change.chord, view.rendering),
+                        action_name(&view.actions, &change.action),
+                        change.kind,
+                        // A key the drawn keyboard has: the row shows it.
+                        view.locate(&change.chord).is_some(),
+                    )
+                })
+                .collect()
+        };
+
+        if !rows.is_empty() {
+            self.draw_text(
+                layers,
+                &ui_font,
+                x,
+                y,
+                &crate::i18n::tr("settings-keymap-changes"),
+                palette.text,
+                max_width,
+            )?;
+            y += line + self.ui_px(16.0);
+
+            let reset = crate::i18n::tr("settings-keymap-reset");
+            let remove = crate::i18n::tr("settings-keymap-remove");
+            let button_width = self
+                .button_width_for_label(&reset, 120.0)
+                .max(self.button_width_for_label(&remove, 120.0));
+            let row_height = self.ui_px(CONTROL_HEIGHT) + self.ui_px(16.0);
+            let padding = self.ui_px(28.0);
+            let card_height = row_height * rows.len() as f32 + padding;
+            self.paint_group_card(layers, x, y, max_width, card_height)?;
+            let mut row_y = y + padding / 2.0;
+            for (place, (chord, name, kind, shows)) in rows.iter().enumerate() {
+                if *shows {
+                    let show = SettingsAction::Keymap(KeymapAction::Changed(place as u16));
+                    // Inside the card's rounded corners.
+                    let hover_x = x + padding / 2.0;
+                    let hover_width = max_width - padding;
+                    if self.ui.interaction.hovered == Some(show) {
+                        self.draw_rounded_rect(
+                            layers,
+                            0,
+                            hover_x,
+                            row_y,
+                            hover_width,
+                            row_height,
+                            palette.control_hover_bg,
+                            self.ui_px(10.0),
+                        )?;
+                    }
+                    // Before the button, which is pushed after it and so wins.
+                    self.ui_context.push(
+                        rect(hover_x, row_y, hover_width, row_height),
+                        WidgetKind::Button,
+                        show,
+                    );
+                }
+                if place > 0 {
+                    self.draw_rect(
+                        layers,
+                        0,
+                        x + padding,
+                        row_y,
+                        max_width - padding * 2.0,
+                        self.ui_px(1.0),
+                        palette.separator,
+                    )?;
+                }
+                let text_y = row_y + (row_height - line) / 2.0;
+
+                let chip_width = self.measure_text_width(&body_font, chord) + self.ui_px(24.0);
+                let chip_height = line + self.ui_px(12.0);
+                self.draw_rounded_frame(
+                    layers,
+                    0,
+                    x + padding,
+                    text_y - self.ui_px(6.0),
+                    chip_width,
+                    chip_height,
+                    palette.control_bg,
+                    palette.control_border,
+                    chip_height / 2.0,
+                )?;
+                self.draw_text(
+                    layers,
+                    &body_font,
+                    x + padding + self.ui_px(12.0),
+                    text_y,
+                    chord,
+                    palette.secondary_text,
+                    chip_width,
+                )?;
+
+                let button_x = x + max_width - padding - button_width;
+                let (tag, button) = match kind {
+                    ChangeKind::Added => ("settings-keymap-kind-added", &remove),
+                    ChangeKind::Changed => ("settings-keymap-source-set-here", &reset),
+                    ChangeKind::Removed => ("settings-keymap-cap-removed", &reset),
+                };
+                let tag = crate::i18n::tr(tag);
+                let tag_x = button_x - self.ui_px(16.0) - self.measure_text_width(&body_font, &tag);
+                self.draw_text(
+                    layers,
+                    &body_font,
+                    tag_x,
+                    text_y,
+                    &tag,
+                    palette.muted_text,
+                    button_x - tag_x,
+                )?;
+                let name_x = x + padding + chip_width + self.ui_px(16.0);
+                self.draw_text(
+                    layers,
+                    &ui_font,
+                    name_x,
+                    text_y,
+                    name,
+                    if *kind == ChangeKind::Removed {
+                        palette.muted_text
+                    } else {
+                        palette.text
+                    },
+                    (tag_x - self.ui_px(16.0) - name_x).max(0.0),
+                )?;
+                let button_y = row_y + (row_height - self.ui_px(CONTROL_HEIGHT)) / 2.0;
+                self.draw_button(
+                    layers,
+                    button_x,
+                    button_y,
+                    button_width,
+                    button,
+                    SettingsAction::Keymap(KeymapAction::Revert(place as u16)),
+                )?;
+                row_y += row_height;
+            }
+            y += card_height + self.ui_px(28.0);
+        }
+
         let anything_set = !self.native_settings.keymap.keys.is_empty()
             || self.native_settings.command_palette.hotkey
                 != crate::native_settings::NativeCommandPaletteHotkey::default();
@@ -1596,6 +1835,42 @@ impl SettingsWindow {
                     }),
                 }
             }
+            KeymapAction::Changed(place) => {
+                let Some(chord) = self.ui.keymap.changes.get(place as usize) else {
+                    return;
+                };
+                let Some((index, mods)) = self
+                    .ui
+                    .keymap
+                    .view
+                    .as_ref()
+                    .and_then(|view| view.locate(chord))
+                else {
+                    // Not a key the drawn keyboard has.
+                    return;
+                };
+                self.ui.keymap.mods = Some(mods);
+                self.ui.keymap.selected = Some(index);
+                self.ui.keymap.set_mode(Mode::Idle);
+                // The keyboard and the detail are at the top of the page.
+                self.ui.content_scroll.reset();
+            }
+            KeymapAction::Revert(place) => {
+                if self
+                    .ui
+                    .keymap
+                    .reverted
+                    .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(500))
+                {
+                    return;
+                }
+                if let Some(chord) = self.ui.keymap.changes.get(place as usize).cloned() {
+                    self.ui.keymap.reverted = Some(std::time::Instant::now());
+                    let result =
+                        crate::native_settings::set_keymap_shortcut(&chord.0, chord.1, None);
+                    self.keymap_saved(result);
+                }
+            }
             KeymapAction::Replace => {
                 if let Mode::Confirm {
                     action,
@@ -1940,6 +2215,49 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn the_list_of_changes_says_what_each_one_did() {
+        let cmd_t = crate::inputmap::canonical_chord(&KeyCode::Char('t'), Modifiers::SUPER);
+        let stock = view_with(&[]).action_beneath(&cmd_t).unwrap();
+        let unchanged = view_with(&[entry('t', Modifiers::SUPER, stock.clone())]);
+        assert!(unchanged.changes().is_empty());
+
+        let view = view_with(&[
+            entry('t', Modifiers::SUPER, KeyAssignment::OpenThreadSearch),
+            entry('w', Modifiers::SUPER, KeyAssignment::DisableDefaultAssignment),
+            entry('j', Modifiers::CTRL | Modifiers::ALT, KeyAssignment::ToggleRightSidebar),
+            // Nothing beneath to take off: no change at all.
+            entry('j', Modifiers::SUPER | Modifiers::ALT, KeyAssignment::DisableDefaultAssignment),
+        ]);
+        let kinds: Vec<(KeyAssignment, ChangeKind)> = view
+            .changes()
+            .into_iter()
+            .map(|change| (change.action, change.kind))
+            .collect();
+        assert_eq!(kinds.len(), 3, "{kinds:?}");
+        assert!(kinds.contains(&(KeyAssignment::OpenThreadSearch, ChangeKind::Changed)));
+        assert!(kinds.contains(&(KeyAssignment::ToggleRightSidebar, ChangeKind::Added)));
+        assert!(kinds
+            .iter()
+            .any(|(action, kind)| *kind == ChangeKind::Removed
+                && *action != KeyAssignment::DisableDefaultAssignment));
+    }
+
+    #[test]
+    fn a_change_is_found_on_its_key_under_its_modifiers() {
+        let one = entry('!', Modifiers::CTRL, KeyAssignment::OpenThreadSearch);
+        let t = entry('t', Modifiers::SUPER, KeyAssignment::OpenThreadSearch);
+        let view = view_with(&[one.clone(), t.clone()]);
+        assert_eq!(
+            view.locate(&(one.key, one.mods)),
+            Some((1, Modifiers::CTRL | Modifiers::SHIFT))
+        );
+        let t_index = (NUMBER_ROW.len() + 5) as u8;
+        assert_eq!(view.locate(&(t.key, t.mods)), Some((t_index, Modifiers::SUPER)));
+        // No switch turns LEADER off: never shown under it.
+        assert_eq!(view.locate(&(KeyCode::Char('t'), Modifiers::LEADER)), None);
     }
 
     #[test]
