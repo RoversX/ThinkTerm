@@ -757,7 +757,7 @@ impl crate::TermWindow {
     fn paint_frontend_takeover_badge(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let gate = self.frontend_terminal_gate();
         // A terminal another device holds wears the badge until it is
         // taken. So does one just taken with its picture kept: a click on a
@@ -769,10 +769,10 @@ impl crate::TermWindow {
             wezterm_client::domain::RemoteFrontendGate::Syncing
         ) && !self.frontend_surface_blocked();
         if !gate.is_claimable() && !syncing_in_view {
-            return Ok(());
+            return Ok(false);
         }
         let Some((title, hint)) = gate.overlay_message() else {
-            return Ok(());
+            return Ok(false);
         };
         let text = format!("{title} \u{2014} {hint}");
         let area = self.content_view_area();
@@ -789,7 +789,7 @@ impl crate::TermWindow {
         let max_text = (area.size.width - pad_x * 4.0).max(0.0);
         let text_width = ctx.measure_text_width(&font, &text).min(max_text);
         if text_width <= 0.0 || area.size.height < line_height * 3.0 {
-            return Ok(());
+            return Ok(false);
         }
         let width = text_width + pad_x * 2.0;
         let height = line_height + pad_y * 2.0;
@@ -812,7 +812,7 @@ impl crate::TermWindow {
             palette.text,
             text_width,
         )?;
-        Ok(())
+        Ok(true)
     }
 
     /// A follower keeps the owner's canonical PTY grid. If its window is
@@ -4295,6 +4295,7 @@ impl crate::TermWindow {
         // half-drawn overview.
         let ui_items_before_terminal = self.ui_items.len();
 
+        let mut takeover_badge = false;
         if paint_terminal_world && !frontend_blocked {
             for pos in panes {
                 if pos.is_active {
@@ -4323,11 +4324,13 @@ impl crate::TermWindow {
             }
             self.paint_frontend_shared_unused_grid(&mut layers)
                 .context("paint shared unused grid")?;
-            self.paint_frontend_takeover_badge(&mut layers)
+            takeover_badge = self
+                .paint_frontend_takeover_badge(&mut layers)
                 .context("paint takeover badge")?;
         }
 
-        if paint_terminal_world && !frontend_blocked {
+        // The badge sits in the quote's corner, and says something to act on.
+        if paint_terminal_world && !frontend_blocked && !takeover_badge {
             self.paint_bottom_quote(&mut layers)
                 .context("paint_bottom_quote")?;
         }
