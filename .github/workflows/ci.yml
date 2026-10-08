@@ -57,6 +57,18 @@ jobs:
       - name: Install dependencies
         run: env CI=yes PATH=$PATH ./get-deps
 
+      # The browser page's own tests (thinkterm-web/ui/tests): Node and the
+      # page's locked packages, no wasm build.
+      - name: Install Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Test the web page
+        run: |
+          bash ci/retry.sh npm ci --prefix thinkterm-web/ui --no-audit --no-fund
+          npm test --prefix thinkterm-web/ui
+
       # `cargo test` compiles the whole workspace, binaries included, so this
       # is the build as well. --no-fail-fast because one crate's failure
       # should not hide the rest of the tree's.

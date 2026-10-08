@@ -243,6 +243,9 @@ jobs:
       - name: Type-check the page
         run: npm run --prefix thinkterm-web/ui check
 
+      - name: Test the page
+        run: npm test --prefix thinkterm-web/ui
+
       - name: Upload
         uses: actions/upload-artifact@v7
         with:
