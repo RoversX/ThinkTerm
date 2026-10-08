@@ -9,7 +9,7 @@ use config::{
     FontRasterizerSelection, FontStretch, FontStyle, FontWeight, TextStyle,
 };
 use rangeset::RangeSet;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::{Rc, Weak};
@@ -44,6 +44,36 @@ pub struct ClearShapeCache {}
 
 static FONT_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type LoadedFontId = usize;
+/// The family the interface is drawn with instead of the system's, and how
+/// many times that has changed: every `FontConfiguration` holds interface
+/// fonts it built for the family of the time, and the count is how each
+/// finds out that they are stale.
+static UI_FONT_FAMILY: Mutex<Option<String>> = Mutex::new(None);
+static UI_FONT_GENERATION: ::std::sync::atomic::AtomicUsize =
+    ::std::sync::atomic::AtomicUsize::new(0);
+
+/// Draw the interface -- window titles, tabs, sidebars, the command palette
+/// -- with `family`, in every window. `None` goes back to the system's
+/// interface font. The terminal's own font is not this one's business.
+/// True when that changed the family.
+pub fn set_ui_font_family(family: Option<String>) -> bool {
+    let family = family
+        .map(|family| family.trim().to_string())
+        .filter(|family| !family.is_empty());
+    let mut current = UI_FONT_FAMILY.lock().unwrap();
+    if *current == family {
+        return false;
+    }
+    *current = family;
+    UI_FONT_GENERATION.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// What `set_ui_font_family` was last given.
+pub fn ui_font_family() -> Option<String> {
+    UI_FONT_FAMILY.lock().unwrap().clone()
+}
+
 pub fn alloc_font_id() -> LoadedFontId {
     FONT_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
 }
@@ -578,6 +608,9 @@ struct FontConfigInner {
     char_select_font: RefCell<Option<Rc<LoadedFont>>>,
     command_palette_font: RefCell<Option<Rc<LoadedFont>>>,
     entity_font_overrides: RefCell<HashMap<(Entity, u64, u16, bool), Rc<LoadedFont>>>,
+    /// `UI_FONT_GENERATION` as it stood when the interface fonts above were
+    /// built.
+    ui_font_generation: Cell<usize>,
     fallback_channel: RefCell<Option<Sender<FallbackResolveInfo>>>,
 }
 
@@ -600,6 +633,9 @@ impl FontConfigInner {
             char_select_font: RefCell::new(None),
             command_palette_font: RefCell::new(None),
             entity_font_overrides: RefCell::new(HashMap::new()),
+            ui_font_generation: Cell::new(
+                UI_FONT_GENERATION.load(::std::sync::atomic::Ordering::Relaxed),
+            ),
             font_scale: RefCell::new(1.0),
             dpi: RefCell::new(dpi),
             config: RefCell::new(config.clone()),
@@ -672,7 +708,24 @@ impl FontConfigInner {
             }
         }
 
-        let mut fonts = vec![if cfg!(target_os = "macos") {
+        let mut fonts = vec![];
+
+        // Their own choice of family goes first, and the system's stays
+        // behind it for whatever theirs has no glyph for -- or for all of
+        // it, should theirs have been uninstalled since.
+        if let Some(family) = ui_font_family() {
+            fonts.push(weighted(
+                &family,
+                if make_bold {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::REGULAR
+                },
+            ));
+        }
+        let chosen = !fonts.is_empty();
+
+        let mut system = if cfg!(target_os = "macos") {
             weighted(
                 ".AppleSystemUIFont",
                 if make_bold {
@@ -685,7 +738,9 @@ impl FontConfigInner {
             weighted("Roboto", FontWeight::BOLD)
         } else {
             FontAttributes::new("Roboto")
-        }];
+        };
+        system.is_fallback = chosen;
+        fonts.push(system);
 
         if cfg!(target_os = "macos") {
             let mut fallback = weighted(
@@ -775,8 +830,15 @@ impl FontConfigInner {
         };
         let font_size = override_font_size.unwrap_or(configured_font_size);
 
-        let text_style =
-            text_style.unwrap_or(config.window_frame.font.as_ref().unwrap_or(&sys_font));
+        // A family chosen in Settings is the newer word on the interface's
+        // font, and outranks what the configuration file asks for.
+        let text_style = if ui_font_family().is_some()
+            && matches!(entity, Entity::Title | Entity::CommandPalette)
+        {
+            &sys_font
+        } else {
+            text_style.unwrap_or(config.window_frame.font.as_ref().unwrap_or(&sys_font))
+        };
         let override_style;
         let text_style = if override_weight.is_some() || override_italic {
             override_style = {
@@ -841,7 +903,21 @@ impl FontConfigInner {
         Ok(loaded)
     }
 
+    /// Drop the interface fonts built for a family that has since been
+    /// changed with `set_ui_font_family`.
+    fn forget_stale_ui_fonts(&self) {
+        let generation = UI_FONT_GENERATION.load(::std::sync::atomic::Ordering::Relaxed);
+        if self.ui_font_generation.replace(generation) != generation {
+            self.title_font.borrow_mut().take();
+            self.pane_select_font.borrow_mut().take();
+            self.char_select_font.borrow_mut().take();
+            self.command_palette_font.borrow_mut().take();
+            self.entity_font_overrides.borrow_mut().clear();
+        }
+    }
+
     fn title_font(&self, myself: &Rc<Self>) -> anyhow::Result<Rc<LoadedFont>> {
+        self.forget_stale_ui_fonts();
         let mut title_font = self.title_font.borrow_mut();
 
         if let Some(entry) = title_font.as_ref() {
@@ -856,6 +932,7 @@ impl FontConfigInner {
     }
 
     fn command_palette_font(&self, myself: &Rc<Self>) -> anyhow::Result<Rc<LoadedFont>> {
+        self.forget_stale_ui_fonts();
         let mut command_palette_font = self.command_palette_font.borrow_mut();
 
         if let Some(entry) = command_palette_font.as_ref() {
@@ -871,6 +948,7 @@ impl FontConfigInner {
     }
 
     fn char_select_font(&self, myself: &Rc<Self>) -> anyhow::Result<Rc<LoadedFont>> {
+        self.forget_stale_ui_fonts();
         let mut char_select_font = self.char_select_font.borrow_mut();
 
         if let Some(entry) = char_select_font.as_ref() {
@@ -885,6 +963,7 @@ impl FontConfigInner {
     }
 
     fn pane_select_font(&self, myself: &Rc<Self>) -> anyhow::Result<Rc<LoadedFont>> {
+        self.forget_stale_ui_fonts();
         let mut pane_select_font = self.pane_select_font.borrow_mut();
 
         if let Some(entry) = pane_select_font.as_ref() {
@@ -906,6 +985,7 @@ impl FontConfigInner {
         font_weight: Option<u16>,
         italic: bool,
     ) -> anyhow::Result<Rc<LoadedFont>> {
+        self.forget_stale_ui_fonts();
         let font_size = font_size.clamp(6.0, 72.0);
         let font_weight = font_weight.unwrap_or(0);
         let key = (entity, font_size.to_bits(), font_weight, italic);
@@ -1441,6 +1521,30 @@ impl FontConfiguration {
         self.inner.locator.enumerate_all_fonts()
     }
 
+    /// Every family there is to choose from -- the system's, those in the
+    /// configured font directories and the built-in ones -- by name, in
+    /// alphabetical order. Families the system keeps for itself, whose names
+    /// start with a dot, are left out.
+    pub fn list_font_families(&self) -> Vec<String> {
+        let mut families = self
+            .inner
+            .locator
+            .enumerate_family_names()
+            .unwrap_or_else(|err| {
+                log::warn!("listing the system's font families: {err:#}");
+                vec![]
+            });
+        families.extend(
+            self.list_fonts_in_font_dirs()
+                .into_iter()
+                .map(|font| font.names().family.clone()),
+        );
+        families.retain(|family| !family.is_empty() && !family.starts_with('.'));
+        families.sort_by_cached_key(|family| (family.to_lowercase(), family.clone()));
+        families.dedup();
+        families
+    }
+
     /// Apply the defined font_rules from the user configuration to
     /// produce the text style that best matches the supplied input
     /// cell attributes.
@@ -1457,8 +1561,13 @@ impl FontConfiguration {
 mod tests {
     use super::*;
 
+    /// The interface's family is the whole process's, and a test that
+    /// changes it would drop the fonts another is holding to compare.
+    static UI_FONT_FAMILY_IN_USE: Mutex<()> = Mutex::new(());
+
     #[test]
     fn dpi_change_invalidates_sized_entity_font_cache() -> anyhow::Result<()> {
+        let _family = UI_FONT_FAMILY_IN_USE.lock().unwrap();
         let fonts = FontConfiguration::new(Some(ConfigHandle::default_config()), 144)?;
 
         let retina = fonts.title_font_with_size(15.0)?;
@@ -1476,6 +1585,38 @@ mod tests {
         let retina_again = fonts.title_font_with_size(15.0)?;
         assert_eq!(retina_again.dpi, 144);
         assert_ne!(retina_again.id(), standard.id());
+
+        Ok(())
+    }
+
+    #[test]
+    fn the_interface_is_drawn_with_the_family_chosen_for_it() -> anyhow::Result<()> {
+        fn family(font: anyhow::Result<Rc<LoadedFont>>) -> anyhow::Result<String> {
+            Ok(font?.clone_handles()[0].names().family.clone())
+        }
+
+        let _family = UI_FONT_FAMILY_IN_USE.lock().unwrap();
+        let fonts = FontConfiguration::new(Some(ConfigHandle::default_config()), 144)?;
+
+        // Not Helvetica Neue, which was next in the list while the system's
+        // own font could not be found.
+        let system = family(fonts.title_font_with_size(15.0))?;
+        assert_ne!(system, "Helvetica Neue");
+        assert_eq!(family(fonts.command_palette_font_with_size(15.0))?, system);
+
+        // A window that already holds fonts takes the change up as well.
+        assert!(set_ui_font_family(Some(" Menlo ".to_string())));
+        assert!(!set_ui_font_family(Some("Menlo".to_string())));
+        let chosen = fonts.title_font_with_size(15.0)?;
+        assert_eq!(family(Ok(Rc::clone(&chosen)))?, "Menlo");
+        assert_eq!(family(fonts.title_font())?, "Menlo");
+        assert_eq!(family(fonts.command_palette_font_with_size(15.0))?, "Menlo");
+        assert!(Rc::ptr_eq(&chosen, &fonts.title_font_with_size(15.0)?));
+
+        // An empty name is no choice.
+        assert!(set_ui_font_family(Some(String::new())));
+        assert_eq!(ui_font_family(), None);
+        assert_eq!(family(fonts.title_font_with_size(15.0))?, system);
 
         Ok(())
     }
