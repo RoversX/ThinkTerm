@@ -6,6 +6,7 @@ use crate::keymap::{map_key, DomKey};
 use crate::page::WebApp;
 use crate::platform::{PointerInput, WheelDelta, WheelInput};
 use wezterm_term::KeyModifiers;
+use std::cell::Cell;
 use std::rc::Rc;
 use web_sys::{
     ClipboardEvent, CompositionEvent, Event, HtmlCanvasElement, HtmlTextAreaElement, InputEvent,
@@ -28,6 +29,11 @@ fn mouse_modifiers(ev: &web_sys::MouseEvent) -> KeyModifiers {
     }
     m
 }
+
+/// How long after an input method put its text in a Return marked 229 is
+/// still its own, in milliseconds: WebKit sends the Return that ended it
+/// then (as `PluginPanel.svelte` knows too).
+const ENDED_COMPOSING_MS: f64 = 500.0;
 
 fn pointer_input(ev: &PointerEvent) -> PointerInput {
     PointerInput {
@@ -73,13 +79,35 @@ pub fn install(app: Rc<WebApp>, canvas: &HtmlCanvasElement, textarea: &HtmlTextA
         });
     }
     let window = web_sys::window().expect("window");
+    // When an input method last put its text in.
+    let composed = Rc::new(Cell::new(f64::NEG_INFINITY));
+    // Only WebKit (Safari, and every browser on iOS) ends a composition
+    // before the key that ended it. Elsewhere that key comes first, marked
+    // composing, and a Return or Backspace just after is the user's own --
+    // on an Android keyboard, marked 229 like every other key.
+    let webkit = js_sys::Reflect::get(&window.navigator(), &"vendor".into())
+        .ok()
+        .and_then(|vendor| vendor.as_string())
+        .is_some_and(|vendor| vendor.starts_with("Apple"));
 
     {
         let app = Rc::downgrade(&app);
+        let composed = Rc::clone(&composed);
         platform.listen::<KeyboardEvent>(textarea, "keydown", move |ev| {
             let Some(app) = app.upgrade() else { return };
             let key = ev.key();
             let code = ev.code();
+            // WebKit ends a composition before the key that ended it
+            // arrives, unmarked but for keyCode 229: the Return that picked
+            // a candidate is not the pane's.
+            if webkit
+                && ev.key_code() == 229
+                && key == "Enter"
+                && ev.time_stamp() - composed.get() < ENDED_COMPOSING_MS
+            {
+                composed.set(f64::NEG_INFINITY);
+                return;
+            }
             let dom = DomKey {
                 key: &key,
                 code: &code,
@@ -126,8 +154,10 @@ pub fn install(app: Rc<WebApp>, canvas: &HtmlCanvasElement, textarea: &HtmlTextA
     {
         let app = Rc::downgrade(&app);
         let textarea = textarea.clone();
+        let composed = Rc::clone(&composed);
         platform.listen::<CompositionEvent>(&textarea.clone(), "compositionend", move |ev| {
             let Some(app) = app.upgrade() else { return };
+            composed.set(ev.time_stamp());
             app.composing(false);
             if let Some(text) = ev.data() {
                 if !text.is_empty() {
