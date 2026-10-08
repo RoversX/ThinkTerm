@@ -48,6 +48,10 @@ varbincode.workspace = true
 zstd.workspace = true
 thinkterm-plugin-channel = { workspace = true, features = ["native"] }
 thinkterm-proto.workspace = true
+thinkterm-core.workspace = true
+thinkterm-tab-icons.workspace = true
+thinkterm-update.workspace = true
+wezterm-ssh.workspace = true
 
 [target."cfg(unix)".dependencies]
 passfd.workspace = true

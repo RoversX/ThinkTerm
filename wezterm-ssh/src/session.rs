@@ -7,8 +7,11 @@ use crate::sftp::{Sftp, SftpRequest};
 use filedescriptor::{socketpair, FileDescriptor};
 use portable_pty::PtySize;
 use smol::channel::{bounded, Receiver, Sender};
+use socket2::Socket;
 use std::collections::HashMap;
 use std::io::Write;
+use std::net::Shutdown;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -85,6 +88,45 @@ pub(crate) struct Exec {
 #[derive(Clone)]
 pub struct Session {
     tx: SessionSender,
+    shutdown: Arc<SessionShutdown>,
+}
+
+/// Shutting down a duplicate interrupts even a backend blocked in its
+/// handshake or a channel request. Sending a request alone cannot do that.
+#[derive(Default)]
+pub(crate) struct SessionShutdown {
+    stopped: AtomicBool,
+    socket: Mutex<Option<Socket>>,
+}
+
+impl SessionShutdown {
+    pub(crate) fn check(&self) -> anyhow::Result<()> {
+        if self.stopped.load(Ordering::Acquire) {
+            anyhow::bail!("SSH session was shut down");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn watch(&self, socket: &Socket) -> anyhow::Result<()> {
+        let mut watched = self.socket.lock().unwrap_or_else(|e| e.into_inner());
+        if self.check().is_err() {
+            let _ = socket.shutdown(Shutdown::Both);
+            anyhow::bail!("SSH session was shut down");
+        }
+        *watched = Some(socket.try_clone()?);
+        Ok(())
+    }
+
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        if let Some(socket) = self.socket.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        self.socket.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
 }
 
 impl Drop for Session {
@@ -95,6 +137,15 @@ impl Drop for Session {
 }
 
 impl Session {
+    /// Abort this session, including open channels and pending requests.
+    /// All clones refer to the same connection; ordinary drop still lets
+    /// its existing channels finish.
+    pub fn shutdown(&self) {
+        self.shutdown.stop();
+        self.tx.tx.close();
+        self.tx.post_send();
+    }
+
     pub fn connect(config: ConfigMap) -> anyhow::Result<(Self, Receiver<SessionEvent>)> {
         let (tx_event, rx_event) = bounded(8);
         let (tx_req, rx_req) = bounded(8);
@@ -117,6 +168,7 @@ impl Session {
         });
 
         let now = Instant::now();
+        let shutdown = Arc::new(SessionShutdown::default());
 
         let mut inner = SessionInner {
             config,
@@ -132,9 +184,16 @@ impl Session {
             shown_accept_env_error: false,
             last_keep_alive: now,
             keep_alive,
+            shutdown: Arc::clone(&shutdown),
         };
         std::thread::spawn(move || inner.run());
-        Ok((Self { tx: session_sender }, rx_event))
+        Ok((
+            Self {
+                tx: session_sender,
+                shutdown,
+            },
+            rx_event,
+        ))
     }
 
     pub async fn request_pty(
@@ -204,4 +263,60 @@ pub struct ExecResult {
     pub stdout: FileDescriptor,
     pub stderr: FileDescriptor,
     pub child: SshChildProcess,
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::io::Read;
+    #[cfg(windows)]
+    use std::net::{Ipv4Addr, TcpListener, TcpStream as Stream};
+    #[cfg(unix)]
+    use std::os::unix::net::UnixStream as Stream;
+
+    #[cfg(unix)]
+    fn pair() -> (Socket, Stream) {
+        let (socket, peer) = Stream::pair().unwrap();
+        (std::os::fd::OwnedFd::from(socket).into(), peer)
+    }
+
+    #[cfg(windows)]
+    fn pair() -> (Socket, Stream) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let peer = Stream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        (socket.into(), peer)
+    }
+
+    #[test]
+    fn shutdown_interrupts_a_blocked_transport_read() {
+        let (socket, _peer) = pair();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let shutdown = SessionShutdown::default();
+        shutdown.watch(&socket).unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            #[cfg(unix)]
+            let mut stream = Stream::from(std::os::fd::OwnedFd::from(socket));
+            #[cfg(windows)]
+            let mut stream = Stream::from(socket);
+            sent.send(stream.read(&mut [0u8; 1])).unwrap();
+        });
+        shutdown.stop();
+        let result = received.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(result, Ok(0)), "{:?}", result);
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_rejects_a_transport_that_arrives_late() {
+        let shutdown = SessionShutdown::default();
+        shutdown.stop();
+        let (socket, mut peer) = pair();
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        assert!(shutdown.watch(&socket).is_err());
+        assert_eq!(peer.read(&mut [0u8; 1]).unwrap(), 0);
+    }
 }

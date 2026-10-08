@@ -1317,6 +1317,11 @@ impl Mux {
         &self.runtime_server_id
     }
 
+    /// The agent socket panes here are given (`SSH_AUTH_SOCK`), if any.
+    pub fn ssh_agent_path(&self) -> Option<std::path::PathBuf> {
+        self.agent.as_ref().map(|agent| agent.path().to_path_buf())
+    }
+
     fn get_default_workspace(&self) -> String {
         let config = configuration();
         config

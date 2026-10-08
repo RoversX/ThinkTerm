@@ -24,6 +24,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// The one subprotocol the browser client speaks. A token rides beside it
 /// in the same header, the only request header a browser lets a page set.
 pub const SUBPROTOCOL: &str = "thinkterm.v1";
+/// The page asking this server to reach another machine for it
+/// (`web_relay`): the same token, a different conversation.
+pub const RELAY_SUBPROTOCOL: &str = "thinkterm.relay.v1";
 pub const TOKEN_PROTOCOL_PREFIX: &str = "tt-token.";
 
 const MAX_HEAD: usize = 16 * 1024;
@@ -282,7 +285,8 @@ pub enum Route {
     /// Serve this file from the bundle.
     Static(PathBuf),
     /// A WebSocket upgrade carrying a token; verified by the caller.
-    Upgrade { key: String, token: String },
+    /// `relay` is the page asking for another machine rather than this one.
+    Upgrade { key: String, token: String, relay: bool },
     Reject { status: u16, reason: &'static str },
 }
 
@@ -332,7 +336,8 @@ pub fn route(site: &WebSite, req: &Request) -> Route {
         None => return reject(403, "Origin required"),
     }
     let protocols = req.header_list("sec-websocket-protocol");
-    if !protocols.iter().any(|p| p == SUBPROTOCOL) {
+    let relay = !protocols.iter().any(|p| p == SUBPROTOCOL);
+    if relay && !protocols.iter().any(|p| p == RELAY_SUBPROTOCOL) {
         return reject(400, "Unknown WebSocket subprotocol");
     }
     let mut tokens = protocols
@@ -342,6 +347,7 @@ pub fn route(site: &WebSite, req: &Request) -> Route {
         (Some(token), None) if !token.is_empty() => Route::Upgrade {
             key: key.to_string(),
             token: token.to_string(),
+            relay,
         },
         _ => reject(401, "Web token required"),
     }
@@ -757,7 +763,7 @@ where
             )
             .await
         }
-        Route::Upgrade { key, token } => {
+        Route::Upgrade { key, token, relay } => {
             // Taken here and nowhere else: the header belongs to the
             // connection being admitted, and there is no second chance to
             // read it once the socket becomes a mux stream.
@@ -782,18 +788,31 @@ where
             // Admitted: the seat is for the unauthenticated wait only.
             drop(seat);
             let accept = accept_key(&key);
+            let protocol = if relay { RELAY_SUBPROTOCOL } else { SUBPROTOCOL };
             let reply = format!(
                 "HTTP/1.1 101 Switching Protocols\r\n\
                  Upgrade: websocket\r\n\
                  Connection: Upgrade\r\n\
                  Sec-WebSocket-Accept: {accept}\r\n\
-                 Sec-WebSocket-Protocol: {SUBPROTOCOL}\r\n\r\n"
+                 Sec-WebSocket-Protocol: {protocol}\r\n\r\n"
             );
             if let Err(err) = stream.write_all(reply.as_bytes()).await {
                 log::debug!("web socket upgrade reply failed: {err}");
                 return;
             }
             let _ = stream.flush().await;
+            let leftover = head[head_len..].to_vec();
+            if relay {
+                log::info!(
+                    "web relay admitted on {} with token {}",
+                    site.describe,
+                    admission.token_id
+                );
+                crate::web_relay::serve(Prefixed::new(leftover, stream), admission.revoked.clone())
+                    .await;
+                drop(admission);
+                return;
+            }
             // The token id when the link has no name of its own: a peer
             // has to be called something in `list-clients`, and the id is
             // the one handle that is always there and always unique.
@@ -812,7 +831,6 @@ where
                 username: site.username.clone(),
                 revoked: admission.revoked.clone(),
             });
-            let leftover = head[head_len..].to_vec();
             let ws = WebStream::new(Prefixed::new(leftover, stream));
             if let Err(err) = process_stream(ws, peer).await {
                 log::error!("web client connection ended: {err:#}");
@@ -1001,9 +1019,16 @@ mod tests {
             route(&site, &good),
             Route::Upgrade {
                 key: "dGhlIHNhbXBsZSBub25jZQ==".into(),
-                token: "abc".into()
+                token: "abc".into(),
+                relay: false,
             }
         );
+        let relay = request(
+            "GET",
+            "/ws",
+            &upgrade_headers("http://localhost:8088", "thinkterm.relay.v1, tt-token.abc"),
+        );
+        assert!(matches!(route(&site, &relay), Route::Upgrade { relay: true, .. }));
         let foreign = request(
             "GET",
             "/ws",

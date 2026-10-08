@@ -3,7 +3,9 @@ use crate::config::ConfigMap;
 use crate::dirwrap::DirWrap;
 use crate::filewrap::FileWrap;
 use crate::pty::*;
-use crate::session::{Exec, ExecResult, SessionEvent, SessionRequest, SignalChannel};
+use crate::session::{
+    Exec, ExecResult, SessionEvent, SessionRequest, SessionShutdown, SignalChannel,
+};
 use crate::sessionwrap::SessionWrap;
 use crate::sftp::dir::{Dir, DirId, DirRequest};
 use crate::sftp::file::{File, FileId, FileRequest};
@@ -20,6 +22,7 @@ use socket2::{Domain, Socket, Type};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -57,10 +60,12 @@ pub(crate) struct SessionInner {
     pub shown_accept_env_error: bool,
     pub last_keep_alive: Instant,
     pub keep_alive: Option<Duration>,
+    pub shutdown: Arc<SessionShutdown>,
 }
 
 impl Drop for SessionInner {
     fn drop(&mut self) {
+        self.shutdown.clear();
         log::trace!("Dropping SessionInner");
     }
 }
@@ -75,6 +80,7 @@ impl SessionInner {
     }
 
     fn run_impl(&mut self) -> anyhow::Result<()> {
+        self.shutdown.check()?;
         let backend = self
             .config
             .get("wezterm_ssh_backend")
@@ -213,6 +219,7 @@ impl SessionInner {
         }
 
         let (sock, _child) = self.connect_to_host(&hostname, port, verbose)?;
+        self.shutdown.watch(&sock)?;
         let raw = {
             #[cfg(unix)]
             {
@@ -297,6 +304,7 @@ impl SessionInner {
             .context("notifying user of banner")?;
 
         let (sock, _child) = self.connect_to_host(&hostname, port, verbose)?;
+        self.shutdown.watch(&sock)?;
 
         let mut sess = ssh2::Session::new()?;
         if verbose {
@@ -341,6 +349,7 @@ impl SessionInner {
         port: u16,
         verbose: bool,
     ) -> anyhow::Result<(Socket, Option<KillOnDropChild>)> {
+        self.shutdown.check()?;
         match self.config.get("proxycommand").map(|s| s.as_str()) {
             Some("none") | None => {}
             Some(proxy_command) => {
@@ -359,30 +368,34 @@ impl SessionInner {
                 cmd.stdin(b.as_stdio()?);
                 cmd.stdout(b.as_stdio()?);
                 cmd.stderr(std::process::Stdio::inherit());
-                let child = cmd
-                    .spawn()
-                    .with_context(|| format!("spawning ProxyCommand {}", proxy_command))?;
+                let child = KillOnDropChild(
+                    cmd.spawn()
+                        .with_context(|| format!("spawning ProxyCommand {}", proxy_command))?,
+                );
+
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsFd;
+                    let socket = Socket::from(a.as_fd().try_clone_to_owned()?);
+                    self.shutdown.watch(&socket)?;
+                }
 
                 #[cfg(unix)]
                 unsafe {
                     use passfd::FdPassingExt;
-                    use std::os::unix::io::{FromRawFd, IntoRawFd};
+                    use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 
-                    let raw = a.into_raw_fd();
                     let dest = match self.config.get("proxyusefdpass").map(|s| s.as_str()) {
-                        Some("yes") => raw.recv_fd()?,
-                        _ => raw,
+                        Some("yes") => a.as_raw_fd().recv_fd()?,
+                        _ => a.into_raw_fd(),
                     };
 
-                    return Ok((Socket::from_raw_fd(dest), Some(KillOnDropChild(child))));
+                    return Ok((Socket::from_raw_fd(dest), Some(child)));
                 }
                 #[cfg(windows)]
                 unsafe {
                     use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-                    return Ok((
-                        Socket::from_raw_socket(a.into_raw_socket()),
-                        Some(KillOnDropChild(child)),
-                    ));
+                    return Ok((Socket::from_raw_socket(a.into_raw_socket()), Some(child)));
                 }
             }
         }
@@ -395,6 +408,7 @@ impl SessionInner {
             log::info!("resolved {hostname}:{port} -> {addr:?}");
         }
         let sock = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
+        self.shutdown.watch(&sock)?;
         if let Some(bind_addr) = self.config.get("bindaddress") {
             let bind_addr = (bind_addr.as_str(), 0)
                 .to_socket_addrs()?
@@ -432,6 +446,7 @@ impl SessionInner {
                     .with_context(|| format!("Connecting to {hostname}:{port} ({addr:?})"))?;
             }
         }
+        self.shutdown.check()?;
         Ok((sock, None))
     }
 
@@ -495,6 +510,7 @@ impl SessionInner {
         let mut idle_wakes: u32 = 0;
 
         loop {
+            self.shutdown.check()?;
             self.do_keepalive(sess)?;
             let mut made_progress = self.tick_io()?;
             made_progress |= self.drain_request_pipe();
@@ -798,6 +814,7 @@ impl SessionInner {
     }
 
     fn dispatch_one_request(&mut self, sess: &mut SessionWrap) -> anyhow::Result<bool> {
+        self.shutdown.check()?;
         match self.rx_req.try_recv() {
             Err(TryRecvError::Closed) => anyhow::bail!("all clients are closed"),
             Err(TryRecvError::Empty) => Ok(false),
