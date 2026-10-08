@@ -1060,16 +1060,6 @@ fn color_with_alpha(color: LinearRgba, alpha: f32) -> LinearRgba {
     LinearRgba(color.0, color.1, color.2, alpha.clamp(0.0, 1.0))
 }
 
-/// Whether a glyph that starts at `pos_x` and moves the pen by `advance`
-/// fits text that ends at `right_edge`.
-///
-/// Decided by the advance alone, as `measure_text_width` and the ellipsis
-/// decide, so a box sized to its measured text keeps its last glyph: some
-/// fonts draw a pixel or two of ink past their advance, and that ink is
-/// drawn into the box's padding. Half a pixel of slack absorbs rounding
-/// between measuring and drawing. Every whole-glyph painter of UI text
-/// decides this way; a surface that must not draw past its edge clips by
-/// pixel instead.
 /// What strings shaped to, for a surface that draws the same text many
 /// times a second. Shaping is the costly part of drawing a label: a
 /// fallback font shared between sizes works out its metrics again each
@@ -1100,6 +1090,16 @@ impl ShapedText {
     }
 }
 
+/// Whether a glyph that starts at `pos_x` and moves the pen by `advance`
+/// fits text that ends at `right_edge`.
+///
+/// Decided by the advance alone, as `measure_text_width` and the ellipsis
+/// decide, so a box sized to its measured text keeps its last glyph: some
+/// fonts draw a pixel or two of ink past their advance, and that ink is
+/// drawn into the box's padding. Half a pixel of slack absorbs rounding
+/// between measuring and drawing. Every whole-glyph painter of UI text
+/// decides this way; a surface that must not draw past its edge clips by
+/// pixel instead.
 pub(crate) fn glyph_fits(pos_x: f32, advance: f32, right_edge: f32) -> bool {
     pos_x + advance <= right_edge + 0.5
 }
