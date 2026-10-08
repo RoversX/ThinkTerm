@@ -1,3 +1,4 @@
+use crate::tab_icons::RgbExt as _;
 use crate::quad::{
     HeapQuadAllocator, QuadClipRect, QuadTrait, TripleLayerQuadAllocator,
     TripleLayerQuadAllocatorTrait,

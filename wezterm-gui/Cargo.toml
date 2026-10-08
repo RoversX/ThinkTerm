@@ -121,6 +121,7 @@ thiserror.workspace = true
 tiny-skia.workspace = true
 thinkterm-syntax = { path = "../thinkterm-syntax" }
 thinkterm-core.workspace = true
+thinkterm-tab-icons.workspace = true
 thinkterm-plugin-channel = { workspace = true, features = ["native"] }
 thinkterm-plugin-panel.workspace = true
 thinkterm-snippets = { workspace = true, features = ["native"] }

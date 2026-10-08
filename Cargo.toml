@@ -24,6 +24,7 @@ members = [
   "plugins/example",
   "plugins/stocks",
   "thinkterm-session",
+  "thinkterm-tab-icons",
   "thinkterm-snippets",
   "thinkterm-web",
   "thinkterm-tui",
@@ -196,6 +197,7 @@ thinkterm-plugin-sdk = { path = "thinkterm-plugin-sdk" }
 thinkterm-proto = { path = "thinkterm-proto" }
 thinkterm-render = { path = "thinkterm-render" }
 thinkterm-session = { path = "thinkterm-session" }
+thinkterm-tab-icons = { path = "thinkterm-tab-icons" }
 thinkterm-snippets = { path = "thinkterm-snippets", default-features = false }
 thinkterm-web = { path = "thinkterm-web" }
 thinkterm-update = { path = "thinkterm-update" }

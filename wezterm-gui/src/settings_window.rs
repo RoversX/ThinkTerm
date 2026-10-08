@@ -1,3 +1,4 @@
+use crate::tab_icons::RgbExt as _;
 use crate::customglyph::{BlockKey, Poly};
 use crate::glyphcache::CachedGlyph;
 use crate::quad::{

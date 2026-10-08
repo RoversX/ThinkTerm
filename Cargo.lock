@@ -8787,6 +8787,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkterm-tab-icons"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thinkterm-proto",
+]
+
+[[package]]
 name = "thinkterm-tui"
 version = "0.1.0"
 dependencies = [
@@ -10656,6 +10665,7 @@ dependencies = [
  "thinkterm-render",
  "thinkterm-snippets",
  "thinkterm-syntax",
+ "thinkterm-tab-icons",
  "thinkterm-update",
  "thiserror 1.0.69",
  "tiny-skia",

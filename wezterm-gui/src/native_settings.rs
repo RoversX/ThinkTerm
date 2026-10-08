@@ -1164,36 +1164,11 @@ pub(crate) fn apply_keymap_to_app() {
     crate::commands::CommandDef::recreate_menubar(&config::configuration());
 }
 
-/// How pane tabs are dressed: see `crate::tab_icons`.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
-#[serde(default)]
-pub(crate) struct NativeTabIconSettings {
-    /// Absent means on.
-    pub(crate) enabled: Option<bool>,
-    /// Built-in cards the user changed, and the user's own cards, in the
-    /// order they are shown.
-    pub(crate) cards: Vec<NativeTabIconCard>,
-}
-
-/// One card's settings. On a built-in card every field left `None` keeps
-/// the built-in value, so a future default still reaches whoever never
-/// touched it.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
-#[serde(default)]
-pub(crate) struct NativeTabIconCard {
-    /// A built-in card's id (`python`), or `custom-<n>` for the user's own.
-    pub(crate) id: String,
-    /// The user's own cards only; a built-in keeps its own name.
-    pub(crate) name: Option<String>,
-    /// Replaces the card's program list.
-    pub(crate) programs: Option<Vec<String>>,
-    /// An imported SVG, by the hex SHA-256 of its bytes, replacing the glyph.
-    pub(crate) svg: Option<String>,
-    /// `#RRGGBB`.
-    pub(crate) circle: Option<String>,
-    /// `#RRGGBB`.
-    pub(crate) glyph: Option<String>,
-}
+/// How pane tabs are dressed: see `crate::tab_icons`. The structs are the
+/// shared crate's, so a server reading this file sees what the desktop does.
+pub(crate) use thinkterm_tab_icons::{
+    TabIconCard as NativeTabIconCard, TabIconSettings as NativeTabIconSettings,
+};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]

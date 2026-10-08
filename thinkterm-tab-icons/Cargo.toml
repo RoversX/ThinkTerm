@@ -1,0 +1,16 @@
+[package]
+name = "thinkterm-tab-icons"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The tab icon cards and which card a pane gets: shared by the desktop and
+# the browser client, so it stays free of anything that cannot build for
+# wasm32.
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+thinkterm-proto.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
