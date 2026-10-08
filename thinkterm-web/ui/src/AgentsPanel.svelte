@@ -37,9 +37,13 @@
 
   // What the panel shows is followed only while it is up: the snippets,
   // and the server's connection to the plugin host for them, go with it.
+  // The client is the one on show when the panel came up: with several
+  // machines the panel comes up afresh for each, and puts down what the
+  // last one followed.
   $effect(() => {
-    handle.client?.set_right_panel_shown(true);
-    return () => handle.client?.set_right_panel_shown(false);
+    const client = handle.client;
+    client?.set_right_panel_shown(true);
+    return () => client?.set_right_panel_shown(false);
   });
 
   // A click anywhere in a row is that row's, as it is on the desktop: the

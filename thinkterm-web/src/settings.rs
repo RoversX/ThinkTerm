@@ -60,6 +60,9 @@ pub struct WebSettings {
     pub auto_reconnect: bool,
     /// The bars over the panes; a phone can do without them.
     pub pane_bars: bool,
+    /// The program's icon at the head of each tab, as the desktop draws
+    /// it from that machine's cards.
+    pub tab_icons: bool,
 }
 
 /// A colour scheme as the page hands it over, straight out of
@@ -126,6 +129,7 @@ impl Default for WebSettings {
             resize_mode: ResizeMode::Live,
             auto_reconnect: true,
             pane_bars: true,
+            tab_icons: true,
         }
     }
 }

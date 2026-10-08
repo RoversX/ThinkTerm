@@ -234,6 +234,10 @@ impl Platform for MobilePlatform {
         true
     }
 
+    fn bare_lone_pane(&self) -> bool {
+        true
+    }
+
     fn set_title(&self, title: &str) {
         self.notify.on_title(title.to_string());
     }

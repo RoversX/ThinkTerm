@@ -34,6 +34,7 @@ pub mod raster;
 pub mod settings;
 pub mod sidebar;
 pub mod snippets;
+pub mod tab_icons;
 pub mod tree;
 pub mod viewport;
 pub mod views;

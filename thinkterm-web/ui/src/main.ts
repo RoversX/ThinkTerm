@@ -2,10 +2,12 @@
 import { flushSync, mount } from 'svelte';
 import App from './App.svelte';
 import { handle } from './client';
-import { attach, setBoot } from './client.svelte';
+import { activate, attach, setBoot, views } from './client.svelte';
+import { configure as configureMachines, fetchTabIcons } from './machines.svelte';
+import { dress, setTabIcons } from './tabicons.svelte';
 import { watchMobile } from './mobile.svelte';
 import { storedPicks, watchHotkey } from './palette.svelte';
-import { applyTheme, previewScheme, storedScheme, storedSettings, storedSpace } from './settings.svelte';
+import { applyTheme, FOLLOW_DESKTOP, previewScheme, storedScheme, storedSettings, storedSpace } from './settings.svelte';
 import type { Theme } from './model';
 import './tokens.css';
 
@@ -95,6 +97,7 @@ async function fetchFont(url: string): Promise<Uint8Array> {
 }
 
 try {
+  setBoot("Loading ThinkTerm…", false, 0);
   const glueUrl = new URL("pkg/thinkterm_web.js", document.baseURI).href;
   const mod = await import(/* @vite-ignore */ glueUrl) as Glue;
   await mod.default();
@@ -117,10 +120,13 @@ try {
     setBoot("GRAPHICS " + await mod.graphics_check(names, data, fontSize));
   } else {
     if (!token) throw new Error("no token: open the URL that `thinkterm cli web-token mint` printed");
+    setBoot("Loading fonts…", false, 1);
     const names = FONTS.map(([n]) => n);
     const data = await Promise.all(FONTS.map(([, u]) => fetchFont(u)));
+    setBoot("Connecting…", false, 2);
     const scheme = location.protocol === "https:" ? "wss" : "ws";
-    handle.client = await mod.start("term", "kbd", `${scheme}://${location.host}/ws`, token, names, data, fontSize, glyphFont, fontPinned, locale, languages);
+    const hub = await mod.start("term", "kbd", `${scheme}://${location.host}/ws`, token, names, data, fontSize, glyphFont, fontPinned, locale, languages, undefined);
+    handle.client = hub;
     // The preferences go over whole: the wasm checks them and applies the
     // language and the font itself. A refusal is worth a line in the
     // console, not a failed boot -- the defaults are perfectly usable.
@@ -129,7 +135,8 @@ try {
     // The picked scheme's colours were stored with its name, so the first
     // frame is already in it and nothing waits on schemes.json.
     if (settings["terminal-scheme"] && settings["terminal-scheme"] !== "desktop") previewScheme(storedScheme());
-    attach(handle.client);
+    attach(hub);
+    activate(hub);
     // Which locale the preference came to, for the settings panel to name.
     document.documentElement.lang = handle.client.set_locale(locale, languages);
     handle.client.set_recent(storedPicks());
@@ -137,6 +144,30 @@ try {
     // and the sidebar simply stays where it landed.
     const space = storedSpace();
     if (space !== "") handle.client.set_space(space);
+    // Other machines, through this server: each a client of its own, with
+    // this browser's preferences as they stand when it opens.
+    configureMachines({
+      // The language as it stands now, not as this load began: start()
+      // activates the one it is given, for the whole page.
+      start: (canvas, textarea, opener) =>
+        mod.start(canvas, textarea, "", token as string, names, data, fontSize, glyphFont, fontPinned, String(views.settings.language || "system"), languages, opener),
+      token: token as string,
+      prepare: (client) => {
+        client.apply_settings(JSON.stringify(views.settings));
+        client.set_locale(String(views.settings.language), languages);
+        if (views.settings["terminal-scheme"] !== FOLLOW_DESKTOP) {
+          const picked = storedScheme();
+          if (picked) client.set_terminal_palette(JSON.stringify(picked));
+        }
+        client.set_recent(storedPicks());
+        dress(client);
+      },
+    }, hub);
+    // The cards this server's desktop dresses its tabs with; without them
+    // (a relay that cannot say) the tabs keep the plain terminal mark.
+    void fetchTabIcons().then((catalog) => {
+      if (catalog !== null) setTabIcons(catalog);
+    });
   }
 } catch (e) {
   const err = e as { message?: string } | null;

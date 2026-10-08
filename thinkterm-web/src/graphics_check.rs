@@ -123,6 +123,7 @@ async fn run(names: Vec<String>, fonts: Vec<js_sys::Uint8Array>, size: f64) -> R
                     cursor_shape: None,
                     cursor_hidden: false,
                     min_contrast: 0.0,
+                    composing: None,
                 },
             )?;
         }
@@ -249,6 +250,7 @@ async fn image_atlas_check(gpu: &mut Gpu, surface: (u32, u32), cell: (u32, u32))
                 origin: (0.0, 0.0), clip: (w, h), hsv: None,
                 draw_cursor: false, cursor_shape: None, cursor_hidden: true,
                 min_contrast: 0.0,
+                composing: None,
             };
             graphics.collect_line(gpu, 0, &params, (cw, ch), (1.0, 1.0), [0.0, 0.0, w, h])?;
         }
@@ -380,6 +382,7 @@ async fn image_check(
         cursor_shape: None,
         cursor_hidden: true,
         min_contrast: 0.0,
+        composing: None,
     };
     let mut graphics = Graphics::default();
     for _ in 0..3 {

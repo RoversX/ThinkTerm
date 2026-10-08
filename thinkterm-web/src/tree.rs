@@ -90,7 +90,7 @@ pub struct TreeProject {
 }
 
 /// A Space as the Space menu lists it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SpaceEntry {
     pub id: String,
     pub name: String,
@@ -105,6 +105,8 @@ pub struct TreeModel {
     pub agents: HashMap<PaneId, AgentState>,
     /// The agent's id and the pane's title as the server reported them.
     agent_details: HashMap<PaneId, (String, String)>,
+    /// Panes whose agent reported its own end.
+    agents_ended: HashSet<PaneId>,
     pub collapsed: HashSet<String>,
     pub archived_open: bool,
     /// The Space the sidebar shows; the first one until chosen.
@@ -169,12 +171,27 @@ impl TreeModel {
                 self.agents.insert(pane_id, s.state);
                 let title = self.agent_details.get(&pane_id).map(|(_, t)| t.clone()).unwrap_or_default();
                 self.agent_details.insert(pane_id, (s.agent_id.clone(), title));
+                if s.ended {
+                    self.agents_ended.insert(pane_id);
+                } else {
+                    self.agents_ended.remove(&pane_id);
+                }
             }
             None => {
                 self.agents.remove(&pane_id);
                 self.agent_details.remove(&pane_id);
+                self.agents_ended.remove(&pane_id);
             }
         }
+    }
+
+    /// The agent a pane runs, by id, until it reports its own end: what
+    /// picks the pane's tab icon, as on the desktop.
+    pub fn agent_id(&self, pane_id: PaneId) -> Option<&str> {
+        if !self.agents.contains_key(&pane_id) || self.agents_ended.contains(&pane_id) {
+            return None;
+        }
+        self.agent_details.get(&pane_id).map(|(id, _)| id.as_str())
     }
 
     /// The windows the server has, for the ones no thread claims.

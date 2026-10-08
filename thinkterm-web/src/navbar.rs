@@ -150,6 +150,8 @@ pub struct CapsuleView {
     pub title: String,
     pub busy: bool,
     pub current: bool,
+    /// The card heading it (`tab_icons`); none with tab icons off.
+    pub icon: Option<String>,
 }
 
 

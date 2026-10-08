@@ -74,6 +74,10 @@ const COMMANDS: &[(&str, &str, &str, &str)] = &[
     ("follow", "web-cmd-follow", "eye", ""),
     ("toggle-sidebar", "web-cmd-toggle-sidebar", "panel-left", ""),
     ("settings", "sidebar-settings", "settings", ""),
+    // The desktop's Shell › Remote Hosts… and Add Remote Host…: the page's
+    // own, as Settings is.
+    ("remote-hosts", "web-machines-title", "network", ""),
+    ("add-remote-host", "menu-add-remote-host", "plus", ""),
     ("font-up", "web-cmd-font-up", "zoom-in", "Cmd+="),
     ("font-down", "web-cmd-font-down", "zoom-out", "Cmd+-"),
     ("font-reset", "web-cmd-font-reset", "rotate-ccw", "Cmd+0"),

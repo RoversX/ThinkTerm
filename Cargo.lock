@@ -8867,6 +8867,7 @@ dependencies = [
  "thinkterm-render",
  "thinkterm-session",
  "thinkterm-snippets",
+ "thinkterm-tab-icons",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

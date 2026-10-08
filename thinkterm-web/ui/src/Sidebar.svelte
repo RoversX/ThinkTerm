@@ -6,9 +6,9 @@
   import {
     archive, archiveRestore, chevronDown, chevronRight, circleAlert, circleCheck, circlePlus,
     bell, ellipsis, folder, folderOpen, folderPlus, layers, loaderCircle, panelLeft, pin, pinOff, plus,
-    trash2,
+    server, trash2,
   } from './icons';
-  import { menu, openMenu } from './menu.svelte';
+  import { menu, openMenu, toggleMenu } from './menu.svelte';
   import { armDrag } from './drag.svelte';
   import { handle } from './client';
   import { toggleSidebar } from './chrome';
@@ -18,6 +18,7 @@
   import { mobile, openSide } from './mobile.svelte';
   import { palette } from './palette.svelte';
   import { followSpace, panel } from './settings.svelte';
+  import { activeLabel, addWorkspaceOn, HERE, hidePanel, machines, stateText, togglePanel, workspaceMachines } from './machines.svelte';
   import type { FooterAction, SideRow } from './model';
 
   const rows = $derived(views.sidebar.rows);
@@ -45,9 +46,19 @@
 
   // The Space on show is this browser's; the next load opens on it, and
   // this is where that load asks for it back.
+  // Only this server's: another machine's Spaces are not this server's to
+  // reopen on.
   $effect(() => {
     const space = views.sidebar.space;
-    if (space) followSpace(space);
+    if (space && machines.active === HERE) followSpace(space);
+  });
+  /** The machine on show, when it is not this server, and how it is. */
+  const machine = $derived(activeLabel());
+  /** Another machine, behind the one on show, waits on an answer. */
+  const waiting = $derived(machines.open.find((o) => o.ask && o.id !== machines.active) ?? null);
+  const machineState = $derived.by(() => {
+    const m = machines.open.find((o) => o.id === machines.active);
+    return m ? stateText(m) : '';
   });
 
   // One row is one element, so a re-listing keeps the DOM it already has --
@@ -106,8 +117,9 @@
     const action = hit.getAttribute('data-action');
     let handled = false;
     switch (action) {
-      // The footer's two: the page's own panels, not the model's.
+      // The footer's three: the page's own panels, not the model's.
       case 'settings': openSettings(); handled = true; break;
+      case 'machines': togglePanel(); handled = true; break;
       case 'search': openPalette('threads'); handled = true; break;
       case 'new-thread': handled = sideClick('new-thread', project); break;
       case 'new-project': handled = sideClick('new-project'); break;
@@ -122,13 +134,13 @@
       // hangs under it.
       case 'space-menu': {
         const box = hit.getBoundingClientRect();
-        openMenu('space', '', box.left, box.bottom + 4);
+        toggleMenu('space', '', box.left, box.bottom + 4, hit);
         handled = true;
         break;
       }
       case 'notifications': {
         const box = hit.getBoundingClientRect();
-        openMenu('notifications', '', box.left, box.bottom + 4);
+        toggleMenu('notifications', '', box.left, box.bottom + 4, hit);
         handled = true;
         break;
       }
@@ -136,7 +148,7 @@
       // so the menu is anchored under the button rather than at a point.
       case 'sidebar-options': {
         const box = hit.getBoundingClientRect();
-        openMenu('sidebar-options', '', box.left, box.bottom + 4);
+        toggleMenu('sidebar-options', '', box.left, box.bottom + 4, hit);
         handled = true;
         break;
       }
@@ -150,9 +162,13 @@
         break;
     }
     if (handled) ev.preventDefault();
-    // On a phone the panel is a drawer over the canvas: picking a terminal
-    // is what it was opened for, so it goes away again.
-    if (handled && mobile.on && (thread !== null || hit.hasAttribute('data-window'))) openSide(false);
+    // Picking a terminal -- a thread, a window, a new thread -- puts the
+    // Remote Hosts page behind it, as the desktop's sidebar does.
+    const picked = action === 'new-thread' || (action === 'rename-thread' && ev.detail < 2) || (action === null && (thread !== null || hit.hasAttribute('data-window')));
+    if (handled && picked) hidePanel();
+    // On a phone the drawer goes away to reveal the chosen terminal or
+    // the Remote Hosts page.
+    if (handled && mobile.on && (thread !== null || hit.hasAttribute('data-window') || action === 'machines')) openSide(false);
   }
 
   // A press on a row is that row's menu: a thread's, a project's, or an
@@ -425,7 +441,7 @@
   <div class="list">
     {#each rows as row (key(row))}
       {#if row.kind === 'space'}
-        <div class="row space" data-action={editingSpace(row.id) ? undefined : 'space-menu'} title={s('web-tip-space')}>{@html layers}{#if editingSpace(row.id)}<input class="rename" value={row.name} spellcheck="false" use:typeHere>{:else}<span class="t">{row.name}</span>{/if}<span class="act">{@html ellipsis}</span></div>
+        <div class="row space" class:remote={machine !== ''} class:down={machineState !== '' || waiting !== null} data-action={editingSpace(row.id) ? undefined : 'space-menu'} title={machineState !== '' ? `${machine} · ${machineState}` : waiting ? `${waiting.label} · ${s('web-machines-needs-you')}` : s('web-tip-space')}>{@html machineState !== '' || waiting ? circleAlert : machine === '' ? layers : server}{#if editingSpace(row.id)}<input class="rename" value={row.name} spellcheck="false" use:typeHere>{:else}<span class="t">{#if machine !== ''}<span class="machine">{machine}</span><span class="sn">{row.name}</span>{:else}{row.name}{/if}</span>{/if}<span class="act">{@html ellipsis}</span></div>
       {:else if row.kind === 'new-thread'}
         <div class="top"><div class="pill" data-action="new-thread" title={s('web-tip-new-thread')}>{@html circlePlus}<span>{s('sidebar-new-thread')}</span></div><span class="act round" data-action="notifications" title={s('tooltip-sidebar-notifications')}>{@html bell}</span></div>
       {:else if row.kind === 'pinned'}
@@ -435,6 +451,12 @@
         {#if addingWorkspace}
           <div class="path" class:bad={!!addError}>
             <div class="lb">{@html folderPlus}<span>{s('web-add-workspace')}</span></div>
+            <!-- Which machine it goes on, once there is more than one. -->
+            {#if workspaceMachines().length > 1}
+              <select class="on" value={machines.active} title={s('web-machines-title')} onchange={(ev) => addWorkspaceOn((ev.currentTarget as HTMLSelectElement).value)}>
+                {#each workspaceMachines() as m (m.key)}<option value={m.key}>{m.label}</option>{/each}
+              </select>
+            {/if}
             <input
               placeholder={s('web-path-placeholder')}
               spellcheck="false"

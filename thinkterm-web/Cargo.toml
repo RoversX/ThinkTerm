@@ -36,6 +36,7 @@ thinkterm-proto.workspace = true
 thinkterm-render = { workspace = true, features = ["wgpu"] }
 thinkterm-session.workspace = true
 thinkterm-snippets.workspace = true
+thinkterm-tab-icons.workspace = true
 wezterm-color-types.workspace = true
 wezterm-term = { workspace = true, features = ["use_serde"] }
 wgpu.workspace = true

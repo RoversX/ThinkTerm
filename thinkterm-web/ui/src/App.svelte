@@ -3,6 +3,7 @@
   // and the remark are drawn here from the views the wasm publishes; the
   // canvas and the keyboard field are the wasm's, and it finds them by id.
   import AgentsPanel from './AgentsPanel.svelte';
+  import Boot from './Boot.svelte';
   import Card from './Card.svelte';
   import ContextMenu from './ContextMenu.svelte';
   import DragLayer from './DragLayer.svelte';
@@ -14,6 +15,8 @@
   import Status from './Status.svelte';
   import TabRow from './TabRow.svelte';
   import { views } from './client.svelte';
+  import { HERE, machines } from './machines.svelte';
+  import MachinesPanel from './MachinesPanel.svelte';
   import { openMenu } from './menu.svelte';
   import { mobile, openSide } from './mobile.svelte';
   import { paneAt } from './pane';
@@ -47,17 +50,31 @@
 
 <Sidebar />
 <TabRow />
-<canvas id="term" data-layout={views.layout} oncontextmenu={onCanvasMenu} use:touch></canvas>
+<!-- One canvas and one keyboard field per machine; the one on show is
+     #term and #kbd, which is how everything else finds it. -->
+<canvas id={machines.active === HERE ? 'term' : 'term-0'} class:off={machines.active !== HERE} data-layout={machines.active === HERE ? views.layout : undefined} oncontextmenu={onCanvasMenu} use:touch></canvas>
+{#each machines.open as m (m.n)}
+  <canvas id={machines.active === m.id ? 'term' : `term-${m.n}`} class:off={machines.active !== m.id} data-layout={machines.active === m.id ? views.layout : undefined} oncontextmenu={onCanvasMenu} use:touch></canvas>
+{/each}
 <NavBars />
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 {#if drawn}<div id="scrim" onclick={closeDrawers}></div>{/if}
 <Card />
-<textarea id="kbd" wrap="off" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
+<textarea id={machines.active === HERE ? 'kbd' : 'kbd-0'} class:off={machines.active !== HERE} wrap="off" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
+{#each machines.open as m (m.n)}
+  <textarea id={machines.active === m.id ? 'kbd' : `kbd-${m.n}`} class:off={machines.active !== m.id} wrap="off" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
+{/each}
 <Status />
-{#if views.settings['agents-panel']}<AgentsPanel />{/if}
-{#if mobile.on}<KeyBar />{/if}
+<!-- Each machine's own: they follow its client and its #term and #kbd,
+     so they come up afresh when another machine comes on show. -->
+{#key machines.active}
+  {#if views.settings['agents-panel']}<AgentsPanel />{/if}
+  {#if mobile.on}<KeyBar />{/if}
+{/key}
 <ContextMenu />
 <DragLayer />
 <SearchPalette />
 <SettingsPanel />
+<MachinesPanel />
+<Boot />

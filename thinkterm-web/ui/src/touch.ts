@@ -14,6 +14,7 @@
 // the press began. At the anchor the selection is empty, which is the one
 // case its Up throws the selection away instead of copying it.
 
+import { handle } from './client';
 import { openMenu } from './menu.svelte';
 import { focusTerminal, mobile, openSide } from './mobile.svelte';
 import { cellHeight, paneAt } from './pane';
@@ -36,8 +37,10 @@ const PINCH_STEP = 48;
 
 type Finger = { x: number; y: number };
 
-/** What the gesture turned out to be; `press` until it is decided. */
-type Mode = 'press' | 'scroll' | 'menu';
+/** What the gesture turned out to be; `press` until it is decided.
+    `divider` is a finger that landed on a split's divider: the wasm drags
+    it from there, with the pointer's own moves and release. */
+type Mode = 'press' | 'scroll' | 'menu' | 'divider';
 
 export function installTouch(canvas: HTMLCanvasElement): () => void {
   const fingers = new Map<number, Finger>();
@@ -199,6 +202,15 @@ export function installTouch(canvas: HTMLCanvasElement): () => void {
     // A finger on the glass stops whatever a fling was still scrolling.
     stopFling();
     fingers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+    if (first === null && handle.client?.touch_divider(ev.clientX, ev.clientY)) {
+      // Every move from here is the canvas's, even over a pane's bar.
+      first = ev.pointerId;
+      mode = 'divider';
+      canvas.setPointerCapture(ev.pointerId);
+      ev.stopImmediatePropagation();
+      ev.preventDefault();
+      return;
+    }
     if (first === null) {
       first = ev.pointerId;
       startX = ev.clientX;
@@ -239,6 +251,8 @@ export function installTouch(canvas: HTMLCanvasElement): () => void {
     if (!ev.isTrusted || ev.pointerType !== 'touch') return;
     if (!fingers.has(ev.pointerId)) return;
     fingers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+    // The divider's drag is the wasm's: its move goes through.
+    if (mode === 'divider') return;
     if (mode === 'menu') {
       ev.stopImmediatePropagation();
       return;
@@ -278,6 +292,15 @@ export function installTouch(canvas: HTMLCanvasElement): () => void {
   const up = (ev: PointerEvent) => {
     if (!ev.isTrusted || ev.pointerType !== 'touch') return;
     if (!fingers.delete(ev.pointerId)) return;
+    if (mode === 'divider') {
+      // The release ends the wasm's drag; it goes through as it is.
+      if (ev.pointerId === first) {
+        first = null;
+        mode = 'press';
+        fingers.clear();
+      }
+      return;
+    }
     // The wasm never saw this finger go down, so it must not see it come
     // up either; what it gets is the tap below, or nothing.
     ev.stopImmediatePropagation();

@@ -137,6 +137,18 @@ pub trait Platform: 'static {
     fn set_backing_size(&self, width: u32, height: u32) -> bool;
     /// The phone shape: no margin above and below the grid.
     fn is_mobile(&self) -> bool;
+    /// Whether a lone pane goes without its bar on a phone: the phone
+    /// app's way, as its terminal apps show one. A page keeps the
+    /// desktop's two rows of tabs.
+    fn bare_lone_pane(&self) -> bool {
+        false
+    }
+    /// Whether this client's terminal is on show. A page with several
+    /// machines shows one; the others keep their sessions but act on
+    /// nothing a person did not ask them to.
+    fn shown(&self) -> bool {
+        true
+    }
 
     // ----- the shell -----
 

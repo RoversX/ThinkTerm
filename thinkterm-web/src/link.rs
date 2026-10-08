@@ -22,6 +22,8 @@ use web_sys::{BinaryType, MessageEvent, WebSocket};
 
 pub const SUBPROTOCOL: &str = "thinkterm.v1";
 pub const TOKEN_PROTOCOL_PREFIX: &str = "tt-token.";
+/// Another machine, reached through the page's server (`web_relay` there).
+pub const RELAY_SUBPROTOCOL: &str = "thinkterm.relay.v1";
 
 // Allow one maximum codec payload plus its three varint header fields.
 // Independent chunk accounting bounds overhead for tiny WebSocket messages.
@@ -141,6 +143,11 @@ struct Inner {
     pub lease: RefCell<Lease>,
     url: String,
     token: String,
+    /// For another machine: the page's own code opens the socket and
+    /// answers the relay's questions (a password, a host key), and hands
+    /// it back ready to carry the mux connection. Used in place of `url`
+    /// for every connect, reconnects included.
+    opener: Option<js_sys::Function>,
 }
 
 /// A handle on the connection; clone freely.
@@ -152,6 +159,16 @@ impl WsLink {
     /// the server to accept it.
     pub async fn connect(url: &str, token: &str) -> Result<Self> {
         let socket = Self::open(url, token).await?;
+        Ok(Self::around(socket, url, token, None))
+    }
+
+    /// Reach another machine through `opener`; see `Inner::opener`.
+    pub async fn connect_via(opener: js_sys::Function) -> Result<Self> {
+        let socket = Self::open_via(&opener).await?;
+        Ok(Self::around(socket, "", "", Some(opener)))
+    }
+
+    fn around(socket: Rc<Socket>, url: &str, token: &str, opener: Option<js_sys::Function>) -> Self {
         let link = Self(Rc::new(Inner {
             socket: RefCell::new(socket),
             serials: RefCell::new(SerialTable::new()),
@@ -162,9 +179,42 @@ impl WsLink {
             lease: RefCell::new(Lease::default()),
             url: url.to_string(),
             token: token.to_string(),
+            opener,
         }));
         link.spawn_reader();
-        Ok(link)
+        link
+    }
+
+    /// Ask the page for a socket to the other machine, already past the
+    /// relay's questions.
+    async fn open_via(opener: &js_sys::Function) -> Result<Rc<Socket>> {
+        fn text(value: &JsValue) -> String {
+            value
+                .as_string()
+                .or_else(|| value.dyn_ref::<js_sys::Error>().map(|e| String::from(e.message())))
+                .unwrap_or_else(|| format!("{value:?}"))
+        }
+        let promise: js_sys::Promise = opener
+            .call0(&JsValue::NULL)
+            .map_err(|e| anyhow!("{}", text(&e)))?
+            .dyn_into()
+            .map_err(|_| anyhow!("the page did not hand back a promise for the socket"))?;
+        let ws: WebSocket = wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .map_err(|e| anyhow!("{}", text(&e)))?
+            .dyn_into()
+            .map_err(|_| anyhow!("the page did not hand back a socket"))?;
+        let socket = Self::adopt(ws);
+        // Closed between the relay's "ready" and here: nothing to adopt.
+        if socket.ws.ready_state() != WebSocket::OPEN {
+            socket.retire();
+            anyhow::bail!("the connection to the machine closed as it opened");
+        }
+        if socket.ws.protocol() != RELAY_SUBPROTOCOL {
+            socket.retire();
+            anyhow::bail!("the server did not select the {RELAY_SUBPROTOCOL} subprotocol");
+        }
+        Ok(socket)
     }
 
     /// Open a socket and wait for the server to accept the token.
@@ -174,12 +224,24 @@ impl WsLink {
         protocols.push(&JsValue::from_str(&format!("{TOKEN_PROTOCOL_PREFIX}{token}")));
         let ws = WebSocket::new_with_str_sequence(url, &protocols)
             .map_err(|e| anyhow!("WebSocket::new: {e:?}"))?;
+        let socket = Self::adopt(ws);
+        Self::opened(&socket).await?;
+        if socket.ws.protocol() != SUBPROTOCOL {
+            socket.retire();
+            anyhow::bail!("the server did not select the {SUBPROTOCOL} subprotocol");
+        }
+        Ok(socket)
+    }
+
+    /// The socket's events, wired to a `Socket`; it may be open already.
+    fn adopt(ws: WebSocket) -> Rc<Socket> {
         ws.set_binary_type(BinaryType::Arraybuffer);
+        let open = ws.ready_state() == WebSocket::OPEN;
         let socket = Rc::new(Socket {
             ws,
             incoming: RefCell::new(ByteQueue::new(MAX_RECEIVE_BYTES, MAX_RECEIVE_CHUNKS)),
             waker: RefCell::new(None),
-            open: Cell::new(false),
+            open: Cell::new(open),
             closed: Cell::new(false),
             close_reason: RefCell::new(String::new()),
             _closures: RefCell::new(Vec::new()),
@@ -253,7 +315,11 @@ impl WsLink {
             closures.push(c);
         }
         *socket._closures.borrow_mut() = closures;
+        socket
+    }
 
+    /// Wait for the server to accept the socket.
+    async fn opened(socket: &Rc<Socket>) -> Result<()> {
         let opened = futures::future::poll_fn(|cx| {
             if socket.open.get() {
                 Poll::Ready(Ok(()))
@@ -281,12 +347,7 @@ impl WsLink {
             socket.retire();
             return Err(err);
         }
-        if socket.ws.protocol() != SUBPROTOCOL {
-            socket.retire();
-            anyhow::bail!("the server did not select the {SUBPROTOCOL} subprotocol");
-        }
-
-        Ok(socket)
+        Ok(())
     }
 
     /// Put a fresh socket under this handle.
@@ -296,7 +357,10 @@ impl WsLink {
     /// swapping the socket underneath them is what makes a reconnect
     /// invisible to everything above.
     pub async fn reconnect_to(&self) -> Result<()> {
-        let socket = Self::open(&self.0.url, &self.0.token).await?;
+        let socket = match &self.0.opener {
+            Some(opener) => Self::open_via(opener).await?,
+            None => Self::open(&self.0.url, &self.0.token).await?,
+        };
         // Anything still waiting was waiting on the old socket and will
         // never be answered; the new server has never heard of those
         // serials.

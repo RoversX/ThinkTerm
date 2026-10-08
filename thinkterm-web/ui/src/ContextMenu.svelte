@@ -3,7 +3,7 @@
   // offers and what a row does are the wasm's (thinkterm-web/src/menu.rs);
   // drawn here, clamped into the viewport, walked with the pointer or the
   // keyboard, and closed by anything that means the page moved on.
-  import { closeInnermost, closeMenu, menu, runItem } from './menu.svelte';
+  import { closeInnermost, closeMenu, menu, menuTrigger, runItem } from './menu.svelte';
   import { chevronRight, iconByName } from './icons';
   import { mobile } from './mobile.svelte';
   import type { MenuItem } from './model';
@@ -99,10 +99,23 @@
     if (menu.items.length === 0) return;
     const inside = (target: EventTarget | null) =>
       target instanceof Node && boxes.some((b) => !!b && b.contains(target));
+    // The button the menu came from closes it itself, on its click:
+    // closing here as well had the click open it again, a flash.
     const down = (ev: Event) => {
+      const from = menuTrigger();
+      if (from && ev.target instanceof Node && from.contains(ev.target)) return;
       if (!inside(ev.target)) closeMenu();
     };
     const away = () => closeMenu();
+    // A wheel is the page moving on only outside the menu, and only once
+    // the menu has been up a moment: a trackpad's scroll coasts on after
+    // the fingers lift, and a menu opened just after scrolling the sidebar
+    // used to close itself on the coast.
+    const opened = performance.now();
+    const wheel = (ev: Event) => {
+      if (inside(ev.target) || performance.now() - opened < 400) return;
+      closeMenu();
+    };
     // On a phone a resize is the soft keyboard coming or going, which is
     // not the page moving on; the menu that opened the keyboard's owner
     // must not vanish because of it.
@@ -112,12 +125,12 @@
     window.addEventListener('pointerdown', down, true);
     window.addEventListener('blur', away);
     window.addEventListener('resize', resized);
-    window.addEventListener('wheel', away, { capture: true, passive: true });
+    window.addEventListener('wheel', wheel, { capture: true, passive: true });
     return () => {
       window.removeEventListener('pointerdown', down, true);
       window.removeEventListener('blur', away);
       window.removeEventListener('resize', resized);
-      window.removeEventListener('wheel', away, { capture: true });
+      window.removeEventListener('wheel', wheel, { capture: true });
     };
   });
 

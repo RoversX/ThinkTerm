@@ -10,7 +10,7 @@ use crate::glyphs::{CachedGlyph, GlyphCache};
 use anyhow::{Context, Result};
 use std::ops::Range;
 use std::rc::Rc;
-use termwiz::cell::{Intensity, Underline};
+use termwiz::cell::{unicode_column_width, Intensity, Underline};
 use termwiz::surface::{CursorShape, CursorVisibility, Line};
 use thinkterm_font_core::PresentationWidth;
 use thinkterm_font_web::GlyphRole;
@@ -52,6 +52,10 @@ pub struct LineParams<'a> {
     /// A WCAG contrast ratio text is lifted to against its background;
     /// under 1 is off.
     pub min_contrast: f32,
+    /// What an input method is composing, drawn over the row at the cursor
+    /// as the desktop draws it (`screen_line.rs`): in the cursor's colours,
+    /// the cursor a block as wide as the text.
+    pub composing: Option<&'a str>,
 }
 
 /// A flat rectangle at `at` of `size`, both in device pixels from the
@@ -142,22 +146,41 @@ pub fn emit_line(
     if p.line.is_double_height_bottom() {
         return Ok(());
     }
+    let cursor_on_row = p.stable_row == p.cursor.y;
+    // The text being composed, over a copy of the row from the cursor on;
+    // only where the cursor is drawn, as only one pane has the keys.
+    let composing = p
+        .composing
+        .filter(|text| cursor_on_row && p.draw_cursor && !text.is_empty());
+    let composed;
+    let line = match composing {
+        Some(text) => {
+            let mut copy = p.line.clone();
+            let seqno = copy.current_seqno();
+            copy.overlay_text_with_attribute(p.cursor.x, text, CellAttributes::blank(), seqno);
+            composed = copy;
+            &composed
+        }
+        None => p.line,
+    };
+    let composing_width = composing.map_or(0, |text| unicode_column_width(text, None));
     let metrics = cache.metrics;
-    let width_scale: f32 = if p.line.is_single_width() { 1.0 } else { 2.0 };
-    let height_scale: f32 = if p.line.is_double_height_top() { 2.0 } else { 1.0 };
+    let width_scale: f32 = if line.is_single_width() { 1.0 } else { 2.0 };
+    let height_scale: f32 = if line.is_double_height_top() { 2.0 } else { 1.0 };
     let cell_width = metrics.cell_size.width as f32 * width_scale;
     let cell_height = metrics.cell_size.height as f32 * height_scale;
     let gl_x = -p.surface.0 / 2.0 + p.origin.0;
     let pos_y = -p.surface.1 / 2.0 + p.origin.1 + p.top_pixel_y;
     let pixel_width = p.clip.0;
 
-    let cursor_on_row = p.stable_row == p.cursor.y;
     let cursor_cell = if cursor_on_row {
-        p.line.get_cell(p.cursor.x)
+        line.get_cell(p.cursor.x)
     } else {
         None
     };
-    let cursor_range = if cursor_on_row {
+    let cursor_range = if composing_width > 0 {
+        p.cursor.x..p.cursor.x + composing_width
+    } else if cursor_on_row {
         p.cursor.x..p.cursor.x + cursor_cell.as_ref().map(|c| c.width()).unwrap_or(1)
     } else {
         0..0
@@ -169,12 +192,19 @@ pub fn emit_line(
     } else {
         p.selection.start as f32 * cell_width..p.selection.end as f32 * cell_width
     };
-    let cursor_visible = p.draw_cursor
-        && cursor_on_row
-        && !p.cursor_hidden
-        && p.cursor.visibility == CursorVisibility::Visible;
-    let cursor_shape = p.cursor_shape.unwrap_or(p.cursor.shape);
-    let filled_cursor = cursor_visible && p.focused && is_block(cursor_shape);
+    // Composing, the text is on show whatever the blink or the program
+    // asked of the cursor, in a block, as on the desktop.
+    let cursor_visible = composing.is_some()
+        || (p.draw_cursor
+            && cursor_on_row
+            && !p.cursor_hidden
+            && p.cursor.visibility == CursorVisibility::Visible);
+    let cursor_shape = if composing.is_some() {
+        CursorShape::Default
+    } else {
+        p.cursor_shape.unwrap_or(p.cursor.shape)
+    };
+    let filled_cursor = cursor_visible && (p.focused || composing.is_some()) && is_block(cursor_shape);
 
     let selection_fg = p.palette.selection_fg.to_linear();
     let selection_bg = p.palette.selection_bg.to_linear();
@@ -210,7 +240,7 @@ pub fn emit_line(
         underline: Option<(thinkterm_render::bitmaps::TextureRect, LinearRgba)>,
         glyphs: Vec<(u8, Rc<CachedGlyph>)>,
     }
-    let clusters = p.line.cluster(None);
+    let clusters = line.cluster(None);
     let mut shaped: Vec<Shaped> = Vec::with_capacity(clusters.len());
     for cluster in &clusters {
         let attrs = &cluster.attrs;
@@ -357,14 +387,14 @@ pub fn emit_line(
     // The cursor: filled when this page has focus and the shape is a
     // block, an outline when it does not, bar and underline as themselves.
     if cursor_visible {
-        let (shape, color) = if !p.focused {
+        let (shape, color) = if !p.focused && composing.is_none() {
             (CursorShape::SteadyBlock, cursor_border)
         } else if is_block(cursor_shape) {
             (CursorShape::Default, cursor_bg)
         } else {
             (cursor_shape, cursor_bg)
         };
-        let width_cells = (cursor_range.end - cursor_range.start).max(1) as u8;
+        let width_cells = (cursor_range.end - cursor_range.start).clamp(1, u8::MAX as usize) as u8;
         let sprite = cache.cursor_sprite(Some(shape), width_cells)?;
         let x = gl_x + cursor_range_pixels.start;
         let mut quad = layers.allocate(2).context("allocate")?;

@@ -7,9 +7,10 @@
 import { handle } from './client';
 import { refreshViews, views } from './client.svelte';
 import { toggleSidebar } from './chrome';
+import { hidePanel, openPanel, togglePanel } from './machines.svelte';
 import type { Hotkey, PaletteEntry, PaletteOutcome, PaletteResults } from './model';
 import { openSettings, setSetting } from './settings.svelte';
-import { focusTerminal } from './mobile.svelte';
+import { focusTerminal, openSide } from './mobile.svelte';
 
 /** Where this browser keeps the picks, most recent first. */
 const RECENT = 'thinkterm.recent';
@@ -107,6 +108,14 @@ export function run(id: string) {
   }
   closePalette();
   if (!outcome.handled) return;
+  // Every pick but the page's own acts on a terminal -- a thread, a tab, a
+  // pane, a Space, a command -- and that terminal comes in front of the
+  // Remote Hosts page, as it does on the desktop, and of the drawer the
+  // palette may have been opened from on a phone.
+  if (outcome.page === null) {
+    openSide(false);
+    hidePanel();
+  }
   // What the pick changed is on show before this returns, as it is for a
   // menu row: the client's own notice is a frame away.
   refreshViews();
@@ -114,6 +123,8 @@ export function run(id: string) {
   const page = outcome.page;
   if (page === 'toggle-sidebar') toggleSidebar();
   else if (page === 'settings') openSettings();
+  else if (page === 'remote-hosts') togglePanel();
+  else if (page === 'add-remote-host') openPanel(true);
   else if (page !== null && page.startsWith('lang:')) {
     // The wasm activated the language; the preference is the page's to
     // keep, and storing it is what makes the next load open in it.

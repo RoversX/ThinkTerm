@@ -6,6 +6,7 @@
   // and the model's next state says how that went.
   import { handle } from './client';
   import { views } from './client.svelte';
+  import { focusTerminal } from './mobile.svelte';
 
   const card = $derived(views.status.card);
   const taking = $derived(card?.state === 'taking');
@@ -27,7 +28,7 @@
     handle.client?.take_over();
     // The keyboard stays the terminal's: a button that took focus would
     // keep the keys once the card is gone.
-    document.getElementById('kbd')?.focus({ preventScroll: true });
+    focusTerminal();
   }
 </script>
 

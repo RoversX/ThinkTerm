@@ -3,7 +3,7 @@
 // shows, kept in runes so the components follow it.
 
 import { flushSync } from 'svelte';
-import { handle, type Client } from './client';
+import { everyClient, handle, type Client } from './client';
 import type { AgentsView, NavsView, PluginsView, SidebarView, SnippetsView, StatusView, Strings, TabsView, WebSettings } from './model';
 
 export const views = $state({
@@ -42,8 +42,11 @@ export const views = $state({
   /** The page's own labels in the active language; empty until attached. */
   strings: {} as Strings,
   /** What the page says before the client exists: the boot, or its failure. */
-  boot: 'loading…',
+  boot: 'Loading…',
   bootFailed: false,
+  /** Which step of the start the page is on: 0 the client's own code,
+      1 the fonts, 2 the connection; the boot screen's bar. */
+  bootStage: 0,
   /** The client is attached; the views below are its, not the boot's. */
   ready: false,
 });
@@ -54,32 +57,59 @@ export function s(id: string): string {
 }
 
 /** The boot's progress, and the probes' one-line results. */
-export function setBoot(text: string, failed = false) {
+export function setBoot(text: string, failed = false, stage?: number) {
   views.boot = text;
   views.bootFailed = failed;
+  if (stage !== undefined) views.bootStage = stage;
 }
 
-/** Re-read every view now. Set by `attach`; a no-op before it. */
+/** Re-read every view now. Set by `activate`; a no-op before it. */
 let refresh: () => void = () => {};
 
-/** Follow a client's views. Called once, right after `start()` resolves. */
-export function attach(client: Client) {
-  // The views are re-listed every frame something moved and are mostly the
-  // same string as last time; parsing only what changed keeps the whole
-  // chrome from being diffed for a cursor blink.
-  let lastTabs = '';
-  let lastNavs = '';
-  let lastStatus = '';
-  let lastStrings = '';
-  let lastSidebar = '';
-  let lastAgents = '';
-  // The snippets can be long; their view is read only when it moved.
-  let lastSnippets = -1;
-  let lastPlugins = -1;
-  let lastPanel = -1;
-  let lastExtended = -1;
-  let lastSettings = '';
-  const read = () => {
+// The views are re-listed every frame something moved and are mostly the
+// same string as last time; parsing only what changed keeps the whole
+// chrome from being diffed for a cursor blink. Kept for the client on show
+// and forgotten when another comes on.
+let lastTabs = '';
+let lastNavs = '';
+let lastStatus = '';
+let lastStrings = '';
+let lastSidebar = '';
+let lastAgents = '';
+// The snippets can be long; their view is read only when it moved.
+let lastSnippets = -1;
+let lastPlugins = -1;
+let lastPanel = -1;
+let lastExtended = -1;
+let lastSettings = '';
+
+function forget() {
+  lastTabs = lastNavs = lastStatus = lastStrings = lastSidebar = lastAgents = lastSettings = '';
+  lastSnippets = lastPlugins = lastPanel = lastExtended = -1;
+}
+
+/** Follow a client: its views are read whenever they change while it is
+    the one on show, and `also` hears of every change regardless. */
+export function attach(client: Client, also: () => void = () => {}) {
+  client.on_change(() => {
+    also();
+    if (handle.client === client) read();
+  });
+}
+
+/** Put a client's views on show: the chrome draws it from here on. */
+export function activate(client: Client) {
+  handle.client = client;
+  forget();
+  refresh = read;
+  views.ready = true;
+  read();
+}
+
+function read() {
+  const client = handle.client;
+  if (!client) return;
+  {
     const strings = client.strings();
     if (strings !== lastStrings) {
       lastStrings = strings;
@@ -140,11 +170,7 @@ export function attach(client: Client) {
       views.settings = JSON.parse(settings) as WebSettings;
     }
     views.layout = client.layout();
-  };
-  refresh = read;
-  views.ready = true;
-  // Registering calls it once, so the first frame is the client's.
-  client.on_change(read);
+  }
 }
 
 /** Re-read every view and put it on show now, for a caller that went to
@@ -157,7 +183,9 @@ export function refreshViews() {
 /** Switch the interface language; returns the locale it resolved to. */
 export function setLocale(preference: string): string {
   if (!handle.client) return '';
-  const code = handle.client.set_locale(preference, Array.from(navigator.languages ?? [navigator.language]));
+  const languages = Array.from(navigator.languages ?? [navigator.language]);
+  for (const other of everyClient()) if (other !== handle.client) other.set_locale(preference, languages);
+  const code = handle.client.set_locale(preference, languages);
   refresh();
   flushSync();
   return code;

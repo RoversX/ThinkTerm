@@ -18,6 +18,12 @@
   --btn: #262628; --btn-hover: #313134; --btn-border: rgba(118,118,128,.35);
   --row-hover: #232326; --row-sel: #3E3E41;
   --card: #1D1D1F; --card-border: rgba(118,118,128,.22); --card-line: rgba(118,118,128,.24); --dot: rgba(242,242,247,.16);
+  /* The settings window's nav rows and squares (`sidebar_row_*`,
+     `paint_active_row_shadow`, `ROW_TILE`). */
+  --nav-hover: rgba(42,42,44,.98); --nav-sel: rgba(54,54,57,.98); --nav-sel-border: rgba(118,118,128,.22);
+  --nav-shadow: .18; --tile-shadow: .35;
+  /* How dark a tab icon's shadow is (tab_icons.rs PLATE). */
+  --ticon-shadow: 50%;
   --fade: background-color .12s ease, border-color .12s ease, color .12s ease, box-shadow .12s ease;
 }
 body[data-side=off] { --side-w: 0px; }
@@ -38,6 +44,9 @@ body:not([data-agents]), body:not([data-extended]) { --ext-w: 0px; }
   --row-hover: rgba(28,28,30,.06); --row-sel: rgba(255,255,255,.94);
   --card: rgba(255,255,255,.72); --card-border: rgba(60,60,67,.16); --card-line: rgba(60,60,67,.14);
   --dot: rgba(28,28,30,.22);
+  --nav-hover: rgba(60,60,67,.08); --nav-sel: rgba(255,255,255,.78); --nav-sel-border: rgba(60,60,67,.18);
+  --nav-shadow: .05; --tile-shadow: .18;
+  --ticon-shadow: 32%;
 }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text2); font: 500 14px var(--ui); overflow: hidden; }
 /* The page is mounted into #app; it generates no box of its own, so the
@@ -51,6 +60,9 @@ svg { width: 16px; height: 16px; flex: none; }
 #tabs .tab { display: inline-flex; align-items: center; flex: 0 0 auto; width: 128px; height: 30px; box-sizing: border-box; padding: 0 9px; border-radius: 999px; border: 1px solid transparent; color: var(--text2); cursor: default; transition: var(--fade); }
 #tabs .tab:hover { background: var(--ctl-hover); }
 #tabs .tab.current { background: var(--ctl); border-color: var(--ctl-border); box-shadow: var(--shadow); color: var(--text); }
+/* The Remote Hosts tab takes the width its title needs: in a terminal
+   tab's 128px it read "Remot…". */
+#tabs .tab[data-page-tab] { width: auto; min-width: 128px; }
 .t { margin-left: 4px; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .x { display: none; margin-left: 4px; width: 22px; height: 22px; border-radius: 999px; align-items: center; justify-content: center; opacity: .82; flex: none; }
 .current .x, .tab:hover .x, .cap:hover .x { display: inline-flex; }
@@ -67,6 +79,8 @@ svg { width: 16px; height: 16px; flex: none; }
 /* Its own layer: the sidebar's edge moves the canvas on every drag frame,
    and a promoted layer moves instead of being laid out again. */
 canvas#term { will-change: transform; }
+/* Another machine's terminal, behind the one on show (machines.svelte.ts). */
+canvas.off, textarea.off { display: none; }
 /* One bar over each pane, laid out from the canvas's cells. */
 #panes { position: absolute; inset: var(--tabs) calc(var(--agents-w) + var(--ext-w)) 0 var(--side-w); pointer-events: none; overflow: hidden; }
 /* The desktop's left sidebar: Spaces, Projects, Threads. Every row's box
@@ -90,19 +104,20 @@ body[data-side=off]:not([data-mobile]) #side.revealed {
 }
 #side .list { position: absolute; inset: 26px 10px 44px 10px; overflow-y: auto; scrollbar-width: thin; display: flex; flex-direction: column; gap: 5px; padding-bottom: 8px; }
 /* The footer as the desktop ends its sidebar: a row of icons, the gear at
-   the left inset and the thread search at the right, no rule above. */
+   the left inset and Remote Hosts and the thread search at the right, no
+   rule above. */
 #side .foot { position: absolute; left: 13px; right: 13px; bottom: 0; height: 58px; display: flex; align-items: center; justify-content: space-between; }
 #side .foot .act { width: 28px; height: 28px; color: var(--text2); border-radius: 8px; }
 /* The gear carries its label, as the desktop's footer does; the row is the
-   label's own width, and the search stays at the right inset. */
-#side .foot .act.lbl { width: auto; min-width: 28px; max-width: calc(100% - 34px); padding: 0 7px; gap: 6px; justify-content: flex-start; font-size: 14px; }
+   label's own width, and gives way before the right-hand actions do. */
+#side .foot .act.lbl { width: auto; min-width: 28px; flex: 0 1 auto; overflow: hidden; padding: 0 7px; gap: 6px; justify-content: flex-start; font-size: 14px; }
 #side .foot .act.lbl .tl { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Under the width the model says the label needs, the gear is a lone
    button again -- `.narrow` is set from that number, not from a media
    query with a number of its own. */
 #side.narrow .foot .act.lbl .tl { display: none; }
-#side .foot .act svg { width: 16px; height: 16px; }
-#side .foot .acts { display: inline-flex; align-items: center; gap: 3px; }
+#side .foot .act svg { width: 16px; height: 16px; flex: none; }
+#side .foot .acts { display: inline-flex; flex: none; align-items: center; gap: 3px; }
 #side .foot .act:hover { color: var(--text); background: var(--row-hover); }
 /* Nothing behind them yet: shown, as the desktop shows them, and inert. */
 #side .foot .act.off { color: var(--muted); opacity: .5; }
@@ -110,6 +125,7 @@ body[data-side=off]:not([data-mobile]) #side.revealed {
 /* The tab row's toggle stays above the revealed panel: a quick press pins
    the panel open without the reveal getting in the way. */
 #tabs [data-action=sidebar] { position: relative; z-index: 18; }
+#tabs .lead, #tabs .strip { display: contents; }
 /* Pinned open, the panel carries the toggle itself at its top-left, as the
    desktop's titlebar does; the tab row's copy shows only while it is away. */
 body:not([data-side=off]):not([data-mobile]) #tabs [data-action=sidebar] { display: none; }
@@ -135,6 +151,15 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 /* The Space row is the pill's height plus 6 design px, not a list row. */
 #side .row.space { min-height: 32px; cursor: default; }
 #side .row.space .act { width: 29px; height: 29px; margin-left: auto; color: var(--text2); }
+/* Another machine on show: its name ahead of the Space's, as the desktop
+   heads a server's Spaces in the menu, and the one that gives way when the
+   row is short. Not connected, the icon is the desktop's amber alert,
+   swapped in place so the row never moves. */
+#side .row.space.remote .t { display: flex; min-width: 0; }
+#side .row.space .machine { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--text); font-weight: 500; }
+#side .row.space .sn { flex: 0 0 auto; max-width: 60%; overflow: hidden; text-overflow: ellipsis; }
+#side .row.space .sn::before { content: '·'; margin: 0 6px; color: var(--muted); }
+#side .row.space.down > svg { color: var(--warn); }
 #side .row:hover { background: var(--row-hover); }
 #side .row.selected { background: var(--row-sel); border-color: rgba(118,118,128,.22); box-shadow: var(--shadow); }
 #side .row.selected .t { color: var(--text); }
@@ -186,6 +211,12 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 #side .path input::placeholder { color: var(--muted); }
 #side .path input:focus { border-color: var(--accent); }
 #side .path .hint { color: var(--muted); font-size: 12px; font-weight: 500; line-height: 1.35; word-break: break-word; }
+/* The machine it goes on: the field's own box and height, with the settings
+   window's drawn chevron rather than the browser's, which a dark ground
+   hides. */
+#side .path select.on { width: 100%; box-sizing: border-box; font: 400 14px var(--ui); color: var(--text); background-color: var(--ctl); border: 1px solid var(--ctl-border); border-radius: 7px; padding: 6px 26px 6px 8px; outline: none; appearance: none; -webkit-appearance: none; background-image: linear-gradient(45deg, transparent 50%, var(--text2) 50%), linear-gradient(135deg, var(--text2) 50%, transparent 50%); background-position: calc(100% - 15px) 55%, calc(100% - 10px) 55%; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; transition: var(--fade); }
+#side .path select.on:hover { background-color: var(--ctl-hover); }
+#side .path select.on:focus { border-color: var(--accent); }
 #side .path.bad input { border-color: var(--danger); }
 #side .path.bad .hint { color: var(--danger); }
 /* With no workspace yet, the header's round button is the only way in and
@@ -317,7 +348,13 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 #agents .se-field:focus { border-color: var(--edge); }
 #agents .se-body { min-height: 180px; flex: none; resize: vertical; font: 400 13px ui-monospace, "SF Mono", Menlo, monospace; line-height: 1.45; white-space: pre; overflow: auto; }
 #agents .se-body.want { border-color: var(--danger); }
-.nav { position: absolute; pointer-events: auto; box-sizing: border-box; display: flex; align-items: center; gap: 9px; padding: 0 5px; background: var(--bg); color: var(--text2); user-select: none; overflow: hidden; }
+.nav { position: absolute; pointer-events: auto; box-sizing: border-box; display: flex; align-items: flex-start; gap: 9px; padding: 0 5px; background: var(--bg); color: var(--text2); user-select: none; overflow: hidden; }
+/* The bar is the desktop's 47px, but the pane pays for it in whole rows
+   (and a pane at the top in its padding too): the capsules sit where they
+   would in a 47px bar at its top, and what the rounding adds is left
+   under them, as the desktop leaves it -- not split above and below. */
+.nav > .caps, .nav > .acts { margin-top: 8.5px; height: 30px; align-items: center; }
+body[data-mobile] .nav > .caps, body[data-mobile] .nav > .acts { margin-top: 6px; height: 40px; }
 .nav.focused { color: var(--text); }
 .nav .caps { display: flex; gap: 9px; flex: 1 1 auto; min-width: 0; overflow: hidden; }
 .nav .cap { display: inline-flex; align-items: center; flex: 0 0 auto; width: 128px; height: 30px; box-sizing: border-box; padding: 0 9px; border-radius: 999px; border: 1px solid transparent; background: var(--wash); color: var(--text2); cursor: default; }
@@ -330,6 +367,23 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 .nav .act svg { width: 13px; height: 13px; }
 .spin { display: inline-flex; animation: spin .96s steps(12) infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+/* A tab's icon (tabicons.svelte.ts), as the desktop draws it (tab_icons.rs
+   PLATE, paint_tab_circle_icon): the card's circle, concentric with the
+   capsule's rounded end (TAB_ICON_CIRCLE_INSET) -- lighter at the top,
+   darker at the foot, its rim the same more strongly, its shadow in its
+   own hue -- carrying the card's mark, or the spinner while the pane
+   works, at TAB_ICON_GLYPH_RATIO of its width. The card gives `--c` (the
+   circle), `--g` (the mark) and `--m` (the mark's shape). */
+.ticon {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  height: calc(100% - 4px); aspect-ratio: 1; margin-left: -7px; border-radius: 50%;
+  background: linear-gradient(color-mix(in srgb, var(--c), #fff 18%), color-mix(in srgb, var(--c), #000 13%));
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--c), #fff 42%), inset 0 -1px 0 color-mix(in srgb, var(--c), #000 25%),
+    0 1.25px 1.75px color-mix(in srgb, color-mix(in srgb, var(--c), #000 55%) var(--ticon-shadow), transparent);
+}
+.ticon > i { width: 56%; height: 56%; background: var(--g); -webkit-mask: var(--m) center / contain no-repeat; mask: var(--m) center / contain no-repeat; }
+.ticon .spin { width: 56%; height: 56%; color: var(--g); }
+.ticon .spin svg { width: 100%; height: 100%; }
 /* What the desktop shows over a terminal another device holds. */
 @keyframes card-in { from { opacity: 0; } to { opacity: 1; } }
 #card:not([hidden]) { animation: card-in .16s cubic-bezier(0,0,.2,1); }
@@ -354,8 +408,7 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 /* The panel arrives at the point it was asked for: a 120ms fade and a
    hair of scale from that corner. Its own measuring reads offsetWidth,
    which a transform does not move. */
-@keyframes menu-in { from { opacity: 0; transform: scale(.97); } to { opacity: 1; transform: scale(1); } }
-.menu { animation: menu-in .12s cubic-bezier(0,0,.2,1); transform-origin: top left; position: fixed; z-index: 20; min-width: 168px; max-width: 340px; box-sizing: border-box; padding: 5px; border-radius: 10px; background: var(--ctl); border: 1px solid var(--ctl-border); box-shadow: 0 8px 28px rgba(0,0,0,.42); color: var(--text); font: 500 13px var(--ui); user-select: none; outline: none; }
+.menu { position: fixed; z-index: 20; min-width: 168px; max-width: 340px; box-sizing: border-box; padding: 5px; border-radius: 10px; background: var(--ctl); border: 1px solid var(--ctl-border); box-shadow: 0 8px 28px rgba(0,0,0,.42); color: var(--text); font: 500 13px var(--ui); user-select: none; outline: none; }
 .menu .mi { display: flex; align-items: center; gap: 8px; height: 28px; box-sizing: border-box; padding: 0 8px; border-radius: 6px; white-space: nowrap; }
 .menu .mi:hover, .menu .mi.on { background: var(--ctl-hover); }
 .menu .mi.disabled { color: var(--muted); }
@@ -405,36 +458,60 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
    control pills right-aligned to the card's 18px inset. */
 #settings { --settings-tf: translate(-50%, -50%); position: fixed; z-index: 31; left: 50%; top: 50%; transform: var(--settings-tf); width: min(960px, 94vw); height: min(602px, 90vh); box-sizing: border-box; display: flex; background: var(--bg); border: 1px solid var(--ctl-border); border-radius: 20px; box-shadow: 0 24px 80px rgba(0,0,0,.55); color: var(--text); font: 500 14px var(--ui); overflow: hidden; outline: none; }
 #settings .sc { position: absolute; right: 12px; top: 12px; z-index: 1; display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: 999px; background: transparent; border: 0; color: var(--muted); transition: var(--fade); }
+#settings .back { display: none; }
 #settings .sc:hover { color: var(--text); background: var(--row-hover); }
 #settings .sc svg { width: 15px; height: 15px; }
-#settings .snav { flex: 0 0 220px; box-sizing: border-box; padding: 18px 14px; background: var(--side-bg); border-right: 1px solid var(--sep); display: flex; flex-direction: column; }
-#settings .app { font-size: 17px; font-weight: 700; color: var(--text); padding: 18px 3px 15px 3px; }
-#settings .find { display: flex; align-items: center; gap: 7px; height: 28px; box-sizing: border-box; padding: 0 10px; border-radius: 999px; background: var(--ctl); border: 1px solid var(--ctl-border); color: var(--muted); }
+#settings .snav { flex: 0 0 220px; box-sizing: border-box; padding: 36px 14px 16px 14px; background: var(--side-bg); border-right: 1px solid var(--sep); display: flex; flex-direction: column; }
+#settings .app { font-size: 17px; font-weight: 750; line-height: 22px; color: var(--text); padding: 0 3px 13px 3px; }
+#settings .find { display: flex; align-items: center; gap: 7px; flex: none; height: 28px; box-sizing: border-box; padding: 0 10px; border-radius: 999px; background: var(--ctl); border: 1px solid var(--ctl-border); color: var(--muted); }
 #settings .find svg { width: 14px; height: 14px; flex: none; }
 #settings .find input { flex: 1 1 auto; min-width: 0; background: transparent; border: 0; outline: none; color: var(--text); font: 500 13px var(--ui); }
-#settings .secs { display: flex; flex-direction: column; gap: 4px; margin-top: 11px; }
-/* 68 device px tall on a 76 px pitch at 2x, and the selected row is the
-   sidebar's own #3E3E41. A shadow rather than a border: a border on the
-   selected row alone would move the text by a pixel. */
-#settings .sec { display: flex; align-items: center; gap: 7px; height: 34px; box-sizing: border-box; padding: 0 9px; border-radius: 10px; color: var(--text); cursor: default; transition: var(--fade); }
-#settings .sec svg { width: 15px; height: 15px; flex: none; color: var(--text2); }
-#settings .sec:hover { background: var(--row-hover); }
-#settings .sec.on { background: var(--row-sel); box-shadow: var(--shadow); }
-#settings .body { flex: 1 1 auto; min-width: 0; overflow-y: auto; scrollbar-width: thin; padding: 28px 26px 24px 22px; }
-#settings .title { font-size: 19px; font-weight: 700; margin: 0 0 20px 0; }
-#settings .card { background: var(--card); border: 1px solid var(--card-border); border-radius: 17px; padding: 0 18px; margin-bottom: 18px; }
-#settings .srow { display: flex; align-items: center; gap: 18px; padding: 11px 0; border-bottom: 1px solid var(--card-line); }
-#settings .srow:last-child { border-bottom: 0; }
+#settings .secs { display: flex; flex-direction: column; gap: 5px; margin-top: 12px; min-height: 0; overflow-y: auto; scrollbar-width: none; margin-left: -4px; margin-right: -4px; padding: 0 4px 4px 4px; }
+/* The desktop's nav rows (`NAV_ROW_*`, 2x): 66 device px tall on a 76 px
+   pitch, a 46 px square 12 px in, the label 16 px after it in the secondary
+   text, the text colour once selected. The selected row is the sidebar's
+   active one, fill, hairline and shadow; the hairline is drawn inside, so
+   the label does not move by a pixel when the row is chosen. */
+#settings .sec { display: flex; align-items: center; gap: 8px; flex: none; height: 33px; box-sizing: border-box; padding: 0 7px; border-radius: 10px; color: var(--text2); cursor: default; transition: var(--fade); }
+#settings .sec .sl { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#settings .sec:hover { background: var(--nav-hover); }
+#settings .sec.on { background: var(--nav-sel); color: var(--text); box-shadow: inset 0 0 0 1px var(--nav-sel-border), 0 1px 1px 1px rgba(0,0,0,var(--nav-shadow)); }
+/* A section's square (`paint_tile`, `ROW_TILE`): its colour lit from above
+   and a step darker below, a faint light rim on top and a soft drop shadow,
+   with the glyph in white at 58% of the side. */
+#settings .tile { --tile: #636366; display: inline-flex; align-items: center; justify-content: center; flex: none; width: 23px; height: 23px; border-radius: 6px; color: #FFFFFF; background: linear-gradient(to bottom, color-mix(in srgb, var(--tile), #FFFFFF 16%), color-mix(in srgb, var(--tile), #000000 10%)); box-shadow: inset 0 .5px 0 rgba(255,255,255,.30), 0 1px 2px rgba(0,0,0,var(--tile-shadow)); }
+#settings .tile svg { width: 13px; height: 13px; }
+#settings .body { flex: 1 1 auto; min-width: 0; overflow-y: auto; scrollbar-width: thin; padding: 36px 24px 24px 23px; display: flex; flex-direction: column; }
+/* A column, so About's maker can sit at the foot; nothing in it shrinks. */
+#settings .body > * { flex: none; }
+/* The page's name on the brand's line, as large as the settings text plus
+   four, at its weight. */
+#settings .title { font-size: 19px; font-weight: 600; line-height: 22px; margin: 0 0 28px 0; }
+#settings .card { background: var(--card); border: 1px solid var(--card-border); border-radius: 18px; padding: 0 18px; margin-bottom: 18px; }
+/* A two-line row is 128 device px at 2x: the label, then its description
+   in the secondary text at the label's size. Its square comes first, the
+   text 12px after it and the control 12px after that (ROW_TILE_GAP); the
+   rule between two rows starts where their text does. */
+#settings .srow { position: relative; display: flex; align-items: center; gap: 12px; min-height: 30px; padding: 13px 0; }
+#settings .srow:not(:last-child)::after { content: ""; position: absolute; left: 40px; right: 0; bottom: 0; height: 1px; background: var(--card-line); }
+#settings .srow:has(> .tx:first-child)::after { left: 0; }
 #settings .tx { flex: 1 1 auto; min-width: 0; }
-#settings .lab { font-weight: 600; color: var(--text); }
-#settings .desc { margin-top: 4px; color: var(--muted); font-size: 13px; font-weight: 500; }
+#settings .lab { font-weight: 600; color: var(--text); line-height: 18px; }
+#settings .desc { margin-top: 4px; color: var(--text2); font-size: 14px; font-weight: 400; line-height: 19px; }
+/* A row's square (`paint_row_tile`, ROW_TILE_SIDE 28pt): the section's
+   square at 28px, its glyph 16px, centred on the label and the first line
+   of the description however many lines that runs to. */
+#settings .srow > .tile { width: 28px; height: 28px; border-radius: 7.5px; align-self: flex-start; margin-top: 6.5px; }
+#settings .srow > .tile svg { width: 16px; height: 16px; }
 #settings .ctl { display: flex; align-items: center; gap: 8px; flex: none; }
 /* The desktop's control pill: 280x54 device px at 2x, flush with the card's
    right inset. */
 #settings .pillsel, #settings .pillbtn { flex: none; box-sizing: border-box; height: 28px; font: 500 13px var(--ui); color: var(--text); background: var(--ctl); border: 1px solid var(--btn-border); border-radius: 8px; padding: 0 12px; min-width: 140px; transition: var(--fade); }
 #settings .pillsel { appearance: none; -webkit-appearance: none; padding-right: 28px; background-image: linear-gradient(45deg, transparent 50%, var(--text2) 50%), linear-gradient(135deg, var(--text2) 50%, transparent 50%); background-position: calc(100% - 16px) 55%, calc(100% - 11px) 55%; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; }
 #settings .pillsel:hover, #settings .pillbtn:hover { background-color: var(--ctl-hover); }
-#settings .pillbtn { min-width: 0; }
+/* A button is fully round (`draw_button`), which tells it from the value
+   pills of the same height. */
+#settings .pillbtn { min-width: 0; border-radius: 999px; }
 #settings .seg { display: inline-flex; height: 28px; box-sizing: border-box; border: 1px solid var(--btn-border); border-radius: 8px; overflow: hidden; background: var(--ctl); }
 #settings .sg { display: inline-flex; align-items: center; gap: 6px; padding: 0 11px; color: var(--text2); font: 500 13px var(--ui); cursor: default; transition: var(--fade); }
 #settings .sg input { position: absolute; opacity: 0; width: 0; height: 0; }
@@ -458,10 +535,177 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 #settings .switch input:checked + .knob { background: var(--accent); }
 #settings .switch input:checked + .knob::after { transform: translateX(16px); }
 #settings .err { padding: 0 2px 8px 2px; color: var(--danger); font-size: 12px; }
-/* A section's own sentence above its cards, and a row's state where it
-   has no control. */
-#settings .sdesc { padding: 0 2px 12px 2px; color: var(--muted); font-size: 13px; font-weight: 500; }
-#settings .pilltag { flex: none; color: var(--muted); font: 500 12px var(--ui); }
+/* A section's own sentence above its cards, in the description's face,
+   and a row's state where it has no control, in a pill as the desktop
+   shows a value (`paint_setting_row`). */
+#settings .sdesc { padding: 0 2px 12px 2px; color: var(--text2); font-size: 14px; font-weight: 400; line-height: 19px; }
+#settings .pilltag { flex: none; box-sizing: border-box; display: inline-flex; align-items: center; height: 28px; min-width: 140px; padding: 0 12px; border-radius: 8px; background: var(--ctl); border: 1px solid var(--btn-border); color: var(--text); font: 500 13px var(--ui); white-space: nowrap; }
+/* The right panel's panels as cards (`paint_panel_cards`): two across once
+   each can be 219px, a 32px square with the switch level with it, then the
+   name 10px under it and two lines of what it is for. Off, the square is
+   grey and the words are a step dimmer. */
+#settings .pcards { display: grid; grid-template-columns: repeat(auto-fill, minmax(max(219px, calc((100% - 12px) / 2)), 1fr)); gap: 12px; margin-bottom: 18px; }
+#settings .pcard { min-width: 0; padding: 15px; border-radius: 14px; background: var(--card); border: 1px solid var(--card-border); }
+#settings .pcard .phead { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+#settings .pcard .tile { width: 32px; height: 32px; border-radius: 8.5px; }
+#settings .pcard .tile svg { width: 18.5px; height: 18.5px; }
+#settings .pcard .desc { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
+#settings .pcard.off .lab { color: var(--text2); }
+#settings .pcard.off .desc { color: var(--muted); }
+/* About's hero (`paint_hero`): the app's icon at 54px, its name in the
+   title's face and its version under it, Copy on the right, in a card of
+   its own at least 90px tall and 26px over the next. */
+#settings .hero { display: flex; align-items: center; gap: 12px; min-height: 90px; box-sizing: border-box; padding: 18px; margin-bottom: 26px; }
+#settings .hero .mark { flex: none; width: 54px; height: 54px; }
+#settings .hero .ht { flex: 1 1 auto; min-width: 0; }
+#settings .hero .hl { font-size: 19px; font-weight: 600; line-height: 22px; color: var(--text); }
+#settings .hero .sl { margin-top: 6px; color: var(--text2); font-weight: 400; line-height: 19px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#settings .hero .pillbtn { min-width: 115px; }
+/* Its facts (`paint_compact_row`): a line each on a 42px pitch, the value
+   flush right in the secondary text; the card adds 6px above and below. */
+#settings .facts { padding: 6px 18px; }
+#settings .fact { box-sizing: border-box; min-height: 42px; padding: 0; }
+#settings .fact > .tile { align-self: center; margin-top: 0; }
+#settings .fact .lab { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#settings .fact .val { flex: 0 1 auto; max-width: 62%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text2); font-weight: 400; text-align: right; }
+/* Who makes it, at the foot of the page when there is room for it there
+   (`draw_closex_logo`): the logo 32px tall in the text colour, the year
+   after it on the wordmark's baseline, small and muted. */
+#settings .maker { margin-top: auto; padding-top: 24px; display: flex; align-items: flex-start; gap: 6px; }
+#settings .maker .logo { flex: none; width: calc(32px * 876 / 234); height: 32px; background: var(--text); -webkit-mask: var(--logo) center / contain no-repeat; mask: var(--logo) center / contain no-repeat; }
+#settings .maker .yr { margin-top: 16.5px; color: var(--muted); font-size: 11px; font-weight: 500; line-height: 13px; }
+/* The Remote Hosts page (MachinesPanel.svelte): the desktop's
+   (ssh_hosts_view.rs, 2x design px halved) where the desktop puts it, in
+   the terminal's place while its tab is on show -- over the canvas, the
+   pane bars and the card, under the drawers and the menus. PAD at the
+   sides; the toolbar (New Host, then the search pill, SEARCH_W) heads a
+   grid of cards (CARD_MIN_W, CARD_GAP, CARD_RADIUS, CARD_PAD) under their
+   group captions, and the form is the inspector beside them at its fixed
+   width (INSPECTOR_W), up to 60% of the page. */
+#machines { position: absolute; inset: var(--tabs) calc(var(--agents-w) + var(--ext-w)) 0 var(--side-w); z-index: 13; box-sizing: border-box; display: flex; gap: 10px; padding: 0 12px; background: var(--bg); color: var(--text); font: 500 14px var(--ui); outline: none; }
+#machines[hidden] { display: none; }
+#machines .lists { flex: 1 1 auto; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+#machines .tools { flex: none; display: flex; align-items: center; gap: 6px; margin-top: 12px; }
+#machines .find { flex: 0 1 180px; min-width: 0; box-sizing: border-box; display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 12px 0 9px; border-radius: 999px; border: 1px solid var(--btn-border); background: var(--ctl); color: var(--muted); transition: var(--fade); }
+#machines .find:focus-within { border-color: var(--accent); }
+#machines .find svg { width: 14px; height: 14px; }
+#machines .find input { flex: 1 1 auto; min-width: 0; height: 100%; padding: 0; border: 0; background: transparent; color: var(--text); font: 400 14px var(--ui); outline: none; }
+#machines .find input::placeholder { color: var(--muted); }
+#machines .find input::-webkit-search-cancel-button { -webkit-appearance: none; }
+/* What scrolls fades out at the top and the foot rather than being cut off
+   at a hard edge. At rest the padding covers the fades. */
+#machines .body, #machines form.add { min-height: 0; overflow-y: auto; scrollbar-width: thin; -webkit-mask-image: linear-gradient(to bottom, transparent, #000 12px, #000 calc(100% - 16px), transparent); mask-image: linear-gradient(to bottom, transparent, #000 12px, #000 calc(100% - 16px), transparent); }
+#machines .body { flex: 1 1 auto; padding: 12px 0 16px 0; }
+/* A group's caption: the section font in the secondary text (GROUP_HEADER_H,
+   GROUP_TITLE_GAP), GROUP_GAP above the next. */
+#machines .label { margin: 0 2px 6px 2px; color: var(--text2); font-size: 13px; font-weight: 600; line-height: 19px; }
+#machines .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 9px; margin-bottom: 18px; }
+/* A host card: the card ground with a hairline, the row hover's fill under
+   the pointer, and the machine on show ringed in the accent as the desktop
+   rings its selected card. */
+#machines .hcard { box-sizing: border-box; min-width: 0; min-height: 56px; padding: 10px 11px 10px 12px; background: var(--card); border: 1px solid var(--card-border); border-radius: 18px; transition: var(--fade); }
+#machines .hcard:hover { background: color-mix(in srgb, var(--card), var(--text) 3%); }
+#machines .hcard.on { border-color: var(--accent); box-shadow: inset 0 0 0 .5px var(--accent); }
+#machines .hcard.wide { grid-column: 1 / -1; }
+#machines .mrow { display: flex; align-items: center; gap: 10px; min-height: 34px; }
+/* The logo is how a machine is picked out without reading: the server
+   glyph, large and muted, with the machine's state as a dot on its corner --
+   green when it is up, the sidebar's live blue while it connects, amber
+   while it waits on you, red once it has failed. */
+#machines .logo { position: relative; display: inline-flex; flex: none; color: var(--muted); }
+#machines .logo > svg { width: 28px; height: 28px; stroke-width: 1.6; }
+#machines .dot { position: absolute; right: -3px; bottom: -3px; width: 10px; height: 10px; border-radius: 50%; background: var(--muted); box-shadow: 0 0 0 2px var(--card); }
+#machines .dot.ok { background: var(--done); }
+#machines .dot.busy { background: var(--open); animation: machines-pulse 1.2s ease-in-out infinite; }
+#machines .dot.wait { background: var(--warn); }
+#machines .dot.bad { background: var(--danger); }
+@keyframes machines-pulse { 50% { opacity: .35; } }
+#machines .tx { flex: 1 1 auto; min-width: 0; }
+#machines .lab { font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#machines .desc { margin-top: 3px; color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#machines .desc > span:not(:last-child)::after { content: '·'; margin: 0 6px; color: var(--muted); }
+#machines .desc .st { color: var(--text2); }
+#machines .bar { height: 4px; margin-top: 7px; border-radius: 999px; background: var(--card-line); overflow: hidden; }
+#machines .bar span { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width .2s; }
+#machines .ctl { display: flex; align-items: center; justify-content: flex-end; gap: 4px; flex: none; }
+/* The machine on show: a check where its Show button would be. */
+#machines .shown { display: inline-flex; align-items: center; justify-content: center; min-width: 28px; color: var(--accent); }
+#machines .shown svg { width: 16px; height: 16px; }
+/* The desktop's buttons are pills, as its toolbar's New Host is. */
+#machines .pillbtn { flex: none; box-sizing: border-box; height: 28px; font: 500 13px var(--ui); color: var(--text); background: var(--ctl); border: 1px solid var(--btn-border); border-radius: 999px; padding: 0 13px; white-space: nowrap; transition: var(--fade); }
+#machines .pillbtn:hover:not(:disabled) { background-color: var(--ctl-hover); }
+/* The one action a question or the form exists for, filled as the desktop
+   fills it: a step lighter on hover in the dark, a step darker in the light. */
+#machines .pillbtn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+#machines .pillbtn.primary:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 86%, var(--text)); border-color: transparent; }
+#machines .pillbtn:disabled { opacity: .45; }
+#machines .iconbtn { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border-radius: 999px; border: 0; background: transparent; color: var(--muted); transition: var(--fade); }
+#machines .iconbtn:hover { background: var(--row-hover); color: var(--text); }
+#machines .iconbtn svg { width: 15px; height: 15px; }
+/* What a machine has under its row starts at its text. */
+#machines .ask, #machines .fail, #machines .log, #machines .more { margin-left: 38px; }
+#machines .ask { margin-top: 10px; margin-bottom: 4px; padding: 12px 14px; border-radius: 12px; background: var(--row-hover); }
+#machines .ask-title { display: flex; align-items: center; gap: 8px; font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
+#machines .ask-title svg { width: 16px; height: 16px; flex: none; color: var(--warn); }
+#machines .hint { margin-top: 6px; color: var(--muted); font-size: 13px; line-height: 1.4; white-space: pre-wrap; overflow-wrap: anywhere; }
+#machines .detail, #machines .log { padding: 8px 10px; border-radius: 8px; background: var(--bg); border: 1px solid var(--card-line); color: var(--text2); font: 12px/1.45 ui-monospace, "SF Mono", Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 160px; overflow-y: auto; }
+#machines .detail { margin: 10px 0 0 0; }
+#machines .log { margin-top: 0; margin-bottom: 4px; }
+#machines .btns { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
+#machines .ask .btns, #machines .ask .foot { margin-top: 12px; }
+#machines .foot { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 12px; }
+#machines .ask .foot .btns { margin: 0 0 0 auto; }
+#machines .field, #machines form.add input { display: block; width: 100%; min-width: 0; box-sizing: border-box; height: 28px; padding: 0 10px; border-radius: 8px; border: 1px solid var(--btn-border); background: var(--ctl); color: var(--text); font: 400 14px var(--ui); outline: none; transition: var(--fade); }
+#machines .field { margin-top: 10px; }
+#machines .field:focus, #machines form.add input:focus { border-color: var(--accent); }
+#machines .field::placeholder, #machines form.add input::placeholder { color: var(--muted); }
+#machines .check { display: inline-flex; align-items: center; gap: 8px; color: var(--text2); font-size: 13px; cursor: default; }
+#machines .switch { position: relative; display: inline-block; width: 40px; height: 24px; flex: none; }
+#machines .switch input { position: absolute; inset: 0; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: default; }
+#machines .switch .knob { position: absolute; inset: 0; border-radius: 999px; background: rgba(118,118,128,.32); transition: background .15s; pointer-events: none; }
+#machines .switch .knob::after { content: ""; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; border-radius: 999px; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.4); transition: transform .15s; }
+#machines .switch input:checked + .knob { background: var(--accent); }
+#machines .switch input:checked + .knob::after { transform: translateX(16px); }
+#machines .switch input:focus-visible + .knob { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent); }
+/* A failure reads on from the row's own state line. */
+#machines .fail .hint { margin: 8px 0 0 0; }
+#machines .fail .btns { justify-content: flex-start; margin-top: 10px; }
+/* Details: a disclosure, its chevron on the text's edge. */
+#machines .more { display: inline-flex; align-items: center; gap: 4px; margin-top: 8px; margin-bottom: 4px; padding: 2px 6px 2px 0; border: 0; border-radius: 6px; background: transparent; color: var(--muted); font: 500 12px var(--ui); transition: var(--fade); }
+#machines .more:hover { color: var(--text); }
+#machines .more svg { width: 13px; height: 13px; transition: transform .15s; }
+#machines .more.open svg { transform: rotate(90deg); }
+/* The desktop's empty page: its server glyph over the one line. */
+#machines .empty { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 28px 24px 34px 24px; color: var(--muted); font-size: 13px; line-height: 1.4; text-align: center; }
+#machines .empty svg { width: 28px; height: 28px; stroke-width: 1.6; }
+#machines .err { margin: -8px 2px 16px 2px; color: var(--danger); font-size: 12px; }
+#machines .addbtn { display: inline-flex; align-items: center; gap: 6px; padding: 0 14px 0 11px; }
+#machines .addbtn svg { width: 14px; height: 14px; }
+/* The inspector: the host's name as its heading and where it connects under
+   it, then the Connection card of labelled fields (label over input, Host
+   beside a narrow Port), then the way through. */
+#machines form.add { flex: 0 0 min(240px, 60%); box-sizing: border-box; display: flex; flex-direction: column; padding: 12px 0 16px 0; scroll-margin: 12px 0; }
+#machines .ihead { padding: 2px 4px 12px 4px; min-width: 0; }
+#machines .ititle { font-size: 16px; font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#machines .iend { margin-top: 3px; color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#machines form.add .card { display: flex; flex-direction: column; gap: 9px; padding: 12px 14px 14px 14px; margin-bottom: 12px; background: var(--card); border: 1px solid var(--card-border); border-radius: 18px; }
+#machines .cap { color: var(--text2); font-size: 13px; font-weight: 600; }
+#machines .pair { display: flex; gap: 8px; }
+#machines .fld { display: flex; flex-direction: column; gap: 4px; flex: 1 1 0; min-width: 0; }
+#machines .fld.port { flex: 0 0 72px; }
+#machines .fld > span { color: var(--muted); font-size: 13px; }
+#machines form.add .btns { flex: none; }
+/* Too narrow for the inspector beside the grid: the form goes over it,
+   and the page scrolls as one. */
+@media (max-width: 720px) {
+  #machines { flex-direction: column; gap: 0; overflow-y: auto; }
+  #machines .lists { flex: none; }
+  #machines .body, #machines form.add { overflow: visible; -webkit-mask-image: none; mask-image: none; }
+  #machines form.add { order: -1; flex: none; padding: 12px 0 4px 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  #machines .dot.busy { animation: none; }
+}
 /* Focus lives here so the IME composes into a real text field; the
    field itself stays out of sight. */
 #kbd { position: fixed; left: 0; top: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; margin: 0; resize: none; overflow: hidden; pointer-events: none; }
@@ -519,18 +763,76 @@ body[data-mobile] canvas#term { touch-action: none; -webkit-tap-highlight-color:
 body[data-mobile] #tabs {
   height: calc(var(--tabs) + var(--safe-t));
   padding: calc(2px + var(--safe-t)) calc(8px + var(--safe-r)) 0 calc(8px + var(--safe-l));
-  gap: 7px; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain;
+  /* The row itself stands still: its strip scrolls (below). */
+  overflow: hidden;
 }
+/* The capsules scroll in a strip of their own, the whole width of the row,
+   under the two buttons at its ends, which stay where they are: nothing
+   they are in moves. Room is left at either end for the capsules to come
+   out from under them. No -webkit-overflow-scrolling: iOS scrolls with
+   momentum anyway, and that property makes its box a stacking context in
+   WebKit -- on the row, it kept the drawers' buttons under the drawers. */
+body[data-mobile] #tabs .strip {
+  position: absolute; left: 0; right: 0; top: calc(2px + var(--safe-t)); bottom: 0;
+  display: flex; align-items: center; gap: 7px; box-sizing: border-box;
+  padding-left: calc(8px + var(--safe-l) + 38px + 7px);
+  overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain; scrollbar-width: none; white-space: nowrap;
+}
+body[data-mobile] #tabs .strip::-webkit-scrollbar { display: none; }
+/* The room at the end, as an item: a scroller's end padding is not always
+   counted in what it scrolls. */
+body[data-mobile] #tabs .strip::after { content: ''; flex: 0 0 calc(8px + var(--safe-r) + 38px); height: 1px; }
 body[data-mobile] #term, body[data-mobile] #panes { top: calc(var(--tabs) + var(--safe-t)); }
+/* While the soft keyboard comes or goes, the canvas rides with the key bar
+   until it is cut to the new height (--term-shift, KeyBar.svelte), so its
+   last row stays on the bar's edge. What rides up past its own top is cut
+   off rather than drawn over the tab row, which cannot be lifted above it:
+   a z-index there would trap the drawers' buttons under the drawers. The
+   top pane's bar stays under the tab row, as it will be once the canvas is
+   cut; the bars and dividers lower down ride with the rows they belong to.
+   `translate`, not `transform`: a divider's own transform centres it. */
+body[data-mobile] #term {
+  translate: 0 var(--term-shift, 0px);
+  clip-path: inset(max(0px, calc(-1 * var(--term-shift, 0px))) 0 0 0);
+}
+body[data-mobile] #panes .nav.lower, body[data-mobile] #panes .grip { translate: 0 var(--term-shift, 0px); }
 body[data-mobile] #term, body[data-mobile] #panes { height: calc(var(--vvh, 100%) - var(--tabs) - var(--safe-t) - var(--keybar)); }
 /* A capsule takes what its title needs, up to under half the screen, so
    two or three tabs share a 390px row instead of one 150px box pushing the
    rest off the edge; the same rule the pane capsules got below. */
-body[data-mobile] #tabs .tab { height: 36px; flex: 0 1 auto; width: auto; min-width: 88px; max-width: min(150px, 44vw); padding: 0 6px 0 10px; }
+/* A capsule on a phone, in either row, is as wide as its title needs
+   between the same two bounds (--cap-min, --cap-max): the tab row keeps
+   its titles and scrolls sideways rather than squeezing them to three
+   letters, and a pane's capsule no longer runs the width of the screen. */
+body[data-mobile] { --cap-min: 128px; --cap-max: min(200px, 56vw); }
+body[data-mobile] #tabs .tab { height: 36px; flex: 0 0 auto; width: auto; min-width: var(--cap-min); max-width: var(--cap-max); padding: 0 6px 0 10px; }
+body[data-mobile] #tabs .tab .ticon { margin-left: -8px; }
 /* The drawer toggle and the trailing buttons stay put while the capsules
    scroll under them, so neither end is ever out of reach. */
-body[data-mobile] #tabs [data-action=sidebar] { position: sticky; left: 0; background: var(--bg); box-shadow: 4px 0 6px -2px var(--bg); }
-body[data-mobile] #tabs .trail { position: sticky; right: 0; margin-left: auto; padding-left: 6px; background: var(--bg); box-shadow: -4px 0 6px -2px var(--bg); z-index: 1; }
+/* The two ends float over the tabs, which slide under them: round
+   buttons on a frosted ground with a shadow, not a strip of the bar's
+   colour. */
+body[data-mobile] #tabs [data-action=sidebar],
+body[data-mobile] #tabs .trail .act {
+  background: color-mix(in srgb, var(--ctl) 78%, transparent);
+  border-color: var(--ctl-border);
+  -webkit-backdrop-filter: blur(12px) saturate(1.4); backdrop-filter: blur(12px) saturate(1.4);
+  box-shadow: 0 1px 3px rgba(0,0,0,.22);
+}
+/* The two buttons, fixed at the row's ends over the strip. Each sits on a
+   short fade of the bar's ground, so a tab passing under it dissolves
+   there instead of running into it: the fade starts under the button and
+   reaches only a little past it. */
+body[data-mobile] #tabs .lead, body[data-mobile] #tabs .trail {
+  position: absolute; top: calc(2px + var(--safe-t)); bottom: 0; display: inline-flex; align-items: center; margin: 0;
+}
+body[data-mobile] #tabs .lead { left: calc(8px + var(--safe-l)); z-index: 18; }
+body[data-mobile] #tabs .trail { right: calc(8px + var(--safe-r)); z-index: 2; padding: 0; background: transparent; }
+body[data-mobile] #tabs .lead::before, body[data-mobile] #tabs .trail::before {
+  content: ''; position: absolute; top: 0; bottom: 0; z-index: -1; pointer-events: none;
+}
+body[data-mobile] #tabs .lead::before { left: calc(-8px - var(--safe-l)); right: -10px; background: linear-gradient(to right, var(--bg) calc(100% - 28px), transparent); }
+body[data-mobile] #tabs .trail::before { right: calc(-8px - var(--safe-r)); left: -10px; background: linear-gradient(to left, var(--bg) calc(100% - 28px), transparent); }
 body[data-mobile] .act { width: 38px; height: 38px; }
 /* A close button between two capsules is easy to hit by mistake; on a
    phone it is only on the tab in front, and big enough to mean it. */
@@ -543,8 +845,15 @@ body[data-mobile] .nav .act[data-action=split-right],
 body[data-mobile] .nav .act[data-action=split-below] { display: none; }
 /* The pane's own capsule has the width the tab row's has not: a 160px box
    on a 390px screen left two thirds of the bar empty. */
-body[data-mobile] .nav .cap { width: auto; flex: 1 1 auto; min-width: 0; max-width: 100%; }
+body[data-mobile] .nav .cap { width: auto; flex: 0 1 auto; min-width: min(var(--cap-min), 100%); max-width: var(--cap-max); height: 36px; padding: 0 6px 0 10px; }
+body[data-mobile] .nav .cap .ticon { margin-left: -8px; }
 body[data-mobile] .nav .acts .act { width: 40px; height: 40px; }
+/* A split's divider on a phone: a short pill on the line, where a finger
+   takes hold of it (touch.ts). Only a mark: the press goes to the canvas. */
+.grip { position: absolute; width: 24px; transform: translate(-50%, -50%); pointer-events: auto; touch-action: none; z-index: 1; }
+.grip.across { height: 24px; }
+.grip::after { content: ''; position: absolute; left: 50%; top: 50%; width: 4px; height: 36px; transform: translate(-50%, -50%); border-radius: 999px; background: var(--muted); opacity: .7; }
+.grip.across::after { width: 36px; height: 4px; }
 /* The two panels are drawers: over the canvas, resizing nothing, or not
    there at all. */
 body[data-mobile] #side,
@@ -557,7 +866,11 @@ body[data-mobile] #agents {
   box-shadow: 0 8px 28px rgba(0,0,0,.42);
   overscroll-behavior: contain;
 }
+/* The left one is the whole screen, the tab row included: a page of its
+   own, as a phone's are, with the sidebar's button left where it was over
+   it (it stays above everything) to put it away again. */
 body[data-mobile] #side {
+  top: 0; width: 100%; height: var(--vvh, 100%); z-index: 17; box-shadow: none; border-right: 0;
   padding-left: var(--safe-l);
   transform: translateX(-101%); visibility: hidden; pointer-events: none; will-change: transform;
   transition: transform .15s cubic-bezier(.4,0,1,1), visibility 0s linear .15s;
@@ -571,6 +884,19 @@ body[data-mobile] #side.open {
 @keyframes drawer-in { from { transform: translateX(101%); } to { transform: translateX(0); } }
 body[data-mobile] #agents { animation: drawer-in .15s cubic-bezier(0,0,.2,1); }
 body[data-mobile] #agents { padding-right: var(--safe-r); }
+/* The right one is the whole screen too, as the left is: its own button
+   stays over it, top right, to put it away; the left one stands down. */
+body[data-mobile] #agents {
+  top: 0; width: 100%; height: var(--vvh, 100%); z-index: 17; box-shadow: none; border-left: 0; padding-bottom: var(--safe-b);
+}
+body[data-mobile] #agents .hd { top: calc(var(--tabs) + var(--safe-t)); padding: 4px calc(14px + var(--safe-r)) 0 14px; }
+body[data-mobile] #agents .list { top: calc(110px + var(--tabs) + var(--safe-t)); left: 14px; right: calc(14px + var(--safe-r)); }
+body[data-mobile] #agents .list.snippets, body[data-mobile] #agents .list.snippet-editor { top: calc(122px + var(--tabs) + var(--safe-t)); }
+body[data-mobile]:has(#agents) #tabs .trail { z-index: 18; }
+body[data-mobile]:has(#agents) #tabs .lead { visibility: hidden; }
+/* Over the open drawer the button stands alone, without the bar's fade. */
+body[data-mobile]:has(#side.open) #tabs .lead::before,
+body[data-mobile]:has(#agents) #tabs .trail::before { display: none; }
 /* Their edges are dragged with a pointer, which a phone has not got. */
 body[data-mobile] #side .handle,
 body[data-mobile] #agents .handle { display: none; }
@@ -584,14 +910,25 @@ body[data-mobile] #side .hdr { min-height: 36px; }
 body[data-mobile] #side .top .pill, body[data-mobile] #side .pill { height: 38px; }
 body[data-mobile] #side .act.round { width: 38px; height: 38px; }
 body[data-mobile] #side .act { width: 40px; height: 40px; }
-body[data-mobile] #side .foot { height: 52px; left: 12px; right: 12px; }
+body[data-mobile] #side .foot { height: 52px; left: 16px; right: calc(16px + var(--safe-r)); bottom: var(--safe-b); }
+/* Settings keeps its word on a phone too: the 40px every footer button
+   gets there is a square, and cut its label to one letter. */
+body[data-mobile] #side .foot .act.lbl { width: auto; padding: 0 10px; }
 body[data-mobile] #side .foot .act { width: 40px; height: 40px; }
-body[data-mobile] #side .list { inset: 12px 10px 52px 10px; }
+body[data-mobile] #side .list { inset: calc(var(--tabs) + var(--safe-t) + 8px) calc(14px + var(--safe-r)) 56px 14px; }
 /* A finger has no hover, so a thread's pin and delete would never appear. */
 body[data-mobile] #side .hov { display: inline-flex; }
 body[data-mobile] #side .path input { padding: 9px 10px; }
+body[data-mobile] #side .path select.on { padding: 9px 28px 9px 10px; font-size: 16px; }
 /* Behind whichever drawer is out: a press here puts it away. */
 #scrim { position: fixed; inset: 0; z-index: 14; background: rgba(0,0,0,.34); }
+/* On a phone a drawer is what is on show: what is behind it goes dark
+   enough not to read as part of it, the pane bars' buttons included. */
+body[data-mobile] #scrim { background: rgba(0,0,0,.6); }
+/* The key bar types into the terminal: not while a drawer or the
+   settings are over it. */
+body:has(#scrim) #keybar, body:has(#settings) #keybar { display: none; }
+body[data-mobile] #side { padding-bottom: var(--safe-b); box-sizing: border-box; }
 /* A menu row a finger can hit, clear of the corners and the indicator. */
 body[data-mobile] .menu {
   min-width: 200px; padding: 6px;
@@ -607,37 +944,109 @@ body[data-mobile] #palette {
 body[data-mobile] #palette .pl { max-height: none; flex: 1 1 auto; }
 body[data-mobile] #palette .pe { height: 44px; }
 body[data-mobile] #palette .st { display: none; }
-/* The settings window has no room for its 220px nav column beside the
-   cards: on a phone it fills the window and the sections become a strip
-   of chips over one column of rows. */
+/* The settings on a phone are two pages, as a phone's own are: the
+   sections as a list of rows (`listing`), then the one picked, full width,
+   with the way back at its top. Nothing of the other page shows. */
 body[data-mobile] #settings {
   left: 0; top: 0; --settings-tf: translate(0, 0); transform: var(--settings-tf); width: 100%;
-  height: calc(var(--vvh, 100%) - var(--keybar));
+  height: var(--vvh, 100%);
   border-radius: 0; border: 0; flex-direction: column;
 }
+body[data-mobile] #settings.listing .body { display: none; }
+body[data-mobile] #settings:not(.listing) .snav { display: none; }
 body[data-mobile] #settings .snav {
-  flex: none; padding: calc(var(--safe-t) + 10px) calc(12px + var(--safe-r)) 10px calc(12px + var(--safe-l));
-  border-right: 0; border-bottom: 1px solid var(--sep);
+  flex: 1 1 auto; width: auto; min-height: 0; overflow-y: auto;
+  padding: calc(var(--safe-t) + 16px) calc(16px + var(--safe-r)) 24px calc(16px + var(--safe-l));
+  border-right: 0;
 }
-body[data-mobile] #settings .app { padding: 0 2px 10px 2px; font-size: 16px; }
+body[data-mobile] #settings .app { padding: 4px 4px 16px 4px; font-size: 26px; }
 body[data-mobile] #settings .find { display: none; }
 body[data-mobile] #settings .secs {
-  flex-direction: row; margin-top: 0; gap: 6px;
-  overflow-x: auto; scrollbar-width: none; padding-bottom: 2px;
+  flex-direction: column; margin-top: 0; gap: 0; padding: 0;
+  background: var(--card); border: 1px solid var(--card-border); border-radius: 14px; overflow: hidden;
 }
-body[data-mobile] #settings .secs::-webkit-scrollbar { display: none; }
-body[data-mobile] #settings .sec { flex: 0 0 auto; height: 38px; border-radius: 999px; background: var(--ctl); }
-body[data-mobile] #settings .sec.on { background: var(--row-sel); }
-body[data-mobile] #settings .body { padding: 18px calc(14px + var(--safe-r)) 24px calc(14px + var(--safe-l)); }
-body[data-mobile] #settings .title { font-size: 20px; margin-bottom: 14px; }
+body[data-mobile] #settings .sec { height: 52px; padding: 0 14px; gap: 12px; border-radius: 0; background: transparent; box-shadow: none; border-bottom: 1px solid var(--card-line); }
+body[data-mobile] #settings .sec:last-child { border-bottom: 0; }
+body[data-mobile] #settings .sec .sl { flex: 1 1 auto; font-size: 16px; }
+body[data-mobile] #settings .sec::after { content: '›'; color: var(--muted); font-size: 22px; line-height: 1; }
+body[data-mobile] #settings .sec.on { background: transparent; }
+body[data-mobile] #settings .back { display: inline-flex; align-items: center; gap: 6px; height: 36px; margin: 0 0 6px -6px; padding: 0 8px; border: 0; border-radius: 8px; background: transparent; color: var(--accent); font: 500 16px var(--ui); }
+body[data-mobile] #settings .back svg { width: 18px; height: 18px; }
+body[data-mobile] #settings .body { padding: calc(var(--safe-t) + 8px) calc(14px + var(--safe-r)) 24px calc(14px + var(--safe-l)); }
+body[data-mobile] #settings .title { font-size: 24px; margin-bottom: 14px; }
 body[data-mobile] #settings .card { padding: 0 14px; }
-/* Label over control, so a description never squeezes into one word a line. */
-body[data-mobile] #settings .srow { flex-direction: column; align-items: stretch; gap: 10px; padding: 14px 0; }
-body[data-mobile] #settings .ctl { justify-content: flex-start; flex-wrap: wrap; }
+/* A row says what it is in a line or two of small print, not a paragraph
+   that pushes its control off the screen. */
+body[data-mobile] #settings .desc { font-size: 13px; line-height: 17px; color: var(--muted); }
+body[data-mobile] #settings .seg .sg { padding: 0 10px; font-size: 13px; }
+/* The square, the label and a switch share the first line; any other
+   control goes under the text, in the text's column, so a description
+   never squeezes into one word a line. */
+/* A row is one line, as a phone's own settings are: the square and the
+   name on the left, the value -- a switch, or what is chosen, in grey with
+   its chevron -- on the right. The paragraph that explains a row on the
+   desktop does not fit beside it, and goes. A control too wide for the
+   line (the font size's) takes the line under the name. */
+body[data-mobile] #settings .srow { display: flex; flex-wrap: wrap; align-items: center; column-gap: 12px; row-gap: 10px; min-height: 50px; padding: 8px 0; box-sizing: border-box; }
+body[data-mobile] #settings .srow > .tx { flex: 1 1 0; min-width: 0; }
+body[data-mobile] #settings .srow .desc { display: none; }
+body[data-mobile] #settings .srow .lab { font-size: 16px; font-weight: 500; }
+body[data-mobile] #settings .srow > .pillsel {
+  flex: 0 1 auto; min-width: 0; max-width: 58%; height: 36px; padding: 0 30px 0 6px;
+  background-color: transparent; border-color: transparent; color: var(--muted); font-size: 15px; text-align: right; text-align-last: right;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* The panel cards are rows here too: the square, the name, the switch. */
+body[data-mobile] #settings .pcards { grid-template-columns: 1fr; gap: 8px; }
+body[data-mobile] #settings .pcard { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; column-gap: 12px; padding: 9px 14px; min-height: 50px; box-sizing: border-box; }
+body[data-mobile] #settings .pcard .phead { display: contents; }
+body[data-mobile] #settings .pcard .tile { grid-area: 1 / 1; width: 28px; height: 28px; border-radius: 7px; }
+body[data-mobile] #settings .pcard .tile svg { width: 16px; height: 16px; }
+body[data-mobile] #settings .pcard .lab { grid-area: 1 / 2; font-size: 16px; font-weight: 500; }
+body[data-mobile] #settings .pcard .switch { grid-area: 1 / 3; }
+body[data-mobile] #settings .pcard .desc { display: none; }
+body[data-mobile] #settings .srow > .ctl { flex: 1 0 100%; padding-left: 40px; box-sizing: border-box; justify-content: flex-start; flex-wrap: wrap; }
+body[data-mobile] #settings .stepper.off, body[data-mobile] #settings .reset:disabled { display: none; }
+/* About keeps its lines whole: a long version wraps rather than being
+   cut, and Copy goes under the name. */
+body[data-mobile] #settings .hero { display: grid; grid-template-columns: 54px minmax(0, 1fr); gap: 12px; padding: 14px; }
+body[data-mobile] #settings .hero .pillbtn { grid-column: 2; justify-self: start; }
+body[data-mobile] #settings .hero .sl { white-space: normal; overflow-wrap: anywhere; }
+body[data-mobile] #settings .facts { padding: 6px 14px; }
+body[data-mobile] #settings .srow.fact { display: flex; padding: 7px 0; }
+body[data-mobile] #settings .fact .val { white-space: normal; overflow-wrap: anywhere; }
 body[data-mobile] #settings .pillsel, body[data-mobile] #settings .pillbtn,
-body[data-mobile] #settings .seg, body[data-mobile] #settings .stepper { height: 38px; }
+body[data-mobile] #settings .seg, body[data-mobile] #settings .stepper { height: 36px; }
 body[data-mobile] #settings .pillsel { flex: 1 1 auto; min-width: 0; }
 body[data-mobile] #settings .sc { top: calc(var(--safe-t) + 10px); right: calc(10px + var(--safe-r)); width: 40px; height: 40px; }
+/* The Remote Hosts page has the terminal's place on a phone too, under
+   the tab row, and the key bar's as well: those keys type into the
+   terminal, which is behind it. It scrolls as one, with controls a thumb
+   can hit; a card takes the full width, its address and state wrap rather
+   than being cut, and the form goes over the list. */
+body[data-mobile] #machines {
+  top: calc(var(--tabs) + var(--safe-t)); bottom: auto; height: calc(var(--vvh, 100%) - var(--tabs) - var(--safe-t));
+  padding: 0 calc(12px + var(--safe-r)) var(--safe-b) calc(12px + var(--safe-l));
+  flex-direction: column; gap: 0; overflow-y: auto;
+}
+body[data-page] #keybar { display: none; }
+body[data-mobile] #machines .lists { flex: none; }
+body[data-mobile] #machines .find { flex: 1 1 auto; height: 38px; }
+body[data-mobile] #machines .find input { font-size: 16px; }
+body[data-mobile] #machines .body, body[data-mobile] #machines form.add { overflow: visible; -webkit-mask-image: none; mask-image: none; }
+body[data-mobile] #machines .body { padding: 12px 0 24px 0; }
+body[data-mobile] #machines form.add { order: -1; flex: none; padding: 12px 0 4px 0; }
+body[data-mobile] #machines .grid { grid-template-columns: 1fr; }
+body[data-mobile] #machines .hcard { padding: 12px; }
+body[data-mobile] #machines .desc { white-space: normal; overflow-wrap: break-word; }
+/* Each part whole: a line breaks between an address and its state. */
+body[data-mobile] #machines .desc > span { display: inline-block; }
+body[data-mobile] #machines form.add .card { padding: 14px; }
+body[data-mobile] #machines .pillbtn { height: 38px; }
+body[data-mobile] #machines .iconbtn { width: 38px; height: 38px; }
+body[data-mobile] #machines .field, body[data-mobile] #machines form.add input { height: 40px; font-size: 16px; }
+body[data-mobile] #machines .ask, body[data-mobile] #machines .fail, body[data-mobile] #machines .log, body[data-mobile] #machines .more { margin-left: 0; }
+body[data-mobile] #machines .more, body[data-mobile] #machines .check { min-height: 38px; }
 /* The remark and the takeover card sit clear of the key bar. */
 body[data-mobile] #status {
   right: calc(10px + var(--safe-r)); left: calc(10px + var(--safe-l)); max-width: none;
@@ -652,23 +1061,44 @@ body[data-mobile] #card .go { height: 38px; }
    leaves room for. */
 #keybar {
   position: fixed; left: 0; right: 0; z-index: 16; box-sizing: border-box;
-  height: calc(52px + env(safe-area-inset-bottom, 0px));
-  padding: 0 6px env(safe-area-inset-bottom, 0px) 6px;
-  display: flex; align-items: center; gap: 5px;
-  background: var(--ctl); border-top: 1px solid var(--ctl-border);
-  overflow-x: auto; overflow-y: hidden; white-space: nowrap; overscroll-behavior-x: contain;
-  scrollbar-width: none; user-select: none; -webkit-user-select: none; touch-action: manipulation;
+  height: calc(62px + env(safe-area-inset-bottom, 0px));
+  padding: 4px calc(18px + var(--safe-r, 0px)) calc(12px + env(safe-area-inset-bottom, 0px)) calc(18px + var(--safe-l, 0px));
+  background: transparent;
+  user-select: none; -webkit-user-select: none; touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;
 }
-#keybar::-webkit-scrollbar { display: none; }
+/* What shows around the bar, and under the home indicator, is the
+   terminal's ground (--term-bg, from KeyBar.svelte), not a strip of the
+   page's colour: the capsule floats on the terminal. The rows still end
+   above it, so nothing typed is ever under it. */
+body[data-mobile] { background: var(--term-bg, var(--bg)); }
+/* A capsule floating over the foot of the screen, as rounded as a phone's
+   own corners: frosted glass the terminal's ground shows through, with a
+   shadow, the keys pills inside it. */
+#keybar .pill {
+  height: 100%; box-sizing: border-box; display: flex; align-items: center; gap: 4px; padding: 0 5px;
+  border-radius: 999px; border: 1px solid var(--ctl-border);
+  background: color-mix(in srgb, var(--ctl) 55%, transparent);
+  -webkit-backdrop-filter: blur(16px) saturate(1.4); backdrop-filter: blur(16px) saturate(1.4);
+  box-shadow: 0 6px 22px rgba(0,0,0,.4);
+}
+/* The keys scroll; the keyboard's button before them does not. */
+#keybar .keys {
+  flex: 1 1 auto; min-width: 0; height: 100%; display: flex; align-items: center; gap: 4px; padding-right: 10px;
+  overflow-x: auto; overflow-y: hidden; white-space: nowrap; overscroll-behavior-x: contain; scrollbar-width: none;
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent);
+}
+#keybar .keys::-webkit-scrollbar { display: none; }
 #keybar .k {
-  flex: 0 0 auto; min-width: 44px; height: 44px; margin: 0; padding: 0 10px;
+  flex: 0 0 auto; min-width: 40px; height: 34px; margin: 0; padding: 0 9px;
   display: inline-flex; align-items: center; justify-content: center; box-sizing: border-box;
-  border-radius: 10px; border: 1px solid var(--ctl-border); background: var(--ctl-hover);
-  color: var(--text); font: 500 14px var(--ui);
+  border-radius: 999px; border: 0; background: transparent;
+  color: var(--text2); font: 500 13px var(--ui);
   touch-action: manipulation; -webkit-tap-highlight-color: transparent; -webkit-user-select: none; user-select: none;
 }
-#keybar .k:active { background: var(--ctl-pressed); }
+#keybar .k.kbd { min-width: 48px; background: color-mix(in srgb, var(--ctl-hover) 75%, transparent); color: var(--text); }
+#keybar .k.kbd svg { width: 20px; height: 20px; pointer-events: none; }
+#keybar .k:active { background: var(--ctl-pressed); color: var(--text); }
 /* An armed modifier: it is spent on the next key, from here or from the
    soft keyboard. The ring says so from across the bar, not only the fill. */
 #keybar .k.armed {
@@ -681,11 +1111,84 @@ body[data-mobile] #card .go { height: 38px; }
   body[data-mobile] { --tabs: 40px; }
   body[data-mobile] #tabs .tab { height: 30px; }
   body[data-mobile] .act { width: 32px; height: 32px; }
-  #keybar { height: calc(44px + env(safe-area-inset-bottom, 0px)); }
-  #keybar .k { height: 36px; min-width: 40px; }
-  body[data-mobile] #settings .srow { flex-direction: row; align-items: center; gap: 14px; }
+  #keybar { height: calc(48px + env(safe-area-inset-bottom, 0px)); padding-bottom: calc(4px + env(safe-area-inset-bottom, 0px)); }
+  #keybar .k { height: 30px; min-width: 36px; }
+  body[data-mobile] #settings .srow, body[data-mobile] #settings .hero { display: flex; align-items: center; gap: 12px; }
   body[data-mobile] #settings .pillsel { flex: none; min-width: 140px; }
 }
+
+/* The boot screen (Boot.svelte): over everything until the client is
+   attached, the app's mark and name centred a little above the middle, a
+   thin bar under them and the step in small print. */
+/* Black and white, and cold: a fine grid of dots fading out towards the
+   edges, drifting; a soft patch of light wandering over it, waking the
+   dots it passes; in the middle the mark, the name, a turning ring and
+   the step in small print. */
+#boot { --boot-ink: #fff; position: fixed; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center; overflow: hidden; background: #0b0b0c; color: #f2f2f2; font: 400 13px var(--ui); user-select: none; }
+:root[data-theme=light] #boot { --boot-ink: #000; background: #f4f4f4; color: #111; }
+/* The grid: fine, even dots on a 24px pitch, fading out well before the
+   edges, drifting a little; over it the same grid brighter and a touch
+   bigger, seen only where a soft light passes. */
+#boot .dots {
+  position: absolute; inset: -48px; pointer-events: none;
+  background-image: radial-gradient(circle at center, color-mix(in srgb, var(--boot-ink) 13%, transparent) 0.9px, transparent 1.3px);
+  background-size: 24px 24px;
+  -webkit-mask-image: radial-gradient(ellipse 55% 50% at 50% 46%, #000 30%, transparent 100%); mask-image: radial-gradient(ellipse 55% 50% at 50% 46%, #000 30%, transparent 100%);
+  animation: boot-drift 10s linear infinite;
+}
+#boot .dots.lit {
+  background-image: radial-gradient(circle at center, color-mix(in srgb, var(--boot-ink) 75%, transparent) 1.2px, transparent 1.8px);
+  -webkit-mask-image: radial-gradient(circle closest-side, rgba(0,0,0,.9), rgba(0,0,0,.35) 45%, transparent); mask-image: radial-gradient(circle closest-side, rgba(0,0,0,.9), rgba(0,0,0,.35) 45%, transparent);
+  -webkit-mask-size: 520px 520px; mask-size: 520px 520px; -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;
+  animation: boot-drift 10s linear infinite, boot-wander 6s ease-in-out infinite alternate;
+}
+@keyframes boot-drift { to { background-position: 24px 48px; } }
+/* A ripple through the grid from the mark, every couple of seconds: a
+   band of brighter dots running outwards and thinning as it goes. */
+#boot .dots.wave {
+  background-image: radial-gradient(circle at center, color-mix(in srgb, var(--boot-ink) 85%, transparent) 1.1px, transparent 1.7px);
+  -webkit-mask-image: radial-gradient(circle closest-side, transparent 72%, #000 86%, transparent 100%); mask-image: radial-gradient(circle closest-side, transparent 72%, #000 86%, transparent 100%);
+  -webkit-mask-position: 50% 44%; mask-position: 50% 44%; -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;
+  animation: boot-drift 10s linear infinite, boot-ripple 2.4s cubic-bezier(.2,.6,.3,1) infinite;
+}
+@keyframes boot-ripple {
+  from { -webkit-mask-size: 60px 60px; mask-size: 60px 60px; opacity: .9; }
+  to { -webkit-mask-size: 1600px 1600px; mask-size: 1600px 1600px; opacity: 0; }
+}
+@keyframes boot-wander {
+  0% { -webkit-mask-position: 10% 20%; mask-position: 10% 20%; }
+  30% { -webkit-mask-position: 70% 10%; mask-position: 70% 10%; }
+  60% { -webkit-mask-position: 90% 75%; mask-position: 90% 75%; }
+  100% { -webkit-mask-position: 25% 90%; mask-position: 25% 90%; }
+}
+#boot .mid { position: relative; display: flex; flex-direction: column; align-items: center; margin-top: -4vh; padding: 0 28px; max-width: 420px; text-align: center; animation: boot-rise .9s cubic-bezier(.2,.8,.2,1) both; }
+@keyframes boot-rise { from { opacity: 0; transform: translateY(8px); filter: blur(4px); } }
+/* The ring goes round the mark: the start's only motion near the middle. */
+#boot .orb { position: relative; width: 96px; height: 96px; display: flex; align-items: center; justify-content: center; }
+#boot .mark { width: 64px; height: 64px; filter: drop-shadow(0 10px 22px rgba(0,0,0,.45)); }
+:root[data-theme=light] #boot .mark { filter: drop-shadow(0 3px 6px rgba(0,0,0,.18)); }
+#boot .name { margin-top: 10px; font-size: 21px; font-weight: 600; letter-spacing: .6px; }
+/* A hairline ring turning, one arc of it bright. */
+#boot .ring { position: absolute; inset: 0; border-radius: 50%; box-sizing: border-box; border: 2.5px solid color-mix(in srgb, var(--boot-ink) 10%, transparent); border-top-color: var(--boot-ink); animation: boot-turn 1.1s cubic-bezier(.55,.15,.45,.85) infinite; }
+@keyframes boot-turn { to { transform: rotate(360deg); } }
+/* The steps, as a terminal lists them: a fixed column for the mark, the
+   step, and on the right what it took. Done ones go quiet, the tick in
+   green with a little pop; the one under way is bright, its spinner too. */
+#boot .log { margin-top: 18px; width: 188px; min-height: calc(3 * 15px + 2 * 5px); display: flex; flex-direction: column; gap: 5px; font: 400 12px ui-monospace, "SF Mono", Menlo, monospace; text-align: left; }
+#boot .ln { display: grid; height: 15px; grid-template-columns: 16px 1fr auto; align-items: center; column-gap: 8px; color: color-mix(in srgb, var(--boot-ink) 88%, transparent); transition: color .4s; }
+#boot .ln.done { color: color-mix(in srgb, var(--boot-ink) 45%, transparent); }
+#boot .ln.bad { color: #ff6b6b; }
+#boot .st { display: inline-flex; justify-content: center; }
+#boot .tick { color: #3fd07a; animation: boot-pop .35s cubic-bezier(.2,1.6,.4,1) both; text-shadow: 0 0 8px rgba(63, 208, 122, .45); }
+:root[data-theme=light] #boot .tick { color: #1a9f52; text-shadow: none; }
+@keyframes boot-pop { from { transform: scale(.2); opacity: 0; } }
+#boot .spin { width: 9px; height: 9px; border-radius: 50%; box-sizing: border-box; border: 1.5px solid color-mix(in srgb, var(--boot-ink) 22%, transparent); border-top-color: var(--boot-ink); animation: boot-turn .7s linear infinite; }
+#boot .cross { color: #ff6b6b; }
+#boot .t { font-size: 11px; opacity: .7; font-variant-numeric: tabular-nums; }
+#boot .why { margin-top: 22px; font-size: 13px; line-height: 1.55; opacity: .75; overflow-wrap: anywhere; }
+#boot .again { margin-top: 20px; height: 32px; padding: 0 18px; border-radius: 999px; border: 1px solid color-mix(in srgb, var(--boot-ink) 40%, transparent); background: transparent; color: inherit; font: 500 12px var(--ui); letter-spacing: 1px; }
+#boot .again:active { background: color-mix(in srgb, var(--boot-ink) 10%, transparent); }
+@media (prefers-reduced-motion: reduce) { #boot .dots, #boot .mid { animation: none; } #boot .ring { animation-duration: 2.4s; } }
 
 /* A reader who has asked the system for less motion gets none of it: the
    page still opens and closes exactly the same things. */

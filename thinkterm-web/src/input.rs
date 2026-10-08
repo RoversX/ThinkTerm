@@ -7,30 +7,10 @@ use crate::page::WebApp;
 use crate::platform::{PointerInput, WheelDelta, WheelInput};
 use wezterm_term::KeyModifiers;
 use std::rc::Rc;
-use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 use web_sys::{
     ClipboardEvent, CompositionEvent, Event, HtmlCanvasElement, HtmlTextAreaElement, InputEvent,
     KeyboardEvent, PointerEvent, WheelEvent,
 };
-
-pub(crate) fn listen<E: JsCast + 'static>(
-    target: &web_sys::EventTarget,
-    name: &str,
-    handler: impl FnMut(E) + 'static,
-) {
-    let mut handler = handler;
-    let closure = Closure::<dyn FnMut(Event)>::new(move |ev: Event| {
-        if let Ok(ev) = ev.dyn_into::<E>() {
-            handler(ev);
-        }
-    });
-    target
-        .add_event_listener_with_callback(name, closure.as_ref().unchecked_ref())
-        .expect("addEventListener");
-    // The listeners live as long as the page.
-    closure.forget();
-}
 
 fn mouse_modifiers(ev: &web_sys::MouseEvent) -> KeyModifiers {
     let mut m = KeyModifiers::NONE;
@@ -77,18 +57,27 @@ fn wheel_input(ev: &WheelEvent) -> WheelInput {
     }
 }
 
+/// Every listener holds the App weakly, and is held by the platform rather
+/// than leaked: the page can close a machine's terminal (machines.svelte.ts)
+/// and stay open, and then `WebPlatform::release` takes them all down.
 pub fn install(app: Rc<WebApp>, canvas: &HtmlCanvasElement, textarea: &HtmlTextAreaElement) {
+    let platform = Rc::clone(&app.platform);
     if let Some(document) = web_sys::window().and_then(|window| window.document()) {
         app.visibility_changed(!document.hidden());
-        let app = Rc::clone(&app);
+        let app = Rc::downgrade(&app);
         let target = document.clone();
-        listen::<Event>(&target, "visibilitychange", move |_| app.visibility_changed(!document.hidden()));
+        platform.listen::<Event>(&target, "visibilitychange", move |_| {
+            if let Some(app) = app.upgrade() {
+                app.visibility_changed(!document.hidden());
+            }
+        });
     }
     let window = web_sys::window().expect("window");
 
     {
-        let app = app.clone();
-        listen::<KeyboardEvent>(textarea, "keydown", move |ev| {
+        let app = Rc::downgrade(&app);
+        platform.listen::<KeyboardEvent>(textarea, "keydown", move |ev| {
+            let Some(app) = app.upgrade() else { return };
             let key = ev.key();
             let code = ev.code();
             let dom = DomKey {
@@ -117,13 +106,28 @@ pub fn install(app: Rc<WebApp>, canvas: &HtmlCanvasElement, textarea: &HtmlTextA
         });
     }
     {
-        let app = app.clone();
-        listen::<CompositionEvent>(textarea, "compositionstart", move |_| app.composing(true));
+        let app = Rc::downgrade(&app);
+        platform.listen::<CompositionEvent>(textarea, "compositionstart", move |_| {
+            if let Some(app) = app.upgrade() {
+                app.composing(true);
+            }
+        });
     }
     {
-        let app = app.clone();
+        // What the input method has so far ("ni hao" before it is 你好),
+        // drawn at the cursor: the field it is typed into is out of sight.
+        let app = Rc::downgrade(&app);
+        platform.listen::<CompositionEvent>(textarea, "compositionupdate", move |ev| {
+            if let Some(app) = app.upgrade() {
+                app.preedit(&ev.data().unwrap_or_default());
+            }
+        });
+    }
+    {
+        let app = Rc::downgrade(&app);
         let textarea = textarea.clone();
-        listen::<CompositionEvent>(&textarea.clone(), "compositionend", move |ev| {
+        platform.listen::<CompositionEvent>(&textarea.clone(), "compositionend", move |ev| {
+            let Some(app) = app.upgrade() else { return };
             app.composing(false);
             if let Some(text) = ev.data() {
                 if !text.is_empty() {
@@ -134,9 +138,10 @@ pub fn install(app: Rc<WebApp>, canvas: &HtmlCanvasElement, textarea: &HtmlTextA
         });
     }
     {
-        let app = app.clone();
+        let app = Rc::downgrade(&app);
         let textarea = textarea.clone();
-        listen::<InputEvent>(&textarea.clone(), "input", move |ev| {
+        platform.listen::<InputEvent>(&textarea.clone(), "input", move |ev| {
+            let Some(app) = app.upgrade() else { return };
             // Composition text arrives through compositionend; anything
             // else typed straight into the textarea (a virtual keyboard,
             // autocorrect) is sent as bytes.
@@ -151,8 +156,9 @@ pub fn install(app: Rc<WebApp>, canvas: &HtmlCanvasElement, textarea: &HtmlTextA
         });
     }
     {
-        let app = app.clone();
-        listen::<ClipboardEvent>(textarea, "paste", move |ev| {
+        let app = Rc::downgrade(&app);
+        platform.listen::<ClipboardEvent>(textarea, "paste", move |ev| {
+            let Some(app) = app.upgrade() else { return };
             ev.prevent_default();
             if let Some(data) = ev.clipboard_data() {
                 if let Ok(text) = data.get_data("text/plain") {
@@ -164,66 +170,89 @@ pub fn install(app: Rc<WebApp>, canvas: &HtmlCanvasElement, textarea: &HtmlTextA
         });
     }
     {
-        let app = app.clone();
+        let app = Rc::downgrade(&app);
         let canvas = canvas.clone();
-        listen::<PointerEvent>(&canvas.clone(), "pointerdown", move |ev| {
+        platform.listen::<PointerEvent>(&canvas.clone(), "pointerdown", move |ev| {
+            let Some(app) = app.upgrade() else { return };
             let _ = canvas.set_pointer_capture(ev.pointer_id());
             app.pointer(&pointer_input(&ev), crate::app::Pointer::Down);
             ev.prevent_default();
         });
     }
     {
-        let app = app.clone();
-        listen::<PointerEvent>(canvas, "pointermove", move |ev| {
-            app.pointer(&pointer_input(&ev), crate::app::Pointer::Move);
+        let app = Rc::downgrade(&app);
+        platform.listen::<PointerEvent>(canvas, "pointermove", move |ev| {
+            if let Some(app) = app.upgrade() {
+                app.pointer(&pointer_input(&ev), crate::app::Pointer::Move);
+            }
         });
     }
     {
-        let app = app.clone();
-        listen::<PointerEvent>(canvas, "pointerup", move |ev| {
-            app.pointer(&pointer_input(&ev), crate::app::Pointer::Up);
+        let app = Rc::downgrade(&app);
+        platform.listen::<PointerEvent>(canvas, "pointerup", move |ev| {
+            if let Some(app) = app.upgrade() {
+                app.pointer(&pointer_input(&ev), crate::app::Pointer::Up);
+            }
         });
     }
     {
-        let app = app.clone();
-        listen::<PointerEvent>(canvas, "pointercancel", move |ev| {
-            app.pointer(&pointer_input(&ev), crate::app::Pointer::Up);
+        let app = Rc::downgrade(&app);
+        platform.listen::<PointerEvent>(canvas, "pointercancel", move |ev| {
+            if let Some(app) = app.upgrade() {
+                app.pointer(&pointer_input(&ev), crate::app::Pointer::Up);
+            }
         });
     }
     {
-        let app = app.clone();
-        listen::<WheelEvent>(canvas, "wheel", move |ev| {
-            if app.wheel(&wheel_input(&ev)) {
+        let app = Rc::downgrade(&app);
+        platform.listen::<WheelEvent>(canvas, "wheel", move |ev| {
+            if app.upgrade().is_some_and(|app| app.wheel(&wheel_input(&ev))) {
                 ev.prevent_default();
             }
         });
     }
     {
-        listen::<Event>(canvas, "contextmenu", move |ev| ev.prevent_default());
+        platform.listen::<Event>(canvas, "contextmenu", move |ev| ev.prevent_default());
     }
     {
-        let app = app.clone();
-        listen::<Event>(&window, "focus", move |_| app.focus(true));
+        let app = Rc::downgrade(&app);
+        platform.listen::<Event>(&window, "focus", move |_| {
+            if let Some(app) = app.upgrade() {
+                app.focus(true);
+            }
+        });
     }
     {
-        let app = app.clone();
-        listen::<Event>(&window, "blur", move |_| app.focus(false));
+        let app = Rc::downgrade(&app);
+        platform.listen::<Event>(&window, "blur", move |_| {
+            if let Some(app) = app.upgrade() {
+                app.focus(false);
+            }
+        });
     }
     {
-        let app = app.clone();
-        listen::<Event>(&window, "resize", move |_| app.resize());
+        let app = Rc::downgrade(&app);
+        platform.listen::<Event>(&window, "resize", move |_| {
+            if let Some(app) = app.upgrade() {
+                app.resize();
+            }
+        });
     }
     {
-        let app = app.clone();
-        listen::<Event>(&window, "scroll", move |_| app.resize());
+        let app = Rc::downgrade(&app);
+        platform.listen::<Event>(&window, "scroll", move |_| {
+            if let Some(app) = app.upgrade() {
+                app.resize();
+            }
+        });
     }
     {
         // The canvas's own box, not just the window: CSS can resize it.
-        let app = app.clone();
-        let closure = Closure::<dyn FnMut(js_sys::Array)>::new(move |_entries: js_sys::Array| app.resize());
-        if let Ok(observer) = web_sys::ResizeObserver::new(closure.as_ref().unchecked_ref()) {
-            observer.observe(canvas);
-            closure.forget();
-        }
+        let app = Rc::downgrade(&app);
+        platform.observe_resize(canvas, move || {
+            if let Some(app) = app.upgrade() {
+                app.resize();
+            }
+        });
     }
 }

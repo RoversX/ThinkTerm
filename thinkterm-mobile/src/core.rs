@@ -971,6 +971,7 @@ impl State {
             rows,
             font_pinned: true,
             languages: vec![],
+            server_version: attached.server_version.clone(),
         });
         host.events.set_wake(app.wake());
         {

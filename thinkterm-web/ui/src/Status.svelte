@@ -24,7 +24,9 @@
   });
 
   const text = $derived.by(() => {
-    if (!views.ready) return views.boot;
+    // Before the client, the boot screen says how the start is going; the
+    // probes (`?check=`) still read their one line here.
+    if (!views.ready) return new URLSearchParams(location.search).has('check') ? views.boot : '';
     if (!toast) return '';
     return toast.sticky || now < toast.at + LIFE ? toast.text : '';
   });

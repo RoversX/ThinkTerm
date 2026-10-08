@@ -11,7 +11,7 @@ const NARROW = 720;
     and below, so every key clears the 44px a thumb needs. The bar reports
     what it really measures as `--keybar`, which is this plus whatever the
     home indicator takes; the canvas and the drawers leave room for that. */
-export const KEYBAR = 52;
+export const KEYBAR = 62;
 
 export const mobile = $state({
   /** The page is in its phone shape. */
@@ -35,21 +35,32 @@ export function wantKeyboard(): boolean {
 /** Put focus back on the field the terminal types through, where that is
     wanted (see `wantKeyboard`). Every "hand focus back to the terminal"
     site goes through here, so a phone never gets the soft keyboard from a
-    panel closing under it. */
+    panel closing under it. A page in the terminal's place (`body[data-page]`
+    names it, machines.svelte.ts) gets the keys instead: the terminal
+    behind it is not on show to type into. */
 export function focusTerminal() {
   if (!wantKeyboard()) return;
-  document.getElementById('kbd')?.focus();
+  const page = document.body.dataset.page;
+  if (page !== undefined) {
+    const el = document.getElementById(page);
+    if (el && !el.contains(document.activeElement)) el.focus({ preventScroll: true });
+    return;
+  }
+  document.getElementById('kbd')?.focus({ preventScroll: true });
 }
 
 /** The keyboard button: ask for the soft keyboard, or send it away. */
 export function toggleKeyboard() {
   const kbd = document.getElementById('kbd');
   if (!(kbd instanceof HTMLTextAreaElement)) return;
-  const up = document.activeElement === kbd;
+  // Up only if it was asked for: the field can hold focus with no
+  // keyboard on show (a desktop-shaped load, a focus iOS would not raise
+  // the keyboard for), and reading that as "up" put a first tap to waste.
+  const up = mobile.keyboard && document.activeElement === kbd;
   mobile.keyboard = !up;
   paintKeyboard();
   if (up) kbd.blur();
-  else kbd.focus();
+  else kbd.focus({ preventScroll: true });
 }
 
 /** The wasm asks the same question through `body[data-keyboard]`, since
@@ -85,8 +96,10 @@ export function watchMobile() {
   // #kbd with nothing else taking focus; from then on the keyboard is not
   // wanted until the button asks again. A blur that moves focus into a
   // panel is that panel's, and the flag stays for when it closes.
-  document.getElementById('kbd')?.addEventListener('blur', () => {
-    if (!mobile.on) return;
+  // Listened for on the document: #kbd is not there yet when this runs,
+  // and it is a different field for each machine's terminal.
+  document.addEventListener('focusout', (ev) => {
+    if (!mobile.on || (ev.target as Element | null)?.id !== 'kbd') return;
     setTimeout(() => {
       if (document.activeElement === document.body || document.activeElement === null) {
         mobile.keyboard = false;

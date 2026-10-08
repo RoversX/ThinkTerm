@@ -42,6 +42,37 @@ pub fn choose_size_pt(
     ((pt - current).abs() >= 0.125).then_some(pt)
 }
 
+/// Where a pane's rows sit while it previews a grid of another height than
+/// the server has given it yet: the preview's row count, placed as the
+/// server's resize will place them. Taller, the bottom stays on the newest
+/// row and the rows above come out of the scrollback, as far as it goes;
+/// shorter, the blank rows under the cursor go first, then the top rows
+/// into the scrollback. The preview itself keeps the old top: a phone's
+/// pane growing as its soft keyboard went away showed rows past the newest
+/// one, not written yet -- blank but for its last rows until the server
+/// answered, and then everything moved. The alternate screen, a program's
+/// own grid, is left as the preview has it.
+pub fn previewed(
+    dims: RenderableDimensions,
+    server: &RenderableDimensions,
+    cursor_row: StableRowIndex,
+    alt_screen: bool,
+) -> RenderableDimensions {
+    if alt_screen || dims.cols != server.cols || dims.viewport_rows == server.viewport_rows {
+        return dims;
+    }
+    let rows = dims.viewport_rows as StableRowIndex;
+    let old = server.viewport_rows as StableRowIndex;
+    let bottom = server.physical_top + old;
+    let physical_top = if rows > old {
+        (bottom - rows).max(dims.scrollback_top)
+    } else {
+        let blank_below = (bottom - 1).saturating_sub(cursor_row).clamp(0, old - rows);
+        bottom - blank_below - rows
+    };
+    RenderableDimensions { physical_top, ..dims }
+}
+
 /// Rows the page shows: the last `rows` of the screen, moved up into the
 /// scrollback by `scroll_from_bottom` lines.
 pub fn visible_rows(
@@ -166,6 +197,36 @@ mod tests {
     #[test]
     fn following_the_tail_shows_the_screen() {
         assert_eq!(visible_rows(&dims(100, 0, 24), 24, 0), 100..124);
+    }
+
+    #[test]
+    fn a_taller_preview_keeps_the_newest_row_at_the_bottom() {
+        // The server has rows 384..400 on show, the cursor on the last; a
+        // keyboard going away previews 32 rows.
+        let server = dims(384, 0, 16);
+        let preview = dims(384, 0, 32);
+        let shown = previewed(preview, &server, 399, false);
+        assert_eq!(visible_rows(&shown, 32, 0), 368..400);
+        // Without that much scrollback, blank rows go under the newest one.
+        let short = previewed(dims(5, 0, 32), &dims(5, 0, 16), 20, false);
+        assert_eq!(visible_rows(&short, 32, 0), 0..32);
+        // The alternate screen is left as previewed.
+        assert_eq!(previewed(preview, &server, 399, true).physical_top, 384);
+    }
+
+    #[test]
+    fn a_shorter_preview_drops_the_blank_rows_under_the_cursor_first() {
+        let server = dims(368, 0, 32);
+        // The cursor on the last row: the top rows go into the scrollback.
+        let full = previewed(dims(368, 0, 16), &server, 399, false);
+        assert_eq!(visible_rows(&full, 16, 0), 384..400);
+        // The cursor near the top of a fresh screen: the blank rows under
+        // it go, and the top stays.
+        let fresh = previewed(dims(368, 0, 16), &server, 370, false);
+        assert_eq!(visible_rows(&fresh, 16, 0), 368..384);
+        // In between: as many blank rows as there are, then the top.
+        let partial = previewed(dims(368, 0, 16), &server, 390, false);
+        assert_eq!(visible_rows(&partial, 16, 0), 375..391);
     }
 
     #[test]

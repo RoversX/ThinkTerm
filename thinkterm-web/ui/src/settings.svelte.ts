@@ -4,7 +4,7 @@
 // show, and the palette's recent picks. The wasm applies what concerns it
 // -- the language and the font -- and the page applies the rest.
 
-import { handle } from './client';
+import { everyClient, handle } from './client';
 import { refreshViews, setLocale, views } from './client.svelte';
 import type { LanguageOption, Scheme, Theme } from './model';
 import { focusTerminal } from './mobile.svelte';
@@ -82,6 +82,9 @@ export function setSetting(key: string, value: unknown) {
   const client = handle.client;
   if (!client) return;
   panel.error = client.set_setting(key, JSON.stringify(value));
+  // The preferences are this browser's, so every machine's terminal takes
+  // them; what the one on show said about them is what the panel shows.
+  for (const other of everyClient()) if (other !== client) other.set_setting(key, JSON.stringify(value));
   // The wasm activated the language itself; this is how the page learns
   // which locale that came to, for the About line.
   if (key === 'language' && panel.error === '') {
@@ -202,9 +205,7 @@ export function storedScheme(): Scheme | null {
 /** Draw with `scheme` without keeping it: what a hover shows. `null` goes
     back to the server's own scheme. */
 export function previewScheme(scheme: Scheme | null) {
-  const client = handle.client;
-  if (!client) return;
-  client.set_terminal_palette(scheme ? JSON.stringify(scheme) : undefined);
+  for (const client of everyClient()) client.set_terminal_palette(scheme ? JSON.stringify(scheme) : undefined);
 }
 
 /** Keep `scheme` for this browser: the colours beside the name, so the next

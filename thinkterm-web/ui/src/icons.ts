@@ -5,7 +5,10 @@
 import archive from '../../../third_party/lucide/icons/archive.svg?raw';
 import arrowLeft from '../../../third_party/lucide/icons/arrow-left.svg?raw';
 import archiveRestore from '../../../third_party/lucide/icons/archive-restore.svg?raw';
+import aLargeSmall from '../../../third_party/lucide/icons/a-large-small.svg?raw';
 import bell from '../../../third_party/lucide/icons/bell.svg?raw';
+import braces from '../../../third_party/lucide/icons/braces.svg?raw';
+import contrast from '../../../third_party/lucide/icons/contrast.svg?raw';
 import info from '../../../third_party/lucide/icons/info.svg?raw';
 import minus from '../../../third_party/lucide/icons/minus.svg?raw';
 import notebookTabs from '../../../third_party/lucide/icons/notebook-tabs.svg?raw';
@@ -27,6 +30,14 @@ import folder from '../../../third_party/lucide/icons/folder.svg?raw';
 import folderOpen from '../../../third_party/lucide/icons/folder-open.svg?raw';
 import folderPlus from '../../../third_party/lucide/icons/folder-plus.svg?raw';
 import globe from '../../../third_party/lucide/icons/globe.svg?raw';
+import keyRound from '../../../third_party/lucide/icons/key-round.svg?raw';
+import keyboard from '../../../third_party/lucide/icons/keyboard.svg?raw';
+import link2 from '../../../third_party/lucide/icons/link-2.svg?raw';
+import network from '../../../third_party/lucide/icons/network.svg?raw';
+import server from '../../../third_party/lucide/icons/server.svg?raw';
+import shieldAlert from '../../../third_party/lucide/icons/shield-alert.svg?raw';
+import unplug from '../../../third_party/lucide/icons/unplug.svg?raw';
+import download from '../../../third_party/lucide/icons/download.svg?raw';
 import grid2x2 from '../../../third_party/lucide/icons/grid-2x2.svg?raw';
 import house from '../../../third_party/lucide/icons/house.svg?raw';
 import languages from '../../../third_party/lucide/icons/languages.svg?raw';
@@ -35,13 +46,20 @@ import loaderCircle from '../../../third_party/lucide/icons/loader-circle.svg?ra
 import mail from '../../../third_party/lucide/icons/mail.svg?raw';
 import maximize2 from '../../../third_party/lucide/icons/maximize-2.svg?raw';
 import minimize2 from '../../../third_party/lucide/icons/minimize-2.svg?raw';
+import mouse from '../../../third_party/lucide/icons/mouse.svg?raw';
+// `package` is a reserved word.
+import packageIcon from '../../../third_party/lucide/icons/package.svg?raw';
 import panelLeft from '../../../third_party/lucide/icons/panel-left.svg?raw';
+import panelLeftOpen from '../../../third_party/lucide/icons/panel-left-open.svg?raw';
 import panelRight from '../../../third_party/lucide/icons/panel-right.svg?raw';
+import panelRightOpen from '../../../third_party/lucide/icons/panel-right-open.svg?raw';
 import pencil from '../../../third_party/lucide/icons/pencil.svg?raw';
 import pin from '../../../third_party/lucide/icons/pin.svg?raw';
 import pinOff from '../../../third_party/lucide/icons/pin-off.svg?raw';
 import plus from '../../../third_party/lucide/icons/plus.svg?raw';
 import rotateCcw from '../../../third_party/lucide/icons/rotate-ccw.svg?raw';
+import rotateCw from '../../../third_party/lucide/icons/rotate-cw.svg?raw';
+import scale from '../../../third_party/lucide/icons/scale.svg?raw';
 import search from '../../../third_party/lucide/icons/search.svg?raw';
 import settings from '../../../third_party/lucide/icons/settings.svg?raw';
 import slidersHorizontal from '../../../third_party/lucide/icons/sliders-horizontal.svg?raw';
@@ -75,9 +93,19 @@ import brandCopilot from '../../../third_party/simple-icons/icons/githubcopilot.
 export {
   archive,
   arrowLeft,
+  download,
+  keyRound,
+  keyboard,
+  link2,
+  network,
+  server,
+  shieldAlert,
+  unplug,
   archiveRestore,
+  aLargeSmall,
   bell,
   bot,
+  braces,
   brandClaude,
   brandCopilot,
   check,
@@ -88,12 +116,14 @@ export {
   circlePlus,
   clipboardPaste,
   codeXml,
+  contrast,
   copy,
   ellipsis,
   eye,
   folder,
   folderOpen,
   folderTree,
+  gitBranch,
   globe,
   grid2x2,
   folderPlus,
@@ -106,15 +136,22 @@ export {
   maximize2,
   minimize2,
   minus,
+  mouse,
   notebookTabs,
+  packageIcon,
   palette,
   panelLeft,
+  panelLeftOpen,
   panelRight,
+  panelRightOpen,
   pencil,
   pin,
   pinOff,
   plus,
+  puzzle,
   rotateCcw,
+  rotateCw,
+  scale,
   search,
   settings,
   slidersHorizontal,
@@ -179,6 +216,8 @@ const BY_NAME: Record<string, string> = {
   x,
   'zoom-in': zoomIn,
   'zoom-out': zoomOut,
+  network,
+  server,
 };
 
 /** A lucide icon by its name; nothing for a name the page has not inlined. */

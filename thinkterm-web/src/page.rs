@@ -79,11 +79,15 @@ pub async fn start(
     // The language: a preference ("system" or a tag) and the browser's list.
     locale: String,
     languages: Vec<String>,
+    // Another machine, reached through this page's server: hands back a
+    // socket ready for its mux connection (`WsLink::connect_via`); `url`
+    // and `token` are then unused.
+    opener: Option<js_sys::Function>,
 ) -> Result<crate::bridge::Client, JsValue> {
     thinkterm_i18n::activate_preference(&locale, &languages);
     run(
         canvas_id, textarea_id, url, token, font_names, fonts, size_pt, glyph_font, font_pinned,
-        languages,
+        languages, opener,
     )
     .await
     .map(crate::bridge::Client::new)
@@ -110,6 +114,7 @@ async fn run(
     glyph_font: String,
     font_pinned: bool,
     languages: Vec<String>,
+    opener: Option<js_sys::Function>,
 ) -> Result<Rc<WebApp>> {
     let canvas: web_sys::HtmlCanvasElement = element(&canvas_id)?;
     let textarea: web_sys::HtmlTextAreaElement = element(&textarea_id)?;
@@ -136,11 +141,21 @@ async fn run(
     let dpi = (96.0 * dpr) as u32;
 
     set_status("connecting…");
-    let link = WsLink::connect(&url, &token).await?;
+    let link_is_relay = opener.is_some();
+    let link = match opener {
+        Some(opener) => WsLink::connect_via(opener).await?,
+        None => WsLink::connect(&url, &token).await?,
+    };
     // From here on a failure must hand the socket back: without this the
     // server keeps a registered client and a TCP session for a page that
     // gave up, and the reader keeps answering its pings.
     let platform = Rc::new(WebPlatform::new(canvas.clone(), textarea.clone()));
+    // Another machine starts behind the one on show; the page brings it on
+    // show. Hidden from the first moment, so nothing in its start-up takes
+    // a terminal from that host's own desktop.
+    if link_is_relay {
+        platform.set_shown(false);
+    }
     let outcome = start_attached(
         &link, platform, &canvas, &textarea, fonts, size_pt, &glyph_font, dpr, dpi, font_pinned,
         languages,
@@ -253,6 +268,7 @@ async fn start_attached(
         rows,
         font_pinned,
         languages,
+        server_version: attached.server_version.clone(),
     });
     host.events.set_wake(app.wake());
     {
@@ -268,7 +284,8 @@ async fn start_attached(
     app.hide_status();
     app.refresh_layout();
     app.poll_layout(5_000);
-    let _ = textarea.focus();
+    // Through the platform, which leaves a phone's soft keyboard down.
+    platform.focus_input();
     app.match_desktop_cell();
     app.resize();
     app.request_frame();

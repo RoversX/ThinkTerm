@@ -196,6 +196,12 @@ impl<H: SessionHost> PaneSession<H> {
         self.state().dimensions
     }
 
+    /// The dimensions the server last reported, while `dimensions` may
+    /// still be a frontend preview of another size.
+    pub fn server_dimensions(&self) -> RenderableDimensions {
+        self.state().server_dimensions
+    }
+
     pub fn cursor_position(&self) -> StableCursorPosition {
         self.state().cursor_position
     }

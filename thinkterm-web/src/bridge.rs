@@ -79,6 +79,41 @@ impl Client {
         self.app.resize();
     }
 
+    /// The page put this machine's terminal on show (`true`) or behind
+    /// another machine's. Hidden, it keeps its sessions but does not paint.
+    pub fn set_shown(&self, shown: bool) {
+        self.app.platform.set_shown(shown);
+        if shown {
+            self.app.resize();
+            self.app.request_frame();
+            // Listed again now, so a tab it shows is claimed as on any
+            // showing rather than at the next poll.
+            self.app.refresh_layout();
+        }
+    }
+
+    /// Let this client go: its connection closes, and nothing it set going
+    /// does anything more. The page frees it after.
+    pub fn close(&self) {
+        self.app.retire();
+        self.app.platform.release();
+    }
+
+    /// Whether the connection is up; a change comes with a view change.
+    pub fn connected(&self) -> bool {
+        self.app.connected()
+    }
+
+    /// This server's Spaces: JSON `[{id, name, current, default}]`.
+    pub fn spaces(&self) -> String {
+        json(&self.app.spaces())
+    }
+
+    /// A new tab in the named domain of this server (a plain ssh one).
+    pub fn new_tab_in(&self, domain: String) {
+        self.app.new_tab_in(Some(domain));
+    }
+
     /// The card's button, or a press on the card: ask for the terminal
     /// another device holds. What comes of it is the card's next state.
     pub fn take_over(&self) {
@@ -357,6 +392,12 @@ impl Client {
         json(&self.app.settings_view())
     }
 
+    /// The version of the ThinkTerm at the other end, as it answered when
+    /// the page attached: what Settings › About shows.
+    pub fn server_version(&self) -> String {
+        self.app.server_version()
+    }
+
     /// The stored preferences, whole, at boot. Returns an error text or "".
     pub fn apply_settings(&self, json: String) -> String {
         self.app.apply_settings(&json).err().unwrap_or_default()
@@ -366,6 +407,18 @@ impl Client {
     /// error text or "".
     pub fn set_setting(&self, key: String, value: String) -> String {
         self.app.set_setting(&key, &value).err().unwrap_or_default()
+    }
+
+    /// A finger came down at a point: whether that starts dragging a
+    /// divider near it (`App::touch_divider`).
+    pub fn touch_divider(&self, x: f64, y: f64) -> bool {
+        self.app.touch_divider(x, y)
+    }
+
+    /// The tab icon cards the page's server sent over the relay (a
+    /// `WireCatalog`, as JSON). Returns an error text or "".
+    pub fn set_tab_icons(&self, json: String) -> String {
+        self.app.set_tab_icons(&json).err().unwrap_or_default()
     }
 
     /// The colours of the scheme named by `terminal-scheme`, as the page

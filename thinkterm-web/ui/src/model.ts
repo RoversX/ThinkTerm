@@ -25,11 +25,15 @@ export type Controls = {
   clipped: [number, number] | null;
 };
 
-export type TabsView = { tabs: TabView[]; controls: Controls };
+/** `icon`: the card heading every tab (tabicons.svelte.ts), the
+    terminal's; null with tab icons off. */
+export type TabsView = { tabs: TabView[]; controls: Controls; icon: string | null };
 
 export type NavRect = { pane: number; left: number; top: number; width: number; height: number };
 
-export type CapsuleView = { pane: number; title: string; busy: boolean; current: boolean };
+/** `icon`: the card heading it, for what the pane runs; null with tab
+    icons off. */
+export type CapsuleView = { pane: number; title: string; busy: boolean; current: boolean; icon: string | null };
 
 export type NavView = {
   rect: NavRect;
@@ -354,6 +358,8 @@ export type WebSettings = {
   'scroll-mode': ScrollMode;
   /** `"desktop"` follows the server's configuration; else a scheme's name. */
   'terminal-scheme': string;
+  /** The program's icon at the head of each tab (tabicons.svelte.ts). */
+  'tab-icons': boolean;
 };
 
 /** One entry of `schemes.json`, built by `thinkterm cli color-schemes

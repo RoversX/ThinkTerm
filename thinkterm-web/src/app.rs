@@ -207,6 +207,8 @@ pub struct Setup<P: Platform, L: Link> {
     pub font_pinned: bool,
     /// The browser's languages, for switching the locale by preference.
     pub languages: Vec<String>,
+    /// The server's version, as it answered the handshake.
+    pub server_version: String,
 }
 
 /// One pane on the page: its session and the state that is the page's
@@ -304,6 +306,14 @@ pub struct Inner<P: Platform, L: Link> {
     /// The size the page started with: what "follow" goes back to.
     boot_size_pt: f64,
     languages: Vec<String>,
+    /// What Settings › About names as the version: the server's, as it
+    /// answered when the page attached.
+    server_version: String,
+    /// What leads each pane's terminal, as the server pushes it, for the
+    /// tab icons. A pane the listing no longer has is let go with it.
+    programs: std::collections::HashMap<PaneId, thinkterm_proto::ForegroundProgram>,
+    /// The cards the page's server sent for its tabs (`tab_icons`).
+    tab_icons: Option<crate::tab_icons::TabIcons>,
     /// Palette picks, most recent first; the page keeps them across loads.
     recent: Vec<String>,
     /// The page's preferences, as it handed them over.
@@ -346,6 +356,9 @@ pub struct Inner<P: Platform, L: Link> {
     last_click_ms: f64,
     focused: bool,
     composing: bool,
+    /// What the input method has composed so far, drawn at the cursor
+    /// until it is committed or dropped (`emit::LineParams::composing`).
+    preedit: String,
     /// Refreshed on layout/scroll changes, avoiding layout reads per glyph
     /// or per frame. The IME field itself uses fixed CSS positioning.
     canvas_rect: [f64; 4],
@@ -653,6 +666,7 @@ impl<P: Platform, L: Link> App<P, L> {
             last_click_ms: 0.0,
             focused: true,
             composing: false,
+            preedit: String::new(),
             canvas_rect: [0.0; 4],
             ime_anchor: None,
             disconnected: None,
@@ -665,6 +679,9 @@ impl<P: Platform, L: Link> App<P, L> {
             capacity: Capacity::new(),
             font_pinned: setup.font_pinned,
             languages: setup.languages,
+            server_version: setup.server_version,
+            programs: std::collections::HashMap::new(),
+            tab_icons: None,
             recent: Vec::new(),
             settings: crate::settings::WebSettings::default(),
             server_palette: None,
@@ -942,13 +959,11 @@ impl<P: Platform, L: Link> App<P, L> {
     }
 
     /// The footer the desktop's sidebar ends with: the gear and its label,
-    /// then Live Overview, Remote Hosts and the thread search. The first
-    /// two need windows the browser has not got, so they are shown and
-    /// refused rather than hidden -- the panel is the shape the desktop's
-    /// is either way.
+    /// then Live Overview, Remote Hosts and the thread search.
     fn side_footer() -> Vec<crate::sidebar::FooterAction> {
-        // Only what the page can do: the desktop's Live Overview and
-        // Remote Hosts have no browser counterpart, so no button for them.
+        // Only what the page can do: the desktop's Live Overview has no
+        // browser counterpart, so no button for it. Remote Hosts is the
+        // page's own machines panel.
         vec![
             crate::sidebar::FooterAction {
                 id: "settings".into(),
@@ -957,6 +972,14 @@ impl<P: Platform, L: Link> App<P, L> {
                 tip: thinkterm_i18n::tr("tooltip-sidebar-settings"),
                 enabled: true,
                 trailing: false,
+            },
+            crate::sidebar::FooterAction {
+                id: "machines".into(),
+                icon: "globe".into(),
+                label: None,
+                tip: thinkterm_i18n::tr("tooltip-sidebar-ssh-hosts"),
+                enabled: true,
+                trailing: true,
             },
             crate::sidebar::FooterAction {
                 id: "search".into(),
@@ -1042,7 +1065,32 @@ impl<P: Platform, L: Link> App<P, L> {
     pub fn tabs_view(&self) -> crate::views::TabsView {
         let inner = self.inner.borrow();
         let (tabs, controls) = Self::strip_model(&inner).unwrap_or_default();
-        crate::views::TabsView { tabs, controls }
+        let icon = Self::tab_icons(&inner).and_then(|icons| icons.terminal()).map(str::to_string);
+        crate::views::TabsView { tabs, controls, icon }
+    }
+
+    /// The cards to dress the tabs with: none until the page has handed
+    /// them over, or with tab icons off.
+    fn tab_icons(inner: &Inner<P, L>) -> Option<&crate::tab_icons::TabIcons> {
+        inner.tab_icons.as_ref().filter(|_| inner.settings.tab_icons)
+    }
+
+    /// The card heading a pane's tab: its agent's, else its program's,
+    /// else the terminal's.
+    fn pane_icon(inner: &Inner<P, L>, pane_id: PaneId) -> Option<String> {
+        Self::tab_icons(inner)?
+            .card(inner.tree.agent_id(pane_id), inner.programs.get(&pane_id))
+            .map(str::to_string)
+    }
+
+    /// The cards this page's server sent for its tabs, as the page read
+    /// them off the relay.
+    pub fn set_tab_icons(self: &Rc<Self>, json: &str) -> Result<(), String> {
+        let icons = crate::tab_icons::TabIcons::parse(json)?;
+        let mut inner = self.inner.borrow_mut();
+        inner.tab_icons = Some(icons);
+        Self::notify(&inner);
+        Ok(())
     }
 
     pub fn navs_view(&self) -> crate::views::NavsView {
@@ -1071,7 +1119,7 @@ impl<P: Platform, L: Link> App<P, L> {
         if cols == 0 || rows == 0 {
             return None;
         }
-        let dims = cell.session.dimensions();
+        let dims = Self::shown_dims(&cell.session);
         let visible = visible_rows(&dims, rows, cell.scroll_from_bottom);
         let (first, lines) = cell.session.get_lines(visible.clone());
         let mut text = String::with_capacity(rows * (cols + 1));
@@ -1148,7 +1196,7 @@ impl<P: Platform, L: Link> App<P, L> {
             let Some(cell) = inner.panes.get_mut(&place.pane_id) else {
                 return;
             };
-            let dims = cell.session.dimensions();
+            let dims = Self::shown_dims(&cell.session);
             let visible = visible_rows(&dims, rows, cell.scroll_from_bottom);
             cell.selection = Some(Selection {
                 anchor: (visible.start + anchor.0 as StableRowIndex, anchor.1),
@@ -1413,6 +1461,19 @@ impl<P: Platform, L: Link> App<P, L> {
                 self.inner.borrow_mut().tree.apply_agent(pane_id, status.as_ref());
                 Self::render_strip(&self.inner.borrow());
             }
+            Pdu::ForegroundProgramChanged(codec::ForegroundProgramChanged { pane_id, program }) => {
+                drop(inner);
+                let mut inner = self.inner.borrow_mut();
+                match program {
+                    Some(program) => {
+                        inner.programs.insert(pane_id, program);
+                    }
+                    None => {
+                        inner.programs.remove(&pane_id);
+                    }
+                }
+                Self::notify(&inner);
+            }
             Pdu::ClientViewportState(_) | Pdu::FrontendAccessState(_) => {
                 drop(inner);
                 // The desktop may have resized: the panes are listed again
@@ -1536,7 +1597,8 @@ impl<P: Platform, L: Link> App<P, L> {
         self.platform.set_timeout(
             delay_ms.max(0.0),
             Box::new(move || {
-                let Some(app) = weak.upgrade() else { return };
+                // A client the page has closed does not come back.
+                let Some(app) = weak.upgrade().filter(|app| !app.retired.get()) else { return };
                 app.inner.borrow_mut().reconnect_pending = false;
                 let task = Rc::clone(&app).try_reconnect();
                 app.spawn(task);
@@ -1820,8 +1882,32 @@ impl<P: Platform, L: Link> App<P, L> {
         true
     }
 
-    pub fn composing(&self, composing: bool) {
-        self.inner.borrow_mut().composing = composing;
+    pub fn composing(self: &Rc<Self>, composing: bool) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.composing = composing;
+            if inner.preedit.is_empty() {
+                return;
+            }
+            // A composition that starts afresh, or ends either way, leaves
+            // nothing drawn at the cursor.
+            inner.preedit.clear();
+        }
+        self.request_frame();
+    }
+
+    /// The input method's text so far, to draw at the cursor as the
+    /// desktop does; the keys it took are not the terminal's yet.
+    pub fn preedit(self: &Rc<Self>, text: &str) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.preedit == text {
+                return;
+            }
+            inner.preedit.clear();
+            inner.preedit.push_str(text);
+        }
+        self.request_frame();
     }
 
     /// Whether input may go out at all. In Handoff mode with the
@@ -1891,6 +1977,32 @@ impl<P: Platform, L: Link> App<P, L> {
             crate::layout::Divider::Row { row: r, left, cols } if row == r && col >= left && col < left + cols => Some((i, py)),
             _ => None,
         })
+    }
+
+    /// A finger is no pointer: a press within a finger's width of a divider
+    /// starts dragging it, as a press right on it does for a mouse. The
+    /// drag is measured from the finger, so the line follows it from where
+    /// it landed. The moves and the release are the pointer's own.
+    pub fn touch_divider(&self, client_x: f64, client_y: f64) -> bool {
+        const NEAR: [f64; 7] = [0.0, -6.0, 6.0, -12.0, 12.0, -18.0, 18.0];
+        let mut inner = self.inner.borrow_mut();
+        let dpr = inner.dpr;
+        let hit = NEAR.iter().find_map(|d| {
+            Self::divider_under(&inner, client_x, client_y + d)
+                .filter(|(i, _)| matches!(inner.tab_layout.as_ref().and_then(|l| l.dividers.get(*i)), Some(crate::layout::Divider::Row { .. })))
+                .map(|(i, at)| (i, at - d * dpr))
+                .or_else(|| {
+                    Self::divider_under(&inner, client_x + d, client_y)
+                        .filter(|(i, _)| matches!(inner.tab_layout.as_ref().and_then(|l| l.dividers.get(*i)), Some(crate::layout::Divider::Col { .. })))
+                        .map(|(i, at)| (i, at - d * dpr))
+                })
+        });
+        let Some((idx, at)) = hit else {
+            return false;
+        };
+        inner.drag_divider = Some((idx, at, 0));
+        inner.drag_layout = inner.tab_layout.clone();
+        true
     }
 
     /// A press on a divider starts dragging it; moves send whole cells
@@ -2450,7 +2562,7 @@ impl<P: Platform, L: Link> App<P, L> {
         };
         let session = Arc::clone(&cell.session);
         let scroll = cell.scroll_from_bottom;
-        let dims = session.dimensions();
+        let dims = Self::shown_dims(&session);
         let rows_shown = Self::placements(&inner)
             .into_iter()
             .find(|p| p.pane_id == hit.pane_id)
@@ -2646,7 +2758,7 @@ impl<P: Platform, L: Link> App<P, L> {
         let session = Arc::clone(&cell.session);
         if session.is_alt_screen() || session.is_mouse_grabbed() {
             let button = if lines < 0.0 { MouseButton::WheelUp(notches) } else { MouseButton::WheelDown(notches) };
-            let dims = session.dimensions();
+            let dims = Self::shown_dims(&session);
             let visible = visible_rows(&dims, rows_shown, cell.scroll_from_bottom);
             let event = MouseEvent {
                 kind: MouseEventKind::Press,
@@ -2676,7 +2788,7 @@ impl<P: Platform, L: Link> App<P, L> {
             self.step_font(step);
             return true;
         }
-        let max = max_scroll(&session.dimensions(), rows_shown);
+        let max = max_scroll(&Self::shown_dims(&session), rows_shown);
         if smooth {
             // Down the page (a positive delta) is towards the newest row,
             // which is the way `normalize_scroll_px` counts. A trackpad or
@@ -2734,10 +2846,12 @@ impl<P: Platform, L: Link> App<P, L> {
             .map(|s| s.pixel_height as f64 / s.rows as f64 * inner.platform.units_per_inch() / s.dpi as f64)
             .unwrap_or(0.0);
         let mut json = format!(
-            "{{\"tab\":{},\"canvas\":[{},{}],\"cell\":[{cw:.3},{ch:.3}],\"font_pt\":{},\"desktop_cell\":{desktop_cell:.3},\"focused\":{},\"owner\":{},\"may_type\":{},\"fit\":{},\"following\":{}",
+            "{{\"tab\":{},\"canvas\":[{},{}],\"cell\":[{cw:.3},{ch:.3}],\"pad\":[{:.3},{:.3}],\"font_pt\":{},\"desktop_cell\":{desktop_cell:.3},\"focused\":{},\"owner\":{},\"may_type\":{},\"fit\":{},\"following\":{}",
             inner.tab_id,
             inner.cols,
             inner.rows,
+            Self::pad(inner).0 as f64 / dpr,
+            Self::pad(inner).1 as f64 / dpr,
             inner.glyphs.size_pt,
             inner.focused_pane,
             lease.owns_viewport(),
@@ -2753,7 +2867,7 @@ impl<P: Platform, L: Link> App<P, L> {
                     .map(|place| Self::shown_in(inner, place).1),
                 None => Self::focused_placement(inner).as_ref().map(|place| Self::shown_in(inner, place).1),
             }.unwrap_or(inner.rows);
-            let max = max_scroll(&cell.session.dimensions(), rows);
+            let max = max_scroll(&Self::shown_dims(&cell.session), rows);
             // With the fraction of a row a smooth scroll is part way
             // through, so a bar following it moves as the rows do rather
             // than a row at a time.
@@ -2849,8 +2963,16 @@ impl<P: Platform, L: Link> App<P, L> {
             // prompt: the rows sit flush with the bottom of the canvas,
             // and whatever part of a row the height cannot fit is the gap
             // under the tab row instead, where it reads as a margin.
+            // Flush with the tab's own rows while the server has yet to
+            // give it the canvas's: the soft keyboard coming or going cuts
+            // the canvas a round trip before the new layout arrives, and
+            // the old one drawn from the top jumped the prompt away from
+            // the keyboard's edge and back.
             let height = inner.gpu.size().1 as f32;
-            let rows = (height / ch.max(1.0)).floor();
+            let rows = match &inner.tab_layout {
+                Some(layout) if layout.rows > 0 => layout.rows as f32,
+                _ => (height / ch.max(1.0)).floor(),
+            };
             return (cw, height - rows * ch);
         }
         (cw, ch / 2.0)
@@ -2872,11 +2994,14 @@ impl<P: Platform, L: Link> App<P, L> {
         Self::nav_rows_for(inner, inner.tab_layout.as_ref().map_or(1, |l| l.panes.len()))
     }
 
-    /// The bar's rows for a tab of `panes` panes. A phone shows a lone
-    /// pane bare, as its terminal apps do; the bar appears with a split,
-    /// when there is something to tell apart.
+    /// The bar's rows for a tab of `panes` panes. The phone app shows a
+    /// lone pane bare, as its terminal apps do, the bar appearing with a
+    /// split, when there is something to tell apart; a page on a phone
+    /// keeps the bar, as the desktop does (`Platform::bare_lone_pane`).
     fn nav_rows_for(inner: &Inner<P, L>, panes: usize) -> usize {
-        if inner.platform.is_mobile() && (panes <= 1 || !inner.settings.pane_bars) {
+        if inner.platform.is_mobile()
+            && (!inner.settings.pane_bars || (panes <= 1 && inner.platform.bare_lone_pane()))
+        {
             return 0;
         }
         crate::navbar::nav_rows(Self::nav_css(inner) * inner.dpr, inner.glyphs.metrics.cell_size.height as f64)
@@ -2885,6 +3010,12 @@ impl<P: Platform, L: Link> App<P, L> {
     /// One bar per drawn pane, as the page shows them.
     fn nav_views(inner: &Inner<P, L>) -> Vec<crate::navbar::NavView> {
         let mut views = Vec::new();
+        // No rows for the bars, no bars: a phone shows a lone pane bare.
+        // A bar's height is its rows plus the padding above the pane, so
+        // without this the padding alone drew a sliver of one.
+        if Self::nav_rows(inner) == 0 {
+            return views;
+        }
         if let Some(layout) = &inner.tab_layout {
             let dpr = inner.dpr.max(0.1);
             let cell_css = (
@@ -2919,6 +3050,7 @@ impl<P: Platform, L: Link> App<P, L> {
                             title: title.to_string(),
                             busy,
                             current: m.pane_id == place.pane_id,
+                            icon: Self::pane_icon(inner, m.pane_id),
                         }
                     })
                     .collect();
@@ -2984,6 +3116,15 @@ impl<P: Platform, L: Link> App<P, L> {
                     }
                 }
                 Err(err) => log::warn!("fetching agent statuses: {err:#}"),
+            }
+            let programs = thinkterm_session::host::request(&link, Pdu::GetForegroundPrograms(codec::GetForegroundPrograms {}), |p| match p {
+                Pdu::GetForegroundProgramsResponse(r) => Ok(r.programs),
+                other => Err(other),
+            })
+            .await;
+            match programs {
+                Ok(entries) => app.inner.borrow_mut().programs = entries.into_iter().map(|e| (e.pane_id, e.program)).collect(),
+                Err(err) => log::warn!("fetching foreground programs: {err:#}"),
             }
             app.fetch_session().await;
             Self::render_strip(&app.inner.borrow());
@@ -3550,6 +3691,12 @@ impl<P: Platform, L: Link> App<P, L> {
         let (fresh, changed, first_layout) = {
             let mut inner = self.inner.borrow_mut();
             inner.tree.apply_panes(&list);
+            let listed: std::collections::HashSet<PaneId> = list
+                .tabs
+                .iter()
+                .flat_map(|node| crate::layout::leaves(node).into_iter().map(|e| e.pane_id))
+                .collect();
+            inner.programs.retain(|pane, _| listed.contains(pane));
             inner.layout = Some(list);
             let first_layout = inner.tab_layout.is_none();
             let before = (inner.focused_pane, inner.tab_layout.clone());
@@ -3625,7 +3772,12 @@ impl<P: Platform, L: Link> App<P, L> {
         // by the next listing.
         let claim = {
             let mut inner = self.inner.borrow_mut();
-            let showing = inner.auto_claimed != Some(tab_id) && inner.disconnected.is_none();
+            // A machine's terminal behind another's on the page is not on
+            // show: it takes nothing from the host's own desktop. It claims
+            // when it comes on show (the page lists it again then).
+            let showing = inner.platform.shown()
+                && inner.auto_claimed != Some(tab_id)
+                && inner.disconnected.is_none();
             if showing {
                 inner.auto_claimed = Some(tab_id);
             }
@@ -3896,6 +4048,13 @@ impl<P: Platform, L: Link> App<P, L> {
 
     /// A new tab in the window this tab is in, at the tab's own size.
     pub fn new_tab(self: &Rc<Self>) {
+        self.new_tab_in(None);
+    }
+
+    /// A new tab in the named domain of the server, rather than the one
+    /// the focused pane is in: a plain ssh terminal on a machine the page
+    /// could not reach with ThinkTerm.
+    pub fn new_tab_in(self: &Rc<Self>, domain: Option<String>) {
         let (window_id, workspace, size) = {
             let inner = self.inner.borrow();
             let size = inner
@@ -3909,7 +4068,10 @@ impl<P: Platform, L: Link> App<P, L> {
         self.act(
             "web-act-new-tab",
             Pdu::SpawnV2(codec::SpawnV2 {
-                domain: thinkterm_proto::SpawnTabDomain::CurrentPaneDomain,
+                domain: match domain {
+                    Some(name) => thinkterm_proto::SpawnTabDomain::DomainName(name),
+                    None => thinkterm_proto::SpawnTabDomain::CurrentPaneDomain,
+                },
                 window_id: Some(window_id),
                 command: None,
                 command_dir: None,
@@ -4049,6 +4211,18 @@ impl<P: Platform, L: Link> App<P, L> {
         };
         self.mutate(intent, |_| {});
         true
+    }
+
+    /// Whether the connection is up: false from a drop until the reconnect
+    /// that ends it.
+    pub fn connected(&self) -> bool {
+        self.inner.borrow().disconnected.is_none()
+    }
+
+    /// Every Space of this server, for a page that lists several servers'
+    /// Spaces in one menu.
+    pub fn spaces(&self) -> Vec<crate::tree::SpaceEntry> {
+        self.inner.borrow().tree.spaces()
     }
 
     /// A context menu for something on the page: `kind` names what was
@@ -5151,18 +5325,27 @@ impl<P: Platform, L: Link> App<P, L> {
             inner.recompute_palettes()
         };
         self.repaint_palettes(&changed);
-        // The pane in use takes the new scheme on the server too.
-        let (link, pane, palette) = {
-            let inner = self.inner.borrow();
-            (inner.link.clone(), inner.focused_pane, inner.configured())
-        };
-        Self::advise_focus(&self.platform, link, pane, palette);
+        // The pane in use takes the new scheme on the server too -- on show
+        // only: telling a host's server which pane has focus moves its
+        // desktop's tab when the desktop follows the page.
+        if self.platform.shown() {
+            let (link, pane, palette) = {
+                let inner = self.inner.borrow();
+                (inner.link.clone(), inner.focused_pane, inner.configured())
+            };
+            Self::advise_focus(&self.platform, link, pane, palette);
+        }
         Self::notify(&self.inner.borrow());
     }
 
     /// The page's preferences, as the model holds them.
     pub fn settings_view(&self) -> crate::settings::WebSettings {
         self.inner.borrow().settings.clone()
+    }
+
+    /// The server's version, as it answered when the page attached.
+    pub fn server_version(&self) -> String {
+        self.inner.borrow().server_version.clone()
     }
 
     /// The page's stored preferences, at boot: applied whole.
@@ -5409,7 +5592,9 @@ impl<P: Platform, L: Link> App<P, L> {
             ("cmd", "close-pane") => self.close_pane(),
             ("cmd", "take-over") => self.take_over(),
             ("cmd", "follow") => self.on_chrome_click(crate::chrome::Click::Follow),
-            ("cmd", "toggle-sidebar") | ("cmd", "settings") => outcome.page = Some(arg.to_string()),
+            ("cmd", "toggle-sidebar") | ("cmd", "settings") | ("cmd", "remote-hosts") | ("cmd", "add-remote-host") => {
+                outcome.page = Some(arg.to_string())
+            }
             ("cmd", "font-up") => self.step_font(1.0),
             ("cmd", "font-down") => self.step_font(-1.0),
             ("cmd", "font-reset") => self.step_font(0.0),
@@ -5976,7 +6161,9 @@ impl<P: Platform, L: Link> App<P, L> {
     /// tab fit the canvas. `None` when the size is right or pinned by
     /// `?font=`.
     fn desired_size_pt(inner: &Inner<P, L>, dev_w: u32, dev_h: u32) -> Option<f64> {
-        if inner.font_pinned {
+        // A canvas with no room -- one machine's terminal behind another's
+        // -- says nothing about the size anyone wants.
+        if inner.font_pinned || dev_w <= 1 || dev_h <= 1 {
             return None;
         }
         // Holding the tab, the page shows its own size; the desktop is
@@ -6254,7 +6441,7 @@ impl<P: Platform, L: Link> App<P, L> {
             let Some(cell) = inner.panes.get(&place.pane_id) else {
                 continue;
             };
-            let dims = cell.session.dimensions();
+            let dims = Self::shown_dims(&cell.session);
             // The extra row a fractional scroll draws is one whose fetch can
             // stall like any other; asking about the range that was painted
             // is what keeps a dropped `GetLines` for it being retried.
@@ -6376,7 +6563,7 @@ impl<P: Platform, L: Link> App<P, L> {
             return layout.panes.clone();
         }
         let cell = inner.focused();
-        let size = cell.session.dimensions();
+        let size = Self::shown_dims(&cell.session);
         vec![crate::layout::PanePlacement {
             pane_id: inner.focused_pane,
             tab_id: inner.tab_id,
@@ -6392,6 +6579,18 @@ impl<P: Platform, L: Link> App<P, L> {
             workspace: inner.workspace.clone(),
             stack: vec![],
         }]
+    }
+
+    /// A pane's dimensions as it is drawn and pointed at: a preview of
+    /// another height placed where the server will put its rows
+    /// (`viewport::previewed`).
+    fn shown_dims(session: &PaneSession<AppHost<P, L>>) -> thinkterm_proto::RenderableDimensions {
+        crate::viewport::previewed(
+            session.dimensions(),
+            &session.server_dimensions(),
+            session.cursor_position().y,
+            session.is_alt_screen(),
+        )
     }
 
     /// The grid a placement shows: its frame, or less when the pane's own
@@ -6433,7 +6632,7 @@ impl<P: Platform, L: Link> App<P, L> {
                 continue;
             };
             let session = Arc::clone(&cell.session);
-            let dims = session.dimensions();
+            let dims = Self::shown_dims(&session);
             let max = max_scroll(&dims, rows_shown);
             if cell.scroll_from_bottom > max {
                 cell.scroll_from_bottom = max;
@@ -6602,6 +6801,7 @@ impl<P: Platform, L: Link> App<P, L> {
                     },
                     cursor_hidden: inner.settings.cursor_blink && !inner.blink_shown,
                     min_contrast: inner.settings.min_contrast,
+                    composing: (inner.composing && !inner.preedit.is_empty()).then_some(inner.preedit.as_str()),
                 };
                 if line.has_images() && inner.frame_control.get(&place.pane_id).is_some_and(|(_, revision)| revision.is_some()) {
                     inner.graphics.collect_line(

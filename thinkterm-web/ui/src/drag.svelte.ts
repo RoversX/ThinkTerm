@@ -10,6 +10,7 @@
 
 import { handle } from './client';
 import { refreshViews, views } from './client.svelte';
+import { focusTerminal } from './mobile.svelte';
 
 /** How far a press travels before it is a drag (the desktop's ~5px). */
 const THRESHOLD = 5;
@@ -201,13 +202,21 @@ function retarget(x: number, y: number) {
   drag.zone = target && target.kind === 'pane' ? target.zone : null;
 }
 
+/** What scrolls the tab row: its strip on a phone, where the buttons at
+    either end stay put over it; elsewhere the strip is no box of its own,
+    and the row scrolls. */
+function tabScroller(): HTMLElement | null {
+  const strip = document.querySelector<HTMLElement>('#tabs .strip');
+  return strip && getComputedStyle(strip).display !== 'contents' ? strip : document.getElementById('tabs');
+}
+
 /** The list under the pointer scrolls while the drag rests at its edge; a
     parked pointer sends no more moves, so each applied step queues the next. */
 function autoscroll(x: number, y: number) {
   if (!spec || spec.kind === 'pane') return;
   const el =
     spec.kind === 'tab'
-      ? document.getElementById('tabs')
+      ? tabScroller()
       : document.querySelector<HTMLElement>('#side .list');
   if (!el) return;
   const bounds = box(el);
@@ -278,7 +287,7 @@ function finish(commit: boolean, clickFollows = false) {
   else handle.client.drop(picked.kind, picked.id, landed.before ?? null, null, null);
   refreshViews();
   // The terminal keeps the keyboard, as it had it before the press.
-  document.getElementById('kbd')?.focus();
+  focusTerminal();
 }
 
 function onMove(ev: PointerEvent) {

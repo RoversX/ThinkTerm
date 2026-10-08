@@ -7,6 +7,7 @@
   // the next key from the bar or from the soft keyboard, whichever comes.
   import { handle } from './client';
   import { KEYBAR, toggleKeyboard } from './mobile.svelte';
+  import { keyboard } from './icons';
 
   /** A key: `name` is the DOM name the wasm maps, `label` what it says. */
   type Key = { name: string; label: string };
@@ -112,6 +113,15 @@
     if (REPEATS.has(name)) startRepeat(name);
   }
 
+  // iOS does not stop at pointerdown: once the finger lifts it plays the
+  // tap as mouse events and a click, and focuses what was tapped -- the bar
+  // itself, which has a tabindex -- so #kbd lost focus and the keyboard the
+  // button had just brought up went straight back down. Cancelling the
+  // touch's end cancels all of that; the press was handled already.
+  function onTouchEnd(ev: TouchEvent) {
+    if (ev.target instanceof Element && ev.target.closest('.k')) ev.preventDefault();
+  }
+
   // An armed modifier applies to the soft keyboard's next key too. #kbd's
   // own listener is the wasm's and sits on the same element without
   // capture, so this one runs first and takes the key instead.
@@ -157,6 +167,19 @@
     const vv = window.visualViewport;
     let settle: ReturnType<typeof setTimeout> | null = null;
     let applied = 0;
+    /** The bar's height when the canvas was last cut to fit above it. */
+    let appliedMine = 0;
+    const root = document.documentElement;
+    /** Until the canvas is cut to the viewport's new height, it rides with
+        the bar (--term-shift in tokens.css): its last row -- the prompt --
+        stays on the bar's edge while the keyboard comes or goes, and the
+        rows the cut adds or takes are at the top, where the server will
+        put them. Left where it was, the prompt fell behind the keyboard as
+        it came up, and the terminal jumped down once it went. */
+    const ride = (barTop: number) => {
+      const shift = applied > 0 ? barTop - (applied - appliedMine) : 0;
+      root.style.setProperty('--term-shift', `${Math.round(shift)}px`);
+    };
     /** The height the canvas is cut to, once the viewport has stopped
         moving. The soft keyboard slides in over a few hundred milliseconds
         and the viewport reports every step of it; cutting the canvas at
@@ -165,22 +188,36 @@
         up. The bar itself still follows every step, so it never floats
         away from the keyboard's edge. */
     const apply = (height: number, mine: number) => {
-      document.documentElement.style.setProperty('--keybar', `${mine}px`);
+      root.style.setProperty('--keybar', `${mine}px`);
+      appliedMine = mine;
+      // Cut to fit, the canvas sits where the bar is: nothing to ride.
+      root.style.setProperty('--term-shift', '0px');
       if (height === applied) return;
       applied = height;
-      document.documentElement.style.setProperty('--vvh', `${height}px`);
+      root.style.setProperty('--vvh', `${height}px`);
     };
     const read = () => {
+      // The page never pans: a browser that moves the view up to show the
+      // focused field (which sits at the terminal's cursor) took the tab
+      // rows off the top and left a gap over the bar. Where the browser
+      // resizes the page for the keyboard instead (interactive-widget in
+      // index.html) this never fires.
+      if (vv && (vv.offsetTop > 0 || window.scrollY > 0)) window.scrollTo(0, 0);
       const height = vv ? vv.height : window.innerHeight;
       const mine = bar?.offsetHeight || KEYBAR;
-      top = (vv ? vv.offsetTop : 0) + height - mine;
+      // Kept in a local: read back from `top`, the state would make this
+      // effect depend on it, and run again -- cutting the canvas at once
+      // -- every time the bar moved.
+      const barTop = (vv ? vv.offsetTop : 0) + height - mine;
+      top = barTop;
+      ride(barTop);
       if (settle !== null) clearTimeout(settle);
       settle = setTimeout(() => {
         settle = null;
         apply(height, mine);
       }, SETTLE);
     };
-    document.documentElement.style.setProperty('--keybar', `${KEYBAR}px`);
+    root.style.setProperty('--keybar', `${KEYBAR}px`);
     // The first cut is immediate: nothing is moving yet, and the terminal
     // must not sit at the window's height for SETTLE before it fits.
     apply(vv ? vv.height : window.innerHeight, bar?.offsetHeight || KEYBAR);
@@ -196,8 +233,29 @@
       vv?.removeEventListener('resize', read);
       vv?.removeEventListener('scroll', read);
       window.removeEventListener('resize', read);
-      document.documentElement.style.removeProperty('--keybar');
-      document.documentElement.style.removeProperty('--vvh');
+      root.style.removeProperty('--keybar');
+      root.style.removeProperty('--vvh');
+      root.style.removeProperty('--term-shift');
+    };
+  });
+
+  // The ground around the bar is the terminal's own (tokens.css,
+  // --term-bg), so the capsule floats on the terminal rather than on a
+  // strip of the page's colour. It is the colour the client on show clears
+  // its canvas to (`data-bg`); showing another machine moves `#term` to
+  // that machine's canvas.
+  $effect(() => {
+    const root = document.documentElement;
+    const read = () => {
+      const bg = document.getElementById('term')?.dataset.bg ?? '';
+      if (/^#[0-9a-fA-F]{6}$/.test(bg)) root.style.setProperty('--term-bg', bg);
+    };
+    const watch = new MutationObserver(read);
+    watch.observe(document.body, { subtree: true, attributes: true, attributeFilter: ['data-bg', 'id'] });
+    read();
+    return () => {
+      watch.disconnect();
+      root.style.removeProperty('--term-bg');
     };
   });
 
@@ -207,7 +265,12 @@
 <!-- The keys are the bar's, delegated, as the tab row's and the sidebar's
      are; a release anywhere ends a repeat. -->
 <svelte:window onpointerup={stopRepeat} onpointercancel={stopRepeat} />
-<div bind:this={bar} id="keybar" role="toolbar" aria-label="Terminal keys" tabindex="-1" style="top:{top.toFixed(2)}px" onpointerdown={onDown}>
+<div bind:this={bar} id="keybar" role="toolbar" aria-label="Terminal keys" tabindex="-1" style="top:{top.toFixed(2)}px" onpointerdown={onDown} ontouchend={onTouchEnd}>
+  <!-- The soft keyboard's own button stays put at the start; the keys
+       scroll beside it. -->
+  <div class="pill">
+  <button class="k kbd" type="button" data-key="kbd" aria-label="Keyboard">{@html keyboard}</button>
+  <div class="keys">
   {#each HEAD as k (k.name)}
     <button class="k" type="button" data-key={k.name} aria-label={k.label}>{k.label}</button>
   {/each}
@@ -216,5 +279,6 @@
   {#each REST as k (k.name)}
     <button class="k" type="button" data-key={k.name} aria-label={k.name}>{k.label}</button>
   {/each}
-  <button class="k" type="button" data-key="kbd" aria-label="Keyboard">&#9000;</button>
+  </div>
+  </div>
 </div>

@@ -14,6 +14,27 @@ pub struct WebPlatform {
     performance: Option<web_sys::Performance>,
     frame: RefCell<Option<Closure<dyn FnMut()>>>,
     ime_anchor: RefCell<Option<crate::ime::Anchor>>,
+    /// The page shows this canvas. One page can hold several machines'
+    /// terminals, one on show at a time; the others keep their sessions
+    /// but neither paint nor name the document.
+    shown: Cell<bool>,
+    /// A frame asked for while hidden, owed once shown again.
+    frame_owed: Cell<bool>,
+    /// The title last asked for, for when this is shown again.
+    title: RefCell<Option<String>>,
+    /// The frame asked for and not yet called back.
+    frame_pending: Cell<Option<i32>>,
+    /// Listeners, timers and observers this client set up on the page,
+    /// held rather than leaked so `release` can take them down when the
+    /// page closes this client while the page itself stays.
+    held: RefCell<Held>,
+}
+
+#[derive(Default)]
+struct Held {
+    listeners: Vec<(web_sys::EventTarget, String, Closure<dyn FnMut(web_sys::Event)>)>,
+    intervals: Vec<(i32, Closure<dyn FnMut()>)>,
+    observers: Vec<(web_sys::ResizeObserver, Closure<dyn FnMut(js_sys::Array)>)>,
 }
 
 impl WebPlatform {
@@ -24,6 +45,88 @@ impl WebPlatform {
             performance: web_sys::window().and_then(|w| w.performance()),
             frame: RefCell::new(None),
             ime_anchor: RefCell::new(None),
+            shown: Cell::new(true),
+            frame_owed: Cell::new(false),
+            title: RefCell::new(None),
+            frame_pending: Cell::new(None),
+            held: RefCell::new(Held::default()),
+        }
+    }
+
+    /// `handler` for `name` events on `target`, until `release`.
+    pub fn listen<E: JsCast + 'static>(
+        &self,
+        target: &web_sys::EventTarget,
+        name: &str,
+        mut handler: impl FnMut(E) + 'static,
+    ) {
+        let closure = Closure::<dyn FnMut(web_sys::Event)>::new(move |ev: web_sys::Event| {
+            if let Ok(ev) = ev.dyn_into::<E>() {
+                handler(ev);
+            }
+        });
+        if target
+            .add_event_listener_with_callback(name, closure.as_ref().unchecked_ref())
+            .is_ok()
+        {
+            self.held
+                .borrow_mut()
+                .listeners
+                .push((target.clone(), name.to_string(), closure));
+        }
+    }
+
+    /// `cb` whenever `element`'s box changes size, until `release`.
+    pub fn observe_resize(&self, element: &web_sys::Element, mut cb: impl FnMut() + 'static) {
+        let closure = Closure::<dyn FnMut(js_sys::Array)>::new(move |_entries: js_sys::Array| cb());
+        if let Ok(observer) = web_sys::ResizeObserver::new(closure.as_ref().unchecked_ref()) {
+            observer.observe(element);
+            self.held.borrow_mut().observers.push((observer, closure));
+        }
+    }
+
+    /// Take down everything this client set up on the page: its listeners,
+    /// timers and observers, and the frame it asked for. The page calls it
+    /// when it closes a machine's terminal and stays open itself; without
+    /// it the canvas, its GPU context and the client stayed reachable from
+    /// the page for as long as the page lived.
+    pub fn release(&self) {
+        self.shown.set(false);
+        let held = std::mem::take(&mut *self.held.borrow_mut());
+        let window = web_sys::window();
+        for (target, name, closure) in held.listeners {
+            let _ = target.remove_event_listener_with_callback(&name, closure.as_ref().unchecked_ref());
+        }
+        for (id, _closure) in held.intervals {
+            if let Some(window) = &window {
+                window.clear_interval_with_handle(id);
+            }
+        }
+        for (observer, _closure) in held.observers {
+            observer.disconnect();
+        }
+        if let (Some(window), Some(id)) = (&window, self.frame_pending.take()) {
+            let _ = window.cancel_animation_frame(id);
+        }
+    }
+
+    /// Put this canvas on show, or take it off; see `shown`.
+    pub fn set_shown(&self, shown: bool) {
+        self.shown.set(shown);
+        if !shown {
+            return;
+        }
+        if let Some(title) = self.title.borrow().as_deref() {
+            Self::write_title(title);
+        }
+        if self.frame_owed.replace(false) {
+            self.request_frame();
+        }
+    }
+
+    fn write_title(title: &str) {
+        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+            doc.set_title(&format!("{title} — ThinkTerm"));
         }
     }
 
@@ -78,15 +181,12 @@ impl Platform for WebPlatform {
     fn set_interval(&self, every_ms: f64, cb: Box<dyn FnMut()>) {
         let closure = Closure::<dyn FnMut()>::new(cb);
         if let Some(window) = web_sys::window() {
-            if window
-                .set_interval_with_callback_and_timeout_and_arguments_0(
-                    closure.as_ref().unchecked_ref(),
-                    every_ms.clamp(0.0, i32::MAX as f64) as i32,
-                )
-                .is_ok()
-            {
-                // One per page, for the life of the page.
-                closure.forget();
+            if let Ok(id) = window.set_interval_with_callback_and_timeout_and_arguments_0(
+                closure.as_ref().unchecked_ref(),
+                every_ms.clamp(0.0, i32::MAX as f64) as i32,
+            ) {
+                // For the life of this client; see `release`.
+                self.held.borrow_mut().intervals.push((id, closure));
             }
         }
     }
@@ -118,10 +218,20 @@ impl Platform for WebPlatform {
         *self.frame.borrow_mut() = Some(Closure::<dyn FnMut()>::new(move || cb()));
     }
 
+    fn shown(&self) -> bool {
+        self.shown.get()
+    }
+
     fn request_frame(&self) {
+        if !self.shown.get() {
+            self.frame_owed.set(true);
+            return;
+        }
         let frame = self.frame.borrow();
         if let (Some(window), Some(closure)) = (web_sys::window(), frame.as_ref()) {
-            let _ = window.request_animation_frame(closure.as_ref().unchecked_ref());
+            if let Ok(id) = window.request_animation_frame(closure.as_ref().unchecked_ref()) {
+                self.frame_pending.set(Some(id));
+            }
         }
     }
 
@@ -156,8 +266,9 @@ impl Platform for WebPlatform {
     }
 
     fn set_title(&self, title: &str) {
-        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-            doc.set_title(&format!("{title} — ThinkTerm"));
+        *self.title.borrow_mut() = Some(title.to_string());
+        if self.shown.get() {
+            Self::write_title(title);
         }
     }
 
@@ -184,6 +295,11 @@ impl Platform for WebPlatform {
             .and_then(|d| d.body())
         {
             if body.has_attribute("data-mobile") && !body.has_attribute("data-keyboard") {
+                return;
+            }
+            // A page in the terminal's place (the Remote Hosts tab) keeps
+            // the keys: the terminal behind it is not on show.
+            if body.has_attribute("data-page") {
                 return;
             }
         }

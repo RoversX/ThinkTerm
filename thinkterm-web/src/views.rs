@@ -30,6 +30,9 @@ pub struct SidebarView {
 pub struct TabsView {
     pub tabs: Vec<TabView>,
     pub controls: Controls,
+    /// The card heading every window tab: the terminal's, as on the
+    /// desktop (`tab_icons`); none with tab icons off.
+    pub icon: Option<String>,
 }
 
 pub type NavsView = Vec<NavView>;
@@ -85,6 +88,78 @@ pub struct Card {
 /// The static labels the page draws itself (tooltips, headers, the
 /// confirmation words), keyed by their catalogue id, in the active locale.
 pub const STRING_KEYS: &[&str] = &[
+    "web-machines-title",
+    "web-machines-here",
+    "web-machines-connected",
+    "web-machines-others",
+    "web-machines-empty",
+    "web-machines-connect",
+    "web-machines-show",
+    "web-machines-disconnect",
+    "web-machines-forget",
+    "web-machines-retry",
+    "web-machines-plain-ssh",
+    "web-machines-name",
+    "web-machines-host",
+    "web-machines-port",
+    "web-machines-user",
+    "web-machines-password",
+    "web-machines-optional",
+    "web-machines-add-connect",
+    "web-machines-cancel",
+    "web-machines-from-ssh-config",
+    "web-machines-from-desktop",
+    "web-machines-from-web",
+    "web-machines-password-kept",
+    "web-machines-step-connecting",
+    "web-machines-step-authenticating",
+    "web-machines-step-checking",
+    "web-machines-step-installing",
+    "web-machines-step-updating",
+    "web-machines-step-starting",
+    "web-machines-reconnecting",
+    "web-machines-needs-you",
+    "web-machines-not-connected",
+    "web-machines-ask-host-key",
+    "web-machines-ask-host-key-hint",
+    "web-machines-ask-password",
+    "web-machines-ask-code",
+    "web-machines-ask-answer",
+    "web-machines-ask-install",
+    "web-machines-ask-install-hint",
+    "web-machines-ask-replace",
+    "web-machines-ask-replace-hint",
+    "web-machines-ask-stop",
+    "web-machines-ask-stop-hint",
+    "web-machines-remember",
+    "web-machines-trust",
+    "web-machines-install",
+    "web-machines-replace",
+    "web-machines-stop",
+    "web-machines-not-now",
+    "web-machines-continue",
+    "web-machines-failed-unreachable",
+    "web-machines-failed-host-key",
+    "web-machines-failed-auth",
+    "web-machines-failed-cancelled",
+    "web-machines-failed-declined",
+    "web-machines-failed-cannot-install",
+    "web-machines-failed-same-server",
+    "web-machines-failed-failed",
+    "web-machines-failed-desktop",
+    "web-machines-failed-gone",
+    "web-machines-bad-port",
+    "web-machines-details",
+    // The add form's card, as the desktop's host form heads it.
+    "ssh-group-connection",
+    // The page's toolbar, as the desktop's Remote Hosts page has it.
+    "ssh-new-host",
+    "ssh-search",
+    // The desktop's Tab Icons switch.
+    "settings-tab-icons-enabled",
+    "settings-tab-icons-enabled-description",
+    "menu-add-remote-host",
+    "menu-new-space-here",
     "sidebar-new-thread",
     "sidebar-pinned",
     "sidebar-workspaces",
@@ -135,6 +210,8 @@ pub const STRING_KEYS: &[&str] = &[
     "web-settings-sidebar-reset",
     "web-settings-about",
     "web-settings-close",
+    // The way back to the sections, on a phone.
+    "sidebar-settings",
     "language-system",
     "settings-section-general",
     "settings-section-appearance",
@@ -143,6 +220,12 @@ pub const STRING_KEYS: &[&str] = &[
     "settings-section-about",
     "web-settings-search",
     "web-settings-build",
+    // Settings › About, in the desktop's words.
+    "settings-about-version",
+    "settings-about-license",
+    "settings-about-copy",
+    "settings-about-copied",
+    "ssh-field-host",
     "web-settings-language-description",
     "web-settings-hotkey-description",
     "web-settings-theme-description",
@@ -302,8 +385,10 @@ mod tests {
                 panes: vec![],
             }],
             controls: Controls { following: true, fit: false, closing_tab: Some(7), clipped: Some((80, 24)) },
+            icon: Some("terminal".into()),
         })
         .unwrap();
+        assert_eq!(v["icon"], "terminal");
         assert_eq!(v["tabs"][0]["tab"], 7);
         assert_eq!(v["tabs"][0]["window"], 0);
         assert_eq!(v["tabs"][0]["target"], 9);
