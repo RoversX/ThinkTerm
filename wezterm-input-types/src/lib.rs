@@ -406,6 +406,11 @@ impl TryFrom<&str> for KeyCode {
             ApplicationRightArrow,
             ApplicationUpArrow,
             ApplicationDownArrow,
+            KeyPadHome,
+            KeyPadEnd,
+            KeyPadPageUp,
+            KeyPadPageDown,
+            KeyPadBegin,
         );
 
         match s {

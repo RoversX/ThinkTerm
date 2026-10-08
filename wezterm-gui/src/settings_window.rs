@@ -5098,6 +5098,13 @@ impl SettingsWindow {
         if before.tab_icons != after.tab_icons {
             self.sync_tab_icon_inputs();
         }
+        // Shortcuts changed by hand in settings.json, or by another
+        // window: the Keymap page decides from what it shows.
+        if before.keymap != after.keymap
+            || before.command_palette.hotkey != after.command_palette.hotkey
+        {
+            self.ui.keymap.refresh();
+        }
         if before.chrome.settings_font_size != after.chrome.settings_font_size
             || before.chrome.settings_font_weight != after.chrome.settings_font_weight
         {

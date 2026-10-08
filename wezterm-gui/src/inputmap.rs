@@ -110,25 +110,23 @@ impl InputMap {
 
         // Every ThinkTerm action can be reached from the palette, so with
         // the defaults disabled it keeps its own chords -- unless another
-        // chord opens it, or one of those was bound or freed on purpose.
+        // chord opens it. Each is kept unless it was bound or freed on
+        // purpose: one taken leaves the other.
         if config.disable_default_key_bindings
             && !keys
                 .default
                 .values()
                 .any(|entry| entry.action == KeyAssignment::ActivateCommandPalette)
         {
-            let chords = default_chords(&KeyAssignment::ActivateCommandPalette);
-            let taken = chords.iter().any(|(code, mods)| {
-                chord_forms(code, *mods)
+            for (code, mods) in default_chords(&KeyAssignment::ActivateCommandPalette) {
+                let taken = chord_forms(&code, mods)
                     .iter()
-                    .any(|form| keys.default.contains_key(form))
-            });
-            if !taken {
-                for (code, mods) in &chords {
+                    .any(|form| keys.default.contains_key(form));
+                if !taken {
                     insert_in_every_form(
                         &mut keys.default,
-                        code,
-                        *mods,
+                        &code,
+                        mods,
                         &KeyAssignment::ActivateCommandPalette,
                         config.key_map_preference,
                     );
@@ -673,6 +671,32 @@ pub(crate) fn canonical_chord(key: &KeyCode, mods: Modifiers) -> (KeyCode, Modif
     key.normalize_shift(mods)
 }
 
+/// The chord a key press records in Settings → Keymap: `canonical_chord`,
+/// which names a symbol by the key that types it on a US layout, as the
+/// drawn keyboard and the defaults name it -- unless the keyboard pressed
+/// types some other symbol on that key. Then the US name would be another
+/// key's: ⇧7 types "/" on a German layout and ⇧ß types "?", which a US
+/// layout types with ⇧/, so the two keys would be one shortcut, and each
+/// would take the other's spellings. Such a chord is kept as the physical
+/// key pressed, which no other key shares and which is looked up first.
+pub(crate) fn recorded_chord(
+    phys: Option<PhysKeyCode>,
+    key: &KeyCode,
+    mods: Modifiers,
+) -> (KeyCode, Modifiers) {
+    if let (Some(phys), KeyCode::Char(c)) = (phys, key) {
+        let symbol = !c.is_ascii_alphanumeric() && !c.is_control() && *c != ' ';
+        if symbol {
+            if let KeyCode::Char(base) = phys.to_key_code() {
+                if *c != base && us_shifted(base) != Some(*c) {
+                    return (KeyCode::Physical(phys), mods.remove_positional_mods());
+                }
+            }
+        }
+    }
+    canonical_chord(key, mods)
+}
+
 /// The key that types `c` with Shift on a US layout: "!" for "1".
 pub(crate) fn us_shifted(c: char) -> Option<char> {
     US_SHIFTED
@@ -681,14 +705,21 @@ pub(crate) fn us_shifted(c: char) -> Option<char> {
         .map(|(_, shifted)| *shifted)
 }
 
-/// Every form the key table may be asked for a chord in: the canonical one;
-/// for a shifted symbol, the symbol with and without Shift, as platforms
-/// report it either way; and the physical key, whose bindings are looked up
-/// before the typed ones.
+/// Every form the key table may be asked for a chord in, in the order a key
+/// press looks them up: the physical key, whose bindings are tried first;
+/// the canonical one; and for a shifted symbol, the symbol with and without
+/// Shift, as platforms report it either way.
 pub(crate) fn chord_forms(key: &KeyCode, mods: Modifiers) -> Vec<(KeyCode, Modifiers)> {
     let canonical = canonical_chord(key, mods);
     let (typed_key, typed_mods) = typed_chord(&canonical.0, canonical.1);
-    let mut forms = vec![canonical];
+    let mut forms = vec![];
+    if let Some(phys) = typed_key.to_phys() {
+        let physical = (KeyCode::Physical(phys), typed_mods);
+        if physical != canonical {
+            forms.push(physical);
+        }
+    }
+    forms.push(canonical);
     if let KeyCode::Char(c) = typed_key {
         if typed_mods.contains(Modifiers::SHIFT) {
             if let Some(shifted) = us_shifted(c) {
@@ -697,18 +728,16 @@ pub(crate) fn chord_forms(key: &KeyCode, mods: Modifiers) -> Vec<(KeyCode, Modif
             }
         }
     }
-    if let Some(phys) = typed_key.to_phys() {
-        forms.push((KeyCode::Physical(phys), typed_mods));
-    }
     forms
 }
 
 /// Bind `action` in `table` in every form a key event for the chord may be
 /// looked up in, so it wins over the shifted-symbol spellings of the same
-/// keys. The physical form is taken only where a physical binding would
-/// otherwise win: under `key_map_preference = "Physical"`, or where the
-/// table already binds it. Elsewhere it would take a key by its US position
-/// on a layout that types something else there.
+/// keys. The physical form of a typed chord is taken only where a physical
+/// binding would otherwise win: under `key_map_preference = "Physical"`, or
+/// where the table already binds it. Elsewhere it would take a key by its
+/// US position on a layout that types something else there. A chord that
+/// is a physical key (`recorded_chord`) is bound as one.
 fn insert_in_every_form(
     table: &mut config::keyassignment::KeyTable,
     key: &KeyCode,
@@ -716,9 +745,11 @@ fn insert_in_every_form(
     action: &KeyAssignment,
     preference: config::KeyMapPreference,
 ) {
+    let chord_is_physical = matches!(key, KeyCode::Physical(_));
     for form in chord_forms(key, mods) {
         let physical = matches!(form.0, KeyCode::Physical(_));
         if physical
+            && !chord_is_physical
             && preference != config::KeyMapPreference::Physical
             && !table.contains_key(&form)
         {
@@ -1273,6 +1304,81 @@ mod tests {
     }
 
     #[test]
+    fn another_layouts_symbol_is_kept_as_the_key_pressed() {
+        let shift_cmd = Modifiers::SUPER | Modifiers::SHIFT;
+        // A US layout: the symbol is named by the key that types it.
+        for typed in ['?', '/'] {
+            assert_eq!(
+                recorded_chord(Some(PhysKeyCode::Slash), &KeyCode::Char(typed), shift_cmd),
+                canonical_chord(&KeyCode::Char(typed), shift_cmd)
+            );
+        }
+        // German: ⇧7 types "/" and ⇧ß types "?". Two keys, two shortcuts,
+        // neither of them ⇧/.
+        let seven = recorded_chord(Some(PhysKeyCode::K7), &KeyCode::Char('/'), shift_cmd);
+        let eszett = recorded_chord(Some(PhysKeyCode::Minus), &KeyCode::Char('?'), shift_cmd);
+        assert_eq!(seven, (KeyCode::Physical(PhysKeyCode::K7), shift_cmd));
+        assert_eq!(eszett, (KeyCode::Physical(PhysKeyCode::Minus), shift_cmd));
+        assert_ne!(seven, canonical_chord(&KeyCode::Char('?'), shift_cmd));
+        // Letters and digits keep their names, as the drawn keyboard has them.
+        assert_eq!(
+            recorded_chord(Some(PhysKeyCode::Q), &KeyCode::Char('a'), Modifiers::SUPER),
+            canonical_chord(&KeyCode::Char('a'), Modifiers::SUPER)
+        );
+        // Without a physical key, as before.
+        assert_eq!(
+            recorded_chord(None, &KeyCode::Char('?'), shift_cmd),
+            canonical_chord(&KeyCode::Char('?'), shift_cmd)
+        );
+
+        // Bound as the physical key, and only as it.
+        let map = InputMap::with_keymap(
+            &ConfigHandle::default_config(),
+            &[KeymapEntry {
+                key: seven.0.clone(),
+                mods: seven.1,
+                action: KeyAssignment::OpenThreadSearch,
+            }],
+        );
+        assert_eq!(
+            map.lookup_key(&seven.0, seven.1, None).map(|entry| entry.action),
+            Some(KeyAssignment::OpenThreadSearch)
+        );
+        assert_ne!(
+            map.lookup_key(&KeyCode::Char('?'), shift_cmd, None)
+                .map(|entry| entry.action),
+            Some(KeyAssignment::OpenThreadSearch)
+        );
+    }
+
+    #[test]
+    fn a_default_palette_chord_taken_leaves_the_other() {
+        let config = ConfigHandle::default_config()
+            .adjusted(|config| config.disable_default_key_bindings = true);
+        let chords = default_chords(&KeyAssignment::ActivateCommandPalette);
+        if chords.len() < 2 {
+            return;
+        }
+        let (taken, kept) = (&chords[0], &chords[1]);
+        let map = InputMap::with_keymap(
+            &config,
+            &[KeymapEntry {
+                key: taken.0.clone(),
+                mods: taken.1,
+                action: KeyAssignment::OpenThreadSearch,
+            }],
+        );
+        assert_eq!(
+            map.lookup_key(&kept.0, kept.1, None).map(|entry| entry.action),
+            Some(KeyAssignment::ActivateCommandPalette)
+        );
+        assert_eq!(
+            map.lookup_key(&taken.0, taken.1, None).map(|entry| entry.action),
+            Some(KeyAssignment::OpenThreadSearch)
+        );
+    }
+
+    #[test]
     fn config_key_names_parse_back_to_their_key() {
         use std::convert::TryFrom;
         for key in [
@@ -1290,7 +1396,13 @@ mod tests {
             KeyCode::LeftArrow,
             KeyCode::PageUp,
             KeyCode::Home,
+            KeyCode::KeyPadHome,
+            KeyCode::KeyPadEnd,
+            KeyCode::KeyPadPageUp,
+            KeyCode::KeyPadPageDown,
+            KeyCode::KeyPadBegin,
             KeyCode::Physical(PhysKeyCode::A),
+            KeyCode::Physical(PhysKeyCode::K7),
         ] {
             let name = config_key_name(&key);
             let parsed = config::DeferredKeyCode::try_from(name.as_str())

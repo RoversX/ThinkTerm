@@ -1072,18 +1072,26 @@ pub(crate) fn reset_keymap() -> anyhow::Result<()> {
     })
 }
 
+/// The modifier the platform's own shortcuts start on: ⌘ on a Mac, Ctrl
+/// elsewhere. The Shortcut menu's default item is the default chord on it.
+fn platform_primary() -> window::Modifiers {
+    if cfg!(target_os = "macos") {
+        window::Modifiers::SUPER
+    } else {
+        window::Modifiers::CTRL
+    }
+}
+
 /// The Command Palette page's pick, which gives the palette that chord
-/// outright: whatever Keymap set on it gives way -- on the default chords,
-/// when the pick is the default.
+/// outright: whatever Keymap set on it gives way. The default item names
+/// one chord, the default on the platform's own modifier: what Keymap set
+/// on the palette's other default chord (⌃⇧P on a Mac), which the menu
+/// never shows, stays. The item already on show changes nothing.
 pub(crate) fn set_palette_hotkey(hotkey: NativeCommandPaletteHotkey) -> anyhow::Result<()> {
-    use config::keyassignment::KeyAssignment;
-    let cleared = match hotkey.picked_chord() {
-        Some((mods, ch)) => vec![crate::inputmap::canonical_chord(
-            &window::KeyCode::Char(ch),
-            mods,
-        )],
-        None => crate::inputmap::default_chords(&KeyAssignment::ActivateCommandPalette),
-    };
+    if palette_hotkey_choice(&load()) == Some(hotkey) {
+        return Ok(());
+    }
+    let cleared = cleared_by_pick(hotkey);
     update_keymap(|settings| {
         settings.keymap.keys.retain(|json| {
             parse_keymap_json(json)
@@ -1091,6 +1099,24 @@ pub(crate) fn set_palette_hotkey(hotkey: NativeCommandPaletteHotkey) -> anyhow::
         });
         settings.command_palette.hotkey = hotkey;
     })
+}
+
+/// The chords picking `hotkey` takes back from what Keymap set: the one it
+/// names.
+fn cleared_by_pick(
+    hotkey: NativeCommandPaletteHotkey,
+) -> Vec<(window::KeyCode, window::Modifiers)> {
+    use config::keyassignment::KeyAssignment;
+    match hotkey.picked_chord() {
+        Some((mods, ch)) => vec![crate::inputmap::canonical_chord(
+            &window::KeyCode::Char(ch),
+            mods,
+        )],
+        None => crate::inputmap::default_chords(&KeyAssignment::ActivateCommandPalette)
+            .into_iter()
+            .filter(|(_, mods)| mods.contains(platform_primary()))
+            .collect(),
+    }
 }
 
 /// What the Command Palette page's Shortcut menu shows as picked: the chord
@@ -1137,14 +1163,9 @@ pub(crate) fn palette_hotkey_choice(
     if set_here.is_some() {
         return set_here;
     }
-    let primary = if cfg!(target_os = "macos") {
-        window::Modifiers::SUPER
-    } else {
-        window::Modifiers::CTRL
-    };
     let default_free = crate::inputmap::default_chords(&KeyAssignment::ActivateCommandPalette)
         .iter()
-        .filter(|(_, mods)| mods.contains(primary))
+        .filter(|(_, mods)| mods.contains(platform_primary()))
         .any(|chord| !taken(chord));
     default_free.then_some(Hotkey::CmdShiftP)
 }
@@ -2433,6 +2454,23 @@ mod tests {
             {"key": "p", "mods": default, "action": "DisableDefaultAssignment"}
         )];
         assert_eq!(palette_hotkey_choice(&settings), None);
+    }
+
+    #[test]
+    fn picking_the_default_palette_shortcut_takes_back_only_its_chord() {
+        let cleared = cleared_by_pick(NativeCommandPaletteHotkey::CmdShiftP);
+        assert_eq!(cleared.len(), 1);
+        assert!(cleared[0].1.contains(platform_primary()));
+        // ⌃⇧P, the palette's other default on a Mac, is not on the menu.
+        let ctrl_shift_p =
+            crate::inputmap::canonical_chord(&window::KeyCode::Char('p'), window::Modifiers::CTRL | window::Modifiers::SHIFT);
+        if cfg!(target_os = "macos") {
+            assert!(!cleared.contains(&ctrl_shift_p));
+        }
+        assert_eq!(
+            cleared_by_pick(NativeCommandPaletteHotkey::CmdK),
+            vec![(window::KeyCode::Char('k'), window::Modifiers::SUPER)]
+        );
     }
 
     #[test]

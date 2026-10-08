@@ -269,6 +269,17 @@ fn needs_modifier(key: &KeyCode, mods: Modifiers) -> bool {
     !matches!(key, KeyCode::Function(_)) && (mods == Modifiers::NONE || mods == Modifiers::SHIFT)
 }
 
+/// Whether `action` runs a function `wezterm.action_callback` made in
+/// thinkterm.lua. Such a function is known by an event numbered in the
+/// order the configuration made it (`user-defined-3`), and the next load
+/// may give that number to another function: written to settings.json, a
+/// shortcut would run whichever function has the number then, or none. It
+/// is changed in thinkterm.lua instead. Looked for anywhere in the action,
+/// which may hold others (`Multiple`, a confirmation's action).
+fn runs_lua_callback(action: &KeyAssignment) -> bool {
+    format!("{action:?}").contains("EmitEvent(\"user-defined-")
+}
+
 /// Where a shortcut comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source {
@@ -310,6 +321,9 @@ struct KeymapView {
     /// A name for every action the key table holds.
     names: HashMap<(KeyCode, Modifiers), String>,
     rendering: UIKeyCapRendering,
+    /// The configuration it was built from: a reload of thinkterm.lua
+    /// makes it stale, and it is built again before it is painted.
+    generation: usize,
 }
 
 impl KeymapView {
@@ -347,7 +361,17 @@ impl KeymapView {
             set_here,
             names,
             rendering: config.ui_key_cap_rendering,
+            generation: config.generation(),
         }
+    }
+
+    /// The form the layer set here keeps `chord` in, if it keeps it: the
+    /// chord itself, or the physical key a press on another layout was
+    /// recorded as (`inputmap::recorded_chord`).
+    fn set_here_chord(&self, chord: &(KeyCode, Modifiers)) -> Option<(KeyCode, Modifiers)> {
+        crate::inputmap::chord_forms(&chord.0, chord.1)
+            .into_iter()
+            .find(|form| self.set_here.contains_key(form))
     }
 
     /// What `cap` does with `mods` held, its chord looked up in every form a
@@ -359,10 +383,14 @@ impl KeymapView {
         if reserved_by_system(key, mods) {
             return CapState::System;
         }
-        // Kept in the one form the layer set here writes.
-        let chord = crate::inputmap::canonical_chord(key, mods);
+        // Kept in the one form the layer set here writes; a shortcut set
+        // here on this key as a physical key is reported in that form, so
+        // what changes it changes that.
+        let typed = crate::inputmap::canonical_chord(key, mods);
+        let stored = self.set_here_chord(&typed);
+        let chord = stored.clone().unwrap_or(typed);
         if let Some(action) = self.action_for(&chord) {
-            let set_here = self.set_here.contains_key(&chord);
+            let set_here = stored.is_some();
             let file_action = self.file_action(&chord);
             let overrides_file = set_here
                 && file_action
@@ -382,7 +410,7 @@ impl KeymapView {
                 overrides_file,
             };
         }
-        if self.set_here.get(&chord) == Some(&KeyAssignment::DisableDefaultAssignment) {
+        if stored.is_some() && self.set_here.get(&chord) == Some(&KeyAssignment::DisableDefaultAssignment) {
             return CapState::Removed { chord };
         }
         if used_by_programs(key, mods) {
@@ -618,7 +646,16 @@ impl SettingsWindow {
         x: f32,
         max_width: f32,
     ) -> anyhow::Result<()> {
-        if self.ui.keymap.view.is_none() {
+        // Built again when there is none, or the one there is predates a
+        // reload of thinkterm.lua: its shortcuts may have changed.
+        let generation = config::configuration().generation();
+        if self
+            .ui
+            .keymap
+            .view
+            .as_ref()
+            .map_or(true, |view| view.generation != generation)
+        {
             self.ui.keymap.view = Some(KeymapView::build());
         }
         let scroll = self.ui.content_scroll.offset;
@@ -1491,6 +1528,10 @@ impl SettingsWindow {
             }
             KeymapAction::Change => {
                 if let Some((chord, action, name)) = self.keymap_selected_binding() {
+                    if runs_lua_callback(&action) {
+                        self.status = crate::i18n::tr("settings-keymap-lua-callback");
+                        return;
+                    }
                     self.ui.keymap.set_mode(Mode::Recording {
                         action,
                         name,
@@ -1542,6 +1583,10 @@ impl SettingsWindow {
                 else {
                     return;
                 };
+                if runs_lua_callback(&action) {
+                    self.status = crate::i18n::tr("settings-keymap-lua-callback");
+                    return;
+                }
                 match std::mem::take(&mut self.ui.keymap.mode) {
                     Mode::Assigning { chord } => self.keymap_bind(action, chord, None),
                     _ => self.ui.keymap.set_mode(Mode::Recording {
@@ -1585,6 +1630,10 @@ impl SettingsWindow {
             KeyCode::Physical(phys) => phys.to_key_code(),
             other => other.clone(),
         };
+        let phys = match &event.key {
+            KeyCode::Physical(phys) => Some(*phys),
+            _ => event.raw.as_ref().and_then(|raw| raw.phys_code),
+        };
         if matches!(
             key,
             KeyCode::Shift
@@ -1616,8 +1665,12 @@ impl SettingsWindow {
         let Mode::Recording { action, from, .. } = self.ui.keymap.mode.clone() else {
             return true;
         };
-        let chord = crate::inputmap::canonical_chord(&key, mods);
-        let (typed_key, typed_mods) = crate::inputmap::typed_chord(&chord.0, chord.1);
+        // What the press types, named as the drawn keyboard names it; and
+        // the chord it is kept as, which on another layout may be the
+        // physical key instead (`inputmap::recorded_chord`).
+        let spelled = crate::inputmap::canonical_chord(&key, mods);
+        let chord = crate::inputmap::recorded_chord(phys, &key, mods);
+        let (typed_key, typed_mods) = crate::inputmap::typed_chord(&spelled.0, spelled.1);
         if reserved_by_system(&typed_key, typed_mods) {
             // It never reaches ThinkTerm; keep listening for another.
             self.status = crate::i18n::tr("settings-keymap-system");
@@ -1626,7 +1679,10 @@ impl SettingsWindow {
         let Some(view) = self.ui.keymap.view.as_ref() else {
             return true;
         };
-        let held = view.action_for(&chord);
+        // What the press runs now: a physical binding, else what it types.
+        let held = view
+            .action_for(&chord)
+            .or_else(|| (chord != spelled).then(|| view.action_for(&spelled)).flatten());
         if held.as_ref() == Some(&action) {
             // Already this action's: nothing to change.
             self.ui.keymap.set_mode(Mode::Idle);
@@ -1656,6 +1712,10 @@ impl SettingsWindow {
         from: Option<(KeyCode, Modifiers)>,
     ) {
         self.ui.keymap.set_mode(Mode::Idle);
+        if runs_lua_callback(&action) {
+            self.status = crate::i18n::tr("settings-keymap-lua-callback");
+            return;
+        }
         let mut changes = vec![(chord.clone(), Some(action))];
         if let Some(from) = from.filter(|from| *from != chord) {
             // Moving off a chord set here gives it back to what lies
@@ -1692,12 +1752,21 @@ impl SettingsWindow {
         }
     }
 
+    /// The selected key's chord, in the form the layer set here keeps it
+    /// when it keeps one.
     fn keymap_selected_chord(&self) -> Option<(KeyCode, Modifiers)> {
         let cap = self.ui.keymap.selected.and_then(cap_at)?;
         let CapKind::Key(key) = &cap.kind else {
             return None;
         };
-        Some(crate::inputmap::canonical_chord(key, self.ui.keymap.mods()))
+        let chord = crate::inputmap::canonical_chord(key, self.ui.keymap.mods());
+        let stored = self
+            .ui
+            .keymap
+            .view
+            .as_ref()
+            .and_then(|view| view.set_here_chord(&chord));
+        Some(stored.unwrap_or(chord))
     }
 
     /// The selected key's shortcut: its chord, action and name.
@@ -1751,6 +1820,22 @@ mod tests {
     }
 
     #[test]
+    fn a_lua_callback_is_never_copied_into_settings() {
+        assert!(runs_lua_callback(&KeyAssignment::EmitEvent(
+            "user-defined-3".to_string()
+        )));
+        assert!(runs_lua_callback(&KeyAssignment::Multiple(vec![
+            KeyAssignment::ActivateCommandPalette,
+            KeyAssignment::EmitEvent("user-defined-0".to_string()),
+        ])));
+        // An event the configuration named itself keeps its name.
+        assert!(!runs_lua_callback(&KeyAssignment::EmitEvent(
+            "toggle-opacity".to_string()
+        )));
+        assert!(!runs_lua_callback(&KeyAssignment::ActivateCommandPalette));
+    }
+
+    #[test]
     fn key_names_drop_the_filler_words() {
         assert_eq!(cap_label("Activate 1st Tab"), "1st Tab");
         assert_eq!(cap_label("Close current Pane"), "Close Pane");
@@ -1772,6 +1857,43 @@ mod tests {
                 .collect(),
             names: HashMap::new(),
             rendering: config.ui_key_cap_rendering,
+            generation: config.generation(),
+        }
+    }
+
+    #[test]
+    fn a_shortcut_kept_as_a_physical_key_shows_and_changes_on_its_key() {
+        let shift_cmd = Modifiers::SUPER | Modifiers::SHIFT;
+        // A German ⇧7, recorded as the key pressed.
+        let seven = crate::inputmap::recorded_chord(
+            Some(window::PhysKeyCode::K7),
+            &KeyCode::Char('/'),
+            shift_cmd,
+        );
+        let view = view_with(&[crate::native_settings::KeymapEntry {
+            key: seven.0.clone(),
+            mods: seven.1,
+            action: KeyAssignment::OpenThreadSearch,
+        }]);
+        let cap = rows()
+            .iter()
+            .flat_map(|row| row.iter())
+            .find(|cap| matches!(&cap.kind, CapKind::Key(KeyCode::Char('7'))))
+            .unwrap();
+        match view.state(cap, shift_cmd) {
+            CapState::Bound {
+                chord,
+                action,
+                source,
+                ..
+            } => {
+                // In the form it is kept in, so Change, Remove and Reset
+                // act on that.
+                assert_eq!(chord, seven);
+                assert_eq!(action, KeyAssignment::OpenThreadSearch);
+                assert_eq!(source, Source::SetHere);
+            }
+            other => panic!("{other:?}"),
         }
     }
 

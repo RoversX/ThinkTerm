@@ -861,6 +861,18 @@ impl super::TermWindow {
         if self.command_palette.is_some() || self.recording_overlay.owns_keyboard() {
             return;
         }
+        // The chord that opens the palette is left to the cooked event that
+        // follows (see `opens_command_palette`): a raw or physical binding
+        // of the same key would otherwise fire here first.
+        if key.key_is_down {
+            let pressed = match (&key.key, key.phys_code) {
+                (KeyCode::Physical(_), _) | (_, None) => key.key.clone(),
+                (_, Some(phys)) => KeyCode::Physical(phys),
+            };
+            if self.opens_command_palette(&pressed, key.modifiers.remove_positional_mods()) {
+                return;
+            }
+        }
         let stage = crate::input_diagnostics::StageTimer::begin("get_active_pane");
         let pane = self.get_active_pane_or_overlay();
         stage.finish(pane.is_some());
@@ -967,6 +979,27 @@ impl super::TermWindow {
             input_trace.handled();
             key.set_handled();
         }
+    }
+
+    /// Whether the key table gives this chord to the command palette, with
+    /// no key table or leader taking keys first. That chord opens it from
+    /// anywhere: ahead of a raw binding of the same key, and in a window
+    /// whose content view has no pane to take keys -- as the palette's own
+    /// shortcut did before it became an entry of the key table.
+    fn opens_command_palette(&mut self, key: &KeyCode, mods: Modifiers) -> bool {
+        if self.leader_is_active_mut() || self.current_key_table_name().is_some() {
+            return false;
+        }
+        let key = match key {
+            KeyCode::Physical(phys) => phys.to_key_code(),
+            other => other.clone(),
+        };
+        matches!(
+            self.input_map.lookup_key(&key, mods, None),
+            Some(KeyTableEntry {
+                action: KeyAssignment::ActivateCommandPalette
+            })
+        )
     }
 
     pub fn current_modifier_and_led_state(&self) -> (Modifiers, KeyboardLedStatus) {
@@ -1096,6 +1129,16 @@ impl super::TermWindow {
                     Key::None => {}
                 }
             }
+            return;
+        }
+        if window_key.key_is_down
+            && self.opens_command_palette(
+                &window_key.key,
+                window_key.modifiers.remove_positional_mods(),
+            )
+        {
+            self.toggle_command_palette();
+            context.invalidate();
             return;
         }
         let mut input_trace = crate::input_diagnostics::KeyEventTrace::begin(
