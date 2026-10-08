@@ -213,6 +213,17 @@ pub trait FontLocator {
         Ok(vec![])
     }
 
+    /// The names of the families `enumerate_all_fonts` would list, for a
+    /// caller that only wants to offer them. A locator that can name them
+    /// without opening every font file should.
+    fn enumerate_family_names(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .enumerate_all_fonts()?
+            .into_iter()
+            .map(|font| font.names().family.clone())
+            .collect())
+    }
+
     fn locate_fallback_for_codepoints(
         &self,
         codepoints: &[char],

@@ -619,6 +619,10 @@ pub(crate) fn default_shell() -> Option<Vec<String>> {
 pub(crate) struct NativeChromeSettings {
     pub(crate) settings_font_size: Option<f64>,
     pub(crate) settings_font_weight: Option<u16>,
+    /// The family the interface -- tabs, sidebars, Settings, the command
+    /// palette -- is drawn with. `None` is the system's interface font. The
+    /// terminal's font is `terminal.font_family`, not this.
+    pub(crate) ui_font_family: Option<String>,
     pub(crate) home_font_size: Option<f64>,
     pub(crate) sidebar_font_size: Option<f64>,
     /// Right sidebar (files / notes / snippets) text size; None follows
@@ -1336,8 +1340,10 @@ fn apply_external_change(before: &ThinkTermNativeSettings, after: &ThinkTermNati
         || before.appearance.app_icon != after.appearance.app_icon
         || before.appearance.color_scheme != after.appearance.color_scheme
         || before.appearance.window_opacity != after.appearance.window_opacity
+        || before.chrome.ui_font_family != after.chrome.ui_font_family
     {
-        // Language, theme, colour scheme, opacity, chrome and app icon.
+        // Language, theme, colour scheme, opacity, chrome, the interface's
+        // font and app icon.
         apply_to_app(after);
     }
     crate::settings_window::follow_open_settings_window(before, after);
@@ -1735,6 +1741,29 @@ pub(crate) fn apply_preferred_appearance(mode: NativeThemeMode) {
     conn.set_preferred_appearance(preferred);
 }
 
+/// Draw the interface of every window with the family `settings` names:
+/// all a change of it needs of `apply_to_app`. The fonts are looked up again
+/// as each window next paints, so nothing happens when the family is the one
+/// already in use.
+pub(crate) fn apply_ui_font_to_app(settings: &ThinkTermNativeSettings) {
+    if !wezterm_font::set_ui_font_family(settings.chrome.ui_font_family.clone()) {
+        return;
+    }
+    if let Some(front_end) = crate::frontend::try_front_end() {
+        for gui_window in front_end.gui_windows() {
+            gui_window
+                .window
+                .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                    |term_window| {
+                        // Laid out with the old family's fonts, and kept.
+                        term_window.invalidate_fancy_tab_bar();
+                        term_window.refresh_chrome();
+                    },
+                )));
+        }
+    }
+}
+
 pub(crate) fn apply_to_app(settings: &ThinkTermNativeSettings) {
     crate::i18n::activate_from_settings(settings);
     apply_preferred_appearance(settings.appearance.theme_mode);
@@ -1752,6 +1781,8 @@ pub(crate) fn apply_to_app(settings: &ThinkTermNativeSettings) {
     // default -- costs nothing.
     // All at once, so a window reloads its configuration once for them.
     let overrides = settings_config_overrides(settings, &config::configuration());
+    // Before the windows repaint below, so that they do it with the family.
+    apply_ui_font_to_app(settings);
     if let Some(front_end) = crate::frontend::try_front_end() {
         for gui_window in front_end.gui_windows() {
             let overrides = overrides.clone();

@@ -76,6 +76,14 @@ const LOGO_CAPTION_FONT_SIZE: f64 = if cfg!(target_os = "macos") {
 };
 const LOGO_CAPTION_FONT_WEIGHT: u16 = 500;
 const CONTROL_HEIGHT: f32 = 56.0;
+/// A dropdown menu's rows, the gap between them and the menu's own padding.
+const DROPDOWN_ROW_HEIGHT: f32 = 46.0;
+const DROPDOWN_ROW_GAP: f32 = 6.0;
+const DROPDOWN_MENU_PADDING: f32 = 8.0;
+/// How many rows the interface font menu shows of its long list, and how
+/// wide it is where there is room.
+const UI_FONT_MENU_ROWS: usize = 8;
+const UI_FONT_MENU_WIDTH: f32 = 520.0;
 const CONTROL_RADIUS: f32 = 14.0;
 const HERO_PADDING: f32 = 36.0;
 const HERO_MARK_SIZE: f32 = 108.0;
@@ -1524,6 +1532,10 @@ enum SettingsAction {
     DecreaseSettingsFontWeight,
     IncreaseSettingsFontWeight,
     ResetSettingsFontWeight,
+    ToggleUiFontMenu,
+    /// `None` is the system's interface font; `Some` indexes the families
+    /// listed when the menu opened.
+    SetUiFont(Option<usize>),
     FontFamilyInput,
     ClearSearch,
     SidebarResize,
@@ -1596,6 +1608,7 @@ enum SettingsDropdown {
     Language,
     MainRenderer,
     DefaultShell,
+    UiFont,
     CommandPaletteHotkey,
     WebLinkTtl,
     /// How long an installed plugin runs unused, keyed as TogglePlugin: its
@@ -2127,6 +2140,13 @@ struct SettingsUiState {
     /// `(x, y, width)` its open menu hangs from. Recorded by the rows, so a
     /// menu follows its row wherever the page put it.
     dropdown_anchors: Vec<(SettingsDropdown, (f32, f32, f32))>,
+    /// The families the interface font menu offers, listed when it first
+    /// opens: empty until then.
+    ui_font_families: Vec<String>,
+    /// How far that menu is scrolled. It shows a few rows of a long list.
+    ui_font_menu_scroll: ScrollState,
+    /// Where that menu was painted this frame, for the wheel to find it.
+    ui_font_menu_rect: Option<window::RectF>,
     /// The fonts the Terminal page previews in, at most one of each kind,
     /// and let go when another page is shown. `None` remembers a face that
     /// would not load, so it is not retried every frame.
@@ -2230,6 +2250,9 @@ impl SettingsUiState {
             content_scrollbar_visible_until: None,
             row_description_lines: 1,
             dropdown_anchors: Vec::new(),
+            ui_font_families: Vec::new(),
+            ui_font_menu_scroll: ScrollState::new(),
+            ui_font_menu_rect: None,
             preview_fonts: Vec::new(),
             stale_glyphs: false,
             terminal_colors: Vec::new(),
@@ -3599,6 +3622,8 @@ impl SettingsWindow {
                         | SettingsAction::SetMainRenderer(_)
                         | SettingsAction::ToggleDefaultShellMenu
                         | SettingsAction::SetDefaultShell(_)
+                        | SettingsAction::ToggleUiFontMenu
+                        | SettingsAction::SetUiFont(_)
                         | SettingsAction::ToggleCommandPaletteHotkeyMenu
                         | SettingsAction::SetCommandPaletteHotkey(_)
                         | SettingsAction::ToggleWebLinkTtlMenu
@@ -3673,6 +3698,22 @@ impl SettingsWindow {
             (self.content_bottom() - content_top).max(0.0),
         );
         let ui_scale = self.ui_scale();
+        // The open font menu takes the wheel over it, and keeps it: the
+        // page underneath must not move while its list is at an end.
+        if let Some(menu) = self
+            .ui
+            .ui_font_menu_rect
+            .filter(|_| self.ui.open_dropdown == Some(SettingsDropdown::UiFont))
+        {
+            if crate::ui::contains(menu, event.coords.x as f32, event.coords.y as f32) {
+                return crate::ui::apply_wheel_to_area(
+                    event,
+                    menu,
+                    &mut self.ui.ui_font_menu_scroll,
+                    ui_scale,
+                );
+            }
+        }
         if crate::ui::apply_wheel_to_area(
             event,
             sidebar_area,
@@ -4594,6 +4635,100 @@ impl SettingsWindow {
         self.save_native_chrome_settings(ChromeFontArea::Settings);
     }
 
+    /// The family the interface is drawn with, if one was chosen.
+    fn chosen_ui_font_family(&self) -> Option<&str> {
+        self.native_settings
+            .chrome
+            .ui_font_family
+            .as_deref()
+            .map(str::trim)
+            .filter(|family| !family.is_empty())
+    }
+
+    /// What the closed interface font dropdown shows.
+    fn current_ui_font_label(&self) -> String {
+        self.chosen_ui_font_family()
+            .map(str::to_string)
+            .unwrap_or_else(|| crate::i18n::tr("settings-ui-font-system"))
+    }
+
+    /// The rows the interface font menu holds -- the system's font, then
+    /// every family -- how many of them it shows at once, and the distance
+    /// from one row to the next.
+    fn ui_font_menu_rows(&self) -> (usize, usize, f32) {
+        let total = self.ui.ui_font_families.len() + 1;
+        (
+            total,
+            total.min(UI_FONT_MENU_ROWS),
+            self.ui_px(DROPDOWN_ROW_HEIGHT + DROPDOWN_ROW_GAP),
+        )
+    }
+
+    /// Open the interface font menu on the family in use.
+    fn open_ui_font_menu(&mut self) {
+        if self.ui.ui_font_families.is_empty() {
+            self.ui.ui_font_families = self.fonts.list_font_families();
+        }
+        // A family typed into settings.json, or uninstalled since it was
+        // chosen, is still the one in use and has to be there to be seen.
+        if let Some(chosen) = self.chosen_ui_font_family().map(str::to_string) {
+            if !self.ui.ui_font_families.contains(&chosen) {
+                self.ui.ui_font_families.insert(0, chosen);
+            }
+        }
+        let selected = self
+            .chosen_ui_font_family()
+            .and_then(|chosen| {
+                self.ui
+                    .ui_font_families
+                    .iter()
+                    .position(|family| family == chosen)
+            })
+            .map_or(0, |index| index + 1);
+        let (total, visible, step) = self.ui_font_menu_rows();
+        let scroll = &mut self.ui.ui_font_menu_scroll;
+        scroll.reset();
+        scroll.set_extents(visible as f32 * step, total as f32 * step);
+        // A few rows down from the top, so what is around it shows too.
+        scroll.scroll_by(selected.saturating_sub(visible / 2) as f32 * step);
+        self.ui.open_dropdown = Some(SettingsDropdown::UiFont);
+    }
+
+    /// Save `family` as the interface's font and draw every window with it.
+    /// `None` is the system's interface font.
+    fn set_ui_font_family(&mut self, family: Option<String>) {
+        let setting = crate::i18n::tr("settings-ui-font");
+        let label = family
+            .clone()
+            .unwrap_or_else(|| crate::i18n::tr("settings-ui-font-system"));
+        // From a fresh read and adopted once it lands, as the default shell
+        // is: the main window saves state of its own to the same file.
+        let mut pending = crate::native_settings::load();
+        pending.chrome.ui_font_family = family;
+        match crate::native_settings::save(&pending) {
+            Ok(()) => {
+                crate::native_settings::apply_ui_font_to_app(&pending);
+                self.set_native_settings(pending);
+                self.status = match self.reload_settings_fonts() {
+                    Ok(()) => settings_tr(
+                        "settings-status-value-now",
+                        &[("setting", setting), ("value", label)],
+                    ),
+                    Err(err) => settings_tr(
+                        "settings-status-save-error",
+                        &[("setting", setting), ("error", format!("{err:#}"))],
+                    ),
+                };
+            }
+            Err(err) => {
+                self.status = settings_tr(
+                    "settings-status-save-error",
+                    &[("setting", setting), ("error", format!("{err:#}"))],
+                );
+            }
+        }
+    }
+
     fn current_main_renderer(&self) -> NativeRendererBackend {
         crate::native_settings::main_window_renderer(
             &self.native_settings,
@@ -5011,6 +5146,7 @@ impl SettingsWindow {
         }
         if before.chrome.settings_font_size != after.chrome.settings_font_size
             || before.chrome.settings_font_weight != after.chrome.settings_font_weight
+            || before.chrome.ui_font_family != after.chrome.ui_font_family
         {
             if let Err(err) = self.reload_settings_fonts() {
                 log::warn!("settings window fonts after an outside change: {err:#}");
@@ -6514,6 +6650,26 @@ impl SettingsWindow {
             SettingsAction::DecreaseSettingsFontWeight => self.step_settings_font_weight(-100),
             SettingsAction::IncreaseSettingsFontWeight => self.step_settings_font_weight(100),
             SettingsAction::ResetSettingsFontWeight => self.reset_settings_font_weight(),
+            SettingsAction::ToggleUiFontMenu => {
+                if self.ui.open_dropdown == Some(SettingsDropdown::UiFont) {
+                    self.ui.open_dropdown = None;
+                } else {
+                    self.open_ui_font_menu();
+                }
+            }
+            SettingsAction::SetUiFont(index) => {
+                self.ui.open_dropdown = None;
+                // `get` rather than indexing, as for the shell catalog: a
+                // stale index must be a no-op, not a panic.
+                let family = match index {
+                    Some(index) => match self.ui.ui_font_families.get(index) {
+                        Some(family) => Some(family.clone()),
+                        None => return,
+                    },
+                    None => None,
+                };
+                self.set_ui_font_family(family);
+            }
             SettingsAction::FontFamilyInput => {
                 self.set_focused_input(Some(SettingsAction::FontFamilyInput));
             }
@@ -6563,6 +6719,7 @@ impl SettingsWindow {
     fn advance_scroll_animations(&mut self, now: Instant) -> bool {
         self.ui.sidebar_scroll.advance_animation(now)
             | self.ui.content_scroll.advance_animation(now)
+            | self.ui.ui_font_menu_scroll.advance_animation(now)
     }
 
     fn do_paint_webgpu(&mut self) -> anyhow::Result<bool> {
@@ -8627,7 +8784,81 @@ impl SettingsWindow {
             SettingsAction::IncreaseSettingsFontWeight,
         )?;
         band_y += band;
+        self.paint_separator(layers, x + indent, band_y, width - indent)?;
+        let (tx, tw) = self.paint_band_tile(
+            layers,
+            x,
+            band_y,
+            band,
+            width,
+            SvgIcon::Type,
+            TileColor::Indigo,
+        )?;
+        self.paint_ui_font_row(layers, tx, band_y, tw, band)?;
+        band_y += band;
         Ok(band_y)
+    }
+
+    /// The family the interface is drawn with, as a dropdown in a band of
+    /// the typography card.
+    fn paint_ui_font_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        band: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let control_height = self.ui_px(CONTROL_HEIGHT);
+        let control_y = y + ((band - control_height) / 2.0).max(0.0);
+        let control_width = self.settings_control_width(width);
+        let control_x = x + width - control_width;
+        self.note_dropdown_anchor(
+            SettingsDropdown::UiFont,
+            (control_x, control_y, control_width),
+        );
+        let action = SettingsAction::ToggleUiFontMenu;
+        // A family's name can be longer than the column is wide.
+        let dropdown_label = self.text_with_ellipsis(
+            &Rc::clone(&self.ui_font),
+            &self.current_ui_font_label(),
+            control_width - self.ui_px(68.0),
+        );
+        let control_rect =
+            self.dropdown_pill_rect(control_x, control_y, control_width, &dropdown_label);
+        let open = self.ui.open_dropdown == Some(SettingsDropdown::UiFont);
+        let hovered = self.ui.interaction.hovered == Some(action);
+        let pressed = self.ui.interaction.pressed == Some(action);
+        let bg = if pressed || hovered {
+            palette.control_hover_bg
+        } else {
+            palette.control_bg
+        };
+        let border = if open {
+            palette.nav_selected_bg
+        } else if hovered || pressed {
+            palette.separator
+        } else {
+            palette.control_border
+        };
+        self.ui_context
+            .push(control_rect, WidgetKind::Button, action);
+        let label_y = self.control_text_y(control_y, control_height);
+        let text_width = (control_rect.origin.x
+            - x
+            - self.ui_px(24.0)
+            - self.ui_px(HINT_ICON_SIDE + HINT_ICON_GAP))
+        .max(0.0);
+        self.paint_hinted_label(
+            layers,
+            x,
+            label_y,
+            text_width,
+            &crate::i18n::tr("settings-ui-font"),
+            "settings-ui-font-description",
+        )?;
+        self.paint_dropdown_pill(layers, control_rect, &dropdown_label, bg, border)
     }
 
     /// The main window and the Settings window drawn small, each part a
@@ -16848,6 +17079,7 @@ impl SettingsWindow {
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
     ) -> anyhow::Result<()> {
+        self.ui.ui_font_menu_rect = None;
         let Some(dropdown) = self.ui.open_dropdown else {
             return Ok(());
         };
@@ -16892,6 +17124,9 @@ impl SettingsWindow {
                 control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
                 control_width,
             ),
+            SettingsDropdown::UiFont => {
+                self.paint_ui_font_menu(layers, control_x, control_y, control_width)
+            }
             SettingsDropdown::CommandPaletteHotkey => self.paint_command_palette_hotkey_menu(
                 layers,
                 control_x,
@@ -16961,11 +17196,26 @@ impl SettingsWindow {
         width: f32,
         options: &[(String, SettingsAction, bool)],
     ) -> anyhow::Result<()> {
+        self.paint_dropdown_menu_on_layer(layers, 1, x, y, width, options)
+    }
+
+    /// `paint_dropdown_menu` on layer `layer_num`, all of it. A menu that
+    /// may open over a row's icons has to be on the top layer, where they
+    /// are: on the one below, they show through it.
+    fn paint_dropdown_menu_on_layer(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        x: f32,
+        y: f32,
+        width: f32,
+        options: &[(String, SettingsAction, bool)],
+    ) -> anyhow::Result<()> {
         let palette = self.palette();
         let ui_font = Rc::clone(&self.ui_font);
-        let row_height = self.ui_px(46.0);
-        let row_gap = self.ui_px(6.0);
-        let menu_padding = self.ui_px(8.0);
+        let row_height = self.ui_px(DROPDOWN_ROW_HEIGHT);
+        let row_gap = self.ui_px(DROPDOWN_ROW_GAP);
+        let menu_padding = self.ui_px(DROPDOWN_MENU_PADDING);
         let menu_height = menu_padding * 2.0
             + row_height * options.len() as f32
             + row_gap * options.len().saturating_sub(1) as f32;
@@ -16987,7 +17237,7 @@ impl SettingsWindow {
 
         self.draw_rounded_frame(
             layers,
-            1,
+            layer_num,
             x,
             y,
             width,
@@ -17022,7 +17272,7 @@ impl SettingsWindow {
             if let Some(row_bg) = row_bg {
                 self.draw_rounded_rect(
                     layers,
-                    1,
+                    layer_num,
                     row_rect.origin.x,
                     row_rect.origin.y,
                     row_rect.size.width,
@@ -17031,8 +17281,9 @@ impl SettingsWindow {
                     self.ui_px(9.0),
                 )?;
             }
-            self.draw_text(
+            self.draw_text_on_layer(
                 layers,
+                layer_num,
                 &ui_font,
                 row_rect.origin.x + self.ui_px(14.0),
                 self.control_text_y(row_rect.origin.y, row_height),
@@ -17047,6 +17298,93 @@ impl SettingsWindow {
             row_y += row_height + row_gap;
         }
 
+        Ok(())
+    }
+
+    /// The interface font menu: the system's font and then every family,
+    /// which is far more rows than a menu can show. It shows
+    /// `UI_FONT_MENU_ROWS` of them and the wheel moves it a whole row at a
+    /// time, so no row is ever cut by the menu's edge. It hangs under its
+    /// control at `control_y`, or over it where the window ends too soon,
+    /// and is wider than the control where the page has the room: a
+    /// family's name is longer than the other menus' options are.
+    fn paint_ui_font_menu(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        control_x: f32,
+        control_y: f32,
+        control_width: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        let right = control_x + control_width;
+        let page_left = self.ui.sidebar.width + self.ui_px(24.0);
+        let width = self
+            .ui_px(UI_FONT_MENU_WIDTH)
+            .min(right - page_left)
+            .max(control_width);
+        let x = right - width;
+        let (total, visible, step) = self.ui_font_menu_rows();
+        let menu_padding = self.ui_px(DROPDOWN_MENU_PADDING);
+        let menu_height = menu_padding * 2.0 + step * visible as f32 - self.ui_px(DROPDOWN_ROW_GAP);
+        let gap = self.ui_px(8.0);
+        let below = control_y + self.ui_px(CONTROL_HEIGHT) + gap;
+        let above = control_y - gap - menu_height;
+        let y = if below + menu_height + gap > self.content_bottom()
+            && above >= self.content_scroll_area_top()
+        {
+            above
+        } else {
+            below
+        };
+
+        self.ui
+            .ui_font_menu_scroll
+            .set_extents(visible as f32 * step, total as f32 * step);
+        let first =
+            ((self.ui.ui_font_menu_scroll.offset / step).round() as usize).min(total - visible);
+        let chosen = self.chosen_ui_font_family().map(str::to_string);
+        let row_width = width - self.ui_px(16.0) - self.ui_px(28.0);
+        let options: Vec<(String, SettingsAction, bool)> = (first..first + visible)
+            .map(|row| match row.checked_sub(1) {
+                None => (
+                    crate::i18n::tr("settings-ui-font-system"),
+                    SettingsAction::SetUiFont(None),
+                    chosen.is_none(),
+                ),
+                Some(index) => {
+                    let family = &self.ui.ui_font_families[index];
+                    (
+                        self.text_with_ellipsis(&ui_font, family, row_width),
+                        SettingsAction::SetUiFont(Some(index)),
+                        chosen.as_deref() == Some(family.as_str()),
+                    )
+                }
+            })
+            .collect();
+        self.ui.ui_font_menu_rect = Some(rect(x, y, width, menu_height));
+        // Over the rows above it, where it opens upwards, and their icons.
+        self.paint_dropdown_menu_on_layer(layers, 2, x, y, width, &options)?;
+
+        // How far through the list this is, down the menu's right edge.
+        let track = menu_height - menu_padding * 2.0;
+        if let Some((thumb_y, thumb_height)) =
+            self.ui
+                .ui_font_menu_scroll
+                .thumb_with_min(y + menu_padding, track, self.ui_px(24.0))
+        {
+            let thumb_width = self.ui_px(4.0);
+            self.draw_rounded_rect(
+                layers,
+                2,
+                x + width - thumb_width - self.ui_px(3.0),
+                thumb_y,
+                thumb_width,
+                thumb_height,
+                palette.secondary_text.mul_alpha(0.45),
+                thumb_width / 2.0,
+            )?;
+        }
         Ok(())
     }
 
