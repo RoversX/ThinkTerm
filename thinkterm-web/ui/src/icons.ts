@@ -19,6 +19,7 @@ import chevronDown from '../../../third_party/lucide/icons/chevron-down.svg?raw'
 import chevronRight from '../../../third_party/lucide/icons/chevron-right.svg?raw';
 import circleAlert from '../../../third_party/lucide/icons/circle-alert.svg?raw';
 import circleCheck from '../../../third_party/lucide/icons/circle-check.svg?raw';
+import circleX from '../../../third_party/lucide/icons/circle-x.svg?raw';
 import circlePlus from '../../../third_party/lucide/icons/circle-plus.svg?raw';
 import codeXml from '../../../third_party/lucide/icons/code-xml.svg?raw';
 import clipboardPaste from '../../../third_party/lucide/icons/clipboard-paste.svg?raw';
@@ -113,6 +114,7 @@ export {
   chevronRight,
   circleAlert,
   circleCheck,
+  circleX,
   circlePlus,
   clipboardPaste,
   codeXml,
@@ -179,6 +181,7 @@ const BY_NAME: Record<string, string> = {
   'chevron-right': chevronRight,
   'circle-alert': circleAlert,
   'circle-check': circleCheck,
+  'circle-x': circleX,
   'circle-plus': circlePlus,
   'clipboard-paste': clipboardPaste,
   copy,

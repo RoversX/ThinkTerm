@@ -175,7 +175,7 @@ export type PaletteOutcome = { handled: boolean; page: string | null; recent: st
 // The right-hand Agents panel (thinkterm-web/src/agents.rs `AgentRow`,
 // `AgentsView`): one row per pane an agent runs in, and the line above them.
 
-export type AgentState = 'working' | 'blocked' | 'idle' | 'unknown';
+export type AgentState = 'working' | 'blocked' | 'error' | 'done' | 'idle' | 'unknown';
 
 export type AgentRow = {
   pane: number;
@@ -192,6 +192,18 @@ export type AgentRow = {
   place: string;
   /** `brand-claude`, `brand-copilot` or `bot`. */
   icon: string;
+  /** What the program said about itself (OSC 7501), when it did. */
+  kind: string | null;
+  said: string | null;
+  progress: number | null;
+  /** "7 sub-tasks \u00b7 5 working": the one line the sub-tasks fold
+      into; empty when there are none. */
+  subtasks_summary: string;
+  /** Whether that line is open, listing them. */
+  subtasks_open: boolean;
+  /** While it is open: the sub-tasks listed, and how many more there are. */
+  subtasks: { state: AgentState; label: string }[];
+  more_subtasks: number;
 };
 
 /** `summary` is the line above the rows; "No agents detected" when empty. */

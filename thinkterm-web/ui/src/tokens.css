@@ -276,6 +276,25 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 #agents .st.spin { color: var(--open); }
 #agents .st.alert { color: var(--warn); }
 #agents .st.idle { color: var(--muted); }
+#agents .st.err { color: var(--danger); }
+#agents .st.done { color: var(--done); }
+/* What the program reported: its words with the waiting reason as an amber
+   pill before them, a progress bar, and its sub-tasks with smaller icons. */
+#agents .said { display: flex; align-items: center; gap: 6px; color: var(--text2); line-height: 20px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#agents .said.err { color: var(--danger); }
+#agents .kind { flex: none; padding: 0 8px; border-radius: 999px; line-height: 18px; font-size: 11px; color: var(--warn); background: color-mix(in srgb, var(--warn) 18%, transparent); }
+#agents .bar { display: block; height: 3px; border-radius: 2px; background: var(--sep); overflow: hidden; }
+#agents .bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
+/* The sub-tasks fold to one line that counts them; a click on it opens
+   the list under its words, a level in. */
+#agents .fold { display: flex; align-items: center; gap: 6px; color: var(--text2); line-height: 20px; min-width: 0; cursor: pointer; }
+#agents .fold:hover { color: var(--text); }
+#agents .fold svg { flex: none; width: 12px; height: 12px; color: var(--muted); }
+#agents .fold .sl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#agents .subs { display: flex; flex-direction: column; gap: 6px; padding-left: 18px; min-width: 0; }
+#agents .subt { display: flex; align-items: center; gap: 6px; color: var(--text2); line-height: 18px; min-width: 0; }
+#agents .subt .st, #agents .subt .st svg { width: 12px; height: 12px; }
+#agents .subt .sl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* A tab of the selector that can be opened lifts under the pointer. */
 #agents .mode:not(.on):not(.off):hover { color: var(--text); }
 /* The Snippets tab (SnippetsBar, SnippetsList), as the desktop draws it:

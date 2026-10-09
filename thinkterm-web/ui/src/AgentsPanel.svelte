@@ -11,8 +11,17 @@
   import SnippetsBar from './SnippetsBar.svelte';
   import SnippetsList from './SnippetsList.svelte';
   import { handle } from './client';
-  import { refreshViews, s, views } from './client.svelte';
-  import { agentIcon, circleAlert, circleCheck, iconByName, loaderCircle } from './icons';
+  import { refreshViews, s, sCount, views } from './client.svelte';
+  import {
+    agentIcon,
+    chevronDown,
+    chevronRight,
+    circleAlert,
+    circleCheck,
+    circleX,
+    iconByName,
+    loaderCircle,
+  } from './icons';
 
   // The desktop's segmented mode selector. Which tabs exist, which this
   // browser can open and what each is called are the model's
@@ -23,6 +32,26 @@
   const heading = $derived(tabs.find((tab) => tab.id === active)?.label ?? s('web-agents-title'));
 
   const rows = $derived(views.agents.rows);
+
+  // The desktop's state icons (`agent_state_icon`): a spinner for working,
+  // amber for waiting, a red cross for an error, a green tick for a result
+  // nobody has seen, a muted one for idle; unknown gets none.
+  function stateIcon(state: string): string {
+    switch (state) {
+      case 'working':
+        return `<span class="st spin">${loaderCircle}</span>`;
+      case 'blocked':
+        return `<span class="st alert">${circleAlert}</span>`;
+      case 'error':
+        return `<span class="st err">${circleX}</span>`;
+      case 'done':
+        return `<span class="st done">${circleCheck}</span>`;
+      case 'idle':
+        return `<span class="st idle">${circleCheck}</span>`;
+      default:
+        return '';
+    }
+  }
   const summary = $derived(views.agents.summary);
 
   // The mark on the body is what makes the tab row, the canvas and the pane
@@ -54,6 +83,16 @@
     const mode = target.closest('.mode:not(.off)')?.getAttribute('data-mode');
     if (mode) {
       if (mode !== active && handle.client?.set_right_panel(mode)) refreshViews();
+      return;
+    }
+    // The sub-tasks' fold line is a target of its own inside the row: it
+    // opens or folds the list rather than revealing the pane.
+    const fold = target.closest('.fold')?.getAttribute('data-fold');
+    if (fold !== null && fold !== undefined) {
+      const pane = Number(fold);
+      if (!Number.isSafeInteger(pane) || pane < 0) return;
+      ev.preventDefault();
+      if (handle.client?.agent_toggle_subtasks(pane)) refreshViews();
       return;
     }
     const raw = target.closest('.ag')?.getAttribute('data-pane');
@@ -194,14 +233,30 @@
         <span class="tx">
           <span class="n">{row.name}{#if row.title !== ''}<span class="d"> · {row.title}</span>{/if}</span>
           <span class="p">{row.state_label}{#if row.place !== ''} · {row.place}{/if}</span>
+          <!-- What the program said about itself, as the desktop's panel
+               shows it: the waiting reason as a pill before its words, how
+               far it got, its sub-tasks. -->
+          {#if row.kind !== null || row.said !== null}
+            <span class="said" class:err={row.state === 'error'}>{#if row.kind !== null}<span class="kind">{row.kind}</span>{/if}{row.said ?? ''}</span>
+          {/if}
+          {#if row.progress !== null}
+            <span class="bar"><i style="width: {row.progress}%"></i></span>
+          {/if}
+          {#if row.subtasks_summary !== ''}
+            <span class="fold" data-fold={row.pane}>{@html row.subtasks_open ? chevronDown : chevronRight}<span class="sl">{row.subtasks_summary}</span></span>
+            {#if row.subtasks_open}
+              <span class="subs">
+                {#each row.subtasks as sub, i (i)}
+                  <span class="subt">{@html stateIcon(sub.state)}<span class="sl">{sub.label}</span></span>
+                {/each}
+                {#if row.more_subtasks > 0}
+                  <span class="p">{sCount('right-agents-more-subtasks', row.more_subtasks)}</span>
+                {/if}
+              </span>
+            {/if}
+          {/if}
         </span>
-        {#if row.state === 'working'}
-          <span class="st spin">{@html loaderCircle}</span>
-        {:else if row.state === 'blocked'}
-          <span class="st alert">{@html circleAlert}</span>
-        {:else if row.state === 'idle'}
-          <span class="st idle">{@html circleCheck}</span>
-        {/if}
+        {@html stateIcon(row.state)}
       </div>
     {/each}
   </div>
