@@ -258,6 +258,81 @@ fn agent_osc_evidence_tracks_only_real_emissions() {
     assert_eq!(term.agent_osc_evidence(), Default::default());
 }
 
+/// OSC 7501: the query is answered, reports are kept, and each of the
+/// protocol's ends for a record -- a new prompt, being seen, a hard reset
+/// -- does what it should.
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn program_status_reports_are_answered_kept_and_retired() {
+    use crate::program_status::ProgramState;
+
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let sink = Sink::default();
+    let mut term = Terminal::new(
+        TerminalSize {
+            rows: 4,
+            cols: 20,
+            pixel_width: 160,
+            pixel_height: 64,
+            dpi: 0,
+        },
+        Arc::new(TestTermConfig { scrollback: 0 }),
+        "ThinkTerm",
+        "O_o",
+        Box::new(sink.clone()),
+    );
+
+    term.advance_bytes("\x1b]7501;?\x07");
+    let reply = b"\x1b]7501;?\x1b\\";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while sink.0.lock().unwrap().len() < reply.len() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(sink.0.lock().unwrap().as_slice(), reply);
+
+    // "Running tests"
+    term.advance_bytes(
+        "\x1b]7501;state=working:app=claude-code:progress=60:msg=UnVubmluZyB0ZXN0cw\x1b\\\
+         \x1b]7501;state=blocked:id=plan:kind=question\x1b\\\
+         \x1b]7501;state=done:id=explore\x1b\\",
+    );
+    let snapshot = term.program_status(usize::MAX);
+    let root = snapshot.root.unwrap();
+    assert_eq!(root.state, ProgramState::Working);
+    assert_eq!(root.progress, Some(60));
+    assert_eq!(root.msg.as_deref(), Some("Running tests"));
+    assert_eq!(snapshot.children.len(), 2);
+    assert_eq!(snapshot.children[1].app.as_deref(), Some("claude-code"));
+
+    // The shell's next prompt: only the unseen result is left.
+    term.advance_bytes("\x1b]133;A\x07");
+    let snapshot = term.program_status(usize::MAX);
+    assert_eq!(snapshot.root, None);
+    assert_eq!(snapshot.children.len(), 1);
+    assert_eq!(snapshot.children[0].state, ProgramState::Done);
+    assert!(snapshot.children[0].orphaned);
+
+    assert!(term.program_status_seen());
+    assert_eq!(term.program_status(usize::MAX), Default::default());
+
+    term.advance_bytes("\x1b]7501;state=error\x1b\\");
+    assert!(term.program_status(usize::MAX).root.is_some());
+    term.advance_bytes("\x1bc");
+    assert_eq!(term.program_status(usize::MAX), Default::default());
+}
+
 #[test]
 fn application_palette_override_tracks_osc_set_query_and_reset() {
     let mut term = TestTerm::new(4, 8, 0);

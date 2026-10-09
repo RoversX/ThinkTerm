@@ -22,7 +22,7 @@ use wezterm_escape_parser::csi::{
 };
 use wezterm_escape_parser::osc::{
     ChangeColorPair, ColorOrQuery, FinalTermSemanticPrompt, ITermProprietary,
-    ITermUnicodeVersionOp, Selection,
+    ITermUnicodeVersionOp, ProgramStatus, Selection,
 };
 use wezterm_escape_parser::{
     Action, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand, CSI,
@@ -884,6 +884,7 @@ impl<'a> Performer<'a> {
                 self.progress = Progress::default();
                 self.agent_osc_title = None;
                 self.agent_osc_progress = None;
+                self.program_status.clear();
 
                 // Before the screen is torn down, while the placement rows
                 // still refer to real lines. The soft reset (DECSTR) already
@@ -1060,6 +1061,9 @@ impl<'a> Performer<'a> {
             ) => {
                 self.fresh_line();
                 self.pen.set_semantic_type(SemanticType::Prompt);
+                // A new shell prompt: whatever filed OSC 7501 records has
+                // finished, and only its unseen results remain.
+                self.program_status.end_of_program();
             }
             OperatingSystemCommand::FinalTermSemanticPrompt(
                 FinalTermSemanticPrompt::StartPrompt(_),
@@ -1266,6 +1270,24 @@ impl<'a> Performer<'a> {
                 }
                 self.implicit_palette_reset_if_same_as_configured();
                 self.palette_did_change();
+            }
+            OperatingSystemCommand::ProgramStatus(ProgramStatus::Query) => {
+                // The same body back is the whole answer: nothing about the
+                // records is ever echoed.
+                write!(
+                    self.writer,
+                    "{}",
+                    OperatingSystemCommand::ProgramStatus(ProgramStatus::Query)
+                )
+                .ok();
+                self.writer.flush().ok();
+            }
+            OperatingSystemCommand::ProgramStatus(ProgramStatus::Report(report)) => {
+                let group = self
+                    .program_status_process_group
+                    .as_ref()
+                    .and_then(|source| source());
+                self.program_status.apply_from(report, group);
             }
             OperatingSystemCommand::ConEmuProgress(prog) => {
                 use wezterm_escape_parser::osc::Progress as TProg;

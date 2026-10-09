@@ -33,6 +33,7 @@ pub mod kitty_animation;
 pub mod kitty_placeholder;
 pub mod kitty_relative;
 pub mod kitty_virtual;
+pub mod program_status;
 
 /// Graphics state carried alongside the unchanged legacy terminal snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]

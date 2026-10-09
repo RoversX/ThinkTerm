@@ -408,6 +408,9 @@ pub struct TerminalState {
     /// before any display flattening (Paused stays distinct). `None`
     /// means the app has not spoken.
     agent_osc_progress: Option<String>,
+    /// What programs have reported about themselves with OSC 7501.
+    program_status: crate::program_status::ProgramStatusRecords,
+    program_status_process_group: Option<Box<dyn Fn() -> Option<u32> + Send + Sync>>,
 
     palette: Option<ColorPalette>,
 
@@ -697,6 +700,8 @@ impl TerminalState {
             progress: Progress::default(),
             agent_osc_title: None,
             agent_osc_progress: None,
+            program_status: Default::default(),
+            program_status_process_group: None,
         }
     }
 
@@ -820,6 +825,36 @@ impl TerminalState {
     pub fn clear_agent_osc_state(&mut self) {
         self.agent_osc_title = None;
         self.agent_osc_progress = None;
+    }
+
+    /// The records programs have filed with OSC 7501, with at most
+    /// `max_children` besides the root.
+    pub fn program_status(
+        &self,
+        max_children: usize,
+    ) -> crate::program_status::ProgramStatusSnapshot {
+        self.program_status.snapshot(max_children)
+    }
+
+    /// Someone has looked at the pane: a finished or failed program's
+    /// result has been seen. Returns whether anything changed.
+    pub fn program_status_seen(&mut self) -> bool {
+        self.program_status.seen()
+    }
+
+    /// Resolve the foreground only when an OSC 7501 report is received.
+    pub fn set_program_status_process_group(
+        &mut self,
+        source: Box<dyn Fn() -> Option<u32> + Send + Sync>,
+    ) {
+        self.program_status_process_group = Some(source);
+    }
+
+    /// The program that filed OSC 7501 records has gone: drop all but the
+    /// results nobody has seen, among the records received up to serial
+    /// `through`. Returns whether anything changed.
+    pub fn end_program_status(&mut self, through: u64) -> bool {
+        self.program_status.end_of_program_through(through)
     }
 
     /// Returns the current working directory associated with the
