@@ -262,7 +262,7 @@ fn host_connected(name: &str) -> bool {
 fn source_id(source: ImportSource) -> Option<&'static str> {
     match source {
         ImportSource::Session(id) => Some(id),
-        ImportSource::WezTerm => None,
+        ImportSource::WezTerm | ImportSource::Editors => None,
     }
 }
 

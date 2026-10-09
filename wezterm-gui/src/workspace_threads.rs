@@ -2519,6 +2519,108 @@ pub fn create_project_from_path(space_id: &str, path: &str) -> Result<WorkspaceT
     Ok(thread_id)
 }
 
+/// The Spaces whose terminals run on this computer, by id and name, in the
+/// sidebar's order.
+pub fn local_spaces() -> Vec<(SpaceId, String)> {
+    let mut store = THREAD_STORE.lock();
+    if store.normalize_after_load() {
+        persist_locked(&store);
+    }
+    store
+        .spaces
+        .iter()
+        .filter(|space| space.client_domain.is_none())
+        .map(|space| (space.id.clone(), space.name.clone()))
+        .collect()
+}
+
+/// `path` resolved, as the sidebar opens a folder, so two spellings of one
+/// folder compare equal. None for a folder that is not there. Taken as it
+/// is first: a name the sidebar's typed-in form would trim is still found.
+pub fn project_path_key(path: &Path) -> Option<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(canonical) => canonical
+            .is_dir()
+            .then(|| shell_compatible_project_path(canonical)),
+        Err(_) => normalize_project_path(&path.to_string_lossy()).ok(),
+    }
+}
+
+/// A Space's projects by their folder, resolved as by `project_path_key`,
+/// each with its id and whether it is archived.
+pub type ResolvedProjects = HashMap<PathBuf, (ProjectId, bool)>;
+
+/// `space_id`'s projects as [`ResolvedProjects`]. Every folder is looked up
+/// on disk, so this belongs on a thread of its own rather than the UI's: a
+/// project on a network share that has gone away can take seconds.
+pub fn resolved_projects(space_id: &str) -> ResolvedProjects {
+    let projects: Vec<(ProjectId, PathBuf, bool)> = {
+        let store = THREAD_STORE.lock();
+        store
+            .projects
+            .iter()
+            .filter(|project| project.space_id == space_id)
+            .map(|project| (project.id.clone(), project.path.clone(), project.is_archived()))
+            .collect()
+    };
+    // Resolved with the store let go: it is the file system's turn.
+    by_folder(
+        projects
+            .into_iter()
+            .filter_map(|(id, path, archived)| Some((project_path_key(&path)?, id, archived))),
+    )
+}
+
+/// Projects by resolved folder. Where two resolve to one folder -- added
+/// under two spellings of it -- the one the sidebar shows wins, so the
+/// folder reads as there already rather than as one to bring back.
+fn by_folder(projects: impl IntoIterator<Item = (PathBuf, ProjectId, bool)>) -> ResolvedProjects {
+    let mut by_folder = ResolvedProjects::new();
+    for (folder, id, archived) in projects {
+        if by_folder
+            .get(&folder)
+            .map_or(true, |(_, kept_archived)| *kept_archived)
+        {
+            by_folder.insert(folder, (id, archived));
+        }
+    }
+    by_folder
+}
+
+/// Add a project for each of `paths`, resolved already, to `space_id`, each
+/// with one thread that starts when it is first opened. The Space's active
+/// project stays put: an import adds to the sidebar, it does not navigate.
+/// `known` is the Space's projects as `resolved_projects` found them: one of
+/// those, however its path is spelled, is left as it is or brought back if
+/// archived. Nothing here asks the file system. How many the sidebar gained.
+pub fn add_projects(space_id: &str, paths: &[PathBuf], known: &ResolvedProjects) -> usize {
+    let mut store = THREAD_STORE.lock();
+    store.normalize_after_load();
+    if !store.has_space(space_id) {
+        return 0;
+    }
+    let mut added = 0;
+    for path in paths {
+        let kept = known
+            .get(path)
+            .map(|(project_id, _)| project_id)
+            .filter(|project_id| store.projects.iter().any(|project| &project.id == *project_id));
+        let gained = match kept {
+            Some(project_id) => store.unarchive_project(project_id),
+            None => store.add_project_for_path(space_id, path.clone()),
+        };
+        if gained {
+            added += 1;
+        }
+    }
+    if added > 0 {
+        // A Space that had no project to open now has one.
+        store.normalize_after_load();
+        persist_locked(&store);
+    }
+    added
+}
+
 pub fn create_disconnected_remote_host_thread(
     space_id: &str,
     host_id: &str,
@@ -6497,30 +6599,26 @@ impl WorkspaceThreadStore {
             }
         }
 
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("Project")
-            .to_string();
-        let mut project = Project {
-            id: project_id.clone(),
-            space_id: space_id.to_string(),
-            name,
-            path,
-            threads: vec![],
-            active_thread_id: None,
-            threads_collapsed: false,
-            active_note_path: None,
-            archived_at: None,
-        };
-        let session = WorkspaceThread::new(project_id.clone(), "main".to_string(), None);
-        let thread_id = session.id.clone();
-        project.active_thread_id = Some(thread_id.clone());
-        project.threads.push(session);
+        let (project, thread_id) = new_project_for_path(space_id, project_id.clone(), path);
         self.set_active_project_for_space(space_id, project_id);
         self.projects.push(project);
         thread_id
+    }
+
+    /// A project for `path` in `space_id`, unless the Space has one for it;
+    /// an archived one is brought back. Whether the sidebar gained one.
+    fn add_project_for_path(&mut self, space_id: &str, path: PathBuf) -> bool {
+        if let Some(project) = self
+            .projects
+            .iter_mut()
+            .find(|project| project.space_id == space_id && project.path == path)
+        {
+            return project.archived_at.take().is_some();
+        }
+        let project_id = project_id_for_path(space_id, &path);
+        let (project, _) = new_project_for_path(space_id, project_id, path);
+        self.projects.push(project);
+        true
     }
 
     fn project_id_for_workspace(&self, space_id: &str, workspace: &str) -> Option<ProjectId> {
@@ -9270,6 +9368,37 @@ fn thread_has_restorable_workspace(thread: &WorkspaceThread) -> bool {
     thread.layout.is_some() || thread.materialized_workspace_name.is_some()
 }
 
+/// A project for `path` with one thread, named for the folder, and that
+/// thread's id.
+fn new_project_for_path(
+    space_id: &str,
+    project_id: ProjectId,
+    path: PathBuf,
+) -> (Project, WorkspaceThreadId) {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Project")
+        .to_string();
+    let mut project = Project {
+        id: project_id.clone(),
+        space_id: space_id.to_string(),
+        name,
+        path,
+        threads: vec![],
+        active_thread_id: None,
+        threads_collapsed: false,
+        active_note_path: None,
+        archived_at: None,
+    };
+    let session = WorkspaceThread::new(project_id, "main".to_string(), None);
+    let thread_id = session.id.clone();
+    project.active_thread_id = Some(thread_id.clone());
+    project.threads.push(session);
+    (project, thread_id)
+}
+
 fn normalize_project_path(path: &str) -> Result<PathBuf> {
     let trimmed = path.trim();
     ensure!(!trimmed.is_empty(), "project path is empty");
@@ -11730,6 +11859,57 @@ mod tests {
         assert_eq!(
             strip_windows_verbatim_prefix_text(r"\\?\UNC\server\share\project").as_deref(),
             Some(r"\\server\share\project")
+        );
+    }
+
+    #[test]
+    fn a_folder_two_projects_share_reads_as_the_shown_one() {
+        let folder = PathBuf::from("/private/tmp/demo");
+        let shown = (folder.clone(), "shown".to_string(), false);
+        let archived = (folder.clone(), "archived".to_string(), true);
+        for projects in [
+            vec![archived.clone(), shown.clone()],
+            vec![shown.clone(), archived.clone()],
+        ] {
+            assert_eq!(by_folder(projects)[&folder], ("shown".to_string(), false));
+        }
+    }
+
+    #[test]
+    fn imported_projects_join_the_space_without_moving_its_active_project() {
+        let space_id = default_space_id();
+        let (first, second) = (tempdir().unwrap(), tempdir().unwrap());
+        let mut store = test_store();
+        store.create_project_from_path(&space_id, first.path().to_path_buf());
+        let active = store.active_project_id_for_space(&space_id);
+
+        assert!(store.add_project_for_path(&space_id, second.path().to_path_buf()));
+        // Already there: nothing to add.
+        assert!(!store.add_project_for_path(&space_id, first.path().to_path_buf()));
+        assert_eq!(store.active_project_id_for_space(&space_id), active);
+        let imported = store
+            .projects
+            .iter()
+            .find(|project| project.path == second.path())
+            .unwrap();
+        assert_eq!(imported.threads.len(), 1);
+        assert!(imported.threads[0].materialized_workspace_name.is_none());
+
+        // An archived one comes back rather than being added twice.
+        store
+            .projects
+            .iter_mut()
+            .find(|project| project.path == second.path())
+            .unwrap()
+            .archived_at = Some(1);
+        assert!(store.add_project_for_path(&space_id, second.path().to_path_buf()));
+        assert_eq!(
+            store
+                .projects
+                .iter()
+                .filter(|project| project.path == second.path())
+                .count(),
+            1
         );
     }
 

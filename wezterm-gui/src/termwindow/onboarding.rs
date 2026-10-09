@@ -218,9 +218,22 @@ fn focus_order(found: &found::Found) -> Vec<OnboardingAction> {
     if found.wezterm_config {
         order.push(OnboardingAction::Import(None));
     }
+    if found.editors.is_some() {
+        order.push(OnboardingAction::Import(Some(
+            crate::settings_window::EDITORS_SOURCE,
+        )));
+    }
     order.push(OnboardingAction::Skip);
     order.push(OnboardingAction::Start);
     order
+}
+
+/// What heads a row of the found card.
+enum FoundMark {
+    /// A program's own mark, or a terminal where it has none.
+    Program(Option<BrandIcon>),
+    /// Editors' marks on overlapping tiles.
+    Editors(Vec<crate::editor_projects::EditorKind>),
 }
 
 /// SplitMix64 over a pair: the curtain's fixed pattern.
@@ -825,8 +838,7 @@ impl OnboardingView {
         };
 
         let show_found = !self.found.is_empty();
-        let found_rows =
-            (self.found.sessions.len() + usize::from(self.found.wezterm_config)) as f32;
+        let found_rows = self.found.rows() as f32;
 
         let privacy = crate::i18n::tr("onboarding-privacy");
         let start_label = crate::i18n::tr("onboarding-start");
@@ -1366,7 +1378,7 @@ impl OnboardingView {
             fx(FOUND_RADIUS),
         )?;
 
-        let mut rows: Vec<(Option<BrandIcon>, String, String, String, OnboardingAction)> = self
+        let mut rows: Vec<(FoundMark, String, String, String, OnboardingAction)> = self
             .found
             .sessions
             .iter()
@@ -1381,7 +1393,7 @@ impl OnboardingView {
                     _ => crate::i18n::tr_args("onboarding-found-sessions", &args),
                 };
                 (
-                    sessions.icon,
+                    FoundMark::Program(sessions.icon),
                     sessions.name.to_string(),
                     detail,
                     crate::i18n::tr("onboarding-found-import"),
@@ -1391,17 +1403,36 @@ impl OnboardingView {
             .collect();
         if self.found.wezterm_config {
             rows.push((
-                Some(BrandIcon::WezTerm),
+                FoundMark::Program(Some(BrandIcon::WezTerm)),
                 "WezTerm".to_string(),
                 crate::i18n::tr("onboarding-found-wezterm"),
                 crate::i18n::tr("onboarding-found-import-settings"),
                 OnboardingAction::Import(None),
             ));
         }
+        if let Some(editors) = &self.found.editors {
+            rows.push((
+                FoundMark::Editors(editors.kinds.clone()),
+                editors.names.clone(),
+                crate::i18n::tr("onboarding-found-editors"),
+                crate::i18n::tr("onboarding-found-choose-projects"),
+                OnboardingAction::Import(Some(crate::settings_window::EDITORS_SOURCE)),
+            ));
+        }
 
         let pad_x = fx(FOUND_PAD_X);
         let icon = fx(FOUND_ICON);
-        for (index, (brand, name, detail, button, action)) in rows.iter().enumerate() {
+        // A row of editors is wider than one mark; every mark is centred
+        // in the widest, so the names still line up.
+        let mark_width = |mark: &FoundMark| match mark {
+            FoundMark::Program(_) => icon,
+            FoundMark::Editors(kinds) => crate::editor_projects::stack_width(kinds.len(), icon),
+        };
+        let column = rows
+            .iter()
+            .map(|(mark, ..)| mark_width(mark))
+            .fold(icon, f32::max);
+        for (index, (mark, name, detail, button, action)) in rows.iter().enumerate() {
             let top = card.origin.y + index as f32 * row_h;
             if index > 0 {
                 ctx.draw_rect(
@@ -1414,17 +1445,30 @@ impl OnboardingView {
                     skin.chip_border,
                 )?;
             }
-            let icon_x = card.origin.x + pad_x;
+            let column_x = card.origin.x + pad_x;
+            let icon_x = column_x + (column - mark_width(mark)) / 2.0;
             let icon_y = top + (row_h - icon) / 2.0;
-            match brand {
-                Some(brand) => ctx.draw_brand_icon(layers, *brand, icon_x, icon_y, icon)?,
-                None => ctx.draw_svg_icon(
+            match mark {
+                FoundMark::Program(Some(brand)) => {
+                    ctx.draw_brand_icon(layers, *brand, icon_x, icon_y, icon)?
+                }
+                FoundMark::Program(None) => ctx.draw_svg_icon(
                     layers,
                     SvgIcon::Terminal,
                     icon_x,
                     icon_y,
                     icon,
                     skin.secondary_text,
+                )?,
+                FoundMark::Editors(kinds) => crate::editor_projects::draw_stack(
+                    ctx,
+                    layers,
+                    kinds,
+                    icon_x,
+                    icon_y,
+                    icon,
+                    skin.chip_bg,
+                    skin.dark,
                 )?,
             }
 
@@ -1442,7 +1486,7 @@ impl OnboardingView {
                 false,
             )?;
 
-            let text_x = icon_x + icon + fx(FOUND_ICON_GAP);
+            let text_x = column_x + column + fx(FOUND_ICON_GAP);
             let text_w = (button_x - fx(FOUND_ICON_GAP) - text_x).max(1.0);
             let text_y = top + (row_h - body_h * 2.0 - fx(FOUND_LINE_GAP)) / 2.0;
             self.text(ctx, layers, font, text_x, text_y, name, skin.text, text_w)?;
@@ -1858,6 +1902,8 @@ struct Skin {
     face_border: LinearRgba,
     /// The open language menu, a step off the page so it reads as above it.
     menu_bg: LinearRgba,
+    /// Whether the page is dark, which lit tiles shade for.
+    dark: bool,
     shadow: LinearRgba,
     primary_bg: LinearRgba,
     primary_text: LinearRgba,
@@ -1885,6 +1931,7 @@ impl Skin {
             ground,
             face_border: mix(ground, palette.text, 0.24),
             menu_bg: mix(ground, palette.text, 0.05),
+            dark: palette.is_dark(),
             shadow: LinearRgba::with_components(0.0, 0.0, 0.0, 0.35),
             // The mono inversion: the primary action is the highest-contrast
             // thing on the page without introducing a hue.
@@ -2184,6 +2231,7 @@ mod tests {
         let found = found::Found {
             sessions: vec![found::FoundSessions::for_test("example", 2, Some(1))],
             wezterm_config: true,
+            editors: None,
         };
         let order = focus_order(&found);
         assert!(order.contains(&OnboardingAction::Import(Some("example"))));
@@ -2280,12 +2328,14 @@ mod tests {
         let found = found::Found {
             sessions: vec![found::FoundSessions::for_test("example", 2, None)],
             wezterm_config: false,
+            editors: None,
         };
         assert!(found.pending());
         assert!(!found.is_empty());
         let found = found::Found {
             sessions: vec![found::FoundSessions::for_test("example", 2, Some(0))],
             wezterm_config: false,
+            editors: None,
         };
         assert!(!found.pending());
         assert!(found::Found::default().is_empty());

@@ -132,6 +132,9 @@ pub enum SvgIcon {
     AgentKimi,
     AgentOpenCode,
     AgentPi,
+    // VS Code's mark, from the Material Icon Theme's file icons. Its own
+    // blue is ignored like any glyph's colour: it takes the caller's tint.
+    VsCode,
 }
 
 impl SvgIcon {
@@ -395,6 +398,9 @@ impl SvgIcon {
                 include_bytes!("../../../../third_party/lobe-icons/opencode.svg")
             }
             Self::AgentPi => include_bytes!("../../../../third_party/lobe-icons/pi.svg"),
+            Self::VsCode => {
+                include_bytes!("../../../../third_party/material-icon-theme/icons/vscode.svg")
+            }
         }
     }
 
@@ -536,6 +542,7 @@ pub enum BrandIcon {
     ArchLinux,
     CentOS,
     Claude,
+    Cursor,
     Debian,
     Docker,
     Fedora,
@@ -548,7 +555,9 @@ pub enum BrandIcon {
     RaspberryPi,
     RedHat,
     Ubuntu,
+    VSCodium,
     WezTerm,
+    Windsurf,
 }
 
 /// Brand colors darker than this perceived luminance (0..=255) are rendered
@@ -588,6 +597,7 @@ impl BrandIcon {
             }
             Self::CentOS => include_bytes!("../../../../third_party/simple-icons/icons/centos.svg"),
             Self::Claude => include_bytes!("../../../../third_party/simple-icons/icons/claude.svg"),
+            Self::Cursor => include_bytes!("../../../../third_party/simple-icons/icons/cursor.svg"),
             Self::Debian => include_bytes!("../../../../third_party/simple-icons/icons/debian.svg"),
             Self::Docker => include_bytes!("../../../../third_party/simple-icons/icons/docker.svg"),
             Self::Fedora => include_bytes!("../../../../third_party/simple-icons/icons/fedora.svg"),
@@ -604,7 +614,13 @@ impl BrandIcon {
             }
             Self::RedHat => include_bytes!("../../../../third_party/simple-icons/icons/redhat.svg"),
             Self::Ubuntu => include_bytes!("../../../../third_party/simple-icons/icons/ubuntu.svg"),
+            Self::VSCodium => {
+                include_bytes!("../../../../third_party/simple-icons/icons/vscodium.svg")
+            }
             Self::WezTerm => include_bytes!("../../../../assets/icon/wezterm-icon.svg"),
+            Self::Windsurf => {
+                include_bytes!("../../../../third_party/simple-icons/icons/windsurf.svg")
+            }
         }
     }
 
@@ -634,6 +650,7 @@ impl BrandIcon {
             Self::ArchLinux => (0x17, 0x93, 0xD1),
             Self::CentOS => (0x26, 0x25, 0x77),
             Self::Claude => (0xD9, 0x77, 0x57),
+            Self::Cursor => (0x00, 0x00, 0x00),
             Self::Debian => (0xA8, 0x1D, 0x33),
             Self::Docker => (0x24, 0x96, 0xED),
             Self::Fedora => (0x51, 0xA2, 0xDA),
@@ -646,7 +663,9 @@ impl BrandIcon {
             Self::RaspberryPi => (0xA2, 0x28, 0x46),
             Self::RedHat => (0xEE, 0x00, 0x00),
             Self::Ubuntu => (0xE9, 0x54, 0x20),
+            Self::VSCodium => (0x2F, 0x80, 0xED),
             Self::WezTerm => (0x4E, 0x49, 0xEE),
+            Self::Windsurf => (0x0B, 0x10, 0x0F),
         }
     }
 
@@ -874,6 +893,7 @@ mod tests {
             SvgIcon::AgentKimi,
             SvgIcon::AgentOpenCode,
             SvgIcon::AgentPi,
+            SvgIcon::VsCode,
         ] {
             let data: Vec<u8> = icon.rasterize(24).unwrap().into();
             assert_eq!(data.len(), 24 * 24 * 4);
@@ -896,6 +916,7 @@ mod tests {
             BrandIcon::ArchLinux,
             BrandIcon::CentOS,
             BrandIcon::Claude,
+            BrandIcon::Cursor,
             BrandIcon::Debian,
             BrandIcon::Docker,
             BrandIcon::Fedora,
@@ -908,7 +929,9 @@ mod tests {
             BrandIcon::RaspberryPi,
             BrandIcon::RedHat,
             BrandIcon::Ubuntu,
+            BrandIcon::VSCodium,
             BrandIcon::WezTerm,
+            BrandIcon::Windsurf,
         ] {
             let data: Vec<u8> = icon.rasterize(24).unwrap().into();
             assert_eq!(data.len(), 24 * 24 * 4);

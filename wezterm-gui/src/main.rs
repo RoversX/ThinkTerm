@@ -42,6 +42,7 @@ mod colorease;
 mod commands;
 mod customglyph;
 mod download;
+mod editor_projects;
 mod framedump;
 mod frontend;
 mod glyphcache;

@@ -10,13 +10,21 @@ pub(super) enum ImportStep {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ImportSource {
     WezTerm,
+    /// The folders VS Code and the editors built from it have opened.
+    Editors,
     #[cfg(unix)]
     Session(&'static str),
 }
 
+/// What first-run setup and the Import page call the editors' source.
+pub(crate) const EDITORS_SOURCE: &str = "editors";
+
 impl ImportSource {
     pub(super) fn all() -> Vec<Self> {
         let mut sources = vec![Self::WezTerm];
+        if !crate::editor_projects::installed().is_empty() {
+            sources.push(Self::Editors);
+        }
         #[cfg(unix)]
         sources.extend(
             thinkterm_import::sources()
@@ -31,6 +39,7 @@ impl ImportSource {
     pub(super) fn named(id: Option<&str>) -> Option<Self> {
         match id {
             None => Some(Self::WezTerm),
+            Some(EDITORS_SOURCE) => Some(Self::Editors),
             #[cfg(unix)]
             Some(id) => thinkterm_import::sources()
                 .into_iter()
@@ -46,8 +55,12 @@ impl ImportSource {
         if let Some(source) = session_import::remembered_source() {
             return source;
         }
+        let selected = std::env::var("THINKTERM_SETTINGS_SECTION").ok();
+        if selected.as_deref() == Some(EDITORS_SOURCE) {
+            return Self::Editors;
+        }
         #[cfg(unix)]
-        if let Ok(selected) = std::env::var("THINKTERM_SETTINGS_SECTION") {
+        if let Some(selected) = selected {
             if let Some(source) = thinkterm_import::sources()
                 .into_iter()
                 .find(|s| s.id.eq_ignore_ascii_case(&selected))
@@ -62,25 +75,28 @@ impl ImportSource {
     /// is new enough to carry a Beta badge.
     fn is_beta(self) -> bool {
         match self {
-            Self::WezTerm => false,
+            Self::WezTerm | Self::Editors => false,
             #[cfg(unix)]
             Self::Session(_) => true,
         }
     }
 
-    pub(super) fn label(self) -> &'static str {
+    pub(super) fn label(self) -> String {
         match self {
-            Self::WezTerm => "WezTerm",
+            Self::WezTerm => "WezTerm".to_string(),
+            Self::Editors => crate::i18n::tr("settings-import-editors"),
             #[cfg(unix)]
             Self::Session(id) => thinkterm_import::source(id)
                 .map(|s| s.info().name)
-                .unwrap_or(id),
+                .unwrap_or(id)
+                .to_string(),
         }
     }
 
     fn description(self) -> String {
         crate::i18n::tr(match self {
             Self::WezTerm => "settings-import-wezterm-description",
+            Self::Editors => "settings-import-editors-description",
             #[cfg(unix)]
             Self::Session(_) => "settings-import-session-description",
         })
@@ -89,6 +105,8 @@ impl ImportSource {
     fn icon(self) -> Option<BrandIcon> {
         match self {
             Self::WezTerm => Some(BrandIcon::WezTerm),
+            // Drawn as its editors' marks, see `paint_editor_stack`.
+            Self::Editors => None,
             #[cfg(unix)]
             Self::Session(id) => {
                 BrandIcon::for_import_source(thinkterm_import::source(id).ok()?.info().icon)
@@ -101,6 +119,7 @@ impl ImportSource {
         match self {
             Self::Session(id) => thinkterm_import::source(id),
             Self::WezTerm => anyhow::bail!("The selected source imports settings, not sessions"),
+            Self::Editors => anyhow::bail!("The selected source imports folders, not sessions"),
         }
     }
 
@@ -113,7 +132,8 @@ impl ImportSource {
         for (name, value) in values {
             args.set(*name, value.as_str());
         }
-        args.set("source", self.label());
+        let label = self.label();
+        args.set("source", label.as_str());
         crate::i18n::tr_args(key, &args)
     }
 }
@@ -166,6 +186,10 @@ impl SettingsWindow {
                     ImportSource::WezTerm => {
                         self.perform_action(SettingsAction::LoadWezTermSource, window)
                     }
+                    ImportSource::Editors => {
+                        let space = OPENED_FROM_SPACE.with(|slot| slot.borrow().clone());
+                        self.start_editor_import(space);
+                    }
                     #[cfg(unix)]
                     ImportSource::Session(_) => {
                         self.perform_session_import_action(SettingsAction::SessionImportDetect)
@@ -186,6 +210,7 @@ impl SettingsWindow {
             SettingsAction::ImportStartOver => {
                 self.ui.import_step = ImportStep::Source;
                 self.ui.import_result = None;
+                self.ui.editor_import.release();
                 #[cfg(unix)]
                 {
                     self.ui.session_import.abandon();
@@ -250,6 +275,7 @@ impl SettingsWindow {
             }
             ImportStep::Review => match self.ui.import_source {
                 ImportSource::WezTerm => self.paint_wezterm_import(layers, x, top, width)?,
+                ImportSource::Editors => self.paint_editor_import(layers, x, top, width)?,
                 #[cfg(unix)]
                 ImportSource::Session(_) => self.paint_session_import(layers, x, top, width)?,
             },
@@ -277,6 +303,7 @@ impl SettingsWindow {
                         }],
                     )?
                 }
+                ImportSource::Editors => self.paint_editor_result(layers, x, top, width)?,
                 #[cfg(unix)]
                 ImportSource::Session(_) => self.paint_session_result(layers, x, top, width)?,
             },
@@ -572,9 +599,16 @@ impl SettingsWindow {
         description: &str,
     ) -> anyhow::Result<f32> {
         let mark = self.ui_px(88.0).min(width * 0.2);
+        // The editors stand side by side, each on a tile as big as another
+        // source's mark.
+        let editors = (self.ui.import_source == ImportSource::Editors)
+            .then(|| self.ui.editor_import.kinds());
+        let mark_width = editors.as_ref().map_or(mark, |kinds| {
+            crate::editor_projects::stack_width(kinds.len(), mark)
+        });
         let gap = self.ui_px(24.0);
-        let left = x + mark + gap;
-        let inner = (width - mark - gap).max(1.0);
+        let left = x + mark_width + gap;
+        let inner = (width - mark_width - gap).max(1.0);
         let title_font = Rc::clone(&self.title_font);
         let body_font = Rc::clone(&self.import_body_font);
         let title_lines = self.wrap_settings_text(&title_font, title, inner);
@@ -593,14 +627,17 @@ impl SettingsWindow {
             + self.ui_px(4.0)
             + body_height * body_lines.len() as f32;
         let height = mark.max(text_height);
-        if let Some(icon) = self.ui.import_source.icon() {
-            self.draw_brand_icon(layers, icon, x, y + (height - mark) / 2.0, mark)?;
+        let mark_y = y + (height - mark) / 2.0;
+        if let Some(kinds) = &editors {
+            self.paint_editor_stack(layers, kinds, x, mark_y, mark, self.palette().window_bg)?;
+        } else if let Some(icon) = self.ui.import_source.icon() {
+            self.draw_brand_icon(layers, icon, x, mark_y, mark)?;
         } else {
             self.draw_svg_icon(
                 layers,
                 SvgIcon::Terminal,
                 x,
-                y + (height - mark) / 2.0,
+                mark_y,
                 mark,
                 self.palette().text,
             )?;
@@ -816,7 +853,21 @@ impl SettingsWindow {
                 },
                 self.ui_px(32.0),
             )?;
-            if let Some(brand) = source.icon() {
+            if *source == ImportSource::Editors {
+                let kinds = crate::editor_projects::stack_kinds(
+                    crate::editor_projects::installed().iter().copied(),
+                );
+                let tile = (icon * 0.6).round();
+                let span = crate::editor_projects::stack_width(kinds.len(), tile);
+                self.paint_editor_stack(
+                    layers,
+                    &kinds,
+                    left + (card_width - span) / 2.0,
+                    top + pad + (icon - tile) / 2.0,
+                    tile,
+                    ground,
+                )?;
+            } else if let Some(brand) = source.icon() {
                 self.draw_brand_icon(
                     layers,
                     brand,
@@ -835,7 +886,8 @@ impl SettingsWindow {
                 )?;
             }
             let title_y = top + pad + icon + self.ui_px(24.0);
-            let title_width = self.measure_text_width(&heading, source.label());
+            let label = source.label();
+            let title_width = self.measure_text_width(&heading, &label);
             // The title and its badge are centered as one line.
             let badge_gap = self.ui_px(14.0);
             let badge_width = if source.is_beta() {
@@ -849,7 +901,7 @@ impl SettingsWindow {
                 &heading,
                 title_x,
                 title_y,
-                source.label(),
+                &label,
                 palette.title,
                 text_width,
             )?;

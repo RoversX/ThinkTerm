@@ -698,6 +698,8 @@ onboarding-found-sessions-running = { $count ->
 onboarding-found-wezterm = A configuration file
 onboarding-found-import = Import
 onboarding-found-import-settings = Import settings
+onboarding-found-editors = Folders you opened
+onboarding-found-choose-projects = Choose projects
 
 # Agent status detection + Agents panel
 settings-agent-panel-description = Detect coding agents (Claude Code, Codex, …) running in panes and show them in the right sidebar.
@@ -1107,6 +1109,28 @@ session-import-project-meta = { $threads } Thread · { $tabs } primary tabs · {
 session-import-terminal-untitled = Terminal { $number }
 settings-import-description = Choose a source to see what you can import.
 settings-import-wezterm-description = Settings and shortcuts
+settings-import-editors = Code editors
+settings-import-editors-description = Project folders
+settings-import-editors-title = Choose projects to add
+settings-import-editors-subtitle = Folders you opened in VS Code and the editors built on it. Only the paths come over; nothing inside the folders is read.
+settings-import-editors-all = All
+settings-import-editors-in-sidebar = Already in the sidebar
+settings-import-editors-add-to = Add to
+settings-import-editors-add-to-description = Each folder becomes a project with one thread.
+settings-import-editors-remote = { $count ->
+        [one] 1 folder opened over SSH, in WSL or in a container can't be added yet.
+       *[other] { $count } folders opened over SSH, in WSL or in containers can't be added yet.
+    }
+settings-import-editors-reading = Reading the folders your editors opened…
+settings-import-editors-empty = No folders to add were found.
+settings-import-editors-add = { $count ->
+        [one] Add 1 project
+       *[other] Add { $count } projects
+    }
+settings-import-editors-done = { $count ->
+        [one] Added 1 project to { $space }.
+       *[other] Added { $count } projects to { $space }.
+    }
 settings-import-session-description = Sessions and layouts
 settings-import-wezterm-title = Import from WezTerm
 settings-import-open = Open

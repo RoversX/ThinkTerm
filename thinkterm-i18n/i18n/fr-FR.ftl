@@ -698,6 +698,8 @@ onboarding-found-sessions-running = { $count ->
 onboarding-found-wezterm = Un fichier de configuration
 onboarding-found-import = Importer
 onboarding-found-import-settings = Importer les réglages
+onboarding-found-editors = Dossiers ouverts
+onboarding-found-choose-projects = Choisir les projets
 
 # Détection d'état des agents + panneau Agents
 settings-agent-panel-description = Détecter les agents de codage (Claude Code, Codex, …) dans les panneaux et les afficher dans la barre latérale droite.
@@ -1104,6 +1106,28 @@ session-import-project-meta = { $threads } fil · { $tabs } onglets principaux �
 session-import-terminal-untitled = Terminal { $number }
 settings-import-description = Choisissez une source pour voir ce que vous pouvez importer.
 settings-import-wezterm-description = Réglages et raccourcis
+settings-import-editors = Éditeurs de code
+settings-import-editors-description = Dossiers de projet
+settings-import-editors-title = Choisir les projets à ajouter
+settings-import-editors-subtitle = Les dossiers ouverts dans VS Code et les éditeurs qui en dérivent. Seuls les chemins sont repris ; le contenu des dossiers n'est pas lu.
+settings-import-editors-all = Tous
+settings-import-editors-in-sidebar = Déjà dans la barre latérale
+settings-import-editors-add-to = Ajouter à
+settings-import-editors-add-to-description = Chaque dossier devient un projet avec une session.
+settings-import-editors-remote = { $count ->
+        [one] 1 dossier ouvert via SSH, dans WSL ou dans un conteneur ne peut pas encore être ajouté.
+       *[other] { $count } dossiers ouverts via SSH, dans WSL ou dans des conteneurs ne peuvent pas encore être ajoutés.
+    }
+settings-import-editors-reading = Lecture des dossiers ouverts dans vos éditeurs…
+settings-import-editors-empty = Aucun dossier à ajouter n'a été trouvé.
+settings-import-editors-add = { $count ->
+        [one] Ajouter 1 projet
+       *[other] Ajouter { $count } projets
+    }
+settings-import-editors-done = { $count ->
+        [one] 1 projet ajouté à { $space }.
+       *[other] { $count } projets ajoutés à { $space }.
+    }
 settings-import-session-description = Sessions et dispositions
 settings-import-wezterm-title = Importer depuis WezTerm
 settings-import-open = Ouvrir

@@ -50,8 +50,10 @@ use fluent_bundle::FluentArgs;
 
 #[cfg(unix)]
 mod session_import;
+mod editor_import;
 mod import;
 mod keymap;
+pub(crate) use import::EDITORS_SOURCE;
 use import::{ImportButton, ImportSource, ImportStep};
 
 // All chrome geometry below is authored in 2x macOS backing pixels.
@@ -142,7 +144,7 @@ const HINT_ICON_SIDE: f32 = 20.0;
 const HINT_ICON_GAP: f32 = 8.0;
 /// How a row's square is lit: more gently than a tab icon, with a faint
 /// light rim and a plain dark shadow, as System Settings draws its own.
-const ROW_TILE: crate::ui::tile::TileStyle = crate::ui::tile::TileStyle {
+pub(crate) const ROW_TILE: crate::ui::tile::TileStyle = crate::ui::tile::TileStyle {
     fill_top_lighten: 0.16,
     fill_bottom_darken: 0.10,
     rim_top_lighten: 0.30,
@@ -725,7 +727,7 @@ fn initial_section() -> SettingsSection {
         "archived" => SettingsSection::Archived,
         "keymap" => SettingsSection::Keymap,
         "commandpalette" => SettingsSection::CommandPalette,
-        "import" | "compatibility" => SettingsSection::Import,
+        "import" | "compatibility" | EDITORS_SOURCE => SettingsSection::Import,
         "developer" => SettingsSection::Developer,
         "uikit" => SettingsSection::UiKit,
         "memory" => SettingsSection::Memory,
@@ -1554,6 +1556,7 @@ enum SettingsAction {
     TabIconSearchInput,
     KeymapSearchInput,
     Keymap(keymap::KeymapAction),
+    EditorImport(editor_import::EditorImportAction),
     ClearTabIconSearch,
 }
 
@@ -1605,6 +1608,8 @@ enum SettingsDropdown {
     DefaultShell,
     CommandPaletteHotkey,
     WebLinkTtl,
+    /// The Space the Import page adds editors' folders to.
+    EditorImportSpace,
     /// How long an installed plugin runs unused, keyed as TogglePlugin: its
     /// row is where the list put it, so the menu opens under the pill last
     /// painted for it.
@@ -2156,6 +2161,7 @@ struct SettingsUiState {
     /// What the cards are narrowed to, by name or program.
     tab_icon_search: TextInputState,
     keymap: keymap::KeymapUi,
+    editor_import: editor_import::EditorImportUi,
     /// The cards as last painted, so a click acts on the card that was
     /// under the pointer.
     tab_icon_cards: Vec<String>,
@@ -2247,6 +2253,7 @@ impl SettingsUiState {
             tab_icon_selected: None,
             tab_icon_search: TextInputState::new(),
             keymap: keymap::KeymapUi::default(),
+            editor_import: editor_import::EditorImportUi::default(),
             tab_icon_cards: Vec::new(),
             tab_icon_programs: Vec::new(),
             tab_icon_drop_rects: Vec::new(),
@@ -3685,6 +3692,10 @@ impl SettingsWindow {
                         | SettingsAction::SetWebLinkTtl(_)
                         | SettingsAction::TogglePluginBackgroundMenu(_)
                         | SettingsAction::SetPluginBackground(..)
+                        | SettingsAction::EditorImport(
+                            editor_import::EditorImportAction::SpaceMenu
+                            | editor_import::EditorImportAction::Space(_),
+                        )
                         | SettingsAction::DropdownMenuBackdrop,
                     ) => {
                         self.set_focused_input(None);
@@ -5280,6 +5291,14 @@ impl SettingsWindow {
         crate::web_settings::hide_qr();
         // The keyboard is built for its page and let go when another shows.
         self.ui.keymap.enter(section == SettingsSection::Keymap);
+        // So is what the editors opened, read as the Import page reviews it;
+        // back on that page, it starts again from choosing a source.
+        if section != SettingsSection::Import {
+            self.ui.editor_import.release();
+            if self.ui.import_source == ImportSource::Editors {
+                self.ui.import_step = ImportStep::Source;
+            }
+        }
         if section == SettingsSection::Agents {
             // Probe PATH on entry so painting never touches the filesystem.
             crate::agent_status::refresh_path_probe();
@@ -6099,6 +6118,7 @@ impl SettingsWindow {
                 // Focused on press; there is nothing more to do on release.
             }
             SettingsAction::Keymap(action) => self.perform_keymap_action(action),
+            SettingsAction::EditorImport(action) => self.perform_editor_import_action(action),
             SettingsAction::ClearTabIconSearch => {
                 self.ui.tab_icon_search.clear();
                 self.set_focused_input(Some(SettingsAction::TabIconSearchInput));
@@ -17002,6 +17022,12 @@ impl SettingsWindow {
                 control_width,
             ),
             SettingsDropdown::WebLinkTtl => self.paint_web_link_ttl_menu(
+                layers,
+                control_x,
+                control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
+                control_width,
+            ),
+            SettingsDropdown::EditorImportSpace => self.paint_editor_space_menu(
                 layers,
                 control_x,
                 control_y + self.ui_px(CONTROL_HEIGHT) + self.ui_px(8.0),
