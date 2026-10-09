@@ -2942,7 +2942,7 @@ impl<P: Platform, L: Link> App<P, L> {
 
     /// The bar's height in device px. The pane gives up the rounded-up
     /// count of rows for it either way. A page in the desktop's shape
-    /// draws the bar at its own height with the rows right under it
+    /// draws the bar at its own height with the rows a pad under it
     /// (`content_offset`), as the desktop does: drawn to the rows it pays
     /// for, it left the rounding as a blank band under the capsules. A
     /// phone draws it to those rows, so its rows stay flush with the
@@ -3033,7 +3033,10 @@ impl<P: Platform, L: Link> App<P, L> {
             let pad_css = (pad.0 as f64 / dpr, pad.1 as f64 / dpr);
             let width_css = inner.gpu.size().0 as f64 / dpr;
             let rows_below = |p: &crate::layout::PanePlacement| Self::content_offset(inner, p) as f64 / dpr;
-            for (rect, place) in crate::navbar::rects(layout, cell_css, pad_css, width_css, rows_below)
+            // A phone's bar reaches down to its rows; the desktop's leaves
+            // the pad between them.
+            let gap_css = if inner.mobile { 0.0 } else { pad_css.1 };
+            for (rect, place) in crate::navbar::rects(layout, cell_css, pad_css, width_css, gap_css, rows_below)
                 .into_iter()
                 .zip(&layout.panes)
             {
@@ -6062,7 +6065,7 @@ impl<P: Platform, L: Link> App<P, L> {
         )
     }
 
-    /// How far below its frame's top a pane's content starts: right under
+    /// How far below its frame's top a pane's content starts: a pad under
     /// the bar, which on a desktop-shaped page starts above the frame
     /// (`navbar::rows_offset_css`), in whole device px so the text stays
     /// sharp. A pane the server has at its whole frame (a layout nobody
@@ -6268,6 +6271,12 @@ impl<P: Platform, L: Link> App<P, L> {
             // not a size anyone asked for: keep the last real grid rather
             // than resize every client's shell to it.
             return;
+        };
+        // In the desktop's shape what fits under the bars decides the rows.
+        let rows = if inner.mobile {
+            rows
+        } else {
+            crate::navbar::grid_rows(dev_h as f64, Self::nav_dev(&inner) as f64, ch as f64, pad.1 as f64, inner.dpr)
         };
         let changed = cols != inner.cols || rows != inner.rows;
         inner.cols = cols;

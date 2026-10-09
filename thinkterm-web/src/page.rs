@@ -195,11 +195,16 @@ async fn start_attached(
         glyphs.metrics.cell_size.width as u32,
         glyphs.metrics.cell_size.height as u32,
     );
+    // Rows the bar above each pane takes, for the first report.
+    let nav_dev = crate::navbar::nav_css(ch as f64 / dpr, None) * dpr;
+    let nav_rows = crate::navbar::nav_rows(nav_dev, ch as f64);
     // A page too small for a cell (hidden, collapsed, mid-layout) reports
     // no viewport: it follows the pane's own size until it has a real one.
-    // Inside the desktop's window padding: a cell left and right, half
-    // a cell top and bottom.
-    let size = crate::app::grid_for(dev_w.saturating_sub(2 * cw), dev_h.saturating_sub(ch), cw, ch).map(|(cols, rows)| {
+    // Inside the desktop's window padding of a cell left and right, with
+    // the rows that fit under the bars (`navbar::grid_rows`), as the page
+    // fits them once running.
+    let size = crate::app::grid_for(dev_w.saturating_sub(2 * cw), dev_h.saturating_sub(ch), cw, ch).map(|(cols, _)| {
+        let rows = crate::navbar::grid_rows(dev_h as f64, nav_dev, ch as f64, ch as f64 / 2.0, dpr);
         wezterm_term::TerminalSize {
             rows,
             cols,
@@ -210,8 +215,6 @@ async fn start_attached(
     });
 
     set_status("attaching…");
-    // Rows the bar above each pane takes, for the first report.
-    let nav_rows = crate::navbar::nav_rows(crate::navbar::nav_css(ch as f64 / dpr, None) * dpr, ch as f64);
     let me = thinkterm_proto::ClientId {
         hostname: "web".into(),
         username: "web".into(),
