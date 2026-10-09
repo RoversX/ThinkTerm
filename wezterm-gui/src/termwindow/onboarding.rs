@@ -16,6 +16,7 @@
 //! selection is carried by fill and border weight instead.
 
 mod found;
+mod hello;
 
 use crate::i18n::{language_option_label, LANGUAGE_OPTIONS};
 use crate::native_settings::{mark_onboarding_seen, NativeThemeMode, ThinkTermNativeSettings};
@@ -91,6 +92,8 @@ const CURTAIN_PITCH: f32 = 1.7;
 /// falling; each step redraws the whole window, which is the curtain's
 /// real cost, so it takes no more than that.
 const CURTAIN_FRAME: Duration = Duration::from_millis(100);
+/// The intro writes its word out smoothly, so it asks for every frame.
+const INTRO_FRAME: Duration = Duration::from_millis(16);
 /// How long the page keeps asking whether found sessions are running.
 const FOUND_WAIT: Duration = Duration::from_secs(15);
 /// Characters every font has, so no strand ever shows a missing glyph.
@@ -437,6 +440,10 @@ pub(crate) struct OnboardingView {
     /// When the page opened, which bounds the wait for the running check.
     opened: Instant,
     curtain: Option<Curtain>,
+    /// "hello." written out before the page appears. Gone once the page is
+    /// fully in; until then the page takes no input, since none of it can
+    /// be seen yet.
+    intro: Option<hello::Intro>,
     /// What this page's strings shaped to. The curtain repaints the page
     /// many times a second, and its text never changes in between.
     shaped: ShapedText,
@@ -444,7 +451,10 @@ pub(crate) struct OnboardingView {
 
 impl OnboardingView {
     pub(crate) fn new(initial_space_id: String, initial_space_name: String) -> Self {
-        Self::with_found(initial_space_id, initial_space_name, found::Found::look())
+        Self {
+            intro: Some(hello::Intro::new()),
+            ..Self::with_found(initial_space_id, initial_space_name, found::Found::look())
+        }
     }
 
     fn with_found(
@@ -471,6 +481,7 @@ impl OnboardingView {
             menu: None,
             opened: Instant::now(),
             curtain: None,
+            intro: None,
             shaped: ShapedText::default(),
         }
     }
@@ -2077,6 +2088,9 @@ impl ContentView for OnboardingView {
     /// FOUND_WAIT: a source wedged past that leaves its row saying how many
     /// sessions there are, and the page goes back to being still.
     fn next_frame_time(&self) -> Option<Instant> {
+        if self.intro.is_some() {
+            return Some(Instant::now() + INTRO_FRAME);
+        }
         let curtain_up = self
             .curtain
             .as_ref()
@@ -2100,23 +2114,51 @@ impl ContentView for OnboardingView {
         caption_font: &Rc<LoadedFont>,
         _cursor_on: bool,
     ) -> anyhow::Result<()> {
-        self.paint_impl(
-            ctx,
-            layers,
-            area,
-            palette,
-            font,
-            title_font,
-            section_font,
-            caption_font,
-        )
+        let frame = self
+            .intro
+            .as_mut()
+            .and_then(|intro| intro.frame(Instant::now()));
+        if frame.is_none() {
+            self.intro = None;
+        }
+        let page_under = match (self.intro.as_mut(), frame) {
+            (Some(intro), Some(frame)) => frame.page_in.is_some() || intro.wants_warm_up(frame),
+            _ => true,
+        };
+        if page_under {
+            self.paint_impl(
+                ctx,
+                layers,
+                area,
+                palette,
+                font,
+                title_font,
+                section_font,
+                caption_font,
+            )?;
+        } else {
+            // Nothing of the page is drawn yet, so nothing can be hit.
+            self.widgets.clear();
+        }
+        match (&self.intro, frame) {
+            (Some(intro), Some(frame)) => {
+                intro.paint(ctx, layers, area, palette.window_bg, frame, page_under)
+            }
+            _ => Ok(()),
+        }
     }
 
     fn on_mouse(&mut self, x: f32, y: f32, kind: WMEK) -> ContentViewResponse {
+        if self.intro.is_some() {
+            return ContentViewResponse::Ignored;
+        }
         self.on_mouse_impl(x, y, kind)
     }
 
     fn on_key(&mut self, key: KeyCode, mods: KeyModifiers) -> ContentViewResponse {
+        if self.intro.is_some() {
+            return ContentViewResponse::Ignored;
+        }
         self.on_key_impl(key, mods)
     }
 
@@ -2248,6 +2290,37 @@ mod tests {
             order[order.len() - 2..],
             [OnboardingAction::Skip, OnboardingAction::Start]
         );
+    }
+
+    /// Nothing of the page shows during the intro, so neither the keys nor
+    /// the pointer may reach it: Enter would start, Escape would skip.
+    #[test]
+    fn the_intro_takes_no_input() {
+        let mut view = OnboardingView {
+            intro: Some(hello::Intro::new()),
+            ..view(found::Found::default())
+        };
+        for key in [
+            KeyCode::Enter,
+            KeyCode::Escape,
+            KeyCode::Tab,
+            KeyCode::Char(' '),
+        ] {
+            assert!(matches!(
+                view.on_key(key, KeyModifiers::NONE),
+                ContentViewResponse::Ignored
+            ));
+        }
+        assert!(matches!(
+            view.on_mouse(10.0, 10.0, WMEK::Press(MousePress::Left)),
+            ContentViewResponse::Ignored
+        ));
+
+        view.intro = None;
+        assert!(matches!(
+            view.on_key(KeyCode::Escape, KeyModifiers::NONE),
+            ContentViewResponse::Run(_)
+        ));
     }
 
     /// The language menu takes the arrow keys and Escape while it is open, and

@@ -622,6 +622,10 @@ impl ImageAllocRecord {
 /// forced a grow are still listed afterwards.
 const IMAGE_ALLOC_LOG_LEN: usize = 16;
 
+/// Sixteen offsets per diameter, and a window drawing at one size uses one
+/// or two diameters; this only bounds a run of resizes.
+const MAX_DISCS: usize = 256;
+
 /// A number of items here are HashMaps rather than LfuCaches;
 /// eviction is managed by recreating Self when the Atlas is filled
 pub struct GlyphCache {
@@ -662,6 +666,10 @@ pub struct GlyphCache {
     /// Blurred rounded-rectangle silhouettes, one per corner radius and
     /// blur, drawn as nine slices under elevated surfaces.
     pub(crate) shadows: HashMap<crate::ui::shadow::ShadowKey, Sprite>,
+    /// Filled circles, white masks keyed by diameter and quarter-pixel
+    /// offset (see `ui::draw::rasterize_disc`). Emptied once it holds
+    /// `MAX_DISCS`, and gone with the atlas like the rest.
+    pub(crate) discs: HashMap<crate::ui::draw::DiscKey, Sprite>,
     min_frame_duration: Duration,
 }
 
@@ -743,6 +751,7 @@ impl GlyphCache {
             tab_glyph_failures: HashMap::new(),
             rotated_svg_icons: HashMap::new(),
             shadows: HashMap::new(),
+            discs: HashMap::new(),
             cursor_glyphs: HashMap::new(),
             color: HashMap::new(),
             min_frame_duration: Duration::from_millis(1000 / fonts.config().max_fps as u64),
@@ -784,6 +793,7 @@ impl GlyphCache {
             tab_glyph_failures: HashMap::new(),
             rotated_svg_icons: HashMap::new(),
             shadows: HashMap::new(),
+            discs: HashMap::new(),
             cursor_glyphs: HashMap::new(),
             color: HashMap::new(),
             min_frame_duration: Duration::from_millis(1000 / fonts.config().max_fps as u64),
@@ -1442,6 +1452,19 @@ impl GlyphCache {
         let image = icon.rasterize(size)?;
         let sprite = self.atlas.allocate(&image)?;
         self.svg_icons.insert(key, sprite.clone());
+        Ok(sprite)
+    }
+
+    pub(crate) fn cached_disc(&mut self, key: crate::ui::draw::DiscKey) -> anyhow::Result<Sprite> {
+        if let Some(sprite) = self.discs.get(&key) {
+            return Ok(sprite.clone());
+        }
+        if self.discs.len() >= MAX_DISCS {
+            self.discs.clear();
+        }
+        let image = crate::ui::draw::rasterize_disc(key);
+        let sprite = self.atlas.allocate(&image)?;
+        self.discs.insert(key, sprite.clone());
         Ok(sprite)
     }
 

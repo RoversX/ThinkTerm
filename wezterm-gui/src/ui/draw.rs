@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use wezterm_bidi::Direction;
 use wezterm_font::{GlyphInfo, LoadedFont, LoadedFontId};
-use window::bitmaps::TextureRect;
+use window::bitmaps::{BitmapImage, Image, TextureRect};
 use window::color::LinearRgba;
 use window::{Dimensions, RectF};
 
@@ -791,6 +791,64 @@ impl<'a> DrawContext<'a> {
         Ok(())
     }
 
+    /// A filled circle centred anywhere, sub-pixel included. The sprite is
+    /// picked by the centre's quarter-pixel offset and lands on whole
+    /// pixels, so the edge stays anti-aliased whichever sampler the layer
+    /// uses. `diameter` is rounded to a whole pixel.
+    pub(crate) fn draw_disc(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        layer_num: usize,
+        cx: f32,
+        cy: f32,
+        diameter: f32,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let diameter = diameter.round().min(u16::MAX as f32 - 2.0);
+        if diameter < 1.0 || color.3 <= 0.0 {
+            return Ok(());
+        }
+        let side = diameter + 2.0;
+        let place = |centre: f32| {
+            let origin = centre - side / 2.0;
+            let whole = origin.floor();
+            let quarters = ((origin - whole) * 4.0).round();
+            if quarters >= 4.0 {
+                (whole + 1.0, 0)
+            } else {
+                (whole, quarters as u8)
+            }
+        };
+        let (x, offset_x) = place(cx);
+        let (y, offset_y) = place(cy);
+        let sprite = self
+            .render_state
+            .glyph_cache
+            .borrow_mut()
+            .cached_disc(DiscKey {
+                diameter: diameter as u16,
+                offset_x,
+                offset_y,
+            })?
+            .texture_coords();
+        let mut quad = layers.allocate(layer_num)?;
+        let left_offset = self.dimensions.pixel_width as f32 / 2.0;
+        let top_offset = self.dimensions.pixel_height as f32 / 2.0;
+        quad.set_position(
+            x - left_offset,
+            y - top_offset,
+            x + side - left_offset,
+            y + side - top_offset,
+        );
+        quad.set_texture(sprite);
+        quad.set_fg_color(color);
+        quad.set_alt_color_and_mix_value(color, 0.0);
+        quad.set_hsv(None);
+        quad.set_has_color(false);
+        quad.set_grayscale();
+        Ok(())
+    }
+
     pub(crate) fn draw_text(
         &self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -1090,6 +1148,37 @@ impl ShapedText {
     }
 }
 
+/// A disc sprite: its diameter in pixels, and how many quarter pixels its
+/// centre sits right of and below the middle of its square.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct DiscKey {
+    pub diameter: u16,
+    pub offset_x: u8,
+    pub offset_y: u8,
+}
+
+/// The disc for `key` in the alpha channel, on a square one pixel wider
+/// than it on each side so every offset fits; colour channels black, as
+/// the grayscale quad path only reads alpha.
+pub(crate) fn rasterize_disc(key: DiscKey) -> Image {
+    let diameter = key.diameter as f32;
+    let side = key.diameter as usize + 2;
+    let radius = diameter / 2.0;
+    let cx = side as f32 / 2.0 + key.offset_x as f32 / 4.0;
+    let cy = side as f32 / 2.0 + key.offset_y as f32 / 4.0;
+    let mut image = Image::new(side, side);
+    let pixels = image.pixel_data_slice_mut();
+    for y in 0..side {
+        for x in 0..side {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            let coverage = (radius - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0);
+            pixels[(y * side + x) * 4 + 3] = (coverage * 255.0).round() as u8;
+        }
+    }
+    image
+}
+
 /// Whether a glyph that starts at `pos_x` and moves the pen by `advance`
 /// fits text that ends at `right_edge`.
 ///
@@ -1346,7 +1435,40 @@ impl RoundedFramePainter for DrawContext<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_ellipsized, glyph_fits, pixel_snap_rounded_rect};
+    use super::{fit_ellipsized, glyph_fits, pixel_snap_rounded_rect, rasterize_disc, DiscKey};
+    use window::bitmaps::BitmapImage;
+
+    #[test]
+    fn a_disc_is_round_and_its_offset_moves_it() {
+        let alpha = |key: DiscKey, x: usize, y: usize| {
+            let mut image = rasterize_disc(key);
+            let (side, _) = image.image_dimensions();
+            image.pixel_data_slice_mut()[(y * side + x) * 4 + 3]
+        };
+        let centred = DiscKey {
+            diameter: 20,
+            offset_x: 0,
+            offset_y: 0,
+        };
+        // Solid in the middle, clear at the corners, the same on all four
+        // sides, with a margin pixel all round.
+        assert_eq!(alpha(centred, 11, 11), 255);
+        assert_eq!(alpha(centred, 0, 0), 0);
+        assert_eq!(alpha(centred, 0, 11), 0);
+        assert_eq!(alpha(centred, 1, 11), alpha(centred, 20, 11));
+        assert_eq!(alpha(centred, 11, 1), alpha(centred, 11, 20));
+        assert!(alpha(centred, 1, 11) > 240);
+
+        // Three quarters of a pixel right: the left edge thins, the right
+        // edge spills into the margin, and nothing is cut off.
+        let shifted = DiscKey {
+            offset_x: 3,
+            ..centred
+        };
+        assert!(alpha(shifted, 1, 11) < alpha(centred, 1, 11));
+        assert!(alpha(shifted, 21, 11) > 0);
+        assert!(alpha(shifted, 21, 11) < 255);
+    }
 
     #[test]
     fn an_ellipsized_string_is_checked_whole() {
