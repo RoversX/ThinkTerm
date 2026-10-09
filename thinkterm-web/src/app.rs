@@ -2940,15 +2940,19 @@ impl<P: Platform, L: Link> App<P, L> {
         crate::navbar::nav_css(cell_css, Self::desktop_cell_css(inner))
     }
 
-    /// The bar's height as the grid pays for it: whole rows. The bar's
-    /// own height is a fraction of a row, and the pane gives up the
-    /// rounded-up count; drawing the content a fraction below the bar
-    /// left the difference as a blank strip under the last row, on top of
-    /// the half-cell pad -- a row and a half of nothing at the bottom of
-    /// every pane. The bar is drawn to the rounded height (`nav_views`), so
-    /// bar and content meet.
+    /// The bar's height in device px. The pane gives up the rounded-up
+    /// count of rows for it either way. A page in the desktop's shape
+    /// draws the bar at its own height with the rows right under it
+    /// (`content_offset`), as the desktop does: drawn to the rows it pays
+    /// for, it left the rounding as a blank band under the capsules. A
+    /// phone draws it to those rows, so its rows stay flush with the
+    /// bottom of the screen (`pad`).
     fn nav_dev(inner: &Inner<P, L>) -> f32 {
-        Self::nav_rows(inner) as f32 * inner.glyphs.metrics.cell_size.height as f32
+        let rows = Self::nav_rows(inner);
+        if inner.mobile || rows == 0 {
+            return rows as f32 * inner.glyphs.metrics.cell_size.height as f32;
+        }
+        (Self::nav_css(inner) * inner.dpr) as f32
     }
 
     /// Where the grid starts in the canvas, in device px: the desktop's
@@ -3011,8 +3015,8 @@ impl<P: Platform, L: Link> App<P, L> {
     fn nav_views(inner: &Inner<P, L>) -> Vec<crate::navbar::NavView> {
         let mut views = Vec::new();
         // No rows for the bars, no bars: a phone shows a lone pane bare.
-        // A bar's height is its rows plus the padding above the pane, so
-        // without this the padding alone drew a sliver of one.
+        // A bar reaches from above the pane down to its rows, so without
+        // this the padding alone drew a sliver of one.
         if Self::nav_rows(inner) == 0 {
             return views;
         }
@@ -3028,8 +3032,8 @@ impl<P: Platform, L: Link> App<P, L> {
             let pad = Self::pad(inner);
             let pad_css = (pad.0 as f64 / dpr, pad.1 as f64 / dpr);
             let width_css = inner.gpu.size().0 as f64 / dpr;
-            let nav_rows_css = Self::nav_rows(inner) as f64 * cell_css.1;
-            for (rect, place) in crate::navbar::rects(layout, cell_css, nav_rows_css, pad_css, width_css)
+            let rows_below = |p: &crate::layout::PanePlacement| Self::content_offset(inner, p) as f64 / dpr;
+            for (rect, place) in crate::navbar::rects(layout, cell_css, pad_css, width_css, rows_below)
                 .into_iter()
                 .zip(&layout.panes)
             {
@@ -6058,13 +6062,22 @@ impl<P: Platform, L: Link> App<P, L> {
         )
     }
 
-    /// How far below its frame's top a pane's content starts: the bar.
-    /// A pane the server has at its whole frame (a layout nobody with a
-    /// bar has claimed yet) loses its last rows under the frame's bottom
-    /// rather than its first under the bar -- the prompt is at the top,
-    /// and the next claim from here makes room.
-    fn content_offset(inner: &Inner<P, L>, _place: &crate::layout::PanePlacement) -> f32 {
-        Self::nav_dev(inner)
+    /// How far below its frame's top a pane's content starts: right under
+    /// the bar, which on a desktop-shaped page starts above the frame
+    /// (`navbar::rows_offset_css`), in whole device px so the text stays
+    /// sharp. A pane the server has at its whole frame (a layout nobody
+    /// with a bar has claimed yet) loses its last rows under the frame's
+    /// bottom rather than its first under the bar -- the prompt is at the
+    /// top, and the next claim from here makes room.
+    fn content_offset(inner: &Inner<P, L>, place: &crate::layout::PanePlacement) -> f32 {
+        let nav = Self::nav_dev(inner);
+        if inner.mobile || nav <= 0.0 {
+            return nav;
+        }
+        let dpr = inner.dpr.max(0.1);
+        let ch = inner.glyphs.metrics.cell_size.height as f64 / dpr;
+        let pad_top = Self::pad(inner).1 as f64 / dpr;
+        (crate::navbar::rows_offset_css(place.frame.top, ch, pad_top, nav as f64 / dpr) * dpr).round() as f32
     }
 
     /// The panes as this page would claim them: the desktop's rule for

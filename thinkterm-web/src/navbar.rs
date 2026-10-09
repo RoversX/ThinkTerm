@@ -47,6 +47,28 @@ pub fn content_offset_dev(place: &PanePlacement, nav_dev: f32, cell_h_dev: f32) 
     nav_dev.min(spare)
 }
 
+/// Where a pane's bar starts, in CSS px from the canvas's top. A pane on
+/// the tab's top row starts at the window's edge, over the padding, like
+/// one at its left edge. Below a divider the bar starts right under the
+/// line, which sits in the middle of the gap row, as the desktop's does.
+pub fn bar_top(frame_top: usize, ch: f64, pad_top: f64) -> f64 {
+    if frame_top == 0 {
+        0.0
+    } else {
+        pad_top + frame_top as f64 * ch - ch / 2.0 + 1.0
+    }
+}
+
+/// How far below its frame's top a pane's rows start under a bar
+/// `nav_css` tall, in CSS px: right under the bar, as the desktop draws
+/// them (`render/pane.rs`, `pane_nav_height` below the bar's top). The
+/// bar starts above the frame, so the rows start less than a bar below
+/// it, and the part of a row the pane's rows leave is under the last one,
+/// where the desktop leaves it too.
+pub fn rows_offset_css(frame_top: usize, ch: f64, pad_top: f64, nav_css: f64) -> f64 {
+    (bar_top(frame_top, ch, pad_top) + nav_css - (pad_top + frame_top as f64 * ch)).max(0.0)
+}
+
 /// Where a bar goes, in CSS px from the canvas's top-left.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct NavRect {
@@ -62,13 +84,14 @@ pub struct NavRect {
 /// desktop's: to the window's edge where the pane touches the tab's
 /// edge (past the padding the grid sits in), half a cell into the
 /// divider where it does not, so neighbours tile. `pad_css` is where the
-/// grid starts and `width_css` the canvas's width.
+/// grid starts, `width_css` the canvas's width, and `rows_below` how far
+/// below its frame's top a pane's rows start: the bar reaches down to them.
 pub fn rects(
     layout: &TabLayout,
     cell_css: (f64, f64),
-    nav_css: f64,
     pad_css: (f64, f64),
     width_css: f64,
+    rows_below: impl Fn(&PanePlacement) -> f64,
 ) -> Vec<NavRect> {
     let (cw, ch) = cell_css;
     layout
@@ -82,17 +105,13 @@ pub fn rects(
             } else {
                 pad_css.0 + end as f64 * cw + cw / 2.0
             };
-            // A pane on the tab's top row starts at the window's edge,
-            // over the padding, like one at its left edge.
-            // Below a divider the bar starts right under the line, which
-            // sits in the middle of the gap row, as the desktop's does.
-            let top = if p.frame.top == 0 { 0.0 } else { pad_css.1 + p.frame.top as f64 * ch - ch / 2.0 + 1.0 };
+            let top = bar_top(p.frame.top, ch, pad_css.1);
             NavRect {
                 pane_id: p.pane_id,
                 left,
                 top,
                 width: right - left,
-                height: nav_css + (pad_css.1 + p.frame.top as f64 * ch - top),
+                height: pad_css.1 + p.frame.top as f64 * ch + rows_below(p) - top,
             }
         })
         .collect()
@@ -212,15 +231,46 @@ mod tests {
             zoomed: None,
             hidden: vec![],
         };
-        let r = rects(&layout, (10.0, 20.0), 47.0, (0.0, 0.0), 800.0);
+        let r = rects(&layout, (10.0, 20.0), (0.0, 0.0), 800.0, |_| 47.0);
         assert_eq!((r[0].left, r[0].width), (0.0, 405.0), "to the divider's middle");
         assert_eq!((r[1].left, r[1].width), (405.0, 395.0), "from it to the tab's edge");
         assert_eq!(r[0].height, 47.0);
         // With the grid padded in a wider canvas, the outer bars still
         // reach the window's edges; the inner edge moves with the grid.
-        let r = rects(&layout, (10.0, 20.0), 47.0, (10.0, 10.0), 1000.0);
+        // The bar reaches down over the padding to the rows.
+        let r = rects(&layout, (10.0, 20.0), (10.0, 10.0), 1000.0, |_| 47.0);
         assert_eq!((r[0].left, r[0].top, r[0].width, r[0].height), (0.0, 0.0, 415.0, 57.0));
         assert_eq!((r[1].left, r[1].width), (415.0, 585.0));
+    }
+
+    #[test]
+    fn the_rows_start_right_under_the_bar_as_on_the_desktop() {
+        // A pane on the tab's top row: its bar covers the half-cell
+        // padding, so its rows start a bar below the window's edge, not a
+        // bar below the padding.
+        assert_eq!(rows_offset_css(0, 22.0, 11.0, 47.0), 36.0);
+        // Below a divider the bar starts a pixel under the line, half a
+        // cell above the frame.
+        assert_eq!(rows_offset_css(14, 22.0, 11.0, 47.0), 37.0);
+        // Either way the bar is its own height, whatever rows the pane
+        // gave up for it (three of 22px here).
+        let mut lower = place(2, 0, 80, 13, 10);
+        lower.frame.top = 14;
+        let layout = TabLayout {
+            tab_id: 1,
+            window_id: 0,
+            workspace: String::new(),
+            cols: 80,
+            rows: 27,
+            size: TerminalSize::default(),
+            panes: vec![place(1, 0, 80, 13, 10), lower],
+            dividers: vec![],
+            zoomed: None,
+            hidden: vec![],
+        };
+        let r = rects(&layout, (10.0, 22.0), (10.0, 11.0), 820.0, |p| rows_offset_css(p.frame.top, 22.0, 11.0, 47.0));
+        assert_eq!((r[0].top, r[0].height), (0.0, 47.0));
+        assert_eq!((r[1].top, r[1].height), (309.0, 47.0));
     }
 
     #[test]

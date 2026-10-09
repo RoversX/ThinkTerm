@@ -348,13 +348,12 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 #agents .se-field:focus { border-color: var(--edge); }
 #agents .se-body { min-height: 180px; flex: none; resize: vertical; font: 400 13px ui-monospace, "SF Mono", Menlo, monospace; line-height: 1.45; white-space: pre; overflow: auto; }
 #agents .se-body.want { border-color: var(--danger); }
-.nav { position: absolute; pointer-events: auto; box-sizing: border-box; display: flex; align-items: flex-start; gap: 9px; padding: 0 5px; background: var(--bg); color: var(--text2); user-select: none; overflow: hidden; }
-/* The bar is the desktop's 47px, but the pane pays for it in whole rows
-   (and a pane at the top in its padding too): the capsules sit where they
-   would in a 47px bar at its top, and what the rounding adds is left
-   under them, as the desktop leaves it -- not split above and below. */
-.nav > .caps, .nav > .acts { margin-top: 8.5px; height: 30px; align-items: center; }
-body[data-mobile] .nav > .caps, body[data-mobile] .nav > .acts { margin-top: 6px; height: 40px; }
+.nav { position: absolute; pointer-events: auto; box-sizing: border-box; display: flex; align-items: center; gap: 9px; padding: 0 5px; background: var(--bg); color: var(--text2); user-select: none; overflow: hidden; }
+/* A phone's bar is drawn down to the whole rows it pays for (and a pane at
+   the top over its padding too): the capsules sit at its top, and what the
+   rounding adds is left under them -- not split above and below. */
+body[data-mobile] .nav { align-items: flex-start; }
+body[data-mobile] .nav > .caps, body[data-mobile] .nav > .acts { margin-top: 6px; height: 40px; align-items: center; }
 .nav.focused { color: var(--text); }
 .nav .caps { display: flex; gap: 9px; flex: 1 1 auto; min-width: 0; overflow: hidden; }
 .nav .cap { display: inline-flex; align-items: center; flex: 0 0 auto; width: 128px; height: 30px; box-sizing: border-box; padding: 0 9px; border-radius: 999px; border: 1px solid transparent; background: var(--wash); color: var(--text2); cursor: default; }
@@ -677,13 +676,13 @@ body[data-mobile] .nav > .caps, body[data-mobile] .nav > .acts { margin-top: 6px
 #machines .more.open svg { transform: rotate(90deg); }
 /* The desktop's empty page: its server glyph over the one line. */
 #machines .empty { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 28px 24px 34px 24px; color: var(--muted); font-size: 13px; line-height: 1.4; text-align: center; }
+#machines .empty svg { width: 28px; height: 28px; stroke-width: 1.6; }
 #machines .empty.off .offt { color: var(--text); font-weight: 600; }
 /* The `~/.ssh/config` group's caption folds it, as the desktop's does. */
 #machines .label.fold { display: flex; align-items: center; gap: 4px; width: calc(100% - 4px); padding: 0; border: 0; background: transparent; text-align: left; cursor: default; font: 600 13px var(--ui); transition: var(--fade); }
 #machines .label.fold:hover { color: var(--text); }
 #machines .label.fold svg { width: 14px; height: 14px; flex: none; transition: transform .15s; }
 #machines .label.fold.open svg { transform: rotate(90deg); }
-#machines .empty svg { width: 28px; height: 28px; stroke-width: 1.6; }
 #machines .err { margin: -8px 2px 16px 2px; color: var(--danger); font-size: 12px; }
 #machines .addbtn { display: inline-flex; align-items: center; gap: 6px; padding: 0 14px 0 11px; }
 #machines .addbtn svg { width: 14px; height: 14px; }
