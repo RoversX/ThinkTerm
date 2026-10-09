@@ -2739,6 +2739,7 @@ impl Client {
     rpc!(write_to_pane, WriteToPane, UnitResponse);
     rpc!(send_paste, SendPaste, UnitResponse);
     rpc!(key_down, SendKeyDown, UnitResponse);
+    rpc!(mark_program_status_seen, MarkProgramStatusSeen, UnitResponse);
     rpc!(mouse_event, SendMouseEvent, UnitResponse);
     rpc!(resize, Resize, UnitResponse);
     rpc!(set_zoomed, SetPaneZoomed, UnitResponse);

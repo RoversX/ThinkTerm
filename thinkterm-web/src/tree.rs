@@ -10,7 +10,7 @@
 
 use codec::{ListPanesResponse, ThinkTermSessionState, ThinkTermSessionThread, ThinkTermTree, TreeOp};
 use std::collections::{HashMap, HashSet};
-use thinkterm_proto::{AgentState, AgentStatus, PaneId, TabId, WindowId};
+use thinkterm_proto::{AgentState, AgentStatus, PaneId, ProgramReport, TabId, WindowId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Status {
@@ -107,6 +107,8 @@ pub struct TreeModel {
     agent_details: HashMap<PaneId, (String, String)>,
     /// Panes whose agent reported its own end.
     agents_ended: HashSet<PaneId>,
+    /// What each pane's program said about itself (OSC 7501), when it did.
+    agent_reports: HashMap<PaneId, ProgramReport>,
     pub collapsed: HashSet<String>,
     pub archived_open: bool,
     /// The Space the sidebar shows; the first one until chosen.
@@ -176,13 +178,46 @@ impl TreeModel {
                 } else {
                     self.agents_ended.remove(&pane_id);
                 }
+                match &s.report {
+                    Some(report) => {
+                        self.agent_reports.insert(pane_id, report.clone());
+                    }
+                    None => {
+                        self.agent_reports.remove(&pane_id);
+                    }
+                }
             }
             None => {
                 self.agents.remove(&pane_id);
                 self.agent_details.remove(&pane_id);
                 self.agents_ended.remove(&pane_id);
+                self.agent_reports.remove(&pane_id);
             }
         }
+    }
+
+    /// What a pane's program said about itself, when it did.
+    pub fn agent_report(&self, pane_id: PaneId) -> Option<&ProgramReport> {
+        self.agent_reports.get(&pane_id)
+    }
+
+    /// Whether a program in the pane left a finished or failed result
+    /// nobody has seen yet.
+    pub fn has_unseen_result(&self, pane_id: PaneId) -> bool {
+        self.agents.contains_key(&pane_id)
+            && self
+                .agent_reports
+                .get(&pane_id)
+                .is_some_and(ProgramReport::has_unseen_result)
+    }
+
+    /// Forget every agent, before a fresh list replaces them: what a pane
+    /// lost while the page was away must not linger in any of the maps.
+    pub fn clear_agents(&mut self) {
+        self.agents.clear();
+        self.agent_details.clear();
+        self.agents_ended.clear();
+        self.agent_reports.clear();
     }
 
     /// The agent a pane runs, by id, until it reports its own end: what
@@ -347,7 +382,9 @@ impl TreeModel {
         let mut working = false;
         for state in agents {
             match state {
-                AgentState::Blocked => return Status::NeedsAttention,
+                // A program stopped on an error wants a look as much as one
+                // that asked something, as the desktop's sidebar has it.
+                AgentState::Blocked | AgentState::Error => return Status::NeedsAttention,
                 AgentState::Working => working = true,
                 _ => {}
             }
@@ -906,6 +943,34 @@ mod tests {
     }
 
     #[test]
+    fn a_resync_forgets_what_the_agents_reported() {
+        use thinkterm_proto::{AgentEvidence, ProgramReport, ProgramReportState};
+        let mut m = TreeModel::default();
+        let status = AgentStatus {
+            agent_id: "claude".into(),
+            state: AgentState::Idle,
+            evidence: AgentEvidence::Report,
+            session_id: None,
+            since_unix: 0,
+            ended: false,
+            report: Some(ProgramReport {
+                state: ProgramReportState::Done,
+                kind: None,
+                progress: None,
+                app: None,
+                title: None,
+                msg: None,
+                children: vec![],
+            }),
+        };
+        m.apply_agent(5, Some(&status));
+        assert!(m.has_unseen_result(5));
+        m.clear_agents();
+        assert!(!m.has_unseen_result(5));
+        assert!(m.agent_report(5).is_none());
+    }
+
+    #[test]
     fn status_is_the_worst_of_the_panes_and_the_server_s_word() {
         let mut m = TreeModel::default();
         let mut t = thread("a", Some("ws"), vec![(1, vec![10, 11])]);
@@ -913,6 +978,9 @@ mod tests {
         m.agents.insert(10, AgentState::Working);
         assert_eq!(m.status_of(&t), Status::Running);
         m.agents.insert(11, AgentState::Blocked);
+        assert_eq!(m.status_of(&t), Status::NeedsAttention);
+        // A program stopped on an error wants a look as well.
+        m.agents.insert(11, AgentState::Error);
         assert_eq!(m.status_of(&t), Status::NeedsAttention);
         m.agents.clear();
         t.work_status = ThinkTermSessionWorkStatus::FinishedUnseen;

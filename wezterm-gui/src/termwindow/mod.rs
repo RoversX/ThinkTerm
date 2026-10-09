@@ -1958,6 +1958,74 @@ pub fn tooltip_left_aligns(item_type: &UIItemType) -> bool {
     )
 }
 
+/// The window holding the keyboard focus, if a ThinkTerm window does.
+/// Held by the window's `space_owner_id`: its mux window id changes with
+/// every thread or Space it switches to, and the holder must still match
+/// when that window loses focus or goes away.
+static FOCUSED_WINDOW: parking_lot::Mutex<Option<u64>> = parking_lot::Mutex::new(None);
+
+impl TermWindow {
+    /// The pane in front of someone has been seen. Whenever the active pane
+    /// of a focused window changes -- a click, a tab or thread switch, a
+    /// pane closing beside it -- or the window regains focus, retire the
+    /// results its programs left. Every one of those shows up as a paint;
+    /// focus alone does not count, for code moves it with nobody looking.
+    pub(crate) fn note_active_pane_seen(&mut self) {
+        if self.focused.is_none() {
+            return;
+        }
+        let Some(pane) = self.get_active_pane_no_overlay() else {
+            return;
+        };
+        if self.seen_active_pane == Some(pane.pane_id()) {
+            return;
+        }
+        self.seen_active_pane = Some(pane.pane_id());
+        if crate::agent_status::has_unseen_result(pane.as_ref()) {
+            pane.program_status_seen();
+        }
+    }
+}
+
+/// Whether someone is looking at ThinkTerm: a system notification about a
+/// thread is for when nobody is.
+pub(crate) fn app_has_focus() -> bool {
+    FOCUSED_WINDOW.lock().is_some()
+}
+
+/// The agents a thread row's hover card lists: those in the thread's
+/// workspace that are up to something. Empty means the row gets no card.
+pub(crate) fn thread_card_agents(item_type: &UIItemType) -> Vec<crate::agent_status::AgentPaneStatus> {
+    let UIItemType::WorkspaceThread(thread_id) = item_type else {
+        return Vec::new();
+    };
+    if !crate::agent_status::enabled() {
+        return Vec::new();
+    }
+    let Some(workspace) = crate::workspace_threads::thread_workspace_name(thread_id) else {
+        return Vec::new();
+    };
+    crate::agent_status::agents_in_workspace(&workspace, |agent| {
+        agent.shown_state() != crate::agent_status::ShownState::Unknown
+    })
+}
+
+/// Whether a thread row has a hover card to show: [`thread_card_agents`]
+/// without copying the agents out, for the pointer's every move.
+pub(crate) fn thread_has_card(item_type: &UIItemType) -> bool {
+    let UIItemType::WorkspaceThread(thread_id) = item_type else {
+        return false;
+    };
+    if !crate::agent_status::enabled() {
+        return false;
+    }
+    crate::workspace_threads::thread_workspace_name(thread_id).is_some_and(|workspace| {
+        crate::agent_status::any_agent_in_workspace(&workspace, |agent| {
+            agent.shown_state() != crate::agent_status::ShownState::Unknown
+        })
+    })
+}
+
 /// The tag to show for an item whose own text cannot say enough: an icon-only
 /// button (no text at all) or a row whose label is cut to fit the sidebar.
 /// `None` for everything that already reads in full.
@@ -2064,6 +2132,51 @@ pub struct PaneState {
 
 fn pane_output_needs_repaint(current: u64, presented: u64) -> bool {
     current != presented
+}
+
+fn agent_status_change_is_visible(
+    window_id: MuxWindowId,
+    pane_window_id: Option<MuxWindowId>,
+    presented_right_sidebar: Option<RightSidebarMode>,
+    sidebar_contains_thread: bool,
+    preview_contains_pane: bool,
+) -> bool {
+    pane_window_id == Some(window_id)
+        || presented_right_sidebar == Some(RightSidebarMode::Agents)
+        || sidebar_contains_thread
+        || preview_contains_pane
+}
+
+#[cfg(test)]
+mod agent_status_repaint_tests {
+    use super::{agent_status_change_is_visible, RightSidebarMode};
+
+    #[test]
+    fn status_changes_repaint_only_windows_that_display_them() {
+        // One pane's owner, an unrelated Snippets panel, an open global Agents
+        // panel, a sidebar referencing the thread, and an overview preview.
+        let windows = [
+            (1, None, false, false),
+            (2, Some(RightSidebarMode::Snippets), false, false),
+            (3, Some(RightSidebarMode::Agents), false, false),
+            (4, None, true, false),
+            (5, None, false, true),
+            (6, None, false, false),
+        ];
+        let repaint: Vec<_> = windows.iter().copied()
+            .filter_map(|(id, panel, sidebar, preview)| {
+                agent_status_change_is_visible(id, Some(1), panel, sidebar, preview).then_some(id)
+            })
+            .collect();
+        assert_eq!(repaint, [1, 3, 4, 5]);
+
+        // Closing the global panel removes the unrelated window's reason
+        // to paint. A vanished pane still updates an open global panel.
+        assert!(!agent_status_change_is_visible(3, Some(1), None, false, false));
+        assert!(agent_status_change_is_visible(
+            3, None, Some(RightSidebarMode::Agents), false, false,
+        ));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2581,6 +2694,9 @@ pub struct TermWindow {
     os_parameters: Option<parameters::Parameters>,
     /// When we most recently received keyboard focus
     pub focused: Option<Instant>,
+    /// The active pane last shown to someone in this window while it had
+    /// focus, so that a pane's results are seen once per showing.
+    seen_active_pane: Option<PaneId>,
     /// When the window stopped being visible to the user (fully covered,
     /// minimized, on another macOS Space, app hidden). None while
     /// visible. The timestamp doubles as the start of the grace period
@@ -3027,6 +3143,10 @@ pub struct TermWindow {
     right_sidebar_collapsed: bool,
     right_sidebar_mode: RightSidebarMode,
     right_sidebar_agents_scroll: f32,
+    /// Agents whose sub-task list is open in the Agents panel; folded is
+    /// the default. Each paint of the panel drops the ones with no
+    /// sub-tasks left, so the next batch starts folded again.
+    right_sidebar_agents_open_subtasks: HashSet<PaneId>,
     right_sidebar_snippet_view: RightSidebarSnippetView,
     right_sidebar_snippet_focus: Option<RightSidebarSnippetField>,
     right_sidebar_snippet_search: TextInputState,
@@ -4041,6 +4161,17 @@ impl TermWindow {
         }
         log::trace!("Setting focus to {:?}", focused);
         self.focused = if focused { Some(Instant::now()) } else { None };
+        {
+            let mut holder = FOCUSED_WINDOW.lock();
+            if focused {
+                *holder = Some(self.space_owner_id);
+            } else if *holder == Some(self.space_owner_id) {
+                *holder = None;
+            }
+        }
+        // Back in front of someone: the active pane is looked at afresh on
+        // the next paint.
+        self.seen_active_pane = None;
         if focused {
             // Focus implies visible; belt-and-braces cover for a lost
             // occlusion edge (the window backend re-posts rather than
@@ -4393,6 +4524,7 @@ impl TermWindow {
             settings_opacity_overrides,
             palette: None,
             focused: None,
+            seen_active_pane: None,
             occluded: None,
             occlusion_released: false,
             occlusion_last_release: None,
@@ -4605,6 +4737,7 @@ impl TermWindow {
             right_sidebar_collapsed: true,
             right_sidebar_mode: RightSidebarMode::Snippets,
             right_sidebar_agents_scroll: 0.0,
+            right_sidebar_agents_open_subtasks: HashSet::new(),
             right_sidebar_snippet_view: RightSidebarSnippetView::List,
             right_sidebar_snippet_focus: None,
             right_sidebar_snippet_search: TextInputState::new(),
@@ -5730,18 +5863,22 @@ impl TermWindow {
                     // The panel snapshot is cached briefly; a real change
                     // must not wait out that TTL.
                     crate::agent_status::invalidate_agent_pane_cache();
-                    self.refresh_thread_work_for_pane(pane_id);
-                    if self.right_sidebar_mode == RightSidebarMode::Agents {
-                        // The thread status may be unchanged while the
-                        // per-pane chip flipped (e.g. Idle→Working inside an
-                        // already-Running thread); repaint the open panel.
-                        if let Some(win) = self.window.as_ref() {
-                            win.invalidate();
+                    // A result that lands in the pane in front of the user is
+                    // seen as it lands: it must not turn up later as unseen.
+                    if self.focused.is_some() {
+                        if let Some(active) = self.get_active_pane_no_overlay() {
+                            if active.pane_id() == pane_id
+                                && crate::agent_status::has_unseen_result(active.as_ref())
+                            {
+                                active.program_status_seen();
+                            }
                         }
-                    } else {
-                        // An agent starting or leaving changes its tab's icon.
-                        self.invalidate_if_pane_tab_shown(pane_id);
                     }
+                    crate::workspace_threads::refresh_thread_work_for_pane(pane_id);
+                    // Waiting -> error leaves the aggregate NeedsAttention
+                    // unchanged, but changes its icon. Decide from what this
+                    // window displays, not from the aggregate's changed bit.
+                    self.invalidate_window_if(self.agent_status_change_is_visible(pane_id));
                 }
                 MuxNotification::ForegroundProgramChanged(pane_id) => {
                     self.invalidate_if_pane_tab_shown(pane_id);
@@ -6217,6 +6354,29 @@ impl TermWindow {
                 window.invalidate();
             }
         }
+    }
+
+    fn agent_status_change_is_visible(&self, pane_id: PaneId) -> bool {
+        let mux = Mux::get();
+        let pane_window_id = mux.resolve_pane_id(pane_id).map(|(_, window_id, _)| window_id);
+        let sidebar_contains_thread = self.workspace_sidebar_is_presented()
+            && pane_window_id
+                .and_then(|window_id| {
+                    mux.get_window(window_id).map(|window| window.get_workspace().to_string())
+                })
+                .is_some_and(|workspace| {
+                    let space = self.workspace_sidebar_space_id();
+                    crate::workspace_threads::thread_id_for_workspace(space, &workspace).is_some()
+                        || crate::workspace_threads::origin_space_for_ref_workspace(space, &workspace)
+                            .is_some()
+                });
+        agent_status_change_is_visible(
+            self.mux_window_id,
+            pane_window_id,
+            self.right_sidebar_presented().then_some(self.right_sidebar_mode),
+            sidebar_contains_thread,
+            self.active_content_view().is_some_and(|view| view.wants_pane_output(pane_id)),
+        )
     }
 
     fn schedule_status_update(&self) {
@@ -11841,6 +12001,14 @@ impl Drop for TermWindow {
         // from leaving its Space permanently marked as occupied.
         crate::workspace_threads::release_window_space(self.space_owner_id);
         crate::input_diagnostics::remove_gauges_for_source(self.space_owner_id);
+        // A window torn down without losing focus first must not leave
+        // ThinkTerm counted as looked at.
+        {
+            let mut holder = FOCUSED_WINDOW.lock();
+            if *holder == Some(self.space_owner_id) {
+                *holder = None;
+            }
+        }
         self.close_plugin_panel();
         self.clear_gui_recovery_intent();
         gpu_debug(format!(

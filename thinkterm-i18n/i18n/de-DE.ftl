@@ -157,6 +157,8 @@ settings-remote-drop-destination-description = Wohin Dateien hochgeladen werden,
 settings-notifications-heading = Mitteilungen
 settings-notification-sounds = Mitteilungstöne
 settings-notification-sounds-description = Spielt einen kurzen Ton ab, wenn ein Thread fertig ist oder auf Sie zu warten beginnt.
+settings-system-notifications = Systembenachrichtigungen
+settings-system-notifications-description = Benachrichtigt, solange ThinkTerm im Hintergrund ist, wenn ein Thread fertig ist, Sie braucht oder mit einem Fehler anhält.
 settings-remote-update-keep-sessions = Sitzungen beim Update eines Remote-Servers behalten
 settings-remote-update-keep-sessions-description = Der laufende Server übergibt seine Panes an die neue Version, statt zu stoppen; nichts, was darin läuft, endet.
 settings-local-sessions-via-mux = Lokale Terminals in einem Hintergrund-Sitzungsserver halten
@@ -713,6 +715,8 @@ right-agents-state-working = Arbeitet
 right-agents-state-blocked = Braucht Eingabe
 right-agents-state-idle = Inaktiv
 right-agents-state-unknown = Unbekannt
+right-agents-state-error = Fehler
+right-agents-state-done = Fertig
 right-agents-none = Keine Agents erkannt
 right-agents-detection-off = Agent-Erkennung ist aus — Einstellungen öffnen
 right-agents-count-working = { $count } arbeiten
@@ -722,6 +726,30 @@ right-agents-count-blocked = { $count ->
     }
 right-agents-count-idle = { $count } inaktiv
 right-agents-count-unknown = { $count } unbekannt
+right-agents-count-error = { $count ->
+        [one] 1 Fehler
+       *[other] { $count } Fehler
+    }
+right-agents-more-subtasks = { $count } weitere
+right-agents-subtasks = { $count ->
+        [one] 1 Unteraufgabe
+       *[other] { $count } Unteraufgaben
+    }
+agent-kind-permission = Berechtigung
+agent-kind-question = Frage
+agent-kind-auth = Anmeldung
+notification-thread-finished = Fertig
+notification-thread-needs-input = Braucht Sie
+notification-thread-error = Mit einem Fehler angehalten
+settings-agent-status-heading = Statusanzeige
+settings-agent-status-description = Beschreibung
+settings-agent-status-description-description = Was ein Programm gerade tut, was es fertiggestellt hat oder warum es angehalten hat.
+settings-agent-status-reason = Wartegrund
+settings-agent-status-reason-description = Ob es auf eine Berechtigung, eine Antwort oder eine Anmeldung wartet.
+settings-agent-status-progress = Fortschritt
+settings-agent-status-progress-description = Wie weit es ist, als Balken im Agenten-Bereich.
+settings-agent-status-subtasks = Unteraufgaben
+settings-agent-status-subtasks-description = Hintergrundaufgaben und Unteragenten: eine Zeile im Agenten-Bereich, die sich zur Liste öffnen lässt.
 settings-section-agents = Agents
 settings-agents-integrations-heading = Integrationen
 settings-integration-screen-active = Im PATH gefunden; der Status wird aus seiner Terminaloberfläche erkannt (Bildschirmregeln).

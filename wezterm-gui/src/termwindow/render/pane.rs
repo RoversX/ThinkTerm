@@ -9,6 +9,8 @@ use crate::termwindow::render::{
     same_hyperlink, CursorProperties, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
     RenderScreenLineParams,
 };
+use crate::agent_status::{AgentEvidence, AgentState, ProgramReportState};
+use crate::termwindow::ui::agent_panel::{AGENT_BLOCKED_COLOR, AGENT_DONE_COLOR};
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::status_icon::{split_leading_legacy_progress_marker, UiStatusKind};
 use crate::termwindow::ui::tokens::{
@@ -686,6 +688,8 @@ impl crate::TermWindow {
                 icon_size,
                 status.is_some(),
                 this_tab_fg,
+                tab_surface_color,
+                selected_tab && self.focused.is_some(),
             )?;
 
             let close_slot_reserved = !is_renaming_tab;
@@ -1074,6 +1078,8 @@ impl crate::TermWindow {
                 icon_size,
                 status.is_some(),
                 this_tab_fg,
+                tab_surface_color,
+                selected_tab && self.focused.is_some(),
             )?;
 
             let close_slot_reserved = !is_renaming_tab;
@@ -1332,9 +1338,39 @@ impl crate::TermWindow {
         icon_size: usize,
         running: bool,
         color: LinearRgba,
+        surface: LinearRgba,
+        watched: bool,
     ) -> anyhow::Result<usize> {
-        let icon = Mux::get()
-            .get_pane(pane_id)
+        let pane = Mux::get().get_pane(pane_id);
+        // What an agent in the pane is up to: a working one spins the icon,
+        // and one waiting on you, stopped on an error, or done with a result
+        // nobody has seen yet gets a dot on the icon's shoulder.
+        // The summary, not the status: this runs for every tab every frame,
+        // and the status carries the report's text.
+        let agent = pane
+            .as_ref()
+            .and_then(|pane| pane.agent_status_summary())
+            .filter(|status| !status.ended && status.evidence != AgentEvidence::Fallback);
+        let running = running
+            || agent
+                .as_ref()
+                .is_some_and(|status| status.state == AgentState::Working);
+        let badge = agent
+            .as_ref()
+            .and_then(|status| match status.state {
+                AgentState::Blocked => Some(AGENT_BLOCKED_COLOR),
+                AgentState::Error => Some(self.chrome().danger),
+                // A result is unseen only while nobody is looking at it.
+                AgentState::Idle
+                    if !watched && status.report_state == Some(ProgramReportState::Done) =>
+                {
+                    Some(AGENT_DONE_COLOR)
+                }
+                _ => None,
+            })
+            .map(|dot| (dot, surface));
+        let icon = pane
+            .as_ref()
             .and_then(|pane| crate::tab_icons::resolve(pane.as_ref()));
         let Some(icon) = icon else {
             let x = self.ui_px(TAB_CONTENT_INSET);
@@ -1344,9 +1380,44 @@ impl crate::TermWindow {
             } else {
                 self.paint_pane_nav_icon(layers, SvgIcon::SquareTerminal, x, y, icon_size, color)?;
             }
+            if let Some(badge) = badge {
+                self.paint_tab_icon_badge(layers, x, y, icon_size, badge)?;
+            }
             return Ok(x + icon_size);
         };
-        self.paint_tab_circle_icon(layers, &icon, tab_y, tab_height, running)
+        self.paint_tab_circle_icon(layers, &icon, tab_y, tab_height, running, badge)
+    }
+
+    /// The dot on a tab icon's top-right shoulder, in `badge.0`, set off
+    /// from the icon by a ring of the tab's own surface, `badge.1`.
+    fn paint_tab_icon_badge(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        icon_x: usize,
+        icon_y: usize,
+        icon_size: usize,
+        badge: (LinearRgba, LinearRgba),
+    ) -> anyhow::Result<()> {
+        let dot = (icon_size as f32 * 0.38).round().max(4.0);
+        let ring = (dot * 0.25).round().max(1.0);
+        let x = icon_x as f32 + icon_size as f32 - dot * 0.8;
+        let y = icon_y as f32 - dot * 0.2;
+        self.fill_rounded_rectangle(
+            layers,
+            2,
+            euclid::rect(x - ring, y - ring, dot + ring * 2.0, dot + ring * 2.0),
+            badge.1,
+            dot / 2.0 + ring,
+        )
+        .context("tab icon badge ring")?;
+        self.fill_rounded_rectangle(
+            layers,
+            2,
+            euclid::rect(x, y, dot, dot),
+            badge.0,
+            dot / 2.0,
+        )
+        .context("tab icon badge")
     }
 
     /// A tab icon's circle, concentric with the rounded left end of the pill
@@ -1360,6 +1431,7 @@ impl crate::TermWindow {
         tab_y: usize,
         tab_height: usize,
         running: bool,
+        badge: Option<(LinearRgba, LinearRgba)>,
     ) -> anyhow::Result<usize> {
         let inset = self.ui_px(TAB_ICON_CIRCLE_INSET).min(tab_height / 4);
         let diameter = tab_height.saturating_sub(inset * 2).max(1);
@@ -1404,6 +1476,9 @@ impl crate::TermWindow {
                 glyph as f32,
                 icon.glyph_color.linear(),
             )?;
+        }
+        if let Some(badge) = badge {
+            self.paint_tab_icon_badge(layers, x, y, diameter, badge)?;
         }
         Ok(x + diameter)
     }

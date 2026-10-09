@@ -1058,6 +1058,7 @@ impl crate::TermWindow {
 
         let start = Instant::now();
         self.advance_tab_scroll_animation(start);
+        self.note_active_pane_seen();
 
         {
             let diff = start.duration_since(self.last_fps_check_time);
@@ -3388,6 +3389,10 @@ impl crate::TermWindow {
         if !self.hover_tooltip_allowed(&hover.item.item_type) {
             return Ok(());
         }
+        let agents = crate::termwindow::thread_card_agents(&hover.item.item_type);
+        if !agents.is_empty() {
+            return self.paint_thread_agent_card(&hover.item, &agents);
+        }
         let Some(label) = crate::termwindow::tooltip_label_for(&hover.item.item_type) else {
             return Ok(());
         };
@@ -3468,6 +3473,165 @@ impl crate::TermWindow {
         )
         .context("hover tooltip label")?;
 
+        Ok(())
+    }
+
+    /// A thread row's hover card: each agent in the thread, its state, and
+    /// -- where its program said -- why it waits, how far it got and what it
+    /// is doing. Beside the row rather than above it: the card is taller
+    /// than a tag, and the rows above are the ones being read.
+    fn paint_thread_agent_card(
+        &mut self,
+        item: &crate::termwindow::UIItem,
+        agents: &[crate::agent_status::AgentPaneStatus],
+    ) -> anyhow::Result<()> {
+        use crate::agent_status::{self, ShownState};
+        use crate::termwindow::ui::agent_panel::{agent_state_icon, agent_state_key};
+
+        let settings = crate::native_settings::load_shared();
+        let font_size = crate::native_settings::home_font_size(&settings);
+        let ui_font = self
+            .fonts
+            .title_font_with_size(font_size)
+            .context("thread card font")?;
+        let metrics = crate::utilsprites::RenderMetrics::with_font_metrics(&ui_font.metrics());
+        let line = metrics.cell_size.height as f32;
+        let chrome = self.chrome();
+        let show = settings.chrome.agent_status_display;
+
+        // Per agent: its state, a heading, and what it said, if anything.
+        let entries: Vec<(ShownState, String, Option<(String, LinearRgba)>)> = agents
+            .iter()
+            .map(|agent| {
+                let shown = agent.shown_state();
+                let mut heading = format!(
+                    "{} · {}",
+                    agent_status::display_name(&agent.agent_id),
+                    crate::i18n::tr(agent_state_key(shown))
+                );
+                let report = agent.report.as_ref();
+                if let Some(kind) = report.and_then(|report| report.kind).filter(|_| show.reason) {
+                    heading.push_str(" · ");
+                    heading.push_str(&crate::i18n::tr(agent_status::blocked_kind_key(kind)));
+                }
+                if let Some(progress) = report
+                    .and_then(|report| report.progress)
+                    .filter(|_| show.progress)
+                {
+                    heading.push_str(&format!(" · {progress}%"));
+                }
+                let said = report
+                    .and_then(|report| report.msg.clone())
+                    .filter(|_| show.description)
+                    .map(|msg| {
+                        let color = if shown == ShownState::Error {
+                            chrome.danger
+                        } else {
+                            chrome.secondary_text
+                        };
+                        (msg, color)
+                    });
+                (shown, heading, said)
+            })
+            .collect();
+
+        let gl_state = self.render_state.as_ref().unwrap();
+        let layer = gl_state
+            .layer_for_zindex(crate::termwindow::TOOLTIP_ZINDEX)
+            .context("thread card layer")?;
+        let mut layers = layer.quad_allocator();
+        let ctx = DrawContext::new(gl_state, self.dimensions, &metrics);
+
+        let pad = self.ui_f32(12.0);
+        let gap = self.ui_f32(8.0);
+        let icon = (line * 0.9).round().max(1.0);
+        let max_text = (self.dimensions.pixel_width as f32 * 0.32).max(160.0);
+        let text_width = entries
+            .iter()
+            .flat_map(|(_, heading, said)| {
+                std::iter::once(heading.as_str()).chain(said.iter().map(|(text, _)| text.as_str()))
+            })
+            .map(|text| ctx.measure_text_width(&ui_font, text))
+            .fold(0.0f32, f32::max)
+            .min(max_text);
+        let entry_height = |said: bool| line + if said { line + self.ui_f32(2.0) } else { 0.0 };
+        let card_w = pad * 2.0 + icon + gap + text_width;
+        let card_h = pad * 2.0
+            + entries
+                .iter()
+                .map(|(_, _, said)| entry_height(said.is_some()))
+                .sum::<f32>()
+            + gap * entries.len().saturating_sub(1) as f32;
+
+        let window_w = self.dimensions.pixel_width as f32;
+        let window_h = self.dimensions.pixel_height as f32;
+        let right_of_row = item.x as f32 + item.width as f32 + gap;
+        let x = if right_of_row + card_w <= window_w {
+            right_of_row
+        } else {
+            (item.x as f32 - gap - card_w).max(0.0)
+        };
+        let y = (item.y as f32).min(window_h - card_h).max(0.0);
+
+        self.fill_rounded_rectangle_with_border(
+            &mut layers,
+            0,
+            euclid::rect(x, y, card_w, card_h),
+            chrome.control_bg,
+            chrome.control_border,
+            self.ui_f32(10.0),
+            1.0,
+        )
+        .context("thread card background")?;
+
+        let text_x = x + pad + icon + gap;
+        let mut entry_y = y + pad;
+        for (shown, heading, said) in &entries {
+            if let Some((glyph, color, spinning)) =
+                agent_state_icon(*shown, chrome, chrome.muted_text)
+            {
+                let icon_x = (x + pad).round() as usize;
+                let icon_y = (entry_y + (line - icon) / 2.0).round() as usize;
+                if spinning {
+                    self.paint_spinning_ui_icon(
+                        &mut layers,
+                        2,
+                        glyph,
+                        icon_x,
+                        icon_y,
+                        icon as usize,
+                        color,
+                    )?;
+                } else {
+                    self.paint_sidebar_icon(&mut layers, glyph, icon_x, icon_y, icon as usize, color)?;
+                }
+            }
+            ctx.draw_text_on_layer(
+                &mut layers,
+                2,
+                &ui_font,
+                text_x,
+                entry_y,
+                heading,
+                chrome.text,
+                text_width,
+            )
+            .context("thread card heading")?;
+            if let Some((text, color)) = said {
+                ctx.draw_text_on_layer(
+                    &mut layers,
+                    2,
+                    &ui_font,
+                    text_x,
+                    entry_y + line + self.ui_f32(2.0),
+                    text,
+                    *color,
+                    text_width,
+                )
+                .context("thread card description")?;
+            }
+            entry_y += entry_height(said.is_some()) + gap;
+        }
         Ok(())
     }
 

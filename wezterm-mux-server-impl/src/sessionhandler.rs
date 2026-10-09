@@ -1110,6 +1110,7 @@ fn web_peer_may_send(pdu: &Pdu) -> bool {
             | Pdu::ListPanes(_)
             | Pdu::WriteToPane(_)
             | Pdu::SendKeyDown(_)
+            | Pdu::MarkProgramStatusSeen(_)
             | Pdu::SendMouseEvent(_)
             | Pdu::SendPaste(_)
             | Pdu::Resize(_)
@@ -1805,6 +1806,23 @@ impl SessionHandler {
                                  want_zoomed={zoomed} | {}",
                                 tab.geometry_trace()
                             );
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
+
+            Pdu::MarkProgramStatusSeen(MarkProgramStatusSeen { pane_id }) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = Mux::get();
+                            let pane = mux
+                                .get_pane(pane_id)
+                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                            pane.program_status_seen();
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
                         send_response,

@@ -157,6 +157,8 @@ settings-remote-drop-destination-description = Where files dropped onto a remote
 settings-notifications-heading = Notifications
 settings-notification-sounds = Notification Sounds
 settings-notification-sounds-description = Play a short sound when a thread finishes or starts waiting on you.
+settings-system-notifications = System Notifications
+settings-system-notifications-description = While ThinkTerm is in the background, notify when a thread finishes, needs you, or stops on an error.
 settings-remote-update-keep-sessions = Keep sessions when updating a remote server
 settings-remote-update-keep-sessions-description = The running server hands its panes to the new version instead of stopping; nothing running in them ends.
 settings-local-sessions-via-mux = Keep local terminals in a background session server
@@ -713,6 +715,8 @@ right-agents-state-working = Working
 right-agents-state-blocked = Needs input
 right-agents-state-idle = Idle
 right-agents-state-unknown = Unknown
+right-agents-state-error = Error
+right-agents-state-done = Done
 right-agents-none = No agents detected
 right-agents-detection-off = Agent detection is off — open settings
 right-agents-count-working = { $count } working
@@ -722,6 +726,30 @@ right-agents-count-blocked = { $count ->
     }
 right-agents-count-idle = { $count } idle
 right-agents-count-unknown = { $count } unknown
+right-agents-count-error = { $count ->
+        [one] 1 error
+       *[other] { $count } errors
+    }
+right-agents-more-subtasks = { $count } more
+right-agents-subtasks = { $count ->
+        [one] 1 sub-task
+       *[other] { $count } sub-tasks
+    }
+agent-kind-permission = Permission
+agent-kind-question = Question
+agent-kind-auth = Sign-in
+notification-thread-finished = Finished
+notification-thread-needs-input = Needs you
+notification-thread-error = Stopped on an error
+settings-agent-status-heading = Status Display
+settings-agent-status-description = Description
+settings-agent-status-description-description = What a program is doing, what it finished, or why it stopped.
+settings-agent-status-reason = Waiting Reason
+settings-agent-status-reason-description = Whether it waits for a permission, an answer or a sign-in.
+settings-agent-status-progress = Progress
+settings-agent-status-progress-description = How far along it is, as a bar in the Agents panel.
+settings-agent-status-subtasks = Sub-tasks
+settings-agent-status-subtasks-description = Background tasks and sub-agents: one line in the Agents panel that opens into the list.
 settings-section-agents = Agents
 settings-agents-integrations-heading = Integrations
 settings-integration-screen-active = Found on PATH; status is detected from its terminal UI (screen rules).

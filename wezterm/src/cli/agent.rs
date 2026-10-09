@@ -43,6 +43,7 @@ fn state_label(state: AgentState) -> &'static str {
         AgentState::Blocked => "blocked",
         AgentState::Idle => "idle",
         AgentState::Unknown => "unknown",
+        AgentState::Error => "error",
     }
 }
 
@@ -51,6 +52,7 @@ fn evidence_label(evidence: AgentEvidence) -> &'static str {
         AgentEvidence::Contract => "contract",
         AgentEvidence::Screen => "screen",
         AgentEvidence::Fallback => "fallback",
+        AgentEvidence::Report => "report",
     }
 }
 

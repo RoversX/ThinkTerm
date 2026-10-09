@@ -65,7 +65,9 @@ impl Pending {
         evidence: AgentEvidence,
         now: Instant,
     ) -> bool {
-        if raw == published || evidence == AgentEvidence::Contract {
+        // A program's own word is not a guess about a half-drawn screen:
+        // neither the contract nor an OSC 7501 report is held back.
+        if raw == published || matches!(evidence, AgentEvidence::Contract | AgentEvidence::Report) {
             self.clear();
             return false;
         }

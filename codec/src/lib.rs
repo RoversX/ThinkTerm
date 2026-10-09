@@ -819,7 +819,9 @@ macro_rules! pdu {
 /// 76: Source-independent session import requests with explicit import modes.
 /// 77: Discover and preview import sessions on their owning mux server.
 /// 78: Durable import request identities and reconnectable result queries.
-pub const CODEC_VERSION: usize = 78;
+/// 79: Agent statuses carry programs' own OSC 7501 reports and an error state;
+///     MarkProgramStatusSeen.
+pub const CODEC_VERSION: usize = 79;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -928,6 +930,7 @@ pdu! {
     PreviewImportSessionResponse: 108,
     GetImportSessionStatus: 109,
     GetImportSessionStatusResponse: 110,
+    MarkProgramStatusSeen: 111,
 }
 
 impl Pdu {
@@ -1862,6 +1865,15 @@ pub struct MoveTab {
 pub struct PluginFrame {
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
+}
+
+/// Someone looked at a pane: retire the finished or failed results its
+/// programs reported with OSC 7501. Only the mux that owns the pane keeps
+/// them, and a client's focus does not always reach it -- a client does not
+/// refocus the pane it already focused when the user comes back to it.
+#[derive(Deserialize, Serialize, PartialEq, Eq, Debug)]
+pub struct MarkProgramStatusSeen {
+    pub pane_id: PaneId,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -3038,13 +3050,17 @@ mod test {
     }
 
     #[test]
-    fn agent_status_protocol_round_trip_at_version_61() {
-        // The agent-status protocol arrived at 61 and is unchanged since.
-        // The exact assertion is the tripwire: whoever bumps the codec must
-        // come here, confirm the round-trips still cover the new version,
-        // and advance it deliberately.
-        assert_eq!(CODEC_VERSION, 78);
-        use thinkterm_proto::{AgentEvidence, AgentState, AgentStatus};
+    fn agent_status_protocol_round_trip_at_version_79() {
+        // The agent-status protocol arrived at 61; 79 added programs' own
+        // OSC 7501 reports and the error state. The exact assertion is the
+        // tripwire: whoever bumps the codec must come here, confirm the
+        // round-trips still cover the new version, and advance it
+        // deliberately.
+        assert_eq!(CODEC_VERSION, 79);
+        use thinkterm_proto::{
+            AgentEvidence, AgentState, AgentStatus, ProgramBlockedKind, ProgramReport,
+            ProgramReportChild, ProgramReportState,
+        };
 
         fn round_trip(pdu: Pdu) {
             let mut encoded = Vec::new();
@@ -3061,6 +3077,7 @@ mod test {
             session_id: Some("abc-123".to_string()),
             since_unix: 1_756_000_000,
             ended: false,
+            report: None,
         };
         round_trip(Pdu::AgentStatusChanged(AgentStatusChanged {
             pane_id: 7,
@@ -3068,9 +3085,34 @@ mod test {
         }));
         round_trip(Pdu::AgentStatusChanged(AgentStatusChanged {
             pane_id: 7,
+            status: Some(AgentStatus {
+                state: AgentState::Error,
+                evidence: AgentEvidence::Report,
+                report: Some(ProgramReport {
+                    state: ProgramReportState::Blocked,
+                    kind: Some(ProgramBlockedKind::Permission),
+                    progress: Some(40),
+                    app: Some("claude-code".to_string()),
+                    title: None,
+                    msg: Some("Bash: npm test".to_string()),
+                    children: vec![ProgramReportChild {
+                        id: "plan".to_string(),
+                        state: ProgramReportState::Done,
+                        kind: None,
+                        progress: None,
+                        title: Some("Plan".to_string()),
+                        msg: None,
+                    }],
+                }),
+                ..status.clone()
+            }),
+        }));
+        round_trip(Pdu::AgentStatusChanged(AgentStatusChanged {
+            pane_id: 7,
             status: None,
         }));
         round_trip(Pdu::GetAgentStatuses(GetAgentStatuses {}));
+        round_trip(Pdu::MarkProgramStatusSeen(MarkProgramStatusSeen { pane_id: 7 }));
         round_trip(Pdu::GetAgentStatusesResponse(GetAgentStatusesResponse {
             statuses: vec![AgentStatusEntry {
                 pane_id: 7,
@@ -3084,7 +3126,7 @@ mod test {
     #[test]
     fn foreground_program_protocol_round_trip_at_version_74() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 78);
+        assert_eq!(CODEC_VERSION, 79);
         use thinkterm_proto::ForegroundProgram;
 
         fn round_trip(pdu: &Pdu) -> Pdu {
@@ -3186,7 +3228,7 @@ mod test {
     fn frame_control_extension_round_trips_without_changing_legacy_version() {
         // The extension is asked for, so it needed no bump of its own; 74
         // is the foreground program's, which a server sends unasked.
-        assert_eq!(CODEC_VERSION, 78);
+        assert_eq!(CODEC_VERSION, 79);
         for pdu in [
             Pdu::GetKittyImage(GetKittyImage { pane_id: 3, image_id: 7, data_hash: [9; 32], have_frames: 2, image_epoch: Some(4) }),
             Pdu::GetKittyFrameSelections(GetKittyFrameSelections { pane_id: 3, subscribe: true }),
@@ -3644,6 +3686,7 @@ mod agent_budget_tests {
             evidence: AgentEvidence::Contract,
             since_unix: 42,
             ended: false,
+            report: None,
         }
     }
     fn assert_stream_survives(message: Pdu, expected: Pdu) {

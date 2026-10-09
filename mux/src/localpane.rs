@@ -303,7 +303,7 @@ pub struct LocalPane {
     pane_id: PaneId,
     terminal: Mutex<Terminal>,
     process: Mutex<ProcessState>,
-    pty: Mutex<Box<dyn MasterPty>>,
+    pty: Arc<Mutex<Box<dyn MasterPty>>>,
     writer: Mutex<Box<dyn Write + Send>>,
     domain_id: DomainId,
     tmux_domain: Mutex<Option<Arc<TmuxDomainState>>>,
@@ -330,6 +330,12 @@ pub struct LocalPane {
     /// focusing a pane is what a person does right before typing into it,
     /// and the main thread must not wait on that pane's parser for it.
     pending_focus: Mutex<Option<bool>>,
+    /// A look at the pane the terminal has yet to hear of, as
+    /// `pending_focus`: it retires finished programs' OSC 7501 results.
+    pending_seen: Mutex<bool>,
+    /// Whether the pane's root was a shell without children, and when:
+    /// finding out walks the process table, so the answer stands a moment.
+    shell_idle: Mutex<Option<(Instant, bool)>>,
     /// The progress the terminal last reported, for `get_progress` while
     /// the parser holds the terminal.
     last_progress: Mutex<Progress>,
@@ -831,6 +837,83 @@ impl Pane for LocalPane {
 
     fn clear_agent_osc_evidence(&self) {
         self.terminal.lock().clear_agent_osc_state();
+    }
+
+    fn program_status(&self) -> wezterm_term::program_status::ProgramStatusSnapshot {
+        let exited = !matches!(&*self.process.lock(), ProcessState::Running { .. });
+        let mut term = self.terminal.lock();
+        if exited {
+            // Held panes remain visible after their child exits. Finalize
+            // each read, including any last reports parsed after the exit.
+            term.end_program_status(u64::MAX);
+        }
+        term.program_status(wezterm_term::program_status::ProgramStatusRecords::MAX_RECORDS)
+    }
+
+    fn end_program_status(&self, through: u64) {
+        self.terminal.lock().end_program_status(through);
+    }
+
+    fn program_status_seen(&self) {
+        // Never waits on the parser, as `focus_changed` does not, and probes
+        // again after leaving the mark: the parser may have made its last
+        // check for pending work in between.
+        match self.terminal.try_lock() {
+            Some(mut term) => self.retire_seen_results(&mut term),
+            None => {
+                *self.pending_seen.lock() = true;
+                if let Some(mut term) = self.terminal.try_lock() {
+                    self.apply_pending_focus(&mut term);
+                }
+            }
+        }
+    }
+
+    fn foreground_process_group(&self) -> Option<u32> {
+        #[cfg(unix)]
+        {
+            // Only ever positive: the pty answers `None` for anything else.
+            self.pty.lock().process_group_leader().map(|pid| pid as u32)
+        }
+        #[cfg(not(unix))]
+        None
+    }
+
+    fn shell_is_foreground(&self) -> Option<bool> {
+        #[cfg(unix)]
+        {
+            let leader = self.pty.lock().process_group_leader()?;
+            let root = self.root_process_id()?;
+            if leader as u32 != root {
+                return Some(false);
+            }
+            // The pane's first process holds the foreground: a shell at its
+            // prompt -- or the program the pane was opened on, or a shell
+            // running a script or a `-c` command, which without job control
+            // keeps its child in its own group. A childless shell may still
+            // be executing a builtin: callers must also check who reported.
+            const SHELL_IDLE_TTL: Duration = Duration::from_secs(2);
+            let now = Instant::now();
+            if let Some((at, idle)) = *self.shell_idle.lock() {
+                if now.duration_since(at) < SHELL_IDLE_TTL {
+                    return Some(idle);
+                }
+            }
+            let path = procinfo::LocalProcessInfo::executable_path(root)?;
+            let name = path.file_name()?.to_string_lossy();
+            let shell = matches!(
+                name.as_ref(),
+                "sh" | "bash" | "zsh" | "fish" | "dash" | "ash" | "busybox" | "ksh" | "mksh"
+                    | "tcsh" | "csh" | "nu" | "elvish" | "xonsh" | "pwsh"
+            );
+            let idle = shell
+                && procinfo::LocalProcessInfo::with_root_pid(root)
+                    .is_some_and(|info| info.children.is_empty());
+            *self.shell_idle.lock() = Some((now, idle));
+            Some(idle)
+        }
+        #[cfg(not(unix))]
+        None
     }
 
     fn palette(&self) -> ColorPalette {
@@ -1474,6 +1557,14 @@ impl LocalPane {
             tmux_domain: None,
         }));
         terminal.set_notification_handler(Box::new(LocalPaneNotifHandler { pane_id }));
+        let pty = Arc::new(Mutex::new(pty));
+        #[cfg(unix)]
+        {
+            let source = Arc::clone(&pty);
+            terminal.set_program_status_process_group(Box::new(move || {
+                source.lock().process_group_leader().map(|pid| pid as u32)
+            }));
+        }
         let last_summary = Mutex::new(PaneSummary::from_terminal(&mut terminal, false));
         let config = Mutex::new(terminal.get_config());
 
@@ -1486,7 +1577,7 @@ impl LocalPane {
                 signaller,
                 killed: false,
             }),
-            pty: Mutex::new(pty),
+            pty,
             writer: Mutex::new(writer),
             domain_id,
             tmux_domain: Mutex::new(None),
@@ -1499,6 +1590,8 @@ impl LocalPane {
             config,
             pending_config: Mutex::new(None),
             pending_focus: Mutex::new(None),
+            pending_seen: Mutex::new(false),
+            shell_idle: Mutex::new(None),
             last_progress: Mutex::new(Progress::default()),
         }
     }
@@ -1509,6 +1602,19 @@ impl LocalPane {
         let pending = self.pending_focus.lock().take();
         if let Some(focused) = pending {
             term.focus_changed(focused);
+        }
+        if std::mem::take(&mut *self.pending_seen.lock()) {
+            self.retire_seen_results(term);
+        }
+    }
+
+    /// Someone has looked: retire the finished or failed results programs
+    /// reported, and have the pane re-judged at once if any went. Asked by
+    /// a frontend that showed the pane to a person -- never by focus alone,
+    /// which code also moves with nobody looking.
+    fn retire_seen_results(&self, term: &mut Terminal) {
+        if term.program_status_seen() {
+            crate::agent_status::nudge(self.pane_id);
         }
     }
 
@@ -1526,6 +1632,7 @@ impl LocalPane {
         self.pending_resize.lock().is_some()
             || self.pending_config.lock().is_some()
             || self.pending_focus.lock().is_some()
+            || *self.pending_seen.lock()
     }
 
     /// Give the terminal a configuration `set_config` could not, with the
@@ -1770,8 +1877,8 @@ mod summary_tests {
         }
     }
 
-    /// A pty that only remembers the sizes it was given.
-    struct RecordingPty(Arc<StdMutex<Vec<PtySize>>>);
+    /// A pty that remembers its sizes and reports a chosen foreground group.
+    struct RecordingPty(Arc<StdMutex<Vec<PtySize>>>, Option<u32>);
 
     impl MasterPty for RecordingPty {
         fn resize(&self, size: PtySize) -> anyhow::Result<()> {
@@ -1789,7 +1896,7 @@ mod summary_tests {
         }
         #[cfg(unix)]
         fn process_group_leader(&self) -> Option<libc::pid_t> {
-            None
+            self.1.map(|pid| pid as libc::pid_t)
         }
         #[cfg(unix)]
         fn as_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
@@ -1840,7 +1947,7 @@ mod summary_tests {
             1,
             terminal,
             Box::new(SleepingChild(exit_rx)),
-            Box::new(RecordingPty(Arc::clone(&sizes))),
+            Box::new(RecordingPty(Arc::clone(&sizes), None)),
             Box::new(Vec::new()),
             0,
             "test".into(),
@@ -1863,6 +1970,65 @@ mod summary_tests {
         assert_eq!(summary.title, title_before);
         assert_eq!(summary.dimensions.cols, 80);
         drop(guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn program_status_keeps_the_process_group_observed_by_the_parser() {
+        let (pane, sizes, _exit) = pane();
+        let report = || {
+            let mut parser = termwiz::escape::parser::Parser::new();
+            let mut actions = vec![];
+            parser.parse(b"\x1b]7501;state=working:app=example\x1b\\", |a| {
+                actions.push(a)
+            });
+            actions
+        };
+        *pane.pty.lock() = Box::new(RecordingPty(Arc::clone(&sizes), Some(9101)));
+        pane.perform_actions(report());
+        *pane.pty.lock() = Box::new(RecordingPty(sizes, Some(9102)));
+        let first = pane.program_status().root.unwrap();
+        assert_eq!(first.process_group, Some(9101));
+        pane.perform_actions(report());
+        let second = pane.program_status().root.unwrap();
+        assert_eq!(second.process_group, Some(9102));
+        assert_ne!(second.serial, first.serial);
+    }
+
+    #[test]
+    fn a_held_exited_pane_retires_active_reports_including_trailing_output() {
+        use wezterm_term::program_status::ProgramState;
+        let (pane, _sizes, _exit) = pane();
+        let report = |state: &str, id: &str| {
+            let mut parser = termwiz::escape::parser::Parser::new();
+            let mut actions = vec![];
+            let osc = format!("\x1b]7501;state={state}:id={id}:app=example\x1b\\");
+            parser.parse(osc.as_bytes(), |action| actions.push(action));
+            pane.perform_actions(actions);
+        };
+        report("working", "work");
+        report("blocked", "input");
+        report("done", "result");
+        assert_eq!(pane.program_status().children.len(), 3);
+
+        // Both Hold and a failed CloseOnCleanExit retain this pane state.
+        *pane.process.lock() = ProcessState::DeadPendingClose { killed: false };
+        assert!(!pane.is_dead());
+        assert!(pane.root_process_id().is_none());
+        let snapshot = pane.program_status();
+        assert_eq!(snapshot.children.len(), 1);
+        assert_eq!(snapshot.children[0].state, ProgramState::Done);
+        assert!(snapshot.children[0].orphaned);
+
+        // The reader may still be draining bytes after the child exits.
+        report("working", "late-work");
+        report("error", "late-result");
+        let snapshot = pane.program_status();
+        assert_eq!(snapshot.children.len(), 2);
+        assert!(snapshot.children.iter().all(|child| child.orphaned));
+        assert!(snapshot.children.iter().all(|child| {
+            matches!(child.state, ProgramState::Done | ProgramState::Error)
+        }));
     }
 
     #[test]

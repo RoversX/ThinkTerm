@@ -84,6 +84,7 @@ impl Client {
     pub fn set_shown(&self, shown: bool) {
         self.app.platform.set_shown(shown);
         if shown {
+            self.app.mark_focused_program_status_seen();
             self.app.resize();
             self.app.request_frame();
             // Listed again now, so a tab it shows is claimed as on any
@@ -150,6 +151,11 @@ impl Client {
     /// Bring an agent's pane on show.
     pub fn agent_reveal(&self, pane: u32) -> bool {
         self.app.agent_reveal(pane as usize)
+    }
+
+    /// Open or fold an agent's sub-task list.
+    pub fn agent_toggle_subtasks(&self, pane: u32) -> bool {
+        self.app.agent_toggle_subtasks(pane as usize)
     }
 
     /// Show the right panel's tab `id` ("agents", "snippets"). False for

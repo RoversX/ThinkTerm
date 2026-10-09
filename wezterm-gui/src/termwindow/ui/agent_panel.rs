@@ -4,7 +4,7 @@
 //! snapshots — the paint path never triggers detection or filesystem
 //! probes.
 
-use crate::agent_status::{self, AgentIcon, AgentPanelAction, AgentState};
+use crate::agent_status::{self, AgentIcon, AgentPanelAction, AgentState, ProgramReportState};
 use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::right_sidebar::{
@@ -30,7 +30,15 @@ const AGENT_WORKING_COLOR: LinearRgba = LinearRgba::with_components(0.12, 0.48, 
 /// An agent waiting on the user: amber, matching the sidebar's other
 /// "needs a human" signal. Deliberately not the notification red, which is
 /// reserved for something being wrong rather than something being asked.
-const AGENT_BLOCKED_COLOR: LinearRgba = LinearRgba::with_components(0.86, 0.45, 0.12, 1.0);
+pub(crate) const AGENT_BLOCKED_COLOR: LinearRgba = LinearRgba::with_components(0.86, 0.45, 0.12, 1.0);
+/// A finished result nobody has looked at yet: the green the left sidebar
+/// gives a finished thread, the same constant so the two cannot drift.
+pub(crate) const AGENT_DONE_COLOR: LinearRgba =
+    crate::termwindow::ui::sidebar::SESSION_STATUS_DONE_COLOR;
+/// The progress bar under a row's description.
+const AGENT_PROGRESS_HEIGHT: usize = 6;
+/// Sub-task lines a row shows before it says how many more there are.
+const AGENT_SUBTASKS_SHOWN: usize = 5;
 
 /// What the toolbar line reports when the list is not empty.
 #[derive(Clone, Copy, Default)]
@@ -38,6 +46,7 @@ pub(crate) struct AgentCounts {
     total: usize,
     working: usize,
     blocked: usize,
+    errored: usize,
     idle: usize,
     unknown: usize,
 }
@@ -52,6 +61,7 @@ impl AgentCounts {
             match agent.state {
                 AgentState::Working => counts.working += 1,
                 AgentState::Blocked => counts.blocked += 1,
+                AgentState::Error => counts.errored += 1,
                 AgentState::Idle => counts.idle += 1,
                 AgentState::Unknown => counts.unknown += 1,
             }
@@ -76,6 +86,9 @@ impl AgentCounts {
         }
         if self.blocked > 0 {
             parts.push(Self::count_text("right-agents-count-blocked", self.blocked));
+        }
+        if self.errored > 0 {
+            parts.push(Self::count_text("right-agents-count-error", self.errored));
         }
         if parts.is_empty() {
             if self.idle > 0 || self.unknown == 0 {
@@ -217,6 +230,17 @@ impl TermWindow {
         let inset = self.ui_px(SIDEBAR_INSET);
 
         let mut agents = agent_status::list_agent_panes();
+        // An open list lasts as long as its sub-tasks: the next batch starts
+        // folded, and an agent that has gone leaves nothing behind.
+        self.right_sidebar_agents_open_subtasks.retain(|pane_id| {
+            agents.iter().any(|agent| {
+                agent.pane_id == *pane_id
+                    && agent
+                        .report
+                        .as_ref()
+                        .is_some_and(|report| !report.children.is_empty())
+            })
+        });
         let counts = AgentCounts::tally(&agents);
         if agents.is_empty() {
             // Nothing but the toolbar: an empty-state card here is a large
@@ -261,36 +285,53 @@ impl TermWindow {
             sidebar_row_element_visible(elem_y, elem_height, content_top, list_top, overflow_bottom)
         };
         let visible_height = viewport_bottom.saturating_sub(list_top);
-        // Rows are spaced like snippet cards: the painted row is
-        // `row_height`, and each one starts a gap further down. The last
-        // row has no trailing gap, so it is not part of the scrollable
-        // height either.
+        // Rows are spaced like snippet cards: each one starts a gap below the
+        // last, and the last has no trailing gap, so it is not part of the
+        // scrollable height either. A row is two lines tall, and grows below
+        // them by what its program reported, as far as the user chose to
+        // see it.
         let row_gap = self.ui_px(SNIPPET_ROW_GAP);
-        let row_pitch = row_height + row_gap;
-        let total_height = agents
-            .len()
-            .saturating_mul(row_pitch)
+        let show = crate::native_settings::agent_status_display();
+        let bar_height = self.ui_px(AGENT_PROGRESS_HEIGHT);
+        let layouts: Vec<AgentRowLayout> = agents
+            .iter()
+            .map(|agent| {
+                AgentRowLayout::of(
+                    agent,
+                    show,
+                    self.right_sidebar_agents_open_subtasks
+                        .contains(&agent.pane_id),
+                    row_height,
+                    cell_height + line_gap,
+                    bar_height + line_gap,
+                )
+            })
+            .collect();
+        let total_height = layouts
+            .iter()
+            .map(|layout| layout.height + row_gap)
+            .sum::<usize>()
             .saturating_sub(row_gap);
         let max_scroll = total_height.saturating_sub(visible_height) as f32;
         self.right_sidebar_agents_scroll = self.right_sidebar_agents_scroll.clamp(0.0, max_scroll);
         let scroll = self.right_sidebar_agents_scroll;
 
-        for (idx, agent) in agents.iter().enumerate() {
-            let row_top = list_top as f32 + (idx * row_pitch) as f32 - scroll;
-            if row_top + row_height as f32 <= list_top as f32 {
+        let mut offset = 0usize;
+        for (agent, layout) in agents.iter().zip(&layouts) {
+            let row_top = list_top as f32 + offset as f32 - scroll;
+            offset += layout.height + row_gap;
+            if row_top + layout.height as f32 <= list_top as f32 {
                 continue;
             }
             if row_top >= viewport_bottom as f32 {
-                // Rows are laid out top-down, so nothing below is visible.
                 break;
             }
-            let Some(band) = agent_row_visible_band(row_top, row_height, list_top, row_clip_bottom)
+            let Some(band) =
+                agent_row_visible_band(row_top, layout.height, list_top, row_clip_bottom)
             else {
                 continue;
             };
             let top = band.top;
-            // Only the hover tint is clipped -- it is the one thing that would
-            // look wrong bleeding past the list, since it reads as a control.
             let hovered = self.is_pointer_over_ui_rect(
                 content_x,
                 band.visible_y,
@@ -308,8 +349,6 @@ impl TermWindow {
                         band.visible_height as f32,
                     ),
                     chrome.sidebar_button_hover_bg,
-                    // Same corner as a snippet card, so the two lists read
-                    // as one control set rather than two designs.
                     self.ui_f32(SIDEBAR_ROW_RADIUS) + 10.0,
                 )
                 .context("agent row hover")?;
@@ -327,11 +366,11 @@ impl TermWindow {
                 }),
             });
 
+            // The icons stay beside the two lines every row has, however far
+            // the row grows below them.
             let icon_x = content_x + inset;
             let icon_y = top + (row_height.saturating_sub(metrics.icon_size)) / 2;
             if visible(icon_y, metrics.icon_size) {
-                // The brand mark when we have one; agents with no logo
-                // (and any id from a custom manifest) keep the generic bot.
                 match agent_status::brand_icon(
                     &agent.agent_id,
                     crate::native_settings::effective_appearance(),
@@ -362,22 +401,11 @@ impl TermWindow {
                 }
             }
 
-            // State chip: spinner while working, alert while blocked. `None`
-            // reserves no width on the right either, so an Unknown agent gets
-            // the whole line for its title.
+            let shown = agent.shown_state();
             let state_size = metrics.icon_size;
             let state_x = content_x + content_width - inset - state_size;
             let state_y = top + (row_height.saturating_sub(state_size)) / 2;
-            // The same three status colors the left sidebar gives a thread,
-            // so "working" and "waiting on you" mean the same thing in both
-            // places: blue for in progress, amber for needs input, and a
-            // muted tick for idle, which must not compete for attention.
-            let state_icon = match agent.state {
-                AgentState::Working => Some((SvgIcon::LoaderCircle, AGENT_WORKING_COLOR, true)),
-                AgentState::Blocked => Some((SvgIcon::CircleAlert, AGENT_BLOCKED_COLOR, false)),
-                AgentState::Idle => Some((SvgIcon::CircleCheck, muted_fg, false)),
-                AgentState::Unknown => None,
-            };
+            let state_icon = agent_state_icon(shown, chrome, muted_fg);
             let has_state_icon = state_icon.is_some();
             if let Some((icon, color, spinning)) =
                 state_icon.filter(|_| visible(state_y, state_size))
@@ -417,12 +445,7 @@ impl TermWindow {
                     foreground,
                 )?;
             }
-            let state_label = match agent.state {
-                AgentState::Working => crate::i18n::tr("right-agents-state-working"),
-                AgentState::Blocked => crate::i18n::tr("right-agents-state-blocked"),
-                AgentState::Idle => crate::i18n::tr("right-agents-state-idle"),
-                AgentState::Unknown => crate::i18n::tr("right-agents-state-unknown"),
-            };
+            let state_label = crate::i18n::tr(agent_state_key(shown));
             // The thread's human name, resolved once per snapshot -- never the
             // internal workspace id, and never a per-frame store walk.
             let detail_line = if agent.place.is_empty() {
@@ -440,6 +463,200 @@ impl TermWindow {
                     text_x,
                     detail_y,
                     text_width,
+                    muted_fg,
+                )?;
+            }
+
+            let Some(report) = agent.report.as_ref() else {
+                continue;
+            };
+            let mut line_y = detail_y + cell_height + line_gap;
+            if layout.message {
+                if visible(line_y, cell_height) {
+                    let mut x = text_x;
+                    if let Some(kind) = report.kind.filter(|_| show.reason) {
+                        let label = crate::i18n::tr(agent_status::blocked_kind_key(kind));
+                        x = self.paint_agent_kind_pill(
+                            layers, ui_font, ui_metrics, &label, x, line_y, text_right,
+                        )?;
+                    }
+                    if let Some(msg) = report.msg.as_deref().filter(|_| show.description) {
+                        let color = if shown == agent_status::ShownState::Error {
+                            chrome.danger
+                        } else {
+                            chrome.secondary_text
+                        };
+                        self.paint_sidebar_text(
+                            layers,
+                            ui_font,
+                            ui_metrics,
+                            msg,
+                            x,
+                            line_y,
+                            text_right.saturating_sub(x),
+                            color,
+                        )?;
+                    }
+                }
+                line_y += cell_height + line_gap;
+            }
+            if let Some(progress) = layout.progress {
+                if visible(line_y, bar_height) {
+                    let radius = bar_height as f32 / 2.0;
+                    self.fill_rounded_rectangle(
+                        layers,
+                        1,
+                        euclid::rect(
+                            text_x as f32,
+                            line_y as f32,
+                            text_width as f32,
+                            bar_height as f32,
+                        ),
+                        chrome.separator,
+                        radius,
+                    )
+                    .context("agent progress track")?;
+                    let filled = (text_width as f32 * f32::from(progress) / 100.0).round();
+                    if filled >= bar_height as f32 {
+                        self.fill_rounded_rectangle(
+                            layers,
+                            1,
+                            euclid::rect(text_x as f32, line_y as f32, filled, bar_height as f32),
+                            chrome.accent,
+                            radius,
+                        )
+                        .context("agent progress")?;
+                    }
+                }
+                line_y += bar_height + line_gap;
+            }
+            let sub_icon = (cell_height * 4 / 5).max(1);
+            let sub_text_gap = sub_icon + self.ui_px(SIDEBAR_ICON_GAP) / 2;
+            if layout.subtask_count > 0 {
+                // The fold line is its own target over the row's: a click on
+                // it opens or folds the list rather than revealing the pane.
+                let hit_top = line_y.max(band.visible_y);
+                let hit_bottom = (line_y + cell_height + line_gap)
+                    .min(band.visible_y + band.visible_height);
+                let mut fold_hovered = false;
+                if hit_bottom > hit_top {
+                    fold_hovered = self.is_pointer_over_ui_rect(
+                        content_x,
+                        hit_top,
+                        content_width,
+                        hit_bottom - hit_top,
+                    );
+                    self.ui_items.push(UIItem {
+                        x: content_x,
+                        y: hit_top,
+                        width: content_width,
+                        height: hit_bottom - hit_top,
+                        item_type: UIItemType::RightSidebarAgent(
+                            AgentPanelAction::ToggleSubtasks(agent.pane_id),
+                        ),
+                    });
+                }
+                if visible(line_y, cell_height) {
+                    let chevron = if layout.subtasks > 0 {
+                        SvgIcon::ChevronDown
+                    } else {
+                        SvgIcon::ChevronRight
+                    };
+                    let icon_y = line_y + (cell_height.saturating_sub(sub_icon)) / 2;
+                    self.paint_sidebar_icon(layers, chevron, text_x, icon_y, sub_icon, muted_fg)?;
+                    let mut args = fluent_bundle::FluentArgs::new();
+                    args.set("count", layout.subtask_count);
+                    let mut line = crate::i18n::tr_args("right-agents-subtasks", &args);
+                    let working = report
+                        .children
+                        .iter()
+                        .filter(|child| matches!(child.state, ProgramReportState::Working))
+                        .count();
+                    if working > 0 {
+                        let mut args = fluent_bundle::FluentArgs::new();
+                        args.set("count", working);
+                        let working = crate::i18n::tr_args("right-agents-count-working", &args);
+                        line = format!("{line} · {working}");
+                    }
+                    let line_x = text_x + sub_text_gap;
+                    self.paint_sidebar_text(
+                        layers,
+                        ui_font,
+                        ui_metrics,
+                        &line,
+                        line_x,
+                        line_y,
+                        text_right.saturating_sub(line_x),
+                        if fold_hovered {
+                            foreground
+                        } else {
+                            chrome.secondary_text
+                        },
+                    )?;
+                }
+                line_y += cell_height + line_gap;
+            }
+            // An open list sits under the fold line's words, a level in.
+            let list_x = text_x + sub_text_gap;
+            for child in report.children.iter().take(layout.subtasks) {
+                if visible(line_y, cell_height) {
+                    let child_state = match child.state {
+                        ProgramReportState::Working => agent_status::ShownState::Working,
+                        ProgramReportState::Blocked => agent_status::ShownState::Blocked,
+                        ProgramReportState::Error => agent_status::ShownState::Error,
+                        ProgramReportState::Done => agent_status::ShownState::Done,
+                        ProgramReportState::Idle => agent_status::ShownState::Idle,
+                    };
+                    let icon_y = line_y + (cell_height.saturating_sub(sub_icon)) / 2;
+                    if let Some((icon, color, spinning)) =
+                        agent_state_icon(child_state, chrome, muted_fg)
+                    {
+                        if spinning {
+                            self.paint_spinning_ui_icon(
+                                layers, 2, icon, list_x, icon_y, sub_icon, color,
+                            )?;
+                        } else {
+                            self.paint_sidebar_icon(layers, icon, list_x, icon_y, sub_icon, color)?;
+                        }
+                    }
+                    let name = child
+                        .title
+                        .as_deref()
+                        .or(child.msg.as_deref())
+                        .unwrap_or(&child.id);
+                    let line = match child.kind.filter(|_| show.reason) {
+                        Some(kind) => format!(
+                            "{name} · {}",
+                            crate::i18n::tr(agent_status::blocked_kind_key(kind))
+                        ),
+                        None => name.to_string(),
+                    };
+                    let line_x = list_x + sub_text_gap;
+                    self.paint_sidebar_text(
+                        layers,
+                        ui_font,
+                        ui_metrics,
+                        &line,
+                        line_x,
+                        line_y,
+                        text_right.saturating_sub(line_x),
+                        chrome.secondary_text,
+                    )?;
+                }
+                line_y += cell_height + line_gap;
+            }
+            if layout.more_subtasks > 0 && visible(line_y, cell_height) {
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("count", layout.more_subtasks);
+                let more = crate::i18n::tr_args("right-agents-more-subtasks", &args);
+                self.paint_sidebar_text(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    &more,
+                    list_x,
+                    line_y,
+                    text_right.saturating_sub(list_x),
                     muted_fg,
                 )?;
             }
@@ -489,6 +706,44 @@ impl TermWindow {
         Ok(())
     }
 
+    /// The pill naming what a blocked program waits for. Returns where the
+    /// text after it starts.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_agent_kind_pill(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        label: &str,
+        x: usize,
+        y: usize,
+        right: usize,
+    ) -> anyhow::Result<usize> {
+        let cell_height = ui_metrics.cell_size.height as usize;
+        let pad = self.ui_px(10);
+        let width = (self.sidebar_text_width(ui_font, label)?.ceil() as usize + pad * 2)
+            .min(right.saturating_sub(x));
+        self.fill_rounded_rectangle(
+            layers,
+            1,
+            euclid::rect(x as f32, y as f32, width as f32, cell_height as f32),
+            AGENT_BLOCKED_COLOR.mul_alpha(0.18),
+            cell_height as f32 / 2.0,
+        )
+        .context("agent waiting reason")?;
+        self.paint_sidebar_text(
+            layers,
+            ui_font,
+            ui_metrics,
+            label,
+            x + pad,
+            y,
+            width.saturating_sub(pad * 2),
+            AGENT_BLOCKED_COLOR,
+        )?;
+        Ok(x + width + self.ui_px(SIDEBAR_ICON_GAP))
+    }
+
     pub(crate) fn mouse_event_right_sidebar_agent(
         &mut self,
         item: UIItem,
@@ -532,6 +787,11 @@ impl TermWindow {
             }
             AgentPanelAction::RevealElsewhere(pane_id) => {
                 self.reveal_agent_pane_elsewhere(pane_id, context);
+            }
+            AgentPanelAction::ToggleSubtasks(pane_id) => {
+                if !self.right_sidebar_agents_open_subtasks.remove(&pane_id) {
+                    self.right_sidebar_agents_open_subtasks.insert(pane_id);
+                }
             }
         }
         context.invalidate();
@@ -666,6 +926,94 @@ struct AgentRowBand {
     /// Top of the part of the card that is inside `[clip_top, clip_bottom)`.
     visible_y: usize,
     visible_height: usize,
+}
+
+/// Which of a row's optional lines it has, and how tall that makes it.
+struct AgentRowLayout {
+    height: usize,
+    /// The description, with the waiting reason in front of it.
+    message: bool,
+    progress: Option<u8>,
+    /// The sub-tasks the folded line counts; none when they are not shown.
+    subtask_count: usize,
+    /// While the list is open: the sub-task lines it lists, then how many
+    /// more there are.
+    subtasks: usize,
+    more_subtasks: usize,
+}
+
+impl AgentRowLayout {
+    fn of(
+        agent: &agent_status::AgentPaneStatus,
+        show: crate::native_settings::NativeAgentStatusDisplay,
+        open: bool,
+        base_height: usize,
+        line: usize,
+        bar: usize,
+    ) -> Self {
+        let Some(report) = agent.report.as_ref() else {
+            return Self {
+                height: base_height,
+                message: false,
+                progress: None,
+                subtask_count: 0,
+                subtasks: 0,
+                more_subtasks: 0,
+            };
+        };
+        let message = (show.description && report.msg.is_some())
+            || (show.reason && report.kind.is_some());
+        let progress = report.progress.filter(|_| show.progress);
+        let subtask_count = if show.subtasks {
+            report.children.len()
+        } else {
+            0
+        };
+        let listed = if open { subtask_count } else { 0 };
+        let subtasks = listed.min(AGENT_SUBTASKS_SHOWN);
+        let more_subtasks = listed - subtasks;
+        let height = base_height
+            + if message { line } else { 0 }
+            + if progress.is_some() { bar } else { 0 }
+            + (usize::from(subtask_count > 0) + subtasks + usize::from(more_subtasks > 0)) * line;
+        Self {
+            height,
+            message,
+            progress,
+            subtask_count,
+            subtasks,
+            more_subtasks,
+        }
+    }
+}
+
+/// The icon a state is shown with: glyph, colour, and whether it spins.
+pub(crate) fn agent_state_icon(
+    state: agent_status::ShownState,
+    chrome: UiPalette,
+    muted_fg: LinearRgba,
+) -> Option<(SvgIcon, LinearRgba, bool)> {
+    use agent_status::ShownState;
+    match state {
+        ShownState::Working => Some((SvgIcon::LoaderCircle, AGENT_WORKING_COLOR, true)),
+        ShownState::Blocked => Some((SvgIcon::CircleAlert, AGENT_BLOCKED_COLOR, false)),
+        ShownState::Error => Some((SvgIcon::CircleX, chrome.danger, false)),
+        ShownState::Done => Some((SvgIcon::CircleCheck, AGENT_DONE_COLOR, false)),
+        ShownState::Idle => Some((SvgIcon::CircleCheck, muted_fg, false)),
+        ShownState::Unknown => None,
+    }
+}
+
+pub(crate) fn agent_state_key(state: agent_status::ShownState) -> &'static str {
+    use agent_status::ShownState;
+    match state {
+        ShownState::Working => "right-agents-state-working",
+        ShownState::Blocked => "right-agents-state-blocked",
+        ShownState::Error => "right-agents-state-error",
+        ShownState::Done => "right-agents-state-done",
+        ShownState::Idle => "right-agents-state-idle",
+        ShownState::Unknown => "right-agents-state-unknown",
+    }
 }
 
 /// Clip one list row to the panel, the way `paint_snippet_card` clips a
@@ -803,6 +1151,68 @@ mod tests {
                 visible_height: 52
             })
         );
+    }
+
+    /// Sub-tasks fold to the one line that counts them: only an open list
+    /// adds its lines, and with sub-tasks switched off there is no line.
+    #[test]
+    fn sub_tasks_fold_to_one_line_until_opened() {
+        use super::AgentRowLayout;
+        use crate::agent_status::{
+            AgentEvidence, AgentPaneStatus, AgentState, ProgramReport, ProgramReportState,
+        };
+        use crate::native_settings::NativeAgentStatusDisplay;
+        use thinkterm_proto::ProgramReportChild;
+
+        let child = |n: usize| ProgramReportChild {
+            id: format!("task-{n}"),
+            state: ProgramReportState::Working,
+            kind: None,
+            progress: None,
+            title: None,
+            msg: None,
+        };
+        let agent = AgentPaneStatus {
+            pane_id: 1,
+            agent_id: "claude".to_string(),
+            state: AgentState::Working,
+            evidence: AgentEvidence::Report,
+            session_id: None,
+            title: String::new(),
+            window_id: None,
+            place: String::new(),
+            workspace: String::new(),
+            report: Some(ProgramReport {
+                state: ProgramReportState::Working,
+                kind: None,
+                progress: None,
+                app: None,
+                title: None,
+                msg: None,
+                children: (0..7).map(child).collect(),
+            }),
+            since_unix: 0,
+        };
+        let show = NativeAgentStatusDisplay::default();
+        let (base, line) = (40, 10);
+
+        let folded = AgentRowLayout::of(&agent, show, false, base, line, 4);
+        assert_eq!(
+            (folded.subtask_count, folded.subtasks, folded.more_subtasks),
+            (7, 0, 0)
+        );
+        assert_eq!(folded.height, base + line);
+
+        let open = AgentRowLayout::of(&agent, show, true, base, line, 4);
+        assert_eq!((open.subtasks, open.more_subtasks), (5, 2));
+        assert_eq!(open.height, base + line * 7, "fold line, five, and the rest");
+
+        let hidden = NativeAgentStatusDisplay {
+            subtasks: false,
+            ..show
+        };
+        let off = AgentRowLayout::of(&agent, hidden, true, base, line, 4);
+        assert_eq!((off.subtask_count, off.height), (0, base));
     }
 
     /// The toolbar line is the only thing explaining a quiet panel, so it

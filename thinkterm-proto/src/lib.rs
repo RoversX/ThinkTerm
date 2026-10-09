@@ -23,7 +23,10 @@ pub mod program;
 pub mod renderable;
 pub mod split;
 
-pub use agent::{AgentEvidence, AgentState, AgentStatus};
+pub use agent::{
+    AgentEvidence, AgentState, AgentStatus, ProgramBlockedKind, ProgramReport, ProgramReportChild,
+    ProgramReportState,
+};
 pub use client::{ClientId, ClientInfo};
 pub use command::{CommandSpec, EnvVar};
 pub use keyassignment::{PaneDirection, ScrollbackEraseMode, SpawnTabDomain};

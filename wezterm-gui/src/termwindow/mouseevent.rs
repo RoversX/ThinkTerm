@@ -1691,7 +1691,10 @@ impl super::TermWindow {
     /// clears `has_animation` on entry and would discard a deadline set here.
     fn update_hover_tooltip(&mut self, item: Option<&UIItem>) {
         let labelled = item
-            .filter(|item| crate::termwindow::tooltip_label_for(&item.item_type).is_some())
+            .filter(|item| {
+                crate::termwindow::tooltip_label_for(&item.item_type).is_some()
+                    || crate::termwindow::thread_has_card(&item.item_type)
+            })
             // The dynamic half of the rule: no tag over a live rename
             // editor, and none for a file row whose label already reads in
             // full. `paint_hover_tooltip` re-checks the same predicate.
@@ -6201,12 +6204,18 @@ impl super::TermWindow {
                         }
                         _ => ContextMenuIcon::Check,
                     };
-                    let label = format!(
-                        "{} — {} · {}",
-                        notification.thread_name,
-                        notification.project_name,
-                        notification.space_name
-                    );
+                    // What the thread's program said beats where the thread
+                    // lives: the reason is what decides which to open first.
+                    let label = match crate::agent_status::thread_reason(&notification.thread_id)
+                    {
+                        Some(reason) => format!("{} — {reason}", notification.thread_name),
+                        None => format!(
+                            "{} — {} · {}",
+                            notification.thread_name,
+                            notification.project_name,
+                            notification.space_name
+                        ),
+                    };
                     self.context_menu_application_item_with_icon(
                         label,
                         icon,

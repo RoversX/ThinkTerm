@@ -12,7 +12,9 @@
 //! double detection structurally impossible — a pane's status has exactly
 //! one producer, the mux that owns it. Do not widen this surface.
 
-pub(crate) use thinkterm_proto::{AgentEvidence, AgentState};
+pub(crate) use thinkterm_proto::{
+    AgentEvidence, AgentState, ProgramBlockedKind, ProgramReport, ProgramReportState,
+};
 
 use crate::termwindow::ui::icons::BrandIcon;
 use crate::ui::icons::SvgIcon;
@@ -40,6 +42,9 @@ pub enum AgentPanelAction {
     /// and pane, then activates the backing thread (workspace switch,
     /// window brought forward) via the left sidebar's activation path.
     RevealElsewhere(PaneId),
+    /// Open or fold the sub-task list of the agent in this pane. Folded
+    /// is the default: one line that counts them.
+    ToggleSubtasks(PaneId),
 }
 
 /// Snapshot of one agent pane for the Agents panel.
@@ -62,6 +67,10 @@ pub(crate) struct AgentPaneStatus {
     /// workspace string. Resolved once per snapshot: the paint loop must
     /// not walk the thread store per row per frame.
     pub place: String,
+    /// The workspace the pane belongs to, as the thread store names it.
+    pub workspace: String,
+    /// What the program said about itself with OSC 7501, when it did.
+    pub report: Option<ProgramReport>,
     /// Unix seconds when `state` last changed, on the detecting host's
     /// clock (approximate across hosts).
     #[allow(dead_code)]
@@ -111,7 +120,9 @@ pub(crate) fn agent_work_status(pane: &dyn Pane) -> Option<WorkspaceThreadWorkSt
     }
     Some(match status.state {
         AgentState::Working => WorkspaceThreadWorkStatus::Running,
-        AgentState::Blocked => WorkspaceThreadWorkStatus::NeedsAttention,
+        // A program stopped on an error wants a look as much as one that
+        // asked a question; the sidebar tells the two apart by colour.
+        AgentState::Blocked | AgentState::Error => WorkspaceThreadWorkStatus::NeedsAttention,
         AgentState::Idle | AgentState::Unknown => WorkspaceThreadWorkStatus::Idle,
     })
 }
@@ -120,7 +131,8 @@ pub(crate) fn agent_work_status(pane: &dyn Pane) -> Option<WorkspaceThreadWorkSt
 /// every window's every tab per frame is wasted work when nothing
 /// changed. Status changes call [`invalidate_agent_pane_cache`], so the
 /// TTL only bounds staleness of titles/workspaces.
-static AGENT_PANES_CACHE: Mutex<Option<(Instant, Vec<AgentPaneStatus>)>> = Mutex::new(None);
+static AGENT_PANES_CACHE: Mutex<Option<(Instant, std::sync::Arc<Vec<AgentPaneStatus>>)>> =
+    Mutex::new(None);
 const AGENT_PANES_TTL: Duration = Duration::from_millis(200);
 
 /// Called from the AgentStatusChanged repaint path so a state change is
@@ -135,10 +147,16 @@ pub(crate) fn invalidate_agent_pane_cache() {
 /// agent status — locally detected or mirrored from a remote server —
 /// minus sessions that reported their own end.
 pub(crate) fn list_agent_panes() -> Vec<AgentPaneStatus> {
+    agent_panes().as_ref().clone()
+}
+
+/// The snapshot behind [`list_agent_panes`], shared rather than copied:
+/// for the callers that only look.
+fn agent_panes() -> std::sync::Arc<Vec<AgentPaneStatus>> {
     if let Ok(guard) = AGENT_PANES_CACHE.lock() {
         if let Some((at, cached)) = guard.as_ref() {
             if at.elapsed() < AGENT_PANES_TTL {
-                return cached.clone();
+                return std::sync::Arc::clone(cached);
             }
         }
     }
@@ -191,14 +209,137 @@ pub(crate) fn list_agent_panes() -> Vec<AgentPaneStatus> {
                 title,
                 window_id,
                 place,
+                workspace,
+                report: status.report,
                 since_unix: status.since_unix,
             })
         })
         .collect();
+    let panes = std::sync::Arc::new(panes);
     if let Ok(mut slot) = AGENT_PANES_CACHE.lock() {
-        *slot = Some((Instant::now(), panes.clone()));
+        *slot = Some((Instant::now(), std::sync::Arc::clone(&panes)));
     }
     panes
+}
+
+/// The agents running in one workspace -- one thread's panes -- that
+/// `keep` accepts, in display order. Served from the panel snapshot, and
+/// only those kept are copied.
+pub(crate) fn agents_in_workspace(
+    workspace: &str,
+    keep: impl Fn(&AgentPaneStatus) -> bool,
+) -> Vec<AgentPaneStatus> {
+    let mut agents: Vec<AgentPaneStatus> = agent_panes()
+        .iter()
+        .filter(|agent| agent.workspace == workspace && keep(agent))
+        .cloned()
+        .collect();
+    sort_for_display(&mut agents);
+    agents
+}
+
+/// Whether some agent in a workspace satisfies `test`, copying nothing:
+/// asked per sidebar row per frame.
+pub(crate) fn any_agent_in_workspace(
+    workspace: &str,
+    test: impl Fn(&AgentPaneStatus) -> bool,
+) -> bool {
+    agent_panes()
+        .iter()
+        .any(|agent| agent.workspace == workspace && test(agent))
+}
+
+/// Whether a pane holds a finished or failed result its program reported
+/// that nobody has seen yet.
+pub(crate) fn has_unseen_result(pane: &dyn Pane) -> bool {
+    pane.agent_status_summary()
+        .is_some_and(|summary| summary.unseen_result)
+}
+
+/// The state a panel row, a tab or a card shows for an agent: its own
+/// report's finer word where it gave one -- `done` is a result waiting to be
+/// seen, not merely idle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShownState {
+    Working,
+    Blocked,
+    Error,
+    Done,
+    Idle,
+    Unknown,
+}
+
+impl AgentPaneStatus {
+    pub(crate) fn shown_state(&self) -> ShownState {
+        match self.state {
+            AgentState::Working => ShownState::Working,
+            AgentState::Blocked => ShownState::Blocked,
+            AgentState::Error => ShownState::Error,
+            AgentState::Unknown => ShownState::Unknown,
+            AgentState::Idle => match self.report.as_ref().map(|report| report.state) {
+                Some(ProgramReportState::Done) => ShownState::Done,
+                _ => ShownState::Idle,
+            },
+        }
+    }
+}
+
+/// One line on why a program is waiting, failed or what it finished --
+/// the reason the bell, a card and a notification give -- shaped by the
+/// user's choice of what to show. `None` when there is nothing to say.
+pub(crate) fn reason_line(agent: &AgentPaneStatus) -> Option<String> {
+    let report = agent.report.as_ref()?;
+    let show = crate::native_settings::agent_status_display();
+    let kind = report
+        .kind
+        .filter(|_| show.reason)
+        .map(|kind| crate::i18n::tr(blocked_kind_key(kind)));
+    let msg = report.msg.clone().filter(|_| show.description);
+    match (kind, msg) {
+        (Some(kind), Some(msg)) => Some(format!("{kind} · {msg}")),
+        (Some(text), None) | (None, Some(text)) => Some(text),
+        (None, None) => None,
+    }
+}
+
+/// Why a thread wants a look, in its most pressing program's own words --
+/// an error before a wait before a finished result. For the bell's list and
+/// the system notification; `None` when no program in it said anything.
+pub(crate) fn thread_reason(thread_id: &str) -> Option<String> {
+    workspace_reason(&crate::workspace_threads::thread_workspace_name(thread_id)?)
+}
+
+/// [`thread_reason`], for the thread a workspace backs.
+pub(crate) fn workspace_reason(workspace: &str) -> Option<String> {
+    /// Long enough for a command line, short enough for a menu.
+    const MAX_CHARS: usize = 80;
+    let rank = |agent: &AgentPaneStatus| match agent.shown_state() {
+        ShownState::Error => 0,
+        ShownState::Blocked => 1,
+        ShownState::Done => 2,
+        _ => 3,
+    };
+    // The most pressing agent that said something: one that did not --
+    // waiting by the look of its screen alone -- must not silence another
+    // that did.
+    let mut agents = agents_in_workspace(workspace, |agent| rank(agent) < 3);
+    agents.sort_by_key(|agent| rank(agent));
+    let reason = agents.iter().find_map(reason_line)?;
+    Some(if reason.chars().count() > MAX_CHARS {
+        let mut cut: String = reason.chars().take(MAX_CHARS - 1).collect();
+        cut.push('…');
+        cut
+    } else {
+        reason
+    })
+}
+
+pub(crate) fn blocked_kind_key(kind: ProgramBlockedKind) -> &'static str {
+    match kind {
+        ProgramBlockedKind::Permission => "agent-kind-permission",
+        ProgramBlockedKind::Question => "agent-kind-question",
+        ProgramBlockedKind::Auth => "agent-kind-auth",
+    }
 }
 
 /// Display order for the Agents panel: stable, and independent of which
@@ -571,8 +712,43 @@ mod tests {
             title: String::new(),
             window_id: None,
             place: place.to_string(),
+            workspace: String::new(),
+            report: None,
             since_unix: 0,
         }
+    }
+
+    /// A program's own report decides what the row says: `done` is a result
+    /// to look at, not idle, and the reason leads with what it waits for.
+    #[test]
+    fn a_report_names_the_state_and_the_reason() {
+        use thinkterm_proto::ProgramReport;
+        let mut agent = row("alpha", "claude", 1);
+        assert_eq!(agent.shown_state(), super::ShownState::Idle);
+        assert_eq!(super::reason_line(&agent), None);
+
+        let report = |state, kind, msg: Option<&str>| ProgramReport {
+            state,
+            kind,
+            progress: None,
+            app: Some("claude-code".to_string()),
+            title: None,
+            msg: msg.map(str::to_string),
+            children: Vec::new(),
+        };
+        agent.report = Some(report(super::ProgramReportState::Done, None, Some("Fixed it")));
+        assert_eq!(agent.shown_state(), super::ShownState::Done);
+        assert_eq!(super::reason_line(&agent).as_deref(), Some("Fixed it"));
+
+        agent.state = super::AgentState::Blocked;
+        agent.report = Some(report(
+            super::ProgramReportState::Blocked,
+            Some(super::ProgramBlockedKind::Permission),
+            Some("Bash: npm test"),
+        ));
+        assert_eq!(agent.shown_state(), super::ShownState::Blocked);
+        let reason = super::reason_line(&agent).unwrap();
+        assert!(reason.ends_with(" · Bash: npm test"), "{}", reason);
     }
 
     /// The panel order must not depend on which Space is frontmost:

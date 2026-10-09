@@ -660,6 +660,8 @@ pub(crate) struct NativeChromeSettings {
     /// Agents panel. Absent means on -- it was off by default while the
     /// detection was new, and is a panel toggle like the three above now.
     pub(crate) agent_panel_enabled: Option<bool>,
+    /// What is shown of the state programs report about themselves.
+    pub(crate) agent_status_display: NativeAgentStatusDisplay,
     /// The panels plugins add to the right sidebar, as the plugin host last
     /// listed them (`plugins::follow_panels`): offered from the start,
     /// before the host is asked.
@@ -772,6 +774,33 @@ impl Default for NativeWindowSettings {
     }
 }
 
+
+/// What the sidebar's thread cards, the bell and the Agents panel show of
+/// the state programs report about themselves (OSC 7501). All of it, unless
+/// the user turned a part off in Settings › Agents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct NativeAgentStatusDisplay {
+    /// What it is doing, what it finished, or why it stopped.
+    pub(crate) description: bool,
+    /// Whether it waits for a permission, an answer or a sign-in.
+    pub(crate) reason: bool,
+    pub(crate) progress: bool,
+    /// Background tasks and sub-agents, in the Agents panel.
+    pub(crate) subtasks: bool,
+}
+
+impl Default for NativeAgentStatusDisplay {
+    fn default() -> Self {
+        Self {
+            description: true,
+            reason: true,
+            progress: true,
+            subtasks: true,
+        }
+    }
+}
+
 pub(crate) const DEFAULT_REMOTE_SFTP_IDLE_MINUTES: u32 = 15;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -789,6 +818,9 @@ pub(crate) struct NativeWorkspaceSettings {
     /// Play a short sound when a thread you are not watching finishes, or when
     /// one starts waiting on you.
     pub(crate) notification_sounds_enabled: bool,
+    /// While ThinkTerm is in the background, tell the system when a thread
+    /// finishes, starts waiting on you, or stops on an error.
+    pub(crate) system_notifications_enabled: bool,
     /// Updating a remote mux server hands its sessions to the new version
     /// instead of stopping it; off, the update asks whether to stop it.
     pub(crate) remote_update_keeps_sessions: bool,
@@ -805,6 +837,7 @@ impl Default for NativeWorkspaceSettings {
             remote_download_directory: String::new(),
             remote_drop_destination: String::new(),
             notification_sounds_enabled: true,
+            system_notifications_enabled: true,
             remote_update_keeps_sessions: true,
             // Preserve the behavior of older settings files without this field.
             // Fresh installs enable it in ThinkTermNativeSettings::for_new_install.
@@ -2325,6 +2358,16 @@ pub(crate) fn pane_header_font_size() -> f64 {
 
 pub(crate) fn notification_sounds_enabled() -> bool {
     load().workspaces.notification_sounds_enabled
+}
+
+pub(crate) fn system_notifications_enabled() -> bool {
+    load_shared().workspaces.system_notifications_enabled
+}
+
+/// What is shown of programs' own status reports. `load_shared`: asked
+/// while painting.
+pub(crate) fn agent_status_display() -> NativeAgentStatusDisplay {
+    load_shared().chrome.agent_status_display
 }
 
 pub(crate) fn remote_update_keeps_sessions() -> bool {

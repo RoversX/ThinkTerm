@@ -823,6 +823,13 @@ impl Pane for ClientPane {
         self.agent_status.lock().clone()
     }
 
+    fn agent_status_summary(&self) -> Option<mux::agent_status::AgentStatusSummary> {
+        self.agent_status
+            .lock()
+            .as_ref()
+            .map(mux::agent_status::AgentStatusSummary::of)
+    }
+
     fn foreground_program(&self) -> Option<thinkterm_proto::ForegroundProgram> {
         self.foreground_program.lock().clone()
     }
@@ -1128,6 +1135,29 @@ impl Pane for ClientPane {
             self.advise_focus();
             *self.unseen_output.lock() = false;
         }
+    }
+
+    fn program_status_seen(&self) {
+        // The records live with the mux that owns the pane; tell it only
+        // when there is a result to retire.
+        let unseen = self
+            .agent_status
+            .lock()
+            .as_ref()
+            .and_then(|status| status.report.as_ref())
+            .is_some_and(thinkterm_proto::ProgramReport::has_unseen_result);
+        if !unseen || self.client.remote_tab_input_is_blocked() {
+            return;
+        }
+        let client = Arc::clone(&self.client);
+        let pane_id = self.remote_pane_id;
+        promise::spawn::spawn(async move {
+            client
+                .client
+                .mark_program_status_seen(codec::MarkProgramStatusSeen { pane_id })
+                .await
+        })
+        .detach();
     }
 
     fn is_remote_mirror(&self) -> bool {

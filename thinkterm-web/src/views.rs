@@ -286,7 +286,7 @@ pub fn strings() -> std::collections::BTreeMap<&'static str, String> {
 
 /// Labels with a number in them: sent with `COUNT_SLOT` where it goes, for
 /// the page to fill in (`sCount` in client.svelte.ts).
-pub const COUNTED_KEYS: &[&str] = &["ssh-system-hosts"];
+pub const COUNTED_KEYS: &[&str] = &["ssh-system-hosts", "right-agents-more-subtasks"];
 pub const COUNT_SLOT: &str = "{count}";
 
 #[cfg(test)]

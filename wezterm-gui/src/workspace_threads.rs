@@ -2927,6 +2927,65 @@ fn announce_work(announcement: WorkAnnouncement, finished_after: Option<Duration
     }
 }
 
+/// How soon one thread may raise another system notification: a program
+/// flapping between states must not turn into a stream of banners.
+const SYSTEM_NOTIFICATION_INTERVAL: Duration = Duration::from_secs(30);
+
+lazy_static::lazy_static! {
+    /// When each thread, by workspace, last raised a system notification.
+    /// Entries past the interval are dropped whenever one is added.
+    static ref SYSTEM_NOTIFIED: Mutex<HashMap<String, std::time::Instant>> =
+        Mutex::new(HashMap::new());
+}
+
+/// Whether the system will take a notification from this process. On macOS
+/// it must be an app bundle: UNUserNotificationCenter throws for a bare
+/// binary -- a development build -- and takes the whole app down with it.
+fn can_notify_system() -> bool {
+    !cfg!(target_os = "macos")
+        || std::env::current_exe()
+            .is_ok_and(|exe| exe.to_string_lossy().contains(".app/Contents/MacOS/"))
+}
+
+/// Tell the system a thread wants a look -- it finished, it waits on you, or
+/// its program stopped on an error -- when nobody is looking at ThinkTerm.
+/// The same moments the sounds mark, with the program's own words when it
+/// gave any.
+fn notify_system(workspace: &str, announcement: WorkAnnouncement, finished_after: Option<Duration>) {
+    if std::env::var_os(DISABLE_SOUND_ENV).is_some()
+        || crate::frontend::try_front_end().is_none()
+        || !can_notify_system()
+        || !crate::native_settings::system_notifications_enabled()
+        || crate::termwindow::app_has_focus()
+        || !should_play_work_sound(announcement, finished_after)
+    {
+        return;
+    }
+    {
+        let now = std::time::Instant::now();
+        let mut notified = SYSTEM_NOTIFIED.lock();
+        if notified
+            .get(workspace)
+            .is_some_and(|at| now.duration_since(*at) < SYSTEM_NOTIFICATION_INTERVAL)
+        {
+            return;
+        }
+        notified.retain(|_, at| now.duration_since(*at) < SYSTEM_NOTIFICATION_INTERVAL);
+        notified.insert(workspace.to_string(), now);
+    }
+    let errored = crate::agent_status::any_agent_in_workspace(workspace, |agent| {
+        agent.state == crate::agent_status::AgentState::Error
+    });
+    let state = crate::i18n::tr(match announcement {
+        WorkAnnouncement::Finished => "notification-thread-finished",
+        WorkAnnouncement::NeedsInput if errored => "notification-thread-error",
+        WorkAnnouncement::NeedsInput => "notification-thread-needs-input",
+    });
+    let thread = thread_display_name_for_workspace(workspace).unwrap_or_else(|| workspace.to_string());
+    let reason = crate::agent_status::workspace_reason(workspace).unwrap_or_default();
+    wezterm_toast_notification::persistent_toast_notification(&format!("{thread} · {state}"), &reason);
+}
+
 pub fn refresh_thread_work_for_workspace(workspace: &str) -> bool {
     let (raw_observed, waiting_panes) = scan_workspace_work_status(workspace);
     let observed = debounce_work_status(workspace, raw_observed);
@@ -2950,6 +3009,7 @@ pub fn refresh_thread_work_for_workspace(workspace: &str) -> bool {
     };
     if let Some(announcement) = change.announce {
         announce_work(announcement, finished_after);
+        notify_system(workspace, announcement, finished_after);
     }
     if change.should_persist {
         schedule_workspace_thread_store_persist();

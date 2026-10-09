@@ -5,7 +5,9 @@
 use crate::tree::TreeModel;
 use serde::Serialize;
 use thinkterm_i18n::{tr, tr_args, FluentArgs};
-use thinkterm_proto::{AgentState, PaneId, WindowId};
+use thinkterm_proto::{
+    AgentState, PaneId, ProgramBlockedKind, ProgramReportChild, ProgramReportState, WindowId,
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AgentRow {
@@ -22,6 +24,66 @@ pub struct AgentRow {
     pub place: String,
     /// The brand or fallback icon the page draws.
     pub icon: &'static str,
+    /// What the program said about itself (OSC 7501): what it waits for,
+    /// what it is doing or why it stopped, how far it got, its sub-tasks.
+    pub kind: Option<String>,
+    pub said: Option<String>,
+    pub progress: Option<u8>,
+    /// "7 sub-tasks · 5 working": the one line the sub-tasks fold into,
+    /// as on the desktop; empty when there are none.
+    pub subtasks_summary: String,
+    /// Whether that line is open, listing them.
+    pub subtasks_open: bool,
+    /// While it is open: the sub-tasks listed, and how many more there are.
+    pub subtasks: Vec<AgentSubtask>,
+    pub more_subtasks: usize,
+}
+
+/// One of a program's sub-tasks, as the desktop's panel lists them.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AgentSubtask {
+    pub state: &'static str,
+    pub label: String,
+}
+
+/// Sub-tasks a row lists before it says how many more there are, as the
+/// desktop's `AGENT_SUBTASKS_SHOWN`.
+const SUBTASKS_SHOWN: usize = 5;
+
+/// The line a row's sub-tasks fold into, worded as the desktop's panel
+/// words it: how many, and how many of them are working.
+fn subtasks_summary(children: &[ProgramReportChild]) -> String {
+    if children.is_empty() {
+        return String::new();
+    }
+    let count = |key: &str, n: usize| {
+        let mut args = FluentArgs::new();
+        args.set("count", n as i64);
+        tr_args(key, &args)
+    };
+    let all = count("right-agents-subtasks", children.len());
+    match children.iter().filter(|child| child.state == ProgramReportState::Working).count() {
+        0 => all,
+        working => format!("{all} · {}", count("right-agents-count-working", working)),
+    }
+}
+
+fn kind_label(kind: ProgramBlockedKind) -> String {
+    tr(match kind {
+        ProgramBlockedKind::Permission => "agent-kind-permission",
+        ProgramBlockedKind::Question => "agent-kind-question",
+        ProgramBlockedKind::Auth => "agent-kind-auth",
+    })
+}
+
+fn report_state_name(state: ProgramReportState) -> &'static str {
+    match state {
+        ProgramReportState::Working => "working",
+        ProgramReportState::Blocked => "blocked",
+        ProgramReportState::Error => "error",
+        ProgramReportState::Done => "done",
+        ProgramReportState::Idle => "idle",
+    }
 }
 
 /// One tab of the right panel's selector, as the desktop lists them
@@ -165,17 +227,32 @@ fn state_key(state: AgentState) -> (&'static str, &'static str) {
         AgentState::Blocked => ("blocked", "right-agents-state-blocked"),
         AgentState::Idle => ("idle", "right-agents-state-idle"),
         AgentState::Unknown => ("unknown", "right-agents-state-unknown"),
+        AgentState::Error => ("error", "right-agents-state-error"),
     }
 }
 
 /// The rows, sorted as the desktop sorts them: by place, agent, pane --
 /// never floating the current window, so a switch does not reorder them.
-pub fn rows(tree: &TreeModel, current_window: WindowId, title_of: impl Fn(PaneId) -> Option<String>) -> Vec<AgentRow> {
+/// `open` says whose sub-task lists are open; the rest stay folded.
+pub fn rows(
+    tree: &TreeModel,
+    current_window: WindowId,
+    title_of: impl Fn(PaneId) -> Option<String>,
+    open: impl Fn(PaneId) -> bool,
+) -> Vec<AgentRow> {
     let mut rows: Vec<AgentRow> = tree
         .agent_entries()
         .map(|(pane, agent_id, state, title)| {
             let (place, window) = tree.place_of_pane(pane);
-            let (state_name, state_label) = state_key(state);
+            let report = tree.agent_report(pane);
+            // A result nobody has seen is its own word, not merely idle.
+            let (state_name, state_label) = match (state, report.map(|r| r.state)) {
+                (AgentState::Idle, Some(ProgramReportState::Done)) => ("done", "right-agents-state-done"),
+                _ => state_key(state),
+            };
+            let children = report.map(|r| r.children.as_slice()).unwrap_or_default();
+            let subtasks_open = !children.is_empty() && open(pane);
+            let listed = if subtasks_open { children } else { &[] };
             AgentRow {
                 pane,
                 window,
@@ -187,6 +264,26 @@ pub fn rows(tree: &TreeModel, current_window: WindowId, title_of: impl Fn(PaneId
                 place,
                 icon: icon(agent_id),
                 agent_id: agent_id.to_string(),
+                kind: report.and_then(|r| r.kind).map(kind_label),
+                said: report.and_then(|r| r.msg.clone()),
+                progress: report.and_then(|r| r.progress),
+                subtasks_summary: subtasks_summary(children),
+                subtasks_open,
+                subtasks: listed
+                    .iter()
+                    .take(SUBTASKS_SHOWN)
+                    .map(|child| {
+                        let name = child.title.as_deref().or(child.msg.as_deref()).unwrap_or(&child.id);
+                        AgentSubtask {
+                            state: report_state_name(child.state),
+                            label: match child.kind {
+                                Some(kind) => format!("{name} · {}", kind_label(kind)),
+                                None => name.to_string(),
+                            },
+                        }
+                    })
+                    .collect(),
+                more_subtasks: listed.len().saturating_sub(SUBTASKS_SHOWN),
             }
         })
         .collect();
@@ -204,7 +301,10 @@ pub fn rows(tree: &TreeModel, current_window: WindowId, title_of: impl Fn(PaneId
 /// else "No agents detected".
 pub fn summary(rows: &[AgentRow]) -> String {
     let count = |s: &str| rows.iter().filter(|r| r.state == s).count();
-    let (working, blocked, idle, unknown) = (count("working"), count("blocked"), count("idle"), count("unknown"));
+    // A finished result is idle to the counts, as the desktop's tally has it.
+    let (working, blocked, idle, unknown) =
+        (count("working"), count("blocked"), count("idle") + count("done"), count("unknown"));
+    let errored = count("error");
     if rows.is_empty() {
         return tr("right-agents-none");
     }
@@ -219,6 +319,9 @@ pub fn summary(rows: &[AgentRow]) -> String {
     }
     if blocked > 0 {
         parts.push(part("right-agents-count-blocked", blocked));
+    }
+    if errored > 0 {
+        parts.push(part("right-agents-count-error", errored));
     }
     if parts.is_empty() {
         if idle > 0 {
@@ -247,6 +350,13 @@ mod tests {
             state_label: String::new(),
             place: place.into(),
             icon: icon(agent),
+            kind: None,
+            said: None,
+            progress: None,
+            subtasks_summary: String::new(),
+            subtasks_open: false,
+            subtasks: Vec::new(),
+            more_subtasks: 0,
         }
     }
 
@@ -258,6 +368,55 @@ mod tests {
         assert_eq!(icon("gemini"), "bot");
     }
 
+    /// Sub-tasks fold to the one line that counts them, as on the desktop;
+    /// only an open list carries them.
+    #[test]
+    fn sub_tasks_fold_to_one_line_until_opened() {
+        use thinkterm_proto::{AgentEvidence, AgentStatus, ProgramReport};
+        let child = |n: usize, state| ProgramReportChild {
+            id: format!("task-{n}"),
+            state,
+            kind: None,
+            progress: None,
+            title: None,
+            msg: None,
+        };
+        let mut children: Vec<_> = (0..5).map(|n| child(n, ProgramReportState::Working)).collect();
+        children.extend((5..7).map(|n| child(n, ProgramReportState::Done)));
+        let mut tree = TreeModel::default();
+        tree.apply_agent(
+            5,
+            Some(&AgentStatus {
+                agent_id: "claude".into(),
+                state: AgentState::Working,
+                evidence: AgentEvidence::Report,
+                session_id: None,
+                since_unix: 0,
+                ended: false,
+                report: Some(ProgramReport {
+                    state: ProgramReportState::Working,
+                    kind: None,
+                    progress: None,
+                    app: None,
+                    title: None,
+                    msg: None,
+                    children,
+                }),
+            }),
+        );
+
+        let folded = rows(&tree, 1, |_| None, |_| false).remove(0);
+        assert!(!folded.subtasks_open);
+        assert!(folded.subtasks.is_empty() && folded.more_subtasks == 0);
+        let line = &folded.subtasks_summary;
+        assert!(line.contains('7') && line.contains('5'), "{line}");
+
+        let open = rows(&tree, 1, |_| None, |pane| pane == 5).remove(0);
+        assert!(open.subtasks_open);
+        assert_eq!((open.subtasks.len(), open.more_subtasks), (5, 2));
+        assert_eq!(open.subtasks_summary, folded.subtasks_summary);
+    }
+
     #[test]
     fn the_summary_counts_like_the_desktop() {
         assert_eq!(summary(&[]), "No agents detected");
@@ -265,5 +424,10 @@ mod tests {
         assert_eq!(summary(&rows), "2 working · 1 needs input");
         let quiet = vec![row(1, "claude", "idle", "a"), row(2, "codex", "unknown", "a"), row(3, "pi", "unknown", "a")];
         assert_eq!(summary(&quiet), "1 idle · 2 unknown");
+        // A finished result counts as idle; an error is named.
+        let done = vec![row(1, "claude", "done", "a")];
+        assert_eq!(summary(&done), "1 idle");
+        let failed = vec![row(1, "claude", "error", "a"), row(2, "codex", "working", "a")];
+        assert_eq!(summary(&failed), "1 working · 1 error");
     }
 }

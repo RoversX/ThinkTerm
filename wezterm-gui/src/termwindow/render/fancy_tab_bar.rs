@@ -852,7 +852,7 @@ impl crate::TermWindow {
         // draw it; the tab's status keeps its own place after it either way.
         let icon_right = match crate::tab_icons::resolve_window_tab() {
             Some(icon) => {
-                self.paint_tab_circle_icon(layers, &icon, tab_surface_y, button_size, false)?
+                self.paint_tab_circle_icon(layers, &icon, tab_surface_y, button_size, false, None)?
             }
             None => {
                 let icon_x = self.ui_px(TAB_CONTENT_INSET);

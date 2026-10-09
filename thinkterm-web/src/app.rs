@@ -442,6 +442,10 @@ pub struct Inner<P: Platform, L: Link> {
     /// whether the page has the panel up at all.
     right_panel: String,
     right_panel_shown: bool,
+    /// Agents whose sub-task list is open in the Agents panel; folded is
+    /// the default, as on the desktop. Each look at the panel drops the
+    /// ones with no sub-tasks left.
+    open_subtasks: std::collections::HashSet<PaneId>,
     /// The plugin panel on show in the right panel, while one is.
     plugin_panel: Option<crate::plugin_panel::PanelModel>,
     /// What the page last said of the room a plugin panel has: its size,
@@ -715,6 +719,7 @@ impl<P: Platform, L: Link> App<P, L> {
             claim: Claim::Idle,
             right_panel: "agents".to_string(),
             right_panel_shown: false,
+            open_subtasks: Default::default(),
             plugin_panel: None,
             plugin_panel_env: None,
             plugin_extended: None,
@@ -816,6 +821,8 @@ impl<P: Platform, L: Link> App<P, L> {
     pub fn visibility_changed(self: &Rc<Self>, visible: bool) {
         self.animations_visible.set(visible);
         if visible {
+            // Coming back to the page is looking at the pane on show.
+            self.mark_focused_program_status_seen();
             self.request_frame();
         } else {
             self.schedule_animation(None);
@@ -1460,6 +1467,8 @@ impl<P: Platform, L: Link> App<P, L> {
                 drop(inner);
                 self.inner.borrow_mut().tree.apply_agent(pane_id, status.as_ref());
                 Self::render_strip(&self.inner.borrow());
+                // A result that lands in the pane on show is seen as it lands.
+                self.mark_seen(pane_id);
             }
             Pdu::ForegroundProgramChanged(codec::ForegroundProgramChanged { pane_id, program }) => {
                 drop(inner);
@@ -2424,7 +2433,12 @@ impl<P: Platform, L: Link> App<P, L> {
     pub fn focus_pane(self: &Rc<Self>, pane_id: PaneId, advise: bool) {
         let link = {
             let mut inner = self.inner.borrow_mut();
-            if !inner.panes.contains_key(&pane_id) || inner.focused_pane == pane_id {
+            if !inner.panes.contains_key(&pane_id) {
+                return;
+            }
+            if inner.focused_pane == pane_id {
+                drop(inner);
+                self.mark_seen(pane_id);
                 return;
             }
             inner.focused_pane = pane_id;
@@ -2440,6 +2454,43 @@ impl<P: Platform, L: Link> App<P, L> {
         if advise {
             Self::advise_focus(&self.platform, link.0, pane_id, link.1);
         }
+        self.mark_seen(pane_id);
+    }
+
+    /// A machine or tab has come on show, including one whose focus stayed put.
+    pub fn mark_focused_program_status_seen(self: &Rc<Self>) {
+        let focused = self.inner.borrow().focused_pane;
+        self.mark_seen(focused);
+    }
+
+    /// Tell the server a pane has been looked at, when a program in it left
+    /// a finished or failed result: only the mux that owns the pane keeps
+    /// those, and it hears of a look no other way. Sent and forgotten.
+    fn mark_seen(self: &Rc<Self>, pane_id: PaneId) {
+        if self.retired.get() || !self.animations_visible.get() || !self.platform.shown() {
+            return;
+        }
+        let link = {
+            let inner = self.inner.borrow();
+            if inner.focused_pane != pane_id
+                || !inner.panes.contains_key(&pane_id)
+                || !inner.tree.has_unseen_result(pane_id)
+            {
+                return;
+            }
+            inner.link.clone()
+        };
+        self.platform.spawn(Box::pin(async move {
+            let pdu = Pdu::MarkProgramStatusSeen(codec::MarkProgramStatusSeen { pane_id });
+            if let Err(err) = thinkterm_session::host::request(&link, pdu, |p| match p {
+                Pdu::UnitResponse(_) => Ok(()),
+                other => Err(other),
+            })
+            .await
+            {
+                log::warn!("result not marked seen: {err:#}");
+            }
+        }));
     }
 
     /// Tell the server (and so the desktop) which pane has the focus.
@@ -3116,7 +3167,7 @@ impl<P: Platform, L: Link> App<P, L> {
             match agents {
                 Ok(entries) => {
                     let mut inner = app.inner.borrow_mut();
-                    inner.tree.agents.clear();
+                    inner.tree.clear_agents();
                     for e in entries {
                         inner.tree.apply_agent(e.pane_id, Some(&e.status));
                         inner.tree.record_agent_details(e.pane_id, &e.status.agent_id, &e.title);
@@ -3124,6 +3175,7 @@ impl<P: Platform, L: Link> App<P, L> {
                 }
                 Err(err) => log::warn!("fetching agent statuses: {err:#}"),
             }
+            app.mark_focused_program_status_seen();
             let programs = thinkterm_session::host::request(&link, Pdu::GetForegroundPrograms(codec::GetForegroundPrograms {}), |p| match p {
                 Pdu::GetForegroundProgramsResponse(r) => Ok(r.programs),
                 other => Err(other),
@@ -3733,6 +3785,7 @@ impl<P: Platform, L: Link> App<P, L> {
             Self::render_strip(&inner);
             (fresh, changed, first_layout)
         };
+        self.mark_focused_program_status_seen();
         // A pane's first push comes when something asks after it: one
         // liveness poll each, and the answer is not waited for.
         self.sync_frame_control();
@@ -4268,10 +4321,20 @@ impl<P: Platform, L: Link> App<P, L> {
 
     /// The Agents panel: every pane an agent runs in, and the summary line.
     pub fn agents_view(&self) -> crate::agents::AgentsView {
-        let inner = self.inner.borrow();
-        let rows = crate::agents::rows(&inner.tree, inner.window_id, |pane| {
-            inner.panes.get(&pane).map(|c| crate::navbar::display_title(&c.title).0)
-        });
+        let mut inner = self.inner.borrow_mut();
+        let inner = &mut *inner;
+        // An open list lasts as long as its sub-tasks: the next batch
+        // starts folded, as on the desktop.
+        let tree = &inner.tree;
+        inner
+            .open_subtasks
+            .retain(|pane| tree.agent_report(*pane).is_some_and(|r| !r.children.is_empty()));
+        let rows = crate::agents::rows(
+            &inner.tree,
+            inner.window_id,
+            |pane| inner.panes.get(&pane).map(|c| crate::navbar::display_title(&c.title).0),
+            |pane| inner.open_subtasks.contains(&pane),
+        );
         let summary = crate::agents::summary(&rows);
         let tabs = Self::panel_tabs(&inner);
         let labeled = crate::agents::labeled(&tabs);
@@ -5262,6 +5325,15 @@ impl<P: Platform, L: Link> App<P, L> {
         Self::spawn_drain(&platform, &cell.session, start);
         drop(inner);
         self.request_frame();
+        true
+    }
+
+    /// Open or fold an agent's sub-task list in the Agents panel.
+    pub fn agent_toggle_subtasks(&self, pane: PaneId) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        if !inner.open_subtasks.remove(&pane) {
+            inner.open_subtasks.insert(pane);
+        }
         true
     }
 

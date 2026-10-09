@@ -536,6 +536,12 @@ pub trait Pane: Downcast + Send + Sync {
         crate::agent_status::status_for_pane(self.pane_id())
     }
 
+    /// [`agent_status`](Self::agent_status) without its report's text: what
+    /// a painter asking every frame needs, without copying the rest.
+    fn agent_status_summary(&self) -> Option<crate::agent_status::AgentStatusSummary> {
+        crate::agent_status::summary_for_pane(self.pane_id())
+    }
+
     /// The program leading this pane's terminal, as observed by the mux
     /// that owns it. Same shape as `agent_status`: locally-owned panes
     /// answer from this process's observer, ClientPane from its server.
@@ -555,6 +561,36 @@ pub trait Pane: Downcast + Send + Sync {
     /// Drop retained agent OSC evidence so a pane's next occupant does not
     /// inherit the previous agent's signals. No-op by default.
     fn clear_agent_osc_evidence(&self) {}
+
+    /// What programs in this pane have reported about themselves with
+    /// OSC 7501. Empty by default: remote mirrors are never classified
+    /// locally.
+    fn program_status(&self) -> wezterm_term::program_status::ProgramStatusSnapshot {
+        Default::default()
+    }
+
+    /// The program behind the pane's OSC 7501 records has gone: drop all
+    /// but the results nobody has seen yet, among the records received up
+    /// to serial `through` -- a snapshot's `latest_serial`. No-op by default.
+    fn end_program_status(&self, _through: u64) {}
+
+    /// Someone has looked at the pane: retire the finished or failed
+    /// results its programs reported. No-op by default.
+    fn program_status_seen(&self) {}
+
+    /// Whether the pane's own shell holds the foreground without child
+    /// processes. This does not establish that it is at a prompt: builtins
+    /// and functions can run in the shell itself. `None` where the platform
+    /// cannot tell.
+    fn shell_is_foreground(&self) -> Option<bool> {
+        None
+    }
+
+    /// The process group holding the pane's foreground, asked fresh. `None`
+    /// where the platform has no such thing or cannot tell.
+    fn foreground_process_group(&self) -> Option<u32> {
+        None
+    }
 
     fn get_foreground_process_name(&self, _policy: CachePolicy) -> Option<String> {
         None

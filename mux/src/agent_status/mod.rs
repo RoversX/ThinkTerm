@@ -33,7 +33,11 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use thinkterm_proto::{AgentEvidence, AgentState, AgentStatus};
+use thinkterm_proto::{
+    AgentEvidence, AgentState, AgentStatus, ProgramBlockedKind, ProgramReport, ProgramReportChild,
+    ProgramReportState,
+};
+use wezterm_term::program_status::{ProgramState, ProgramStatusRecord};
 
 /// Minimum interval between screen reads for one pane even while output
 /// is flowing. Must be comfortably larger than EVAL_INTERVAL to do
@@ -94,6 +98,10 @@ struct AgentPaneRecord {
     /// alive when the contract itself has gone stale.
     contract_raw: Option<String>,
     contract_leader: Option<String>,
+    /// Source of the last accepted report, so an unnamed successor cannot
+    /// inherit this pane's previous program name.
+    report_process_group: Option<u32>,
+    report_orphaned: bool,
 }
 
 lazy_static::lazy_static! {
@@ -104,6 +112,11 @@ lazy_static::lazy_static! {
     static ref LAST_EVAL: Mutex<HashMap<PaneId, Instant>> = Mutex::new(HashMap::new());
     static ref PROCESS_PREFERENCE: RwLock<Option<Box<dyn Fn() -> bool + Send + Sync>>> =
         RwLock::new(None);
+    /// Who filed each pane's OSC 7501 root. Kept apart from the registry:
+    /// a report must stay pinned to its program across the records the
+    /// registry drops and makes. A pane's entry goes when its root does, or
+    /// with the pane.
+    static ref REPORT_FILERS: Mutex<HashMap<PaneId, ReportFiler>> = Mutex::new(HashMap::new());
 }
 static TICK_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -112,6 +125,43 @@ static INSTALLED: AtomicBool = AtomicBool::new(false);
 /// threads' hot path, so it runs only on the refresh points (init, the
 /// safety tick, config reload, the settings toggle).
 static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// What a painter needs of an agent's status every frame, without its
+/// report's text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentStatusSummary {
+    pub state: AgentState,
+    pub evidence: AgentEvidence,
+    pub ended: bool,
+    /// The program's own word on its state, when it gave one.
+    pub report_state: Option<ProgramReportState>,
+    /// A finished or failed result nobody has looked at yet.
+    pub unseen_result: bool,
+}
+
+impl AgentStatusSummary {
+    pub fn of(status: &AgentStatus) -> Self {
+        Self {
+            state: status.state,
+            evidence: status.evidence,
+            ended: status.ended,
+            report_state: status.report.as_ref().map(|report| report.state),
+            unseen_result: status
+                .report
+                .as_ref()
+                .is_some_and(ProgramReport::has_unseen_result),
+        }
+    }
+}
+
+/// [`status_for_pane`] summarised, copying no text.
+pub fn summary_for_pane(pane_id: PaneId) -> Option<AgentStatusSummary> {
+    REGISTRY
+        .read()
+        .get(&pane_id)
+        .and_then(|record| record.published.as_ref())
+        .map(AgentStatusSummary::of)
+}
 
 /// The status the owning process last published for this pane, if any.
 /// This is what `Pane::agent_status`'s default body answers with.
@@ -275,6 +325,12 @@ fn mark_dirty(pane_id: PaneId) {
     .detach();
 }
 
+/// Re-judge a pane soon: something its status depends on changed without
+/// any output, such as focus retiring a finished program's OSC 7501 result.
+pub fn nudge(pane_id: PaneId) {
+    mark_dirty(pane_id);
+}
+
 /// Reload the screen-rule manifests and re-judge every known pane. The
 /// engine swap alone is not enough: a pane whose screen has not changed
 /// since its last evaluation keeps serving a cached verdict (the
@@ -312,6 +368,7 @@ pub fn reload_rules() -> usize {
 fn evict_pane(pane_id: PaneId) -> bool {
     identify::forget_pane(pane_id);
     LAST_EVAL.lock().remove(&pane_id);
+    REPORT_FILERS.lock().remove(&pane_id);
     REGISTRY
         .write()
         .remove(&pane_id)
@@ -363,6 +420,7 @@ fn drain_and_evaluate() {
         // PaneRemoved is ignored while detection is off, so this sweep is
         // the only place orphaned timestamps get reclaimed.
         LAST_EVAL.lock().clear();
+        REPORT_FILERS.lock().clear();
         return;
     }
     let dirty: Vec<PaneId> = PENDING.lock().drain().collect();
@@ -466,6 +524,64 @@ fn evaluate_pane(pane: &dyn Pane) -> bool {
     let process_agent = identify::identify_by_process(pane);
     let process_backed = process_agent.is_some();
     let leader = identify::leader_path(pane);
+
+    // OSC 7501. A return from another process group to the shell ends that
+    // program's reports. The shell can itself be running a builtin or a
+    // function, so holding the foreground alone does not mean it is idle.
+    let mut program = pane.program_status();
+    let foreground = pane.foreground_process_group();
+    let unsettled: Vec<_> = program
+        .root
+        .iter()
+        .chain(&program.children)
+        .filter(|record| !record.orphaned)
+        .collect();
+    let returned_to_shell = !unsettled.is_empty()
+        && unsettled.iter().all(|record| {
+            matches!((record.process_group, foreground), (Some(then), Some(now)) if then != now)
+        })
+        && pane.shell_is_foreground() == Some(true);
+    if returned_to_shell {
+        // Only what was taken in before the look: a report the next command
+        // files meanwhile is that command's, and alive.
+        pane.end_program_status(program.latest_serial);
+        program = pane.program_status();
+    }
+    // A live root speaks with its own sub-tasks only: results an earlier
+    // program left behind are not this one's to show.
+    let mut children: Vec<ProgramStatusRecord> = match &program.root {
+        Some(root) if !root.orphaned => program
+            .children
+            .iter()
+            .filter(|child| !child.orphaned)
+            .cloned()
+            .collect(),
+        _ => program.children.clone(),
+    };
+    // A root can go while its sub-tasks' results stay -- a prompt drops a
+    // working root and keeps a failed child -- and the pane then speaks
+    // through them.
+    let root = program
+        .root
+        .clone()
+        .or_else(|| root_from_children(&children));
+    // Who filed it matters only while the root is live: a result left
+    // behind speaks for nobody running, whatever holds the foreground.
+    let from_foreground = match root.as_ref() {
+        Some(root) if !root.orphaned => report_from_foreground(
+            pane_id,
+            root,
+            foreground,
+            pane.root_process_id(),
+        ),
+        _ => {
+            REPORT_FILERS.lock().remove(&pane_id);
+            true
+        }
+    };
+    if let Some(root) = root.as_ref().filter(|root| !root.orphaned) {
+        retain_report_children(pane_id, root, &mut children, pane.root_process_id());
+    }
     let contract_identity = parsed_contract.as_ref().and_then(|c| {
         if c.ended || process_agent.is_some() {
             return None;
@@ -510,7 +626,39 @@ fn evaluate_pane(pane: &dyn Pane) -> bool {
         }
         Some(c.agent_id.clone())
     });
-    let agent_id = process_agent.or(contract_identity);
+    let report = root.filter(|root| {
+        report_applies(
+            root,
+            process_agent.as_deref(),
+            contract_identity.is_some(),
+            from_foreground,
+        )
+    });
+    let report_state = report.as_ref().map(|root| match root.state {
+        ProgramState::Working => AgentState::Working,
+        ProgramState::Blocked => AgentState::Blocked,
+        ProgramState::Error => AgentState::Error,
+        ProgramState::Idle | ProgramState::Done | ProgramState::Clear => AgentState::Idle,
+    });
+    // R4: a program that reports its own state counts whatever it is. A
+    // report naming no program keeps an earlier name only when its source
+    // is still the same observed process group. An orphan cannot name the
+    // next live program, and an unknown source cannot establish continuity.
+    let report_identity = report.as_ref().map(|root| match root.app.as_deref() {
+        Some(app) => agent_id_for_app(Some(app)),
+        None => REGISTRY
+            .read()
+            .get(&pane_id)
+            .filter(|record| {
+                record.evidence == AgentEvidence::Report
+                    && root.process_group.is_some()
+                    && record.report_process_group == root.process_group
+                    && (!record.report_orphaned || root.orphaned)
+            })
+            .map(|record| record.agent_id.clone())
+            .unwrap_or_else(|| agent_id_for_app(None)),
+    });
+    let agent_id = process_agent.or(contract_identity).or(report_identity);
 
     let Some(agent_id) = agent_id else {
         let removed = REGISTRY.write().remove(&pane_id);
@@ -606,8 +754,10 @@ fn evaluate_pane(pane: &dyn Pane) -> bool {
         progress.clear();
     }
 
-    // Phase 2, no lock: the screen read and the manifest scan.
+    // Phase 2, no lock: the screen read and the manifest scan -- unless the
+    // program has said where it is, which no screen rule can overrule.
     let (verdict, fresh_cache) = match reused_verdict {
+        _ if report_state.is_some() => (CachedVerdict::NoMatch, None),
         Some(verdict) => (verdict, None),
         None => {
             let screen = read_screen_tail(pane);
@@ -678,12 +828,18 @@ fn evaluate_pane(pane: &dyn Pane) -> bool {
                     pending: Default::default(),
                     contract_raw: None,
                     contract_leader: None,
+                    report_process_group: None,
+                    report_orphaned: false,
                 },
             );
         }
     }
 
     let (state, evidence) = match verdict {
+        _ if report_state.is_some() => (
+            report_state.unwrap_or(AgentState::Idle),
+            AgentEvidence::Report,
+        ),
         CachedVerdict::State(state) => (state, AgentEvidence::Screen),
         CachedVerdict::Freeze => match previous_state {
             Some(state) => (state, AgentEvidence::Screen),
@@ -710,8 +866,12 @@ fn evaluate_pane(pane: &dyn Pane) -> bool {
         pending: Default::default(),
         contract_raw: None,
         contract_leader: None,
+        report_process_group: None,
+        report_orphaned: false,
     });
     record.agent_id = agent_id;
+    record.report_process_group = report.as_ref().and_then(|root| root.process_group);
+    record.report_orphaned = report.as_ref().is_some_and(|root| root.orphaned);
     if record.contract_raw != contract_raw {
         // A (re-)emission: snapshot who the foreground leader was, so a
         // later staleness check can tell "silent but alive" from "gone".
@@ -756,6 +916,7 @@ fn evaluate_pane(pane: &dyn Pane) -> bool {
         session_id: record.session_id.clone(),
         since_unix: record.since_unix,
         ended: record.ended,
+        report: program_report(report.as_ref(), &children),
     };
     if record.published.as_ref() == Some(&status) {
         false
@@ -763,6 +924,231 @@ fn evaluate_pane(pane: &dyn Pane) -> bool {
         record.published = Some(status);
         true
     }
+}
+
+/// The agent id an OSC 7501 `app` stands for: the id ThinkTerm already
+/// knows an agent by where the two differ, the app's own name otherwise.
+fn agent_id_for_app(app: Option<&str>) -> String {
+    match app {
+        Some("claude-code") => "claude".to_string(),
+        Some(app) => app.to_string(),
+        None => "program".to_string(),
+    }
+}
+
+/// The process group a pane's OSC 7501 root came from.
+struct ReportFiler {
+    /// Each receipt counts, including an identical payload sent again.
+    serial: u64,
+    /// The group in the foreground then; `None` where none could be seen.
+    group: Option<u32>,
+    /// The foreground last compared with `group`, and whether it descends
+    /// from it: walking the process table once per change, not per round.
+    checked: Option<(u32, bool)>,
+    /// Only groups in the current snapshot (at most MAX_RECORDS); replaced
+    /// on every evaluation and released with this root or pane.
+    children: Vec<(Option<u32>, bool)>,
+}
+
+/// Whether a pane's OSC 7501 root speaks for whatever holds the foreground
+/// now: the program that was in front when the root was filed, or one it
+/// handed the foreground to -- a pager, an editor. A root does not speak
+/// for an unrelated program that took its place, named in it or not.
+fn report_from_foreground(
+    pane_id: PaneId,
+    root: &ProgramStatusRecord,
+    foreground: Option<u32>,
+    pane_root: Option<u32>,
+) -> bool {
+    let mut filers = REPORT_FILERS.lock();
+    if !filers.get(&pane_id).is_some_and(|filer| filer.serial == root.serial) {
+        // The parser recorded the foreground before this deferred evaluation.
+        // The current foreground may already belong to the next command.
+        filers.insert(
+            pane_id,
+            ReportFiler {
+                serial: root.serial,
+                group: root.process_group,
+                checked: None,
+                children: Vec::new(),
+            },
+        );
+    }
+    let Some(filer) = filers.get_mut(&pane_id) else {
+        return true;
+    };
+    match (filer.group, foreground) {
+        (Some(group), Some(now)) if group != now => match filer.checked {
+            Some((seen, verdict)) if seen == now => verdict,
+            _ => {
+                let verdict = descends_from(now, group, pane_root);
+                filer.checked = Some((now, verdict));
+                verdict
+            }
+        },
+        _ => true,
+    }
+}
+
+fn retain_report_children(
+    pane_id: PaneId,
+    root: &ProgramStatusRecord,
+    children: &mut Vec<ProgramStatusRecord>,
+    pane_root: Option<u32>,
+) {
+    let mut filers = REPORT_FILERS.lock();
+    let Some(filer) = filers.get_mut(&pane_id) else {
+        return;
+    };
+    let mut checked: Vec<(Option<u32>, bool)> = Vec::with_capacity(children.len());
+    children.retain(|child| {
+        if let Some((_, belongs)) = checked.iter().find(|(group, _)| *group == child.process_group) {
+            return *belongs;
+        }
+        let belongs = filer.children
+            .iter()
+            .find(|(group, _)| *group == child.process_group)
+            .map(|(_, belongs)| *belongs)
+            .unwrap_or_else(|| match (root.process_group, child.process_group) {
+                (Some(root), Some(child)) if root != child => {
+                    descends_from(child, root, pane_root) || descends_from(root, child, pane_root)
+                }
+                _ => true,
+            });
+        checked.push((child.process_group, belongs));
+        belongs
+    });
+    filer.children = checked;
+}
+
+/// Whether process `pid` is `ancestor` or descends from it, walking up
+/// from `pid`: a step per parent, where walking down would collect the
+/// ancestor's whole tree. The pane's own first process, `stop`, is as high
+/// as a program the pane runs can reach.
+#[cfg(not(test))]
+fn descends_from(pid: u32, ancestor: u32, stop: Option<u32>) -> bool {
+    let mut at = pid;
+    // Deep enough for any wrapper chain; a loop in a racing table ends.
+    for _ in 0..16 {
+        if at == ancestor {
+            return true;
+        }
+        if Some(at) == stop || at <= 1 {
+            return false;
+        }
+        match procinfo::LocalProcessInfo::with_root_pid(at) {
+            Some(info) => at = info.ppid,
+            None => return false,
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+fn descends_from(pid: u32, ancestor: u32, _stop: Option<u32>) -> bool {
+    tests::fake_descends_from(pid, ancestor)
+}
+
+/// Whether a pane's OSC 7501 report speaks for what runs in it now.
+fn report_applies(
+    root: &ProgramStatusRecord,
+    process_agent: Option<&str>,
+    contract: bool,
+    from_foreground: bool,
+) -> bool {
+    // A result left behind by a program that has gone describes nothing
+    // running now: it speaks only while no agent does.
+    if root.orphaned {
+        return process_agent.is_none() && !contract;
+    }
+    // A report that names another program is not about this one.
+    if let (Some(agent), Some(app)) = (process_agent, root.app.as_deref()) {
+        if agent_id_for_app(Some(app)) != agent {
+            return false;
+        }
+    }
+    from_foreground
+}
+
+/// A pane's report when only sub-tasks are left: the most pressing of them
+/// -- an error before a wait before work before a result -- stands in for
+/// the root.
+fn root_from_children(children: &[ProgramStatusRecord]) -> Option<ProgramStatusRecord> {
+    let rank = |state: ProgramState| match state {
+        ProgramState::Error => 0,
+        ProgramState::Blocked => 1,
+        ProgramState::Working => 2,
+        ProgramState::Done => 3,
+        ProgramState::Idle | ProgramState::Clear => 4,
+    };
+    // Live sub-tasks speak before results left behind, never mixed with
+    // them: the stand-in is left behind only when every one of them is.
+    let live = children.iter().any(|child| !child.orphaned);
+    let children: Vec<&ProgramStatusRecord> = children
+        .iter()
+        .filter(|child| !live || !child.orphaned)
+        .collect();
+    let child = children.iter().copied().min_by_key(|child| rank(child.state))?;
+    Some(ProgramStatusRecord {
+        serial: child.serial,
+        process_group: child.process_group,
+        id: None,
+        state: child.state,
+        kind: child.kind,
+        progress: None,
+        app: child.app.clone(),
+        title: None,
+        msg: child.msg.clone().or_else(|| child.title.clone()),
+        orphaned: !live,
+    })
+}
+
+/// A pane's OSC 7501 records in the shape every consumer receives them.
+fn program_report(
+    root: Option<&ProgramStatusRecord>,
+    children: &[ProgramStatusRecord],
+) -> Option<ProgramReport> {
+    fn state(state: ProgramState) -> ProgramReportState {
+        match state {
+            ProgramState::Working => ProgramReportState::Working,
+            ProgramState::Done => ProgramReportState::Done,
+            ProgramState::Blocked => ProgramReportState::Blocked,
+            ProgramState::Error => ProgramReportState::Error,
+            ProgramState::Idle | ProgramState::Clear => ProgramReportState::Idle,
+        }
+    }
+    fn kind(kind: wezterm_term::program_status::ProgramBlockedKind) -> ProgramBlockedKind {
+        use wezterm_term::program_status::ProgramBlockedKind as Kind;
+        match kind {
+            Kind::Permission => ProgramBlockedKind::Permission,
+            Kind::Question => ProgramBlockedKind::Question,
+            Kind::Auth => ProgramBlockedKind::Auth,
+        }
+    }
+    let root = root?;
+    Some(ProgramReport {
+        state: state(root.state),
+        kind: root.kind.map(kind),
+        progress: root.progress,
+        app: root.app.clone(),
+        title: root.title.clone(),
+        msg: root.msg.clone(),
+        children: children
+            .iter()
+            .take(ProgramReport::MAX_CHILDREN)
+            .filter_map(|child| {
+                Some(ProgramReportChild {
+                    id: child.id.clone()?,
+                    state: state(child.state),
+                    kind: child.kind.map(kind),
+                    progress: child.progress,
+                    title: child.title.clone(),
+                    msg: child.msg.clone(),
+                })
+            })
+            .take(ProgramReport::MAX_CHILDREN)
+            .collect(),
+    })
 }
 
 /// The pane's live screen bottom, independent of the user's scroll
@@ -801,6 +1187,25 @@ mod tests {
     use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, StableRowIndex, TerminalSize};
 
     static NEXT_PANE_ID: AtomicUsize = AtomicUsize::new(9000);
+
+    lazy_static::lazy_static! {
+        /// A process table for the tests: child pid to parent pid.
+        static ref FAKE_PARENTS: Mutex<HashMap<u32, u32>> = Mutex::new(HashMap::new());
+    }
+
+    pub(super) fn fake_descends_from(pid: u32, ancestor: u32) -> bool {
+        let parents = FAKE_PARENTS.lock();
+        let mut at = pid;
+        loop {
+            if at == ancestor {
+                return true;
+            }
+            match parents.get(&at) {
+                Some(parent) => at = *parent,
+                None => return false,
+            }
+        }
+    }
 
     lazy_static::lazy_static! {
         static ref PUBLISH_LOG: parking_lot::Mutex<Vec<PaneId>> =
@@ -866,6 +1271,11 @@ mod tests {
         swap_after_read: parking_lot::Mutex<Option<String>>,
         /// The parser holds the terminal: reading the pane would wait.
         contended: AtomicBool,
+        program: parking_lot::Mutex<wezterm_term::program_status::ProgramStatusRecords>,
+        /// What `shell_is_foreground` answers.
+        shell_foreground: parking_lot::Mutex<Option<bool>>,
+        /// What `foreground_process_group` answers.
+        foreground_group: parking_lot::Mutex<Option<u32>>,
     }
 
     impl FakeAgentPane {
@@ -885,7 +1295,39 @@ mod tests {
                 dead: AtomicBool::new(false),
                 swap_after_read: parking_lot::Mutex::new(None),
                 contended: AtomicBool::new(false),
+                program: parking_lot::Mutex::new(Default::default()),
+                shell_foreground: parking_lot::Mutex::new(None),
+                foreground_group: parking_lot::Mutex::new(None),
             })
+        }
+
+        /// Put process group `group` in the foreground, with whether it is
+        /// the pane's own shell.
+        fn set_foreground(&self, group: u32, shell: bool) {
+            *self.foreground_group.lock() = Some(group);
+            *self.shell_foreground.lock() = Some(shell);
+        }
+
+        /// File an OSC 7501 report, as the program in the pane would.
+        fn report(
+            &self,
+            state: ProgramState,
+            app: Option<&str>,
+            edit: impl FnOnce(&mut wezterm_term::program_status::ProgramStatusReport),
+        ) {
+            let mut report = wezterm_term::program_status::ProgramStatusReport {
+                state,
+                id: None,
+                kind: None,
+                progress: None,
+                app: app.map(str::to_string),
+                title: None,
+                msg: None,
+            };
+            edit(&mut report);
+            let group = *self.foreground_group.lock();
+            self.program.lock().apply_from(report, group);
+            self.seqno.fetch_add(1, Ordering::SeqCst);
         }
 
         fn set_screen(&self, text: &str) {
@@ -1005,6 +1447,20 @@ mod tests {
         fn clear_agent_osc_evidence(&self) {
             *self.osc_evidence.lock() = Default::default();
         }
+        fn program_status(&self) -> wezterm_term::program_status::ProgramStatusSnapshot {
+            self.program
+                .lock()
+                .snapshot(wezterm_term::program_status::ProgramStatusRecords::MAX_RECORDS)
+        }
+        fn end_program_status(&self, through: u64) {
+            self.program.lock().end_of_program_through(through);
+        }
+        fn shell_is_foreground(&self) -> Option<bool> {
+            *self.shell_foreground.lock()
+        }
+        fn foreground_process_group(&self) -> Option<u32> {
+            *self.foreground_group.lock()
+        }
         fn copy_user_vars(&self) -> HashMap<String, String> {
             self.user_vars.lock().clone()
         }
@@ -1095,6 +1551,331 @@ mod tests {
             status_for_pane(pane.pane_id()).expect("read once free").agent_id,
             "soul"
         );
+        evict_pane(pane.pane_id());
+    }
+
+    #[test]
+    fn any_program_that_reports_its_state_counts() {
+        let pane = FakeAgentPane::new(Some("/opt/homebrew/bin/brew"));
+        pane.report(ProgramState::Working, Some("brew"), |report| {
+            report.progress = Some(25);
+            report.msg = Some("Upgrading 3 of 12".to_string());
+            report.id = None;
+        });
+        pane.program.lock().apply(wezterm_term::program_status::ProgramStatusReport {
+            state: ProgramState::Blocked,
+            id: Some("fetch".to_string()),
+            kind: Some(wezterm_term::program_status::ProgramBlockedKind::Auth),
+            progress: None,
+            app: None,
+            title: Some("Fetch".to_string()),
+            msg: None,
+        });
+        assert!(evaluate_pane(pane.as_ref() as &dyn Pane));
+        let status = status_for_pane(pane.pane_id()).expect("classified");
+        assert_eq!(status.agent_id, "brew");
+        assert_eq!(status.state, AgentState::Working);
+        assert_eq!(status.evidence, AgentEvidence::Report);
+        let report = status.report.expect("the report travels with it");
+        assert_eq!(report.progress, Some(25));
+        assert_eq!(report.msg.as_deref(), Some("Upgrading 3 of 12"));
+        assert_eq!(report.children.len(), 1);
+        assert_eq!(report.children[0].kind, Some(ProgramBlockedKind::Auth));
+        evict_pane(pane.pane_id());
+    }
+
+    #[test]
+    fn a_program_report_outranks_the_screen() {
+        let pane = FakeAgentPane::new(Some("/usr/local/bin/claude"));
+        pane.set_screen("✻ Thinking… (esc to interrupt)\n");
+        pane.report(ProgramState::Blocked, Some("claude-code"), |report| {
+            report.kind = Some(wezterm_term::program_status::ProgramBlockedKind::Permission);
+            report.msg = Some("Bash: npm test".to_string());
+        });
+        assert!(evaluate_pane(pane.as_ref() as &dyn Pane));
+        let status = status_for_pane(pane.pane_id()).expect("classified");
+        assert_eq!(status.agent_id, "claude");
+        assert_eq!(status.state, AgentState::Blocked);
+        assert_eq!(status.evidence, AgentEvidence::Report);
+        assert_eq!(
+            status.report.and_then(|report| report.kind),
+            Some(ProgramBlockedKind::Permission)
+        );
+
+        // An error is its own state, not a flavour of waiting.
+        pane.report(ProgramState::Error, Some("claude-code"), |_| {});
+        assert!(evaluate_pane(pane.as_ref() as &dyn Pane));
+        assert_eq!(
+            status_for_pane(pane.pane_id()).map(|status| status.state),
+            Some(AgentState::Error)
+        );
+        evict_pane(pane.pane_id());
+    }
+
+    /// A report outlives its program only as a result left behind: once
+    /// the pane's shell has the foreground back, what was in progress is
+    /// over, and the result speaks only while nothing else runs.
+    #[test]
+    fn only_an_unseen_result_outlives_the_program_that_reported_it() {
+        // zsh is 9100; brew 9101 runs a pager 9102.
+        FAKE_PARENTS.lock().insert(9102, 9101);
+        let pane = FakeAgentPane::new(Some("/opt/homebrew/bin/brew"));
+        pane.set_foreground(9101, false);
+        pane.report(ProgramState::Working, Some("brew"), |_| {});
+        assert!(evaluate_pane(pane.as_ref() as &dyn Pane));
+
+        // brew hands the foreground to its pager: it is still going.
+        pane.set_process(Some("/usr/bin/less"));
+        pane.set_foreground(9102, false);
+        evaluate_pane(pane.as_ref() as &dyn Pane);
+        assert_eq!(
+            status_for_pane(pane.pane_id()).map(|status| status.state),
+            Some(AgentState::Working)
+        );
+
+        // brew exits and the shell is back: nothing is in progress any more.
+        pane.set_process(Some("/bin/zsh"));
+        pane.set_foreground(9100, true);
+        assert!(evaluate_pane(pane.as_ref() as &dyn Pane));
+        assert!(status_for_pane(pane.pane_id()).is_none());
+        assert_eq!(pane.program_status(), Default::default());
+
+        // A failed result stays, as brew's own...
+        pane.set_process(Some("/opt/homebrew/bin/brew"));
+        pane.set_foreground(9101, false);
+        pane.report(ProgramState::Error, Some("brew"), |report| {
+            report.msg = Some("Download failed".to_string());
+        });
+        assert!(evaluate_pane(pane.as_ref() as &dyn Pane));
+        pane.set_process(Some("/bin/zsh"));
+        pane.set_foreground(9100, true);
+        evaluate_pane(pane.as_ref() as &dyn Pane);
+        let status = status_for_pane(pane.pane_id()).expect("the result stays");
+        assert_eq!(status.agent_id, "brew");
+        assert_eq!(status.state, AgentState::Error);
+
+        // ...but does not speak for the agent started next in the pane.
+        pane.set_process(Some("/usr/local/bin/claude"));
+        pane.set_foreground(9103, false);
+        evaluate_pane(pane.as_ref() as &dyn Pane);
+        let status = status_for_pane(pane.pane_id()).expect("claude is running");
+        assert_eq!(status.agent_id, "claude");
+        assert_ne!(status.state, AgentState::Error);
+        assert_ne!(status.evidence, AgentEvidence::Report);
+        assert!(status.report.is_none());
+        evict_pane(pane.pane_id());
+    }
+
+    /// A program that left without the shell ever getting the foreground
+    /// back -- the next command of a chain took it straight away -- leaves
+    /// a report that names nobody. It is still not the new program's.
+    #[test]
+    fn an_unnamed_report_does_not_speak_for_a_program_that_took_its_place() {
+        let pane = FakeAgentPane::new(Some("/usr/local/bin/tool"));
+        pane.set_foreground(9201, false);
+        pane.report(ProgramState::Done, None, |report| {
+            report.msg = Some("Built".to_string());
+        });
+        evaluate_pane(pane.as_ref() as &dyn Pane);
+
+        pane.set_process(Some("/usr/local/bin/claude"));
+        pane.set_foreground(9202, false);
+        evaluate_pane(pane.as_ref() as &dyn Pane);
+        let status = status_for_pane(pane.pane_id()).expect("claude is running");
+        assert_eq!(status.agent_id, "claude");
+        assert_ne!(status.evidence, AgentEvidence::Report);
+        assert!(status.report.is_none());
+
+        // Its own report speaks at once.
+        pane.report(ProgramState::Working, Some("claude-code"), |_| {});
+        evaluate_pane(pane.as_ref() as &dyn Pane);
+        let status = status_for_pane(pane.pane_id()).expect("claude reports");
+        assert_eq!(status.state, AgentState::Working);
+        assert_eq!(status.evidence, AgentEvidence::Report);
+        evict_pane(pane.pane_id());
+    }
+
+    /// Sub-tasks an earlier program left behind are not the next agent's.
+    #[test]
+    fn left_behind_sub_tasks_stay_out_of_the_next_agents_report() {
+        let pane = FakeAgentPane::new(Some("/opt/homebrew/bin/brew"));
+        pane.set_foreground(9401, false);
+        pane.report(ProgramState::Working, None, |_| {});
+        pane.report(ProgramState::Error, None, |report| {
+            report.id = Some("fetch".to_string());
+        });
+        evaluate_pane(pane.as_ref() as &dyn Pane);
+        pane.set_process(Some("/bin/zsh"));
+        pane.set_foreground(9400, true);
+        evaluate_pane(pane.as_ref() as &dyn Pane);
+
+        pane.set_process(Some("/usr/local/bin/claude"));
+        pane.set_foreground(9402, false);
+        pane.report(ProgramState::Working, Some("claude-code"), |_| {});
+        evaluate_pane(pane.as_ref() as &dyn Pane);
+        let status = status_for_pane(pane.pane_id()).expect("claude reports");
+        assert_eq!(status.evidence, AgentEvidence::Report);
+        let report = status.report.expect("published");
+        assert!(report.children.is_empty(), "{:?}", report.children);
+        evict_pane(pane.pane_id());
+    }
+
+    #[test]
+    fn a_shell_builtin_keeps_its_report_until_the_prompt() {
+        let pane = FakeAgentPane::new(Some("/bin/sh"));
+        pane.set_foreground(9800, true);
+        pane.report(ProgramState::Blocked, Some("example"), |_| {});
+        evaluate_pane(pane.as_ref());
+        assert_eq!(status_for_pane(pane.id).unwrap().state, AgentState::Blocked);
+        assert!(!pane.program_status().root.unwrap().orphaned);
+
+        // OSC 133's prompt marker is an explicit end even when the shell
+        // never handed its process group to an external command.
+        pane.program.lock().end_of_program();
+        evaluate_pane(pane.as_ref());
+        assert!(status_for_pane(pane.id).is_none());
+        evict_pane(pane.id);
+    }
+
+    #[test]
+    fn a_command_chain_does_not_attach_old_children_to_the_next_root() {
+        let pane = FakeAgentPane::new(Some("/usr/bin/example"));
+        pane.set_foreground(9811, false);
+        pane.report(ProgramState::Working, Some("example"), |_| {});
+        for n in 0..ProgramReport::MAX_CHILDREN {
+            pane.report(ProgramState::Blocked, None, |report| {
+                report.id = Some(format!("old-{n:02}"));
+            });
+        }
+        evaluate_pane(pane.as_ref());
+
+        // The next command reports before a prompt or an evaluator tick.
+        pane.set_process(Some("/usr/local/bin/claude"));
+        pane.set_foreground(9812, false);
+        pane.report(ProgramState::Working, Some("claude-code"), |_| {});
+        pane.report(ProgramState::Working, None, |report| {
+            report.id = Some("task".to_string());
+        });
+        evaluate_pane(pane.as_ref());
+        let report = status_for_pane(pane.id).unwrap().report.unwrap();
+        assert_eq!(report.children.len(), 1);
+        assert_eq!(report.children[0].id, "task");
+        // A cached decision has the same ownership boundary.
+        evaluate_pane(pane.as_ref());
+        assert_eq!(status_for_pane(pane.id).unwrap().report.unwrap().children.len(), 1);
+        evict_pane(pane.id);
+        assert!(!REPORT_FILERS.lock().contains_key(&pane.id));
+    }
+
+    #[test]
+    fn children_reported_by_a_descendant_stay_with_the_root() {
+        FAKE_PARENTS.lock().insert(9822, 9821);
+        let pane = FakeAgentPane::new(Some("/usr/bin/example"));
+        pane.set_foreground(9821, false);
+        pane.report(ProgramState::Working, Some("example"), |_| {});
+        pane.set_foreground(9822, false);
+        pane.report(ProgramState::Blocked, None, |report| {
+            report.id = Some("task".to_string());
+        });
+        evaluate_pane(pane.as_ref());
+        assert_eq!(status_for_pane(pane.id).unwrap().report.unwrap().children.len(), 1);
+        evict_pane(pane.id);
+    }
+
+    /// A program that names itself in some reports only keeps its name.
+    #[test]
+    fn a_report_naming_nobody_keeps_the_name_the_program_gave() {
+        let pane = FakeAgentPane::new(Some("/opt/homebrew/bin/brew"));
+        pane.set_foreground(9831, false);
+        pane.report(ProgramState::Working, Some("brew"), |_| {});
+        evaluate_pane(pane.as_ref() as &dyn Pane);
+        pane.report(ProgramState::Working, None, |report| {
+            report.progress = Some(40);
+        });
+        evaluate_pane(pane.as_ref() as &dyn Pane);
+        let status = status_for_pane(pane.pane_id()).expect("still brew");
+        assert_eq!(status.agent_id, "brew");
+        assert_eq!(status.report.and_then(|report| report.progress), Some(40));
+        evict_pane(pane.pane_id());
+    }
+
+    #[test]
+    fn an_unnamed_successor_does_not_borrow_the_previous_programs_name() {
+        let pane = FakeAgentPane::new(Some("/usr/bin/example"));
+        pane.set_foreground(9841, false);
+        pane.report(ProgramState::Working, Some("tool-a"), |_| {});
+        evaluate_pane(pane.as_ref());
+        assert_eq!(status_for_pane(pane.id).unwrap().agent_id, "tool-a");
+
+        pane.set_foreground(9842, false);
+        pane.report(ProgramState::Working, None, |_| {});
+        evaluate_pane(pane.as_ref());
+        let status = status_for_pane(pane.id).unwrap();
+        assert_eq!(status.agent_id, "program");
+        assert_eq!(status.evidence, AgentEvidence::Report);
+        assert_eq!(status.state, AgentState::Working);
+        evict_pane(pane.id);
+    }
+
+    #[test]
+    fn an_unknown_report_source_cannot_inherit_a_program_name() {
+        let pane = FakeAgentPane::new(None);
+        pane.report(ProgramState::Working, Some("tool-a"), |_| {});
+        evaluate_pane(pane.as_ref());
+        pane.report(ProgramState::Working, None, |_| {});
+        evaluate_pane(pane.as_ref());
+        assert_eq!(status_for_pane(pane.id).unwrap().agent_id, "program");
+        evict_pane(pane.id);
+    }
+
+    #[test]
+    fn an_orphaned_result_cannot_name_a_new_report_from_the_shell() {
+        let pane = FakeAgentPane::new(Some("/bin/sh"));
+        pane.set_foreground(9851, true);
+        pane.report(ProgramState::Done, Some("tool-a"), |_| {});
+        evaluate_pane(pane.as_ref());
+        pane.program.lock().end_of_program();
+        evaluate_pane(pane.as_ref());
+        pane.report(ProgramState::Working, None, |_| {});
+        evaluate_pane(pane.as_ref());
+        assert_eq!(status_for_pane(pane.id).unwrap().agent_id, "program");
+        evict_pane(pane.id);
+    }
+
+    #[test]
+    fn a_report_naming_another_program_does_not_speak_for_the_agent() {
+        let pane = FakeAgentPane::new(Some("/usr/local/bin/claude"));
+        pane.report(ProgramState::Done, Some("make"), |_| {});
+        evaluate_pane(pane.as_ref() as &dyn Pane);
+        let status = status_for_pane(pane.pane_id()).expect("claude is running");
+        assert_eq!(status.agent_id, "claude");
+        assert_ne!(status.evidence, AgentEvidence::Report);
+        assert!(status.report.is_none());
+        evict_pane(pane.pane_id());
+    }
+
+    #[test]
+    fn sub_task_results_speak_once_the_root_has_gone() {
+        let pane = FakeAgentPane::new(Some("/usr/local/bin/tool"));
+        pane.set_foreground(9301, false);
+        pane.report(ProgramState::Working, Some("tool"), |_| {});
+        pane.report(ProgramState::Error, None, |report| {
+            report.id = Some("fetch".to_string());
+            report.msg = Some("404 Not Found".to_string());
+        });
+        assert!(evaluate_pane(pane.as_ref() as &dyn Pane));
+
+        // The shell is back: the working root goes, the failed sub-task
+        // stays, and still answers to its program's name.
+        pane.set_process(Some("/bin/zsh"));
+        pane.set_foreground(9300, true);
+        evaluate_pane(pane.as_ref() as &dyn Pane);
+        let status = status_for_pane(pane.pane_id()).expect("the sub-task's result");
+        assert_eq!(status.agent_id, "tool");
+        assert_eq!(status.state, AgentState::Error);
+        let report = status.report.expect("published");
+        assert_eq!(report.msg.as_deref(), Some("404 Not Found"));
+        assert_eq!(report.children.len(), 1);
         evict_pane(pane.pane_id());
     }
 
@@ -1739,5 +2520,59 @@ mod tests {
             Some(AgentState::Blocked)
         );
         evict_pane(pane.pane_id());
+    }
+
+    #[test]
+    fn an_identical_report_from_the_next_process_is_a_new_emission() {
+        let pane = FakeAgentPane::new(Some("/usr/bin/example"));
+        pane.set_foreground(9501, false);
+        pane.report(ProgramState::Working, Some("example"), |_| {});
+        evaluate_pane(pane.as_ref());
+        assert_eq!(status_for_pane(pane.id).unwrap().state, AgentState::Working);
+        // The next command in a chain reports the same initial state.
+        pane.set_process(Some("/usr/bin/example"));
+        pane.set_foreground(9502, false);
+        pane.report(ProgramState::Working, Some("example"), |_| {});
+        evaluate_pane(pane.as_ref());
+        assert_eq!(
+            status_for_pane(pane.id).map(|s| s.state),
+            Some(AgentState::Working),
+            "the new program emitted its own report"
+        );
+        evict_pane(pane.id);
+    }
+
+    #[test]
+    fn a_report_received_before_process_turnover_is_not_rebound_on_first_poll() {
+        let pane = FakeAgentPane::new(Some("/usr/bin/example"));
+        pane.set_foreground(9601, false);
+        pane.report(ProgramState::Done, None, |_| {});
+        // The short command exits before the evaluator gets a turn.
+        pane.set_process(Some("/usr/local/bin/claude"));
+        pane.set_foreground(9602, false);
+        pane.set_screen("some output\n⏵⏵ Cooking… (esc to interrupt · 12s)\n");
+        evaluate_pane(pane.as_ref());
+        let status = status_for_pane(pane.id).unwrap();
+        assert_eq!(status.agent_id, "claude");
+        assert_eq!(
+            status.state,
+            AgentState::Working,
+            "the report was emitted by the previous command"
+        );
+        evict_pane(pane.id);
+    }
+
+    #[test]
+    fn an_anonymous_result_does_not_override_a_working_successor() {
+        let pane = FakeAgentPane::new(Some("/usr/bin/example"));
+        pane.set_foreground(9701, false);
+        pane.report(ProgramState::Done, None, |_| {});
+        evaluate_pane(pane.as_ref());
+        pane.set_process(Some("/usr/local/bin/claude"));
+        pane.set_foreground(9702, false);
+        pane.set_screen("some output\n⏵⏵ Cooking… (esc to interrupt · 12s)\n");
+        evaluate_pane(pane.as_ref());
+        assert_eq!(status_for_pane(pane.id).unwrap().state, AgentState::Working);
+        evict_pane(pane.id);
     }
 }

@@ -12,6 +12,7 @@ pub enum SvgIcon {
     ArrowRight,
     ArrowUp,
     Bell,
+    BellRing,
     Bot,
     Braces,
     Bug,
@@ -89,6 +90,7 @@ pub enum SvgIcon {
     Shrink,
     CircleAlert,
     CircleCheck,
+    CircleX,
     CirclePlus,
     SquarePlus,
     Square,
@@ -207,6 +209,7 @@ impl SvgIcon {
                 include_bytes!("../../../../third_party/lucide/icons/arrow-up.svg")
             }
             Self::Bell => include_bytes!("../../../../third_party/lucide/icons/bell.svg"),
+            Self::BellRing => include_bytes!("../../../../third_party/lucide/icons/bell-ring.svg"),
             Self::Bot => include_bytes!("../../../../third_party/lucide/icons/bot.svg"),
             Self::Braces => include_bytes!("../../../../third_party/lucide/icons/braces.svg"),
             Self::Check => include_bytes!("../../../../third_party/lucide/icons/check.svg"),
@@ -332,6 +335,7 @@ impl SvgIcon {
             Self::CircleCheck => {
                 include_bytes!("../../../../third_party/lucide/icons/circle-check.svg")
             }
+            Self::CircleX => include_bytes!("../../../../third_party/lucide/icons/circle-x.svg"),
             Self::CirclePlus => {
                 include_bytes!("../../../../third_party/lucide/icons/circle-plus.svg")
             }
@@ -830,6 +834,7 @@ mod tests {
             SvgIcon::ArchiveRestore,
             SvgIcon::ArrowLeft,
             SvgIcon::Bell,
+            SvgIcon::BellRing,
             SvgIcon::Braces,
             SvgIcon::Server,
             SvgIcon::ExternalLink,
@@ -874,6 +879,7 @@ mod tests {
             SvgIcon::Shrink,
             SvgIcon::CircleAlert,
             SvgIcon::CircleCheck,
+            SvgIcon::CircleX,
             SvgIcon::CirclePlus,
             SvgIcon::Square,
             SvgIcon::SquareTerminal,

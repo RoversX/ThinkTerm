@@ -67,7 +67,7 @@ const SESSION_ACTION_ICON_INSET: usize = 12;
 const SESSION_STATUS_DOT_SIZE: usize = 10;
 const SESSION_STATUS_ICON_SIZE: usize = 20;
 const SESSION_STATUS_ACTIVE_ICON_SIZE: usize = 26;
-const SESSION_STATUS_DONE_COLOR: LinearRgba = LinearRgba::with_components(0.20, 0.78, 0.36, 1.0);
+pub(crate) const SESSION_STATUS_DONE_COLOR: LinearRgba = LinearRgba::with_components(0.20, 0.78, 0.36, 1.0);
 const SESSION_STATUS_OPEN_COLOR: LinearRgba = LinearRgba::with_components(0.12, 0.48, 1.0, 1.0);
 const SPACE_DISCONNECTED_COLOR: LinearRgba = LinearRgba::with_components(0.86, 0.45, 0.12, 1.0);
 const NOTIFICATION_BADGE_COLOR: LinearRgba = LinearRgba::with_components(0.96, 0.16, 0.22, 1.0);
@@ -143,6 +143,15 @@ pub fn workspace_sidebar_width_for_metrics(render_metrics: &RenderMetrics, dpi: 
         .map(|width| scale_ui_usize(width, dpi))
         .unwrap_or(default_width)
         .clamp(min_width, max_width)
+}
+
+/// Whether a program in the thread reported that it stopped on an error.
+fn thread_has_errored_agent(thread_id: &str) -> bool {
+    workspace_threads::thread_workspace_name(thread_id).is_some_and(|workspace| {
+        crate::agent_status::any_agent_in_workspace(&workspace, |agent| {
+            agent.state == crate::agent_status::AgentState::Error
+        })
+    })
 }
 
 fn centered_inner_start(origin: usize, outer: usize, inner: usize) -> usize {
@@ -697,6 +706,9 @@ impl crate::TermWindow {
             SESSION_STATUS_DONE_COLOR
         } else if session.is_active && !suppress_active {
             foreground
+        } else if status == UiStatusKind::NeedsAttention {
+            // The amber the Agents panel and the tabs use for a wait.
+            crate::termwindow::ui::agent_panel::AGENT_BLOCKED_COLOR
         } else {
             self.sidebar_thread_dot_color(session, chrome, foreground, suppress_active)
         }
@@ -723,6 +735,20 @@ impl crate::TermWindow {
     ) -> anyhow::Result<()> {
         let icon_y = y + ((row_height.saturating_sub(self.ui_px(SESSION_STATUS_ICON_SIZE))) / 2);
         if let Some(status) = self.sidebar_thread_status_kind(session) {
+            // A thread one of whose programs stopped on an error is marked as
+            // the Agents panel marks it: a red cross, not a wait.
+            if status == UiStatusKind::NeedsAttention && thread_has_errored_agent(&session.id) {
+                let size = self.ui_px(SESSION_STATUS_ICON_SIZE);
+                return self.paint_ui_icon(
+                    layers,
+                    2,
+                    SvgIcon::CircleX,
+                    x,
+                    centered_inner_start(y, row_height, size),
+                    size,
+                    chrome.danger,
+                );
+            }
             let status_size = if matches!(status, UiStatusKind::Running | UiStatusKind::Done) {
                 self.ui_px(SESSION_STATUS_ACTIVE_ICON_SIZE)
             } else {
