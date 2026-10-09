@@ -631,7 +631,7 @@ impl SettingsWindow {
         if let Some(kinds) = &editors {
             self.paint_editor_stack(layers, kinds, x, mark_y, mark, self.palette().window_bg)?;
         } else if let Some(icon) = self.ui.import_source.icon() {
-            self.draw_brand_icon(layers, icon, x, mark_y, mark)?;
+            self.paint_brand_tile(layers, icon, x, mark_y, mark)?;
         } else {
             self.draw_svg_icon(
                 layers,
@@ -868,7 +868,7 @@ impl SettingsWindow {
                     ground,
                 )?;
             } else if let Some(brand) = source.icon() {
-                self.draw_brand_icon(
+                self.paint_brand_tile(
                     layers,
                     brand,
                     left + (card_width - icon) / 2.0,

@@ -10,6 +10,7 @@
 //! quads each and no memory per tile.
 
 use crate::quad::TripleLayerQuadAllocator;
+use crate::termwindow::ui::icons::BrandIcon;
 use crate::ui::draw::DrawContext;
 use window::color::{LinearRgba, SrgbaTuple};
 
@@ -113,6 +114,95 @@ pub(crate) fn draw_tile(
     )
 }
 
+/// How opaque white (`toward` 1) or black (`toward` 0) laid over `ground`
+/// has to be to turn it into `target`. Layers blend in linear light, where
+/// a little white goes a long way on a dark colour, so this is worked out
+/// from the colours rather than taken from an amount.
+fn cover(ground: LinearRgba, target: LinearRgba, toward: f32) -> f32 {
+    let channel = |ground: f32, target: f32| {
+        let span = toward - ground;
+        if span.abs() < 1e-4 {
+            0.0
+        } else {
+            ((target - ground) / span).clamp(0.0, 1.0)
+        }
+    };
+    (channel(ground.0, target.0) + channel(ground.1, target.1) + channel(ground.2, target.2))
+        / 3.0
+}
+
+/// An app's icon lit as [`draw_tile`] lights a coloured square: a shadow
+/// and rim in the icon's own ground, the icon inside the rim, and the
+/// fill's light and shade laid over it, as strong as they would be on that
+/// ground. Icons without a square of their own are drawn as they are.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_brand_tile(
+    ctx: &DrawContext,
+    layers: &mut TripleLayerQuadAllocator,
+    icon: BrandIcon,
+    x: f32,
+    y: f32,
+    side: f32,
+    dark: bool,
+    style: &TileStyle,
+) -> anyhow::Result<()> {
+    let Some((r, g, b)) = icon.app_icon_ground() else {
+        return ctx.draw_brand_icon(layers, icon, x, y, side);
+    };
+    // On the top layer, where the icon is, so the light lands over it.
+    let (x, y, side) = (x.round(), y.round(), side.round());
+    let color = LinearRgba::with_srgba(r, g, b, 0xFF);
+    let radius = side * 0.27;
+    let shadow_alpha = if dark {
+        style.shadow_alpha_dark
+    } else {
+        style.shadow_alpha_light
+    };
+    let bounds = euclid::rect(x, y, side, side);
+    ctx.draw_shadow(
+        layers,
+        2,
+        bounds,
+        radius,
+        ctx.px(style.shadow_sigma),
+        ctx.px(style.shadow_drop),
+        darken(color, style.shadow_darken).mul_alpha(shadow_alpha),
+    )?;
+    ctx.draw_rounded_rect_vertical_gradient(
+        layers,
+        2,
+        bounds,
+        radius,
+        lighten(color, style.rim_top_lighten),
+        darken(color, style.rim_bottom_darken),
+    )?;
+    let rim = (side * style.rim_per_side).round().max(1.0);
+    let inner = (side - rim * 2.0).max(0.0);
+    ctx.draw_brand_icon(layers, icon, x + rim, y + rim, inner)?;
+    let fill = euclid::rect(x + rim, y + rim, inner, inner);
+    let fill_radius = (radius - rim).max(0.0);
+    let white = LinearRgba::with_components(1.0, 1.0, 1.0, 1.0);
+    let light = cover(color, lighten(color, style.fill_top_lighten), 1.0);
+    ctx.draw_rounded_rect_vertical_gradient(
+        layers,
+        2,
+        fill,
+        fill_radius,
+        white.mul_alpha(light),
+        white.mul_alpha(0.0),
+    )?;
+    let black = LinearRgba::with_components(0.0, 0.0, 0.0, 1.0);
+    let shade = cover(color, darken(color, style.fill_bottom_darken), 0.0);
+    ctx.draw_rounded_rect_vertical_gradient(
+        layers,
+        2,
+        fill,
+        fill_radius,
+        black.mul_alpha(0.0),
+        black.mul_alpha(shade),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +210,27 @@ mod tests {
     fn srgb_bytes(color: LinearRgba) -> (u8, u8, u8) {
         let byte = |linear: f32| (to_srgb(linear) * 255.0).round() as u8;
         (byte(color.0), byte(color.1), byte(color.2))
+    }
+
+    #[test]
+    fn an_icons_light_is_as_strong_as_a_tiles() {
+        let over = |ground: LinearRgba, toward: f32, alpha: f32| {
+            let mix = |g: f32| g + (toward - g) * alpha;
+            LinearRgba::with_components(mix(ground.0), mix(ground.1), mix(ground.2), 1.0)
+        };
+        for byte in [0x22, 0x80, 0xD9] {
+            let ground = LinearRgba::with_srgba(byte, byte, byte, 0xFF);
+            let lit = lighten(ground, 0.16);
+            let shaded = darken(ground, 0.10);
+            assert_eq!(srgb_bytes(over(ground, 1.0, cover(ground, lit, 1.0))), srgb_bytes(lit));
+            assert_eq!(
+                srgb_bytes(over(ground, 0.0, cover(ground, shaded, 0.0))),
+                srgb_bytes(shaded)
+            );
+        }
+        // On a dark ground the white is far fainter than the amount.
+        let dark = LinearRgba::with_srgba(0x22, 0x22, 0x22, 0xFF);
+        assert!(cover(dark, lighten(dark, 0.16), 1.0) < 0.06);
     }
 
     #[test]

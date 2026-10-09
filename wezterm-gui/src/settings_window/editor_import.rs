@@ -669,6 +669,33 @@ impl SettingsWindow {
         .detach();
     }
 
+    /// A source's mark, lit like the editors' tiles where it is an app icon.
+    pub(super) fn paint_brand_tile(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        icon: BrandIcon,
+        x: f32,
+        y: f32,
+        size: f32,
+    ) -> anyhow::Result<()> {
+        let ctx = crate::ui::draw::DrawContext::new(
+            self.render_state.as_ref().unwrap(),
+            self.dimensions,
+            &self.metrics,
+        );
+        let dark = self.chrome_palette.is_dark();
+        crate::ui::tile::draw_brand_tile(
+            &ctx,
+            layers,
+            icon,
+            x,
+            y,
+            size,
+            dark,
+            &crate::settings_window::ROW_TILE,
+        )
+    }
+
     pub(super) fn perform_editor_import_action(&mut self, action: EditorImportAction) {
         match action {
             EditorImportAction::Filter(editor) => {

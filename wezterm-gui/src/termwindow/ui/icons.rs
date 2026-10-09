@@ -669,6 +669,16 @@ impl BrandIcon {
         }
     }
 
+    /// The ground of a mark drawn as an app icon, with its own square:
+    /// what a lit tile around it is coloured. None for a bare mark.
+    pub fn app_icon_ground(self) -> Option<(u8, u8, u8)> {
+        match self {
+            Self::Herdr => Some((0xD9, 0xDA, 0xD8)),
+            Self::WezTerm => Some((0x22, 0x2D, 0x33)),
+            _ => None,
+        }
+    }
+
     /// Brand color, falling back to white when too dark for the dark UI.
     pub fn display_color(self) -> (u8, u8, u8) {
         let (r, g, b) = self.brand_color();

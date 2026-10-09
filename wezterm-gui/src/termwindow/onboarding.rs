@@ -1449,9 +1449,16 @@ impl OnboardingView {
             let icon_x = column_x + (column - mark_width(mark)) / 2.0;
             let icon_y = top + (row_h - icon) / 2.0;
             match mark {
-                FoundMark::Program(Some(brand)) => {
-                    ctx.draw_brand_icon(layers, *brand, icon_x, icon_y, icon)?
-                }
+                FoundMark::Program(Some(brand)) => crate::ui::tile::draw_brand_tile(
+                    ctx,
+                    layers,
+                    *brand,
+                    icon_x,
+                    icon_y,
+                    icon,
+                    skin.dark,
+                    &crate::settings_window::ROW_TILE,
+                )?,
                 FoundMark::Program(None) => ctx.draw_svg_icon(
                     layers,
                     SvgIcon::Terminal,
