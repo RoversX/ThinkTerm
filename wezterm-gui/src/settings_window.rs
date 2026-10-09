@@ -97,7 +97,6 @@ const NAV_ROW_INSET: f32 = 10.0;
 const NAV_ROW_GAP: f32 = 10.0;
 const HEADER_HEIGHT: f32 = 132.0;
 const SIDEBAR_TITLE_Y: f32 = 78.0;
-const SIDEBAR_TITLE_Y_WITH_CUSTOM_CHROME: f32 = 34.0;
 const SIDEBAR_BRAND_FONT_SIZE_WITH_CUSTOM_CHROME: f64 = if cfg!(target_os = "macos") {
     22.0
 } else {
@@ -7179,11 +7178,12 @@ impl SettingsWindow {
         let sidebar_width = self.ui.sidebar.width;
         let sidebar_icon_size = self.sidebar_icon_size();
 
+        let (title_x, title_y) = self.sidebar_title_origin(&sidebar_title_font);
         self.draw_text(
             layers,
             &sidebar_title_font,
-            tokens.sidebar_padding + 6.0,
-            self.sidebar_title_y(),
+            title_x,
+            title_y,
             "ThinkTerm",
             palette.title,
             sidebar_width - tokens.sidebar_padding * 2.0,
@@ -17169,12 +17169,30 @@ impl SettingsWindow {
         (self.content_bottom() - self.content_scroll_area_top()).max(0.0)
     }
 
-    fn sidebar_title_y(&self) -> f32 {
-        if self.settings_window_shows_window_buttons() {
-            self.ui_px(SIDEBAR_TITLE_Y_WITH_CUSTOM_CHROME)
-        } else {
-            self.ui_px(SIDEBAR_TITLE_Y)
+    /// Where the brand title is drawn. On macOS it sits below the traffic
+    /// lights. Elsewhere nothing shares its corner, so its T stands as far
+    /// from the window's left edge as from the top of the window's area --
+    /// measured on the T's ink rather than the line box, since each
+    /// platform's fonts put a different bearing and ascent around it.
+    fn sidebar_title_origin(&self, font: &Rc<LoadedFont>) -> (f32, f32) {
+        let tokens = self.ui.tokens;
+        let below_traffic_lights = (tokens.sidebar_padding + 6.0, self.ui_px(SIDEBAR_TITLE_Y));
+        if cfg!(target_os = "macos") {
+            return below_traffic_lights;
         }
+        let Some(t) = self
+            .shaped_text(font, "ThinkTerm")
+            .and_then(|shaped| shaped.glyphs.first().cloned())
+        else {
+            return below_traffic_lights;
+        };
+        let margin = tokens.sidebar_padding;
+        // `draw_text` puts the baseline this far below the y it is given.
+        let baseline = self.metrics.cell_size.height as f32 + self.metrics.descender.get() as f32;
+        (
+            margin - (t.x_offset + t.bearing_x).get() as f32,
+            margin + (t.y_offset + t.bearing_y).get() as f32 - baseline,
+        )
     }
 
     fn sidebar_scrollbar_visible(&self) -> bool {
