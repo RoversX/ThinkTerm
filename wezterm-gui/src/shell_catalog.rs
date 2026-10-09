@@ -38,6 +38,10 @@ impl DiscoveredShell {
 /// settings.json.
 const WINDOWS_POWERSHELL_VERSIONS: &[&str] = &["7", "8"];
 
+/// WSL distributions offered at most: the dropdown neither scrolls nor
+/// flips upward, so a machine with many must not push it off the window.
+const WSL_DISTRO_LIMIT: usize = 3;
+
 /// Unix candidates, curated rather than taken from `/etc/shells`: that
 /// file lists `csh`, `dash`, `ksh` and `tcsh` on a stock mac, which
 /// nobody is choosing here, and the dropdown has no room to spare (its
@@ -65,7 +69,48 @@ const UNIX_PREFIXES: &[&str] = &[
 
 /// The shells present on this machine.
 pub(crate) fn discover() -> Vec<DiscoveredShell> {
-    discover_with(&real_env, &is_executable_file)
+    discover_with(&real_env, &is_executable_file, &real_wsl_distros())
+}
+
+/// The distributions WSL has, its default first, by the names `wsl.exe -d`
+/// takes. Read from the registry, where WSL records them, rather than by
+/// running `wsl.exe -l`, which Settings would have to wait on as it opens.
+/// The one probe here that is not a path, so the one with a `cfg`.
+#[cfg(windows)]
+fn real_wsl_distros() -> Vec<String> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+    let Ok(lxss) = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Lxss")
+    else {
+        return vec![];
+    };
+    let default: Option<String> = lxss.get_value("DefaultDistribution").ok();
+    let mut distros = vec![];
+    for id in lxss.enum_keys().flatten() {
+        let Ok(key) = lxss.open_subkey(&id) else {
+            continue;
+        };
+        // 1 is installed; one still installing or being removed is listed
+        // too, and `wsl.exe -d` would only fail on it.
+        if key.get_value::<u32, _>("State").is_ok_and(|state| state != 1) {
+            continue;
+        }
+        let Ok(name) = key.get_value::<String, _>("DistributionName") else {
+            continue;
+        };
+        if default.as_deref() == Some(id.as_str()) {
+            distros.insert(0, name);
+        } else {
+            distros.push(name);
+        }
+    }
+    distros
+}
+
+#[cfg(not(windows))]
+fn real_wsl_distros() -> Vec<String> {
+    vec![]
 }
 
 /// `SHELL` is deliberately absent: `env_bootstrap` removes it at startup
@@ -102,19 +147,22 @@ fn is_executable_file(path: &str) -> bool {
 }
 
 /// The testable core. `env` reads an environment variable, `exists`
-/// answers whether a path is present; both are injected so the whole
-/// table can be exercised for either platform from any host.
+/// answers whether a path is present, and `wsl_distros` are the WSL
+/// distributions installed; all are injected so the whole table can be
+/// exercised for either platform from any host.
 pub(crate) fn discover_with(
     env: &dyn Fn(&str) -> Option<String>,
     exists: &dyn Fn(&str) -> bool,
+    wsl_distros: &[String],
 ) -> Vec<DiscoveredShell> {
     let mut found = vec![];
     let mut seen = HashSet::new();
 
-    let push = |shell: DiscoveredShell, seen: &mut HashSet<String>, found: &mut Vec<_>| {
-        // Keyed by program, so the same shell reached through two
-        // candidate paths is offered once.
-        if seen.insert(shell.argv[0].clone()) {
+    let push = |shell: DiscoveredShell, seen: &mut HashSet<Vec<String>>, found: &mut Vec<_>| {
+        // Keyed by command line, so the same shell reached through two
+        // candidate paths is offered once, while the WSL distributions,
+        // which share a launcher, are each offered.
+        if seen.insert(shell.argv.clone()) {
             found.push(shell);
         }
     };
@@ -141,7 +189,7 @@ pub(crate) fn discover_with(
         }
     }
 
-    for shell in windows_candidates(env, exists) {
+    for shell in windows_candidates(env, exists, wsl_distros) {
         push(shell, &mut seen, &mut found);
     }
 
@@ -151,6 +199,7 @@ pub(crate) fn discover_with(
 fn windows_candidates(
     env: &dyn Fn(&str) -> Option<String>,
     exists: &dyn Fn(&str) -> bool,
+    wsl_distros: &[String],
 ) -> Vec<DiscoveredShell> {
     let mut found = vec![];
 
@@ -202,6 +251,44 @@ fn windows_candidates(
             if exists(&path) {
                 found.push(DiscoveredShell::new("PowerShell", &path));
             }
+        }
+    }
+
+    // Git for Windows' bash, started as its own Windows Terminal profile
+    // starts it: interactive and a login shell, so the profile Git ships
+    // sets up its PATH. Installed for everyone, for one user, or by Scoop.
+    let git_roots = [
+        env("ProgramFiles").map(|root| join_windows(&root, &["Git"])),
+        env("ProgramFiles(x86)").map(|root| join_windows(&root, &["Git"])),
+        env("LOCALAPPDATA").map(|root| join_windows(&root, &["Programs", "Git"])),
+        env("USERPROFILE").map(|root| join_windows(&root, &["scoop", "apps", "git", "current"])),
+    ];
+    if let Some(bash) = git_roots
+        .iter()
+        .flatten()
+        .map(|root| join_windows(root, &["bin", "bash.exe"]))
+        .find(|path| exists(path))
+    {
+        found.push(DiscoveredShell {
+            label: "Git Bash".to_string(),
+            argv: vec![bash, "-i".to_string(), "-l".to_string()],
+        });
+    }
+
+    // Each distribution by name, and only with one to launch: `wsl.exe` can
+    // be there with no Linux installed. Docker Desktop's own distributions
+    // are its engine, not a shell anyone opens.
+    let wsl = join_windows(&system_root, &["System32", "wsl.exe"]);
+    if exists(&wsl) {
+        for name in wsl_distros
+            .iter()
+            .filter(|name| !name.starts_with("docker-desktop"))
+            .take(WSL_DISTRO_LIMIT)
+        {
+            found.push(DiscoveredShell {
+                label: format!("{name} (WSL)"),
+                argv: vec![wsl.clone(), "-d".to_string(), name.clone()],
+            });
         }
     }
 
@@ -309,10 +396,75 @@ mod tests {
     }
 
     fn discover_fake(env: &[(&str, &str)], present: &[&str]) -> Vec<DiscoveredShell> {
+        discover_fake_with_wsl(env, present, &[])
+    }
+
+    fn discover_fake_with_wsl(
+        env: &[(&str, &str)],
+        present: &[&str],
+        wsl: &[&str],
+    ) -> Vec<DiscoveredShell> {
         let (env, present) = probe(env, present);
-        discover_with(&|name| env.get(name).cloned(), &|path| {
-            present.contains(path)
-        })
+        let wsl: Vec<String> = wsl.iter().map(|name| name.to_string()).collect();
+        discover_with(
+            &|name| env.get(name).cloned(),
+            &|path| present.contains(path),
+            &wsl,
+        )
+    }
+
+    #[test]
+    fn git_bash_is_found_wherever_git_for_windows_put_it() {
+        let shells = discover_fake(
+            &[
+                ("ProgramFiles", r"C:\Program Files"),
+                ("LOCALAPPDATA", r"C:\Users\me\AppData\Local"),
+            ],
+            &[r"C:\Users\me\AppData\Local\Programs\Git\bin\bash.exe"],
+        );
+        assert_eq!(
+            shells,
+            vec![DiscoveredShell {
+                label: "Git Bash".to_string(),
+                argv: vec![
+                    r"C:\Users\me\AppData\Local\Programs\Git\bin\bash.exe".to_string(),
+                    "-i".to_string(),
+                    "-l".to_string(),
+                ],
+            }]
+        );
+        // One for everyone wins over one in the user's own programs.
+        let both = discover_fake(
+            &[
+                ("ProgramFiles", r"C:\Program Files"),
+                ("LOCALAPPDATA", r"C:\Users\me\AppData\Local"),
+            ],
+            &[
+                r"C:\Program Files\Git\bin\bash.exe",
+                r"C:\Users\me\AppData\Local\Programs\Git\bin\bash.exe",
+            ],
+        );
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].argv[0], r"C:\Program Files\Git\bin\bash.exe");
+    }
+
+    #[test]
+    fn wsl_distributions_are_offered_by_name_when_wsl_can_launch_them() {
+        let wsl = r"C:\Windows\System32\wsl.exe";
+        let shells = discover_fake_with_wsl(
+            &[("SystemRoot", r"C:\Windows")],
+            &[wsl],
+            &["Ubuntu", "docker-desktop", "docker-desktop-data", "Debian", "Alpine", "Arch"],
+        );
+        let labels: Vec<&str> = shells.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, ["Ubuntu (WSL)", "Debian (WSL)", "Alpine (WSL)"]);
+        assert_eq!(
+            shells[1].argv,
+            vec![wsl.to_string(), "-d".to_string(), "Debian".to_string()]
+        );
+        // No launcher, no entries, whatever the registry says.
+        let none = discover_fake_with_wsl(&[("SystemRoot", r"C:\Windows")], &[], &["Ubuntu"]);
+        assert!(none.is_empty(), "{none:?}");
     }
 
     #[test]

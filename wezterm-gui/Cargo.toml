@@ -172,6 +172,7 @@ winapi = { workspace=true, features = [
 windows = { workspace=true, features = [
     "Win32_UI_Shell",
 ]}
+winreg.workspace = true
 
 [dev-dependencies]
 benchmarking.workspace = true
