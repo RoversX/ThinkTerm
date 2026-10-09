@@ -1,18 +1,28 @@
 use luahelper::impl_lua_conversion_dynamic;
 use wezterm_dynamic::{FromDynamic, ToDynamic};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum FrontEndSelection {
+    /// The default on Windows. It falls back to WebGpu the way WebGpu falls
+    /// back to it, so a machine without a usable OpenGL still opens.
     OpenGL,
-    /// The default since the main window learned to fall back: wgpu asks for
-    /// every backend it has (Metal, then DX12/Vulkan/GL depending on the
-    /// platform; on Windows GL is left out where OpenGL would be Mesa), and
-    /// if none of them can be brought up the window quietly opens on OpenGL
-    /// instead of failing to open at all. OpenGL falls back to WebGpu the same
-    /// way; Software never falls back.
-    #[default]
+    /// The default elsewhere since the main window learned to fall back: wgpu
+    /// asks for every backend it has (Metal, then DX12/Vulkan/GL depending on
+    /// the platform; on Windows GL is left out where OpenGL would be Mesa),
+    /// and if none of them can be brought up the window quietly opens on
+    /// OpenGL instead of failing to open at all. Software never falls back.
     WebGpu,
     Software,
+}
+
+impl Default for FrontEndSelection {
+    fn default() -> Self {
+        if cfg!(windows) {
+            Self::OpenGL
+        } else {
+            Self::WebGpu
+        }
+    }
 }
 
 /// Corresponds to <https://docs.rs/wgpu/latest/wgpu/struct.AdapterInfo.html>
