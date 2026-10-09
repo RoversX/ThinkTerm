@@ -671,6 +671,7 @@ impl crate::TermWindow {
         let close_button = button == IntegratedTitleButton::Close;
 
         if hovered {
+            let chrome = self.chrome();
             let fill = if close_button {
                 let mut red = LinearRgba::with_srgba(232, 17, 35, 255);
                 if pressed {
@@ -678,21 +679,24 @@ impl crate::TermWindow {
                 }
                 red
             } else if pressed {
-                // Foreground-tinted overlay reads correctly on both themes;
-                // the palette's control_hover_bg is near-white and washes
-                // out on the light tab bar.
-                foreground.mul_alpha(0.16)
+                // Opaque, as the buttons beside them: a bordered fill is laid
+                // over a disc of the border's colour, which showed through a
+                // see-through tint and turned the button a dark grey disc.
+                chrome.control_pressed_bg
             } else {
-                foreground.mul_alpha(0.10)
+                chrome.control_hover_bg
             };
             let border = if close_button {
                 LinearRgba::TRANSPARENT
             } else {
                 foreground.mul_alpha(if pressed { 0.52 } else { 0.38 })
             };
+            // On the trailing action mask's layer, after it, under the icon:
+            // on a layer below, the mask hid every hover but the icon's, and
+            // a hovered Close showed a white cross on a light bar.
             self.fill_rounded_rectangle_with_border(
                 layers,
-                1,
+                2,
                 euclid::rect(
                     (button_x + press_inset) as f32,
                     (button_y + press_inset) as f32,
@@ -777,7 +781,7 @@ impl crate::TermWindow {
         let tab_surface_color = if active {
             chrome.active_tab_surface()
         } else if is_hovered && !is_renaming {
-            chrome.control_hover_bg
+            chrome.hover_fill(chrome.control_hover_bg)
         } else if self.chrome_see_through() {
             // The bar's own ground: a second coat would show as a darker pill.
             LinearRgba::TRANSPARENT
@@ -1028,7 +1032,7 @@ impl crate::TermWindow {
         let surface = if active {
             chrome.active_tab_surface()
         } else if is_hovered {
-            chrome.control_hover_bg
+            chrome.hover_fill(chrome.control_hover_bg)
         } else if self.chrome_see_through() {
             // As the window tabs: no second coat of the bar's ground.
             LinearRgba::TRANSPARENT
@@ -1180,9 +1184,10 @@ impl crate::TermWindow {
                 chrome.control_hover_bg
             };
             let border_alpha = if pressed { 0.52 } else { 0.38 };
+            // Above the trailing action mask, as the window buttons'.
             self.fill_rounded_rectangle_with_border(
                 layers,
-                1,
+                2,
                 euclid::rect(
                     (button_x + press_inset) as f32,
                     (button_y + press_inset) as f32,
@@ -1251,9 +1256,10 @@ impl crate::TermWindow {
                 chrome.control_hover_bg
             };
             let border_alpha = if pressed { 0.52 } else { 0.38 };
+            // As the new-tab button beside it: above the trailing mask.
             self.fill_rounded_rectangle_with_border(
                 layers,
-                1,
+                2,
                 euclid::rect(
                     (button_x + press_inset) as f32,
                     (button_y + press_inset) as f32,

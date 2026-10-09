@@ -7054,9 +7054,11 @@ impl SettingsWindow {
             } else {
                 palette.text.mul_alpha(if pressed { 0.52 } else { 0.38 })
             };
+            // Over the content's chrome mask, which shares the row and
+            // hid every hover but the icon's: a white cross on white.
             self.draw_rounded_frame(
                 layers,
-                1,
+                2,
                 x + press_inset,
                 y + press_inset,
                 visual_size,

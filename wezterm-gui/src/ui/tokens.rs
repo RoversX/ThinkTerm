@@ -241,6 +241,20 @@ impl UiPalette {
         palette
     }
 
+    /// A hovered tab's or segment's fill, given the dark palette's own. The
+    /// light palette's hover greys are near-white, and the tab strips and the
+    /// right sidebar's switcher sit on white or nearly white ground, where
+    /// they did not show: on light the text is laid thinly over the ground
+    /// instead. Only for a fill with no border: a bordered one is laid over a
+    /// disc of the border's colour, which shows through a see-through fill.
+    pub(crate) fn hover_fill(&self, dark: LinearRgba) -> LinearRgba {
+        if self.is_dark() {
+            dark
+        } else {
+            self.text.mul_alpha(0.12)
+        }
+    }
+
     /// The raised tab, given that the strip beneath it is the terminal's own
     /// ground rather than a piece of sidebar.
     ///

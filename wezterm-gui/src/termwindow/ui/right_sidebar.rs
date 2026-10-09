@@ -7721,7 +7721,7 @@ impl crate::TermWindow {
                     layers,
                     2,
                     pill,
-                    chrome.sidebar_button_hover_bg,
+                    chrome.hover_fill(chrome.sidebar_button_hover_bg),
                     WINDOW_TAB_ADD_BUTTON_RADIUS,
                 )
                 .context("right sidebar hovered mode")?;

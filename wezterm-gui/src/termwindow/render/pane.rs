@@ -624,7 +624,7 @@ impl crate::TermWindow {
             let tab_surface_color = if selected_tab {
                 chrome.active_tab_surface()
             } else if is_hovered && !is_renaming_tab {
-                chrome.control_hover_bg
+                chrome.hover_fill(chrome.control_hover_bg)
             } else {
                 foreground.mul_alpha(0.025)
             };
@@ -1012,7 +1012,7 @@ impl crate::TermWindow {
             let tab_surface_color = if selected_tab {
                 chrome.active_tab_surface()
             } else if is_hovered && !is_renaming_tab {
-                chrome.control_hover_bg
+                chrome.hover_fill(chrome.control_hover_bg)
             } else {
                 foreground.mul_alpha(0.025)
             };
