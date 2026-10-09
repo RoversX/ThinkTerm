@@ -1012,6 +1012,8 @@ web-settings-close = Close
 settings-web-reachable = Reachable from other devices
 settings-web-reachable-description = Listens on every network address with a certificate of its own; a phone on the same network or tailnet can open the link. Turn it on only on networks you trust. Off, only the machine it runs on can.
 settings-web-reachable-restart = Turned browser access off and on again at the new address.
+settings-web-relay = Reach other machines
+settings-web-relay-description = Enables every web listener; off leaves only relay = true listeners enabled. Uses this computer’s SSH settings and keys to reach other machines. Changes to relay in thinkterm.lua take effect on config reload.
 settings-web-qr = Scan on your phone
 settings-web-qr-description = Makes a link and shows it as a code; compare the certificate fingerprint before continuing.
 settings-web-qr-show = Show code
@@ -1157,7 +1159,6 @@ session-import-result-unavailable = The connection was interrupted. Check the im
 web-machines-title = Remote Hosts
 web-machines-here = This server
 web-machines-connected = Connected
-web-machines-others = Other machines
 web-machines-empty = No other machines yet. Add one here, or list it in ~/.ssh/config on this server.
 web-machines-connect = Connect
 web-machines-show = Show
@@ -1214,5 +1215,8 @@ web-machines-failed-same-server = That is this server
 web-machines-failed-failed = Could not connect
 web-machines-failed-desktop = The desktop app there needs updating first
 web-machines-failed-gone = No longer on this server’s list
+web-machines-off = Reaching other machines is off on this server
+web-machines-off-hint = Turn on “Reach other machines” in Settings → Web on this server’s desktop, or set relay = true in its web_servers entry in thinkterm.lua.
+web-machines-failed-off = Turned off on this server
 web-machines-bad-port = A port is a number from 1 to 65535
 web-machines-details = Details

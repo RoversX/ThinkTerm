@@ -881,6 +881,8 @@ settings-web-no-listener = 没有在监听,链接无处指向。请先打开浏�
 settings-web-reachable = 其他设备也能访问
 settings-web-reachable-description = 在所有网络地址上监听,并使用自己的证书;同一网络或 tailnet 里的手机就能打开链接。只在你信任的网络里打开。关闭时只有它所在的那台机器能访问。
 settings-web-reachable-restart = 已把浏览器访问关掉再打开,换到了新地址。
+settings-web-relay = 连接其他机器
+settings-web-relay-description = 为所有网页监听器开启访问;关闭后,只有 relay = true 的监听器仍允许连接其他机器。使用这台电脑的 SSH 设置和密钥。thinkterm.lua 中的 relay 修改在配置重载后生效。
 settings-web-qr = 用手机扫码
 settings-web-qr-description = 生成一个链接,并显示成二维码;继续之前,请先核对证书指纹。
 settings-web-qr-show = 显示二维码
@@ -1129,7 +1131,6 @@ session-import-result-unavailable = 连接已中断。请使用“检查导入�
 web-machines-title = 远程主机
 web-machines-here = 这台服务器
 web-machines-connected = 已连接
-web-machines-others = 其他机器
 web-machines-empty = 还没有其他机器。可以在这里添加，或写进这台服务器的 ~/.ssh/config。
 web-machines-connect = 连接
 web-machines-show = 显示
@@ -1186,5 +1187,8 @@ web-machines-failed-same-server = 这就是当前这台服务器
 web-machines-failed-failed = 连接失败
 web-machines-failed-desktop = 那台机器上的桌面版需要先更新
 web-machines-failed-gone = 这台服务器的列表里已经没有它了
+web-machines-off = 这台服务器没有开启连接其他机器
+web-machines-off-hint = 在这台服务器桌面版的设置 → 网页里打开“连接其他机器”,或者在它的 thinkterm.lua 里给 web_servers 那一项加上 relay = true。
+web-machines-failed-off = 这台服务器已关闭此功能
 web-machines-bad-port = 端口是 1 到 65535 之间的数字
 web-machines-details = 详情

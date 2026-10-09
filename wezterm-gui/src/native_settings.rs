@@ -875,6 +875,10 @@ pub(crate) struct NativeWebSettings {
     /// Listen on every address (with the server's own certificate) rather
     /// than loopback only, so a phone can reach it.
     pub(crate) reachable: bool,
+    /// Let a page reach the machines this computer can SSH to, through its
+    /// session server. Read by the server itself each time (web_relay.rs),
+    /// so it takes effect without a restart.
+    pub(crate) relay: bool,
 }
 
 impl Default for NativeWebSettings {
@@ -882,6 +886,7 @@ impl Default for NativeWebSettings {
         Self {
             reachable: false,
             link_ttl_secs: Some(DEFAULT_WEB_LINK_TTL_SECS),
+            relay: false,
         }
     }
 }

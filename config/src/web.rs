@@ -9,7 +9,8 @@ use wezterm_dynamic::{FromDynamic, ToDynamic};
 /// unix socket and the TLS credentials.
 ///
 /// Like `tls_servers`, these are read when the server starts; a config
-/// reload does not open or close web ports.
+/// reload does not open or close web ports. The `relay` permission is read
+/// again after reload, including for connections already open.
 #[derive(Debug, Clone, FromDynamic, ToDynamic)]
 pub struct WebServer {
     /// The address:port to listen on. Loopback by default: browsers only
@@ -50,6 +51,16 @@ pub struct WebServer {
     /// `ssh -L` to reach a remote server instead.
     #[dynamic(default = "default_true")]
     pub require_tls_off_loopback: bool,
+
+    /// Let a page opened here reach the machines this server can SSH to --
+    /// its `~/.ssh/config`, the desktop's saved hosts, and ones added in the
+    /// browser -- signing in for the page with this server's own SSH
+    /// settings and keys. Off by default. The desktop's Settings → Web has
+    /// a switch that turns it on for every listener; this is the same for a
+    /// server with no desktop. Changes take effect on config reload;
+    /// turning both permissions off ends existing relays within two seconds.
+    #[dynamic(default)]
+    pub relay: bool,
 }
 
 fn default_web_bind_address() -> String {
@@ -67,6 +78,7 @@ impl Default for WebServer {
             token_file: None,
             allowed_origins: vec![],
             require_tls_off_loopback: true,
+            relay: false,
         }
     }
 }

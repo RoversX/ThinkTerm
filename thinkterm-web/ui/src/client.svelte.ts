@@ -56,6 +56,12 @@ export function s(id: string): string {
   return views.strings[id] ?? id;
 }
 
+/** A label with a number in it: the wasm sends it with `{count}` where the
+    number goes (`COUNTED_KEYS` in views.rs). */
+export function sCount(id: string, count: number): string {
+  return s(id).replace('{count}', String(count));
+}
+
 /** The boot's progress, and the probes' one-line results. */
 export function setBoot(text: string, failed = false, stage?: number) {
   views.boot = text;

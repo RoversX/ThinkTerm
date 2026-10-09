@@ -5,7 +5,7 @@
   // page, for a page whose only way out is its server, and a tab of its
   // own as that one is: in the terminal's place while it is on show, kept
   // as it was while another tab is.
-  import { s } from './client.svelte';
+  import { s, sCount } from './client.svelte';
   import { check, chevronRight, download, house, keyRound, plus, search, server, shieldAlert, unplug, x } from './icons';
   import {
     addMachine, answer, close, closePanel, connect, forgetMachine, HERE, machines, openPlainSsh, showMachine,
@@ -20,9 +20,17 @@
     return q === '' || label.toLowerCase().includes(q) || endpoint.toLowerCase().includes(q);
   }
 
-  /** The machines open here, and the ones not, in the server's order. */
+  /** The machines open here, and the ones not, in the server's order: the
+      hosts saved on the desktop or added here, and the ones from
+      `~/.ssh/config`, which the desktop's page groups apart and folds. */
   const opened = $derived(machines.open.filter((m) => found(m.label, endpointOf(m.id))));
   const others = $derived(machines.list.filter((m) => !machines.open.some((o) => o.id === m.id) && found(m.label, m.endpoint)));
+  const own = $derived(others.filter((m) => m.source !== 'ssh-config'));
+  const system = $derived(others.filter((m) => m.source === 'ssh-config'));
+  /** The `~/.ssh/config` group is unfolded: folded by default, as on the
+      desktop, and open while a search could find something in it. */
+  let systemOpen = $state(false);
+  const systemShown = $derived(systemOpen || query.trim() !== '');
 
   const SOURCE: Record<string, string> = {
     'ssh-config': 'web-machines-from-ssh-config',
@@ -59,9 +67,17 @@
     form = { label: '', host: '', port: '', user: '', password: '' };
   });
 
-  // A tab closed starts the next one afresh: no search left in its field.
+  // A tab closed starts the next one afresh: no search left in its field,
+  // and the `~/.ssh/config` group folded again.
   $effect(() => {
-    if (!machines.tab) query = '';
+    if (machines.tab) return;
+    query = '';
+    systemOpen = false;
+  });
+
+  // Reaching other machines turned off: no host can be added.
+  $effect(() => {
+    if (!machines.enabled) machines.adding = false;
   });
 
   // On show, the page takes the keys -- unless a field in it already has
@@ -188,7 +204,7 @@
   <div id="machines" class:adding={machines.adding} hidden={!machines.panel} tabindex="-1" onkeydown={onKeydown} bind:this={page}>
     <div class="lists">
     <div class="tools">
-      <button class="pillbtn primary addbtn" type="button" data-action="add-machine" onclick={() => (machines.adding = true)}>{@html plus}<span>{s('ssh-new-host')}</span></button>
+      {#if machines.enabled}<button class="pillbtn primary addbtn" type="button" data-action="add-machine" onclick={() => (machines.adding = true)}>{@html plus}<span>{s('ssh-new-host')}</span></button>{/if}
       <label class="find">{@html search}<input type="search" bind:value={query} placeholder={s('ssh-search')} spellcheck="false" autocapitalize="off" autocomplete="off" /></label>
     </div>
     <div class="body">
@@ -279,30 +295,42 @@
         {/each}
       </div>
 
-      {#if others.length > 0 || (machines.listed && machines.list.length === 0)}<div class="label">{s('web-machines-others')}</div>{/if}
-      {#if others.length > 0}
-        <div class="grid">
-          {#each others as m (m.id)}
-            <div class="hcard">
-              <div class="mrow" data-machine={m.id}>
-                <span class="logo">{@html server}</span>
-                <div class="tx">
-                  <div class="lab">{m.label}</div>
-                  <div class="desc"><span>{m.endpoint}</span><span>{sourceOf(m)}</span>{#if m.password}<span>{s('web-machines-password-kept')}</span>{/if}</div>
-                </div>
-                <div class="ctl">
-                  <button class="pillbtn" type="button" data-action="connect" onclick={(ev) => go(ev, m.id)}>{s('web-machines-connect')}</button>
-                  {#if m.forgettable}
-                    <button class="iconbtn" type="button" title={s('web-machines-forget')} data-action="forget" onclick={() => void forgetMachine(m.id)}>{@html x}</button>
-                  {/if}
-                </div>
-              </div>
+      {#snippet hostCard(m: MachineEntry)}
+        <div class="hcard">
+          <div class="mrow" data-machine={m.id}>
+            <span class="logo">{@html server}</span>
+            <div class="tx">
+              <div class="lab">{m.label}</div>
+              <div class="desc"><span>{m.endpoint}</span><span>{sourceOf(m)}</span>{#if m.password}<span>{s('web-machines-password-kept')}</span>{/if}</div>
             </div>
-          {/each}
+            <div class="ctl">
+              <button class="pillbtn" type="button" data-action="connect" onclick={(ev) => go(ev, m.id)}>{s('web-machines-connect')}</button>
+              {#if m.forgettable}
+                <button class="iconbtn" type="button" title={s('web-machines-forget')} data-action="forget" onclick={() => void forgetMachine(m.id)}>{@html x}</button>
+              {/if}
+            </div>
+          </div>
         </div>
-      {:else if machines.listed && machines.list.length === 0}
-        <!-- The desktop's empty page: the server glyph over one line. -->
-        <div class="empty">{@html server}<span>{s('web-machines-empty')}</span></div>
+      {/snippet}
+      {#if machines.listed && !machines.enabled}
+        <!-- Turned off at the server: what to turn on, and where. -->
+        <div class="empty off" data-machines="off">{@html server}<span class="offt">{s('web-machines-off')}</span><span>{s('web-machines-off-hint')}</span></div>
+      {:else}
+        <!-- The desktop's groups: the hosts saved there or added here, then
+             `~/.ssh/config`'s under a caption that folds them, folded at
+             first and open while searching. -->
+        {#if own.length > 0}
+          <div class="label">{s('ssh-group-hosts')}</div>
+          <div class="grid">{#each own as m (m.id)}{@render hostCard(m)}{/each}</div>
+        {/if}
+        {#if system.length > 0}
+          <button class="label fold" class:open={systemShown} type="button" data-action="system-hosts" aria-expanded={systemShown} onclick={() => (systemOpen = !systemOpen)}>{@html chevronRight}<span>{sCount('ssh-system-hosts', system.length)}</span></button>
+          {#if systemShown}<div class="grid">{#each system as m (m.id)}{@render hostCard(m)}{/each}</div>{/if}
+        {/if}
+        {#if machines.listed && machines.list.length === 0}
+          <!-- The desktop's empty page: the server glyph over one line. -->
+          <div class="empty">{@html server}<span>{s('web-machines-empty')}</span></div>
+        {/if}
       {/if}
       {#if machines.error !== ''}<div class="err">{machines.error}</div>{/if}
     </div>

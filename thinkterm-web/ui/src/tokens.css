@@ -677,6 +677,12 @@ body[data-mobile] .nav > .caps, body[data-mobile] .nav > .acts { margin-top: 6px
 #machines .more.open svg { transform: rotate(90deg); }
 /* The desktop's empty page: its server glyph over the one line. */
 #machines .empty { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 28px 24px 34px 24px; color: var(--muted); font-size: 13px; line-height: 1.4; text-align: center; }
+#machines .empty.off .offt { color: var(--text); font-weight: 600; }
+/* The `~/.ssh/config` group's caption folds it, as the desktop's does. */
+#machines .label.fold { display: flex; align-items: center; gap: 4px; width: calc(100% - 4px); padding: 0; border: 0; background: transparent; text-align: left; cursor: default; font: 600 13px var(--ui); transition: var(--fade); }
+#machines .label.fold:hover { color: var(--text); }
+#machines .label.fold svg { width: 14px; height: 14px; flex: none; transition: transform .15s; }
+#machines .label.fold.open svg { transform: rotate(90deg); }
 #machines .empty svg { width: 28px; height: 28px; stroke-width: 1.6; }
 #machines .err { margin: -8px 2px 16px 2px; color: var(--danger); font-size: 12px; }
 #machines .addbtn { display: inline-flex; align-items: center; gap: 6px; padding: 0 14px 0 11px; }

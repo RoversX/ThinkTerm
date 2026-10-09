@@ -881,6 +881,8 @@ settings-web-no-listener = 待ち受けていないため、リンクの向き�
 settings-web-reachable = 他のデバイスから接続できる
 settings-web-reachable-description = すべてのネットワークアドレスで、自前の証明書を使って待ち受けます。同じネットワークや tailnet のスマートフォンからリンクを開けます。信頼できるネットワークでだけオンにしてください。オフなら、それが動いているマシンだけです。
 settings-web-reachable-restart = ブラウザアクセスを切り、新しいアドレスで入れ直しました。
+settings-web-relay = ほかのマシンに接続
+settings-web-relay-description = すべての Web リスナーで接続を許可します。オフでも relay = true のリスナーは接続を許可します。このコンピュータの SSH 設定と鍵を使います。thinkterm.lua の relay の変更は構成の再読み込みで反映されます。
 settings-web-qr = スマートフォンで読み取る
 settings-web-qr-description = リンクを作り、コードとして表示します。進む前に証明書の指紋を照合してください。
 settings-web-qr-show = コードを表示
@@ -1129,7 +1131,6 @@ session-import-result-unavailable = 接続が中断されました。「イン�
 web-machines-title = リモートホスト
 web-machines-here = このサーバー
 web-machines-connected = 接続済み
-web-machines-others = ほかのマシン
 web-machines-empty = ほかのマシンはまだありません。ここで追加するか、このサーバーの ~/.ssh/config に書いてください。
 web-machines-connect = 接続
 web-machines-show = 表示
@@ -1186,5 +1187,8 @@ web-machines-failed-same-server = このサーバー自身です
 web-machines-failed-failed = 接続できませんでした
 web-machines-failed-desktop = そのマシンのデスクトップ版を先に更新してください
 web-machines-failed-gone = このサーバーの一覧にもうありません
+web-machines-off = このサーバーでは、ほかのマシンへの接続がオフです
+web-machines-off-hint = このサーバーのデスクトップ版で 設定 → Web の「ほかのマシンに接続」をオンにするか、thinkterm.lua の web_servers の項目に relay = true を加えてください。
+web-machines-failed-off = このサーバーでオフになっています
 web-machines-bad-port = ポートは 1 から 65535 までの数字です
 web-machines-details = 詳細

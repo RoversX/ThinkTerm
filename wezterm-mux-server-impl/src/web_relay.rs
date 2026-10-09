@@ -20,7 +20,10 @@
 //!
 //! The token already gives a shell on this server, and through it whatever
 //! this server's ssh setup reaches; the relay adds no reach of its own, so
-//! there is no list of allowed hosts.
+//! there is no list of allowed hosts. It is off until it is turned on --
+//! by the desktop's Settings → Web, or by `relay = true` in the listener's
+//! `web_servers` entry on a server with no desktop -- and turning it off
+//! ends the machines open through it.
 //!
 //! The same socket is also where the page asks for this machine's tab icon
 //! cards: they are edited in the desktop's settings, and a page only draws
@@ -70,6 +73,11 @@ const MAX_HELLO_FRAME: u64 = 1024 * 1024;
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
 /// Bytes of a host command's error output kept for the page.
 const STDERR_TAIL: usize = 4096;
+/// What a page is told when reaching other machines is turned off here.
+const OFF: &str = "reaching other machines is turned off on this server";
+/// How often a machine open through the relay looks at the switch again,
+/// so turning it off ends the machine within this long.
+const SWITCH_CHECK: Duration = Duration::from_secs(2);
 /// The most a host command may print before it is given up on. What is run
 /// prints a few lines; a login script that never stops printing must not
 /// fill this server's memory in the minute the command has.
@@ -154,6 +162,9 @@ enum Reply {
     Machines {
         /// This server's own name, for the page to head its own Spaces.
         here: String,
+        /// Reaching other machines is turned on here. Off, the list is
+        /// empty: nothing about the machines is told to the page.
+        enabled: bool,
         machines: Vec<MachineView>,
     },
     Saved {
@@ -244,6 +255,8 @@ enum Reason {
     SameServer,
     /// Not on this server's list any more.
     Gone,
+    /// Reaching other machines is turned off on this server.
+    Off,
     Failed,
 }
 
@@ -534,14 +547,74 @@ fn machines() -> Vec<Machine> {
     machines_from(&kept, saved, system, resolved_address)
 }
 
-fn machines_reply() -> Reply {
+fn machines_reply(enabled: bool) -> Reply {
     Reply::Machines {
         here: hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
             .unwrap_or_default(),
-        machines: machines().iter().map(Machine::view).collect(),
+        enabled,
+        machines: if enabled {
+            machines().iter().map(Machine::view).collect()
+        } else {
+            vec![]
+        },
     }
+}
+
+/// Whether the desktop's Settings → Web turned reaching other machines on,
+/// as its settings file at `path` says. A file that is not there, or does
+/// not read, leaves it off.
+fn desktop_allows_at(path: &Path) -> bool {
+    #[derive(Default, Deserialize)]
+    struct Web {
+        #[serde(default)]
+        relay: bool,
+    }
+    #[derive(Default, Deserialize)]
+    struct Settings {
+        #[serde(default)]
+        web: Web,
+    }
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Settings>(&text).ok())
+        .is_some_and(|settings| settings.web.relay)
+}
+
+/// Whether a page may reach other machines through this server: the
+/// listener's current `relay = true`, or the desktop's switch. Neither is
+/// captured at listener startup, so a config reload also reaches open relays.
+fn relay_allowed(listener: &str) -> bool {
+    relay_allowed_at(
+        &config::configuration().web_servers,
+        listener,
+        &config::native_settings_path(),
+    )
+}
+
+fn relay_allowed_at(servers: &[config::WebServer], listener: &str, settings: &Path) -> bool {
+    servers
+        .iter()
+        .find(|server| server.bind_address == listener)
+        .is_some_and(|server| server.relay)
+        || desktop_allows_at(settings)
+}
+
+/// Ends the relay once reaching other machines is turned off: an open
+/// machine is let go of within `SWITCH_CHECK` of the switch.
+fn watch_switch(attempt: &Attempt, listener: String) -> smol::Task<()> {
+    let attempt = attempt.clone();
+    crate::connections::spawn_task(async move {
+        loop {
+            smol::Timer::after(SWITCH_CHECK).await;
+            let listener = listener.clone();
+            if !smol::unblock(move || relay_allowed(&listener)).await {
+                attempt.stop("reaching other machines was turned off on this server");
+                return;
+            }
+        }
+    })
 }
 
 /// The tab icon cards of the desktop on this machine, as a page draws them:
@@ -2291,10 +2364,13 @@ struct Relay<S> {
     sender: Sender<S>,
     incoming: smol::channel::Receiver<Incoming>,
     attempt: Attempt,
+    /// The address whose current configuration governs this connection.
+    listener: String,
 }
 
-/// One relay socket, from its first message to its close.
-pub async fn serve<S>(socket: S, revoked: smol::channel::Receiver<()>)
+/// One relay socket, from its first message to its close. `listener` is
+/// its bind address, used to read the current policy (see `relay_allowed`).
+pub async fn serve<S>(socket: S, revoked: smol::channel::Receiver<()>, listener: String)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -2336,6 +2412,7 @@ where
         sender,
         incoming,
         attempt,
+        listener,
     };
     if relay.run().await.is_err() {
         log::debug!("web relay ended with an error");
@@ -2397,6 +2474,31 @@ where
                     continue;
                 }
             };
+            let listener = self.listener.clone();
+            let enabled = smol::unblock(move || relay_allowed(&listener)).await;
+            if !enabled {
+                // Off: no machine is listed, saved, forgotten or opened. The
+                // tab icon cards are this machine's own and still answered.
+                match &request {
+                    Request::Open { .. } => {
+                        return self
+                            .reply(&Reply::Failed {
+                                reason: Reason::Off,
+                                message: OFF.to_string(),
+                                ssh_domain: None,
+                            })
+                            .await;
+                    }
+                    Request::Save { .. } | Request::Forget { .. } => {
+                        self.reply(&Reply::Error {
+                            message: OFF.to_string(),
+                        })
+                        .await?;
+                        continue;
+                    }
+                    Request::List | Request::TabIcons | Request::Answer { .. } => {}
+                }
+            }
             match request {
                 Request::List => {}
                 Request::Save { machine } => match smol::unblock(move || save_machine(machine)).await {
@@ -2427,12 +2529,15 @@ where
                 // Nothing was asked.
                 Request::Answer { .. } => continue,
             }
-            let list = smol::unblock(machines_reply).await;
+            let list = smol::unblock(move || machines_reply(enabled)).await;
             self.reply(&list).await?;
         }
     }
 
     async fn open(&mut self, id: &str) -> anyhow::Result<()> {
+        // For as long as the machine is open, through its questions and
+        // then its bytes: turned off meanwhile, it ends.
+        let _switch = watch_switch(&self.attempt, self.listener.clone());
         let all = smol::unblock(machines).await;
         let Some(machine) = all.into_iter().find(|m| m.id == id) else {
             return self
@@ -2845,6 +2950,66 @@ mod tests {
             }
             other => panic!("{:?}", other),
         }
+    }
+
+    #[test]
+    fn reaching_other_machines_is_off_until_turned_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        // No desktop here, or one that never touched the switch: off.
+        assert!(!desktop_allows_at(&settings));
+        std::fs::write(&settings, r#"{"theme":"x","web":{"reachable":true}}"#).unwrap();
+        assert!(!desktop_allows_at(&settings));
+        std::fs::write(&settings, r#"{"theme":"x","web":{"reachable":true,"relay":true}}"#).unwrap();
+        assert!(desktop_allows_at(&settings));
+        // A file that does not read is no go-ahead.
+        std::fs::write(&settings, "{").unwrap();
+        assert!(!desktop_allows_at(&settings));
+        // Off, the page hears so, and of no machine.
+        let text = serde_json::to_string(&Reply::Machines {
+            here: "server-a".into(),
+            enabled: false,
+            machines: vec![],
+        })
+        .unwrap();
+        assert_eq!(text, r#"{"op":"machines","here":"server-a","enabled":false,"machines":[]}"#);
+        assert_eq!(serde_json::to_string(&Reason::Off).unwrap(), r#""off""#);
+    }
+
+    #[test]
+    fn relay_policy_tracks_each_listener_and_the_desktop_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        let mut servers = vec![
+            config::WebServer {
+                bind_address: "server-a:8088".into(),
+                relay: true,
+                ..Default::default()
+            },
+            config::WebServer {
+                bind_address: "server-b:8088".into(),
+                ..Default::default()
+            },
+        ];
+        assert!(relay_allowed_at(&servers, "server-a:8088", &settings));
+        assert!(!relay_allowed_at(&servers, "server-b:8088", &settings));
+        assert!(!relay_allowed_at(&servers, "server-c:8088", &settings));
+
+        // The desktop switch can change the other listeners independently.
+        std::fs::write(&settings, r#"{"web":{"relay":true}}"#).unwrap();
+        assert!(relay_allowed_at(&servers, "server-b:8088", &settings));
+        assert!(relay_allowed_at(&servers, "server-c:8088", &settings));
+        std::fs::write(&settings, r#"{"web":{"relay":false}}"#).unwrap();
+        assert!(relay_allowed_at(&servers, "server-a:8088", &settings));
+        assert!(!relay_allowed_at(&servers, "server-b:8088", &settings));
+
+        // A reloaded entry, or its removal, must replace the startup policy.
+        servers[0].relay = false;
+        assert!(!relay_allowed_at(&servers, "server-a:8088", &settings));
+        servers[1].relay = true;
+        assert!(relay_allowed_at(&servers, "server-b:8088", &settings));
+        servers.clear();
+        assert!(!relay_allowed_at(&servers, "server-b:8088", &settings));
     }
 
     #[test]

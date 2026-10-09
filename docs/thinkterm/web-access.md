@@ -46,6 +46,11 @@ config.web_servers = {
 
     -- Refuse to start without TLS when bind_address is not loopback.
     -- require_tls_off_loopback = true,
+
+    -- Let a page opened here reach the machines this server can SSH to
+    -- (see "Other machines" below). Off by default; the desktop's
+    -- Settings → Web has the same switch.
+    -- relay = true,
   },
 }
 ```
@@ -111,6 +116,40 @@ A listener that is reached under some other name (a reverse proxy) must
 list that name in `allowed_origins`; the minted URLs then point there. A
 non-loopback listener with `require_tls_off_loopback = false` serves plain
 http and no certificate is made; a browser reaching it has no WebGPU.
+
+## Other machines
+
+The page's Remote Hosts tab opens other machines through the server it was
+loaded from, which is all a browser-only setup can reach. It is off until it
+is turned on: "Reach other machines" in the desktop's Settings → Web, or
+`relay = true` in the listener's `web_servers` entry on a server with no
+desktop. The desktop switch enables it for every listener; turning that
+switch off leaves only the listeners whose own `relay` setting is true.
+Unlike the listener's bind address, `relay` changes take effect on config
+reload, without restarting the listener. Once both permissions are off,
+the tab lists nothing and existing relays end within two seconds.
+
+The machines are the ones the server knows: its `~/.ssh/config` (folded
+under "System SSH", as on the desktop), the desktop's saved remote hosts,
+and any added in the browser, which are kept on the server. Opening one, the
+server signs in over SSH with its own settings and keys; a password, a host
+key or a one-time code is asked in the page, and a password can be kept on
+the server, encrypted. Then the server runs `thinkterm cli --prefer-mux
+proxy` there and relays the page's mux connection to that machine's own mux
+server, byte for byte, as the desktop's SSHMUX domains do. Each machine is a
+client of its own in the page, and the Space menu groups the Spaces by
+machine.
+
+Where ThinkTerm is not installed, the page asks once, then the server puts it
+in `~/.local/bin` there; an older one is updated and its sessions handed over
+to the new server. A desktop install is never replaced. Where ThinkTerm
+cannot run, or the answer is no, the page offers a plain SSH terminal from
+the server instead, which lasts as long as the server's SSH connection.
+
+The relay is not end-to-end encrypted: TLS ends at the server and SSH starts
+there, so the server can see what passes through it, though it does not
+decode it. That is the trust the token already carries: it is a shell on the
+server, and the server's own keys reach those machines.
 
 ## The page's chrome
 
@@ -234,7 +273,8 @@ local rows, to keep or delete there.
 Images (kitty, sixel, iTerm2) are not drawn; the cursor does not blink. The
 input method's hidden field follows the terminal cursor, including
 scrolling and resizing, so the browser can place its candidate window
-there; pre-edit text and its underline are not yet drawn in the grid.
+there, and the text being composed is drawn at the cursor in the cursor's
+colours, as on the desktop.
 
 A dropped socket is reopened by the page itself, with a backoff, on the same
 tab; the remark stays while it is down. It gives up only when there is

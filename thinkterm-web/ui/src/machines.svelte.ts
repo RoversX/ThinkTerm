@@ -70,6 +70,9 @@ export const machines = $state({
   here: '',
   list: [] as MachineEntry[],
   listed: false,
+  /** Reaching other machines is turned on at this server; off, the list
+      is empty and the page says how to turn it on. */
+  enabled: true,
   /** Why the list or the last change to it failed; empty when it did not. */
   error: '',
   open: [] as OpenMachine[],
@@ -153,6 +156,7 @@ function request(message: object): Promise<string | null> {
       const reply = JSON.parse(ev.data);
       if (reply.op === 'machines') {
         machines.here = reply.here;
+        machines.enabled = reply.enabled !== false;
         machines.list = reply.machines;
         machines.listed = true;
         for (const m of machines.open) m.label = machines.list.find((e) => e.id === m.id)?.label ?? m.label;

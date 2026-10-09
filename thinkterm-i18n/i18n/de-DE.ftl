@@ -909,6 +909,8 @@ settings-web-no-listener = Nichts lauscht, also gibt es kein Ziel für einen Lin
 settings-web-reachable = Von anderen Geräten erreichbar
 settings-web-reachable-description = Lauscht auf allen Netzwerkadressen mit einem eigenen Zertifikat; ein Telefon im selben Netzwerk oder Tailnet kann den Link öffnen. Schalten Sie es nur in Netzwerken ein, denen Sie vertrauen. Aus kommt nur die Maschine heran, auf der er läuft.
 settings-web-reachable-restart = Der Browserzugriff wurde aus- und unter der neuen Adresse wieder eingeschaltet.
+settings-web-relay = Andere Rechner erreichen
+settings-web-relay-description = Aktiviert alle Web-Listener; aus bleiben nur Listener mit relay = true aktiv. Der Zugriff nutzt die SSH-Einstellungen und Schlüssel dieses Computers. Änderungen an relay in thinkterm.lua gelten nach dem Neuladen der Konfiguration.
 settings-web-qr = Mit dem Telefon scannen
 settings-web-qr-description = Erzeugt einen Link und zeigt ihn als Code; vergleichen Sie vor dem Fortfahren den Zertifikat-Fingerabdruck.
 settings-web-qr-show = Code zeigen
@@ -1157,7 +1159,6 @@ session-import-result-unavailable = Die Verbindung wurde unterbrochen. Prüfen S
 web-machines-title = Remote-Hosts
 web-machines-here = Dieser Server
 web-machines-connected = Verbunden
-web-machines-others = Andere Rechner
 web-machines-empty = Noch keine anderen Rechner. Fügen Sie hier einen hinzu oder tragen Sie ihn auf diesem Server in ~/.ssh/config ein.
 web-machines-connect = Verbinden
 web-machines-show = Anzeigen
@@ -1214,5 +1215,8 @@ web-machines-failed-same-server = Das ist dieser Server
 web-machines-failed-failed = Verbindung fehlgeschlagen
 web-machines-failed-desktop = Die Desktop-App dort muss zuerst aktualisiert werden
 web-machines-failed-gone = Nicht mehr in der Liste dieses Servers
+web-machines-off = Andere Rechner zu erreichen ist auf diesem Server aus
+web-machines-off-hint = Schalten Sie „Andere Rechner erreichen“ unter Einstellungen → Web in der Desktop-App dieses Servers ein, oder setzen Sie relay = true in seinem web_servers-Eintrag in thinkterm.lua.
+web-machines-failed-off = Auf diesem Server ausgeschaltet
 web-machines-bad-port = Ein Port ist eine Zahl von 1 bis 65535
 web-machines-details = Details

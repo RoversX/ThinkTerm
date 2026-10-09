@@ -89,9 +89,12 @@ pub struct Card {
 /// confirmation words), keyed by their catalogue id, in the active locale.
 pub const STRING_KEYS: &[&str] = &[
     "web-machines-title",
+    "web-machines-off",
+    "web-machines-off-hint",
+    "web-machines-failed-off",
+    "ssh-group-hosts",
     "web-machines-here",
     "web-machines-connected",
-    "web-machines-others",
     "web-machines-empty",
     "web-machines-connect",
     "web-machines-show",
@@ -271,8 +274,20 @@ pub const STRING_KEYS: &[&str] = &[
 ];
 
 pub fn strings() -> std::collections::BTreeMap<&'static str, String> {
-    STRING_KEYS.iter().map(|key| (*key, thinkterm_i18n::tr(key))).collect()
+    let mut strings: std::collections::BTreeMap<&'static str, String> =
+        STRING_KEYS.iter().map(|key| (*key, thinkterm_i18n::tr(key))).collect();
+    let mut args = thinkterm_i18n::FluentArgs::new();
+    args.set("count", COUNT_SLOT);
+    for key in COUNTED_KEYS {
+        strings.insert(*key, thinkterm_i18n::tr_args(key, &args));
+    }
+    strings
 }
+
+/// Labels with a number in them: sent with `COUNT_SLOT` where it goes, for
+/// the page to fill in (`sCount` in client.svelte.ts).
+pub const COUNTED_KEYS: &[&str] = &["ssh-system-hosts"];
+pub const COUNT_SLOT: &str = "{count}";
 
 #[cfg(test)]
 mod tests {
@@ -362,7 +377,7 @@ mod tests {
                 let key_like = quoted.starts_with(|c: char| c.is_ascii_lowercase())
                     && quoted.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
                 if key_like && thinkterm_i18n::has_key(quoted) {
-                    if !STRING_KEYS.contains(&quoted) {
+                    if !STRING_KEYS.contains(&quoted) && !COUNTED_KEYS.contains(&quoted) {
                         missing.push(format!("{name}: {quoted}"));
                     }
                     at += len + 1;

@@ -808,8 +808,12 @@ where
                     site.describe,
                     admission.token_id
                 );
-                crate::web_relay::serve(Prefixed::new(leftover, stream), admission.revoked.clone())
-                    .await;
+                crate::web_relay::serve(
+                    Prefixed::new(leftover, stream),
+                    admission.revoked.clone(),
+                    site.describe.clone(),
+                )
+                .await;
                 drop(admission);
                 return;
             }

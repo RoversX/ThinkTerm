@@ -1442,6 +1442,7 @@ enum SettingsAction {
     CopyWebLink,
     /// Listen on every address (a phone can reach it) or loopback only.
     ToggleWebReachable,
+    ToggleWebRelay,
     /// Mint a link and show it as a QR code, or hide the one shown.
     ToggleWebQr,
     /// Index into the token rows cached at paint time.
@@ -5840,6 +5841,11 @@ impl SettingsWindow {
                     crate::web_settings::restart(window.clone(), self.web_bind_address());
                 }
             }
+            SettingsAction::ToggleWebRelay => {
+                self.ui.open_dropdown = None;
+                self.native_settings.web.relay = !self.native_settings.web.relay;
+                self.save_web_settings();
+            }
             SettingsAction::ToggleWebQr => {
                 self.ui.open_dropdown = None;
                 if crate::web_settings::state().qr.is_some() {
@@ -9212,6 +9218,25 @@ impl SettingsWindow {
                     &crate::i18n::tr("settings-web-reachable-description"),
                     this.native_settings.web.reachable,
                     SettingsAction::ToggleWebReachable,
+                    rows.rule(),
+                )?);
+                let (tx, tw) = this.paint_row_tile(
+                    layers,
+                    row_x,
+                    rows.y,
+                    row_width,
+                    SvgIcon::Server,
+                    TileColor::Purple,
+                )?;
+                rows.add(this.paint_toggle_setting_row(
+                    layers,
+                    tx,
+                    rows.y,
+                    tw,
+                    &crate::i18n::tr("settings-web-relay"),
+                    &crate::i18n::tr("settings-web-relay-description"),
+                    this.native_settings.web.relay,
+                    SettingsAction::ToggleWebRelay,
                     rows.rule(),
                 )?);
                 let (tx, tw) = this.paint_row_tile(
