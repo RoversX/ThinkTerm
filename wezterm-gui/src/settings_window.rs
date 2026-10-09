@@ -1380,6 +1380,63 @@ fn web_token_key(id: &str) -> u64 {
     hasher.finish()
 }
 
+/// The parts of a program's own status report (OSC 7501) the Status
+/// Display card switches on and off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentStatusPart {
+    Description,
+    Reason,
+    Progress,
+    Subtasks,
+}
+
+impl AgentStatusPart {
+    /// In the order the card numbers them.
+    const ALL: [Self; 4] = [
+        Self::Description,
+        Self::Reason,
+        Self::Progress,
+        Self::Subtasks,
+    ];
+
+    fn label_key(self) -> &'static str {
+        match self {
+            Self::Description => "settings-agent-status-description",
+            Self::Reason => "settings-agent-status-reason",
+            Self::Progress => "settings-agent-status-progress",
+            Self::Subtasks => "settings-agent-status-subtasks",
+        }
+    }
+
+    fn description_key(self) -> &'static str {
+        match self {
+            Self::Description => "settings-agent-status-description-description",
+            Self::Reason => "settings-agent-status-reason-description",
+            Self::Progress => "settings-agent-status-progress-description",
+            Self::Subtasks => "settings-agent-status-subtasks-description",
+        }
+    }
+
+    fn shown(self, display: &crate::native_settings::NativeAgentStatusDisplay) -> bool {
+        match self {
+            Self::Description => display.description,
+            Self::Reason => display.reason,
+            Self::Progress => display.progress,
+            Self::Subtasks => display.subtasks,
+        }
+    }
+
+    fn toggle(self, display: &mut crate::native_settings::NativeAgentStatusDisplay) {
+        let shown = match self {
+            Self::Description => &mut display.description,
+            Self::Reason => &mut display.reason,
+            Self::Progress => &mut display.progress,
+            Self::Subtasks => &mut display.subtasks,
+        };
+        *shown = !*shown;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsAction {
     SelectImportSource(ImportSource),
@@ -1413,6 +1470,8 @@ enum SettingsAction {
     ToggleImportField(ImportFieldId),
     ToggleMainWindowFrameRestore,
     ToggleNotificationSounds,
+    ToggleSystemNotifications,
+    ToggleAgentStatusPart(AgentStatusPart),
     ToggleRemoteUpdateKeepsSessions,
     ToggleLocalSessionsViaMux,
     StopSessionServer,
@@ -5528,6 +5587,38 @@ impl SettingsWindow {
                     }
                 }
             }
+            SettingsAction::ToggleSystemNotifications => {
+                self.ui.open_dropdown = None;
+                self.native_settings.workspaces.system_notifications_enabled =
+                    !self.native_settings.workspaces.system_notifications_enabled;
+                let setting = crate::i18n::tr("settings-system-notifications");
+                self.status = match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => settings_tr("settings-status-saved", &[("setting", setting)]),
+                    Err(err) => settings_tr(
+                        "settings-status-save-error",
+                        &[("setting", setting), ("error", format!("{err:#}"))],
+                    ),
+                };
+            }
+            SettingsAction::ToggleAgentStatusPart(part) => {
+                self.ui.open_dropdown = None;
+                part.toggle(&mut self.native_settings.chrome.agent_status_display);
+                let setting = crate::i18n::tr(part.label_key());
+                self.status = match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => {
+                        // The sidebars, tabs and cards that show the part are
+                        // in the main windows.
+                        if let Some(front_end) = crate::frontend::try_front_end() {
+                            front_end.invalidate_all_windows();
+                        }
+                        settings_tr("settings-status-saved", &[("setting", setting)])
+                    }
+                    Err(err) => settings_tr(
+                        "settings-status-save-error",
+                        &[("setting", setting), ("error", format!("{err:#}"))],
+                    ),
+                };
+            }
             SettingsAction::Hint(_) => {}
             SettingsAction::ToggleRemoteUpdateKeepsSessions => {
                 self.ui.open_dropdown = None;
@@ -8935,6 +9026,408 @@ impl SettingsWindow {
         Ok(y + height)
     }
 
+    /// Settings › Agents › Status Display: a picture of where a program's
+    /// own report shows, numbered like the switches under it, then one
+    /// switch per part. Returns where the card ends.
+    fn paint_agent_status_card(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        card_y: f32,
+        max_width: f32,
+    ) -> anyhow::Result<f32> {
+        let card_padding = self.ui_px(36.0);
+        let row_x = x + card_padding;
+        let row_width = max_width - card_padding * 2.0;
+        self.paint_card(layers, x, card_y, max_width, |this, layers, top| {
+            let diagram_bottom = this.paint_agent_status_diagram(layers, row_x, top, row_width)?;
+            let slot = this.ui_px(ROW_TILE_SIDE);
+            let indent = slot + this.ui_px(ROW_TILE_GAP);
+            let badge = this.ui_px(ROW_BADGE_SIDE).round();
+            let mut rows = RowCursor::new(diagram_bottom + this.ui_px(52.0), this);
+            // The first rule closes off the picture, across the card.
+            this.paint_separator(layers, row_x, rows.y - this.ui_px(28.0), row_width)?;
+            let display = this.native_settings.chrome.agent_status_display;
+            for (index, part) in AgentStatusPart::ALL.iter().copied().enumerate() {
+                let block_bottom = this.settings_row_description_y(rows.y)
+                    + this.metrics.cell_size.height as f32;
+                this.paint_number_badge(
+                    layers,
+                    row_x + ((slot - badge) / 2.0).round(),
+                    ((rows.y + block_bottom - badge) / 2.0).round(),
+                    badge,
+                    index + 1,
+                )?;
+                rows.add(this.paint_toggle_setting_row(
+                    layers,
+                    row_x + indent,
+                    rows.y,
+                    row_width - indent,
+                    &crate::i18n::tr(part.label_key()),
+                    &crate::i18n::tr(part.description_key()),
+                    part.shown(&display),
+                    SettingsAction::ToggleAgentStatusPart(part),
+                    rows.rule(),
+                )?);
+            }
+            Ok(rows.bottom)
+        })
+    }
+
+    /// The main window drawn small with the parts of a program's own report
+    /// where they show: a thread's hover card beside the sidebar, and the
+    /// Agents panel on the right. Each part carries its switch's number; a
+    /// part switched off is left out, and the one whose switch is under the
+    /// pointer lights up. Returns where the picture ends.
+    fn paint_agent_status_diagram(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+    ) -> anyhow::Result<f32> {
+        use crate::termwindow::ui::agent_panel::AGENT_BLOCKED_COLOR;
+        let colors = self.chrome_palette;
+        let ground = opaque(colors.window_bg);
+        let sidebar_ground = opaque(colors.workspace_sidebar_bg);
+        let surface = opaque(colors.control_bg);
+        let rule = colors.control_border;
+        let line = self.ui_px(2.0).max(1.0).round();
+        let height = self.ui_px(330.0).round();
+        let radius = self.ui_px(16.0).round();
+        // Smaller than the font-size picture's: here four sit in one column.
+        let badge = self.ui_px(30.0).round();
+        let bar = self.ui_px(10.0).round();
+        let pad = self.ui_px(18.0).round();
+        let muted = colors.muted_text.mul_alpha(0.55);
+        let strong = colors.text.mul_alpha(0.8);
+        let brand = LinearRgba::with_srgba(0xD9, 0x77, 0x57, 0xFF);
+        let tint = colors.accent.mul_alpha(0.22);
+        let show = self.native_settings.chrome.agent_status_display;
+        let lit = self.hovered_agent_status_part();
+        let sidebar_w = (width * 0.2).round();
+        let panel_w = (width * 0.34).round();
+        let middle_x = x + sidebar_w;
+        let panel_x = x + width - panel_w;
+        let middle_w = panel_x - middle_x;
+        let tabs_h = self.ui_px(54.0).round();
+
+        let window = (x, y, width, height, radius);
+        self.paint_window_shape(layers, window, sidebar_w, ground, sidebar_ground)?;
+        self.draw_rect(layers, 0, middle_x, y, line, height, rule)?;
+        self.draw_rect(layers, 0, panel_x, y, line, height, rule)?;
+        self.draw_rect(layers, 0, middle_x, y + tabs_h, middle_w, line, rule)?;
+        self.draw_rounded_frame(
+            layers,
+            0,
+            x,
+            y,
+            width,
+            height,
+            LinearRgba::TRANSPARENT,
+            rule,
+            radius,
+        )?;
+
+        // A part's elements, lit when its switch is under the pointer.
+        let part = |this: &mut Self,
+                        layers: &mut TripleLayerQuadAllocator<'_>,
+                        which: AgentStatusPart,
+                        (px, py, pw, ph): (f32, f32, f32, f32),
+                        color: LinearRgba|
+         -> anyhow::Result<()> {
+            if lit == Some(which) {
+                let grow = this.ui_px(6.0);
+                this.draw_rounded_rect(
+                    layers,
+                    0,
+                    px - grow,
+                    py - grow,
+                    pw + grow * 2.0,
+                    ph + grow * 2.0,
+                    tint,
+                    (ph / 2.0 + grow).min(this.ui_px(12.0)),
+                )?;
+            }
+            this.draw_rounded_rect(layers, 0, px, py, pw, ph, color, ph / 2.0)
+        };
+        // The waiting reason's pill, in the panel's amber.
+        let pill = |this: &mut Self,
+                    layers: &mut TripleLayerQuadAllocator<'_>,
+                    px: f32,
+                    py: f32|
+         -> anyhow::Result<f32> {
+            let pw = this.ui_px(54.0).round();
+            let ph = bar * 1.8;
+            if lit == Some(AgentStatusPart::Reason) {
+                let grow = this.ui_px(6.0);
+                this.draw_rounded_rect(
+                    layers,
+                    0,
+                    px - grow,
+                    py - grow,
+                    pw + grow * 2.0,
+                    ph + grow * 2.0,
+                    tint,
+                    ph / 2.0 + grow,
+                )?;
+            }
+            this.draw_rounded_rect(
+                layers,
+                0,
+                px,
+                py,
+                pw,
+                ph,
+                AGENT_BLOCKED_COLOR.mul_alpha(0.3),
+                ph / 2.0,
+            )?;
+            Ok(px + pw + this.ui_px(10.0))
+        };
+
+        // The sidebar's threads, the third one under the pointer.
+        let row_step = self.ui_px(34.0).round();
+        let first_row = y + self.ui_px(52.0).round();
+        let hovered_row = first_row + row_step * 2.0;
+        for (index, share) in [0.75f32, 0.6, 0.7, 0.5, 0.65].iter().copied().enumerate() {
+            let row_y = first_row + row_step * index as f32;
+            if index == 2 {
+                self.draw_rounded_rect(
+                    layers,
+                    0,
+                    x + pad / 2.0,
+                    row_y - bar,
+                    sidebar_w - pad,
+                    bar * 3.0,
+                    surface,
+                    bar * 1.5,
+                )?;
+            }
+            let dot = if index == 2 { AGENT_BLOCKED_COLOR } else { muted };
+            self.draw_rounded_rect(layers, 0, x + pad, row_y, bar, bar, dot, bar / 2.0)?;
+            let bar_x = x + pad + bar * 2.0;
+            self.draw_rounded_rect(
+                layers,
+                0,
+                bar_x,
+                row_y,
+                (x + sidebar_w - pad - bar_x) * share,
+                bar,
+                strong,
+                bar / 2.0,
+            )?;
+        }
+
+        // Two tabs: an agent's, with the dot that says it waits.
+        let tab_h = self.ui_px(32.0).round();
+        let tab_w = (middle_w * 0.26).round();
+        let tab_y = y + ((tabs_h - tab_h) / 2.0).round();
+        for index in 0..2 {
+            let tab_x = middle_x + pad + (tab_w + pad * 0.6) * index as f32;
+            self.draw_rounded_rect(layers, 0, tab_x, tab_y, tab_w, tab_h, surface, tab_h / 2.0)?;
+            let circle = tab_h - self.ui_px(8.0);
+            let circle_x = tab_x + self.ui_px(4.0);
+            let circle_y = tab_y + self.ui_px(4.0);
+            let fill = if index == 0 { brand } else { muted };
+            self.draw_rounded_rect(layers, 0, circle_x, circle_y, circle, circle, fill, circle / 2.0)?;
+            self.draw_rounded_rect(
+                layers,
+                0,
+                circle_x + circle + self.ui_px(8.0),
+                tab_y + (tab_h - bar) / 2.0,
+                tab_w * 0.45,
+                bar,
+                muted,
+                bar / 2.0,
+            )?;
+            if index == 0 {
+                let dot = self.ui_px(12.0).round();
+                self.draw_rounded_rect(
+                    layers,
+                    0,
+                    circle_x + circle - dot * 0.7,
+                    circle_y - dot * 0.25,
+                    dot,
+                    dot,
+                    AGENT_BLOCKED_COLOR,
+                    dot / 2.0,
+                )?;
+            }
+        }
+
+        // The hovered thread's card, beside the sidebar.
+        let card_x = middle_x + self.ui_px(12.0);
+        let card_w = (middle_w * 0.55).round();
+        let card_y = hovered_row - self.ui_px(22.0);
+        let card_h = pad * 2.0 + bar + self.ui_px(14.0) + bar * 1.8;
+        self.draw_rounded_frame(
+            layers,
+            0,
+            card_x,
+            card_y,
+            card_w,
+            card_h,
+            surface,
+            rule,
+            self.ui_px(10.0),
+        )?;
+        let heading_y = card_y + pad;
+        self.draw_rounded_rect(
+            layers,
+            0,
+            card_x + pad,
+            heading_y,
+            bar,
+            bar,
+            AGENT_BLOCKED_COLOR,
+            bar / 2.0,
+        )?;
+        self.draw_rounded_rect(
+            layers,
+            0,
+            card_x + pad + bar * 2.0,
+            heading_y,
+            card_w * 0.4,
+            bar,
+            strong,
+            bar / 2.0,
+        )?;
+        let said_y = heading_y + bar + self.ui_px(14.0);
+        let mut said_x = card_x + pad;
+        if show.reason {
+            said_x = pill(self, layers, said_x, said_y)?;
+        }
+        let card_said_end = card_x + card_w - pad;
+        if show.description {
+            part(
+                self,
+                layers,
+                AgentStatusPart::Description,
+                (said_x, said_y + bar * 0.4, (card_said_end - said_x).max(bar), bar),
+                muted,
+            )?;
+        }
+
+        // The Agents panel: one agent with everything it reported, a part
+        // to a line in the switches' order, each line's number in a gutter
+        // to the right where it sits on nothing.
+        let gutter = badge + self.ui_px(16.0);
+        let row_x = panel_x + pad / 2.0;
+        let row_w = panel_w - pad - gutter;
+        let text_x = row_x + pad + bar * 2.4;
+        let text_end = row_x + row_w - pad;
+        let line_step = (badge + self.ui_px(8.0)).round();
+        let progress_h = self.ui_px(8.0).round();
+        let row_y = y + self.ui_px(36.0).round();
+        let lines = 2
+            + usize::from(show.description)
+            + usize::from(show.reason)
+            + usize::from(show.progress)
+            + usize::from(show.subtasks);
+        let row_h = pad * 2.0 + line_step * (lines - 1) as f32 + bar;
+        self.draw_rounded_rect(layers, 0, row_x, row_y, row_w, row_h, surface, self.ui_px(12.0))?;
+        let mark = bar * 1.6;
+        let mut line_y = row_y + pad;
+        self.draw_rounded_rect(
+            layers,
+            0,
+            row_x + pad,
+            line_y - bar * 0.3,
+            mark,
+            mark,
+            brand,
+            mark / 2.0,
+        )?;
+        self.draw_rounded_rect(layers, 0, text_x, line_y, (text_end - text_x) * 0.7, bar, strong, bar / 2.0)?;
+        line_y += line_step;
+        self.draw_rounded_rect(layers, 0, text_x, line_y, (text_end - text_x) * 0.45, bar, muted, bar / 2.0)?;
+        let badge_x = (row_x + row_w + (gutter - badge) / 2.0).round();
+        let mut badges = Vec::new();
+        if show.description {
+            line_y += line_step;
+            part(
+                self,
+                layers,
+                AgentStatusPart::Description,
+                (text_x, line_y, (text_end - text_x) * 0.85, bar),
+                muted,
+            )?;
+            badges.push((1, line_y + bar / 2.0));
+        }
+        if show.reason {
+            line_y += line_step;
+            pill(self, layers, text_x, line_y - bar * 0.4)?;
+            badges.push((2, line_y + bar / 2.0));
+        }
+        if show.progress {
+            line_y += line_step;
+            let track_y = line_y + (bar - progress_h) / 2.0;
+            let track_w = text_end - text_x;
+            part(
+                self,
+                layers,
+                AgentStatusPart::Progress,
+                (text_x, track_y, track_w, progress_h),
+                colors.separator,
+            )?;
+            self.draw_rounded_rect(
+                layers,
+                0,
+                text_x,
+                track_y,
+                (track_w * 0.6).round(),
+                progress_h,
+                colors.accent,
+                progress_h / 2.0,
+            )?;
+            badges.push((3, line_y + bar / 2.0));
+        }
+        if show.subtasks {
+            // Folded to the one line that counts them, as the panel shows
+            // them until that line is clicked.
+            line_y += line_step;
+            let chevron = (bar * 1.6).round();
+            self.draw_svg_icon(
+                layers,
+                SvgIcon::ChevronRight,
+                text_x - (chevron - bar) / 2.0,
+                line_y + (bar - chevron) / 2.0,
+                chevron,
+                colors.muted_text,
+            )?;
+            part(
+                self,
+                layers,
+                AgentStatusPart::Subtasks,
+                (
+                    text_x + bar * 2.0,
+                    line_y,
+                    (text_end - text_x - bar * 2.0) * 0.55,
+                    bar,
+                ),
+                muted,
+            )?;
+            badges.push((4, line_y + bar / 2.0));
+        }
+        for (number, center_y) in badges {
+            self.paint_number_badge(layers, badge_x, (center_y - badge / 2.0).round(), badge, number)?;
+        }
+        Ok(y + height)
+    }
+
+    /// The Status Display part whose switch the pointer is on, if any.
+    fn hovered_agent_status_part(&self) -> Option<AgentStatusPart> {
+        match self
+            .ui
+            .interaction
+            .pressed
+            .or(self.ui.interaction.hovered)?
+        {
+            SettingsAction::ToggleAgentStatusPart(part) => Some(part),
+            _ => None,
+        }
+    }
+
     /// Tint one part of a window drawn by `paint_typography_diagram`: the
     /// window's rounded shape, cut down to the part, so a part on the
     /// window's edge keeps its corner.
@@ -10014,6 +10507,25 @@ impl SettingsWindow {
                 SettingsAction::ToggleNotificationSounds,
                 rows.rule(),
             )?);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::BellRing,
+                TileColor::Red,
+            )?;
+            rows.add(this.paint_toggle_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-system-notifications"),
+                &crate::i18n::tr("settings-system-notifications-description"),
+                this.native_settings.workspaces.system_notifications_enabled,
+                SettingsAction::ToggleSystemNotifications,
+                rows.rule(),
+            )?);
             Ok(rows.bottom)
         })?;
 
@@ -10290,7 +10802,20 @@ impl SettingsWindow {
                 (detail_block_rel_y + detail_block_height + self.ui_px(18.0) - row_step).max(0.0)
             })
             .unwrap_or(0.0);
-        let integrations_title_y = section_y;
+        // How much of a program's own report shows comes first; the
+        // integrations follow under their own heading.
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            section_y,
+            &crate::i18n::tr("settings-agent-status-heading"),
+            palette.muted_text,
+            max_width,
+        )?;
+        let (status_card_y, _) = self.settings_card_geometry(section_y, 0);
+        let status_bottom = self.paint_agent_status_card(layers, x, status_card_y, max_width)?;
+        let integrations_title_y = status_bottom + self.settings_section_card_gap();
         let integrations_card_y = integrations_title_y + self.settings_section_card_gap();
         let integrations_first_row_y = integrations_card_y + self.settings_card_top_padding();
         let mut integrations_card_height =
