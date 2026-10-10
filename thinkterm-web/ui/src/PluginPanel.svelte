@@ -634,7 +634,7 @@
   // as a click. The canvas takes no touch of the browser's own
   // (`touch-action`), so a drag never scrolls the page instead.
   const SLOP = 8;
-  const FLING_DECAY = 0.94;
+  const FLING_DECAY = 0.92;
   const FLING_MIN = 0.04;
   type Drag = { id: number; x0: number; y0: number; x: number; y: number; at: number; vx: number; vy: number; moving: boolean };
   let drag: Drag | null = null;

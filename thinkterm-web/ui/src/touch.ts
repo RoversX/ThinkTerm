@@ -30,7 +30,7 @@ const CELL = 17;
 const SETTLED = 1000;
 /** How much of a fling's speed is left after 16ms, and the speed (px/ms)
     below which it has stopped. */
-const FLING_DECAY = 0.94;
+const FLING_DECAY = 0.92;
 const FLING_MIN = 0.04;
 /** How far two fingers have to spread or close for one font step. */
 const PINCH_STEP = 48;
