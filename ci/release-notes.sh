@@ -65,7 +65,23 @@ link_to() {
   return 1
 }
 
-echo "<!-- What changed in this release goes above this line. Then delete it. -->"
+# The same header on every release, from main: the tag does not exist until
+# the draft is published, so a link through it would show broken in the draft.
+echo "## $version"
+echo
+echo "![ThinkTerm](https://raw.githubusercontent.com/RoversX/thinkterm/main/assets/release-header.jpg)"
+echo
+echo "🍺 Homebrew (macOS):"
+echo
+echo '```'
+echo "brew install --cask roversx/tap/thinkterm"
+echo '```'
+echo
+echo "🌐 Website: [closex.org/thinkterm](https://closex.org/thinkterm)"
+echo
+echo "📚 Documentation: [docs.closex.org/thinkterm](https://docs.closex.org/thinkterm)"
+echo
+echo "<!-- What changed in this release goes here. Then delete this line. -->"
 echo
 echo "## Downloads"
 echo
