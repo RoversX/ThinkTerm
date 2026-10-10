@@ -124,7 +124,7 @@ signing_run "Prepare signing probe" cp /usr/bin/true "$PROBE"
 if ! signing_run "Sign certificate probe" codesign --keychain "$KEYCHAIN" --force --options runtime --sign "$MACOS_TEAM_ID" "$PROBE"; then
   fail "the certificate does not sign for MACOS_TEAM_ID: it has to be a Developer ID Application certificate of that team, exported with its private key"
 fi
-codesign -dv "$PROBE" 2>&1 | grep -q '^Authority=Developer ID Application:' ||
+codesign -dvv "$PROBE" 2>&1 | grep -q '^Authority=Developer ID Application:' ||
   fail "the certificate is not a Developer ID Application certificate, the only kind Apple notarizes"
 if ! (security find-certificate -c "Developer ID Application" -p "$KEYCHAIN" |
   openssl x509 -noout -checkend $((60 * 24 * 3600))) >/dev/null 2>&1; then

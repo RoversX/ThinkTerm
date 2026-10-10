@@ -49,7 +49,7 @@ elif tool == "security" and args[0] == "default-keychain" and args[-1] == "/home
     Path(os.environ["HOME"], "restored").touch()
 elif tool == "uuidgen":
     print("00000000-0000-0000-0000-000000000000")
-elif tool == "codesign" and args[0] == "-dv":
+elif tool == "codesign" and args[0] == "-dvv":
     print("Authority=Developer ID Application: Example Person", file=sys.stderr)
 elif tool == "xcrun" and args[:2] == ["notarytool", "submit"]:
     sys.stdout.buffer.write(plistlib.dumps({"status": os.environ.get("MOCK_STATUS", "Accepted"), "id": payload}))
