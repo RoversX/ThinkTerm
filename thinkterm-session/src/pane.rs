@@ -628,8 +628,8 @@ impl<H: SessionHost> PaneSession<H> {
             }
         };
 
-        let band =
-            (dims.viewport_rows.max(1) * config.scrollback_lookahead_screens()) as StableRowIndex;
+        let band = (dims.viewport_rows.max(1) * config.scrollback_lookahead_screens())
+            .max(config.scrollback_lookahead_rows()) as StableRowIndex;
         if band > 0 && budget > 0 {
             let mut ahead = uncached(
                 st,
@@ -1484,6 +1484,7 @@ mod tests {
 
     struct TestConfig {
         lookahead: Cell<usize>,
+        lookahead_rows: Cell<usize>,
         warm: Cell<bool>,
         rate: Cell<u32>,
     }
@@ -1491,6 +1492,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 lookahead: Cell::new(0),
+                lookahead_rows: Cell::new(0),
                 warm: Cell::new(false),
                 rate: Cell::new(100),
             }
@@ -1505,6 +1507,9 @@ mod tests {
         }
         fn scrollback_lookahead_screens(&self) -> usize {
             self.lookahead.get()
+        }
+        fn scrollback_lookahead_rows(&self) -> usize {
+            self.lookahead_rows.get()
         }
         fn warm_scrollback(&self) -> bool {
             self.warm.get()
@@ -2330,6 +2335,38 @@ mod tests {
         let _ = session.get_lines(10..14);
         host.spawner.run_all();
         assert_eq!(rows_requested(&host), 0, "everything around is cached now");
+    }
+
+    /// A viewport a soft keyboard cut short still fetches the host's floor
+    /// of rows ahead, not a screen of its own: the rows the keyboard gives
+    /// back are cached by the time it goes.
+    #[test]
+    fn a_short_viewport_fetches_the_hosts_floor_of_rows_ahead() {
+        let rows: Vec<_> = (0..48).map(|r| (r, "row")).collect();
+        for (floor, reaches) in [(0, false), (30, true)] {
+            let (host, session) = session(&rows);
+            host.config.lookahead.set(1);
+            host.config.lookahead_rows.set(floor);
+            let mut short = delta(1, false, false);
+            short.dimensions.viewport_rows = 8;
+            short.dimensions.scrollback_rows = 48;
+            short.dimensions.physical_top = 40;
+            session.queue_render_delta(short);
+            host.spawner.run_all();
+
+            let _ = session.get_lines(40..48);
+            host.spawner.run_all();
+            let st = session.state();
+            assert!(
+                matches!(st.lines.peek(&33), Some(LineEntry::Line(_))),
+                "a screen ahead either way"
+            );
+            assert_eq!(
+                matches!(st.lines.peek(&12), Some(LineEntry::Line(_))),
+                reaches,
+                "with a floor of {floor} rows"
+            );
+        }
     }
 
     /// The whole scrollback is fetched once per cache epoch when the host

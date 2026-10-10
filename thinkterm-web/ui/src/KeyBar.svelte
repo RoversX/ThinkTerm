@@ -169,6 +169,15 @@
     let applied = 0;
     /** The bar's height when the canvas was last cut to fit above it. */
     let appliedMine = 0;
+    /** The height the canvas had before the soft keyboard cut it down;
+        zero while it has it. */
+    let rest = 0;
+    /** Grown back to `rest` as the keyboard began to go: the canvas stays
+        where it is and the keyboard slides off its last rows, as a phone's
+        own apps do. Riding down with the bar instead showed blank above it
+        until the cut, a beat after the keyboard had gone. */
+    let ahead = false;
+    let lastHeight = 0;
     const root = document.documentElement;
     /** Until the canvas is cut to the viewport's new height, it rides with
         the bar (--term-shift in tokens.css): its last row -- the prompt --
@@ -177,7 +186,7 @@
         put them. Left where it was, the prompt fell behind the keyboard as
         it came up, and the terminal jumped down once it went. */
     const ride = (barTop: number) => {
-      const shift = applied > 0 ? barTop - (applied - appliedMine) : 0;
+      const shift = applied > 0 && !ahead ? barTop - (applied - appliedMine) : 0;
       root.style.setProperty('--term-shift', `${Math.round(shift)}px`);
     };
     /** The height the canvas is cut to, once the viewport has stopped
@@ -193,6 +202,8 @@
       // Cut to fit, the canvas sits where the bar is: nothing to ride.
       root.style.setProperty('--term-shift', '0px');
       if (height === applied) return;
+      if (height < applied && rest === 0) rest = applied;
+      if (height >= rest) rest = 0;
       applied = height;
       root.style.setProperty('--vvh', `${height}px`);
     };
@@ -210,10 +221,18 @@
       // -- every time the bar moved.
       const barTop = (vv ? vv.offsetTop : 0) + height - mine;
       top = barTop;
+      // The keyboard going: back to the whole height at once, one cut.
+      if (height < lastHeight) ahead = false;
+      if (!ahead && rest > 0 && height > applied) {
+        ahead = true;
+        apply(rest, mine);
+      }
+      lastHeight = height;
       ride(barTop);
       if (settle !== null) clearTimeout(settle);
       settle = setTimeout(() => {
         settle = null;
+        ahead = false;
         apply(height, mine);
       }, SETTLE);
     };

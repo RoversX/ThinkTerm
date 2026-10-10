@@ -3,7 +3,7 @@
 //! client; only `P` and `L` differ.
 
 use crate::platform::{Link, Platform};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use thinkterm_session::clock::{Clock, Timestamp};
@@ -85,13 +85,27 @@ impl SessionEvents for Events {
 
 pub struct Config {
     rules: Arc<Vec<termwiz::hyperlink::Rule>>,
+    /// The most rows the page has given its grid. A phone's soft keyboard
+    /// cuts the grid to what shows above it, and the rows fetched ahead
+    /// are kept to this many: the ones the keyboard gives back as it goes
+    /// are then on hand, where a screen of the short grid fell well short
+    /// of them and the top of the pane showed blank for a round trip.
+    tallest_rows: Cell<usize>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             rules: Arc::new(Vec::new()),
+            tallest_rows: Cell::new(0),
         }
+    }
+}
+
+impl Config {
+    /// The page laid its grid out `rows` tall.
+    pub fn saw_rows(&self, rows: usize) {
+        self.tallest_rows.set(self.tallest_rows.get().max(rows));
     }
 }
 
@@ -104,6 +118,9 @@ impl HostConfig for Config {
     }
     fn scrollback_lookahead_screens(&self) -> usize {
         1
+    }
+    fn scrollback_lookahead_rows(&self) -> usize {
+        self.tallest_rows.get()
     }
     fn warm_scrollback(&self) -> bool {
         false

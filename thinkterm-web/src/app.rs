@@ -335,6 +335,14 @@ pub struct Inner<P: Platform, L: Link> {
     /// The layout as the divider drag began: every step is measured
     /// from it, not from the last step's result.
     drag_layout: Option<crate::layout::TabLayout>,
+    /// The tab as this page last claimed it for its own grid, drawn until
+    /// the server's layout answers: a phone's soft keyboard going away
+    /// grows the grid at once, its top filled from the rows fetched
+    /// ahead, where the old layout sat flush with the bottom and left the
+    /// rest of the canvas blank for a round trip.
+    claimed_layout: Option<crate::layout::TabLayout>,
+    /// When `claimed_layout` was claimed, on the platform's clock.
+    claimed_at: f64,
     /// A divider claim on the wire, and the step that arrived meanwhile
     /// to send when it answers: one round trip at a time, the newest
     /// position wins.
@@ -660,6 +668,8 @@ impl<P: Platform, L: Link> App<P, L> {
             drag_pane: None,
             drag_divider: None,
             drag_layout: None,
+            claimed_layout: None,
+            claimed_at: 0.0,
             divider_claim_busy: false,
             divider_claim_next: None,
             preview_epoch: 0,
@@ -2385,7 +2395,7 @@ impl<P: Platform, L: Link> App<P, L> {
             inner.glyphs.metrics.cell_size.height as f64,
         );
         let (col, row) = cell_at(px, py, cw, ch);
-        let place = match &inner.tab_layout {
+        let place = match Self::drawn_layout(inner) {
             Some(layout) => crate::layout::hit(layout, col, row)?.clone(),
             None => Self::focused_placement(inner)?,
         };
@@ -2913,7 +2923,7 @@ impl<P: Platform, L: Link> App<P, L> {
         // Where the focused pane is in its scrollback: rows above the
         // bottom, and rows there are to scroll through.
         if let Some(cell) = inner.panes.get(&inner.focused_pane) {
-            let rows = match &inner.tab_layout {
+            let rows = match Self::drawn_layout(inner) {
                 Some(layout) => layout.panes.iter().find(|place| place.pane_id == inner.focused_pane)
                     .map(|place| Self::shown_in(inner, place).1),
                 None => Self::focused_placement(inner).as_ref().map(|place| Self::shown_in(inner, place).1),
@@ -2931,7 +2941,7 @@ impl<P: Platform, L: Link> App<P, L> {
             let above = cell.scroll_from_bottom as f32 + cell.scroll_px / cell_h;
             json.push_str(&format!(",\"scroll\":[{above:.3},{max}]"));
         }
-        match &inner.tab_layout {
+        match Self::drawn_layout(inner) {
             Some(layout) => {
                 json.push_str(&format!(",\"cols\":{},\"rows\":{},\"zoomed\":", layout.cols, layout.rows));
                 match layout.zoomed {
@@ -3024,7 +3034,7 @@ impl<P: Platform, L: Link> App<P, L> {
             // the old one drawn from the top jumped the prompt away from
             // the keyboard's edge and back.
             let height = inner.gpu.size().1 as f32;
-            let rows = match &inner.tab_layout {
+            let rows = match Self::drawn_layout(inner) {
                 Some(layout) if layout.rows > 0 => layout.rows as f32,
                 _ => (height / ch.max(1.0)).floor(),
             };
@@ -3943,8 +3953,20 @@ impl<P: Platform, L: Link> App<P, L> {
                 .map(|p| p.pane_id)
                 .unwrap_or(want)
         };
+        // A layout sent before the claim -- the server's word on an earlier
+        // size -- leaves the claimed one drawn; the answer to it, another
+        // tab, or a claim nobody met in time puts the server's back.
+        let answered = inner.claimed_layout.as_ref().is_none_or(|claimed| {
+            claimed.tab_id != layout.tab_id
+                || (claimed.cols, claimed.rows) == (layout.cols, layout.rows)
+                || inner.platform.monotonic_ms() - inner.claimed_at > Self::PREVIEW_PATIENCE_MS
+        });
         inner.tab_layout = Some(layout);
-        Self::settle_previews(inner);
+        // Nor do the panes' previews give way to it.
+        if answered {
+            inner.claimed_layout = None;
+            Self::settle_previews(inner);
+        }
         fresh
     }
 
@@ -6353,6 +6375,7 @@ impl<P: Platform, L: Link> App<P, L> {
         let changed = cols != inner.cols || rows != inner.rows;
         inner.cols = cols;
         inner.rows = rows;
+        inner.host.config.saw_rows(rows);
         // The bars are placed from the cell size, which may just have moved.
         Self::notify(&inner);
         if changed {
@@ -6379,7 +6402,7 @@ impl<P: Platform, L: Link> App<P, L> {
                 // Pane by pane, at frames scaled to the new grid: one
                 // claim that reserves every bar's rows, rather than a bare
                 // grid the listing then corrects (two reflows on screen).
-                if let Some(scaled) = Self::scaled_layout(&inner, cols, rows) {
+                if let Some(mut scaled) = Self::scaled_layout(&inner, cols, rows) {
                     let panes = Self::native_panes(&inner, &scaled);
                     let sizes: Vec<(PaneId, TerminalSize)> = panes.iter().map(|p| (p.pane_id, p.size)).collect();
                     let mut lease = inner.link.lease_mut();
@@ -6387,12 +6410,25 @@ impl<P: Platform, L: Link> App<P, L> {
                     lease.native_root = Some(size);
                     drop(lease);
                     Self::preview_panes(&mut inner, &sizes);
+                    // Drawn at the claimed grid until the server answers.
+                    for place in &mut scaled.panes {
+                        if let Some((_, claimed)) = sizes.iter().find(|(pane, _)| *pane == place.pane_id) {
+                            place.content = (claimed.cols, claimed.rows);
+                            place.size = *claimed;
+                        }
+                    }
+                    inner.claimed_layout = Some(scaled);
+                    inner.claimed_at = inner.platform.monotonic_ms();
                 }
                 let link = inner.link.clone();
                 let tab_id = inner.tab_id;
+                let app = Rc::clone(self);
                 self.spawn(async move {
                     if let Err(err) = link.claim(tab_id).await {
                         log::warn!("fitting the tab to this window: {err:#}");
+                        // Nothing will answer it: back to the server's layout.
+                        app.inner.borrow_mut().claimed_layout = None;
+                        app.request_frame();
                     }
                 });
             }
@@ -6653,7 +6689,7 @@ impl<P: Platform, L: Link> App<P, L> {
     /// The panes to draw and where. Before the first listing there is
     /// one, at the canvas's origin and the page's own grid.
     fn placements(inner: &Inner<P, L>) -> Vec<crate::layout::PanePlacement> {
-        if let Some(layout) = &inner.tab_layout {
+        if let Some(layout) = Self::drawn_layout(inner) {
             return layout.panes.clone();
         }
         let cell = inner.focused();
@@ -6673,6 +6709,12 @@ impl<P: Platform, L: Link> App<P, L> {
             workspace: inner.workspace.clone(),
             stack: vec![],
         }]
+    }
+
+    /// The tab as it is drawn and pointed at: the grid this page claimed,
+    /// while the server has yet to answer the claim, else the server's.
+    fn drawn_layout(inner: &Inner<P, L>) -> Option<&crate::layout::TabLayout> {
+        inner.claimed_layout.as_ref().or(inner.tab_layout.as_ref())
     }
 
     /// A pane's dimensions as it is drawn and pointed at: a preview of
@@ -6925,7 +6967,7 @@ impl<P: Platform, L: Link> App<P, L> {
         }
         let (cell_w, cell_h) = (root_w, root_h);
         // Dividers, centred in the gap cell like the desktop's.
-        if let Some(layout) = &inner.tab_layout {
+        if let Some(layout) = inner.claimed_layout.as_ref().or(inner.tab_layout.as_ref()) {
             let t = (inner.glyphs.metrics.underline_height.max(1)) as f32;
             let colour = focused_palette.split.to_linear();
             // Centred in the gap cell, and as long as the desktop's: half a

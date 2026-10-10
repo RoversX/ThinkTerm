@@ -119,6 +119,13 @@ pub trait HostConfig {
     /// How far past a painted range rows are fetched ahead, on each side,
     /// in viewports. Zero fetches only what is painted.
     fn scrollback_lookahead_screens(&self) -> usize;
+    /// Rows fetched ahead on each side at the least, however short the
+    /// viewport is now: a pane a phone's soft keyboard cut down then has
+    /// the rows the keyboard gives back on hand when it goes away. Zero
+    /// leaves it to [`scrollback_lookahead_screens`](Self::scrollback_lookahead_screens).
+    fn scrollback_lookahead_rows(&self) -> usize {
+        0
+    }
     /// Whether a pane's whole scrollback is fetched once it is first shown,
     /// so scrolling never paints a row that is still on its way.
     fn warm_scrollback(&self) -> bool;
