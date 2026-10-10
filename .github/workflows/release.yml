@@ -25,16 +25,6 @@ on:
         description: 'Version, e.g. 0.1.0 (blank = timestamped test build)'
         type: string
         default: ''
-      # Signed with the Developer ID certificate and notarized once the run is
-      # approved for the release environment, whose secrets hold both.
-      macos_arm64:
-        description: macOS arm64 (signed and notarized)
-        type: boolean
-        default: false
-      macos_x86_64:
-        description: macOS x86_64 (signed and notarized)
-        type: boolean
-        default: false
       # dist adds fat LTO and writes the symbols beside the binaries (.dSYM,
       # .pdb), which makes it the slow one; release is quicker for a build that
       # only needs testing. Every platform builds with the one chosen here.
@@ -45,6 +35,16 @@ on:
           - dist
           - release
         default: dist
+      # Signed with the Developer ID certificate and notarized once the run is
+      # approved for the release environment, whose secrets hold both.
+      macos_arm64:
+        description: macOS arm64 (signed and notarized)
+        type: boolean
+        default: false
+      macos_x86_64:
+        description: macOS x86_64 (signed and notarized)
+        type: boolean
+        default: false
       windows_x86_64:
         description: Windows x86_64
         type: boolean
