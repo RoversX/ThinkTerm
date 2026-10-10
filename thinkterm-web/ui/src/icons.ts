@@ -85,11 +85,18 @@ import gitBranch from '../../../third_party/lucide/icons/git-branch.svg?raw';
 import gitCompare from '../../../third_party/lucide/icons/git-compare.svg?raw';
 import listTodo from '../../../third_party/lucide/icons/list-todo.svg?raw';
 import puzzle from '../../../third_party/lucide/icons/puzzle.svg?raw';
-// The two brand marks the Agents panel draws (simple-icons): a single
-// fill-less path, so they take their colour from CSS `fill: currentColor`
-// rather than from `stroke` as the lucide icons above do.
-import brandClaude from '../../../third_party/simple-icons/icons/claude.svg?raw';
-import brandCopilot from '../../../third_party/simple-icons/icons/githubcopilot.svg?raw';
+// The Agents panel's marks, the desktop's (lobe-icons, as
+// `agent_status::brand_icon` picks them): Claude, Copilot and Kimi in their
+// own colours, the others single-colour (`fill="currentColor"`), as their
+// makers publish them.
+import brandClaude from '../../../third_party/lobe-icons/claude-color.svg?raw';
+import brandCopilot from '../../../third_party/lobe-icons/copilot-color.svg?raw';
+import brandKimi from '../../../third_party/lobe-icons/kimi-color.svg?raw';
+import brandKimiMono from '../../../third_party/lobe-icons/kimi.svg?raw';
+import brandCodex from '../../../third_party/lobe-icons/openai.svg?raw';
+import brandCursor from '../../../third_party/lobe-icons/cursor.svg?raw';
+import brandOpenCode from '../../../third_party/lobe-icons/opencode.svg?raw';
+import brandPi from '../../../third_party/lobe-icons/pi.svg?raw';
 
 export {
   archive,
@@ -107,8 +114,6 @@ export {
   bell,
   bot,
   braces,
-  brandClaude,
-  brandCopilot,
   check,
   chevronDown,
   chevronRight,
@@ -245,14 +250,29 @@ const PANEL_ICONS: Record<string, string> = {
 
 // An agent row names its mark the way `agents.rs` does: a brand when the
 // page has one, `bot` otherwise. Kept apart from `BY_NAME` above, which is
-// lucide's names and nothing else.
+// lucide's names and nothing else. Kimi's coloured mark is a white glyph
+// that all but vanishes on a light page, so it comes with its single-colour
+// one and the theme shows one of the two (tokens.css), as on the desktop.
 const AGENT_ICONS: Record<string, string> = {
   'brand-claude': brandClaude,
   'brand-copilot': brandCopilot,
+  'brand-kimi': `<span class="dark-only">${brandKimi}</span><span class="light-only">${brandKimiMono}</span>`,
+  'brand-codex': brandCodex,
+  'brand-cursor': brandCursor,
+  'brand-opencode': brandOpenCode,
+  'brand-pi': brandPi,
   bot,
 };
 
-/** An agent row's icon by its name; the bot for one the page has not inlined. */
+let copies = 0;
+
+/** An agent row's icon by its name; the bot for one the page has not inlined.
+    Every copy gets ids of its own: Copilot's gradients are referenced by
+    id, which resolves to the first in the page, and that one may be in a
+    list that is hidden. */
 export function agentIcon(name: string): string {
-  return AGENT_ICONS[name] ?? bot;
+  const svg = AGENT_ICONS[name] ?? bot;
+  if (!svg.includes(' id="')) return svg;
+  const n = ++copies;
+  return svg.replace(/ id="([^"]+)"/g, ` id="$1-${n}"`).replace(/url\(#([^)]+)\)/g, `url(#$1-${n})`);
 }

@@ -263,8 +263,9 @@ body[data-side=off]:not([data-mobile]) #side .list { top: var(--tabs); }
 #agents .ag.elsewhere { opacity: .62; }
 #agents .ic { display: inline-flex; width: 20px; height: 20px; flex: none; align-items: center; justify-content: center; color: var(--text2); }
 #agents .ic svg { width: 20px; height: 20px; }
-/* The brand marks carry no stroke and no fill of their own. */
-#agents .ic svg[role=img] { fill: currentColor; }
+/* Kimi's mark per theme (icons.ts): coloured on dark, single-colour on light. */
+#agents .ic .dark-only, #agents .ic .light-only { display: inline-flex; }
+[data-theme=light] #agents .ic .dark-only, :root:not([data-theme=light]) #agents .ic .light-only { display: none; }
 #agents .tx { display: flex; flex-direction: column; gap: 6px; flex: 1 1 auto; min-width: 0; }
 #agents .n { color: var(--text); line-height: 20px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #agents .n .d { color: var(--muted); }

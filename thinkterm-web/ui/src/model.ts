@@ -190,7 +190,7 @@ export type AgentRow = {
   state_label: string;
   /** "Project \u00b7 Thread", or the workspace when no thread claims it. */
   place: string;
-  /** `brand-claude`, `brand-copilot` or `bot`. */
+  /** `brand-<agent>` for an agent with a logo (agents.rs `icon`), else `bot`. */
   icon: string;
   /** What the program said about itself (OSC 7501), when it did. */
   kind: string | null;

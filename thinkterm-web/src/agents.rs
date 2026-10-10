@@ -212,11 +212,17 @@ pub fn display_name(agent_id: &str) -> String {
     }
 }
 
-/// Brand icons the page has (simple-icons: claude, githubcopilot); `bot` otherwise.
+/// The mark the page draws for an agent, as the desktop picks it
+/// (`agent_status::brand_icon`, lobe-icons); `bot` for one with no logo.
 pub fn icon(agent_id: &str) -> &'static str {
     match agent_id {
         "claude" => "brand-claude",
         "copilot" => "brand-copilot",
+        "kimi" => "brand-kimi",
+        "codex" => "brand-codex",
+        "cursor" => "brand-cursor",
+        "opencode" => "brand-opencode",
+        "pi" => "brand-pi",
         _ => "bot",
     }
 }
@@ -365,6 +371,8 @@ mod tests {
         assert_eq!(display_name("claude"), "Claude Code");
         assert_eq!(display_name("gemini"), "Gemini");
         assert_eq!(icon("claude"), "brand-claude");
+        assert_eq!(icon("codex"), "brand-codex");
+        assert_eq!(icon("kimi"), "brand-kimi");
         assert_eq!(icon("gemini"), "bot");
     }
 
