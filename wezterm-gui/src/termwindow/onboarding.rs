@@ -440,10 +440,14 @@ pub(crate) struct OnboardingView {
     /// When the page opened, which bounds the wait for the running check.
     opened: Instant,
     curtain: Option<Curtain>,
-    /// "hello." written out before the page appears. Gone once the page is
-    /// fully in; until then the page takes no input, since none of it can
-    /// be seen yet.
+    /// "hello." written out before the page appears, and the pen's flight
+    /// round the icon after. Until the page is fully in it takes no input,
+    /// since it cannot all be seen yet; the flight plays on over a page
+    /// that does.
     intro: Option<hello::Intro>,
+    /// Where the page last laid its icon out, which the intro's pen flies
+    /// round; `None` while a window too short for it leaves it out.
+    mark: Option<RectF>,
     /// What this page's strings shaped to. The curtain repaints the page
     /// many times a second, and its text never changes in between.
     shaped: ShapedText,
@@ -482,8 +486,14 @@ impl OnboardingView {
             opened: Instant::now(),
             curtain: None,
             intro: None,
+            mark: None,
             shaped: ShapedText::default(),
         }
+    }
+
+    /// Whether the intro still keeps the page from taking input.
+    fn intro_hides_page(&self) -> bool {
+        self.intro.as_ref().is_some_and(|intro| !intro.page_shown())
     }
 
     fn space_name(&self) -> String {
@@ -783,7 +793,7 @@ impl OnboardingView {
             area.origin.y,
             area.size.width,
             area.size.height,
-            palette.window_bg,
+            skin.ground,
         )?;
 
         let body_h = Self::text_h(font);
@@ -950,13 +960,14 @@ impl OnboardingView {
         let mut y = area.origin.y + ((area.size.height - total_h) / 2.0).max(0.0);
 
         // --- brand
+        self.mark = None;
         if show_mark {
-            ctx.draw_app_icon(
-                layers,
-                col_x + (col_w - fx(MARK_SIZE)) / 2.0,
-                y,
-                fx(MARK_SIZE),
-            )?;
+            let mark_x = col_x + (col_w - fx(MARK_SIZE)) / 2.0;
+            ctx.draw_app_icon(layers, mark_x, y, fx(MARK_SIZE))?;
+            self.mark = Some(RectF::new(
+                euclid::point2(mark_x, y),
+                euclid::size2(fx(MARK_SIZE), fx(MARK_SIZE)),
+            ));
             y += mark_h;
         }
 
@@ -1930,7 +1941,7 @@ struct Skin {
 
 impl Skin {
     fn new(palette: UiPalette) -> Self {
-        let ground = palette.window_bg;
+        let ground = page_ground(palette);
         // Every fill below is opaque — see `mix`. The selected chip in
         // particular sits only a little way from the ground, so the ordinary
         // text colour still reads on it; pushing it towards the text colour
@@ -1954,9 +1965,22 @@ impl Skin {
             // The mono inversion: the primary action is the highest-contrast
             // thing on the page without introducing a hue.
             primary_bg: palette.text,
-            primary_text: palette.window_bg,
+            primary_text: ground,
             focus: mix(ground, palette.text, 0.65),
         }
+    }
+}
+
+/// The page's ground: the window's own colour, except plain white for the
+/// light theme's own grey, where the first thing a new user sees should
+/// read bright rather than grey. A ground taken from a terminal scheme keeps
+/// its tint, so the page matches the chrome around it. The controls are
+/// mixed from it, so they follow.
+fn page_ground(palette: UiPalette) -> LinearRgba {
+    if palette.is_dark() || palette.derived {
+        palette.window_bg
+    } else {
+        LinearRgba::with_srgba(255, 255, 255, 255)
     }
 }
 
@@ -2114,15 +2138,22 @@ impl ContentView for OnboardingView {
         caption_font: &Rc<LoadedFont>,
         _cursor_on: bool,
     ) -> anyhow::Result<()> {
+        let to_mark = self.mark.is_some();
         let frame = self
             .intro
             .as_mut()
-            .and_then(|intro| intro.frame(Instant::now()));
+            .and_then(|intro| intro.frame(Instant::now(), to_mark));
         if frame.is_none() {
             self.intro = None;
         }
+        // From the moment the word starts going, the page is laid out under
+        // the still opaque ground every frame: where its icon is, which the
+        // pen flies to, has to be where it is now, not where the warm-up
+        // found it.
         let page_under = match (self.intro.as_mut(), frame) {
-            (Some(intro), Some(frame)) => frame.page_in.is_some() || intro.wants_warm_up(frame),
+            (Some(intro), Some(frame)) => {
+                frame.page_in.is_some() || frame.tail > 0.0 || intro.wants_warm_up(frame)
+            }
             _ => true,
         };
         if page_under {
@@ -2141,22 +2172,28 @@ impl ContentView for OnboardingView {
             self.widgets.clear();
         }
         match (&self.intro, frame) {
-            (Some(intro), Some(frame)) => {
-                intro.paint(ctx, layers, area, palette.window_bg, frame, page_under)
-            }
+            (Some(intro), Some(frame)) => intro.paint(
+                ctx,
+                layers,
+                area,
+                page_ground(palette),
+                frame,
+                page_under,
+                self.mark,
+            ),
             _ => Ok(()),
         }
     }
 
     fn on_mouse(&mut self, x: f32, y: f32, kind: WMEK) -> ContentViewResponse {
-        if self.intro.is_some() {
+        if self.intro_hides_page() {
             return ContentViewResponse::Ignored;
         }
         self.on_mouse_impl(x, y, kind)
     }
 
     fn on_key(&mut self, key: KeyCode, mods: KeyModifiers) -> ContentViewResponse {
-        if self.intro.is_some() {
+        if self.intro_hides_page() {
             return ContentViewResponse::Ignored;
         }
         self.on_key_impl(key, mods)
@@ -2317,6 +2354,25 @@ mod tests {
         ));
 
         view.intro = None;
+        assert!(matches!(
+            view.on_key(KeyCode::Escape, KeyModifiers::NONE),
+            ContentViewResponse::Run(_)
+        ));
+    }
+
+    /// Once the page is fully in, it answers while the pen's flight round
+    /// the icon is still playing over it; not a moment before.
+    #[test]
+    fn the_page_takes_input_once_it_is_in() {
+        let mut view = OnboardingView {
+            intro: Some(hello::Intro::new()),
+            ..view(found::Found::default())
+        };
+        assert!(matches!(
+            view.on_key(KeyCode::Escape, KeyModifiers::NONE),
+            ContentViewResponse::Ignored
+        ));
+        view.intro = Some(hello::Intro::with_page_shown());
         assert!(matches!(
             view.on_key(KeyCode::Escape, KeyModifiers::NONE),
             ContentViewResponse::Run(_)
