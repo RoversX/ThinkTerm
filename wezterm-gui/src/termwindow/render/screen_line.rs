@@ -65,6 +65,13 @@ impl crate::TermWindow {
         let pos_y = (self.dimensions.pixel_height as f32 / -2.) + params.top_pixel_y;
         let gl_x = self.dimensions.pixel_width as f32 / -2.;
 
+        // A line can hold more cells than the grid shows: while a resize
+        // settles, rows laid out for the old width are drawn into the new
+        // one. Nothing past the grid's edge is drawn, or it shows up in the
+        // padding as stale text.
+        let grid_cols = (params.pixel_width / cell_width) as usize;
+        let grid_pixels = params.left_pixel_x..params.left_pixel_x + params.pixel_width;
+
         let start = Instant::now();
 
         let cursor_idx = if params.pane.is_some()
@@ -207,6 +214,9 @@ impl crate::TermWindow {
         // * Reverse video attribute
         for item in shaped.iter() {
             let cluster = &item.cluster;
+            if cluster.first_cell_idx >= grid_cols {
+                continue;
+            }
             let attrs = &cluster.attrs;
             let cluster_width = cluster.width;
 
@@ -273,6 +283,9 @@ impl crate::TermWindow {
                 // Draw one per cell, otherwise curly underlines
                 // stretch across the whole span
                 for i in 0..cluster_width {
+                    if cluster.first_cell_idx + i >= grid_cols {
+                        break;
+                    }
                     let mut quad = layers.allocate(0).context("layers.allocate(0)")?;
                     let x = gl_x
                         + params.left_pixel_x
@@ -314,8 +327,12 @@ impl crate::TermWindow {
             0.0..0.0
         };
 
-        // Consider cursor
-        if !cursor_range.is_empty() {
+        // Consider cursor, as far as it is inside the grid
+        let cursor_cells = cursor_range
+            .end
+            .min(grid_cols)
+            .saturating_sub(cursor_range.start);
+        if cursor_cells > 0 {
             let (fg_color, bg_color) = if let Some(c) = &cursor_cell {
                 let attrs = c.attrs();
 
@@ -412,18 +429,14 @@ impl crate::TermWindow {
                     quad.set_position(
                         pos_x,
                         pos_y,
-                        pos_x + (cursor_range.end - cursor_range.start) as f32 * cell_width,
+                        pos_x + cursor_cells as f32 * cell_width,
                         pos_y + cell_height,
                     );
                     quad.set_texture(
                         gl_state
                             .glyph_cache
                             .borrow_mut()
-                            .cursor_sprite(
-                                Some(shape),
-                                &params.render_metrics,
-                                (cursor_range.end - cursor_range.start) as u8,
-                            )?
+                            .cursor_sprite(Some(shape), &params.render_metrics, cursor_cells as u8)?
                             .texture_coords(),
                     );
                 }
@@ -482,6 +495,9 @@ impl crate::TermWindow {
                 }
 
                 for glyph_idx in 0..info.pos.num_cells as usize {
+                    if visual_cell_idx + glyph_idx >= grid_cols {
+                        break;
+                    }
                     for img in &images {
                         if img.z_index() < 0 {
                             self.populate_image_quad(
@@ -601,6 +617,13 @@ impl crate::TermWindow {
                         let adjust = (glyph.x_offset + glyph.bearing_x).get() as f32;
                         let texture_range = pos_x + adjust
                             ..pos_x + adjust + (texture.coords.size.width as f32 * width_scale);
+                        // A glyph wholly inside the grid keeps its overhang;
+                        // one whose cells reach past it is cut at the edge.
+                        let texture_range = if cluster.first_cell_idx + cluster.width <= grid_cols {
+                            texture_range
+                        } else {
+                            intersection(&texture_range, &grid_pixels)
+                        };
 
                         // First bucket the ranges according to cursor position
                         let (left, mid, right) = range3(&texture_range, &cursor_range_pixels);
@@ -680,6 +703,9 @@ impl crate::TermWindow {
                 }
 
                 for glyph_idx in 0..info.pos.num_cells as usize {
+                    if visual_cell_idx + glyph_idx >= grid_cols {
+                        break;
+                    }
                     for img in &images {
                         if img.z_index() >= 0 {
                             overlay_images.push((
