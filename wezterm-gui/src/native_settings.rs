@@ -662,6 +662,8 @@ pub(crate) struct NativeChromeSettings {
     pub(crate) agent_panel_enabled: Option<bool>,
     /// What is shown of the state programs report about themselves.
     pub(crate) agent_status_display: NativeAgentStatusDisplay,
+    /// How the Agents panel's view menu filters, groups and orders it.
+    pub(crate) agents_panel_view: NativeAgentsPanelView,
     /// The panels plugins add to the right sidebar, as the plugin host last
     /// listed them (`plugins::follow_panels`): offered from the start,
     /// before the host is asked.
@@ -797,6 +799,158 @@ impl Default for NativeAgentStatusDisplay {
             reason: true,
             progress: true,
             subtasks: true,
+        }
+    }
+}
+
+/// The parts of a program's own status report (OSC 7501) that can be
+/// switched on and off: in Settings › Agents and in the Agents panel's view
+/// menu, which flip the same settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentStatusPart {
+    Description,
+    Reason,
+    Progress,
+    Subtasks,
+}
+
+impl AgentStatusPart {
+    /// In the order the Status Display card numbers them.
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Description,
+        Self::Reason,
+        Self::Progress,
+        Self::Subtasks,
+    ];
+
+    pub(crate) fn label_key(self) -> &'static str {
+        match self {
+            Self::Description => "settings-agent-status-description",
+            Self::Reason => "settings-agent-status-reason",
+            Self::Progress => "settings-agent-status-progress",
+            Self::Subtasks => "settings-agent-status-subtasks",
+        }
+    }
+
+    pub(crate) fn description_key(self) -> &'static str {
+        match self {
+            Self::Description => "settings-agent-status-description-description",
+            Self::Reason => "settings-agent-status-reason-description",
+            Self::Progress => "settings-agent-status-progress-description",
+            Self::Subtasks => "settings-agent-status-subtasks-description",
+        }
+    }
+
+    pub(crate) fn shown(self, display: &NativeAgentStatusDisplay) -> bool {
+        match self {
+            Self::Description => display.description,
+            Self::Reason => display.reason,
+            Self::Progress => display.progress,
+            Self::Subtasks => display.subtasks,
+        }
+    }
+
+    pub(crate) fn toggle(self, display: &mut NativeAgentStatusDisplay) {
+        let shown = match self {
+            Self::Description => &mut display.description,
+            Self::Reason => &mut display.reason,
+            Self::Progress => &mut display.progress,
+            Self::Subtasks => &mut display.subtasks,
+        };
+        *shown = !*shown;
+    }
+}
+
+/// The Agents panel's view menu. Grouping and order are kept as keys, so a
+/// hand-edited value the app does not know falls back to the default
+/// instead of making the whole settings file unreadable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct NativeAgentsPanelView {
+    /// States hidden, as the workspace sidebar's filter keys them.
+    pub(crate) hidden_statuses: Vec<String>,
+    /// Machines hidden, by the key
+    /// `workspace_threads::thread_place_and_machine_for_workspace` gives.
+    pub(crate) hidden_machines: Vec<String>,
+    pub(crate) group_by: String,
+    pub(crate) sort_by: String,
+}
+
+impl NativeAgentsPanelView {
+    pub(crate) fn group_by(&self) -> AgentsGroupBy {
+        match self.group_by.as_str() {
+            "thread" => AgentsGroupBy::Thread,
+            "none" => AgentsGroupBy::None,
+            _ => AgentsGroupBy::State,
+        }
+    }
+
+    pub(crate) fn sort_by(&self) -> AgentsSortBy {
+        match self.sort_by.as_str() {
+            "recent" => AgentsSortBy::Recent,
+            _ => AgentsSortBy::Fixed,
+        }
+    }
+
+    pub(crate) fn hides_status(&self, key: &str) -> bool {
+        self.hidden_statuses.iter().any(|hidden| hidden == key)
+    }
+
+    pub(crate) fn hides_machine(&self, key: &str) -> bool {
+        self.hidden_machines.iter().any(|hidden| hidden == key)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentsGroupBy {
+    /// Needing attention, running, done, idle: the default.
+    State,
+    Thread,
+    None,
+}
+
+impl AgentsGroupBy {
+    pub(crate) const ALL: [Self; 3] = [Self::State, Self::Thread, Self::None];
+
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::State => "state",
+            Self::Thread => "thread",
+            Self::None => "none",
+        }
+    }
+
+    pub(crate) fn label_key(self) -> &'static str {
+        match self {
+            Self::State => "menu-group-state",
+            Self::Thread => "menu-group-thread",
+            Self::None => "menu-group-none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentsSortBy {
+    /// By thread, agent and pane: rows never trade places on their own.
+    Fixed,
+    /// Whatever changed state last comes first.
+    Recent,
+}
+
+impl AgentsSortBy {
+    pub(crate) const ALL: [Self; 2] = [Self::Fixed, Self::Recent];
+
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Recent => "recent",
+        }
+    }
+
+    pub(crate) fn label_key(self) -> &'static str {
+        match self {
+            Self::Fixed => "menu-sort-fixed",
+            Self::Recent => "menu-sort-recent",
         }
     }
 }
@@ -2368,6 +2522,36 @@ pub(crate) fn system_notifications_enabled() -> bool {
 /// while painting.
 pub(crate) fn agent_status_display() -> NativeAgentStatusDisplay {
     load_shared().chrome.agent_status_display
+}
+
+/// Flip one part of the status display from outside Settings (the Agents
+/// panel's view menu). Painting reads it live, so no reload is owed.
+pub(crate) fn toggle_agent_status_part(part: AgentStatusPart) -> anyhow::Result<()> {
+    update_ui_state_and_settings_window(|settings| {
+        part.toggle(&mut settings.chrome.agent_status_display)
+    })
+}
+
+/// `update_ui_state`, then the open Settings window brought up to it: that
+/// window saves its whole copy, so one still holding the old value would
+/// write it back on its next save.
+fn update_ui_state_and_settings_window(
+    edit: impl FnOnce(&mut ThinkTermNativeSettings),
+) -> anyhow::Result<()> {
+    let before = load();
+    update_ui_state(edit)?;
+    crate::settings_window::follow_open_settings_window(&before, &load());
+    Ok(())
+}
+
+/// The Agents panel's view menu, as a copy to change and save. Painting
+/// borrows it from `load_shared` instead.
+pub(crate) fn agents_panel_view() -> NativeAgentsPanelView {
+    load_shared().chrome.agents_panel_view.clone()
+}
+
+pub(crate) fn save_agents_panel_view(view: NativeAgentsPanelView) -> anyhow::Result<()> {
+    update_ui_state_and_settings_window(|settings| settings.chrome.agents_panel_view = view)
 }
 
 pub(crate) fn remote_update_keeps_sessions() -> bool {

@@ -1,6 +1,7 @@
 use crate::tab_icons::RgbExt as _;
 use crate::customglyph::{BlockKey, Poly};
 use crate::glyphcache::CachedGlyph;
+use crate::native_settings::AgentStatusPart;
 use crate::quad::{
     HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait,
 };
@@ -1378,63 +1379,6 @@ fn web_token_key(id: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     id.hash(&mut hasher);
     hasher.finish()
-}
-
-/// The parts of a program's own status report (OSC 7501) the Status
-/// Display card switches on and off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentStatusPart {
-    Description,
-    Reason,
-    Progress,
-    Subtasks,
-}
-
-impl AgentStatusPart {
-    /// In the order the card numbers them.
-    const ALL: [Self; 4] = [
-        Self::Description,
-        Self::Reason,
-        Self::Progress,
-        Self::Subtasks,
-    ];
-
-    fn label_key(self) -> &'static str {
-        match self {
-            Self::Description => "settings-agent-status-description",
-            Self::Reason => "settings-agent-status-reason",
-            Self::Progress => "settings-agent-status-progress",
-            Self::Subtasks => "settings-agent-status-subtasks",
-        }
-    }
-
-    fn description_key(self) -> &'static str {
-        match self {
-            Self::Description => "settings-agent-status-description-description",
-            Self::Reason => "settings-agent-status-reason-description",
-            Self::Progress => "settings-agent-status-progress-description",
-            Self::Subtasks => "settings-agent-status-subtasks-description",
-        }
-    }
-
-    fn shown(self, display: &crate::native_settings::NativeAgentStatusDisplay) -> bool {
-        match self {
-            Self::Description => display.description,
-            Self::Reason => display.reason,
-            Self::Progress => display.progress,
-            Self::Subtasks => display.subtasks,
-        }
-    }
-
-    fn toggle(self, display: &mut crate::native_settings::NativeAgentStatusDisplay) {
-        let shown = match self {
-            Self::Description => &mut display.description,
-            Self::Reason => &mut display.reason,
-            Self::Progress => &mut display.progress,
-            Self::Subtasks => &mut display.subtasks,
-        };
-        *shown = !*shown;
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

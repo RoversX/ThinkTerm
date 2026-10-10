@@ -7894,8 +7894,6 @@ impl crate::TermWindow {
                 }
                 self.paint_agents_sidebar(
                     layers,
-                    ui_font,
-                    ui_metrics,
                     chrome,
                     foreground,
                     muted_fg,

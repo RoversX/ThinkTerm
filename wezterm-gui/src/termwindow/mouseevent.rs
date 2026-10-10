@@ -6050,47 +6050,13 @@ impl super::TermWindow {
     }
 
     fn workspace_sidebar_view_options_menu_items(&mut self) -> Vec<ContextMenuItem> {
-        use crate::workspace_threads::WorkspaceThreadWorkStatus;
         use config::keyassignment::KeyAssignment;
 
         self.begin_context_menu_application_actions();
         let hidden = crate::native_settings::workspace_sidebar_hidden_statuses();
-        let mut status_items = Vec::new();
-        for (label, icon, status) in [
-            (
-                crate::i18n::tr("menu-status-running"),
-                ContextMenuIcon::Refresh,
-                WorkspaceThreadWorkStatus::Running,
-            ),
-            (
-                crate::i18n::tr("menu-status-attention"),
-                ContextMenuIcon::Warning,
-                WorkspaceThreadWorkStatus::NeedsAttention,
-            ),
-            (
-                crate::i18n::tr("menu-status-done"),
-                ContextMenuIcon::Check,
-                WorkspaceThreadWorkStatus::FinishedUnseen,
-            ),
-            (
-                crate::i18n::tr("menu-status-idle"),
-                ContextMenuIcon::Info,
-                WorkspaceThreadWorkStatus::Idle,
-            ),
-        ] {
-            let visible = !hidden.iter().any(|key| key == status.settings_key());
-            status_items.push(
-                self.context_menu_application_item_with_icon(
-                    label,
-                    icon,
-                    crate::termwindow::ContextMenuApplicationAction::ToggleWorkspaceStatusFilter(
-                        status,
-                    ),
-                    true,
-                )
-                .checked(visible),
-            );
-        }
+        let status_items = self.status_filter_menu_items(&hidden, |status| {
+            crate::termwindow::ContextMenuApplicationAction::ToggleWorkspaceStatusFilter(status)
+        });
 
         vec![
             ContextMenuItem::section_header(crate::i18n::tr("menu-group-by")),
@@ -6141,22 +6107,10 @@ impl super::TermWindow {
         &mut self,
         status: crate::workspace_threads::WorkspaceThreadWorkStatus,
     ) {
-        let mut hidden = crate::native_settings::workspace_sidebar_hidden_statuses();
-        let key = status.settings_key();
-        if let Some(index) = hidden.iter().position(|entry| entry == key) {
-            hidden.remove(index);
-        } else {
-            hidden.push(key.to_string());
-            let parsed = hidden
-                .iter()
-                .filter_map(|entry| {
-                    crate::workspace_threads::WorkspaceThreadWorkStatus::from_settings_key(entry)
-                })
-                .collect::<Vec<_>>();
-            if crate::workspace_threads::hidden_statuses_cover_all(&parsed) {
-                return;
-            }
-        }
+        let hidden = crate::native_settings::workspace_sidebar_hidden_statuses();
+        let Some(hidden) = crate::workspace_threads::toggle_hidden_status(hidden, status) else {
+            return;
+        };
         if let Err(err) = crate::native_settings::save_workspace_sidebar_hidden_statuses(hidden) {
             log::warn!("failed to save sidebar status filter: {err:#}");
         }

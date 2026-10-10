@@ -185,6 +185,52 @@ impl crate::TermWindow {
         action: crate::termwindow::ContextMenuApplicationAction,
         enabled: bool,
     ) -> ContextMenuItem {
+        let item = self.context_menu_application_item(label, action).with_icon(icon);
+        if enabled {
+            item
+        } else {
+            item.disabled()
+        }
+    }
+
+    /// A status filter's four states, ticked when shown, in the order, words
+    /// and icons both the workspace sidebar's and the Agents panel's view
+    /// menus list them in.
+    pub(crate) fn status_filter_menu_items(
+        &mut self,
+        hidden: &[String],
+        action: impl Fn(
+            crate::workspace_threads::WorkspaceThreadWorkStatus,
+        ) -> crate::termwindow::ContextMenuApplicationAction,
+    ) -> Vec<ContextMenuItem> {
+        use crate::workspace_threads::WorkspaceThreadWorkStatus as Status;
+        [
+            ("menu-status-running", ContextMenuIcon::Refresh, Status::Running),
+            ("menu-status-attention", ContextMenuIcon::Warning, Status::NeedsAttention),
+            ("menu-status-done", ContextMenuIcon::Check, Status::FinishedUnseen),
+            ("menu-status-idle", ContextMenuIcon::Info, Status::Idle),
+        ]
+        .iter()
+        .map(|&(label, icon, status)| {
+            let shown = !hidden.iter().any(|key| key == status.settings_key());
+            self.context_menu_application_item_with_icon(
+                crate::i18n::tr(label),
+                icon,
+                action(status),
+                true,
+            )
+            .checked(shown)
+        })
+        .collect()
+    }
+
+    /// An application item with no icon: the choices of a view menu's
+    /// submenu, where the tick is the only mark they need.
+    pub(crate) fn context_menu_application_item(
+        &mut self,
+        label: impl Into<String>,
+        action: crate::termwindow::ContextMenuApplicationAction,
+    ) -> ContextMenuItem {
         let action_id = self.next_context_menu_application_action_id;
         self.next_context_menu_application_action_id = self
             .next_context_menu_application_action_id
@@ -192,12 +238,7 @@ impl crate::TermWindow {
             .max(1);
         self.context_menu_application_actions
             .insert(action_id, action);
-        let item = ContextMenuItem::application_item(label, action_id).with_icon(icon);
-        if enabled {
-            item
-        } else {
-            item.disabled()
-        }
+        ContextMenuItem::application_item(label, action_id)
     }
 
     /// Is the window currently displaying `thread_id`'s workspace? Asked
@@ -304,6 +345,24 @@ impl crate::TermWindow {
             crate::termwindow::ContextMenuApplicationAction::ToggleWorkspaceShowArchived => {
                 self.workspace_sidebar_show_archived = !self.workspace_sidebar_show_archived;
                 self.invalidate_window();
+            }
+            crate::termwindow::ContextMenuApplicationAction::ToggleAgentsStatusFilter(status) => {
+                self.toggle_agents_status_filter(status);
+            }
+            crate::termwindow::ContextMenuApplicationAction::ToggleAgentsMachineFilter(key) => {
+                self.toggle_agents_machine_filter(key);
+            }
+            crate::termwindow::ContextMenuApplicationAction::SetAgentsGroupBy(group_by) => {
+                self.set_agents_group_by(group_by);
+            }
+            crate::termwindow::ContextMenuApplicationAction::SetAgentsSortBy(sort_by) => {
+                self.set_agents_sort_by(sort_by);
+            }
+            crate::termwindow::ContextMenuApplicationAction::ToggleAgentStatusPart(part) => {
+                self.toggle_agent_status_part(part);
+            }
+            crate::termwindow::ContextMenuApplicationAction::ReloadAgentRules => {
+                self.reload_agent_rules();
             }
             crate::termwindow::ContextMenuApplicationAction::AddThreadToCollection {
                 collection_space_id,

@@ -31,7 +31,6 @@ use std::time::{Duration, Instant};
 /// `UIItemType::RightSidebarAgent`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentPanelAction {
-    ReloadRules,
     /// The toolbar line says detection is off; clicking it opens the
     /// settings page that owns that switch, so the panel explains itself
     /// instead of just sitting empty.
@@ -45,6 +44,9 @@ pub enum AgentPanelAction {
     /// Open or fold the sub-task list of the agent in this pane. Folded
     /// is the default: one line that counts them.
     ToggleSubtasks(PaneId),
+    /// The toolbar button that opens the view menu: what to show, how to
+    /// group and order it, and which parts of a report to show.
+    ViewOptions,
 }
 
 /// Snapshot of one agent pane for the Agents panel.
@@ -69,11 +71,14 @@ pub(crate) struct AgentPaneStatus {
     pub place: String,
     /// The workspace the pane belongs to, as the thread store names it.
     pub workspace: String,
+    /// The machine its thread runs on, as
+    /// `workspace_threads::thread_place_and_machine_for_workspace` keys it;
+    /// empty for this device. Resolved with `place`, once per snapshot.
+    pub machine: String,
     /// What the program said about itself with OSC 7501, when it did.
     pub report: Option<ProgramReport>,
     /// Unix seconds when `state` last changed, on the detecting host's
     /// clock (approximate across hosts).
-    #[allow(dead_code)]
     pub since_unix: u64,
 }
 
@@ -187,11 +192,11 @@ fn agent_panes() -> std::sync::Arc<Vec<AgentPaneStatus>> {
                 Some((window_id, workspace)) => (Some(*window_id), workspace.clone()),
                 None => (None, String::new()),
             };
-            let place = if workspace.is_empty() {
-                String::new()
+            let (place, machine) = if workspace.is_empty() {
+                (String::new(), String::new())
             } else {
-                crate::workspace_threads::thread_display_name_for_workspace(&workspace)
-                    .unwrap_or_else(|| workspace.clone())
+                crate::workspace_threads::thread_place_and_machine_for_workspace(&workspace)
+                    .unwrap_or_else(|| (workspace.clone(), String::new()))
             };
             let raw_title = pane.get_title();
             let title =
@@ -210,6 +215,7 @@ fn agent_panes() -> std::sync::Arc<Vec<AgentPaneStatus>> {
                 window_id,
                 place,
                 workspace,
+                machine,
                 report: status.report,
                 since_unix: status.since_unix,
             })
@@ -270,6 +276,18 @@ pub(crate) enum ShownState {
 }
 
 impl AgentPaneStatus {
+    /// The state as the sidebars' status filter and the Agents panel's
+    /// groups name it: waiting and failed both need the user.
+    pub(crate) fn work_status(&self) -> crate::workspace_threads::WorkspaceThreadWorkStatus {
+        use crate::workspace_threads::WorkspaceThreadWorkStatus as Status;
+        match self.shown_state() {
+            ShownState::Working => Status::Running,
+            ShownState::Blocked | ShownState::Error => Status::NeedsAttention,
+            ShownState::Done => Status::FinishedUnseen,
+            ShownState::Idle | ShownState::Unknown => Status::Idle,
+        }
+    }
+
     pub(crate) fn shown_state(&self) -> ShownState {
         match self.state {
             AgentState::Working => ShownState::Working,
@@ -713,6 +731,7 @@ mod tests {
             window_id: None,
             place: place.to_string(),
             workspace: String::new(),
+            machine: String::new(),
             report: None,
             since_unix: 0,
         }

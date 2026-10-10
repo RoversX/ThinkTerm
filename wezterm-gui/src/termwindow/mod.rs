@@ -658,6 +658,18 @@ pub(crate) enum ContextMenuApplicationAction {
     ToggleWorkspaceStatusFilter(crate::workspace_threads::WorkspaceThreadWorkStatus),
     /// Sidebar view-options: transiently reveal archived projects.
     ToggleWorkspaceShowArchived,
+    /// Agents panel view menu: show or hide agents in this state.
+    ToggleAgentsStatusFilter(crate::workspace_threads::WorkspaceThreadWorkStatus),
+    /// Agents panel view menu: show or hide the agents on this machine, by
+    /// `workspace_threads::thread_place_and_machine_for_workspace`.
+    ToggleAgentsMachineFilter(String),
+    SetAgentsGroupBy(crate::native_settings::AgentsGroupBy),
+    SetAgentsSortBy(crate::native_settings::AgentsSortBy),
+    /// Agents panel view menu: one part of programs' status reports, the
+    /// same switch Settings › Agents flips.
+    ToggleAgentStatusPart(crate::native_settings::AgentStatusPart),
+    /// Agents panel view menu: re-read the agent detection rules.
+    ReloadAgentRules,
     /// Add a thread reference to a Space (local, non-home, not already
     /// holding it — the menu only offers eligible targets).
     AddThreadToCollection {
@@ -3147,6 +3159,10 @@ pub struct TermWindow {
     /// the default. Each paint of the panel drops the ones with no
     /// sub-tasks left, so the next batch starts folded again.
     right_sidebar_agents_open_subtasks: HashSet<PaneId>,
+    /// What each agent's description was cut to, so a description that does
+    /// not fit is cut and measured once rather than every frame. Each paint
+    /// of the panel drops the agents that have gone.
+    right_sidebar_agents_fitted: HashMap<PaneId, ui::agent_panel::FittedDescription>,
     right_sidebar_snippet_view: RightSidebarSnippetView,
     right_sidebar_snippet_focus: Option<RightSidebarSnippetField>,
     right_sidebar_snippet_search: TextInputState,
@@ -4738,6 +4754,7 @@ impl TermWindow {
             right_sidebar_mode: RightSidebarMode::Snippets,
             right_sidebar_agents_scroll: 0.0,
             right_sidebar_agents_open_subtasks: HashSet::new(),
+            right_sidebar_agents_fitted: HashMap::new(),
             right_sidebar_snippet_view: RightSidebarSnippetView::List,
             right_sidebar_snippet_focus: None,
             right_sidebar_snippet_search: TextInputState::new(),

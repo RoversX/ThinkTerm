@@ -39,6 +39,16 @@ impl UiStatusKind {
     }
 }
 
+/// Spinner frames since the epoch, on the wall clock so every spinner in
+/// every window turns together. Read it once per surface and frame, and
+/// pass it to whatever animates on it there.
+pub(crate) fn spinner_frames() -> u128 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    now.as_millis() / SPINNER_FRAME_MS as u128
+}
+
 pub fn split_leading_legacy_progress_marker(title: &str) -> Option<&str> {
     let trimmed = title.trim_start();
     let mut chars = trimmed.char_indices();
@@ -85,15 +95,34 @@ impl TermWindow {
         size: usize,
         color: LinearRgba,
     ) -> anyhow::Result<()> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        let frame =
-            ((now.as_millis() / SPINNER_FRAME_MS as u128) % SPINNER_FRAME_COUNT as u128) as u8;
+        self.paint_spinning_ui_icon_at(layers, layer, icon, x, y, size, color, spinner_frames())
+    }
+
+    /// A spinner at a clock reading the caller took, so everything one
+    /// surface animates in a frame steps together.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_spinning_ui_icon_at(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer: usize,
+        icon: SvgIcon,
+        x: usize,
+        y: usize,
+        size: usize,
+        color: LinearRgba,
+        frames: u128,
+    ) -> anyhow::Result<()> {
+        let frame = (frames % SPINNER_FRAME_COUNT as u128) as u8;
+        self.request_spinner_frame();
+        self.paint_ui_icon_impl(layers, layer, icon, x, y, size, color, Some(frame))
+    }
+
+    /// Ask for the next spinner frame. Anything else animated on the
+    /// spinner's clock asks for the same one, so it adds no repaints.
+    pub(crate) fn request_spinner_frame(&self) {
         self.update_next_frame_time(Some(
             Instant::now() + Duration::from_millis(SPINNER_FRAME_MS),
         ));
-        self.paint_ui_icon_impl(layers, layer, icon, x, y, size, color, Some(frame))
     }
 
     pub(crate) fn paint_status_icon(

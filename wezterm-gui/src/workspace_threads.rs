@@ -2172,18 +2172,54 @@ pub fn origin_space_for_ref_workspace(host_space_id: &str, workspace: &str) -> O
 /// workspace id would otherwise leak into the UI (e.g. the Agents panel).
 pub fn thread_display_name_for_workspace(workspace: &str) -> Option<String> {
     let store = THREAD_STORE.lock();
+    let (project, thread) = project_and_thread_for_workspace(&store, workspace)?;
+    Some(project_thread_name(project, thread))
+}
+
+fn project_thread_name(project: &Project, thread: &WorkspaceThread) -> String {
+    if project.name.is_empty() || project.name == thread.name {
+        thread.name.clone()
+    } else {
+        format!("{} \u{b7} {}", project.name, thread.name)
+    }
+}
+
+/// What the Agents panel shows of a workspace's thread, from one walk of
+/// the store: its human name, as `thread_display_name_for_workspace` gives
+/// it, and a key for the machine it runs on that stays put while it does
+/// (empty for this device). `None` for workspaces no thread claims.
+pub fn thread_place_and_machine_for_workspace(workspace: &str) -> Option<(String, String)> {
+    let store = THREAD_STORE.lock();
+    let (project, thread) = project_and_thread_for_workspace(&store, workspace)?;
+    Some((
+        project_thread_name(project, thread),
+        project_machine(project, &store.spaces).key(),
+    ))
+}
+
+/// What the machine a workspace's thread runs on is called, as
+/// `origin_machine_for_project` names it; `None` for this device. Reads the
+/// host list, so it is for menus rather than painting.
+pub fn machine_label_for_workspace(workspace: &str) -> Option<String> {
+    let store = THREAD_STORE.lock();
+    let (project, _) = project_and_thread_for_workspace(&store, workspace)?;
+    let (label, local) = origin_machine_for_project(project, &store.spaces);
+    (!local).then_some(label)
+}
+
+fn project_and_thread_for_workspace<'a>(
+    store: &'a WorkspaceThreadStore,
+    workspace: &str,
+) -> Option<(&'a Project, &'a WorkspaceThread)> {
     store.projects.iter().find_map(|project| {
-        project.threads.iter().find_map(|thread| {
-            let matches = thread.materialized_workspace_name.as_deref() == Some(workspace)
-                || workspace_name_for_thread(&project.id, &thread.id) == workspace;
-            matches.then(|| {
-                if project.name.is_empty() || project.name == thread.name {
-                    thread.name.clone()
-                } else {
-                    format!("{} \u{b7} {}", project.name, thread.name)
-                }
+        project
+            .threads
+            .iter()
+            .find(|thread| {
+                thread.materialized_workspace_name.as_deref() == Some(workspace)
+                    || workspace_name_for_thread(&project.id, &thread.id) == workspace
             })
-        })
+            .map(|thread| (project, thread))
     })
 }
 
@@ -3091,6 +3127,26 @@ pub fn filter_threads_view_by_status(
 
 /// Guard for the view-options menu: refuse a toggle that would hide every
 /// status and leave the sidebar inexplicably empty.
+/// A status filter's hidden keys with `status` flipped, or `None` when that
+/// would hide every state: an empty list reads as broken, not filtered.
+/// The workspace sidebar's filter and the Agents panel's share it.
+pub fn toggle_hidden_status(
+    mut hidden: Vec<String>,
+    status: WorkspaceThreadWorkStatus,
+) -> Option<Vec<String>> {
+    let key = status.settings_key();
+    if let Some(index) = hidden.iter().position(|entry| entry == key) {
+        hidden.remove(index);
+        return Some(hidden);
+    }
+    hidden.push(key.to_string());
+    let parsed: Vec<_> = hidden
+        .iter()
+        .filter_map(|entry| WorkspaceThreadWorkStatus::from_settings_key(entry))
+        .collect();
+    (!hidden_statuses_cover_all(&parsed)).then_some(hidden)
+}
+
 pub fn hidden_statuses_cover_all(hidden: &[WorkspaceThreadWorkStatus]) -> bool {
     WorkspaceThreadWorkStatus::ALL
         .iter()
@@ -9401,29 +9457,59 @@ fn is_remote_project(project: &Project, spaces: &[Space]) -> bool {
 /// (which lives in a LOCAL Space, so the Space's `client_domain` alone
 /// misses it — same three-way test as `is_remote_project`), or this device.
 fn origin_machine_for_project(project: &Project, spaces: &[Space]) -> (String, bool) {
+    let host_id = match project_machine(project, spaces) {
+        ProjectMachine::Domain(domain) => return (domain, false),
+        ProjectMachine::Local => return ("Local".to_string(), true),
+        ProjectMachine::Ssh(host_id) => host_id,
+    };
+    let label = crate::ssh_hosts::host_spec(host_id)
+        .map(|spec| spec.label)
+        .or_else(|| {
+            // `ssh://user@host/...` — the authority names the machine.
+            let path = project.path.to_string_lossy().into_owned();
+            let rest = path.strip_prefix("ssh://")?;
+            let authority = rest.split('/').next()?;
+            let host = authority.rsplit('@').next()?;
+            (!host.is_empty()).then(|| host.to_string())
+        })
+        .unwrap_or_else(|| project.name.clone());
+    (label, false)
+}
+
+/// The machine a project's threads run on: the same three-way test as
+/// `is_remote_project`, made once for both the name a menu shows and the
+/// key a filter keeps.
+enum ProjectMachine<'a> {
+    /// A Space a mux domain owns.
+    Domain(String),
+    /// A direct-SSH project, by host id.
+    Ssh(&'a str),
+    Local,
+}
+
+impl ProjectMachine<'_> {
+    /// Stable while the machine is: empty for this device.
+    fn key(&self) -> String {
+        match self {
+            Self::Domain(domain) => format!("domain:{domain}"),
+            Self::Ssh(host_id) => format!("ssh:{host_id}"),
+            Self::Local => String::new(),
+        }
+    }
+}
+
+fn project_machine<'a>(project: &'a Project, spaces: &[Space]) -> ProjectMachine<'a> {
     if let Some(domain) = spaces
         .iter()
         .find(|space| space.id == project.space_id)
         .and_then(|space| space.client_domain.clone())
     {
-        return (domain, false);
+        return ProjectMachine::Domain(domain);
     }
     if is_remote_project(project, spaces) {
-        let host_id = remote_host_id_for_project_id(&project.id);
-        let label = crate::ssh_hosts::host_spec(host_id)
-            .map(|spec| spec.label)
-            .or_else(|| {
-                // `ssh://user@host/...` — the authority names the machine.
-                let path = project.path.to_string_lossy().into_owned();
-                let rest = path.strip_prefix("ssh://")?;
-                let authority = rest.split('/').next()?;
-                let host = authority.rsplit('@').next()?;
-                (!host.is_empty()).then(|| host.to_string())
-            })
-            .unwrap_or_else(|| project.name.clone());
-        return (label, false);
+        return ProjectMachine::Ssh(remote_host_id_for_project_id(&project.id));
     }
-    ("Local".to_string(), true)
+    ProjectMachine::Local
 }
 
 fn thread_has_restorable_workspace(thread: &WorkspaceThread) -> bool {
@@ -10093,6 +10179,21 @@ fn now_ts() -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A filter flips one state at a time and never hides them all.
+    #[test]
+    fn a_status_filter_never_hides_every_state() {
+        use super::{toggle_hidden_status, WorkspaceThreadWorkStatus as Status};
+        let hidden = toggle_hidden_status(Vec::new(), Status::Idle).unwrap();
+        assert_eq!(hidden, ["idle"]);
+        let hidden = toggle_hidden_status(hidden, Status::Running).unwrap();
+        let hidden = toggle_hidden_status(hidden, Status::FinishedUnseen).unwrap();
+        assert_eq!(toggle_hidden_status(hidden.clone(), Status::NeedsAttention), None);
+        assert_eq!(
+            toggle_hidden_status(hidden, Status::Idle).unwrap(),
+            ["running", "finished"]
+        );
+    }
     use super::*;
 
     /// Only the exact `$HOME` of a Thread rooted elsewhere is dropped: a
