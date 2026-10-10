@@ -716,17 +716,34 @@ program = "plugin.sh"
         let host = host_in(dir.path());
         let mut child = spawn(&host, &[]);
         wait_until("the host to listen", || host.socket.exists());
-        let keep = |keeper: &mut thinkterm_plugin_channel::client::Connection| {
+        let mut keeper = host.connect().unwrap();
+        // A keep is answered once the host has looked for plugins. Waiting
+        // for that keeps the switches this test writes from landing while
+        // the host writes its own, holding back a plugin it found not yet
+        // let run: the later write would undo the other. ThinkTerm turns a
+        // plugin on through the host, never past it.
+        let (answers, answered) = mpsc::channel();
+        let mut reader = keeper.try_clone().unwrap();
+        std::thread::spawn(move || {
+            while let Ok(message) = reader.recv() {
+                if let FromHost::Ok { id, .. } = message {
+                    if answers.send(id).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        let keep = |keeper: &mut thinkterm_plugin_channel::client::Connection, id: u64| {
             keeper
                 .send(&ToHost::Call {
-                    id: 1,
+                    id,
                     plugin: api::PLUGIN.into(),
                     body: json!({"op": "keep"}),
                 })
                 .unwrap();
+            assert_eq!(answered.recv_timeout(WAIT), Ok(id), "the keep is answered");
         };
-        let mut keeper = host.connect().unwrap();
-        keep(&mut keeper);
+        keep(&mut keeper, 1);
         let always = thinkterm_plugin_channel::paths::always_in(&host.data_dir);
 
         // Installed while the host runs, and nothing asked for the list.
@@ -741,7 +758,7 @@ program = "plugin.sh"
             ),
         )
         .unwrap();
-        keep(&mut keeper);
+        keep(&mut keeper, 2);
         wait_until("it to be marked", || {
             std::fs::read_to_string(&always).is_ok_and(|ids| ids == "shell\n")
         });
