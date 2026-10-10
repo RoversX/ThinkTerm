@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod anim;
+pub(crate) mod color;
 pub(crate) mod draw;
 pub(crate) mod events;
 pub(crate) mod geometry;

@@ -1984,49 +1984,17 @@ fn page_ground(palette: UiPalette) -> LinearRgba {
     }
 }
 
-/// Opaque blend from `from` towards `to`, **in sRGB space**.
-///
-/// Two things this has to get right:
+/// Opaque blend from `from` towards `to`, in sRGB space (see
+/// [`crate::ui::color::mix`] for why it must be sRGB).
 ///
 /// Fills passed to [`DrawContext::draw_rounded_frame`] must be opaque. That
 /// helper paints the *whole* rect in the border colour and then draws the fill
 /// inset by one pixel on top, so a translucent fill lets the border colour
 /// flood the control: a chip whose fill was white at 24% over a border of white
 /// at 55% came out pale enough that its own white label vanished into it.
-///
-/// And the blend must happen in sRGB, not in the linear values these colours
-/// are stored as. Lerping 10% of the way from near-black to near-white in
-/// *linear* space lands around 34% in sRGB — so greys meant to sit just off the
-/// page came out as mid-greys.
 fn mix(from: LinearRgba, to: LinearRgba, t: f32) -> LinearRgba {
-    let t = t.clamp(0.0, 1.0);
-    let lerp = |a: f32, b: f32| srgb_decode(srgb_encode(a) + (srgb_encode(b) - srgb_encode(a)) * t);
-    LinearRgba::with_components(
-        lerp(from.0, to.0),
-        lerp(from.1, to.1),
-        lerp(from.2, to.2),
-        1.0,
-    )
-}
-
-// The standard sRGB transfer function, written out rather than reached for on
-// `LinearRgba`/`SrgbaTuple`: those two use different curves (one exact, one a
-// gamma-2.2 approximation) and so do not round-trip. These are exact inverses,
-// which is what a blend needs.
-fn srgb_encode(c: f32) -> f32 {
-    if c <= 0.003_130_8 {
-        c * 12.92
-    } else {
-        1.055 * c.powf(1.0 / 2.4) - 0.055
-    }
-}
-
-fn srgb_decode(c: f32) -> f32 {
-    if c <= 0.040_45 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
+    let mixed = crate::ui::color::mix(from, to, t);
+    LinearRgba::with_components(mixed.0, mixed.1, mixed.2, 1.0)
 }
 
 #[derive(Debug, Clone)]
@@ -2219,6 +2187,7 @@ impl ContentView for OnboardingView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::color::srgb_encode;
     use window::Appearance;
 
     fn prefs_with_language(language: &'static str) -> OnboardingPrefs {
