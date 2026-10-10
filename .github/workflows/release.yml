@@ -282,6 +282,20 @@ jobs:
       - name: Check submodules
         run: bash ci/check-submodules.sh
 
+      # A secret set wrong fails here, a minute in, rather than after the
+      # build. Prints nothing of the secrets.
+      - name: Check signing credentials
+        env:
+          MACOS_APPLEID: ${{ secrets.MACOS_APPLEID }}
+          MACOS_APP_PW: ${{ secrets.MACOS_APP_PW }}
+          MACOS_CERT: ${{ secrets.MACOS_CERT }}
+          MACOS_CERT_PW: ${{ secrets.MACOS_CERT_PW }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+        run: bash ci/macos-check-signing.sh
+
       # wezterm-version's build.rs prefers a `.tag` file over deriving the
       # version from git. Without it a released binary reports a commit stamp,
       # and wezterm-gui's update check compares that against a `v*` release tag

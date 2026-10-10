@@ -172,10 +172,25 @@ case $OSTYPE in
       fi
     elif [ -n "$MACOS_TEAM_ID" ] ; then
       MACOS_PW=$(echo $MACOS_CERT_PW | base64 --decode)
+      # GitHub masks the secret as stored, not what it decodes to.
+      if [[ "${GITHUB_ACTIONS:-}" == true ]] ; then
+        echo "::add-mask::$MACOS_PW"
+      fi
 
       # Remove pesky additional quotes from default-keychain output
       def_keychain=$(eval echo $(security default-keychain -d user))
       echo "Default keychain is $def_keychain"
+      # The certificate waits in a directory only this user can read. However
+      # signing ends -- set -e stops the script at a wrong password or a
+      # failed codesign -- the file, the keychain holding the private key and
+      # the default keychain are put back.
+      cert_dir=$(mktemp -d)
+      sign_cleanup() {
+        security default-keychain -d user -s "$def_keychain" || true
+        security delete-keychain build.keychain >/dev/null 2>&1 || true
+        rm -rf "$cert_dir"
+      }
+      trap sign_cleanup EXIT
       echo "Speculative delete of build.keychain"
       security delete-keychain build.keychain || true
       echo "Create build.keychain"
@@ -185,18 +200,17 @@ case $OSTYPE in
       echo "Unlock build.keychain"
       security unlock-keychain -p "$MACOS_PW" build.keychain
       echo "Import .p12 data"
-      echo $MACOS_CERT | base64 --decode > /tmp/certificate.p12
-      security import /tmp/certificate.p12 -k build.keychain -P "$MACOS_PW" -T /usr/bin/codesign
-      rm /tmp/certificate.p12
+      (umask 077 && printf '%s' "$MACOS_CERT" | base64 --decode > "$cert_dir/certificate.p12")
+      security import "$cert_dir/certificate.p12" -k build.keychain -P "$MACOS_PW" -T /usr/bin/codesign
+      rm "$cert_dir/certificate.p12"
       echo "Grant apple tools access to build.keychain"
       security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_PW" build.keychain
       echo "Codesign"
       /usr/bin/codesign --keychain build.keychain --force --options runtime \
         --entitlements ci/macos-entitlement.plist --deep --sign "$MACOS_TEAM_ID" $zipdir/ThinkTerm.app/
-      echo "Restore default keychain"
-      security default-keychain -d user -s $def_keychain
-      echo "Remove build.keychain"
-      security delete-keychain build.keychain || true
+      echo "Restore default keychain and remove build.keychain"
+      sign_cleanup
+      trap - EXIT
       notarize=yes
     else
       # A normal local package should still be a correctly sealed app bundle.
