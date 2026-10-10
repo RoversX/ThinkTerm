@@ -26,15 +26,15 @@ on:
         type: string
         default: ''
       # dist adds fat LTO and writes the symbols beside the binaries (.dSYM,
-      # .pdb), which makes it the slow one; release is quicker for a build that
-      # only needs testing. Every platform builds with the one chosen here.
+      # .pdb): smaller binaries, but a much slower build. Every platform
+      # builds with the one chosen here.
       profile:
-        description: Build profile (dist = what ships, release = faster test build)
+        description: Build profile (release = faster build, dist = smaller binaries + crash symbols, slow)
         type: choice
         options:
-          - dist
           - release
-        default: dist
+          - dist
+        default: release
       # Signed with the Developer ID certificate and notarized once the run is
       # approved for the release environment, whose secrets hold both.
       macos_arm64:
@@ -276,7 +276,7 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: '14.0'
       TAG_NAME: ${{ needs.prepare.outputs.version }}
       MACOS_ARCH: ${{ matrix.arch }}
-      CARGO_PROFILE: ${{ inputs.profile || 'dist' }}
+      CARGO_PROFILE: ${{ inputs.profile || 'release' }}
 
     steps:
       - name: Checkout
@@ -397,7 +397,7 @@ jobs:
       RUSTUP_WINDOWS_PATH_ADD_BIN: '1'
       TAG_NAME: ${{ needs.prepare.outputs.version }}
       # Build, packaging, cache selection and symbol upload share this value.
-      CARGO_PROFILE: ${{ inputs.profile || 'dist' }}
+      CARGO_PROFILE: ${{ inputs.profile || 'release' }}
 
     steps:
       - name: Checkout
@@ -501,7 +501,7 @@ jobs:
       TAG_NAME: ${{ needs.prepare.outputs.version }}
       # Packaging and AppImage must read the same profile directory as the
       # build and cache steps.
-      CARGO_PROFILE: ${{ inputs.profile || 'dist' }}
+      CARGO_PROFILE: ${{ inputs.profile || 'release' }}
       # Job-wide, not per-step: ./get-deps pulls in tzdata and friends, and a
       # debconf prompt there would hang until timeout-minutes with no output.
       DEBIAN_FRONTEND: noninteractive
