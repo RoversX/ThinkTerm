@@ -363,6 +363,11 @@ jobs:
           MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
           MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
           MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+          # The app reports Info.plist's version to its update check, so a
+          # named release writes its version there, as ci/macos-package.sh
+          # does; one that disagrees with its tag offers itself as an update
+          # on every launch. A timestamped test build leaves it alone.
+          MACOS_BUNDLE_VERSION: ${{ inputs.version != '' && needs.prepare.outputs.version || '' }}
         run: bash ci/deploy.sh
 
       - name: Upload
