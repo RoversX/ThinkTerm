@@ -5,10 +5,26 @@ set -euo pipefail
 APP_PATH=${1:?usage: macos-notarize-local.sh path/to/ThinkTerm.app [keychain-profile]}
 PROFILE=${2:-${MACOS_NOTARY_PROFILE:-thinkterm}}
 
+if [[ ! -d "$APP_PATH" ]]; then
+  echo "App bundle not found: ${APP_PATH}" >&2
+  exit 1
+fi
+
+WORK_DIR=$(mktemp -d)
+trap 'rm -rf "$WORK_DIR"' EXIT
+
 # Locally the credentials live in a keychain profile created once with
 # `notarytool store-credentials`.  A CI runner has no such keychain, so prefer
-# the credentials passed in the environment whenever all three are present.
-if [[ -n "${MACOS_APPLEID:-}" && -n "${MACOS_APP_PW:-}" && -n "${MACOS_TEAM_ID:-}" ]]; then
+# credentials passed in the environment: an App Store Connect API key (the
+# .p8 file base64-encoded, its key ID and the issuer ID), which is tied to no
+# person's Apple ID and can be revoked on its own; else an Apple ID with an
+# app-specific password.
+if [[ -n "${MACOS_NOTARY_KEY:-}" && -n "${MACOS_NOTARY_KEY_ID:-}" && -n "${MACOS_NOTARY_ISSUER:-}" ]]; then
+  KEY_FILE="$WORK_DIR/AuthKey_${MACOS_NOTARY_KEY_ID}.p8"
+  (umask 077 && printf '%s' "$MACOS_NOTARY_KEY" | base64 --decode >"$KEY_FILE")
+  NOTARY_AUTH=(--key "$KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER")
+  echo "==> Using an App Store Connect API key from the environment"
+elif [[ -n "${MACOS_APPLEID:-}" && -n "${MACOS_APP_PW:-}" && -n "${MACOS_TEAM_ID:-}" ]]; then
   NOTARY_AUTH=(--apple-id "$MACOS_APPLEID" --password "$MACOS_APP_PW" --team-id "$MACOS_TEAM_ID")
   echo "==> Using notarization credentials from the environment"
 else
@@ -16,16 +32,9 @@ else
   echo "==> Using notarization credentials from keychain profile '$PROFILE'"
 fi
 
-if [[ ! -d "$APP_PATH" ]]; then
-  echo "App bundle not found: ${APP_PATH}" >&2
-  exit 1
-fi
-
 # Notarization only accepts a container, never a bare .app, and it has to be
 # built with ditto: plain `zip` drops the symlinks and extended attributes that
 # codesign relies on, which Apple rejects as a damaged bundle.
-WORK_DIR=$(mktemp -d)
-trap 'rm -rf "$WORK_DIR"' EXIT
 SUBMISSION_ZIP="$WORK_DIR/submission.zip"
 RESULT_PLIST="$WORK_DIR/result.plist"
 

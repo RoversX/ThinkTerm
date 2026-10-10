@@ -264,6 +264,9 @@ jobs:
         include: ${{ fromJSON(needs.prepare.outputs.macos_matrix) }}
     runs-on: macos-latest
     timeout-minutes: 90
+    # The signing certificate and the notarization key are this
+    # environment's secrets: a run only reaches them once it is approved.
+    environment: release
 
     env:
       MACOSX_DEPLOYMENT_TARGET: '14.0'
@@ -336,6 +339,9 @@ jobs:
           MACOS_CERT: ${{ secrets.MACOS_CERT }}
           MACOS_CERT_PW: ${{ secrets.MACOS_CERT_PW }}
           MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
           CARGO_PROFILE: dist
         run: bash ci/deploy.sh
 

@@ -172,8 +172,6 @@ case $OSTYPE in
       fi
     elif [ -n "$MACOS_TEAM_ID" ] ; then
       MACOS_PW=$(echo $MACOS_CERT_PW | base64 --decode)
-      echo "pw sha"
-      echo $MACOS_PW | shasum
 
       # Remove pesky additional quotes from default-keychain output
       def_keychain=$(eval echo $(security default-keychain -d user))
@@ -188,8 +186,6 @@ case $OSTYPE in
       security unlock-keychain -p "$MACOS_PW" build.keychain
       echo "Import .p12 data"
       echo $MACOS_CERT | base64 --decode > /tmp/certificate.p12
-      echo "decoded sha"
-      shasum /tmp/certificate.p12
       security import /tmp/certificate.p12 -k build.keychain -P "$MACOS_PW" -T /usr/bin/codesign
       rm /tmp/certificate.p12
       echo "Grant apple tools access to build.keychain"
