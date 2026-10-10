@@ -8616,6 +8616,13 @@ fn schedule_host_tree_reconcile() {
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_millis(150));
         HOST_TREE_RECONCILE_SCHEDULED.store(false, Ordering::Release);
+        // A write at startup -- the sweep of Spaces whose host was deleted --
+        // can come before the main thread takes work. No host has attached
+        // by then, so there is nothing to restate; spawning would panic and
+        // poison the scheduler for the whole app.
+        if !promise::spawn::is_scheduler_configured() {
+            return;
+        }
         promise::spawn::spawn_into_main_thread(async {
             reconcile_host_tree();
         })
