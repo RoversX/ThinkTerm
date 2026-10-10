@@ -64,8 +64,10 @@ on:
         type: boolean
         default: false
 
+# Only runs that publish queue behind one another, so two never upload to the
+# same release; test builds each get a group of their own and run side by side.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.ref }}-${{ inputs.publish && 'publish' || github.run_id }}
 
 env:
   CARGO_INCREMENTAL: '0'
