@@ -162,51 +162,65 @@ case $OSTYPE in
     fi
 
     set +x
+    . "$(dirname "$0")/macos-signing-log.sh"
     # Only a Developer ID signature is eligible for notarization; the notary
     # service rejects adhoc and Apple Development identities outright.
     notarize=no
     if [[ -n "${MACOS_SIGNING_MODE:-}" ]] ; then
-      bash ci/macos-sign-local.sh "$zipdir/ThinkTerm.app" "$MACOS_SIGNING_MODE"
+      signing_run "Sign app bundle" bash ci/macos-sign-local.sh "$zipdir/ThinkTerm.app" "$MACOS_SIGNING_MODE"
       if [[ "$MACOS_SIGNING_MODE" == developerid ]] ; then
         notarize=yes
       fi
     elif [ -n "$MACOS_TEAM_ID" ] ; then
-      MACOS_PW=$(echo $MACOS_CERT_PW | base64 --decode)
-      # GitHub masks the secret as stored, not what it decodes to.
-      if [[ "${GITHUB_ACTIONS:-}" == true ]] ; then
-        echo "::add-mask::$MACOS_PW"
+      if ! MACOS_PW=$(printf '%s' "$MACOS_CERT_PW" | base64 --decode 2>/dev/null); then
+        echo "error: MACOS_CERT_PW must contain a base64-encoded certificate password." >&2
+        exit 1
       fi
+      # GitHub masks the secret as stored, not what it decodes to.
+      signing_mask "$MACOS_PW"
 
-      # Remove pesky additional quotes from default-keychain output
-      def_keychain=$(eval echo $(security default-keychain -d user))
-      echo "Default keychain is $def_keychain"
       # The certificate waits in a directory only this user can read. However
       # signing ends -- set -e stops the script at a wrong password or a
       # failed codesign -- the file, the keychain holding the private key and
       # the default keychain are put back.
-      cert_dir=$(mktemp -d)
+      cert_dir=$(mktemp -d 2>/dev/null) || {
+        echo "error: Could not create the private signing directory." >&2
+        exit 1
+      }
+      def_keychain=
+      keychain_made=
       sign_cleanup() {
-        security default-keychain -d user -s "$def_keychain" || true
-        security delete-keychain build.keychain >/dev/null 2>&1 || true
-        rm -rf "$cert_dir"
+        if [[ -n "$def_keychain" ]]; then
+          signing_run "Restore default keychain" security default-keychain -d user -s "$def_keychain" || true
+        fi
+        if [[ -n "$keychain_made" ]]; then
+          signing_run "Remove signing keychain" security delete-keychain build.keychain || true
+        fi
+        rm -rf "$cert_dir" 2>/dev/null || echo "warning: Could not remove the private signing directory." >&2
       }
       trap sign_cleanup EXIT
+      signing_capture "Read default keychain" "$cert_dir/default-keychain" security default-keychain -d user
+      def_keychain=$(sed -e 's/^ *"//' -e 's/" *$//' "$cert_dir/default-keychain")
       echo "Speculative delete of build.keychain"
-      security delete-keychain build.keychain || true
+      security delete-keychain build.keychain >/dev/null 2>&1 || true
       echo "Create build.keychain"
-      security create-keychain -p "$MACOS_PW" build.keychain
+      signing_run "Create signing keychain" security create-keychain -p "$MACOS_PW" build.keychain
+      keychain_made=yes
       echo "Make build.keychain the default"
-      security default-keychain -d user -s build.keychain
+      signing_run "Select signing keychain" security default-keychain -d user -s build.keychain
       echo "Unlock build.keychain"
-      security unlock-keychain -p "$MACOS_PW" build.keychain
+      signing_run "Unlock signing keychain" security unlock-keychain -p "$MACOS_PW" build.keychain
       echo "Import .p12 data"
-      (umask 077 && printf '%s' "$MACOS_CERT" | base64 --decode > "$cert_dir/certificate.p12")
-      security import "$cert_dir/certificate.p12" -k build.keychain -P "$MACOS_PW" -T /usr/bin/codesign
-      rm "$cert_dir/certificate.p12"
+      if ! (umask 077 && printf '%s' "$MACOS_CERT" | base64 --decode > "$cert_dir/certificate.p12") 2>/dev/null; then
+        echo "error: Could not decode MACOS_CERT into the private certificate file." >&2
+        exit 1
+      fi
+      signing_run "Import signing certificate" security import "$cert_dir/certificate.p12" -k build.keychain -P "$MACOS_PW" -T /usr/bin/codesign
+      signing_run "Remove temporary certificate" rm "$cert_dir/certificate.p12"
       echo "Grant apple tools access to build.keychain"
-      security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_PW" build.keychain
+      signing_run "Grant signing access" security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_PW" build.keychain
       echo "Codesign"
-      /usr/bin/codesign --keychain build.keychain --force --options runtime \
+      signing_run "Sign app bundle" /usr/bin/codesign --keychain build.keychain --force --options runtime \
         --entitlements ci/macos-entitlement.plist --deep --sign "$MACOS_TEAM_ID" $zipdir/ThinkTerm.app/
       echo "Restore default keychain and remove build.keychain"
       sign_cleanup
@@ -216,7 +230,7 @@ case $OSTYPE in
       # A normal local package should still be a correctly sealed app bundle.
       # Development/Developer ID identities remain opt-in, but ad-hoc signing
       # is a safer and less surprising default than producing an invalid app.
-      bash ci/macos-sign-local.sh "$zipdir/ThinkTerm.app" adhoc
+      signing_run "Sign app bundle" bash ci/macos-sign-local.sh "$zipdir/ThinkTerm.app" adhoc
     fi
 
     # Notarize and staple before packing, not after.  Stapling rewrites the

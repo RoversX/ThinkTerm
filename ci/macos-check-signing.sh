@@ -10,7 +10,10 @@
 # Reads the environment the package step gets. Without a certificate there is
 # nothing to check: ci/deploy.sh then signs ad hoc.
 
+set +x
 set -euo pipefail
+
+. "$(dirname "$0")/macos-signing-log.sh"
 
 fail() {
   echo "::error::$*" >&2
@@ -41,15 +44,20 @@ fi
 [[ ${#missing[@]} -eq 0 ]] ||
   fail "signing needs all of MACOS_CERT, MACOS_CERT_PW and MACOS_TEAM_ID; not set: ${missing[*]}"
 
-WORK_DIR=$(mktemp -d)
+WORK_DIR=$(mktemp -d 2>/dev/null) || fail "cannot create the private signing directory"
 KEYCHAIN="$WORK_DIR/signing-check.keychain-db"
+KEYCHAIN_MADE=
 ORIGINAL_KEYCHAIN=
 cleanup() {
   if [[ -n "$ORIGINAL_KEYCHAIN" ]]; then
-    security default-keychain -d user -s "$ORIGINAL_KEYCHAIN" || true
+    signing_run "Restore default keychain" security default-keychain -d user -s "$ORIGINAL_KEYCHAIN" || true
   fi
-  security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true
-  rm -rf "$WORK_DIR"
+  # A keychain that was never made cannot be deleted, and saying so would
+  # read as a second failure after the real one.
+  if [[ -n "$KEYCHAIN_MADE" ]]; then
+    signing_run "Remove signing keychain" security delete-keychain "$KEYCHAIN" || true
+  fi
+  rm -rf "$WORK_DIR" 2>/dev/null || echo "warning: Could not remove the private signing directory." >&2
 }
 trap cleanup EXIT
 
@@ -61,20 +69,18 @@ trap cleanup EXIT
   fail "MACOS_TEAM_ID is not a team ID: ten letters and digits, from developer.apple.com > Membership"
 
 CERT="$WORK_DIR/cert.p12"
-if ! printf '%s' "$MACOS_CERT" | base64 --decode >"$CERT" 2>/dev/null || [[ ! -s "$CERT" ]]; then
+if ! (umask 077; printf '%s' "$MACOS_CERT" | base64 --decode >"$CERT") 2>/dev/null || [[ ! -s "$CERT" ]]; then
   fail "MACOS_CERT is not base64: set it to the output of  base64 -i cert.p12"
 fi
 # A .p12 is DER, which opens with an ASN.1 sequence.
-[[ "$(head -c 1 "$CERT" | od -An -tx1 | tr -d ' \n')" == "30" ]] ||
+[[ "$(head -c 1 "$CERT" 2>/dev/null | od -An -tx1 | tr -d ' \n')" == "30" ]] ||
   fail "MACOS_CERT is not a .p12 file: export the certificate with its private key as .p12, then  base64 -i cert.p12"
 
 if ! CERT_PW=$(printf '%s' "$MACOS_CERT_PW" | base64 --decode 2>/dev/null); then
   fail "MACOS_CERT_PW is not base64: set it to the output of  printf '%s' 'the .p12 password' | base64"
 fi
 # GitHub masks the secret as stored, not what it decodes to.
-if [[ "${GITHUB_ACTIONS:-}" == true ]]; then
-  echo "::add-mask::$CERT_PW"
-fi
+signing_mask "$CERT_PW"
 
 NOTARY_AUTH=()
 if [[ -n "${MACOS_NOTARY_KEY:-}" || -n "${MACOS_NOTARY_KEY_ID:-}" || -n "${MACOS_NOTARY_ISSUER:-}" ]]; then
@@ -84,9 +90,9 @@ if [[ -n "${MACOS_NOTARY_KEY:-}" || -n "${MACOS_NOTARY_KEY_ID:-}" || -n "${MACOS
     fail "MACOS_NOTARY_ISSUER is not an issuer ID: the UUID above the keys in App Store Connect > Users and Access > Integrations"
   [[ "$MACOS_NOTARY_KEY_ID" =~ ^[A-Z0-9]{8,12}$ ]] ||
     fail "MACOS_NOTARY_KEY_ID is not a key ID: the short ID on the key's own row, not the issuer ID"
-  KEY_FILE="$WORK_DIR/AuthKey_${MACOS_NOTARY_KEY_ID}.p8"
-  if ! (umask 077 && printf '%s' "$MACOS_NOTARY_KEY" | base64 --decode >"$KEY_FILE" 2>/dev/null) ||
-    [[ "$(head -n 1 "$KEY_FILE" | tr -d '\r')" != "-----BEGIN PRIVATE KEY-----" ]]; then
+  KEY_FILE="$WORK_DIR/notary-key.p8"
+  if ! (umask 077 && printf '%s' "$MACOS_NOTARY_KEY" | base64 --decode >"$KEY_FILE") 2>/dev/null ||
+    [[ "$(head -n 1 "$KEY_FILE" 2>/dev/null | tr -d '\r')" != "-----BEGIN PRIVATE KEY-----" ]]; then
     fail "MACOS_NOTARY_KEY is not a .p8 key: set it to the output of  base64 -i AuthKey_<key id>.p8"
   fi
   NOTARY_AUTH=(--key "$KEY_FILE" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER")
@@ -100,28 +106,28 @@ else
 fi
 
 # --- the certificate signs, as ci/deploy.sh will sign the app --------------
-KEYCHAIN_PW=$(uuidgen)
-security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
-security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
-security import "$CERT" -k "$KEYCHAIN" -P "$CERT_PW" -T /usr/bin/codesign >/dev/null 2>&1 ||
+KEYCHAIN_PW=$(uuidgen 2>/dev/null) || fail "cannot generate a temporary keychain password"
+signing_run "Create signing keychain" security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+KEYCHAIN_MADE=yes
+signing_run "Unlock signing keychain" security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+signing_run "Import signing certificate" security import "$CERT" -k "$KEYCHAIN" -P "$CERT_PW" -T /usr/bin/codesign ||
   fail "MACOS_CERT does not open with MACOS_CERT_PW: check the .p12 password, base64-encoded as above"
-security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null 2>&1
-ORIGINAL_KEYCHAIN=$(security default-keychain -d user | sed -e 's/^ *"//' -e 's/" *$//')
-security default-keychain -d user -s "$KEYCHAIN"
+signing_run "Grant signing access" security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
+signing_capture "Read default keychain" "$WORK_DIR/default-keychain" security default-keychain -d user
+ORIGINAL_KEYCHAIN=$(sed -e 's/^ *"//' -e 's/" *$//' "$WORK_DIR/default-keychain")
+signing_run "Select signing keychain" security default-keychain -d user -s "$KEYCHAIN"
 
 # ci/deploy.sh names the identity by the team ID, which codesign matches
 # against the certificate's name.
 PROBE="$WORK_DIR/probe"
-cp /usr/bin/true "$PROBE"
-if ! codesign --keychain "$KEYCHAIN" --force --options runtime --sign "$MACOS_TEAM_ID" "$PROBE" \
-  >/dev/null 2>"$WORK_DIR/codesign.err"; then
-  echo "codesign: $(tail -n 1 "$WORK_DIR/codesign.err")" >&2
+signing_run "Prepare signing probe" cp /usr/bin/true "$PROBE"
+if ! signing_run "Sign certificate probe" codesign --keychain "$KEYCHAIN" --force --options runtime --sign "$MACOS_TEAM_ID" "$PROBE"; then
   fail "the certificate does not sign for MACOS_TEAM_ID: it has to be a Developer ID Application certificate of that team, exported with its private key"
 fi
 codesign -dv "$PROBE" 2>&1 | grep -q '^Authority=Developer ID Application:' ||
   fail "the certificate is not a Developer ID Application certificate, the only kind Apple notarizes"
-if ! security find-certificate -c "Developer ID Application" -p "$KEYCHAIN" |
-  openssl x509 -noout -checkend $((60 * 24 * 3600)) >/dev/null 2>&1; then
+if ! (security find-certificate -c "Developer ID Application" -p "$KEYCHAIN" |
+  openssl x509 -noout -checkend $((60 * 24 * 3600))) >/dev/null 2>&1; then
   echo "::warning::The Developer ID certificate expires within 60 days: make a new one at developer.apple.com and replace MACOS_CERT and MACOS_CERT_PW"
 fi
 echo "==> The certificate signs as a Developer ID Application of the team"
@@ -129,8 +135,7 @@ echo "==> The certificate signs as a Developer ID Application of the team"
 # --- the notary service takes the credentials -----------------------------
 # Lists past submissions, which needs the same sign-in as a submission and
 # submits nothing.
-if ! xcrun notarytool history "${NOTARY_AUTH[@]}" >/dev/null 2>"$WORK_DIR/notary.err"; then
-  echo "notarytool: $(tail -n 1 "$WORK_DIR/notary.err")" >&2
+if ! signing_run "Check notarization authentication" xcrun notarytool history "${NOTARY_AUTH[@]}"; then
   fail "the notary service does not accept $NOTARY_WHAT"
 fi
 echo "==> The notary service accepts $NOTARY_WHAT"
