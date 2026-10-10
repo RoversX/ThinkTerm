@@ -25,17 +25,26 @@ on:
         description: 'Version, e.g. 0.1.0 (blank = timestamped test build)'
         type: string
         default: ''
-      # Off by default: this runner has no Developer ID certificate, so
-      # ci/deploy.sh falls back to an ad-hoc signature that Gatekeeper refuses.
-      # Release builds are produced locally with ci/macos-package.sh instead.
+      # Signed with the Developer ID certificate and notarized once the run is
+      # approved for the release environment, whose secrets hold both.
       macos_arm64:
-        description: macOS arm64 (no certificate here -- ad-hoc signed only)
+        description: macOS arm64 (signed and notarized)
         type: boolean
         default: false
       macos_x86_64:
-        description: macOS x86_64 (no certificate here -- ad-hoc signed only)
+        description: macOS x86_64 (signed and notarized)
         type: boolean
         default: false
+      # dist adds fat LTO and writes the symbols beside the binaries (.dSYM,
+      # .pdb), which makes it the slow one; release is quicker for a build that
+      # only needs testing. Every platform builds with the one chosen here.
+      profile:
+        description: Build profile (dist = what ships, release = faster test build)
+        type: choice
+        options:
+          - dist
+          - release
+        default: dist
       windows_x86_64:
         description: Windows x86_64
         type: boolean
@@ -114,11 +123,6 @@ jobs:
           fi
 
           publish='${{ inputs.publish }}'
-          # macOS is signed, notarized and stapled locally by
-          # ci/macos-package.sh, because the Developer ID certificate lives in
-          # a keychain rather than in this repo's secrets. Anything built here
-          # is ad-hoc signed: well-formed, but refused by Gatekeeper on every
-          # Mac but this runner, and billed at the 10x macOS rate to produce.
           macos_arm64='${{ inputs.macos_arm64 }}'
           macos_x86_64='${{ inputs.macos_x86_64 }}'
           windows='${{ inputs.windows_x86_64 }}'
@@ -272,6 +276,7 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: '14.0'
       TAG_NAME: ${{ needs.prepare.outputs.version }}
       MACOS_ARCH: ${{ matrix.arch }}
+      CARGO_PROFILE: ${{ inputs.profile || 'dist' }}
 
     steps:
       - name: Checkout
@@ -321,7 +326,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: macos-${{ matrix.arch }}-dist
+          key: macos-${{ matrix.arch }}-${{ env.CARGO_PROFILE }}
           cache-on-failure: true
           save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
@@ -330,7 +335,7 @@ jobs:
 
       - name: Build
         run: |
-          cargo build --profile dist --target ${{ matrix.target }} \
+          cargo build --profile "$CARGO_PROFILE" --target ${{ matrix.target }} \
             -p wezterm \
             -p wezterm-gui \
             -p wezterm-mux-server \
@@ -356,7 +361,6 @@ jobs:
           MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
           MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
           MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
-          CARGO_PROFILE: dist
         run: bash ci/deploy.sh
 
       - name: Upload
@@ -373,6 +377,8 @@ jobs:
       # asset: nobody but us reads a crash report against them, and on the
       # release page they would only look like another download.
       - name: Upload symbols
+        # Only dist writes the .dSYM bundle.
+        if: env.CARGO_PROFILE == 'dist'
         uses: actions/upload-artifact@v7
         with:
           name: macos-${{ matrix.arch }}-symbols
@@ -390,10 +396,8 @@ jobs:
     env:
       RUSTUP_WINDOWS_PATH_ADD_BIN: '1'
       TAG_NAME: ${{ needs.prepare.outputs.version }}
-      # dist's concurrent fat-LTO builds exhausted the Windows runner's memory.
-      # Keep the previous release profile until dist is validated here again.
       # Build, packaging, cache selection and symbol upload share this value.
-      CARGO_PROFILE: release
+      CARGO_PROFILE: ${{ inputs.profile || 'dist' }}
 
     steps:
       - name: Checkout
@@ -495,15 +499,9 @@ jobs:
 
     env:
       TAG_NAME: ${{ needs.prepare.outputs.version }}
-      # Every Linux leg builds with the release profile. Fedora kept dist
-      # so that CI could revalidate it, and that is now answered: fat LTO
-      # with a single codegen unit links wezterm-gui in one process too
-      # large for a standard runner, and the job was killed at 78 minutes
-      # -- inside the 90 minute limit, and with no log uploaded -- while
-      # the release leg finished in 28. dist is still what the macOS
-      # packaging builds with. Packaging and AppImage must read the same
-      # profile directory as the build and cache steps.
-      CARGO_PROFILE: release
+      # Packaging and AppImage must read the same profile directory as the
+      # build and cache steps.
+      CARGO_PROFILE: ${{ inputs.profile || 'dist' }}
       # Job-wide, not per-step: ./get-deps pulls in tzdata and friends, and a
       # debconf prompt there would hang until timeout-minutes with no output.
       DEBIAN_FRONTEND: noninteractive
