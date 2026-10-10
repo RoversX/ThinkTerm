@@ -225,6 +225,10 @@ pub enum ContextMenuIcon {
     Folder,
     FolderAdd,
     FolderRemove,
+    /// What a view shows: the sliders of a view-options button.
+    Filter,
+    /// How a view groups its rows.
+    Group,
     Home,
     Info,
     MoveLeft,
@@ -241,6 +245,7 @@ pub enum ContextMenuIcon {
     Search,
     Server,
     Settings,
+    Sort,
     Sidebar,
     Spellcheck,
     SplitHorizontal,
@@ -320,6 +325,8 @@ impl ContextMenuIcon {
             Self::Folder | Self::Vault => "folder",
             Self::FolderAdd => "folder.badge.plus",
             Self::FolderRemove => "folder.badge.minus",
+            Self::Filter => "slider.horizontal.3",
+            Self::Group => "square.stack.3d.up",
             Self::Home => "house",
             Self::Info => "info.circle",
             Self::MoveLeft => "arrow.left",
@@ -337,6 +344,7 @@ impl ContextMenuIcon {
             Self::Search => "magnifyingglass",
             Self::Server => "server.rack",
             Self::Settings => "gearshape",
+            Self::Sort => "arrow.up.arrow.down",
             Self::Sidebar => "sidebar.leading",
             Self::Spellcheck => "textformat.abc.dottedunderline",
             Self::SplitHorizontal => "rectangle.split.2x1",
@@ -379,6 +387,10 @@ impl ContextMenuIcon {
             Self::FolderRemove => {
                 include_bytes!("../../third_party/lucide/icons/folder-minus.svg")
             }
+            Self::Filter => {
+                include_bytes!("../../third_party/lucide/icons/sliders-horizontal.svg")
+            }
+            Self::Group => include_bytes!("../../third_party/lucide/icons/layers.svg"),
             Self::Home => include_bytes!("../../third_party/lucide/icons/house.svg"),
             Self::Info => include_bytes!("../../third_party/lucide/icons/info.svg"),
             Self::MoveRight => include_bytes!("../../third_party/lucide/icons/arrow-right.svg"),
@@ -396,6 +408,7 @@ impl ContextMenuIcon {
             Self::Search => include_bytes!("../../third_party/lucide/icons/search.svg"),
             Self::Server => include_bytes!("../../third_party/lucide/icons/server.svg"),
             Self::Settings => include_bytes!("../../third_party/lucide/icons/settings.svg"),
+            Self::Sort => include_bytes!("../../third_party/lucide/icons/arrow-up-down.svg"),
             Self::Sidebar => include_bytes!("../../third_party/lucide/icons/panel-left.svg"),
             Self::Spellcheck => include_bytes!("../../third_party/lucide/icons/spell-check.svg"),
             Self::SplitHorizontal => {

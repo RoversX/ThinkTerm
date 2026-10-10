@@ -84,6 +84,19 @@ struct MenuMetrics {
     width: usize,
     height: usize,
     row_height: usize,
+    /// Columns before the labels, each only as wide as the menu needs: a
+    /// tick column when some item is ticked, an icon column when some
+    /// item has an icon. Empty columns left the labels adrift from their
+    /// ticks.
+    check_slot: usize,
+    icon_slot: usize,
+}
+
+impl MenuMetrics {
+    /// From the menu's edge to where its labels start.
+    fn label_offset(&self, term: &crate::TermWindow) -> usize {
+        term.ui_px(MENU_PADDING_X) + self.check_slot + self.icon_slot + term.ui_px(MENU_LABEL_GAP)
+    }
 }
 
 impl ContextMenuState {
@@ -669,7 +682,7 @@ impl crate::TermWindow {
                 )
             };
 
-            paint_menu_panel(self, &mut layers, palette, origin, metrics)?;
+            paint_menu_panel(self, &mut layers, palette, ui_metrics, origin, metrics)?;
             paint_menu_rows(
                 self,
                 &mut layers,
@@ -770,13 +783,23 @@ fn compute_menu_metrics(
 ) -> anyhow::Result<MenuMetrics> {
     let mut label_width = 0usize;
     let mut height = term.ui_px(MENU_PADDING_Y) * 2;
+    let mut any_checked = false;
+    let mut any_icon = false;
 
     for row in rows {
         match row {
             MenuRow::Item { item, .. } => {
-                if let ContextMenuItem::Item { label, .. } = item {
+                if let ContextMenuItem::Item {
+                    label,
+                    checked,
+                    icon,
+                    ..
+                } = item
+                {
                     label_width =
                         label_width.max(term.sidebar_text_width(font, label)?.ceil() as usize);
+                    any_checked |= *checked;
+                    any_icon |= icon.as_ref().and_then(menu_icon).is_some();
                 }
                 height = height.saturating_add(row_height);
             }
@@ -795,10 +818,20 @@ fn compute_menu_metrics(
     // Rows are laid out inside the border, not across it, so the width owed to
     // the widest label has to include the border it sits between; without this
     // that one label is the only one that ends up ellipsized.
+    let check_slot = if any_checked {
+        term.ui_px(MENU_CHECK_SLOT)
+    } else {
+        0
+    };
+    let icon_slot = if any_icon {
+        term.ui_px(MENU_ICON_SLOT)
+    } else {
+        0
+    };
     let ideal_width = term.ui_px(MENU_PADDING_X) * 2
         + (term.ui_f32(MENU_BORDER_WIDTH) as usize) * 2
-        + term.ui_px(MENU_CHECK_SLOT)
-        + term.ui_px(MENU_ICON_SLOT)
+        + check_slot
+        + icon_slot
         + term.ui_px(MENU_LABEL_GAP)
         + label_width
         + term.ui_px(MENU_ARROW_SLOT);
@@ -813,6 +846,8 @@ fn compute_menu_metrics(
         width,
         height,
         row_height,
+        check_slot,
+        icon_slot,
     })
 }
 
@@ -854,6 +889,7 @@ fn paint_menu_panel(
     term: &crate::TermWindow,
     layers: &mut TripleLayerQuadAllocator<'_>,
     palette: UiPalette,
+    font_metrics: RenderMetrics,
     origin: (usize, usize),
     metrics: MenuMetrics,
 ) -> anyhow::Result<()> {
@@ -864,18 +900,25 @@ fn paint_menu_panel(
         metrics.width as f32,
         metrics.height as f32,
     );
-    term.fill_rounded_rectangle(
-        layers,
-        2,
-        euclid::rect(
-            x.saturating_add(4) as f32,
-            y.saturating_add(5) as f32,
-            metrics.width as f32,
-            metrics.height as f32,
-        ),
-        LinearRgba::with_components(0.0, 0.0, 0.0, 0.18),
-        term.ui_f32(MENU_RADIUS),
-    )?;
+    // The soft shadow every other floating surface casts (two blurred
+    // silhouettes, as `draw_elevated_surface` lays them), in place of an
+    // offset copy of the card whose hard edge read as a second outline.
+    if let Some(render_state) = term.render_state.as_ref() {
+        let ctx = crate::ui::DrawContext::new(render_state, term.dimensions, &font_metrics);
+        let alpha = if palette.is_dark() { 0.58 } else { 0.43 };
+        let radius = term.ui_f32(MENU_RADIUS);
+        for (sigma, offset, share) in [(9.0, 6.0, 0.42), (2.0, 1.5, 0.28)] {
+            ctx.draw_shadow(
+                layers,
+                2,
+                rect,
+                radius,
+                ctx.px(sigma),
+                ctx.px(offset),
+                LinearRgba::with_components(0.0, 0.0, 0.0, alpha * share),
+            )?;
+        }
+    }
     term.fill_rounded_rectangle_with_border(
         layers,
         2,
@@ -924,12 +967,7 @@ fn paint_menu_rows(
             // A caption, not a command: muted, never highlighted, and left out
             // of `ui_items`/`layout` so the mouse cannot land on it at all.
             MenuRow::SectionHeader { label } => {
-                let label_x = x
-                    + term.ui_f32(MENU_BORDER_WIDTH) as usize
-                    + term.ui_px(MENU_PADDING_X)
-                    + term.ui_px(MENU_CHECK_SLOT)
-                    + term.ui_px(MENU_ICON_SLOT)
-                    + term.ui_px(MENU_LABEL_GAP);
+                let label_x = x + term.ui_f32(MENU_BORDER_WIDTH) as usize + metrics.label_offset(term);
                 let text_y = cursor_y
                     + (metrics
                         .row_height
@@ -1018,7 +1056,7 @@ fn paint_menu_rows(
                     let icon_y = item_rect.y
                         + (item_rect.height.saturating_sub(term.ui_px(MENU_ICON_SIZE))) / 2;
                     let check_x = item_rect.x + term.ui_px(MENU_PADDING_X);
-                    let icon_x = check_x + term.ui_px(MENU_CHECK_SLOT);
+                    let icon_x = check_x + metrics.check_slot;
                     if *checked {
                         term.paint_sidebar_icon(
                             layers,
@@ -1040,11 +1078,7 @@ fn paint_menu_rows(
                         )?;
                     }
 
-                    let label_x = item_rect.x
-                        + term.ui_px(MENU_PADDING_X)
-                        + term.ui_px(MENU_CHECK_SLOT)
-                        + term.ui_px(MENU_ICON_SLOT)
-                        + term.ui_px(MENU_LABEL_GAP);
+                    let label_x = item_rect.x + metrics.label_offset(term);
                     let arrow_width = if ContextMenuState::has_renderable_items(submenu) {
                         term.ui_px(MENU_ARROW_SLOT)
                     } else {
@@ -1134,6 +1168,8 @@ fn menu_icon(icon: &ContextMenuIcon) -> Option<SvgIcon> {
         ContextMenuIcon::Folder => Some(SvgIcon::Folder),
         ContextMenuIcon::FolderAdd => Some(SvgIcon::FolderPlus),
         ContextMenuIcon::FolderRemove => Some(SvgIcon::FolderMinus),
+        ContextMenuIcon::Filter => Some(SvgIcon::SlidersHorizontal),
+        ContextMenuIcon::Group => Some(SvgIcon::Layers),
         ContextMenuIcon::Home => Some(SvgIcon::House),
         ContextMenuIcon::Info => Some(SvgIcon::Info),
         ContextMenuIcon::MoveRight => Some(SvgIcon::ArrowRight),
@@ -1149,6 +1185,7 @@ fn menu_icon(icon: &ContextMenuIcon) -> Option<SvgIcon> {
         ContextMenuIcon::Search => Some(SvgIcon::Search),
         ContextMenuIcon::Server => Some(SvgIcon::Server),
         ContextMenuIcon::Settings => Some(SvgIcon::Settings),
+        ContextMenuIcon::Sort => Some(SvgIcon::MoveVertical),
         ContextMenuIcon::Sidebar => Some(SvgIcon::PanelLeft),
         ContextMenuIcon::Spellcheck => Some(SvgIcon::SpellCheck),
         ContextMenuIcon::SplitHorizontal => Some(SvgIcon::SplitHorizontal),
