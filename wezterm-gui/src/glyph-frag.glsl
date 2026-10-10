@@ -189,7 +189,11 @@ void main() {
     // and we need to tint with the fg_color
     color = fg_color;
     if (!subpixel_aa) {
-      color.a = colorMask.a;
+      // Multiply rather than replace, as the WebGPU shader does: the mask
+      // decides the shape, the colour how present the glyph is. Replacing
+      // it dropped any opacity the caller asked for, so text that was meant
+      // to fade stayed solid here.
+      color.a = colorMask.a * fg_color.a;
     }
     color = apply_hsv(color, foreground_text_hsb);
   }
