@@ -18,7 +18,12 @@ use std::collections::HashSet;
 
 lazy_static::lazy_static! {
     static ref FALLBACK: Vec<ParsedFont> = build_fallback_list();
+    static ref SYSTEM_UI: Vec<ParsedFont> = build_system_ui_font_list();
 }
+
+/// The family name that stands for the font the system draws its own
+/// interface with (San Francisco, on current releases).
+pub const SYSTEM_UI_FONT_FAMILY: &str = ".AppleSystemUIFont";
 
 #[link(name = "CoreText", kind = "framework")]
 extern "C" {
@@ -84,6 +89,14 @@ impl FontLocator for CoreTextFontLocator {
         let mut fonts = vec![];
 
         for attr in fonts_selection {
+            if attr.family == SYSTEM_UI_FONT_FAMILY {
+                if let Some(parsed) = ParsedFont::best_match(attr, pixel_size, SYSTEM_UI.clone()) {
+                    log::trace!("system ui font for {:?} is {:?}", attr, parsed);
+                    fonts.push(parsed);
+                    loaded.insert(attr.clone());
+                    continue;
+                }
+            }
             match descriptor_from_attr(attr) {
                 Ok(descriptors) => {
                     let mut handles = vec![];
@@ -225,6 +238,13 @@ impl FontLocator for CoreTextFontLocator {
         Ok(matches.into_iter().map(|(_len, handle)| handle).collect())
     }
 
+    fn enumerate_family_names(&self) -> anyhow::Result<Vec<String>> {
+        Ok(core_text::font_collection::get_family_names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect())
+    }
+
     fn enumerate_all_fonts(&self) -> anyhow::Result<Vec<ParsedFont>> {
         let mut fonts = vec![];
 
@@ -239,6 +259,45 @@ impl FontLocator for CoreTextFontLocator {
         fonts.dedup();
         Ok(fonts)
     }
+}
+
+/// The faces of the system interface font.
+///
+/// Core Text keeps that font out of its collections and matches nothing to
+/// its family name, so asking for it the way any other family is asked for
+/// finds nothing and the interface falls through to the next font in its
+/// list. Asking for the UI font itself does find it.
+///
+/// It is a variable font whose named instances come at every weight and
+/// width, and then again at several grades. One instance is kept for each
+/// weight, width and style -- the first, which is the ungraded one -- and its
+/// weight is rounded to the hundred the instance is named for, since the
+/// font's own are a little off them (Medium is 510, Semibold 590) and
+/// matching looks for a weight exactly before it looks nearby.
+fn build_system_ui_font_list() -> Vec<ParsedFont> {
+    let font = new_ui_font_for_language(kCTFontSystemFontType, 0.0, None);
+    // How far each kept face's own weight is from the one it is filed under.
+    let mut kept: Vec<(u16, ParsedFont)> = vec![];
+    for parsed in handles_from_descriptor(&font.copy_descriptor()) {
+        let exact = parsed.weight().to_opentype_weight();
+        let rounded = ((exact + 50) / 100 * 100).clamp(100, 1000);
+        let off_by = exact.abs_diff(rounded);
+        let parsed = parsed.with_weight(FontWeight::from_opentype_weight(rounded));
+        match kept.iter_mut().find(|(_, other)| {
+            other.weight() == parsed.weight()
+                && other.stretch() == parsed.stretch()
+                && other.style() == parsed.style()
+        }) {
+            // Ultralight and Thin both round to 100: the nearer stays.
+            Some(other) if off_by < other.0 => *other = (off_by, parsed),
+            Some(_) => {}
+            None => kept.push((off_by, parsed)),
+        }
+    }
+    if kept.is_empty() {
+        log::warn!("the system interface font has no faces that could be read");
+    }
+    kept.into_iter().map(|(_, parsed)| parsed).collect()
 }
 
 fn build_fallback_list() -> Vec<ParsedFont> {
@@ -323,4 +382,37 @@ fn build_fallback_list_impl() -> anyhow::Result<Vec<ParsedFont>> {
     }
 
     Ok(fonts)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// Core Text matches nothing to the system interface font's family
+    /// name, and the interface was drawn with the next font in its list.
+    #[test]
+    fn the_system_interface_font_is_found_at_the_weight_asked_for() {
+        for weight in [FontWeight::REGULAR, FontWeight::MEDIUM, FontWeight::BOLD] {
+            let attr = FontAttributes {
+                family: SYSTEM_UI_FONT_FAMILY.to_string(),
+                weight,
+                ..Default::default()
+            };
+            let mut loaded = HashSet::new();
+            let fonts = CoreTextFontLocator {}
+                .load_fonts(&[attr.clone()], &mut loaded, 16)
+                .unwrap();
+            assert_eq!(fonts.len(), 1, "one face for {attr:?}: {fonts:?}");
+            assert_eq!(fonts[0].weight(), weight);
+            assert_eq!(fonts[0].stretch(), FontStretch::Normal);
+            assert_eq!(fonts[0].style(), FontStyle::Normal);
+            assert!(loaded.contains(&attr));
+        }
+    }
+
+    #[test]
+    fn the_families_on_offer_are_named_without_opening_them() {
+        let families = CoreTextFontLocator {}.enumerate_family_names().unwrap();
+        assert!(families.iter().any(|family| family == "Menlo"));
+    }
 }

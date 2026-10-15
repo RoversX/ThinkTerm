@@ -563,6 +563,13 @@ impl ParsedFont {
         self.weight
     }
 
+    /// This font filed under `weight` instead of the weight it reports.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn with_weight(mut self, weight: FontWeight) -> Self {
+        self.weight = weight;
+        self
+    }
+
     pub fn stretch(&self) -> FontStretch {
         self.stretch
     }
