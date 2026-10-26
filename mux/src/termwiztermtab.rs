@@ -111,7 +111,7 @@ impl TermWizTerminalPane {
         let mut terminal = wezterm_term::Terminal::new(
             size,
             term_config.unwrap_or_else(|| Arc::new(config::TermConfig::new())),
-            "ThinkTerm",
+            config::TERM_PROGRAM,
             config::wezterm_version(),
             Box::new(Vec::new()), // FIXME: connect to something?
         );

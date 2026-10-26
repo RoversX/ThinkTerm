@@ -214,7 +214,7 @@ impl TmuxDomainState {
         let terminal = wezterm_term::Terminal::new(
             size,
             std::sync::Arc::new(config::TermConfig::new()),
-            "ThinkTerm",
+            config::TERM_PROGRAM,
             config::wezterm_version(),
             writer,
         );

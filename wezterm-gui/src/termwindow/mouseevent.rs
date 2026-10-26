@@ -9704,6 +9704,37 @@ impl super::TermWindow {
                     self.scroll_to_bottom(&pane);
                 }
 
+                // A link belongs to the terminal even when the application
+                // has grabbed the mouse. Programs such as OpenCode handle
+                // clicks themselves; over an SSH session their "open" would
+                // run on the remote host, where there is often no browser.
+                // Keep a plain click on a link here, and swallow its release
+                // so the application does not see half a click.
+                //
+                // Clear a claim whose release never arrived (focus loss, for
+                // example) before deciding this press; otherwise a later,
+                // unrelated release would be swallowed.
+                if matches!(event.kind, WMEK::Press(_)) {
+                    self.hyperlink_press_claimed = false;
+                }
+                if self.hyperlink_press_claimed
+                    && matches!(event.kind, WMEK::Release(MousePress::Left))
+                {
+                    self.hyperlink_press_claimed = false;
+                    return;
+                }
+                if claims_hyperlink_press(
+                    mouse_reporting,
+                    event.modifiers,
+                    &event.kind,
+                    &event_trigger_type,
+                    self.current_highlight.is_some(),
+                ) {
+                    self.hyperlink_press_claimed = true;
+                    self.do_open_link_at_mouse_cursor(&pane);
+                    return;
+                }
+
                 // normalize delta and streak to make mouse assignment
                 // easier to wrangle
                 match event_trigger_type {
@@ -9849,6 +9880,104 @@ fn mouse_press_to_tmb(press: &MousePress) -> TMB {
         MousePress::Left => TMB::Left,
         MousePress::Right => TMB::Right,
         MousePress::Middle => TMB::Middle,
+    }
+}
+
+/// Whether a link click belongs to the terminal while the application has
+/// grabbed the mouse. Modified clicks are left to the application; Shift
+/// already bypasses mouse reporting and reaches the normal binding.
+fn claims_hyperlink_press(
+    mouse_reporting: bool,
+    modifiers: ::window::Modifiers,
+    kind: &WMEK,
+    trigger: &MouseEventTrigger,
+    has_highlight: bool,
+) -> bool {
+    mouse_reporting
+        && modifiers.is_empty()
+        && matches!(kind, WMEK::Press(MousePress::Left))
+        && matches!(
+            trigger,
+            MouseEventTrigger::Down {
+                streak: 1,
+                button: MouseButton::Left,
+            }
+        )
+        && has_highlight
+}
+
+#[cfg(test)]
+mod hyperlink_press_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_unmodified_single_left_press_on_a_link_is_claimed() {
+        let left = MouseEventTrigger::Down {
+            streak: 1,
+            button: MouseButton::Left,
+        };
+        assert!(claims_hyperlink_press(
+            true,
+            ::window::Modifiers::NONE,
+            &WMEK::Press(MousePress::Left),
+            &left,
+            true
+        ));
+
+        // The application keeps the mouse unless it has grabbed it.
+        assert!(!claims_hyperlink_press(
+            false,
+            ::window::Modifiers::NONE,
+            &WMEK::Press(MousePress::Left),
+            &left,
+            true
+        ));
+        // Modified clicks stay with the application.
+        assert!(!claims_hyperlink_press(
+            true,
+            ::window::Modifiers::SHIFT,
+            &WMEK::Press(MousePress::Left),
+            &left,
+            true
+        ));
+        // Only the press is ours; its release is swallowed by the flag.
+        assert!(!claims_hyperlink_press(
+            true,
+            ::window::Modifiers::NONE,
+            &WMEK::Release(MousePress::Left),
+            &left,
+            true
+        ));
+        // A double click is not a fresh link click.
+        assert!(!claims_hyperlink_press(
+            true,
+            ::window::Modifiers::NONE,
+            &WMEK::Press(MousePress::Left),
+            &MouseEventTrigger::Down {
+                streak: 2,
+                button: MouseButton::Left,
+            },
+            true
+        ));
+        // Other buttons are the application's.
+        assert!(!claims_hyperlink_press(
+            true,
+            ::window::Modifiers::NONE,
+            &WMEK::Press(MousePress::Right),
+            &MouseEventTrigger::Down {
+                streak: 1,
+                button: MouseButton::Right,
+            },
+            true
+        ));
+        // And there must be a link under the pointer.
+        assert!(!claims_hyperlink_press(
+            true,
+            ::window::Modifiers::NONE,
+            &WMEK::Press(MousePress::Left),
+            &left,
+            false
+        ));
     }
 }
 

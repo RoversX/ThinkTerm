@@ -1427,7 +1427,7 @@ fn build_terminal(
     let mut terminal = wezterm_term::Terminal::new(
         snapshot_size,
         Arc::new(config::TermConfig::new()),
-        "ThinkTerm",
+        config::TERM_PROGRAM,
         config::wezterm_version(),
         writer,
     );

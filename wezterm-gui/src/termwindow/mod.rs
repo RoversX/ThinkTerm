@@ -3115,6 +3115,9 @@ pub struct TermWindow {
     /// A mouse binding took the right button's press: its release does not
     /// run the built-in right click as well.
     right_press_claimed: bool,
+    /// A plain click opened a hyperlink while the application had grabbed
+    /// the mouse: its release belongs to us too.
+    hyperlink_press_claimed: bool,
     recording_overlay: ui::recording_overlay::RecordingOverlay,
     command_palette: Option<ui::command_palette::CommandPaletteState>,
     /// The contrast floor text is held to, or `None` to leave the
@@ -5079,6 +5082,7 @@ impl TermWindow {
             closed_pane_nav: None,
             nav_morph: None,
             right_press_claimed: false,
+            hyperlink_press_claimed: false,
             recording_overlay: Default::default(),
             command_palette: None,
             text_min_contrast: crate::native_settings::text_min_contrast_ratio(&config),

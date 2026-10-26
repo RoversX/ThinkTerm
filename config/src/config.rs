@@ -1847,7 +1847,7 @@ impl Config {
         // de-facto standard for terminal capability detection. Keep the
         // WezTerm identity for compatibility with third-party tools; use the
         // THINKTERM variables below for ThinkTerm-specific detection.
-        cmd.env("TERM_PROGRAM", "WezTerm");
+        cmd.env("TERM_PROGRAM", TERM_PROGRAM);
         cmd.env("TERM_PROGRAM_VERSION", crate::wezterm_version());
         cmd.env("THINKTERM", "1");
         cmd.env("THINKTERM_VERSION", crate::wezterm_version());
@@ -1983,6 +1983,11 @@ fn default_harfbuzz_features() -> Vec<String> {
 fn default_term() -> String {
     "xterm-256color".into()
 }
+
+/// The terminal name that programs see.  ThinkTerm is a WezTerm fork and
+/// third-party capability detection often keys off the WezTerm identity;
+/// use the THINKTERM environment variables to tell the fork apart.
+pub const TERM_PROGRAM: &str = "WezTerm";
 
 fn default_font_size() -> f64 {
     12.0
