@@ -7500,12 +7500,17 @@ impl super::TermWindow {
                                 ..Default::default()
                             },
                         );
+                        let keep_ui = ui.clone();
                         let outcome = crate::attach_domain_with_retry(
                             domain,
                             Some(mux_window_id),
                             ui,
-                            move || Mux::get().get_window(mux_window_id).is_some(),
+                            move || {
+                                Mux::get().get_window(mux_window_id).is_some()
+                                    && !keep_ui.abandoned()
+                            },
                             Some(std::time::Duration::from_secs(60)),
+                            Some(wezterm_client::domain::ATTACH_MAX_ATTEMPTS),
                         )
                         .await?;
                         anyhow::Ok(matches!(outcome, crate::AttachRetryOutcome::Attached))

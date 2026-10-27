@@ -347,6 +347,7 @@ settings-import-preview-custom-colors = 自定义配色
 settings-import-preview-font-table = 字体配置
 sidebar-default-space = 默认
 sidebar-connecting = 正在连接…
+sidebar-connecting-attempt = 正在连接…（{ $current }/{ $total }）
 sidebar-reconnect = 重新连接
 sidebar-new-thread = 新建会话
 sidebar-pinned = 已置顶

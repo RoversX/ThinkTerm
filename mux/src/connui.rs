@@ -71,11 +71,23 @@ struct ConnectionUIImpl {
 enum CloseStatus {
     Explicit,
     Implicit,
+    /// The tab that hosted this UI was closed. Retrying into a UI nobody
+    /// can see would leave the connection running with no way to stop it.
+    Abandoned,
 }
 
 impl ConnectionUIImpl {
     fn run(&mut self) -> anyhow::Result<CloseStatus> {
         loop {
+            // Closing the terminal tab drops the pane that feeds this
+            // terminal, which disconnects its input channel. Without this
+            // check the retry loop kept running behind an empty window: the
+            // attach Activity holds the window from being pruned, so the
+            // "window still exists" cancellation test could never fire.
+            if self.term.input_disconnected() {
+                log::info!("connection UI tab was closed; stopping retries");
+                return Ok(CloseStatus::Abandoned);
+            }
             match self.rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(UIRequest::Close) => return Ok(CloseStatus::Explicit),
                 Ok(UIRequest::Output(changes)) => self.term.render(&changes)?,
@@ -629,6 +641,11 @@ pub struct ConnectionUI {
     /// dropped. A dropped `Promise` parks its caller in `block_on` forever —
     /// `promise` has no `Drop` impl that completes the future.
     alive: Arc<AtomicBool>,
+    /// Set only when the tab hosting the UI was closed underneath it. A
+    /// normal `close()` (the connection finished, or the attempt failed)
+    /// leaves this false, so a retry loop can tell "nobody is looking any
+    /// more, stop" apart from "we closed our own progress tab".
+    abandoned: Arc<AtomicBool>,
 }
 
 impl ConnectionUI {
@@ -640,17 +657,31 @@ impl ConnectionUI {
         let (tx, rx) = unbounded();
         let alive = Arc::new(AtomicBool::new(true));
         let backend_alive = Arc::clone(&alive);
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let backend_abandoned = Arc::clone(&abandoned);
         promise::spawn::spawn_into_main_thread(termwiztermtab::run(
             params.size,
             params.window_id,
             move |term| {
                 let mut ui = ConnectionUIImpl { term, rx };
-                let status = ui.run().unwrap_or_else(|e| {
-                    log::error!("while running ConnectionUI loop: {:?}", e);
-                    CloseStatus::Implicit
-                });
+                let status = match ui.run() {
+                    Ok(status) => status,
+                    Err(e) => {
+                        log::error!("while running ConnectionUI loop: {:?}", e);
+                        // A render into a closed pane fails before the next
+                        // top-of-loop input check can run. The pane being
+                        // gone is still what happened, not a normal finish.
+                        if ui.term.input_disconnected() {
+                            CloseStatus::Abandoned
+                        } else {
+                            CloseStatus::Implicit
+                        }
+                    }
+                };
 
-                if !params.disable_close_delay && status == CloseStatus::Implicit {
+                if status == CloseStatus::Abandoned {
+                    backend_abandoned.store(true, Ordering::Release);
+                } else if !params.disable_close_delay && status == CloseStatus::Implicit {
                     ui.sleep(
                         "(this window will close automatically)",
                         Duration::new(120, 0),
@@ -676,7 +707,11 @@ impl ConnectionUI {
             None,
         ))
         .detach();
-        Self { tx, alive }
+        Self {
+            tx,
+            alive,
+            abandoned,
+        }
     }
 
     pub fn new_with_no_close_delay() -> Self {
@@ -696,7 +731,11 @@ impl ConnectionUI {
             backend_alive.store(false, Ordering::Release);
             result
         });
-        Self { tx, alive }
+        Self {
+            tx,
+            alive,
+            abandoned: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// A UI that costs nothing until it has something to ask.
@@ -729,7 +768,11 @@ impl ConnectionUI {
                 .run()
             })
             .expect("failed to spawn lazy connui relay");
-        Self { tx, alive }
+        Self {
+            tx,
+            alive,
+            abandoned: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub fn run_and_log_error<T, F>(&self, f: F) -> anyhow::Result<T>
@@ -856,6 +899,13 @@ impl ConnectionUI {
     /// backend ignores it.
     pub fn materialize(&self) {
         self.tx.send(UIRequest::Materialize).ok();
+    }
+
+    /// The tab hosting this UI was closed. Retry loops watching a
+    /// `ConnectionUI` use this to stop: unlike `test_alive`, it stays true
+    /// once set, and a normal `close()` never sets it.
+    pub fn abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::Acquire)
     }
 
     pub fn test_alive(&self) -> bool {

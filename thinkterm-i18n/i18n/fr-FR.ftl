@@ -350,6 +350,7 @@ settings-import-preview-custom-colors = Couleurs personnalisées
 settings-import-preview-font-table = Configuration des polices
 sidebar-default-space = Par défaut
 sidebar-connecting = Connexion…
+sidebar-connecting-attempt = Connexion… ({ $current }/{ $total })
 sidebar-reconnect = Reconnecter
 sidebar-new-thread = Nouvelle session
 sidebar-pinned = Épinglées

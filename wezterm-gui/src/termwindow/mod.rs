@@ -6737,12 +6737,16 @@ impl TermWindow {
                             window_id: Some(mux_window_id),
                             ..Default::default()
                         });
+                    let keep_ui = ui.clone();
                     crate::attach_domain_with_retry(
                         domain,
                         Some(mux_window_id),
                         ui,
-                        move || Mux::get().get_window(mux_window_id).is_some(),
+                        move || {
+                            Mux::get().get_window(mux_window_id).is_some() && !keep_ui.abandoned()
+                        },
                         Some(std::time::Duration::from_secs(60)),
+                        Some(wezterm_client::domain::ATTACH_MAX_ATTEMPTS),
                     )
                     .await?;
                 }
@@ -11714,17 +11718,22 @@ impl TermWindow {
                             window_id: Some(window),
                             ..Default::default()
                         });
+                    let keep_ui = ui.clone();
                     match crate::attach_domain_with_retry(
                         domain.clone(),
                         Some(window),
                         ui,
-                        move || Mux::get().get_window(window).is_some(),
+                        move || {
+                            Mux::get().get_window(window).is_some() && !keep_ui.abandoned()
+                        },
                         Some(std::time::Duration::from_secs(60)),
+                        Some(wezterm_client::domain::ATTACH_MAX_ATTEMPTS),
                     )
                     .await?
                     {
                         crate::AttachRetryOutcome::Attached => {}
-                        crate::AttachRetryOutcome::Cancelled => {
+                        crate::AttachRetryOutcome::Cancelled
+                        | crate::AttachRetryOutcome::AbandonedAfterAttach => {
                             return Result::<(), anyhow::Error>::Ok(())
                         }
                     }

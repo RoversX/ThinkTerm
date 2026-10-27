@@ -696,6 +696,18 @@ impl crate::TermWindow {
         }
     }
 
+    /// Attempt x of y of the active Space's attach retry sequence, when one
+    /// is running. `None` keeps the banner's plain "Connecting…" for the
+    /// frames before the first attempt starts (or for non-retry attaches).
+    fn space_attach_attempt_progress(&self, space_id: &str) -> Option<(usize, usize)> {
+        let domain_name = crate::local_sessions::connection_domain_for_space(space_id)?;
+        let mux = Mux::get();
+        let domain = mux.get_domain_by_name(&domain_name)?;
+        domain
+            .downcast_ref::<wezterm_client::domain::ClientDomain>()?
+            .attach_attempt_progress()
+    }
+
     /// Called from the status heartbeat: repaint only when the sidebar
     /// Space's connection state has changed since the last check. Remote
     /// Spaces already tick while their indicator is painted.
@@ -1382,7 +1394,15 @@ impl crate::TermWindow {
         let row_text_max =
             (row_x + row_width).saturating_sub(row_text_x + self.ui_px(SIDEBAR_INSET));
         let reconnect_label = if reconnect_in_flight {
-            crate::i18n::tr("sidebar-connecting")
+            match self.space_attach_attempt_progress(self.workspace_sidebar_space_id()) {
+                Some((current, total)) => {
+                    let mut args = fluent_bundle::FluentArgs::new();
+                    args.set("current", current.to_string());
+                    args.set("total", total.to_string());
+                    crate::i18n::tr_args("sidebar-connecting-attempt", &args)
+                }
+                None => crate::i18n::tr("sidebar-connecting"),
+            }
         } else {
             crate::i18n::tr("sidebar-reconnect")
         };

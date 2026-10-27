@@ -347,6 +347,7 @@ settings-import-preview-custom-colors = カスタムカラー
 settings-import-preview-font-table = フォント設定
 sidebar-default-space = デフォルト
 sidebar-connecting = 接続中…
+sidebar-connecting-attempt = 接続中…（{ $current }/{ $total }）
 sidebar-reconnect = 再接続
 sidebar-new-thread = 新しいセッション
 sidebar-pinned = ピン留め
