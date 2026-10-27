@@ -364,6 +364,8 @@ tooltip-sidebar-thread-search = Find Thread
 tooltip-sidebar-ssh-hosts = Remote Hosts
 tooltip-sidebar-live-overview = Live Overview
 tooltip-sidebar-notifications = Notifications
+tooltip-refresh-files = Refresh Directory Information
+tooltip-upload-files = Upload Files/Folders
 menu-rename-project = Rename Project…
 menu-grant-folder-access = Grant Folder Access…
 menu-new-thread = New Thread
@@ -564,6 +566,11 @@ right-script-required = Script *
 right-script-placeholder = Type command or script
 right-run = Run
 right-download = Download
+right-upload-to = Upload to { $path }…
+right-upload-files-to = Upload Files to { $path }…
+right-upload-folder-to = Upload Folder to { $path }…
+right-upload-picker-title = Upload Files/Folders
+right-upload-picker-prompt = Upload
 right-new-folder = New Folder
 right-delete = Delete…
 right-copy-all = Copy All
@@ -1675,6 +1682,21 @@ remote-files-listing-refused = The remote host could not list files: { $detail }
 remote-files-listing-too-large = The remote file listing is too large
 download-completed = Download completed
 download-completed-body = Downloaded { $path }
+transfer-card-preparing = Preparing…
+transfer-card-canceling = Canceling…
+download-card-failed = Download failed
+download-card-saved-to = Saved to { $path }
+transfer-card-items = { $count ->
+        [one] { $count } item
+       *[other] { $count } items
+    }
+download-open-file = Open File
+download-open-folder = Open Folder
+download-open-downloads = Open Download Folder
+upload-card-uploading = Uploading
+upload-completed = Upload completed
+upload-card-failed = Upload failed
+upload-card-uploaded-to = Uploaded to { $path }
 
 ## Why a plugin's ask was not done. Plugins show these as they are.
 plugin-answer-no-terminal = no terminal is beside the panel

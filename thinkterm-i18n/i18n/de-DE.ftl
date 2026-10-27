@@ -364,6 +364,8 @@ tooltip-sidebar-thread-search = Thread finden
 tooltip-sidebar-ssh-hosts = Remote-Hosts
 tooltip-sidebar-live-overview = Live-Übersicht
 tooltip-sidebar-notifications = Mitteilungen
+tooltip-refresh-files = Verzeichnisinformationen aktualisieren
+tooltip-upload-files = Dateien/Ordner hochladen
 menu-rename-project = Projekt umbenennen…
 menu-grant-folder-access = Ordnerzugriff gewähren…
 menu-new-thread = Neuer Thread
@@ -564,6 +566,11 @@ right-script-required = Skript *
 right-script-placeholder = Befehl oder Skript eingeben
 right-run = Ausführen
 right-download = Herunterladen
+right-upload-to = Hochladen nach { $path }…
+right-upload-files-to = Dateien nach { $path } hochladen…
+right-upload-folder-to = Ordner nach { $path } hochladen…
+right-upload-picker-title = Dateien/Ordner hochladen
+right-upload-picker-prompt = Hochladen
 right-new-folder = Neuer Ordner
 right-delete = Löschen…
 right-copy-all = Alles kopieren
@@ -1675,6 +1682,21 @@ remote-files-listing-refused = Der entfernte Host konnte keine Dateien auflisten
 remote-files-listing-too-large = Die entfernte Dateiliste ist zu groß
 download-completed = Download abgeschlossen
 download-completed-body = Geladen nach { $path }
+transfer-card-preparing = Wird vorbereitet…
+transfer-card-canceling = Wird abgebrochen…
+download-card-failed = Download fehlgeschlagen
+download-card-saved-to = Gespeichert in { $path }
+transfer-card-items = { $count ->
+        [one] { $count } Element
+       *[other] { $count } Elemente
+    }
+download-open-file = Datei öffnen
+download-open-folder = Ordner öffnen
+download-open-downloads = Download-Ordner öffnen
+upload-card-uploading = Wird hochgeladen
+upload-completed = Upload abgeschlossen
+upload-card-failed = Upload fehlgeschlagen
+upload-card-uploaded-to = Hochgeladen nach { $path }
 
 ## Why a plugin's ask was not done. Plugins show these as they are.
 plugin-answer-no-terminal = neben dem Panel ist kein Terminal

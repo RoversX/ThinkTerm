@@ -4,9 +4,9 @@ use crate::parameters::{self, Parameters};
 use crate::{
     Appearance, ApplicationEvent, Clipboard, ClipboardContents, DeadKeyStatus, Dimensions,
     FilePickerOptions, FolderPickerOptions, Handled, KeyCode, KeyEvent, Modifiers, MouseButtons,
-    MouseCursor, MouseEvent, MouseEventKind, MousePress, Point, RawKeyEvent, Rect,
-    RequestedWindowGeometry, ResolvedGeometry, ScreenPoint, ScreenRect, ULength, WindowDecorations,
-    WindowEvent, WindowEventSender, WindowOps, WindowState,
+    MouseCursor, MouseEvent, MouseEventKind, MousePress, PathPickerOptions, Point, RawKeyEvent,
+    Rect, RequestedWindowGeometry, ResolvedGeometry, ScreenPoint, ScreenRect, ULength,
+    WindowDecorations, WindowEvent, WindowEventSender, WindowOps, WindowState,
 };
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
@@ -37,7 +37,7 @@ use winapi::shared::minwindef::*;
 use winapi::shared::ntdef::*;
 use winapi::shared::windef::*;
 use winapi::shared::winerror::{
-    ERROR_CANCELLED, FAILED, HRESULT_FROM_WIN32, RPC_E_CHANGED_MODE, S_FALSE, S_OK,
+    ERROR_CANCELLED, FAILED, HRESULT_FROM_WIN32, RPC_E_CHANGED_MODE, S_FALSE, S_OK, SUCCEEDED,
 };
 use winapi::shared::wtypesbase::CLSCTX_INPROC_SERVER;
 use winapi::um::combaseapi::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize};
@@ -47,10 +47,12 @@ use winapi::um::objbase::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use winapi::um::shellapi::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use winapi::um::shellscalingapi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use winapi::um::shobjidl::{
-    IFileOpenDialog, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR, FOS_PATHMUSTEXIST,
-    FOS_PICKFOLDERS,
+    IFileOpenDialog, FILEOPENDIALOGOPTIONS, FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST,
+    FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS,
 };
-use winapi::um::shobjidl_core::{CLSID_FileOpenDialog, IShellItem, SIGDN_FILESYSPATH};
+use winapi::um::shobjidl_core::{
+    CLSID_FileOpenDialog, IShellItem, IShellItemArray, SIGDN_FILESYSPATH,
+};
 use winapi::um::shtypes::COMDLG_FILTERSPEC;
 use winapi::um::sysinfoapi::{GetTickCount, GetVersionExW};
 use winapi::um::uxtheme::SetWindowTheme;
@@ -366,6 +368,108 @@ unsafe fn pick_file_dialog(
         (*dialog).Release();
 
         dialog_result.map(|_| selected_path)
+    })();
+
+    if should_uninitialize {
+        CoUninitialize();
+    }
+
+    result
+}
+
+unsafe fn pick_paths_dialog(
+    hwnd: HWND,
+    options: &PathPickerOptions,
+) -> anyhow::Result<Vec<PathBuf>> {
+    if !options.allow_files && !options.allow_directories {
+        return Ok(Vec::new());
+    }
+
+    let coinit = CoInitializeEx(
+        null_mut(),
+        COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+    );
+    let should_uninitialize = coinit == S_OK || coinit == S_FALSE;
+    if FAILED(coinit) && coinit != RPC_E_CHANGED_MODE {
+        hresult_to_result(coinit, "CoInitializeEx")?;
+    }
+
+    let result = (|| {
+        let mut dialog: *mut IFileOpenDialog = null_mut();
+        hresult_to_result(
+            CoCreateInstance(
+                &CLSID_FileOpenDialog,
+                null_mut(),
+                CLSCTX_INPROC_SERVER,
+                &IFileOpenDialog::uuidof(),
+                &mut dialog as *mut _ as *mut _,
+            ),
+            "CoCreateInstance(FileOpenDialog)",
+        )?;
+
+        let title = wide_null(&options.title);
+        let choose = wide_null(&options.prompt);
+        let mut dialog_options = FOS_FORCEFILESYSTEM as u32
+            | FOS_PATHMUSTEXIST as u32
+            | FOS_NOCHANGEDIR as u32;
+        if options.multiple {
+            dialog_options |= FOS_ALLOWMULTISELECT as u32;
+        }
+        // The Windows dialog has one mode: files or folders. The caller uses
+        // its menu fallback when it needs both, so this combination means
+        // "files" here.
+        if options.allow_directories && !options.allow_files {
+            dialog_options |= FOS_PICKFOLDERS as u32;
+        }
+        let dialog_options: FILEOPENDIALOGOPTIONS = std::mem::transmute(dialog_options);
+        hresult_to_result(
+            (*dialog).SetOptions(dialog_options),
+            "IFileDialog::SetOptions",
+        )?;
+        hresult_to_result((*dialog).SetTitle(title.as_ptr()), "IFileDialog::SetTitle")?;
+        hresult_to_result(
+            (*dialog).SetOkButtonLabel(choose.as_ptr()),
+            "IFileDialog::SetOkButtonLabel",
+        )?;
+
+        let show_result = (*dialog).Show(hwnd);
+        if show_result == HRESULT_FROM_WIN32(ERROR_CANCELLED) {
+            (*dialog).Release();
+            return Ok(Vec::new());
+        }
+        hresult_to_result(show_result, "IFileDialog::Show")?;
+
+        let mut results: *mut IShellItemArray = null_mut();
+        hresult_to_result(
+            (*dialog).GetResults(&mut results),
+            "IFileOpenDialog::GetResults",
+        )?;
+        let mut selected = Vec::new();
+        let mut count: DWORD = 0;
+        if !results.is_null() {
+            hresult_to_result(
+                (*results).GetCount(&mut count),
+                "IShellItemArray::GetCount",
+            )?;
+            for index in 0..count {
+                let mut item: *mut IShellItem = null_mut();
+                if SUCCEEDED((*results).GetItemAt(index, &mut item)) && !item.is_null() {
+                    let mut raw_path: LPWSTR = null_mut();
+                    if SUCCEEDED((*item).GetDisplayName(SIGDN_FILESYSPATH, &mut raw_path)) {
+                        if let Some(path) = pathbuf_from_shell_string(raw_path) {
+                            selected.push(path);
+                        }
+                    }
+                    if !raw_path.is_null() {
+                        CoTaskMemFree(raw_path as *mut _);
+                    }
+                    (*item).Release();
+                }
+            }
+            (*results).Release();
+        }
+        (*dialog).Release();
+        Ok(selected)
     })();
 
     if should_uninitialize {
@@ -1416,6 +1520,27 @@ impl WindowOps for Window {
                 }
             };
             callback(path);
+        })
+        .detach();
+    }
+
+    fn pick_paths_async(
+        &self,
+        options: PathPickerOptions,
+        callback: Box<dyn FnOnce(Vec<PathBuf>) + 'static>,
+    ) {
+        let hwnd = self.0 .0;
+        promise::spawn::spawn(async move {
+            let paths = unsafe {
+                match pick_paths_dialog(hwnd, &options) {
+                    Ok(paths) => paths,
+                    Err(err) => {
+                        log::warn!("failed to show path picker: {err:#}");
+                        Vec::new()
+                    }
+                }
+            };
+            callback(paths);
         })
         .detach();
     }

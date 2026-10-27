@@ -1743,10 +1743,18 @@ impl super::TermWindow {
             | UIItemType::RightSidebarFileCopyText
             | UIItemType::RightSidebarRemoteFileConnect
             | UIItemType::RightSidebarRemoteFileRefresh
+            | UIItemType::RightSidebarRemoteFileUpload
             | UIItemType::RightSidebarRemoteFileRow(_)
             | UIItemType::RightSidebarRemoteFileBack
             | UIItemType::RightSidebarRemoteFileCopyText
             | UIItemType::RightSidebarRemoteTransfer(_)
+            | UIItemType::TransferCardCancel(_)
+            | UIItemType::TransferCardDismiss(_)
+            | UIItemType::TransferCardRetry(_)
+            | UIItemType::TransferCardOpen(_)
+            | UIItemType::TransferCardOpenDownloads(_)
+            | UIItemType::TransferCardCopyPath(_)
+            | UIItemType::TransferCardBackground
             | UIItemType::ContextMenuBackdrop
             | UIItemType::ContextMenuItem(_)
             | UIItemType::CommandPalette
@@ -1921,10 +1929,18 @@ impl super::TermWindow {
             | UIItemType::RightSidebarFileCopyText
             | UIItemType::RightSidebarRemoteFileConnect
             | UIItemType::RightSidebarRemoteFileRefresh
+            | UIItemType::RightSidebarRemoteFileUpload
             | UIItemType::RightSidebarRemoteFileRow(_)
             | UIItemType::RightSidebarRemoteFileBack
             | UIItemType::RightSidebarRemoteFileCopyText
             | UIItemType::RightSidebarRemoteTransfer(_)
+            | UIItemType::TransferCardCancel(_)
+            | UIItemType::TransferCardDismiss(_)
+            | UIItemType::TransferCardRetry(_)
+            | UIItemType::TransferCardOpen(_)
+            | UIItemType::TransferCardOpenDownloads(_)
+            | UIItemType::TransferCardCopyPath(_)
+            | UIItemType::TransferCardBackground
             | UIItemType::ContextMenuBackdrop
             | UIItemType::ContextMenuItem(_)
             | UIItemType::CommandPalette
@@ -4212,11 +4228,21 @@ impl super::TermWindow {
             }
             UIItemType::RightSidebarRemoteFileConnect
             | UIItemType::RightSidebarRemoteFileRefresh
+            | UIItemType::RightSidebarRemoteFileUpload
             | UIItemType::RightSidebarRemoteFileRow(_)
             | UIItemType::RightSidebarRemoteFileBack
             | UIItemType::RightSidebarRemoteFileCopyText
             | UIItemType::RightSidebarRemoteTransfer(_) => {
                 self.mouse_event_right_sidebar_remote_file(item.clone(), event, context);
+            }
+            UIItemType::TransferCardCancel(_)
+            | UIItemType::TransferCardDismiss(_)
+            | UIItemType::TransferCardRetry(_)
+            | UIItemType::TransferCardOpen(_)
+            | UIItemType::TransferCardOpenDownloads(_)
+            | UIItemType::TransferCardCopyPath(_)
+            | UIItemType::TransferCardBackground => {
+                self.mouse_event_transfer_card(item.clone(), event, context);
             }
             UIItemType::UpdateCapsule => self.mouse_event_update_capsule(false, event, context),
             UIItemType::UpdateCapsuleDismiss => {
@@ -4678,6 +4704,15 @@ impl super::TermWindow {
             UIItemType::WorkspaceSidebarResize => {
                 self.mouse_event_workspace_sidebar_resize(item, event, context);
             }
+            UIItemType::TransferCardCancel(_)
+            | UIItemType::TransferCardDismiss(_)
+            | UIItemType::TransferCardRetry(_)
+            | UIItemType::TransferCardOpen(_)
+            | UIItemType::TransferCardOpenDownloads(_)
+            | UIItemType::TransferCardCopyPath(_)
+            | UIItemType::TransferCardBackground => {
+                self.mouse_event_transfer_card(item.clone(), event, context);
+            }
             UIItemType::UpdateCapsule => self.mouse_event_update_capsule(false, event, context),
             UIItemType::UpdateCapsuleDismiss => {
                 self.mouse_event_update_capsule(true, event, context)
@@ -4833,6 +4868,7 @@ impl super::TermWindow {
             }
             UIItemType::RightSidebarRemoteFileConnect
             | UIItemType::RightSidebarRemoteFileRefresh
+            | UIItemType::RightSidebarRemoteFileUpload
             | UIItemType::RightSidebarRemoteFileRow(_)
             | UIItemType::RightSidebarRemoteFileBack
             | UIItemType::RightSidebarRemoteFileCopyText
@@ -5681,6 +5717,9 @@ impl super::TermWindow {
             UIItemType::RightSidebarRemoteFileRefresh => {
                 self.refresh_right_sidebar_remote_files();
             }
+            UIItemType::RightSidebarRemoteFileUpload => {
+                self.begin_remote_upload_picker(event.coords);
+            }
             UIItemType::RightSidebarRemoteFileRow(ref path) => {
                 if self.is_renaming_sidebar_remote_file(path) {
                     let double_click = self
@@ -5734,6 +5773,38 @@ impl super::TermWindow {
             _ => {}
         }
         self.invalidate_or_reflow_right_sidebar(previous_width, context);
+    }
+
+    fn mouse_event_transfer_card(
+        &mut self,
+        item: UIItem,
+        event: MouseEvent,
+        context: &dyn WindowOps,
+    ) {
+        if item.item_type == UIItemType::TransferCardBackground {
+            // The card's empty surface is still part of the card: keep the
+            // click here instead of letting it select a file underneath.
+            context.set_cursor(Some(MouseCursor::Arrow));
+            return;
+        }
+        context.set_cursor(Some(MouseCursor::Hand));
+        if event.kind != WMEK::Press(MousePress::Left) {
+            return;
+        }
+        match item.item_type {
+            UIItemType::TransferCardCancel(id) => self.cancel_transfer(id),
+            UIItemType::TransferCardDismiss(id) => self.dismiss_transfer_toast(id),
+            UIItemType::TransferCardRetry(id) => {
+                self.retry_transfer_from_card(id, event.coords)
+            }
+            UIItemType::TransferCardOpen(id) => self.open_download_toast(id),
+            UIItemType::TransferCardOpenDownloads(id) => {
+                self.open_download_toast_folder(id)
+            }
+            UIItemType::TransferCardCopyPath(id) => self.copy_transfer_path(id),
+            _ => return,
+        }
+        context.invalidate();
     }
 
     fn mouse_event_update_capsule(

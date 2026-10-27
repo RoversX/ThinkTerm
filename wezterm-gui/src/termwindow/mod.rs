@@ -725,6 +725,15 @@ pub(crate) enum ContextMenuApplicationAction {
         parent: remote_files::RemotePath,
         origin: remote_files::RemoteOperationOrigin,
     },
+    /// The header's Upload button on a platform whose native dialog cannot
+    /// offer files and folders together: choose which one this picker is for.
+    UploadFromPicker {
+        allow_files: bool,
+        allow_directories: bool,
+        directory: remote_files::RemotePath,
+        origin: remote_files::RemoteOperationOrigin,
+        anchor: ::window::Point,
+    },
     /// Run a finished transfer again from its recorded source. Carries the
     /// menu's position so a retried folder download can re-raise its size
     /// confirmation in place.
@@ -873,12 +882,26 @@ pub enum UIItemType {
     RightSidebarFileCopyText,
     RightSidebarRemoteFileConnect,
     RightSidebarRemoteFileRefresh,
+    /// Upload local files or folders into the remote directory shown here.
+    RightSidebarRemoteFileUpload,
     RightSidebarRemoteFileRow(remote_files::RemotePath),
     RightSidebarRemoteFileBack,
     RightSidebarRemoteFileCopyText,
     /// A row in the transfer strip. Clicking cancels it while it runs and
     /// dismisses it once it has finished.
     RightSidebarRemoteTransfer(u64),
+    /// A control on the floating transfer card: cancel a running transfer,
+    /// dismiss a finished one, open what it downloaded, or copy the remote
+    /// path of what it uploaded.
+    TransferCardCancel(u64),
+    TransferCardDismiss(u64),
+    TransferCardRetry(u64),
+    TransferCardOpen(u64),
+    TransferCardOpenDownloads(u64),
+    TransferCardCopyPath(u64),
+    /// The card's own surface: swallows clicks that miss a button so they do
+    /// not fall through to the file tree or terminal underneath.
+    TransferCardBackground,
     /// The area a plugin's panel draws in: the pointer and the wheel over it
     /// go to the panel's player.
     RightSidebarPluginPanel,
@@ -2147,6 +2170,11 @@ pub fn tooltip_label_for(item_type: &UIItemType) -> Option<String> {
         UIItemType::WorkspaceSidebarSshHosts => "tooltip-sidebar-ssh-hosts",
         UIItemType::WorkspaceSidebarLiveOverview => "tooltip-sidebar-live-overview",
         UIItemType::WorkspaceSidebarNotifications => "tooltip-sidebar-notifications",
+        UIItemType::RightSidebarFileRefresh | UIItemType::RightSidebarRemoteFileRefresh => {
+            "tooltip-refresh-files"
+        }
+        UIItemType::RightSidebarRemoteFileUpload => "tooltip-upload-files",
+        UIItemType::TransferCardDismiss(_) => "right-dismiss",
         UIItemType::RightSidebarAgent(crate::agent_status::AgentPanelAction::ViewOptions) => {
             "tooltip-sidebar-view-options"
         }
@@ -3498,6 +3526,9 @@ pub struct TermWindow {
     /// its own lease and must outlive the panel switching between trees.
     right_sidebar_remote_transfers: Vec<remote_files::RemoteTransfer>,
     right_sidebar_remote_transfer_next_id: u64,
+    /// Downloads that have stopped, held for the floating card after the
+    /// transfer row may already have been trimmed out of the strip.
+    transfer_toasts: Vec<render::transfer_card::TransferToast>,
     /// The directory a file drag is currently hovering over, so the row can be
     /// highlighted and the drop knows where it would land.
     right_sidebar_remote_drop_target: Option<remote_files::RemotePath>,
@@ -5268,6 +5299,7 @@ impl TermWindow {
             right_sidebar_remote_files_lease: None,
             right_sidebar_remote_transfers: Vec::new(),
             right_sidebar_remote_transfer_next_id: 0,
+            transfer_toasts: Vec::new(),
             right_sidebar_remote_drop_target: None,
             right_sidebar_local_drop_target: None,
             pending_local_copy: None,

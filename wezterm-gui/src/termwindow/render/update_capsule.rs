@@ -153,6 +153,12 @@ struct Flight {
 }
 
 impl crate::TermWindow {
+    /// Whether the capsule painted this frame. The download cards stack above
+    /// it when both share the bottom-right corner.
+    pub(crate) fn update_capsule_visible(&self) -> bool {
+        self.update_capsule.painted.is_some()
+    }
+
     pub(crate) fn paint_update_capsule(&mut self) -> anyhow::Result<()> {
         let now = Instant::now();
         let gear_dot = self.update_capsule.gear_dot_slot.take();

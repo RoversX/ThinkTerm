@@ -364,6 +364,8 @@ tooltip-sidebar-thread-search = Trouver un fil
 tooltip-sidebar-ssh-hosts = Hôtes distants
 tooltip-sidebar-live-overview = Aperçu en direct
 tooltip-sidebar-notifications = Notifications
+tooltip-refresh-files = Actualiser les informations du dossier
+tooltip-upload-files = Envoyer des fichiers/dossiers
 menu-rename-project = Renommer le projet…
 menu-grant-folder-access = Autoriser l'accès au dossier…
 menu-new-thread = Nouvelle session
@@ -564,6 +566,11 @@ right-script-required = Script *
 right-script-placeholder = Saisissez une commande ou un script
 right-run = Exécuter
 right-download = Télécharger
+right-upload-to = Envoyer vers { $path }…
+right-upload-files-to = Envoyer des fichiers vers { $path }…
+right-upload-folder-to = Envoyer un dossier vers { $path }…
+right-upload-picker-title = Envoyer des fichiers/dossiers
+right-upload-picker-prompt = Envoyer
 right-new-folder = Nouveau dossier
 right-delete = Supprimer…
 right-copy-all = Tout copier
@@ -1669,6 +1676,21 @@ remote-files-listing-refused = L’hôte distant n’a pas pu lister les fichier
 remote-files-listing-too-large = La liste des fichiers distants est trop grande
 download-completed = Téléchargement terminé
 download-completed-body = Téléchargé dans { $path }
+transfer-card-preparing = Préparation…
+transfer-card-canceling = Annulation…
+download-card-failed = Échec du téléchargement
+download-card-saved-to = Enregistré dans { $path }
+transfer-card-items = { $count ->
+        [one] { $count } élément
+       *[other] { $count } éléments
+    }
+download-open-file = Ouvrir le fichier
+download-open-folder = Ouvrir le dossier
+download-open-downloads = Ouvrir le dossier de téléchargement
+upload-card-uploading = Envoi en cours
+upload-completed = Envoi terminé
+upload-card-failed = Échec de l’envoi
+upload-card-uploaded-to = Envoyé dans { $path }
 
 ## Why a plugin's ask was not done. Plugins show these as they are.
 plugin-answer-no-terminal = aucun terminal à côté du panneau

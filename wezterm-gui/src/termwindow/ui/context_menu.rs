@@ -493,6 +493,21 @@ impl crate::TermWindow {
                     self.create_right_sidebar_remote_folder(parent);
                 }
             }
+            crate::termwindow::ContextMenuApplicationAction::UploadFromPicker {
+                allow_files,
+                allow_directories,
+                directory,
+                origin,
+                anchor,
+            } => {
+                self.pick_remote_upload_paths(
+                    allow_files,
+                    allow_directories,
+                    directory,
+                    origin,
+                    anchor,
+                );
+            }
             crate::termwindow::ContextMenuApplicationAction::RetryRemoteTransfer { id, anchor } => {
                 self.retry_remote_transfer(id, anchor);
             }

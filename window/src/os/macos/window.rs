@@ -12,9 +12,9 @@ use crate::{
     Clipboard, ClipboardContents, Connection, ContextMenuItem, DeadKeyStatus, Dimensions,
     FilePickerOptions, FolderPickerOptions, Handled, Image, KeyCode, KeyEvent, Modifiers,
     MouseButtons, MouseCursor, MouseEvent, MouseEventKind, MousePress, NativeTextInputSnapshot,
-    Point, PreciseScrollDelta, RawKeyEvent, Rect, RequestedWindowGeometry, ResizeIncrement,
-    ResolvedGeometry, ScreenPoint, ScrollPhase, Size, TextCheckCapabilities, TextCheckIssue,
-    TextCheckRequest, TextCheckResponse, ULength, WindowDecorations, WindowEvent,
+    PathPickerOptions, Point, PreciseScrollDelta, RawKeyEvent, Rect, RequestedWindowGeometry,
+    ResizeIncrement, ResolvedGeometry, ScreenPoint, ScrollPhase, Size, TextCheckCapabilities,
+    TextCheckIssue, TextCheckRequest, TextCheckResponse, ULength, WindowDecorations, WindowEvent,
     WindowEventSender, WindowOps, WindowState,
 };
 use anyhow::{anyhow, bail, ensure};
@@ -1370,6 +1370,71 @@ impl WindowOps for Window {
             });
             let () = msg_send![*panel, beginWithCompletionHandler: &*block];
         }
+    }
+
+    fn pick_paths_async(
+        &self,
+        options: PathPickerOptions,
+        callback: Box<dyn FnOnce(Vec<PathBuf>) + 'static>,
+    ) {
+        unsafe {
+            let _pool = NSAutoreleasePool::new(nil);
+            let panel: id = msg_send![class!(NSOpenPanel), openPanel];
+            let panel = StrongPtr::retain(panel);
+            let can_files: BOOL = if options.allow_files { YES } else { NO };
+            let can_directories: BOOL = if options.allow_directories { YES } else { NO };
+            let multiple: BOOL = if options.multiple { YES } else { NO };
+            let () = msg_send![*panel, setCanChooseFiles: can_files];
+            let () = msg_send![*panel, setCanChooseDirectories: can_directories];
+            let () = msg_send![*panel, setAllowsMultipleSelection: multiple];
+            let () = msg_send![*panel, setCanCreateDirectories: NO];
+            let () = msg_send![*panel, setResolvesAliases: YES];
+            let title = nsstring(&options.title);
+            let prompt = nsstring(&options.prompt);
+            let () = msg_send![*panel, setTitle: *title];
+            let () = msg_send![*panel, setPrompt: *prompt];
+            if let Some(directory) = options.directory.as_ref().and_then(|dir| dir.to_str()) {
+                let directory = nsstring(directory);
+                let url: id = msg_send![class!(NSURL), fileURLWithPath: *directory isDirectory: YES];
+                if url != nil {
+                    let () = msg_send![*panel, setDirectoryURL: url];
+                }
+            }
+
+            const NS_MODAL_RESPONSE_OK: NSInteger = 1;
+            let callback = Arc::new(Mutex::new(Some(callback)));
+            let callback_for_block = callback.clone();
+            let panel_for_block = panel.clone();
+            let block = RcBlock::new(move |result: NSInteger| {
+                let mut paths = Vec::new();
+                if result == NS_MODAL_RESPONSE_OK {
+                    let urls: id = msg_send![*panel_for_block, URLs];
+                    if urls != nil {
+                        let count: NSUInteger = msg_send![urls, count];
+                        for index in 0..count {
+                            let url: id = msg_send![urls, objectAtIndex: index];
+                            if url == nil {
+                                continue;
+                            }
+                            let path: id = msg_send![url, path];
+                            if path != nil {
+                                paths.push(PathBuf::from(nsstring_to_str(path)));
+                            }
+                        }
+                    }
+                }
+                if let Ok(mut callback) = callback_for_block.lock() {
+                    if let Some(callback) = callback.take() {
+                        callback(paths);
+                    }
+                }
+            });
+            let () = msg_send![*panel, beginWithCompletionHandler: &*block];
+        }
+    }
+
+    fn supports_combined_path_picker(&self) -> bool {
+        true
     }
 
     fn invalidate(&self) {

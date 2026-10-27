@@ -283,6 +283,33 @@ impl Default for FolderPickerOptions {
     }
 }
 
+/// What a path picker offers: files, folders, or both, and whether more than
+/// one selection is allowed. macOS can offer both in one panel; the other
+/// native dialogs generally cannot, so callers check
+/// [`WindowOps::supports_combined_path_picker`] first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathPickerOptions {
+    pub title: String,
+    pub prompt: String,
+    pub directory: Option<PathBuf>,
+    pub allow_files: bool,
+    pub allow_directories: bool,
+    pub multiple: bool,
+}
+
+impl Default for PathPickerOptions {
+    fn default() -> Self {
+        Self {
+            title: "Choose".to_string(),
+            prompt: "Choose".to_string(),
+            directory: None,
+            allow_files: true,
+            allow_directories: false,
+            multiple: false,
+        }
+    }
+}
+
 /// What a file picker offers and how it is worded: one kind of file, named
 /// by its extension.
 #[derive(Debug, Clone)]
@@ -834,6 +861,24 @@ pub trait WindowOps {
         callback: Box<dyn FnOnce(Option<PathBuf>) + 'static>,
     ) {
         callback(None);
+    }
+
+    /// Show a native picker for files, folders, or both. The callback gets
+    /// every selected path, or an empty list when the user cancels. A platform
+    /// that cannot offer both kinds in one panel leaves
+    /// [`Self::supports_combined_path_picker`] false and the caller offers a
+    /// menu instead.
+    fn pick_paths_async(
+        &self,
+        _options: PathPickerOptions,
+        callback: Box<dyn FnOnce(Vec<PathBuf>) + 'static>,
+    ) {
+        callback(Vec::new());
+    }
+
+    /// Whether one native panel can offer files and folders together.
+    fn supports_combined_path_picker(&self) -> bool {
+        false
     }
 
     /// Invalidate the window so that the entire client area will

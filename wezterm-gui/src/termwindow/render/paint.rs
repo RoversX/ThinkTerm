@@ -5504,6 +5504,8 @@ impl crate::TermWindow {
         drop(layers);
         self.paint_update_capsule()
             .context("paint_update_capsule")?;
+        self.paint_transfer_cards()
+            .context("paint_transfer_cards")?;
 
         self.paint_modal().context("paint_modal")?;
         self.paint_context_menu().context("paint_context_menu")?;
