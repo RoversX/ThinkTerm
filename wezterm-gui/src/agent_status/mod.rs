@@ -910,6 +910,24 @@ mod tests {
         }
     }
 
+    /// Every agent the settings list calls supported must have a tab icon
+    /// of its own, or a pane's tab would keep the generic bot while its
+    /// agents row says which agent it is. Soul is native and has no mark;
+    /// it keeps the catch-all.
+    #[test]
+    fn every_supported_agent_has_a_tab_icon_card() {
+        let catalog =
+            thinkterm_tab_icons::Catalog::build(&Default::default(), |key| key.to_string());
+        for (id, _, _) in super::SUPPORTED_AGENTS {
+            let card = catalog.card_for(Some(id), None);
+            if *id == "soul" {
+                assert_eq!(card.id, "agent", "soul should keep the catch-all");
+            } else {
+                assert_eq!(card.id, *id, "{id} has no tab icon card");
+            }
+        }
+    }
+
     #[test]
     fn display_name_falls_back_to_the_raw_id() {
         assert_eq!(display_name("claude"), "Claude Code");
