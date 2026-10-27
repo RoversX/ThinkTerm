@@ -406,7 +406,14 @@ pub(crate) fn draw_webgpu_layers(
                 });
                 cleared = true;
 
-                render_pass.set_pipeline(&webgpu.render_pipeline);
+                let pipeline = if layer.zindex()
+                    == crate::termwindow::TERMINAL_CORNER_ERASE_ZINDEX
+                {
+                    &webgpu.erase_alpha_pipeline
+                } else {
+                    &webgpu.render_pipeline
+                };
+                render_pass.set_pipeline(pipeline);
                 render_pass.set_bind_group(0, &window_uniforms, &[]);
                 render_pass.set_bind_group(1, &texture_linear_bind_group, &[]);
                 render_pass.set_bind_group(2, &texture_nearest_bind_group, &[]);
@@ -605,6 +612,23 @@ pub(crate) fn draw_opengl_layers(
         ..Default::default()
     };
 
+    // Clear alpha, not colour: a terminal's rounded corner must reveal the
+    // glass behind the window rather than paint an approximation of it.
+    let erase_alpha = glium::DrawParameters {
+        blend: glium::Blend {
+            color: BlendingFunction::Addition {
+                source: LinearBlendingFactor::Zero,
+                destination: LinearBlendingFactor::One,
+            },
+            alpha: BlendingFunction::Addition {
+                source: LinearBlendingFactor::Zero,
+                destination: LinearBlendingFactor::OneMinusSourceAlpha,
+            },
+            constant_value: (0.0, 0.0, 0.0, 0.0),
+        },
+        ..Default::default()
+    };
+
     // Clamp and use the nearest texel rather than interpolate.
     // This prevents things like the box cursor outlines from
     // being randomly doubled in width or height
@@ -659,16 +683,21 @@ pub(crate) fn draw_opengl_layers(
                 uniforms.add_struct("blink", blink);
                 uniforms.add_struct("rapid_blink", rapid_blink);
 
+                let blend = if layer.zindex()
+                    == crate::termwindow::TERMINAL_CORNER_ERASE_ZINDEX
+                {
+                    &erase_alpha
+                } else if subpixel_aa {
+                    &dual_source_blending
+                } else {
+                    &alpha_blending
+                };
                 frame.draw(
                     vertices.glium().slice(0..vertex_count).unwrap(),
                     vb.indices.glium().slice(0..index_count).unwrap(),
                     gl_state.glyph_prog.as_ref().unwrap(),
                     &uniforms,
-                    if subpixel_aa {
-                        &dual_source_blending
-                    } else {
-                        &alpha_blending
-                    },
+                    blend,
                 )?;
             }
 

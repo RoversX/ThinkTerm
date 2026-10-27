@@ -494,6 +494,13 @@ const CONTENT_VIEW_CHROME_TRAVEL: Duration = Duration::from_millis(180);
 /// Arriving together would leave the frame sitting around an empty middle.
 const CHROME_RETURN_DELAY: Duration = Duration::from_millis(90);
 
+/// Z-index of the pass that clears the alpha channel in the corner wedges
+/// outside a terminal's rounded painted surface. Above the terminal and its
+/// chrome, below tooltips and content views; its blend leaves RGB alone and
+/// removes alpha, so the glass behind the window shows through the wedges
+/// instead of being covered by a colour.
+pub(crate) const TERMINAL_CORNER_ERASE_ZINDEX: i8 = 5;
+
 /// Z-index the travelling terminal is composited into: above the arriving
 /// view, because it is shrinking *into* the card and has to be seen crossing
 /// the grid that is arriving underneath it.

@@ -767,6 +767,7 @@ pub(crate) fn sticky_allow_images(
     }
 }
 
+
 /// What the cover over a terminal says, in the user's language. The gate's
 /// own `overlay_message` is the English the TUI shows.
 fn gate_message(gate: &wezterm_client::domain::RemoteFrontendGate) -> Option<(String, String)> {
@@ -800,6 +801,45 @@ fn gate_message(gate: &wezterm_client::domain::RemoteFrontendGate) -> Option<(St
         ),
         Syncing => (tr("terminal-gate-syncing"), tr("terminal-gate-wait-hint")),
     })
+}
+
+/// Where the visible ink of the bottom quote starts.
+///
+/// The quote lives in the gutter below the last row, but that gutter is only
+/// what the terminal grid left over: it grows by whole cells as the window
+/// grows and shrinks back when a row is added. Measuring the quote from the
+/// grid therefore makes it step up and down in cell-sized jumps while the
+/// window edge is dragged, instead of following the edge. Anchor the ink to
+/// the window's bottom edge, with a small margin, so it tracks the edge pixel
+/// for pixel. When the gutter is shorter than the quote, the ink rises over
+/// the last row's line box instead of being pushed out of the window.
+fn bottom_quote_ink_top(content_bottom: f32, ink_height: f32, bottom_margin: f32) -> f32 {
+    (content_bottom - bottom_margin - ink_height).max(0.0)
+}
+
+#[cfg(test)]
+mod bottom_quote_tests {
+    use super::bottom_quote_ink_top;
+
+    #[test]
+    fn a_quote_sits_a_margin_above_the_window_bottom() {
+        assert_eq!(bottom_quote_ink_top(200.0, 20.0, 4.0), 176.0);
+    }
+
+    #[test]
+    fn the_quote_follows_the_bottom_edge_pixel_for_pixel() {
+        // The terminal grid stops in whole rows, so its bottom moves in
+        // cell-sized steps. The quote must move with the window edge, not
+        // with the grid: one pixel of window is one pixel of quote.
+        assert_eq!(bottom_quote_ink_top(200.0, 20.0, 4.0), 176.0);
+        assert_eq!(bottom_quote_ink_top(199.0, 20.0, 4.0), 175.0);
+    }
+
+    #[test]
+    fn a_quote_that_cannot_fit_is_not_pushed_below_the_window() {
+        assert_eq!(bottom_quote_ink_top(10.0, 20.0, 4.0), 0.0);
+        assert_eq!(bottom_quote_ink_top(0.0, 20.0, 4.0), 0.0);
+    }
 }
 
 impl crate::TermWindow {
@@ -3751,8 +3791,9 @@ impl crate::TermWindow {
         let quote_font = self
             .fonts
             .command_palette_font_with_size_and_weight(quote_font_size, 500)?;
+        let quote_font_metrics = quote_font.metrics();
         let quote_metrics =
-            crate::utilsprites::RenderMetrics::with_font_metrics(&quote_font.metrics());
+            crate::utilsprites::RenderMetrics::with_font_metrics(&quote_font_metrics);
         let quote_height = quote_metrics.cell_size.height as f32;
 
         let inset = 10.0;
@@ -3770,7 +3811,25 @@ impl crate::TermWindow {
             .measure_text_width(&quote_font, &display_text)
             .min(max_width);
         let x = (grid_left + self.terminal_size.pixel_width as f32 - inset - text_width).max(0.0);
-        let y = (grid_bottom + ((gutter_height - quote_height) / 2.0).max(0.0)).max(0.0);
+
+        // The line box carries leading above the glyphs, so centring it alone
+        // leaves the quote reading low in the gutter. Centre the ink instead
+        // where the font tells us enough to measure it; scripts whose ink is
+        // taller than their capitals keep the conservative line box.
+        let descender = quote_font_metrics.descender.get() as f32;
+        let (ink_height, ink_top_offset) = match quote_font_metrics
+            .cap_height
+            .map(|height| height.get() as f32)
+            .filter(|_| quote.is_ascii())
+        {
+            Some(cap_height) => (
+                (cap_height - descender).max(1.0),
+                (quote_height + descender - cap_height).max(0.0),
+            ),
+            None => (quote_height, 0.0),
+        };
+        let ink_top = bottom_quote_ink_top(content_bottom, ink_height, self.ui_px(4) as f32);
+        let y = (ink_top - ink_top_offset).max(0.0);
         // Opaque, and deliberately so. These carried `.mul_alpha(0.46)` and
         // `.mul_alpha(0.38)`, but the glyph shader discarded a vertex alpha
         // until it was fixed to honour one, so the quote has always rendered
