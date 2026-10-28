@@ -132,6 +132,20 @@ pub(crate) enum NativeAppIcon {
     Red,
     #[serde(alias = "default")]
     Classic,
+    /// Terminal chevrons beside rounded agent capsules.
+    Capsules,
+    /// A cream face with a black chevron and coral and green capsules.
+    Dawn,
+    /// A pale face with a black chevron, a green capsule and two bars.
+    Ivory,
+    /// A night-navy face split by a cream and rust panel.
+    Split,
+    /// A dark face carrying a `>tt` ligature.
+    Ligature,
+    /// A quiet dark face with a cream prompt.
+    Pure,
+    /// A quiet dark monolith with grey bars and a warm prompt.
+    Nordic,
 }
 
 impl Default for NativeAppIcon {
@@ -146,6 +160,13 @@ impl NativeAppIcon {
             Self::Simple => "Blue Pill",
             Self::Red => "Red Pill",
             Self::Classic => "Classic",
+            Self::Capsules => "Capsules",
+            Self::Dawn => "Dawn",
+            Self::Ivory => "Ivory",
+            Self::Split => "Split",
+            Self::Ligature => "Ligature",
+            Self::Pure => "Pure",
+            Self::Nordic => "Nordic",
         }
     }
 
@@ -154,10 +175,28 @@ impl NativeAppIcon {
             Self::Simple => "ThinkTerm_simple.icns",
             Self::Red => "ThinkTerm_red.icns",
             Self::Classic => "ThinkTerm.icns",
+            Self::Capsules => "ThinkTerm_capsules.icns",
+            Self::Dawn => "ThinkTerm_dawn.icns",
+            Self::Ivory => "ThinkTerm_ivory.icns",
+            Self::Split => "ThinkTerm_split.icns",
+            Self::Ligature => "ThinkTerm_ligature.icns",
+            Self::Pure => "ThinkTerm_pure.icns",
+            Self::Nordic => "ThinkTerm_nordic.icns",
         }
     }
 
-    pub(crate) const ALL: [Self; 3] = [Self::Simple, Self::Red, Self::Classic];
+    pub(crate) const ALL: [Self; 10] = [
+        Self::Simple,
+        Self::Red,
+        Self::Classic,
+        Self::Capsules,
+        Self::Dawn,
+        Self::Ivory,
+        Self::Split,
+        Self::Ligature,
+        Self::Pure,
+        Self::Nordic,
+    ];
 
     /// A 128px copy of the icon, for Settings to show as a choice: the
     /// full-size art is megabytes of PNG to decode for a 44pt picture.
@@ -166,6 +205,13 @@ impl NativeAppIcon {
             Self::Simple => include_bytes!("../../assets/icon/ThinkTerm_simple_128.png"),
             Self::Red => include_bytes!("../../assets/icon/ThinkTerm_red_128.png"),
             Self::Classic => include_bytes!("../../assets/icon/ThinkTerm_128.png"),
+            Self::Capsules => include_bytes!("../../assets/icon/ThinkTerm_capsules_128.png"),
+            Self::Dawn => include_bytes!("../../assets/icon/ThinkTerm_dawn_128.png"),
+            Self::Ivory => include_bytes!("../../assets/icon/ThinkTerm_ivory_128.png"),
+            Self::Split => include_bytes!("../../assets/icon/ThinkTerm_split_128.png"),
+            Self::Ligature => include_bytes!("../../assets/icon/ThinkTerm_ligature_128.png"),
+            Self::Pure => include_bytes!("../../assets/icon/ThinkTerm_pure_128.png"),
+            Self::Nordic => include_bytes!("../../assets/icon/ThinkTerm_nordic_128.png"),
         }
     }
 }
@@ -3715,6 +3761,22 @@ mod tests {
         let json = r#"{ "version": 1, "appearance": { "app_icon": "red" } }"#;
         let settings: ThinkTermNativeSettings = serde_json::from_str(json).unwrap();
         assert_eq!(settings.appearance.app_icon, NativeAppIcon::Red);
+
+        let json = r#"{ "version": 1, "appearance": { "app_icon": "pure" } }"#;
+        let settings: ThinkTermNativeSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.appearance.app_icon, NativeAppIcon::Pure);
+    }
+
+    /// Settings draws these as pictures, not names, so a missing or
+    /// mis-sized thumbnail is an icon that cannot be chosen at all.
+    #[test]
+    fn every_app_icon_choice_has_a_128px_thumbnail() {
+        use image::GenericImageView;
+        for icon in NativeAppIcon::ALL {
+            let image = image::load_from_memory(icon.thumbnail())
+                .unwrap_or_else(|err| panic!("{}: {err}", icon.label()));
+            assert_eq!(image.dimensions(), (128, 128), "{}", icon.label());
+        }
     }
 
     #[test]

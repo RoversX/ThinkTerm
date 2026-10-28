@@ -1638,6 +1638,13 @@ fn localized_app_icon_label(icon: NativeAppIcon) -> String {
         NativeAppIcon::Simple => "settings-app-icon-simple",
         NativeAppIcon::Red => "settings-app-icon-red",
         NativeAppIcon::Classic => "settings-app-icon-classic",
+        NativeAppIcon::Capsules => "settings-app-icon-capsules",
+        NativeAppIcon::Dawn => "settings-app-icon-dawn",
+        NativeAppIcon::Ivory => "settings-app-icon-ivory",
+        NativeAppIcon::Split => "settings-app-icon-split",
+        NativeAppIcon::Ligature => "settings-app-icon-ligature",
+        NativeAppIcon::Pure => "settings-app-icon-pure",
+        NativeAppIcon::Nordic => "settings-app-icon-nordic",
     })
 }
 
@@ -10046,16 +10053,7 @@ impl SettingsWindow {
             .iter()
             .map(|label| self.measure_text_width(&body_font, label))
             .fold(0.0, f32::max);
-        let count = NativeAppIcon::ALL.len() as f32;
-        let spacing = self.ui_px(12.0);
-        // Every name gets the room of the widest, so none is cut off --
-        // unless the names would then take over half the row: in a narrow
-        // window they end in an ellipsis rather than crowd out the title.
-        let label_room = widest.min(((width * 0.5 - spacing * (count - 1.0)) / count).max(side));
-        // Names a little apart; wide ones spread the icons.
-        let gap = self.ui_px(20.0).max(label_room + spacing - side).ceil();
-        // How far a name wider than its icon hangs past it, on each side.
-        let overhang = ((label_room - side) / 2.0).max(0.0).ceil();
+        let count = NativeAppIcon::ALL.len();
         // The artwork keeps the macOS icon grid's margin: 13 of every 128
         // pixels on each side are clear, and the ring hugs what is drawn.
         let inset = (side * 13.0 / 128.0).round();
@@ -10064,13 +10062,35 @@ impl SettingsWindow {
         let cell_height = self.metrics.cell_size.height as f32;
         let chosen = self.native_settings.appearance.app_icon;
         let accent = self.chrome_palette.accent;
-        let block_x = x + width - overhang - side * count - gap * (count - 1.0);
-        // The drawn face's top lines up with the label's.
-        let icon_y = y - inset;
-        let label_y = icon_y + side - inset + self.ui_px(10.0);
+
+        // The choices are a gallery now, not a single line: four columns once
+        // ten choices make a 3×3 grid lopsided, three for the smaller
+        // catalogues, fewer when the window is too narrow to keep the title a
+        // comfortable column.  A cell is wide enough for the longest
+        // translated name ("Pilule rouge", "ノルディック") at the user's
+        // settings font size, not just at the default one.
+        let cell = self.ui_px(170.0).max(widest.ceil() + self.ui_px(16.0));
+        let gap = self.ui_px(20.0);
+        let min_text = self.ui_px(240.0);
+        let max_columns = if count > 9 { 4 } else { 3 };
+        let mut columns = max_columns.min(count).max(1);
+        while columns > 1
+            && columns as f32 * cell + (columns - 1) as f32 * gap > width - min_text
+        {
+            columns -= 1;
+        }
+        let grid_width = columns as f32 * cell + (columns - 1) as f32 * gap;
+        let block_x = x + width - grid_width;
+        // The first drawn face's top lines up with the row's title.
+        let row_step = side + self.ui_px(10.0) + cell_height + self.ui_px(16.0);
+        let first_icon_y = y - inset;
+        let mut grid_bottom = y;
 
         for (index, icon) in NativeAppIcon::ALL.iter().copied().enumerate() {
-            let icon_x = block_x + (side + gap) * index as f32;
+            let cell_x = block_x + (index % columns) as f32 * (cell + gap);
+            let icon_x = cell_x + (cell - side) / 2.0;
+            let icon_y = first_icon_y + (index / columns) as f32 * row_step;
+            let label_y = icon_y + side - inset + self.ui_px(10.0);
             let action = SettingsAction::SetAppIcon(icon);
             let selected = chosen == icon;
             let hovered = self.ui.interaction.hovered == Some(action)
@@ -10093,11 +10113,11 @@ impl SettingsWindow {
             }
             self.draw_app_icon_choice(layers, icon, icon_x, icon_y, side)?;
             let label = &labels[index];
-            let label_width = self.measure_text_width(&body_font, &label).min(label_room);
+            let label_width = self.measure_text_width(&body_font, &label).min(cell);
             self.draw_text(
                 layers,
                 &body_font,
-                icon_x + (side - label_width) / 2.0,
+                cell_x + (cell - label_width) / 2.0,
                 label_y,
                 &label,
                 if selected {
@@ -10105,17 +10125,18 @@ impl SettingsWindow {
                 } else {
                     palette.secondary_text
                 },
-                label_room,
+                cell,
             )?;
             let top = icon_y + inset - ring;
             self.ui_context.push(
-                rect(icon_x, top, side, label_y + cell_height - top),
+                rect(cell_x, top, cell, label_y + cell_height - top),
                 WidgetKind::Button,
                 action,
             );
+            grid_bottom = grid_bottom.max(label_y + cell_height);
         }
 
-        let text_width = (block_x - overhang - x - self.ui_px(24.0)).max(0.0);
+        let text_width = (block_x - x - self.ui_px(24.0)).max(0.0);
         self.draw_text(
             layers,
             &ui_font,
@@ -10141,7 +10162,7 @@ impl SettingsWindow {
                 &crate::i18n::tr("settings-app-icon-note"),
                 text_width,
             )?;
-        let bottom = (last_note_y + cell_height).max(label_y + cell_height) + self.ui_px(6.0);
+        let bottom = (last_note_y + cell_height).max(grid_bottom) + self.ui_px(6.0);
         Ok((bottom - (y + self.settings_row_visual_height())).max(0.0))
     }
 
