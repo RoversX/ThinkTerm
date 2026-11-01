@@ -486,6 +486,28 @@ impl NativeWindowTabs {
     pub(crate) const ALL: [Self; 2] = [Self::Show, Self::AutoHide];
 }
 
+/// Where a connected server's threads show, and how the Space menu lists
+/// servers.
+///
+/// `OwnSpace` is the default and what servers have always done: each one
+/// has Spaces of its own, every one of them spelled out in the Space menu
+/// under its server. `OneRowEach` keeps those Spaces and folds each server
+/// into one row of the menu. `Folders` keeps the Space menu to this device's
+/// Spaces and shows every server as folders in one of them instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeServerPlacement {
+    #[default]
+    OwnSpace,
+    OneRowEach,
+    Folders,
+}
+
+impl NativeServerPlacement {
+    /// Every choice, in the order the settings window offers them.
+    pub(crate) const ALL: [Self; 3] = [Self::OwnSpace, Self::OneRowEach, Self::Folders];
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct NativeAppearanceSettings {
@@ -530,6 +552,9 @@ pub(crate) struct NativeAppearanceSettings {
     /// Under `AutoHide`, the row's pin is in: it stays out and takes its
     /// height in the layout, as under `Show`.
     pub(crate) window_tabs_pinned: bool,
+    /// See [`NativeServerPlacement`].
+    #[serde(deserialize_with = "choice_or_default")]
+    pub(crate) server_placement: NativeServerPlacement,
 }
 
 /// How a sidebar thread row draws the programs its panes run. All but
@@ -1117,6 +1142,19 @@ pub(crate) fn save_window_tabs_pinned(pinned: bool) -> anyhow::Result<()> {
     update_ui_state_and_settings_window(|settings| {
         settings.appearance.window_tabs_pinned = pinned
     })
+}
+
+/// Whether servers show as folders in this device's Spaces rather than in
+/// Spaces of their own. Through the shared handle: the sidebar asks each
+/// time it builds its rows.
+pub(crate) fn servers_as_folders() -> bool {
+    load_shared().appearance.server_placement == NativeServerPlacement::Folders
+}
+
+/// Whether the Space menu folds each server into one row. Asked as the
+/// menu opens.
+pub(crate) fn space_menu_one_row_per_server() -> bool {
+    load_shared().appearance.server_placement == NativeServerPlacement::OneRowEach
 }
 
 /// Read once per painted pane, through the shared handle.
@@ -3753,6 +3791,31 @@ mod tests {
         assert_eq!(settings.appearance.window_tabs, NativeWindowTabs::AutoHide);
         let out = serde_json::to_string(&settings).expect("serialises");
         assert!(out.contains("\"window_tabs\":\"auto_hide\""), "{out}");
+    }
+
+    /// Servers keep their own Spaces unless a file says otherwise, and a
+    /// choice this build does not know falls back to that too.
+    #[test]
+    fn a_server_placement_choice_round_trips_and_defaults_to_own_spaces() {
+        let json = r#"{ "version": 1, "appearance": { "theme_mode": "system" } }"#;
+        let settings: ThinkTermNativeSettings =
+            serde_json::from_str(json).expect("the file has to survive");
+        assert_eq!(
+            settings.appearance.server_placement,
+            NativeServerPlacement::OwnSpace
+        );
+
+        for (written, expected) in [
+            ("own_space", NativeServerPlacement::OwnSpace),
+            ("one_row_each", NativeServerPlacement::OneRowEach),
+            ("folders", NativeServerPlacement::Folders),
+            ("someday", NativeServerPlacement::OwnSpace),
+        ] {
+            let json = format!(r#"{{"appearance": {{"server_placement": "{written}"}}}}"#);
+            let settings: ThinkTermNativeSettings =
+                serde_json::from_str(&json).expect("the file has to survive");
+            assert_eq!(settings.appearance.server_placement, expected, "{written}");
+        }
     }
 
     #[test]

@@ -657,10 +657,12 @@ impl GuiFrontEnd {
         //    window (updating known_windows via rebind) or closes itself.
         let known_windows = std::mem::take(&mut *self.known_windows.borrow_mut());
         let mut windows = BTreeMap::new();
+        let mut recovering = false;
         for (window, window_id) in known_windows.into_iter() {
             if mux.get_window(window_id).is_some() {
                 windows.insert(window, window_id);
             } else {
+                recovering = true;
                 self.spawned_mux_window.borrow_mut().remove(&window_id);
                 window.notify(TermWindowNotif::Apply(Box::new(|term_window| {
                     term_window.recover_from_dead_mux_window();
@@ -745,6 +747,28 @@ impl GuiFrontEnd {
                 ) {
                     log::debug!(
                         "reconcile: leaving background domain window {} in workspace {:?} hidden",
+                        mux_window_id,
+                        window_workspace,
+                    );
+                    continue;
+                }
+                // A server holding two windows for one thread (left by an
+                // earlier mirror rebuild or a second materialization) shows
+                // the thread once, as the session host's leftovers do: the
+                // other window stays in the background instead of opening
+                // a window of its own on top. While a window that lost its
+                // mux window recovers, it is the one to show a thread's
+                // remaining window, in place.
+                if is_domain_owned
+                    && (front_end().thread_window_is_duplicate(mux_window_id, &window_workspace)
+                        || (recovering
+                            && crate::workspace_threads::is_thread_workspace_name(
+                                &window_workspace,
+                            )))
+                {
+                    log::debug!(
+                        "reconcile: leaving window {} in workspace {:?} hidden: the thread \
+                         is shown by another of its windows",
                         mux_window_id,
                         window_workspace,
                     );
@@ -1009,6 +1033,28 @@ impl GuiFrontEnd {
             }
         }
         false
+    }
+
+    /// `mux_window_id` is one of several windows of a thread workspace, and
+    /// the thread is on screen through another of them already, or about to
+    /// be.
+    fn thread_window_is_duplicate(&self, mux_window_id: MuxWindowId, workspace: &str) -> bool {
+        if !crate::workspace_threads::is_thread_workspace_name(workspace) {
+            return false;
+        }
+        let mux = Mux::get();
+        let in_workspace = |id: MuxWindowId| {
+            id != mux_window_id
+                && mux
+                    .get_window(id)
+                    .is_some_and(|window| window.get_workspace() == workspace)
+        };
+        self.known_windows.borrow().values().any(|id| in_workspace(*id))
+            || self
+                .spawned_mux_window
+                .borrow()
+                .iter()
+                .any(|id| in_workspace(*id))
     }
 
     /// Pre-claim a mux window that the caller is about to create a GUI window

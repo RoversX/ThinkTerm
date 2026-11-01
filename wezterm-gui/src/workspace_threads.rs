@@ -53,6 +53,33 @@ pub struct WorkspaceThreadStore {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub imported_sessions: Vec<ImportedSession>,
     pub projects: Vec<Project>,
+    /// While servers show as folders: the local Space each server's Spaces
+    /// show in, mux domain → local Space id, set by connecting the server
+    /// from that Space. Kept by server rather than by Space, because the
+    /// Space a first connect invents gives way to the server's own once its
+    /// tree arrives. A server not listed shows in `server_folder_host_space`.
+    /// Per-device, like the fields above.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub server_folder_spaces: HashMap<String, SpaceId>,
+    /// Mux domains whose server has sent this device its tree at least once.
+    /// A server Space of any other domain is only what a first connect
+    /// invented -- possibly one that never got through -- so it does not
+    /// make the server known yet (`known_mux_domain_space`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub synced_server_domains: std::collections::BTreeSet<String>,
+    /// Servers whose Space a connect from here invented and that have not
+    /// sent their tree since: their folders stay out of sight, so a first
+    /// connect that never gets through -- it fails, or the install it needs
+    /// is turned down -- leaves no folder behind.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub invented_server_domains: std::collections::BTreeSet<String>,
+    /// The Appearance choice to show servers as folders in this device's
+    /// Spaces (see `NativeServerPlacement`), mirrored so store methods can
+    /// follow it without reading settings under the store's lock. Entry
+    /// points that depend on it refresh it first; see
+    /// `lock_store_following_settings`.
+    #[serde(skip)]
+    pub servers_as_folders: bool,
 }
 
 /// One session the Import page brought in, and the Space it became.
@@ -387,6 +414,9 @@ pub struct ThreadRefGroupView {
     /// Whether the origin domain is currently attached; a detached group's
     /// rows paint dimmed.
     pub attached: bool,
+    /// A server folder: the group shows a server's project because servers
+    /// are set to show as folders, not (only) threads referenced one by one.
+    pub server_folder: bool,
     /// Filled in by the sidebar from its runtime collapse state before
     /// painting/geometry/hit-testing (never persisted here).
     pub collapsed: bool,
@@ -457,6 +487,9 @@ pub struct ThreadRefView {
     /// it should try to attach `machine_label`'s domain rather than
     /// activate directly.
     pub dangling: bool,
+    /// The row's project is one of the Space's server folders (servers show
+    /// as folders there). The Space may hold a reference to it as well.
+    pub server_folder: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -643,6 +676,10 @@ pub struct SpaceView {
     /// Always false for local Spaces; consult `is_swipe_reachable` instead of
     /// reading this directly.
     pub is_domain_attached: bool,
+    /// A remote Space while servers show as folders: its threads appear in
+    /// a local Space, so the Space menu and swipes pass it by. It can still
+    /// be opened from its folder.
+    pub shown_as_folders: bool,
 }
 
 impl SpaceView {
@@ -655,7 +692,9 @@ impl SpaceView {
     /// connection UI and error reporting) instead of parking the gesture on a
     /// page that may take ten seconds to exist or never arrive.
     pub fn is_swipe_reachable(&self) -> bool {
-        !self.is_occupied_by_other_window && (!self.is_remote || self.is_domain_attached)
+        !self.is_occupied_by_other_window
+            && !self.shown_as_folders
+            && (!self.is_remote || self.is_domain_attached)
     }
 }
 
@@ -665,7 +704,16 @@ pub fn adjacent_swipe_space_ids(
 ) -> (Option<SpaceId>, Option<SpaceId>) {
     let reachable = spaces
         .iter()
-        .filter(|space| space.is_swipe_reachable())
+        .filter(|space| {
+            space.is_swipe_reachable()
+                // A window on a server's own Space, which swipes pass by
+                // while servers show as folders, swipes out of it all the
+                // same: it is on screen, and the server there.
+                || (space.id == active_space_id
+                    && space.shown_as_folders
+                    && !space.is_occupied_by_other_window
+                    && (!space.is_remote || space.is_domain_attached))
+        })
         .collect::<Vec<_>>();
     let Some(index) = reachable
         .iter()
@@ -814,10 +862,19 @@ pub fn workspace_thread_store_is_unreadable() -> bool {
 }
 
 pub fn load_workspace_thread_store() -> Result<WorkspaceThreadStore> {
-    load_workspace_thread_store_from_path(&workspace_thread_store_path())
+    // The groom as it loads keeps a server folder's thread a Space reopens
+    // only while servers show as folders: it has to know first.
+    load_store_from_path(
+        &workspace_thread_store_path(),
+        crate::native_settings::servers_as_folders(),
+    )
 }
 
 pub fn load_workspace_thread_store_from_path(path: &Path) -> Result<WorkspaceThreadStore> {
+    load_store_from_path(path, false)
+}
+
+fn load_store_from_path(path: &Path, servers_as_folders: bool) -> Result<WorkspaceThreadStore> {
     if !path.exists() {
         return Ok(WorkspaceThreadStore::default());
     }
@@ -834,6 +891,7 @@ pub fn load_workspace_thread_store_from_path(path: &Path) -> Result<WorkspaceThr
     }
     let mut store: WorkspaceThreadStore =
         serde_json::from_value(value).with_context(|| format!("parse {}", path.display()))?;
+    store.servers_as_folders = servers_as_folders;
     store.normalize_after_load();
     Ok(store)
 }
@@ -1328,10 +1386,11 @@ pub fn switch_window_space(owner_id: u64, space_id: &str) -> bool {
 pub fn spaces_for_window(owner_id: u64) -> Vec<SpaceView> {
     let active_space_id = space_for_window(owner_id);
     let occupied = WINDOW_SPACES.lock().clone();
-    let mut store = THREAD_STORE.lock();
+    let mut store = lock_store_following_settings();
     if store.normalize_after_load() {
         persist_locked(&store);
     }
+    let folders = store.servers_as_folders;
     let mut views: Vec<SpaceView> = store
         .spaces
         .iter()
@@ -1346,6 +1405,7 @@ pub fn spaces_for_window(owner_id: u64) -> Vec<SpaceView> {
             is_remote: space.client_domain.is_some(),
             domain: space.client_domain.clone(),
             is_domain_attached: false,
+            shown_as_folders: folders && space.client_domain.is_some(),
         })
         .collect();
     // Resolved after the store lock is released: the mux takes its own locks
@@ -1577,6 +1637,16 @@ pub fn move_thread_ref_before(
     moved
 }
 
+/// The store, with `servers_as_folders` brought up to date first. The
+/// setting is read before the lock is taken, so the store never waits on
+/// the settings while it is held.
+fn lock_store_following_settings() -> parking_lot::MutexGuard<'static, WorkspaceThreadStore> {
+    let folders = crate::native_settings::servers_as_folders();
+    let mut store = THREAD_STORE.lock();
+    store.servers_as_folders = folders;
+    store
+}
+
 /// The reference list of a Space, in display order.
 pub fn space_thread_refs(host_space_id: &str) -> Vec<String> {
     THREAD_STORE
@@ -1591,7 +1661,8 @@ pub fn space_thread_refs(host_space_id: &str) -> Vec<String> {
 /// Remember which reference the user last opened from this Space, so the
 /// next switch back restores it.
 pub fn note_thread_active_ref(host_space_id: &str, thread_id: &str) {
-    let mut store = THREAD_STORE.lock();
+    let mut store = lock_store_following_settings();
+    let in_server_folder = store.shows_server_folder_thread(host_space_id, thread_id);
     let Some(space) = store
         .spaces
         .iter_mut()
@@ -1599,7 +1670,7 @@ pub fn note_thread_active_ref(host_space_id: &str, thread_id: &str) {
     else {
         return;
     };
-    if !space.thread_refs.iter().any(|id| id == thread_id) {
+    if !in_server_folder && !space.thread_refs.iter().any(|id| id == thread_id) {
         return;
     }
     if space.active_thread_ref.as_deref() != Some(thread_id) {
@@ -1625,10 +1696,22 @@ pub fn clear_thread_active_ref(host_space_id: &str) {
     }
 }
 
+/// Whether `host_space_id` opens `thread_id` in place: it holds a reference
+/// to it, or shows it in one of its server folders.
 pub fn thread_ref_exists(host_space_id: &str, thread_id: &str) -> bool {
-    THREAD_STORE.lock().spaces.iter().any(|space| {
-        space.id == host_space_id && space.thread_refs.iter().any(|id| id == thread_id)
-    })
+    let store = lock_store_following_settings();
+    store.holds_thread_ref(host_space_id, thread_id)
+        || store.shows_server_folder_thread(host_space_id, thread_id)
+}
+
+/// Whether `host_space_id` holds a reference of its own to `thread_id`, as
+/// opposed to showing it in a server folder. Only such a row can be taken
+/// out of the Space or moved to another one; a server folder row stays as
+/// long as its server shows there.
+pub fn thread_ref_is_explicit(host_space_id: &str, thread_id: &str) -> bool {
+    THREAD_STORE
+        .lock()
+        .holds_thread_ref(host_space_id, thread_id)
 }
 
 /// Deliberate host deletion: drop every Space's references whose origin
@@ -1647,10 +1730,18 @@ pub fn purge_thread_refs_for_machines(machines: &[String]) -> bool {
 
 /// The origin project a reference group's "+" should create a thread in.
 /// Group keys are origin project ids, so this only confirms the key names
-/// the project of some resolvable ref in `host_space_id`'s list (a machine
-/// fallback key for dangling groups never matches).
+/// one of `host_space_id`'s server folders or the project of some
+/// resolvable ref in its list (a machine fallback key for dangling groups
+/// never matches).
 pub fn ref_group_origin_project(host_space_id: &str, group_key: &str) -> Option<ProjectId> {
-    let store = THREAD_STORE.lock();
+    let store = lock_store_following_settings();
+    if store
+        .server_folder_projects(host_space_id)
+        .iter()
+        .any(|project| project.id == group_key)
+    {
+        return Some(group_key.to_string());
+    }
     let space = store
         .spaces
         .iter()
@@ -1816,6 +1907,20 @@ pub fn move_thread_ref_to_space(
 /// `wezterm-mux://` sentinel path) and its first thread come along, because a
 /// Space with nothing in it has nowhere to put a terminal.
 pub fn create_space_on_domain(domain_name: &str, name: Option<String>) -> Result<SpaceId> {
+    new_space_on_domain(domain_name, name, true)
+}
+
+/// As `create_space_on_domain`, for a window staying where it is: see
+/// `add_space`.
+pub fn add_space_on_domain(domain_name: &str, name: Option<String>) -> Result<SpaceId> {
+    new_space_on_domain(domain_name, name, false)
+}
+
+fn new_space_on_domain(
+    domain_name: &str,
+    name: Option<String>,
+    make_last_active: bool,
+) -> Result<SpaceId> {
     ensure!(
         remote_tree_mutation_allowed(Some(domain_name)),
         "{domain_name} is disconnected"
@@ -2251,24 +2356,31 @@ pub fn space_id_for_workspace(workspace: &str) -> Option<SpaceId> {
 }
 
 /// The origin Space of `workspace`, but only when the thread it is bound to
-/// is actually referenced by `host_space_id`. A window that was just
-/// switched to (nothing clicked yet) still displays the previous Space's
-/// workspace — that one must NOT leak through, or Files/paste would
-/// silently keep targeting the previous machine.
+/// is actually referenced by `host_space_id`, or shown in one of its server
+/// folders. A window that was just switched to (nothing clicked yet) still
+/// displays the previous Space's workspace — that one must NOT leak
+/// through, or Files/paste would silently keep targeting the previous
+/// machine.
 pub fn origin_space_for_ref_workspace(host_space_id: &str, workspace: &str) -> Option<SpaceId> {
-    let store = THREAD_STORE.lock();
+    let store = lock_store_following_settings();
     let space = store
         .spaces
         .iter()
         .find(|space| space.id == host_space_id)?;
+    let server_folders: Vec<&str> = store
+        .server_folder_projects(host_space_id)
+        .iter()
+        .map(|project| project.id.as_str())
+        .collect();
     store.projects.iter().find_map(|project| {
+        let in_server_folder = server_folders.contains(&project.id.as_str());
         project
             .threads
             .iter()
             .any(|session| {
                 (session.materialized_workspace_name.as_deref() == Some(workspace)
                     || workspace_name_for_thread(&project.id, &session.id) == workspace)
-                    && space.thread_refs.iter().any(|id| id == &session.id)
+                    && (in_server_folder || space.thread_refs.iter().any(|id| id == &session.id))
             })
             .then(|| project.space_id.clone())
     })
@@ -2545,6 +2657,7 @@ fn group_thread_refs_by_origin(refs: Vec<ThreadRefView>) -> Vec<ThreadRefGroupVi
         match groups.iter_mut().find(|group| group.key == key) {
             Some(group) => {
                 group.attached |= reference.origin_domain_attached;
+                group.server_folder |= reference.server_folder;
                 group.threads.push(reference);
             }
             None => groups.push(ThreadRefGroupView {
@@ -2558,6 +2671,7 @@ fn group_thread_refs_by_origin(refs: Vec<ThreadRefView>) -> Vec<ThreadRefGroupVi
                 machine_is_local: reference.machine_is_local,
                 origin_space_name: reference.origin_space_name.clone(),
                 attached: reference.origin_domain_attached,
+                server_folder: reference.server_folder,
                 collapsed: false,
                 threads: vec![reference],
             }),
@@ -2619,6 +2733,61 @@ pub fn thread_to_recover_after_window_death(space_id: &str) -> Option<WorkspaceT
     if !store.has_space(space_id) {
         return None;
     }
+    if let Some(thread_id) = other_thread_after_window_death(&store, space_id) {
+        return Some(thread_id);
+    }
+
+    let active_project_id = store.active_project_id_for_space(space_id);
+    let project_id = active_project_id
+        .filter(|project_id| {
+            store
+                .projects
+                .iter()
+                .any(|p| p.space_id == space_id && &p.id == project_id && !p.is_archived())
+        })
+        .or_else(|| {
+            store
+                .projects
+                .iter()
+                .find(|p| p.space_id == space_id && !p.is_archived())
+                .map(|p| p.id.clone())
+        })?;
+    let thread_id = store.create_thread(&project_id, None);
+    persist_locked(&store);
+    Some(thread_id)
+}
+
+/// As `thread_to_recover_after_window_death`, but never a new thread: a
+/// remote Space's thread is only real once its server has it, and one made
+/// here alone is not.
+pub fn existing_thread_to_recover_after_window_death(space_id: &str) -> Option<WorkspaceThreadId> {
+    let mut store = THREAD_STORE.lock();
+    store.normalize_after_load();
+    other_thread_after_window_death(&store, space_id)
+}
+
+/// The thread the Space shows as recorded: the reference it restores, or
+/// its active project's active thread. Unlike
+/// `ensure_active_thread_for_space`, nothing is made when there is none.
+pub fn recorded_active_thread_for_space(space_id: &str) -> Option<WorkspaceThreadId> {
+    let store = THREAD_STORE.lock();
+    if let Some(thread_id) = store.thread_ref_to_restore(space_id) {
+        return Some(thread_id);
+    }
+    let project_id = store.active_project_id_for_space(space_id)?;
+    store
+        .projects
+        .iter()
+        .find(|project| project.space_id == space_id && project.id == project_id)?
+        .active_thread_id
+        .clone()
+}
+
+/// The most recently used thread of the Space other than its active one.
+fn other_thread_after_window_death(
+    store: &WorkspaceThreadStore,
+    space_id: &str,
+) -> Option<WorkspaceThreadId> {
     let active_project_id = store.active_project_id_for_space(space_id);
     let dead_thread_id = active_project_id
         .as_ref()
@@ -2644,27 +2813,7 @@ pub fn thread_to_recover_after_window_death(space_id: &str) -> Option<WorkspaceT
             }
         }
     }
-    if let Some((_, thread_id)) = best {
-        return Some(thread_id);
-    }
-
-    let project_id = active_project_id
-        .filter(|project_id| {
-            store
-                .projects
-                .iter()
-                .any(|p| p.space_id == space_id && &p.id == project_id && !p.is_archived())
-        })
-        .or_else(|| {
-            store
-                .projects
-                .iter()
-                .find(|p| p.space_id == space_id && !p.is_archived())
-                .map(|p| p.id.clone())
-        })?;
-    let thread_id = store.create_thread(&project_id, None);
-    persist_locked(&store);
-    Some(thread_id)
+    best.map(|(_, thread_id)| thread_id)
 }
 
 pub fn create_project_from_path(space_id: &str, path: &str) -> Result<WorkspaceThreadId> {
@@ -5044,6 +5193,20 @@ impl WorkspaceThreadStore {
                 .or_insert(last);
             moved = true;
         }
+        if let Some(local) = self.server_folder_spaces.remove(from) {
+            self.server_folder_spaces
+                .entry(to.to_string())
+                .or_insert(local);
+            moved = true;
+        }
+        if self.synced_server_domains.remove(from) {
+            self.synced_server_domains.insert(to.to_string());
+            moved = true;
+        }
+        if self.invented_server_domains.remove(from) {
+            self.invented_server_domains.insert(to.to_string());
+            moved = true;
+        }
         moved
     }
 }
@@ -5153,6 +5316,9 @@ pub fn ingest_remote_tree(domain_name: &str, tree: codec::ThinkTermTree) {
         );
         return;
     }
+    // The server answered: from now on its Space here is more than a first
+    // connect's guess.
+    note_server_tree_arrived(domain_name);
 
     // The first tree of a connection is the only place allowed to invent a
     // Space when the server has none.  Online mutations from the previous
@@ -5607,8 +5773,8 @@ fn submit_thread_state(store: &WorkspaceThreadStore, thread_id: &str) {
 /// for a dangling group) — the drag ghost shows it while the group header
 /// is being reordered.
 pub fn ref_group_title(host_space_id: &str, group_key: &str) -> Option<String> {
-    let store = THREAD_STORE.lock();
-    group_thread_refs_by_origin(store.view_for_thread_refs(host_space_id, &[], None))
+    let store = lock_store_following_settings();
+    store.view_for_ref_groups(host_space_id, &[], None)
         .into_iter()
         .find(|group| group.key == group_key)
         .map(|group| group.label)
@@ -5618,7 +5784,7 @@ pub fn ref_group_title(host_space_id: &str, group_key: &str) -> Option<String> {
 /// and ref-group keys, exactly as displayed. Feeds drag targeting (the
 /// logical-order end anchor) and reordering.
 pub fn ordered_sidebar_folder_keys(space_id: &str) -> Vec<String> {
-    let store = THREAD_STORE.lock();
+    let store = lock_store_following_settings();
     ordered_folder_keys_locked(&store, space_id)
 }
 
@@ -5630,7 +5796,7 @@ fn ordered_folder_keys_locked(store: &WorkspaceThreadStore, space_id: &str) -> V
         .map(|project| project.id.clone())
         .collect();
     let group_keys: Vec<String> =
-        group_thread_refs_by_origin(store.view_for_thread_refs(space_id, &[], None))
+        store.view_for_ref_groups(space_id, &[], None)
             .into_iter()
             .map(|group| group.key)
             .collect();
@@ -6092,7 +6258,48 @@ impl WorkspaceThreadStore {
         changed |= self.ensure_unique_thread_names();
         changed |= self.retire_collection_spaces();
         changed |= self.groom_thread_refs();
+        changed |= self.groom_server_folder_spaces();
         changed
+    }
+
+    /// Forget a server this device keeps no Space of any more, and where a
+    /// server's folders went once that local Space is gone (they show in
+    /// the host Space again): neither record can outgrow the Spaces here.
+    fn groom_server_folder_spaces(&mut self) -> bool {
+        let before = (
+            self.server_folder_spaces.len(),
+            self.synced_server_domains.len(),
+            self.invented_server_domains.len(),
+        );
+        let spaces = &self.spaces;
+        let has_spaces =
+            |domain: &str| spaces.iter().any(|space| space.client_domain.as_deref() == Some(domain));
+        self.server_folder_spaces.retain(|domain, local| {
+            has_spaces(domain)
+                && spaces
+                    .iter()
+                    .any(|space| space.id == *local && space.client_domain.is_none())
+        });
+        self.synced_server_domains.retain(|domain| has_spaces(domain));
+        self.invented_server_domains.retain(|domain| has_spaces(domain));
+        // A server with Spaces here in neither record dates from before
+        // they were kept: it was connected, so it counts as heard from.
+        // Every Space made for a server since is in one of the two.
+        for space in spaces {
+            if let Some(domain) = space.client_domain.as_deref() {
+                if !self.synced_server_domains.contains(domain)
+                    && !self.invented_server_domains.contains(domain)
+                {
+                    self.synced_server_domains.insert(domain.to_string());
+                }
+            }
+        }
+        before
+            != (
+                self.server_folder_spaces.len(),
+                self.synced_server_domains.len(),
+                self.invented_server_domains.len(),
+            )
     }
 
     /// The collection-Space prototype is retired: a Space that carried the
@@ -6183,6 +6390,14 @@ impl WorkspaceThreadStore {
                 }
             }
         }
+        // A server folder row has no reference to keep it, yet a Space
+        // restores it when it was opened last (`thread_ref_to_restore`).
+        let server_folder_threads: Vec<WorkspaceThreadId> = self
+            .spaces
+            .iter()
+            .flat_map(|space| self.server_folder_projects(&space.id))
+            .flat_map(|project| project.threads.iter().map(|thread| thread.id.clone()))
+            .collect();
         let mut changed = false;
         for space in &mut self.spaces {
             if space.thread_refs.is_empty() && space.thread_ref_meta.is_empty() {
@@ -6220,7 +6435,7 @@ impl WorkspaceThreadStore {
             thread_ref_meta.retain(|id, _| thread_refs.iter().any(|r| r == id));
             changed |= thread_ref_meta.len() != before;
             if let Some(active) = active_thread_ref {
-                if !thread_refs.contains(active) {
+                if !thread_refs.contains(active) && !server_folder_threads.contains(active) {
                     *active_thread_ref = None;
                     changed = true;
                 }
@@ -6377,7 +6592,9 @@ impl WorkspaceThreadStore {
         let last_opened = space
             .active_thread_ref
             .clone()
-            .filter(|id| space.thread_refs.contains(id))
+            .filter(|id| {
+                space.thread_refs.contains(id) || self.shows_server_folder_thread(space_id, id)
+            })
             .filter(resolvable);
         if last_opened.is_some() {
             return last_opened;
@@ -6494,6 +6711,45 @@ impl WorkspaceThreadStore {
         true
     }
 
+    fn view_for_ref_groups(
+        &self,
+        space_id: &str,
+        live_workspaces: &[String],
+        active_workspace: Option<&str>,
+    ) -> Vec<ThreadRefGroupView> {
+        let mut groups = group_thread_refs_by_origin(self.view_for_thread_refs(
+            space_id,
+            live_workspaces,
+            active_workspace,
+        ));
+        // A server's project remains a folder even after its last thread
+        // is deleted. Its header is also where a new thread can be made.
+        for project in self.server_folder_projects(space_id) {
+            if groups.iter().any(|group| group.key == project.id) {
+                continue;
+            }
+            let Some(origin) = self.spaces.iter().find(|space| space.id == project.space_id) else {
+                continue;
+            };
+            let (machine_label, machine_is_local) = origin_machine_for_project(project, &self.spaces);
+            groups.push(ThreadRefGroupView {
+                key: project.id.clone(),
+                label: project.name.clone(),
+                machine_label,
+                machine_is_local,
+                origin_space_name: origin.name.clone(),
+                attached: origin
+                    .client_domain
+                    .as_deref()
+                    .is_some_and(remote_tree_domain_is_attached),
+                server_folder: true,
+                collapsed: false,
+                threads: Vec::new(),
+            });
+        }
+        groups
+    }
+
     fn view_for_thread_refs(
         &self,
         space_id: &str,
@@ -6503,7 +6759,8 @@ impl WorkspaceThreadStore {
         let Some(space) = self.spaces.iter().find(|space| space.id == space_id) else {
             return Vec::new();
         };
-        space
+        let server_folders = self.server_folder_projects(space_id);
+        let mut views: Vec<ThreadRefView> = space
             .thread_refs
             .iter()
             .filter_map(|thread_id| {
@@ -6535,6 +6792,7 @@ impl WorkspaceThreadStore {
                         origin_domain_attached: false,
                         workspace_name: String::new(),
                         dangling: true,
+                        server_folder: false,
                     });
                 };
                 // A ref into an archived project is hidden, not pruned:
@@ -6543,42 +6801,188 @@ impl WorkspaceThreadStore {
                 if project.is_archived() {
                     return None;
                 }
-                let origin = self.spaces.iter().find(|s| s.id == project.space_id)?;
                 let session = project.threads.iter().find(|t| &t.id == thread_id)?;
-                let workspace_name = session
-                    .materialized_workspace_name
-                    .clone()
-                    .unwrap_or_else(|| workspace_name_for_thread(&project.id, &session.id));
-                let thread = WorkspaceThreadView {
-                    id: session.id.clone(),
-                    name: session.name.clone(),
-                    is_active: active_workspace == Some(workspace_name.as_str()),
-                    is_materialized: live_workspaces.iter().any(|live| live == &workspace_name),
-                    is_pinned: session.is_pinned,
-                    is_unread: session.is_unread,
-                    work_status: session.work_status(),
-                };
-                let (machine_label, machine_is_local) =
-                    origin_machine_for_project(project, &self.spaces);
-                let origin_domain_attached = origin
-                    .client_domain
-                    .as_deref()
-                    .map(remote_tree_domain_is_attached)
-                    .unwrap_or(true);
-                Some(ThreadRefView {
-                    thread,
-                    origin_space_id: origin.id.clone(),
-                    origin_space_name: origin.name.clone(),
-                    origin_project_id: project.id.clone(),
-                    origin_project_name: project.name.clone(),
-                    machine_label,
-                    machine_is_local,
-                    origin_domain_attached,
-                    workspace_name,
-                    dangling: false,
-                })
+                let server_folder = server_folders.iter().any(|folder| folder.id == project.id);
+                self.resolved_ref_view(
+                    project,
+                    session,
+                    live_workspaces,
+                    active_workspace,
+                    server_folder,
+                )
+            })
+            .collect();
+        // Then the server folders, each thread in its project's order. One
+        // the Space also references stays where its reference put it.
+        for project in server_folders {
+            for session in &project.threads {
+                if space.thread_refs.contains(&session.id) {
+                    continue;
+                }
+                views.extend(self.resolved_ref_view(
+                    project,
+                    session,
+                    live_workspaces,
+                    active_workspace,
+                    true,
+                ));
+            }
+        }
+        views
+    }
+
+    /// The row for a thread a Space shows from somewhere else, whether by
+    /// reference or in a server folder.
+    fn resolved_ref_view(
+        &self,
+        project: &Project,
+        session: &WorkspaceThread,
+        live_workspaces: &[String],
+        active_workspace: Option<&str>,
+        server_folder: bool,
+    ) -> Option<ThreadRefView> {
+        let origin = self.spaces.iter().find(|s| s.id == project.space_id)?;
+        let workspace_name = session
+            .materialized_workspace_name
+            .clone()
+            .unwrap_or_else(|| workspace_name_for_thread(&project.id, &session.id));
+        let thread = WorkspaceThreadView {
+            id: session.id.clone(),
+            name: session.name.clone(),
+            is_active: active_workspace == Some(workspace_name.as_str()),
+            is_materialized: live_workspaces.iter().any(|live| live == &workspace_name),
+            is_pinned: session.is_pinned,
+            is_unread: session.is_unread,
+            work_status: session.work_status(),
+        };
+        let (machine_label, machine_is_local) = origin_machine_for_project(project, &self.spaces);
+        let origin_domain_attached = origin
+            .client_domain
+            .as_deref()
+            .map(remote_tree_domain_is_attached)
+            .unwrap_or(true);
+        Some(ThreadRefView {
+            thread,
+            origin_space_id: origin.id.clone(),
+            origin_space_name: origin.name.clone(),
+            origin_project_id: project.id.clone(),
+            origin_project_name: project.name.clone(),
+            machine_label,
+            machine_is_local,
+            origin_domain_attached,
+            workspace_name,
+            dangling: false,
+            server_folder,
+        })
+    }
+
+    /// Whether `space_id` holds a reference of its own to `thread_id`.
+    fn holds_thread_ref(&self, space_id: &str, thread_id: &str) -> bool {
+        self.spaces
+            .iter()
+            .any(|space| space.id == space_id && space.thread_refs.iter().any(|id| id == thread_id))
+    }
+
+    /// The server projects `space_id` shows as folders. None unless servers
+    /// are set to show as folders; then the live projects of every server
+    /// Space that shows in it (`server_folder_shown_in`), in store order.
+    /// Archived ones stay hidden, as they are for references, and so do
+    /// those of a server whose first connect has not got through
+    /// (`invented_server_domains`).
+    fn server_folder_projects(&self, space_id: &str) -> Vec<&Project> {
+        if !self.servers_as_folders {
+            return Vec::new();
+        }
+        self.projects
+            .iter()
+            .filter(|project| {
+                !project.is_archived()
+                    && self.is_client_domain_space(&project.space_id)
+                    && !self.server_space_is_invented(&project.space_id)
+                    && self.server_folder_shown_in(&project.space_id) == Some(space_id)
             })
             .collect()
+    }
+
+    /// Whether `space_id` is a server's Space a first connect invented, its
+    /// server not heard from since.
+    fn server_space_is_invented(&self, space_id: &str) -> bool {
+        self.spaces
+            .iter()
+            .find(|space| space.id == space_id)
+            .and_then(|space| space.client_domain.as_deref())
+            .is_some_and(|domain| self.invented_server_domains.contains(domain))
+    }
+
+    /// The local Space `server_space_id`'s folders show in: the one its
+    /// server was connected from, while that Space is still here, else the
+    /// host Space.
+    fn server_folder_shown_in(&self, server_space_id: &str) -> Option<&str> {
+        self.spaces
+            .iter()
+            .find(|space| space.id == server_space_id)
+            .and_then(|space| space.client_domain.as_deref())
+            .and_then(|domain| self.server_folder_spaces.get(domain))
+            .map(String::as_str)
+            .filter(|local| {
+                self.spaces
+                    .iter()
+                    .any(|space| space.id == *local && space.client_domain.is_none())
+            })
+            .or_else(|| self.server_folder_host_space())
+    }
+
+    /// Show the folders of `server_space_id`'s server in `local_space_id`
+    /// from now on. Only a server Space can be placed, and only in a local
+    /// one.
+    fn place_server_folder(&mut self, server_space_id: &str, local_space_id: &str) -> bool {
+        let Some(domain) = self
+            .spaces
+            .iter()
+            .find(|space| space.id == server_space_id)
+            .and_then(|space| space.client_domain.clone())
+        else {
+            return false;
+        };
+        if !self
+            .spaces
+            .iter()
+            .any(|space| space.id == local_space_id && space.client_domain.is_none())
+            || self.server_folder_shown_in(server_space_id) == Some(local_space_id)
+        {
+            return false;
+        }
+        self.server_folder_spaces
+            .insert(domain, local_space_id.to_string());
+        true
+    }
+
+    /// Whether `domain_name`'s server is one this device has heard from:
+    /// it has a Space here and the server has sent its tree at least once.
+    fn is_known_server(&self, domain_name: &str) -> bool {
+        self.synced_server_domains.contains(domain_name)
+            && !self
+                .space_ids_for_domains(&[domain_name.to_string()])
+                .is_empty()
+    }
+
+    /// The local Space the server folders show in when nothing placed them:
+    /// the default one, or the first local Space when the default is itself
+    /// a server's -- as on a device whose very first window connected
+    /// straight to one.
+    fn server_folder_host_space(&self) -> Option<&str> {
+        self.spaces
+            .iter()
+            .find(|space| space.is_default && space.client_domain.is_none())
+            .or_else(|| self.spaces.iter().find(|space| space.client_domain.is_none()))
+            .map(|space| space.id.as_str())
+    }
+
+    /// Whether `thread_id` is in one of `space_id`'s server folders.
+    fn shows_server_folder_thread(&self, space_id: &str, thread_id: &str) -> bool {
+        self.server_folder_projects(space_id)
+            .iter()
+            .any(|project| project.threads.iter().any(|thread| thread.id == thread_id))
     }
 
     fn rename_space(&mut self, space_id: &str, name: String) -> bool {
@@ -6918,9 +7322,13 @@ impl WorkspaceThreadStore {
 
     fn sync_current_project(&mut self, space_id: &str, active_workspace: &str) -> bool {
         let mut changed = self.normalize_after_load();
-        // A window watching a shared pane shows a workspace of its own:
-        // binding the active thread to it would lose the thread's.
-        if is_share_view_workspace(active_workspace) {
+        // A window watching a shared pane, or showing a server's connection
+        // page, shows a workspace of its own: binding the active thread to
+        // it would lose the thread's, and in a local Space a project would
+        // be made up for it.
+        if is_share_view_workspace(active_workspace)
+            || is_connection_page_workspace(active_workspace)
+        {
             return changed;
         }
         // A refs-only Space (a migrated collection) owns no projects: the
@@ -10561,6 +10969,16 @@ pub fn is_share_view_workspace(workspace: &str) -> bool {
     workspace.starts_with(SHARE_VIEW_WORKSPACE_PREFIX)
 }
 
+/// The workspaces of the pages a window shows while it connects a server on
+/// demand, one per server (see `termwindow::SpaceConnectionPage`). As with
+/// a share view, no thread owns one and none may be bound to one: nothing
+/// restores, snapshots or counts it as a live thread.
+pub const CONNECTION_PAGE_WORKSPACE_PREFIX: &str = "thinkterm-connecting:";
+
+pub fn is_connection_page_workspace(workspace: &str) -> bool {
+    workspace.starts_with(CONNECTION_PAGE_WORKSPACE_PREFIX)
+}
+
 /// Whether `workspace` is the mux workspace this thread runs in: its
 /// materialized name once the server has reported one, else the name the
 /// thread is planned under. Both the writer and the reader of remote font
@@ -10928,6 +11346,53 @@ pub fn ensure_mux_domain_space(domain_name: &str) -> MuxDomainSpacePlan {
     plan
 }
 
+/// `ensure_mux_domain_space` for a server this device has heard from
+/// already (`is_known_server`); `None` for one it meets for the first
+/// time, whose Space only the first connect may invent and then seed on
+/// the server -- and for one whose first connect never got through, which
+/// leaves an invented Space behind and has to be tried the first way again.
+pub fn known_mux_domain_space(domain_name: &str) -> Option<MuxDomainSpacePlan> {
+    let mut store = THREAD_STORE.lock();
+    if !store.is_known_server(domain_name) {
+        return None;
+    }
+    let plan = store.ensure_mux_domain_space(domain_name);
+    persist_locked(&store);
+    Some(plan)
+}
+
+/// Remember that `domain_name`'s server has sent its tree, which makes it
+/// known (`known_mux_domain_space`). Only a server this device keeps a
+/// Space of is remembered, so the record goes with its Spaces.
+fn note_server_tree_arrived(domain_name: &str) {
+    let mut store = THREAD_STORE.lock();
+    if store.invented_server_domains.remove(domain_name) {
+        persist_locked(&store);
+    }
+    if store.synced_server_domains.contains(domain_name)
+        || store
+            .space_ids_for_domains(&[domain_name.to_string()])
+            .is_empty()
+    {
+        return;
+    }
+    store
+        .synced_server_domains
+        .insert(domain_name.to_string());
+    persist_locked(&store);
+}
+
+/// Show a server Space's folders in `local_space_id` from now on, as when
+/// the server is connected from a window showing that Space.
+pub fn place_server_folder(server_space_id: &str, local_space_id: &str) -> bool {
+    let mut store = THREAD_STORE.lock();
+    let changed = store.place_server_folder(server_space_id, local_space_id);
+    if changed {
+        persist_locked(&store);
+    }
+    changed
+}
+
 /// Whether `name` has the shape of a saved host's record id
 /// (`ssh-<hash>`, `system-ssh-<hash>`).
 fn is_host_record_id(name: &str) -> bool {
@@ -10972,6 +11437,7 @@ impl WorkspaceThreadStore {
         let space_id = store
             .preferred_space_for_domain(domain_name)
             .unwrap_or_else(|| {
+                store.invented_server_domains.insert(domain_name.to_string());
                 store.create_space_record_for_domain(label.clone(), Some(domain_name.to_string()))
             });
 
@@ -11316,6 +11782,33 @@ mod tests {
     }
 
     #[test]
+    fn window_death_names_only_threads_that_exist() {
+        let mut store = test_store();
+        let space_id = store.create_space_record("Server".to_string());
+        let mut project = default_project_for_space(&space_id);
+        let only = WorkspaceThread::new(project.id.clone(), "only".to_string(), None);
+        let only_id = only.id.clone();
+        project.threads.push(only);
+        project.active_thread_id = Some(only_id);
+        let project_id = project.id.clone();
+        store.projects.push(project);
+        store.set_active_project_for_space(&space_id, project_id.clone());
+
+        // The dying thread was the only one: nothing to move to, and
+        // nothing made up for a server that has not heard of it.
+        assert_eq!(other_thread_after_window_death(&store, &space_id), None);
+        assert_eq!(store.projects.last().unwrap().threads.len(), 1);
+
+        let other = WorkspaceThread::new(project_id, "other".to_string(), None);
+        let other_id = other.id.clone();
+        store.projects.last_mut().unwrap().threads.push(other);
+        assert_eq!(
+            other_thread_after_window_death(&store, &space_id),
+            Some(other_id)
+        );
+    }
+
+    #[test]
     fn refs_only_space_is_never_claimed_by_startup_windows() {
         let (mut store, coll_id, t1, _) = store_with_collection();
         // A refs-only Space (holds references, owns no projects) must not be
@@ -11499,6 +11992,340 @@ mod tests {
         // A domain-owned Space is not: ingest would wipe the ref.
         let remote = store.create_space_record_for_domain("syd".to_string(), Some("syd".into()));
         assert!(!store.add_thread_ref(&remote, &t1));
+    }
+
+    /// A store whose one server's tree has been taken in, for the server
+    /// folder tests: (store, the default Space, the server's threads).
+    fn server_folder_store() -> (WorkspaceThreadStore, String, Vec<String>) {
+        let mut store = remote_test_store("syd");
+        assert!(store.ingest_remote_tree("syd", &sample_tree()));
+        let local = store.spaces[0].id.clone();
+        let threads = store
+            .projects
+            .iter()
+            .find(|project| project.id == "rp1")
+            .unwrap()
+            .threads
+            .iter()
+            .map(|thread| thread.id.clone())
+            .collect();
+        (store, local, threads)
+    }
+
+    fn ref_row_ids(rows: &[ThreadRefView]) -> Vec<String> {
+        rows.iter().map(|row| row.thread.id.clone()).collect()
+    }
+
+    #[test]
+    fn servers_show_as_folders_in_the_default_space_only_once_chosen() {
+        let (mut store, local, threads) = server_folder_store();
+        assert!(
+            store.view_for_thread_refs(&local, &[], None).is_empty(),
+            "servers keep their own Spaces unless asked otherwise"
+        );
+
+        store.servers_as_folders = true;
+        let rows = store.view_for_thread_refs(&local, &[], None);
+        assert_eq!(ref_row_ids(&rows), threads);
+        assert!(rows.iter().all(|row| row.server_folder && !row.dangling));
+        let groups = store.view_for_ref_groups(&local, &[], None);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].key, "rp1");
+        assert!(groups[0].server_folder);
+
+        let other = store.create_space_record("Paper".to_string());
+        assert!(
+            store.view_for_thread_refs(&other, &[], None).is_empty(),
+            "every server shows in the default Space, not in each one"
+        );
+    }
+
+    #[test]
+    fn an_empty_server_project_keeps_its_folder_and_new_thread_target() {
+        let mut store = remote_test_store("server-a");
+        let local = store.spaces[0].id.clone();
+        let tree = sample_tree();
+        assert!(store.ingest_remote_tree("server-a", &tree));
+        store.servers_as_folders = true;
+
+        let mut empty = tree.clone();
+        empty.projects[0].threads.clear();
+        assert!(store.ingest_remote_tree("server-a", &empty));
+        store.normalize_after_load();
+        assert!(store.view_for_thread_refs(&local, &[], None).is_empty());
+        let groups = store.view_for_ref_groups(&local, &[], None);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].key, "rp1");
+        assert_eq!(groups[0].label, empty.projects[0].name);
+        assert!(groups[0].server_folder);
+        assert!(!groups[0].machine_is_local);
+        assert!(groups[0].threads.is_empty());
+        assert!(ordered_folder_keys_locked(&store, &local).contains(&groups[0].key));
+
+        assert!(store.ingest_remote_tree("server-a", &tree));
+        let groups = store.view_for_ref_groups(&local, &[], None);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].key, "rp1");
+        assert_eq!(groups[0].threads.len(), tree.projects[0].threads.len());
+
+        store
+            .projects
+            .iter_mut()
+            .find(|project| project.id == "rp1")
+            .unwrap()
+            .archived_at = Some(1);
+        assert!(store.view_for_ref_groups(&local, &[], None).is_empty());
+    }
+
+    #[test]
+    fn renaming_a_server_preserves_its_folder_placement_and_known_status() {
+        let mut store = remote_test_store("server-a");
+        assert!(store.ingest_remote_tree("server-a", &sample_tree()));
+        store.synced_server_domains.insert("server-a".to_string());
+        store.servers_as_folders = true;
+        let local = store.create_space_record("Work".to_string());
+        assert!(store.place_server_folder("space-remote", &local));
+
+        assert!(store.move_spaces_to_domain("server-a", "server-b"));
+        store.normalize_after_load();
+        assert_eq!(
+            store.server_folder_shown_in("space-remote"),
+            Some(local.as_str())
+        );
+        assert_eq!(store.server_folder_spaces.get("server-b"), Some(&local));
+        assert!(!store.server_folder_spaces.contains_key("server-a"));
+        assert!(store.is_known_server("server-b"));
+        assert!(!store.is_known_server("server-a"));
+        assert!(!store.synced_server_domains.contains("server-a"));
+        assert!(!store.move_spaces_to_domain("server-a", "server-b"));
+
+        let saved = serde_json::to_vec(&store).unwrap();
+        let mut restored: WorkspaceThreadStore = serde_json::from_slice(&saved).unwrap();
+        restored.normalize_after_load();
+        assert_eq!(
+            restored.server_folder_shown_in("space-remote"),
+            Some(local.as_str())
+        );
+        assert!(restored.is_known_server("server-b"));
+    }
+
+    /// A device whose first window connected straight to a server has that
+    /// server's Space as its default; the folders go to the first local
+    /// Space instead of nowhere.
+    #[test]
+    fn server_folders_find_a_local_space_when_the_default_is_a_servers() {
+        let (mut store, local, threads) = server_folder_store();
+        for space in &mut store.spaces {
+            space.is_default = space.client_domain.is_some();
+        }
+        store.servers_as_folders = true;
+        assert_eq!(store.server_folder_host_space(), Some(local.as_str()));
+        assert_eq!(
+            ref_row_ids(&store.view_for_thread_refs(&local, &[], None)),
+            threads
+        );
+    }
+
+    /// Connecting a server from another Space moves its folders there; a
+    /// server Space is no place for them.
+    #[test]
+    fn a_server_folder_moves_to_the_space_it_was_connected_from() {
+        let (mut store, local, threads) = server_folder_store();
+        store.servers_as_folders = true;
+        let paper = store.create_space_record("Paper".to_string());
+
+        assert!(store.place_server_folder("space-remote", &paper));
+        assert_eq!(
+            ref_row_ids(&store.view_for_thread_refs(&paper, &[], None)),
+            threads
+        );
+        assert!(store.view_for_thread_refs(&local, &[], None).is_empty());
+        assert!(
+            !store.place_server_folder("space-remote", &paper),
+            "placing it where it is changes nothing"
+        );
+
+        assert!(!store.place_server_folder("space-remote", "space-remote"));
+        assert!(!store.place_server_folder("space-remote", "no-such-space"));
+        assert!(!store.place_server_folder(&local, &paper), "a local Space is no server");
+        assert_eq!(store.server_folder_shown_in("space-remote"), Some(paper.as_str()));
+    }
+
+    #[test]
+    fn a_server_folder_goes_back_to_the_host_space_once_its_space_is_gone() {
+        let (mut store, local, threads) = server_folder_store();
+        store.servers_as_folders = true;
+        let paper = store.create_space_record("Paper".to_string());
+        assert!(store.place_server_folder("space-remote", &paper));
+
+        store.spaces.retain(|space| space.id != paper);
+        store.normalize_after_load();
+
+        assert!(store.server_folder_spaces.is_empty());
+        assert_eq!(
+            ref_row_ids(&store.view_for_thread_refs(&local, &[], None)),
+            threads
+        );
+    }
+
+    /// A device meeting a server places its folders while the Space its
+    /// first connect invented stands in for the server's own; the server's
+    /// Space taking over keeps them where they were placed.
+    #[test]
+    fn a_server_folder_stays_put_when_the_servers_own_space_takes_over() {
+        let (mut store, _, _) = server_folder_store();
+        store.servers_as_folders = true;
+        let paper = store.create_space_record("Paper".to_string());
+        assert!(store.place_server_folder("space-remote", &paper));
+
+        let own = store.create_space_record_for_domain("syd".to_string(), Some("syd".into()));
+        store
+            .projects
+            .retain(|project| project.space_id != "space-remote");
+        store.spaces.retain(|space| space.id != "space-remote");
+        store.normalize_after_load();
+
+        assert_eq!(store.server_folder_shown_in(&own), Some(paper.as_str()));
+    }
+
+    /// Only a server that has sent its tree is known: the Space a first
+    /// connect invents -- left behind when that connect never got through --
+    /// is not enough, and the record goes with the server's last Space.
+    #[test]
+    fn a_server_is_known_once_its_tree_arrived() {
+        let mut store = remote_test_store("syd");
+        assert!(!store.is_known_server("syd"));
+        store.synced_server_domains.insert("syd".to_string());
+        assert!(store.is_known_server("syd"));
+        assert!(!store.is_known_server("server-b"));
+
+        store.spaces.retain(|space| space.client_domain.is_none());
+        store.normalize_after_load();
+        assert!(store.synced_server_domains.is_empty());
+    }
+
+    #[test]
+    fn a_server_folder_thread_opens_in_place_without_being_a_reference() {
+        let (mut store, local, threads) = server_folder_store();
+        store.servers_as_folders = true;
+        assert!(store.shows_server_folder_thread(&local, &threads[0]));
+        assert!(!store.holds_thread_ref(&local, &threads[0]));
+        assert_eq!(
+            store
+                .server_folder_projects(&local)
+                .iter()
+                .map(|project| project.id.as_str())
+                .collect::<Vec<_>>(),
+            ["rp1"]
+        );
+
+        store.servers_as_folders = false;
+        assert!(!store.shows_server_folder_thread(&local, &threads[0]));
+    }
+
+    #[test]
+    fn a_referenced_server_thread_keeps_its_place_and_shows_once() {
+        let (mut store, local, threads) = server_folder_store();
+        assert!(store.add_thread_ref(&local, &threads[1]));
+        store.servers_as_folders = true;
+        let rows = store.view_for_thread_refs(&local, &[], None);
+        assert_eq!(
+            ref_row_ids(&rows),
+            vec![threads[1].clone(), threads[0].clone()]
+        );
+        assert!(
+            rows[0].server_folder,
+            "a reference into a server folder's project reads as part of the folder"
+        );
+        assert!(store.holds_thread_ref(&local, &threads[1]));
+    }
+
+    #[test]
+    fn the_server_folder_thread_opened_last_is_restored_after_grooming() {
+        let (mut store, local, threads) = server_folder_store();
+        store.servers_as_folders = true;
+        // A reference of its own makes grooming visit the Space at all.
+        assert!(store.add_thread_ref(&local, &threads[1]));
+        store
+            .spaces
+            .iter_mut()
+            .find(|space| space.id == local)
+            .unwrap()
+            .active_thread_ref = Some(threads[0].clone());
+
+        store.normalize_after_load();
+
+        let space = store.spaces.iter().find(|space| space.id == local).unwrap();
+        assert_eq!(space.active_thread_ref.as_deref(), Some(threads[0].as_str()));
+        assert_eq!(
+            store.thread_ref_to_restore(&local).as_deref(),
+            Some(threads[0].as_str())
+        );
+    }
+
+    /// Whether servers show as folders is not saved: loading is told, or
+    /// its groom lets the thread go before anything sets it.
+    #[test]
+    fn the_server_folder_thread_opened_last_is_restored_after_a_restart() {
+        let (mut store, local, threads) = server_folder_store();
+        assert!(store.add_thread_ref(&local, &threads[1]));
+        store
+            .spaces
+            .iter_mut()
+            .find(|space| space.id == local)
+            .unwrap()
+            .active_thread_ref = Some(threads[0].clone());
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("workspace_threads.json");
+        save_workspace_thread_store_to_path(&path, &store).unwrap();
+
+        let loaded = load_store_from_path(&path, true).unwrap();
+
+        let space = loaded.spaces.iter().find(|space| space.id == local).unwrap();
+        assert_eq!(space.active_thread_ref.as_deref(), Some(threads[0].as_str()));
+    }
+
+    /// A store from before servers' records were kept: the servers it
+    /// connected count as heard from, not as met for the first time.
+    #[test]
+    fn servers_connected_before_their_records_were_kept_count_as_known() {
+        let mut store = remote_test_store("syd");
+        store.synced_server_domains.clear();
+        store.invented_server_domains.clear();
+        store.normalize_after_load();
+        assert!(store.is_known_server("syd"));
+
+        // One a connect from here invented is not taken for one.
+        store.synced_server_domains.clear();
+        store.invented_server_domains.insert("syd".to_string());
+        store.normalize_after_load();
+        assert!(!store.is_known_server("syd"));
+    }
+
+    /// A first connect invents the server's Space. Until the server sends
+    /// its tree no folder of it shows, so a connect that never gets through
+    /// leaves none behind.
+    #[test]
+    fn an_invented_server_space_shows_no_folder_until_its_tree_arrives() {
+        let mut store = test_store();
+        store.servers_as_folders = true;
+        let local = default_space_id();
+        let plan = store.ensure_mux_domain_space("server-b");
+        assert!(store.server_folder_projects(&local).is_empty());
+        assert!(!store.shows_server_folder_thread(&local, &plan.thread_id));
+        // Connecting again finds the Space it invented, still unheard from.
+        assert_eq!(store.ensure_mux_domain_space("server-b").space_id, plan.space_id);
+        assert!(store.server_folder_projects(&local).is_empty());
+
+        // As `note_server_tree_arrived` has it.
+        store.invented_server_domains.remove("server-b");
+        assert!(store.shows_server_folder_thread(&local, &plan.thread_id));
+
+        // Gone with the server's last Space.
+        store.invented_server_domains.insert("server-b".to_string());
+        store.spaces.retain(|space| space.client_domain.is_none());
+        store.normalize_after_load();
+        assert!(store.invented_server_domains.is_empty());
     }
 
     #[test]
@@ -11689,6 +12516,7 @@ mod tests {
             is_remote,
             domain: is_remote.then(|| "server".to_string()),
             is_domain_attached: false,
+            shown_as_folders: false,
         }
     }
 
@@ -11759,6 +12587,30 @@ mod tests {
             (Some("local-2".into()), None)
         );
         assert_eq!(adjacent_swipe_space_ids(&spaces, "remote"), (None, None));
+    }
+
+    #[test]
+    fn adjacent_space_swipe_targets_skip_servers_shown_as_folders() {
+        let spaces = vec![
+            space_view("local-1", false, false),
+            SpaceView {
+                shown_as_folders: true,
+                ..attached_remote_space_view("attached")
+            },
+            space_view("local-2", false, false),
+        ];
+
+        // Its threads live in a local Space's sidebar, so it is no page of
+        // its own, attached or not.
+        assert_eq!(
+            adjacent_swipe_space_ids(&spaces, "local-1"),
+            (None, Some("local-2".into()))
+        );
+        // A window on it all the same swipes out of it.
+        assert_eq!(
+            adjacent_swipe_space_ids(&spaces, "attached"),
+            (Some("local-1".into()), Some("local-2".into()))
+        );
     }
 
     #[test]
@@ -13321,6 +14173,59 @@ mod tests {
             thread.materialized_workspace_name.as_deref() != Some(watching.as_str())
         })));
         assert_eq!(store.projects.len(), 1, "no project is made up for it");
+    }
+
+    #[test]
+    fn a_connection_page_on_screen_leaves_the_threads_alone() {
+        let space = default_space_id();
+        let page = format!("{CONNECTION_PAGE_WORKSPACE_PREFIX}server-a");
+
+        // Opened in place in a local Space, from a reference row.
+        let mut store = test_store();
+        let thread = WorkspaceThread::new(
+            "project-default".to_string(),
+            "main".to_string(),
+            Some("workspace-default".to_string()),
+        );
+        let thread_id = thread.id.clone();
+        let mut project = test_project_in_space(
+            &space,
+            "project-default",
+            "Default",
+            PathBuf::from("/tmp/default"),
+            vec![thread],
+        );
+        project.active_thread_id = Some(thread_id);
+        store.projects.push(project);
+        store.set_active_project_for_space(&space, "project-default".to_string());
+        store.sync_current_project(&space, &page);
+        assert_eq!(store.projects.len(), 1, "no project is made up for it");
+        assert_eq!(store.workspace_space_id(&page), None);
+
+        // In the server's own Space, while its thread waits on the page.
+        let mut store = test_store();
+        store.spaces[0].client_domain = Some("server-a".to_string());
+        let project_id = remote_project_id_for_space(&space, &mux_domain_host_id("server-a"));
+        let mut thread = WorkspaceThread::new(project_id.clone(), "main".to_string(), None);
+        let workspace = workspace_name_for_thread(&project_id, &thread.id);
+        thread.materialized_workspace_name = Some(workspace.clone());
+        let thread_id = thread.id.clone();
+        let mut project = test_project_in_space(
+            &space,
+            &project_id,
+            "server-a",
+            PathBuf::from("wezterm-mux://server-a"),
+            vec![thread],
+        );
+        project.active_thread_id = Some(thread_id);
+        store.projects.push(project);
+        store.set_active_project_for_space(&space, project_id);
+        store.sync_current_project(&space, &page);
+        assert_eq!(
+            store.projects[0].threads[0].materialized_workspace_name,
+            Some(workspace),
+            "the thread keeps its own workspace"
+        );
     }
 
     #[test]

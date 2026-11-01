@@ -265,6 +265,34 @@ pub(crate) struct LocalThreadActivationState {
     pub workspace_name: String,
 }
 
+/// The connection page of a mux-domain Space reached on demand: a mux
+/// window of its own, shown in place of the thread the window was on, so
+/// the page never lands among that thread's tabs. Leaving it (another
+/// thread, another Space) gives the connection up.
+pub(crate) struct SpaceConnectionPage {
+    pub mux_window_id: MuxWindowId,
+    pub domain_name: String,
+    /// What to open once the server answers.
+    pub thread_id: String,
+    pub orphan_candidate_window_id: Option<MuxWindowId>,
+    pub workspaces_to_kill_after_adopt: Vec<String>,
+    /// Where to go back to when the page closes without a connection.
+    pub return_space_id: String,
+    /// The thread the page took the place of, when it opened in place in
+    /// that Space (a reference or server folder row): the one to go back
+    /// to, rather than whichever thread the Space would pick.
+    pub return_thread_id: Option<String>,
+    /// The attach behind the page ended without a connection. The page
+    /// stays up to show why; opening the Space again starts over.
+    pub gave_up: bool,
+}
+
+fn domain_is_attached(domain_name: &str) -> bool {
+    Mux::get()
+        .get_domain_by_name(domain_name)
+        .is_some_and(|domain| domain.state() == mux::domain::DomainState::Attached)
+}
+
 use crate::spawn::SpawnWhere;
 use prevcursor::PrevCursorPos;
 
@@ -3207,12 +3235,20 @@ pub struct TermWindow {
     next_mosh_connect_generation: u64,
     local_thread_activation: Option<LocalThreadActivationState>,
     next_local_thread_activation_generation: u64,
+    space_connection_page: Option<SpaceConnectionPage>,
+    /// The Space this window showed before `active_space_id`: where a remote
+    /// Space that loses its server sends the window back to.
+    previous_space_id: Option<String>,
     space_owner_id: u64,
     active_space_id: String,
     /// True for windows the user did not explicitly open (domain-owned
     /// windows spawned by the reconcile, e.g. reconnect/auth prompts): they
     /// close when their mux window dies instead of falling back to a thread.
     dies_with_mux_window: bool,
+    /// Opened for a server's connection (Connect, `thinkterm connect`) that
+    /// has not got through yet: if it fails or is turned down, the window
+    /// goes, as it came for nothing else.
+    opened_to_connect: bool,
     /// Domains with a user-requested reconnect currently in flight (the
     /// sidebar Reconnect button); suppresses double-clicks and drives the
     /// row's "Connecting…" label.
@@ -5144,9 +5180,12 @@ impl TermWindow {
             next_mosh_connect_generation: 1,
             local_thread_activation: None,
             next_local_thread_activation_generation: 1,
+            space_connection_page: None,
+            previous_space_id: None,
             space_owner_id,
             active_space_id,
             dies_with_mux_window,
+            opened_to_connect: remote_open_domain.is_some(),
             space_reconnects_in_flight: HashSet::new(),
             watched_space_connection_state: None,
             workspace_layout_structure_fingerprint,
@@ -6594,6 +6633,7 @@ impl TermWindow {
             return;
         }
 
+        let left_connection_page = self.take_left_space_connection_page(mux_window_id);
         self.cancel_remote_divider_resizes_except(None);
         self.mux_window_id = mux_window_id;
         *self.mux_window_id_for_subscriptions.lock().unwrap() = mux_window_id;
@@ -6662,6 +6702,12 @@ impl TermWindow {
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
+
+        // Only now that the subscription names the adopted window, so the
+        // page window's WindowRemoved cannot be taken for ours.
+        if let Some(page) = left_connection_page {
+            Mux::get().kill_window(page.mux_window_id);
+        }
     }
 
     pub(crate) fn active_space_id(&self) -> &str {
@@ -6697,8 +6743,11 @@ impl TermWindow {
     /// exited, e.g. `exit` in a thread's only shell). Fall back to another
     /// thread of the Space — or a fresh one — instead of dying with it,
     /// which used to take the whole app down when this was the last window.
-    /// Incidental windows (reconnect/auth prompts) and remote mux Spaces
-    /// keep the close-with-the-mux-window behavior.
+    /// A remote mux Space moves to another of its threads while its server
+    /// is connected; one with no other thread, no server, or a connection
+    /// page that closed unconnected sends the window back to the Space it
+    /// came from. Only incidental windows (reconnect/auth prompts) close
+    /// with their mux window.
     pub(crate) fn recover_from_dead_mux_window(&mut self) {
         let mux = Mux::get();
         if mux.get_window(self.mux_window_id).is_some() {
@@ -6719,10 +6768,65 @@ impl TermWindow {
                 return;
             }
         }
-        let recovery_thread = if self.dies_with_mux_window
-            || crate::workspace_threads::client_domain_for_space(&self.active_space_id).is_some()
+        if self
+            .space_connection_page
+            .as_ref()
+            .is_some_and(|page| page.mux_window_id == self.mux_window_id)
         {
+            if let Some(page) = self.space_connection_page.take() {
+                self.recover_from_closed_connection_page(page, &window);
+            }
+            return;
+        }
+        // The thread has another window left (a server holding two for
+        // it): show that one here rather than leaving the thread.
+        if !self.dies_with_mux_window {
+            if let Some(thread_id) =
+                crate::workspace_threads::recorded_active_thread_for_space(&self.active_space_id)
+            {
+                let live_workspaces = Mux::get().iter_workspaces();
+                if crate::workspace_threads::activation_plan_for_thread(
+                    &thread_id,
+                    &live_workspaces,
+                )
+                .is_some_and(|plan| !plan.needs_materialize)
+                {
+                    self.activate_workspace_thread(thread_id, &window);
+                    return;
+                }
+            }
+        }
+        let recovery_thread = if self.dies_with_mux_window {
             None
+        } else if let Some(domain_name) =
+            crate::workspace_threads::client_domain_for_space(&self.active_space_id)
+        {
+            // Another of the Space's threads while its server is there; no
+            // fresh one, which the server would not know yet.
+            let other_thread = domain_is_attached(&domain_name)
+                .then(|| {
+                    crate::workspace_threads::existing_thread_to_recover_after_window_death(
+                        &self.active_space_id,
+                    )
+                })
+                .flatten();
+            if other_thread.is_none() {
+                // Opened for this connection alone, which never got through:
+                // it goes. Not as the last window, whose closing would end
+                // every other connection.
+                if self.opened_to_connect && front_end().gui_windows().len() > 1 {
+                    window.close();
+                    front_end().forget_known_window(&window);
+                    return;
+                }
+                let return_space_id = self
+                    .previous_space_id
+                    .clone()
+                    .unwrap_or_else(crate::workspace_threads::default_space_id);
+                self.return_from_unreachable_space(return_space_id, None, &window);
+                return;
+            }
+            other_thread
         } else {
             crate::workspace_threads::thread_to_recover_after_window_death(&self.active_space_id)
         };
@@ -6739,6 +6843,294 @@ impl TermWindow {
         self.activate_workspace_thread(thread_id, &window);
     }
 
+    /// Put the connection page of `domain_name`'s Space on screen: a mux
+    /// window of its own in place of what this window showed, so the page
+    /// is never filed among the tabs of the thread being left. Returns the
+    /// window for the connection UI, or None when this Space's page is up
+    /// and still connecting; that page then opens `thread_id` instead of the
+    /// earlier pick. A page that gave up makes way for a fresh attempt.
+    pub(crate) fn show_space_connection_page(
+        &mut self,
+        domain_name: &str,
+        thread_id: String,
+        orphan_candidate_window_id: Option<MuxWindowId>,
+        workspaces_to_kill_after_adopt: Vec<String>,
+    ) -> Option<MuxWindowId> {
+        let shown_mux_window_id = self.mux_window_id;
+        let shown_page = self
+            .space_connection_page
+            .as_mut()
+            .filter(|page| page.mux_window_id == shown_mux_window_id);
+        let (return_space_id, return_thread_id) = match shown_page {
+            Some(page) if page.domain_name == domain_name && !page.gave_up => {
+                page.thread_id = thread_id;
+                page.orphan_candidate_window_id = orphan_candidate_window_id;
+                page.workspaces_to_kill_after_adopt = workspaces_to_kill_after_adopt;
+                return None;
+            }
+            // Another Space's page, or this one's that gave up, gives way;
+            // going back skips it.
+            Some(page) => Some((page.return_space_id.clone(), page.return_thread_id.clone())),
+            None => None,
+        }
+        .unwrap_or_else(|| self.place_to_return_to());
+        let mux = Mux::get();
+        let workspace = format!(
+            "{}{domain_name}",
+            crate::workspace_threads::CONNECTION_PAGE_WORKSPACE_PREFIX
+        );
+        let builder = mux.new_empty_window_for_domain(Some(workspace.clone()), None, None);
+        let page_window_id = *builder;
+        // Shown here before the frontend hears of it, so the reconcile finds
+        // it taken instead of opening a window of its own for it; the thread
+        // being left goes to the background like any thread switched away
+        // from.
+        mux.set_active_workspace(&workspace);
+        self.switch_to_mux_window(page_window_id);
+        drop(builder);
+        self.space_connection_page = Some(SpaceConnectionPage {
+            mux_window_id: page_window_id,
+            domain_name: domain_name.to_string(),
+            thread_id,
+            orphan_candidate_window_id,
+            workspaces_to_kill_after_adopt,
+            return_space_id,
+            return_thread_id,
+            gave_up: false,
+        });
+        Some(page_window_id)
+    }
+
+    /// The attach behind the connection page failed. The page stays to
+    /// show why, but no longer counts as connecting: opening the Space
+    /// again, or its Reconnect, tries again.
+    pub(crate) fn note_space_connection_page_gave_up(&mut self, page_window_id: MuxWindowId) {
+        if let Some(page) = self
+            .space_connection_page
+            .as_mut()
+            .filter(|page| page.mux_window_id == page_window_id)
+        {
+            page.gave_up = true;
+        }
+    }
+
+    /// The server behind the connection page answered: open what the page
+    /// was for, unless the person moved on (the connection then stays up in
+    /// the background).
+    pub(crate) fn open_connected_space_page(
+        &mut self,
+        page_window_id: MuxWindowId,
+        domain_id: Option<DomainId>,
+    ) {
+        let Some(page) = self
+            .space_connection_page
+            .as_ref()
+            .filter(|page| page.mux_window_id == page_window_id)
+            .filter(|_| self.mux_window_id == page_window_id)
+        else {
+            return;
+        };
+        let domain_name = page.domain_name.clone();
+        let thread_id = page.thread_id.clone();
+        let (return_space_id, return_thread_id) =
+            (page.return_space_id.clone(), page.return_thread_id.clone());
+        let orphan_candidate_window_id = page.orphan_candidate_window_id;
+        let workspaces_to_kill_after_adopt = page.workspaces_to_kill_after_adopt.clone();
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let Some(thread_id) = self.thread_for_connected_page(&domain_name, thread_id) else {
+            self.return_from_unreachable_space(return_space_id, return_thread_id, &window);
+            return;
+        };
+        // Switching into a cold mux-domain Space is as explicit an open as
+        // the Connect button, so it gets the same one-shot claim. Armed
+        // only: the activation releases it when its tab is on screen, and
+        // the paint path consumes it once that tab's gate is claimable.
+        if let Some(domain_id) = domain_id {
+            self.note_remote_open_intent(domain_id);
+        }
+        // Leaving the page for the thread closes it (switch_to_mux_window).
+        self.activate_workspace_thread_impl(
+            thread_id,
+            &window,
+            orphan_candidate_window_id,
+            workspaces_to_kill_after_adopt,
+        );
+    }
+
+    /// What a connection page that got through opens: the thread it was
+    /// for, while this window may still open it, else another of the
+    /// Space's. The thread can have gone while it connected -- deleted from
+    /// another device, or out of the folders here as servers stopped
+    /// showing as them -- and what was settled before the server's tree
+    /// came, which drops anything only this device had, is settled again
+    /// first and the server told of what it still lacks, as
+    /// `connect_domain_into_space` does.
+    fn thread_for_connected_page(&self, domain_name: &str, thread_id: String) -> Option<String> {
+        let settled = crate::workspace_threads::ensure_mux_domain_space(domain_name);
+        crate::workspace_threads::reconcile_remote_subtree(domain_name);
+        std::iter::once(thread_id)
+            .chain(std::iter::once(settled.thread_id))
+            .chain(crate::workspace_threads::existing_thread_to_recover_after_window_death(
+                &self.active_space_id,
+            ))
+            .find(|thread_id| self.may_open_thread(thread_id))
+    }
+
+    /// Whether this window may open `thread_id`: one of its Space's own, or
+    /// one the Space shows -- the gate `activate_workspace_thread_impl`
+    /// keeps.
+    fn may_open_thread(&self, thread_id: &str) -> bool {
+        crate::workspace_threads::thread_space_id(thread_id).as_deref()
+            == Some(self.active_space_id.as_str())
+            || crate::workspace_threads::thread_ref_exists(&self.active_space_id, thread_id)
+    }
+
+    /// The connection page this window leaves by showing `next_mux_window_id`.
+    /// Leaving gives the connection up: closing the page's window answers
+    /// whatever it was asking with a no and stops the retries.
+    fn take_left_space_connection_page(
+        &mut self,
+        next_mux_window_id: MuxWindowId,
+    ) -> Option<SpaceConnectionPage> {
+        if self
+            .space_connection_page
+            .as_ref()
+            .is_some_and(|page| page.mux_window_id != next_mux_window_id)
+        {
+            return self.space_connection_page.take();
+        }
+        None
+    }
+
+    /// The connection page closed while on screen: the person closed it,
+    /// or it ran out its close delay after a failure.
+    fn recover_from_closed_connection_page(&mut self, page: SpaceConnectionPage, window: &Window) {
+        if !domain_is_attached(&page.domain_name) {
+            self.return_from_unreachable_space(page.return_space_id, page.return_thread_id, window);
+            return;
+        }
+        // Connected, and the page went before the thread made it on screen.
+        let opening = self
+            .local_thread_activation
+            .as_ref()
+            .is_some_and(|activation| activation.thread_id == page.thread_id);
+        if opening {
+            return;
+        }
+        let Some(thread_id) = self.thread_for_connected_page(&page.domain_name, page.thread_id)
+        else {
+            self.return_from_unreachable_space(page.return_space_id, page.return_thread_id, window);
+            return;
+        };
+        if let Some(domain_id) = Mux::get()
+            .get_domain_by_name(&page.domain_name)
+            .map(|domain| domain.domain_id())
+        {
+            self.note_remote_open_intent(domain_id);
+        }
+        self.activate_workspace_thread_impl(
+            thread_id,
+            window,
+            page.orphan_candidate_window_id,
+            page.workspaces_to_kill_after_adopt,
+        );
+    }
+
+    /// Where a connection page that closes unconnected goes back to: the
+    /// thread on screen, when it is one this Space shows (its own, or a
+    /// reference or server folder thread opened in place), otherwise the
+    /// Space just left.
+    fn place_to_return_to(&self) -> (String, Option<String>) {
+        let shown_thread = self.current_mux_workspace().and_then(|workspace| {
+            crate::workspace_threads::thread_id_for_workspace(&self.active_space_id, &workspace)
+                .or_else(|| {
+                    crate::workspace_threads::origin_space_for_ref_workspace(
+                        &self.active_space_id,
+                        &workspace,
+                    )
+                    .and_then(|_| crate::workspace_threads::thread_id_for_workspace_any(&workspace))
+                })
+        });
+        if shown_thread.is_some() {
+            return (self.active_space_id.clone(), shown_thread);
+        }
+        let space_id = self
+            .previous_space_id
+            .clone()
+            .unwrap_or_else(crate::workspace_threads::default_space_id);
+        (space_id, None)
+    }
+
+    /// A remote Space with nothing left to show: go back to the Space the
+    /// window came from — or the default Space, when that one is gone,
+    /// taken, or another unreachable server — instead of closing the
+    /// window, which as the last one disconnected every server. A page
+    /// opened in place goes back to the thread it stood in for.
+    fn return_from_unreachable_space(
+        &mut self,
+        return_space_id: String,
+        return_thread_id: Option<String>,
+        window: &Window,
+    ) {
+        if return_space_id == self.active_space_id {
+            // Only while it is still there: activating it otherwise would
+            // build it again, or ask for another server.
+            let live_workspaces = Mux::get().iter_workspaces();
+            if let Some(thread_id) = return_thread_id.filter(|thread_id| {
+                crate::workspace_threads::activation_plan_for_thread(thread_id, &live_workspaces)
+                    .is_some_and(|plan| !plan.needs_materialize)
+            }) {
+                self.activate_workspace_thread(thread_id, window);
+                // Handed to another window that shows it: carry on below.
+                if Mux::get().get_window(self.mux_window_id).is_some() {
+                    return;
+                }
+            }
+        }
+        // An in-place return can lose its original thread while the
+        // server is away. It still has the same Space fallbacks -- and any
+        // local Space free for this window, for when those are all this
+        // server's own: the device's first window connected straight to it.
+        let local_spaces = crate::workspace_threads::spaces_for_window(self.space_owner_id)
+            .into_iter()
+            .filter(|space| !space.is_remote && !space.is_occupied_by_other_window)
+            .map(|space| space.id);
+        let candidates = std::iter::once(return_space_id)
+            .chain(self.previous_space_id.clone())
+            .chain(std::iter::once(crate::workspace_threads::default_space_id()))
+            .chain(local_spaces);
+        for space_id in candidates {
+            let reachable = crate::workspace_threads::client_domain_for_space(&space_id)
+                .map_or(true, |domain_name| domain_is_attached(&domain_name));
+            if space_id != self.active_space_id
+                && reachable
+                && self.switch_space_to_thread(space_id, None, window)
+            {
+                return;
+            }
+        }
+        if crate::workspace_threads::client_domain_for_space(&self.active_space_id).is_none() {
+            if let Some(thread_id) =
+                crate::workspace_threads::thread_to_recover_after_window_death(&self.active_space_id)
+            {
+                self.activate_workspace_thread(thread_id, window);
+                return;
+            }
+        }
+        // The last window, with no local Space to go to: closing it would
+        // end every connection, so a new Space of its own.
+        if front_end().gui_windows().len() <= 1 {
+            let space_id = crate::workspace_threads::create_space(None);
+            if self.switch_space_to_thread(space_id, None, window) {
+                return;
+            }
+        }
+        window.close();
+        front_end().forget_known_window(window);
+    }
+
     /// The sidebar Reconnect button: bring the active Space's mux domain
     /// back. A parked retry loop (gave up after continuous failure) is
     /// resumed in place; a detached or never-connected domain is attached
@@ -6749,6 +7141,35 @@ impl TermWindow {
         else {
             return;
         };
+        // This server's connection page gave up and is still on screen: try
+        // it again, so that what it was for opens once the server answers
+        // and the failure goes with it.
+        let failed_page = self
+            .space_connection_page
+            .as_ref()
+            .filter(|page| {
+                page.gave_up
+                    && page.mux_window_id == self.mux_window_id
+                    && page.domain_name == domain_name
+            })
+            .map(|page| {
+                (
+                    page.thread_id.clone(),
+                    page.orphan_candidate_window_id,
+                    page.workspaces_to_kill_after_adopt.clone(),
+                )
+            });
+        if let (Some((thread_id, orphan_candidate_window_id, workspaces_to_kill)), Some(window)) =
+            (failed_page, self.window.clone())
+        {
+            self.activate_workspace_thread_impl(
+                thread_id,
+                &window,
+                orphan_candidate_window_id,
+                workspaces_to_kill,
+            );
+            return;
+        }
         // Renamed since it connected: the old way while that connection
         // lasts, then the new one, with the Space moved over to it first.
         let domain_name = crate::ssh_hosts::connect_name_after_rename(&domain_name);
@@ -7404,7 +7825,7 @@ impl TermWindow {
         self.clear_right_sidebar_text_focus();
         self.set_content_view_active(false);
         self.remember_workspace_sidebar_scroll();
-        self.active_space_id = space_id.clone();
+        self.previous_space_id = Some(std::mem::replace(&mut self.active_space_id, space_id.clone()));
         self.refresh_active_space_note_vault_flag();
         self.sync_content_view_surfaces_with_mux();
         self.workspace_sidebar_scroll_offset = self.remembered_workspace_sidebar_scroll();

@@ -1398,7 +1398,12 @@ impl crate::TermWindow {
     }
 
     fn build_space_group(&self) -> Option<PaletteGroup> {
-        let spaces = crate::workspace_threads::spaces_for_window(self.space_owner_id);
+        // A server shown as folders is reached from its folder, as in the
+        // Space menu; the one open now still names the current value.
+        let spaces: Vec<_> = crate::workspace_threads::spaces_for_window(self.space_owner_id)
+            .into_iter()
+            .filter(|space| !space.shown_as_folders || space.is_active)
+            .collect();
         if spaces.len() < GROUP_FOLD_THRESHOLD {
             return None;
         }

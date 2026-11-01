@@ -273,6 +273,31 @@ impl crate::TermWindow {
         }
     }
 
+    /// A server's thread on screen through a folder this Space no longer
+    /// shows -- the folder went to another Space, or servers keep Spaces of
+    /// their own again -- is let go of like a removed reference. Kept up,
+    /// its terminal would have no row in the sidebar, and Files would look
+    /// at this machine (`content_space_id`).
+    pub(crate) fn leave_server_folder_content_if_hidden(&mut self) {
+        let Some(workspace) = self.current_mux_workspace() else {
+            return;
+        };
+        let Some(home) = crate::workspace_threads::space_id_for_workspace(&workspace) else {
+            return;
+        };
+        if home == self.active_space_id
+            || crate::workspace_threads::client_domain_for_space(&home).is_none()
+            || crate::workspace_threads::origin_space_for_ref_workspace(
+                &self.active_space_id,
+                &workspace,
+            )
+            .is_some()
+        {
+            return;
+        }
+        self.leave_detached_ref_content();
+    }
+
     pub(crate) fn perform_context_menu_application_action(&mut self, action_id: u64) {
         let Some(action) = self
             .context_menu_application_actions

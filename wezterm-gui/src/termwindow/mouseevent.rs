@@ -174,6 +174,73 @@ fn space_destructive_menu_items(
     )]
 }
 
+/// A server's row in the one-row-per-server Space menu: a server with one
+/// Space switches to it from the row itself; one with several opens them,
+/// and a new one, in a submenu.
+fn server_menu_row(
+    label: String,
+    domain: &str,
+    spaces: &[&crate::workspace_threads::SpaceView],
+) -> ContextMenuItem {
+    if let [space] = spaces {
+        let item = ContextMenuItem::item_with_icon(
+            label,
+            ContextMenuIcon::Server,
+            KeyAssignment::SwitchSpace(space.id.to_string()),
+        );
+        return if space.is_occupied_by_other_window {
+            item.disabled()
+        } else {
+            item
+        };
+    }
+    let mut children: Vec<ContextMenuItem> = spaces
+        .iter()
+        .map(|space| {
+            let item = ContextMenuItem::item_with_icon(
+                if space.is_occupied_by_other_window {
+                    tr_with_name("menu-space-occupied", &space.name)
+                } else {
+                    space.name.clone()
+                },
+                ContextMenuIcon::Stack,
+                KeyAssignment::SwitchSpace(space.id.to_string()),
+            );
+            if space.is_occupied_by_other_window {
+                item.disabled()
+            } else {
+                item
+            }
+        })
+        .collect();
+    children.push(ContextMenuItem::Separator);
+    children.push(ContextMenuItem::item_with_icon(
+        crate::i18n::tr("menu-new-space-here"),
+        ContextMenuIcon::New,
+        KeyAssignment::CreateSpaceOnDomain(domain.to_string()),
+    ));
+    ContextMenuItem::submenu_with_icon(label, ContextMenuIcon::Server, children)
+}
+
+/// "New Space on Server": one row per server, (label, mux domain), each
+/// making a Space there.
+fn new_space_on_server_menu(servers: Vec<(String, String)>) -> ContextMenuItem {
+    ContextMenuItem::submenu_with_icon(
+        crate::i18n::tr("menu-new-space-on-server"),
+        ContextMenuIcon::Server,
+        servers
+            .into_iter()
+            .map(|(label, domain)| {
+                ContextMenuItem::item_with_icon(
+                    label,
+                    ContextMenuIcon::Server,
+                    KeyAssignment::CreateSpaceOnDomain(domain),
+                )
+            })
+            .collect(),
+    )
+}
+
 fn note_drag_scroll_delta(
     pointer_y: f32,
     top: f32,
@@ -5984,9 +6051,16 @@ impl super::TermWindow {
                     return;
                 };
                 // Reference rows reorder the local reference list, so the
-                // origin thread's pinned state is irrelevant there.
-                let draggable = self.sidebar_row_is_thread_ref(&thread_id)
-                    || !crate::workspace_threads::thread_is_pinned(&thread_id);
+                // origin thread's pinned state is irrelevant there. A server
+                // folder row has no reference to move, so it stays put.
+                let draggable = if self.sidebar_row_is_thread_ref(&thread_id) {
+                    crate::workspace_threads::thread_ref_is_explicit(
+                        &self.active_space_id,
+                        &thread_id,
+                    )
+                } else {
+                    !crate::workspace_threads::thread_is_pinned(&thread_id)
+                };
                 let title = crate::workspace_threads::thread_name(&thread_id)
                     .unwrap_or_else(|| thread_id.clone());
                 self.arm_sidebar_row_drag(
@@ -6336,18 +6410,51 @@ impl super::TermWindow {
         for space in spaces.iter().filter(|space| space.domain.is_none()) {
             items.push(space_item(space));
         }
+        // While servers show as folders their Spaces are not listed: they
+        // live in a local Space's sidebar. One opened from its folder stays
+        // listed while it is open, so the menu still says where the window
+        // is.
+        if let Some(space) = spaces
+            .iter()
+            .find(|space| space.shown_as_folders && space.is_active)
+        {
+            items.push(
+                ContextMenuItem::item_with_icon(
+                    space.name.clone(),
+                    ContextMenuIcon::Server,
+                    KeyAssignment::SwitchSpace(space.id.to_string()),
+                )
+                .checked(true),
+            );
+        }
 
         // Keep the servers in the order their Spaces appear rather than
         // sorting: that order is the user's.
         let mut domains: Vec<&str> = vec![];
-        for domain in spaces.iter().filter_map(|space| space.domain.as_deref()) {
+        for domain in spaces
+            .iter()
+            .filter(|space| !space.shown_as_folders)
+            .filter_map(|space| space.domain.as_deref())
+        {
             if !domains.contains(&domain) {
                 domains.push(domain);
             }
         }
 
-        for domain in domains {
-            items.push(ContextMenuItem::Separator);
+        // Folded to one row each, servers sit together; the one the window
+        // is on stays spelled out, so moving between its Spaces is one click.
+        let one_row = crate::native_settings::space_menu_one_row_per_server();
+        let mut last_was_row = false;
+        for domain in domains.iter().copied() {
+            let here: Vec<&crate::workspace_threads::SpaceView> = spaces
+                .iter()
+                .filter(|space| space.domain.as_deref() == Some(domain))
+                .collect();
+            let collapsed = one_row && !here.iter().any(|space| space.is_active);
+            if !(collapsed && last_was_row) {
+                items.push(ContextMenuItem::Separator);
+            }
+            last_was_row = collapsed;
             let state = spaces
                 .iter()
                 .find(|space| space.domain.as_deref() == Some(domain))
@@ -6371,6 +6478,10 @@ impl super::TermWindow {
                     tr_with_name("menu-space-server-group-offline", &name)
                 }
             };
+            if collapsed {
+                items.push(server_menu_row(header, domain, &here));
+                continue;
+            }
             // A server is a heading, not something to switch to. Saying that
             // with a section header rather than a disabled row is what makes it
             // *look* like a heading: the platform styles it as a caption and
@@ -6406,6 +6517,21 @@ impl super::TermWindow {
             ContextMenuIcon::New,
             KeyAssignment::CreateSpace,
         ));
+        // A server folded to a single row has no "New Space Here" of its
+        // own; they all gather here, one per server.
+        if one_row && !domains.is_empty() {
+            items.push(new_space_on_server_menu(
+                domains
+                    .iter()
+                    .map(|domain| {
+                        (
+                            crate::ssh_hosts::connect_domain_label(domain),
+                            domain.to_string(),
+                        )
+                    })
+                    .collect(),
+            ));
+        }
         items.push(ContextMenuItem::item_with_icon(
             spaces
                 .iter()
@@ -6753,41 +6879,45 @@ impl super::TermWindow {
         // holding it).
         if is_thread_ref {
             items.push(ContextMenuItem::Separator);
-            let remove_item = self.context_menu_application_item_with_icon(
-                crate::i18n::tr("menu-remove-thread-ref"),
-                ContextMenuIcon::Close,
-                crate::termwindow::ContextMenuApplicationAction::RemoveThreadFromCollection {
-                    collection_space_id: active_space.clone(),
-                    thread_id: thread_id.clone(),
-                },
-                true,
-            );
-            items.push(remove_item);
-            // Move the REFERENCE elsewhere: gone from this Space's list,
-            // added to the target's. ref_host_candidates already excludes
-            // the origin and every Space holding it — this one included.
-            let move_targets: Vec<ContextMenuItem> =
-                crate::workspace_threads::ref_host_candidates(&thread_id)
-                    .into_iter()
-                    .map(|(space_id, name)| {
-                        self.context_menu_application_item_with_icon(
-                            name,
-                            ContextMenuIcon::ExternalLink,
-                            crate::termwindow::ContextMenuApplicationAction::MoveThreadRefToSpace {
-                                from_space_id: active_space.clone(),
-                                space_id,
-                                thread_id: thread_id.clone(),
-                            },
-                            true,
-                        )
-                    })
-                    .collect();
-            if !move_targets.is_empty() {
-                items.push(ContextMenuItem::submenu_with_icon(
-                    crate::i18n::tr("menu-move-to-space"),
-                    ContextMenuIcon::ExternalLink,
-                    move_targets,
-                ));
+            // A server folder row has no reference of its own to remove or
+            // move: it shows for as long as its server shows here.
+            if crate::workspace_threads::thread_ref_is_explicit(&active_space, &thread_id) {
+                let remove_item = self.context_menu_application_item_with_icon(
+                    crate::i18n::tr("menu-remove-thread-ref"),
+                    ContextMenuIcon::Close,
+                    crate::termwindow::ContextMenuApplicationAction::RemoveThreadFromCollection {
+                        collection_space_id: active_space.clone(),
+                        thread_id: thread_id.clone(),
+                    },
+                    true,
+                );
+                items.push(remove_item);
+                // Move the REFERENCE elsewhere: gone from this Space's list,
+                // added to the target's. ref_host_candidates already excludes
+                // the origin and every Space holding it — this one included.
+                let move_targets: Vec<ContextMenuItem> =
+                    crate::workspace_threads::ref_host_candidates(&thread_id)
+                        .into_iter()
+                        .map(|(space_id, name)| {
+                            self.context_menu_application_item_with_icon(
+                                name,
+                                ContextMenuIcon::ExternalLink,
+                                crate::termwindow::ContextMenuApplicationAction::MoveThreadRefToSpace {
+                                    from_space_id: active_space.clone(),
+                                    space_id,
+                                    thread_id: thread_id.clone(),
+                                },
+                                true,
+                            )
+                        })
+                        .collect();
+                if !move_targets.is_empty() {
+                    items.push(ContextMenuItem::submenu_with_icon(
+                        crate::i18n::tr("menu-move-to-space"),
+                        ContextMenuIcon::ExternalLink,
+                        move_targets,
+                    ));
+                }
             }
             if let Some(origin_space) = crate::workspace_threads::thread_space_id(&thread_id) {
                 let origin_item = self.context_menu_application_item_with_icon(
@@ -6895,11 +7025,77 @@ impl super::TermWindow {
             }
         };
         // Reference it before activating: the activation gate only lets this
-        // window open threads its Space owns or references.
-        crate::workspace_threads::add_thread_ref(&self.active_space_id, &thread_id);
+        // window open threads its Space owns or references. A server folder
+        // shows its new thread without one.
+        if !crate::workspace_threads::thread_ref_exists(&self.active_space_id, &thread_id) {
+            crate::workspace_threads::add_thread_ref(&self.active_space_id, &thread_id);
+        }
         if !self.open_remote_workspace_thread_without_connecting(&thread_id, context) {
             self.activate_workspace_thread(thread_id, context);
         }
+    }
+
+    /// While servers show as folders, connecting the server `domain_name`
+    /// leaves this window in its Space: the server's folders show here from
+    /// now on, and its thread opens in place -- through the connection page,
+    /// as any folder thread of a server not yet connected does. Returns
+    /// false to have the caller connect the usual way, into the server's own
+    /// Space: always when servers keep Spaces of their own; when this window
+    /// is on a server's own Space, which shows no folders; and while this
+    /// device has not heard from the server yet -- the first connect seeds
+    /// the Space it invents on the server (`connect_domain_into_space`), and
+    /// only that way falls back to plain ssh when the host has no ThinkTerm.
+    /// Its folders land here either way.
+    pub(crate) fn connect_server_into_folder(
+        &mut self,
+        domain_name: &str,
+        context: &dyn WindowOps,
+    ) -> bool {
+        if !crate::native_settings::servers_as_folders() {
+            return false;
+        }
+        let known = crate::workspace_threads::known_mux_domain_space(domain_name);
+        if known.is_some() {
+            // The plan may have added a row here the server has not seen,
+            // which its next tree would take away again.
+            crate::workspace_threads::reconcile_remote_subtree(domain_name);
+        }
+        let plan = known
+            .clone()
+            .unwrap_or_else(|| crate::workspace_threads::ensure_mux_domain_space(domain_name));
+        let moved =
+            crate::workspace_threads::place_server_folder(&plan.space_id, &self.active_space_id);
+        if moved {
+            // The folders left another Space: a window there showing one of
+            // the server's threads lets it go.
+            for gui_window in crate::frontend::front_end().gui_windows() {
+                gui_window
+                    .window
+                    .notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                        term_window.leave_server_folder_content_if_hidden();
+                    })));
+            }
+        }
+        if known.is_none()
+            || !crate::workspace_threads::thread_ref_exists(&self.active_space_id, &plan.thread_id)
+        {
+            return false;
+        }
+        if moved {
+            // Once those windows have let go: one still showing the thread
+            // would be handed it, and focused, and then let it go.
+            if let Some(window) = self.window.clone() {
+                let thread_id = plan.thread_id;
+                window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    if let Some(window) = term_window.window.clone() {
+                        term_window.activate_workspace_thread(thread_id, &window);
+                    }
+                })));
+                return true;
+            }
+        }
+        self.activate_workspace_thread(plan.thread_id, context);
+        true
     }
 
     pub(crate) fn create_workspace_thread(&mut self, project_id: &str, context: &dyn WindowOps) {
@@ -6954,6 +7150,9 @@ impl super::TermWindow {
             let name = crate::ssh_hosts::connect_name_after_rename(
                 &crate::ssh_hosts::connect_domain_name(&spec),
             );
+            if self.connect_server_into_folder(&name, context) {
+                return true;
+            }
             // These hosts used to skip OS detection entirely: the branch
             // returned before anything read `detect_os`, and both detection
             // call sites downcast to `RemoteSshDomain`, which a mux client
@@ -7340,7 +7539,7 @@ impl super::TermWindow {
                 != Some(self.active_space_id.as_str())
     }
 
-    fn activate_workspace_thread_impl(
+    pub(super) fn activate_workspace_thread_impl(
         &mut self,
         thread_id: String,
         context: &dyn WindowOps,
@@ -7497,14 +7696,38 @@ impl super::TermWindow {
                 .get_domain_by_name(domain_name)
                 .map_or(false, |d| d.state() == mux::domain::DomainState::Attached);
             if !attached {
-                // Attach on demand (auth prompts go through the ConnectionUI),
-                // then re-run this activation once the domain is live.
+                // Attach on demand (auth prompts go through the ConnectionUI,
+                // on a page of the Space's own), then open the thread once
+                // the domain is live.
                 let Some(window) = self.window.clone() else {
                     context.invalidate();
                     return;
                 };
                 let domain_name = domain_name.to_string();
-                let mux_window_id = self.mux_window_id;
+                let Some(page_window_id) = self.show_space_connection_page(
+                    &domain_name,
+                    thread_id,
+                    orphan_candidate_window_id,
+                    workspaces_to_kill_after_adopt,
+                ) else {
+                    // The Space's page is connecting already.
+                    context.invalidate();
+                    return;
+                };
+                // The page's window is empty until the ConnectionUI's tab
+                // lands in it; nothing may prune it before then.
+                let page_activity = mux::activity::Activity::new();
+                // Open while it holds the page; empty before the tab lands,
+                // and again once the person closed it.
+                let mut page_seen = false;
+                let page_is_open = move || match Mux::get().get_window(page_window_id) {
+                    Some(page) if !page.is_empty() => {
+                        page_seen = true;
+                        true
+                    }
+                    Some(_) => !page_seen,
+                    None => false,
+                };
                 // Bridge the frames between this switch and the retry engine
                 // raising its own in-flight flag: without it the sidebar
                 // paints "Disconnected — Reconnect" for the gap.
@@ -7523,24 +7746,27 @@ impl super::TermWindow {
                         };
                         let ui = mux::connui::ConnectionUI::with_params(
                             mux::connui::ConnectionUIParams {
-                                window_id: Some(mux_window_id),
+                                window_id: Some(page_window_id),
                                 ..Default::default()
                             },
                         );
+                        // No primary window: none of the server's windows
+                        // belongs in the page's.
                         let outcome = crate::attach_domain_with_retry(
                             domain,
-                            Some(mux_window_id),
+                            None,
                             ui,
-                            move || Mux::get().get_window(mux_window_id).is_some(),
+                            page_is_open,
                             Some(std::time::Duration::from_secs(60)),
                         )
                         .await?;
                         anyhow::Ok(matches!(outcome, crate::AttachRetryOutcome::Attached))
                     }
                     .await;
+                    drop(page_activity);
                     let cleanup_name = domain_name.clone();
                     match result {
-                        // Cancelled (the hosting window went away mid-retry)
+                        // Cancelled (the page was closed or left mid-retry)
                         // leaves nothing to activate.
                         Ok(false) => {}
                         Ok(true) => {
@@ -7548,27 +7774,14 @@ impl super::TermWindow {
                                 .get_domain_by_name(&domain_name)
                                 .map(|domain| domain.domain_id());
                             window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                                // Switching into a cold mux-domain Space is as
-                                // explicit an open as the Connect button, so it
-                                // gets the same one-shot claim. Armed only: the
-                                // retried activation releases it when its tab
-                                // is on screen, and the paint path consumes it
-                                // once that tab's gate is claimable.
-                                if let Some(domain_id) = domain_id {
-                                    term_window.note_remote_open_intent(domain_id);
-                                }
-                                if let Some(win) = term_window.window.clone() {
-                                    term_window.activate_workspace_thread_impl(
-                                        thread_id,
-                                        &win,
-                                        orphan_candidate_window_id,
-                                        workspaces_to_kill_after_adopt,
-                                    );
-                                }
+                                term_window.open_connected_space_page(page_window_id, domain_id);
                             })));
                         }
                         Err(err) => {
                             log::error!("attaching {domain_name} for thread switch: {err:#}");
+                            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                                term_window.note_space_connection_page_gave_up(page_window_id);
+                            })));
                         }
                     }
                     window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
@@ -10375,6 +10588,7 @@ mod space_menu_tests {
             is_remote,
             domain: is_remote.then(|| "DO SYD X user".to_string()),
             is_domain_attached: false,
+            shown_as_folders: false,
         }
     }
 
@@ -10411,6 +10625,72 @@ mod space_menu_tests {
         assert_eq!(
             actions(&items),
             vec![KeyAssignment::DeleteSpace("s1".to_string())]
+        );
+    }
+
+    fn server_space(id: &str, occupied: bool) -> SpaceView {
+        SpaceView {
+            id: id.to_string(),
+            name: id.to_string(),
+            is_active: false,
+            is_occupied_by_other_window: occupied,
+            ..space(true)
+        }
+    }
+
+    fn action(item: &ContextMenuItem) -> KeyAssignment {
+        actions(std::slice::from_ref(item)).remove(0)
+    }
+
+    /// Folded to one row, a server with one Space is that Space: the row
+    /// switches straight to it, with nothing to open.
+    #[test]
+    fn a_server_with_one_space_switches_from_its_row() {
+        let only = server_space("s1", false);
+        let row = super::server_menu_row("devbox".to_string(), "devbox", &[&only]);
+        assert!(submenu_of(&row).is_empty());
+        assert_eq!(action(&row), KeyAssignment::SwitchSpace("s1".to_string()));
+    }
+
+    /// Several Spaces open from the row, with a new one after them.
+    #[test]
+    fn a_server_with_several_spaces_opens_them_from_its_row() {
+        let (first, second) = (server_space("s1", false), server_space("s2", false));
+        let row = super::server_menu_row("devbox".to_string(), "devbox", &[&first, &second]);
+        let children = submenu_of(&row);
+        assert_eq!(children.len(), 4);
+        assert!(matches!(children[2], ContextMenuItem::Separator));
+        assert_eq!(
+            [&children[0], &children[1], &children[3]].map(action),
+            [
+                KeyAssignment::SwitchSpace("s1".to_string()),
+                KeyAssignment::SwitchSpace("s2".to_string()),
+                KeyAssignment::CreateSpaceOnDomain("devbox".to_string()),
+            ]
+        );
+    }
+
+    /// A Space open in another window cannot be switched to from here, so
+    /// the row of a server that has only that one is greyed.
+    #[test]
+    fn a_server_whose_only_space_is_open_elsewhere_is_greyed() {
+        let only = server_space("s1", true);
+        let row = super::server_menu_row("devbox".to_string(), "devbox", &[&only]);
+        assert!(matches!(row, ContextMenuItem::Item { enabled: false, .. }));
+    }
+
+    #[test]
+    fn new_space_on_server_offers_every_server() {
+        let menu = super::new_space_on_server_menu(vec![
+            ("devbox".to_string(), "devbox".to_string()),
+            ("server-b".to_string(), "server-b".to_string()),
+        ]);
+        assert_eq!(
+            actions(submenu_of(&menu)),
+            vec![
+                KeyAssignment::CreateSpaceOnDomain("devbox".to_string()),
+                KeyAssignment::CreateSpaceOnDomain("server-b".to_string()),
+            ]
         );
     }
 

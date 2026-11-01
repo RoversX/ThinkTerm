@@ -1285,6 +1285,8 @@ impl super::TermWindow {
     }
 
     pub(crate) fn finish_remote_open(&mut self, domain_id: mux::domain::DomainId) {
+        // Got through: from here on the window is the Space's like any.
+        self.opened_to_connect = false;
         if let Some(intent) = self.remote_open_intent.as_mut() {
             if intent.domain_id == domain_id {
                 intent.ready = true;

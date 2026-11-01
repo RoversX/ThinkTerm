@@ -1866,6 +1866,17 @@ fn localized_window_tabs_label(mode: crate::native_settings::NativeWindowTabs) -
     })
 }
 
+fn localized_server_placement_label(
+    placement: crate::native_settings::NativeServerPlacement,
+) -> String {
+    use crate::native_settings::NativeServerPlacement;
+    crate::i18n::tr(match placement {
+        NativeServerPlacement::OwnSpace => "settings-server-placement-expanded",
+        NativeServerPlacement::OneRowEach => "settings-server-placement-one-row",
+        NativeServerPlacement::Folders => "settings-server-placement-folders",
+    })
+}
+
 fn localized_cursor_shape_label(shape: crate::native_settings::NativeCursorShape) -> String {
     use crate::native_settings::NativeCursorShape;
     crate::i18n::tr(match shape {
@@ -2234,6 +2245,7 @@ enum SettingsAction {
     SetSidebarShade(crate::native_settings::NativeShade),
     SetTabBarShade(crate::native_settings::NativeShade),
     SetWindowTabs(crate::native_settings::NativeWindowTabs),
+    SetServerPlacement(crate::native_settings::NativeServerPlacement),
     SetTerminalShade(crate::native_settings::NativeShade),
     SetThreadIcons(crate::native_settings::NativeThreadIcons),
     SetThreadStatus(crate::native_settings::NativeThreadStatus),
@@ -6648,6 +6660,9 @@ impl SettingsWindow {
                 |appearance| appearance.tab_bar_shade = shade,
             ),
             SettingsAction::SetWindowTabs(mode) => self.apply_window_tabs(mode),
+            SettingsAction::SetServerPlacement(placement) => {
+                self.apply_server_placement(placement)
+            }
             SettingsAction::SetTerminalShade(shade) => self.apply_window_areas(
                 "settings-terminal-shade",
                 localized_shade_label(shade),
@@ -9447,6 +9462,53 @@ impl SettingsWindow {
                 tw,
                 rows.rule(),
                 ThreadChoice::AgentStatus,
+            )?);
+            Ok(rows.bottom)
+        })?;
+
+        let card_y = self.paint_card_heading(
+            layers,
+            x,
+            bottom,
+            max_width,
+            &crate::i18n::tr("settings-appearance-servers-heading"),
+        )?;
+        let bottom = self.paint_card(layers, x, card_y, max_width, |this, layers, top| {
+            use crate::native_settings::NativeServerPlacement;
+            let mut rows = RowCursor::new(top, this);
+            let options: Vec<(String, SettingsAction)> = NativeServerPlacement::ALL
+                .iter()
+                .map(|placement| {
+                    (
+                        localized_server_placement_label(*placement),
+                        SettingsAction::SetServerPlacement(*placement),
+                    )
+                })
+                .collect();
+            let selected = NativeServerPlacement::ALL
+                .iter()
+                .position(|placement| {
+                    *placement == this.native_settings.appearance.server_placement
+                })
+                .unwrap_or(0);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Server,
+                TileColor::Teal,
+            )?;
+            rows.add(this.paint_segmented_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-server-placement"),
+                &crate::i18n::tr("settings-server-placement-description"),
+                &options,
+                selected,
+                rows.rule(),
             )?);
             Ok(rows.bottom)
         })?;
@@ -20039,6 +20101,52 @@ impl SettingsWindow {
                 self.status = settings_tr(
                     "settings-status-value-now",
                     &[("setting", setting), ("value", localized_window_tabs_label(mode))],
+                );
+            }
+            Err(err) => {
+                self.set_native_settings(crate::native_settings::load());
+                self.status = settings_tr(
+                    "settings-status-save-error",
+                    &[("setting", setting), ("error", format!("{err:#}"))],
+                );
+            }
+        }
+    }
+
+    /// Give servers Spaces of their own or show them as folders in this
+    /// device's Spaces. The sidebars read the choice as they paint, the
+    /// Space menu and the palette as they open; what it owes the windows is
+    /// a repaint, and letting go of a server thread whose folder is gone.
+    fn apply_server_placement(
+        &mut self,
+        placement: crate::native_settings::NativeServerPlacement,
+    ) {
+        self.ui.open_dropdown = None;
+        if crate::native_settings::load_shared().appearance.server_placement == placement {
+            return;
+        }
+        let mut merged = crate::native_settings::load();
+        merged.appearance.server_placement = placement;
+        self.set_native_settings(merged);
+        let setting = crate::i18n::tr("settings-server-placement");
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                // A server thread on screen through a folder that is gone
+                // now is let go of.
+                for gui_window in crate::frontend::front_end().gui_windows() {
+                    gui_window
+                        .window
+                        .notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
+                            |term_window| term_window.leave_server_folder_content_if_hidden(),
+                        )));
+                }
+                crate::frontend::front_end().invalidate_all_windows();
+                self.status = settings_tr(
+                    "settings-status-value-now",
+                    &[
+                        ("setting", setting),
+                        ("value", localized_server_placement_label(placement)),
+                    ],
                 );
             }
             Err(err) => {

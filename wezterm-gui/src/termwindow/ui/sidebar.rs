@@ -2765,9 +2765,15 @@ impl crate::TermWindow {
                         disclosure_size,
                         muted_fg,
                     )?;
+                    // A server folder is the server itself, not a link to
+                    // threads picked one by one.
                     self.paint_sidebar_icon(
                         layers,
-                        SvgIcon::Link2,
+                        if group.server_folder {
+                            SvgIcon::Server
+                        } else {
+                            SvgIcon::Link2
+                        },
                         group_icon_x,
                         icon_y,
                         icon_size,
@@ -2975,7 +2981,16 @@ impl crate::TermWindow {
                             &chrome,
                             foreground,
                         )?;
-                        let text_right = if is_hovered { delete_x } else { marks_right };
+                        // Only a reference can be taken out: a row a server
+                        // folder shows, with none of its own, stays as long
+                        // as the folder does.
+                        let removable = is_hovered
+                            && (!reference.server_folder
+                                || workspace_threads::thread_ref_is_explicit(
+                                    self.workspace_sidebar_space_id(),
+                                    &session.id,
+                                ));
+                        let text_right = if removable { delete_x } else { marks_right };
                         let text_fg = if dimmed {
                             muted_fg.mul_alpha(0.7)
                         } else if is_selected {
@@ -2994,7 +3009,7 @@ impl crate::TermWindow {
                             text_fg,
                         )?;
 
-                        if is_hovered {
+                        if removable {
                             // An X, not a trash can: removing a reference
                             // leaves the origin thread running untouched.
                             let hovered = self.is_pointer_over_ui_rect(
