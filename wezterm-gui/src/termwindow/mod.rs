@@ -12534,7 +12534,7 @@ impl TermWindow {
                 };
                 if default_click {
                     if link_open::classify(&link) == link_open::LinkOpen::Direct {
-                        log::info!("clicking {}", link);
+                        log::info!("opening terminal link");
                         wezterm_open_url::open_url(&link);
                     } else {
                         term_window.notify(TermWindowNotif::Apply(Box::new(move |myself| {

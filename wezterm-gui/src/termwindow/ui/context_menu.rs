@@ -529,7 +529,7 @@ impl crate::TermWindow {
             }
             crate::termwindow::ContextMenuApplicationAction::ResolveTerminalLink(link) => {
                 if let Some(link) = link {
-                    log::info!("clicking {}", link);
+                    log::info!("opening terminal link");
                     wezterm_open_url::open_url(&link);
                 }
             }
