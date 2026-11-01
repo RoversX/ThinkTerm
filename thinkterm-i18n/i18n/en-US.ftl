@@ -1740,6 +1740,7 @@ share-pill-removed = { $owner } removed you · Close
 share-pill-expired = The share ran out · Close
 share-pill-closed = The shared terminal closed · Close
 settings-section-share-sync = Share & Sync
+settings-section-privacy = Permissions
 settings-share-sync-description = Let other accounts on this machine watch your terminals.
 settings-sharing = Share terminals
 settings-sharing-description = When on, terminals have a share button, and the sidebar lists what others share with you. Others can only watch; to type, they ask and you decide. Turning it off stops what you share.
@@ -1748,3 +1749,43 @@ settings-sharing-experimental = This is an experimental feature: it may be remov
 settings-status-sharing-on = Sharing turned on
 settings-status-sharing-off = Sharing turned off
 settings-status-sharing-error = Could not save the sharing setting: { $error }
+
+## Asking before something a terminal program printed is acted on.
+link-open-other-app = Open in Another App
+link-open-cancel = Cancel
+link-refused-unsafe = Not Opened: the Link Is Unsafe
+paste-confirm-header = This text has line breaks and could run commands as soon as it is pasted
+paste-confirm-anyway = Paste Anyway
+paste-confirm-cancel = Cancel
+settings-paste-confirmation = Ask before pasting line breaks
+settings-paste-confirmation-description = Before text with line breaks goes into a program that would run each line as it arrives, ask first. Shells that take a paste as one block, such as zsh, are not asked about.
+
+## Settings › Workspaces › Notifications: which moments each prompt answers.
+settings-dock-badge = Dock Icon Count
+settings-dock-badge-description = Show on ThinkTerm's Dock icon how many threads have something you haven't looked at yet.
+settings-work-moment-finished = Finished
+settings-work-moment-needs-input = Needs You
+settings-work-moment-error = Error
+
+## Settings › General: what macOS lets programs in local terminals do.
+settings-privacy-page-description = macOS counts every program run in ThinkTerm's terminals as ThinkTerm: a permission allowed here is one each of them can use.
+settings-privacy-heading = Permissions for Programs in Terminals
+settings-privacy-full-disk = Full Disk Access
+settings-privacy-full-disk-description = Read and write protected places such as Desktop, Documents, Downloads and Mail.
+settings-privacy-full-disk-caution = Caution: once allowed, any program in a terminal, scripts and AI agents included, can read and write these places and other apps' data without macOS asking. Turn it on only when you need it, and off again in System Settings when done.
+settings-privacy-screen = Screen & System Audio Recording
+settings-privacy-screen-description = For programs that take screenshots, record the screen or record system audio.
+settings-privacy-microphone = Microphone
+settings-privacy-microphone-description = For programs that record sound or take voice input. macOS asks the first time one does.
+settings-privacy-camera = Camera
+settings-privacy-camera-description = For programs that take photos or video. macOS asks the first time one does.
+settings-privacy-open = Open System Settings
+settings-privacy-granted = Allowed
+settings-privacy-not-granted = Not allowed
+settings-privacy-denied = Denied
+settings-privacy-not-asked = Not asked yet
+settings-privacy-unknown = Unknown
+settings-privacy-checking = Checking…
+settings-privacy-holder-server = ThinkTerm Background Service
+settings-privacy-holder-app = ThinkTerm
+settings-privacy-holder-description = These permissions are kept under its name. Full Disk Access has to be added by hand: click + in System Settings and drag it into the list.

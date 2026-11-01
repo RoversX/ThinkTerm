@@ -59,6 +59,8 @@ mod overlay;
 mod page_poll;
 mod perf;
 mod plugins;
+#[cfg(target_os = "macos")]
+mod privacy_status;
 mod quad;
 mod renderer_choice;
 mod renderstate;

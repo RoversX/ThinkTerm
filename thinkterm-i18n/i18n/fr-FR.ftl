@@ -1734,6 +1734,7 @@ share-pill-removed = { $owner } vous a retiré · Fermer
 share-pill-expired = Le partage a expiré · Fermer
 share-pill-closed = Le terminal partagé s'est fermé · Fermer
 settings-section-share-sync = Partage et synchronisation
+settings-section-privacy = Autorisations
 settings-share-sync-description = Laissez d'autres comptes de cette machine regarder vos terminaux.
 settings-sharing = Partager les terminaux
 settings-sharing-description = Activé, les terminaux ont un bouton de partage et la barre latérale liste ce que d'autres partagent avec vous. Les autres ne font que regarder ; pour taper, ils le demandent et vous décidez. Le désactiver arrête vos partages en cours.
@@ -1742,3 +1743,43 @@ settings-sharing-experimental = Cette fonction est expérimentale : elle pourra 
 settings-status-sharing-on = Partage activé
 settings-status-sharing-off = Partage désactivé
 settings-status-sharing-error = Impossible d'enregistrer le réglage de partage : { $error }
+
+## Asking before something a terminal program printed is acted on.
+link-open-other-app = Ouvrir dans une autre app
+link-open-cancel = Annuler
+link-refused-unsafe = Non ouvert : le lien est dangereux
+paste-confirm-header = Ce texte contient des retours à la ligne et pourrait lancer des commandes dès qu'il est collé
+paste-confirm-anyway = Coller quand même
+paste-confirm-cancel = Annuler
+settings-paste-confirmation = Demander avant de coller des retours à la ligne
+settings-paste-confirmation-description = Demande avant de coller du texte avec des retours à la ligne dans un programme qui exécuterait chaque ligne aussitôt. Les shells comme zsh, qui reçoivent un collage d'un seul bloc, ne sont pas concernés.
+
+## Settings › Workspaces › Notifications: which moments each prompt answers.
+settings-dock-badge = Nombre sur l'icône du Dock
+settings-dock-badge-description = Afficher sur l'icône de ThinkTerm dans le Dock combien de sessions ont du nouveau que vous n'avez pas encore vu.
+settings-work-moment-finished = Terminé
+settings-work-moment-needs-input = Vous attend
+settings-work-moment-error = Erreur
+
+## Settings › General: what macOS lets programs in local terminals do.
+settings-privacy-page-description = macOS compte chaque programme lancé dans les terminaux de ThinkTerm comme ThinkTerm : une autorisation accordée ici, chacun d'eux peut s'en servir.
+settings-privacy-heading = Autorisations des programmes dans les terminaux
+settings-privacy-full-disk = Accès complet au disque
+settings-privacy-full-disk-description = Lire et écrire dans des emplacements protégés comme le Bureau, Documents, Téléchargements et Mail.
+settings-privacy-full-disk-caution = Attention : une fois autorisé, tout programme lancé dans un terminal, outils en ligne de commande, scripts et agents IA compris, peut lire et modifier ces emplacements et les données des autres apps sans que macOS vous le demande. Ne l'activez que si vous en avez besoin, et désactivez-le ensuite dans Réglages Système.
+settings-privacy-screen = Enregistrement de l'écran et de l'audio du système
+settings-privacy-screen-description = Pour les programmes qui font des captures d'écran ou enregistrent l'écran ou le son du système.
+settings-privacy-microphone = Micro
+settings-privacy-microphone-description = Pour les programmes qui enregistrent du son ou utilisent la saisie vocale. macOS demande la première fois qu'un programme en a besoin.
+settings-privacy-camera = Caméra
+settings-privacy-camera-description = Pour les programmes qui prennent des photos ou des vidéos. macOS demande la première fois qu'un programme en a besoin.
+settings-privacy-open = Ouvrir Réglages Système
+settings-privacy-granted = Autorisé
+settings-privacy-not-granted = Non autorisé
+settings-privacy-denied = Refusé
+settings-privacy-not-asked = Pas encore demandé
+settings-privacy-unknown = Inconnu
+settings-privacy-checking = Vérification…
+settings-privacy-holder-server = Service d'arrière-plan de ThinkTerm
+settings-privacy-holder-app = ThinkTerm
+settings-privacy-holder-description = Ces autorisations sont enregistrées à son nom. L'accès complet au disque s'ajoute à la main : cliquez sur + dans Réglages Système et faites-le glisser dans la liste.

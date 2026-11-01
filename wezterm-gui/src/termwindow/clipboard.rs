@@ -1,4 +1,4 @@
-use crate::termwindow::TermWindowNotif;
+use crate::termwindow::{ContextMenuApplicationAction, TermWindowNotif};
 use crate::TermWindow;
 use config::keyassignment::{ClipboardCopyDestination, ClipboardPasteSource};
 use mux::pane::{Pane, PaneId};
@@ -103,11 +103,70 @@ impl TermWindow {
                 mux.get_pane(pane_id)
             });
         if let Some(pane) = pane {
-            // Where the paste goes in, read before it does.
-            let cursor = pane.get_cursor_position();
-            if pane.send_paste(text).is_ok() {
-                self.light_up_terminal_paste(&pane, text, cursor);
-            }
+            self.paste_text_into(&pane, text);
+        }
+    }
+
+    /// Paste `text` into `pane`, the terminal or an overlay over it, asking
+    /// first, when the setting is on, if its newlines would run what comes
+    /// before them.
+    pub(crate) fn paste_text_into(&mut self, pane: &Arc<dyn Pane>, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        // An overlay takes a paste in itself; only the program can run it.
+        if crate::native_settings::paste_confirmation()
+            && paste_needs_confirmation(text, pane.bracketed_paste())
+            && self.pane_state(pane.pane_id()).overlay.is_none()
+        {
+            self.confirm_paste(pane.pane_id(), text.to_string());
+            return;
+        }
+        self.deliver_paste(pane, text);
+    }
+
+    fn deliver_paste(&mut self, pane: &Arc<dyn Pane>, text: &str) {
+        // Where the paste goes in, read before it does.
+        let cursor = pane.get_cursor_position();
+        if pane.send_paste(text).is_ok() {
+            self.light_up_terminal_paste(pane, text, cursor);
+        }
+    }
+
+    /// Ask, in a menu at the text cursor, before pasting `text` where its
+    /// newlines would run what comes before them.
+    fn confirm_paste(&mut self, pane_id: PaneId, text: String) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let anchor = self
+            .text_cursor_rect
+            .map(|cell| window::Point::new(cell.min_x(), cell.max_y()))
+            .or_else(|| self.current_mouse_event.as_ref().map(|event| event.coords))
+            .unwrap_or_else(|| window::Point::new(0, 0));
+        let header = window::ContextMenuItem::SectionHeader {
+            label: crate::i18n::tr("paste-confirm-header"),
+        };
+        self.begin_context_menu_application_actions();
+        let paste = self.context_menu_application_item_with_icon(
+            crate::i18n::tr("paste-confirm-anyway"),
+            window::ContextMenuIcon::Paste,
+            ContextMenuApplicationAction::ResolvePaste(Some((pane_id, text))),
+            true,
+        );
+        let cancel = self.context_menu_application_item_with_icon(
+            crate::i18n::tr("paste-confirm-cancel"),
+            window::ContextMenuIcon::Close,
+            ContextMenuApplicationAction::ResolvePaste(None),
+            true,
+        );
+        self.show_term_context_menu(&window, anchor, vec![header, paste, cancel]);
+    }
+
+    /// Paste what the person agreed to paste, should its pane still be there.
+    pub(crate) fn paste_confirmed(&mut self, pane_id: PaneId, text: &str) {
+        if let Some(pane) = Mux::get().get_pane(pane_id) {
+            self.deliver_paste(&pane, text);
         }
     }
 
@@ -124,5 +183,30 @@ impl TermWindow {
         if self.pane_state(pane.pane_id()).overlay.is_none() {
             self.light_up_paste(pane, text, cursor);
         }
+    }
+}
+
+/// Whether pasting `text` could run commands before the person sees them:
+/// it breaks a line, and the program did not ask for pastes bracketed, so
+/// each line goes in as if typed and entered. A bracketed paste cannot end
+/// early -- the terminal strips the markers from it -- and a pane that
+/// cannot tell is not asked about.
+fn paste_needs_confirmation(text: &str, bracketed_paste: Option<bool>) -> bool {
+    bracketed_paste == Some(false) && text.contains(['\n', '\r'])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::paste_needs_confirmation;
+
+    #[test]
+    fn only_a_line_break_into_an_unbracketed_program_asks() {
+        assert!(paste_needs_confirmation("ls\nrm -rf build\n", Some(false)));
+        assert!(paste_needs_confirmation("make install\n", Some(false)));
+        assert!(paste_needs_confirmation("a\rb", Some(false)));
+        assert!(!paste_needs_confirmation("git status", Some(false)));
+        assert!(!paste_needs_confirmation("ls\nrm -rf build\n", Some(true)));
+        assert!(!paste_needs_confirmation("ls\n\x1b[201~rm -rf build\n", Some(true)));
+        assert!(!paste_needs_confirmation("ls\nrm -rf build\n", None));
     }
 }

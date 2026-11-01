@@ -1,4 +1,5 @@
 use anyhow::{ensure, Context, Result};
+use crate::native_settings::{WorkMoment, WorkMoments};
 use chrono::Utc;
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use fluent_bundle::FluentArgs;
@@ -206,15 +207,15 @@ pub struct WorkspaceThread {
     pub work_needs_attention: bool,
     /// The user acknowledged the *current* waiting episode (any keypress in
     /// the active workspace does). The badge may relight silently while the
-    /// agent is still waiting, but the needs-input sound must not replay
+    /// agent is still waiting, but the same attention kind must not replay
     /// until the state genuinely leaves and re-enters attention.
     #[serde(skip)]
     pub work_attention_acknowledged: bool,
-    /// Panes whose waiting has already rung this episode. A pane newly
-    /// joining the waiting set is a new question and rings even while
-    /// others are still waiting; a pane merely re-observed stays quiet.
+    /// Each waiting pane's last attention kind. A new pane or a changed
+    /// kind may ring; re-observing the same wait stays quiet even after
+    /// a keypress acknowledges it. Replaced on each scan, cleared on exit.
     #[serde(skip)]
-    pub work_waiting_panes: std::collections::HashSet<PaneId>,
+    pub work_waiting_panes: HashMap<PaneId, WorkMoment>,
     #[serde(default)]
     pub work_finished_unseen: bool,
 }
@@ -515,7 +516,7 @@ pub struct ThreadWorkNotification {
     pub status: WorkspaceThreadWorkStatus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct WorkspaceThreadWorkChange {
     changed: bool,
     should_persist: bool,
@@ -523,6 +524,8 @@ struct WorkspaceThreadWorkChange {
     /// the observation that first crosses into the state, so re-scanning a
     /// thread that has not moved stays quiet without any extra bookkeeping.
     announce: Option<WorkAnnouncement>,
+    /// Panes newly waiting or reporting a different attention kind.
+    new_waiting_panes: Vec<(PaneId, WorkMoment)>,
 }
 
 /// A transition is at most one of these, so a single field makes it impossible
@@ -790,6 +793,7 @@ static STORE_IS_UNREADABLE: AtomicBool = AtomicBool::new(false);
 static NEXT_SPACE_OWNER_ID: AtomicU64 = AtomicU64::new(1);
 fn publish_thinkterm_session_changed() {
     wezterm_mux_server_impl::thinkterm_session::publish_changed();
+    schedule_dock_badge_refresh();
 }
 
 pub fn workspace_thread_store_path() -> PathBuf {
@@ -3056,11 +3060,119 @@ fn should_play_work_sound(
     }
 }
 
-fn announce_work(announcement: WorkAnnouncement, finished_after: Option<Duration>) {
+fn no_work_moments() -> WorkMoments {
+    WorkMoments {
+        finished: false,
+        needs_input: false,
+        error: false,
+    }
+}
+
+fn attention_moment(
+    agent: Option<WorkspaceThreadWorkStatus>,
+    agent_errored: bool,
+    progress: &Progress,
+) -> Option<WorkMoment> {
+    match agent {
+        Some(WorkspaceThreadWorkStatus::NeedsAttention) => Some(if agent_errored {
+            WorkMoment::Error
+        } else {
+            WorkMoment::NeedsInput
+        }),
+        Some(_) => None,
+        None if reports_native_error(agent, progress) => Some(WorkMoment::Error),
+        None => None,
+    }
+}
+
+fn pane_attention_moment(pane: &dyn Pane) -> Option<WorkMoment> {
+    let agent = crate::agent_status::enabled()
+        .then(|| crate::agent_status::agent_work_status(pane))
+        .flatten();
+    let errored = pane
+        .agent_status()
+        .is_some_and(|status| status.state == crate::agent_status::AgentState::Error);
+    attention_moment(agent, errored, &pane.get_progress())
+}
+
+fn collect_work_moments(moments: impl IntoIterator<Item = WorkMoment>) -> WorkMoments {
+    let mut collected = no_work_moments();
+    for moment in moments {
+        match moment {
+            WorkMoment::Finished => collected.finished = true,
+            WorkMoment::NeedsInput => collected.needs_input = true,
+            WorkMoment::Error => collected.error = true,
+        }
+    }
+    collected
+}
+
+fn first_work_moment(
+    moments: WorkMoments,
+    enabled: impl Fn(WorkMoment) -> bool,
+) -> Option<WorkMoment> {
+    WorkMoment::ALL
+        .iter()
+        .copied()
+        .find(|moment| moments.includes(*moment) && enabled(*moment))
+}
+
+/// A thread can have both a failed build and an agent waiting for input.
+/// Keep both kinds so a prompt's filter never masks the other one.
+fn workspace_attention_moments(workspace: &str) -> WorkMoments {
+    let mux = Mux::get();
+    let moments = mux
+        .iter_windows_in_workspace(workspace)
+        .into_iter()
+        .flat_map(|window_id| {
+            let Some(window) = mux.get_window(window_id) else {
+                return Vec::new();
+            };
+            let tabs = (0..window.len())
+                .filter_map(|idx| window.get_by_idx(idx).cloned())
+                .collect::<Vec<_>>();
+            drop(window);
+            tabs.iter()
+                .flat_map(|tab| {
+                    tab.iter_all_panes()
+                        .into_iter()
+                        .filter_map(|pane| pane_attention_moment(pane.as_ref()))
+                })
+                .collect::<Vec<_>>()
+        });
+    collect_work_moments(moments)
+}
+
+/// Whether a pane's own progress report says it stopped on an error. It
+/// counts only where it set the pane's status -- an agent the pane runs
+/// speaks for it instead, as in `scan_workspace_work_status`.
+fn reports_native_error(agent: Option<WorkspaceThreadWorkStatus>, progress: &Progress) -> bool {
+    agent.is_none() && matches!(progress, Progress::Error(_))
+}
+
+/// Only this transition's new attention kinds contribute: an old error in
+/// another pane must not turn an input request into an error prompt.
+fn work_moments(
+    announcement: WorkAnnouncement,
+    new_waiting_panes: &[(PaneId, WorkMoment)],
+) -> WorkMoments {
+    match announcement {
+        WorkAnnouncement::Finished => collect_work_moments([WorkMoment::Finished]),
+        WorkAnnouncement::NeedsInput => {
+            collect_work_moments(new_waiting_panes.iter().map(|(_, moment)| *moment))
+        }
+    }
+}
+
+fn announce_work(
+    moment: WorkMoment,
+    announcement: WorkAnnouncement,
+    finished_after: Option<Duration>,
+) {
     if std::env::var_os(DISABLE_SOUND_ENV).is_some() {
         return;
     }
-    if !crate::native_settings::notification_sounds_enabled() {
+    if !crate::native_settings::notification_sound_for(moment) {
         return;
     }
     if !should_play_work_sound(announcement, finished_after) {
@@ -3104,11 +3216,16 @@ fn can_notify_system() -> bool {
 /// its program stopped on an error -- when nobody is looking at ThinkTerm.
 /// The same moments the sounds mark, with the program's own words when it
 /// gave any.
-fn notify_system(workspace: &str, announcement: WorkAnnouncement, finished_after: Option<Duration>) {
+fn notify_system(
+    workspace: &str,
+    moment: WorkMoment,
+    announcement: WorkAnnouncement,
+    finished_after: Option<Duration>,
+) {
     if std::env::var_os(DISABLE_SOUND_ENV).is_some()
         || crate::frontend::try_front_end().is_none()
         || !can_notify_system()
-        || !crate::native_settings::system_notifications_enabled()
+        || !crate::native_settings::system_notification_for(moment)
         || crate::termwindow::app_has_focus()
         || !should_play_work_sound(announcement, finished_after)
     {
@@ -3126,13 +3243,10 @@ fn notify_system(workspace: &str, announcement: WorkAnnouncement, finished_after
         notified.retain(|_, at| now.duration_since(*at) < SYSTEM_NOTIFICATION_INTERVAL);
         notified.insert(workspace.to_string(), now);
     }
-    let errored = crate::agent_status::any_agent_in_workspace(workspace, |agent| {
-        agent.state == crate::agent_status::AgentState::Error
-    });
-    let state = crate::i18n::tr(match announcement {
-        WorkAnnouncement::Finished => "notification-thread-finished",
-        WorkAnnouncement::NeedsInput if errored => "notification-thread-error",
-        WorkAnnouncement::NeedsInput => "notification-thread-needs-input",
+    let state = crate::i18n::tr(match moment {
+        WorkMoment::Finished => "notification-thread-finished",
+        WorkMoment::Error => "notification-thread-error",
+        WorkMoment::NeedsInput => "notification-thread-needs-input",
     });
     let thread = thread_display_name_for_workspace(workspace).unwrap_or_else(|| workspace.to_string());
     let reason = crate::agent_status::workspace_reason(workspace).unwrap_or_default();
@@ -3144,6 +3258,98 @@ fn notify_system(workspace: &str, announcement: WorkAnnouncement, finished_after
         &reason,
         &target,
     );
+}
+
+/// The moments an unseen thread's status stands for, if it is unseen work.
+fn unseen_work_moments(status: WorkspaceThreadWorkStatus, attention: WorkMoments) -> WorkMoments {
+    match status {
+        WorkspaceThreadWorkStatus::FinishedUnseen => collect_work_moments([WorkMoment::Finished]),
+        WorkspaceThreadWorkStatus::NeedsAttention => attention,
+        WorkspaceThreadWorkStatus::Running | WorkspaceThreadWorkStatus::Idle => no_work_moments(),
+    }
+}
+
+/// How many threads the Dock icon counts: the ones the notification bell
+/// lists, narrowed to `moments`.
+fn dock_badge_count(moments: WorkMoments) -> usize {
+    // Collected first: asking about agents must not happen under the store.
+    let unseen: Vec<(String, WorkspaceThreadWorkStatus)> = {
+        let store = THREAD_STORE.lock();
+        store
+            .projects
+            .iter()
+            .flat_map(|project| {
+                project.threads.iter().filter_map(move |thread| {
+                    let status = thread.work_status();
+                    if !matches!(
+                        status,
+                        WorkspaceThreadWorkStatus::NeedsAttention
+                            | WorkspaceThreadWorkStatus::FinishedUnseen
+                    ) {
+                        return None;
+                    }
+                    let workspace = thread
+                        .materialized_workspace_name
+                        .clone()
+                        .unwrap_or_else(|| workspace_name_for_thread(&project.id, &thread.id));
+                    Some((workspace, status))
+                })
+            })
+            .collect()
+    };
+    unseen
+        .into_iter()
+        .filter(|(workspace, status)| {
+            let attention = if *status == WorkspaceThreadWorkStatus::NeedsAttention {
+                workspace_attention_moments(workspace)
+            } else {
+                no_work_moments()
+            };
+            first_work_moment(unseen_work_moments(*status, attention), |moment| {
+                moments.includes(moment)
+            })
+            .is_some()
+        })
+        .count()
+}
+
+static DOCK_BADGE_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
+
+lazy_static::lazy_static! {
+    /// What the Dock icon shows now, so an unchanged count is not set again.
+    static ref DOCK_BADGE_SHOWN: Mutex<Option<String>> = Mutex::new(None);
+}
+
+/// Bring the Dock icon's count up to date soon, on the main thread: what
+/// changed the threads may still hold the store, or run elsewhere.
+pub(crate) fn schedule_dock_badge_refresh() {
+    if !cfg!(target_os = "macos") || !promise::spawn::is_scheduler_configured() {
+        return;
+    }
+    if DOCK_BADGE_REFRESH_PENDING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    promise::spawn::spawn_into_main_thread(async {
+        DOCK_BADGE_REFRESH_PENDING.store(false, Ordering::Release);
+        refresh_dock_badge();
+    })
+    .detach();
+}
+
+/// Show on the Dock icon how many threads have unseen work of the moments
+/// chosen for it; nothing when there is none or it is turned off.
+pub fn refresh_dock_badge() {
+    let count = crate::native_settings::dock_badge_moments().map_or(0, dock_badge_count);
+    let label = (count > 0).then(|| count.to_string());
+    let mut shown = DOCK_BADGE_SHOWN.lock();
+    if *shown == label {
+        return;
+    }
+    use ::window::ConnectionOps;
+    if let Some(connection) = ::window::Connection::get() {
+        connection.set_dock_badge(label.as_deref());
+        *shown = label;
+    }
 }
 
 pub fn refresh_thread_work_for_workspace(workspace: &str) -> bool {
@@ -3168,8 +3374,17 @@ pub fn refresh_thread_work_for_workspace(workspace: &str) -> bool {
         }
     };
     if let Some(announcement) = change.announce {
-        announce_work(announcement, finished_after);
-        notify_system(workspace, announcement, finished_after);
+        let moments = work_moments(announcement, &change.new_waiting_panes);
+        if let Some(moment) =
+            first_work_moment(moments, crate::native_settings::notification_sound_for)
+        {
+            announce_work(moment, announcement, finished_after);
+        }
+        if let Some(moment) =
+            first_work_moment(moments, crate::native_settings::system_notification_for)
+        {
+            notify_system(workspace, moment, announcement, finished_after);
+        }
     }
     if change.should_persist {
         schedule_workspace_thread_store_persist();
@@ -3189,8 +3404,14 @@ pub fn refresh_all_thread_work() -> bool {
     for workspace in workspaces {
         changed |= refresh_thread_work_for_workspace(&workspace);
     }
+    // Unseen work saved by the last run counts before anything changes.
+    if !DOCK_BADGE_PRIMED.swap(true, Ordering::AcqRel) {
+        schedule_dock_badge_refresh();
+    }
     changed
 }
+
+static DOCK_BADGE_PRIMED: AtomicBool = AtomicBool::new(false);
 
 pub fn acknowledge_thread_work_for_workspace(workspace: &str) -> bool {
     WORK_SOUND_TIMING.lock().forget(workspace);
@@ -7743,7 +7964,7 @@ impl WorkspaceThreadStore {
             work_is_running: bool,
             work_needs_attention: bool,
             work_attention_acknowledged: bool,
-            work_waiting_panes: std::collections::HashSet<PaneId>,
+            work_waiting_panes: HashMap<PaneId, WorkMoment>,
             work_finished_unseen: bool,
         }
 
@@ -8198,7 +8419,7 @@ impl WorkspaceThreadStore {
         &mut self,
         workspace: &str,
         observed: WorkspaceThreadWorkStatus,
-        waiting_panes: &[PaneId],
+        waiting_panes: &[(PaneId, WorkMoment)],
     ) -> Option<WorkspaceThreadWorkChange> {
         for project in &mut self.projects {
             let project_id = project.id.clone();
@@ -8244,6 +8465,7 @@ impl WorkspaceThreadStore {
                         changed,
                         should_persist,
                         announce: None,
+                        new_waiting_panes: Vec::new(),
                     };
                 }
             }
@@ -8252,6 +8474,7 @@ impl WorkspaceThreadStore {
             changed: false,
             should_persist: false,
             announce: None,
+            new_waiting_panes: Vec::new(),
         }
     }
 
@@ -8270,6 +8493,7 @@ impl WorkspaceThreadStore {
                         changed,
                         should_persist,
                         announce: None,
+                        new_waiting_panes: Vec::new(),
                     };
                 }
             }
@@ -8278,6 +8502,7 @@ impl WorkspaceThreadStore {
             changed: false,
             should_persist: false,
             announce: None,
+            new_waiting_panes: Vec::new(),
         }
     }
 
@@ -8889,7 +9114,7 @@ impl WorkspaceThread {
     fn observe_work_status(
         &mut self,
         observed: WorkspaceThreadWorkStatus,
-        waiting_panes: &[PaneId],
+        waiting_panes: &[(PaneId, WorkMoment)],
     ) -> WorkspaceThreadWorkChange {
         match observed {
             WorkspaceThreadWorkStatus::Running => {
@@ -8907,26 +9132,27 @@ impl WorkspaceThread {
                     changed,
                     should_persist,
                     announce: None,
+                    new_waiting_panes: Vec::new(),
                 }
             }
             WorkspaceThreadWorkStatus::NeedsAttention => {
                 let changed = !self.work_needs_attention;
                 self.work_needs_attention = true;
-                // One ring per pane per waiting episode: a pane newly
-                // joining the waiting set is a new question and rings even
-                // while other agents are still waiting; a pane merely
-                // re-observed stays quiet. That last part is load-bearing —
-                // typing an answer into the agent's own question form
-                // acknowledges and re-observes the same pane every scan,
-                // and ringing there would ring on every keystroke.
-                let new_waiter = waiting_panes
+                // A new waiter or a change from input to error may ring.
+                // Re-observing the same kind stays quiet: typing into an
+                // agent's question acknowledges and re-observes the pane
+                // on every keypress without starting a new wait.
+                let new_waiting_panes: Vec<_> = waiting_panes
                     .iter()
-                    .any(|pane| !self.work_waiting_panes.contains(pane));
+                    .copied()
+                    .filter(|(pane, moment)| self.work_waiting_panes.get(pane) != Some(moment))
+                    .collect();
                 self.work_waiting_panes = waiting_panes.iter().copied().collect();
                 WorkspaceThreadWorkChange {
                     changed,
                     should_persist: false,
-                    announce: new_waiter.then_some(WorkAnnouncement::NeedsInput),
+                    announce: (!new_waiting_panes.is_empty()).then_some(WorkAnnouncement::NeedsInput),
+                    new_waiting_panes,
                 }
             }
             WorkspaceThreadWorkStatus::Idle | WorkspaceThreadWorkStatus::FinishedUnseen => {
@@ -8950,6 +9176,7 @@ impl WorkspaceThread {
                     changed: was_running || had_attention,
                     should_persist,
                     announce: finished_now.then_some(WorkAnnouncement::Finished),
+                    new_waiting_panes: Vec::new(),
                 }
             }
         }
@@ -10096,11 +10323,12 @@ pub(crate) fn native_pane_work_status(pane: &dyn mux::pane::Pane) -> WorkspaceTh
     WorkspaceThreadWorkStatus::Idle
 }
 
-fn scan_workspace_work_status(workspace: &str) -> (WorkspaceThreadWorkStatus, Vec<PaneId>) {
+fn scan_workspace_work_status(
+    workspace: &str,
+) -> (WorkspaceThreadWorkStatus, Vec<(PaneId, WorkMoment)>) {
     let mux = Mux::get();
     let mut running = false;
-    // Which panes are waiting, not just whether any is: a pane newly
-    // joining this set is a fresh question and earns its own ring.
+    // Keep the kind too: the same pane can go straight from input to error.
     let mut waiting_panes = Vec::new();
     let agents_enabled = crate::agent_status::enabled();
     for window_id in mux.iter_windows_in_workspace(workspace) {
@@ -10114,12 +10342,26 @@ fn scan_workspace_work_status(workspace: &str) -> (WorkspaceThreadWorkStatus, Ve
 
         for tab in tabs {
             for pane in tab.iter_all_panes() {
-                let observed = agents_enabled
+                let agent = agents_enabled
                     .then(|| crate::agent_status::agent_work_status(pane.as_ref()))
-                    .flatten()
-                    .unwrap_or_else(|| native_pane_work_status(pane.as_ref()));
+                    .flatten();
+                let observed = agent.unwrap_or_else(|| native_pane_work_status(pane.as_ref()));
                 match observed {
-                    WorkspaceThreadWorkStatus::NeedsAttention => waiting_panes.push(pane.pane_id()),
+                    WorkspaceThreadWorkStatus::NeedsAttention => {
+                        // Native NeedsAttention only comes from Error.
+                        // Keep that observation even if progress changes
+                        // before the next read of the pane.
+                        let errored = agent.is_none()
+                            || pane.agent_status().is_some_and(|status| {
+                                status.state == crate::agent_status::AgentState::Error
+                            });
+                        let moment = if errored {
+                            WorkMoment::Error
+                        } else {
+                            WorkMoment::NeedsInput
+                        };
+                        waiting_panes.push((pane.pane_id(), moment));
+                    }
                     WorkspaceThreadWorkStatus::Running => running = true,
                     _ => {}
                 }
@@ -12314,8 +12556,7 @@ mod tests {
 
     /// Typing an answer into an agent's question must not ring per key:
     /// each keypress acknowledges the active workspace and the next scan
-    /// re-observes the same still-waiting pane. Only a pane newly joining
-    /// the waiting set may ring.
+    /// re-observes the same still-waiting pane and attention kind.
     #[test]
     fn acknowledged_waiting_episode_relights_silently() {
         let mut thread = WorkspaceThread::new(
@@ -12323,7 +12564,8 @@ mod tests {
             "main".to_string(),
             Some("workspace-1".to_string()),
         );
-        let first = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &[7]);
+        let waiting = [(7, WorkMoment::NeedsInput)];
+        let first = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &waiting);
         assert_eq!(first.announce, Some(WorkAnnouncement::NeedsInput));
         // Keypress: acknowledge clears the badge and marks the episode.
         if thread.work_needs_attention {
@@ -12331,12 +12573,12 @@ mod tests {
         }
         thread.work_needs_attention = false;
         // The agent is still waiting: badge relights, sound stays quiet.
-        let relight = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &[7]);
+        let relight = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &waiting);
         assert!(relight.changed);
         assert_eq!(relight.announce, None, "same pane must not re-ring");
         // The question is answered and a new one appears: rings again.
         thread.observe_work_status(WorkspaceThreadWorkStatus::Running, &[]);
-        let next = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &[7]);
+        let next = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &waiting);
         assert_eq!(next.announce, Some(WorkAnnouncement::NeedsInput));
     }
 
@@ -12349,20 +12591,22 @@ mod tests {
             "main".to_string(),
             Some("workspace-1".to_string()),
         );
-        let a = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &[1]);
+        let first = [(1, WorkMoment::NeedsInput)];
+        let both = [(1, WorkMoment::NeedsInput), (2, WorkMoment::NeedsInput)];
+        let a = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &first);
         assert_eq!(a.announce, Some(WorkAnnouncement::NeedsInput));
         // A second agent starts waiting while the first still is.
-        let b = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &[1, 2]);
+        let b = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &both);
         assert_eq!(b.announce, Some(WorkAnnouncement::NeedsInput));
         // Both merely still waiting: quiet.
-        let held = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &[1, 2]);
+        let held = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &both);
         assert_eq!(held.announce, None);
         // One is answered while the other still waits: quiet.
-        let fewer = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &[2]);
+        let fewer = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &both[1..]);
         assert_eq!(fewer.announce, None);
         // The answered one asks a new question: it left and re-joined the
         // waiting set, so it rings again.
-        let again = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &[1, 2]);
+        let again = thread.observe_work_status(WorkspaceThreadWorkStatus::NeedsAttention, &both);
         assert_eq!(again.announce, Some(WorkAnnouncement::NeedsInput));
     }
 
@@ -12428,8 +12672,8 @@ mod tests {
     ) -> Option<WorkAnnouncement> {
         // NeedsAttention always arrives with the waiting panes in
         // production (the status IS "some pane waits"); mirror that.
-        let waiting: &[PaneId] = match status {
-            WorkspaceThreadWorkStatus::NeedsAttention => &[1],
+        let waiting: &[(PaneId, WorkMoment)] = match status {
+            WorkspaceThreadWorkStatus::NeedsAttention => &[(1, WorkMoment::NeedsInput)],
             _ => &[],
         };
         store
@@ -12583,6 +12827,154 @@ mod tests {
                 .announce,
             None
         );
+    }
+
+    #[test]
+    fn the_dock_counts_each_matching_thread_once_even_with_both_attention_kinds() {
+        use WorkspaceThreadWorkStatus as Status;
+        let attention = collect_work_moments([WorkMoment::NeedsInput, WorkMoment::Error]);
+        let unseen = unseen_work_moments(Status::NeedsAttention, attention);
+        assert_eq!(
+            first_work_moment(unseen, |m| m == WorkMoment::NeedsInput),
+            Some(WorkMoment::NeedsInput)
+        );
+        assert_eq!(
+            first_work_moment(unseen, |m| m == WorkMoment::Error),
+            Some(WorkMoment::Error)
+        );
+        assert_eq!(
+            first_work_moment(unseen, |_| true),
+            Some(WorkMoment::NeedsInput)
+        );
+        assert_eq!(
+            first_work_moment(
+                unseen_work_moments(Status::FinishedUnseen, attention),
+                |_| true
+            ),
+            Some(WorkMoment::Finished)
+        );
+        assert_eq!(
+            first_work_moment(unseen_work_moments(Status::Running, attention), |_| true),
+            None
+        );
+        assert_eq!(
+            first_work_moment(unseen_work_moments(Status::Idle, attention), |_| true),
+            None
+        );
+    }
+
+    #[test]
+    fn an_old_error_does_not_reclassify_a_new_input_request() {
+        use WorkspaceThreadWorkStatus as Status;
+        let mut thread = WorkspaceThread::new("project-1".into(), "work".into(), None);
+        let waiting = [
+            (1, attention_moment(None, false, &Progress::Error(100)).unwrap()),
+            (
+                2,
+                attention_moment(Some(Status::NeedsAttention), false, &Progress::Error(100))
+                    .unwrap(),
+            ),
+        ];
+        thread.observe_work_status(Status::NeedsAttention, &waiting[..1]);
+        let change = thread.observe_work_status(Status::NeedsAttention, &waiting);
+        assert_eq!(change.new_waiting_panes, vec![(2, WorkMoment::NeedsInput)]);
+        let moments = work_moments(change.announce.unwrap(), &change.new_waiting_panes);
+        assert!(moments.needs_input);
+        assert!(!moments.error);
+        assert_eq!(
+            first_work_moment(moments, |m| m == WorkMoment::NeedsInput),
+            Some(WorkMoment::NeedsInput)
+        );
+        assert!(thread
+            .observe_work_status(Status::NeedsAttention, &waiting)
+            .new_waiting_panes
+            .is_empty());
+
+        assert_eq!(
+            attention_moment(Some(Status::NeedsAttention), true, &Progress::None),
+            Some(WorkMoment::Error)
+        );
+        assert_eq!(
+            attention_moment(Some(Status::Idle), false, &Progress::Error(100)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_waiting_pane_changing_to_error_announces_once_with_an_error_only_filter() {
+        use WorkspaceThreadWorkStatus as Status;
+        let mut store = work_store_with_one_thread();
+        let waiting = [(1, WorkMoment::NeedsInput)];
+        let failed = [(1, WorkMoment::Error)];
+        let error_only = WorkMoments {
+            finished: false,
+            needs_input: false,
+            error: true,
+        };
+        let input = store
+            .observe_thread_work_for_workspace("workspace-1", Status::NeedsAttention, &waiting)
+            .unwrap();
+        assert_eq!(
+            first_work_moment(
+                work_moments(input.announce.unwrap(), &input.new_waiting_panes),
+                |moment| error_only.includes(moment)
+            ),
+            None
+        );
+
+        // Each keypress acknowledges the question, then the next scan
+        // sees it still waiting. Neither sound nor a banner may replay.
+        for _ in 0..3 {
+            store.acknowledge_thread_work_for_workspace("workspace-1");
+            let same = store
+                .observe_thread_work_for_workspace("workspace-1", Status::NeedsAttention, &waiting)
+                .unwrap();
+            assert_eq!(same.announce, None);
+            assert!(same.new_waiting_panes.is_empty());
+        }
+
+        // No Running or Idle observation separates the input and error.
+        let error = store
+            .observe_thread_work_for_workspace("workspace-1", Status::NeedsAttention, &failed)
+            .unwrap();
+        assert_eq!(error.new_waiting_panes, failed);
+        let moments = work_moments(error.announce.unwrap(), &error.new_waiting_panes);
+        assert_eq!(moments, error_only);
+        assert_eq!(
+            first_work_moment(moments, |moment| error_only.includes(moment)),
+            Some(WorkMoment::Error),
+            "both sound and system notification filters must see the new error"
+        );
+        for _ in 0..3 {
+            store.acknowledge_thread_work_for_workspace("workspace-1");
+            let same = store
+                .observe_thread_work_for_workspace("workspace-1", Status::NeedsAttention, &failed)
+                .unwrap();
+            assert_eq!(same.announce, None);
+        }
+
+        // Leaving attention ends the episode, so a later error is new.
+        for cleared in [Status::Running, Status::Idle] {
+            store.observe_thread_work_for_workspace("workspace-1", cleared, &[]);
+            let next = store
+                .observe_thread_work_for_workspace("workspace-1", Status::NeedsAttention, &failed)
+                .unwrap();
+            assert_eq!(next.announce, Some(WorkAnnouncement::NeedsInput));
+            assert_eq!(next.new_waiting_panes, failed);
+        }
+    }
+
+    #[test]
+    fn a_failed_build_reported_by_progress_is_an_error() {
+        use WorkspaceThreadWorkStatus as Status;
+        assert!(reports_native_error(None, &Progress::Error(100)));
+        assert!(!reports_native_error(None, &Progress::Percentage(40)));
+        assert!(!reports_native_error(None, &Progress::None));
+        // An agent's own state decides for its pane.
+        assert!(!reports_native_error(
+            Some(Status::NeedsAttention),
+            &Progress::Error(100)
+        ));
     }
 
     #[test]

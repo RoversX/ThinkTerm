@@ -131,6 +131,8 @@ pub enum SvgIcon {
     KeyRound,
     LogOut,
     Monitor,
+    Mic,
+    Camera,
     Network,
     /// The mux server of the README's architecture diagram: a host whose
     /// sessions live on it, which is what ThinkTerm Connect means.
@@ -428,6 +430,8 @@ impl SvgIcon {
             Self::KeyRound => include_bytes!("../../../../third_party/lucide/icons/key-round.svg"),
             Self::LogOut => include_bytes!("../../../../third_party/lucide/icons/log-out.svg"),
             Self::Monitor => include_bytes!("../../../../third_party/lucide/icons/monitor.svg"),
+            Self::Mic => include_bytes!("../../../../third_party/lucide/icons/mic.svg"),
+            Self::Camera => include_bytes!("../../../../third_party/lucide/icons/camera.svg"),
             Self::Apple => include_bytes!("../../../../third_party/simple-icons/icons/apple.svg"),
             Self::Network => include_bytes!("../../../../third_party/lucide/icons/network.svg"),
             Self::MuxServer => include_bytes!("../../../../assets/ui/mux-server.svg"),
@@ -957,6 +961,9 @@ mod tests {
             SvgIcon::Apple,
             SvgIcon::Monitor,
             SvgIcon::Network,
+            // Settings › General's permissions.
+            SvgIcon::Mic,
+            SvgIcon::Camera,
             // What a plugin's panel is shown by in the selector.
             SvgIcon::Activity,
             SvgIcon::Bug,

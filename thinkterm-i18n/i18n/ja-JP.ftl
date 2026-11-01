@@ -1694,6 +1694,7 @@ share-pill-removed = { $owner } さんに外されました · 閉じる
 share-pill-expired = 共有の時間が終わりました · 閉じる
 share-pill-closed = 共有されていたターミナルが閉じました · 閉じる
 settings-section-share-sync = 共有と同期
+settings-section-privacy = 権限
 settings-share-sync-description = このマシンの他のアカウントにターミナルを見せます。
 settings-sharing = ターミナルを共有
 settings-sharing-description = オンにすると、ターミナルに共有ボタンが付き、サイドバーに共有されたターミナルが表示されます。相手は見るだけで、入力するには申請してあなたが許可します。オフにすると共有中のものは止まります。
@@ -1702,3 +1703,43 @@ settings-sharing-experimental = 試験中の機能です。今後なくなる可
 settings-status-sharing-on = 共有をオンにしました
 settings-status-sharing-off = 共有をオフにしました
 settings-status-sharing-error = 共有の設定を保存できませんでした：{ $error }
+
+## Asking before something a terminal program printed is acted on.
+link-open-other-app = 別のアプリで開く
+link-open-cancel = キャンセル
+link-refused-unsafe = 開きませんでした：安全でないリンクです
+paste-confirm-header = 改行を含むため、貼り付けるとすぐにコマンドが実行されるおそれがあります
+paste-confirm-anyway = それでも貼り付ける
+paste-confirm-cancel = キャンセル
+settings-paste-confirmation = 改行を含む貼り付けの前に確認
+settings-paste-confirmation-description = 改行を含む内容を、1 行ずつすぐ実行してしまうプログラムに貼り付ける前に確認します。zsh のように貼り付けをひとまとまりで受け取るシェルでは確認しません。
+
+## Settings › Workspaces › Notifications: which moments each prompt answers.
+settings-dock-badge = Dock アイコンの数字
+settings-dock-badge-description = Dock の ThinkTerm アイコンに、まだ見ていないスレッドの数を表示します。
+settings-work-moment-finished = 完了
+settings-work-moment-needs-input = 対応待ち
+settings-work-moment-error = エラー
+
+## Settings › General: what macOS lets programs in local terminals do.
+settings-privacy-page-description = macOS は ThinkTerm のターミナルで実行するプログラムをすべて ThinkTerm として扱います。ここで許可した権限は、ターミナル内のどのプログラムも使えます。
+settings-privacy-heading = ターミナル内のプログラムの権限
+settings-privacy-full-disk = フルディスクアクセス
+settings-privacy-full-disk-description = デスクトップ、書類、ダウンロード、メールなど保護された場所の読み書き。
+settings-privacy-full-disk-caution = 注意：許可すると、ターミナルで実行するどのプログラムも（コマンドラインツール、スクリプト、AI エージェントを含む）、macOS に確認されることなく、これらの場所や他のアプリのデータを読み書きできます。必要なときだけオンにし、使い終わったらシステム設定でオフにしてください。
+settings-privacy-screen = 画面とシステムオーディオの録音
+settings-privacy-screen-description = スクリーンショット、画面収録、システム音声の録音をするプログラムに必要です。
+settings-privacy-microphone = マイク
+settings-privacy-microphone-description = 録音や音声入力をするプログラムに必要です。プログラムが最初に使うときにシステムが確認します。
+settings-privacy-camera = カメラ
+settings-privacy-camera-description = 写真やビデオを撮るプログラムに必要です。プログラムが最初に使うときにシステムが確認します。
+settings-privacy-open = システム設定を開く
+settings-privacy-granted = 許可済み
+settings-privacy-not-granted = 未許可
+settings-privacy-denied = 拒否
+settings-privacy-not-asked = 未確認
+settings-privacy-unknown = 不明
+settings-privacy-checking = 確認中…
+settings-privacy-holder-server = ThinkTerm バックグラウンドサービス
+settings-privacy-holder-app = ThinkTerm
+settings-privacy-holder-description = これらの権限はこのプログラムの名前で記録されます。フルディスクアクセスは手動で追加します：システム設定で + を押し、これをリストにドラッグしてください。

@@ -502,6 +502,17 @@ impl crate::TermWindow {
             crate::termwindow::ContextMenuApplicationAction::ResolveRemoteConfirm(proceed) => {
                 self.resolve_pending_remote_confirm(proceed);
             }
+            crate::termwindow::ContextMenuApplicationAction::ResolveTerminalLink(link) => {
+                if let Some(link) = link {
+                    log::info!("clicking {}", link);
+                    wezterm_open_url::open_url(&link);
+                }
+            }
+            crate::termwindow::ContextMenuApplicationAction::ResolvePaste(paste) => {
+                if let Some((pane_id, text)) = paste {
+                    self.paste_confirmed(pane_id, &text);
+                }
+            }
             crate::termwindow::ContextMenuApplicationAction::CopyRemotePreviewSelection => {
                 self.copy_right_sidebar_selected_file_preview_text();
             }

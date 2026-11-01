@@ -1694,6 +1694,7 @@ share-pill-removed = { $owner } 把你移出了 · 关闭
 share-pill-expired = 分享到时间了 · 关闭
 share-pill-closed = 分享的终端已关闭 · 关闭
 settings-section-share-sync = 共享与同步
+settings-section-privacy = 权限
 settings-share-sync-description = 让这台机器上的其他账户看你的终端。
 settings-sharing = 分享终端
 settings-sharing-description = 打开后，终端右上角会有分享按钮，侧栏会列出别人分享给你的终端。对方只能看，要打字得你同意。关掉会停止你正在进行的分享。
@@ -1702,3 +1703,43 @@ settings-sharing-experimental = 这是测试中的功能，之后可能会移除
 settings-status-sharing-on = 已打开分享
 settings-status-sharing-off = 已关闭分享
 settings-status-sharing-error = 没能保存分享设置：{ $error }
+
+## Asking before something a terminal program printed is acted on.
+link-open-other-app = 用其他应用打开
+link-open-cancel = 取消
+link-refused-unsafe = 没有打开：链接不安全
+paste-confirm-header = 这段内容带换行，一粘贴就可能直接执行命令
+paste-confirm-anyway = 仍然粘贴
+paste-confirm-cancel = 取消
+settings-paste-confirmation = 粘贴带换行的内容前先问
+settings-paste-confirmation-description = 带换行的内容要贴进会一行行马上执行的程序时，先问一下。zsh 这类把整段当一次粘贴的 shell 不会问。
+
+## Settings › Workspaces › Notifications: which moments each prompt answers.
+settings-dock-badge = Dock 图标数字
+settings-dock-badge-description = Dock 上的 ThinkTerm 图标显示有几个 Thread 你还没看。
+settings-work-moment-finished = 完成
+settings-work-moment-needs-input = 等你
+settings-work-moment-error = 出错
+
+## Settings › General: what macOS lets programs in local terminals do.
+settings-privacy-page-description = macOS 把 ThinkTerm 终端里运行的程序都算在 ThinkTerm 名下：在这里允许的权限，终端里的每个程序都能用。
+settings-privacy-heading = 终端里程序的权限
+settings-privacy-full-disk = 完全磁盘访问
+settings-privacy-full-disk-description = 读写桌面、文稿、下载、邮件这些受保护的位置。
+settings-privacy-full-disk-caution = 注意：允许后，终端里运行的任何程序，包括命令行工具、脚本和 AI agent，都能直接读写这些位置和其他应用的数据，系统不会再问你。只在确实需要时打开，用完可以在系统设置里关掉。
+settings-privacy-screen = 屏幕与系统录音
+settings-privacy-screen-description = 截屏、录屏、录系统声音的程序要用。
+settings-privacy-microphone = 麦克风
+settings-privacy-microphone-description = 录音、语音输入的程序要用。程序第一次用时系统会问。
+settings-privacy-camera = 摄像头
+settings-privacy-camera-description = 拍照、录像的程序要用。程序第一次用时系统会问。
+settings-privacy-open = 打开系统设置
+settings-privacy-granted = 已允许
+settings-privacy-not-granted = 没有
+settings-privacy-denied = 被拒绝
+settings-privacy-not-asked = 还没问过
+settings-privacy-unknown = 查不到
+settings-privacy-checking = 正在查…
+settings-privacy-holder-server = ThinkTerm 后台服务
+settings-privacy-holder-app = ThinkTerm
+settings-privacy-holder-description = 这些权限记在它名下。完全磁盘访问要自己加：在系统设置里点 +，把它拖进列表。

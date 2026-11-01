@@ -151,6 +151,7 @@ pub mod charselect;
 pub mod clipboard;
 pub mod content_view;
 pub mod keyevent;
+mod link_open;
 pub(crate) mod live_overview;
 pub mod modal;
 mod mouseevent;
@@ -742,6 +743,12 @@ pub(crate) enum ContextMenuApplicationAction {
     CopyRemotePreviewAll,
     /// Answer to "these files already exist" for a queued local copy.
     ResolveLocalCopyConflict(transfer_walk::ConflictChoice),
+    /// Answer to "open this terminal link in another app?": the link to
+    /// open, or `None` to leave it.
+    ResolveTerminalLink(Option<String>),
+    /// Answer to "this paste could run commands, paste anyway?": the pane
+    /// and the text to paste into it, or `None` to leave it.
+    ResolvePaste(Option<(PaneId, String)>),
 }
 
 /// The scrollbar track a thumb, or the space above or below it, belongs
@@ -2934,6 +2941,9 @@ pub struct TermWindow {
     last_mouse_coords: (usize, i64),
     window_drag_position: Option<MouseEvent>,
     current_mouse_event: Option<MouseEvent>,
+    /// The active pane's cursor cell as last painted, in window pixels:
+    /// where a question about a paste is asked.
+    text_cursor_rect: Option<Rect>,
     prev_cursor: PrevCursorPos,
     last_scroll_info: RenderableDimensions,
 
@@ -4988,6 +4998,7 @@ impl TermWindow {
             last_mouse_coords: (0, -1),
             window_drag_position: None,
             current_mouse_event: None,
+            text_cursor_rect: None,
             current_modifier_and_leds: Default::default(),
             prev_cursor: PrevCursorPos::new(),
             last_scroll_info: RenderableDimensions::default(),
@@ -5852,9 +5863,8 @@ impl TermWindow {
                     Some(pane) => pane,
                     None => return Ok(true),
                 };
-                let cursor = pane.get_cursor_position();
-                pane.send_paste(text.as_str())?;
-                self.light_up_terminal_paste(&pane, &text, cursor);
+                // Dropped text is a paste, and asks first like one.
+                self.paste_text_into(&pane, &text);
                 Ok(true)
             }
             WindowEvent::DroppedUrl(urls) => {
@@ -6378,6 +6388,9 @@ impl TermWindow {
                         }
                     }
                     crate::workspace_threads::refresh_thread_work_for_pane(pane_id);
+                    // Blocked and Error share NeedsAttention, but the Dock
+                    // can count just one of them.
+                    crate::workspace_threads::schedule_dock_badge_refresh();
                     // Waiting -> error leaves the aggregate NeedsAttention
                     // unchanged, but changes its icon. Decide from what this
                     // window displays, not from the aggregate's changed bit.
@@ -9797,6 +9810,7 @@ impl TermWindow {
             cell_size,
         );
         win.set_text_cursor_position(r);
+        self.text_cursor_rect = Some(r);
     }
 
     fn activate_window(&mut self, window_idx: usize) -> anyhow::Result<()> {
@@ -12022,13 +12036,21 @@ impl TermWindow {
         if let Some(link) = self.current_highlight.as_ref().cloned() {
             let window = GuiWin::new(self);
             let pane = MuxPane(pane.pane_id());
+            // Where a link that asks first puts its menu.
+            let anchor = self
+                .current_mouse_event
+                .as_ref()
+                .map(|event| event.coords)
+                .unwrap_or_else(|| ::window::Point::new(0, 0));
 
             async fn open_uri(
                 lua: Option<Rc<mlua::Lua>>,
                 window: GuiWin,
                 pane: MuxPane,
                 link: String,
+                anchor: ::window::Point,
             ) -> anyhow::Result<()> {
+                let term_window = window.window.clone();
                 let default_click = match lua {
                     Some(lua) => {
                         let args = lua.pack_multi((window, pane, link.clone()))?;
@@ -12042,14 +12064,20 @@ impl TermWindow {
                     None => true,
                 };
                 if default_click {
-                    log::info!("clicking {}", link);
-                    wezterm_open_url::open_url(&link);
+                    if link_open::classify(&link) == link_open::LinkOpen::Direct {
+                        log::info!("clicking {}", link);
+                        wezterm_open_url::open_url(&link);
+                    } else {
+                        term_window.notify(TermWindowNotif::Apply(Box::new(move |myself| {
+                            myself.open_terminal_link(link, anchor);
+                        })));
+                    }
                 }
                 Ok(())
             }
 
             promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| {
-                open_uri(lua, window, pane, link.uri().to_string())
+                open_uri(lua, window, pane, link.uri().to_string(), anchor)
             }))
             .detach();
         }

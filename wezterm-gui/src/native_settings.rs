@@ -952,6 +952,10 @@ pub(crate) struct NativeTerminalSettings {
     pub(crate) copy_on_select: bool,
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) right_click: NativeRightClick,
+    /// Ask before a paste whose line breaks would run its lines one by one,
+    /// in a program that did not ask for pastes bracketed. Off unless chosen.
+    #[serde(default)]
+    pub(crate) paste_confirmation: bool,
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) copy_effect: NativeCopyEffect,
     /// The pane the mouse moves onto takes the focus, without a click.
@@ -990,6 +994,7 @@ impl Default for NativeTerminalSettings {
             selection_style: NativeSelectionStyle::default(),
             copy_on_select: true,
             right_click: NativeRightClick::default(),
+            paste_confirmation: false,
             copy_effect: NativeCopyEffect::default(),
             focus_follows_mouse: false,
             text_contrast: NativeTextContrast::default(),
@@ -1032,6 +1037,11 @@ pub(crate) fn selection_rounded() -> bool {
 /// Read on every right click, through the shared handle.
 pub(crate) fn right_click() -> NativeRightClick {
     load_shared().terminal.right_click
+}
+
+/// Read on every paste with a line break in it, through the shared handle.
+pub(crate) fn paste_confirmation() -> bool {
+    load_shared().terminal.paste_confirmation
 }
 
 /// Read on every copy and paste, through the shared handle.
@@ -1518,6 +1528,14 @@ pub(crate) struct NativeWorkspaceSettings {
     /// While ThinkTerm is in the background, tell the system when a thread
     /// finishes, starts waiting on you, or stops on an error.
     pub(crate) system_notifications_enabled: bool,
+    /// Which of a thread's moments the sounds mark, while they are on.
+    pub(crate) notification_sound_moments: WorkMoments,
+    /// Which of them the system notifications tell of, while they are on.
+    pub(crate) system_notification_moments: WorkMoments,
+    /// Count the threads with something unseen on the Dock icon (macOS).
+    pub(crate) dock_badge_enabled: bool,
+    /// Which of their moments the Dock icon counts, while it counts.
+    pub(crate) dock_badge_moments: WorkMoments,
     /// Updating a remote mux server hands its sessions to the new version
     /// instead of stopping it; off, the update asks whether to stop it.
     pub(crate) remote_update_keeps_sessions: bool,
@@ -1546,6 +1564,10 @@ impl Default for NativeWorkspaceSettings {
             remote_drop_destination: String::new(),
             notification_sounds_enabled: true,
             system_notifications_enabled: true,
+            notification_sound_moments: WorkMoments::default(),
+            system_notification_moments: WorkMoments::default(),
+            dock_badge_enabled: true,
+            dock_badge_moments: WorkMoments::default(),
             remote_update_keeps_sessions: true,
             update_download_source: thinkterm_update::DownloadSource::Auto.name().to_string(),
             check_for_updates: None,
@@ -1554,6 +1576,59 @@ impl Default for NativeWorkspaceSettings {
             // Fresh installs enable it in ThinkTermNativeSettings::for_new_install.
             local_sessions_via_mux: false,
         }
+    }
+}
+
+/// A moment in a thread's work that may prompt you: it finished, it waits
+/// on you, or its program stopped on an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkMoment {
+    Finished,
+    NeedsInput,
+    Error,
+}
+
+impl WorkMoment {
+    pub(crate) const ALL: [WorkMoment; 3] =
+        [WorkMoment::Finished, WorkMoment::NeedsInput, WorkMoment::Error];
+}
+
+/// Which [`WorkMoment`]s one kind of prompt -- the sound, the system
+/// notification, the Dock count -- answers. All of them unless taken out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct WorkMoments {
+    pub(crate) finished: bool,
+    pub(crate) needs_input: bool,
+    pub(crate) error: bool,
+}
+
+impl Default for WorkMoments {
+    fn default() -> Self {
+        Self {
+            finished: true,
+            needs_input: true,
+            error: true,
+        }
+    }
+}
+
+impl WorkMoments {
+    pub(crate) fn includes(self, moment: WorkMoment) -> bool {
+        match moment {
+            WorkMoment::Finished => self.finished,
+            WorkMoment::NeedsInput => self.needs_input,
+            WorkMoment::Error => self.error,
+        }
+    }
+
+    pub(crate) fn toggle(&mut self, moment: WorkMoment) {
+        let slot = match moment {
+            WorkMoment::Finished => &mut self.finished,
+            WorkMoment::NeedsInput => &mut self.needs_input,
+            WorkMoment::Error => &mut self.error,
+        };
+        *slot = !*slot;
     }
 }
 
@@ -3133,12 +3208,33 @@ pub(crate) fn pane_header_font_size(settings: &ThinkTermNativeSettings) -> f64 {
         .clamp(10.0, 28.0)
 }
 
-pub(crate) fn notification_sounds_enabled() -> bool {
-    load().workspaces.notification_sounds_enabled
-}
-
 pub(crate) fn system_notifications_enabled() -> bool {
     load_shared().workspaces.system_notifications_enabled
+}
+
+/// Whether a sound marks `moment`: sounds are on, and on for it.
+pub(crate) fn notification_sound_for(moment: WorkMoment) -> bool {
+    let settings = load_shared();
+    settings.workspaces.notification_sounds_enabled
+        && settings.workspaces.notification_sound_moments.includes(moment)
+}
+
+/// Whether the system is told of `moment`, as for the sounds.
+pub(crate) fn system_notification_for(moment: WorkMoment) -> bool {
+    system_notifications_enabled()
+        && load_shared()
+            .workspaces
+            .system_notification_moments
+            .includes(moment)
+}
+
+/// The moments the Dock icon counts, or `None` while it counts nothing.
+pub(crate) fn dock_badge_moments() -> Option<WorkMoments> {
+    let settings = load_shared();
+    settings
+        .workspaces
+        .dock_badge_enabled
+        .then_some(settings.workspaces.dock_badge_moments)
 }
 
 /// What is shown of programs' own status reports. `load_shared`: asked
@@ -3247,6 +3343,35 @@ pub(crate) fn main_window_renderer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_moment_prompts_until_one_is_taken_out() {
+        // A settings file from before the moments: as it behaved, and the
+        // Dock counts.
+        let settings: ThinkTermNativeSettings = serde_json::from_str("{}").unwrap();
+        let workspaces = &settings.workspaces;
+        for moment in WorkMoment::ALL {
+            assert!(workspaces.notification_sound_moments.includes(moment));
+            assert!(workspaces.system_notification_moments.includes(moment));
+            assert!(workspaces.dock_badge_moments.includes(moment));
+        }
+        assert!(workspaces.dock_badge_enabled);
+
+        let settings: ThinkTermNativeSettings = serde_json::from_str(
+            r#"{"workspaces": {"notification_sound_moments": {"finished": false}}}"#,
+        )
+        .unwrap();
+        let moments = settings.workspaces.notification_sound_moments;
+        assert!(!moments.includes(WorkMoment::Finished));
+        assert!(moments.includes(WorkMoment::NeedsInput));
+        assert!(moments.includes(WorkMoment::Error));
+
+        let mut moments = WorkMoments::default();
+        moments.toggle(WorkMoment::Error);
+        assert!(!moments.includes(WorkMoment::Error));
+        moments.toggle(WorkMoment::Error);
+        assert_eq!(moments, WorkMoments::default());
+    }
 
     #[test]
     fn sharing_is_off_until_turned_on() {
@@ -3760,15 +3885,16 @@ mod tests {
         assert_eq!(settings.terminal.scroll_mode, NativeScrollMode::Stepped);
         assert_eq!(settings.localization.language.as_deref(), Some("ja-JP"));
 
-        // Selecting copies unless turned off; the focus waits for a click
-        // unless turned on.
+        // Selecting copies unless turned off; the focus waits for a click,
+        // and a paste goes in without asking, unless turned on.
         assert!(settings.terminal.copy_on_select);
         assert!(!settings.terminal.focus_follows_mouse);
+        assert!(!settings.terminal.paste_confirmation);
 
         // The ones this build knows still read as written.
         let json = r#"{ "version": 1, "terminal": {
             "selection_style": "square", "copy_on_select": false, "right_click": "copy_or_paste",
-            "copy_effect": "color", "focus_follows_mouse": true
+            "copy_effect": "color", "focus_follows_mouse": true, "paste_confirmation": true
         } }"#;
         let settings: ThinkTermNativeSettings = serde_json::from_str(json).unwrap();
         assert!(!settings.terminal.copy_on_select);
@@ -3776,6 +3902,7 @@ mod tests {
         assert_eq!(settings.terminal.right_click, NativeRightClick::CopyOrPaste);
         assert_eq!(settings.terminal.copy_effect, NativeCopyEffect::Color);
         assert!(settings.terminal.focus_follows_mouse);
+        assert!(settings.terminal.paste_confirmation);
     }
 
     /// The four this build does know still round-trip.

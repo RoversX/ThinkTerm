@@ -1740,6 +1740,7 @@ share-pill-removed = { $owner } hat Sie entfernt · Schließen
 share-pill-expired = Die Freigabe ist abgelaufen · Schließen
 share-pill-closed = Das geteilte Terminal wurde geschlossen · Schließen
 settings-section-share-sync = Teilen & Synchronisieren
+settings-section-privacy = Berechtigungen
 settings-share-sync-description = Lassen Sie andere Konten auf diesem Rechner Ihren Terminals zusehen.
 settings-sharing = Terminals teilen
 settings-sharing-description = Eingeschaltet haben Terminals einen Teilen-Knopf, und die Seitenleiste zeigt, was andere mit Ihnen teilen. Andere sehen nur zu; zum Tippen fragen sie an, und Sie entscheiden. Ausschalten beendet Ihre laufenden Freigaben.
@@ -1748,3 +1749,43 @@ settings-sharing-experimental = Diese Funktion ist experimentell: Sie wird viell
 settings-status-sharing-on = Teilen eingeschaltet
 settings-status-sharing-off = Teilen ausgeschaltet
 settings-status-sharing-error = Die Einstellung zum Teilen konnte nicht gespeichert werden: { $error }
+
+## Asking before something a terminal program printed is acted on.
+link-open-other-app = In anderer App öffnen
+link-open-cancel = Abbrechen
+link-refused-unsafe = Nicht geöffnet: Der Link ist unsicher
+paste-confirm-header = Der Text enthält Zeilenumbrüche und könnte beim Einfügen sofort Befehle ausführen
+paste-confirm-anyway = Trotzdem einfügen
+paste-confirm-cancel = Abbrechen
+settings-paste-confirmation = Vor dem Einfügen von Zeilenumbrüchen fragen
+settings-paste-confirmation-description = Fragt nach, bevor Text mit Zeilenumbrüchen in ein Programm geht, das jede Zeile sofort ausführen würde. Shells wie zsh, die Eingefügtes als Ganzes annehmen, sind nicht betroffen.
+
+## Settings › Workspaces › Notifications: which moments each prompt answers.
+settings-dock-badge = Zahl am Dock-Symbol
+settings-dock-badge-description = Zeigt am Dock-Symbol von ThinkTerm, wie viele Threads etwas haben, das Sie noch nicht angesehen haben.
+settings-work-moment-finished = Fertig
+settings-work-moment-needs-input = Braucht Sie
+settings-work-moment-error = Fehler
+
+## Settings › General: what macOS lets programs in local terminals do.
+settings-privacy-page-description = macOS rechnet jedes Programm in den Terminals von ThinkTerm ThinkTerm zu: Eine hier erlaubte Berechtigung kann jedes davon nutzen.
+settings-privacy-heading = Berechtigungen für Programme in Terminals
+settings-privacy-full-disk = Festplattenvollzugriff
+settings-privacy-full-disk-description = Lesen und Schreiben an geschützten Orten wie Schreibtisch, Dokumente, Downloads und Mail.
+settings-privacy-full-disk-caution = Vorsicht: Einmal erlaubt, kann jedes Programm in einem Terminal, auch Kommandozeilenwerkzeuge, Skripte und KI-Agenten, diese Orte und die Daten anderer Apps lesen und ändern, ohne dass macOS Sie fragt. Schalten Sie ihn nur ein, wenn Sie ihn brauchen, und danach in den Systemeinstellungen wieder aus.
+settings-privacy-screen = Bildschirm- und System-Audioaufnahme
+settings-privacy-screen-description = Für Programme, die Bildschirmfotos machen, den Bildschirm oder den Systemton aufnehmen.
+settings-privacy-microphone = Mikrofon
+settings-privacy-microphone-description = Für Programme, die Ton aufnehmen oder Spracheingabe nutzen. macOS fragt, wenn eines es zum ersten Mal braucht.
+settings-privacy-camera = Kamera
+settings-privacy-camera-description = Für Programme, die Fotos oder Videos aufnehmen. macOS fragt, wenn eines es zum ersten Mal braucht.
+settings-privacy-open = Systemeinstellungen öffnen
+settings-privacy-granted = Erlaubt
+settings-privacy-not-granted = Nicht erlaubt
+settings-privacy-denied = Abgelehnt
+settings-privacy-not-asked = Noch nicht gefragt
+settings-privacy-unknown = Unbekannt
+settings-privacy-checking = Wird geprüft…
+settings-privacy-holder-server = ThinkTerm-Hintergrunddienst
+settings-privacy-holder-app = ThinkTerm
+settings-privacy-holder-description = Diese Berechtigungen gelten unter seinem Namen. Festplattenvollzugriff muss von Hand hinzugefügt werden: in den Systemeinstellungen auf + klicken und ihn in die Liste ziehen.

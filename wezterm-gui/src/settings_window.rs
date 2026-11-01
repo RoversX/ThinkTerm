@@ -2,6 +2,8 @@ use crate::tab_icons::RgbExt as _;
 use crate::customglyph::{BlockKey, Poly};
 use crate::glyphcache::CachedGlyph;
 use crate::native_settings::AgentStatusPart;
+use crate::native_settings::{NativeWorkspaceSettings, WorkMoment, WorkMoments};
+use wezterm_mux_server_impl::privacy::PrivacyReport;
 use crate::quad::{
     HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait,
 };
@@ -86,6 +88,10 @@ const HERO_MARK_SIZE: f32 = 108.0;
 const SWITCH_WIDTH: f32 = 76.0;
 const SWITCH_HEIGHT: f32 = 44.0;
 const SWITCH_KNOB_INSET: f32 = 4.0;
+/// The ticked chips under a Notifications prompt, one per moment.
+const WORK_MOMENT_CHIP_HEIGHT: f32 = 44.0;
+const WORK_MOMENT_CHIP_GAP: f32 = 14.0;
+const WORK_MOMENT_CHECK_SIDE: f32 = 24.0;
 // Matches termwindow::ui::tokens::SIDEBAR_ROW_HIGHLIGHT_RADIUS: the two
 // sidebars draw the same shape.
 const NAV_ROW_RADIUS: f32 = 20.0;
@@ -912,6 +918,9 @@ enum SettingsSection {
     /// Sharing a terminal with other accounts on its machine, and later
     /// syncing with one's other devices.
     ShareSync,
+    /// What macOS lets the programs run in terminals do, and where to allow
+    /// it. A Mac's page only.
+    Privacy,
     /// Not a page: what a search for it finds, which leads to the Tailscale
     /// group in Remote Hosts, where the tailnet is set up beside its
     /// machines.
@@ -938,6 +947,7 @@ const BASE_SECTIONS: &[SettingsSection] = &[
     SettingsSection::Agents,
     SettingsSection::Web,
     SettingsSection::ShareSync,
+    SettingsSection::Privacy,
     SettingsSection::Archived,
     SettingsSection::Keymap,
     SettingsSection::CommandPalette,
@@ -1015,6 +1025,8 @@ fn initial_section() -> SettingsSection {
         "agents" => SettingsSection::Agents,
         "web" => SettingsSection::Web,
         "share" | "sharing" | "sharesync" | "share-sync" => SettingsSection::ShareSync,
+        // A Mac's page only: elsewhere there is none to open.
+        "privacy" | "permissions" if cfg!(target_os = "macos") => SettingsSection::Privacy,
         // The plugins are on the Sidebar page, the only place they show.
         "plugins" => SettingsSection::Sidebar,
         "archived" => SettingsSection::Archived,
@@ -1051,6 +1063,7 @@ impl SettingsSection {
             Self::Agents => crate::i18n::tr("settings-section-agents"),
             Self::Web => crate::i18n::tr("settings-section-web"),
             Self::ShareSync => crate::i18n::tr("settings-section-share-sync"),
+            Self::Privacy => crate::i18n::tr("settings-section-privacy"),
             Self::Tailscale => crate::i18n::tr("settings-section-tailscale"),
             Self::Archived => crate::i18n::tr("settings-section-archived"),
             Self::Keymap => crate::i18n::tr("settings-section-keymap"),
@@ -1076,6 +1089,7 @@ impl SettingsSection {
             Self::Agents => SettingsIcon::Agents,
             Self::Web => SettingsIcon::Web,
             Self::ShareSync => SettingsIcon::Share,
+            Self::Privacy => SettingsIcon::Privacy,
             Self::Tailscale => SettingsIcon::Tailscale,
             Self::Archived => SettingsIcon::Archived,
             Self::Keymap => SettingsIcon::Keymap,
@@ -1103,6 +1117,7 @@ impl SettingsSection {
             Self::Agents => TileColor::Orange,
             Self::Web => TileColor::Teal,
             Self::ShareSync => TileColor::Green,
+            Self::Privacy => TileColor::Blue,
             Self::Tailscale => TileColor::Blue,
             Self::Archived => TileColor::Indigo,
             Self::Keymap => TileColor::Gray,
@@ -1156,6 +1171,14 @@ impl SettingsSection {
                 "Shared with Me",
                 "Watch",
                 "Sync",
+            ],
+            Self::Privacy => &[
+                "Permissions",
+                "Privacy",
+                "Full Disk Access",
+                "Screen Recording",
+                "Microphone",
+                "Camera",
             ],
             Self::Tailscale => &[
                 "Tailscale",
@@ -1246,6 +1269,10 @@ impl SettingsSection {
                 "Remote Files",
                 "SFTP",
                 "Idle Timeout",
+                "Notifications",
+                "Sounds",
+                "Dock",
+                "Badge",
             ],
             Self::Agents => &[
                 "Agent",
@@ -1396,6 +1423,16 @@ impl SettingsSection {
                 && ["settings-language", "settings-restore-pane-output"]
                     .iter()
                     .any(|key| crate::i18n::tr(key).to_lowercase().contains(query)))
+            || (self == Self::Privacy
+                && [
+                    "settings-privacy-heading",
+                    "settings-privacy-full-disk",
+                    "settings-privacy-screen",
+                    "settings-privacy-microphone",
+                    "settings-privacy-camera",
+                ]
+                .iter()
+                .any(|key| crate::i18n::tr(key).to_lowercase().contains(query)))
             || (self == Self::Appearance
                 && [
                     "settings-window-opacity",
@@ -1422,6 +1459,7 @@ impl SettingsSection {
                     "settings-copy-on-select",
                     "settings-right-click",
                     "settings-right-click-paste",
+                    "settings-paste-confirmation",
                     "settings-copy-effect",
                     "settings-focus-follows-mouse",
                     "settings-split-animation",
@@ -1482,6 +1520,16 @@ mod settings_search_tests {
         }
         let localized_label = crate::i18n::tr("settings-right-click").to_lowercase();
         assert!(SettingsSection::Terminal.matches_search(&localized_label));
+    }
+
+    #[test]
+    fn permissions_are_found_on_their_own_page() {
+        for query in ["full disk access", "screen recording", "permissions", "camera"] {
+            assert!(SettingsSection::Privacy.matches_search(query), "{}", query);
+            assert!(!SettingsSection::General.matches_search(query), "{}", query);
+        }
+        let heading = crate::i18n::tr("settings-privacy-heading").to_lowercase();
+        assert!(SettingsSection::Privacy.matches_search(&heading));
     }
 
     #[test]
@@ -1999,6 +2047,79 @@ fn web_token_key(id: &str) -> u64 {
     hasher.finish()
 }
 
+/// One way a thread's moments can prompt you, as the Notifications card
+/// lists them, each with the moments it answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkPrompt {
+    Sound,
+    SystemNotification,
+    DockBadge,
+}
+
+impl WorkPrompt {
+    fn label_key(self) -> &'static str {
+        match self {
+            Self::Sound => "settings-notification-sounds",
+            Self::SystemNotification => "settings-system-notifications",
+            Self::DockBadge => "settings-dock-badge",
+        }
+    }
+
+    fn enabled(self, workspaces: &NativeWorkspaceSettings) -> bool {
+        match self {
+            Self::Sound => workspaces.notification_sounds_enabled,
+            Self::SystemNotification => workspaces.system_notifications_enabled,
+            Self::DockBadge => workspaces.dock_badge_enabled,
+        }
+    }
+
+    fn moments(self, workspaces: &NativeWorkspaceSettings) -> WorkMoments {
+        match self {
+            Self::Sound => workspaces.notification_sound_moments,
+            Self::SystemNotification => workspaces.system_notification_moments,
+            Self::DockBadge => workspaces.dock_badge_moments,
+        }
+    }
+
+    fn moments_mut(self, workspaces: &mut NativeWorkspaceSettings) -> &mut WorkMoments {
+        match self {
+            Self::Sound => &mut workspaces.notification_sound_moments,
+            Self::SystemNotification => &mut workspaces.system_notification_moments,
+            Self::DockBadge => &mut workspaces.dock_badge_moments,
+        }
+    }
+
+    fn merge(self, from: &NativeWorkspaceSettings, into: &mut NativeWorkspaceSettings) {
+        match self {
+            Self::Sound => into.notification_sounds_enabled = from.notification_sounds_enabled,
+            Self::SystemNotification => {
+                into.system_notifications_enabled = from.system_notifications_enabled;
+            }
+            Self::DockBadge => into.dock_badge_enabled = from.dock_badge_enabled,
+        }
+        *self.moments_mut(into) = self.moments(from);
+    }
+}
+
+/// What the programs in local terminals may do, as Settings › General last
+/// found it (macOS).
+#[derive(Debug, Clone)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+enum PrivacyCheck {
+    /// Not looked yet, or due for another look.
+    Stale,
+    Checking,
+    Done(Result<PrivacyReport, String>),
+}
+
+fn work_moment_label_key(moment: WorkMoment) -> &'static str {
+    match moment {
+        WorkMoment::Finished => "settings-work-moment-finished",
+        WorkMoment::NeedsInput => "settings-work-moment-needs-input",
+        WorkMoment::Error => "settings-work-moment-error",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsAction {
     SelectImportSource(ImportSource),
@@ -2027,6 +2148,16 @@ enum SettingsAction {
     ToggleSharing,
     ToggleNotificationSounds,
     ToggleSystemNotifications,
+    ToggleDockBadge,
+    /// One moment's chip under a prompt in the Notifications card.
+    ToggleWorkMoment(WorkPrompt, WorkMoment),
+    /// A permission's page in System Settings › Privacy & Security.
+    #[cfg(target_os = "macos")]
+    OpenPrivacySettings(&'static str),
+    /// Show the program the permissions belong to in Finder, to be dragged
+    /// into a permission's list.
+    #[cfg(target_os = "macos")]
+    RevealPrivacyHolder,
     ToggleAgentStatusPart(AgentStatusPart),
     ToggleRemoteUpdateKeepsSessions,
     ToggleLocalSessionsViaMux,
@@ -2135,6 +2266,7 @@ enum SettingsAction {
     SetScrollMode(crate::native_settings::NativeScrollMode),
     SetSelectionStyle(crate::native_settings::NativeSelectionStyle),
     ToggleCopyOnSelect,
+    TogglePasteConfirmation,
     ToggleFocusFollowsMouse,
     SetRightClick(crate::native_settings::NativeRightClick),
     SetCopyEffect(crate::native_settings::NativeCopyEffect),
@@ -2830,6 +2962,8 @@ struct SettingsUiState {
     tab_icon_glyph_input_dirty: bool,
     /// Two-step delete: the card whose Delete was clicked once.
     confirm_delete_tab_icon: Option<String>,
+    /// The permissions card's last look (macOS).
+    privacy: PrivacyCheck,
 }
 
 impl SettingsUiState {
@@ -2910,6 +3044,7 @@ impl SettingsUiState {
             tab_icon_glyph_input: TextInputState::new(),
             tab_icon_glyph_input_dirty: false,
             confirm_delete_tab_icon: None,
+            privacy: PrivacyCheck::Stale,
         }
     }
 }
@@ -4210,6 +4345,15 @@ impl SettingsWindow {
                 // macOS, so it ends when Settings is left.
                 self.ui.keymap.stop_recording();
                 window.invalidate();
+                Ok(true)
+            }
+            WindowEvent::FocusChanged(true) => {
+                // Back from System Settings, perhaps having granted one: the
+                // permissions card looks again when it is next painted.
+                if matches!(self.ui.privacy, PrivacyCheck::Done(_)) {
+                    self.ui.privacy = PrivacyCheck::Stale;
+                    window.invalidate();
+                }
                 Ok(true)
             }
             WindowEvent::AppearanceChanged(appearance) => {
@@ -6146,6 +6290,11 @@ impl SettingsWindow {
                 sections.extend_from_slice(DEVELOPER_SECTIONS);
             }
         }
+        // What macOS asks of programs run in terminals: other systems ask
+        // nothing of the kind.
+        if !cfg!(target_os = "macos") {
+            sections.retain(|section| *section != SettingsSection::Privacy);
+        }
         sections
     }
 
@@ -6339,7 +6488,7 @@ impl SettingsWindow {
                 self.ui.open_dropdown = None;
                 self.native_settings.workspaces.notification_sounds_enabled =
                     !self.native_settings.workspaces.notification_sounds_enabled;
-                match crate::native_settings::save(&self.native_settings) {
+                match self.persist_work_prompt(WorkPrompt::Sound) {
                     Ok(()) => {
                         self.status = if self.native_settings.workspaces.notification_sounds_enabled
                         {
@@ -6361,13 +6510,39 @@ impl SettingsWindow {
                 self.native_settings.workspaces.system_notifications_enabled =
                     !self.native_settings.workspaces.system_notifications_enabled;
                 let setting = crate::i18n::tr("settings-system-notifications");
-                self.status = match crate::native_settings::save(&self.native_settings) {
+                self.status = match self.persist_work_prompt(WorkPrompt::SystemNotification) {
                     Ok(()) => settings_tr("settings-status-saved", &[("setting", setting)]),
                     Err(err) => settings_tr(
                         "settings-status-save-error",
                         &[("setting", setting), ("error", format!("{err:#}"))],
                     ),
                 };
+            }
+            SettingsAction::ToggleDockBadge => {
+                self.ui.open_dropdown = None;
+                self.native_settings.workspaces.dock_badge_enabled =
+                    !self.native_settings.workspaces.dock_badge_enabled;
+                self.save_work_prompt(WorkPrompt::DockBadge);
+            }
+            SettingsAction::ToggleWorkMoment(prompt, moment) => {
+                self.ui.open_dropdown = None;
+                prompt
+                    .moments_mut(&mut self.native_settings.workspaces)
+                    .toggle(moment);
+                self.save_work_prompt(prompt);
+            }
+            #[cfg(target_os = "macos")]
+            SettingsAction::OpenPrivacySettings(pane) => {
+                self.ui.open_dropdown = None;
+                wezterm_open_url::open_url(&crate::privacy_status::settings_url(pane));
+            }
+            #[cfg(target_os = "macos")]
+            SettingsAction::RevealPrivacyHolder => {
+                self.ui.open_dropdown = None;
+                match crate::privacy_status::responsible_program() {
+                    Ok(program) => wezterm_open_url::reveal_path(&program),
+                    Err(err) => log::warn!("finding the program permissions belong to: {err:#}"),
+                }
             }
             SettingsAction::ToggleAgentStatusPart(part) => {
                 self.ui.open_dropdown = None;
@@ -6766,6 +6941,19 @@ impl SettingsWindow {
                 });
                 self.apply_terminal_change("settings-copy-on-select", done, |terminal| {
                     terminal.copy_on_select = on
+                })
+            }
+            SettingsAction::TogglePasteConfirmation => {
+                let on = !self.native_settings.terminal.paste_confirmation;
+                let done = settings_tr(
+                    "settings-status-value-now",
+                    &[
+                        ("setting", crate::i18n::tr("settings-paste-confirmation")),
+                        ("value", crate::i18n::tr(if on { "common-on" } else { "common-off" })),
+                    ],
+                );
+                self.apply_terminal_change("settings-paste-confirmation", done, |terminal| {
+                    terminal.paste_confirmation = on
                 })
             }
             SettingsAction::ToggleFocusFollowsMouse => {
@@ -8518,6 +8706,7 @@ impl SettingsWindow {
             SettingsSection::Agents => self.paint_agents(layers, x, max_width)?,
             SettingsSection::Web => self.paint_web(layers, x, max_width)?,
             SettingsSection::ShareSync => self.paint_share_sync(layers, x, max_width)?,
+            SettingsSection::Privacy => self.paint_privacy(layers, x, max_width)?,
             // Never selected: picking it opens Remote Hosts instead.
             SettingsSection::Tailscale => {}
             SettingsSection::Archived => self.paint_archived(layers, x, max_width)?,
@@ -8959,6 +9148,7 @@ impl SettingsWindow {
                     Ok(end)
                 })?;
         }
+
 
         let card_y = self.paint_card_heading(
             layers,
@@ -11888,44 +12078,54 @@ impl SettingsWindow {
         )?;
         let bottom = self.paint_card(layers, x, card_y, max_width, |this, layers, top| {
             let mut rows = RowCursor::new(top, this);
-            let (tx, tw) = this.paint_row_tile(
-                layers,
-                row_x,
-                rows.y,
-                row_width,
-                SvgIcon::Bell,
-                TileColor::Red,
-            )?;
-            rows.add(this.paint_toggle_setting_row(
-                layers,
-                tx,
-                rows.y,
-                tw,
-                &crate::i18n::tr("settings-notification-sounds"),
-                &crate::i18n::tr("settings-notification-sounds-description"),
-                this.native_settings.workspaces.notification_sounds_enabled,
-                SettingsAction::ToggleNotificationSounds,
-                rows.rule(),
-            )?);
-            let (tx, tw) = this.paint_row_tile(
-                layers,
-                row_x,
-                rows.y,
-                row_width,
-                SvgIcon::BellRing,
-                TileColor::Red,
-            )?;
-            rows.add(this.paint_toggle_setting_row(
-                layers,
-                tx,
-                rows.y,
-                tw,
-                &crate::i18n::tr("settings-system-notifications"),
-                &crate::i18n::tr("settings-system-notifications-description"),
-                this.native_settings.workspaces.system_notifications_enabled,
-                SettingsAction::ToggleSystemNotifications,
-                rows.rule(),
-            )?);
+            let mut prompts = vec![
+                (
+                    WorkPrompt::Sound,
+                    SvgIcon::Bell,
+                    "settings-notification-sounds-description",
+                    SettingsAction::ToggleNotificationSounds,
+                ),
+                (
+                    WorkPrompt::SystemNotification,
+                    SvgIcon::BellRing,
+                    "settings-system-notifications-description",
+                    SettingsAction::ToggleSystemNotifications,
+                ),
+            ];
+            // Only the Dock has a count to show on an application's icon.
+            if cfg!(target_os = "macos") {
+                prompts.push((
+                    WorkPrompt::DockBadge,
+                    SvgIcon::AppWindow,
+                    "settings-dock-badge-description",
+                    SettingsAction::ToggleDockBadge,
+                ));
+            }
+            for (prompt, icon, description, action) in prompts {
+                let enabled = prompt.enabled(&this.native_settings.workspaces);
+                let moments = prompt.moments(&this.native_settings.workspaces);
+                let (tx, tw) =
+                    this.paint_row_tile(layers, row_x, rows.y, row_width, icon, TileColor::Red)?;
+                let extra = this.paint_toggle_setting_row(
+                    layers,
+                    tx,
+                    rows.y,
+                    tw,
+                    &crate::i18n::tr(prompt.label_key()),
+                    &crate::i18n::tr(description),
+                    enabled,
+                    action,
+                    rows.rule(),
+                )?;
+                // Under the description, whatever its length.
+                let description_bottom = this.settings_row_description_y(rows.y)
+                    + this.metrics.cell_size.height as f32
+                    + extra;
+                let chips_top = description_bottom + this.ui_px(WORK_MOMENT_CHIP_GAP);
+                let chips_height =
+                    this.paint_work_moment_chips(layers, tx, chips_top, prompt, moments, enabled)?;
+                rows.add(chips_top + chips_height - description_bottom + extra);
+            }
             Ok(rows.bottom)
         })?;
 
@@ -14059,6 +14259,26 @@ impl SettingsWindow {
                 }),
                 &options,
                 selected,
+                rows.rule(),
+            )?);
+
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Shield,
+                TileColor::Orange,
+            )?;
+            rows.add(this.paint_toggle_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-paste-confirmation"),
+                &crate::i18n::tr("settings-paste-confirmation-description"),
+                this.native_settings.terminal.paste_confirmation,
+                SettingsAction::TogglePasteConfirmation,
                 rows.rule(),
             )?);
 
@@ -17616,6 +17836,444 @@ impl SettingsWindow {
             hovered,
             pressed,
         )?;
+        Ok(extra)
+    }
+
+    /// The moments `prompt` answers, as a row of ticked chips starting at
+    /// `x, y`: one per [`WorkMoment`], each flipped by a click. While the
+    /// prompt is off they are greyed and keep what was chosen. Returns their
+    /// height.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_work_moment_chips(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        prompt: WorkPrompt,
+        moments: WorkMoments,
+        active: bool,
+    ) -> anyhow::Result<f32> {
+        let palette = self.palette();
+        let font = Rc::clone(&self.ui_font);
+        let height = self.ui_px(WORK_MOMENT_CHIP_HEIGHT);
+        let check = self.ui_px(WORK_MOMENT_CHECK_SIDE);
+        let pad = self.ui_px(12.0);
+        let mut chip_x = x;
+        for moment in WorkMoment::ALL {
+            let label = crate::i18n::tr(work_moment_label_key(moment));
+            let label_width = self.measure_text_width(&font, &label);
+            let width = pad + check + self.ui_px(10.0) + label_width + pad + self.ui_px(4.0);
+            let action = SettingsAction::ToggleWorkMoment(prompt, moment);
+            let state = if !active {
+                ControlState::Disabled
+            } else if self.ui.interaction.pressed == Some(action) {
+                ControlState::Pressed
+            } else if self.ui.interaction.hovered == Some(action) {
+                ControlState::Hovered
+            } else {
+                ControlState::Normal
+            };
+            if active {
+                self.ui_context
+                    .push(rect(chip_x, y, width, height), WidgetKind::Button, action);
+            }
+            let (background, border) = state.colors(self.chrome_palette);
+            self.draw_rounded_frame(
+                layers,
+                0,
+                chip_x,
+                y,
+                width,
+                height,
+                background,
+                border,
+                height / 2.0,
+            )?;
+
+            let check_x = chip_x + pad;
+            let check_y = y + (height - check) / 2.0;
+            let ticked = moments.includes(moment);
+            if ticked {
+                let fill = if active {
+                    self.chrome_palette.accent
+                } else {
+                    palette.muted_text
+                };
+                self.draw_rounded_rect(
+                    layers,
+                    0,
+                    check_x,
+                    check_y,
+                    check,
+                    check,
+                    fill,
+                    self.ui_px(6.0),
+                )?;
+                let glyph = (check * 0.75).round();
+                self.draw_svg_icon(
+                    layers,
+                    SvgIcon::Check,
+                    check_x + (check - glyph) / 2.0,
+                    check_y + (check - glyph) / 2.0,
+                    glyph,
+                    palette.on_accent,
+                )?;
+            } else {
+                self.draw_rounded_frame(
+                    layers,
+                    0,
+                    check_x,
+                    check_y,
+                    check,
+                    check,
+                    palette.control_bg,
+                    palette.control_border,
+                    self.ui_px(6.0),
+                )?;
+            }
+            let text_x = check_x + check + self.ui_px(10.0);
+            self.draw_text(
+                layers,
+                &font,
+                text_x,
+                self.control_text_y(y, height),
+                &label,
+                if active {
+                    palette.text
+                } else {
+                    palette.muted_text
+                },
+                label_width + self.ui_px(4.0),
+            )?;
+            chip_x += width + self.ui_px(10.0);
+        }
+        Ok(height)
+    }
+
+    fn persist_work_prompt(&mut self, prompt: WorkPrompt) -> anyhow::Result<()> {
+        let workspaces = self.native_settings.workspaces.clone();
+        let saved = crate::native_settings::update(|settings| {
+            prompt.merge(&workspaces, &mut settings.workspaces);
+        });
+        self.set_native_settings(match &saved {
+            Ok(settings) => settings.as_ref().clone(),
+            Err(_) => crate::native_settings::load(),
+        });
+        saved.map(drop)
+    }
+
+    /// Save a change to one of the Notifications card's prompts, and show
+    /// it on the Dock icon at once when that is the prompt that changed.
+    fn save_work_prompt(&mut self, prompt: WorkPrompt) {
+        let setting = crate::i18n::tr(prompt.label_key());
+        self.status = match self.persist_work_prompt(prompt) {
+            Ok(()) => settings_tr("settings-status-saved", &[("setting", setting)]),
+            Err(err) => settings_tr(
+                "settings-status-save-error",
+                &[("setting", setting), ("error", format!("{err:#}"))],
+            ),
+        };
+        if prompt == WorkPrompt::DockBadge {
+            crate::workspace_threads::refresh_dock_badge();
+        }
+    }
+
+    /// Look up what the programs in local terminals may do, off the main
+    /// thread, and repaint once the answer is in.
+    #[cfg(target_os = "macos")]
+    fn start_privacy_check(&mut self) {
+        self.ui.privacy = PrivacyCheck::Checking;
+        let instance_id = self.instance_id;
+        let spawned = std::thread::Builder::new()
+            .name("thinkterm-privacy-check".into())
+            .spawn(move || {
+                let result = crate::privacy_status::query().map_err(|err| format!("{err:#}"));
+                if let Err(err) = &result {
+                    log::warn!("privacy check: {err}");
+                }
+                promise::spawn::spawn_into_main_thread(async move {
+                    let Some(settings) = settings_window_for_instance(instance_id) else {
+                        return;
+                    };
+                    let mut settings = settings.borrow_mut();
+                    settings.ui.privacy = PrivacyCheck::Done(result);
+                    if let Some(window) = settings.window.as_ref() {
+                        window.invalidate();
+                    }
+                })
+                .detach();
+            });
+        if let Err(err) = spawned {
+            self.ui.privacy = PrivacyCheck::Done(Err(format!("{err:#}")));
+        }
+    }
+
+    /// Settings › Permissions: whose permissions they are -- every program
+    /// run in a terminal is ThinkTerm to macOS -- and the card of them. A
+    /// Mac's page only; listed nowhere else.
+    fn paint_privacy(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            let palette = self.palette();
+            let body_font = Rc::clone(&self.body_font);
+            let scroll = self.ui.content_scroll.offset;
+            let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
+            let lines = self.wrap_settings_text(
+                &body_font,
+                &crate::i18n::tr("settings-privacy-page-description"),
+                max_width,
+            );
+            let last = self.draw_text_lines(
+                layers,
+                &body_font,
+                x,
+                section_y,
+                &lines,
+                palette.secondary_text,
+                max_width,
+            )?;
+            let card_padding = self.ui_px(36.0);
+            let bottom = self.paint_privacy_card(
+                layers,
+                x,
+                section_y + last,
+                max_width,
+                x + card_padding,
+                max_width - card_padding * 2.0,
+            )?;
+            self.ui.content_scroll.set_extents(
+                self.content_viewport_extent(),
+                self.settings_content_extent(bottom + scroll),
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (layers, x, max_width);
+        Ok(())
+    }
+
+    /// Settings › Permissions' card on what macOS lets the programs in
+    /// local terminals do: each permission as it stands with a way to its
+    /// page in System Settings, then the program they belong to, to be added
+    /// to a list by hand. Returns where the card ends.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    fn paint_privacy_card(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        top: f32,
+        max_width: f32,
+        row_x: f32,
+        row_width: f32,
+    ) -> anyhow::Result<f32> {
+        use crate::privacy_status::{
+            CAMERA_PANE, FULL_DISK_ACCESS_PANE, MICROPHONE_PANE, SCREEN_RECORDING_PANE,
+        };
+        use wezterm_mux_server_impl::privacy::PrivacyStatus;
+        if matches!(self.ui.privacy, PrivacyCheck::Stale) {
+            self.start_privacy_check();
+        }
+        let card_y = self.paint_card_heading(
+            layers,
+            x,
+            top,
+            max_width,
+            &crate::i18n::tr("settings-privacy-heading"),
+        )?;
+        let report = match &self.ui.privacy {
+            PrivacyCheck::Done(Ok(report)) => Some(*report),
+            _ => None,
+        };
+        let checking = matches!(
+            self.ui.privacy,
+            PrivacyCheck::Stale | PrivacyCheck::Checking
+        );
+        let held_by_server = crate::privacy_status::held_by_server();
+        self.paint_card(layers, x, card_y, max_width, |this, layers, top| {
+            let mut rows = RowCursor::new(top, this);
+            let permissions = [
+                (
+                    SvgIcon::FileText,
+                    TileColor::Gray,
+                    "settings-privacy-full-disk",
+                    "settings-privacy-full-disk-description",
+                    // Every program in every terminal past every folder at
+                    // once: what that risks, under what it is for.
+                    Some("settings-privacy-full-disk-caution"),
+                    FULL_DISK_ACCESS_PANE,
+                    report.map(|report| report.full_disk_access),
+                ),
+                (
+                    SvgIcon::Monitor,
+                    TileColor::Indigo,
+                    "settings-privacy-screen",
+                    "settings-privacy-screen-description",
+                    None,
+                    SCREEN_RECORDING_PANE,
+                    report.map(|report| report.screen_recording),
+                ),
+                (
+                    SvgIcon::Mic,
+                    TileColor::Orange,
+                    "settings-privacy-microphone",
+                    "settings-privacy-microphone-description",
+                    None,
+                    MICROPHONE_PANE,
+                    report.map(|report| report.microphone),
+                ),
+                (
+                    SvgIcon::Camera,
+                    TileColor::Teal,
+                    "settings-privacy-camera",
+                    "settings-privacy-camera-description",
+                    None,
+                    CAMERA_PANE,
+                    report.map(|report| report.camera),
+                ),
+            ];
+            for (icon, color, label, description, caution, pane, status) in permissions {
+                let (tx, tw) = this.paint_row_tile(layers, row_x, rows.y, row_width, icon, color)?;
+                let (state, dot) = match status {
+                    _ if checking => ("settings-privacy-checking", this.palette().control_border),
+                    Some(PrivacyStatus::Granted) => {
+                        ("settings-privacy-granted", TileColor::Green.linear())
+                    }
+                    Some(PrivacyStatus::NotGranted) => {
+                        ("settings-privacy-not-granted", this.palette().muted_text)
+                    }
+                    Some(PrivacyStatus::Denied) => {
+                        ("settings-privacy-denied", TileColor::Red.linear())
+                    }
+                    Some(PrivacyStatus::NotAsked) => {
+                        ("settings-privacy-not-asked", this.palette().control_border)
+                    }
+                    Some(PrivacyStatus::Unknown) | None => {
+                        ("settings-privacy-unknown", this.palette().control_border)
+                    }
+                };
+                rows.add(this.paint_privacy_row(
+                    layers,
+                    tx,
+                    rows.y,
+                    tw,
+                    &crate::i18n::tr(label),
+                    &crate::i18n::tr(description),
+                    caution.map(crate::i18n::tr).as_deref(),
+                    &crate::i18n::tr(state),
+                    dot,
+                    SettingsAction::OpenPrivacySettings(pane),
+                    rows.rule(),
+                )?);
+            }
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                if held_by_server {
+                    SvgIcon::MuxServer
+                } else {
+                    SvgIcon::AppWindow
+                },
+                TileColor::Slate,
+            )?;
+            rows.add(this.paint_action_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr(if held_by_server {
+                    "settings-privacy-holder-server"
+                } else {
+                    "settings-privacy-holder-app"
+                }),
+                &crate::i18n::tr("settings-privacy-holder-description"),
+                &crate::i18n::tr("menu-reveal-finder"),
+                SettingsAction::RevealPrivacyHolder,
+                rows.rule(),
+            )?);
+            Ok(rows.bottom)
+        })
+    }
+
+    /// A permission's row: its name and what it is for, then what allowing
+    /// it risks where it has a `caution`; how it stands as a dot and a word,
+    /// and a button to its page in System Settings.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    fn paint_privacy_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        y: f32,
+        width: f32,
+        label: &str,
+        description: &str,
+        caution: Option<&str>,
+        state: &str,
+        dot_color: LinearRgba,
+        action: SettingsAction,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<f32> {
+        let palette = self.palette();
+        let ui_font = Rc::clone(&self.ui_font);
+        if draw_top_rule {
+            self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
+        }
+        let button = crate::i18n::tr("settings-privacy-open");
+        let button_width = self.button_width_for_label(&button, 0.0);
+        let button_x = x + width - button_width;
+        let control_y = y + self.ui_px(4.0);
+        let control_height = self.ui_px(CONTROL_HEIGHT);
+        let dot = self.ui_px(14.0);
+        let state_width = self.measure_text_width(&ui_font, state);
+        let state_x = button_x - self.ui_px(20.0) - state_width;
+        let dot_x = state_x - self.ui_px(10.0) - dot;
+        let text_width = (dot_x - x - self.ui_px(24.0)).max(width * 0.35);
+
+        self.draw_text(layers, &ui_font, x, y, label, palette.text, text_width)?;
+        let mut extra = self.draw_row_description(layers, x, y, description, text_width)?;
+        if let Some(caution) = caution {
+            // Whole, and in a colour of its own: it is there to be read.
+            let body_font = Rc::clone(&self.body_font);
+            let step = self.description_line_step();
+            let lines = self.wrap_settings_text(&body_font, caution, text_width);
+            extra += step
+                + self.draw_text_lines(
+                    layers,
+                    &body_font,
+                    x,
+                    self.settings_row_description_y(y) + extra + step,
+                    &lines,
+                    TileColor::Orange.linear(),
+                    text_width,
+                )?;
+        }
+        self.draw_rounded_rect(
+            layers,
+            0,
+            dot_x,
+            control_y + (control_height - dot) / 2.0,
+            dot,
+            dot,
+            dot_color,
+            dot / 2.0,
+        )?;
+        self.draw_text(
+            layers,
+            &ui_font,
+            state_x,
+            self.control_text_y(control_y, control_height),
+            state,
+            palette.secondary_text,
+            state_width + self.ui_px(4.0),
+        )?;
+        self.draw_button(layers, button_x, control_y, button_width, &button, action)?;
         Ok(extra)
     }
 
