@@ -198,26 +198,90 @@ fn windows_default_executable(
     windows_progid_executable(hkcr, &progid)
 }
 
+/// A bare leading dash is an opener option, not a link or an unambiguous
+/// path. A file with that name can still be named with `./` or absolutely.
+pub fn is_opener_option(target: &str) -> bool {
+    target.starts_with('-')
+}
+
 #[cfg(not(windows))]
-pub fn open_url(url: &str) {
-    let url = url.to_string();
-    std::thread::spawn(move || {
-        #[cfg(target_os = "macos")]
-        let candidates: &[&[&str]] = &[&["/usr/bin/open", &url]];
+fn open_url_commands(url: &str) -> Vec<std::process::Command> {
+    if is_opener_option(url) {
+        return Vec::new();
+    }
+    #[cfg(target_os = "macos")]
+    let candidates: &[&[&str]] = &[&["/usr/bin/open", url]];
 
-        #[cfg(not(target_os = "macos"))]
-        let candidates: &[&[&str]] = &[
-            &["xdg-open", &url],
-            &["gio", "open", &url] as &[_],
-            &["gnome-open", &url],
-            &["kde-open", &url],
-            &["wslview", &url],
-        ];
+    #[cfg(not(target_os = "macos"))]
+    let candidates: &[&[&str]] = &[
+        &["xdg-open", url],
+        &["gio", "open", url] as &[_],
+        &["gnome-open", url],
+        &["kde-open", url],
+        &["wslview", url],
+    ];
 
-        for candidate in candidates {
+    candidates
+        .iter()
+        .map(|candidate| {
             let mut cmd = std::process::Command::new(candidate[0]);
             cmd.args(&candidate[1..]);
+            cmd
+        })
+        .collect()
+}
 
+#[cfg(all(test, not(windows)))]
+mod opening_target_tests {
+    use super::*;
+
+    #[test]
+    fn launcher_options_never_construct_a_command() {
+        for target in [
+            "-a/home/user/Downloads/example.app",
+            "--args",
+            "--help",
+            "-",
+            "-R/home/user",
+        ] {
+            assert!(open_url_commands(target).is_empty(), "{target}");
+        }
+    }
+
+    #[test]
+    fn ordinary_targets_remain_one_unchanged_operand() {
+        for target in [
+            "https://example.com/a?b=c",
+            "file:///home/user/my notes.txt",
+            "example-app:open?item=1",
+            "/home/user/my notes.txt",
+            "notes.txt",
+            "./-notes.txt",
+            "https://example.com/%2Da",
+            "notes;$(example) 'quoted'.txt",
+        ] {
+            let commands = open_url_commands(target);
+            assert!(!commands.is_empty());
+            for command in commands {
+                let args: Vec<_> = command.get_args().collect();
+                assert_eq!(args.last().copied(), Some(std::ffi::OsStr::new(target)));
+                assert_eq!(
+                    args.len(),
+                    if command.get_program() == "gio" { 2 } else { 1 }
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn open_url(url: &str) {
+    let commands = open_url_commands(url);
+    if commands.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        for mut cmd in commands {
             if let Ok(status) = cmd.status() {
                 if status.success() {
                     return;
@@ -229,6 +293,9 @@ pub fn open_url(url: &str) {
 
 #[cfg(not(windows))]
 pub fn open_with(url: &str, app: &str) {
+    if is_opener_option(url) {
+        return;
+    }
     let url = url.to_string();
     let app = app.to_string();
 
@@ -264,6 +331,9 @@ pub fn open_with(url: &str, app: &str) {
 
 #[cfg(target_os = "macos")]
 pub fn reveal_path(path: &std::path::Path) {
+    if is_opener_option(&path.to_string_lossy()) {
+        return;
+    }
     let path = path.to_path_buf();
     std::thread::spawn(move || {
         let _ = std::process::Command::new("/usr/bin/open")
@@ -275,6 +345,9 @@ pub fn reveal_path(path: &std::path::Path) {
 
 #[cfg(all(not(windows), not(target_os = "macos")))]
 pub fn reveal_path(path: &std::path::Path) {
+    if is_opener_option(&path.to_string_lossy()) {
+        return;
+    }
     let path = path.to_path_buf();
     std::thread::spawn(move || {
         for candidate in ["xdg-open", "gio", "gnome-open", "kde-open", "wslview"] {
@@ -330,11 +403,17 @@ fn shell_execute(url: String, with: Option<String>) {
 
 #[cfg(windows)]
 pub fn open_url(url: &str) {
+    if is_opener_option(url) {
+        return;
+    }
     shell_execute(url.to_string(), None);
 }
 
 #[cfg(windows)]
 pub fn open_with(url: &str, app: &str) {
+    if is_opener_option(url) {
+        return;
+    }
     shell_execute(url.to_string(), Some(app.to_string()));
 }
 
