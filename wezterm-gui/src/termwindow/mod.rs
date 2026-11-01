@@ -852,6 +852,8 @@ pub enum UIItemType {
     WorkspaceSidebarNotifications,
     /// The pill that brings the list back to the thread out of sight.
     WorkspaceSidebarJump,
+    /// Anything in the Library, and the sidebar footer's button opening it.
+    Library(ui::library::LibraryItem),
     UpdateCapsule,
     UpdateCapsuleDismiss,
     RightSidebarToggle,
@@ -1678,6 +1680,10 @@ mod tooltip_tests {
             UIItemType::WorkspaceSidebarLiveOverview,
             UIItemType::WorkspaceSidebarNotifications,
             UIItemType::WorkspaceSidebarJump,
+            UIItemType::Library(ui::library::LibraryItem::Open),
+            UIItemType::Library(ui::library::LibraryItem::Back),
+            UIItemType::Library(ui::library::LibraryItem::NewSpace(None)),
+            UIItemType::Library(ui::library::LibraryItem::SpaceMenu("s".to_string())),
         ] {
             let label = tooltip_label_for(&item_type)
                 .unwrap_or_else(|| panic!("no tooltip label for {:?}", item_type));
@@ -2199,6 +2205,11 @@ pub fn tooltip_label_for(item_type: &UIItemType) -> Option<String> {
         UIItemType::WorkspaceSidebarLiveOverview => "tooltip-sidebar-live-overview",
         UIItemType::WorkspaceSidebarNotifications => "tooltip-sidebar-notifications",
         UIItemType::WorkspaceSidebarJump => "tooltip-sidebar-jump",
+        UIItemType::Library(ui::library::LibraryItem::Open) => "tooltip-sidebar-library",
+        UIItemType::Library(ui::library::LibraryItem::Back) => "tooltip-library-back",
+        UIItemType::Library(ui::library::LibraryItem::Spaces) => "library-spaces",
+        UIItemType::Library(ui::library::LibraryItem::NewSpace(_)) => "tooltip-library-new-space",
+        UIItemType::Library(ui::library::LibraryItem::SpaceMenu(_)) => "tooltip-library-more",
         UIItemType::PaneNav {
             action: PaneNavAction::Share,
             ..
@@ -3311,6 +3322,8 @@ pub struct TermWindow {
     /// The pill at the list's edge while the window's thread is out of
     /// sight, and the scroll its click starts.
     pub(crate) sidebar_jump: ui::sidebar_jump::SidebarJump,
+    /// The Library in place of the left sidebar, open or on its way.
+    pub(crate) library: ui::library::LibraryState,
     /// Presentation-only hover reveal of the collapsed sidebar. This never
     /// touches `workspace_sidebar_collapsed` or `workspace_sidebar_width`:
     /// the terminal must not reflow for a hover.
@@ -4312,6 +4325,7 @@ impl TermWindow {
             || self.right_sidebar_hover.needs_frames()
             || self.window_tab_reveal.needs_frames()
             || self.overlay_scrollbar_owes_frames()
+            || self.library_open()
             // A light still running, or a paste still to show up for one:
             // copying and then switching to the app to paste it in is the
             // usual way, and a light left frozen on screen would stay.
@@ -5222,6 +5236,7 @@ impl TermWindow {
             workspace_space_swipe_needs_settle_start: false,
             workspace_sidebar_scrollbar_visible_until: None,
             sidebar_jump: Default::default(),
+            library: Default::default(),
             workspace_sidebar_hover: sidebar_hover::SidebarHoverReveal::default(),
             window_tab_reveal,
             right_sidebar_hover: sidebar_hover::SidebarHoverReveal::default(),
@@ -10505,6 +10520,19 @@ impl TermWindow {
     }
 
     fn prompt_rename_space(&mut self, space_id: String) {
+        // The name is edited in the sidebar's header: from the Library, go
+        // back to that Space's sidebar first.
+        if self.library_open() {
+            let Some(window) = self.window.clone() else {
+                return;
+            };
+            if space_id != self.active_space_id
+                && !self.switch_space_to_thread(space_id.clone(), None, &window)
+            {
+                return;
+            }
+            self.close_library(&window);
+        }
         let initial_title = crate::workspace_threads::active_space_name(&space_id)
             .unwrap_or_else(|| "Space".to_string());
         self.inline_tab_rename = Some(InlineTabRename::new(
@@ -12324,6 +12352,11 @@ impl TermWindow {
             }
             ToggleLiveOverview => {
                 self.toggle_live_overview_view();
+            }
+            ToggleLibrary => {
+                if let Some(window) = window.as_ref() {
+                    self.toggle_library(window);
+                }
             }
             OpenThreadSearch => {
                 self.open_thread_search();

@@ -469,12 +469,14 @@ impl crate::TermWindow {
     /// Whether a frame would draw the sidebars and the terminal between them
     /// from recordings a slide can move: not while hidden, nor while a view
     /// holds the terminal's place or is on its way to it, nor when panes are
-    /// painted straight to the window.
+    /// painted straight to the window, nor while the Library is in the left
+    /// sidebar's place, laid out as it is and moving its own way.
     fn sidebar_slides_drawable(&self) -> bool {
         self.occluded.is_none()
             && !self.config.use_box_model_render
             && !self.content_view_foreground()
             && self.content_view_fade.is_none()
+            && !self.library_presented()
     }
 
     /// Have the sidebars on their way get there now.

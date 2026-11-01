@@ -371,6 +371,20 @@ tooltip-sidebar-ssh-hosts = Remote-Hosts
 tooltip-sidebar-live-overview = Live-Übersicht
 tooltip-sidebar-notifications = Mitteilungen
 tooltip-sidebar-jump = Zum aktuellen Thread scrollen
+tooltip-sidebar-library = ThinkTerm Library
+tooltip-library-back = Zurück zur Seitenleiste
+tooltip-library-new-space = Neuer Space
+tooltip-library-more = Mehr
+library-title = ThinkTerm Library
+library-spaces = Spaces
+library-count = { $machines ->
+        [one] 1 Rechner
+       *[other] { $machines } Rechner
+    } · { $spaces ->
+        [one] 1 Space
+       *[other] { $spaces } Spaces
+    }
+library-disconnected = getrennt
 menu-rename-project = Projekt umbenennen…
 menu-grant-folder-access = Ordnerzugriff gewähren…
 menu-new-thread = Neuer Thread
@@ -1503,6 +1517,7 @@ command-check-for-updates = Nach Updates suchen…
 command-remote-hosts = Remote-Hosts…
 command-add-remote-host = Remote-Host hinzufügen…
 command-live-overview = Live-Übersicht
+command-library = ThinkTerm Library
 command-find-thread = Thread suchen
 command-toggle-left-sidebar = Linke Seitenleiste ein-/ausblenden
 command-toggle-right-sidebar = Rechte Seitenleiste ein-/ausblenden

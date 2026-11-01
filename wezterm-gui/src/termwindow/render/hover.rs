@@ -306,7 +306,13 @@ impl TermWindow {
         );
         let left_align = crate::termwindow::tooltip_left_aligns(&item.item_type);
         let x = crate::termwindow::tooltip_anchor_x(bx, bw, tip_w, window_w, left_align);
-        let y = if by - gap - tip_h >= 0.0 {
+        // The Library's Spaces tab stands level with the window's own
+        // buttons, with nothing under it: its tag goes there.
+        let below_first = matches!(
+            item.item_type,
+            UIItemType::Library(crate::termwindow::ui::library::LibraryItem::Spaces)
+        );
+        let y = if !below_first && by - gap - tip_h >= 0.0 {
             by - gap - tip_h
         } else {
             (by + bh + gap).min((window_h - tip_h).max(0.0))

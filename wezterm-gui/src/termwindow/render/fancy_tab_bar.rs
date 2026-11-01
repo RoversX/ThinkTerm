@@ -70,12 +70,14 @@ impl crate::TermWindow {
         let button_size = content_row_height
             .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
             .max(icon_size);
-        let row_width = self
+        // Past the window's edge, by as much as the Library pushes it.
+        let row_width = (self
             .dimensions
             .pixel_width
             .saturating_sub(row_x + border.right.get() as usize)
             .saturating_sub(self.right_sidebar_width())
-            .max(1);
+            + self.library_push())
+        .max(1);
         let row_right = row_x + row_width;
         let viewport_left = (row_x as f32 + self.window_tab_left_padding_pixels()).ceil() as usize
             + self.ui_px(TAB_ROW_START_PADDING);
@@ -299,12 +301,14 @@ impl crate::TermWindow {
             .saturating_sub(self.ui_px(TAB_VERTICAL_PADDING) * 2)
             .max(icon_size);
         let row_x = self.tab_bar_left_edge();
-        let row_width = self
+        // Past the window's edge, by as much as the Library pushes it.
+        let row_width = (self
             .dimensions
             .pixel_width
             .saturating_sub(row_x + border.right.get() as usize)
             .saturating_sub(self.right_sidebar_width())
-            .max(1);
+            + self.library_push())
+        .max(1);
         let row_right = row_x + row_width;
         let chrome = self.chrome();
         let foreground = chrome.text;
@@ -487,6 +491,22 @@ impl crate::TermWindow {
             .saturating_sub(border.right.get() as usize)
             .saturating_sub(self.ui_px(WINDOW_TAB_INSET) + 2);
         let chrome = self.chrome();
+        if self.library_push() > 0 && self.right_sidebar_width() == 0 {
+            // Over the row the Library pushed along, which goes on under
+            // them: on a ground of the row's own.
+            let width = self.window_tab_window_buttons_width(button_size) + self.ui_px(WINDOW_TAB_INSET) + 2;
+            self.filled_rectangle(
+                layers,
+                2,
+                euclid::rect(
+                    right.saturating_sub(width) as f32,
+                    border.top.get() as f32,
+                    (width + self.ui_px(WINDOW_TAB_INSET) + 2) as f32,
+                    row_height as f32,
+                ),
+                self.tab_bar_surface(chrome.header_bg),
+            )?;
+        }
         let mut ui_items = Vec::new();
         self.paint_window_tab_window_buttons(
             layers,
@@ -665,8 +685,10 @@ impl crate::TermWindow {
     /// leaving them room where they go once it is gone.
     pub(crate) fn right_sidebar_holds_window_buttons(&self) -> bool {
         self.fancy_tab_bar_shows_window_buttons()
-            && !self.right_sidebar_floats()
-            && self.right_sidebar_docked_width() > 0
+            && ((!self.right_sidebar_floats() && self.right_sidebar_docked_width() > 0)
+                // The row's end is pushed past the window's edge, or on its
+                // way back from there: they stay at its corner all the same.
+                || self.library_drawn_push() > 0)
     }
 
     #[allow(clippy::too_many_arguments)]

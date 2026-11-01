@@ -1448,6 +1448,8 @@ impl crate::TermWindow {
         if let Some(render_state) = self.render_state.as_mut() {
             render_state.recreate_texture_atlas(&self.fonts, &self.render_metrics, size)?;
         }
+        // The Library's cards hold coordinates into the old atlas.
+        self.discard_library_recordings();
         Ok(())
     }
 

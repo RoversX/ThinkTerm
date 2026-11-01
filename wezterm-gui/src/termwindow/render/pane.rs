@@ -439,10 +439,13 @@ impl crate::TermWindow {
 
     pub(crate) fn terminal_viewport_right(&self) -> f32 {
         let border = self.get_os_border();
-        self.dimensions
+        // Past the window's edge, by as much as the Library pushes it.
+        (self
+            .dimensions
             .pixel_width
             .saturating_sub(border.right.get() as usize)
-            .saturating_sub(self.right_sidebar_width()) as f32
+            .saturating_sub(self.right_sidebar_width())
+            + self.library_push()) as f32
     }
 
     pub(crate) fn pane_content_origin(&self, pos: &PositionedPane) -> anyhow::Result<(f32, f32)> {

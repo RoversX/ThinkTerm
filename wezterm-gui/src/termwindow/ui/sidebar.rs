@@ -244,6 +244,9 @@ impl crate::TermWindow {
     /// Every consumer that decides where the terminal, the tab bar or a pane
     /// lives asks this one.
     pub fn workspace_sidebar_width(&self) -> usize {
+        if let Some(width) = self.library_laid_out_width() {
+            return width;
+        }
         self.workspace_sidebar_sizing_width()
     }
 
@@ -315,6 +318,11 @@ impl crate::TermWindow {
     /// setting, brushing the left edge and clicking "close" would re-dock the
     /// sidebar for every window from then on.
     pub fn toggle_workspace_sidebar(&mut self) {
+        // The Library is in its place: there is no sidebar to toggle, as the
+        // titlebar's button says by hiding (`open_library`).
+        if self.library_presented() {
+            return;
+        }
         let revealed = self.workspace_sidebar_hover.progress(Instant::now());
         let shown =
             workspace_sidebar_toggle_target(self.workspace_sidebar_collapsed, revealed.is_some());
@@ -385,6 +393,10 @@ impl crate::TermWindow {
     /// The panel as presented — a hover reveal is included. Anything
     /// deriving terminal geometry wants `workspace_sidebar_width` instead.
     pub fn workspace_sidebar_rect(&self) -> Option<WorkspaceSidebarRect> {
+        // A Library card is this sidebar, laid out in the card.
+        if let Some(rect) = self.library_card_rect() {
+            return Some(rect);
+        }
         self.workspace_sidebar_rect_for_width(self.workspace_sidebar_presented_width())
     }
 
@@ -1148,6 +1160,15 @@ impl crate::TermWindow {
         )
     }
 
+    /// How far below the panel's top edge the Space row sits.
+    pub(crate) fn workspace_sidebar_space_row_offset(&self) -> usize {
+        let mut offset = self.workspace_sidebar_content_top(0);
+        if platform_chrome::workspace_sidebar_shows_toolbar(self.window_state) {
+            offset += self.workspace_sidebar_toggle_visual_size() + self.ui_px(SIDEBAR_INSET);
+        }
+        offset
+    }
+
     fn workspace_sidebar_layout(
         &self,
         rect: WorkspaceSidebarRect,
@@ -1171,10 +1192,7 @@ impl crate::TermWindow {
             platform_chrome::workspace_sidebar_toolbar_uses_fullscreen_style(self.window_state);
         let row_height = (ui_cell_height.max(icon_size) + self.ui_px(SIDEBAR_INSET))
             .max(self.ui_px(SESSION_ROW_MIN_HEIGHT));
-        let mut y = self.workspace_sidebar_content_top(panel_y);
-        if show_sidebar_toolbar {
-            y += self.workspace_sidebar_toggle_visual_size() + self.ui_px(SIDEBAR_INSET);
-        }
+        let mut y = panel_y + self.workspace_sidebar_space_row_offset();
         let top_action_height = row_height
             .min(self.ui_px(TOP_ACTION_MAX_HEIGHT))
             .max(ui_cell_height + self.ui_px(SIDEBAR_INSET))
@@ -1244,6 +1262,23 @@ impl crate::TermWindow {
             .unwrap_or(self.render_metrics.cell_size.height as usize)
     }
 
+    /// The rows of the Space the sidebar is painted for. Painted for one
+    /// this window is not in -- a card in the Library, a Space swiped to --
+    /// nothing of the window's own workspace goes into them.
+    fn workspace_sidebar_view(
+        &self,
+        active_workspace: &str,
+        workspaces: &[String],
+    ) -> workspace_threads::WorkspaceThreadsView {
+        let space_id = self.workspace_sidebar_space_id();
+        self.apply_workspace_thread_status_filter(workspace_threads::view_for_space(
+            space_id,
+            (space_id == self.active_space_id).then_some(active_workspace),
+            workspaces,
+            self.workspace_sidebar_show_archived,
+        ))
+    }
+
     pub fn workspace_sidebar_scroll_max(&self) -> f32 {
         let Some(rect) = self.workspace_sidebar_rect() else {
             return 0.0;
@@ -1270,13 +1305,7 @@ impl crate::TermWindow {
             .current_mux_workspace()
             .unwrap_or_else(|| mux.active_workspace());
         let workspaces = mux.iter_workspaces();
-        let view =
-            self.apply_workspace_thread_status_filter(workspace_threads::view_for_current_project(
-                self.workspace_sidebar_space_id(),
-                &active_workspace,
-                &workspaces,
-                self.workspace_sidebar_show_archived,
-            ));
+        let view = self.workspace_sidebar_view(&active_workspace, &workspaces);
         let row_gap = self.ui_px(SIDEBAR_ROW_GAP);
         let total_height = Self::workspace_sidebar_scroll_height(
             &view,
@@ -1332,13 +1361,7 @@ impl crate::TermWindow {
             .current_mux_workspace()
             .unwrap_or_else(|| mux.active_workspace());
         let workspaces = mux.iter_workspaces();
-        let view =
-            self.apply_workspace_thread_status_filter(workspace_threads::view_for_current_project(
-                self.workspace_sidebar_space_id(),
-                &active_workspace,
-                &workspaces,
-                self.workspace_sidebar_show_archived,
-            ));
+        let view = self.workspace_sidebar_view(&active_workspace, &workspaces);
         let row_gap = self.ui_px(SIDEBAR_ROW_GAP);
         let total_height = Self::workspace_sidebar_scroll_height(
             &view,
@@ -1479,6 +1502,10 @@ impl crate::TermWindow {
         // this point either reached the row loop and recorded a real span, or
         // left this `None`. It can never describe an earlier paint.
         self.workspace_sidebar_list_quads = None;
+        // The Library takes the sidebar's place, wherever it is painted.
+        if self.library_presented() && !self.library_painting_sidebar() {
+            return self.paint_library(layers);
+        }
         let rect = match self.workspace_sidebar_rect() {
             Some(rect) => rect,
             None => return Ok(()),
@@ -1511,11 +1538,14 @@ impl crate::TermWindow {
         let content_bottom = layout.content_bottom;
         let settings_footer_y = layout.settings_footer_y;
         let settings_footer_height = layout.settings_footer_height;
+        // Painted for a Library card: the card is the ground, rounded, and
+        // the list is cut where the card ends rather than covered.
+        let card = self.library_card_rect().is_some();
 
         if rect.y > 0 {
             // See-through, `paint_window_borders` paints this band, and a
             // second coat would show.
-            if !see_through {
+            if !see_through && !card {
                 self.filled_rectangle(
                     layers,
                     0,
@@ -1532,18 +1562,20 @@ impl crate::TermWindow {
                 item_type: UIItemType::WorkspaceSidebarBackground,
             });
         }
-        self.filled_rectangle(
-            layers,
-            0,
-            euclid::rect(
-                panel_x as f32,
-                panel_y as f32,
-                panel_width as f32,
-                panel_height as f32,
-            ),
-            sidebar_bg,
-        )
-        .context("sidebar background")?;
+        if !card {
+            self.filled_rectangle(
+                layers,
+                0,
+                euclid::rect(
+                    panel_x as f32,
+                    panel_y as f32,
+                    panel_width as f32,
+                    panel_height as f32,
+                ),
+                sidebar_bg,
+            )
+            .context("sidebar background")?;
+        }
         self.ui_items.push(UIItem {
             x: rect.x,
             y: rect.y,
@@ -1578,13 +1610,7 @@ impl crate::TermWindow {
             .current_mux_workspace()
             .unwrap_or_else(|| mux.active_workspace());
         let workspaces = mux.iter_workspaces();
-        let view =
-            self.apply_workspace_thread_status_filter(workspace_threads::view_for_current_project(
-                self.workspace_sidebar_space_id(),
-                &active_workspace,
-                &workspaces,
-                self.workspace_sidebar_show_archived,
-            ));
+        let view = self.workspace_sidebar_view(&active_workspace, &workspaces);
         // A ref row is showing its workspace, or a row of "Shared with me"
         // is: the Space's own rows must not paint a second active highlight
         // from their stale pointer.
@@ -1632,6 +1658,8 @@ impl crate::TermWindow {
                 self.window_state,
             ))
             .min(sidebar_toggle_size.saturating_sub(2));
+        // A Library card has no toolbar either: set apart, as the footer is.
+        let card_toolbar_start = layers.heap_mark().filter(|_| card);
         if show_sidebar_toolbar {
             let toggle_hovered = self.is_pointer_over_ui_rect(
                 sidebar_toggle_x,
@@ -1671,6 +1699,9 @@ impl crate::TermWindow {
                 sidebar_toggle_icon_size,
                 if toggle_hovered { foreground } else { muted_fg },
             )?;
+        }
+        if let (Some(start), Some(end)) = (card_toolbar_start, layers.heap_mark()) {
+            self.mark_library_card_toolbar(start, end);
         }
         // One diameter for every round sidebar action button. It follows the
         // notification button, which is pinned to the New Thread row's height
@@ -2186,10 +2217,13 @@ impl crate::TermWindow {
                         .saturating_sub(self.ui_px(SIDEBAR_INSET) + action_size);
                     let pin_x = delete_x.saturating_sub(action_size + 4);
                     let action_y = y + ((session_row_height.saturating_sub(action_size)) / 2);
-                    let shows_actions = is_hovered && !is_renaming_session;
+                    let row_hovered = is_hovered && !is_renaming_session;
+                    // In a Library card a row takes its click whole
+                    // (`push_library_card_items`): no buttons on it there.
+                    let shows_actions = row_hovered && self.library_card_rect().is_none();
                     let surface = if is_selected {
                         over(selected_bg, sidebar_bg)
-                    } else if shows_actions {
+                    } else if row_hovered {
                         over(chrome.sidebar_row_hover_bg, sidebar_bg)
                     } else {
                         sidebar_bg
@@ -2224,7 +2258,7 @@ impl crate::TermWindow {
                         if is_selected { active_fg } else { foreground },
                     )?;
 
-                    if is_hovered && !is_renaming_session {
+                    if shows_actions {
                         let affordances = vec![
                             (
                                 pin_x,
@@ -2636,10 +2670,13 @@ impl crate::TermWindow {
                                 )
                                 .context("sidebar hovered thread")?;
                             }
-                            let shows_actions = is_hovered && !is_renaming_session;
+                            let row_hovered = is_hovered && !is_renaming_session;
+                            // As for a pinned thread: no buttons on a row in a
+                            // Library card.
+                            let shows_actions = row_hovered && self.library_card_rect().is_none();
                             let surface = if is_selected {
                                 over(selected_bg, sidebar_bg)
-                            } else if shows_actions {
+                            } else if row_hovered {
                                 over(chrome.sidebar_row_hover_bg, sidebar_bg)
                             } else {
                                 sidebar_bg
@@ -2677,7 +2714,7 @@ impl crate::TermWindow {
                                 text_width,
                                 if is_selected { active_fg } else { foreground },
                             )?;
-                            if is_hovered && !is_renaming_session {
+                            if shows_actions {
                                 let pin_icon = if session.is_pinned {
                                     SvgIcon::PinOff
                                 } else {
@@ -3319,8 +3356,9 @@ impl crate::TermWindow {
         // See-through, a row scrolled under the header or the footer is cut
         // off there: the covers painted over it opaque would show as darker
         // bands. Only a recording can be cut, so the see-through callers
-        // record; anything else keeps the covers.
-        let list_cut = match (see_through, list_quads_start, &mut *layers) {
+        // record; anything else keeps the covers. So does a Library card,
+        // whose covers would square its corners.
+        let list_cut = match (see_through || card, list_quads_start, &mut *layers) {
             (true, Some(start), TripleLayerQuadAllocator::Heap(heap)) => {
                 heap.clip_after(
                     &start,
@@ -3337,6 +3375,10 @@ impl crate::TermWindow {
             _ => false,
         };
         self.workspace_sidebar_list_quads = list_quads_start.zip(layers.heap_mark());
+
+        // The fades over the ends of the list, wherever they read as fades:
+        // not over a see-through ground, where they would be bands.
+        let list_fades = !list_cut || (card && !see_through);
 
         let header_mask_height = list_top.saturating_sub(panel_y);
         // Covers what the list left under the header, then paints the header
@@ -3561,7 +3603,7 @@ impl crate::TermWindow {
             }
         }
 
-        if max_scroll > 0.0 && scroll_offset > 0.0 && !list_cut {
+        if max_scroll > 0.0 && scroll_offset > 0.0 && list_fades {
             let fade_height = self
                 .ui_px(SIDEBAR_TOP_FADE_HEIGHT)
                 .min(content_bottom.saturating_sub(list_top));
@@ -3606,7 +3648,7 @@ impl crate::TermWindow {
                 .ui_px(SIDEBAR_SETTINGS_FADE_HEIGHT)
                 .min(settings_footer_y.saturating_sub(panel_y))
                 .min(content_bottom.saturating_sub(panel_y));
-            if max_scroll > 0.0 && fade_height > 0 && !list_cut {
+            if max_scroll > 0.0 && fade_height > 0 && list_fades {
                 for step in 0..fade_height {
                     let progress = (step + 1) as f32 / fade_height as f32;
                     self.filled_rectangle(
@@ -3622,6 +3664,11 @@ impl crate::TermWindow {
                     )
                     .context("sidebar settings fade")?;
                 }
+            }
+            // A Library card has no footer: what follows is set apart, for
+            // the sidebar on its way into its card to let go of.
+            if card {
+                self.mark_library_card_footer(layers.heap_mark());
             }
 
             if !list_cut {
@@ -3695,24 +3742,9 @@ impl crate::TermWindow {
             // Library now. Sized as the settings button was once its label
             // no longer fit, so the row keeps its shape.
             let settings_icon_probe = icon_size.min(settings_row_height.saturating_sub(8));
-            let settings_label = crate::i18n::tr("sidebar-settings");
-            let settings_label_x_inset = self.ui_px(SIDEBAR_SETTINGS_ICON_EXTRA_INSET)
-                + settings_icon_probe
-                + self.ui_px(SIDEBAR_ICON_GAP)
-                + 8;
-            let settings_label_fits = self
-                .cached_ui_text_advance(&ui_font, &ui_metrics, &settings_label)
-                .map(|advance| {
-                    settings_label_x_inset + (advance.ceil() as usize) + self.ui_px(SIDEBAR_INSET)
-                        <= settings_body_width
-                })
-                .unwrap_or(false);
-            let settings_body_width = if settings_label_fits {
-                settings_body_width
-            } else {
-                (self.ui_px(SIDEBAR_SETTINGS_ICON_EXTRA_INSET) * 2 + settings_icon_probe)
-                    .min(settings_body_width)
-            };
+            let settings_body_width = (self.ui_px(SIDEBAR_SETTINGS_ICON_EXTRA_INSET) * 2
+                + settings_icon_probe)
+                .min(settings_body_width);
             let settings_hovered = self.is_pointer_over_ui_rect(
                 settings_row_x,
                 settings_row_y,
@@ -3746,7 +3778,9 @@ impl crate::TermWindow {
                 y: settings_row_y,
                 width: settings_body_width,
                 height: settings_row_height,
-                item_type: UIItemType::WorkspaceSidebarSettings,
+                item_type: UIItemType::Library(
+                    crate::termwindow::ui::library::LibraryItem::Open,
+                ),
             });
             if settings_options_hovered {
                 self.fill_rounded_rectangle(
@@ -3891,21 +3925,18 @@ impl crate::TermWindow {
             let settings_icon_x = settings_row_x + self.ui_px(SIDEBAR_SETTINGS_ICON_EXTRA_INSET);
             let settings_icon_y =
                 settings_row_y + ((settings_row_height.saturating_sub(settings_icon_size)) / 2);
-            let settings_text_x =
-                settings_icon_x + settings_icon_size + self.ui_px(SIDEBAR_ICON_GAP) + 8;
-            let settings_text_y =
-                settings_row_y + ((settings_row_height.saturating_sub(ui_cell_height)) / 2);
             self.paint_sidebar_icon(
                 layers,
-                SvgIcon::Settings,
+                SvgIcon::LibraryBig,
                 settings_icon_x,
                 settings_icon_y,
                 settings_icon_size,
                 foreground,
             )?;
             // The update capsule, once dismissed, lives on as a dot on the
-            // gear's shoulder, ringed in the sidebar background so it reads
-            // on the icon rather than in it; red when the install failed.
+            // shoulder of the button that leads to settings, ringed in the
+            // sidebar background so it reads on the icon rather than in it;
+            // red when the install failed.
             // Where the dot goes is recorded either way: the capsule flies
             // there when it is dismissed.
             let dot = (settings_icon_size / 3).max(self.ui_px(5)) as f32;

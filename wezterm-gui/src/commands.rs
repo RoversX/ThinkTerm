@@ -952,6 +952,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Shell"],
             icon: Some("cod_multiple_windows"),
         },
+        ToggleLibrary => CommandDef {
+            brief: tr("command-library").into(),
+            doc: "Shows every Space, grouped by machine, in place of the left sidebar".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Shell"],
+            icon: Some("md_bookshelf"),
+        },
         OpenThreadSearch => CommandDef {
             brief: tr("command-find-thread").into(),
             doc: "Searches every saved thread and jumps to the one picked".into(),
@@ -2611,6 +2619,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         // ----------------- Shell
         CreateWorkspaceThreadInActiveProject,
         ToggleLiveOverview,
+        ToggleLibrary,
         OpenSshHosts,
         AddRemoteHost,
         ArchiveActiveProject,

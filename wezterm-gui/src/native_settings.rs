@@ -1207,6 +1207,9 @@ pub(crate) struct NativeChromeSettings {
     /// home_font_size.
     pub(crate) right_sidebar_font_size: Option<f64>,
     pub(crate) workspace_sidebar_width: Option<usize>,
+    /// The Library's width in design pixels, as its edge was last left;
+    /// `None` for the default.
+    pub(crate) library_width: Option<usize>,
     /// Hover-reveal of the collapsed left sidebar; `None` means enabled.
     pub(crate) workspace_sidebar_hover_reveal: Option<bool>,
     /// Whether the file preview shows a Markdown file rendered (the default)
@@ -3019,6 +3022,15 @@ pub(crate) fn workspace_sidebar_width() -> Option<usize> {
 
 pub(crate) fn save_workspace_sidebar_width(width: usize) -> anyhow::Result<()> {
     update_ui_state(|settings| settings.chrome.workspace_sidebar_width = Some(width))
+}
+
+/// The Library's width in design pixels, if its edge was ever dragged.
+pub(crate) fn library_width() -> Option<usize> {
+    load_shared().chrome.library_width
+}
+
+pub(crate) fn save_library_width(width: usize) -> anyhow::Result<()> {
+    update_ui_state(|settings| settings.chrome.library_width = Some(width))
 }
 
 /// Remember whether the workspace sidebar is open, so a new window starts the

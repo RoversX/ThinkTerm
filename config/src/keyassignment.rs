@@ -645,6 +645,8 @@ pub enum KeyAssignment {
     /// `OpenSshHosts`, which toggles the page: this one only ever opens.
     AddRemoteHost,
     ToggleLiveOverview,
+    /// The ThinkTerm Library in place of the left sidebar, or back.
+    ToggleLibrary,
     /// The sidebar's search button: the command palette, opened already
     /// inside its thread group.
     OpenThreadSearch,

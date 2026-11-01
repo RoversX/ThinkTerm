@@ -2112,6 +2112,57 @@ impl WorkPrompt {
     }
 }
 
+#[cfg(test)]
+mod work_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn saving_one_prompt_preserves_fresh_widths_and_other_prompts() {
+        for prompt in [
+            WorkPrompt::Sound,
+            WorkPrompt::SystemNotification,
+            WorkPrompt::DockBadge,
+        ] {
+            let mut stale = ThinkTermNativeSettings::default();
+            stale.workspaces.notification_sounds_enabled = false;
+            stale.workspaces.system_notifications_enabled = false;
+            stale.workspaces.dock_badge_enabled = false;
+            prompt
+                .moments_mut(&mut stale.workspaces)
+                .toggle(WorkMoment::NeedsInput);
+
+            let mut latest = ThinkTermNativeSettings::default();
+            latest.chrome.workspace_sidebar_width = Some(360);
+            latest.chrome.library_width = Some(960);
+            latest.chrome.right_sidebar_width = Some(420);
+            let before = latest.clone();
+            prompt.merge(&stale.workspaces, &mut latest.workspaces);
+
+            assert_eq!(latest.chrome.workspace_sidebar_width, Some(360));
+            assert_eq!(latest.chrome.library_width, Some(960));
+            assert_eq!(latest.chrome.right_sidebar_width, Some(420));
+            assert!(!prompt.enabled(&latest.workspaces));
+            assert!(!prompt.moments(&latest.workspaces).needs_input);
+            for other in [
+                WorkPrompt::Sound,
+                WorkPrompt::SystemNotification,
+                WorkPrompt::DockBadge,
+            ] {
+                if other != prompt {
+                    assert_eq!(
+                        other.enabled(&latest.workspaces),
+                        other.enabled(&before.workspaces)
+                    );
+                    assert_eq!(
+                        other.moments(&latest.workspaces),
+                        other.moments(&before.workspaces)
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// What the programs in local terminals may do, as Settings › General last
 /// found it (macOS).
 #[derive(Debug, Clone)]

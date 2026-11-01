@@ -8500,6 +8500,14 @@ impl crate::TermWindow {
             .dimensions
             .pixel_width
             .saturating_sub(border.right.get() as usize);
+        // Docked, it goes along with the terminal the Library pushes past the
+        // window's edge, there and back as the terminal is drawn; a hover
+        // reveal floats over it at the edge.
+        let right_edge = if self.right_sidebar_floats() {
+            right_edge
+        } else {
+            right_edge + self.library_drawn_push()
+        };
         Some(RightSidebarRect {
             x: right_edge.saturating_sub(width),
             y,

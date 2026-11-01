@@ -1151,6 +1151,29 @@ impl super::TermWindow {
             }
             return;
         }
+        // Escape takes the Library back to the sidebar, unless something
+        // else is there to take it first -- a modal such as the character
+        // selector, an overlay such as copy mode, a view in front such as
+        // Live Overview, a field in the right sidebar, a menu, a key table or
+        // the leader. Every other key is the terminal's, which stays beside
+        // it.
+        if self.library_open()
+            && window_key.key_is_down
+            && window_key.modifiers.remove_positional_mods().is_empty()
+            && matches!(window_key.key, KeyCode::Char('\u{1b}'))
+            && self.get_modal().is_none()
+            && self.get_active_pane_or_overlay().map(|pane| pane.pane_id())
+                == self.get_active_pane_no_overlay().map(|pane| pane.pane_id())
+            && !self.content_view_foreground()
+            && !self.right_sidebar_has_text_focus()
+            && self.context_menu.is_none()
+            && !self.native_context_menu_open
+            && self.key_table_state.current_table().is_none()
+            && !self.leader_is_active()
+        {
+            self.close_library(context);
+            return;
+        }
         if window_key.key_is_down
             && self.opens_command_palette(
                 &window_key.key,

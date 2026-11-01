@@ -1502,11 +1502,23 @@ pub fn set_space_note_vault(
 }
 
 pub fn create_space(name: Option<String>) -> SpaceId {
+    new_space(name, true)
+}
+
+/// As `create_space`, for a window staying where it is -- the Library's
+/// + -- so the Space a window opens on next is still the one it was.
+pub fn add_space(name: Option<String>) -> SpaceId {
+    new_space(name, false)
+}
+
+fn new_space(name: Option<String>, make_last_active: bool) -> SpaceId {
     let mut store = THREAD_STORE.lock();
     store.normalize_after_load();
     let name = name.unwrap_or_else(|| next_space_name(&store.spaces));
     let id = store.create_space_record(name);
-    store.last_active_space_id = Some(id.clone());
+    if make_last_active {
+        store.last_active_space_id = Some(id.clone());
+    }
     persist_locked(&store);
     id
 }
@@ -1948,7 +1960,9 @@ fn new_space_on_domain(
     if let Some(space) = store.spaces.iter_mut().find(|space| space.id == space_id) {
         space.active_project_id = Some(project_id);
     }
-    store.last_active_space_id = Some(space_id.clone());
+    if make_last_active {
+        store.last_active_space_id = Some(space_id.clone());
+    }
     persist_locked(&store);
     drop(store);
 
@@ -2584,15 +2598,25 @@ pub fn view_for_current_project(
     live_workspaces: &[String],
     include_archived: bool,
 ) -> WorkspaceThreadsView {
-    let mut store = THREAD_STORE.lock();
+    view_for_space(space_id, Some(active_workspace), live_workspaces, include_archived)
+}
+
+/// As `view_for_current_project`, with `active_workspace` the workspace of
+/// a window in `space_id`. `None` for a window showing the Space without
+/// being in it -- a card in its Library: nothing of the window's own goes
+/// into the view, and a Space with nothing saved shows nothing rather than
+/// the window's workspace as its "main".
+pub fn view_for_space(
+    space_id: &str,
+    active_workspace: Option<&str>,
+    live_workspaces: &[String],
+    include_archived: bool,
+) -> WorkspaceThreadsView {
+    let mut store = lock_store_following_settings();
     if store.normalize_after_load() {
         persist_locked(&store);
     }
-    let ref_groups = group_thread_refs_by_origin(store.view_for_thread_refs(
-        space_id,
-        live_workspaces,
-        Some(active_workspace),
-    ));
+    let ref_groups = store.view_for_ref_groups(space_id, live_workspaces, active_workspace);
     let folder_order = store
         .spaces
         .iter()
@@ -2616,8 +2640,8 @@ pub fn view_for_current_project(
         view.rebuild_display_order(&folder_order);
         return view;
     }
-    if let Some(project_id) = store
-        .project_id_for_workspace(space_id, active_workspace)
+    if let Some(project_id) = active_workspace
+        .and_then(|workspace| store.project_id_for_workspace(space_id, workspace))
         .or_else(|| store.active_project_id_for_space(space_id))
         .filter(|project_id| {
             store
@@ -2634,6 +2658,16 @@ pub fn view_for_current_project(
         return view;
     }
 
+    let Some(active_workspace) = active_workspace else {
+        let mut view = WorkspaceThreadsView {
+            pinned_threads: Vec::new(),
+            projects: Vec::new(),
+            ref_groups,
+            display_order: Vec::new(),
+        };
+        view.rebuild_display_order(&folder_order);
+        return view;
+    };
     let is_remote = store.is_client_domain_space(space_id);
     let mut view =
         current_project_for_workspace(space_id, active_workspace).view(live_workspaces, is_remote);

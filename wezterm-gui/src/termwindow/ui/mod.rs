@@ -8,6 +8,7 @@ pub mod plugin_panel;
 pub mod right_sidebar;
 pub mod recording_overlay;
 pub mod sidebar;
+pub mod library;
 pub mod sidebar_jump;
 pub mod status_icon;
 pub mod tokens;

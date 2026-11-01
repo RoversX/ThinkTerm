@@ -131,7 +131,7 @@ fn tr_with_name(id: &'static str, name: &str) -> String {
 /// into one submenu instead: the name is said once, on the parent, and the
 /// children say only what they do. A local Space has a single action, so it
 /// stays flat — a submenu holding one item is just an extra click.
-fn space_destructive_menu_items(
+pub(crate) fn space_destructive_menu_items(
     space: &crate::workspace_threads::SpaceView,
     offer_remote_kill: bool,
 ) -> Vec<ContextMenuItem> {
@@ -1153,6 +1153,15 @@ impl super::TermWindow {
         event: &MouseEvent,
         context: &dyn WindowOps,
     ) -> bool {
+        // Over the Library, a wheel or a trackpad moves along its cards, never
+        // to another Space.
+        if self.library_presented() {
+            let sideways = self.sidebar_horizontal_scroll_delta(event);
+            let down = self.sidebar_vertical_scroll_delta(event);
+            if let Some(handled) = self.scroll_library(event, sideways, down, context) {
+                return handled;
+            }
+        }
         #[cfg(target_os = "macos")]
         if let Some(handled) = self.mouse_wheel_workspace_sidebar_space_swipe(event, context) {
             return handled;
@@ -1782,6 +1791,7 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarLiveOverview
             | UIItemType::WorkspaceSidebarNotifications
             | UIItemType::WorkspaceSidebarJump
+            | UIItemType::Library(_)
             | UIItemType::RightSidebarToggle
             | UIItemType::WindowTabsPin
             | UIItemType::WindowTabsTravelling
@@ -1961,6 +1971,7 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarLiveOverview
             | UIItemType::WorkspaceSidebarNotifications
             | UIItemType::WorkspaceSidebarJump
+            | UIItemType::Library(_)
             | UIItemType::RightSidebarToggle
             | UIItemType::WindowTabsPin
             | UIItemType::WindowTabsTravelling
@@ -2398,6 +2409,12 @@ impl super::TermWindow {
                         item.item_type == UIItemType::WorkspaceSidebarResize
                     }) {
                         self.persist_workspace_sidebar_width();
+                    }
+                    if completed_drag.as_ref().is_some_and(|(item, _)| {
+                        item.item_type
+                            == UIItemType::Library(crate::termwindow::ui::library::LibraryItem::Edge)
+                    }) {
+                        self.release_library_edge();
                     }
                     if completed_drag.as_ref().is_some_and(|(item, _)| {
                         item.item_type == UIItemType::RightSidebarResize
@@ -3161,6 +3178,9 @@ impl super::TermWindow {
             }
             UIItemType::WorkspaceSidebarResize => {
                 self.drag_workspace_sidebar_resize(item, start_event, event, context);
+            }
+            UIItemType::Library(crate::termwindow::ui::library::LibraryItem::Edge) => {
+                self.drag_library_edge(item, start_event, event, context);
             }
             UIItemType::RightSidebarResize => {
                 self.drag_right_sidebar_resize(item, start_event, event, context);
@@ -4371,6 +4391,9 @@ impl super::TermWindow {
                     self.activate_sidebar_jump();
                 }
             }
+            UIItemType::Library(ref which) => {
+                self.mouse_event_library(item.clone(), which.clone(), event, context);
+            }
             UIItemType::ContextMenuBackdrop
             | UIItemType::SharePanel
             | UIItemType::CommandPalette => {
@@ -4838,6 +4861,9 @@ impl super::TermWindow {
                 if event.kind == WMEK::Press(MousePress::Left) {
                     self.activate_sidebar_jump();
                 }
+            }
+            UIItemType::Library(ref which) => {
+                self.mouse_event_library(item.clone(), which.clone(), event, context);
             }
             UIItemType::RightSidebarToggle => {
                 self.mouse_event_right_sidebar_toggle(event, context);

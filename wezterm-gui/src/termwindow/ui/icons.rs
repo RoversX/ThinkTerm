@@ -53,6 +53,7 @@ pub enum SvgIcon {
     Info,
     Keyboard,
     Layers,
+    LibraryBig,
     Link2,
     Loader,
     LoaderCircle,
@@ -292,6 +293,9 @@ impl SvgIcon {
             Self::Info => include_bytes!("../../../../third_party/lucide/icons/info.svg"),
             Self::Keyboard => include_bytes!("../../../../third_party/lucide/icons/keyboard.svg"),
             Self::Layers => include_bytes!("../../../../third_party/lucide/icons/layers.svg"),
+            Self::LibraryBig => {
+                include_bytes!("../../../../third_party/lucide/icons/library-big.svg")
+            }
             Self::Link2 => include_bytes!("../../../../third_party/lucide/icons/link-2.svg"),
             Self::Loader => include_bytes!("../../../../third_party/lucide/icons/loader.svg"),
             Self::LoaderCircle => {

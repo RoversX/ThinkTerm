@@ -4348,9 +4348,18 @@ impl crate::TermWindow {
             shift: (lead_shift, 0.),
             clip: span(between.min_x(), lead_end),
         };
-        let trail = Drawn {
-            shift: (0., 0.),
-            clip: span(trail, between.max_x()),
+        let trail = if self.library_presented() {
+            // Beside the Library the terminal's right edge goes too, past the
+            // window's: the buttons at the row's end go along with it.
+            Drawn {
+                shift: (shift, 0.),
+                clip: span(lead_end, between.max_x()),
+            }
+        } else {
+            Drawn {
+                shift: (0., 0.),
+                clip: span(trail, between.max_x()),
+            }
         };
         self.replay_pane(&row, layers, lead)?;
         self.replay_pane(&row, layers, trail)?;
@@ -4536,7 +4545,7 @@ impl crate::TermWindow {
         &mut self,
         now: Instant,
     ) -> anyhow::Result<Option<(HeapQuadAllocator, f32, Vec<UIItem>)>> {
-        if !self.workspace_sidebar_collapsed {
+        if !self.workspace_sidebar_collapsed || self.library_presented() {
             return Ok(None);
         }
         let Some(progress) = self.workspace_sidebar_hover.progress(now) else {
@@ -4919,6 +4928,8 @@ impl crate::TermWindow {
         self.advance_right_sidebar_hover(frame_now);
         self.advance_window_tab_reveal(frame_now);
         self.advance_content_view_fade(frame_now);
+        self.advance_sidebar_slides(frame_now);
+        self.advance_library(frame_now);
         // Card texture work is queued per pass, and a retried pass queues its
         // own. A texture whose render is dropped here was never drawn into,
         // and its card -- a cache hit on the retry -- would composite it
@@ -4971,7 +4982,9 @@ impl crate::TermWindow {
         let slides = self.advance_split_slide(&panes, &splits, frame_now);
         // Where the sidebars on their way are drawn this frame, and what is
         // between them.
-        let sidebar_slide = self.sidebar_slide_frame(frame_now);
+        let sidebar_slide = self
+            .library_slide_frame(frame_now)
+            .or_else(|| self.sidebar_slide_frame(frame_now));
         let focused = self.focused.is_some();
         let window_is_transparent =
             !self.window_background.is_empty() || self.config.window_background_opacity != 1.0;
@@ -5133,9 +5146,10 @@ impl crate::TermWindow {
         // half-drawn overview.
         let ui_items_before_terminal = self.ui_items.len();
         // The buttons at the bars' ends stay where they stand while a
-        // sidebar slides, the terminal's right edge staying too.
+        // sidebar slides, the terminal's right edge staying too. Beside the
+        // Library it goes with the rest, out past the window's edge and back.
         let sidebar_slide_bars = match sidebar_slide {
-            Some(_) => self
+            Some(_) if !self.library_presented() => self
                 .sidebar_slide_end_bars(&panes)
                 .context("sidebar slide end bars")?,
             _ => vec![],
@@ -5629,6 +5643,24 @@ impl crate::TermWindow {
                         )));
                     }
                 }
+            } else if let Some(drawn) = sidebar_slide
+                .filter(|_| !self.library_presented())
+                .and_then(|slide| slide.left)
+            {
+                // The Library paints its own way in, below.
+                let recorded = self
+                    .record_sliding_sidebar(drawn, |term_window, layers| {
+                        term_window.paint_workspace_sidebar(layers)
+                    })
+                    .context("record sliding workspace sidebar")?;
+                // The marks describe a recording about to be dropped.
+                self.workspace_sidebar_list_quads = None;
+                self.replay_pane(&recorded, &mut layer.quad_allocator(), drawn)
+                    .context("replay sliding workspace sidebar")?;
+                if let Some(sliver) = sidebar_slide.and_then(|slide| slide.left_sliver) {
+                    self.replay_pane(&recorded, &mut layer.quad_allocator(), sliver)
+                        .context("replay sliding workspace sidebar's edge")?;
+                }
             } else if self.chrome_see_through() {
                 // As above: the list is cut in a recording, one whose buffer
                 // is kept from frame to frame.
@@ -5703,6 +5735,9 @@ impl crate::TermWindow {
                 .context("paint window buttons over the right sidebar")?;
             self.ui_items.extend(window_buttons);
             drop(chrome_layers);
+            // The sidebar on its way into its Library card, over the tab row.
+            self.paint_library_flight()
+                .context("paint the sidebar on its way into the Library")?;
 
             if let Some((overlay, hidden, items)) = hover_overlay {
                 self.paint_workspace_sidebar_hover_overlay(&overlay, hidden)
