@@ -89,7 +89,11 @@ pub struct TermWizTerminalPane {
     pane_id: PaneId,
     domain_id: DomainId,
     terminal: Mutex<wezterm_term::Terminal>,
-    input_tx: Sender<InputEvent>,
+    /// Taken by `kill`: the applet blocked reading input then sees the
+    /// channel close and gives up, instead of waiting for keys that can no
+    /// longer come while the dead pane is still referenced (the mux keeps
+    /// it until its window is pruned, which waits for every Activity).
+    input_tx: Mutex<Option<Sender<InputEvent>>>,
     dead: Mutex<bool>,
     writer: Mutex<Vec<u8>>,
     render_rx: FileDescriptor,
@@ -126,10 +130,21 @@ impl TermWizTerminalPane {
             terminal: Mutex::new(terminal),
             writer: Mutex::new(Vec::new()),
             render_rx,
-            input_tx,
+            input_tx: Mutex::new(Some(input_tx)),
             dead: Mutex::new(false),
             last_summary,
         }
+    }
+
+    fn send_input(&self, event: InputEvent) -> anyhow::Result<()> {
+        let sent = match self.input_tx.lock().as_ref() {
+            Some(input_tx) => input_tx.send(event).map_err(anyhow::Error::from),
+            None => Err(anyhow::anyhow!("pane {} is dead", self.pane_id)),
+        };
+        if sent.is_err() {
+            *self.dead.lock() = true;
+        }
+        sent
     }
 }
 
@@ -206,9 +221,7 @@ impl Pane for TermWizTerminalPane {
     }
 
     fn send_paste(&self, text: &str) -> anyhow::Result<()> {
-        let paste = InputEvent::Paste(text.to_string());
-        self.input_tx.send(paste)?;
-        Ok(())
+        self.send_input(InputEvent::Paste(text.to_string()))
     }
 
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
@@ -223,10 +236,13 @@ impl Pane for TermWizTerminalPane {
     }
 
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
-        self.input_tx.send(InputEvent::Resized {
-            rows: size.rows as usize,
-            cols: size.cols as usize,
-        })?;
+        // A killed pane has no applet left to tell; its screen still follows.
+        if let Some(input_tx) = self.input_tx.lock().as_ref() {
+            input_tx.send(InputEvent::Resized {
+                rows: size.rows as usize,
+                cols: size.cols as usize,
+            })?;
+        }
 
         self.terminal.lock().resize(size);
 
@@ -234,15 +250,10 @@ impl Pane for TermWizTerminalPane {
     }
 
     fn key_down(&self, key: KeyCode, modifiers: KeyModifiers) -> anyhow::Result<()> {
-        let event = InputEvent::Key(KeyEvent {
+        self.send_input(InputEvent::Key(KeyEvent {
             key,
             modifiers: modifiers.remove_positional_mods(),
-        });
-        if let Err(e) = self.input_tx.send(event) {
-            *self.dead.lock() = true;
-            return Err(e.into());
-        }
-        Ok(())
+        }))
     }
 
     fn key_up(&self, _key: KeyCode, _modifiers: KeyModifiers) -> anyhow::Result<()> {
@@ -264,17 +275,12 @@ impl Pane for TermWizTerminalPane {
             MouseButton::None => Buttons::NONE,
         };
 
-        let event = InputEvent::Mouse(TermWizMouseEvent {
+        self.send_input(InputEvent::Mouse(TermWizMouseEvent {
             x: event.x as u16,
             y: event.y as u16,
             mouse_buttons,
             modifiers: event.modifiers,
-        });
-        if let Err(e) = self.input_tx.send(event) {
-            *self.dead.lock() = true;
-            return Err(e.into());
-        }
-        Ok(())
+        }))
     }
 
     fn set_config(&self, config: Arc<dyn TerminalConfiguration>) {
@@ -300,6 +306,7 @@ impl Pane for TermWizTerminalPane {
 
     fn kill(&self) {
         *self.dead.lock() = true;
+        self.input_tx.lock().take();
     }
 
     fn is_dead(&self) -> bool {
@@ -626,4 +633,29 @@ pub async fn run<
     .detach();
 
     result
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn killing_the_pane_ends_a_pending_read() {
+        config::use_test_configuration();
+        let (input_tx, input_rx) = channel();
+        let render = Pipe::new().unwrap();
+        let pane = TermWizTerminalPane::new(0, TerminalSize::default(), input_tx, render.read, None);
+
+        pane.send_paste("n").unwrap();
+        assert!(matches!(input_rx.recv(), Ok(InputEvent::Paste(text)) if text == "n"));
+
+        // An applet blocked on its next key, as a prompt is, wakes up to a
+        // closed channel instead of waiting for keys nobody can send.
+        pane.kill();
+        assert!(input_rx.recv().is_err());
+        assert!(pane.send_paste("y").is_err());
+        assert!(pane.is_dead());
+        // The screen still follows the window.
+        pane.resize(TerminalSize::default()).unwrap();
+    }
 }
