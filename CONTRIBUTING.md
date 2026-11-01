@@ -15,7 +15,7 @@ remains under its original MIT license, preserved in
 [LICENSE-MIT](LICENSE-MIT); other third-party components are listed in
 [licenses/README.md](licenses/README.md).
 
-### Contributor agreement (version 1.1)
+### Contributor agreement (version 1.2)
 
 ThinkTerm may move to the MIT License in the future. To make that possible,
 contributions are accepted under the following terms, which you agree to by
@@ -36,27 +36,40 @@ including your subsequent updates to it.
    a future MIT release without asking you for further consent. Applicable
    copyright and license notices must be preserved. This permission does not
    require ThinkTerm to change its license or set a date for doing so.
-4. **Authority to contribute.** You confirm that you have the right to make
+4. **Patent license.** You grant RoversX, the ThinkTerm project maintainers
+   and everyone who receives ThinkTerm a perpetual, worldwide, non-exclusive,
+   no-charge, royalty-free, irrevocable (except as stated in this clause)
+   patent license to make, have made, use, offer to sell, sell, import, and
+   otherwise transfer your contribution and ThinkTerm. It covers only the
+   patent claims you can license that your contribution infringes, alone or
+   combined with ThinkTerm as it stood when you submitted it. If anyone starts
+   patent litigation (including a cross-claim or counterclaim) alleging that
+   your contribution or ThinkTerm infringes a patent, the patent licenses
+   granted to them under this agreement for that contribution or ThinkTerm end
+   on the date the litigation is filed.
+5. **Authority to contribute.** You confirm that you have the right to make
    these grants. If your employer or another party owns rights in your work,
    you must obtain the necessary authorization before agreeing.
-5. **Third-party material.** Identify any material you did not create, its
+6. **Third-party material.** Identify any material you did not create, its
    source, and its license in the pull request, and preserve its notices.
    This agreement does not relicense third-party material or grant rights you
    do not control. Maintainers must review any such material separately for
    compatibility with both the current license and a possible MIT release.
 
 This agreement does not revoke GPL rights already granted for released copies.
-It also covers pull requests opened before 22 October 2026, when agreeing
+Version 1.1 also covers pull requests opened before 22 October 2026, when agreeing
 came with opening one: their contributors agree in the same way unless they
 object, in that pull request or in an issue. Contributions merged before that
-date are not affected: they keep the terms they came under. Beyond that, changes to this agreement
+date are not affected: they keep the terms they came under. The patent license
+(clause 4) came with version 1.2 on 29 October 2026 and covers only pull
+requests opened from that date. Beyond that, changes to this agreement
 do not expand an earlier grant without new consent.
 
 ### Recording your agreement
 
 Opening a pull request records it: you agree to the ThinkTerm Contributor
-Agreement version 1.1 for your contributions in that pull request, including
-the permission for a future MIT release, and confirm that you are authorized
+Agreement version 1.2 for your contributions in that pull request, including
+the permission for a future MIT release and the patent license, and confirm that you are authorized
 to make these grants and have identified any third-party material. The pull
 request template says so; there is nothing to check.
 
