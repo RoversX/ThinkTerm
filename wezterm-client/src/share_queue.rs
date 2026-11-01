@@ -281,6 +281,7 @@ mod tests {
             mouse_grabbed: false,
             alt_screen,
             keyboard_encoding: Default::default(),
+            bracketed_paste: false,
             cursor_position: StableCursorPosition::default(),
             dimensions: RenderableDimensions {
                 cols: 80,

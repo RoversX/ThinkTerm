@@ -1136,6 +1136,10 @@ impl Pane for ClientPane {
         self.session.is_mouse_grabbed()
     }
 
+    fn bracketed_paste(&self) -> Option<bool> {
+        self.session.bracketed_paste()
+    }
+
     fn is_alt_screen_active(&self) -> bool {
         self.session.is_alt_screen()
     }

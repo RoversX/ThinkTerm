@@ -1848,6 +1848,7 @@ mod tests {
             mouse_grabbed: false,
             alt_screen: false,
             keyboard_encoding: Default::default(),
+            bracketed_paste: false,
             cursor_position: view.cursor,
             dimensions: view.dims,
             dirty_lines,

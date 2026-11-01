@@ -893,7 +893,9 @@ macro_rules! pdu {
 ///     ClientJoined/ClientLeft.
 /// 82: SwapPanes swaps two panes of a tab, each into the other's place.
 /// 83: Sharing a pane with other accounts on the machine (Share* PDUs).
-pub const CODEC_VERSION: usize = 83;
+/// 84: Render pushes say whether the program takes pastes bracketed
+///     (GetPaneRenderChangesResponse::bracketed_paste).
+pub const CODEC_VERSION: usize = 84;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -2382,6 +2384,10 @@ pub struct GetPaneRenderChangesResponse {
 
     pub input_serial: Option<InputSerial>,
     pub seqno: SequenceNo,
+    /// Whether the program takes pastes bracketed (DECSET 2004). A
+    /// client asks before pasting line breaks to one that does not:
+    /// each line would run as it went in. Last, as codec 84 added it.
+    pub bracketed_paste: bool,
 }
 
 /// `termwiz::input::KeyboardEncoding` for the wire: the termwiz type has no
@@ -2840,6 +2846,7 @@ mod golden {
             mouse_grabbed: false,
             alt_screen: true,
             keyboard_encoding: WireKeyboardEncoding::Kitty(3),
+            bracketed_paste: true,
             cursor_position: StableCursorPosition::default(),
             dimensions: RenderableDimensions {
                 cols: 80,
@@ -2936,6 +2943,13 @@ mod golden {
         [LIST_PANES, &[0]].concat()
     }
 
+    /// RENDER_CHANGES as codec 84 writes it: whether the program takes
+    /// pastes bracketed went on the end, a one after the bytes captured
+    /// before.
+    fn render_changes_with_bracketed_paste() -> Vec<u8> {
+        [RENDER_CHANGES, &[1]].concat()
+    }
+
     #[test]
     fn wire_bytes_are_stable() {
         assert_eq!(
@@ -2945,7 +2959,10 @@ mod golden {
         assert_eq!(varbincode_bytes(&split_pane()), SPLIT_PANE);
         assert_eq!(varbincode_bytes(&search_request()), SEARCH);
         assert_eq!(varbincode_bytes(&client_list_response()), CLIENT_LIST);
-        assert_eq!(varbincode_bytes(&render_changes_response()), RENDER_CHANGES);
+        assert_eq!(
+            varbincode_bytes(&render_changes_response()),
+            render_changes_with_bracketed_paste()
+        );
     }
 
     #[test]
@@ -2966,7 +2983,7 @@ mod golden {
             client_list_response()
         );
         assert_eq!(
-            back::<GetPaneRenderChangesResponse>(RENDER_CHANGES),
+            back::<GetPaneRenderChangesResponse>(&render_changes_with_bracketed_paste()),
             render_changes_response()
         );
     }
@@ -3553,7 +3570,7 @@ mod test {
         // tripwire: whoever bumps the codec must come here, confirm the
         // round-trips still cover the new version, and advance it
         // deliberately.
-        assert_eq!(CODEC_VERSION, 83);
+        assert_eq!(CODEC_VERSION, 84);
         use thinkterm_proto::{
             AgentEvidence, AgentState, AgentStatus, ProgramBlockedKind, ProgramReport,
             ProgramReportChild, ProgramReportState,
@@ -3623,7 +3640,7 @@ mod test {
     #[test]
     fn foreground_program_protocol_round_trip_at_version_74() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 83);
+        assert_eq!(CODEC_VERSION, 84);
         use thinkterm_proto::ForegroundProgram;
 
         fn round_trip(pdu: &Pdu) -> Pdu {
@@ -3724,7 +3741,7 @@ mod test {
     #[test]
     fn run_state_protocol_round_trip_at_version_80() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 83);
+        assert_eq!(CODEC_VERSION, 84);
         use thinkterm_proto::{PaneExit, PaneRunState, ProgramState, ShellCommands};
 
         let exit = PaneExit {
@@ -3823,7 +3840,7 @@ mod test {
     fn frame_control_extension_round_trips_without_changing_legacy_version() {
         // The extension is asked for, so it needed no bump of its own; 74
         // is the foreground program's, which a server sends unasked.
-        assert_eq!(CODEC_VERSION, 83);
+        assert_eq!(CODEC_VERSION, 84);
         for pdu in [
             Pdu::GetKittyImage(GetKittyImage { pane_id: 3, image_id: 7, data_hash: [9; 32], have_frames: 2, image_epoch: Some(4) }),
             Pdu::GetKittyFrameSelections(GetKittyFrameSelections { pane_id: 3, subscribe: true }),

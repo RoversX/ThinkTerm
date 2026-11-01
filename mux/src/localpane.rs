@@ -818,6 +818,10 @@ impl Pane for LocalPane {
         }
     }
 
+    fn bracketed_paste(&self) -> Option<bool> {
+        Some(self.terminal.lock().bracketed_paste_enabled())
+    }
+
     fn get_title(&self) -> String {
         let mut title = self.terminal.lock().get_title().to_string();
         self.spice_title(&mut title);

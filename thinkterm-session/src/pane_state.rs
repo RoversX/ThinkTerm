@@ -42,6 +42,9 @@ pub struct PaneState {
     pub(crate) alt_screen: bool,
     pub(crate) mouse_grabbed: bool,
     pub(crate) keyboard_encoding: KeyboardEncoding,
+    /// Whether the remote program takes pastes bracketed, once a push
+    /// has said.
+    pub(crate) bracketed_paste: Option<bool>,
     pub(crate) dimensions: RenderableDimensions,
     /// The dimensions most recently confirmed by the remote pane.  A GUI
     /// takeover may resize its local surface optimistically; keeping the
@@ -112,6 +115,7 @@ impl PaneState {
             alt_screen,
             mouse_grabbed: false,
             keyboard_encoding: KeyboardEncoding::Xterm,
+            bracketed_paste: None,
             server_dimensions: dimensions,
             frontend_preview: None,
             geometry_repair: GeometryRepair::default(),

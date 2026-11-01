@@ -353,6 +353,12 @@ pub trait Pane: Downcast + Send + Sync {
         Progress::None
     }
     fn send_paste(&self, text: &str) -> anyhow::Result<()>;
+    /// Whether the program in the pane takes pastes bracketed (DECSET
+    /// 2004), so that a newline pasted to it runs nothing by itself. `None`
+    /// when this side cannot tell.
+    fn bracketed_paste(&self) -> Option<bool> {
+        None
+    }
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>>;
     /// The pty behind `reader`, when there is one: the reader thread waits
     /// for it with poll, which is what lets it be parked (see

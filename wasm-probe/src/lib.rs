@@ -371,6 +371,7 @@ mod session_probe {
             mouse_grabbed: false,
             alt_screen: false,
             keyboard_encoding: Default::default(),
+            bracketed_paste: false,
             cursor_position: StableCursorPosition {
                 x: cursor_x,
                 y: 2,

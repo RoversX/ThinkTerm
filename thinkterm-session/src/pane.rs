@@ -240,6 +240,10 @@ impl<H: SessionHost> PaneSession<H> {
         self.state().mouse_grabbed
     }
 
+    pub fn bracketed_paste(&self) -> Option<bool> {
+        self.state().bracketed_paste
+    }
+
     pub fn keyboard_encoding(&self) -> KeyboardEncoding {
         self.state().keyboard_encoding
     }
@@ -866,6 +870,7 @@ impl<H: SessionHost> PaneSession<H> {
         }
         st.mouse_grabbed = delta.mouse_grabbed;
         st.keyboard_encoding = delta.keyboard_encoding.into();
+        st.bracketed_paste = Some(delta.bracketed_paste);
 
         let live_preview_accepts_snapshot = st.frontend_preview.is_none_or(|preview| {
             preview.policy != FrontendPreviewPolicy::LiveResize
@@ -1857,6 +1862,7 @@ mod tests {
             mouse_grabbed,
             alt_screen,
             keyboard_encoding: Default::default(),
+            bracketed_paste: false,
             cursor_position: Default::default(),
             dimensions: dims(),
             dirty_lines: vec![],

@@ -98,6 +98,7 @@ pub(crate) struct PerPane {
     mouse_grabbed: bool,
     alt_screen: bool,
     keyboard_encoding: WireKeyboardEncoding,
+    bracketed_paste: bool,
     /// Outer None means that this connection has never received application
     /// palette state for the pane. Inner None is an explicit reset to the
     /// client's own configured palette.
@@ -260,6 +261,7 @@ impl PerPane {
             mouse_grabbed: self.mouse_grabbed,
             alt_screen: self.alt_screen,
             keyboard_encoding: self.keyboard_encoding,
+            bracketed_paste: self.bracketed_paste,
             seqno: self.seqno,
         }
     }
@@ -274,6 +276,7 @@ impl PerPane {
             mouse_grabbed,
             alt_screen,
             keyboard_encoding,
+            bracketed_paste,
             dimensions,
             cursor_position,
             title,
@@ -290,6 +293,7 @@ impl PerPane {
         self.mouse_grabbed = mouse_grabbed;
         self.alt_screen = alt_screen;
         self.keyboard_encoding = keyboard_encoding;
+        self.bracketed_paste = bracketed_paste;
         self.seqno = seqno;
 
         self.sent_images.remember(&bonus_lines);
@@ -299,6 +303,7 @@ impl PerPane {
             mouse_grabbed,
             alt_screen,
             keyboard_encoding,
+            bracketed_paste,
             dirty_lines: dirty_lines.iter().cloned().collect(),
             dimensions,
             cursor_position,
@@ -328,6 +333,7 @@ struct LastSent {
     mouse_grabbed: bool,
     alt_screen: bool,
     keyboard_encoding: WireKeyboardEncoding,
+    bracketed_paste: bool,
     seqno: SequenceNo,
 }
 
@@ -336,6 +342,7 @@ struct PaneReading {
     mouse_grabbed: bool,
     alt_screen: bool,
     keyboard_encoding: WireKeyboardEncoding,
+    bracketed_paste: bool,
     dimensions: RenderableDimensions,
     cursor_position: StableCursorPosition,
     title: String,
@@ -405,6 +412,11 @@ fn read_pane_changes(
         changed = true;
     }
 
+    let bracketed_paste = pane.bracketed_paste().unwrap_or(false);
+    if bracketed_paste != last.bracketed_paste {
+        changed = true;
+    }
+
     let dims = pane.get_dimensions();
     if dims != last.dimensions {
         changed = true;
@@ -465,6 +477,7 @@ fn read_pane_changes(
     };
 
     Some(PaneReading {
+        bracketed_paste,
         mouse_grabbed,
         alt_screen,
         keyboard_encoding,
