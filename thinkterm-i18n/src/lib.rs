@@ -32,6 +32,7 @@ pub const LANGUAGE_OPTIONS: &[LanguageOption] = &[
     LanguageOption { preference: "ja-JP", native_name: "日本語" },
     LanguageOption { preference: "fr-FR", native_name: "Français" },
     LanguageOption { preference: "de-DE", native_name: "Deutsch" },
+    LanguageOption { preference: "ru-RU", native_name: "Русский" },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,11 +46,12 @@ const ZH_CN: Locale = Locale { code: "zh-CN", source: include_str!("../i18n/zh-C
 const JA_JP: Locale = Locale { code: "ja-JP", source: include_str!("../i18n/ja-JP.ftl") };
 const FR_FR: Locale = Locale { code: "fr-FR", source: include_str!("../i18n/fr-FR.ftl") };
 const DE_DE: Locale = Locale { code: "de-DE", source: include_str!("../i18n/de-DE.ftl") };
+const RU_RU: Locale = Locale { code: "ru-RU", source: include_str!("../i18n/ru-RU.ftl") };
 
 /// The one registry that drives negotiation, catalogue construction and
 /// the parity test. Adding a locale is a resource, one entry here, and one
 /// user-facing entry in `LANGUAGE_OPTIONS`.
-const SUPPORTED_LOCALES: &[Locale] = &[EN_US, ZH_CN, JA_JP, FR_FR, DE_DE];
+const SUPPORTED_LOCALES: &[Locale] = &[EN_US, ZH_CN, JA_JP, FR_FR, DE_DE, RU_RU];
 
 impl Locale {
     fn index(self) -> usize {
@@ -332,6 +334,9 @@ mod tests {
         assert_eq!(negotiate(&one("fr-CA")), "fr-FR");
         assert_eq!(negotiate(&one("en-GB")), "en-US");
         assert_eq!(negotiate(&one("de-AT")), "de-DE");
+        assert_eq!(negotiate(&one("ru")), "ru-RU");
+        assert_eq!(negotiate(&one("ru-BY")), "ru-RU");
+        assert_eq!(resolve_preference("system", &one("ru-RU")), "ru-RU");
         assert_eq!(negotiate(&one("xx")), "en-US");
         assert_eq!(resolve_preference("system", &one("fr")), "fr-FR");
         assert_eq!(resolve_preference("ja-JP", &one("fr")), "ja-JP");
@@ -354,6 +359,42 @@ mod tests {
         assert_eq!(in_english(|| { in_english(|| ()); current_locale() }), "en-US");
         assert_eq!(tr("command-copy-to-clipboard"), translated);
         activate_preference("en-US", &[]);
+    }
+
+    #[test]
+    fn every_russian_message_formats_without_fallback() {
+        let variables: BTreeSet<_> = EN_US.source
+            .split('$')
+            .skip(1)
+            .map(|tail| tail.split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_').next().unwrap())
+            .collect();
+        let catalog = &catalogs().locales[RU_RU.index()];
+        for count in [0, 1, 2, 5, 11, 21, 22, 25, 101] {
+            let mut args = FluentArgs::new();
+            for variable in &variables {
+                args.set(*variable, count);
+            }
+            for id in message_ids(EN_US.source) {
+                let message = catalog.bundle.get_message(&id).expect("Russian key exists");
+                let mut errors = vec![];
+                let value = catalog.bundle.format_pattern(message.value().unwrap(), Some(&args), &mut errors);
+                assert!(errors.is_empty(), "{id} ({count}): {errors:?}");
+                assert!(!value.is_empty(), "{id} is empty");
+            }
+        }
+    }
+
+    #[test]
+    fn russian_agent_counts_use_russian_plural_forms() {
+        for (count, expected) in [
+            (0, "0 агентов"), (1, "1 агент"), (2, "2 агента"),
+            (5, "5 агентов"), (11, "11 агентов"), (21, "21 агент"),
+            (22, "22 агента"), (25, "25 агентов"), (101, "101 агент"),
+        ] {
+            let mut args = FluentArgs::new();
+            args.set("count", count);
+            assert_eq!(format_for(RU_RU, "hover-card-agents", Some(&args)).as_deref(), Some(expected));
+        }
     }
 
     #[test]
