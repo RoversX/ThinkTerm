@@ -246,6 +246,16 @@ impl ConnectionOps for Connection {
         }
     }
 
+    fn set_dock_badge(&self, label: Option<&str>) {
+        let Some(mtm) = objc2::MainThreadMarker::new() else {
+            log::debug!("Dock badge set off the main thread; left as it was");
+            return;
+        };
+        let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+        let label = label.map(objc2_foundation::NSString::from_str);
+        app.dockTile().setBadgeLabel(label.as_deref());
+    }
+
     fn screens(&self) -> anyhow::Result<Screens> {
         let mut by_name = HashMap::new();
         let mut virtual_rect = euclid::rect(0, 0, 0, 0);

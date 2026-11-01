@@ -175,6 +175,10 @@ pub trait ConnectionOps {
     /// callers nothing and removes the lifetime hazard entirely.
     fn play_sound(&self, _wav: &'static [u8]) {}
 
+    /// Show `label` on the application's Dock icon, or clear it with `None`.
+    /// A platform without one ignores it.
+    fn set_dock_badge(&self, _label: Option<&str>) {}
+
     /// Returns information about the screens
     fn screens(&self) -> anyhow::Result<Screens> {
         anyhow::bail!("Unable to query screen information");
