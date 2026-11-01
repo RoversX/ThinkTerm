@@ -28,7 +28,9 @@ use termwiz::surface::{Line, SEQ_ZERO};
 use unicode_normalization::UnicodeNormalization;
 use wezterm_bidi::Direction;
 pub(crate) use wezterm_client::domain::AttachRetryOutcome;
-use wezterm_client::domain::{is_fatal_attach_error, ClientDomain, ClientDomainConfig};
+use wezterm_client::domain::{
+    is_fatal_attach_error, ClientDomain, ClientDomainConfig, ATTACH_MAX_ATTEMPTS,
+};
 use wezterm_font::shaper::PresentationWidth;
 use wezterm_font::FontConfiguration;
 use wezterm_gui_subcommands::*;
@@ -321,19 +323,22 @@ fn have_panes_in_domain_and_ws(domain: &Arc<dyn Domain>, workspace: &Option<Stri
 }
 
 /// Attach `domain`, retrying transient failures with exponential backoff.
-/// ClientDomain owns the shared retry engine so generic Domain::attach calls
-/// (including mux spawn/split paths) receive the same behavior. Other domain
-/// kinds have no distinct attach operation and remain single-attempt.
+/// `max_attempts` bounds interactive attaches; `None` keeps retrying until
+/// `max_total` or `keep_going` stops it. ClientDomain owns the shared retry
+/// engine so generic Domain::attach calls (including mux spawn/split paths)
+/// receive the same behavior. Other domain kinds have no distinct attach
+/// operation and remain single-attempt.
 pub(crate) async fn attach_domain_with_retry(
     domain: Arc<dyn Domain>,
     window_id: Option<mux::window::WindowId>,
     ui: mux::connui::ConnectionUI,
     mut keep_going: impl FnMut() -> bool,
     max_total: Option<std::time::Duration>,
+    max_attempts: Option<usize>,
 ) -> anyhow::Result<AttachRetryOutcome> {
     if let Some(client) = domain.downcast_ref::<ClientDomain>() {
         return client
-            .attach_with_ui_retry(window_id, ui, keep_going, max_total)
+            .attach_with_ui_retry(window_id, ui, keep_going, max_total, max_attempts)
             .await;
     }
     if !keep_going() {
@@ -366,9 +371,10 @@ async fn attach_domain_in_window_with_retry(
     attach_domain_with_retry(
         domain,
         Some(window_id),
-        ui,
-        move || Mux::get().get_window(window_id).is_some(),
+        ui.clone(),
+        move || Mux::get().get_window(window_id).is_some() && !ui.abandoned(),
         Some(std::time::Duration::from_secs(60)),
+        Some(ATTACH_MAX_ATTEMPTS),
     )
     .await
 }
@@ -442,7 +448,9 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
 
     match attach_domain_in_window_with_retry(Arc::clone(&domain), window_id).await? {
         AttachRetryOutcome::Attached => {}
-        AttachRetryOutcome::Cancelled => return Ok(()),
+        AttachRetryOutcome::Cancelled | AttachRetryOutcome::AbandonedAfterAttach => {
+            return Ok(())
+        }
     }
 
     if have_panes_in_domain_and_ws(&domain, &workspace) {
@@ -841,16 +849,20 @@ pub(crate) async fn connect_domain_into_space(
             window_id: Some(window_id),
             ..Default::default()
         });
+        let keep_ui = ui.clone();
         match attach_domain_with_retry(
             domain.clone(),
             Some(window_id),
             ui.clone(),
-            move || Mux::get().get_window(window_id).is_some(),
-            None,
+            move || Mux::get().get_window(window_id).is_some() && !keep_ui.abandoned(),
+            Some(std::time::Duration::from_secs(60)),
+            Some(ATTACH_MAX_ATTEMPTS),
         )
         .await
         {
-            Ok(AttachRetryOutcome::Cancelled) => return Ok(()),
+            Ok(AttachRetryOutcome::Cancelled | AttachRetryOutcome::AbandonedAfterAttach) => {
+                return Ok(())
+            }
             Ok(AttachRetryOutcome::Attached) => {
                 // The transport can finish connecting just after the user
                 // closes its GUI. Do not turn that late success into a
@@ -1025,6 +1037,10 @@ async fn connect_to_auto_connect_domains() -> anyhow::Result<()> {
                         ui,
                         move || gate_domain.state() == mux::domain::DomainState::Detached,
                         Some(std::time::Duration::from_secs(60)),
+                        // Auto-connect waits out a VPN at login: keep the
+                        // existing time budget without the interactive
+                        // attempt cap.
+                        None,
                     )
                     .await
                     {
@@ -1171,7 +1187,9 @@ async fn async_run_terminal_gui(
 
             match attach_domain_in_window_with_retry(Arc::clone(domain), window_id).await? {
                 AttachRetryOutcome::Attached => {}
-                AttachRetryOutcome::Cancelled => return Ok(()),
+                AttachRetryOutcome::Cancelled | AttachRetryOutcome::AbandonedAfterAttach => {
+                    return Ok(())
+                }
             }
             let config = config::configuration();
             let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi());

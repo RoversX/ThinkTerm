@@ -306,6 +306,19 @@ pub enum AttachRetryOutcome {
     /// `keep_going` said stop before the domain attached. The ConnectionUI
     /// has been closed and the domain remains detached.
     Cancelled,
+    /// The attempt attached, but the user closed its progress tab before the
+    /// retry loop could hand the connection back. `attach_with_ui_retry`
+    /// detaches it before returning: a transport with no window would
+    /// otherwise run invisibly. Callers treat it like `Cancelled`.
+    AbandonedAfterAttach,
+}
+
+/// What one attach attempt did. "Already attached" is not ours to tear down
+/// when the caller's progress tab disappears: another window may own it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachAttemptOutcome {
+    AttachedHere,
+    AlreadyAttached,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -313,6 +326,41 @@ struct AttachRetryTiming {
     initial_backoff: Duration,
     max_backoff: Duration,
     cancellation_poll: Duration,
+}
+
+/// How many times an interactive attach tries before giving up. Bounded on
+/// purpose: a host with no SSH server refuses instantly, and an unbounded
+/// loop turns that into an invisible, uncancellable spinner.
+pub const ATTACH_MAX_ATTEMPTS: usize = 5;
+
+/// The attempt number a retry sequence is on, for the progress tab title and
+/// the sidebar's connection banner. Atomics because the sidebar paints from
+/// the main thread while the retry loop runs on the connection thread.
+#[derive(Default)]
+struct AttachProgress {
+    attempt: std::sync::atomic::AtomicUsize,
+    total: std::sync::atomic::AtomicUsize,
+}
+
+impl AttachProgress {
+    fn begin(&self, attempt: usize, total: Option<usize>) {
+        use std::sync::atomic::Ordering;
+        self.total.store(total.unwrap_or(0), Ordering::SeqCst);
+        self.attempt.store(attempt, Ordering::SeqCst);
+    }
+
+    fn clear(&self) {
+        use std::sync::atomic::Ordering;
+        self.attempt.store(0, Ordering::SeqCst);
+        self.total.store(0, Ordering::SeqCst);
+    }
+
+    fn current(&self) -> Option<(usize, usize)> {
+        use std::sync::atomic::Ordering;
+        let attempt = self.attempt.load(Ordering::SeqCst);
+        let total = self.total.load(Ordering::SeqCst);
+        (attempt > 0 && total > 0).then_some((attempt, total))
+    }
 }
 
 impl Default for AttachRetryTiming {
@@ -382,22 +430,41 @@ async fn attach_with_retry_loop<Attempt, AttemptFuture, KeepGoing>(
     mut attempt: Attempt,
     mut keep_going: KeepGoing,
     max_total: Option<Duration>,
+    max_attempts: Option<usize>,
+    progress: &AttachProgress,
     timing: AttachRetryTiming,
 ) -> anyhow::Result<AttachRetryOutcome>
 where
     Attempt: FnMut() -> AttemptFuture,
-    AttemptFuture: Future<Output = anyhow::Result<()>>,
+    AttemptFuture: Future<Output = anyhow::Result<AttachAttemptOutcome>>,
     KeepGoing: FnMut() -> bool,
 {
     let start = Instant::now();
     let mut backoff = timing.initial_backoff;
+    let mut attempt_no = 0usize;
     loop {
         if !keep_going() {
             ui.close();
             return Ok(AttachRetryOutcome::Cancelled);
         }
+        attempt_no += 1;
+        progress.begin(attempt_no, max_attempts);
         match attempt().await {
-            Ok(()) => {
+            Ok(outcome) => {
+                // The user may have closed the progress tab while the
+                // transport was finishing. Attaching with no UI leaves the
+                // connection running invisibly, so undo it via
+                // AbandonedAfterAttach. An already-attached domain belongs
+                // to another caller and is left alone.
+                if !keep_going() {
+                    ui.close();
+                    return Ok(match outcome {
+                        AttachAttemptOutcome::AttachedHere => {
+                            AttachRetryOutcome::AbandonedAfterAttach
+                        }
+                        AttachAttemptOutcome::AlreadyAttached => AttachRetryOutcome::Cancelled,
+                    });
+                }
                 // ClientDomain::attach_with_ui already closes on success, but
                 // owning that invariant here keeps the retry runner correct
                 // for tests and any future single-attempt implementation.
@@ -406,11 +473,36 @@ where
             }
             Err(err) if is_fatal_attach_error(&err) => return Err(err),
             Err(err) => {
-                if max_total.is_some_and(|limit| start.elapsed() + backoff >= limit) {
+                if max_attempts.is_some_and(|max| attempt_no >= max) {
+                    log::error!(
+                        "attaching {domain_name} failed after {attempt_no} attempt(s): {err:#}"
+                    );
+                    ui.output_str(&format!(
+                        "\r\nGiving up after {attempt_no} attempt(s): {err:#}\r\n"
+                    ));
                     return Err(err);
                 }
-                log::error!("attaching {domain_name} failed: {err:#}; retrying in {backoff:?}");
-                ui.output_str(&format!("Will retry in {backoff:?}...\n"));
+                if max_total.is_some_and(|limit| start.elapsed() + backoff >= limit) {
+                    log::error!(
+                        "attaching {domain_name} failed after {attempt_no} attempt(s) \
+                         within the time budget: {err:#}"
+                    );
+                    ui.output_str(&format!(
+                        "\r\nGiving up after {attempt_no} attempt(s) (time limit): {err:#}\r\n"
+                    ));
+                    return Err(err);
+                }
+                let label = match max_attempts {
+                    Some(max) => format!("{attempt_no}/{max}"),
+                    None => attempt_no.to_string(),
+                };
+                log::error!(
+                    "attaching {domain_name} failed (attempt {label}): {err:#}; \
+                     retrying in {backoff:?}"
+                );
+                ui.output_str(&format!(
+                    "Attempt {label} failed. Will retry in {backoff:?}...\n"
+                ));
                 if !wait_attach_backoff(&mut keep_going, backoff, timing.cancellation_poll).await {
                     ui.close();
                     return Ok(AttachRetryOutcome::Cancelled);
@@ -2098,6 +2190,9 @@ pub struct ClientDomain {
     /// engine has not given up between attempts, or every backoff gap paints
     /// as a disconnect.
     attach_retries: std::sync::atomic::AtomicUsize,
+    /// Attempt x of y of the running attach retry sequence, for the progress
+    /// tab title and the sidebar's orange "Connecting…" row.
+    attach_progress: AttachProgress,
     /// Serializes topology snapshots. Immediate callers join an active
     /// generation; background pushes coalesce behind one trailing pass.
     resync_coordinator: Mutex<ResyncCoordinatorState>,
@@ -2565,6 +2660,7 @@ impl ClientDomain {
             early_remote_state: Mutex::new(EarlyRemoteState::default()),
             attaching: std::sync::atomic::AtomicBool::new(false),
             attach_retries: std::sync::atomic::AtomicUsize::new(0),
+            attach_progress: AttachProgress::default(),
             resync_coordinator: Mutex::new(ResyncCoordinatorState::default()),
             unsent_labels: Mutex::new(HashMap::new()),
             label_edits: Mutex::new(LabelEdits::default()),
@@ -2647,6 +2743,16 @@ impl ClientDomain {
         self.attach_retries
             .load(std::sync::atomic::Ordering::SeqCst)
             > 0
+    }
+
+    /// The attempt a running attach retry sequence is on, as `(current,
+    /// total)`. `None` when no retry sequence is active or the current one
+    /// has not started its first attempt yet.
+    pub fn attach_attempt_progress(&self) -> Option<(usize, usize)> {
+        if !self.is_attach_retrying() {
+            return None;
+        }
+        self.attach_progress.current()
     }
 
     pub fn perform_detach(&self) {
@@ -4618,8 +4724,9 @@ mod tests {
         attach_with_retry_loop, consistent_remote_tab_id, is_fatal_attach_error,
         next_attach_backoff, owns_remote_viewport_from_states, place_in_listed_order,
         remote_frontend_gate_from_state, remote_move_pane_id, server_runtime_replaced,
-        stale_mirrors_to_reap, thread_id_for_workspace, AttachRetryOutcome, AttachRetryTiming,
-        AutomaticRemotePaneResize, FrontendRecoveryAck, FrontendRecoveryBarrier,
+        stale_mirrors_to_reap, thread_id_for_workspace, AttachAttemptOutcome, AttachProgress,
+        AttachRetryOutcome, AttachRetryTiming, AutomaticRemotePaneResize, FrontendRecoveryAck,
+        FrontendRecoveryBarrier,
         FrontendRecoverySlot, LabelEdits, MirrorOrigin, RemoteFrontendGate, ResyncCoordinatorState,
         ResyncDriverAction, ResyncOutcome, ResyncRequestKind, SharedResyncCompletion,
         ViewportLatencyState,
@@ -4955,17 +5062,95 @@ mod tests {
                     if attempt < 3 {
                         Err(anyhow::anyhow!("temporary routing failure"))
                     } else {
-                        Ok(())
+                        Ok(AttachAttemptOutcome::AttachedHere)
                     }
                 }
             },
             || true,
             None,
+            None,
+            &AttachProgress::default(),
             fast_retry_timing(),
         ))
         .expect("transient failures should eventually attach");
         assert_eq!(outcome, AttachRetryOutcome::Attached);
         assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
+    fn attempt_budget_stops_after_the_last_attempt() {
+        let attempts = Rc::new(Cell::new(0));
+        let attempt_counter = Rc::clone(&attempts);
+        let progress = Rc::new(AttachProgress::default());
+        let attempt_progress = Rc::clone(&progress);
+        let last_seen = Rc::new(Cell::new(None));
+        let seen_at_attempt = Rc::clone(&last_seen);
+
+        let err = smol::block_on(attach_with_retry_loop(
+            "attempt-budget-test",
+            ConnectionUI::new_headless(),
+            move || {
+                attempt_counter.set(attempt_counter.get() + 1);
+                seen_at_attempt.set(attempt_progress.current());
+                async { Err(anyhow::anyhow!("still unavailable")) }
+            },
+            || true,
+            None,
+            Some(3),
+            &progress,
+            fast_retry_timing(),
+        ))
+        .expect_err("the attempt budget must return the last error");
+
+        assert!(err.to_string().contains("still unavailable"));
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(last_seen.get(), Some((3, 3)));
+    }
+
+    #[test]
+    fn abandoning_the_ui_after_our_attach_asks_the_caller_to_detach() {
+        let checks = Rc::new(Cell::new(0));
+        let keep_checks = Rc::clone(&checks);
+        let outcome = smol::block_on(attach_with_retry_loop(
+            "abandoned-after-attach",
+            ConnectionUI::new_headless(),
+            || async { Ok(AttachAttemptOutcome::AttachedHere) },
+            move || {
+                let check = keep_checks.get();
+                keep_checks.set(check + 1);
+                check == 0
+            },
+            None,
+            Some(3),
+            &AttachProgress::default(),
+            fast_retry_timing(),
+        ))
+        .expect("abandonment is not an attach error");
+        assert_eq!(outcome, AttachRetryOutcome::AbandonedAfterAttach);
+        assert_eq!(checks.get(), 2);
+    }
+
+    #[test]
+    fn abandoning_the_ui_after_someone_elses_attach_leaves_it_alone() {
+        let outcome = smol::block_on(attach_with_retry_loop(
+            "already-attached",
+            ConnectionUI::new_headless(),
+            || async { Ok(AttachAttemptOutcome::AlreadyAttached) },
+            {
+                let checks = Rc::new(Cell::new(0));
+                move || {
+                    let check = checks.get();
+                    checks.set(check + 1);
+                    check == 0
+                }
+            },
+            None,
+            Some(3),
+            &AttachProgress::default(),
+            fast_retry_timing(),
+        ))
+        .expect("abandonment is not an attach error");
+        assert_eq!(outcome, AttachRetryOutcome::Cancelled);
     }
 
     #[test]
@@ -4987,6 +5172,8 @@ mod tests {
                 check == 0
             },
             None,
+            None,
+            &AttachProgress::default(),
             fast_retry_timing(),
         ))
         .expect("cancellation is not an attach error");
@@ -5007,6 +5194,8 @@ mod tests {
             },
             || true,
             Some(Duration::ZERO),
+            None,
+            &AttachProgress::default(),
             fast_retry_timing(),
         ))
         .expect_err("an exhausted retry budget returns the last error");
@@ -5055,6 +5244,8 @@ mod tests {
             },
             || true,
             None,
+            None,
+            &AttachProgress::default(),
             fast_retry_timing(),
         ))
         .expect_err("fatal failures must be returned immediately");
@@ -6144,16 +6335,20 @@ impl Domain for ClientDomain {
         let outcome = self
             .attach_with_ui_retry(
                 window_id,
-                ui,
+                ui.clone(),
                 move || {
                     window_id.is_none_or(|window_id| Mux::get().get_window(window_id).is_some())
+                        && !ui.abandoned()
                 },
                 Some(Duration::from_secs(60)),
+                Some(ATTACH_MAX_ATTEMPTS),
             )
             .await?;
         match outcome {
             AttachRetryOutcome::Attached => Ok(()),
-            AttachRetryOutcome::Cancelled => bail!("attach cancelled because its window closed"),
+            AttachRetryOutcome::Cancelled | AttachRetryOutcome::AbandonedAfterAttach => {
+                bail!("attach cancelled because its window closed")
+            }
         }
     }
 
@@ -6182,34 +6377,58 @@ impl Domain for ClientDomain {
 impl ClientDomain {
     /// Attach with one ConnectionUI shared by every attempt. Transient
     /// failures use 1s..10s exponential backoff; fatal failures return
-    /// immediately. `None` retries until `keep_going` cancels the operation.
+    /// immediately. `max_attempts` bounds interactive attaches (the GUI
+    /// passes [`ATTACH_MAX_ATTEMPTS`]); `None` keeps retrying until
+    /// `max_total` or `keep_going` stops it, which auto-connect at login
+    /// needs while a VPN is still coming up.
     pub async fn attach_with_ui_retry(
         &self,
         window_id: Option<WindowId>,
         ui: ConnectionUI,
         keep_going: impl FnMut() -> bool,
         max_total: Option<Duration>,
+        max_attempts: Option<usize>,
     ) -> anyhow::Result<AttachRetryOutcome> {
-        struct RetryFlag<'a>(&'a std::sync::atomic::AtomicUsize);
+        struct RetryFlag<'a>(&'a std::sync::atomic::AtomicUsize, &'a AttachProgress);
         impl Drop for RetryFlag<'_> {
             fn drop(&mut self) {
-                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                // Clear only when the last retry sequence ends: two callers
+                // can be waiting on the same domain, and the survivor still
+                // needs its attempt counter.
+                if self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                    self.1.clear();
+                }
             }
         }
         self.attach_retries
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let _in_flight = RetryFlag(&self.attach_retries);
+        let _in_flight = RetryFlag(&self.attach_retries, &self.attach_progress);
 
         let attempt_ui = ui.clone();
-        attach_with_retry_loop(
+        let outcome = attach_with_retry_loop(
             self.domain_name(),
             ui,
-            move || self.attach_with_ui(window_id, attempt_ui.clone()),
+            move || self.attach_with_ui_outcome(window_id, attempt_ui.clone()),
             keep_going,
             max_total,
+            max_attempts,
+            &self.attach_progress,
             AttachRetryTiming::default(),
         )
-        .await
+        .await?;
+
+        if outcome == AttachRetryOutcome::AbandonedAfterAttach {
+            // The last attempt attached, then lost the race with the user
+            // closing its progress tab. Keep the transport from outliving
+            // the UI that was supposed to host it.
+            log::info!(
+                "detaching {} because its connection UI was abandoned",
+                self.domain_name()
+            );
+            self.perform_detach();
+        }
+
+        Ok(outcome)
     }
 
     /// The body of Domain::attach, with a caller-supplied ConnectionUI so
@@ -6222,12 +6441,26 @@ impl ClientDomain {
         window_id: Option<WindowId>,
         ui: ConnectionUI,
     ) -> anyhow::Result<()> {
+        self.attach_with_ui_outcome(window_id, ui)
+            .await
+            .map(|_| ())
+    }
+
+    /// As [`Self::attach_with_ui`], but says whether this call installed the
+    /// transport or found the domain already attached. The retry loop uses
+    /// that to know what it may detach if the progress tab disappears while
+    /// an attempt is finishing.
+    async fn attach_with_ui_outcome(
+        &self,
+        window_id: Option<WindowId>,
+        ui: ConnectionUI,
+    ) -> anyhow::Result<AttachAttemptOutcome> {
         use std::sync::atomic::Ordering;
 
         if self.state() == DomainState::Attached {
             // Already attached
             ui.close();
-            return Ok(());
+            return Ok(AttachAttemptOutcome::AlreadyAttached);
         }
 
         // Connecting takes seconds (ssh handshake, auth, pane list) while
@@ -6242,7 +6475,7 @@ impl ClientDomain {
             }
             if self.state() == DomainState::Attached {
                 ui.close();
-                return Ok(());
+                return Ok(AttachAttemptOutcome::AlreadyAttached);
             }
             anyhow::bail!("a concurrent attach attempt for this domain failed");
         }
@@ -6250,7 +6483,7 @@ impl ClientDomain {
         let result = self.attach_with_ui_impl(window_id, ui).await;
         self.attaching.store(false, Ordering::SeqCst);
         wake_thinkterm_frontend();
-        result
+        result.map(|()| AttachAttemptOutcome::AttachedHere)
     }
 
     async fn attach_with_ui_impl(
@@ -6262,7 +6495,11 @@ impl ClientDomain {
         let config = self.config.clone();
 
         let activity = mux::activity::Activity::new();
-        ui.title("ThinkTerm: Connecting...");
+        let title = match self.attach_attempt_progress() {
+            Some((attempt, total)) => format!("ThinkTerm: Connecting... ({attempt}/{total})"),
+            None => "ThinkTerm: Connecting...".to_string(),
+        };
+        ui.title(&title);
 
         ui.async_run_and_log_error({
             let ui = ui.clone();

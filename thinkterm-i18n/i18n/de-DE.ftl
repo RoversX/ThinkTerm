@@ -350,6 +350,7 @@ settings-import-preview-custom-colors = Eigene Farben
 settings-import-preview-font-table = Schriftkonfiguration
 sidebar-default-space = Standard
 sidebar-connecting = Verbinden…
+sidebar-connecting-attempt = Verbinden… ({ $current }/{ $total })
 sidebar-reconnect = Erneut verbinden
 sidebar-new-thread = Neuer Thread
 sidebar-pinned = Angeheftet

@@ -15,11 +15,12 @@ use crate::Mux;
 use anyhow::bail;
 use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
-use crossbeam::channel::{unbounded as channel, Receiver, Sender};
+use crossbeam::channel::{unbounded as channel, Receiver, Sender, TryRecvError};
 use filedescriptor::{FileDescriptor, Pipe};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use portable_pty::*;
 use rangeset::RangeSet;
+use std::collections::VecDeque;
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::sync::Arc;
@@ -345,6 +346,10 @@ impl Pane for TermWizTerminalPane {
 pub struct TermWizTerminal {
     render_tx: TermWizTerminalRenderTty,
     input_rx: Receiver<InputEvent>,
+    /// Input events pulled off the channel while checking whether the pane
+    /// that feeds it still exists. Kept in front of the channel so a probe
+    /// never eats a keystroke meant for the next prompt.
+    pending_input: VecDeque<InputEvent>,
     renderer: TerminfoRenderer,
     grab_mouse: bool,
 }
@@ -352,6 +357,22 @@ pub struct TermWizTerminal {
 impl TermWizTerminal {
     pub fn no_grab_mouse_in_raw_mode(&mut self) {
         self.grab_mouse = false;
+    }
+
+    /// True once the pane that owns this terminal is gone: closing its tab
+    /// drops the pane, and with it the sender side of `input_rx`.
+    ///
+    /// A zero-time poll while idle is how the connection UI notices that the
+    /// user closed its tab and stops retrying. Events found here are buffered
+    /// rather than dropped, so this cannot steal a password keystroke.
+    pub fn input_disconnected(&mut self) -> bool {
+        loop {
+            match self.input_rx.try_recv() {
+                Ok(event) => self.pending_input.push_back(event),
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => return true,
+            }
+        }
     }
 }
 
@@ -377,6 +398,11 @@ impl termwiz::render::RenderTty for TermWizTerminalRenderTty {
 
 impl TermWizTerminal {
     fn do_input_poll(&mut self, wait: Option<Duration>) -> termwiz::Result<Option<InputEvent>> {
+        // Anything the liveness probe pulled off the channel comes first, in
+        // arrival order.
+        if let Some(event) = self.pending_input.pop_front() {
+            return Ok(Some(event));
+        }
         if let Some(timeout) = wait {
             match self.input_rx.recv_timeout(timeout) {
                 Ok(input) => Ok(Some(input)),
@@ -501,6 +527,7 @@ pub fn allocate(
             },
         },
         input_rx,
+        pending_input: VecDeque::new(),
         renderer,
         grab_mouse: true,
     };
@@ -550,6 +577,7 @@ pub async fn run<
             },
         },
         input_rx,
+        pending_input: VecDeque::new(),
         renderer,
         grab_mouse: true,
     };
