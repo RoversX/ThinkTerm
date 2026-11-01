@@ -103,6 +103,30 @@ fn main() {
     if let Some(watch) = wezterm_mux_server_impl::hold::requested() {
         wezterm_mux_server_impl::hold::run(&watch, env_bootstrap::setup_logger);
     }
+    // The GUI asking what macOS lets the programs in panes do: answer with
+    // the identity a server has, which the launcher's is not, and exit.
+    #[cfg(target_os = "macos")]
+    {
+        use wezterm_mux_server_impl::privacy;
+        match privacy::requested() {
+            Some(privacy::Request::TakeIdentity) => {
+                let err = match std::env::current_exe() {
+                    Ok(exe) => daemonize::exec_as_own_tcc_identity(
+                        exe.as_os_str(),
+                        &[privacy::REPORT_AS_SELF_OPTION.into()],
+                    ),
+                    Err(err) => err,
+                };
+                eprintln!("privacy report: could not take the server's identity: {err:#}");
+                std::process::exit(1);
+            }
+            Some(privacy::Request::Report) => {
+                privacy::print_report();
+                std::process::exit(0);
+            }
+            None => {}
+        }
+    }
     thinkterm_import_herdr::register().expect("register built-in session importer");
     if let Some(result) = thinkterm_import::maybe_run_helper() {
         std::process::exit(if result.is_ok() { 0 } else { 1 });

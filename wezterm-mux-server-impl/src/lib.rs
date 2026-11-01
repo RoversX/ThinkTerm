@@ -15,6 +15,7 @@ pub mod session_import;
 pub mod local;
 pub mod pki;
 mod plugin_relay;
+pub mod privacy;
 mod private_file;
 mod sent_images;
 pub mod sessionhandler;
