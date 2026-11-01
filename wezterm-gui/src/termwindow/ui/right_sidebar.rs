@@ -2185,7 +2185,7 @@ impl crate::TermWindow {
     /// preview pane and the Note pane; both keep a terminal reserve.
     fn right_sidebar_pane_total_max_width(&self) -> usize {
         let available_width = self.right_sidebar_available_width();
-        let content_width = available_width.saturating_sub(self.workspace_sidebar_width());
+        let content_width = available_width.saturating_sub(self.workspace_sidebar_sizing_width());
         let min_preview_total =
             self.ui_px(RIGHT_SIDEBAR_MIN_WIDTH) + self.ui_px(FILE_PREVIEW_PANE_MIN_WIDTH);
         let terminal_reserve = content_width / 5;
@@ -2321,7 +2321,7 @@ impl crate::TermWindow {
     }
 
     /// The width the panel has when it is on screen, docked or not.
-    fn right_sidebar_docked_width(&self) -> usize {
+    pub(crate) fn right_sidebar_docked_width(&self) -> usize {
         if !self.right_sidebar_has_panels() {
             return 0;
         }
@@ -2343,7 +2343,7 @@ impl crate::TermWindow {
     }
 
     /// The width the panel is DRAWN and HIT-TESTED at: the docked width while
-    /// it is docked or hover-revealed, zero otherwise.
+    /// it is docked, hover-revealed or sliding away, zero otherwise.
     pub(crate) fn right_sidebar_presented_width(&self) -> usize {
         if self.right_sidebar_presented() {
             self.right_sidebar_docked_width()
@@ -2352,10 +2352,24 @@ impl crate::TermWindow {
         }
     }
 
-    /// Whether the panel is on screen at all, docked or by a hover reveal.
-    /// What the panel shows follows this; the terminal's layout does not.
+    /// Whether the panel is on screen at all: docked, by a hover reveal, or
+    /// on its way back into the edge. What the panel shows follows this; the
+    /// terminal's layout does not.
     pub(crate) fn right_sidebar_presented(&self) -> bool {
-        !self.right_sidebar_collapsed || self.right_sidebar_hover.is_presented()
+        !self.right_sidebar_collapsed
+            || self.right_sidebar_hover.is_presented()
+            || self
+                .sidebar_slides
+                .closing(crate::termwindow::sidebar_slide::Side::Right)
+    }
+
+    /// Whether the panel, when it is on screen, is a hover reveal. One on its
+    /// way back from being docked is not: it keeps its shape until it is gone.
+    pub(crate) fn right_sidebar_floats(&self) -> bool {
+        self.right_sidebar_collapsed
+            && !self
+                .sidebar_slides
+                .closing(crate::termwindow::sidebar_slide::Side::Right)
     }
 
     pub fn right_sidebar_max_width(&self) -> usize {
@@ -2465,6 +2479,9 @@ impl crate::TermWindow {
     }
 
     pub fn toggle_right_sidebar(&mut self) {
+        // Docking a hover reveal moves nothing but what of the panel is not
+        // out yet.
+        let revealed = self.right_sidebar_hover.progress(Instant::now());
         // Collapsing must not instantly re-reveal under a pointer still on the
         // button, and docking makes a reveal moot.
         self.right_sidebar_hover.suppress_until_pointer_leaves();
@@ -2472,16 +2489,31 @@ impl crate::TermWindow {
         self.right_sidebar_collapsed = !self.right_sidebar_collapsed;
         crate::native_settings::save_right_sidebar_shown(!self.right_sidebar_collapsed);
         if self.right_sidebar_collapsed {
-            self.right_sidebar_contents_scratch.clear();
             if self.right_sidebar_mode == RightSidebarMode::Tasks {
                 self.clear_right_sidebar_text_focus();
             }
-            self.drop_hidden_right_sidebar_markdown_preview_focus();
-            self.close_plugin_panel();
-            self.schedule_right_sidebar_file_memory_release();
-            self.release_right_sidebar_remote_files_if_hidden();
-            self.schedule_right_sidebar_note_memory_release();
+            if self.slide_sidebar(crate::termwindow::sidebar_slide::Side::Right, false) {
+                // Painted from what it shows until it is gone, but no longer
+                // typed into meanwhile.
+                self.unfocus_right_sidebar_markdown_preview();
+                if self.plugin_panel_has_keyboard() {
+                    self.release_plugin_panel_keyboard();
+                }
+            } else {
+                self.let_go_of_right_sidebar();
+            }
         } else {
+            match revealed {
+                Some(revealed) => {
+                    self.dock_revealed_sidebar(
+                        crate::termwindow::sidebar_slide::Side::Right,
+                        revealed,
+                    );
+                }
+                None => {
+                    self.slide_sidebar(crate::termwindow::sidebar_slide::Side::Right, true);
+                }
+            }
             self.kick_right_sidebar_file_rescan_cycle();
             self.request_right_sidebar_remote_files_connect(false);
             if self.right_sidebar_mode == RightSidebarMode::Tasks {
@@ -2491,11 +2523,27 @@ impl crate::TermWindow {
         }
     }
 
+    /// Let go of what the collapsed panel showed: as it collapses, or once it
+    /// has slid out of sight.
+    pub(crate) fn let_go_of_right_sidebar(&mut self) {
+        self.right_sidebar_contents_scratch.clear();
+        self.drop_hidden_right_sidebar_markdown_preview_focus();
+        self.close_plugin_panel();
+        self.schedule_right_sidebar_file_memory_release();
+        self.release_right_sidebar_remote_files_if_hidden();
+        self.schedule_right_sidebar_note_memory_release();
+    }
+
     pub fn expand_right_sidebar(&mut self) {
+        // Out of nothing it slides out; docked or revealed, it is out already.
+        let hidden = self.right_sidebar_collapsed && !self.right_sidebar_hover.is_presented();
         self.right_sidebar_hover.suppress_until_pointer_leaves();
         self.right_sidebar_hover_was_presented = false;
         self.right_sidebar_collapsed = false;
         crate::native_settings::save_right_sidebar_shown(true);
+        if hidden {
+            self.slide_sidebar(crate::termwindow::sidebar_slide::Side::Right, true);
+        }
         self.kick_right_sidebar_file_rescan_cycle();
         self.request_right_sidebar_remote_files_connect(false);
         if self.right_sidebar_mode == RightSidebarMode::Tasks {
@@ -8418,8 +8466,9 @@ impl crate::TermWindow {
         // Off macOS the panel has no toggle of its own and the tab bar keeps
         // the window buttons at its right end; a hover-revealed panel stays
         // below the tab bar so both remain reachable -- below as much of it
-        // as is out, when it hides, or below the pane bar holding them.
-        if !cfg!(target_os = "macos") && self.right_sidebar_collapsed {
+        // as is out, when it hides, or below the pane bar holding them. A
+        // docked one sliding away keeps its shape.
+        if !cfg!(target_os = "macos") && self.right_sidebar_floats() {
             let tab_bar = self.window_top_right_chrome_height().ceil() as usize;
             let top = rect.y.saturating_add(tab_bar);
             rect.height = rect.height.saturating_sub(top - rect.y);
@@ -8977,7 +9026,7 @@ impl crate::TermWindow {
         let y = rect.y + self.ui_px(SIDEBAR_INSET) * 2;
         // A non-macOS hover panel already sits below the window buttons and
         // has no toggle of its own, so it needs no additional button row.
-        let height = if !cfg!(target_os = "macos") && self.right_sidebar_collapsed {
+        let height = if !cfg!(target_os = "macos") && self.right_sidebar_floats() {
             0
         } else {
             self.ui_px(RIGHT_SIDEBAR_TOP_BAR_HEIGHT).min(

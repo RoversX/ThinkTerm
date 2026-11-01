@@ -370,6 +370,7 @@ tooltip-sidebar-thread-search = Find Thread
 tooltip-sidebar-ssh-hosts = Remote Hosts
 tooltip-sidebar-live-overview = Live Overview
 tooltip-sidebar-notifications = Notifications
+tooltip-sidebar-jump = Scroll to Current Thread
 menu-rename-project = Rename Project…
 menu-grant-folder-access = Grant Folder Access…
 menu-new-thread = New Thread

@@ -16,6 +16,7 @@ use crate::termwindow::render::split_slide::{
     self, ClosedNav, Drawn, Leaving, MovingPane, Nav, NavMorph, OtherPane, Placed, SlideFrame,
     TabLayout,
 };
+use crate::termwindow::sidebar_slide::{EndBar, Side, SidebarSlideFrame};
 use mux::tab::{PositionedPane, PositionedSplit, SplitDirection, TabId};
 use smol::Timer;
 use std::collections::hash_map::DefaultHasher;
@@ -489,6 +490,44 @@ fn clip_right_sidebar_hover_items(items: &mut Vec<UIItem>, top: usize, bottom: u
         item.height = end.saturating_sub(item.y);
         item.height > 0
     });
+}
+
+/// While a sidebar is on its way, nothing in it is where it looks to be: one
+/// inert item over the part of it on screen stands for what it registers,
+/// and keeps the pointer off what lies under it. Beside the left one the
+/// same goes for what is between the sidebars, going along with its edge:
+/// the panes and the tab row, but for what the row keeps where it is (see
+/// `paint_tab_row_between_sliding_sidebars`), registered after these.
+fn sliding_sidebar_items(slide: &SidebarSlideFrame) -> Vec<UIItem> {
+    let mut items = vec![];
+    let between = (slide.terminal.shift.0 != 0.).then_some(slide.terminal.clip);
+    // A panel drawn where it docks keeps its own (see
+    // `record_sliding_sidebar`).
+    let moving = |drawn: Option<Drawn>| {
+        drawn
+            .filter(|drawn| drawn.shift != (0., 0.))
+            .map(|drawn| drawn.clip)
+    };
+    for (clip, item_type) in [
+        (moving(slide.left), UIItemType::WorkspaceSidebarBackground),
+        // Taking no click, as a travelling tab row's does.
+        (between, UIItemType::WindowTabsTravelling),
+        (moving(slide.right), UIItemType::RightSidebarBackground),
+    ] {
+        let Some(clip) = clip else {
+            continue;
+        };
+        if clip.width() >= 1.0 {
+            items.push(UIItem {
+                x: clip.min_x() as usize,
+                y: 0,
+                width: clip.width() as usize,
+                height: clip.max_y() as usize,
+                item_type,
+            });
+        }
+    }
+    items
 }
 
 fn quad_clip_rect(rect: RectF, dimensions: &Dimensions) -> QuadClipRect {
@@ -1460,6 +1499,7 @@ impl crate::TermWindow {
         }
         if present_frame {
             self.split_slides.shown();
+            self.sidebar_slides.shown();
         }
         let draw_result = if present_frame {
             self.call_draw(frame).map(|_| true)
@@ -1728,6 +1768,18 @@ impl crate::TermWindow {
             self.clip_of(target),
             opacity,
         )
+    }
+
+    /// How far past the card it lands in the travelling terminal has gone as
+    /// it settles, and where it set off; `None` but while it is past one.
+    fn content_view_landing_settle(&self, now: Instant) -> Option<(RectF, f32)> {
+        let fade = self.content_view_fade.as_ref()?;
+        let flight = fade.flight.as_ref().filter(|flight| flight.lands_in_card)?;
+        if fade.travel.target() < 0.5 || fade.landing.is_some() {
+            return None;
+        }
+        let past = fade.travel.value(now) - 1.0;
+        (past > 0.0).then_some((flight.source, past))
     }
 
     /// Where the recorded terminal was recorded, and where its travel has
@@ -2254,7 +2306,22 @@ impl crate::TermWindow {
             }
         }
         let source = self.terminal_content_rect();
+        let overshoot = crate::termwindow::content_view::flight_overshoot(
+            source,
+            destination,
+            self.ui_f32(crate::termwindow::content_view::FLIGHT_MOST_OVERSHOOT),
+        );
         if let Some(fade) = self.content_view_fade.as_mut() {
+            // Into its card, the terminal goes a little past and comes back,
+            // carrying the card (`content_view_landing_settle`), as a sidebar
+            // does. Its way is known only now, on the first frame, before the
+            // travel's clock starts. Back out of it, it does not.
+            if lands_in_card && fade.travel.target() >= 0.5 {
+                fade.travel.reshape(
+                    crate::ui::anim::Easing::settling(overshoot),
+                    crate::termwindow::content_view::FLIGHT_SETTLE_STRETCH,
+                );
+            }
             fade.flight = Some(crate::termwindow::content_view::ContentViewFlight {
                 surface,
                 source,
@@ -2325,6 +2392,11 @@ impl crate::TermWindow {
         // reading it as "a heap is being recorded", as it must.
         let mut heap = std::mem::take(&mut self.content_view_frame_scratch);
         heap.recycle();
+        // The card the terminal lands in goes past and back with it.
+        let settle = self.content_view_landing_settle(Instant::now());
+        if let Some(view) = self.active_content_view_mut() {
+            view.set_terminal_landing_settle(settle);
+        }
         {
             let mut recorded = TripleLayerQuadAllocator::Heap(&mut heap);
             self.paint_content_view(&mut recorded)?;
@@ -4087,8 +4159,9 @@ impl crate::TermWindow {
 
     /// Step the hover-reveal machine from the frame loop, so a motionless
     /// pointer still reveals at dwell expiry and a departed one still
-    /// retreats at grace expiry.
+    /// retreats at grace expiry; and pace a travelling panel by the frame.
     fn advance_workspace_sidebar_hover(&mut self, now: Instant) {
+        self.workspace_sidebar_hover.pace(now);
         let input = self.workspace_sidebar_hover_input();
         match self.workspace_sidebar_hover.step(input, now) {
             crate::termwindow::sidebar_hover::HoverFrame::None => {}
@@ -4108,6 +4181,7 @@ impl crate::TermWindow {
 
     /// The right sidebar's counterpart of `advance_workspace_sidebar_hover`.
     fn advance_right_sidebar_hover(&mut self, now: Instant) {
+        self.right_sidebar_hover.pace(now);
         match self.step_right_sidebar_hover(now) {
             crate::termwindow::sidebar_hover::HoverFrame::None => {}
             crate::termwindow::sidebar_hover::HoverFrame::Now => {
@@ -4119,6 +4193,186 @@ impl crate::TermWindow {
                 self.update_next_frame_time(Some(due));
             }
         }
+    }
+
+    /// A sidebar on its way out of its edge or back, painted where it is
+    /// docked into a recording to replay where the slide has it, `drawn`.
+    /// While it moves nothing in it is where it looks to be, so what it
+    /// registers for the pointer is dropped (see `sliding_sidebar_items`).
+    /// Drawn where it docks -- a hover reveal docked, with only the
+    /// terminal beside it moving -- it keeps it.
+    fn record_sliding_sidebar(
+        &mut self,
+        drawn: Drawn,
+        paint: impl FnOnce(&mut Self, &mut TripleLayerQuadAllocator) -> anyhow::Result<()>,
+    ) -> anyhow::Result<RecordedPane> {
+        let ui_items = self.ui_items.len();
+        let images = self.image_composites.borrow().mark();
+        let mut quads = HeapQuadAllocator::default();
+        let painted = paint(self, &mut TripleLayerQuadAllocator::Heap(&mut quads));
+        let images = self.image_composites.borrow_mut().take_since(images);
+        if drawn.shift != (0., 0.) {
+            self.ui_items.truncate(ui_items);
+        }
+        painted?;
+        Ok(RecordedPane { quads, images })
+    }
+
+    /// Room between the sidebars the terminal does not reach yet while one
+    /// slides, filled as the panes along the terminal's right edge fill
+    /// their own. Recorded with the terminal, where the slide's shift takes
+    /// it to the room.
+    fn paint_sidebar_slide_room(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        panes: &[PositionedPane],
+        slide: &SidebarSlideFrame,
+    ) -> anyhow::Result<()> {
+        let Some(room) = slide.room else {
+            return Ok(());
+        };
+        let left = room.min_x() - slide.terminal.shift.0;
+        let right_edge = self.terminal_viewport_right();
+        for pos in panes {
+            let place = self.split_slide_place(pos)?;
+            if place.max_x() < right_edge - 1.0 {
+                continue;
+            }
+            let rect = euclid::rect(left, place.min_y(), room.width(), place.height());
+            self.paint_room_of(layers, pos, rect, 0.)?;
+        }
+        Ok(())
+    }
+
+    /// The bars of the panes along the terminal's right edge, which does
+    /// not move as a sidebar slides: the buttons at their ends stay with it
+    /// (see `SidebarSlideFrame::terminal_pieces`).
+    fn sidebar_slide_end_bars(&self, panes: &[PositionedPane]) -> anyhow::Result<Vec<EndBar>> {
+        let right_edge = self.terminal_viewport_right();
+        let mut bars = vec![];
+        for pos in panes {
+            if self.split_slide_place(pos)?.max_x() < right_edge - 1.0 {
+                continue;
+            }
+            if let Some((band, buttons)) = self.pane_nav_band(pos)? {
+                bars.push(EndBar { band, buttons });
+            }
+        }
+        Ok(bars)
+    }
+
+    /// The tab row while a sidebar slides: painted where it is laid out into
+    /// a recording, and drawn in two parts with the rest of what is between
+    /// the sidebars. The buttons at its end stay where they are, as the
+    /// terminal's right edge does, and those at the ends of the pane bars
+    /// along it. What leads it goes along with the terminal's left edge, but
+    /// no further left than it stands with the sidebar collapsed: the
+    /// window's own buttons are there, which the tabs would run under coming
+    /// out from beneath the sidebar, and jump clear of as it leaves. Room
+    /// neither part reaches is the row's colour. Returns what of the row
+    /// takes clicks meanwhile: what is where it is drawn.
+    fn paint_tab_row_between_sliding_sidebars(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        slide: SidebarSlideFrame,
+        defer_trailing_actions: bool,
+    ) -> anyhow::Result<Vec<UIItem>> {
+        let images = self.image_composites.borrow().mark();
+        let mut quads = HeapQuadAllocator::default();
+        let items = {
+            let mut row_layers = TripleLayerQuadAllocator::Heap(&mut quads);
+            match self.window_tab_row_travel_shift() {
+                Some(shift) => self.paint_window_tab_row_travelling(&mut row_layers, shift),
+                None => self.paint_fancy_tab_bar(&mut row_layers, defer_trailing_actions),
+            }
+        };
+        let row = RecordedPane {
+            quads,
+            images: self.image_composites.borrow_mut().take_since(images),
+        };
+        let items = items?;
+
+        let between = slide.terminal.clip;
+        let shift = slide.terminal.shift.0;
+        let row_left = self.tab_bar_left_edge() as f32;
+        let row_right = self.terminal_viewport_right();
+        let trail_left = row_right - self.window_tab_trailing_action_reserved_width() as f32;
+        let lead_shift = if slide.left.is_some() {
+            // Docked, the tabs start right at the sidebar's edge.
+            let collapsed = self.get_os_border().left.get() as f32
+                + crate::termwindow::ui::platform_chrome::WindowTabChromeParams {
+                    workspace_sidebar_width: 0,
+                    ..self.window_tab_chrome_params()
+                }
+                .left_padding_pixels();
+            collapsed.max(row_left + shift) - (row_left + self.window_tab_left_padding_pixels())
+        } else {
+            0.
+        };
+        let window_button = |item: &UIItem| {
+            matches!(
+                item.item_type,
+                UIItemType::TabBar(crate::tabbar::TabBarItem::WindowButton(_))
+            )
+        };
+        let trail = trail_left.clamp(between.min_x(), between.max_x());
+        let lead_end = (trail_left + lead_shift).min(trail);
+        let height = self.dimensions.pixel_height as f32;
+        let span = |left: f32, right: f32| euclid::rect(left, 0., (right - left).max(0.), height);
+
+        let row_height = self.tab_bar_pixel_height().unwrap_or(0.0).ceil();
+        if row_height > 0.0 && self.window_tab_row_in_place() {
+            let top = self.get_os_border().top.get() as f32;
+            let color = self.tab_bar_surface(self.chrome().header_bg);
+            // Behind where it starts, between its two parts, and past where
+            // it ends, laid out beside a right panel that is not all the way
+            // out yet.
+            for (left, right) in [
+                (between.min_x(), row_left + lead_shift),
+                (lead_end, trail),
+                (row_right, between.max_x()),
+            ] {
+                let (left, right) = (left.max(between.min_x()), right.min(between.max_x()));
+                if right > left {
+                    self.filled_rectangle(
+                        layers,
+                        0,
+                        euclid::rect(left, top, right - left, row_height),
+                        color,
+                    )
+                    .context("tab bar room")?;
+                }
+            }
+        }
+        let lead = Drawn {
+            shift: (lead_shift, 0.),
+            clip: span(between.min_x(), lead_end),
+        };
+        let trail = Drawn {
+            shift: (0., 0.),
+            clip: span(trail, between.max_x()),
+        };
+        self.replay_pane(&row, layers, lead)?;
+        self.replay_pane(&row, layers, trail)?;
+
+        // Going along with the left sidebar's edge, the frame's item between
+        // the sidebars stands for the row: only the window's buttons take a
+        // click. Beside the right one it stays put: what of it is on screen
+        // takes clicks as usual.
+        let moving = shift != 0. || lead_shift != 0.;
+        Ok(items
+            .into_iter()
+            .filter(|item| !moving || window_button(item))
+            .filter_map(|mut item| {
+                let left = (item.x as f32).max(between.min_x());
+                let right = ((item.x + item.width) as f32).min(between.max_x());
+                (right > left).then(|| {
+                    item.x = left as usize;
+                    item.width = (right - left) as usize;
+                    item
+                })
+            })
+            .collect())
     }
 
     /// The left sidebar's hover shadow, mirrored: it falls off the revealed
@@ -4160,7 +4414,9 @@ impl crate::TermWindow {
         &mut self,
         now: Instant,
     ) -> anyhow::Result<Option<(HeapQuadAllocator, f32, Vec<UIItem>)>> {
-        if !self.right_sidebar_collapsed {
+        // Docked, or on its way back as docked: what it shows is let go of
+        // once it is gone.
+        if !self.right_sidebar_collapsed || self.sidebar_slides.closing(Side::Right) {
             return Ok(None);
         }
         let Some(progress) = self.right_sidebar_hover.progress(now) else {
@@ -4713,6 +4969,9 @@ impl crate::TermWindow {
         let panes = self.get_panes_to_render();
         let splits = self.get_splits();
         let slides = self.advance_split_slide(&panes, &splits, frame_now);
+        // Where the sidebars on their way are drawn this frame, and what is
+        // between them.
+        let sidebar_slide = self.sidebar_slide_frame(frame_now);
         let focused = self.focused.is_some();
         let window_is_transparent =
             !self.window_background.is_empty() || self.config.window_background_opacity != 1.0;
@@ -4810,6 +5069,20 @@ impl crate::TermWindow {
             .context("filled_rectangle for chrome header background")?;
         }
 
+        // While a sidebar slides, what is between the sidebars is painted
+        // where it is laid out into a recording, the pictures it puts on
+        // textures of their own taken back with it, and drawn where the
+        // slide has it before the sidebars are painted.
+        let mut slid_terminal = HeapQuadAllocator::default();
+        let slid_images = self.image_composites.borrow().mark();
+        let mut layers = match sidebar_slide {
+            Some(_) => {
+                drop(layers);
+                TripleLayerQuadAllocator::Heap(&mut slid_terminal)
+            }
+            None => layers,
+        };
+
         // When a content view is the foreground it takes over the content area,
         // so skip painting the terminal panes / splits -- except while one is
         // arriving or leaving, when both have to be on screen at once for the
@@ -4859,6 +5132,14 @@ impl crate::TermWindow {
         // let a click land on a pane the user is looking at through a
         // half-drawn overview.
         let ui_items_before_terminal = self.ui_items.len();
+        // The buttons at the bars' ends stay where they stand while a
+        // sidebar slides, the terminal's right edge staying too.
+        let sidebar_slide_bars = match sidebar_slide {
+            Some(_) => self
+                .sidebar_slide_end_bars(&panes)
+                .context("sidebar slide end bars")?,
+            _ => vec![],
+        };
 
         let mut takeover_badge = false;
         if paint_terminal_world && !frontend_blocked {
@@ -4880,6 +5161,10 @@ impl crate::TermWindow {
                 )),
                 _ => None,
             };
+            if let Some(slide) = sidebar_slide.as_ref() {
+                self.paint_sidebar_slide_room(&mut layers, &panes, slide)
+                    .context("sidebar slide room")?;
+            }
             // Room no pane is in yet looks like the pane it belongs to: the
             // window's own ground is lighter than a pane dimmed for not
             // being active.
@@ -5112,6 +5397,23 @@ impl crate::TermWindow {
             // tab bar, right sidebar and window chrome on the live GPU path, then
             // isolate just the left sidebar while its middle list page transitions.
             drop(layers);
+            if let Some(slide) = sidebar_slide.as_ref() {
+                let recorded = RecordedPane {
+                    quads: slid_terminal,
+                    images: self.image_composites.borrow_mut().take_since(slid_images),
+                };
+                let (pieces, bare) = slide.terminal_pieces(&sidebar_slide_bars);
+                let mut terminal_layers = layer.quad_allocator();
+                for drawn in pieces {
+                    self.replay_pane(&recorded, &mut terminal_layers, drawn)
+                        .context("replay terminal between sliding sidebars")?;
+                }
+                let bar = self.tab_bar_surface(self.chrome().header_bg);
+                for rect in bare {
+                    self.filled_rectangle(&mut terminal_layers, 0, rect, bar)
+                        .context("bar between its tabs and buttons")?;
+                }
+            }
 
             self.capture_workspace_space_swipe_target(frame_now)?;
 
@@ -5354,13 +5656,33 @@ impl crate::TermWindow {
             let mut chrome_layers = layer.quad_allocator();
             // A hover-revealed right sidebar was recorded above and is
             // composited after the tab bar instead.
-            if !self.right_sidebar_collapsed {
+            if let Some(drawn) = sidebar_slide.and_then(|slide| slide.right) {
+                let recorded = self
+                    .record_sliding_sidebar(drawn, |term_window, layers| {
+                        term_window.paint_right_sidebar(layers)
+                    })
+                    .context("record sliding right sidebar")?;
+                self.replay_pane(&recorded, &mut chrome_layers, drawn)
+                    .context("replay sliding right sidebar")?;
+                if let Some(sliver) = sidebar_slide.and_then(|slide| slide.right_sliver) {
+                    self.replay_pane(&recorded, &mut chrome_layers, sliver)
+                        .context("replay sliding right sidebar's edge")?;
+                }
+            } else if !self.right_sidebar_collapsed {
                 self.paint_right_sidebar(&mut chrome_layers)
                     .context("paint_right_sidebar")?;
             }
 
             let defer_trailing_actions = !cfg!(target_os = "macos") && right_hover_overlay.is_some();
-            let tab_items = if let Some(shift) = self.window_tab_row_travel_shift() {
+            let tab_items = if let Some(slide) = sidebar_slide {
+                // With the rest of what is between the sidebars.
+                self.paint_tab_row_between_sliding_sidebars(
+                    &mut chrome_layers,
+                    slide,
+                    defer_trailing_actions,
+                )
+                .context("paint tab bar between sliding sidebars")?
+            } else if let Some(shift) = self.window_tab_row_travel_shift() {
                 // On its way down from the top edge or back up: nothing on
                 // it takes a click until it lands.
                 self.paint_window_tab_row_travelling(&mut chrome_layers, shift)
@@ -5369,6 +5691,11 @@ impl crate::TermWindow {
                 self.paint_fancy_tab_bar(&mut chrome_layers, defer_trailing_actions)
                     .context("paint_tab_bar")?
             };
+            if let Some(slide) = sidebar_slide.as_ref() {
+                // Under what the row keeps where it is: the row hands back
+                // nothing that is under the sidebars.
+                self.ui_items.extend(sliding_sidebar_items(slide));
+            }
             self.ui_items.extend(tab_items);
             // Over an open right sidebar, whatever the row is doing.
             let window_buttons = self
@@ -5552,6 +5879,73 @@ mod tests {
             assert_eq!((items[1].y, items[1].height), (40, 25));
             assert_eq!((items[2].y, items[2].height), (100, 20));
         }
+    }
+
+    #[test]
+    fn nothing_between_sliding_sidebars_takes_a_click_while_it_moves() {
+        use crate::termwindow::sidebar_slide::{Out, Panel};
+        let frame = |left: Option<f32>, right: Option<f32>| {
+            SidebarSlideFrame::new(
+                0.,
+                1000.,
+                600.,
+                Panel {
+                    docked: 200.,
+                    laid_out: 200.,
+                    out: left.map(Out::along),
+                },
+                Panel {
+                    docked: 300.,
+                    laid_out: 300.,
+                    out: right.map(Out::along),
+                },
+            )
+            .unwrap()
+        };
+        let under = |items: &[UIItem], x| {
+            items
+                .iter()
+                .rev()
+                .find(|item| item.hit_test(x, 300))
+                .map(|item| item.item_type.clone())
+        };
+        // Beside the left one, what is between goes along with its edge.
+        let items = sliding_sidebar_items(&frame(Some(0.5), None));
+        assert_eq!(
+            under(&items, 50),
+            Some(UIItemType::WorkspaceSidebarBackground)
+        );
+        assert_eq!(under(&items, 500), Some(UIItemType::WindowTabsTravelling));
+        assert_eq!(under(&items, 800), None);
+        // Beside the right one alone it stays put, and keeps its own.
+        let items = sliding_sidebar_items(&frame(None, Some(0.5)));
+        assert_eq!(under(&items, 500), None);
+        assert_eq!(under(&items, 950), Some(UIItemType::RightSidebarBackground));
+        // Docked from a hover reveal, the panel stays where it docks and
+        // keeps its own: only the terminal coming out from under it is
+        // inert.
+        let docking = SidebarSlideFrame::new(
+            0.,
+            1000.,
+            600.,
+            Panel {
+                docked: 200.,
+                laid_out: 200.,
+                out: Some(Out {
+                    panel: 1.0,
+                    clear: 0.25,
+                }),
+            },
+            Panel {
+                docked: 300.,
+                laid_out: 300.,
+                out: None,
+            },
+        )
+        .unwrap();
+        let items = sliding_sidebar_items(&docking);
+        assert_eq!(under(&items, 50), None);
+        assert_eq!(under(&items, 500), Some(UIItemType::WindowTabsTravelling));
     }
 
     fn test_preview(area: RectF) -> TerminalPreviewRequest {

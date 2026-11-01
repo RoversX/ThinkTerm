@@ -367,6 +367,7 @@ tooltip-sidebar-thread-search = 查找线程
 tooltip-sidebar-ssh-hosts = 远程主机
 tooltip-sidebar-live-overview = 实时总览
 tooltip-sidebar-notifications = 通知
+tooltip-sidebar-jump = 滚到当前会话
 menu-rename-project = 重命名项目…
 menu-grant-folder-access = 授权文件夹访问…
 menu-new-thread = 新建会话

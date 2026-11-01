@@ -539,6 +539,9 @@ pub(crate) struct LiveOverviewView {
     /// When that terminal set off. Its card keeps the first picture captured
     /// after this until it lands; see the capture in `paint`.
     terminal_in_flight_since: Option<Instant>,
+    /// How far past its card that terminal is as it settles, and where it set
+    /// off: see `set_terminal_landing_settle`.
+    terminal_landing_settle: Option<(RectF, f32)>,
     visible_panes: HashSet<PaneId>,
     live_resizing: bool,
     card_motion: HashMap<LiveThreadKey, CardMotion>,
@@ -606,6 +609,7 @@ impl LiveOverviewView {
             card_preview_rects: HashMap::new(),
             terminal_in_flight: None,
             terminal_in_flight_since: None,
+            terminal_landing_settle: None,
             visible_panes: HashSet::new(),
             live_resizing: false,
             card_motion: HashMap::new(),
@@ -1016,12 +1020,28 @@ impl LiveOverviewView {
                                 0.0,
                                 self.viewport.origin.y - self.scroll.offset,
                             ));
+                    let in_flight = self.terminal_in_flight == Some(card.tab_id);
+                    // Where the card's picture is at rest, which is what the
+                    // terminal landing in it has built...
+                    let resting_preview = card_preview_rect(
+                        rect,
+                        card_header_height,
+                        card_inset,
+                        self.host_preview_aspect,
+                    );
+                    // ...and the card, carried past it by that terminal as it
+                    // settles.
+                    let rect = match self.terminal_landing_settle.filter(|_| in_flight) {
+                        Some((source, past)) => {
+                            card_carried_past(rect, resting_preview, source, past)
+                        }
+                        None => rect,
+                    };
 
                     // Keep one complete row warm above and below the viewport
                     // so a scroll does not reveal an uncaptured thumbnail. All
                     // other cards remain metadata-only.
                     let overscan = layout.grid.card_height + gap;
-                    let in_flight = self.terminal_in_flight == Some(card.tab_id);
                     let snapshot = if card_is_warm(rect, self.viewport, overscan) {
                         warm_tabs.insert(card.tab_id);
                         if self.defer_preview_captures {
@@ -1165,12 +1185,11 @@ impl LiveOverviewView {
                     let close_x = rect.max_x() - ctx.px(CARD_CLOSE_RIGHT_PAD) - close_size;
                     let close_y = rect.origin.y + (ctx.px(CAPSULE_HEIGHT) - close_size) / 2.0;
 
-                    let preview_width = (rect.size.width - card_inset * 2.0).max(1.0);
-                    let preview = euclid::rect(
-                        rect.origin.x + card_inset,
-                        panel.origin.y + card_inset,
-                        preview_width,
-                        preview_width / self.host_preview_aspect,
+                    let preview = card_preview_rect(
+                        rect,
+                        card_header_height,
+                        card_inset,
+                        self.host_preview_aspect,
                     );
                     // A card whose terminal is currently flying to it is left
                     // empty, but not neutral: the panel takes that terminal's
@@ -1212,7 +1231,9 @@ impl LiveOverviewView {
                                     self.previews.push(TerminalPreviewRequest {
                                         tab_id,
                                         snapshot: Arc::clone(snapshot),
-                                        area: preview,
+                                        // At rest: carried past, it would be
+                                        // built again for every frame of it.
+                                        area: resting_preview,
                                         clip,
                                         hold_scale: self.live_resizing,
                                         opacity: 0.0,
@@ -2436,6 +2457,10 @@ impl ContentView for LiveOverviewView {
         self.card_preview_rects.get(&tab_id).copied()
     }
 
+    fn set_terminal_landing_settle(&mut self, settle: Option<(RectF, f32)>) {
+        self.terminal_landing_settle = settle;
+    }
+
     fn set_terminal_in_flight(&mut self, tab_id: Option<TabId>) {
         if tab_id.is_none() {
             self.terminal_in_flight_since = None;
@@ -3197,6 +3222,36 @@ fn group_grid(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Where a card's picture is in `card`: below a header `header` high and
+/// `inset` inside the panel, `aspect` wide to high.
+fn card_preview_rect(card: RectF, header: f32, inset: f32, aspect: f32) -> RectF {
+    let width = (card.size.width - inset * 2.0).max(1.0);
+    euclid::rect(
+        card.origin.x + inset,
+        card.origin.y + header + inset,
+        width,
+        width / aspect,
+    )
+}
+
+/// `card`, carried by the terminal landing in it from `source` as that goes
+/// `past` of its way beyond the card's picture, `preview`: the whole card
+/// goes past and back, rather than the picture alone shrinking inside a card
+/// that stays put.
+fn card_carried_past(card: RectF, preview: RectF, source: RectF, past: f32) -> RectF {
+    let beyond = |from: f32, to: f32| to + (to - from) * past;
+    let left = beyond(source.min_x(), preview.min_x());
+    let top = beyond(source.min_y(), preview.min_y());
+    let scale_x = (beyond(source.max_x(), preview.max_x()) - left) / preview.size.width.max(1.0);
+    let scale_y = (beyond(source.max_y(), preview.max_y()) - top) / preview.size.height.max(1.0);
+    euclid::rect(
+        left + (card.origin.x - preview.origin.x) * scale_x,
+        top + (card.origin.y - preview.origin.y) * scale_y,
+        card.size.width * scale_x,
+        card.size.height * scale_y,
+    )
+}
+
 fn group_layouts(
     counts: &[usize],
     content_width: f32,
@@ -3254,6 +3309,29 @@ mod tests {
     use super::*;
     // Lives in `ui::geometry` now, and only the tests reach for it directly.
     use crate::ui::grid_columns;
+
+    #[test]
+    fn a_card_carried_past_goes_with_the_terminal_landing_in_it() {
+        let card = euclid::rect(100.0, 100.0, 300.0, 240.0);
+        let preview = card_preview_rect(card, 40.0, 10.0, 1.6);
+        assert_eq!(preview, euclid::rect(110.0, 150.0, 280.0, 175.0));
+        let source = euclid::rect(0.0, 0.0, 1600.0, 1000.0);
+        assert_eq!(card_carried_past(card, preview, source, 0.0), card);
+        // 2% past a terminal shrinking from 1600 wide into 280: the whole
+        // card narrows as its picture would, 26.4 of 280, inside where it was.
+        let carried = card_carried_past(card, preview, source, 0.02);
+        let scale = (280.0 - 1320.0 * 0.02) / 280.0;
+        assert!(
+            (carried.size.width - 300.0 * scale).abs() < 1e-3,
+            "{:?}",
+            carried
+        );
+        assert!(
+            carried.min_x() > card.min_x() && carried.max_x() < card.max_x(),
+            "{:?}",
+            carried
+        );
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn test_group_grid(

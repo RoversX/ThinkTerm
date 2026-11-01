@@ -7,6 +7,7 @@
 //! terminal, which is why nothing in here touches `workspace_sidebar_width`
 //! or `workspace_sidebar_collapsed`.
 
+use crate::termwindow::render::split_slide::MIN_FRAMES;
 use crate::termwindow::ui::tokens::{SIDEBAR_HOVER_DWELL_MS, SIDEBAR_HOVER_GRACE_MS};
 use crate::ui::anim::{self, Easing, Timeline};
 use std::time::{Duration, Instant};
@@ -233,6 +234,20 @@ impl SidebarHoverReveal {
         frame
     }
 
+    /// Pace a travelling panel by the frame being painted: it goes no more
+    /// than its share of the way in one, as a split's slide does, so a slow
+    /// few frames -- its contents drawn for the first time, in a build
+    /// without optimisation -- do not see it out or away in one. Call once
+    /// per frame painted, before `step`.
+    pub(crate) fn pace(&mut self, now: Instant) {
+        if let Phase::Revealing { travel }
+        | Phase::Departing { travel, .. }
+        | Phase::Retreating { travel } = &mut self.phase
+        {
+            travel.pace(now, REVEAL / MIN_FRAMES);
+        }
+    }
+
     /// `None` = nothing presented; `Some(0.0..=1.0)` = how far out the panel
     /// is.
     pub(crate) fn progress(&self, now: Instant) -> Option<f32> {
@@ -392,6 +407,29 @@ mod tests {
             }
         }
         panic!("panel never settled");
+    }
+
+    #[test]
+    fn slow_frames_still_see_the_panel_on_its_way() {
+        let start = Instant::now();
+        let mut machine = SidebarHoverReveal::default();
+        machine.step(input(PointerZone::HotZone), start);
+        let mut now = at(start, SIDEBAR_HOVER_DWELL_MS);
+        let mut seen = vec![];
+        loop {
+            machine.pace(now);
+            machine.step(input(PointerZone::HotZone), now);
+            let progress = machine.progress(now).unwrap();
+            seen.push(progress);
+            if progress >= 1.0 {
+                break;
+            }
+            assert!(seen.len() < 50, "{:?}", seen);
+            // Each frame takes longer than the whole reveal.
+            now += Duration::from_millis(200);
+        }
+        let on_its_way = seen.iter().filter(|&&out| out > 0.0 && out < 1.0).count();
+        assert!(on_its_way as u32 >= MIN_FRAMES - 1, "{:?}", seen);
     }
 
     #[test]

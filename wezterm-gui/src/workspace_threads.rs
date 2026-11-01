@@ -6099,6 +6099,16 @@ pub fn toggle_project_threads_collapsed(project_id: &str) -> bool {
     changed
 }
 
+/// Open a project's folded thread list; false when it was open already.
+pub fn expand_project_threads(project_id: &str) -> bool {
+    let mut store = THREAD_STORE.lock();
+    let changed = store.expand_project_threads(project_id);
+    if changed {
+        persist_locked(&store);
+    }
+    changed
+}
+
 fn thread_views_for_project(
     project: &Project,
     active_project_id: Option<&str>,
@@ -9353,6 +9363,18 @@ impl WorkspaceThreadStore {
             return false;
         };
         project.threads_collapsed = !project.threads_collapsed;
+        true
+    }
+
+    fn expand_project_threads(&mut self, project_id: &str) -> bool {
+        let Some(project) = self
+            .projects
+            .iter_mut()
+            .find(|project| project.id == project_id && project.threads_collapsed)
+        else {
+            return false;
+        };
+        project.threads_collapsed = false;
         true
     }
 

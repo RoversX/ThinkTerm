@@ -312,19 +312,24 @@ impl crate::TermWindow {
         let mut ui_items = Vec::new();
         let mut action_right = row_right.saturating_sub(self.ui_px(WINDOW_TAB_INSET) + 2);
         // Over an open right sidebar the window's buttons are the sidebar's:
-        // see `paint_right_sidebar_window_buttons`.
+        // see `paint_right_sidebar_window_buttons`. One sliding away holds
+        // them where they are, which is where the row's go once it is gone.
         if self.fancy_tab_bar_shows_window_buttons() && self.right_sidebar_width() == 0 {
-            action_right = self.paint_window_tab_window_buttons(
-                layers,
-                &mut ui_items,
-                action_right,
-                content_row_y,
-                content_row_height,
-                button_size,
-                icon_size,
-                foreground,
-                muted_fg,
-            )?;
+            action_right = if self.right_sidebar_holds_window_buttons() {
+                action_right.saturating_sub(self.window_tab_window_buttons_width(button_size))
+            } else {
+                self.paint_window_tab_window_buttons(
+                    layers,
+                    &mut ui_items,
+                    action_right,
+                    content_row_y,
+                    content_row_height,
+                    button_size,
+                    icon_size,
+                    foreground,
+                    muted_fg,
+                )?
+            };
         }
 
         // An auto-hiding row's pin takes the new-tab button's slot, just
@@ -465,10 +470,7 @@ impl crate::TermWindow {
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<Vec<UIItem>> {
         let row_height = self.tab_bar_pixel_height()?.ceil() as usize;
-        if row_height == 0
-            || self.right_sidebar_width() == 0
-            || !self.fancy_tab_bar_shows_window_buttons()
-        {
+        if row_height == 0 || !self.right_sidebar_holds_window_buttons() {
             return Ok(Vec::new());
         }
         let border = self.get_os_border();
@@ -520,17 +522,22 @@ impl crate::TermWindow {
         let chrome = self.chrome();
         let mut x = bar_right.saturating_sub(self.ui_px(WINDOW_TAB_INSET) + 2);
         if parts.window_buttons {
-            x = self.paint_window_tab_window_buttons(
-                layers,
-                ui_items,
-                x,
-                bar_y,
-                bar_height,
-                button_size,
-                icon_size,
-                chrome.text,
-                chrome.secondary_text,
-            )?;
+            // A right sidebar sliding away holds them until it is gone.
+            x = if self.right_sidebar_holds_window_buttons() {
+                x.saturating_sub(self.window_tab_window_buttons_width(button_size))
+            } else {
+                self.paint_window_tab_window_buttons(
+                    layers,
+                    ui_items,
+                    x,
+                    bar_y,
+                    bar_height,
+                    button_size,
+                    icon_size,
+                    chrome.text,
+                    chrome.secondary_text,
+                )?
+            };
         }
         if parts.right_sidebar_toggle {
             x = x.saturating_sub(button_size);
@@ -575,7 +582,7 @@ impl crate::TermWindow {
     ) -> usize {
         let gap = self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP);
         let window_buttons = if parts.window_buttons {
-            self.config.integrated_title_buttons.len() * (button_size + gap / 2) + gap / 2
+            self.window_tab_window_buttons_width(button_size)
         } else {
             0
         };
@@ -650,6 +657,16 @@ impl crate::TermWindow {
         uses_integrated_window_buttons(self.config.window_decorations, self.window_state)
             && self.config.integrated_title_button_style != IntegratedTitleButtonStyle::MacOsNative
             && !self.config.integrated_title_buttons.is_empty()
+    }
+
+    /// Whether the window's buttons are the right sidebar's, at its top
+    /// (see `paint_right_sidebar_window_buttons`): while it is docked, and
+    /// while it slides back into the edge after, the row and the pane bars
+    /// leaving them room where they go once it is gone.
+    pub(crate) fn right_sidebar_holds_window_buttons(&self) -> bool {
+        self.fancy_tab_bar_shows_window_buttons()
+            && !self.right_sidebar_floats()
+            && self.right_sidebar_docked_width() > 0
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -817,6 +834,12 @@ impl crate::TermWindow {
         }
 
         Ok(action_right.saturating_sub(self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP) / 2))
+    }
+
+    /// What `paint_window_tab_window_buttons` takes from the right.
+    fn window_tab_window_buttons_width(&self, button_size: usize) -> usize {
+        let gap = self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP);
+        self.config.integrated_title_buttons.len() * (button_size + gap / 2) + gap / 2
     }
 
     #[allow(clippy::too_many_arguments)]

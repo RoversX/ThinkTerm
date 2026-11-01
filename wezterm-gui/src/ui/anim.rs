@@ -34,12 +34,22 @@ pub(crate) const LONG: Duration = Duration::from_millis(300);
 /// keep asking for frames forever.
 const PRESENT_GRACE: Duration = Duration::from_millis(120);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How far past its target a move that settles goes, as a share of its
+/// way...
+pub(crate) const OVERSHOOT: f32 = 0.0125;
+/// ...and never further than this, at the design scale: a long way's share
+/// would be a lurch.
+pub(crate) const MOST_OVERSHOOT: f32 = 4.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Easing {
     /// Decelerate into the target. The default for anything that moves: the
     /// destination is already on screen, so slowing into it reads as the thing
     /// arriving. Accelerating away from the start reads as a stall instead.
     OutCubic,
+    /// `OutCubic` that goes a little past the target and comes back, as a
+    /// sidebar set sliding does: see [`settle`]. Made by [`Self::settling`].
+    Settle(f32),
     /// Symmetric. For opacity, where there is no position for the eye to
     /// track and a hard start is what looks wrong.
     Smooth,
@@ -47,14 +57,43 @@ pub(crate) enum Easing {
 }
 
 impl Easing {
+    /// Settling at most `overshoot` of the way past the target.
+    pub(crate) fn settling(overshoot: f32) -> Self {
+        Self::Settle(tension(overshoot))
+    }
+
     pub(crate) fn apply(self, t: f32) -> f32 {
         let t = t.clamp(0.0, 1.0);
         match self {
             Self::OutCubic => 1.0 - (1.0 - t).powi(3),
+            Self::Settle(tension) => settle(t, tension),
             Self::Smooth => t * t * (3.0 - 2.0 * t),
             Self::Linear => t,
         }
     }
+}
+
+/// From 0 to 1: quick, then a little past 1 and back. A back-out curve, its
+/// tension from `tension`; none is a plain cubic ease out.
+pub(crate) fn settle(t: f32, tension: f32) -> f32 {
+    let u = t.clamp(0.0, 1.0) - 1.0;
+    1.0 + (tension + 1.0) * u.powi(3) + tension * u.powi(2)
+}
+
+/// The tension that takes `settle` `overshoot` past 1 at most. It goes
+/// 4s³/27(s+1)² past, which grows with s.
+pub(crate) fn tension(overshoot: f32) -> f32 {
+    let past = |s: f32| 4.0 * s.powi(3) / (27.0 * (s + 1.0).powi(2));
+    let (mut low, mut high) = (0.0f32, 4.0f32);
+    for _ in 0..24 {
+        let mid = (low + high) / 2.0;
+        if past(mid) < overshoot {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    low
 }
 
 /// One value travelling from `from` to `to` over `duration`.
@@ -66,6 +105,8 @@ pub(crate) struct Timeline {
     from: f32,
     to: f32,
     duration: Duration,
+    /// How long it was made to take, which [`Self::reshape`] stretches.
+    unstretched: Duration,
     easing: Easing,
     /// When the clock actually started, which is later than construction --
     /// see [`Self::advance`]. `None` while still waiting.
@@ -78,6 +119,8 @@ pub(crate) struct Timeline {
     /// timeline has that its opening frame was drawn. A `Cell` so painting can
     /// keep taking `&self`.
     presented: Cell<bool>,
+    /// The frame [`Self::pace`] last saw, if it is being paced.
+    paced_at: Option<Instant>,
     finished: bool,
 }
 
@@ -87,11 +130,13 @@ impl Timeline {
             from,
             to,
             duration,
+            unstretched: duration,
             easing,
             started_at: None,
             armed_at: now,
             delay: Duration::ZERO,
             presented: Cell::new(false),
+            paced_at: None,
             finished: from == to || duration.is_zero(),
         }
     }
@@ -177,6 +222,20 @@ impl Timeline {
         true
     }
 
+    /// Let the clock have run no more than `most` since the last frame:
+    /// one that took longer has the rest held back, so the travel takes
+    /// longer rather than skip most of its way. A busy window or a build
+    /// without optimisation can take several such frames in a row, past the
+    /// opening one [`Self::advance`] already waits out.
+    ///
+    /// Call this once per frame painted, before `advance`.
+    pub(crate) fn pace(&mut self, now: Instant, most: Duration) {
+        if let (Some(started_at), Some(paced_at)) = (self.started_at.as_mut(), self.paced_at) {
+            *started_at += now.saturating_duration_since(paced_at).saturating_sub(most);
+        }
+        self.paced_at = Some(now);
+    }
+
     pub(crate) fn value(&self, now: Instant) -> f32 {
         self.presented.set(true);
         if self.finished {
@@ -194,6 +253,18 @@ impl Timeline {
             return self.to;
         }
         self.from + (self.to - self.from) * self.easing.apply(t)
+    }
+
+    /// Ease with `easing` instead, taking `by` times as long as it was made
+    /// to: for a value whose way is only known once it is set going. Only
+    /// before the clock starts, so it does not jump; asked again by then, it
+    /// is as if asked once.
+    pub(crate) fn reshape(&mut self, easing: Easing, by: f32) {
+        if self.started_at.is_some() {
+            return;
+        }
+        self.easing = easing;
+        self.duration = self.unstretched.mul_f32(by);
     }
 
     /// Send the value somewhere else, departing from wherever it is right now.
@@ -315,6 +386,88 @@ mod tests {
         // The clock starts on the frame after the first presented one.
         timeline.advance(at(start, 100));
         assert_eq!(timeline.arrives_at(), Some(at(start, 300)));
+    }
+
+    #[test]
+    fn the_tension_found_goes_as_far_past_as_asked() {
+        assert_eq!(tension(0.0), 0.0);
+        for overshoot in [0.01, OVERSHOOT, 0.1] {
+            let tension = tension(overshoot);
+            let top = (0..=1000)
+                .map(|step| settle(step as f32 / 1000.0, tension))
+                .fold(0.0, f32::max);
+            assert!(
+                (top - 1.0 - overshoot).abs() < 1e-3,
+                "{} went {} past",
+                overshoot,
+                top - 1.0
+            );
+        }
+    }
+
+    #[test]
+    fn settling_goes_a_little_past_and_lands_on_the_target() {
+        let start = Instant::now();
+        let mut timeline = Timeline::new(
+            start,
+            100.0,
+            0.0,
+            Duration::from_millis(200),
+            Easing::settling(OVERSHOOT),
+        );
+        timeline.advance(at(start, 0));
+        timeline.value(at(start, 0));
+        timeline.advance(at(start, 0));
+        let seen: Vec<f32> = (0..=200)
+            .map(|millis| timeline.value(at(start, millis)))
+            .collect();
+        let lowest = seen.iter().copied().fold(f32::MAX, f32::min);
+        assert!(
+            lowest < 0.0 && lowest >= -100.0 * OVERSHOOT - 1e-3,
+            "{}",
+            lowest
+        );
+        assert_eq!(seen.last(), Some(&0.0));
+    }
+
+    #[test]
+    fn reshaped_before_it_starts_it_takes_as_much_longer_and_no_more() {
+        let start = Instant::now();
+        let mut timeline = armed(start);
+        timeline.reshape(Easing::OutCubic, 1.5);
+        // Asked again before it starts -- its picture recorded again -- it
+        // is not stretched twice.
+        timeline.reshape(Easing::OutCubic, 1.5);
+        timeline.advance(at(start, 0));
+        timeline.value(at(start, 0));
+        timeline.advance(at(start, 0));
+        assert_eq!(timeline.arrives_at(), Some(at(start, 300)));
+        assert!(timeline.value(at(start, 200)) < 100.0);
+        // Under way, it is left as it goes.
+        let before = timeline.value(at(start, 100));
+        timeline.reshape(Easing::Linear, 3.0);
+        assert_eq!(timeline.value(at(start, 100)), before);
+        assert_eq!(timeline.arrives_at(), Some(at(start, 300)));
+    }
+
+    #[test]
+    fn paced_a_slow_frame_moves_it_no_further_than_a_quick_one() {
+        let start = Instant::now();
+        let mut timeline = armed(start);
+        let frame = |timeline: &mut Timeline, millis| {
+            timeline.pace(at(start, millis), Duration::from_millis(20));
+            timeline.advance(at(start, millis));
+            timeline.value(at(start, millis))
+        };
+        let near = |value: f32, expected: f32| (value - expected).abs() < 1e-3;
+        assert_eq!(frame(&mut timeline, 0), 0.0);
+        assert_eq!(frame(&mut timeline, 10), 0.0);
+        // Two frames of 100ms go 20ms each...
+        assert!(near(frame(&mut timeline, 110), 10.0));
+        assert!(near(frame(&mut timeline, 210), 20.0));
+        // ...and quick ones after them carry on from there.
+        assert!(near(frame(&mut timeline, 220), 25.0));
+        assert_eq!(timeline.arrives_at(), Some(at(start, 370)));
     }
 
     #[test]

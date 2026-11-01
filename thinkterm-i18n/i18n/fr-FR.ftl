@@ -370,6 +370,7 @@ tooltip-sidebar-thread-search = Trouver un fil
 tooltip-sidebar-ssh-hosts = Hôtes distants
 tooltip-sidebar-live-overview = Aperçu en direct
 tooltip-sidebar-notifications = Notifications
+tooltip-sidebar-jump = Aller à la session actuelle
 menu-rename-project = Renommer le projet…
 menu-grant-folder-access = Autoriser l'accès au dossier…
 menu-new-thread = Nouvelle session

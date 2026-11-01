@@ -422,6 +422,16 @@ impl SidebarSpaceSwipeState {
         !matches!(self.phase, Phase::Idle)
     }
 
+    /// Whether the pages are moving sideways: following the finger, waiting
+    /// on a commit, or settling. A gesture still making up its mind, or one
+    /// that went vertical, leaves the list where it is.
+    pub(crate) fn is_sliding(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Tracking(_) | Phase::AwaitingCommit(_) | Phase::Settling(_)
+        )
+    }
+
     pub(crate) fn is_committing_or_committed(&self) -> bool {
         matches!(
             &self.phase,
@@ -534,6 +544,26 @@ mod tests {
             swipe.finish(at(start, 40), 300.0),
             SidebarSpaceSwipeFinish::None
         );
+    }
+
+    /// Things drawn over the list -- the jump-to-thread pill -- hide while
+    /// the pages slide, not while the list scrolls.
+    #[test]
+    fn only_a_sideways_gesture_counts_as_sliding() {
+        let start = Instant::now();
+        let mut swipe = SidebarSpaceSwipeState::default();
+        swipe.begin("source".into(), None, Some("next".into()), 0.0, start);
+        assert!(swipe.is_active() && !swipe.is_sliding(), "still deciding");
+        swipe.update(2.0, -20.0, at(start, 16));
+        assert!(swipe.is_active() && !swipe.is_sliding(), "scrolling");
+        swipe.finish(at(start, 40), 300.0);
+
+        let mut swipe = SidebarSpaceSwipeState::default();
+        swipe.begin("source".into(), None, Some("next".into()), 0.0, start);
+        swipe.update(-20.0, 0.0, at(start, 16));
+        assert!(swipe.is_sliding(), "following the finger");
+        swipe.finish(at(start, 32), 300.0);
+        assert!(swipe.is_sliding(), "travelling back or on to the next page");
     }
 
     #[test]

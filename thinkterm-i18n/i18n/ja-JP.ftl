@@ -367,6 +367,7 @@ tooltip-sidebar-thread-search = スレッドを検索
 tooltip-sidebar-ssh-hosts = リモートホスト
 tooltip-sidebar-live-overview = ライブ概要
 tooltip-sidebar-notifications = 通知
+tooltip-sidebar-jump = 現在のセッションへスクロール
 menu-rename-project = プロジェクト名を変更…
 menu-grant-folder-access = フォルダへのアクセスを許可…
 menu-new-thread = 新しいセッション

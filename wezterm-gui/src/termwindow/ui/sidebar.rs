@@ -5,6 +5,7 @@ use crate::termwindow::render::corners::{
 };
 use crate::termwindow::ui::icons::{distro_to_icon, BrandIcon, MaterialIcon, SvgIcon};
 use crate::termwindow::ui::platform_chrome;
+use crate::termwindow::ui::sidebar_jump::{CurrentRow, Fold, JumpList};
 use crate::termwindow::ui::status_icon::UiStatusKind;
 use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, SIDEBAR_ICON_GAP, SIDEBAR_INSET, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
@@ -32,7 +33,7 @@ use window::color::LinearRgba;
 use window::{MouseEventKind as WMEK, RectF, WindowOps};
 
 const SIDEBAR_SCROLLBAR_VISIBLE_MS: u64 = 900;
-const SIDEBAR_SETTINGS_FOOTER_HEIGHT: usize = 72;
+pub(crate) const SIDEBAR_SETTINGS_FOOTER_HEIGHT: usize = 72;
 const SIDEBAR_SETTINGS_FADE_HEIGHT: usize = 52;
 const SIDEBAR_LIST_BOTTOM_PADDING: usize = 65;
 const SIDEBAR_SETTINGS_ROW_TOP_PADDING: usize = 4;
@@ -232,7 +233,7 @@ impl crate::TermWindow {
     /// The docked width, clamped. Not "the width right now": ask
     /// `workspace_sidebar_width` for what the terminal is laid out against
     /// and `workspace_sidebar_presented_width` for what is on screen.
-    fn workspace_sidebar_docked_width(&self) -> usize {
+    pub(crate) fn workspace_sidebar_docked_width(&self) -> usize {
         let min_width = scale_ui_usize(SIDEBAR_MIN_WIDTH, self.dimensions.dpi);
         self.workspace_sidebar_width
             .clamp(min_width, self.workspace_sidebar_max_width())
@@ -243,6 +244,14 @@ impl crate::TermWindow {
     /// Every consumer that decides where the terminal, the tab bar or a pane
     /// lives asks this one.
     pub fn workspace_sidebar_width(&self) -> usize {
+        self.workspace_sidebar_sizing_width()
+    }
+
+    /// The width the terminal's SIZE is worked out against: the sidebar's,
+    /// the Library open or not. The Library pushes the terminal aside, past
+    /// the window's edge, rather than making it narrower, so its programs
+    /// hear of no resize.
+    pub(crate) fn workspace_sidebar_sizing_width(&self) -> usize {
         if self.workspace_sidebar_collapsed {
             0
         } else {
@@ -253,22 +262,24 @@ impl crate::TermWindow {
     /// The width the panel is DRAWN and HIT-TESTED at. Equal to
     /// `workspace_sidebar_width` while docked; the full docked width while a
     /// hover reveal is on screen, at which point the terminal behind it has
-    /// not moved. Presentation and pointer routing only.
+    /// not moved, and while it slides away after collapsing. Presentation
+    /// and pointer routing only.
     pub(crate) fn workspace_sidebar_presented_width(&self) -> usize {
-        if self.workspace_sidebar_collapsed {
-            if self.workspace_sidebar_hover.is_presented() {
-                self.workspace_sidebar_docked_width()
-            } else {
-                0
-            }
-        } else {
+        if self.workspace_sidebar_is_presented() {
             self.workspace_sidebar_docked_width()
+        } else {
+            0
         }
     }
 
-    /// Whether the panel is on screen at all, by either route.
+    /// Whether the panel is on screen at all, by any route: docked, a hover
+    /// reveal, or on its way back into the edge.
     pub(crate) fn workspace_sidebar_is_presented(&self) -> bool {
-        !self.workspace_sidebar_collapsed || self.workspace_sidebar_hover.is_presented()
+        !self.workspace_sidebar_collapsed
+            || self.workspace_sidebar_hover.is_presented()
+            || self
+                .sidebar_slides
+                .closing(crate::termwindow::sidebar_slide::Side::Left)
     }
 
     pub fn workspace_sidebar_max_width(&self) -> usize {
@@ -304,17 +315,33 @@ impl crate::TermWindow {
     /// setting, brushing the left edge and clicking "close" would re-dock the
     /// sidebar for every window from then on.
     pub fn toggle_workspace_sidebar(&mut self) {
-        let shown = workspace_sidebar_toggle_target(
-            self.workspace_sidebar_collapsed,
-            self.workspace_sidebar_hover.is_presented(),
-        );
+        let revealed = self.workspace_sidebar_hover.progress(Instant::now());
+        let shown =
+            workspace_sidebar_toggle_target(self.workspace_sidebar_collapsed, revealed.is_some());
         self.workspace_sidebar_swipe.cancel_immediately();
         self.clear_workspace_space_swipe_frame_transition();
         self.set_workspace_sidebar_shown(shown);
+        match revealed.filter(|_| shown) {
+            // Out over the terminal already, or on its way: the terminal
+            // comes out from under it.
+            Some(revealed) => {
+                self.dock_revealed_sidebar(crate::termwindow::sidebar_slide::Side::Left, revealed);
+            }
+            None => {
+                self.slide_sidebar(crate::termwindow::sidebar_slide::Side::Left, shown);
+            }
+        }
     }
 
     pub fn expand_workspace_sidebar(&mut self) {
         self.set_workspace_sidebar_shown(true);
+        // Docked while on its way back: it comes out again from there.
+        if self
+            .sidebar_slides
+            .closing(crate::termwindow::sidebar_slide::Side::Left)
+        {
+            self.slide_sidebar(crate::termwindow::sidebar_slide::Side::Left, true);
+        }
     }
 
     /// Dock or collapse the panel and persist that choice.
@@ -1110,7 +1137,7 @@ impl crate::TermWindow {
         self.window_tab_chrome_params().sidebar_toggle_button_size()
     }
 
-    fn workspace_sidebar_content_top(&self, panel_y: usize) -> usize {
+    pub(crate) fn workspace_sidebar_content_top(&self, panel_y: usize) -> usize {
         let tab_row_height = self.tab_bar_pixel_height().unwrap_or(0.0).ceil() as usize;
         platform_chrome::workspace_sidebar_content_top(
             panel_y,
@@ -2006,6 +2033,9 @@ impl crate::TermWindow {
             );
             total_height.saturating_sub(viewport_height) as f32
         };
+        if self.workspace_sidebar_preview_space_id.is_none() {
+            self.advance_sidebar_jump_scroll(Instant::now());
+        }
         let scroll_offset = self.workspace_sidebar_scroll_offset.clamp(0.0, max_scroll);
         if self.workspace_sidebar_preview_space_id.is_none() {
             // Writing the clamp back is what stops the sidebar staying scrolled
@@ -2022,6 +2052,15 @@ impl crate::TermWindow {
             .as_ref()
             .is_some_and(|event| matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_)));
         let mut virtual_y = 0usize;
+        // The row of the thread this window shows, wherever it is, for the
+        // pill that brings it back into sight.
+        let mut current_row: Option<CurrentRow> = None;
+        let thread_icon = |session: &workspace_threads::WorkspaceThreadView| {
+            row_marks
+                .icons(&session.id, session.is_materialized)
+                .first()
+                .cloned()
+        };
         // Everything from here until the end of the project loop scrolls with
         // `virtual_y`. A space-swipe slides exactly this stretch and leaves the
         // chrome painted before and after it standing.
@@ -2073,6 +2112,11 @@ impl crate::TermWindow {
                 let hit_y = row_top.max(list_top_f).floor().max(0.0) as usize;
                 let hit_bottom = row_bottom.min(content_bottom_f).ceil().max(hit_y as f32) as usize;
                 let hit_height = hit_bottom.saturating_sub(hit_y).max(1);
+                if current_row.is_none()
+                    && self.is_workspace_sidebar_thread_selected(session, suppress_own_active)
+                {
+                    current_row = Some(CurrentRow::new(virtual_y, None, thread_icon(session)));
+                }
 
                 if row_is_visible {
                     self.ui_items.push(UIItem {
@@ -2520,6 +2564,10 @@ impl crate::TermWindow {
 
                         let is_selected =
                             self.is_workspace_sidebar_thread_selected(session, suppress_own_active);
+                        if is_selected && current_row.is_none() {
+                            current_row =
+                                Some(CurrentRow::new(virtual_y, None, thread_icon(session)));
+                        }
                         if row_is_visible && is_selected {
                             let row_rect = euclid::rect(
                                 session_x as f32,
@@ -2683,6 +2731,22 @@ impl crate::TermWindow {
                         }
 
                         virtual_y += session_row_height + row_gap;
+                    }
+                } else if current_row.is_none() {
+                    // Folded away: where it would be once its folder opens.
+                    if let Some((index, session)) =
+                        project.threads.iter().enumerate().find(|(_, session)| {
+                            self.is_workspace_sidebar_thread_selected(session, suppress_own_active)
+                        })
+                    {
+                        current_row = Some(CurrentRow::new(
+                            virtual_y + index * (session_row_height + row_gap),
+                            Some((
+                                Fold::Project(project.id.clone()),
+                                virtual_y.saturating_sub(session_row_height + row_gap),
+                            )),
+                            thread_icon(session),
+                        ));
                     }
                 }
             }
@@ -2865,6 +2929,22 @@ impl crate::TermWindow {
                 virtual_y += session_row_height + row_gap;
 
                 if group.collapsed {
+                    if current_row.is_none() {
+                        if let Some((index, reference)) =
+                            group.threads.iter().enumerate().find(|(_, reference)| {
+                                self.is_workspace_sidebar_thread_selected(&reference.thread, false)
+                            })
+                        {
+                            current_row = Some(CurrentRow::new(
+                                virtual_y + index * (session_row_height + row_gap),
+                                Some((
+                                    Fold::RefGroup(format!("{group_space_id}::{}", group.key)),
+                                    virtual_y.saturating_sub(session_row_height + row_gap),
+                                )),
+                                thread_icon(&reference.thread),
+                            ));
+                        }
+                    }
                     continue;
                 }
                 let session_x =
@@ -2883,6 +2963,11 @@ impl crate::TermWindow {
                     let hit_bottom =
                         row_bottom.min(content_bottom_f).ceil().max(hit_y as f32) as usize;
                     let hit_height = hit_bottom.saturating_sub(hit_y).max(1);
+                    if current_row.is_none()
+                        && self.is_workspace_sidebar_thread_selected(session, false)
+                    {
+                        current_row = Some(CurrentRow::new(virtual_y, None, thread_icon(session)));
+                    }
 
                     if row_is_visible {
                         // A dangling ref has nothing to activate; it paints
@@ -3606,9 +3691,9 @@ impl crate::TermWindow {
             let settings_body_width = overview_action_x
                 .saturating_sub(settings_row_x)
                 .saturating_sub(self.ui_px(SIDEBAR_INSET) / 2);
-            // When the label cannot fit, the whole row collapses to an
-            // icon-sized pill: a full-width hover capsule around a lone gear
-            // reads as a broken button.
+            // The Library's button, an icon on its own: settings live in the
+            // Library now. Sized as the settings button was once its label
+            // no longer fit, so the row keeps its shape.
             let settings_icon_probe = icon_size.min(settings_row_height.saturating_sub(8));
             let settings_label = crate::i18n::tr("sidebar-settings");
             let settings_label_x_inset = self.ui_px(SIDEBAR_SETTINGS_ICON_EXTRA_INSET)
@@ -3851,23 +3936,6 @@ impl crate::TermWindow {
                 )
                 .context("sidebar update dot")?;
             }
-            // A truncated "S…" reads worse than no label: when the sidebar is
-            // too narrow for the whole word, the gear icon stands alone (and
-            // the row shrank to an icon pill above).
-            if settings_label_fits {
-                self.paint_sidebar_text(
-                    layers,
-                    &ui_font,
-                    ui_metrics,
-                    &settings_label,
-                    settings_text_x,
-                    settings_text_y,
-                    settings_body_width
-                        .saturating_sub(settings_text_x.saturating_sub(settings_row_x))
-                        .saturating_sub(self.ui_px(SIDEBAR_INSET)),
-                    foreground,
-                )?;
-            }
             if SHOW_SIDEBAR_VIEW_OPTIONS {
                 let settings_action_icon_size = settings_icon_size;
                 self.paint_sidebar_icon(
@@ -3885,6 +3953,33 @@ impl crate::TermWindow {
                     },
                 )?;
             }
+        }
+
+        // Over everything that covers the list, and not for a neighbouring
+        // Space painted only to slide in.
+        if self.workspace_sidebar_preview_space_id.is_none() {
+            // Clear of the Settings row, which is lifted over the list.
+            let list_bottom = if settings_footer_height > 0 {
+                (settings_footer_y + self.ui_px(SIDEBAR_SETTINGS_ROW_TOP_PADDING))
+                    .saturating_sub(self.ui_px(SIDEBAR_SETTINGS_ROW_LIFT))
+                    .min(content_bottom)
+            } else {
+                content_bottom
+            };
+            self.paint_sidebar_jump(
+                layers,
+                current_row,
+                JumpList {
+                    x: panel_x,
+                    width: panel_width,
+                    top: list_top,
+                    bottom: list_bottom.max(list_top),
+                    scroll: scroll_offset,
+                    max_scroll,
+                    row_height: session_row_height,
+                },
+                &chrome,
+            )?;
         }
 
         if self.workspace_sidebar_scrollbar_visible() {

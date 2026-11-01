@@ -71,8 +71,9 @@ pub(crate) struct ContentViewFade {
 
 /// How long a running transition may hold input before it is assumed stuck.
 ///
-/// The longest piece of the animation is 260ms, and its clock does not start
-/// until a frame has been presented. This ceiling is well clear of that while
+/// The longest piece of the animation is the terminal settling into its card,
+/// about 360ms, and its clock does not start until a frame has been
+/// presented. This ceiling is well clear of that while
 /// still bounded, because the fade is only ever cleared by painting: a window
 /// that stops painting mid-transition -- occluded, or on a display that has
 /// gone to sleep -- would otherwise hold input forever.
@@ -145,9 +146,9 @@ mod card_landing_tests {
 
     #[test]
     fn the_travel_and_the_wait_end_before_input_is_let_go() {
-        assert!(
-            crate::termwindow::CONTENT_VIEW_TRAVEL + FLIGHT_LANDING_WAIT < TRANSITION_INPUT_HOLD
-        );
+        // Settling into a card, the travel takes longer.
+        let travel = crate::termwindow::CONTENT_VIEW_TRAVEL.mul_f32(FLIGHT_SETTLE_STRETCH);
+        assert!(travel + FLIGHT_LANDING_WAIT < TRANSITION_INPUT_HOLD);
     }
 }
 
@@ -177,6 +178,16 @@ mod flight_rect_tests {
     fn travel_is_clamped_at_both_ends() {
         assert_eq!(flight_rect_at(source(), destination(), -0.5), source());
         assert_eq!(flight_rect_at(source(), destination(), 4.0), destination());
+    }
+
+    #[test]
+    fn it_goes_past_by_no_more_than_asked_on_the_edge_that_goes_furthest() {
+        // The right edge goes furthest: from 1600 in to 700.
+        let overshoot = flight_overshoot(source(), destination(), 9.0);
+        assert!((overshoot - 0.01).abs() < 1e-6, "{}", overshoot);
+        // A short way goes past by its share, not by the most allowed.
+        let near = euclid::rect(10.0, 50.0, 1600.0, 900.0);
+        assert_eq!(flight_overshoot(source(), near, 9.0), FLIGHT_OVERSHOOT);
     }
 
     #[test]
@@ -374,8 +385,36 @@ pub(crate) fn flight_is_landing(source: RectF, destination: RectF, travel: f32) 
         <= FLIGHT_LANDING_OVERSIZE
 }
 
+/// How far past its card the terminal landing in it goes as it settles, card
+/// and all, as a share of its way... Further than a sidebar does: a
+/// sidebar's few pixels were lost on a terminal shrinking by most of the
+/// window.
+const FLIGHT_OVERSHOOT: f32 = 0.02;
+/// ...and never further than this on the edge that goes furthest, at the
+/// design scale.
+pub(crate) const FLIGHT_MOST_OVERSHOOT: f32 = 24.0;
+/// How many times as long settling into a card takes as the plain travel:
+/// the going past and back needs time to be seen.
+pub(crate) const FLIGHT_SETTLE_STRETCH: f32 = 1.4;
+
+/// How far past its card the terminal landing in it goes as it settles, as
+/// a share of its way: no more than `most` on the edge that goes furthest.
+pub(crate) fn flight_overshoot(source: RectF, destination: RectF, most: f32) -> f32 {
+    let furthest = [
+        destination.min_x() - source.min_x(),
+        destination.min_y() - source.min_y(),
+        destination.max_x() - source.max_x(),
+        destination.max_y() - source.max_y(),
+    ]
+    .iter()
+    .fold(0.0f32, |furthest, way| furthest.max(way.abs()));
+    FLIGHT_OVERSHOOT.min(most / furthest.max(1.0))
+}
+
 /// Where the travelling terminal sits at `travel`, between the rectangle it
-/// was recorded in and the one it is heading for.
+/// was recorded in and the one it is heading for. Settling past a card, it
+/// stays on the card, which goes past and back with it
+/// (`set_terminal_landing_settle`).
 pub(crate) fn flight_rect_at(source: RectF, destination: RectF, travel: f32) -> RectF {
     let travel = travel.clamp(0.0, 1.0);
     let lerp = |from: f32, to: f32| from + (to - from) * travel;
@@ -713,6 +752,12 @@ pub(crate) trait ContentView {
     /// one flying towards it, and the transition reads as two pictures of the
     /// same thing rather than one thing moving.
     fn set_terminal_in_flight(&mut self, _tab_id: Option<TabId>) {}
+
+    /// The terminal landing in its place here has gone `past` of its way
+    /// beyond it, from `source` where it set off, as it settles: the place
+    /// goes past and back with it, the terminal on it. `None` while it is
+    /// not past.
+    fn set_terminal_landing_settle(&mut self, _settle: Option<(RectF, f32)>) {}
 
     /// The opening frame of a full-window transition records the terminal and
     /// grows the atlas; defer thumbnail capture until the next frame so that

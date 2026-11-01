@@ -58,14 +58,14 @@ const LEAVE_DURATION: Duration = Duration::from_millis(140);
 /// optimisation -- the slide takes longer rather than skip most of its way:
 /// timed on the clock alone it got one frame in, at a third of the way,
 /// and was then found at its end.
-const MIN_FRAMES: u32 = 8;
+pub(crate) const MIN_FRAMES: u32 = 8;
 /// The first frame is drawn as if one had already passed, so the pane is
 /// on its way in that frame rather than still all outside its place.
 const FIRST_FRAME: Duration = Duration::from_micros(16_667);
 /// A slide painted this many times and still not at its end is let go of.
 /// Frames that are painted but never shown -- a pass that fails every time
 /// -- would otherwise have it ask for frames for ever.
-const MOST_PAINTS: u32 = 8 * MIN_FRAMES;
+pub(crate) const MOST_PAINTS: u32 = 8 * MIN_FRAMES;
 
 /// The edge of its place a new pane comes in from, or a closed one goes
 /// out by.
@@ -805,7 +805,12 @@ impl Rearranging {
 
 /// How far through a slide lasting `duration` is, from 0 to 1, in the
 /// frame after `shown` frames; `None` once it is over.
-fn progress(started: Instant, shown: u32, duration: Duration, now: Instant) -> Option<f32> {
+pub(crate) fn progress(
+    started: Instant,
+    shown: u32,
+    duration: Duration,
+    now: Instant,
+) -> Option<f32> {
     let elapsed = now.saturating_duration_since(started) + FIRST_FRAME;
     let by_clock = elapsed.as_secs_f32() / duration.as_secs_f32();
     let by_frames = (shown + 1) as f32 / MIN_FRAMES as f32;

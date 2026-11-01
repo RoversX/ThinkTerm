@@ -168,6 +168,7 @@ pub mod resize;
 pub(crate) mod share;
 mod selection;
 mod sidebar_hover;
+mod sidebar_slide;
 mod space_swipe;
 mod window_tab_reveal;
 pub mod spawn;
@@ -849,6 +850,8 @@ pub enum UIItemType {
     WorkspaceSidebarSshHosts,
     WorkspaceSidebarLiveOverview,
     WorkspaceSidebarNotifications,
+    /// The pill that brings the list back to the thread out of sight.
+    WorkspaceSidebarJump,
     UpdateCapsule,
     UpdateCapsuleDismiss,
     RightSidebarToggle,
@@ -1674,6 +1677,7 @@ mod tooltip_tests {
             UIItemType::WorkspaceSidebarSshHosts,
             UIItemType::WorkspaceSidebarLiveOverview,
             UIItemType::WorkspaceSidebarNotifications,
+            UIItemType::WorkspaceSidebarJump,
         ] {
             let label = tooltip_label_for(&item_type)
                 .unwrap_or_else(|| panic!("no tooltip label for {:?}", item_type));
@@ -2194,6 +2198,7 @@ pub fn tooltip_label_for(item_type: &UIItemType) -> Option<String> {
         UIItemType::WorkspaceSidebarSshHosts => "tooltip-sidebar-ssh-hosts",
         UIItemType::WorkspaceSidebarLiveOverview => "tooltip-sidebar-live-overview",
         UIItemType::WorkspaceSidebarNotifications => "tooltip-sidebar-notifications",
+        UIItemType::WorkspaceSidebarJump => "tooltip-sidebar-jump",
         UIItemType::PaneNav {
             action: PaneNavAction::Share,
             ..
@@ -3163,6 +3168,9 @@ pub struct TermWindow {
     /// A pane sliding in on a split, or out on closing (see
     /// `render::split_slide`).
     split_slides: render::split_slide::SplitSlides,
+    /// A docked sidebar sliding out as it opens, or back as it closes (see
+    /// `sidebar_slide`).
+    sidebar_slides: sidebar_slide::SidebarSlides,
     /// Set while a closed pane is painted on its way out.
     closed_pane_nav: Option<render::split_slide::ClosedNav>,
     /// Set while a pane carried into another stack is painted on its way.
@@ -3300,6 +3308,9 @@ pub struct TermWindow {
     /// when the sidebar collapses.
     workspace_sidebar_scratch: HeapQuadAllocator,
     workspace_sidebar_scrollbar_visible_until: Option<Instant>,
+    /// The pill at the list's edge while the window's thread is out of
+    /// sight, and the scroll its click starts.
+    pub(crate) sidebar_jump: ui::sidebar_jump::SidebarJump,
     /// Presentation-only hover reveal of the collapsed sidebar. This never
     /// touches `workspace_sidebar_collapsed` or `workspace_sidebar_width`:
     /// the terminal must not reflow for a hover.
@@ -4401,6 +4412,8 @@ impl TermWindow {
             // What is split or closed while it is out of sight is not to
             // slide when it is seen again, nor a closed pane held till then.
             self.split_slides.release();
+            // Nor a sidebar left on its way, still holding what it shows.
+            self.finish_sidebar_slides();
         }
     }
 
@@ -5146,6 +5159,7 @@ impl TermWindow {
             edge_lights: vec![],
             pending_paste: None,
             split_slides: Default::default(),
+            sidebar_slides: Default::default(),
             closed_pane_nav: None,
             nav_morph: None,
             right_press_claimed: false,
@@ -5207,6 +5221,7 @@ impl TermWindow {
             workspace_space_swipe_pending_commit: None,
             workspace_space_swipe_needs_settle_start: false,
             workspace_sidebar_scrollbar_visible_until: None,
+            sidebar_jump: Default::default(),
             workspace_sidebar_hover: sidebar_hover::SidebarHoverReveal::default(),
             window_tab_reveal,
             right_sidebar_hover: sidebar_hover::SidebarHoverReveal::default(),

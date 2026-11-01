@@ -1171,6 +1171,13 @@ impl super::TermWindow {
         {
             return false;
         }
+        // On its way, the panel is not where its list is laid out: the wheel
+        // moves nothing under the pointer.
+        if matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_))
+            && self.sidebar_panel_moving(crate::termwindow::sidebar_slide::Side::Left)
+        {
+            return true;
+        }
 
         let delta = match event.kind {
             WMEK::VertWheel(_) => self.sidebar_vertical_scroll_delta(event).unwrap_or(0.0),
@@ -1250,9 +1257,12 @@ impl super::TermWindow {
             return None;
         }
 
-        // Docked, or hover-revealed and fully arrived: a panel still sliding
-        // out must not host a second animation.
-        let panel_ready_for_swipe = !self.workspace_sidebar_collapsed
+        // Docked and done sliding, or hover-revealed and fully arrived: a
+        // panel still on its way must not host a second animation.
+        let panel_ready_for_swipe = (!self.workspace_sidebar_collapsed
+            && !self
+                .sidebar_slides
+                .sliding(crate::termwindow::sidebar_slide::Side::Left))
             || self
                 .workspace_sidebar_hover
                 .is_fully_presented(Instant::now());
@@ -1544,6 +1554,20 @@ impl super::TermWindow {
     }
 
     fn mouse_wheel_right_sidebar(&mut self, event: &MouseEvent, context: &dyn WindowOps) -> bool {
+        // On its way, the panel is not where what it shows is laid out: the
+        // wheel moves nothing under the pointer.
+        if matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_))
+            && self.sidebar_panel_moving(crate::termwindow::sidebar_slide::Side::Right)
+            && self.right_sidebar_rect().is_some_and(|rect| {
+                let (x, y) = (event.coords.x, event.coords.y);
+                x >= rect.x as isize
+                    && x < rect.x.saturating_add(rect.width) as isize
+                    && y >= rect.y as isize
+                    && y < rect.y.saturating_add(rect.height) as isize
+            })
+        {
+            return true;
+        }
         if self.right_sidebar_mode == super::RightSidebarMode::Chat {
             if let Some(rect) = self.right_sidebar_file_preview_rect() {
                 let x = event.coords.x;
@@ -1757,6 +1781,7 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarSshHosts
             | UIItemType::WorkspaceSidebarLiveOverview
             | UIItemType::WorkspaceSidebarNotifications
+            | UIItemType::WorkspaceSidebarJump
             | UIItemType::RightSidebarToggle
             | UIItemType::WindowTabsPin
             | UIItemType::WindowTabsTravelling
@@ -1935,6 +1960,7 @@ impl super::TermWindow {
             | UIItemType::WorkspaceSidebarSshHosts
             | UIItemType::WorkspaceSidebarLiveOverview
             | UIItemType::WorkspaceSidebarNotifications
+            | UIItemType::WorkspaceSidebarJump
             | UIItemType::RightSidebarToggle
             | UIItemType::WindowTabsPin
             | UIItemType::WindowTabsTravelling
@@ -4339,6 +4365,12 @@ impl super::TermWindow {
             UIItemType::WorkspaceSidebarNotifications => {
                 self.mouse_event_workspace_sidebar_notifications(item.clone(), event, context);
             }
+            UIItemType::WorkspaceSidebarJump => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.activate_sidebar_jump();
+                }
+            }
             UIItemType::ContextMenuBackdrop
             | UIItemType::SharePanel
             | UIItemType::CommandPalette => {
@@ -4800,6 +4832,12 @@ impl super::TermWindow {
             }
             UIItemType::WorkspaceSidebarNotifications => {
                 self.mouse_event_workspace_sidebar_notifications(item.clone(), event, context);
+            }
+            UIItemType::WorkspaceSidebarJump => {
+                context.set_cursor(Some(MouseCursor::Hand));
+                if event.kind == WMEK::Press(MousePress::Left) {
+                    self.activate_sidebar_jump();
+                }
             }
             UIItemType::RightSidebarToggle => {
                 self.mouse_event_right_sidebar_toggle(event, context);

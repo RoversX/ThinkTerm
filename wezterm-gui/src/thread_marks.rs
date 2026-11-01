@@ -304,6 +304,44 @@ fn draw_icon(
     Ok(())
 }
 
+/// One icon on its own, `alpha` of the way in: the sidebar's jump pill
+/// fades the icon of the thread it stands for in and out with itself.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_alone(
+    ctx: &DrawContext,
+    layers: &mut TripleLayerQuadAllocator,
+    icon: &ResolvedIcon,
+    x: f32,
+    y: f32,
+    d: f32,
+    dark: bool,
+    alpha: f32,
+) -> Result<()> {
+    crate::ui::tile::draw_tile(
+        ctx,
+        layers,
+        LAYER,
+        x,
+        y,
+        d,
+        d / 2.0,
+        icon.circle.linear().mul_alpha(alpha),
+        dark,
+        &tab_icons::PLATE,
+    )?;
+    let size = (d * TAB_ICON_GLYPH_RATIO).round();
+    tab_icons::draw_glyph(
+        ctx,
+        layers,
+        LAYER,
+        &icon.glyph,
+        x + (d - size) / 2.0,
+        y + (d - size) / 2.0,
+        size,
+        icon.glyph_color.linear().mul_alpha(alpha),
+    )
+}
+
 /// A neutral disc saying how many more programs there are.
 #[allow(clippy::too_many_arguments)]
 fn draw_count(
