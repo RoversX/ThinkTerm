@@ -12,6 +12,11 @@ use objc::runtime::{Class, Object, Sel, BOOL, NO, YES};
 pub use objc::*;
 use std::ffi::c_void;
 
+/// `NSMenuItemImageVisibilityVisible`. From macOS 27 a menu hides its items'
+/// images unless each asks for them to show; ours are chosen for every item
+/// that has one.
+const MENU_ITEM_IMAGE_VISIBLE: NSInteger = 1;
+
 pub struct Menu {
     menu: StrongPtr,
 }
@@ -345,6 +350,16 @@ impl MenuItem {
 
             let () = msg_send![image, setTemplate:YES];
             let () = msg_send![*self.item, setImage:image];
+            let shows: BOOL = msg_send![
+                *self.item,
+                respondsToSelector: sel!(setPreferredImageVisibility:)
+            ];
+            if shows == YES {
+                let () = msg_send![
+                    *self.item,
+                    setPreferredImageVisibility: MENU_ITEM_IMAGE_VISIBLE
+                ];
+            }
             true
         }
     }
@@ -371,6 +386,16 @@ impl MenuItem {
             let image = StrongPtr::new(image);
             let () = msg_send![*image, setTemplate:YES];
             let () = msg_send![*self.item, setImage:*image];
+            let shows: BOOL = msg_send![
+                *self.item,
+                respondsToSelector: sel!(setPreferredImageVisibility:)
+            ];
+            if shows == YES {
+                let () = msg_send![
+                    *self.item,
+                    setPreferredImageVisibility: MENU_ITEM_IMAGE_VISIBLE
+                ];
+            }
         }
     }
 

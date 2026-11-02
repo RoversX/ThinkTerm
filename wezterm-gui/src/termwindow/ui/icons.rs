@@ -135,6 +135,8 @@ pub enum SvgIcon {
     Mic,
     Camera,
     Network,
+    /// The Mac mini a remote host can be shown as: lucide has none.
+    HardDrive,
     /// The mux server of the README's architecture diagram: a host whose
     /// sessions live on it, which is what ThinkTerm Connect means.
     MuxServer,
@@ -438,6 +440,9 @@ impl SvgIcon {
             Self::Camera => include_bytes!("../../../../third_party/lucide/icons/camera.svg"),
             Self::Apple => include_bytes!("../../../../third_party/simple-icons/icons/apple.svg"),
             Self::Network => include_bytes!("../../../../third_party/lucide/icons/network.svg"),
+            Self::HardDrive => {
+                include_bytes!("../../../../third_party/lucide/icons/hard-drive.svg")
+            }
             Self::MuxServer => include_bytes!("../../../../assets/ui/mux-server.svg"),
             Self::QrCode => include_bytes!("../../../../third_party/lucide/icons/qr-code.svg"),
             Self::Smartphone => {
@@ -968,6 +973,10 @@ mod tests {
             // Settings › General's permissions.
             SvgIcon::Mic,
             SvgIcon::Camera,
+            // The kinds of machine a remote host can be shown as.
+            SvgIcon::Laptop,
+            SvgIcon::HardDrive,
+            SvgIcon::Package,
             // What a plugin's panel is shown by in the selector.
             SvgIcon::Activity,
             SvgIcon::Bug,

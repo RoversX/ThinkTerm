@@ -211,12 +211,18 @@ pub enum ContextMenuIcon {
     ArchiveRestore,
     Back,
     Check,
+    /// The kinds of machine a remote host can be shown as (`HostIcon`):
+    /// these and `Server`.
+    Chip,
     Close,
+    Cloud,
     Code,
     Collapse,
+    Container,
     Copy,
     Cut,
     Delete,
+    Desktop,
     Disconnect,
     Edit,
     Expand,
@@ -227,10 +233,13 @@ pub enum ContextMenuIcon {
     FolderRemove,
     /// What a view shows: the sliders of a view-options button.
     Filter,
+    Globe,
     /// How a view groups its rows.
     Group,
     Home,
     Info,
+    Laptop,
+    MacMini,
     MoveLeft,
     MoveRight,
     Network,
@@ -307,7 +316,11 @@ impl ContextMenuIcon {
             Self::ArchiveRestore => "tray.and.arrow.up",
             Self::Back => "chevron.left",
             Self::Check => "checkmark.circle",
+            Self::Chip => "cpu",
             Self::Close => "xmark",
+            Self::Cloud => "cloud",
+            Self::Container => "shippingbox",
+            Self::Desktop => "desktopcomputer",
             Self::Code => "chevron.left.forwardslash.chevron.right",
             Self::Collapse => "rectangle.compress.vertical",
             Self::Copy => "doc.on.doc",
@@ -326,6 +339,9 @@ impl ContextMenuIcon {
             Self::FolderAdd => "folder.badge.plus",
             Self::FolderRemove => "folder.badge.minus",
             Self::Filter => "slider.horizontal.3",
+            Self::Globe => "globe",
+            Self::Laptop => "laptopcomputer",
+            Self::MacMini => "macmini",
             Self::Group => "square.stack.3d.up",
             Self::Home => "house",
             Self::Info => "info.circle",
@@ -369,7 +385,11 @@ impl ContextMenuIcon {
                 include_bytes!("../../third_party/lucide/icons/arrow-left.svg")
             }
             Self::Check => include_bytes!("../../third_party/lucide/icons/circle-check.svg"),
+            Self::Chip => include_bytes!("../../third_party/lucide/icons/cpu.svg"),
             Self::Close => include_bytes!("../../third_party/lucide/icons/x.svg"),
+            Self::Cloud => include_bytes!("../../third_party/lucide/icons/cloud.svg"),
+            Self::Container => include_bytes!("../../third_party/lucide/icons/package.svg"),
+            Self::Desktop => include_bytes!("../../third_party/lucide/icons/monitor.svg"),
             Self::Code => include_bytes!("../../third_party/lucide/icons/code-xml.svg"),
             Self::Collapse => include_bytes!("../../third_party/lucide/icons/shrink.svg"),
             Self::Copy => include_bytes!("../../third_party/lucide/icons/copy.svg"),
@@ -390,6 +410,11 @@ impl ContextMenuIcon {
             Self::Filter => {
                 include_bytes!("../../third_party/lucide/icons/sliders-horizontal.svg")
             }
+            Self::Globe => include_bytes!("../../third_party/lucide/icons/globe.svg"),
+            Self::Laptop => include_bytes!("../../third_party/lucide/icons/laptop.svg"),
+            // lucide has no Mac mini; its flat drive with the lights on the
+            // front is the same squat box.
+            Self::MacMini => include_bytes!("../../third_party/lucide/icons/hard-drive.svg"),
             Self::Group => include_bytes!("../../third_party/lucide/icons/layers.svg"),
             Self::Home => include_bytes!("../../third_party/lucide/icons/house.svg"),
             Self::Info => include_bytes!("../../third_party/lucide/icons/info.svg"),

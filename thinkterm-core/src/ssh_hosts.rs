@@ -32,6 +32,72 @@ impl SshNetwork {
     }
 }
 
+/// The picture a host is shown by where servers are listed, such as the
+/// Space menu: what kind of machine it is, picked by the person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HostIcon {
+    Server,
+    Cloud,
+    Globe,
+    Laptop,
+    MacMini,
+    Desktop,
+    /// A small board: a Raspberry Pi and the like.
+    Chip,
+    Container,
+}
+
+impl HostIcon {
+    /// Every icon, in the order the picker offers them.
+    pub const ALL: [HostIcon; 8] = [
+        Self::Server,
+        Self::Cloud,
+        Self::Globe,
+        Self::Laptop,
+        Self::MacMini,
+        Self::Desktop,
+        Self::Chip,
+        Self::Container,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::Cloud => "cloud",
+            Self::Globe => "globe",
+            Self::Laptop => "laptop",
+            Self::MacMini => "mac_mini",
+            Self::Desktop => "desktop",
+            Self::Chip => "chip",
+            Self::Container => "container",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|icon| icon.as_str() == name)
+    }
+}
+
+/// `SshHostSpec::icon` as written: by name, so that one a newer version
+/// added reads back as no icon rather than failing the whole host list.
+mod host_icon_serde {
+    use super::HostIcon;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(icon: &Option<HostIcon>, s: S) -> Result<S::Ok, S::Error> {
+        match icon {
+            Some(icon) => s.serialize_some(icon.as_str()),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<HostIcon>, D::Error> {
+        Ok(Option::<String>::deserialize(d)?
+            .as_deref()
+            .and_then(HostIcon::from_name))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SshHostSpec {
     pub label: String,
@@ -90,6 +156,13 @@ pub struct SshHostSpec {
     /// Connect.
     #[serde(default)]
     pub files_auto_connect: bool,
+    /// The kind of machine it is, as picked; none shows the plain server.
+    #[serde(
+        default,
+        with = "host_icon_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub icon: Option<HostIcon>,
 }
 
 /// Why setting a host's shell integration up failed.
@@ -229,6 +302,7 @@ pub fn parse_system_ssh_config(content: &str) -> Vec<SshHostEntry> {
                     shell_integration_unsupported: None,
                     shell_integration_failure: None,
                     files_auto_connect: false,
+                    icon: None,
                 },
             });
         }
@@ -479,6 +553,25 @@ mod tests {
     }
 
     #[test]
+    fn host_icon_round_trips_and_an_unknown_one_reads_as_none() {
+        let mut spec: SshHostSpec =
+            serde_json::from_str(r#"{"label":"server-a","host":"example.test"}"#).unwrap();
+        assert_eq!(spec.icon, None);
+        assert!(!serde_json::to_string(&spec).unwrap().contains("icon"));
+
+        spec.icon = Some(HostIcon::MacMini);
+        let saved = serde_json::to_string(&spec).unwrap();
+        assert!(saved.contains(r#""icon":"mac_mini""#), "{}", saved);
+        assert_eq!(
+            serde_json::from_str::<SshHostSpec>(&saved).unwrap().icon,
+            Some(HostIcon::MacMini)
+        );
+
+        let newer = r#"{"label":"server-a","host":"example.test","icon":"toaster"}"#;
+        assert_eq!(serde_json::from_str::<SshHostSpec>(newer).unwrap().icon, None);
+    }
+
+    #[test]
     fn explicit_default_port_keeps_the_legacy_domain_name() {
         let spec = SshHostSpec {
             label: "server".into(),
@@ -501,6 +594,7 @@ mod tests {
             shell_integration_unsupported: None,
             shell_integration_failure: None,
             files_auto_connect: false,
+            icon: None,
         };
         assert_eq!(ssh_domain_name(&spec), "ssh:root@example.test");
         assert_eq!(build_ssh_domain(&spec).remote_address, "example.test:22");

@@ -598,6 +598,9 @@ pub(crate) enum RemoteHostCommand {
     Edit,
     Duplicate,
     Delete,
+    /// The icon picked in the form's icon menu, for the host the form edits
+    /// (an empty id: the new one it is making).
+    SetIcon(crate::ssh_hosts::HostIcon),
 }
 
 pub(crate) trait ContentView {

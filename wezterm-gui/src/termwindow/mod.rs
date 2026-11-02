@@ -9287,6 +9287,42 @@ impl TermWindow {
         self.show_term_context_menu(&window, euclid::point2(x as isize, y as isize), items);
     }
 
+    /// The icon menu of the Remote Hosts form, at `x`, `y`: every kind of
+    /// machine a host can be shown as, `current` ticked. `host_id` is the
+    /// host the form edits, empty for a new one.
+    pub(crate) fn show_remote_host_icon_menu(
+        &mut self,
+        host_id: String,
+        current: Option<crate::ssh_hosts::HostIcon>,
+        x: f32,
+        y: f32,
+    ) {
+        use crate::ssh_hosts::HostIcon;
+        use crate::termwindow::content_view::RemoteHostCommand;
+        let Some(window) = self.window.as_ref().cloned() else {
+            return;
+        };
+        self.begin_context_menu_application_actions();
+        let current = current.unwrap_or(HostIcon::Server);
+        let items = HostIcon::ALL
+            .iter()
+            .copied()
+            .map(|icon| {
+                self.context_menu_application_item_with_icon(
+                    crate::ssh_hosts::host_icon_name(icon),
+                    crate::ssh_hosts::host_menu_icon(Some(icon)),
+                    ContextMenuApplicationAction::RemoteHost {
+                        host_id: host_id.clone(),
+                        command: RemoteHostCommand::SetIcon(icon),
+                    },
+                    true,
+                )
+                .checked(icon == current)
+            })
+            .collect();
+        self.show_term_context_menu(&window, euclid::point2(x as isize, y as isize), items);
+    }
+
     /// Open the SSH hosts page on a blank host form. Unlike
     /// `toggle_ssh_hosts_view` this never closes an open page: it is reached
     /// from a menu entry worded as an action, and an action that sometimes

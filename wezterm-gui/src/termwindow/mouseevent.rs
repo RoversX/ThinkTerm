@@ -176,16 +176,17 @@ pub(crate) fn space_destructive_menu_items(
 
 /// A server's row in the one-row-per-server Space menu: a server with one
 /// Space switches to it from the row itself; one with several opens them,
-/// and a new one, in a submenu.
+/// and a new one, in a submenu. `icon` is the one picked for the host.
 fn server_menu_row(
     label: String,
     domain: &str,
+    icon: ContextMenuIcon,
     spaces: &[&crate::workspace_threads::SpaceView],
 ) -> ContextMenuItem {
     if let [space] = spaces {
         let item = ContextMenuItem::item_with_icon(
             label,
-            ContextMenuIcon::Server,
+            icon,
             KeyAssignment::SwitchSpace(space.id.to_string()),
         );
         return if space.is_occupied_by_other_window {
@@ -219,26 +220,36 @@ fn server_menu_row(
         ContextMenuIcon::New,
         KeyAssignment::CreateSpaceOnDomain(domain.to_string()),
     ));
-    ContextMenuItem::submenu_with_icon(label, ContextMenuIcon::Server, children)
+    ContextMenuItem::submenu_with_icon(label, icon, children)
 }
 
-/// "New Space on Server": one row per server, (label, mux domain), each
-/// making a Space there.
-fn new_space_on_server_menu(servers: Vec<(String, String)>) -> ContextMenuItem {
+/// "New Space on Server": one row per server, (label, mux domain, icon),
+/// each making a Space there.
+fn new_space_on_server_menu(servers: Vec<(String, String, ContextMenuIcon)>) -> ContextMenuItem {
     ContextMenuItem::submenu_with_icon(
         crate::i18n::tr("menu-new-space-on-server"),
         ContextMenuIcon::Server,
         servers
             .into_iter()
-            .map(|(label, domain)| {
+            .map(|(label, domain, icon)| {
                 ContextMenuItem::item_with_icon(
                     label,
-                    ContextMenuIcon::Server,
+                    icon,
                     KeyAssignment::CreateSpaceOnDomain(domain),
                 )
             })
             .collect(),
     )
+}
+
+/// Servers folded to one row each, connected ones first, then those on
+/// their way, then the rest; in their own order within each.
+fn order_servers_by_connection<T>(servers: &mut [(T, SpaceConnectionState)]) {
+    servers.sort_by_key(|(_, state)| match state {
+        SpaceConnectionState::Connected => 0,
+        SpaceConnectionState::Connecting | SpaceConnectionState::Reconnecting => 1,
+        SpaceConnectionState::Disconnected => 2,
+    });
 }
 
 fn note_drag_scroll_delta(
@@ -6448,7 +6459,7 @@ impl super::TermWindow {
         self.begin_context_menu_application_actions();
         let spaces = crate::workspace_threads::spaces_for_window(self.space_owner_id);
 
-        let space_item = |space: &crate::workspace_threads::SpaceView| {
+        let space_item = |space: &crate::workspace_threads::SpaceView, icon: Option<ContextMenuIcon>| {
             let label = if space.is_occupied_by_other_window {
                 tr_with_name("menu-space-occupied", &space.name)
             } else {
@@ -6459,7 +6470,7 @@ impl super::TermWindow {
                 if space.is_default {
                     ContextMenuIcon::Home
                 } else {
-                    ContextMenuIcon::Stack
+                    icon.unwrap_or(ContextMenuIcon::Stack)
                 },
                 KeyAssignment::SwitchSpace(space.id.to_string()),
             )
@@ -6472,7 +6483,7 @@ impl super::TermWindow {
 
         let mut items = vec![];
         for space in spaces.iter().filter(|space| space.domain.is_none()) {
-            items.push(space_item(space));
+            items.push(space_item(space, None));
         }
         // While servers show as folders their Spaces are not listed: they
         // live in a local Space's sidebar. One opened from its folder stays
@@ -6485,31 +6496,39 @@ impl super::TermWindow {
             items.push(
                 ContextMenuItem::item_with_icon(
                     space.name.clone(),
-                    ContextMenuIcon::Server,
+                    crate::ssh_hosts::host_menu_icon(
+                        space
+                            .domain
+                            .as_deref()
+                            .and_then(crate::ssh_hosts::connect_domain_icon),
+                    ),
                     KeyAssignment::SwitchSpace(space.id.to_string()),
                 )
                 .checked(true),
             );
         }
 
-        // Keep the servers in the order their Spaces appear rather than
-        // sorting: that order is the user's.
-        let mut domains: Vec<&str> = vec![];
-        for domain in spaces
-            .iter()
-            .filter(|space| !space.shown_as_folders)
-            .filter_map(|space| space.domain.as_deref())
-        {
-            if !domains.contains(&domain) {
-                domains.push(domain);
+        // Keep the servers in the order their Spaces appear: that order is
+        // the user's.
+        let mut domains: Vec<(&str, SpaceConnectionState)> = vec![];
+        for space in spaces.iter().filter(|space| !space.shown_as_folders) {
+            let Some(domain) = space.domain.as_deref() else {
+                continue;
+            };
+            if !domains.iter().any(|(known, _)| *known == domain) {
+                domains.push((domain, self.space_connection_state(&space.id)));
             }
         }
 
         // Folded to one row each, servers sit together; the one the window
         // is on stays spelled out, so moving between its Spaces is one click.
+        // Those connected come first there: they are the ones in use.
         let one_row = crate::native_settings::space_menu_one_row_per_server();
+        if one_row {
+            order_servers_by_connection(&mut domains);
+        }
         let mut last_was_row = false;
-        for domain in domains.iter().copied() {
+        for (domain, state) in domains.iter().copied() {
             let here: Vec<&crate::workspace_threads::SpaceView> = spaces
                 .iter()
                 .filter(|space| space.domain.as_deref() == Some(domain))
@@ -6519,11 +6538,8 @@ impl super::TermWindow {
                 items.push(ContextMenuItem::Separator);
             }
             last_was_row = collapsed;
-            let state = spaces
-                .iter()
-                .find(|space| space.domain.as_deref() == Some(domain))
-                .map(|space| self.space_connection_state(&space.id))
-                .unwrap_or(SpaceConnectionState::Connected);
+            let icon =
+                crate::ssh_hosts::host_menu_icon(crate::ssh_hosts::connect_domain_icon(domain));
             // The host's own name: one on the embedded tailnet is connected
             // under its address.
             let name = crate::ssh_hosts::connect_domain_label(domain);
@@ -6543,7 +6559,7 @@ impl super::TermWindow {
                 }
             };
             if collapsed {
-                items.push(server_menu_row(header, domain, &here));
+                items.push(server_menu_row(header, domain, icon, &here));
                 continue;
             }
             // A server is a heading, not something to switch to. Saying that
@@ -6551,11 +6567,9 @@ impl super::TermWindow {
             // *look* like a heading: the platform styles it as a caption and
             // never highlights it under the pointer.
             items.push(ContextMenuItem::section_header(header));
-            for space in spaces
-                .iter()
-                .filter(|space| space.domain.as_deref() == Some(domain))
-            {
-                items.push(space_item(space));
+            // A heading has no icon, so the server's Spaces carry it.
+            for space in here.iter().copied() {
+                items.push(space_item(space, Some(icon)));
             }
             items.push(ContextMenuItem::item_with_icon(
                 crate::i18n::tr("menu-new-space-here"),
@@ -6587,10 +6601,13 @@ impl super::TermWindow {
             items.push(new_space_on_server_menu(
                 domains
                     .iter()
-                    .map(|domain| {
+                    .map(|(domain, _)| {
                         (
                             crate::ssh_hosts::connect_domain_label(domain),
                             domain.to_string(),
+                            crate::ssh_hosts::host_menu_icon(
+                                crate::ssh_hosts::connect_domain_icon(domain),
+                            ),
                         )
                     })
                     .collect(),
@@ -10637,9 +10654,11 @@ mod sidebar_drag_tests {
 #[cfg(test)]
 mod space_menu_tests {
     use super::space_destructive_menu_items;
+    use crate::termwindow::ui::sidebar::SpaceConnectionState;
     use crate::workspace_threads::SpaceView;
     use config::keyassignment::KeyAssignment;
     use window::ContextMenuAction;
+    use window::ContextMenuIcon;
     use window::ContextMenuItem;
 
     fn space(is_remote: bool) -> SpaceView {
@@ -10711,7 +10730,7 @@ mod space_menu_tests {
     #[test]
     fn a_server_with_one_space_switches_from_its_row() {
         let only = server_space("s1", false);
-        let row = super::server_menu_row("devbox".to_string(), "devbox", &[&only]);
+        let row = super::server_menu_row("devbox".to_string(), "devbox", ContextMenuIcon::Server, &[&only]);
         assert!(submenu_of(&row).is_empty());
         assert_eq!(action(&row), KeyAssignment::SwitchSpace("s1".to_string()));
     }
@@ -10720,7 +10739,7 @@ mod space_menu_tests {
     #[test]
     fn a_server_with_several_spaces_opens_them_from_its_row() {
         let (first, second) = (server_space("s1", false), server_space("s2", false));
-        let row = super::server_menu_row("devbox".to_string(), "devbox", &[&first, &second]);
+        let row = super::server_menu_row("devbox".to_string(), "devbox", ContextMenuIcon::Server, &[&first, &second]);
         let children = submenu_of(&row);
         assert_eq!(children.len(), 4);
         assert!(matches!(children[2], ContextMenuItem::Separator));
@@ -10739,15 +10758,23 @@ mod space_menu_tests {
     #[test]
     fn a_server_whose_only_space_is_open_elsewhere_is_greyed() {
         let only = server_space("s1", true);
-        let row = super::server_menu_row("devbox".to_string(), "devbox", &[&only]);
+        let row = super::server_menu_row("devbox".to_string(), "devbox", ContextMenuIcon::Server, &[&only]);
         assert!(matches!(row, ContextMenuItem::Item { enabled: false, .. }));
     }
 
     #[test]
     fn new_space_on_server_offers_every_server() {
         let menu = super::new_space_on_server_menu(vec![
-            ("devbox".to_string(), "devbox".to_string()),
-            ("server-b".to_string(), "server-b".to_string()),
+            (
+                "devbox".to_string(),
+                "devbox".to_string(),
+                ContextMenuIcon::Server,
+            ),
+            (
+                "server-b".to_string(),
+                "server-b".to_string(),
+                ContextMenuIcon::Cloud,
+            ),
         ]);
         assert_eq!(
             actions(submenu_of(&menu)),
@@ -10755,6 +10782,26 @@ mod space_menu_tests {
                 KeyAssignment::CreateSpaceOnDomain("devbox".to_string()),
                 KeyAssignment::CreateSpaceOnDomain("server-b".to_string()),
             ]
+        );
+    }
+
+    /// Connected servers come first, then those on their way, then the
+    /// rest, each keeping the order it had.
+    #[test]
+    fn servers_folded_to_rows_put_connected_ones_first() {
+        use SpaceConnectionState::*;
+        let mut servers = vec![
+            ("a", Disconnected),
+            ("b", Connected),
+            ("c", Reconnecting),
+            ("d", Disconnected),
+            ("e", Connected),
+            ("f", Connecting),
+        ];
+        super::order_servers_by_connection(&mut servers);
+        assert_eq!(
+            servers.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            ["b", "e", "c", "f", "a", "d"]
         );
     }
 

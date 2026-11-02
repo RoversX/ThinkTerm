@@ -8,7 +8,7 @@
 
 use crate::quad::{HeapQuadAllocator, QuadClipRect, TripleLayerQuadAllocator};
 use crate::ssh_hosts::{
-    self, ShellIntegrationFailure, SshHostEntry, SshHostSource, SshHostSpec, SshNetwork,
+    self, HostIcon, ShellIntegrationFailure, SshHostEntry, SshHostSource, SshHostSpec, SshNetwork,
 };
 use crate::tailnet::{
     Device, Machine as TailnetMachine, State as TailnetState, View as TailnetView,
@@ -212,6 +212,8 @@ enum SshViewAction {
     /// Connect to the host the inspector is showing.
     Connect,
     FocusField(usize),
+    /// The icon button: a menu of the kinds of machine to show the host as.
+    PickIcon,
     SetNetwork(SshNetwork),
     ToggleDetect,
     /// One of the three ways to reach the host.
@@ -277,6 +279,7 @@ impl HostMode {
 /// `SshHostsView::save_choice`). What is typed waits for Save.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HostChoice {
+    Icon(Option<HostIcon>),
     Network(SshNetwork),
     Mode(HostMode),
     DetectOs(bool),
@@ -288,6 +291,7 @@ impl HostChoice {
     /// Makes the choice on `spec`, as Save makes it from the form.
     fn apply_to(self, spec: &mut SshHostSpec) {
         match self {
+            Self::Icon(icon) => spec.icon = icon,
             Self::Network(network) => spec.network = network,
             Self::Mode(mode) => {
                 // Mosh and ThinkTerm Connect are alternative transports;
@@ -308,6 +312,7 @@ impl HostChoice {
     /// could not be saved shows instead.
     fn show_saved(self, saved: &SshHostSpec, form: &mut HostForm) {
         match self {
+            Self::Icon(_) => form.icon = saved.icon,
             Self::Network(_) => form.network = saved.network,
             Self::Mode(_) => {
                 form.use_mosh = saved.use_mosh;
@@ -457,6 +462,7 @@ struct HostForm {
     /// the user is still typing.
     options: Vec<(TextInputState, TextInputState)>,
     advanced_open: bool,
+    icon: Option<HostIcon>,
     network: SshNetwork,
     detect_os: bool,
     use_mosh: bool,
@@ -515,6 +521,8 @@ pub(crate) struct SshHostsView {
     form_content_h: f32,
     /// Bounds of the form column, remembered for wheel hit-testing.
     form_area: RectF,
+    /// The icon button as last painted: where its menu opens.
+    icon_button: RectF,
     widgets: UiContext<SshViewAction>,
     interaction: InteractionState<SshViewAction>,
     scroll: ScrollState,
@@ -564,6 +572,7 @@ impl SshHostsView {
             form_scroll: ScrollState::new(),
             form_content_h: 0.0,
             form_area: rect(0.0, 0.0, 0.0, 0.0),
+            icon_button: rect(0.0, 0.0, 0.0, 0.0),
             widgets: UiContext::default(),
             interaction: InteractionState::default(),
             scroll: ScrollState::new(),
@@ -738,6 +747,7 @@ impl SshHostsView {
             input.set_text_end(text);
             input
         });
+        let icon = spec.icon;
         let network = spec.network;
         let detect_os = spec.detect_os;
         let use_mosh = spec.use_mosh;
@@ -762,6 +772,7 @@ impl SshHostsView {
             fields,
             options,
             advanced_open,
+            icon,
             network,
             detect_os,
             use_mosh,
@@ -840,10 +851,12 @@ impl SshHostsView {
             shell_integration_unsupported: None,
             shell_integration_failure: None,
             files_auto_connect: false,
+            icon: None,
         });
         spec.label = label;
         spec.host = host;
         spec.port = port;
+        spec.icon = form.icon;
         spec.network = form.network;
         spec.other_addresses =
             ssh_hosts::parse_other_addresses(&form.fields[FIELD_OTHER_ADDRESSES].text());
@@ -1207,6 +1220,7 @@ impl SshHostsView {
                 self.focus = Focus::Field(n.min(count - 1));
                 ContentViewResponse::Redraw
             }
+            SshViewAction::PickIcon => self.icon_menu(),
             SshViewAction::SetNetwork(network) => {
                 let tailnet_on = self.tailnet_on;
                 if let Some(form) = self.form.as_mut() {
@@ -1512,6 +1526,7 @@ impl SshHostsView {
             form.multiplexing = spec.multiplexing;
             form.shell_integration = spec.shell_integration;
             form.files_auto_connect = spec.files_auto_connect;
+            form.icon = spec.icon;
             form.options = spec
                 .ssh_options
                 .iter()
@@ -1539,7 +1554,38 @@ impl SshHostsView {
             }
             RemoteHostCommand::Duplicate => self.duplicate_host(host_id),
             RemoteHostCommand::Delete => self.delete_host(host_id),
+            RemoteHostCommand::SetIcon(icon) => self.set_form_icon(host_id, icon),
         }
+    }
+
+    /// The icon button's menu, under the button. The page cannot open a
+    /// menu itself, as for a card's.
+    fn icon_menu(&mut self) -> ContentViewResponse {
+        let Some(form) = self.form.as_ref() else {
+            return ContentViewResponse::Redraw;
+        };
+        let host_id = form.editing.clone().unwrap_or_default();
+        let current = form.icon;
+        let (x, y) = (self.icon_button.origin.x, self.icon_button.max_y());
+        ContentViewResponse::Run(Box::new(move |term_window| {
+            term_window.show_remote_host_icon_menu(host_id, current, x, y);
+        }))
+    }
+
+    /// `icon`, picked in the icon menu, on the form for `host_id` (empty
+    /// for a new host) if that form is still the one open. The plain server
+    /// is what no icon shows, so picking it saves none.
+    fn set_form_icon(&mut self, host_id: &str, icon: HostIcon) -> ContentViewResponse {
+        let Some(form) = self.form.as_mut() else {
+            return ContentViewResponse::Redraw;
+        };
+        if form.editing.as_deref().unwrap_or("") != host_id {
+            return ContentViewResponse::Redraw;
+        }
+        let icon = (icon != HostIcon::Server).then_some(icon);
+        form.icon = icon;
+        self.save_choice(HostChoice::Icon(icon));
+        ContentViewResponse::Redraw
     }
 
     /// The card under the pointer, if any.
@@ -3832,6 +3878,7 @@ impl SshHostsView {
             return Ok(());
         };
         let editing = form.editing.clone();
+        let icon = form.icon;
         let network = form.network;
         let detect_os = form.detect_os;
         let use_mosh = form.use_mosh;
@@ -4001,7 +4048,7 @@ impl SshHostsView {
             let conn_h = Self::inspector_card_height(
                 ctx,
                 section_h,
-                &[field_h, field_h + lock_note_h, field_h, field_h, field_h],
+                &[field_h, field_h, field_h + lock_note_h, field_h, field_h, field_h],
             );
             let mut fy = Self::paint_inspector_card(
                 ctx,
@@ -4023,6 +4070,16 @@ impl SshHostsView {
                 &crate::i18n::tr("ssh-field-name"),
                 FIELD_NAME,
                 &fields[FIELD_NAME].text(),
+                x + pad,
+                fy,
+                inner,
+            )? + gap;
+            fy = self.paint_icon_row(
+                ctx,
+                &mut body_layers,
+                font,
+                palette,
+                icon,
                 x + pad,
                 fy,
                 inner,
@@ -4649,6 +4706,96 @@ impl SshHostsView {
         // over the clipped edge dimmed the Save/Cancel row into looking
         // broken. Content past the fold is simply clipped.
         Ok(())
+    }
+
+    /// The icon row: its label, and a button showing the icon picked with
+    /// its name, which opens the menu of them. Returns the y under it.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_icon_row(
+        &mut self,
+        ctx: &DrawContext,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        font: &Rc<LoadedFont>,
+        palette: UiPalette,
+        icon: Option<HostIcon>,
+        x: f32,
+        y: f32,
+        width: f32,
+    ) -> anyhow::Result<f32> {
+        let line_h = ctx.metrics.cell_size.height as f32;
+        ctx.draw_text(
+            layers,
+            font,
+            x,
+            y,
+            &crate::i18n::tr("ssh-field-icon"),
+            palette.text,
+            width,
+        )?;
+        let icon = icon.unwrap_or(HostIcon::Server);
+        let glyph = match icon {
+            HostIcon::Server => SvgIcon::Server,
+            HostIcon::Cloud => SvgIcon::Cloud,
+            HostIcon::Globe => SvgIcon::Globe,
+            HostIcon::Laptop => SvgIcon::Laptop,
+            HostIcon::MacMini => SvgIcon::HardDrive,
+            HostIcon::Desktop => SvgIcon::Monitor,
+            HostIcon::Chip => SvgIcon::Cpu,
+            HostIcon::Container => SvgIcon::Package,
+        };
+        let label = ssh_hosts::host_icon_name(icon);
+        let action = SshViewAction::PickIcon;
+        let state = self.button_state(action);
+        let variant = ButtonVariant::Secondary;
+        let button = rect(
+            x,
+            y + line_h + ctx.px(LABEL_GAP),
+            width,
+            ctx.px(INPUT_H),
+        );
+        self.icon_button = button;
+        draw_button(
+            ctx,
+            layers,
+            font,
+            &mut self.widgets,
+            palette,
+            ButtonSpec {
+                label: "",
+                action,
+                rect: button,
+                state,
+                kind: WidgetKind::Button,
+                variant,
+            },
+        )?;
+        // Laid out as the system's pop-up button: the choice at the start,
+        // the arrows at the end.
+        let (_, _, ink) = variant.colors(state, palette);
+        let size = ctx.px(16.0);
+        let inset = ctx.px(14.0);
+        let icon_y = button.origin.y + (button.size.height - size) / 2.0;
+        ctx.draw_svg_icon(layers, glyph, button.origin.x + inset, icon_y, size, ink)?;
+        let arrows_x = button.max_x() - inset - size;
+        ctx.draw_svg_icon(
+            layers,
+            SvgIcon::ChevronsUpDown,
+            arrows_x,
+            icon_y,
+            size,
+            palette.muted_text,
+        )?;
+        let text_x = button.origin.x + inset + size + ctx.px(8.0);
+        ctx.draw_text(
+            layers,
+            font,
+            text_x,
+            button.origin.y + ((button.size.height - line_h) / 2.0).max(0.0),
+            &label,
+            ink,
+            (arrows_x - ctx.px(8.0) - text_x).max(0.0),
+        )?;
+        Ok(y + Self::field_row_height(ctx))
     }
 
     /// Which of the three visual states a button is in. "Primary" is no
@@ -6148,6 +6295,7 @@ mod tests {
             shell_integration_unsupported: None,
             shell_integration_failure: None,
             files_auto_connect: false,
+            icon: None,
         }
     }
 
@@ -6212,7 +6360,10 @@ mod tests {
         view.filtered = vec![SshHostEntry {
             id: "ssh-original".to_string(),
             source: SshHostSource::ThinkTerm,
-            spec: spec("prod-1", "10.0.0.7"),
+            spec: SshHostSpec {
+                icon: Some(crate::ssh_hosts::HostIcon::Cloud),
+                ..spec("prod-1", "192.0.2.7")
+            },
         }];
 
         view.password_visible = true;
@@ -6236,6 +6387,7 @@ mod tests {
         // host it was copied from. Host is the one field left for the user.
         assert_eq!(form.fields[FIELD_HOST].text(), "");
         assert_eq!(view.focus, Focus::Field(FIELD_HOST));
+        assert_eq!(form.icon, Some(crate::ssh_hosts::HostIcon::Cloud));
     }
 
     fn row(key: &str, value: &str) -> (super::TextInputState, super::TextInputState) {
