@@ -24,6 +24,7 @@ UPSTREAM_USERS = {
 APP_TEMPLATE = {
     "assets/macos/ThinkTerm.app/Contents/Info.plist",
     "assets/macos/ThinkTerm.app/Contents/Resources/ThinkTerm.icns",
+    "assets/macos/ThinkTerm.app/Contents/Resources/ThinkTerm_otter.icns",
     "assets/macos/ThinkTerm.app/Contents/Resources/ThinkTerm_red.icns",
     "assets/macos/ThinkTerm.app/Contents/Resources/ThinkTerm_simple.icns",
     "assets/macos/ThinkTerm.app/Contents/Resources/terminal.icns",
