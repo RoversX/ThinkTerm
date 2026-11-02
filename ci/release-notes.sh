@@ -97,6 +97,8 @@ linux=''
 desktop=$(links_by_arch 'thinkterm-[0-9]*-linux-*.tar.gz') || desktop=''
 server=$(links_by_arch 'thinkterm-server-*-linux-*64.tar.gz') || server=''
 server_old=$(links_by_arch 'thinkterm-server-*-glibc*.tar.gz') || server_old=''
+server_xz=$(links_by_arch 'thinkterm-server-*-linux-*64.tar.xz') || server_xz=''
+server_old_xz=$(links_by_arch 'thinkterm-server-*-glibc*.tar.xz') || server_old_xz=''
 if [ -n "$desktop$server$server_old" ]; then
   linux="$linux
 **Install script** — \`curl -fsSL https://raw.githubusercontent.com/RoversX/thinkterm/main/install.sh | sh\` puts ThinkTerm under \`~/.local\` without root and asks which variant you want; \`--desktop\` or \`--server\` (headless remote host, no GUI) skips the question
@@ -105,7 +107,13 @@ if [ -n "$desktop$server$server_old" ]; then
 Desktop tarball: $desktop
 "
   [ -z "$server" ] || linux="$linux
-Server tarball: $server
+Server tarball (gzip): $server
+"
+  [ -z "$server_xz" ] || linux="$linux
+Server tarball (smaller xz download): $server_xz
+"
+  [ -z "$server_old_xz" ] || linux="$linux
+Server tarball for older glibc (xz): $server_old_xz
 "
   [ -z "$server_old" ] || linux="$linux
 Server tarball for older glibc (Ubuntu 20.04, Debian 11; OpenSSL built in): $server_old

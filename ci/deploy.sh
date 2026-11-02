@@ -767,6 +767,9 @@ EOF
           # uid, which would surface as a stray numeric owner on extraction
           # as root.
           tar czf "$tardir.tar.gz" --owner=0 --group=0 "$tardir"
+          if [[ "$variant" == thinkterm-server ]] ; then
+            XZ_OPT=-9e tar cJf "$tardir.tar.xz" --owner=0 --group=0 "$tardir"
+          fi
           rm -rf "$tardir"
         }
         if [[ -z "${OLD_GLIBC_SERVER:-}" ]] ; then

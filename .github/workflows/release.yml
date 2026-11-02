@@ -713,11 +713,6 @@ jobs:
           mkdir -p artifacts dist
           find artifacts -type f -exec mv -t dist {} +
 
-      # No checksum files are published. GitHub records a sha256 for every
-      # release asset as it is uploaded -- including the macOS zip attached by
-      # hand -- and shows it on the asset. A checksums file of our own would
-      # cover only what CI built, and unsigned it sits on the same server as
-      # the packages, so it proves no more than the digest already does.
       - name: Check there is something to publish
         run: |
           set -eu
@@ -741,10 +736,43 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: bash ci/retry.sh bash ci/create-release.sh "$RELEASE_TAG"
 
+      # A rerun may build only one platform. Keep the other release assets in
+      # the signed inventory, without uploading or replacing them again.
+      - name: Gather existing release packages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          previous="$RUNNER_TEMP/thinkterm-existing-release"
+          mkdir -p "$previous"
+          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' > "$RUNNER_TEMP/thinkterm-assets.txt"
+          while IFS= read -r name; do
+            case "$name" in
+              thinkterm-release.txt|thinkterm-release.txt.sig|*-dSYM.zip|*-pdb.zip) continue ;;
+              ""|*[!A-Za-z0-9._+-]*) echo "::error::unexpected release asset name"; exit 1 ;;
+            esac
+            [ ! -f "dist/$name" ] || continue
+            gh release download "$RELEASE_TAG" --pattern "$name" --dir "$previous"
+          done < "$RUNNER_TEMP/thinkterm-assets.txt"
+
+      - name: Sign release metadata
+        env:
+          THINKTERM_RELEASE_SIGNING_KEY: ${{ secrets.THINKTERM_RELEASE_SIGNING_KEY }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: bash ci/sign-release.sh "$RELEASE_TAG" dist "$RUNNER_TEMP/thinkterm-existing-release"
+
       - name: Upload to release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
-          bash ci/retry.sh gh release upload --clobber \
-            "$RELEASE_TAG" dist/*
+          set -euo pipefail
+          packages=()
+          for file in dist/*; do
+            case "$file" in dist/thinkterm-release.txt|dist/thinkterm-release.txt.sig) continue ;; esac
+            packages+=("$file")
+          done
+          bash ci/retry.sh gh release upload --clobber "$RELEASE_TAG" "${packages[@]}"
+          bash ci/retry.sh gh release upload --clobber "$RELEASE_TAG" \
+            dist/thinkterm-release.txt dist/thinkterm-release.txt.sig
