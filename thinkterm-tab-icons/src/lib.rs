@@ -43,6 +43,7 @@ pub enum BuiltinGlyph {
     Bot,
     Bun,
     Claude,
+    CodeBuddy,
     Copilot,
     Cursor,
     Deno,
@@ -116,6 +117,7 @@ impl BuiltinGlyph {
             Self::Bot => lucide!("bot"),
             Self::Bun => simple!("bun"),
             Self::Claude => simple!("claude"),
+            Self::CodeBuddy => lobe!("codebuddy"),
             Self::Copilot => simple!("githubcopilot"),
             Self::Cursor => lobe!("cursor"),
             Self::Deno => simple!("deno"),
@@ -254,6 +256,16 @@ pub const BUILTIN_CARDS: &[BuiltinCard] = &[
         programs: &["claude"],
     },
     BuiltinCard {
+        id: "codebuddy",
+        name: "CodeBuddy",
+        glyph: BuiltinGlyph::CodeBuddy,
+        // CodeBuddy's own mint, from its app mark.
+        circle: Rgb(0x00, 0xBC, 0x90),
+        glyph_color: WHITE,
+        agents: &["codebuddy"],
+        programs: &["codebuddy", "codebuddy-code", "cbc", "codebuddy-lowmem"],
+    },
+    BuiltinCard {
         id: "codex",
         name: "Codex",
         glyph: BuiltinGlyph::OpenAi,
@@ -297,6 +309,17 @@ pub const BUILTIN_CARDS: &[BuiltinCard] = &[
         glyph_color: WHITE,
         agents: &["kimi"],
         programs: &["kimi"],
+    },
+    BuiltinCard {
+        id: "omp",
+        // OMP is a Pi fork and borrows Pi's mark, as the agents panel
+        // does; the circle is the violet of its own gradient.
+        name: "OMP",
+        glyph: BuiltinGlyph::Pi,
+        circle: Rgb(0x9B, 0x4D, 0xFF),
+        glyph_color: WHITE,
+        agents: &["omp"],
+        programs: &["omp"],
     },
     BuiltinCard {
         id: "opencode",
@@ -1098,6 +1121,37 @@ mod tests {
         assert!(other.agents.iter().any(|agent| agent == "*"));
         assert_eq!(catalog.card_for(None, None).id, TERMINAL_CARD);
         assert_eq!(catalog.terminal_card().id, TERMINAL_CARD);
+    }
+
+    #[test]
+    fn every_agent_the_status_panel_names_gets_its_own_card() {
+        let catalog = build(&TabIconSettings::default());
+        for id in [
+            "claude", "codebuddy", "codex", "copilot", "cursor", "kimi", "omp", "opencode", "pi",
+        ] {
+            assert_eq!(catalog.card_for(Some(id), None).id, id, "{id}");
+        }
+        // Soul is native and ships no mark of its own, so it keeps the
+        // catch-all rather than wearing a brand it does not have.
+        assert_eq!(catalog.card_for(Some("soul"), None).id, "agent");
+    }
+
+    #[test]
+    fn a_launcher_is_dressed_before_its_agent_is_classified() {
+        // A pane has an icon from the moment its program leads it, which
+        // is often before the agent's rules have said what it is.
+        let catalog = build(&TabIconSettings::default());
+        for name in ["codebuddy", "codebuddy-code", "cbc", "codebuddy-lowmem"] {
+            assert_eq!(card_id(&catalog, &program(name, None)), "codebuddy", "{name}");
+        }
+        // Both ship as scripts under a runtime: `node .../codebuddy`, and
+        // `bun .../omp`. The script names the agent; the runtime does not.
+        assert_eq!(
+            card_id(&catalog, &program("node", Some("codebuddy"))),
+            "codebuddy"
+        );
+        assert_eq!(card_id(&catalog, &program("omp", None)), "omp");
+        assert_eq!(card_id(&catalog, &program("bun", Some("omp"))), "omp");
     }
 
     #[test]
