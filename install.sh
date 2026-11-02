@@ -1,10 +1,11 @@
 #!/bin/sh
+# thinkterm-installer-v1
 # ThinkTerm installer for Linux and macOS.
 #
 #   curl -fsSL https://raw.githubusercontent.com/RoversX/thinkterm/main/install.sh | sh
 #
-# Downloads the release for this machine, verifies it against the digest
-# GitHub recorded at upload, and installs it for the current user -- no root,
+# Downloads the release for this machine, verifies it against GitHub's digest
+# or the signed release inventory, and installs it for the current user -- no root,
 # no package manager. Linux gets a tarball unpacked under ~/.local; macOS gets
 # the signed ThinkTerm.app plus command-line links under ~/.local/bin. The two
 # variants are mutually exclusive: installing one removes the other's files.
@@ -20,10 +21,10 @@
 #                     (or ~/Applications when that is not writable).
 #   --from FILE       Use an already-downloaded tarball or zip; nothing is
 #                     fetched.
-#   --mirror M        Where the release archive comes from: auto (GitHub,
-#                     then each known mirror while it fails or crawls, then
-#                     GitHub again; the default), direct (GitHub only), or a
-#                     mirror's host such as ghfast.top (it, then GitHub).
+#   --sha256 HASH     Verify a --from archive against this SHA-256.
+#   --mirror M        auto tries GitHub, then ranks mirrors if GitHub is slow;
+#                     direct uses only GitHub; a mirror host tries that host,
+#                     then GitHub. Mirrors require a trusted checksum.
 #   --dry-run         Say what would be done and stop before touching the disk.
 #
 # GITHUB_TOKEN in the environment is sent with every request. It is what lets
@@ -55,8 +56,8 @@ min_glibc_desktop="2.35"   # the GUI's alone; the rest need min_glibc_server_mai
 # beside the desktop's, which links the host's OpenSSL 3; an older host has
 # only OpenSSL 1.1 and gets the one made on Ubuntu 20.04 with OpenSSL built in.
 min_glibc_server_main="2.34"
-# Hosts that proxy github.com downloads, for --mirror auto, in the order
-# tried. thinkterm-update carries the same list for Settings.
+# Hosts probed in parallel when GitHub is slow under --mirror auto.
+# thinkterm-update carries the same list for Settings.
 mirrors="ghfast.top gh-proxy.org ghproxy.net gh.llkk.cc"
 # Bytes a second under which a source that is not the last one is given up.
 min_rate=307200
@@ -67,6 +68,8 @@ version=""
 prefix="${HOME}/.local"
 app_dir_opt=""
 from=""
+expected_sha256=""
+release_info=""
 mirror="auto"
 dry_run=""
 old_glibc=""
@@ -87,12 +90,11 @@ Install ThinkTerm on Linux or macOS.
                     (or ~/Applications when that is not writable).
   --from FILE       Use an already-downloaded tarball or zip; nothing is
                     fetched.
-  --mirror M        Where the release archive comes from: auto (GitHub, then
-                    ghfast.top gh-proxy.org ghproxy.net gh.llkk.cc while it
-                    fails or crawls, then GitHub again; the default), direct
-                    (GitHub only), or one mirror's host (it, then GitHub).
-                    Whatever serves it, the archive must match the SHA-256
-                    GitHub recorded.
+  --sha256 HASH     Verify a --from archive against this SHA-256.
+  --mirror M        auto (default) tries GitHub, then probes mirrors in parallel
+                    if it is slow: ghfast.top gh-proxy.org ghproxy.net gh.llkk.cc.
+                    direct uses only GitHub; a mirror host tries it, then GitHub.
+                    Mirrors require a SHA-256 from GitHub or signed metadata.
   --dry-run         Say what would be done and stop before touching the disk.
 EOF
 }
@@ -230,7 +232,7 @@ with_spinner() {
 # half blocks, shaded lavender to blue from left to right. Draws the first
 # $1 letters with a cursor after them when $2 is 1.
 wordmark() {
-  awk -v shown="$1" -v cursor="$2" -v palette="$palette" -v color="$ui_color" -v esc="$esc" '
+  awk -v shown="$1" -v cursor="$2" -v palette="$palette" -v color="$ui_color" -v esc="$esc" -v clear="$tty_out" '
     function shade(x,   f, r, g, b) {
       if (!color) return ""
       f = (x - 1) / (width - 1)
@@ -270,7 +272,8 @@ wordmark() {
           else out = out " "
         }
         sub(/ +$/, "", out)
-        printf "  %s%s[K\n", out, esc
+        if (clear) printf "  %s%s[K\n", out, esc
+        else printf "  %s\n", out
       }
     }'
 }
@@ -278,6 +281,10 @@ wordmark() {
 # The wordmark types itself out on a terminal that can redraw; elsewhere it
 # is printed once, or, without UTF-8 or room, the name in plain text.
 banner() {
+  if [ "${THINKTERM_INSTALL_PROGRESS:-}" = 1 ] && [ -z "$tty_out" ]; then
+    say; wordmark 9 0; say '  installer'; say
+    return
+  fi
   if [ -z "$tty_out" ] || [ -z "$unicode" ] || [ "$cols" -lt 44 ]; then
     printf '\n  %sThinkTerm%s %sinstaller%s\n\n' "$ui_bold" "$ui_reset" "$ui_dim" "$ui_reset"
     return
@@ -311,6 +318,10 @@ while [ $# -gt 0 ]; do
     --app-dir=*) app_dir_opt="${1#--app-dir=}" ;;
     --from)     [ $# -ge 2 ] || die "--from needs a value"; from="$2"; shift ;;
     --from=*)   from="${1#--from=}" ;;
+    --sha256)   [ $# -ge 2 ] || die "--sha256 needs a value"; expected_sha256="$2"; shift ;;
+    --sha256=*) expected_sha256="${1#--sha256=}" ;;
+    # Trusted metadata delivered by the client over its authenticated SSH connection.
+    --release-info) [ $# -ge 2 ] || die "--release-info needs a file"; release_info="$2"; shift ;;
     --mirror)   [ $# -ge 2 ] || die "--mirror needs a value"; mirror="$2"; shift ;;
     --mirror=*) mirror="${1#--mirror=}" ;;
     --dry-run)  dry_run=1 ;;
@@ -321,13 +332,18 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$prefix" ] || die "--prefix needs a directory"
+case "$tag" in *[!A-Za-z0-9._+-]*) die "invalid release version" ;; esac
+if [ -n "$expected_sha256" ]; then
+  [ -n "$from" ] || die "--sha256 requires --from"
+  case "$expected_sha256" in *[!0-9a-f]*) die "invalid SHA-256" ;; esac
+  [ "${#expected_sha256}" -eq 64 ] || die "invalid SHA-256"
+fi
 tag_requested=""
 [ -z "$tag" ] || tag_requested=1
 # Where the archive is fetched from, in order: "github" or a mirror's host.
 case "$mirror" in
   direct) sources="github" ;;
-  # GitHub again last, with no hurry: a link slow everywhere ends there.
-  auto)   sources="github $mirrors github" ;;
+  auto)   sources="github $mirrors" ;;
   *)
     mirror="${mirror#https://}"; mirror="${mirror%/}"
     case "$mirror" in
@@ -459,13 +475,14 @@ else
   sha256() { return 1; }
 fi
 
-fetch() {
+fetch() (
+  ulimit -f 2048 || exit 1
   if [ -n "${GITHUB_TOKEN:-}" ]; then
-    curl -fsSL --retry 3 -H "Authorization: Bearer $GITHUB_TOKEN" "$@"
+    exec curl --disable -fsSL --proto =https --proto-redir =https --connect-timeout 3 --max-time 8 --retry 0 -H "Authorization: Bearer $GITHUB_TOKEN" "$@"
   else
-    curl -fsSL --retry 3 "$@"
+    exec curl --disable -fsSL --proto =https --proto-redir =https --connect-timeout 3 --max-time 8 --retry 0 "$@"
   fi
-}
+)
 
 # Where the app bundle goes on macOS. /Applications is writable by any admin
 # user without sudo; a standard user gets ~/Applications, which Launchpad and
@@ -486,6 +503,26 @@ if [ "$os" = macos ]; then
 fi
 app="$app_dir/ThinkTerm.app"
 
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/thinkterm-install.XXXXXX")
+# Linux binaries are staged on the destination filesystem, in a directory
+# owned by this invocation. Never glob temporary files in the shared bin/.
+bin_stage=""
+app_staging=""
+probe_pids=""
+cleanup() {
+  [ -z "$bg_pid" ] || kill "$bg_pid" 2>/dev/null || true
+  for pid in $probe_pids; do kill "$pid" 2>/dev/null || true; done
+  for pid in $probe_pids; do wait "$pid" 2>/dev/null || true; done
+  leave
+  rm -rf "$tmp"
+  [ -z "$bin_stage" ] || rm -rf "$bin_stage" 2>/dev/null || true
+  [ -z "$app_staging" ] || rm -rf "$app_dir/.ThinkTerm.app.tmp" 2>/dev/null || true
+  [ -z "$app_staging" ] || rm -rf "$app_dir/.ThinkTerm.app.old" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
 # ---- resolve the release ---------------------------------------------------
 
 api="https://api.github.com/repos/$repo/releases"
@@ -504,60 +541,157 @@ asset_name() {
   esac
 }
 
-if [ -z "$from" ]; then
-  if [ -n "$tag" ]; then
-    release_json=$(with_spinner "looking up release $tag" fetch "$api/tags/$tag") \
-      || die "release '$tag' not found at https://github.com/$repo/releases"
-  else
-    release_json=$(with_spinner "looking up the latest release" fetch "$api/latest") \
-      || die "could not look up the latest release (is the network up? does https://github.com/$repo have a release yet?)"
-    tag=$(printf '%s' "$release_json" | sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
-    [ -n "$tag" ] || die "could not read the release tag from the GitHub API response"
-  fi
+# This public key is shared with assets/release-signing.pub, which the client
+# embeds. Private signing material is only held by the release workflow.
+release_signing_key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILio64rghh4lVquJuwWvNpMVnmV78OnXQmKYDH8Z83t0 thinkterm-release'
 
-  # The tag as GitHub has it goes in the URL path; the filename is built from
-  # the version ci/deploy.sh stamped, which never carries a leading v.
+validate_release_info() {
+  [ -f "$1" ] && [ "$(wc -c < "$1")" -le 1048576 ] || return 1
+  LC_ALL=C awk -v version="$tag" -v missing="$2" '
+    NR == 1 { if ($0 != "thinkterm-release-v1") exit 1; next }
+    NR == 2 { if ($0 != "version " version) exit 1; next }
+    {
+      if (NF != 3 || $0 != $1 " " $2 " " $3) exit 1
+      if (!(missing && $1 == "-") && (length($1) != 64 || $1 ~ /[^0-9a-f]/)) exit 1
+      if ($2 !~ /^[0-9]+$/ || $2 + 0 <= 0 || $2 + 0 > 8589934592) exit 1
+      if (length($3) > 200 || $3 !~ /^[A-Za-z0-9][A-Za-z0-9._+-]*$/ || seen[$3]++) exit 1
+    }
+    END { if (NR < 3) exit 1 }
+  ' "$1"
+}
+
+# No token goes to a mirror. Time and file limits apply even when an older
+# curl cannot enforce --max-filesize on a chunked response.
+fetch_metadata() (
+  ulimit -f 2048 || exit 1
+  curl --disable -fsSL --proto =https --proto-redir =https --connect-timeout 3 \
+    --max-time 8 --retry 0 --max-filesize 1048576 -o "$2" "$1"
+)
+
+signed_release_info() {
+  have ssh-keygen || { warn "ssh-keygen is unavailable; signed metadata cannot be verified"; return 1; }
+  printf 'thinkterm-release namespaces="thinkterm-release" %s\n' "$release_signing_key" > "$tmp/signers"
+  invalid_metadata=""
+  metadata_sources="$sources"
+  [ -z "${GITHUB_TOKEN:-}" ] || metadata_sources=github
+  for metadata_source in $metadata_sources; do
+    metadata_url="https://github.com/$repo/releases/download/$tag/thinkterm-release.txt"
+    [ "$metadata_source" = github ] || metadata_url="https://$metadata_source/$metadata_url"
+    if ! fetch_metadata "$metadata_url" "$tmp/release-info" 2>/dev/null \
+        || ! fetch_metadata "$metadata_url.sig" "$tmp/release-info.sig" 2>/dev/null; then
+      continue
+    fi
+    if ! ssh-keygen -Y verify -f "$tmp/signers" -I thinkterm-release -n thinkterm-release \
+        -s "$tmp/release-info.sig" < "$tmp/release-info" > "$tmp/verify.log" 2>&1; then
+      # An old OpenSSH cannot verify SSHSIG. It must not authorize a mirror.
+      if grep -Ei 'unknown option|illegal option|unsupported operation|invalid option' "$tmp/verify.log" >/dev/null; then
+        warn "ssh-keygen does not support release signatures; using GitHub only"
+        return 1
+      fi
+      invalid_metadata=1
+      warn "release signature verification failed from $metadata_source"
+      continue
+    fi
+    if ! validate_release_info "$tmp/release-info" 0; then
+      invalid_metadata=1
+      warn "signed release metadata has an invalid format or a different version"
+      continue
+    fi
+    release_info="$tmp/release-info"
+    return 0
+  done
+  [ -z "$invalid_metadata" ] || return 2
+  return 1
+}
+
+if [ -z "$from" ]; then
+  release_json=""
+  if [ -n "$release_info" ]; then
+    [ -n "$tag" ] || die "client release metadata requires --version"
+    validate_release_info "$release_info" 1 || die "invalid client release metadata or version mismatch"
+  else
+    api_path=latest
+    [ -z "$tag" ] || api_path="tags/$tag"
+    api_status=""
+    if api_status=$(with_spinner "looking up release ${tag:-latest}" fetch --max-filesize 1048576 \
+        -o "$tmp/release.json" -w '%{http_code}' "$api/$api_path"); then
+      release_json=$(cat "$tmp/release.json")
+      if [ -z "$tag" ]; then
+        tag=$(printf '%s' "$release_json" | sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)
+        [ -n "$tag" ] || die "could not read the release tag from the GitHub API response"
+      fi
+    else
+      case "$api_status" in
+        404) warn "GitHub API did not find release ${tag:-latest} (HTTP 404)" ;;
+        403|429) warn "GitHub API refused the lookup or rate-limited it (HTTP $api_status)" ;;
+        *) warn "could not reach GitHub API or complete the lookup (HTTP ${api_status:-unknown})" ;;
+      esac
+      [ -n "$tag" ] || die "cannot resolve the latest release; retry or pass --version X"
+      if signed_release_info; then
+        ok "verified release metadata"
+      else
+        metadata_status=$?
+        [ "$metadata_status" -ne 2 ] || die "release metadata verification failed; nothing was installed"
+        warn "no verifiable release metadata is available; trying the GitHub archive directly, without mirrors"
+        sources=github
+      fi
+    fi
+  fi
+  case "$tag" in ""|*[!A-Za-z0-9._+-]*) die "invalid release version" ;; esac
   version="${tag#v}"
   asset=$(asset_name "$version")
-  url="https://github.com/$repo/releases/download/$tag/$asset"
-
-  # GitHub stores a sha256 for every asset as it is uploaded and reports it
-  # on the API as "sha256:<hex>". That is the only checksum the release
-  # carries -- there is no checksums file -- so read it from the same JSON.
-  # The asset object is the block between the "name" line naming our file and
-  # the next "name" line, and "digest" sits inside it.
-  digest=$(printf '%s' "$release_json" \
-    | awk -v want="\"name\": \"$asset\"" '
-        index($0, want)      { inside = 1; next }
-        inside && /"name":/  { exit }
-        inside && /"digest": *"sha256:/ {
-          sub(/.*"digest": *"sha256:/, ""); sub(/".*/, ""); print; exit
-        }')
-  # Anything but a hex string means the field was absent or null: install
-  # unverified with a warning rather than fail a good download against junk.
-  case "$digest" in *[!0-9a-f]* | "") digest="" ;; esac
-  # Its size, from the same object, for the download bar.
-  size=$(printf '%s' "$release_json" \
-    | awk -v want="\"name\": \"$asset\"" '
-        index($0, want)      { inside = 1; next }
-        inside && /"name":/  { exit }
-        inside && /"size": *[0-9]/ { sub(/.*"size": */, ""); sub(/[^0-9].*/, ""); print; exit }')
-  # The asset's own API address, for a private repository: the download URL
-  # under github.com/.../releases/download answers only for public ones,
-  # while the API serves the bytes to a token with Accept: octet-stream. In
-  # the asset object "url" comes before "name", so it is the last "url"
-  # seen when the name line matches.
-  if [ -n "${GITHUB_TOKEN:-}" ]; then
-    asset_api_url=$(printf '%s' "$release_json" \
-      | awk -v want="\"name\": \"$asset\"" '
-          /^ *"url": *"https:\/\/api\.github\.com\/repos\/[^"]*\/releases\/assets\/[0-9]+"/ {
-            u = $0; sub(/.*"url": *"/, "", u); sub(/".*/, "", u)
-          }
-          index($0, want) { print u; exit }')
+  if [ "$os/$variant" = linux/server ] && have xz; then
+    xz_asset="${asset%.gz}.xz"
+    if { [ -n "$release_info" ] && awk -v name="$xz_asset" '$3 == name { found=1 } END { exit !found }' "$release_info"; } \
+        || { [ -n "$release_json" ] && printf '%s' "$release_json" | grep -qF "\"name\": \"$xz_asset\""; }; then
+      asset="$xz_asset"
+    fi
   fi
-  if [ -z "$digest" ]; then
-    printf '%s' "$release_json" | grep -qF "\"name\": \"$asset\"" \
-      || die "release $version has no $asset; see https://github.com/$repo/releases/tag/$tag"
+  url="https://github.com/$repo/releases/download/$tag/$asset"
+  if [ -n "$release_info" ]; then
+    row=$(awk -v name="$asset" '$3 == name { print $1 " " $2 }' "$release_info")
+    [ -n "$row" ] || die "release $version exists, but has no package $asset for this host"
+    digest=${row%% *}; size=${row#* }
+    [ "$digest" != - ] || digest=""
+  elif [ -n "$release_json" ]; then
+    # GitHub stores a sha256 for every asset as it is uploaded and reports it
+    # on the API as "sha256:<hex>". Read it from the same authenticated API response.
+    # The asset object is the block between the "name" line naming our file and
+    # the next "name" line, and "digest" sits inside it.
+    digest=$(printf '%s' "$release_json" \
+      | awk -v want="\"name\": \"$asset\"" '
+          index($0, want)      { inside = 1; next }
+          inside && /"name":/  { exit }
+          inside && /"digest": *"sha256:/ {
+            sub(/.*"digest": *"sha256:/, ""); sub(/".*/, ""); print; exit
+          }')
+    # Anything but a hex string means the field was absent or null: install
+    # unverified with a warning rather than fail a good download against junk.
+    case "$digest" in *[!0-9a-f]* | "") digest="" ;; esac
+    [ "${#digest}" -eq 64 ] || digest=""
+    # Its size, from the same object, for the download bar.
+    size=$(printf '%s' "$release_json" \
+      | awk -v want="\"name\": \"$asset\"" '
+          index($0, want)      { inside = 1; next }
+          inside && /"name":/  { exit }
+          inside && /"size": *[0-9]/ { sub(/.*"size": */, ""); sub(/[^0-9].*/, ""); print; exit }')
+    # The asset's own API address, for a private repository: the download URL
+    # under github.com/.../releases/download answers only for public ones,
+    # while the API serves the bytes to a token with Accept: octet-stream. In
+    # the asset object "url" comes before "name", so it is the last "url"
+    # seen when the name line matches.
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+      asset_api_url=$(printf '%s' "$release_json" \
+        | awk -v want="\"name\": \"$asset\"" '
+            /^ *"url": *"https:\/\/api\.github\.com\/repos\/[^"]*\/releases\/assets\/[0-9]+"/ {
+              u = $0; sub(/.*"url": *"/, "", u); sub(/".*/, "", u)
+            }
+            index($0, want) { print u; exit }')
+    fi
+    if [ -z "$digest" ]; then
+      printf '%s' "$release_json" | grep -qF "\"name\": \"$asset\"" \
+        || die "release $version has no $asset; see https://github.com/$repo/releases/tag/$tag"
+    fi
   fi
 else
   # No release lookup, so the version comes from --version, or else from the
@@ -568,8 +702,13 @@ else
   else
     version=$(basename "$from" | sed -n \
       -e 's/^ThinkTerm-macos-[^-]*-\([0-9A-Za-z][0-9A-Za-z.+-]*\)\.zip$/\1/p' \
-      -e 's/^thinkterm-\(server-\)\{0,1\}\([0-9A-Za-z][0-9A-Za-z.+-]*\)-linux-[^-]*\(-glibc[0-9.]*\)\{0,1\}\.tar\.gz$/\2/p')
+      -e 's/^thinkterm-\(server-\)\{0,1\}\([0-9A-Za-z][0-9A-Za-z.+-]*\)-linux-[^-]*\(-glibc[0-9.]*\)\{0,1\}\.tar\.\(gz\|xz\)$/\2/p')
   fi
+fi
+
+if [ -n "$size" ]; then
+  case "$size" in *[!0-9]*) die "invalid release archive size" ;; esac
+  [ "$size" -gt 0 ] && [ "$size" -le 8589934592 ] || die "invalid release archive size"
 fi
 
 if [ -n "$from" ]; then
@@ -590,7 +729,7 @@ if [ -n "$prev_variant" ]; then
   esac
 fi
 if [ -z "$from" ] && [ -z "$digest" ]; then
-  warn "GitHub recorded no checksum for $asset; the download will not be verified"
+  warn "no trusted checksum is available for $asset; the GitHub download will not be verified"
 fi
 
 if [ -n "$dry_run" ]; then
@@ -608,22 +747,6 @@ if [ -n "$dry_run" ]; then
 fi
 
 # ---- download and verify ---------------------------------------------------
-
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/thinkterm-install.XXXXXX")
-# Linux binaries are staged on the destination filesystem, in a directory
-# owned by this invocation. Never glob temporary files in the shared bin/.
-bin_stage=""
-cleanup() {
-  [ -z "$bg_pid" ] || kill "$bg_pid" 2>/dev/null || true
-  leave
-  rm -rf "$tmp"
-  [ -z "$bin_stage" ] || rm -rf "$bin_stage" 2>/dev/null || true
-  [ -z "$app_dir" ] || rm -rf "$app_dir/.ThinkTerm.app.tmp" 2>/dev/null || true
-  [ -z "$app_dir" ] || rm -rf "$app_dir/.ThinkTerm.app.old" 2>/dev/null || true
-}
-trap cleanup EXIT
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
 
 mb() { t=$(($1 * 10 / 1048576)); printf '%d.%d' $((t / 10)) $((t % 10)); }
 
@@ -657,28 +780,47 @@ progress_bar() {
 # Runs curl with the remaining arguments in the background while drawing how
 # much of $1 has arrived: a line with the amount and rate, and the bar under
 # it. $2 names the mirror, if it is one; $3 is "token" to send GITHUB_TOKEN.
-# With $4 set, a transfer that averages under $min_rate over the five seconds
-# after its first byte is stopped there, rather than after curl's own twenty. Returns
-# curl's status, or 28 (curl's for too slow) when stopped, with both lines
-# gone. curl runs directly, not through a function, so $! is curl itself.
+# Curl enforces the same transfer deadlines in interactive and SSH modes.
+# A non-terminal gets periodic plain lines rather than redraw control codes.
 download() {
-  dest=$1; via=$2; auth=$3; early=$4; shift 4
+  dest=$1; via=$2; auth=$3; shift 3
+  initial_bytes=0
+  [ ! -f "$dest" ] || initial_bytes=$(wc -c < "$dest")
+  if [ -n "$size" ]; then
+    set -- --max-filesize "$size" "$@"
+  fi
   if [ "$auth" = token ] && [ -n "${GITHUB_TOKEN:-}" ]; then
     set -- -H "Authorization: Bearer $GITHUB_TOKEN" "$@"
   fi
   if [ -z "$anim" ]; then
     printf '  %s>%s downloading%s...\n' "$ui_accent" "$ui_reset" "${via:+ from $via}" >&4
-    curl -fsSL "$@"
-    return
+    ( [ -z "$size" ] || ulimit -f "$(((size + 511) / 512))" || exit 1
+      exec curl --disable -fsSL --proto =https --proto-redir =https "$@" ) &
+    bg_pid=$!
+    plain_started=$(date +%s)
+    plain_initial=$initial_bytes
+    while kill -0 "$bg_pid" 2>/dev/null; do
+      sleep 2
+      kill -0 "$bg_pid" 2>/dev/null || break
+      plain_got=0
+      [ ! -f "$dest" ] || plain_got=$(wc -c < "$dest")
+      plain_elapsed=$(($(date +%s) - plain_started))
+      [ "$plain_elapsed" -gt 0 ] || plain_elapsed=1
+      plain_rate=$(((plain_got - plain_initial) / plain_elapsed))
+      [ "$plain_rate" -ge 0 ] || plain_rate=0
+      plain_percent=""
+      [ -z "$size" ] || plain_percent=" $((plain_got * 100 / size))% of $(mb "$size") MB"
+      printf '    %s MB%s, %s KB/s%s\n' "$(mb "$plain_got")" "$plain_percent" "$((plain_rate / 1024))" "${via:+ from $via}" >&4
+    done
+    if wait "$bg_pid"; then status=0; else status=$?; fi
+    bg_pid=""
+    return "$status"
   fi
-  curl -fsSL "$@" 2>"$errlog" &
+  ( [ -z "$size" ] || ulimit -f "$(((size + 511) / 512))" || exit 1
+    exec curl --disable -fsSL --proto =https --proto-redir =https "$@" ) 2>"$errlog" &
   bg_pid=$!
-  cut_short=""
   hide_cursor
   started=$(date +%s)
-  # The early check times the transfer from its first byte, so the DNS
-  # lookup, TLS and redirects to a far-away server do not count against it.
-  flowing=""
   width=$((cols - 6)); [ "$width" -le 44 ] || width=44; [ "$width" -ge 10 ] || width=10
   i=0
   printf '\n' >&4
@@ -687,16 +829,6 @@ download() {
     # shellcheck disable=SC2046
     if [ -f "$dest" ]; then set -- $(wc -c < "$dest"); got=${1:-0}; fi
     now=$(date +%s)
-    if [ "$got" -gt 0 ] && [ -z "$flowing" ]; then flowing=$now; fi
-    # Whole seconds, so six on the clock is at least five gone.
-    if [ -n "$early" ] && [ -n "$flowing" ] && [ $((now - flowing)) -ge 6 ]; then
-      early=""
-      if [ "$got" -lt $((min_rate * (now - flowing - 1))) ]; then
-        cut_short=1
-        kill "$bg_pid" 2>/dev/null || true
-        break
-      fi
-    fi
     # The parts of the status line, dropped from the least useful while the
     # line would not fit: a wrapped line breaks the redraw a line above.
     amount=" / $(mb "${size:-0}") MB"; [ -n "$size" ] || amount=" MB"
@@ -704,7 +836,8 @@ download() {
     rate_part=""
     elapsed=$((now - started))
     if [ "$elapsed" -gt 0 ]; then
-      rate=$((got / elapsed))
+      rate=$(((got - initial_bytes) / elapsed))
+      [ "$rate" -ge 0 ] || rate=0
       if [ "$rate" -ge 1048576 ]; then rate_part=" $dot $(mb "$rate") MB/s"
       else rate_part=" $dot $((rate / 1024)) KB/s"; fi
     fi
@@ -729,57 +862,169 @@ download() {
   show_cursor
   if wait "$bg_pid"; then status=0; else status=$?; fi
   bg_pid=""
-  if [ -n "$cut_short" ]; then status=28; : > "$errlog"; fi
   [ "$status" -eq 0 ] || show_error
   return "$status"
+}
+
+# Probes never feed the archive: a fast error page is not a verified package.
+# Each child owns its curl process so cancellation also stops parallel probes.
+probe_source() (
+  probe_source_name=$1
+  probe_url="$url"
+  [ "$probe_source_name" = github ] || probe_url="https://$probe_source_name/$url"
+  probe_pid=""
+  trap '[ -z "$probe_pid" ] || { kill "$probe_pid" 2>/dev/null || true; wait "$probe_pid" 2>/dev/null || true; }' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  ulimit -f 2048 || exit 1
+  curl --disable -fsSL --proto =https --proto-redir =https --connect-timeout 2 --max-time 3 \
+    --range 0-1048575 --max-filesize 1048576 --retry 0 \
+    -o "$tmp/probe-$probe_source_name" -w '%{http_code} %{size_download} %{time_total}\n' \
+    "$probe_url" > "$tmp/probe-$probe_source_name.stats" 2>/dev/null &
+  probe_pid=$!
+  wait "$probe_pid" || true
+  probe_pid=""
+  awk -v source="$probe_source_name" '
+    ($1 == 200 || $1 == 206) && $2 > 0 && $3 > 0 { rate=int($2/$3) }
+    END { print rate+0, source }
+  ' "$tmp/probe-$probe_source_name.stats" > "$tmp/rate-$probe_source_name"
+  rm -f "$tmp/probe-$probe_source_name"
+)
+
+rank_sources() {
+  github_fast=""
+  if [ "$mirror" != auto ]; then
+    printf '%s\n' $sources > "$tmp/ranked-sources"
+    return
+  fi
+  if [ "${1:-}" != mirrors ]; then
+    note "checking GitHub download speed"
+    probe_source github
+    github_rate=$(awk '{print $1}' "$tmp/rate-github")
+    if [ "$github_rate" -ge "$min_rate" ]; then
+      github_fast=1
+      printf 'github\n' > "$tmp/ranked-sources"
+      return
+    fi
+  fi
+  note "GitHub is slow or unavailable; checking mirrors in parallel"
+  probe_pids=""
+  for probe_host in $mirrors; do
+    probe_source "$probe_host" &
+    probe_pids="$probe_pids $!"
+  done
+  for pid in $probe_pids; do wait "$pid" || true; done
+  probe_pids=""
+  # A source that failed the probe is still a last resort, after the measured
+  # ones. A short probe can fail during DNS/TLS while a full transfer works.
+  cat "$tmp"/rate-* | sort -nr | awk '{print $2}' > "$tmp/ranked-sources"
+}
+
+verified_download() {
+  source=$1
+  transfer_mode=${2:-}
+  source_url="$url"; source_via=""; source_auth=token
+  if [ "$source" != github ]; then
+    source_url="https://$source/$url"; source_via=$source; source_auth=""
+  fi
+  rm -f "$archive" "$tmp/slow-$source"
+  attempt=0
+  while [ "$attempt" -lt 3 ]; do
+    attempt=$((attempt + 1))
+    # If every measured link is slow, keep the fastest rather than refuse all
+    # of them. If it stalls or breaks, the next source still gets a chance.
+    transfer_rate=1; transfer_window=15
+    if [ "$transfer_mode" != slow ]; then
+      if [ "$mirror" != auto ] && [ "$source" != github ]; then
+        transfer_rate=$min_rate; transfer_window=5
+      fi
+      if [ -f "$tmp/rate-$source" ] && [ "$(awk '{print $1}' "$tmp/rate-$source")" -ge "$min_rate" ]; then
+        transfer_rate=$min_rate; transfer_window=5
+      fi
+    fi
+    if download "$archive" "$source_via" "$source_auth" --connect-timeout 4 \
+        --speed-limit "$transfer_rate" --speed-time "$transfer_window" --retry 0 \
+        -C - -o "$archive" "$source_url"; then
+      if [ "$(sha256 "$archive")" = "$digest" ] \
+          && { [ -z "$size" ] || [ "$(wc -c < "$archive")" -eq "$size" ]; }; then
+        return 0
+      fi
+      warn "checksum or size mismatch from $source; discarded"
+      rm -f "$archive"
+      return 1
+    else
+      transfer_status=$?
+      # Try other sources before allowing a slow transfer. Only one that
+      # delivered bytes gets that fallback; a connection timeout does not.
+      # Broken transfers resume; range refusal gets a fresh retry.
+      case "$transfer_status" in
+        22|63) break ;;
+        28)
+          if [ "$transfer_rate" -gt 1 ]; then
+            if [ "$mirror" = auto ] && [ -s "$archive" ]; then
+              : > "$tmp/slow-$source"
+            fi
+            break
+          fi
+          ;;
+        33|36) rm -f "$archive" ;;
+      esac
+      [ "$attempt" -ge 3 ] || note "retrying $source (resuming when supported)"
+    fi
+  done
+  warn "$source download failed or was too slow"
+  return 1
 }
 
 if [ -n "$from" ]; then
   [ -f "$from" ] || die "no such file: $from"
   archive="$from"
+  if [ -n "$expected_sha256" ]; then
+    got=$(sha256 "$archive") || die "SHA-256 verification requires sha256sum or shasum"
+    [ "$got" = "$expected_sha256" ] || die "checksum mismatch for --from archive; nothing was installed"
+    ok "verified SHA-256"
+  fi
 else
   archive="$tmp/$asset"
   verified=""
   came_from=""
   dl_started=$(date +%s)
   if [ -n "$asset_api_url" ]; then
-    download "$archive" "" token "" --retry 3 -H "Accept: application/octet-stream" -o "$archive" "$asset_api_url" \
+    download "$archive" "" token --connect-timeout 4 --speed-limit 1 --speed-time 30 --retry 3 -H "Accept: application/octet-stream" -o "$archive" "$asset_api_url" \
       || die "download failed: $asset_api_url"
   elif [ "$sources" != github ] && [ -n "$digest" ] && { have sha256sum || have shasum; }; then
-    # Each source in turn, until one sends the file GitHub recorded. A
-    # mirror is a third party serving the bytes, so mirrors are only used
-    # when the digest from the API can check what they send: anything that
-    # does not match is thrown away and the next source tried. The token
-    # never goes to a mirror. While another source is left, a transfer under
-    # 300 KB/s for 20 seconds counts as failed: a working connection to
-    # GitHub's CDN is far faster, and at that rate the server tarball still
-    # arrives in under three minutes. On a terminal, where the bar is
-    # watching the transfer anyway, a source that has averaged under that over
-    # the five seconds after its first byte is dropped then instead.
-    left=$(printf '%s\n' $sources | wc -l)
-    for source in $sources; do
-      left=$((left - 1))
-      slow="--retry 3"; early=""
-      [ "$left" -eq 0 ] || { slow="--retry 0 --connect-timeout 10 --speed-limit $min_rate --speed-time 20"; early=1; }
-      rm -f "$archive"
-      dl_started=$(date +%s)
-      if [ "$source" = github ]; then
-        # shellcheck disable=SC2086
-        download "$archive" "" token "$early" $slow -o "$archive" "$url" \
-          || { warn "GitHub failed or was too slow"; continue; }
-      else
-        # shellcheck disable=SC2086
-        download "$archive" "$source" "" "$early" $slow -o "$archive" "https://$source/$url" \
-          || { warn "mirror $source failed or was too slow"; continue; }
-      fi
-      if [ "$(sha256 "$archive")" = "$digest" ]; then
+    rank_sources
+    if [ -n "$github_fast" ]; then
+      if verified_download github; then
         verified=1
-        [ "$source" = github ] || came_from=$source
-        break
+      else
+        printf '0 github\n' > "$tmp/rate-github"
+        rank_sources mirrors
       fi
-      warn "checksum mismatch from $source; discarded"
-    done
-    [ -n "$verified" ] || die "could not download $asset from: $sources. Try another --mirror, or download $url yourself and pass it with --from"
+    fi
+    if [ -z "$verified" ]; then
+      for source in $(cat "$tmp/ranked-sources"); do
+        if verified_download "$source"; then
+          verified=1
+          [ "$source" = github ] || came_from=$source
+          break
+        fi
+      done
+    fi
+    if [ -z "$verified" ] && [ "$mirror" = auto ]; then
+      # A quick probe can overestimate sustained speed. Revisit progressing
+      # sources in rank order with stall protection, not the fast cutoff.
+      for source in $(cat "$tmp/ranked-sources"); do
+        [ -f "$tmp/slow-$source" ] || continue
+        note "retrying $source, allowing a slower download"
+        if verified_download "$source" slow; then
+          verified=1
+          [ "$source" = github ] || came_from=$source
+          break
+        fi
+      done
+    fi
+    [ -n "$verified" ] || die "all download sources failed, were too slow, or failed verification for $asset; retry or use --from with --sha256"
   else
     if [ "$sources" != github ]; then
       if [ -n "$digest" ]; then
@@ -788,7 +1033,13 @@ else
         warn "GitHub recorded no checksum to check a mirror's download against; downloading from GitHub"
       fi
     fi
-    download "$archive" "" token "" --retry 3 -o "$archive" "$url" || die "download failed: $url"
+    if [ -n "$digest" ] && { have sha256sum || have shasum; }; then
+      verified_download github || die "GitHub download failed or did not pass verification"
+      verified=1
+    else
+      download "$archive" "" token --connect-timeout 4 --speed-limit 1 --speed-time 30 --retry 3 \
+        -o "$archive" "$url" || die "GitHub archive download failed (network error or package unavailable): $url"
+    fi
   fi
   # shellcheck disable=SC2046
   set -- $(wc -c < "$archive")
@@ -810,7 +1061,11 @@ fi
 mkdir "$tmp/x"
 case "$os" in
   linux)
-    with_spinner "unpacking" tar xzf "$archive" -C "$tmp/x" || die "could not unpack $archive"
+    case "$archive" in
+      *.tar.xz) have xz || die "xz is required to unpack this archive"; tar_flag=xJf ;;
+      *) tar_flag=xzf ;;
+    esac
+    with_spinner "unpacking" tar "$tar_flag" "$archive" -C "$tmp/x" || die "could not unpack $archive"
     # The tarball holds exactly one top-level directory named after itself.
     root=$(find "$tmp/x" -mindepth 1 -maxdepth 1 -type d | head -n1)
     [ -n "$root" ] && [ -d "$root/bin" ] || die "unexpected tarball layout: no bin/ directory inside"
@@ -919,6 +1174,7 @@ if [ "$os" = macos ]; then
   # The command-line tools are symlinks into the bundle: a copy would run
   # outside the seal, and the wezterm shim locates thinkterm next to itself.
   mkdir -p "$app_dir"
+  app_staging=1
   rm -rf "$app_dir/.ThinkTerm.app.tmp" "$app_dir/.ThinkTerm.app.old"
   mv "$root" "$app_dir/.ThinkTerm.app.tmp"
   if [ -e "$app" ]; then

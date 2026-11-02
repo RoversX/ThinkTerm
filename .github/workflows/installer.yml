@@ -1,0 +1,50 @@
+name: publish installer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - install.sh
+      - assets/release-signing.pub
+      - ci/sign-installer.sh
+      - .github/workflows/installer.yml
+  workflow_dispatch:
+
+concurrency:
+  group: signed-installer-v1
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Test installer
+        run: python3 ci/test-remote-update.py -v
+      - name: Sign installer
+        env:
+          THINKTERM_RELEASE_SIGNING_KEY: ${{ secrets.THINKTERM_RELEASE_SIGNING_KEY }}
+        run: bash ci/sign-installer.sh "$RUNNER_TEMP/signed-installer"
+      - name: Publish signed installer
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! gh release view installer-v1 >/dev/null 2>&1; then
+            gh release create installer-v1 --prerelease --target "$GITHUB_SHA" \
+              --title 'Signed installer v1' \
+              --notes 'Signed installer channel for SSH installs; not an application release.'
+          fi
+          [ "$(gh release view installer-v1 --json isPrerelease --jq .isPrerelease)" = true ]
+          gh release upload --clobber installer-v1 \
+            "$RUNNER_TEMP/signed-installer/install.sh" \
+            "$RUNNER_TEMP/signed-installer/install.sh.sig"
