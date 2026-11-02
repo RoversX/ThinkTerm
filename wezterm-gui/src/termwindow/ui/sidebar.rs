@@ -692,6 +692,19 @@ impl crate::TermWindow {
         self.domain_connection_state(&domain_name, is_remote)
     }
 
+    /// Whether `space_id`'s server dropped and is being tried again on its
+    /// own, between tries most of the time -- not one that looks connected
+    /// and has only gone quiet.
+    fn space_server_retrying(&self, space_id: &str) -> bool {
+        workspace_threads::client_domain_for_space(space_id)
+            .and_then(|name| Mux::get().get_domain_by_name(&name))
+            .is_some_and(|domain| {
+                domain
+                    .downcast_ref::<wezterm_client::domain::ClientDomain>()
+                    .is_some_and(|client| client.is_reconnecting())
+            })
+    }
+
     /// How the link to the server `domain_name` stands; `is_remote` for one
     /// on another machine, whose silence counts against it, and which the
     /// indicator showing it looks at again each second.
@@ -1212,11 +1225,18 @@ impl crate::TermWindow {
         // Connecting keeps the row (as a spinner) so the whole retry
         // sequence paints one stable row instead of flickering between
         // "row while disconnected" and "no row while an attempt runs".
+        // A pill as tall as New Thread's under it, which it looks like. Also
+        // while the server is being tried again on its own: to try now.
+        let reconnect_state = self.space_connection_state(self.workspace_sidebar_space_id());
         let reconnect_row_height = if matches!(
-            self.space_connection_state(self.workspace_sidebar_space_id()),
+            reconnect_state,
             SpaceConnectionState::Disconnected | SpaceConnectionState::Connecting
-        ) {
-            ui_cell_height + self.ui_px(SIDEBAR_INSET)
+        ) || (reconnect_state == SpaceConnectionState::Reconnecting
+            && self.space_server_retrying(self.workspace_sidebar_space_id()))
+        {
+            row_height
+                .min(self.ui_px(TOP_ACTION_MAX_HEIGHT))
+                .max(ui_cell_height + self.ui_px(SIDEBAR_INSET))
         } else {
             0
         };
@@ -1429,16 +1449,38 @@ impl crate::TermWindow {
                 });
         let hovered =
             !reconnect_in_flight && self.is_pointer_over_ui_rect(row_x, y, row_width, row_height);
-        self.fill_rounded_rectangle(
+        // New Thread's pill, the warning colour only in its icon and words.
+        self.paint_sidebar_action_button(
             layers,
             layer,
             euclid::rect(row_x as f32, y as f32, row_width as f32, row_height as f32),
-            SPACE_DISCONNECTED_COLOR.mul_alpha(if hovered { 0.30 } else { 0.18 }),
-            self.ui_f32(SIDEBAR_ROW_RADIUS),
+            self.chrome(),
+            hovered,
+            false,
         )
         .context("sidebar reconnect row")?;
-        let row_icon_size = ui_cell_height.min(row_height.saturating_sub(6));
-        let row_icon_x = row_x + self.ui_px(SIDEBAR_INSET);
+        let reconnect_label = if reconnect_in_flight {
+            crate::i18n::tr("sidebar-connecting")
+        } else {
+            crate::i18n::tr("sidebar-reconnect")
+        };
+        let row_icon_size = (ui_cell_height + self.ui_px(12))
+            .clamp(self.ui_px(30), self.ui_px(36))
+            .min(self.ui_px(32))
+            .min(row_height.saturating_sub(14));
+        let gap = self.ui_px(SIDEBAR_ICON_GAP) + 4;
+        let row_text_max = row_width
+            .saturating_sub(row_icon_size + gap + self.ui_px(SIDEBAR_INSET) * 2);
+        let row_label = self
+            .ellipsize_ui_text(ui_font, &reconnect_label, row_text_max)?
+            .into_owned();
+        let row_text_width = self
+            .sidebar_text_width(ui_font, &row_label)?
+            .ceil()
+            .max(0.0) as usize;
+        // Centred, as New Thread's are.
+        let row_icon_x =
+            row_x + row_width.saturating_sub(row_icon_size + gap + row_text_width) / 2;
         let row_icon_y = y + ((row_height.saturating_sub(row_icon_size)) / 2);
         if reconnect_in_flight {
             // The spinning painter also schedules the next repaint; the
@@ -1462,16 +1504,7 @@ impl crate::TermWindow {
                 SPACE_DISCONNECTED_COLOR,
             )?;
         }
-        let row_text_x = row_icon_x + row_icon_size + self.ui_px(SIDEBAR_ICON_GAP);
-        let row_text_max =
-            (row_x + row_width).saturating_sub(row_text_x + self.ui_px(SIDEBAR_INSET));
-        let reconnect_label = if reconnect_in_flight {
-            crate::i18n::tr("sidebar-connecting")
-        } else {
-            crate::i18n::tr("sidebar-reconnect")
-        };
-        let row_label = self.ellipsize_ui_text(ui_font, &reconnect_label, row_text_max)?;
-        let row_label = row_label.into_owned();
+        let row_text_x = row_icon_x + row_icon_size + gap;
         self.paint_sidebar_text(
             layers,
             ui_font,
@@ -1479,7 +1512,7 @@ impl crate::TermWindow {
             &row_label,
             row_text_x,
             y + ((row_height.saturating_sub(ui_cell_height)) / 2),
-            row_text_max,
+            row_text_width,
             SPACE_DISCONNECTED_COLOR,
         )?;
         if register_ui_item && !reconnect_in_flight {

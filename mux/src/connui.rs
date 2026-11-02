@@ -54,6 +54,8 @@ pub enum UIRequest {
     Sleep {
         reason: String,
         duration: Duration,
+        /// Ends the sleep early once set (`ConnectionUI::sleep_or_until`).
+        cut_short: Option<Arc<AtomicBool>>,
         respond: Promise<()>,
     },
     /// Become visible without reading anything back. Only the lazy relay acts
@@ -96,9 +98,10 @@ impl ConnectionUIImpl {
                 Ok(UIRequest::Sleep {
                     reason,
                     duration,
+                    cut_short,
                     mut respond,
                 }) => {
-                    respond.result(self.sleep(&reason, duration));
+                    respond.result(self.sleep(&reason, duration, cut_short.as_deref()));
                 }
                 // Already visible.
                 Ok(UIRequest::Materialize) => {}
@@ -132,14 +135,19 @@ impl ConnectionUIImpl {
         }
     }
 
-    fn sleep(&mut self, reason: &str, duration: Duration) -> anyhow::Result<()> {
+    fn sleep(
+        &mut self,
+        reason: &str,
+        duration: Duration,
+        cut_short: Option<&AtomicBool>,
+    ) -> anyhow::Result<()> {
         let start = Instant::now();
         let deadline = start + duration;
         let mut last_draw = None;
 
         loop {
             let now = Instant::now();
-            if now >= deadline {
+            if now >= deadline || cut_short.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 break;
             }
 
@@ -211,6 +219,24 @@ impl ConnectionUIImpl {
     }
 }
 
+/// How often a sleep that may be cut short looks whether it has been.
+const CUT_SHORT_POLL: Duration = Duration::from_millis(50);
+
+/// Sleep for `duration`, or until `cut_short` is set.
+fn sleep_unless_cut_short(duration: Duration, cut_short: Option<&AtomicBool>) {
+    let Some(flag) = cut_short else {
+        std::thread::sleep(duration);
+        return;
+    };
+    let deadline = Instant::now() + duration;
+    while let Some(remain) = deadline.checked_duration_since(Instant::now()) {
+        if flag.load(Ordering::Acquire) {
+            return;
+        }
+        std::thread::sleep(remain.min(CUT_SHORT_POLL));
+    }
+}
+
 struct HeadlessImpl {
     rx: Receiver<UIRequest>,
 }
@@ -230,9 +256,10 @@ impl HeadlessImpl {
                     mut respond,
                     reason,
                     duration,
+                    cut_short,
                 }) => {
                     log::error!("{} (sleeping for {:?})", reason, duration);
-                    std::thread::sleep(duration);
+                    sleep_unless_cut_short(duration, cut_short.as_deref());
                     respond.result(Ok(()));
                 }
                 // Nothing to become visible in.
@@ -468,6 +495,7 @@ impl LazyImpl {
         let UIRequest::Sleep {
             reason,
             duration,
+            cut_short,
             mut respond,
         } = req
         else {
@@ -481,13 +509,24 @@ impl LazyImpl {
         let deadline = Instant::now() + duration;
         let mut closed = false;
         while let Some(remain) = deadline.checked_duration_since(Instant::now()) {
-            match self.rx.recv_timeout(remain) {
+            if cut_short
+                .as_deref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+            {
+                break;
+            }
+            // In steps short enough to notice being cut short.
+            let step = match cut_short {
+                Some(_) => remain.min(CUT_SHORT_POLL),
+                None => remain,
+            };
+            match self.rx.recv_timeout(step) {
                 Ok(UIRequest::Close) => {
                     closed = true;
                     break;
                 }
                 Ok(other) => self.deferred.push_back(other),
-                Err(err) if err.is_timeout() => break,
+                Err(err) if err.is_timeout() => continue,
                 // Every Sender is gone.
                 Err(_) => {
                     closed = true;
@@ -654,6 +693,7 @@ impl ConnectionUI {
                     ui.sleep(
                         "(this window will close automatically)",
                         Duration::new(120, 0),
+                        None,
                     )
                     .ok();
                 }
@@ -777,6 +817,26 @@ impl ConnectionUI {
     /// Sleep (blocking!) for the specified duration, but updates
     /// the UI with the reason and a count down during that time.
     pub fn sleep_with_reason(&self, reason: &str, duration: Duration) -> anyhow::Result<()> {
+        self.sleep_for(reason, duration, None)
+    }
+
+    /// As `sleep_with_reason`, over as soon as `cut_short` is set -- by
+    /// someone asking for the retry it waits for to come now.
+    pub fn sleep_or_until(
+        &self,
+        reason: &str,
+        duration: Duration,
+        cut_short: Arc<AtomicBool>,
+    ) -> anyhow::Result<()> {
+        self.sleep_for(reason, duration, Some(cut_short))
+    }
+
+    fn sleep_for(
+        &self,
+        reason: &str,
+        duration: Duration,
+        cut_short: Option<Arc<AtomicBool>>,
+    ) -> anyhow::Result<()> {
         let mut promise = Promise::new();
         let future = promise.get_future().unwrap();
 
@@ -784,6 +844,7 @@ impl ConnectionUI {
             .send(UIRequest::Sleep {
                 reason: reason.to_string(),
                 duration,
+                cut_short,
                 respond: promise,
             })
             .context("send to ConnectionUI failed")?;
@@ -970,6 +1031,39 @@ mod tests {
             .sleep_with_reason("under test", Duration::from_millis(50))
             .is_ok());
         assert!(start.elapsed() >= Duration::from_millis(50));
+    }
+
+    /// A retry asked for now ends the wait before it, silent or headless,
+    /// and an unasked-for one waits it out.
+    #[test]
+    fn a_sleep_ends_once_cut_short() {
+        for ui in [
+            ConnectionUI::new_lazy(ConnectionUIParams::default()),
+            ConnectionUI::new_headless(),
+        ] {
+            let flag = Arc::new(AtomicBool::new(false));
+            let setter = Arc::clone(&flag);
+            let cut = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                setter.store(true, Ordering::Release);
+            });
+            let start = Instant::now();
+            assert!(ui
+                .sleep_or_until("under test", Duration::from_secs(10), flag)
+                .is_ok());
+            assert!(start.elapsed() < Duration::from_secs(2));
+            cut.join().unwrap();
+
+            let start = Instant::now();
+            assert!(ui
+                .sleep_or_until(
+                    "under test",
+                    Duration::from_millis(120),
+                    Arc::new(AtomicBool::new(false))
+                )
+                .is_ok());
+            assert!(start.elapsed() >= Duration::from_millis(120));
+        }
     }
 
     #[test]

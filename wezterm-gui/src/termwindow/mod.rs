@@ -7219,7 +7219,9 @@ impl TermWindow {
                     None => crate::connect_domain_from_ssh_host(&domain_name)?,
                 };
                 if let Some(client) = domain.downcast_ref::<ClientDomain>() {
-                    if client.is_reconnect_suspended() {
+                    // Parked, or still trying on its own: either way, try
+                    // again now.
+                    if client.is_reconnect_suspended() || client.is_reconnecting() {
                         client.resume_reconnect();
                         return anyhow::Ok(());
                     }

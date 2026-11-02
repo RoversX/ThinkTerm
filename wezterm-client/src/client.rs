@@ -175,6 +175,9 @@ pub struct Client {
     /// restored first.
     connection_phase: Arc<AtomicU8>,
     resume_reconnect_tx: Sender<()>,
+    /// Set by `resume_reconnect` while the reconnect loop is waiting between
+    /// tries: the next try comes now, the outage counted from it.
+    retry_now: Arc<AtomicBool>,
     remote_server_id: Arc<RwLock<Option<String>>>,
     /// The distro id the server reported when we shook hands, if any.
     remote_os_release: Arc<RwLock<Option<String>>>,
@@ -214,9 +217,13 @@ impl Client {
         self.connection_phase() == ClientConnectionPhase::Suspended
     }
 
-    /// Wake a parked reconnect loop for another round of retries.
+    /// Wake a parked reconnect loop for another round of retries, or have
+    /// one still trying try again now rather than at the end of its wait.
     pub fn resume_reconnect(&self) {
+        // Publish the token before waking the retry wait: a reader that
+        // honors the hint must also be able to consume this request.
         let _ = self.resume_reconnect_tx.try_send(());
+        self.retry_now.store(true, Ordering::Release);
     }
 
     pub fn remote_server_id(&self) -> Option<String> {
@@ -2198,6 +2205,8 @@ impl Client {
         let connection_phase = Arc::new(AtomicU8::new(ClientConnectionPhase::Registering as u8));
         let reader_connection_phase = Arc::clone(&connection_phase);
         let (resume_reconnect_tx, resume_reconnect_rx) = bounded::<()>(1);
+        let retry_now = Arc::new(AtomicBool::new(false));
+        let reader_retry_now = Arc::clone(&retry_now);
         let remote_server_id = Arc::new(RwLock::new(None));
         let remote_os_release = Arc::new(RwLock::new(None));
         let connection_generation = Arc::new(AtomicU64::new(0));
@@ -2374,6 +2383,8 @@ impl Client {
                     reader_connection_phase
                         .store(ClientConnectionPhase::Reconnecting as u8, Ordering::Release);
                     crate::domain::wake_thinkterm_frontend();
+                    // A Reconnect asked for while connected is not for this.
+                    take_reconnect_request(&reader_retry_now, &resume_reconnect_rx);
 
                     let session_lasted = session_started.elapsed() >= SHORT_SESSION;
                     if session_lasted {
@@ -2468,9 +2479,10 @@ impl Client {
                         if suspend.is_some() {
                             // Parked below; no further attempt this round.
                         } else if ui
-                            .sleep_with_reason(
+                            .sleep_or_until(
                                 &format!("client disconnected {}; will reconnect", e),
                                 backoff,
+                                Arc::clone(&reader_retry_now),
                             )
                             .is_err()
                         {
@@ -2481,6 +2493,14 @@ impl Client {
                         } else {
                             if shutdown_rx.is_closed() {
                                 break 'client;
+                            }
+                            if take_reconnect_request(&reader_retry_now, &resume_reconnect_rx) {
+                                // Asked for now, by Reconnect in the sidebar:
+                                // a fresh round, as after a parked loop resumes.
+                                log::info!("retrying now, as asked");
+                                *outage_started = std::time::Instant::now();
+                                backoff = BASE_INTERVAL;
+                                short_sessions = 0;
                             }
                             let initial = false;
                             // Normally a reconnect must not auto-start a
@@ -2545,6 +2565,8 @@ impl Client {
                                 async { resume_reconnect_rx.recv().await.map_err(|_| ()) },
                             )) {
                                 Ok(()) => {
+                                    // The Reconnect that woke it is answered.
+                                    reader_retry_now.store(false, Ordering::Release);
                                     reader_connection_phase.store(
                                         ClientConnectionPhase::Reconnecting as u8,
                                         Ordering::Release,
@@ -2634,6 +2656,7 @@ impl Client {
             client_domain_config,
             connection_phase,
             resume_reconnect_tx,
+            retry_now,
             remote_server_id,
             remote_os_release,
             connection_generation,
@@ -3151,6 +3174,14 @@ impl Client {
     rpc!(subscribe_events, SubscribeEvents, UnitResponse);
 }
 
+// The flag only interrupts the sleep; the queued token owns the request.
+// Clear the hint first so a concurrently queued request can wake the next
+// wait. An answered request must not later wake a suspended retry loop.
+fn take_reconnect_request(retry_now: &AtomicBool, resume: &Receiver<()>) -> bool {
+    retry_now.store(false, Ordering::Release);
+    resume.try_recv().is_ok()
+}
+
 /// The outage clock to carry into the next reconnect round, given how the
 /// session that just ended fared. `None` means no outage is in progress.
 fn outage_clock_after_session(
@@ -3171,6 +3202,42 @@ mod tests {
     use super::{is_auth_cancelled, outage_clock_after_session, split_host_port, Reconnectable};
     use crate::domain::ClientDomainConfig;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn immediate_reconnect_consumes_the_request_before_a_later_suspension() {
+        use super::{take_reconnect_request, AtomicBool, Ordering};
+        let (sender, receiver) = smol::channel::bounded(1);
+        let hint = AtomicBool::new(false);
+        sender.try_send(()).unwrap();
+        hint.store(true, Ordering::Release);
+        assert!(take_reconnect_request(&hint, &receiver));
+        assert!(!hint.load(Ordering::Acquire));
+        // Neither give-up nor a declined prompt may wake on the old click.
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(smol::channel::TryRecvError::Empty)
+        ));
+        assert!(!take_reconnect_request(&hint, &receiver));
+        // A new click still wakes a parked loop.
+        sender.try_send(()).unwrap();
+        hint.store(true, Ordering::Release);
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn reconnect_tokens_are_authoritative_even_when_the_hint_arrives_late() {
+        use super::{take_reconnect_request, AtomicBool, Ordering};
+        let (sender, receiver) = smol::channel::bounded(1);
+        let hint = AtomicBool::new(false);
+        // The reader can run between publication of the token and hint.
+        sender.try_send(()).unwrap();
+        assert!(take_reconnect_request(&hint, &receiver));
+        hint.store(true, Ordering::Release);
+        assert!(!take_reconnect_request(&hint, &receiver));
+        assert!(!hint.load(Ordering::Acquire));
+        sender.try_send(()).unwrap();
+        assert!(take_reconnect_request(&hint, &receiver));
+    }
 
     #[test]
     fn releasing_a_share_tap_drops_payloads_without_removing_its_replacement() {
