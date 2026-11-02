@@ -27,7 +27,7 @@ use config::SshDomain;
 use mux::connui::ConnectionUI;
 use portable_pty::Child as _;
 use std::convert::TryFrom;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use wezterm_ssh::Session;
 
@@ -109,21 +109,14 @@ pub fn offer_remote_update(
         ));
         return Ok(RemoteUpdateOutcome::Declined);
     }
-    if let Err(lookup) = thinkterm_update::get_release_by_tag(&local) {
-        if !is_not_published(&lookup) {
-            ui.output_str(&format!("Could not look up {local} on GitHub: {lookup:#}\n"));
+    ui.output_str(&format!("Looking up release information for {local}...\n"));
+    let release = match thinkterm_update::remote::get_release(&local) {
+        Ok(release) => release,
+        Err(lookup) => {
+            ui.output_str(&format!("Could not resolve release {local}: {lookup:#}\n"));
             return Ok(RemoteUpdateOutcome::Declined);
         }
-        let latest = thinkterm_update::get_latest_release_info()
-            .map(|latest| format!(" (the latest is {})", latest.tag_name))
-            .unwrap_or_default();
-        ui.output_str(&format!(
-            "GitHub has no release {local} yet{latest}. Update {host} once it is \
-             released, or build a matching thinkterm-mux-server there from the same \
-             source now.\n"
-        ));
-        return Ok(RemoteUpdateOutcome::Declined);
-    }
+    };
 
     // The ssh session comes first: the host has to be asked what is
     // installed there before the question can say what will change. A
@@ -163,8 +156,8 @@ pub fn offer_remote_update(
 
     let answer = ui.input(&format!(
         "ThinkTerm can install {local} there now ({variant} variant, as the ssh user, \
-         under ~/.local, with no root):\n  \
-         {command}\n\
+         under ~/.local, with no root). A verified online installer (or bundled fallback) \
+         and trusted release information will be sent over SSH; the host downloads the archive.\n\
          {caveat}Install it? [y/N] ",
     ));
     let answer = match answer {
@@ -182,10 +175,10 @@ pub fn offer_remote_update(
     }
 
     ui.output_str(&format!("\nInstalling ThinkTerm {local} on {host}...\n"));
-    let status = run_and_relay(&session, ui, &command)?;
+    let status = run_remote_installer(&session, ui, variant, &release)?;
     if !status {
         ui.output_str(&format!(
-            "\nThe installer on {host} failed; its output is above. Nothing was changed there.\n\
+            "\nThe installer on {host} failed; its output is above.\n\
              If it refused the host (glibc, musl, architecture), a release binary cannot run on it.\n{}\n",
             thinkterm_update::build_from_source_instructions(&local)
         ));
@@ -319,9 +312,9 @@ pub fn offer_remote_install(
         String::new()
     };
     let answer = ui.input(&format!(
-        "ThinkTerm can install {local} there now (downloaded from GitHub, as the ssh \
-         user, under ~/.local, with no root):\n  \
-         {command}\n\
+        "ThinkTerm can install {local} there now (as the ssh user, under ~/.local, \
+         with no root). A verified online installer (or bundled fallback) and trusted release \
+         information will be sent over SSH; the host downloads the archive.\n\
          {caveat}Install it? [y/N] "
     ));
     let answer = match answer {
@@ -340,17 +333,14 @@ pub fn offer_remote_install(
         ));
         return Ok(RemoteInstallOutcome::Declined);
     }
-    if let Err(lookup) = thinkterm_update::get_release_by_tag(&local) {
-        if is_not_published(&lookup) {
-            ui.output_str(&format!(
-                "GitHub has no release {local} yet. Install a matching \
-                 thinkterm-mux-server on {host} by hand, or switch the host to SSH.\n"
-            ));
-        } else {
-            ui.output_str(&format!("Could not look up {local} on GitHub: {lookup:#}\n"));
+    ui.output_str(&format!("Looking up release information for {local}...\n"));
+    let release = match thinkterm_update::remote::get_release(&local) {
+        Ok(release) => release,
+        Err(lookup) => {
+            ui.output_str(&format!("Could not resolve release {local}: {lookup:#}\n"));
+            return Ok(RemoteInstallOutcome::Unavailable);
         }
-        return Ok(RemoteInstallOutcome::Unavailable);
-    }
+    };
 
     let ssh_config = mux::ssh::ssh_domain_to_ssh_config(ssh_dom)?;
     let mut ui_for_auth = ui.clone();
@@ -369,7 +359,7 @@ pub fn offer_remote_install(
     }
 
     ui.output_str(&format!("\nInstalling ThinkTerm {local} on {host}...\n"));
-    if !run_and_relay(&session, ui, &command)? {
+    if !run_remote_installer(&session, ui, variant, &release)? {
         ui.output_str(&format!(
             "\nThe installer on {host} failed; its output is above.\n{}\n",
             thinkterm_update::build_from_source_instructions(&local)
@@ -415,7 +405,10 @@ fn release_refusal(probe: &str, variant: &str) -> Option<String> {
     let arch = lines.next()?;
     let libc = lines.next().unwrap_or("");
     if os == "Linux" && !matches!(arch, "x86_64" | "aarch64") {
-        return Some(format!("{host_arch} has no release build", host_arch = arch));
+        return Some(format!(
+            "{host_arch} has no release build",
+            host_arch = arch
+        ));
     }
     if os == "Linux" && libc.to_ascii_lowercase().contains("musl") {
         return Some("The host uses musl libc".to_string());
@@ -474,11 +467,66 @@ fn is_yes(answer: &str) -> bool {
     matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
 }
 
-/// Whether a release lookup failed because GitHub has no such release, as
-/// opposed to GitHub being unreachable. `thinkterm_update` reports HTTP
-/// errors as "fetching <uri>: HTTP <status> <reason>".
-fn is_not_published(err: &anyhow::Error) -> bool {
-    format!("{err:#}").contains(": HTTP 404 ")
+fn run_remote_installer(
+    session: &Session,
+    ui: &ConnectionUI,
+    variant: &str,
+    release: &thinkterm_update::Release,
+) -> anyhow::Result<bool> {
+    ui.output_str("Checking for a signed installer (up to 4 seconds)...\n");
+    let installer = thinkterm_update::remote::installer_script();
+    ui.output_str(if installer.online {
+        "Verified the online installer; sending it and release information over SSH...\n"
+    } else {
+        "No verified online installer available; sending the bundled installer over SSH...\n"
+    });
+    let (command, payload) =
+        thinkterm_update::remote::install_payload(variant, release, &installer.text)?;
+    let exec =
+        smol::block_on(session.exec(&command, None)).context("starting the remote installer")?;
+    let mut stdin = exec.stdin;
+    let mut child = exec.child;
+    let stdout = exec.stdout;
+    let stderr = exec.stderr;
+    // The receiver reads exact byte counts, not EOF. Keep stdin alive until
+    // both output streams have drained and the remote command has exited.
+    let writer = std::thread::spawn(move || {
+        let result = stdin.write_all(&payload).and_then(|_| stdin.flush());
+        (stdin, result)
+    });
+    let ui_err = ui.clone();
+    let stderr_thread = std::thread::spawn(move || relay_lines(stderr, &ui_err));
+    let stdout_result = relay_lines(stdout, ui);
+    let stderr_result = stderr_thread.join();
+    let status = child.wait();
+    let (stdin, sent) = writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("installer upload thread failed"))?;
+    drop(stdin);
+    sent.context("sending the installer over SSH")?;
+    stdout_result?;
+    stderr_result.map_err(|_| anyhow::anyhow!("installer output thread failed"))??;
+    Ok(status
+        .context("waiting for the remote installer")?
+        .success())
+}
+
+fn relay_lines(reader: impl Read, ui: &ConnectionUI) -> std::io::Result<()> {
+    // Buffer UTF-8 across SSH reads so the wordmark cannot split a character.
+    // The installer emits bounded, newline-terminated progress in this mode.
+    let mut reader = BufReader::new(reader);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let len = reader
+            .by_ref()
+            .take(16 * 1024)
+            .read_until(b'\n', &mut line)?;
+        if len == 0 {
+            return Ok(());
+        }
+        ui.output_str(&String::from_utf8_lossy(&line));
+    }
 }
 
 /// Run `command` on the session, copying its stdout and stderr into the UI
@@ -519,14 +567,16 @@ fn run_and_relay_status(
         ui.output_str(&String::from_utf8_lossy(&buf[..len]));
     }
     let _ = stderr_thread.join();
-    let status = child.wait().with_context(|| format!("waiting for `{command}`"));
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting for `{command}`"));
     drop(stdin);
     status
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_not_published, is_yes, release_refusal, without_input};
+    use super::{is_yes, release_refusal, without_input};
 
     #[test]
     fn only_an_explicit_yes_counts() {
@@ -598,22 +648,5 @@ mod tests {
         let mut out = String::new();
         std::io::Read::read_to_string(child.stdout.as_mut().unwrap(), &mut out).unwrap();
         assert_eq!(out, "done\n");
-    }
-
-    #[test]
-    fn only_a_404_means_the_release_is_not_out() {
-        let uri = "https://api.github.com/repos/o/r/releases/tags/9.9.9";
-        assert!(is_not_published(&anyhow::anyhow!(
-            "fetching {}: HTTP 404 Not Found",
-            uri
-        )));
-        assert!(!is_not_published(&anyhow::anyhow!(
-            "fetching {}: HTTP 403 Forbidden",
-            uri
-        )));
-        assert!(!is_not_published(&anyhow::anyhow!(
-            "fetching {}: failed to lookup address information",
-            uri
-        )));
     }
 }

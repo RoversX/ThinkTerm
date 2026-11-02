@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 pub mod manifest;
 pub mod method;
+pub mod remote;
 
 pub use manifest::InstallManifest;
 pub use method::InstallMethod;
@@ -26,9 +27,10 @@ pub use method::InstallMethod;
 pub const REPO_URL: &str = "https://github.com/RoversX/thinkterm";
 
 /// Raw address of the installer on the default branch. `thinkterm update`
-/// and the remote update fetch it from here rather than from the release
-/// they install: the script has to understand the *current* archive layout,
-/// and a fix to it should reach every existing install at once.
+/// fetches it from here rather than from the release it installs: the script
+/// has to understand the *current* archive layout,
+/// and a fix to it should reach every existing install at once. Remote
+/// installs prefer a signed online script with a bundled fallback in `remote`.
 pub const INSTALL_SCRIPT_URL: &str =
     "https://raw.githubusercontent.com/RoversX/thinkterm/main/install.sh";
 
@@ -38,9 +40,9 @@ pub const INSTALL_SCRIPT_URL: &str =
 pub const MIRRORS: [&str; 4] = ["ghfast.top", "gh-proxy.org", "ghproxy.net", "gh.llkk.cc"];
 
 /// Where release archives and the Windows installer are downloaded from.
-/// Only those: the releases API and the installer script always come from
-/// GitHub, and an archive from a mirror is used only when it matches the
-/// digest GitHub recorded for it.
+/// Signed SSH installer scripts and release inventories also use these
+/// sources. The releases API stays on GitHub; mirrored archives require
+/// a trusted checksum and mirrored scripts require a pinned-key signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DownloadSource {
     /// GitHub, then each of `MIRRORS` in turn, then GitHub again: a link
@@ -733,6 +735,17 @@ fn curl_get(
     give_way: Option<GiveWay>,
     body: &mut dyn Write,
 ) -> anyhow::Result<Answer> {
+    curl_get_inner(extra, url, headers, give_way, body, true)
+}
+
+fn curl_get_inner(
+    extra: &[&str],
+    url: &str,
+    headers: &[(&str, String)],
+    give_way: Option<GiveWay>,
+    body: &mut dyn Write,
+    allow_fallback: bool,
+) -> anyhow::Result<Answer> {
     use std::io::{BufRead, BufReader, Read};
     use std::process::{Command, Stdio};
 
@@ -770,7 +783,7 @@ fn curl_get(
         .spawn()
     {
         Ok(child) => child,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        Err(err) if allow_fallback && err.kind() == std::io::ErrorKind::NotFound => {
             return http_req_transport(url, headers, give_way, body);
         }
         Err(err) => return Err(err).context("running curl"),
