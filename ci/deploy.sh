@@ -94,7 +94,9 @@ case $OSTYPE in
     rm $zipdir/ThinkTerm.app/*.dylib
     mkdir -p $zipdir/ThinkTerm.app/Contents/MacOS
     mkdir -p $zipdir/ThinkTerm.app/Contents/Resources
-    cp assets/icon/ThinkTerm_simple.icns $zipdir/ThinkTerm.app/Contents/Resources/ThinkTerm_simple.icns
+    # Every icon Settings can switch to has to travel with the app.  The
+    # template bundle carries the original three; the glob picks up the rest.
+    cp assets/icon/ThinkTerm*.icns $zipdir/ThinkTerm.app/Contents/Resources/
     cp -r assets/shell-integration/* $zipdir/ThinkTerm.app/Contents/Resources
     cp -r assets/shell-completion $zipdir/ThinkTerm.app/Contents/Resources
     # The license texts (GPL-3 for this project, MIT for the upstream WezTerm
