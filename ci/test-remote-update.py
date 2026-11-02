@@ -95,7 +95,7 @@ class InstallerTests(unittest.TestCase):
         (self.root / "tmp").mkdir()
         (self.root / "requests").mkdir()
         for name in ("awk", "basename", "cat", "chmod", "cp", "cut", "date", "dirname", "find",
-                     "grep", "head", "id", "ln", "mkdir", "mktemp", "mv", "rm", "sed", "sh",
+                     "grep", "gzip", "head", "id", "ln", "mkdir", "mktemp", "mv", "rm", "sed", "sh",
                      "sort", "stty", "tar", "tr", "wc", "xz", "sha256sum", "shasum", "ssh-keygen", "sleep", "ditto"):
             tool = shutil.which(name)
             if tool:
