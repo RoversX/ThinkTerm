@@ -21,6 +21,7 @@
             }
           },
           "glass" : true,
+          "hidden" : false,
           "image-name" : "Vector.png",
           "name" : "Vector",
           "position" : {
@@ -44,9 +45,24 @@
     {
       "layers" : [
         {
+          "glass" : true,
+          "hidden" : false,
+          "image-name" : "dark-svg.svg",
+          "name" : "dark-svg",
+          "position" : {
+            "scale" : 1.01,
+            "translation-in-points" : [
+              0,
+              0
+            ]
+          }
+        },
+        {
           "glass" : false,
+          "hidden" : false,
           "image-name" : "image 2.png",
           "name" : "image 2",
+          "opacity" : 1,
           "position" : {
             "scale" : 1,
             "translation-in-points" : [
@@ -54,7 +70,41 @@
               0
             ]
           }
+        },
+        {
+          "glass" : false,
+          "hidden" : false,
+          "image-name" : "martix-gray.svg",
+          "name" : "martix-gray",
+          "opacity" : 0.45,
+          "position" : {
+            "scale" : 1.12,
+            "translation-in-points" : [
+              4.499999999999943,
+              -22
+            ]
+          }
+        },
+        {
+          "glass" : false,
+          "hidden" : true,
+          "image-name" : "martix-blue.svg",
+          "name" : "martix-blue",
+          "opacity" : 0.83
         }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    },
+    {
+      "layers" : [
+
       ],
       "shadow" : {
         "kind" : "neutral",

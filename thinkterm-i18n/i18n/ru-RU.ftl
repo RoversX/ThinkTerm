@@ -171,6 +171,7 @@ settings-badge-beta = Бета
 settings-app-icon-simple = Синяя капсула
 settings-app-icon-red = Красная капсула
 settings-app-icon-classic = Классический
+settings-app-icon-otter = Выдра
 settings-effective-color-scheme = Текущая цветовая схема
 settings-effective-color-scheme-description = Цвета терминала. Нажмите для выбора.
 settings-color-scheme-inline = Цвета из конфигурации

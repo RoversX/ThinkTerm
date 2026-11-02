@@ -9,6 +9,9 @@ windows_src=ThinkTerm_windows.png
 macos_icns=ThinkTerm_simple.icns
 classic_macos_icns=ThinkTerm.icns
 red_macos_icns=ThinkTerm_red.icns
+otter_icon=ThinkTerm-otter.icon
+otter_macos_icns=ThinkTerm_otter.icns
+ictool="/Applications/Icon Composer.app/Contents/Executables/ictool"
 
 conv_opts="-colors 256 -background none -density 300"
 
@@ -49,6 +52,26 @@ if [ -f "$macos_icns" ]; then
   fi
 else
   png2icns ../macos/ThinkTerm.app/Contents/Resources/ThinkTerm_simple.icns icon_*px.png
+fi
+
+# The otter is an Icon Composer document. ictool renders it edge to edge, so
+# it goes on the macOS icon grid (824 of 1024, centred) with the grid's soft
+# shadow, like the icons above, before it becomes an .icns.
+if [ -x "$ictool" ] && command -v iconutil >/dev/null 2>&1 ; then
+  rm -rf otter.iconset && mkdir otter.iconset
+  "$ictool" "$otter_icon" --export-image --output-file otter-body.png \
+    --platform macOS --rendition Default --width 824 --height 824 --scale 1
+  convert otter-body.png -background none -gravity center -extent 1024x1024 \
+    \( +clone -channel A -blur 0x7 -evaluate multiply 0.32 +channel -fill black -colorize 100 -roll +0+10 \) \
+    +swap -composite -depth 8 otter-1024.png
+  for dim in 16 32 128 256 512 ; do
+    convert otter-1024.png -resize "${dim}x${dim}" "otter.iconset/icon_${dim}x${dim}.png"
+    convert otter-1024.png -resize "$((dim * 2))x$((dim * 2))" "otter.iconset/icon_${dim}x${dim}@2x.png"
+  done
+  iconutil -c icns otter.iconset -o "$otter_macos_icns"
+  rm -rf otter.iconset otter-body.png otter-1024.png
+  cp "$otter_macos_icns" ../macos/ThinkTerm.app/Contents/Resources/ThinkTerm_otter.icns
+  sips -z 128 128 -s format png "$otter_macos_icns" --out ThinkTerm_otter_128.png
 fi
 
 # Clean up

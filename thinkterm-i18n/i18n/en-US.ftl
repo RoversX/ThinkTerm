@@ -174,6 +174,7 @@ settings-badge-beta = Beta
 settings-app-icon-simple = Blue Pill
 settings-app-icon-red = Red Pill
 settings-app-icon-classic = Classic
+settings-app-icon-otter = Otter
 settings-effective-color-scheme = Effective Color Scheme
 settings-effective-color-scheme-description = What the terminal is painted in. Click to choose.
 settings-color-scheme-inline = Custom inline colors

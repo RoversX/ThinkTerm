@@ -171,6 +171,7 @@ settings-badge-beta = Beta
 settings-app-icon-simple = 蓝色药丸
 settings-app-icon-red = 红色药丸
 settings-app-icon-classic = 经典
+settings-app-icon-otter = 水獭
 settings-effective-color-scheme = 当前配色方案
 settings-effective-color-scheme-description = 终端当前用的配色。点击选择。
 settings-color-scheme-inline = 配置文件里的自定义颜色

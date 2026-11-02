@@ -171,6 +171,7 @@ settings-badge-beta = ベータ
 settings-app-icon-simple = 青いピル
 settings-app-icon-red = 赤いピル
 settings-app-icon-classic = クラシック
+settings-app-icon-otter = カワウソ
 settings-effective-color-scheme = 有効なカラースキーム
 settings-effective-color-scheme-description = ターミナルの配色です。クリックで選択します。
 settings-color-scheme-inline = 設定ファイル内のカスタム色

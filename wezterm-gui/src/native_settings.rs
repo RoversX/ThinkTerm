@@ -132,6 +132,7 @@ pub(crate) enum NativeAppIcon {
     Red,
     #[serde(alias = "default")]
     Classic,
+    Otter,
 }
 
 impl Default for NativeAppIcon {
@@ -146,6 +147,7 @@ impl NativeAppIcon {
             Self::Simple => "Blue Pill",
             Self::Red => "Red Pill",
             Self::Classic => "Classic",
+            Self::Otter => "Otter",
         }
     }
 
@@ -154,10 +156,13 @@ impl NativeAppIcon {
             Self::Simple => "ThinkTerm_simple.icns",
             Self::Red => "ThinkTerm_red.icns",
             Self::Classic => "ThinkTerm.icns",
+            Self::Otter => "ThinkTerm_otter.icns",
         }
     }
 
-    pub(crate) const ALL: [Self; 3] = [Self::Simple, Self::Red, Self::Classic];
+    /// The icons Settings offers. Classic is no longer among them, but a
+    /// settings file that chose it keeps it.
+    pub(crate) const CHOICES: [Self; 3] = [Self::Simple, Self::Red, Self::Otter];
 
     /// A 128px copy of the icon, for Settings to show as a choice: the
     /// full-size art is megabytes of PNG to decode for a 44pt picture.
@@ -166,6 +171,7 @@ impl NativeAppIcon {
             Self::Simple => include_bytes!("../../assets/icon/ThinkTerm_simple_128.png"),
             Self::Red => include_bytes!("../../assets/icon/ThinkTerm_red_128.png"),
             Self::Classic => include_bytes!("../../assets/icon/ThinkTerm_128.png"),
+            Self::Otter => include_bytes!("../../assets/icon/ThinkTerm_otter_128.png"),
         }
     }
 }

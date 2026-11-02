@@ -174,6 +174,7 @@ settings-badge-beta = Beta
 settings-app-icon-simple = Blaue Pille
 settings-app-icon-red = Rote Pille
 settings-app-icon-classic = Klassisch
+settings-app-icon-otter = Otter
 settings-effective-color-scheme = Aktives Farbschema
 settings-effective-color-scheme-description = Die Farben des Terminals. Zum Auswählen klicken.
 settings-color-scheme-inline = Eigene Farben aus der Konfiguration

@@ -174,6 +174,7 @@ settings-badge-beta = Bêta
 settings-app-icon-simple = Pilule bleue
 settings-app-icon-red = Pilule rouge
 settings-app-icon-classic = Classique
+settings-app-icon-otter = Loutre
 settings-effective-color-scheme = Jeu de couleurs actif
 settings-effective-color-scheme-description = Les couleurs du terminal. Cliquez pour choisir.
 settings-color-scheme-inline = Couleurs personnalisées du fichier

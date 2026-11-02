@@ -1709,6 +1709,7 @@ fn localized_app_icon_label(icon: NativeAppIcon) -> String {
         NativeAppIcon::Simple => "settings-app-icon-simple",
         NativeAppIcon::Red => "settings-app-icon-red",
         NativeAppIcon::Classic => "settings-app-icon-classic",
+        NativeAppIcon::Otter => "settings-app-icon-otter",
     })
 }
 
@@ -10399,12 +10400,12 @@ impl SettingsWindow {
             self.paint_separator(layers, x, y - self.ui_px(28.0), width)?;
         }
         let side = self.ui_px(88.0).round();
-        let labels = NativeAppIcon::ALL.map(localized_app_icon_label);
+        let labels = NativeAppIcon::CHOICES.map(localized_app_icon_label);
         let widest = labels
             .iter()
             .map(|label| self.measure_text_width(&body_font, label))
             .fold(0.0, f32::max);
-        let count = NativeAppIcon::ALL.len() as f32;
+        let count = NativeAppIcon::CHOICES.len() as f32;
         let spacing = self.ui_px(12.0);
         // Every name gets the room of the widest, so none is cut off --
         // unless the names would then take over half the row: in a narrow
@@ -10427,7 +10428,7 @@ impl SettingsWindow {
         let icon_y = y - inset;
         let label_y = icon_y + side - inset + self.ui_px(10.0);
 
-        for (index, icon) in NativeAppIcon::ALL.iter().copied().enumerate() {
+        for (index, icon) in NativeAppIcon::CHOICES.iter().copied().enumerate() {
             let icon_x = block_x + (side + gap) * index as f32;
             let action = SettingsAction::SetAppIcon(icon);
             let selected = chosen == icon;
