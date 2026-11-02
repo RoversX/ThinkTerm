@@ -488,10 +488,11 @@ impl TermWindow {
     }
 
     /// A thread row's card: the thread's name and how many agents it holds,
-    /// then each agent in two lines -- its mark, title and state icon, then
-    /// its state in words, how far it has got, what it waits for and what it
-    /// says -- parted by hairlines. Beside the row rather than above it: the
-    /// card is taller than a tag, and the rows above are the ones being read.
+    /// then each agent in two lines -- its mark, title, pane and state icon,
+    /// then its state in words, how far it has got, what it waits for and
+    /// what it says -- parted by hairlines. Beside the row rather than above
+    /// it: the card is taller than a tag, and the rows above are the ones
+    /// being read.
     fn paint_thread_hover_card(
         &mut self,
         item: &UIItem,
@@ -581,9 +582,27 @@ impl TermWindow {
 
         let right = x + text_x + text_w;
         let active_pane_id = self.get_active_pane_no_overlay().map(|pane| pane.pane_id());
+        let pane_word = crate::i18n::tr("hover-card-pane");
         for agent in &agents[..rows] {
             let state = agent.shown_state();
             let brand = brand_of(agent);
+            // Which pane, as the command line names it, at the end of the
+            // title's line: the title gives way to it.
+            let pane = format!("{pane_word} {}", cli_pane_id(agent.pane_id));
+            let pane_w = self
+                .cached_ui_text_advance(&style.body, &style.metrics, &pane)?
+                .ceil()
+                .min(text_w);
+            self.paint_agent_text(
+                &mut layers,
+                &style.body,
+                style.metrics,
+                &pane,
+                (right - pane_w).round() as usize,
+                cy.round() as usize,
+                pane_w as usize,
+                style.palette.muted_text,
+            )?;
             self.paint_agent_mark(
                 &mut layers,
                 agent,
@@ -608,7 +627,7 @@ impl TermWindow {
                 &agent_row_title(agent, brand),
                 (x + text_x).round() as usize,
                 cy.round() as usize,
-                text_w.max(0.0) as usize,
+                (text_w - pane_w - gap / 2.0).max(0.0) as usize,
                 style.palette.text,
             )?;
 
@@ -687,8 +706,8 @@ impl TermWindow {
     /// An Agents panel row's card: everything the row has no room for. The
     /// title and the description in full (wrapped), the agent and its state,
     /// progress, then where it runs, on which machine, for how long it has
-    /// been in this state and its sub-tasks. Left of the panel, which runs
-    /// along the window's right edge.
+    /// been in this state, its sub-tasks and which pane it is. Left of the
+    /// panel, which runs along the window's right edge.
     fn paint_agent_hover_card(
         &mut self,
         item: &UIItem,
@@ -868,7 +887,7 @@ impl TermWindow {
             }
         }
 
-        // Where, on which machine, for how long, and its sub-tasks.
+        // Where, on which machine, for how long, its sub-tasks and its pane.
         cy += gap;
         self.paint_hover_separator(&mut layers, x, cy, card_w, style)?;
         cy += 1.0 + gap;
@@ -910,7 +929,7 @@ impl TermWindow {
         agent: &AgentPaneStatus,
         show: crate::native_settings::NativeAgentStatusDisplay,
     ) -> Vec<(String, String)> {
-        let mut facts = Vec::with_capacity(4);
+        let mut facts = Vec::with_capacity(5);
         if !agent.place.is_empty() {
             facts.push((crate::i18n::tr("hover-card-thread"), agent.place.clone()));
         }
@@ -961,8 +980,32 @@ impl TermWindow {
                 facts.push((crate::i18n::tr("hover-card-subtasks"), value));
             }
         }
+        let mut pane = cli_pane_id(agent.pane_id);
+        if let Some(label) = mux::Mux::get().pane_label(agent.pane_id) {
+            pane = format!("{pane} \u{b7} {label}");
+        }
+        facts.push((crate::i18n::tr("hover-card-pane"), pane));
         facts
     }
+}
+
+/// Pane `pane_id` as `thinkterm cli --pane` names it, so that what a card
+/// says is what a program types: `MACHINE/ID` for one on a server, its
+/// number on the session server for one that server keeps for this machine,
+/// and its number here for any other.
+fn cli_pane_id(pane_id: PaneId) -> String {
+    if let Some(on) = wezterm_mux_server_impl::foreign_panes::on_its_machine(pane_id) {
+        return format!("{}/{}", on.machine, on.pane_id);
+    }
+    mux::Mux::get()
+        .get_pane(pane_id)
+        .filter(|pane| crate::local_sessions::is_host_domain_id(pane.domain_id()))
+        .and_then(|pane| {
+            pane.downcast_ref::<wezterm_client::pane::ClientPane>()
+                .map(|client| client.remote_pane_id)
+        })
+        .unwrap_or(pane_id)
+        .to_string()
 }
 
 /// How long ago, in the largest whole unit that fits.

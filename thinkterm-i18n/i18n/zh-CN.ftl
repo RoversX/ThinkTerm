@@ -903,6 +903,7 @@ right-agents-all-hidden = 显示选项隐藏了所有 Agent
 hover-card-agents = { $count } 个 Agent
 hover-card-thread = 会话
 hover-card-machine = 机器
+hover-card-pane = 窗格
 hover-card-duration = 持续
 hover-card-subtasks = 子任务
 hover-card-more-agents = 还有 { $count } 个

@@ -906,6 +906,7 @@ hover-card-agents = { $count ->
 }
 hover-card-thread = Ветка
 hover-card-machine = Компьютер
+hover-card-pane = Панель
 hover-card-duration = Длительность
 hover-card-subtasks = Подзадачи
 hover-card-more-agents = Ещё { $count }

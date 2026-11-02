@@ -930,6 +930,7 @@ hover-card-agents = { $count ->
 }
 hover-card-thread = Thread
 hover-card-machine = Rechner
+hover-card-pane = Pane
 hover-card-duration = Seit
 hover-card-subtasks = Teilaufgaben
 hover-card-more-agents = { $count } weitere

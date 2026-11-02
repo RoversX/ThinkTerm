@@ -903,6 +903,7 @@ right-agents-all-hidden = 表示オプションですべてのエージェント
 hover-card-agents = { $count } 個のエージェント
 hover-card-thread = セッション
 hover-card-machine = マシン
+hover-card-pane = ペイン
 hover-card-duration = 経過
 hover-card-subtasks = サブタスク
 hover-card-more-agents = ほか { $count } 件
