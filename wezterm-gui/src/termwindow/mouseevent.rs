@@ -1165,8 +1165,9 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) -> bool {
         // Over the Library, a wheel or a trackpad moves along its cards, never
-        // to another Space.
-        if self.library_presented() {
+        // to another Space -- but for the swipe that is bringing it out, which
+        // goes on as it began.
+        if self.library_presented() && !self.workspace_sidebar_swipe.is_active() {
             let sideways = self.sidebar_horizontal_scroll_delta(event);
             let down = self.sidebar_vertical_scroll_delta(event);
             if let Some(handled) = self.scroll_library(event, sideways, down, context) {
@@ -1325,7 +1326,11 @@ impl super::TermWindow {
                 && self.workspace_sidebar_swipe.is_active()
             {
                 // A fresh gesture supersedes any unfinished/settling visual
-                // from the preceding gesture.
+                // from the preceding gesture -- and lets go of a Library the
+                // preceding one never finished bringing out.
+                if self.workspace_sidebar_swipe.library_pull().is_some() {
+                    self.let_go_library(0.0, context);
+                }
                 self.workspace_sidebar_swipe.cancel_immediately();
                 self.clear_workspace_space_swipe_frame_transition();
             }
@@ -1359,7 +1364,14 @@ impl super::TermWindow {
             let update = self.workspace_sidebar_swipe.update(delta_x, delta_y, now);
             match update {
                 SidebarSpaceSwipeUpdate::Pending => {}
-                SidebarSpaceSwipeUpdate::Horizontal => context.invalidate(),
+                SidebarSpaceSwipeUpdate::Horizontal => {
+                    // On past the first Space: the Library comes out with
+                    // the finger.
+                    if let Some(pull) = self.workspace_sidebar_swipe.library_pull() {
+                        self.hold_library(true, pull, context);
+                    }
+                    context.invalidate();
+                }
                 SidebarSpaceSwipeUpdate::Vertical(delta_y) => {
                     self.clear_workspace_space_swipe_frame_transition();
                     self.scroll_workspace_sidebar_by(-delta_y, context);
@@ -1372,6 +1384,11 @@ impl super::TermWindow {
                 self.finish_workspace_sidebar_space_swipe(now, context);
             }
             ScrollPhase::Cancelled => {
+                // Taken over, not ended: the Library it was bringing out is
+                // let go of where it is.
+                if self.workspace_sidebar_swipe.library_pull().is_some() {
+                    self.let_go_library(0.0, context);
+                }
                 self.workspace_sidebar_swipe.cancel_immediately();
                 self.clear_workspace_space_swipe_frame_transition();
                 context.invalidate();
@@ -1423,6 +1440,14 @@ impl super::TermWindow {
             SidebarSpaceSwipeFinish::FlushVertical(delta_y) => {
                 self.clear_workspace_space_swipe_frame_transition();
                 self.scroll_workspace_sidebar_by(-delta_y, context);
+                true
+            }
+            SidebarSpaceSwipeFinish::Library { velocity } => {
+                // On past the first Space the Library came out with the
+                // finger: on out, or back, as it lets go.
+                self.clear_workspace_space_swipe_frame_transition();
+                self.let_go_library(velocity, context);
+                context.invalidate();
                 true
             }
             SidebarSpaceSwipeFinish::None => {

@@ -4326,12 +4326,16 @@ impl crate::TermWindow {
             let color = self.tab_bar_surface(self.chrome().header_bg);
             // Behind where it starts, between its two parts, and past where
             // it ends, laid out beside a right panel that is not all the way
-            // out yet.
-            for (left, right) in [
+            // out yet. Beside the Library its end goes along with the
+            // terminal and covers the rest itself: filled under that too,
+            // a see-through row would show darker there.
+            let rooms = [
                 (between.min_x(), row_left + lead_shift),
                 (lead_end, trail),
                 (row_right, between.max_x()),
-            ] {
+            ];
+            let rooms = if self.library_presented() { &rooms[..1] } else { &rooms[..] };
+            for &(left, right) in rooms {
                 let (left, right) = (left.max(between.min_x()), right.min(between.max_x()));
                 if right > left {
                     self.filled_rectangle(

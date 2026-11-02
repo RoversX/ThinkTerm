@@ -54,6 +54,10 @@ pub(crate) enum SidebarSpaceSwipeFinish {
     None,
     Switch(String),
     AnimateBack,
+    /// Past the first Space, where a Space before it would be, the Library
+    /// went along with the finger: it lets go, at `velocity` pixels a second
+    /// towards the Library.
+    Library { velocity: f32 },
     /// The gesture ended before either axis locked, so its vertical travel was
     /// only ever accumulated. Scroll by it now: the state machine consumed the
     /// events, so nothing else will.
@@ -91,6 +95,9 @@ struct Gesture {
     raw_y: f32,
     velocity_x: f32,
     last_sample_at: Instant,
+    /// Gone towards a Space before the first: the Library's, which comes
+    /// out with the finger from then on, the pages staying where they are.
+    library: bool,
 }
 
 impl Gesture {
@@ -110,6 +117,7 @@ impl Gesture {
             raw_y: 0.0,
             velocity_x: 0.0,
             last_sample_at: now,
+            library: false,
         }
     }
 
@@ -126,8 +134,19 @@ impl Gesture {
         self.velocity_x = self.velocity_x * 0.65 + instantaneous * 0.35;
     }
 
+    /// Following the finger sideways: one heading for a Space before the
+    /// first goes to the Library, and stays its.
+    fn track(mut self) -> Self {
+        if self.previous_space_id.is_none() && self.raw_x > 0.0 {
+            self.library = true;
+        }
+        self
+    }
+
     fn target_space_id(&self) -> Option<&String> {
-        if self.raw_x < 0.0 {
+        if self.library {
+            None
+        } else if self.raw_x < 0.0 {
             self.next_space_id.as_ref()
         } else if self.raw_x > 0.0 {
             self.previous_space_id.as_ref()
@@ -137,7 +156,9 @@ impl Gesture {
     }
 
     fn display_offset(&self, sidebar_width: f32) -> f32 {
-        if self.raw_x < 0.0 {
+        if self.library {
+            0.0
+        } else if self.raw_x < 0.0 {
             if self.next_space_id.is_some() {
                 self.raw_x.max(-sidebar_width)
             } else {
@@ -253,13 +274,13 @@ impl SidebarSpaceSwipeState {
                 let max_axis = x.max(y);
 
                 if x >= HORIZONTAL_LOCK_DISTANCE && x > y * AXIS_LOCK_RATIO {
-                    self.phase = Phase::Tracking(gesture);
+                    self.phase = Phase::Tracking(gesture.track());
                     SidebarSpaceSwipeUpdate::Horizontal
                 } else if y >= VERTICAL_LOCK_DISTANCE && y > x * AXIS_LOCK_RATIO {
                     self.phase = Phase::Vertical;
                     SidebarSpaceSwipeUpdate::Vertical(gesture.raw_y)
                 } else if max_axis >= AXIS_LOCK_FALLBACK_DISTANCE && x >= y {
-                    self.phase = Phase::Tracking(gesture);
+                    self.phase = Phase::Tracking(gesture.track());
                     SidebarSpaceSwipeUpdate::Horizontal
                 } else if max_axis >= AXIS_LOCK_FALLBACK_DISTANCE {
                     self.phase = Phase::Vertical;
@@ -271,7 +292,7 @@ impl SidebarSpaceSwipeState {
             }
             Phase::Tracking(mut gesture) => {
                 gesture.update(delta_x, delta_y, now);
-                self.phase = Phase::Tracking(gesture);
+                self.phase = Phase::Tracking(gesture.track());
                 SidebarSpaceSwipeUpdate::Horizontal
             }
             Phase::Vertical => {
@@ -293,6 +314,15 @@ impl SidebarSpaceSwipeState {
                 let target = gesture.target_space_id().cloned().expect("checked above");
                 self.phase = Phase::AwaitingCommit(gesture);
                 SidebarSpaceSwipeFinish::Switch(target)
+            }
+            Phase::Tracking(gesture) if gesture.library => {
+                // The Library has had the gesture: where it goes on to is
+                // its to decide.
+                self.suppress_momentum = true;
+                self.phase = Phase::Idle;
+                SidebarSpaceSwipeFinish::Library {
+                    velocity: gesture.velocity_x,
+                }
             }
             Phase::Tracking(gesture) => {
                 self.suppress_momentum = true;
@@ -400,6 +430,8 @@ impl SidebarSpaceSwipeState {
         sidebar_width: f32,
     ) -> Option<SidebarSpaceSwipeVisual> {
         match &self.phase {
+            // The Library has the gesture, and the sidebar with it.
+            Phase::Tracking(gesture) if gesture.library => None,
             Phase::Tracking(gesture) | Phase::AwaitingCommit(gesture) => {
                 Some(SidebarSpaceSwipeVisual {
                     source_space_id: gesture.source_space_id.clone(),
@@ -446,6 +478,15 @@ impl SidebarSpaceSwipeState {
     pub(crate) fn pending_switch_target(&self) -> Option<&str> {
         match &self.phase {
             Phase::AwaitingCommit(gesture) => gesture.target_space_id().map(String::as_str),
+            _ => None,
+        }
+    }
+
+    /// How far a swipe past the first Space has gone towards the Library,
+    /// in pixels, while the finger is down; `None` for any other.
+    pub(crate) fn library_pull(&self) -> Option<f32> {
+        match &self.phase {
+            Phase::Tracking(gesture) if gesture.library => Some(gesture.raw_x.max(0.0)),
             _ => None,
         }
     }
@@ -724,15 +765,44 @@ mod tests {
     fn unavailable_edge_is_resisted_and_never_commits() {
         let start = Instant::now();
         let mut swipe = SidebarSpaceSwipeState::default();
-        swipe.begin("source".into(), None, Some("next".into()), 0.0, start);
-        swipe.update(400.0, 0.0, at(start, 16));
+        swipe.begin("source".into(), Some("previous".into()), None, 0.0, start);
+        swipe.update(-400.0, 0.0, at(start, 16));
         let visual = swipe.visual(at(start, 16), 300.0).unwrap();
         assert_eq!(visual.target_space_id, None);
-        assert_eq!(visual.offset, 48.0);
+        assert_eq!(visual.offset, -48.0);
         assert_eq!(
             swipe.finish(at(start, 20), 300.0),
             SidebarSpaceSwipeFinish::AnimateBack
         );
+    }
+
+    #[test]
+    fn a_swipe_on_past_the_first_space_takes_the_library_with_it() {
+        let start = Instant::now();
+        let mut swipe = SidebarSpaceSwipeState::default();
+        swipe.begin("first".into(), None, Some("next".into()), 0.0, start);
+        swipe.update(40.0, 0.0, at(start, 16));
+        // From the first pixel, all of it: the pages stay put.
+        assert_eq!(swipe.library_pull(), Some(40.0));
+        assert_eq!(swipe.visual(at(start, 16), 300.0), None);
+        swipe.update(60.0, 0.0, at(start, 32));
+        assert_eq!(swipe.library_pull(), Some(100.0));
+        // Back past where it began is the Library's still, and next is not
+        // gone to.
+        swipe.update(-150.0, 0.0, at(start, 48));
+        assert_eq!(swipe.library_pull(), Some(0.0));
+        match swipe.finish(at(start, 64), 300.0) {
+            SidebarSpaceSwipeFinish::Library { .. } => {}
+            other => panic!("the Library's to let go: {other:?}"),
+        }
+        assert!(!swipe.is_active());
+        assert_eq!(swipe.library_pull(), None);
+
+        // Anywhere but the first Space, a Space before it is gone to.
+        let mut swipe = SidebarSpaceSwipeState::default();
+        swipe.begin("second".into(), Some("first".into()), None, 0.0, start);
+        swipe.update(40.0, 0.0, at(start, 16));
+        assert_eq!(swipe.library_pull(), None);
     }
 
     #[test]

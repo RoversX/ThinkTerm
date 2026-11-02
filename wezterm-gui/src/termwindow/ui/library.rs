@@ -34,7 +34,7 @@ use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
 use window::{
     ContextMenuIcon, ContextMenuItem, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress,
-    RectF, WindowOps,
+    RectF, ScrollPhase, WindowOps,
 };
 
 /// The least of the terminal that stays in view beside the Library, in
@@ -117,6 +117,9 @@ const SNAP: Feel = Feel {
 /// Going back, the card lifts out first and the Library follows it this much
 /// later, in seconds.
 const GO_BACK_LAG: f32 = 0.12;
+/// Let go at this speed or more, in pixels a second, towards where the
+/// finger was taking it, the Library goes on there however far it got.
+const LET_GO_FLING: f32 = 600.0;
 /// Springs are stepped this finely, and a frame is never taken for longer
 /// than the most, so a stall cannot fling one.
 const STEP: f32 = 1.0 / 240.0;
@@ -188,6 +191,26 @@ struct Edge {
     spring: Spring,
 }
 
+/// The Library going with a finger on the trackpad, out from the first
+/// Space or back from beside its cards: as far along as the finger has
+/// gone, its springs left where it puts them until it lets go.
+#[derive(Clone, Copy, Debug)]
+struct Held {
+    opening: bool,
+}
+
+/// A swipe begun beside the cards -- the rail, the title, between and
+/// under them: sideways towards the terminal it takes the Library back.
+#[derive(Clone, Copy, Debug)]
+struct Swipe {
+    x: f32,
+    y: f32,
+    /// Towards the terminal, in pixels a second.
+    velocity: f32,
+    last: Instant,
+    sideways: bool,
+}
+
 /// The row of cards on its way to show in full a card chosen from it, as
 /// the card goes back.
 #[derive(Clone, Copy, Debug)]
@@ -241,6 +264,11 @@ pub(crate) struct LibraryState {
     /// was bringing out.
     sidebar_out: f32,
     edge: Option<Edge>,
+    held: Option<Held>,
+    swipe: Option<Swipe>,
+    /// After a swipe that took the Library back or failed to: its momentum
+    /// is not for the cards.
+    swipe_momentum: bool,
     /// How far the row of cards is scrolled.
     scroll: f32,
     glide: Option<Glide>,
@@ -619,6 +647,7 @@ impl crate::TermWindow {
             || library.landing.moving()
             || library.edge.is_some()
             || library.glide.is_some()
+            || library.held.is_some()
     }
 
     /// A window out of sight, drawn as boxes, under a view covering the
@@ -685,6 +714,7 @@ impl crate::TermWindow {
         if !self.library.open {
             return;
         }
+        self.library.held = None;
         if self.library.edge.is_some() {
             self.commit_library_edge();
         }
@@ -717,6 +747,82 @@ impl crate::TermWindow {
         context.invalidate();
     }
 
+    /// A finger on the trackpad takes the Library out from the first Space
+    /// (`opening`), or back from beside its cards, as far as `pull` pixels
+    /// of the way the terminal's edge goes: the edge keeps under it.
+    pub(crate) fn hold_library(&mut self, opening: bool, pull: f32, context: &dyn WindowOps) {
+        if self.library.held.is_none() {
+            if opening {
+                if self.library.open {
+                    return;
+                }
+                self.open_library(context);
+            } else if !self.library.open || self.library_moving() {
+                return;
+            }
+            if !self.library.open || !self.library_drawable() {
+                return;
+            }
+            if !opening {
+                // The window's own card out of view: the row brings it in
+                // as the finger takes the Library back.
+                if let Some((glide, cut)) = self.library_glide_to(&self.active_space_id.clone()) {
+                    self.library.glide = Some(glide);
+                    self.library.flight_cut = Some(cut);
+                }
+            }
+            self.library.held = Some(Held { opening });
+        }
+        let along = clamp01(pull / self.library_reach());
+        let x = if opening { along } else { 1.0 - along };
+        for spring in [&mut self.library.out, &mut self.library.landing] {
+            spring.x = x;
+            spring.v = 0.0;
+            spring.delay = 0.0;
+        }
+        context.invalidate();
+    }
+
+    /// The finger lets go: the Library goes on to where it was being
+    /// taken, if it got halfway or was flung that way, else back; at
+    /// `velocity` pixels a second towards where it was being taken.
+    pub(crate) fn let_go_library(&mut self, velocity: f32, context: &dyn WindowOps) {
+        let Some(held) = self.library.held.take() else {
+            return;
+        };
+        let x = self.library.out.x;
+        let along = if held.opening { x } else { 1.0 - x };
+        let goes_on = along >= 0.5 || (velocity >= LET_GO_FLING && along > 0.02);
+        // Out of the finger's speed into the springs': the way it was going
+        // is towards 1 opening, towards 0 going back. Left where it began,
+        // it has nothing to carry on with.
+        let speed = if along > 0.02 {
+            velocity / self.library_reach() * if held.opening { 1.0 } else { -1.0 }
+        } else {
+            0.0
+        };
+        if held.opening != goes_on {
+            self.close_library(context);
+            // From where the finger left it, together: nothing has lifted
+            // out first for the Library to follow.
+            self.library.out.to(0.0, GO_BACK, 0.0);
+        } else {
+            self.library.out.to(1.0, COME_OUT, 0.0);
+            self.library.landing.to(1.0, LAND, 0.0);
+        }
+        self.library.paints = 0;
+        for spring in [&mut self.library.out, &mut self.library.landing] {
+            spring.v = speed;
+        }
+        context.invalidate();
+    }
+
+    /// How far the terminal's edge goes between the sidebar and the
+    /// Library, which is how far a finger takes the Library all the way.
+    fn library_reach(&self) -> f32 {
+        (self.library_shown_width() - self.library.sidebar_width).max(1.0)
+    }
+
     /// Let go of what the Library holds while it is on screen.
     fn release_library(&mut self) {
         let library = &mut self.library;
@@ -726,6 +832,9 @@ impl crate::TermWindow {
         library.flight = None;
         library.glide = None;
         library.flight_cut = None;
+        library.held = None;
+        library.swipe = None;
+        library.swipe_momentum = false;
         library.recordings.clear();
     }
 
@@ -736,6 +845,20 @@ impl crate::TermWindow {
             // Gone, however it went -- closed out of sight it never moved.
             self.release_library();
             return;
+        }
+        // A hold whose finger has gone -- its gesture cancelled, or taken
+        // over with no end -- lets go where the finger left it.
+        if let Some(held) = self.library.held {
+            let finger = if held.opening {
+                self.workspace_sidebar_swipe.library_pull().is_some()
+            } else {
+                self.library.swipe.is_some_and(|swipe| swipe.sideways)
+            };
+            if !finger {
+                if let Some(window) = self.window.clone() {
+                    self.let_go_library(0.0, &window);
+                }
+            }
         }
         if !self.library_moving() {
             self.library.last_step = None;
@@ -752,8 +875,15 @@ impl crate::TermWindow {
         let library = &mut self.library;
         library.last_step = Some(now);
         library.paints += 1;
+        if library.held.is_some() {
+            // Where the finger has it, for as long as it takes.
+            library.paints = 0;
+        }
         let give_up = !drawable || library.paints > MOST_PAINTS;
         for spring in [&mut library.out, &mut library.landing] {
+            if library.held.is_some() {
+                continue;
+            }
             if give_up {
                 spring.settle();
             } else {
@@ -2252,6 +2382,25 @@ impl crate::TermWindow {
         if !self.library_presented() || !matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_)) {
             return None;
         }
+        // What a swipe that took the Library in or out, or might have,
+        // flings on with is not for the cards -- until the next one begins.
+        if matches!(event.scroll_phase, Some(ScrollPhase::Began)) {
+            self.library.swipe_momentum = false;
+        }
+        if let Some(momentum) = event.momentum_phase {
+            let ended = matches!(momentum, ScrollPhase::Ended | ScrollPhase::Cancelled);
+            let after_space_swipe = self.workspace_sidebar_swipe.consume_momentum(ended);
+            let after_own = self.library.swipe_momentum;
+            if ended {
+                self.library.swipe_momentum = false;
+            }
+            if after_space_swipe || after_own {
+                return Some(true);
+            }
+        }
+        if let Some(handled) = self.swipe_library_back(event, context) {
+            return Some(handled);
+        }
         let left = self.get_os_border().left.get() as f32;
         let x = event.coords.x as f32;
         if x < left || x >= left + self.library_terminal_edge() {
@@ -2281,6 +2430,76 @@ impl crate::TermWindow {
         if let Some(delta) = sideways.or(down) {
             self.library.scroll += delta;
             context.invalidate();
+        }
+        Some(true)
+    }
+
+    /// A trackpad swipe begun on the Library beside its cards -- the rail,
+    /// the title, between and under them: sideways towards the terminal it
+    /// takes the Library back with it, as far as the finger goes. `None`
+    /// for any other, the cards' to scroll.
+    fn swipe_library_back(&mut self, event: &MouseEvent, context: &dyn WindowOps) -> Option<bool> {
+        let phase = library_swipe_phase(event.scroll_phase, event.momentum_phase)?;
+        let now = Instant::now();
+        let (dx, dy) = event
+            .precise_scroll_delta
+            .map(|delta| (delta.x, delta.y))
+            .unwrap_or((0.0, 0.0));
+        if matches!(phase, ScrollPhase::Began) {
+            self.library.swipe = None;
+            let left = self.get_os_border().left.get() as f32;
+            let at = euclid::point2(event.coords.x as f32, event.coords.y as f32);
+            if self.library.open
+                && !self.library_moving()
+                && at.x >= left
+                && at.x < left + self.library_terminal_edge()
+                && self.library_card_at(at).is_none()
+            {
+                self.library.swipe = Some(Swipe {
+                    x: 0.0,
+                    y: 0.0,
+                    velocity: 0.0,
+                    last: now,
+                    sideways: false,
+                });
+            }
+        }
+        let mut swipe = self.library.swipe?;
+        if matches!(phase, ScrollPhase::Began | ScrollPhase::Changed) {
+            let dt = now
+                .saturating_duration_since(swipe.last)
+                .as_secs_f32()
+                .clamp(1.0 / 240.0, 1.0 / 20.0);
+            swipe.last = now;
+            swipe.x += dx;
+            swipe.y += dy;
+            // Towards the terminal is the way the next Space is swiped to.
+            swipe.velocity = swipe.velocity * 0.65 + (-dx / dt) * 0.35;
+            if !swipe.sideways {
+                let (x, y) = (swipe.x.abs(), swipe.y.abs());
+                if x >= 8.0 && x > y * 1.15 && swipe.x > 0.0 {
+                    // Away from the terminal: the cards' to scroll along.
+                    self.library.swipe = None;
+                    return None;
+                } else if x >= 8.0 && x > y * 1.15 {
+                    swipe.sideways = true;
+                } else if y >= 18.0 {
+                    // Up or down: the cards' as any wheel is.
+                    self.library.swipe = None;
+                    return None;
+                }
+            }
+        }
+        self.library.swipe = Some(swipe);
+        if swipe.sideways {
+            self.hold_library(false, (-swipe.x).max(0.0), context);
+        }
+        if matches!(phase, ScrollPhase::Ended | ScrollPhase::Cancelled) {
+            self.library.swipe = None;
+            if swipe.sideways {
+                self.library.swipe_momentum = true;
+                self.let_go_library(swipe.velocity, context);
+            }
         }
         Some(true)
     }
@@ -2387,9 +2606,35 @@ impl crate::TermWindow {
     }
 }
 
+// macOS can start momentum without a scroll Ended. Release the finger
+// without applying the momentum delta to the held position.
+fn library_swipe_phase(
+    scroll: Option<ScrollPhase>,
+    momentum: Option<ScrollPhase>,
+) -> Option<ScrollPhase> {
+    scroll.or_else(|| matches!(momentum, Some(ScrollPhase::Began)).then_some(ScrollPhase::Ended))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn momentum_without_scroll_ended_releases_the_library_swipe() {
+        assert_eq!(
+            library_swipe_phase(Some(ScrollPhase::Changed), None),
+            Some(ScrollPhase::Changed)
+        );
+        assert_eq!(
+            library_swipe_phase(None, Some(ScrollPhase::Began)),
+            Some(ScrollPhase::Ended)
+        );
+        assert_eq!(library_swipe_phase(None, Some(ScrollPhase::Changed)), None);
+        assert_eq!(
+            library_swipe_phase(Some(ScrollPhase::Cancelled), None),
+            Some(ScrollPhase::Cancelled)
+        );
+    }
 
     fn space(id: &str, domain: Option<&str>) -> SpaceView {
         SpaceView {
