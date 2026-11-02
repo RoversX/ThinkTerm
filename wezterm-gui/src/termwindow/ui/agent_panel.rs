@@ -11,6 +11,7 @@ use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::right_sidebar::{
     right_sidebar_file_row_metrics, sidebar_row_element_visible, FILE_SCROLL_FADE_HEIGHT,
+    REMOTE_EMPTY_DETAIL_GAP, REMOTE_EMPTY_ICON_GAP, REMOTE_EMPTY_ICON_SIZE,
 };
 use crate::termwindow::ui::tokens::{
     SIDEBAR_ICON_GAP, SIDEBAR_INSET, SIDEBAR_ROW_RADIUS, TAB_ICON_GLYPH_RATIO,
@@ -88,7 +89,6 @@ impl TermWindow {
         content_top: usize,
         content_width: usize,
         status: Option<&str>,
-        has_agents: bool,
     ) -> anyhow::Result<()> {
         let cell_height = ui_metrics.cell_size.height as usize;
         let button_height = self.agents_toolbar_button_height(cell_height);
@@ -110,13 +110,13 @@ impl TermWindow {
 
         // The line to the left of that button, only when there is something
         // to say: a reload acknowledgement while it lives, because it is the
-        // answer to the click that just happened, or why the list is empty.
-        // A running count would only repeat the group headings, cut short.
+        // answer to the click that just happened, or that detection is off.
+        // An empty list says so in the panel's middle instead. A running
+        // count would only repeat the group headings, cut short.
         let detection_on = agent_status::enabled();
         let line = match status {
             Some(status) => status.to_string(),
             None if !detection_on => crate::i18n::tr("right-agents-detection-off"),
-            None if !has_agents => crate::i18n::tr("right-agents-none"),
             None => String::new(),
         };
         if status.is_some() {
@@ -144,6 +144,96 @@ impl TermWindow {
                 height: button_height,
                 item_type: UIItemType::RightSidebarAgent(AgentPanelAction::OpenSettings),
             });
+        }
+        Ok(())
+    }
+
+    /// The panel with nothing in it: the tab's icon, a title and a line on
+    /// what shows up here, centred like the remote Files panel's empty state.
+    /// Agents are not all that lands in this list -- a program reporting its
+    /// progress does too -- so the words do not say "agent" alone.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_agents_empty_state(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_font: &Rc<LoadedFont>,
+        ui_metrics: RenderMetrics,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        font_size: f64,
+        content_x: usize,
+        content_top: usize,
+        content_width: usize,
+        content_bottom: usize,
+    ) -> anyhow::Result<()> {
+        // The card titles' semibold, so the title reads as one.
+        let title_font = self
+            .fonts
+            .title_font_with_size_and_weight(font_size, 600)
+            .context("agents empty state title font")?;
+        let title_metrics = RenderMetrics::with_font_metrics(&title_font.metrics());
+        let title_h = title_metrics.cell_size.height as usize;
+        let line_h = ui_metrics.cell_size.height as usize;
+        let icon_size = self.ui_px(REMOTE_EMPTY_ICON_SIZE);
+        let icon_gap = self.ui_px(REMOTE_EMPTY_ICON_GAP);
+        let detail_gap = self.ui_px(REMOTE_EMPTY_DETAIL_GAP);
+        // Narrower than the panel, so the explanation sets as a short block
+        // instead of running edge to edge.
+        let text_width = content_width
+            .saturating_sub(self.ui_px(SIDEBAR_INSET) * 4)
+            .max(1);
+
+        let title = crate::i18n::tr("right-agents-empty-title");
+        let detail = crate::i18n::tr("right-agents-empty-detail");
+        let (title_lines, detail_lines) = {
+            let wrap = |font: &Rc<LoadedFont>, text: &str| {
+                wrap_at_line_breaks(text, |line| {
+                    self.sidebar_text_width(font, line).unwrap_or(f32::MAX) <= text_width as f32
+                })
+            };
+            (wrap(&title_font, &title), wrap(ui_font, &detail))
+        };
+
+        let block_h = icon_size
+            + icon_gap
+            + title_lines.len() * title_h
+            + detail_gap
+            + detail_lines.len() * line_h;
+        // Centre in the panel, but never above its top edge when short.
+        let available = content_bottom.saturating_sub(content_top);
+        let mut y = content_top + available.saturating_sub(block_h) / 2;
+
+        let icon_x = content_x + content_width.saturating_sub(icon_size) / 2;
+        // Faint, like the line under the title: the title is what reads first.
+        self.paint_sidebar_icon(layers, SvgIcon::Eye, icon_x, y, icon_size, chrome.muted_text)?;
+        y += icon_size + icon_gap;
+
+        for line in &title_lines {
+            self.paint_remote_files_centered_text(
+                layers,
+                &title_font,
+                title_metrics,
+                line,
+                content_x,
+                y,
+                content_width,
+                foreground,
+            )?;
+            y += title_h;
+        }
+        y += detail_gap;
+        for line in &detail_lines {
+            self.paint_remote_files_centered_text(
+                layers,
+                ui_font,
+                ui_metrics,
+                line,
+                content_x,
+                y,
+                content_width,
+                chrome.muted_text,
+            )?;
+            y += line_h;
         }
         Ok(())
     }
@@ -190,11 +280,7 @@ impl TermWindow {
             self.right_sidebar_agents_list = None;
             self.right_sidebar_agents_fitted.clear();
             self.right_sidebar_agents_open_subtasks.clear();
-            // Nothing but the toolbar: an empty-state card here is a large
-            // bordered box explaining that a list is empty, which the
-            // toolbar line already says in one row. The panel reads as
-            // quiet rather than broken.
-            return self.paint_agents_toolbar(
+            self.paint_agents_toolbar(
                 layers,
                 ui_font,
                 ui_metrics,
@@ -205,8 +291,24 @@ impl TermWindow {
                 content_top,
                 content_width,
                 status.as_deref(),
-                has_agents,
-            );
+            )?;
+            // With detection off the toolbar line says so and leads to the
+            // switch; there is nothing to wait for, so no empty state.
+            if agent_status::enabled() {
+                self.paint_agents_empty_state(
+                    layers,
+                    ui_font,
+                    ui_metrics,
+                    chrome,
+                    foreground,
+                    font_size,
+                    content_x,
+                    content_top,
+                    content_width,
+                    content_bottom,
+                )?;
+            }
+            return Ok(());
         }
 
         // The view menu's choices: what is hidden, then how the rest is
@@ -983,7 +1085,6 @@ impl TermWindow {
             content_top,
             content_width,
             status.as_deref(),
-            has_agents,
         )?;
         if scrolled {
             let fade_height = self
@@ -2307,9 +2408,45 @@ fn agent_row_visible_band(
     })
 }
 
+/// `text` as lines that each `fits`, broken where Unicode allows: between
+/// words, and between the characters of a script written without spaces, so
+/// Chinese and Japanese wrap as evenly as English and no line starts with
+/// "，". A piece too wide for a line on its own is left whole.
+fn wrap_at_line_breaks(text: &str, mut fits: impl FnMut(&str) -> bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    let mut last_break = 0;
+    for (at, _) in unicode_linebreak::linebreaks(text) {
+        if last_break > line_start && !fits(text[line_start..at].trim_end()) {
+            lines.push(text[line_start..last_break].trim_end().to_string());
+            line_start = last_break;
+        }
+        last_break = at;
+    }
+    if line_start < text.len() {
+        lines.push(text[line_start..].trim_end().to_string());
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{agent_row_visible_band, AgentRowBand, ShimmerBand};
+    use super::{agent_row_visible_band, wrap_at_line_breaks, AgentRowBand, ShimmerBand};
+
+    #[test]
+    fn chinese_wraps_between_characters_and_never_starts_a_line_with_a_comma() {
+        // Eight characters a line, whatever the script.
+        let lines = wrap_at_line_breaks("在终端里运行程序，它们会显示在这里。", |line| {
+            line.chars().count() <= 8
+        });
+        assert_eq!(lines, ["在终端里运行程", "序，它们会显示在", "这里。"]);
+    }
+
+    #[test]
+    fn english_wraps_between_words() {
+        let lines = wrap_at_line_breaks("show up here once they run", |line| line.len() <= 12);
+        assert_eq!(lines, ["show up here", "once they", "run"]);
+    }
 
     const H: usize = 52;
     const TOP: usize = 100;

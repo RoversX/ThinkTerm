@@ -151,10 +151,11 @@ const PREVIEW_OPEN_BUTTON_MIN: usize = 80;
 /// Narrower than this and the "Open With" button drops its dropdown arrow.
 const PREVIEW_OPEN_SPLIT_MIN_WIDTH: usize = 112;
 const PREVIEW_OPEN_ARROW_WIDTH: usize = 36;
-/// Empty-state geometry for the remote Files panel, in design pixels.
-const REMOTE_EMPTY_ICON_SIZE: usize = 40;
-const REMOTE_EMPTY_ICON_GAP: usize = 18;
-const REMOTE_EMPTY_DETAIL_GAP: usize = 6;
+/// Empty-state geometry for the remote Files panel, in design pixels. The
+/// Status panel's empty state uses it too.
+pub(crate) const REMOTE_EMPTY_ICON_SIZE: usize = 40;
+pub(crate) const REMOTE_EMPTY_ICON_GAP: usize = 18;
+pub(crate) const REMOTE_EMPTY_DETAIL_GAP: usize = 6;
 const REMOTE_EMPTY_BUTTON_GAP: usize = 22;
 const REMOTE_EMPTY_BUTTON_HEIGHT: usize = 44;
 /// Toolbar control height.
@@ -13833,7 +13834,7 @@ impl crate::TermWindow {
     /// Horizontally centre a single line, falling back to the full width (and
     /// therefore ellipsizing) only when the text cannot fit.
     #[allow(clippy::too_many_arguments)]
-    fn paint_remote_files_centered_text(
+    pub(crate) fn paint_remote_files_centered_text(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
         ui_font: &Rc<LoadedFont>,
