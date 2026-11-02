@@ -910,6 +910,12 @@ async fn say_why<S: ConnectionStream>(
 /// everything else becomes the PDU it will be sent as, with whatever the
 /// mux has to be asked read here.
 fn item_for_notification(n: MuxNotification) -> Option<Item> {
+    // Not a word of another machine's terminals a window keeps from the
+    // programs here, asked again as each is sent: one that heard of them
+    // while it might goes on hearing of them no longer.
+    if crate::foreign_panes::hides(&n) {
+        return None;
+    }
     let write = |pdu: Pdu| Some(Item::WritePdu(DecodedPdu { serial: 0, pdu }));
     match n {
         MuxNotification::PaneOutput(_)

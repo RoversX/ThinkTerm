@@ -4,6 +4,7 @@ use anyhow::{bail, Context};
 use clap::Parser;
 use codec::Pdu;
 use mux::pane::PaneId;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::time::Duration;
 use thinkterm_proto::{TabId, WindowId};
@@ -393,20 +394,81 @@ impl Event {
     }
 }
 
+/// Current identities plus a bounded tail for removals queued before a
+/// listing refresh. A removal releases its identity once printed.
+#[derive(Default)]
+struct PaneNames {
+    live: HashMap<PaneId, Option<String>>,
+    removed: VecDeque<(PaneId, String)>,
+}
+
+impl PaneNames {
+    fn refresh(&mut self, listing: codec::ListPanesResponse) {
+        let mut live: HashMap<PaneId, Option<String>> = listing
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.entries())
+            .map(|pane| (pane.pane_id, None))
+            .collect();
+        for (pane_id, on) in listing.pane_machines {
+            live.insert(pane_id, Some(format!("{}/{}", on.machine, on.pane_id)));
+        }
+        for (pane_id, name) in std::mem::replace(&mut self.live, live) {
+            if !self.live.contains_key(&pane_id) {
+                if let Some(name) = name {
+                    self.removed.push_back((pane_id, name));
+                }
+            }
+        }
+        while self.removed.len() > BACKLOG {
+            self.removed.pop_front();
+        }
+    }
+
+    fn knows(&self, pane_id: PaneId) -> bool {
+        self.live.contains_key(&pane_id) || self.removed.iter().any(|(id, _)| *id == pane_id)
+    }
+
+    fn get(&self, pane_id: PaneId) -> Option<&str> {
+        if let Some(name) = self.live.get(&pane_id) {
+            return name.as_deref();
+        }
+        self.removed
+            .iter()
+            .rev()
+            .find(|(id, _)| *id == pane_id)
+            .map(|(_, name)| name.as_str())
+    }
+
+    fn forget(&mut self, pane_id: PaneId) {
+        self.live.remove(&pane_id);
+        self.removed.retain(|(id, _)| *id != pane_id);
+    }
+}
+
 impl EventsCommand {
     pub async fn run(self, client: Client) -> anyhow::Result<()> {
-        let only_pane = match &self.pane {
-            Some(name) => Some(crate::cli::target::resolve(&client, None, Some(name)).await?),
-            None => self.pane_id,
+        let (client, only_pane) = match &self.pane {
+            Some(name) => {
+                let (client, pane_id) =
+                    crate::cli::target::resolve_reaching_servers(client, None, Some(name)).await?;
+                (client, Some(pane_id))
+            }
+            None => (client, self.pane_id),
         };
         let format = if self.json {
             CliOutputFormatKind::Json
         } else {
             self.format
         };
+        // A pane on a server, heard of through the window, by the name
+        // that reaches it again -- `MACHINE/ID` -- rather than the window's
+        // own number for it, which names some other pane anywhere else.
         let pushes = wezterm_client::client::tap_unilateral_pdus(BACKLOG);
         client.subscribe_events(codec::SubscribeEvents {}).await?;
         let mut subscribed_on = client.connection_generation();
+        let mut on_servers = PaneNames::default();
+        on_servers.refresh(client.list_panes().await?);
 
         let out = std::io::stdout();
         loop {
@@ -415,6 +477,7 @@ impl EventsCommand {
             if client.connection_generation() != subscribed_on {
                 subscribed_on = client.connection_generation();
                 client.subscribe_events(codec::SubscribeEvents {}).await?;
+                on_servers.refresh(client.list_panes().await?);
             }
             let next = smol::future::or(async { Some(pushes.recv().await) }, async {
                 smol::Timer::after(LIVENESS_INTERVAL).await;
@@ -435,18 +498,46 @@ impl EventsCommand {
             let Some(event) = Event::from_pdu(pdu) else {
                 continue;
             };
+            if matches!(event, Event::PaneAdded { .. } | Event::TabAdded { .. })
+                || event.pane_id().is_some_and(|id| !on_servers.knows(id))
+            {
+                on_servers.refresh(client.list_panes().await?);
+            }
             if only_pane.is_some() && event.pane_id() != only_pane {
+                if let Event::PaneRemoved { pane_id } = event {
+                    on_servers.forget(pane_id);
+                }
                 continue;
             }
+            let on_server = event.pane_id().and_then(|pane_id| {
+                on_servers
+                    .get(pane_id)
+                    .map(|name| (format!("pane {pane_id}"), name))
+            });
             let line = match format {
-                CliOutputFormatKind::Json => serde_json::to_string(&event)?,
-                CliOutputFormatKind::Table => format!(
-                    "{}  {}",
-                    chrono::Local::now().format("%H:%M:%S"),
-                    printable(&event.describe())
-                ),
+                CliOutputFormatKind::Json => {
+                    let mut value = serde_json::to_value(&event)?;
+                    if let (Some((_, name)), Some(fields)) = (&on_server, value.as_object_mut()) {
+                        fields.insert("pane".to_string(), (*name).into());
+                    }
+                    value.to_string()
+                }
+                CliOutputFormatKind::Table => {
+                    let mut text = event.describe();
+                    if let Some((window_number, name)) = &on_server {
+                        text = text.replacen(window_number.as_str(), &format!("pane {name}"), 1);
+                    }
+                    format!(
+                        "{}  {}",
+                        chrono::Local::now().format("%H:%M:%S"),
+                        printable(&text)
+                    )
+                }
             };
             writeln!(out.lock(), "{line}").map_err(crate::stdout_error)?;
+            if let Event::PaneRemoved { pane_id } = event {
+                on_servers.forget(pane_id);
+            }
         }
     }
 }
@@ -454,6 +545,55 @@ impl EventsCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn machines(ids: &[PaneId]) -> codec::ListPanesResponse {
+        codec::ListPanesResponse {
+            tabs: vec![],
+            tab_titles: vec![],
+            window_titles: HashMap::new(),
+            pane_labels: HashMap::new(),
+            pane_machines: ids
+                .iter()
+                .map(|id| {
+                    (
+                        *id,
+                        codec::PaneMachine {
+                            machine: "devbox".to_string(),
+                            pane_id: id + 10,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn event_names_follow_new_panes_and_survive_refresh_until_removal() {
+        let mut names = PaneNames::default();
+        names.refresh(machines(&[1]));
+        names.refresh(machines(&[1, 2]));
+        assert_eq!(names.get(2), Some("devbox/12"));
+        // A reconnect/list refresh can precede queued removal events.
+        names.refresh(machines(&[2, 3]));
+        assert_eq!(names.get(1), Some("devbox/11"));
+        assert_eq!(names.get(3), Some("devbox/13"));
+        names.forget(1);
+        assert!(!names.knows(1));
+        names.forget(2);
+        assert!(!names.knows(2));
+    }
+
+    #[test]
+    fn lost_removal_events_cannot_grow_retired_names_without_bound() {
+        let mut names = PaneNames::default();
+        for id in 0..BACKLOG + 2 {
+            names.refresh(machines(&[id]));
+        }
+        assert_eq!(names.removed.len(), BACKLOG);
+        assert_eq!(names.get(0), None);
+        assert!(names.get(BACKLOG).is_some());
+        assert!(names.get(BACKLOG + 1).is_some());
+    }
 
     #[test]
     fn an_unavailable_program_exit_status_is_explicit() {

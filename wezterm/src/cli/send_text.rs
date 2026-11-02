@@ -36,8 +36,12 @@ pub struct SendText {
 
 impl SendText {
     pub async fn run(self, client: Client) -> anyhow::Result<()> {
-        let pane_id =
-            crate::cli::target::resolve(&client, self.pane_id, self.pane.as_deref()).await?;
+        let (client, pane_id) = crate::cli::target::resolve_reaching_servers(
+            client,
+            self.pane_id,
+            self.pane.as_deref(),
+        )
+        .await?;
 
         let data = match self.text {
             Some(text) => text,

@@ -760,6 +760,28 @@ pub fn connect_domain_label(domain_name: &str) -> String {
     domain_name.to_string()
 }
 
+/// What a domain that is a connection to another machine is called where
+/// the command line names it (`--pane MACHINE/ID`): the label of the saved
+/// host it reaches -- over a session server there, or a plain SSH session --
+/// or, for one that is not saved, its own name.
+pub fn machine_label(domain_name: &str) -> String {
+    if let Ok(store) = host_store() {
+        let label = store
+            .hosts
+            .iter()
+            .map(|record| &record.spec)
+            .find(|spec| {
+                connect_domain_name(spec) == domain_name || ssh_domain_name(spec) == domain_name
+            })
+            .map(|spec| spec.label.trim().to_string())
+            .filter(|label| !label.is_empty());
+        if let Some(label) = label {
+            return label;
+        }
+    }
+    connect_domain_label(domain_name)
+}
+
 fn label_for_connect_domain<'a>(
     mut specs: impl Iterator<Item = &'a SshHostSpec>,
     domain_name: &str,

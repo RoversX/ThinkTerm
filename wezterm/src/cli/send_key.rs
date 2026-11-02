@@ -56,14 +56,22 @@ impl SendKey {
             .map_err(|err| UsageError(format!("{err:#}")))?;
 
         if !self.wait {
-            let pane_id =
-                crate::cli::target::resolve(&client, self.pane_id, self.pane.as_deref()).await?;
+            let (client, pane_id) = crate::cli::target::resolve_reaching_servers(
+                client,
+                self.pane_id,
+                self.pane.as_deref(),
+            )
+            .await?;
             return send_keys(&client, pane_id, events).await;
         }
         let code = with_deadline(deadline, async {
             // Finding the focused pane asks the server too.
-            let pane_id =
-                crate::cli::target::resolve(&client, self.pane_id, self.pane.as_deref()).await?;
+            let (client, pane_id) = crate::cli::target::resolve_reaching_servers(
+                client.clone(),
+                self.pane_id,
+                self.pane.as_deref(),
+            )
+            .await?;
             // Counted before the keys go, so a command that finishes at
             // once is not missed.
             let before = shell_commands(&client, pane_id).await?.finished;

@@ -48,8 +48,12 @@ impl WaitCommand {
     pub async fn run(self, client: Client) -> anyhow::Result<()> {
         let deadline = self.timeout.map(|t| Instant::now() + t);
         let code = with_deadline(deadline, async {
-            let pane_id =
-                crate::cli::target::resolve(&client, self.pane_id, self.pane.as_deref()).await?;
+            let (client, pane_id) = crate::cli::target::resolve_reaching_servers(
+                client.clone(),
+                self.pane_id,
+                self.pane.as_deref(),
+            )
+            .await?;
             Ok(if self.command {
                 let before = shell_commands(&client, pane_id).await?;
                 // A command typed a moment ago may not have reached the shell.

@@ -225,6 +225,7 @@ mod tests {
             tab_titles: vec!["".to_string(), "work".to_string(), "".to_string()],
             window_titles: Default::default(),
             pane_labels: Default::default(),
+            pane_machines: Default::default(),
         }
     }
 
@@ -283,6 +284,7 @@ mod tests {
             tab_titles: vec![],
             window_titles: Default::default(),
             pane_labels: Default::default(),
+            pane_machines: Default::default(),
         };
         assert_eq!(first_choice(&stack).map(|e| e.pane_id), Some(31));
     }

@@ -1619,6 +1619,13 @@ impl SessionHandler {
             }
         }
 
+        // The terminals of the machines a window is connected to, as far as
+        // its Settings let the programs on this one have them.
+        if let Err(err) = crate::foreign_panes::gate(&decoded.pdu) {
+            send_response(Err(err));
+            return;
+        }
+
         if requires_existing_frontend_access(&decoded.pdu) {
             if let Err(err) = require_registered_frontend_access(
                 &Mux::get(),
@@ -1806,6 +1813,9 @@ impl SessionHandler {
                                 let Some(status) = pane.agent_status() else {
                                     continue;
                                 };
+                                if crate::foreign_panes::hidden(pane.pane_id()) {
+                                    continue;
+                                }
                                 agents.push((pane.pane_id(), status, pane.get_title()));
                             }
                             if agents.is_empty() {
@@ -1860,6 +1870,9 @@ impl SessionHandler {
                                 .iter_panes()
                                 .into_iter()
                                 .filter_map(|pane| {
+                                    if crate::foreign_panes::hidden(pane.pane_id()) {
+                                        return None;
+                                    }
                                     let program = pane.foreground_program()?;
                                     Some(ForegroundProgramEntry {
                                         pane_id: pane.pane_id(),
@@ -1899,20 +1912,39 @@ impl SessionHandler {
                             let mut tabs = vec![];
                             let mut tab_titles = vec![];
                             let mut window_titles = HashMap::new();
+                            let mut pane_machines = HashMap::new();
                             for window_id in mux.iter_windows().into_iter() {
                                 let window = mux.get_window(window_id).unwrap();
                                 window_titles.insert(window_id, window.get_title().to_string());
                                 for tab in window.iter() {
-                                    tabs.push(tab.codec_pane_tree());
+                                    let tree = crate::foreign_panes::visible_tree(
+                                        tab.codec_pane_tree(),
+                                        &crate::foreign_panes::hidden,
+                                    );
+                                    if matches!(tree, mux::tab::PaneNode::Empty) {
+                                        continue;
+                                    }
+                                    for pane in tree.entries() {
+                                        if let Some(machine) =
+                                            crate::foreign_panes::machine(pane.pane_id)
+                                        {
+                                            pane_machines.insert(pane.pane_id, machine);
+                                        }
+                                    }
+                                    tabs.push(tree);
                                     tab_titles.push(tab.get_title());
                                 }
                             }
                             log::trace!("ListPanes {tabs:#?} {tab_titles:?}");
+                            let mut pane_labels = mux.pane_labels();
+                            pane_labels
+                                .retain(|pane_id, _| !crate::foreign_panes::hidden(*pane_id));
                             Ok(Pdu::ListPanesResponse(ListPanesResponse {
                                 tabs,
                                 tab_titles,
                                 window_titles,
-                                pane_labels: mux.pane_labels(),
+                                pane_labels,
+                                pane_machines,
                             }))
                         },
                         send_response,
@@ -2619,6 +2651,13 @@ impl SessionHandler {
 
             Pdu::GetPaneRenderableDimensions(GetPaneRenderableDimensions { pane_id }) => {
                 spawn_into_main_thread(async move {
+                    // Another machine's pane, as that machine has it.
+                    if let Some(fetched) =
+                        crate::foreign_panes::dimensions_from_its_machine(pane_id).await
+                    {
+                        send_response(fetched.map(Pdu::GetPaneRenderableDimensionsResponse));
+                        return;
+                    }
                     catch(
                         move || {
                             let mux = Mux::get();
@@ -2729,6 +2768,19 @@ impl SessionHandler {
                     lines
                 };
                 spawn_into_main_thread(async move {
+                    // The upstream connection belongs to the owner and
+                    // does not carry this viewer's history restriction.
+                    // Screen-only shares must use get_screen_lines below.
+                    if !screen_only {
+                        if let Some(fetched) =
+                            crate::foreign_panes::lines_from_its_machine(pane_id, lines.clone()).await
+                        {
+                            send_response(fetched.map(|lines| {
+                                Pdu::GetLinesResponse(GetLinesResponse { pane_id, lines })
+                            }));
+                            return;
+                        }
+                    }
                     // Read once the pane can be read without waiting, like
                     // a push: the client asks again for rows it does not
                     // get, and the main thread has everyone else's work.

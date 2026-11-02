@@ -1751,6 +1751,42 @@ impl Default for NativeWebSettings {
     }
 }
 
+/// How far the programs on this machine -- `thinkterm cli`, the agents it
+/// is run by, plugins -- may reach the terminals of the servers a window is
+/// connected to: Settings › Agents. Off until turned on: what they would
+/// reach is a shell on another machine, logged in as the person at the
+/// window (`wezterm_mux_server_impl::foreign_panes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeServerTerminals {
+    #[default]
+    Off,
+    /// Listed and read, not typed into.
+    Read,
+    /// Listed, read and typed into.
+    Type,
+}
+
+impl NativeServerTerminals {
+    /// Every choice, in the order the settings window offers them.
+    pub(crate) const ALL: [Self; 3] = [Self::Off, Self::Read, Self::Type];
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct NativeAgentsSettings {
+    /// A build without a choice a newer one made falls back to off rather
+    /// than failing the file.
+    #[serde(deserialize_with = "choice_or_default")]
+    pub(crate) server_terminals: NativeServerTerminals,
+}
+
+/// How far the programs here may reach servers' terminals. Through the
+/// shared handle: asked of every request a program makes of one.
+pub(crate) fn server_terminals() -> NativeServerTerminals {
+    load_shared().agents.server_terminals
+}
+
 /// Sharing a terminal with other accounts on its machine
 /// (`termwindow::share`): the Share & Sync page. Off until turned on.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -2084,6 +2120,7 @@ pub(crate) struct ThinkTermNativeSettings {
     pub(crate) web: NativeWebSettings,
     pub(crate) tab_icons: NativeTabIconSettings,
     pub(crate) sharing: NativeSharingSettings,
+    pub(crate) agents: NativeAgentsSettings,
 }
 
 impl Default for ThinkTermNativeSettings {
@@ -2104,6 +2141,7 @@ impl Default for ThinkTermNativeSettings {
             web: NativeWebSettings::default(),
             tab_icons: NativeTabIconSettings::default(),
             sharing: NativeSharingSettings::default(),
+            agents: NativeAgentsSettings::default(),
         }
     }
 }

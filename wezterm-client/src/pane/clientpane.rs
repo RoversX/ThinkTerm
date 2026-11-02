@@ -484,6 +484,42 @@ impl ClientPane {
         self.remote_tab_id.load(Ordering::Relaxed)
     }
 
+    /// `lines` as the server has them, asked of it now rather than read
+    /// from what this side holds: rows not shown here yet come back blank
+    /// from that, until fetched.
+    /// Whether what is typed here reaches the server: not while its
+    /// terminal is another device's to use, or not this side's yet, or the
+    /// connection is not up. Typing then is dropped, as the window shows.
+    pub fn frontend_gate(&self) -> crate::domain::RemoteFrontendGate {
+        self.client.remote_frontend_gate()
+    }
+
+    /// Where the cursor is and how far the rows run, as the server has
+    /// them now: what this side holds is only as fresh as what it has shown.
+    pub async fn fetch_dimensions(&self) -> anyhow::Result<GetPaneRenderableDimensionsResponse> {
+        self.client
+            .client
+            .get_dimensions(GetPaneRenderableDimensions {
+                pane_id: self.remote_pane_id,
+            })
+            .await
+    }
+
+    pub async fn fetch_lines(
+        &self,
+        lines: Vec<Range<StableRowIndex>>,
+    ) -> anyhow::Result<SerializedLines> {
+        let response = self
+            .client
+            .client
+            .get_lines(GetLines {
+                pane_id: self.remote_pane_id,
+                lines,
+            })
+            .await?;
+        Ok(response.lines)
+    }
+
     pub fn remote_viewport_state(&self) -> Option<codec::ClientViewportState> {
         self.client.remote_viewport_state(self.remote_tab_id())
     }

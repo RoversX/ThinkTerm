@@ -87,8 +87,12 @@ impl GetText {
         client: Client,
         pushes: Option<smol::channel::Receiver<Pdu>>,
     ) -> anyhow::Result<()> {
-        let pane_id =
-            crate::cli::target::resolve(&client, self.pane_id, self.pane.as_deref()).await?;
+        let (client, pane_id) = crate::cli::target::resolve_reaching_servers(
+            client,
+            self.pane_id,
+            self.pane.as_deref(),
+        )
+        .await?;
 
         let info = client
             .get_dimensions(codec::GetPaneRenderableDimensions { pane_id })

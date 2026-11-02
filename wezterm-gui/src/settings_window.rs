@@ -1286,6 +1286,9 @@ impl SettingsSection {
                 "Copilot",
                 "Cursor",
                 "Detection Rules",
+                "Servers",
+                "Remote",
+                "thinkterm cli",
             ],
             Self::Archived => &[
                 "Archive",
@@ -1866,6 +1869,15 @@ fn localized_window_tabs_label(mode: crate::native_settings::NativeWindowTabs) -
     })
 }
 
+fn localized_server_terminals_label(reach: crate::native_settings::NativeServerTerminals) -> String {
+    use crate::native_settings::NativeServerTerminals;
+    crate::i18n::tr(match reach {
+        NativeServerTerminals::Off => "settings-server-terminals-off",
+        NativeServerTerminals::Read => "settings-server-terminals-read",
+        NativeServerTerminals::Type => "settings-server-terminals-type",
+    })
+}
+
 fn localized_server_placement_label(
     placement: crate::native_settings::NativeServerPlacement,
 ) -> String {
@@ -2297,6 +2309,7 @@ enum SettingsAction {
     SetTabBarShade(crate::native_settings::NativeShade),
     SetWindowTabs(crate::native_settings::NativeWindowTabs),
     SetServerPlacement(crate::native_settings::NativeServerPlacement),
+    SetServerTerminals(crate::native_settings::NativeServerTerminals),
     SetTerminalShade(crate::native_settings::NativeShade),
     SetThreadIcons(crate::native_settings::NativeThreadIcons),
     SetThreadStatus(crate::native_settings::NativeThreadStatus),
@@ -6714,6 +6727,7 @@ impl SettingsWindow {
             SettingsAction::SetServerPlacement(placement) => {
                 self.apply_server_placement(placement)
             }
+            SettingsAction::SetServerTerminals(reach) => self.apply_server_terminals(reach),
             SettingsAction::SetTerminalShade(shade) => self.apply_window_areas(
                 "settings-terminal-shade",
                 localized_shade_label(shade),
@@ -10732,6 +10746,70 @@ impl SettingsWindow {
     /// Settings › Agents › Status Display: a picture of where a program's
     /// own report shows, numbered like the switches under it, then one
     /// switch per part. Returns where the card ends.
+    /// Settings › Agents' card on how far the programs here may reach the
+    /// terminals of the servers a window is connected to, under its own
+    /// heading below `above`. Returns where it ends.
+    fn paint_server_terminals_card(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        above: f32,
+        max_width: f32,
+    ) -> anyhow::Result<f32> {
+        use crate::native_settings::NativeServerTerminals;
+        let card_padding = self.ui_px(36.0);
+        let row_x = x + card_padding;
+        let row_width = max_width - card_padding * 2.0;
+        let card_y = self.paint_card_heading(
+            layers,
+            x,
+            above,
+            max_width,
+            &crate::i18n::tr("settings-server-terminals-heading"),
+        )?;
+        // What turning it on lets a program do, as whom, takes its lines.
+        let layout = CardLayout {
+            description_lines: 4,
+            ..self.card_layout()
+        };
+        self.paint_card_as(layers, x, card_y, max_width, layout, |this, layers, top| {
+            let mut rows = RowCursor::new(top, this);
+            let options: Vec<(String, SettingsAction)> = NativeServerTerminals::ALL
+                .iter()
+                .map(|reach| {
+                    (
+                        localized_server_terminals_label(*reach),
+                        SettingsAction::SetServerTerminals(*reach),
+                    )
+                })
+                .collect();
+            let selected = NativeServerTerminals::ALL
+                .iter()
+                .position(|reach| *reach == this.native_settings.agents.server_terminals)
+                .unwrap_or(0);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Server,
+                TileColor::Orange,
+            )?;
+            rows.add(this.paint_segmented_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-server-terminals"),
+                &crate::i18n::tr("settings-server-terminals-description"),
+                &options,
+                selected,
+                rows.rule(),
+            )?);
+            Ok(rows.bottom)
+        })
+    }
+
     fn paint_agent_status_card(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -12528,6 +12606,7 @@ impl SettingsWindow {
         )?;
         let (status_card_y, _) = self.settings_card_geometry(section_y, 0);
         let status_bottom = self.paint_agent_status_card(layers, x, status_card_y, max_width)?;
+        let status_bottom = self.paint_server_terminals_card(layers, x, status_bottom, max_width)?;
         let integrations_title_y = status_bottom + self.settings_section_card_gap();
         let integrations_card_y = integrations_title_y + self.settings_section_card_gap();
         let integrations_first_row_y = integrations_card_y + self.settings_card_top_padding();
@@ -20197,6 +20276,38 @@ impl SettingsWindow {
                     &[
                         ("setting", setting),
                         ("value", localized_server_placement_label(placement)),
+                    ],
+                );
+            }
+            Err(err) => {
+                self.set_native_settings(crate::native_settings::load());
+                self.status = settings_tr(
+                    "settings-status-save-error",
+                    &[("setting", setting), ("error", format!("{err:#}"))],
+                );
+            }
+        }
+    }
+
+    /// How far the programs here may reach servers' terminals. The window's
+    /// server for the command line asks each time a program asks, so
+    /// saving is all it owes.
+    fn apply_server_terminals(&mut self, reach: crate::native_settings::NativeServerTerminals) {
+        self.ui.open_dropdown = None;
+        if crate::native_settings::load_shared().agents.server_terminals == reach {
+            return;
+        }
+        let mut merged = crate::native_settings::load();
+        merged.agents.server_terminals = reach;
+        self.set_native_settings(merged);
+        let setting = crate::i18n::tr("settings-server-terminals");
+        match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                self.status = settings_tr(
+                    "settings-status-value-now",
+                    &[
+                        ("setting", setting),
+                        ("value", localized_server_terminals_label(reach)),
                     ],
                 );
             }

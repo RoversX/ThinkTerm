@@ -1,5 +1,7 @@
 use crate::cli::CliOutputFormatKind;
 use clap::Parser;
+use codec::ListPanesResponse;
+use mux::pane::PaneId;
 use tabout::{tabulate_output, Alignment, Column};
 use wezterm_client::client::Client;
 use wezterm_term::TerminalSize;
@@ -18,32 +20,22 @@ pub struct ListCommand {
 
 impl ListCommand {
     pub async fn run(&self, client: Client) -> anyhow::Result<()> {
-        let mut output_items = vec![];
         let panes = client.list_panes().await?;
-
-        for (tabroot, tab_title) in panes.tabs.into_iter().zip(panes.tab_titles.iter()) {
-            let mut cursor = tabroot.into_tree().cursor();
-
-            loop {
-                if let Some(stack) = cursor.leaf_mut() {
-                    for entry in &stack.panes {
-                        let window_title = panes
-                            .window_titles
-                            .get(&entry.window_id)
-                            .map(|s| s.as_str())
-                            .unwrap_or("");
-                        output_items.push(CliListResultItem::from(
-                            entry.clone(),
-                            tab_title,
-                            window_title,
-                            panes.pane_labels.get(&entry.pane_id).cloned(),
-                        ));
-                    }
-                }
-                match cursor.preorder_next() {
-                    Ok(c) => cursor = c,
-                    Err(_) => break,
-                }
+        let mut output_items = items(panes, |_| true);
+        // Then the panes on servers, as the window this machine has open
+        // is connected to them and its Settings let programs here have
+        // them: asked of it unless it was asked already, and not waited
+        // on for long.
+        if crate::cli::servers_terminals_reachable()
+            && !output_items.iter().any(|item| item.machine.is_some())
+        {
+            let theirs = crate::cli::within_window_wait(async {
+                crate::cli::window_client().await?.list_panes().await.ok()
+            })
+            .await;
+            if let Some(theirs) = theirs {
+                let on_servers: Vec<PaneId> = theirs.pane_machines.keys().copied().collect();
+                output_items.extend(items(theirs, |pane_id| on_servers.contains(&pane_id)));
             }
         }
         let format = if self.json {
@@ -113,6 +105,66 @@ impl ListCommand {
     }
 }
 
+/// The panes `panes` lists, those `keep` keeps, as `list` prints them.
+fn items(panes: ListPanesResponse, keep: impl Fn(PaneId) -> bool) -> Vec<CliListResultItem> {
+    let mut output_items = vec![];
+    for (tabroot, tab_title) in panes.tabs.into_iter().zip(panes.tab_titles.iter()) {
+        let mut cursor = tabroot.into_tree().cursor();
+
+        loop {
+            if let Some(stack) = cursor.leaf_mut() {
+                for entry in &stack.panes {
+                    if !keep(entry.pane_id) {
+                        continue;
+                    }
+                    let window_title = panes
+                        .window_titles
+                        .get(&entry.window_id)
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
+                    let mut item = CliListResultItem::from(
+                        entry.clone(),
+                        tab_title,
+                        window_title,
+                        panes.pane_labels.get(&entry.pane_id).cloned(),
+                    );
+                    // Named by its machine and its id there.
+                    if let Some(on) = panes.pane_machines.get(&entry.pane_id) {
+                        item.machine = Some(on.machine.clone());
+                        item.pane_id =
+                            ListedPaneId::There(format!("{}/{}", on.machine, on.pane_id));
+                    }
+                    output_items.push(item);
+                }
+            }
+            match cursor.preorder_next() {
+                Ok(c) => cursor = c,
+                Err(_) => break,
+            }
+        }
+    }
+    output_items
+}
+
+/// A pane's id as `list` gives it: a number for one of this machine's, and
+/// `MACHINE/ID` for one on a server -- a string, so that it is never taken
+/// for one of this machine's and passed to `--pane-id`, but to `--pane`.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum ListedPaneId {
+    Here(PaneId),
+    There(String),
+}
+
+impl std::fmt::Display for ListedPaneId {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::Here(pane_id) => write!(f, "{pane_id}"),
+            Self::There(target) => f.write_str(target),
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 struct CliListResultPtySize {
     rows: usize,
@@ -133,9 +185,12 @@ struct CliListResultPtySize {
 struct CliListResultItem {
     window_id: mux::window::WindowId,
     tab_id: mux::tab::TabId,
-    pane_id: mux::pane::PaneId,
+    pane_id: ListedPaneId,
     /// The label the pane was given, if any.
     label: Option<String>,
+    /// The server the pane is on, when it is not this machine's: then
+    /// `pane_id` is `MACHINE/ID`, for `--pane`.
+    machine: Option<String>,
     workspace: String,
     size: CliListResultPtySize,
     title: String,
@@ -192,8 +247,9 @@ impl CliListResultItem {
         CliListResultItem {
             window_id,
             tab_id,
-            pane_id,
+            pane_id: ListedPaneId::Here(pane_id),
             label,
+            machine: None,
             workspace,
             size: CliListResultPtySize {
                 rows,
@@ -220,5 +276,22 @@ impl CliListResultItem {
             is_zoomed: is_zoomed_pane,
             tty_name,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pane_on_a_server_is_listed_by_a_name_no_id_here_could_be() {
+        let here = serde_json::to_string(&ListedPaneId::Here(3)).unwrap();
+        let there = serde_json::to_string(&ListedPaneId::There("devbox/3".into())).unwrap();
+        assert_eq!(here, "3");
+        assert_eq!(there, "\"devbox/3\"");
+        assert_eq!(
+            ListedPaneId::There("devbox/3".into()).to_string(),
+            "devbox/3"
+        );
     }
 }

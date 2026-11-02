@@ -7452,6 +7452,7 @@ mod tests {
             tab_titles: Vec::new(),
             window_titles: Default::default(),
             pane_labels: Default::default(),
+            pane_machines: Default::default(),
         };
         let at = |pane_id| tab_places(&layout, pane_id).map(|places| places.iter().map(|p| (p.pane, p.left, p.top)).collect::<Vec<_>>());
         assert_eq!(at(10), Some(vec![(10, 0, 0)]));

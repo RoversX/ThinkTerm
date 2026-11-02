@@ -895,7 +895,9 @@ macro_rules! pdu {
 /// 83: Sharing a pane with other accounts on the machine (Share* PDUs).
 /// 84: Render pushes say whether the program takes pastes bracketed
 ///     (GetPaneRenderChangesResponse::bracketed_paste).
-pub const CODEC_VERSION: usize = 84;
+/// 85: The machine a pane of another one is on (ListPanesResponse::
+///     pane_machines), as a window gives the panes it is connected to.
+pub const CODEC_VERSION: usize = 85;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -1331,6 +1333,18 @@ pub struct ListPanesResponse {
     /// The labels of the panes that have one.
     #[serde(default)]
     pub pane_labels: HashMap<PaneId, String>,
+    /// The panes that are another machine's, as a window connected to it
+    /// gives them: the machine, and each one's id there.
+    #[serde(default)]
+    pub pane_machines: HashMap<PaneId, PaneMachine>,
+}
+
+/// Where a pane of another machine is: the name the window gives the
+/// machine, and the pane's id on it.
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct PaneMachine {
+    pub machine: String,
+    pub pane_id: PaneId,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]
@@ -2792,6 +2806,7 @@ mod golden {
             tab_titles: vec!["main".to_string()],
             window_titles,
             pane_labels: HashMap::new(),
+            pane_machines: Default::default(),
         }
     }
 
@@ -2937,10 +2952,11 @@ mod golden {
         assert_eq!(back, command_spec());
     }
 
-    /// LIST_PANES as codec 81 writes it: the pane labels went on the end,
-    /// and an empty map is one zero byte after the bytes captured before.
+    /// LIST_PANES as codec 85 writes it: the pane labels went on the end at
+    /// 81, the panes' machines after them at 85, and an empty map is one
+    /// zero byte, each after the bytes captured before.
     fn list_panes_with_labels() -> Vec<u8> {
-        [LIST_PANES, &[0]].concat()
+        [LIST_PANES, &[0, 0]].concat()
     }
 
     /// RENDER_CHANGES as codec 84 writes it: whether the program takes
@@ -3570,7 +3586,7 @@ mod test {
         // tripwire: whoever bumps the codec must come here, confirm the
         // round-trips still cover the new version, and advance it
         // deliberately.
-        assert_eq!(CODEC_VERSION, 84);
+        assert_eq!(CODEC_VERSION, 85);
         use thinkterm_proto::{
             AgentEvidence, AgentState, AgentStatus, ProgramBlockedKind, ProgramReport,
             ProgramReportChild, ProgramReportState,
@@ -3640,7 +3656,7 @@ mod test {
     #[test]
     fn foreground_program_protocol_round_trip_at_version_74() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 84);
+        assert_eq!(CODEC_VERSION, 85);
         use thinkterm_proto::ForegroundProgram;
 
         fn round_trip(pdu: &Pdu) -> Pdu {
@@ -3741,7 +3757,7 @@ mod test {
     #[test]
     fn run_state_protocol_round_trip_at_version_80() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 84);
+        assert_eq!(CODEC_VERSION, 85);
         use thinkterm_proto::{PaneExit, PaneRunState, ProgramState, ShellCommands};
 
         let exit = PaneExit {
@@ -3804,6 +3820,13 @@ mod test {
                 tab_titles: vec![],
                 window_titles: HashMap::new(),
                 pane_labels: HashMap::from([(10, "reviewer".to_string())]),
+                pane_machines: HashMap::from([(
+                    12,
+                    PaneMachine {
+                        machine: "devbox".to_string(),
+                        pane_id: 3,
+                    },
+                )]),
             }),
             Pdu::GetWorkspaceNames(GetWorkspaceNames {}),
             Pdu::GetWorkspaceNamesResponse(GetWorkspaceNamesResponse {
@@ -3840,7 +3863,7 @@ mod test {
     fn frame_control_extension_round_trips_without_changing_legacy_version() {
         // The extension is asked for, so it needed no bump of its own; 74
         // is the foreground program's, which a server sends unasked.
-        assert_eq!(CODEC_VERSION, 84);
+        assert_eq!(CODEC_VERSION, 85);
         for pdu in [
             Pdu::GetKittyImage(GetKittyImage { pane_id: 3, image_id: 7, data_hash: [9; 32], have_frames: 2, image_epoch: Some(4) }),
             Pdu::GetKittyFrameSelections(GetKittyFrameSelections { pane_id: 3, subscribe: true }),

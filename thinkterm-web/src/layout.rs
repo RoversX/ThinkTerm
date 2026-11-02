@@ -738,6 +738,7 @@ mod tests {
             tab_titles: vec![],
             window_titles: Default::default(),
             pane_labels: Default::default(),
+            pane_machines: Default::default(),
         };
         assert!(matches!(tab_containing(&list, 7), Some(PaneNode::Leaf(e)) if e.pane_id == 7));
         assert!(tab_containing(&list, 9).is_none());
@@ -755,6 +756,7 @@ mod tests {
             tab_titles: vec!["a".into(), "b".into(), "c".into(), "d".into()],
             window_titles: Default::default(),
             pane_labels: Default::default(),
+            pane_machines: Default::default(),
         };
         let mut overflowing = pane(5, 80, 24, 0, 0, true);
         overflowing.physical_top = StableRowIndex::MAX;
