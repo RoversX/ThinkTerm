@@ -979,14 +979,22 @@ impl Tab {
     }
 
     pub fn set_title(&self, title: &str) {
-        let mut inner = self.inner.lock();
-        if inner.title != title {
+        let tab_id = {
+            let mut inner = self.inner.lock();
+            if inner.title == title {
+                return;
+            }
             inner.title = title.to_string();
-            Mux::try_get().map(|mux| {
-                mux.notify(MuxNotification::TabTitleChanged {
-                    tab_id: inner.id,
-                    title: title.to_string(),
-                })
+            inner.id
+        };
+        // Notified with the lock released: a subscriber is allowed to read
+        // this tab. The client domain does, deriving a mirror's remote tab
+        // id from its panes when the tab map has no entry, and reading the
+        // tab takes this same lock.
+        if let Some(mux) = Mux::try_get() {
+            mux.notify(MuxNotification::TabTitleChanged {
+                tab_id,
+                title: title.to_string(),
             });
         }
     }
@@ -4407,6 +4415,41 @@ mod test {
         let serial = SERIAL.lock();
         Mux::set_mux(&Arc::new(Mux::new(None)));
         MuxTestGuard { _serial: serial }
+    }
+
+    /// `set_title` changes the title and tells the mux about it. A
+    /// subscriber is allowed to read the tab it was told about: the client
+    /// domain does exactly that when a mirror's remote-id mapping is
+    /// missing, falling back to the panes' own remote tab id. Holding the
+    /// tab's lock across `Mux::notify` turns that read into a self-deadlock
+    /// on the GUI thread, with the rename never reaching the server.
+    #[test]
+    fn set_title_notifies_without_holding_the_tab_lock() {
+        let _mux = install_mux();
+        let size = test_size();
+        let tab = Arc::new(Tab::new(&size));
+        let watcher = Arc::clone(&tab);
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen_in_callback = Arc::clone(&seen);
+        Mux::get().subscribe(move |n| {
+            if matches!(n, MuxNotification::TabTitleChanged { .. }) {
+                seen_in_callback.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                assert!(
+                    watcher.count_panes().is_some(),
+                    "Tab::set_title held the tab lock while notifying; a \
+                     subscriber that reads the tab deadlocks"
+                );
+            }
+            true
+        });
+
+        tab.set_title("renamed");
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the title change must reach subscribers"
+        );
+        assert_eq!(tab.get_title(), "renamed");
     }
 
     #[test]
