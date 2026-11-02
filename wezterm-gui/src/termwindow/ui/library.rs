@@ -974,7 +974,14 @@ impl crate::TermWindow {
         let height = (self.dimensions.pixel_height as f32 - top - border.bottom.get() as f32).max(1.0);
         let width = self.library_shown_width();
         let rail = self.ui_f32(RAIL_WIDTH);
-        let title_y = self.workspace_sidebar_content_top(top as usize) as f32;
+        let title_y = self.workspace_sidebar_content_top(top as usize) as f32
+            + if !cfg!(target_os = "macos")
+                || self.window_state.contains(window::WindowState::FULL_SCREEN)
+            {
+                self.ui_f32(24.0)
+            } else {
+                0.0
+            };
         let cards_top = title_y + self.ui_f32(TITLE_HEIGHT) + self.ui_f32(16.0);
         let cards = euclid::rect(
             left + rail,
