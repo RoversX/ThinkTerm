@@ -35,7 +35,7 @@ impl Write for TmuxPtyWriter {
             keys: buf.to_vec(),
         }));
         TmuxDomainState::schedule_send_next_command(self.domain_id);
-        Ok(0)
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -56,7 +56,7 @@ impl Write for TmuxPty {
             keys: buf.to_vec(),
         }));
         TmuxDomainState::schedule_send_next_command(self.domain_id);
-        Ok(0)
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -168,5 +168,44 @@ impl MasterPty for TmuxPty {
     #[cfg(unix)]
     fn tty_name(&self) -> Option<std::path::PathBuf> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tmux::TmuxRemotePane;
+    use filedescriptor::Pipe;
+    use std::collections::VecDeque;
+
+    /// The terminal's writer thread uses `write_all`, which gives up on a
+    /// write that reports nothing written, and with it on the pane's input.
+    #[test]
+    fn queued_keys_count_as_written() {
+        static SCHEDULER: std::sync::Once = std::sync::Once::new();
+        SCHEDULER.call_once(|| {
+            promise::spawn::SimpleExecutor::new();
+        });
+        let mut writer = TmuxPtyWriter {
+            domain_id: 0,
+            master_pane: Arc::new(Mutex::new(TmuxRemotePane {
+                local_pane_id: 0,
+                output_write: Pipe::new().unwrap().write,
+                active_lock: Arc::new((Mutex::new(false), Condvar::new())),
+                session_id: 0,
+                window_id: 0,
+                pane_id: 0,
+                cursor_x: 0,
+                cursor_y: 0,
+                pane_width: 80,
+                pane_height: 24,
+                pane_left: 0,
+                pane_top: 0,
+            })),
+            cmd_queue: Arc::new(Mutex::new(VecDeque::new())),
+        };
+        writer.write_all(b"first").unwrap();
+        writer.write_all(b"second").unwrap();
+        assert_eq!(writer.cmd_queue.lock().len(), 2);
     }
 }
