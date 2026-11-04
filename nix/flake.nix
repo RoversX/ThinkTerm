@@ -68,6 +68,7 @@
           ]
           ++ lib.optionals stdenv.isLinux [
             libxkbcommon
+            pam
             wayland
 
             xorg.libX11

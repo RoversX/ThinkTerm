@@ -52,6 +52,8 @@ env_logger.workspace = true
 k9.workspace = true
 predicates.workspace = true
 rstest.workspace = true
+russh = { version = "0.63.3", default-features = false, features = ["ring"] }
 shell-words.workspace = true
 termwiz.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
 whoami.workspace = true

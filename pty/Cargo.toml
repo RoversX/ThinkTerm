@@ -24,6 +24,7 @@ default = []
 serde_support = ["serde"]
 
 [target."cfg(windows)".dependencies]
+interprocess = { version = "2.4.5", default-features = false }
 bitflags.workspace = true
 lazy_static.workspace = true
 shared_library.workspace = true

@@ -1,3 +1,4 @@
+use crate::authentication::AuthenticationInfo;
 use crate::channelwrap::ChannelWrap;
 use crate::config::ConfigMap;
 use crate::dirwrap::DirWrap;
@@ -21,7 +22,7 @@ use smol::channel::{bounded, Receiver, Sender, TryRecvError};
 use socket2::Socket;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -65,6 +66,7 @@ pub(crate) struct SessionInner {
     pub last_keep_alive: Instant,
     pub keep_alive: Option<Duration>,
     pub shutdown: Arc<SessionShutdown>,
+    pub authentication: Arc<OnceLock<AuthenticationInfo>>,
 }
 
 impl Drop for SessionInner {
@@ -153,7 +155,6 @@ impl SessionInner {
             .unwrap_or("false")
             == "true";
         if verbose {
-
             /// libssh logs to stderr, but on Windows in the GUI there isn't a valid
             /// stderr for it to log to.
             /// So, we redirect logging via our own log callback and pipe it via
@@ -234,8 +235,11 @@ impl SessionInner {
             .try_send(SessionEvent::Banner(Some(banner)))
             .context("notifying user of banner")?;
 
-        self.host_verification_libssh(&sess, &hostname, port)?;
-        self.authenticate_libssh(&sess)?;
+        let host_verified = self.host_verification_libssh(&sess, &hostname, port)?;
+        let authentication = self.authenticate_libssh(&sess)?.finish(host_verified);
+        self.authentication
+            .set(authentication)
+            .map_err(|_| anyhow!("SSH authentication was already recorded"))?;
         if let Some(reached) = &reached {
             crate::addresses::remember_reached(&hostname, port, reached);
         }
@@ -373,11 +377,16 @@ impl SessionInner {
             .try_send(SessionEvent::Banner(sess.banner().map(|s| s.to_string())))
             .context("notifying user of banner")?;
 
-        self.host_verification(&sess, &hostname, port, &remote_address)
+        let host_verified = self
+            .host_verification(&sess, &hostname, port, &remote_address)
             .context("host verification")?;
 
-        self.authenticate(&sess, &user, &hostname)
+        let authentication = self
+            .authenticate(&sess, &user, &hostname)
             .context("authentication")?;
+        self.authentication
+            .set(authentication.finish(host_verified))
+            .map_err(|_| anyhow!("SSH authentication was already recorded"))?;
         if let Some(reached) = &reached {
             crate::addresses::remember_reached(&hostname, port, reached);
         }

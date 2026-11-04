@@ -1,0 +1,3 @@
+# Installed as /etc/pam.d/thinkterm-connect-auth by the system package.
+@include common-auth
+@include common-account

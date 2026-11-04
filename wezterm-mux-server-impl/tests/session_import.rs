@@ -549,8 +549,10 @@ async fn scenario(local_id: mux::domain::DomainId) -> Result<()> {
     }
     assert_eq!(mux.iter_panes().len(), 1);
     let existing_thread = result.tree.projects[0].threads[0].id.clone();
-    live_scenario(existing_thread.clone(), true).await?;
-    live_scenario(existing_thread, false).await?;
+    // Each fixture owns several clients and complete wire messages. Keep
+    // these nested futures off the caller's test-thread stack.
+    Box::pin(live_scenario(existing_thread.clone(), true)).await?;
+    Box::pin(live_scenario(existing_thread, false)).await?;
     Ok(())
 }
 

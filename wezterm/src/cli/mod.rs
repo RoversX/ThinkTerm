@@ -20,6 +20,7 @@ mod move_pane_to_new_tab;
 mod proxy;
 mod rename_workspace;
 mod restore_output;
+mod reverse;
 mod send_key;
 mod send_text;
 mod set_pane_label;
@@ -207,6 +208,9 @@ enum CliSubCommand {
 
     #[command(name = "proxy", about = "start rpc proxy pipe")]
     Proxy(proxy::ProxyCommand),
+
+    #[command(name = "connect-reverse-proxy", hide = true)]
+    ConnectReverseProxy(reverse::Proxy),
 
     #[command(name = "tlscreds", about = "obtain tls credentials")]
     TlsCreds(tls_creds::TlsCredsCommand),
@@ -490,6 +494,7 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::GetText(cmd) => cmd.run(client, palette_pushes).await,
         CliSubCommand::SpawnCommand(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
         CliSubCommand::Proxy(cmd) => cmd.run(client, &crate::init_config(opts)?).await,
+        CliSubCommand::ConnectReverseProxy(cmd) => cmd.run(client).await,
         CliSubCommand::TlsCreds(cmd) => cmd.run(client).await,
         CliSubCommand::WebServer(cmd) => cmd.run(client).await,
         CliSubCommand::WebToken(cmd) => cmd.run(client).await,

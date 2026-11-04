@@ -1276,6 +1276,12 @@ if [ -d "$root/share/thinkterm/web" ]; then
   # time, so an install that rewrites them can mislead it.
   cp -Rp "$root/share/thinkterm/web" "$sharedir/thinkterm/web"
 fi
+if [ "$os" = linux ] && [ "$variant" = desktop ] && [ -d "$root/share/thinkterm/connect-auth" ]; then
+  # Keep the supplied policy templates and instructions for administrator
+  # setup; a user-prefix install must not write the system PAM policy.
+  rm -rf "$sharedir/thinkterm/connect-auth"
+  cp -Rp "$root/share/thinkterm/connect-auth" "$sharedir/thinkterm/connect-auth"
+fi
 
 # Written last, so it only ever describes a completed install.
 {

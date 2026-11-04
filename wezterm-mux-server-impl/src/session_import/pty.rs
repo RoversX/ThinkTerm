@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
-use portable_pty::{MasterPty, PtySize};
+use portable_pty::unix::NonblockingInput;
+use portable_pty::{MasterPty, PtySize, TryInputWriter};
 use rustix::event::{poll, PollFd, PollFlags};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Duplicates are reserved before commit; dropping them only closes them.
 /// Unlike UnixMasterWriter, these files never inject EOF when dropped.
@@ -15,6 +16,7 @@ pub struct ImportedPty {
     master: OwnedFd,
     reader: Mutex<Option<File>>,
     writer: Mutex<Option<File>>,
+    input: Mutex<Option<Arc<NonblockingInput>>>,
 }
 
 struct ImportedWriter(File);
@@ -95,6 +97,7 @@ impl ImportedPty {
             master,
             reader: Mutex::new(Some(reader)),
             writer: Mutex::new(Some(writer)),
+            input: Mutex::new(None),
         })
     }
 }
@@ -140,6 +143,25 @@ impl MasterPty for ImportedPty {
                 .take()
                 .context("Imported terminal writer was already taken")?,
         )))
+    }
+
+    /// `ImportedReader` and `ImportedWriter` already work either way.
+    fn try_input_writer(&self) -> Result<Box<dyn TryInputWriter>> {
+        let mut input = self.input.lock().unwrap();
+        if let Some(input) = input.as_ref() {
+            return Ok(input.writer());
+        }
+        let created = NonblockingInput::new(&self.master)?;
+        let writer = created.writer();
+        *input = Some(created);
+        Ok(writer)
+    }
+
+    fn quiesce_input(&self) -> Result<()> {
+        if let Some(input) = self.input.lock().unwrap().take() {
+            input.close()?;
+        }
+        Ok(())
     }
 
     fn as_raw_fd(&self) -> Option<RawFd> {

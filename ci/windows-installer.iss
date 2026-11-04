@@ -60,6 +60,7 @@ Source: "{#MyAppSourceDir}\wezterm.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSourceDir}\thinkterm-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSourceDir}\thinkterm-mux-server.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSourceDir}\thinkterm-plugin-server.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppSourceDir}\thinkterm-connect-auth.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#MyAppSourceDir}\mesa\opengl32.dll"; DestDir: "{app}\mesa"; Flags: ignoreversion
 ; ANGLE has no arm64 build here
 #if MyAppArch != "arm64"

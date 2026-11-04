@@ -40,6 +40,7 @@ mod bottom_quotes;
 mod bounded_file;
 mod colorease;
 mod commands;
+mod connect_access;
 mod customglyph;
 mod download;
 mod editor_projects;

@@ -3,8 +3,8 @@ use clap::Parser;
 use codec::{InputSerial, SendKeyDown};
 use mux::pane::PaneId;
 use std::io::Read;
-use std::time::Duration;
 use termwiz::input::{KeyCode, KeyEvent, Modifiers};
+use thinkterm_reverse_access::protocol::enter_delay;
 use wezterm_client::client::Client;
 
 #[derive(Debug, Parser, Clone)]
@@ -36,6 +36,31 @@ pub struct SendText {
 
 impl SendText {
     pub async fn run(self, client: Client) -> anyhow::Result<()> {
+        if let Some(target) = crate::cli::reverse::resolve(&client, self.pane.as_deref()).await? {
+            let text = match self.text {
+                Some(text) => text,
+                None => {
+                    let mut text = String::new();
+                    std::io::stdin()
+                        .take((thinkterm_reverse_access::MAX_INPUT_BYTES + 1) as u64)
+                        .read_to_string(&mut text)
+                        .context("reading reverse input")?;
+                    text
+                }
+            };
+            if text.len() > thinkterm_reverse_access::MAX_INPUT_BYTES {
+                return Err(
+                    crate::cli::UsageError("reverse input is limited to 64 KiB".into()).into(),
+                );
+            }
+            let command = thinkterm_reverse_access::protocol::Command::Text {
+                export: target.export,
+                bytes: text.len(),
+                no_paste: self.no_paste,
+                enter: self.enter,
+            };
+            return crate::cli::reverse::send(target, command, Some(&text)).await;
+        }
         let (client, pane_id) = crate::cli::target::resolve_reaching_servers(
             client,
             self.pane_id,
@@ -84,13 +109,6 @@ impl SendText {
         }
         Ok(())
     }
-}
-
-/// How long `--enter` waits after `len` bytes of text: a moment, and a
-/// little more for a long text a program takes longer to read, up to two
-/// seconds.
-fn enter_delay(len: usize) -> Duration {
-    Duration::from_millis((300 + len as u64 / 1024 * 50).min(2000))
 }
 
 #[cfg(test)]

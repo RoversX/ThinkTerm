@@ -55,6 +55,7 @@ mod session_import;
 mod editor_import;
 mod import;
 mod keymap;
+mod connect_access;
 pub(crate) use import::EDITORS_SOURCE;
 use import::{ImportButton, ImportSource, ImportStep};
 
@@ -2311,6 +2312,20 @@ enum SettingsAction {
     SetWindowTabs(crate::native_settings::NativeWindowTabs),
     SetServerPlacement(crate::native_settings::NativeServerPlacement),
     SetServerTerminals(crate::native_settings::NativeServerTerminals),
+    ReverseSourceMenu,
+    ReverseHostMenu,
+    ReverseSource(mux::domain::DomainId),
+    ReverseHost(Option<mux::domain::DomainId>),
+    ReverseSetup,
+    ReversePane(u64),
+    ReversePermission(bool),
+    ReverseApprove,
+    ReverseRefresh,
+    ReverseClose(u64),
+    ReverseCancel(u64),
+    ReverseRevoke(u64, thinkterm_reverse_access::GrantRef),
+    ReverseRenew(u64, thinkterm_reverse_access::GrantRef),
+    ReverseMinutes(i8),
     SetTerminalShade(crate::native_settings::NativeShade),
     SetThreadIcons(crate::native_settings::NativeThreadIcons),
     SetThreadStatus(crate::native_settings::NativeThreadStatus),
@@ -2451,6 +2466,8 @@ enum SettingsDrag {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsDropdown {
+    ReverseSource,
+    ReverseHost,
     Language,
     MainRenderer,
     /// What a see-through window shows behind it, on macOS.
@@ -3990,6 +4007,7 @@ struct SettingsWindow {
     chrome_palette: UiPalette,
     selected: SettingsSection,
     agents_expanded: Option<&'static str>,
+    reverse_access: connect_access::UiState,
     native_settings: ThinkTermNativeSettings,
     active_main_renderer: NativeRendererBackend,
     ui: SettingsUiState,
@@ -4165,6 +4183,7 @@ impl SettingsWindow {
             ),
             selected: initial_section(),
             agents_expanded: initial_expanded_agent(),
+            reverse_access: connect_access::UiState::default(),
             native_settings,
             active_main_renderer,
             ui,
@@ -4312,6 +4331,7 @@ impl SettingsWindow {
             return;
         }
         self.cleaned_up = true;
+        self.leave_reverse_editor();
         self.commit_focused_input();
         // Closed mid-drag: what the windows are previewing is what is kept.
         if matches!(self.ui.drag, Some(SettingsDrag::WindowOpacity)) {
@@ -4584,6 +4604,10 @@ impl SettingsWindow {
                         | SettingsAction::SetCommandPaletteHotkey(_)
                         | SettingsAction::ToggleWebLinkTtlMenu
                         | SettingsAction::SetWebLinkTtl(_)
+                        | SettingsAction::ReverseSourceMenu
+                        | SettingsAction::ReverseHostMenu
+                        | SettingsAction::ReverseSource(_)
+                        | SettingsAction::ReverseHost(_)
                         | SettingsAction::TogglePluginBackgroundMenu(_)
                         | SettingsAction::SetPluginBackground(..)
                         | SettingsAction::EditorImport(
@@ -6311,6 +6335,9 @@ impl SettingsWindow {
     }
 
     fn enter_section(&mut self, section: SettingsSection) {
+        if section != SettingsSection::Agents {
+            self.leave_reverse_editor();
+        }
         self.selected = section;
         self.ui.content_scroll.reset();
         self.ui.open_dropdown = None;
@@ -6729,6 +6756,20 @@ impl SettingsWindow {
                 self.apply_server_placement(placement)
             }
             SettingsAction::SetServerTerminals(reach) => self.apply_server_terminals(reach),
+            action @ (SettingsAction::ReverseSourceMenu
+            | SettingsAction::ReverseHostMenu
+            | SettingsAction::ReverseSource(_)
+            | SettingsAction::ReverseHost(_)
+            | SettingsAction::ReverseSetup
+            | SettingsAction::ReversePane(_)
+            | SettingsAction::ReversePermission(_)
+            | SettingsAction::ReverseApprove
+            | SettingsAction::ReverseRefresh
+            | SettingsAction::ReverseClose(_)
+            | SettingsAction::ReverseCancel(_)
+            | SettingsAction::ReverseRevoke(..)
+            | SettingsAction::ReverseRenew(..)
+            | SettingsAction::ReverseMinutes(_)) => self.apply_reverse_action(action),
             SettingsAction::SetTerminalShade(shade) => self.apply_window_areas(
                 "settings-terminal-shade",
                 localized_shade_label(shade),
@@ -12607,7 +12648,9 @@ impl SettingsWindow {
         )?;
         let (status_card_y, _) = self.settings_card_geometry(section_y, 0);
         let status_bottom = self.paint_agent_status_card(layers, x, status_card_y, max_width)?;
-        let status_bottom = self.paint_server_terminals_card(layers, x, status_bottom, max_width)?;
+        let status_bottom =
+            self.paint_server_terminals_card(layers, x, status_bottom, max_width)?;
+        let status_bottom = self.paint_reverse_access_card(layers, x, status_bottom, max_width)?;
         let integrations_title_y = status_bottom + self.settings_section_card_gap();
         let integrations_card_y = integrations_title_y + self.settings_section_card_gap();
         let integrations_first_row_y = integrations_card_y + self.settings_card_top_padding();
@@ -20554,6 +20597,8 @@ impl SettingsWindow {
     /// and whether it is the current one.
     fn dropdown_menu_options(&self, dropdown: SettingsDropdown) -> Vec<(String, SettingsAction, bool)> {
         match dropdown {
+            SettingsDropdown::ReverseSource => self.reverse_source_options(),
+            SettingsDropdown::ReverseHost => self.reverse_host_options(),
             SettingsDropdown::Language => self.language_menu_options(),
             SettingsDropdown::MacGlass => self.mac_glass_menu_options(),
             SettingsDropdown::MainRenderer => self.main_renderer_menu_options(),

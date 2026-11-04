@@ -37,6 +37,68 @@ use wezterm_term::{
 
 const PROC_INFO_CACHE_TTL: Duration = Duration::from_millis(300);
 
+fn connect_plain_text(
+    term: &Terminal,
+    options: thinkterm_reverse_access::protocol::ReadOptions,
+) -> thinkterm_reverse_access::Result<String> {
+    use thinkterm_reverse_access::{Error, MAX_READ_BYTES, MAX_READ_LINES};
+    let screen = term.screen();
+    let rows = screen.scrollback_rows();
+    let top = rows.saturating_sub(screen.physical_rows);
+    let row = |relative: i64| (top as i128 + relative as i128).max(0);
+    let start = options.start.map(row).unwrap_or(top as i128);
+    let end = options.end.map(row).unwrap_or(rows as i128);
+    if start > end {
+        return Err(Error::Protocol);
+    }
+    let start = start.min(rows as i128) as usize;
+    let end = (end + 1).min(rows as i128) as usize;
+    if end - start > MAX_READ_LINES {
+        return Err(Error::TooLarge);
+    }
+    let mut text = String::with_capacity(MAX_READ_BYTES);
+    let mut result = Ok(());
+    let mut logical_start = 0;
+    let mut keep = 0;
+    let mut last_nonempty_end = 0;
+    screen.with_phys_lines(start..end, |lines| {
+        for (index, line) in lines.iter().enumerate() {
+            for cell in line.visible_cells() {
+                let value = cell.str();
+                if value.len() >= MAX_READ_BYTES - text.len() {
+                    result = Err(Error::TooLarge);
+                    return;
+                }
+                text.push_str(value);
+                if !value.trim().is_empty() {
+                    keep = text.len();
+                }
+            }
+            if !options.unwrap || !line.last_cell_was_wrapped() || index + 1 == lines.len() {
+                if options.trim {
+                    text.truncate(keep.max(logical_start));
+                }
+                if text.len() == MAX_READ_BYTES {
+                    result = Err(Error::TooLarge);
+                    return;
+                }
+                let nonempty = text.len() > logical_start;
+                text.push('\n');
+                if nonempty {
+                    last_nonempty_end = text.len();
+                }
+                logical_start = text.len();
+                keep = logical_start;
+            }
+        }
+    });
+    result?;
+    if options.trim {
+        text.truncate(last_nonempty_end);
+    }
+    Ok(text)
+}
+
 #[derive(Debug)]
 enum ProcessState {
     Running {
@@ -1582,6 +1644,127 @@ fn open_child_process(pid: u32) -> std::io::Result<std::os::windows::io::OwnedHa
 }
 
 impl LocalPane {
+    pub fn quiesce_connect_input(&self) -> anyhow::Result<()> {
+        self.pty.lock().quiesce_input()
+    }
+
+    pub(crate) fn connect_eligible(&self) -> thinkterm_reverse_access::Result<()> {
+        use thinkterm_reverse_access::Error;
+        if self.tmux_domain.try_lock().ok_or(Error::Busy)?.is_some() {
+            return Err(Error::Unavailable);
+        }
+        match &*self.process.try_lock().ok_or(Error::Busy)? {
+            ProcessState::Running {
+                pid: Some(_),
+                killed: false,
+                ..
+            } => Ok(()),
+            _ => Err(Error::Unavailable),
+        }
+    }
+
+    pub(crate) fn connect_read(
+        &self,
+        options: thinkterm_reverse_access::protocol::ReadOptions,
+    ) -> thinkterm_reverse_access::Result<String> {
+        let term = self
+            .terminal
+            .try_lock()
+            .ok_or(thinkterm_reverse_access::Error::Busy)?;
+        connect_plain_text(&term, options)
+    }
+
+    pub(crate) fn connect_title(&self) -> thinkterm_reverse_access::Result<String> {
+        let term = self
+            .terminal
+            .try_lock()
+            .ok_or(thinkterm_reverse_access::Error::Busy)?;
+        Ok(thinkterm_reverse_access::protocol::display_text(
+            term.get_title(),
+            128,
+        ))
+    }
+
+    pub(crate) fn connect_input(
+        &self,
+        input: &crate::connect::Input,
+    ) -> thinkterm_reverse_access::Result<(
+        Box<dyn portable_pty::TryInputWriter>,
+        crate::connect::EncodedInput,
+    )> {
+        use crate::connect::{EncodedInput, Input};
+        use thinkterm_reverse_access::{Error, MAX_INPUT_BYTES, MAX_KEYS};
+        let term = self.terminal.try_lock().ok_or(Error::Busy)?;
+        let (mut bytes, enter, paste) = match input {
+            Input::Text {
+                text,
+                no_paste,
+                enter,
+            } => {
+                if text.len() > MAX_INPUT_BYTES {
+                    return Err(Error::TooLarge);
+                }
+                let paste = !no_paste && term.bracketed_paste_enabled();
+                let bytes = if *no_paste {
+                    text.clone().into_bytes()
+                } else {
+                    term.encode_paste(text).into_bytes()
+                };
+                (bytes, *enter, paste)
+            }
+            Input::Keys(keys) => {
+                if keys.is_empty() || keys.len() > MAX_KEYS {
+                    return Err(Error::TooLarge);
+                }
+                let mut bytes = Vec::new();
+                for (key, modifiers) in keys {
+                    let encoded = term
+                        .encode_key(key.clone(), *modifiers, true)
+                        .map_err(|_| Error::Protocol)?;
+                    if encoded.len() > MAX_INPUT_BYTES - bytes.len() {
+                        return Err(Error::TooLarge);
+                    }
+                    bytes.extend_from_slice(encoded.as_bytes());
+                }
+                (bytes, false, false)
+            }
+        };
+        let text_end = bytes.len();
+        if enter {
+            let key = term
+                .encode_key(KeyCode::Enter, KeyModifiers::NONE, true)
+                .map_err(|_| Error::Protocol)?;
+            bytes.extend_from_slice(key.as_bytes());
+        }
+        let writer = self
+            .pty
+            .try_lock()
+            .ok_or(Error::Busy)?
+            .try_input_writer()
+            .map_err(|_| Error::Unavailable)?;
+        Ok((
+            writer,
+            EncodedInput {
+                bytes,
+                text_end,
+                enter,
+                enter_delay: thinkterm_reverse_access::protocol::enter_delay(text_end),
+                paste,
+            },
+        ))
+    }
+
+    /// Takes `submit` only once the terminal is free, so Busy can be retried.
+    pub(crate) fn connect_queue(
+        &self,
+        submit: &mut Option<Box<dyn FnOnce() + Send>>,
+    ) -> thinkterm_reverse_access::Result<()> {
+        use thinkterm_reverse_access::Error;
+        let mut term = self.terminal.try_lock().ok_or(Error::Busy)?;
+        term.queue_checked_input(submit.take().ok_or(Error::Protocol)?)
+            .map_err(|_| Error::Unavailable)
+    }
+
     /// The pieces a successor server needs to adopt this pane, or None
     /// for a pane that cannot travel: one over a channel rather than a
     /// pty (ssh, tmux), or one whose process has already exited.
@@ -1968,6 +2151,681 @@ impl Drop for LocalPane {
         if let ProcessState::Running { signaller, .. } = &mut *self.process.lock() {
             let _ = signaller.kill();
         }
+    }
+}
+
+#[cfg(test)]
+mod connect_read_tests {
+    use super::*;
+    use thinkterm_reverse_access::protocol::ReadOptions;
+
+    #[derive(Debug)]
+    struct TestConfig;
+    impl TerminalConfiguration for TestConfig {
+        fn scrollback_size(&self) -> usize {
+            32
+        }
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
+    fn terminal(cols: usize, rows: usize) -> Terminal {
+        Terminal::new(
+            TerminalSize {
+                cols,
+                rows,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 96,
+            },
+            Arc::new(TestConfig),
+            "ThinkTerm",
+            "test",
+            Box::new(Vec::new()),
+        )
+    }
+
+    #[test]
+    fn connect_plain_text_preserves_wrap_trim_and_inclusive_ranges() {
+        let mut terminal = terminal(4, 4);
+        terminal.advance_bytes(b"abcde\r\nx   \r\n");
+        let trim = ReadOptions {
+            trim: true,
+            ..ReadOptions::default()
+        };
+        assert_eq!(connect_plain_text(&terminal, trim).unwrap(), "abcd\ne\nx\n");
+        assert_eq!(
+            connect_plain_text(
+                &terminal,
+                ReadOptions {
+                    unwrap: true,
+                    ..trim
+                }
+            )
+            .unwrap(),
+            "abcde\nx\n"
+        );
+        assert_eq!(
+            connect_plain_text(
+                &terminal,
+                ReadOptions {
+                    start: Some(1),
+                    end: Some(1),
+                    ..trim
+                }
+            )
+            .unwrap(),
+            "e\n"
+        );
+        assert!(connect_plain_text(
+            &terminal,
+            ReadOptions {
+                start: Some(2),
+                end: Some(1),
+                ..trim
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn connect_plain_text_uses_current_screen_coordinates_and_bounds_history() {
+        let mut terminal = terminal(8, 2);
+        terminal.advance_bytes(b"first\r\nsecond\r\nthird");
+        let trim = ReadOptions {
+            trim: true,
+            ..ReadOptions::default()
+        };
+        assert_eq!(
+            connect_plain_text(&terminal, trim).unwrap(),
+            "second\nthird\n"
+        );
+        assert_eq!(
+            connect_plain_text(
+                &terminal,
+                ReadOptions {
+                    start: Some(-1),
+                    end: Some(-1),
+                    ..trim
+                }
+            )
+            .unwrap(),
+            "first\n"
+        );
+        terminal.advance_bytes(b"\x1b[?1049hALT");
+        assert_eq!(
+            connect_plain_text(
+                &terminal,
+                ReadOptions {
+                    start: Some(-100),
+                    ..trim
+                }
+            )
+            .unwrap(),
+            "ALT\n"
+        );
+        assert!(connect_plain_text(
+            &terminal,
+            ReadOptions {
+                start: Some(i64::MAX),
+                ..trim
+            }
+        )
+        .is_err());
+    }
+
+    /// Once the scrollback is full the line store wraps around in memory,
+    /// wherever a read's range falls in it.
+    #[test]
+    fn connect_plain_text_reads_a_full_scrollback() {
+        let trim = ReadOptions {
+            trim: true,
+            ..ReadOptions::default()
+        };
+        let mut terminal = terminal(16, 4);
+        for line in 0..2000 {
+            terminal.advance_bytes(format!("line-{line}\r\n").as_bytes());
+            if line < 40 {
+                continue;
+            }
+            assert_eq!(
+                connect_plain_text(&terminal, trim).unwrap(),
+                format!("line-{}\nline-{}\nline-{}\n", line - 2, line - 1, line)
+            );
+            assert_eq!(
+                connect_plain_text(
+                    &terminal,
+                    ReadOptions {
+                        start: Some(-8),
+                        end: Some(-1),
+                        ..trim
+                    }
+                )
+                .unwrap(),
+                (line - 10..=line - 3)
+                    .map(|line| format!("line-{line}\n"))
+                    .collect::<String>()
+            );
+        }
+    }
+
+    #[test]
+    fn connect_plain_text_rejects_a_view_over_the_line_limit() {
+        let terminal = terminal(1, thinkterm_reverse_access::MAX_READ_LINES + 1);
+        assert_eq!(
+            connect_plain_text(&terminal, ReadOptions::default()),
+            Err(thinkterm_reverse_access::Error::TooLarge)
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod connect_host_tests {
+    use super::*;
+    use crate::client::ClientId;
+    use crate::connect::{Host, HostRoute};
+    use crate::tab::Tab;
+    use crate::Mux;
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use smol::io::{AsyncRead, AsyncWrite};
+    use std::future::Future;
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use thinkterm_reverse_access::budget::Budgets;
+    use thinkterm_reverse_access::channel::{Channel, Deadline};
+    use thinkterm_reverse_access::exchange::receive_reply;
+    use thinkterm_reverse_access::protocol::{Command, ExportRef, InputStatus, ReadOptions, Reply};
+    use thinkterm_reverse_access::wire::{Assembly, Payload};
+    use thinkterm_reverse_access::{Error, Id, Permission};
+
+    /// Stands in for the native window, which needs a person: approves
+    /// whatever it is asked, and keeps the session monitor's heartbeat.
+    const HELPER: &str = r#"#!/bin/sh
+case "$1" in
+--monitor)
+    printf '{"kind":"ready","id":null}\n'
+    while :; do
+        printf '{"kind":"alive","id":null}\n'
+        sleep 1
+    done
+    ;;
+--authenticate)
+    IFS= read -r line
+    id=${line#*\"Id\":\"}
+    printf '{"kind":"approved","id":"%s"}\n' "${id%%\"*}"
+    ;;
+esac
+"#;
+
+    struct InstalledHelper(PathBuf);
+    impl InstalledHelper {
+        fn new() -> Self {
+            let path = std::env::current_exe()
+                .unwrap()
+                .with_file_name("thinkterm-connect-auth");
+            std::fs::write(&path, HELPER).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for InstalledHelper {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestConfig;
+    impl TerminalConfiguration for TestConfig {
+        fn scrollback_size(&self) -> usize {
+            32
+        }
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
+    struct Fixture {
+        mux: Arc<Mux>,
+        pane: Arc<LocalPane>,
+        connect: Arc<Host>,
+        client: ClientId,
+        route: Arc<HostRoute>,
+        reader: Box<dyn Read + Send>,
+        sequence: u64,
+        _helper: InstalledHelper,
+        _serial: parking_lot::MutexGuard<'static, ()>,
+    }
+
+    fn fixture() -> Fixture {
+        static SCHEDULER: std::sync::Once = std::sync::Once::new();
+        SCHEDULER.call_once(|| {
+            promise::spawn::SimpleExecutor::new();
+        });
+        // Which also keeps these to the helper's one path, one at a time.
+        let serial = crate::GLOBAL_MUX_TESTS.lock();
+        let helper = InstalledHelper::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let size = TerminalSize {
+            cols: 40,
+            rows: 6,
+            pixel_width: 0,
+            pixel_height: 0,
+            dpi: 96,
+        };
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 6,
+                cols: 40,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let child = pair
+            .slave
+            .spawn_command(CommandBuilder::new("/bin/cat"))
+            .unwrap();
+        let reader = pair.master.try_clone_reader().unwrap();
+        let terminal = Terminal::new(
+            size,
+            Arc::new(TestConfig),
+            "ThinkTerm",
+            "test",
+            pair.master.take_writer().unwrap(),
+        );
+        let pane = Arc::new(LocalPane::new(
+            crate::pane::alloc_pane_id(),
+            terminal,
+            child,
+            pair.master,
+            Box::new(Vec::new()),
+            0,
+            "test".into(),
+        ));
+        let dyn_pane: Arc<dyn Pane> = pane.clone();
+        let tab = Arc::new(Tab::new(&size));
+        tab.assign_pane(&dyn_pane);
+        mux.panes.write().insert(pane.pane_id(), dyn_pane);
+        mux.add_tab_no_panes(&tab);
+        let mut window = crate::window::Window::new(Some("default".into()), None, None);
+        window.push(&tab);
+        mux.windows.write().insert(window.window_id(), window);
+        let client = ClientId {
+            hostname: "devbox".into(),
+            username: "user".into(),
+            pid: std::process::id(),
+            epoch: 0,
+            id: 0,
+            ssh_auth_sock: None,
+        };
+        mux.register_client(Arc::new(client.clone()));
+        let connect = Host::new(&mux).unwrap();
+        let route = connect
+            .open(client.clone(), "user@server-a:22", "zh-CN")
+            .unwrap();
+        route.heartbeat().unwrap();
+        route
+            .begin_all_local_approval(Permission::ReadAndInput, 60, None)
+            .unwrap();
+        let deadline = Deadline::request().unwrap();
+        while route.status().grants.is_empty() {
+            assert!(route.status().error.is_none());
+            deadline.remaining().unwrap();
+            route.heartbeat().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Fixture {
+            mux,
+            pane,
+            connect,
+            client,
+            route,
+            reader,
+            sequence: 0,
+            _helper: helper,
+            _serial: serial,
+        }
+    }
+
+    impl Fixture {
+        /// One request through the host and over a real socket, as the data
+        /// connection carries it.
+        fn exchange(
+            &mut self,
+            command: Command,
+            payload: Option<Payload>,
+        ) -> thinkterm_reverse_access::Result<(Reply, Option<Payload>)> {
+            self.sequence += 1;
+            let sequence = self.sequence;
+            let route = Arc::clone(&self.route);
+            route.heartbeat()?;
+            smol::block_on(async move {
+                let budgets = Budgets::new()?;
+                let budget = budgets.open_route(Id::random()?)?;
+                let (near, far) = smol::Async::<UnixStream>::pair().unwrap();
+                let mut near = Channel::new(near, budget.acquire(1024 * 1024)?)?;
+                let mut far = Channel::new(far, budget.acquire(1024 * 1024)?)?;
+                let deadline = Deadline::request()?;
+                let reply = route
+                    .prepare_reply(sequence, command, payload, &deadline, &deadline)
+                    .await?;
+                let (sent, received) = smol::future::zip(
+                    reply.send(&mut near, sequence, &deadline, &deadline),
+                    receive_reply(
+                        &mut far,
+                        sequence,
+                        |bytes| Assembly::text(bytes, &budget),
+                        &deadline,
+                    ),
+                )
+                .await;
+                sent?;
+                received?
+            })
+        }
+
+        fn list(&mut self) -> Vec<ExportRef> {
+            match self
+                .exchange(Command::List { after: None }, None)
+                .unwrap()
+                .0
+            {
+                Reply::List { exports, .. } => exports.iter().map(|item| item.export).collect(),
+                _ => panic!("not a list"),
+            }
+        }
+
+        fn read(&mut self, export: ExportRef) -> String {
+            let command = Command::Read {
+                export,
+                options: ReadOptions {
+                    trim: true,
+                    ..ReadOptions::default()
+                },
+            };
+            let (reply, payload) = self.exchange(command, None).unwrap();
+            assert!(matches!(reply, Reply::Text { .. }));
+            payload.unwrap().text().to_string()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.route.close();
+            self.mux.panes.write().clear();
+        }
+    }
+
+    /// Takes a frame's first byte and then nothing until `opens`, as a
+    /// connection that has slowed down leaves a frame partly written.
+    struct Stalled {
+        socket: smol::Async<UnixStream>,
+        opens: smol::Timer,
+        started: bool,
+        open: bool,
+    }
+    impl AsyncRead for Stalled {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.socket).poll_read(cx, bytes)
+        }
+    }
+    impl AsyncWrite for Stalled {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if !self.started {
+                self.started = true;
+                return Pin::new(&mut self.socket).poll_write(cx, &bytes[..1]);
+            }
+            if !self.open {
+                if Pin::new(&mut self.opens).poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.open = true;
+            }
+            Pin::new(&mut self.socket).poll_write(cx, bytes)
+        }
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.socket).poll_flush(cx)
+        }
+        fn poll_close(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.socket).poll_close(cx)
+        }
+    }
+
+    #[test]
+    fn a_grant_lists_reads_and_types_into_a_real_terminal() {
+        let mut host = fixture();
+        let exports = host.list();
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0].target.pane, host.pane.pane_id() as u64);
+
+        // Past the scrollback, where a read used to end the whole host.
+        {
+            let mut terminal = host.pane.terminal.lock();
+            for line in 0..500 {
+                terminal.advance_bytes(format!("line-{line}\r\n").as_bytes());
+            }
+        }
+        assert!(host.read(exports[0]).ends_with("line-499\n"));
+
+        // A terminal in the middle of its output is waited for, not failed.
+        let pane = Arc::clone(&host.pane);
+        let (locked, is_locked) = std::sync::mpsc::channel();
+        let parser = std::thread::spawn(move || {
+            let terminal = pane.terminal.lock();
+            locked.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            drop(terminal);
+        });
+        is_locked.recv().unwrap();
+        assert!(host.read(exports[0]).ends_with("line-499\n"));
+        parser.join().unwrap();
+        let pane = Arc::clone(&host.pane);
+        let (locked, is_locked) = std::sync::mpsc::channel();
+        let parser = std::thread::spawn(move || {
+            let terminal = pane.terminal.lock();
+            locked.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            drop(terminal);
+        });
+        is_locked.recv().unwrap();
+        assert_eq!(host.list(), exports);
+        parser.join().unwrap();
+
+        // Text, then its Enter after the delay, reach the program.
+        let started = Instant::now();
+        let budgets = Budgets::new().unwrap();
+        let budget = budgets.open_route(Id::random().unwrap()).unwrap();
+        let mut payload = Assembly::input(5, &budget).unwrap();
+        payload.append(0, b"hello").unwrap();
+        let (reply, _) = host
+            .exchange(
+                Command::Text {
+                    export: exports[0],
+                    bytes: 5,
+                    no_paste: true,
+                    enter: true,
+                },
+                Some(payload.finish().unwrap()),
+            )
+            .unwrap();
+        let Reply::Input(result) = reply else {
+            panic!("not an input result");
+        };
+        assert_eq!(result.status, InputStatus::Submitted);
+        assert!(result.enter_submitted);
+        assert!(started.elapsed() >= thinkterm_reverse_access::protocol::enter_delay(5));
+        let mut seen = Vec::new();
+        let mut bytes = [0; 256];
+        while !String::from_utf8_lossy(&seen).contains("hello") {
+            let count = host.reader.read(&mut bytes).unwrap();
+            assert!(count > 0);
+            seen.extend_from_slice(&bytes[..count]);
+        }
+
+        // Revoked is over, for reads as for the next list.
+        let grant = host.route.status().grants[0].grant;
+        host.route.revoke(grant).unwrap();
+        assert!(host
+            .exchange(
+                Command::Read {
+                    export: exports[0],
+                    options: ReadOptions::default(),
+                },
+                None,
+            )
+            .is_err());
+        assert!(host.route.status().grants.is_empty());
+    }
+
+    #[test]
+    fn a_read_out_of_time_partway_through_a_frame_finishes_it_and_cancels() {
+        let mut host = fixture();
+        let exports = host.list();
+        host.pane.terminal.lock().advance_bytes(b"example\r\n");
+        host.route.heartbeat().unwrap();
+        host.sequence += 1;
+        let sequence = host.sequence;
+        let command = Command::Read {
+            export: exports[0],
+            options: ReadOptions::default(),
+        };
+        let route = Arc::clone(&host.route);
+        let received = smol::block_on(async move {
+            let budgets = Budgets::new()?;
+            let budget = budgets.open_route(Id::random()?)?;
+            let (near, far) = smol::Async::<UnixStream>::pair().unwrap();
+            // Still stuck in the reply's first frame when the operation ends.
+            let near = Stalled {
+                socket: near,
+                opens: smol::Timer::after(Duration::from_millis(600)),
+                started: false,
+                open: false,
+            };
+            let mut near = Channel::new(near, budget.acquire(1024 * 1024)?)?;
+            let mut far = Channel::new(far, budget.acquire(1024 * 1024)?)?;
+            let deadline = Deadline::request()?;
+            let operation = Deadline::after(Duration::from_millis(400))?;
+            let reply = route
+                .prepare_reply(sequence, command, None, &operation, &deadline)
+                .await?;
+            let (sent, received) = smol::future::zip(
+                reply.send(&mut near, sequence, &operation, &deadline),
+                receive_reply(
+                    &mut far,
+                    sequence,
+                    |bytes| Assembly::text(bytes, &budget),
+                    &deadline,
+                ),
+            )
+            .await;
+            sent?;
+            received
+        })
+        .unwrap();
+        assert!(matches!(received, Err(Error::Unavailable)));
+
+        // That was one request: the route and its grant carry on.
+        assert!(host.read(exports[0]).contains("example"));
+    }
+
+    #[test]
+    fn a_second_press_of_authenticate_is_the_approval_already_running() {
+        let host = fixture();
+        let grant = host.route.status().grants[0].grant;
+        std::fs::write(
+            &host._helper.0,
+            "#!/bin/sh\nIFS= read -r line\nid=${line#*\\\"Id\\\":\\\"}\nsleep 1\n\
+             printf '{\"kind\":\"approved\",\"id\":\"%s\"}\\n' \"${id%%\\\"*}\"\n",
+        )
+        .unwrap();
+        for _ in 0..2 {
+            host.route
+                .begin_all_local_approval(Permission::Read, 60, Some(grant))
+                .unwrap();
+            let status = host.route.status();
+            assert!(status.authenticating);
+            assert!(status.error.is_none());
+        }
+
+        // Another route has not asked yet, and has to wait for this one.
+        let other = host
+            .connect
+            .open(host.client.clone(), "user@server-b:22", "zh-CN")
+            .unwrap();
+        assert!(matches!(
+            other.begin_all_local_approval(Permission::Read, 60, None),
+            Err(Error::Busy)
+        ));
+        assert!(other.status().error.is_some());
+        assert!(host.route.status().error.is_none());
+
+        let deadline = Deadline::request().unwrap();
+        while host.route.status().authenticating {
+            deadline.remaining().unwrap();
+            host.route.heartbeat().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = host.route.status();
+        assert!(status.error.is_none());
+        assert_eq!(status.grants.len(), 1);
+        assert_ne!(status.grants[0].grant, grant);
+    }
+
+    #[test]
+    fn a_refused_dialog_is_not_a_failure_and_a_missing_one_stays_reported() {
+        let host = fixture();
+        let grant = host.route.status().grants[0].grant;
+        std::fs::write(
+            &host._helper.0,
+            "#!/bin/sh\nIFS= read -r line\nid=${line#*\\\"Id\\\":\\\"}\n\
+             printf '{\"kind\":\"rejected\",\"id\":\"%s\"}\\n' \"${id%%\\\"*}\"\n",
+        )
+        .unwrap();
+        host.route
+            .begin_all_local_approval(Permission::Read, 60, Some(grant))
+            .unwrap();
+        let deadline = Deadline::request().unwrap();
+        while host.route.status().authenticating {
+            deadline.remaining().unwrap();
+            host.route.heartbeat().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = host.route.status();
+        assert!(status.error.is_none());
+        assert_eq!(status.grants[0].grant, grant);
+
+        std::fs::remove_file(&host._helper.0).unwrap();
+        host.route.revoke(grant).unwrap();
+        // The monitor ended with the last grant, so this needs a new helper.
+        assert!(host
+            .route
+            .begin_all_local_approval(Permission::Read, 60, None)
+            .is_err());
+        assert!(host.route.status().error.is_some());
+        assert!(host.route.status().error.is_some());
+        host.route.cancel_approval();
+        assert!(host.route.status().error.is_none());
     }
 }
 

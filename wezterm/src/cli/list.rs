@@ -43,8 +43,22 @@ impl ListCommand {
         } else {
             self.format
         };
+        let reverse = crate::cli::reverse::list(&client).await.unwrap_or_default();
         match format {
-            CliOutputFormatKind::Json => crate::cli::print_json(&output_items)?,
+            CliOutputFormatKind::Json => {
+                #[derive(serde::Serialize)]
+                #[serde(untagged)]
+                enum Item<'a> {
+                    Local(&'a CliListResultItem),
+                    Reverse(&'a crate::cli::reverse::Listed),
+                }
+                let items: Vec<_> = output_items
+                    .iter()
+                    .map(Item::Local)
+                    .chain(reverse.iter().map(Item::Reverse))
+                    .collect();
+                crate::cli::print_json(&items)?;
+            }
             CliOutputFormatKind::Table => {
                 let cols = vec![
                     Column {
@@ -82,7 +96,7 @@ impl ListCommand {
                         alignment: Alignment::Left,
                     },
                 ];
-                let data = output_items
+                let mut data = output_items
                     .iter()
                     .map(|output_item| {
                         vec![
@@ -97,6 +111,18 @@ impl ListCommand {
                         ]
                     })
                     .collect::<Vec<_>>();
+                data.extend(reverse.iter().map(|item| {
+                    vec![
+                        String::new(),
+                        String::new(),
+                        item.pane_id.clone(),
+                        String::new(),
+                        String::new(),
+                        item.title.clone(),
+                        String::new(),
+                        item.label.clone(),
+                    ]
+                }));
                 tabulate_output(&cols, &data, &mut std::io::stdout().lock())
                     .map_err(crate::stdout_error)?;
             }

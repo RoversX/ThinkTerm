@@ -541,6 +541,7 @@ struct ThreadedWriter {
 enum WriterMessage {
     Data(Vec<u8>),
     Flush,
+    CheckedInput(Box<dyn FnOnce() + Send>),
 }
 
 impl ThreadedWriter {
@@ -561,7 +562,7 @@ impl ThreadedWriter {
             while let Ok(msg) = receiver.recv() {
                 match msg {
                     WriterMessage::Data(buf) => {
-                        if writer.write(&buf).is_err() {
+                        if writer.write_all(&buf).is_err() {
                             break;
                         }
                     }
@@ -570,6 +571,7 @@ impl ThreadedWriter {
                             break;
                         }
                     }
+                    WriterMessage::CheckedInput(submit) => submit(),
                 }
             }
         });
@@ -603,14 +605,14 @@ impl std::io::Write for ThreadedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.sender
             .send(WriterMessage::Data(buf.to_vec()))
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?;
+            .map_err(|_| std::io::ErrorKind::BrokenPipe)?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.sender
             .send(WriterMessage::Flush)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?;
+            .map_err(|_| std::io::ErrorKind::BrokenPipe)?;
         Ok(())
     }
 }
@@ -1079,6 +1081,36 @@ impl TerminalState {
     #[cfg(not(target_family = "wasm"))]
     pub fn writer_handle(&self) -> Box<dyn std::io::Write + Send> {
         Box::new(self.writer.get_ref().handle())
+    }
+
+    /// One bounded delegated operation, ordered with ordinary terminal input.
+    /// The operation owns its budget and performs authorization again at each
+    /// nonblocking PTY write. The callback is never exposed to Lua or RPC.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn queue_checked_input(&mut self, submit: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+        self.writer.flush()?;
+        self.writer
+            .get_ref()
+            .sender
+            .send(WriterMessage::CheckedInput(submit))
+            .map_err(|_| std::io::ErrorKind::BrokenPipe.into())
+    }
+
+    pub fn encode_paste(&self, text: &str) -> String {
+        let canon = if self.bracketed_paste {
+            NewlineCanon::None
+        } else {
+            self.config.canonicalize_pasted_newlines()
+        };
+        let text = canon
+            .canonicalize(text)
+            .replace("\x1b[200~", "")
+            .replace("\x1b[201~", "");
+        if self.bracketed_paste {
+            format!("\x1b[200~{text}\x1b[201~")
+        } else {
+            text
+        }
     }
 
     pub fn send_paste(&mut self, text: &str) -> Result<(), Error> {

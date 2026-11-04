@@ -7,6 +7,8 @@ members = [
   "sync-color-schemes",
   "thinkterm-syntax",
   "thinkterm-core",
+  "thinkterm-reverse-access",
+  "thinkterm-connect-auth",
   "thinkterm-tailnet",
   "thinkterm-tailnet-node",
   "thinkterm-file-index",

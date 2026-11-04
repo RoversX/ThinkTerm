@@ -124,16 +124,31 @@ class InstallerTests(unittest.TestCase):
         path.write_text(text)
         path.chmod(0o755)
 
-    def package(self, name):
+    def package(self, name, extra_files=()):
         path = self.root / name
         with tarfile.open(path, "w:xz" if name.endswith(".xz") else "w:gz") as archive:
-            entry = tarfile.TarInfo("thinkterm-example/bin/thinkterm")
-            entry.mode = 0o755
-            data = b"#!/bin/sh\nexit 0\n"
-            entry.size = len(data)
-            archive.addfile(entry, io.BytesIO(data))
+            for relative, data, mode in [("bin/thinkterm", b"#!/bin/sh\nexit 0\n", 0o755), *extra_files]:
+                entry = tarfile.TarInfo("thinkterm-example/" + relative)
+                entry.mode = mode
+                entry.size = len(data)
+                archive.addfile(entry, io.BytesIO(data))
         self.packages.append(name)
         return path
+
+    def desktop_package(self, authentication=True):
+        files = [
+            ("bin/thinkterm-gui", b"#!/bin/sh\nexit 0\n", 0o755),
+            ("share/applications/com.roversx.thinkterm.desktop",
+             b"[Desktop Entry]\nExec=thinkterm start\nTryExec=thinkterm\n", 0o644),
+            ("share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png", b"example icon", 0o644),
+        ]
+        if authentication:
+            files.append(("bin/thinkterm-connect-auth", b"#!/bin/sh\nexit 0\n", 0o755))
+            files.append(("share/thinkterm/connect-auth/README.md",
+                          (ROOT / "docs/thinkterm/connect-reverse-access.md").read_bytes(), 0o644))
+            files.extend(("share/thinkterm/connect-auth/pam/" + policy.name, policy.read_bytes(), 0o644)
+                         for policy in sorted((ROOT / "thinkterm-connect-auth/pam").iterdir()))
+        return self.package(f"thinkterm-{TAG}-linux-x86_64.tar.gz", files)
 
     def write_api(self, missing_digest=False):
         assets = []
@@ -302,6 +317,26 @@ class InstallerTests(unittest.TestCase):
         self.network["rates"] = {"github.com": 900000}
         self.run_install()
         self.assertTrue(any(r["name"] == name for r in self.requests()))
+
+    def test_linux_desktop_retains_authentication_setup_files(self):
+        archive = self.desktop_package()
+        prefix = self.home / "desktop prefix"
+        self.run_install("--desktop", "--prefix", str(prefix), "--from", str(archive),
+                         "--sha256", hashlib.sha256(archive.read_bytes()).hexdigest())
+        self.assertTrue(os.access(prefix / "bin/thinkterm-connect-auth", os.X_OK))
+        installed = prefix / "share/thinkterm/connect-auth"
+        self.assertEqual((installed / "README.md").read_bytes(),
+                         (ROOT / "docs/thinkterm/connect-reverse-access.md").read_bytes())
+        for policy in (ROOT / "thinkterm-connect-auth/pam").iterdir():
+            self.assertEqual((installed / "pam" / policy.name).read_bytes(), policy.read_bytes())
+        self.assertFalse((prefix / "etc/pam.d/thinkterm-connect-auth").exists())
+
+    def test_linux_desktop_without_authentication_assets_still_installs(self):
+        archive = self.desktop_package(authentication=False)
+        self.run_install("--desktop", "--from", str(archive),
+                         "--sha256", hashlib.sha256(archive.read_bytes()).hexdigest())
+        self.assertTrue((self.home / ".local/bin/thinkterm-gui").is_file())
+        self.assertFalse((self.home / ".local/share/thinkterm/connect-auth").exists())
 
     @unittest.skipUnless(sys.platform == "darwin", "macOS ditto required")
     def test_macos_server_from_install_stays_inside_isolated_home(self):

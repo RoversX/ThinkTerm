@@ -150,6 +150,17 @@ case $OSTYPE in
       fi
     done
 
+    # Build the native authentication companion for exactly the architectures
+    # of the packaged GUI, including a local universal build.
+    auth_arches=$(lipo -archs "$zipdir/ThinkTerm.app/Contents/MacOS/thinkterm-gui")
+    auth_parts=()
+    for arch in $auth_arches ; do
+      auth_dir="$TARGET_DIR/connect-auth/$arch"
+      bash ci/build-connect-auth.sh macos "$arch" "$auth_dir"
+      auth_parts+=("$auth_dir/thinkterm-connect-auth")
+    done
+    lipo -create "${auth_parts[@]}" -output "$zipdir/ThinkTerm.app/Contents/MacOS/thinkterm-connect-auth"
+
     # The symbols the dist profile writes beside each binary (split-debuginfo
     # = "packed"): zipped next to the app, never inside it, so a crash
     # report's addresses can be resolved against the matching build.
@@ -322,6 +333,7 @@ case $OSTYPE in
       "$artifact_dir/wezterm.exe" \
       "$artifact_dir/thinkterm-mux-server.exe" \
       "$artifact_dir/thinkterm-gui.exe" \
+      "$artifact_dir/thinkterm-connect-auth.exe" \
       "$artifact_dir/thinkterm-plugin-server.exe" \
       "$artifact_dir/strip-ansi-escapes.exe" \
       $win_assets/conhost/conpty.dll \
@@ -395,11 +407,11 @@ source ~/.cargo/env
 
 cargo build --profile ${PROFILE} \
       -p wezterm-gui -p wezterm -p wezterm-mux-server \
-      -p thinkterm-plugin-server -p thinkterm-tailnet-node -p strip-ansi-escapes
+      -p thinkterm-plugin-server -p thinkterm-tailnet-node -p strip-ansi-escapes -p thinkterm-connect-auth
 BUILDEOFEOF
 )
           BUILD_REQUIRES=$(cat <<BREQEOF
-BuildRequires: gcc, gcc-c++, make, curl, fontconfig-devel, openssl-devel, libxcb-devel, libxkbcommon-devel, libxkbcommon-x11-devel, wayland-devel, xcb-util-devel, xcb-util-keysyms-devel, xcb-util-image-devel, xcb-util-wm-devel, git
+BuildRequires: gcc, gcc-c++, make, curl, fontconfig-devel, openssl-devel, pam-devel, libxcb-devel, libxkbcommon-devel, libxkbcommon-x11-devel, wayland-devel, xcb-util-devel, xcb-util-keysyms-devel, xcb-util-image-devel, xcb-util-wm-devel, git
 %if 0%{?suse_version}
 BuildRequires: Mesa-libEGL-devel
 %else
@@ -454,7 +466,7 @@ URL: https://github.com/RoversX/thinkterm
 Summary: ThinkTerm workspace-first terminal emulator.
 ${BUILD_REQUIRES}
 Conflicts: thinkterm-server, wezterm
-Requires: openssl
+Requires: openssl, pam, zenity
 %if 0%{?suse_version}
 Requires: dbus-1, fontconfig, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-egl1, libwayland-cursor0, Mesa-libEGL1, libxcb-keysyms1, libxcb-ewmh2, libxcb-icccm4
 %else
@@ -489,6 +501,12 @@ install -Dm755 assets/open-thinkterm-here assets/open-wezterm-here -t %{buildroo
 install -Dsm755 $TARGET_DIR/$PROFILE/thinkterm -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/$PROFILE/wezterm -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/$PROFILE/thinkterm-gui -t %{buildroot}/usr/bin
+install -Dsm755 $TARGET_DIR/$PROFILE/thinkterm-connect-auth -t %{buildroot}/usr/bin
+%if 0%{?suse_version}
+install -Dm644 thinkterm-connect-auth/pam/suse %{buildroot}/etc/pam.d/thinkterm-connect-auth
+%else
+install -Dm644 thinkterm-connect-auth/pam/fedora %{buildroot}/etc/pam.d/thinkterm-connect-auth
+%endif
 install -Dsm755 $TARGET_DIR/$PROFILE/thinkterm-plugin-server -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/$PROFILE/thinkterm-tailnet -t %{buildroot}/usr/bin
 install -Dsm755 $TARGET_DIR/$PROFILE/thinkterm-mux-server -t %{buildroot}/usr/bin
@@ -517,6 +535,8 @@ ${RPM_WEB_INSTALL}
 /usr/bin/thinkterm
 /usr/bin/wezterm
 /usr/bin/thinkterm-gui
+/usr/bin/thinkterm-connect-auth
+%config(noreplace) /etc/pam.d/thinkterm-connect-auth
 /usr/bin/thinkterm-plugin-server
 /usr/bin/thinkterm-tailnet
 /usr/bin/thinkterm-mux-server
@@ -665,6 +685,9 @@ EOF
           install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/strip-ansi-escapes
           if [[ "$variant" == desktop ]] ; then
             install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/thinkterm-gui
+            install -Dsm755 -t $root/usr/bin $TARGET_DIR/$PROFILE/thinkterm-connect-auth
+            install -Dm644 thinkterm-connect-auth/pam/debian $root/etc/pam.d/thinkterm-connect-auth
+            printf '/etc/pam.d/thinkterm-connect-auth\n' > "$root/DEBIAN/conffiles"
             install -Dm755 -t $root/usr/bin assets/open-thinkterm-here assets/open-wezterm-here
             install -Dm644 assets/icon/terminal.png $root/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
             install -Dm644 assets/wezterm.desktop $root/usr/share/applications/com.roversx.thinkterm.desktop
@@ -680,6 +703,9 @@ EOF
           } > "$root/control"
           local deps
           deps=$(cd "pkg/$variant" && dpkg-shlibdeps -O -e debian/usr/bin/*)
+          if [[ "$variant" == desktop ]] ; then
+            deps="$deps, zenity, libpam-runtime"
+          fi
           rm "$root/control"
           echo $deps | sed -e 's/shlibs:Depends=/Depends: /' >> $root/DEBIAN/control
           cat $root/DEBIAN/control
@@ -759,6 +785,9 @@ EOF
           install -Dm644 -t "$tardir" NOTICE LICENSE.md LICENSE-MIT
           install_web_bundle "$tardir/share/thinkterm/web"
           if [[ "$variant" == thinkterm ]] ; then
+            install -Dsm755 "$TARGET_DIR/$PROFILE/thinkterm-connect-auth" "$tardir/bin/thinkterm-connect-auth"
+            install -Dm644 -t "$tardir/share/thinkterm/connect-auth/pam" thinkterm-connect-auth/pam/*
+            install -Dm644 docs/thinkterm/connect-reverse-access.md "$tardir/share/thinkterm/connect-auth/README.md"
             install -Dm755 -t "$tardir/bin" assets/open-thinkterm-here assets/open-wezterm-here
             install -Dm644 assets/wezterm.desktop "$tardir/share/applications/com.roversx.thinkterm.desktop"
             install -Dm644 assets/icon/terminal.png "$tardir/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png"

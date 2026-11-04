@@ -1,4 +1,5 @@
 use crate::auth::*;
+use crate::authentication::AuthenticationInfo;
 use crate::config::ConfigMap;
 use crate::host::*;
 use crate::pty::*;
@@ -12,7 +13,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::net::Shutdown;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -89,6 +90,7 @@ pub(crate) struct Exec {
 pub struct Session {
     tx: SessionSender,
     shutdown: Arc<SessionShutdown>,
+    authentication: Arc<OnceLock<AuthenticationInfo>>,
 }
 
 /// Shutting down a duplicate interrupts even a backend blocked in its
@@ -137,6 +139,13 @@ impl Drop for Session {
 }
 
 impl Session {
+    /// Available before `SessionEvent::Authenticated` is delivered. It is
+    /// populated only by this session's handshake and never by configuration
+    /// or a caller-supplied authentication event. It is not a live grant.
+    pub fn authentication_info(&self) -> Option<&AuthenticationInfo> {
+        self.authentication.get()
+    }
+
     /// Abort this session, including open channels and pending requests.
     /// All clones refer to the same connection; ordinary drop still lets
     /// its existing channels finish.
@@ -169,6 +178,7 @@ impl Session {
 
         let now = Instant::now();
         let shutdown = Arc::new(SessionShutdown::default());
+        let authentication = Arc::new(OnceLock::new());
 
         let mut inner = SessionInner {
             config,
@@ -185,12 +195,14 @@ impl Session {
             last_keep_alive: now,
             keep_alive,
             shutdown: Arc::clone(&shutdown),
+            authentication: Arc::clone(&authentication),
         };
         std::thread::spawn(move || inner.run());
         Ok((
             Self {
                 tx: session_sender,
                 shutdown,
+                authentication,
             },
             rx_event,
         ))

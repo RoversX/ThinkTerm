@@ -101,6 +101,18 @@ pub trait MasterPty: Downcast + Send {
     /// It is invalid to take the writer more than once.
     fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, Error>;
 
+    /// A nonblocking input handle for a checked submission on the terminal's
+    /// existing writer thread. It must not be used as a second input queue.
+    fn try_input_writer(&self) -> Result<Box<dyn TryInputWriter>, Error> {
+        anyhow::bail!("this pty does not support nonblocking delegated input")
+    }
+
+    /// Invalidate delegated handles and restore ordinary descriptor mode
+    /// before exporting it to a successor that may predate this API.
+    fn quiesce_input(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// If applicable to the type of the tty, return the local process id
     /// of the process group or session leader
     #[cfg(unix)]
@@ -131,6 +143,12 @@ pub trait MasterPty: Downcast + Send {
     }
 }
 impl_downcast!(MasterPty);
+
+pub trait TryInputWriter: Send {
+    /// Submit immediately available bytes; never wait for the application.
+    /// WouldBlock means that no bytes were submitted by this call.
+    fn try_write(&mut self, bytes: &[u8]) -> IoResult<usize>;
+}
 
 /// Represents a child process spawned into the pty.
 /// This handle can be used to wait for or terminate that child process.

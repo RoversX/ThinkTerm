@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use rangeset::intersects_range;
 use std::collections::HashMap;
 use std::convert::TryInto;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use wezterm_term::TerminalSize;
 
 pub type PaneStackId = usize;
@@ -250,7 +250,11 @@ struct TabInner {
     zoomed: Option<Arc<dyn Pane>>,
     title: String,
     recency: Recency,
+    delegated_panes: HashMap<PaneId, Weak<()>>,
 }
+
+/// A pane's uninterrupted membership in this tab, retained only by exports.
+pub(crate) struct PaneMembership(Arc<()>);
 
 /// A Tab is a container of Panes
 pub struct Tab {
@@ -1057,6 +1061,48 @@ impl Tab {
         self.inner.lock().contains_pane(pane)
     }
 
+    pub(crate) fn capture_delegated_pane(
+        &self,
+        pane: PaneId,
+    ) -> thinkterm_reverse_access::Result<PaneMembership> {
+        use thinkterm_reverse_access::Error;
+        let mut inner = self.inner.try_lock().ok_or(Error::Busy)?;
+        if !inner.contains_pane(pane) {
+            return Err(Error::Unavailable);
+        }
+        inner
+            .delegated_panes
+            .retain(|_, token| token.strong_count() > 0);
+        if let Some(token) = inner.delegated_panes.get(&pane).and_then(Weak::upgrade) {
+            return Ok(PaneMembership(token));
+        }
+        if inner.delegated_panes.len() >= thinkterm_reverse_access::MAX_TARGETS {
+            return Err(Error::TooLarge);
+        }
+        let token = Arc::new(());
+        inner.delegated_panes.insert(pane, Arc::downgrade(&token));
+        Ok(PaneMembership(token))
+    }
+
+    pub(crate) fn with_delegated_panes<T>(
+        &self,
+        panes: &[(PaneId, &PaneMembership)],
+        submit: impl FnOnce() -> T,
+    ) -> thinkterm_reverse_access::Result<T> {
+        use thinkterm_reverse_access::Error;
+        let inner = self.inner.try_lock().ok_or(Error::Busy)?;
+        if panes.iter().any(|(pane, token)| {
+            !inner.contains_pane(*pane)
+                || !inner
+                    .delegated_panes
+                    .get(pane)
+                    .is_some_and(|current| current.ptr_eq(&Arc::downgrade(&token.0)))
+        }) {
+            return Err(Error::Unavailable);
+        }
+        Ok(submit())
+    }
+
     /// Whether a native frontend viewport describes every split leaf in this
     /// tab.  Zoomed frontends intentionally report just the pane that fills
     /// the root, and that viewport can race ahead of the separate zoom RPC.
@@ -1238,6 +1284,34 @@ impl Tab {
         self.inner.lock().remove_pane(pane_id)
     }
 
+    pub(crate) fn move_pane_to_split(
+        &self,
+        pane_id: PaneId,
+        target: PaneId,
+        request: SplitRequest,
+    ) -> anyhow::Result<Arc<dyn Pane>> {
+        let mut inner = self.inner.lock();
+        let membership = inner.delegated_panes.remove(&pane_id);
+        let pane = inner
+            .remove_pane(pane_id)
+            .ok_or_else(|| anyhow::anyhow!("pane {pane_id} not found in tab"))?;
+        let result = match inner.pane_index_for_pane(target) {
+            Some(index) => inner.split_and_insert(index, request, Arc::clone(&pane)),
+            None => Err(anyhow::anyhow!(
+                "target pane {target} vanished while moving pane"
+            )),
+        };
+        if result.is_err() {
+            inner.push_pane_into_first_stack(&pane);
+        }
+        if let Some(membership) = membership {
+            inner.delegated_panes.insert(pane_id, membership);
+        }
+        result?;
+        inner.set_active_pane(&pane);
+        Ok(pane)
+    }
+
     pub fn can_close_without_prompting(&self, reason: CloseReason) -> bool {
         self.inner.lock().can_close_without_prompting(reason)
     }
@@ -1399,6 +1473,7 @@ impl TabInner {
             zoomed: None,
             title: String::new(),
             recency: Recency::default(),
+            delegated_panes: HashMap::new(),
         }
     }
 
@@ -1513,6 +1588,14 @@ impl TabInner {
         self.recency.tag(self.active);
         self.pane.replace(cursor.tree());
         self.zoomed = zoomed;
+        let retained: Vec<_> = self
+            .delegated_panes
+            .keys()
+            .copied()
+            .filter(|pane| self.contains_pane(*pane))
+            .collect();
+        self.delegated_panes
+            .retain(|pane, token| token.strong_count() > 0 && retained.contains(pane));
 
         // For a changed topology the rebuilt tree carries the peer's cell
         // geometry (derived from its pane dimensions, which for client
@@ -3082,6 +3165,9 @@ impl TabInner {
         }
 
         if !dead_panes.is_empty() {
+            for pane in &dead_panes {
+                self.delegated_panes.remove(&pane.pane_id());
+            }
             self.advise_focus_change(prior);
         }
 
@@ -3434,9 +3520,13 @@ impl TabInner {
         }
 
         // Detach: remove_pane handles emptied-stack pruning and geometry.
+        let membership = self.delegated_panes.remove(&src_pane_id);
         let removed = self.remove_pane(src_pane_id).ok_or_else(|| {
             anyhow::anyhow!("pane {src_pane_id} vanished while moving between stacks")
         })?;
+        if let Some(membership) = membership {
+            self.delegated_panes.insert(src_pane_id, membership);
+        }
 
         // Attach: walk the (possibly restructured) tree and push into the
         // target stack. No fallible steps; resize after the removal's
@@ -3639,6 +3729,8 @@ impl TabInner {
     }
 
     fn assign_pane(&mut self, pane: &Arc<dyn Pane>) {
+        self.delegated_panes
+            .retain(|id, token| *id == pane.pane_id() && token.strong_count() > 0);
         match Tree::new()
             .cursor()
             .assign_top(PaneStack::new(Arc::clone(pane)))
@@ -4411,8 +4503,7 @@ mod test {
         // test threads would register their windows and panes into whichever
         // instance is installed at that moment, corrupting each other's
         // still-referenced scans — so global-Mux tests run one at a time.
-        static SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-        let serial = SERIAL.lock();
+        let serial = crate::GLOBAL_MUX_TESTS.lock();
         Mux::set_mux(&Arc::new(Mux::new(None)));
         MuxTestGuard { _serial: serial }
     }
@@ -5810,6 +5901,7 @@ mod test {
         mux.add_tab_no_panes(&tab);
         mux.add_pane(&target).unwrap();
         mux.add_pane(&src).unwrap();
+        let membership = tab.capture_delegated_pane(src.pane_id()).unwrap();
 
         let moved = mux
             .move_pane_to_split(
@@ -5825,6 +5917,110 @@ mod test {
         assert_eq!(tab.iter_panes().len(), 2);
         assert!(tab.pane_index_for_pane(target.pane_id()).is_some());
         assert!(tab.pane_index_for_pane(src.pane_id()).is_some());
+        assert!(tab
+            .with_delegated_panes(&[(src.pane_id(), &membership)], || ())
+            .is_ok());
+    }
+
+    #[test]
+    fn delegated_membership_does_not_survive_a_tab_round_trip() {
+        use thinkterm_reverse_access::Error;
+        let _guard = install_mux();
+        let mux = Mux::get();
+        let size = test_size();
+        let first = Arc::new(Tab::new(&size));
+        let second = Arc::new(Tab::new(&size));
+        let pane = FakePane::new(10_051, size);
+        let spare = FakePane::new(10_052, size);
+        let target = FakePane::new(10_053, size);
+        first.assign_pane(&spare);
+        first
+            .add_pane_to_stack(spare.pane_id(), pane.clone())
+            .unwrap();
+        second.assign_pane(&target);
+        for tab in [&first, &second] {
+            mux.add_tab_no_panes(tab);
+        }
+        for pane in [&pane, &spare, &target] {
+            mux.add_pane(pane).unwrap();
+        }
+        let membership = first.capture_delegated_pane(pane.pane_id()).unwrap();
+        let unaffected = first.capture_delegated_pane(spare.pane_id()).unwrap();
+        {
+            let _lock = first.inner.lock();
+            assert_eq!(
+                first.with_delegated_panes(&[(pane.pane_id(), &membership)], || ()),
+                Err(Error::Busy)
+            );
+        }
+        mux.move_pane_to_split(
+            pane.pane_id(),
+            second.tab_id(),
+            target.pane_id(),
+            SplitRequest::default(),
+        )
+        .unwrap();
+        mux.move_pane_to_split(
+            pane.pane_id(),
+            first.tab_id(),
+            spare.pane_id(),
+            SplitRequest::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            first.with_delegated_panes(&[(pane.pane_id(), &membership)], || ()),
+            Err(Error::Unavailable)
+        );
+        assert!(first
+            .with_delegated_panes(&[(spare.pane_id(), &unaffected)], || ())
+            .is_ok());
+        let fresh = first.capture_delegated_pane(pane.pane_id()).unwrap();
+        assert!(first
+            .with_delegated_panes(&[(pane.pane_id(), &fresh)], || ())
+            .is_ok());
+        first.remove_pane(pane.pane_id()).unwrap();
+        assert_eq!(
+            first.with_delegated_panes(&[(pane.pane_id(), &fresh)], || ()),
+            Err(Error::Unavailable)
+        );
+    }
+
+    #[test]
+    fn delegated_membership_tracks_tree_replacement_but_not_layout_changes() {
+        use thinkterm_reverse_access::Error;
+        let _guard = install_mux();
+        let size = test_size();
+        let tab = Tab::new(&size);
+        let first = FakePane::new(1, size);
+        let second = FakePane::new(2, size);
+        tab.assign_pane(&first);
+        let membership = tab.capture_delegated_pane(1).unwrap();
+        tab.split_and_insert(0, SplitRequest::default(), second.clone())
+            .unwrap();
+        tab.move_pane_to_stack(1, 2).unwrap();
+        tab.resize(TerminalSize { cols: 100, ..size });
+        assert!(tab.with_delegated_panes(&[(1, &membership)], || ()).is_ok());
+        tab.sync_with_pane_tree(size, PaneNode::Leaf(pane_entry(1, size, true)), |_| {
+            first.clone()
+        });
+        assert!(tab.with_delegated_panes(&[(1, &membership)], || ()).is_ok());
+        tab.sync_with_pane_tree(size, PaneNode::Leaf(pane_entry(2, size, true)), |_| {
+            second.clone()
+        });
+        tab.sync_with_pane_tree(size, PaneNode::Leaf(pane_entry(1, size, true)), |_| {
+            first.clone()
+        });
+        assert_eq!(
+            tab.with_delegated_panes(&[(1, &membership)], || ()),
+            Err(Error::Unavailable)
+        );
+        let fresh = tab.capture_delegated_pane(1).unwrap();
+        tab.assign_pane(&second);
+        tab.assign_pane(&first);
+        assert_eq!(
+            tab.with_delegated_panes(&[(1, &fresh)], || ()),
+            Err(Error::Unavailable)
+        );
     }
 
     #[test]

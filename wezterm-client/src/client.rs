@@ -192,6 +192,7 @@ pub struct Client {
     /// loop checks it after every dead session, surfaces it in a visible
     /// window, and stops.
     fatal_connection_error: Arc<Mutex<Option<String>>>,
+    connect_transport: Arc<Mutex<Option<ConnectTransport>>>,
 }
 
 impl Client {
@@ -268,6 +269,7 @@ impl Client {
     /// Retire this client, including an initial attach waiting on an update
     /// decision. A replacement must get a new client and registration.
     pub(crate) fn close(&self) {
+        self.connect_transport.lock().unwrap().take();
         self.shutdown.close();
         self.sender.close();
         self.set_connection_phase(ClientConnectionPhase::Detached);
@@ -1585,6 +1587,188 @@ struct Reconnectable {
     stream: Option<Box<dyn AsyncReadAndWrite>>,
     tls_creds: Option<GetTlsCredsResponse>,
     incoming_payload_limit: Option<usize>,
+    connect_transport: Arc<Mutex<Option<ConnectTransport>>>,
+}
+
+struct ConnectTransport {
+    session: wezterm_ssh::Session,
+    live: Arc<AtomicBool>,
+    command: String,
+    source: String,
+}
+
+impl std::fmt::Debug for ConnectTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConnectTransport(..)")
+    }
+}
+
+impl Drop for ConnectTransport {
+    fn drop(&mut self) {
+        self.live.store(false, Ordering::Release);
+    }
+}
+
+/// A channel opener obtained only from the authenticated, currently attached
+/// Connect transport. It cannot be reconstructed from a PDU or configuration.
+#[derive(Clone)]
+pub struct VerifiedConnectSession {
+    session: wezterm_ssh::Session,
+    live: std::sync::Weak<AtomicBool>,
+    command: String,
+    source: String,
+}
+
+impl VerifiedConnectSession {
+    pub fn is_alive(&self) -> bool {
+        self.live
+            .upgrade()
+            .is_some_and(|live| live.load(Ordering::Acquire))
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub async fn open_reverse_channel(&self) -> anyhow::Result<Box<dyn AsyncReadAndWrite>> {
+        anyhow::ensure!(self.is_alive(), "Connect session is no longer available");
+        let exec = self
+            .session
+            .exec(&self.command, None)
+            .or(async {
+                smol::Timer::after(Duration::from_secs(5)).await;
+                bail!("opening the Connect reverse channel timed out")
+            })
+            .await?;
+        anyhow::ensure!(self.is_alive(), "Connect session is no longer available");
+        let mut stderr = Async::new(SshStream {
+            stdin: exec.stderr.try_clone()?,
+            stdout: exec.stderr,
+        })?;
+        // Each direction on the descriptor it uses: `Async` makes that one
+        // nonblocking and waits on it. A write that blocks here would pass
+        // every deadline and hold the output guard, which Revoke needs.
+        let reader = Async::new(SshStream {
+            stdin: exec.stdout.try_clone()?,
+            stdout: exec.stdout,
+        })?;
+        let writer = Async::new(SshStream {
+            stdin: exec.stdin.try_clone()?,
+            stdout: exec.stdin,
+        })?;
+        let (stop, stopped) = bounded::<()>(1);
+        let state = Arc::new(ReverseChannelState {
+            failed: AtomicBool::new(false),
+            wake: futures::task::AtomicWaker::new(),
+        });
+        let worker_state = Arc::clone(&state);
+        smol::spawn(async move {
+            let result: std::io::Result<()> = async {
+                let mut remaining = 4096;
+                let mut buffer = [0; 512];
+                loop {
+                    let count = stderr.read(&mut buffer).await?;
+                    if count == 0 {
+                        return Ok(());
+                    }
+                    if count > remaining {
+                        return Err(std::io::ErrorKind::InvalidData.into());
+                    }
+                    remaining -= count;
+                }
+            }
+            .or(async {
+                let _ = stopped.recv().await;
+                Ok(())
+            })
+            .await;
+            if result.is_err() {
+                worker_state.failed.store(true, Ordering::Release);
+                worker_state.wake.wake();
+            }
+        })
+        .detach();
+        Ok(Box::new(ReverseSshStream {
+            reader,
+            writer,
+            child: Box::new(exec.child),
+            stop,
+            state,
+        }))
+    }
+}
+
+struct ReverseChannelState {
+    failed: AtomicBool,
+    wake: futures::task::AtomicWaker,
+}
+
+struct ReverseSshStream {
+    reader: Async<SshStream>,
+    writer: Async<SshStream>,
+    child: Box<wezterm_ssh::SshChildProcess>,
+    stop: Sender<()>,
+    state: Arc<ReverseChannelState>,
+}
+
+impl std::fmt::Debug for ReverseSshStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReverseSshStream(..)")
+    }
+}
+
+impl AsyncRead for ReverseSshStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.state.wake.register(cx.waker());
+        if self.state.failed.load(Ordering::Acquire) {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::InvalidData.into()));
+        }
+        std::pin::Pin::new(&mut self.reader).poll_read(cx, buffer)
+    }
+}
+
+impl AsyncWrite for ReverseSshStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.state.wake.register(cx.waker());
+        if self.state.failed.load(Ordering::Acquire) {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::InvalidData.into()));
+        }
+        std::pin::Pin::new(&mut self.writer).poll_write(cx, buffer)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.writer).poll_flush(cx)
+    }
+    fn poll_close(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.writer).poll_close(cx)
+    }
+}
+
+#[async_trait(?Send)]
+impl AsyncReadAndWrite for ReverseSshStream {
+    async fn wait_for_readable(&self) -> anyhow::Result<()> {
+        Ok(self.reader.readable().await?)
+    }
+}
+
+impl Drop for ReverseSshStream {
+    fn drop(&mut self) {
+        self.stop.close();
+        let _ = portable_pty::ChildKiller::kill(self.child.as_mut());
+    }
 }
 
 struct SshStream {
@@ -1650,6 +1834,7 @@ impl Reconnectable {
             stream,
             tls_creds: None,
             incoming_payload_limit: None,
+            connect_transport: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1794,6 +1979,21 @@ impl Reconnectable {
         no_auto_start: bool,
     ) -> anyhow::Result<()> {
         let ssh_config = mux::ssh::ssh_domain_to_ssh_config(&ssh_dom)?;
+        let reverse_source = ssh_config
+            .get("user")
+            .zip(ssh_config.get("hostname"))
+            .map(|(user, host)| {
+                format!(
+                    "{}@{}:{}",
+                    user,
+                    host,
+                    ssh_config.get("port").map(String::as_str).unwrap_or("22")
+                )
+            })
+            .filter(|source| {
+                source.len() <= 256
+                    && thinkterm_reverse_access::protocol::display_text(source, 256) == *source
+            });
 
         let sess =
             ssh_connect_with_ui_and_password(ssh_config, ui, ssh_dom.stored_password.clone())?;
@@ -1855,6 +2055,22 @@ impl Reconnectable {
             stdout: exec.stdout,
         })?);
         self.stream.replace(stream);
+        if ssh_dom.override_proxy_command.is_none()
+            && sess
+                .authentication_info()
+                .is_some_and(|info| info.is_verified_password_only())
+            && reverse_source.is_some()
+        {
+            *self.connect_transport.lock().unwrap() = Some(ConnectTransport {
+                session: sess,
+                live: Arc::new(AtomicBool::new(true)),
+                command: Self::remote_mux_command(
+                    &ssh_dom.remote_wezterm_path,
+                    "cli --prefer-mux --no-auto-start connect-reverse-proxy",
+                ),
+                source: reverse_source.unwrap(),
+            });
+        }
         Ok(())
     }
 
@@ -2191,6 +2407,7 @@ fn split_host_port(address: &str) -> Option<(&str, u16)> {
 
 impl Client {
     fn new(local_domain_id: Option<DomainId>, mut reconnectable: Reconnectable) -> Self {
+        let connect_transport = Arc::clone(&reconnectable.connect_transport);
         let client_domain_config = reconnectable.config.clone();
         let is_reconnectable = reconnectable.reconnectable();
         let is_local = reconnectable.is_local();
@@ -2310,14 +2527,16 @@ impl Client {
                     })
                     .detach();
                 }
-                if let Err(e) = client_thread(
+                let connection_result = client_thread(
                     &mut reconnectable,
                     local_domain_id,
                     generation,
                     &mut receiver,
                     &shutdown_rx,
                     &abort_rx,
-                ) {
+                );
+                reconnectable.connect_transport.lock().unwrap().take();
+                if let Err(e) = connection_result {
                     *reader_abort.lock().unwrap() = None;
                     // A client let go of on purpose ends so: nothing to warn
                     // of, however often a command asks and lets go.
@@ -2661,7 +2880,23 @@ impl Client {
             remote_os_release,
             connection_generation,
             fatal_connection_error,
+            connect_transport,
         }
+    }
+
+    pub fn verified_connect_session(&self) -> Option<VerifiedConnectSession> {
+        if self.connection_phase() != ClientConnectionPhase::Ready || self.local_domain_id.is_none()
+        {
+            return None;
+        }
+        let transport = self.connect_transport.lock().ok()?;
+        let transport = transport.as_ref()?;
+        Some(VerifiedConnectSession {
+            session: transport.session.clone(),
+            live: Arc::downgrade(&transport.live),
+            command: transport.command.clone(),
+            source: transport.source.clone(),
+        })
     }
 
     /// Mark the connection as failed in a way no amount of retrying can fix.
@@ -3115,6 +3350,11 @@ impl Client {
         GetPaneRenderableDimensionsResponse
     );
     rpc!(get_codec_version, GetCodecVersion, GetCodecVersionResponse);
+    rpc!(
+        get_connect_endpoint,
+        GetConnectEndpoint,
+        GetConnectEndpointResponse
+    );
     rpc!(get_tls_creds, GetTlsCreds = (), GetTlsCredsResponse);
     rpc!(web_token_mint, WebTokenMint, WebTokenMintResponse);
     rpc!(web_token_list, WebTokenList = (), WebTokenListResponse);

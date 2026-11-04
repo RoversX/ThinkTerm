@@ -29,6 +29,7 @@ rangeset.workspace = true
 smol.workspace = true
 termwiz.workspace = true
 thinkterm-proto.workspace = true
+thinkterm-reverse-access = { path = "../thinkterm-reverse-access" }
 thinkterm-session.workspace = true
 thinkterm-update.workspace = true
 thiserror.workspace = true

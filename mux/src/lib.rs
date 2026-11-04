@@ -41,6 +41,7 @@ pub mod activity;
 pub mod agent_status;
 pub mod client;
 pub mod command_spec;
+pub mod connect;
 pub mod connui;
 pub mod default_prog;
 pub mod domain;
@@ -61,6 +62,32 @@ pub mod tmux;
 pub mod tmux_commands;
 mod tmux_pty;
 pub mod window;
+
+/// The Mux is a process-wide singleton, and tests that install one assert on
+/// its global state: they take this and run one at a time.
+#[cfg(test)]
+pub(crate) static GLOBAL_MUX_TESTS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+pub struct ConnectSuspension {
+    mux: Weak<Mux>,
+    resume: bool,
+}
+
+impl ConnectSuspension {
+    pub fn keep(mut self) {
+        self.resume = false;
+    }
+}
+
+impl Drop for ConnectSuspension {
+    fn drop(&mut self) {
+        if self.resume {
+            if let Some(mux) = self.mux.upgrade() {
+                mux.connect_suspended.store(false, Ordering::Release);
+            }
+        }
+    }
+}
 
 use crate::activity::Activity;
 
@@ -264,6 +291,7 @@ pub struct FrontendAccessState {
 #[derive(Default)]
 struct TabFrontendLease {
     owner: Option<ClientId>,
+    ownership_generation: u64,
     /// Last geometry advertised by each renderer. Network claims always carry
     /// their geometry and never trust this cache; it remains useful for the
     /// in-process GUI, whose Pane input reaches the mux without a wire PDU.
@@ -272,6 +300,15 @@ struct TabFrontendLease {
     /// it can never describe a renderer that is no longer driving.
     view: Option<FrontendView>,
     generation: u64,
+}
+
+impl TabFrontendLease {
+    fn set_owner(&mut self, owner: Option<ClientId>) {
+        if self.owner != owner {
+            self.ownership_generation = self.ownership_generation.saturating_add(1);
+            self.owner = owner;
+        }
+    }
 }
 
 /// True when `me` is the only *live* client that has advertised geometry for
@@ -332,6 +369,7 @@ struct FrontendLeaseState {
     tabs: HashMap<TabId, TabFrontendLease>,
     access_mode: FrontendAccessMode,
     handoff_owner: Option<ClientId>,
+    ownership_generation: u64,
     /// Distinguishes initial server startup (first renderer auto-owns) from an
     /// owner disconnect (everyone stays blocked until an explicit takeover).
     handoff_ever_owned: bool,
@@ -362,12 +400,29 @@ impl Default for FrontendLeaseState {
             tabs: HashMap::new(),
             access_mode: FrontendAccessMode::Handoff,
             handoff_owner: None,
+            ownership_generation: 0,
             handoff_ever_owned: false,
             handoff_last_owner: None,
             ever_rendered: HashSet::new(),
             access_initialized: false,
             access_generation: 0,
             next_generation: 1,
+        }
+    }
+}
+
+impl FrontendLeaseState {
+    fn set_handoff_owner(&mut self, owner: Option<ClientId>) {
+        if self.handoff_owner != owner {
+            self.ownership_generation = self.ownership_generation.saturating_add(1);
+            self.handoff_owner = owner;
+        }
+    }
+
+    fn set_access_mode(&mut self, mode: FrontendAccessMode) {
+        if self.access_mode != mode {
+            self.ownership_generation = self.ownership_generation.saturating_add(1);
+            self.access_mode = mode;
         }
     }
 }
@@ -473,6 +528,8 @@ impl PaletteAdvisoryState {
 
 pub struct Mux {
     runtime_server_id: String,
+    connect_service: Mutex<Option<Arc<connect::service::Service>>>,
+    connect_suspended: AtomicBool,
     tabs: RwLock<HashMap<TabId, Arc<Tab>>>,
     panes: RwLock<HashMap<PaneId, Arc<dyn Pane>>>,
     windows: RwLock<HashMap<WindowId, Window>>,
@@ -1451,6 +1508,8 @@ impl Mux {
 
         Self {
             runtime_server_id,
+            connect_service: Mutex::new(None),
+            connect_suspended: AtomicBool::new(false),
             tabs: RwLock::new(HashMap::new()),
             panes: RwLock::new(HashMap::new()),
             windows: RwLock::new(HashMap::new()),
@@ -1482,6 +1541,33 @@ impl Mux {
     /// to the old value.
     pub fn runtime_server_id(&self) -> &str {
         &self.runtime_server_id
+    }
+
+    pub fn connect_service(
+        self: &Arc<Self>,
+    ) -> thinkterm_reverse_access::Result<Arc<connect::service::Service>> {
+        let mut service = self.connect_service.lock();
+        if self.connect_suspended.load(Ordering::Acquire) {
+            return Err(thinkterm_reverse_access::Error::Unavailable);
+        }
+        if service.is_none() {
+            *service = Some(connect::service::Service::start(self)?);
+        }
+        Ok(Arc::clone(
+            service.as_ref().expect("initialized Connect service"),
+        ))
+    }
+
+    pub fn suspend_connect(self: &Arc<Self>) -> ConnectSuspension {
+        let mut service = self.connect_service.lock();
+        self.connect_suspended.store(true, Ordering::Release);
+        if let Some(service) = service.take() {
+            service.close();
+        }
+        ConnectSuspension {
+            mux: Arc::downgrade(self),
+            resume: true,
+        }
     }
 
     /// The agent socket panes here are given (`SSH_AUTH_SOCK`), if any.
@@ -1634,7 +1720,7 @@ impl Mux {
                 return;
             }
             let changed = lease.access_mode != mode;
-            lease.access_mode = mode;
+            lease.set_access_mode(mode);
             lease.access_initialized = true;
             changed
         };
@@ -1756,7 +1842,7 @@ impl Mux {
                         .as_ref()
                         .is_some_and(|last| same_device(last, client_id)))
             {
-                lease.handoff_owner = Some(client_id.clone());
+                lease.set_handoff_owner(Some(client_id.clone()));
                 lease.handoff_ever_owned = true;
                 lease.handoff_last_owner = None;
                 access_changed = true;
@@ -1784,7 +1870,7 @@ impl Mux {
             };
             let owner_changed = can_drive && !owner_was_me;
             if owner_changed {
-                state.owner = Some(client_id.clone());
+                state.set_owner(Some(client_id.clone()));
                 // Dropping the view on a takeover is safe because every path
                 // that vacates the owner also clears the view; a reseed
                 // therefore never discards a live scroll position.
@@ -2010,7 +2096,7 @@ impl Mux {
             let mut affected_tabs = vec![tab_id];
             if mode == FrontendAccessMode::Handoff {
                 access_changed = lease.handoff_owner.as_ref() != Some(client_id);
-                lease.handoff_owner = Some(client_id.clone());
+                lease.set_handoff_owner(Some(client_id.clone()));
                 lease.handoff_ever_owned = true;
                 // An explicit claim supersedes whoever drove before: the
                 // returning-device rule must not hand the lease back to it.
@@ -2025,7 +2111,7 @@ impl Mux {
             }
             let state = lease.tabs.entry(tab_id).or_default();
             state.viewports.insert(client_id.clone(), viewport.clone());
-            state.owner = Some(client_id.clone());
+            state.set_owner(Some(client_id.clone()));
             state.view = None;
             (access_changed, affected_tabs, joined)
         };
@@ -2138,14 +2224,14 @@ impl Mux {
 
         let affected_tabs = {
             let mut lease = self.frontend_lease.lock();
-            lease.access_mode = mode;
+            lease.set_access_mode(mode);
             lease.access_initialized = true;
             match mode {
                 FrontendAccessMode::TmuxLatest => {
-                    lease.handoff_owner = None;
+                    lease.set_handoff_owner(None);
                 }
                 FrontendAccessMode::Handoff => {
-                    lease.handoff_owner = Some(client_id.clone());
+                    lease.set_handoff_owner(Some(client_id.clone()));
                     lease.handoff_ever_owned = true;
                 }
             }
@@ -2157,7 +2243,7 @@ impl Mux {
             }
             let state = lease.tabs.entry(tab_id).or_default();
             state.viewports.insert(client_id.clone(), viewport.clone());
-            state.owner = Some(client_id.clone());
+            state.set_owner(Some(client_id.clone()));
             if !affected.contains(&tab_id) {
                 affected.push(tab_id);
             }
@@ -2379,7 +2465,7 @@ impl Mux {
         let (mode, mut affected_tabs) = {
             let mut lease = self.frontend_lease.lock();
             if let Some(mode) = restore_mode {
-                lease.access_mode = mode;
+                lease.set_access_mode(mode);
                 lease.access_initialized = true;
             }
             let mode = lease.access_mode;
@@ -2389,18 +2475,19 @@ impl Mux {
                     // The screen whose geometry failed is the one that gets
                     // to come back without a click, not whoever drove
                     // before it.
-                    lease.handoff_last_owner = lease.handoff_owner.take();
+                    lease.handoff_last_owner = lease.handoff_owner.clone();
+                    lease.set_handoff_owner(None);
                     lease.handoff_ever_owned = true;
                     for (affected_tab_id, state) in &mut lease.tabs {
-                        state.owner = None;
+                        state.set_owner(None);
                         state.view = None;
                         affected.push(*affected_tab_id);
                     }
                 }
                 FrontendAccessMode::TmuxLatest => {
-                    lease.handoff_owner = None;
+                    lease.set_handoff_owner(None);
                     let state = lease.tabs.entry(tab_id).or_default();
-                    state.owner = None;
+                    state.set_owner(None);
                     state.view = None;
                     affected.push(tab_id);
                 }
@@ -2729,7 +2816,7 @@ impl Mux {
                 if state.owner.as_ref() != Some(client_id) {
                     continue;
                 }
-                state.owner = None;
+                state.set_owner(None);
                 state.view = None;
                 affected.push(*tab_id);
             }
@@ -2740,7 +2827,7 @@ impl Mux {
                 // remaining device stays opaque until one explicitly clicks,
                 // wheels or swipes the takeover surface -- except this very
                 // device coming back, which inherits (see handoff_last_owner).
-                lease.handoff_owner = None;
+                lease.set_handoff_owner(None);
                 lease.handoff_ever_owned = true;
                 lease.handoff_last_owner = Some(client_id.clone());
             }
@@ -3667,6 +3754,9 @@ impl Mux {
             .cloned()
             .ok_or_else(|| anyhow!("pane {src_pane_id} not found in any tab"))?;
         let src_tab_id = src_tab.tab_id();
+        if Arc::ptr_eq(&src_tab, &target_tab) {
+            return src_tab.move_pane_to_split(src_pane_id, target_pane_id, request);
+        }
         let pane = src_tab.remove_pane(src_pane_id).ok_or_else(|| {
             anyhow!("pane {src_pane_id} not found in its containing tab {src_tab_id}")
         })?;
@@ -4053,6 +4143,14 @@ impl Mux {
     }
 }
 
+impl Drop for Mux {
+    fn drop(&mut self) {
+        if let Some(service) = self.connect_service.get_mut().take() {
+            service.close();
+        }
+    }
+}
+
 fn pane_size_for_cell_grid(size: TerminalSize, cols: usize, rows: usize) -> TerminalSize {
     let cols = cols.max(1);
     let rows = rows.max(1);
@@ -4434,7 +4532,7 @@ mod tests {
             Some(frontend_test_size(10, 5)),
             "only the driving frontend's sizes count"
         );
-        lease.handoff_owner = None;
+        lease.set_handoff_owner(None);
         assert_eq!(driving_frontend_size_over_root(&lease, 3, 7, root), None);
 
         lease.access_mode = FrontendAccessMode::TmuxLatest;
@@ -4616,7 +4714,7 @@ mod tests {
         mux.register_client(Arc::clone(&tui));
         {
             let mut lease = mux.frontend_lease.lock();
-            lease.handoff_owner = None;
+            lease.set_handoff_owner(None);
             lease.handoff_ever_owned = true;
             let state = lease.tabs.entry(tab_id).or_default();
             state
@@ -4645,7 +4743,7 @@ mod tests {
         let tui_registration = mux.register_client(Arc::clone(&tui));
         {
             let mut lease = mux.frontend_lease.lock();
-            lease.handoff_owner = None;
+            lease.set_handoff_owner(None);
             lease.handoff_ever_owned = true;
             let state = lease.tabs.entry(tab_id).or_default();
             state

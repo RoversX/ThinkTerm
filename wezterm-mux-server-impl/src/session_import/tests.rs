@@ -327,3 +327,46 @@ fn a_shell_is_known_by_its_program_name() {
         assert!(!names_a_shell(&program), "{:?}", program);
     }
 }
+
+/// Delegated input works from the start, without changing how the imported
+/// reader and writer behave, and a handoff ends it.
+#[test]
+fn imported_terminal_takes_delegated_input_until_handed_off() {
+    let pty = nix::pty::openpty(None, None).unwrap();
+    let mut attributes = nix::sys::termios::tcgetattr(&pty.slave).unwrap();
+    nix::sys::termios::cfmakeraw(&mut attributes);
+    nix::sys::termios::tcsetattr(
+        &pty.slave,
+        nix::sys::termios::SetArg::TCSANOW,
+        &attributes,
+    )
+    .unwrap();
+    let master = pty::ImportedPty::prepare(pty.master).unwrap();
+    let mut regular = portable_pty::MasterPty::take_writer(&master).unwrap();
+    let mut reader = portable_pty::MasterPty::try_clone_reader(&master).unwrap();
+    let mut delegated = portable_pty::MasterPty::try_input_writer(&master).unwrap();
+    assert_eq!(delegated.try_write(b"typed").unwrap(), 5);
+    regular.write_all(b"after").unwrap();
+    let mut slave = std::fs::File::from(pty.slave);
+    let mut bytes = [0; 10];
+    slave.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"typedafter");
+
+    // Reading does not fail on the descriptor having turned nonblocking.
+    let read = std::thread::spawn(move || {
+        let mut bytes = [0; 5];
+        reader.read_exact(&mut bytes).unwrap();
+        bytes
+    });
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    slave.write_all(b"reply").unwrap();
+    assert_eq!(&read.join().unwrap(), b"reply");
+
+    portable_pty::MasterPty::quiesce_input(&master).unwrap();
+    assert_eq!(
+        delegated.try_write(b"stale").unwrap_err().kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+    let mut next = portable_pty::MasterPty::try_input_writer(&master).unwrap();
+    assert_eq!(next.try_write(b"next").unwrap(), 4);
+}

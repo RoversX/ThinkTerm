@@ -14,6 +14,7 @@ provides=('thinkterm' 'wezterm')
 conflicts=('thinkterm' 'wezterm')
 # Don't strip: it will break the binary and it only saves ~10% anyway
 options=('!strip')
+backup=('etc/pam.d/thinkterm-connect-auth')
 makedepends=('fuse')
 depends=(
   'dbus'
@@ -24,6 +25,8 @@ depends=(
   'wayland'
   'xcb-util-keysyms'
   'xcb-util-wm'
+  'pam'
+  'zenity'
 )
 optdepends=(
   'python-nautilus: ThinkTerm context menu in Nautilus'
@@ -51,6 +54,9 @@ package() {
   install -Dm755 squashfs-root/usr/bin/thinkterm -t "${pkgdir}/usr/bin/"
   install -Dm755 squashfs-root/usr/bin/wezterm -t "${pkgdir}/usr/bin/"
   install -Dm755 squashfs-root/usr/bin/thinkterm-gui -t "${pkgdir}/usr/bin/"
+  install -Dm755 squashfs-root/usr/bin/thinkterm-connect-auth -t "${pkgdir}/usr/bin/"
+  install -Dm644 squashfs-root/usr/share/thinkterm/connect-auth/pam/fedora \
+    "${pkgdir}/etc/pam.d/thinkterm-connect-auth"
   install -Dm755 squashfs-root/usr/bin/thinkterm-mux-server -t "${pkgdir}/usr/bin/"
   install -Dm755 squashfs-root/usr/bin/thinkterm-plugin-server -t "${pkgdir}/usr/bin/"
   install -Dm755 squashfs-root/usr/bin/thinkterm-tailnet -t "${pkgdir}/usr/bin/"

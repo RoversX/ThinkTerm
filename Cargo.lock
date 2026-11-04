@@ -2233,6 +2233,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "780955b8b195a21ab8e4ac6b60dd1dbdcec1dc6c51c0617964b08c81785e12c9"
 
 [[package]]
+name = "doctest-file"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2db04e74f0a9a93103b50e90b96024c9b2bdca8bce6a632ec71b88736d3d359"
+
+[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4329,6 +4335,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "interprocess"
+version = "2.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4a4fff6c51dece332bdbf3af5fe376c49cfc8dced782725e95be0bb489e35d7"
+dependencies = [
+ "doctest-file",
+ "futures-core",
+ "libc",
+ "recvmsg",
+ "tokio",
+ "widestring",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "intl-memoizer"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5406,6 +5427,7 @@ dependencies = [
  "fancy-regex 0.14.0",
  "filedescriptor 0.8.3",
  "finl_unicode 1.3.0",
+ "getrandom 0.3.4",
  "hostname",
  "k9",
  "lazy_static",
@@ -5434,6 +5456,7 @@ dependencies = [
  "termwiz-funcs",
  "textwrap",
  "thinkterm-proto",
+ "thinkterm-reverse-access",
  "thiserror 1.0.69",
  "toml 0.8.23",
  "url",
@@ -6190,6 +6213,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e6eb142958d64335fb0e345c5b9ead2ecd6fc438c307e9d7d3c4fd428dbaf12"
 
 [[package]]
+name = "pam-client2"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "407daa00f98b05147dbbaa6d2f6bce574e76794fa4952a5b38764681a23dde5f"
+dependencies = [
+ "bitflags 2.13.1",
+ "libc",
+ "pam-sys2",
+ "rustversion",
+]
+
+[[package]]
+name = "pam-sys2"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63e07ea89c210813e1a48fc32cb358ba693aae8ca70163461e22d11f1884bf1d"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6711,6 +6755,7 @@ dependencies = [
  "downcast-rs 1.2.1",
  "filedescriptor 0.8.3",
  "futures",
+ "interprocess",
  "lazy_static",
  "libc",
  "log",
@@ -7335,6 +7380,12 @@ dependencies = [
  "bytemuck",
  "font-types",
 ]
+
+[[package]]
+name = "recvmsg"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
 
 [[package]]
 name = "redox_syscall"
@@ -9290,6 +9341,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinkterm-connect-auth"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "embed-resource",
+ "futures-lite",
+ "futures-util",
+ "nix 0.29.0",
+ "pam-client2",
+ "serde",
+ "serde_json",
+ "smol",
+ "windows 0.62.2",
+ "windows-future",
+ "winreg",
+ "zbus",
+ "zeroize",
+ "zvariant",
+]
+
+[[package]]
 name = "thinkterm-core"
 version = "0.1.0"
 dependencies = [
@@ -9523,6 +9595,24 @@ dependencies = [
  "wezterm-color-types 0.3.0",
  "wezterm-input-types 0.1.0",
  "wgpu",
+]
+
+[[package]]
+name = "thinkterm-reverse-access"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "getrandom 0.3.4",
+ "interprocess",
+ "nix 0.29.0",
+ "procinfo",
+ "serde",
+ "serde_json",
+ "smol",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "widestring",
 ]
 
 [[package]]
@@ -9959,6 +10049,7 @@ checksum = "2efa149fe76073d6e8fd97ef4f4eca7b67f599660115591483572e406e165594"
 dependencies = [
  "bytes",
  "futures-core",
+ "futures-io",
  "futures-sink",
  "futures-util",
  "pin-project-lite",
@@ -11723,6 +11814,7 @@ dependencies = [
  "embed-resource",
  "env-bootstrap",
  "filedescriptor 0.8.3",
+ "futures",
  "hostname",
  "humantime",
  "image",
@@ -11744,6 +11836,7 @@ dependencies = [
  "thinkterm-file-index",
  "thinkterm-plugin-channel",
  "thinkterm-proto",
+ "thinkterm-reverse-access",
  "thinkterm-tailnet",
  "thinkterm-tui",
  "thinkterm-update",
@@ -11856,6 +11949,7 @@ dependencies = [
  "tempfile",
  "termwiz 0.24.0",
  "thinkterm-proto",
+ "thinkterm-reverse-access",
  "thinkterm-session",
  "thinkterm-update",
  "thiserror 1.0.69",
@@ -12102,6 +12196,7 @@ dependencies = [
  "thinkterm-plugin-panel",
  "thinkterm-proto",
  "thinkterm-render",
+ "thinkterm-reverse-access",
  "thinkterm-snippets",
  "thinkterm-syntax",
  "thinkterm-tab-icons",
@@ -12298,6 +12393,7 @@ dependencies = [
  "predicates",
  "regex",
  "rstest",
+ "russh",
  "sha2 0.10.9",
  "shell-words",
  "smol",
@@ -12305,6 +12401,7 @@ dependencies = [
  "ssh2",
  "termwiz 0.24.0",
  "thiserror 1.0.69",
+ "tokio",
  "wezterm-uds",
  "whoami",
 ]
@@ -12580,6 +12677,12 @@ dependencies = [
  "bytemuck",
  "safe_arch",
 ]
+
+[[package]]
+name = "widestring"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 
 [[package]]
 name = "winapi"

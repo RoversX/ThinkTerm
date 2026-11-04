@@ -3,6 +3,9 @@ compile_error!("Either libssh-rs or ssh2 must be enabled!");
 
 mod addresses;
 mod auth;
+mod authentication;
+#[cfg(all(test, unix))]
+mod authentication_tests;
 mod channelwrap;
 mod config;
 mod dirwrap;
@@ -18,6 +21,7 @@ mod through;
 
 pub use addresses::OTHER_ADDRESSES;
 pub use auth::*;
+pub use authentication::{AuthenticationBackend, AuthenticationInfo, AuthenticationMethod};
 pub use config::*;
 pub use host::*;
 pub use pty::*;

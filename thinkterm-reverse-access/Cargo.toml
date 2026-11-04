@@ -1,0 +1,23 @@
+[package]
+name = "thinkterm-reverse-access"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+getrandom.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+futures.workspace = true
+smol.workspace = true
+procinfo = { path = "../procinfo", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["time", "process", "signal", "socket", "user"] }
+
+[target.'cfg(windows)'.dependencies]
+widestring = "1.2.1"
+interprocess = { version = "2.4.7", default-features = false, features = ["tokio"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }

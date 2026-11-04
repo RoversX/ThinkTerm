@@ -32,13 +32,13 @@ impl crate::sessioninner::SessionInner {
         sess: &libssh_rs::Session,
         hostname: &str,
         port: u16,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let key = sess
             .get_server_public_key()?
             .get_public_key_hash_hexa(libssh_rs::PublicKeyHashType::Sha256)?;
 
         match sess.is_known_server()? {
-            libssh_rs::KnownHosts::Ok => Ok(()),
+            libssh_rs::KnownHosts::Ok => Ok(true),
             libssh_rs::KnownHosts::NotFound | libssh_rs::KnownHosts::Unknown => {
                 let (reply, confirm) = bounded(1);
                 self.tx_event
@@ -60,7 +60,8 @@ impl crate::sessioninner::SessionInner {
                     anyhow::bail!("user declined to trust host");
                 }
 
-                Ok(sess.update_known_hosts_file()?)
+                sess.update_known_hosts_file()?;
+                Ok(true)
             }
             libssh_rs::KnownHosts::Changed => {
                 let mut file = None;
@@ -133,7 +134,7 @@ impl crate::sessioninner::SessionInner {
         remote_host_name: &str,
         port: u16,
         remote_address: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         use anyhow::anyhow;
         use std::io::Write;
         use std::path::Path;
@@ -147,6 +148,7 @@ impl crate::sessioninner::SessionInner {
             .split_whitespace()
             .map(|s| s.to_string());
 
+        let mut verified = false;
         for file in known_hosts_files {
             let file = Path::new(&file);
 
@@ -187,7 +189,7 @@ impl crate::sessioninner::SessionInner {
                 .ok_or_else(|| anyhow!("failed to get host fingerprint"))?;
 
             match known_hosts.check_port(&remote_host_name, port, key) {
-                ssh2::CheckResult::Match => {}
+                ssh2::CheckResult::Match => verified = true,
                 ssh2::CheckResult::NotFound => {
                     let (reply, confirm) = bounded(1);
                     self.tx_event
@@ -222,6 +224,7 @@ impl crate::sessioninner::SessionInner {
                     known_hosts
                         .write_file(&file, ssh2::KnownHostFileKind::OpenSSH)
                         .with_context(|| format!("writing known_hosts file {}", file.display()))?;
+                    verified = true;
                 }
                 ssh2::CheckResult::Mismatch => {
                     let failed = HostVerificationFailed {
@@ -240,6 +243,6 @@ impl crate::sessioninner::SessionInner {
             }
         }
 
-        Ok(())
+        Ok(verified)
     }
 }

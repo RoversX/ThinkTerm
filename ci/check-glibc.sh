@@ -66,6 +66,7 @@ else
     check "$bin" "$server_main"
   done
   check thinkterm-gui "$desktop"
+  check thinkterm-connect-auth "$desktop"
 fi
 
 exit $status

@@ -774,6 +774,7 @@ struct Capture {
     panes: Vec<(HandoffPane, PaneObjects)>,
     topology: Vec<HandoffWindow>,
     paused: Vec<PausedReader>,
+    connect: mux::ConnectSuspension,
 }
 
 fn serve_inner(stream: &mut UnixStream, socket_path: &Path) -> anyhow::Result<()> {
@@ -859,6 +860,7 @@ fn serve_inner(stream: &mut UnixStream, socket_path: &Path) -> anyhow::Result<()
     for paused in capture.paused {
         paused.keep();
     }
+    capture.connect.keep();
     Ok(())
 }
 
@@ -920,6 +922,7 @@ where
 /// Runs on the main thread, where the mux is read.
 fn capture(pid_file: bool) -> anyhow::Result<Capture> {
     let mux = Mux::get();
+    let connect = mux.suspend_connect();
     let local_domain = mux.default_domain().domain_id();
     let mut paused = Vec::new();
     let mut panes = Vec::new();
@@ -929,8 +932,11 @@ fn capture(pid_file: bool) -> anyhow::Result<Capture> {
     for pane in mux.iter_panes() {
         let pane_id = pane.pane_id();
         let parts = match pane.downcast_ref::<LocalPane>() {
-            Some(local) if pane.domain_id() == local_domain => travelling_parts(local)
-                .with_context(|| format!("pane {pane_id} cannot be handed over"))?,
+            Some(local) if pane.domain_id() == local_domain => {
+                local.quiesce_connect_input()?;
+                travelling_parts(local)
+                    .with_context(|| format!("pane {pane_id} cannot be handed over"))?
+            }
             _ => None,
         };
         let Some(parts) = parts else {
@@ -1010,6 +1016,7 @@ fn capture(pid_file: bool) -> anyhow::Result<Capture> {
         panes,
         topology,
         paused,
+        connect,
     })
 }
 

@@ -1567,6 +1567,20 @@ impl SessionHandler {
         spawn_into_main_thread(push_pane_changes_when_free(pane_id, sender, per_pane)).detach();
     }
 
+    fn connect_endpoint(&self) -> anyhow::Result<Pdu> {
+        if !matches!(self.peer, ConnectionPeer::Local) {
+            anyhow::bail!("Connect local endpoint is unavailable");
+        }
+        let mux = Mux::get();
+        let service = mux.connect_service()?;
+        Ok(Pdu::GetConnectEndpointResponse(
+            GetConnectEndpointResponse {
+                server_id: mux.runtime_server_id().to_string(),
+                address: service.name().to_string(),
+            },
+        ))
+    }
+
     pub fn process_one(&mut self, decoded: DecodedPdu) {
         let start = Instant::now();
         let sender = self.to_write_tx.clone();
@@ -2997,6 +3011,8 @@ impl SessionHandler {
                 }
             }
 
+            Pdu::GetConnectEndpoint(_) => send_response(self.connect_endpoint()),
+
             // Carried to the plugin host unread; see plugin_relay.
             Pdu::PluginFrame(PluginFrame { data }) => {
                 if data.is_empty() {
@@ -3473,6 +3489,7 @@ impl SessionHandler {
             | Pdu::SearchScrollbackResponse { .. }
             | Pdu::GetLinesResponse { .. }
             | Pdu::GetCodecVersionResponse { .. }
+            | Pdu::GetConnectEndpointResponse { .. }
             | Pdu::WindowWorkspaceChanged { .. }
             | Pdu::GetTlsCredsResponse { .. }
             | Pdu::WebTokenMintResponse { .. }

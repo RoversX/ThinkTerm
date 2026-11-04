@@ -11,6 +11,9 @@ install -Dsm755 -t AppDir/usr/bin target/$PROFILE/thinkterm-mux-server
 install -Dsm755 -t AppDir/usr/bin target/$PROFILE/thinkterm
 install -Dsm755 -t AppDir/usr/bin target/$PROFILE/wezterm
 install -Dsm755 -t AppDir/usr/bin target/$PROFILE/thinkterm-gui
+install -Dsm755 -t AppDir/usr/bin target/$PROFILE/thinkterm-connect-auth
+install -Dm644 -t AppDir/usr/share/thinkterm/connect-auth/pam thinkterm-connect-auth/pam/*
+install -Dm644 docs/thinkterm/connect-reverse-access.md AppDir/usr/share/thinkterm/connect-auth/README.md
 install -Dsm755 -t AppDir/usr/bin target/$PROFILE/thinkterm-plugin-server
 install -Dsm755 -t AppDir/usr/bin target/$PROFILE/thinkterm-tailnet
 install -Dsm755 -t AppDir/usr/bin target/$PROFILE/strip-ansi-escapes
@@ -81,6 +84,8 @@ UPDATE_INFORMATION="$UPDATE" \
 OUTPUT="$OUTPUT" \
   /tmp/linuxdeploy \
   --exclude-library='libwayland-client.so.0' \
+  --exclude-library='libpam.so.0' \
+  --exclude-library='libpam_misc.so.0' \
   --appdir AppDir \
   --output appimage \
   --desktop-file assets/wezterm.desktop

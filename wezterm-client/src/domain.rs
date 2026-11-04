@@ -2579,6 +2579,12 @@ impl ClientDomain {
         self.inner()?.client.remote_os_release()
     }
 
+    pub fn connect_client(&self) -> Option<crate::client::Client> {
+        let inner = self.inner()?;
+        (inner.client.connection_phase() == ClientConnectionPhase::Ready)
+            .then(|| inner.client.clone())
+    }
+
     pub(crate) fn inner(&self) -> Option<Arc<ClientInner>> {
         self.inner.lock().unwrap().as_ref().map(Arc::clone)
     }

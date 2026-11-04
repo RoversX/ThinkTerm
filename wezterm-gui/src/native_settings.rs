@@ -1778,13 +1778,37 @@ impl NativeServerTerminals {
     pub(crate) const ALL: [Self; 3] = [Self::Off, Self::Read, Self::Type];
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct NativeAgentsSettings {
     /// A build without a choice a newer one made falls back to off rather
     /// than failing the file.
     #[serde(deserialize_with = "choice_or_default")]
     pub(crate) server_terminals: NativeServerTerminals,
+    #[serde(deserialize_with = "reverse_minutes")]
+    pub(crate) reverse_access_minutes: u16,
+}
+
+impl Default for NativeAgentsSettings {
+    fn default() -> Self {
+        Self {
+            server_terminals: NativeServerTerminals::Off,
+            reverse_access_minutes: 30,
+        }
+    }
+}
+
+/// A value outside the range reads as the default, and the file is kept: see
+/// [`choice_or_default`].
+fn reverse_minutes<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u16, D::Error> {
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    match u16::deserialize(&raw) {
+        Ok(value @ 1..=120) => Ok(value),
+        _ => {
+            log::warn!("reverse access duration {raw} is not 1 to 120 minutes; using the default");
+            Ok(NativeAgentsSettings::default().reverse_access_minutes)
+        }
+    }
 }
 
 /// How far the programs here may reach servers' terminals. Through the
@@ -3475,6 +3499,19 @@ mod tests {
         let settings: ThinkTermNativeSettings =
             serde_json::from_str(r#"{"sharing": {"enabled": true}}"#).unwrap();
         assert!(settings.sharing.enabled);
+    }
+
+    #[test]
+    fn a_reverse_access_duration_out_of_range_costs_only_itself() {
+        let agents = |json: &str| -> NativeAgentsSettings { serde_json::from_str(json).unwrap() };
+        assert_eq!(agents("{}").reverse_access_minutes, 30);
+        assert_eq!(agents(r#"{"reverse_access_minutes": 45}"#).reverse_access_minutes, 45);
+        for bad in ["0", "121", "-1", "70000", "\"long\"", "null"] {
+            let json = format!(r#"{{"reverse_access_minutes": {bad}, "server_terminals": "type"}}"#);
+            let settings = agents(&json);
+            assert_eq!(settings.reverse_access_minutes, 30, "{bad}");
+            assert_eq!(settings.server_terminals, NativeServerTerminals::Type, "{bad}");
+        }
     }
 
     #[test]

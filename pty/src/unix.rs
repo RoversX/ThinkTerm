@@ -12,6 +12,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::{io, mem, ptr};
 
 pub use std::os::unix::io::RawFd;
@@ -52,6 +53,7 @@ fn openpty(size: PtySize) -> anyhow::Result<(UnixMasterPty, UnixSlavePty)> {
         fd: PtyFd(unsafe { FileDescriptor::from_raw_fd(master) }),
         took_writer: RefCell::new(false),
         tty_name,
+        input_writer: RefCell::new(None),
     };
     let slave = UnixSlavePty {
         fd: PtyFd(unsafe { FileDescriptor::from_raw_fd(slave) }),
@@ -92,16 +94,109 @@ impl std::ops::DerefMut for PtyFd {
 
 impl Read for PtyFd {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
-        match self.0.read(buf) {
-            Err(ref e) if e.raw_os_error() == Some(libc::EIO) => {
-                // EIO indicates that the slave pty has been closed.
-                // Treat this as EOF so that std::io::Read::read_to_string
-                // and similar functions gracefully terminate when they
-                // encounter this condition
-                Ok(0)
+        loop {
+            match self.0.read(buf) {
+                Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    wait_pty(&self.0, filedescriptor::POLLIN)?;
+                }
+                Err(ref e) if e.raw_os_error() == Some(libc::EIO) => {
+                    // EIO indicates that the slave pty has been closed.
+                    // Treat this as EOF so that std::io::Read::read_to_string
+                    // and similar functions gracefully terminate when they
+                    // encounter this condition
+                    return Ok(0);
+                }
+                result => return result,
             }
-            x => x,
         }
+    }
+}
+
+fn wait_pty(fd: &FileDescriptor, events: i16) -> io::Result<()> {
+    let mut fds = [filedescriptor::pollfd {
+        fd: fd.as_raw_fd(),
+        events,
+        revents: 0,
+    }];
+    loop {
+        match filedescriptor::poll(&mut fds, None) {
+            Ok(_) => return Ok(()),
+            Err(filedescriptor::Error::Poll(error))
+                if error.kind() == io::ErrorKind::Interrupted =>
+            {
+                ()
+            }
+            Err(error) => return Err(io::Error::new(io::ErrorKind::Other, error)),
+        }
+    }
+}
+
+impl Write for PtyFd {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        loop {
+            match self.0.write(buf) {
+                Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    wait_pty(&self.0, filedescriptor::POLLOUT)?;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+/// The delegated input handle of a master, which sets O_NONBLOCK on every
+/// duplicate of it. Readers and writers of that master have to allow for it.
+#[derive(Debug)]
+pub struct NonblockingInput {
+    fd: std::sync::Mutex<FileDescriptor>,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl NonblockingInput {
+    pub fn new(master: &impl AsRawFd) -> Result<Arc<Self>, Error> {
+        let mut fd = FileDescriptor::dup(master)?;
+        fd.set_non_blocking(true)?;
+        Ok(Arc::new(Self {
+            fd: std::sync::Mutex::new(fd),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+
+    pub fn writer(self: &Arc<Self>) -> Box<dyn crate::TryInputWriter> {
+        Box::new(UnixTryInput(Arc::clone(self)))
+    }
+
+    /// Writers already handed out stop working, and the master is left as
+    /// ordinary code expects it.
+    pub fn close(&self) -> Result<(), Error> {
+        let mut fd = self
+            .fd
+            .lock()
+            .map_err(|_| anyhow::anyhow!("pty input is unavailable"))?;
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        fd.set_non_blocking(false)?;
+        Ok(())
+    }
+}
+
+struct UnixTryInput(Arc<NonblockingInput>);
+
+impl crate::TryInputWriter for UnixTryInput {
+    fn try_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut fd = self
+            .0
+            .fd
+            .try_lock()
+            .map_err(|_| io::ErrorKind::WouldBlock)?;
+        if self.0.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        fd.write(bytes)
     }
 }
 
@@ -304,6 +399,7 @@ struct UnixMasterPty {
     fd: PtyFd,
     took_writer: RefCell<bool>,
     tty_name: Option<PathBuf>,
+    input_writer: RefCell<Option<Arc<NonblockingInput>>>,
 }
 
 /// A master pty this process did not open: the descriptor came from
@@ -321,6 +417,7 @@ pub fn master_from_raw_fd(
         fd: PtyFd(fd),
         took_writer: RefCell::new(false),
         tty_name,
+        input_writer: RefCell::new(None),
     }))
 }
 
@@ -381,6 +478,26 @@ impl MasterPty for UnixMasterPty {
         Ok(Box::new(UnixMasterWriter { fd }))
     }
 
+    fn try_input_writer(&self) -> Result<Box<dyn crate::TryInputWriter>, Error> {
+        let mut cached = self.input_writer.borrow_mut();
+        if let Some(input) = cached.as_ref() {
+            return Ok(input.writer());
+        }
+        let input = NonblockingInput::new(&self.fd.0)?;
+        // Keep the mode stable for this master's lifetime. Restoring it
+        // as a previous lease drops can race with acquiring a new lease.
+        let writer = input.writer();
+        *cached = Some(input);
+        Ok(writer)
+    }
+
+    fn quiesce_input(&self) -> Result<(), Error> {
+        if let Some(input) = self.input_writer.borrow_mut().take() {
+            input.close()?;
+        }
+        Ok(())
+    }
+
     fn as_raw_fd(&self) -> Option<RawFd> {
         Some(self.fd.0.as_raw_fd())
     }
@@ -428,5 +545,85 @@ impl Write for UnixMasterWriter {
     }
     fn flush(&mut self) -> Result<(), io::Error> {
         self.fd.flush()
+    }
+}
+
+#[cfg(test)]
+mod delegated_input_tests {
+    use super::*;
+    use std::os::fd::AsFd;
+
+    #[test]
+    fn checked_input_is_nonblocking_and_preserves_regular_io() {
+        let (master, slave) = openpty(PtySize::default()).unwrap();
+        let mut attributes = nix::sys::termios::tcgetattr(slave.fd.as_fd()).unwrap();
+        nix::sys::termios::cfmakeraw(&mut attributes);
+        nix::sys::termios::tcsetattr(
+            slave.fd.as_fd(),
+            nix::sys::termios::SetArg::TCSANOW,
+            &attributes,
+        )
+        .unwrap();
+        let mut checked = master.try_input_writer().unwrap();
+        let mut regular = master.take_writer().unwrap();
+        let mut slave_reader = slave.fd.try_clone().unwrap();
+        let block = [b'x'; 4096];
+        let mut accepted = 0;
+        loop {
+            match checked.try_write(&block) {
+                Ok(0) => panic!("nonempty PTY input made no progress"),
+                Ok(count) => accepted += count,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("unexpected PTY error: {}", error),
+            }
+            assert!(
+                accepted < 8 * 1024 * 1024,
+                "PTY failed to apply backpressure"
+            );
+        }
+        assert!(accepted > 0);
+        // A normal write must still wait and eventually deliver all bytes.
+        let drain = std::thread::spawn(move || {
+            let mut received = vec![0; accepted + 4];
+            slave_reader.read_exact(&mut received).unwrap();
+            assert!(received[..accepted].iter().all(|byte| *byte == b'x'));
+            assert_eq!(&received[accepted..], b"done");
+        });
+        regular.write_all(b"done").unwrap();
+        drain.join().unwrap();
+
+        let mut reader = master.try_clone_reader().unwrap();
+        let read = std::thread::spawn(move || {
+            let mut bytes = [0; 5];
+            reader.read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"reply");
+        });
+        slave.fd.try_clone().unwrap().write_all(b"reply").unwrap();
+        read.join().unwrap();
+        drop(checked);
+        let mut next = master.try_input_writer().unwrap();
+        assert_eq!(next.try_write(b"next").unwrap(), 4);
+    }
+
+    #[test]
+    fn handoff_quiesces_old_writers_without_changing_successor_mode_on_drop() {
+        let (master, _slave) = openpty(PtySize::default()).unwrap();
+        let mut old = master.try_input_writer().unwrap();
+        master.quiesce_input().unwrap();
+        assert_eq!(
+            old.try_write(b"stale").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        let flags = || {
+            nix::fcntl::OFlag::from_bits_truncate(
+                nix::fcntl::fcntl(master.fd.0.as_raw_fd(), nix::fcntl::FcntlArg::F_GETFL).unwrap(),
+            )
+        };
+        assert!(!flags().contains(nix::fcntl::OFlag::O_NONBLOCK));
+        let mut current = master.try_input_writer().unwrap();
+        assert!(flags().contains(nix::fcntl::OFlag::O_NONBLOCK));
+        drop(old);
+        assert!(flags().contains(nix::fcntl::OFlag::O_NONBLOCK));
+        assert_eq!(current.try_write(b"current").unwrap(), 7);
     }
 }

@@ -1,4 +1,5 @@
 pub mod client;
+pub mod connect;
 mod connection_io;
 pub mod discovery;
 pub mod domain;

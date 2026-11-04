@@ -55,6 +55,54 @@ impl SendKey {
             .collect::<anyhow::Result<Vec<_>>>()
             .map_err(|err| UsageError(format!("{err:#}")))?;
 
+        if self.wait
+            && self
+                .pane
+                .as_deref()
+                .is_some_and(crate::cli::reverse::looks_like_target)
+        {
+            return Err(UsageError("reverse access does not support --wait".into()).into());
+        }
+        if let Some(target) = crate::cli::reverse::resolve(&client, self.pane.as_deref()).await? {
+            use thinkterm_reverse_access::protocol::{Command, Key};
+            if events.len() > thinkterm_reverse_access::MAX_KEYS {
+                return Err(UsageError("reverse input is limited to 64 keys".into()).into());
+            }
+            let keys = events
+                .into_iter()
+                .map(|event| {
+                    let name = match event.key {
+                        KeyCode::Char(c) => c.to_string(),
+                        KeyCode::Enter => "enter".into(),
+                        KeyCode::Tab => "tab".into(),
+                        KeyCode::Escape => "escape".into(),
+                        KeyCode::Backspace => "backspace".into(),
+                        KeyCode::Delete => "delete".into(),
+                        KeyCode::UpArrow => "up".into(),
+                        KeyCode::DownArrow => "down".into(),
+                        KeyCode::LeftArrow => "left".into(),
+                        KeyCode::RightArrow => "right".into(),
+                        KeyCode::Home => "home".into(),
+                        KeyCode::End => "end".into(),
+                        KeyCode::PageUp => "pageup".into(),
+                        KeyCode::PageDown => "pagedown".into(),
+                        KeyCode::Insert => "insert".into(),
+                        KeyCode::Function(n) => format!("f{n}"),
+                        _ => return Err(UsageError("unsupported reverse key".into())),
+                    };
+                    Ok(Key {
+                        name,
+                        modifiers: event.modifiers.bits(),
+                    })
+                })
+                .collect::<Result<Vec<_>, UsageError>>()?;
+            let command = Command::Keys {
+                export: target.export,
+                keys,
+            };
+            return crate::cli::reverse::send(target, command, None).await;
+        }
+
         if !self.wait {
             let (client, pane_id) = crate::cli::target::resolve_reaching_servers(
                 client,

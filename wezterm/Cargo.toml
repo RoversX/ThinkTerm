@@ -22,6 +22,8 @@ default = ["tailnet"]
 tailnet = ["dep:thinkterm-tailnet"]
 
 [dependencies]
+futures.workspace = true
+thinkterm-reverse-access = { path = "../thinkterm-reverse-access" }
 base64 = { workspace = true, features = ["std"] }
 thinkterm-tailnet = { workspace = true, optional = true }
 anyhow.workspace = true

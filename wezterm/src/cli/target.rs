@@ -13,10 +13,27 @@ pub async fn resolve(
     pane_id: Option<PaneId>,
     pane: Option<&str>,
 ) -> anyhow::Result<PaneId> {
+    if pane.is_some_and(crate::cli::reverse::looks_like_target) {
+        return Err(UsageError("this operation does not support reverse terminals".into()).into());
+    }
     match pane {
         Some(name) => find(client, name).await,
         None => client.resolve_pane_id(pane_id).await,
     }
+}
+
+pub(super) async fn local_match(client: &Client, name: &str) -> anyhow::Result<bool> {
+    let panes = candidates(client).await?;
+    Ok(local_match_in(&panes, name.trim()))
+}
+
+fn local_match_in(panes: &[Candidate], name: &str) -> bool {
+    let id = as_pane_id(name);
+    // A name claimed by several panes still conflicts with a reverse
+    // target, including a thread name that needs further disambiguation.
+    panes
+        .iter()
+        .any(|pane| id == Some(pane.pane_id) || names(pane, name, true))
 }
 
 /// The pane `pane` names, and the client that reaches it: a pane of this
@@ -379,6 +396,39 @@ mod tests {
             pane(4, Some("build"), "w-solo", Some("solo")),
             pane(5, None, "default", None),
         ]
+    }
+
+    #[test]
+    fn local_reverse_name_collisions_include_ambiguous_labels() {
+        let name = "desktop-0123abcd/21";
+        let mut panes = vec![pane(1, Some(name), "w-a", None)];
+        assert!(local_match_in(&panes, name));
+        panes.push(pane(2, Some("DESKTOP-0123ABCD/21"), "w-b", None));
+        assert!(choose(&panes, name, None).is_err());
+        assert!(local_match_in(&panes, name));
+        assert!(local_match_in(&panes, "DESKTOP-0123ABCD/21"));
+        assert!(!local_match_in(&panes, "desktop-0123abcd/22"));
+        assert!(!local_match_in(&[], name));
+    }
+
+    #[test]
+    fn local_reverse_name_collisions_include_shared_thread_names_and_labels() {
+        let name = "desktop-0123abcd/21";
+        let panes = vec![
+            pane(1, None, "w-a", Some(name)),
+            pane(2, None, "w-a", Some(name)),
+        ];
+        assert!(choose(&panes, name, None).is_err());
+        assert!(local_match_in(&panes, name));
+        let panes = vec![
+            pane(1, Some("21"), "w-a", Some("desktop-0123abcd")),
+            pane(2, Some("21"), "w-b", Some("desktop-0123abcd")),
+        ];
+        assert!(choose(&panes, name, None).is_err());
+        assert!(local_match_in(&panes, name));
+        assert!(local_match_in(&panes, "1"));
+        assert!(!local_match_in(&panes, "3"));
+        assert!(!local_match_in(&panes, "zsh"));
     }
 
     #[test]
