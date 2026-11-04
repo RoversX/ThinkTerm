@@ -15,18 +15,18 @@ CHARTS = [
     dict(
         prefix="performance",
         rival="WezTerm",
-        legend=("ThinkTerm 0.3.0 · 2026-10-21", "WezTerm 20260117 · 2026-09-23"),
+        legend=("ThinkTerm 0.4.1 · 2026-11-04", "WezTerm 20260117 · 2026-09-23"),
         machine="Mac · M1 Pro",
         caption="mac",
         scale_max=300,
         # workload: (ThinkTerm MB/s, rival MB/s)
         results={
-            "ascii": (133.0, 23.6),
-            "unicode": (104.5, 46.7),
-            "multi": (197.5, 49.3),
-            "csi": (49.5, 15.6),
-            "long": (213.8, 194.9),
-            "images": (257.2, 270.5),
+            "ascii": (134.0, 23.6),
+            "unicode": (109.2, 46.7),
+            "multi": (234.4, 49.3),
+            "csi": (53.5, 15.6),
+            "long": (257.3, 194.9),
+            "images": (271.0, 270.5),
         },
     ),
     dict(
@@ -44,12 +44,34 @@ CHARTS = [
             "images": (391.8, 181.0),
         },
     ),
+    dict(
+        prefix="performance-progress",
+        legend=(
+            "ThinkTerm early · 2026-09",
+            "ThinkTerm 0.3.0 · 2026-10-21",
+            "ThinkTerm 0.4.1 · 2026-11-04",
+        ),
+        machine="Mac · M1 Pro",
+        caption="progress",
+        scale_max=300,
+        row_height=84,
+        # workload: (early MB/s, earlier MB/s, latest MB/s)
+        results={
+            "ascii": (45.3, 133.0, 134.0),
+            "unicode": (52.2, 104.5, 109.2),
+            "multi": (67.8, 197.5, 234.4),
+            "csi": (25.7, 49.5, 53.5),
+            "long": (219.4, 213.8, 257.3),
+            "images": (218.0, 257.2, 271.0),
+        },
+    ),
 ]
 
 LATIN_FONTS = "-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Segoe UI', 'Helvetica Neue', Helvetica, Arial"
 
 LANGS = {
     "en": dict(
+        progress_title="ThinkTerm across versions",
         fonts=LATIN_FONTS,
         decimal=".",
         subhead="kitten __benchmark__ · {machine} · MB/s, higher is better",
@@ -68,6 +90,7 @@ LANGS = {
         ),
     ),
     "zh-CN": dict(
+        progress_title="ThinkTerm 版本进步",
         fonts=LATIN_FONTS + ", 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC'",
         decimal=".",
         subhead="kitten __benchmark__ · {machine} · MB/s，越大越好",
@@ -86,6 +109,7 @@ LANGS = {
         ),
     ),
     "ja-JP": dict(
+        progress_title="バージョンごとの ThinkTerm",
         fonts=LATIN_FONTS + ", 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Yu Gothic', 'Meiryo', 'Noto Sans CJK JP'",
         decimal=".",
         subhead="kitten __benchmark__ · {machine} · MB/s、大きいほど高速",
@@ -104,6 +128,7 @@ LANGS = {
         ),
     ),
     "de-DE": dict(
+        progress_title="ThinkTerm über die Versionen",
         fonts=LATIN_FONTS,
         decimal=",",
         subhead="kitten __benchmark__ · {machine} · MB/s, höher ist besser",
@@ -122,6 +147,7 @@ LANGS = {
         ),
     ),
     "fr-FR": dict(
+        progress_title="ThinkTerm au fil des versions",
         fonts=LATIN_FONTS,
         decimal=",",
         subhead="kitten __benchmark__ · {machine} · Mo/s, plus c’est élevé, mieux c’est",
@@ -144,13 +170,13 @@ LANGS = {
 THEMES = {
     "light": dict(
         card="#ffffff", card_edge="#d2d2d7", ink="#1d1d1f", sub="#6e6e73", faint="#86868b",
-        grid="#ececf0", axis="#d2d2d7", ours_a="#2b8cff", ours_b="#0071e3", theirs="#c7c7cc",
+        grid="#ececf0", axis="#d2d2d7", ours_a="#2b8cff", ours_b="#0071e3", theirs="#c7c7cc", mid="#9cc6f7",
         win_fill="#e8f1ff", win_edge="#c4d7f6", win_ink="#0071e3",
         even_fill="#f5f5f7", even_edge="#e3e3e8", even_ink="#6e6e73", glow=0.28,
     ),
     "dark": dict(
         card="#000000", card_edge="#2c2c2e", ink="#f5f5f7", sub="#a1a1a6", faint="#8e8e93",
-        grid="#1c1c1e", axis="#3a3a3c", ours_a="#5fb0ff", ours_b="#2f8cff", theirs="#48484a",
+        grid="#1c1c1e", axis="#3a3a3c", ours_a="#5fb0ff", ours_b="#2f8cff", theirs="#48484a", mid="#2c5f9e",
         win_fill="#0b1f3d", win_edge="#1f4a85", win_ink="#4da3ff",
         even_fill="#1c1c1e", even_edge="#3a3a3c", even_ink="#a1a1a6", glow=0.5,
     ),
@@ -175,12 +201,15 @@ def label_width(s):
 def build(chart, lang, t):
     L = LANGS[lang]
     c = THEMES[t]
-    rows = [(L["labels"][k], a, b) for k, (a, b) in chart["results"].items()]
+    # Newest first in a comparison, oldest first along a version history.
+    progress = chart["caption"] == "progress"
+    row_h = chart.get("row_height", ROW_H)
+    rows = [(L["labels"][k], v) for k, v in chart["results"].items()]
     scale_max = chart["scale_max"]
-    x0 = max(MIN_X0, round(max(label_width(n) for n, _, _ in rows)) + 70)
+    x0 = max(MIN_X0, round(max(label_width(n) for n, _ in rows)) + 70)
     scale_w = BAR_END - x0
     subhead = L["subhead"].format(machine=chart["machine"])
-    title = f'ThinkTerm vs {chart["rival"]}'
+    title = L["progress_title"] if progress else f'ThinkTerm vs {chart["rival"]}'
 
     def x_of(v):
         return x0 + v / scale_max * scale_w
@@ -192,12 +221,20 @@ def build(chart, lang, t):
         r = a / b
         return num(r, 2 if r < 1 else 1) + "×"
 
-    h = TOP + ROW_H * len(rows) + 96
+    def lead(values):
+        """The two values the ratio compares: newer, then older."""
+        return (values[-1], values[0]) if progress else values
+
+    h = TOP + row_h * len(rows) + (56 if progress else 96)
     o = []
     o.append(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {h}" width="{W}" height="{h}" role="img" aria-labelledby="t d">')
     o.append(f'<title id="t">{title}</title>')
     o.append(f'<desc id="d">{escape(subhead)}. '
-             + escape("; ".join(f'{n}: ThinkTerm {num(a)}, {chart["rival"]} {num(b)} ({ratio(a, b)})' for n, a, b in rows))
+             + escape("; ".join(
+                 f'{n}: ' + ", ".join(f"{name.split(' · ')[0]} {num(v)}" for name, v in zip(chart["legend"], vs))
+                 + f' ({ratio(*lead(vs))})' if progress
+                 else f'{n}: ThinkTerm {num(vs[0])}, {chart["rival"]} {num(vs[1])} ({ratio(*vs)})'
+                 for n, vs in rows))
              + '.</desc>')
     o.append('<defs>')
     o.append(f'<linearGradient id="ours" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="{c["ours_b"]}"/><stop offset="1" stop-color="{c["ours_a"]}"/></linearGradient>')
@@ -218,6 +255,8 @@ def build(chart, lang, t):
     o.append('.ours { fill: url(#ours); }')
     o.append('.ours-bar { fill: url(#ours); filter: url(#glow); }')
     o.append(f'.theirs {{ fill: {c["theirs"]}; }}')
+    if progress:
+        o.append(f'.mid {{ fill: {c["mid"]}; }}')
     o.append(f'.win {{ fill: {c["win_fill"]}; stroke: {c["win_edge"]}; }}')
     o.append(f'.win-t {{ font-size: 14px; font-weight: 700; fill: {c["win_ink"]}; }}')
     o.append(f'.even {{ fill: {c["even_fill"]}; stroke: {c["even_edge"]}; }}')
@@ -229,17 +268,21 @@ def build(chart, lang, t):
 
     # legend
     ly = 132
-    ours, theirs = chart["legend"]
-    o.append(f'<rect x="{LEGEND_X}" y="{ly - 10}" width="22" height="12" rx="6" class="ours"/>')
-    o.append(f'<text x="{LEGEND_X + 30}" y="{ly}" class="legend">{ours}</text>')
-    lx = LEGEND_X + 30 + round(len(ours) * 7.0) + 30
-    o.append(f'<rect x="{lx}" y="{ly - 10}" width="22" height="12" rx="6" class="theirs"/>')
-    o.append(f'<text x="{lx + 30}" y="{ly}" class="legend">{theirs}</text>')
+    if progress:
+        bars = ("theirs", "mid", "ours")
+        lx = 72
+    else:
+        bars = ("ours", "theirs")
+        lx = LEGEND_X
+    for name, cls in zip(chart["legend"], bars):
+        o.append(f'<rect x="{lx}" y="{ly - 10}" width="22" height="12" rx="6" class="{cls}"/>')
+        o.append(f'<text x="{lx + 30}" y="{ly}" class="legend">{name}</text>')
+        lx += 30 + round(len(name) * 7.0) + 30
     o.append(f'<text x="{PILL_CX}" y="{ly}" class="legend" text-anchor="middle">{escape(L["ratio"])}</text>')
 
     # grid, six steps whatever the scale
     gy0 = TOP - 14
-    gy1 = TOP + ROW_H * len(rows) - 10
+    gy1 = TOP + row_h * len(rows) - 10
     step = scale_max // 6
     for v in range(step, scale_max + 1, step):
         x = x_of(v)
@@ -249,22 +292,24 @@ def build(chart, lang, t):
     o.append(f'<text x="{x0}" y="{gy1 + 20}" class="tick" text-anchor="middle">0</text>')
 
     r = BAR_H / 2
-    for i, (name, a, b) in enumerate(rows):
-        y = TOP + i * ROW_H
-        mid = y + BAR_H + GAP / 2
+    for i, (name, values) in enumerate(rows):
+        y = TOP + i * row_h
+        mid = y + (BAR_H * len(values) + GAP * (len(values) - 1)) / 2
         o.append(f'<text x="{x0 - 22}" y="{mid + 5:.1f}" class="label" text-anchor="end">{escape(name)}</text>')
-        wa = x_of(a) - x0
-        wb = x_of(b) - x0
-        o.append(f'<rect x="{x0}" y="{y}" width="{wa:.1f}" height="{BAR_H}" rx="{r}" class="ours-bar"/>')
-        o.append(f'<text x="{x0 + wa + 8:.1f}" y="{y + 12.5}" class="val-ours">{num(a)}</text>')
-        yb = y + BAR_H + GAP
-        o.append(f'<rect x="{x0}" y="{yb}" width="{wb:.1f}" height="{BAR_H}" rx="{r}" class="theirs"/>')
-        o.append(f'<text x="{x0 + wb + 8:.1f}" y="{yb + 12.5}" class="val-theirs">{num(b)}</text>')
-        cls = "win" if a > b else "even"
+        for j, (v, cls) in enumerate(zip(values, bars)):
+            yb = y + j * (BAR_H + GAP)
+            width = x_of(v) - x0
+            bar, val = ("ours-bar", "val-ours") if cls == "ours" else (cls, "val-theirs")
+            o.append(f'<rect x="{x0}" y="{yb}" width="{width:.1f}" height="{BAR_H}" rx="{r}" class="{bar}"/>')
+            o.append(f'<text x="{x0 + width + 8:.1f}" y="{yb + 12.5}" class="{val}">{num(v)}</text>')
+        a, b = lead(values)
+        # A lead too small to show in the ratio is not a win.
+        cls = "win" if a / b >= 1.05 else "even"
         o.append(f'<rect x="{PILL_CX - 34}" y="{mid - 14:.1f}" width="68" height="28" rx="14" class="{cls}"/>')
         o.append(f'<text x="{PILL_CX}" y="{mid + 5:.1f}" class="{cls}-t" text-anchor="middle">{ratio(a, b)}</text>')
 
-    o.append(f'<text x="500" y="{h - 34}" class="caption" text-anchor="middle">{escape(L["captions"][chart["caption"]])}</text>')
+    if not progress:
+        o.append(f'<text x="500" y="{h - 34}" class="caption" text-anchor="middle">{escape(L["captions"][chart["caption"]])}</text>')
     o.append('</svg>')
     return "\n".join(o) + "\n"
 

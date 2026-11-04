@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 738" width="1000" height="738" role="img" aria-labelledby="t d">
+<title id="t">バージョンごとの ThinkTerm</title>
+<desc id="d">kitten __benchmark__ · Mac · M1 Pro · MB/s、大きいほど高速. ASCII 文字のみ: ThinkTerm early 45.3, ThinkTerm 0.3.0 133.0, ThinkTerm 0.4.1 134.0 (3.0×); Unicode 文字: ThinkTerm early 52.2, ThinkTerm 0.3.0 104.5, ThinkTerm 0.4.1 109.2 (2.1×); 複数コードポイントの Unicode セル: ThinkTerm early 67.8, ThinkTerm 0.3.0 197.5, ThinkTerm 0.4.1 234.4 (3.5×); 文字の少ない CSI シーケンス: ThinkTerm early 25.7, ThinkTerm 0.3.0 49.5, ThinkTerm 0.4.1 53.5 (2.1×); 長いエスケープシーケンス: ThinkTerm early 219.4, ThinkTerm 0.3.0 213.8, ThinkTerm 0.4.1 257.3 (1.2×); 画像: ThinkTerm early 218.0, ThinkTerm 0.3.0 257.2, ThinkTerm 0.4.1 271.0 (1.2×).</desc>
+<defs>
+<linearGradient id="ours" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#0071e3"/><stop offset="1" stop-color="#2b8cff"/></linearGradient>
+<filter id="glow" x="-10%" y="-80%" width="120%" height="300%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#0071e3" flood-opacity="0.28"/></filter>
+</defs>
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Yu Gothic', 'Meiryo', 'Noto Sans CJK JP', sans-serif; fill: #1d1d1f; }
+.headline { font-size: 32px; font-weight: 700; letter-spacing: -0.6px; }
+.subhead { font-size: 16px; fill: #6e6e73; }
+.label { font-size: 15px; font-weight: 600; letter-spacing: -0.1px; }
+.legend { font-size: 13.5px; font-weight: 500; fill: #6e6e73; }
+.val-ours { font-size: 13px; font-weight: 700; }
+.val-theirs { font-size: 12.5px; font-weight: 500; fill: #6e6e73; }
+.tick { font-size: 11.5px; fill: #86868b; }
+.caption { font-size: 13px; font-weight: 500; fill: #86868b; }
+.grid { stroke: #ececf0; stroke-width: 1; }
+.axis { stroke: #d2d2d7; stroke-width: 1.2; }
+.ours { fill: url(#ours); }
+.ours-bar { fill: url(#ours); filter: url(#glow); }
+.theirs { fill: #c7c7cc; }
+.mid { fill: #9cc6f7; }
+.win { fill: #e8f1ff; stroke: #c4d7f6; }
+.win-t { font-size: 14px; font-weight: 700; fill: #0071e3; }
+.even { fill: #f5f5f7; stroke: #e3e3e8; }
+.even-t { font-size: 14px; font-weight: 700; fill: #6e6e73; }
+</style>
+<rect x="0.5" y="0.5" width="999" height="737" rx="28" fill="#ffffff" stroke="#d2d2d7"/>
+<text x="500" y="62" class="headline" text-anchor="middle">バージョンごとの ThinkTerm</text>
+<text x="500" y="92" class="subhead" text-anchor="middle">kitten __benchmark__ · Mac · M1 Pro · MB/s、大きいほど高速</text>
+<rect x="72" y="122" width="22" height="12" rx="6" class="theirs"/>
+<text x="102" y="132" class="legend">ThinkTerm early · 2026-09</text>
+<rect x="307" y="122" width="22" height="12" rx="6" class="mid"/>
+<text x="337" y="132" class="legend">ThinkTerm 0.3.0 · 2026-10-21</text>
+<rect x="563" y="122" width="22" height="12" rx="6" class="ours"/>
+<text x="593" y="132" class="legend">ThinkTerm 0.4.1 · 2026-11-04</text>
+<text x="912" y="132" class="legend" text-anchor="middle">倍率</text>
+<line x1="450.3" y1="164" x2="450.3" y2="672" class="grid"/>
+<text x="450.3" y="692" class="tick" text-anchor="middle">50</text>
+<line x1="528.7" y1="164" x2="528.7" y2="672" class="grid"/>
+<text x="528.7" y="692" class="tick" text-anchor="middle">100</text>
+<line x1="607.0" y1="164" x2="607.0" y2="672" class="grid"/>
+<text x="607.0" y="692" class="tick" text-anchor="middle">150</text>
+<line x1="685.3" y1="164" x2="685.3" y2="672" class="grid"/>
+<text x="685.3" y="692" class="tick" text-anchor="middle">200</text>
+<line x1="763.7" y1="164" x2="763.7" y2="672" class="grid"/>
+<text x="763.7" y="692" class="tick" text-anchor="middle">250</text>
+<line x1="842.0" y1="164" x2="842.0" y2="672" class="grid"/>
+<text x="842.0" y="692" class="tick" text-anchor="middle">300</text>
+<line x1="372" y1="164" x2="372" y2="672" class="axis"/>
+<text x="372" y="692" class="tick" text-anchor="middle">0</text>
+<text x="350" y="212.0" class="label" text-anchor="end">ASCII 文字のみ</text>
+<rect x="372" y="178" width="71.0" height="16" rx="8.0" class="theirs"/>
+<text x="451.0" y="190.5" class="val-theirs">45.3</text>
+<rect x="372" y="199" width="208.4" height="16" rx="8.0" class="mid"/>
+<text x="588.4" y="211.5" class="val-theirs">133.0</text>
+<rect x="372" y="220" width="209.9" height="16" rx="8.0" class="ours-bar"/>
+<text x="589.9" y="232.5" class="val-ours">134.0</text>
+<rect x="878" y="193.0" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="212.0" class="win-t" text-anchor="middle">3.0×</text>
+<text x="350" y="296.0" class="label" text-anchor="end">Unicode 文字</text>
+<rect x="372" y="262" width="81.8" height="16" rx="8.0" class="theirs"/>
+<text x="461.8" y="274.5" class="val-theirs">52.2</text>
+<rect x="372" y="283" width="163.7" height="16" rx="8.0" class="mid"/>
+<text x="543.7" y="295.5" class="val-theirs">104.5</text>
+<rect x="372" y="304" width="171.1" height="16" rx="8.0" class="ours-bar"/>
+<text x="551.1" y="316.5" class="val-ours">109.2</text>
+<rect x="878" y="277.0" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="296.0" class="win-t" text-anchor="middle">2.1×</text>
+<text x="350" y="380.0" class="label" text-anchor="end">複数コードポイントの Unicode セル</text>
+<rect x="372" y="346" width="106.2" height="16" rx="8.0" class="theirs"/>
+<text x="486.2" y="358.5" class="val-theirs">67.8</text>
+<rect x="372" y="367" width="309.4" height="16" rx="8.0" class="mid"/>
+<text x="689.4" y="379.5" class="val-theirs">197.5</text>
+<rect x="372" y="388" width="367.2" height="16" rx="8.0" class="ours-bar"/>
+<text x="747.2" y="400.5" class="val-ours">234.4</text>
+<rect x="878" y="361.0" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="380.0" class="win-t" text-anchor="middle">3.5×</text>
+<text x="350" y="464.0" class="label" text-anchor="end">文字の少ない CSI シーケンス</text>
+<rect x="372" y="430" width="40.3" height="16" rx="8.0" class="theirs"/>
+<text x="420.3" y="442.5" class="val-theirs">25.7</text>
+<rect x="372" y="451" width="77.6" height="16" rx="8.0" class="mid"/>
+<text x="457.6" y="463.5" class="val-theirs">49.5</text>
+<rect x="372" y="472" width="83.8" height="16" rx="8.0" class="ours-bar"/>
+<text x="463.8" y="484.5" class="val-ours">53.5</text>
+<rect x="878" y="445.0" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="464.0" class="win-t" text-anchor="middle">2.1×</text>
+<text x="350" y="548.0" class="label" text-anchor="end">長いエスケープシーケンス</text>
+<rect x="372" y="514" width="343.7" height="16" rx="8.0" class="theirs"/>
+<text x="723.7" y="526.5" class="val-theirs">219.4</text>
+<rect x="372" y="535" width="335.0" height="16" rx="8.0" class="mid"/>
+<text x="715.0" y="547.5" class="val-theirs">213.8</text>
+<rect x="372" y="556" width="403.1" height="16" rx="8.0" class="ours-bar"/>
+<text x="783.1" y="568.5" class="val-ours">257.3</text>
+<rect x="878" y="529.0" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="548.0" class="win-t" text-anchor="middle">1.2×</text>
+<text x="350" y="632.0" class="label" text-anchor="end">画像</text>
+<rect x="372" y="598" width="341.5" height="16" rx="8.0" class="theirs"/>
+<text x="721.5" y="610.5" class="val-theirs">218.0</text>
+<rect x="372" y="619" width="402.9" height="16" rx="8.0" class="mid"/>
+<text x="782.9" y="631.5" class="val-theirs">257.2</text>
+<rect x="372" y="640" width="424.6" height="16" rx="8.0" class="ours-bar"/>
+<text x="804.6" y="652.5" class="val-ours">271.0</text>
+<rect x="878" y="613.0" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="632.0" class="win-t" text-anchor="middle">1.2×</text>
+</svg>

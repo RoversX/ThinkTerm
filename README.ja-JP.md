@@ -79,21 +79,21 @@ ThinkTerm はローカル mux を有効にした状態で計測しています�
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/performance-ja-JP-dark.svg">
-    <img src="assets/performance-ja-JP-light.svg" alt="kitten ベンチマーク 6 項目での ThinkTerm と WezTerm のスループット比較：ThinkTerm は 5 項目で高速（1.1×〜5.6×）、画像のみわずかに低速（0.95×）" width="100%">
+    <img src="assets/performance-ja-JP-light.svg" alt="kitten ベンチマーク 6 項目での ThinkTerm と WezTerm のスループット比較：ThinkTerm は 5 項目で高速（1.3×〜5.7×）、画像はほぼ同等（1.0×）" width="100%">
   </picture>
 </p>
 
 <details>
 <summary>表形式のデータ</summary>
 
-| 項目 | ThinkTerm 0.3.0<br>2026-10-21 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | 倍率 |
+| 項目 | ThinkTerm 0.4.1<br>2026-11-04 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | 倍率 |
 | --- | ---: | ---: | ---: |
-| ASCII 文字のみ | **133.0** | 23.6 | 5.6× |
-| Unicode 文字 | **104.5** | 46.7 | 2.2× |
-| 複数コードポイントの Unicode セル | **197.5** | 49.3 | 4.0× |
-| 文字の少ない CSI シーケンス | **49.5** | 15.6 | 3.2× |
-| 長いエスケープシーケンス | **213.8** | 194.9 | 1.1× |
-| 画像 | 257.2 | **270.5** | 0.95× |
+| ASCII 文字のみ | **134.0** | 23.6 | 5.7× |
+| Unicode 文字 | **109.2** | 46.7 | 2.3× |
+| 複数コードポイントの Unicode セル | **234.4** | 49.3 | 4.8× |
+| 文字の少ない CSI シーケンス | **53.5** | 15.6 | 3.4× |
+| 長いエスケープシーケンス | **257.3** | 194.9 | 1.3× |
+| 画像 | **271.0** | 270.5 | 1.0× |
 
 </details>
 
@@ -116,6 +116,29 @@ Linux では kitty と比較しました。Ubuntu 20.04（i9-12900K）、180×50
 | 文字の少ない CSI シーケンス | **50.0** | 44.0 | 1.1× |
 | 長いエスケープシーケンス | **533.5** | 238.1 | 2.2× |
 | 画像 | **391.8** | 181.0 | 2.2× |
+
+</details>
+
+同じ Mac でのバージョンごとの推移です。倍率は 0.4.1 と初期ビルドの比較です。
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-progress-ja-JP-dark.svg">
+    <img src="assets/performance-progress-ja-JP-light.svg" alt="kitten ベンチマーク 6 項目における ThinkTerm のバージョンごとのスループット：初期ビルドから 0.3.0、0.4.1 まで。0.4.1 は全項目で初期ビルドを上回る（1.2×〜3.5×）" width="100%">
+  </picture>
+</p>
+
+<details>
+<summary>表形式のデータ</summary>
+
+| 項目 | ThinkTerm 初期<br>2026-09 | ThinkTerm 0.3.0<br>2026-10-21 | ThinkTerm 0.4.1<br>2026-11-04 | 倍率 |
+| --- | ---: | ---: | ---: | ---: |
+| ASCII 文字のみ | 45.3 | 133.0 | **134.0** | 3.0× |
+| Unicode 文字 | 52.2 | 104.5 | **109.2** | 2.1× |
+| 複数コードポイントの Unicode セル | 67.8 | 197.5 | **234.4** | 3.5× |
+| 文字の少ない CSI シーケンス | 25.7 | 49.5 | **53.5** | 2.1× |
+| 長いエスケープシーケンス | 219.4 | 213.8 | **257.3** | 1.2× |
+| 画像 | 218.0 | 257.2 | **271.0** | 1.2× |
 
 </details>
 
