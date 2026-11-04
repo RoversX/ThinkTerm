@@ -3328,4 +3328,71 @@ mod summary_tests {
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(title(&pane), "second", "a kept pause never resumes");
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn synchronized_output_survives_reader_pause_and_eof() {
+        use std::os::unix::io::AsRawFd;
+        use std::sync::atomic::Ordering;
+        ensure_scheduler();
+        let pipe = filedescriptor::Pipe::new().unwrap();
+        let mut program = pipe.write;
+        let raw = pipe.read.as_raw_fd();
+        let (_exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let terminal = Terminal::new(
+            size(80, 24),
+            Arc::new(config::TermConfig::new()),
+            "ThinkTerm",
+            "test",
+            Box::new(Vec::new()),
+        );
+        let pane: Arc<dyn Pane> = Arc::new(LocalPane::new(
+            4243,
+            terminal,
+            Box::new(SleepingChild(exit_rx)),
+            Box::new(PipePty { read: pipe.read }),
+            Box::new(Vec::new()),
+            0,
+            "test".into(),
+        ));
+        let reader = pane.reader().unwrap().unwrap();
+        let weak = Arc::downgrade(&pane);
+        let reader_thread =
+            std::thread::spawn(move || crate::read_from_pane_pty(weak, None, reader, Some(raw)));
+        let title = |pane: &Arc<dyn Pane>| pane.summary_without_waiting().title;
+        let wait_for = |want: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while title(&pane) != want && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(title(&pane), want);
+        };
+
+        program.write_all(b"\x1b]0;initial\x07").unwrap();
+        wait_for("initial");
+        program.write_all(b"\x1b[?2026h").unwrap();
+        program.write_all(&vec![b'x'; 256 * 1024 + 17]).unwrap();
+        program.write_all(b"\x1b]0;held\x07").unwrap();
+        let control = crate::PANE_READERS.lock().get(&4243).cloned().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !control.holding.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(control.holding.load(Ordering::SeqCst));
+        let paused = crate::pause_pane_reader(4243, Duration::from_secs(2)).unwrap();
+        assert_eq!(title(&pane), "initial");
+        program.write_all(b"\x1b[?2026l").unwrap();
+        drop(paused);
+        wait_for("held");
+
+        program.write_all(b"\x1b[?2026h\x1b]0;final\x07").unwrap();
+        drop(program);
+        wait_for("final");
+        reader_thread.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while control.pending_bytes() != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(control.pending_bytes(), 0);
+    }
 }

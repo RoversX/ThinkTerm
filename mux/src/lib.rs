@@ -7,9 +7,8 @@ use anyhow::{anyhow, Context, Error};
 use config::keyassignment::SpawnTabDomain;
 use config::{configuration, ExitBehavior, GuiPosition};
 use domain::{Domain, DomainId, DomainState, SplitSource};
-use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
 #[cfg(unix)]
-use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use filedescriptor::{poll, pollfd, AsRawSocketDescriptor, FileDescriptor, POLLIN};
 use log::error;
 use metrics::histogram;
 use parking_lot::{
@@ -20,8 +19,6 @@ use portable_pty::{CommandBuilder, ExitStatus, PtySize};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::io::{Read, Write};
-#[cfg(windows)]
-use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread;
@@ -34,8 +31,6 @@ use wezterm_term::color::ColorPalette;
 use wezterm_term::{
     Clipboard, ClipboardSelection, DownloadHandler, TerminalConfiguration, TerminalSize,
 };
-#[cfg(windows)]
-use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 
 pub mod activity;
 pub mod agent_status;
@@ -49,6 +44,7 @@ pub mod foreground_program;
 pub mod geometrytrace;
 pub mod kept_output;
 pub mod localpane;
+mod output_buffer;
 pub mod pane;
 mod parse_watchdog;
 pub mod renderable;
@@ -675,12 +671,10 @@ impl Drop for TabGeometryTransaction<'_> {
     }
 }
 
-const BUFSIZE: usize = 1024 * 1024;
-
 /// Size of the per-pane pty read buffer. This lives for the lifetime of the
 /// pane's reader thread, so it is sized for what a single read() can actually
 /// return (the kernel tty buffer is far smaller than this) rather than
-/// BUFSIZE, which would pin 1MB per pane.
+/// a large parser batch, which would pin excess memory per pane.
 const PTY_READ_BUFSIZE: usize = 64 * 1024;
 
 /// Bytes of external kitty payloads one flush may read into memory. A
@@ -809,25 +803,16 @@ fn release_action_buffer(actions: &Vec<Action>, read_capacity: usize, more_to_re
     actions.capacity() > 0 && (!more_to_read || actions.capacity() > read_capacity)
 }
 
-/// Whether `fd` has data to read right now, without waiting for any.
-fn readable_now(fd: &FileDescriptor) -> bool {
-    let mut pfd = [pollfd {
-        fd: fd.as_socket_descriptor(),
-        events: POLLIN,
-        revents: 0,
-    }];
-    matches!(poll(&mut pfd, Some(Duration::ZERO)), Ok(1))
-}
-
 fn parse_buffered_data(
     pane: Weak<dyn Pane>,
     pane_id: PaneId,
     dead: &Arc<AtomicBool>,
-    mut rx: FileDescriptor,
+    mut rx: output_buffer::OutputReceiver,
     heartbeat: Arc<parse_watchdog::ParseHeartbeat>,
     control: Option<Arc<ReaderControl>>,
 ) {
-    let mut buf = vec![0; configuration().mux_output_parser_buffer_size];
+    let mut read_capacity = configuration().mux_output_parser_buffer_size;
+    let mut buf = Vec::new();
     // Bytes read and not yet turned into applied actions; settled against
     // the reader's count whenever nothing is left waiting to be sent.
     let mut unapplied = 0usize;
@@ -841,12 +826,12 @@ fn parse_buffered_data(
 
     loop {
         if actions.is_empty() && actions.capacity() > 0 {
-            let more_to_read = readable_now(&rx);
-            if release_action_buffer(&actions, buf.len(), more_to_read) {
+            let more_to_read = rx.readable_now();
+            if release_action_buffer(&actions, read_capacity, more_to_read) {
                 actions = Vec::new();
             }
         }
-        match rx.read(&mut buf) {
+        match rx.read_buffered(&mut buf, read_capacity) {
             Ok(size) if size == 0 => {
                 dead.store(true, Ordering::Relaxed);
                 break;
@@ -901,7 +886,7 @@ fn parse_buffered_data(
                         action_size = 0;
                     }
                 });
-                // The poll() wait below is idle time, so busy work is
+                // The receive wait below is idle time, so busy work is
                 // recorded here (the parse, including any mid-parse flushes
                 // into the terminal) and separately around the flush below.
                 heartbeat.add(work_started.elapsed(), size);
@@ -911,7 +896,7 @@ fn parse_buffered_data(
                     // pause for a short while to increase the chances
                     // that we coalesce a full "frame" from an unoptimized
                     // TUI program
-                    if action_size < buf.len() {
+                    if action_size < read_capacity {
                         let poll_delay = match deadline {
                             None => {
                                 deadline.replace(Instant::now() + delay);
@@ -919,13 +904,8 @@ fn parse_buffered_data(
                             }
                             Some(target) => target.checked_duration_since(Instant::now()),
                         };
-                        if poll_delay.is_some() {
-                            let mut pfd = [pollfd {
-                                fd: rx.as_socket_descriptor(),
-                                events: POLLIN,
-                                revents: 0,
-                            }];
-                            if let Ok(1) = poll(&mut pfd, poll_delay) {
+                        if let Some(poll_delay) = poll_delay {
+                            if rx.wait_readable(poll_delay) {
                                 // We can read now without blocking, so accumulate
                                 // more data into actions
                                 continue;
@@ -945,7 +925,7 @@ fn parse_buffered_data(
                 }
 
                 let config = configuration();
-                buf.resize(config.mux_output_parser_buffer_size, 0);
+                read_capacity = config.mux_output_parser_buffer_size;
                 delay = Duration::from_millis(config.mux_output_parser_coalesce_delay_ms);
 
                 if actions.is_empty() {
@@ -974,36 +954,6 @@ fn parse_buffered_data(
         control.pending_bytes.fetch_sub(unapplied, Ordering::SeqCst);
     }
     parse_watchdog::unregister(pane_id);
-}
-
-fn set_socket_buffer(fd: &mut FileDescriptor, option: i32, size: usize) -> anyhow::Result<()> {
-    let size = size as c_int;
-    let socklen = std::mem::size_of_val(&size);
-    unsafe {
-        let res = libc::setsockopt(
-            fd.as_socket_descriptor(),
-            SOL_SOCKET,
-            option,
-            &size as *const c_int as *const _,
-            socklen as _,
-        );
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error()).context("setsockopt")
-        }
-    }
-}
-
-fn allocate_socketpair() -> anyhow::Result<(FileDescriptor, FileDescriptor)> {
-    let (mut tx, mut rx) = socketpair().context("socketpair")?;
-    set_socket_buffer(&mut tx, SO_SNDBUF, BUFSIZE)
-        .context("SO_SNDBUF")
-        .ok();
-    set_socket_buffer(&mut rx, SO_RCVBUF, BUFSIZE)
-        .context("SO_RCVBUF")
-        .ok();
-    Ok((tx, rx))
 }
 
 /// A pane's reader thread, from the outside. A takeover hands the pty to
@@ -1202,8 +1152,8 @@ pub fn pause_pane_reader(pane_id: PaneId, timeout: Duration) -> anyhow::Result<P
 
 /// This function is run in a separate thread; its purpose is to perform
 /// blocking reads from the pty (non-blocking reads are not portable to
-/// all platforms) and to feed the bytes to the parser thread over a
-/// socketpair. With a pty file descriptor to poll, the reader can also be
+/// all platforms) and to feed the bytes to the parser thread through a
+/// bounded byte buffer. With a pty file descriptor to poll, the reader can also be
 /// parked; see [`pause_pane_reader`].
 fn read_from_pane_pty(
     pane: Weak<dyn Pane>,
@@ -1220,20 +1170,7 @@ fn read_from_pane_pty(
         None => return,
     };
 
-    let (mut tx, rx) = match allocate_socketpair() {
-        Ok(pair) => pair,
-        Err(err) => {
-            log::error!("read_from_pane_pty: Unable to allocate a socketpair: {err:#}");
-            localpane::emit_output_for_pane(
-                pane_id,
-                &format!(
-                    "⚠️  ThinkTerm: read_from_pane_pty: \
-                    Unable to allocate a socketpair: {err:#}"
-                ),
-            );
-            return;
-        }
-    };
+    let (mut tx, rx) = output_buffer::channel();
 
     // The wake pipe and the control exist only when the pty can be polled;
     // without them the loop below is the plain blocking read.
