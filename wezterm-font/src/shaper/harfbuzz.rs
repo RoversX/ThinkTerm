@@ -7,9 +7,10 @@ use config::ConfigHandle;
 use finl_unicode::grapheme_clusters::Graphemes;
 use log::error;
 use ordered_float::NotNan;
-use std::cell::{RefCell, RefMut};
+use std::cell::{Cell, RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::time::{Duration, Instant};
 use termwiz::cell::{unicode_column_width, Presentation};
 use wezterm_bidi::Direction;
 
@@ -71,6 +72,8 @@ struct FontPair {
     presentation: Presentation,
     features: Vec<harfbuzz::hb_feature_t>,
     last_size_and_dpi: RefCell<Option<(f64, u32)>>,
+    /// When a pass over this font last left it with nothing shaped.
+    last_fruitless: Cell<Instant>,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -79,6 +82,14 @@ struct MetricsKey {
     size: NotNan<f64>,
     dpi: u32,
 }
+
+/// How long a fallback that shapes nothing stays loaded after the last pass
+/// that tried it. Loading one means opening the file, validating its tables
+/// and measuring a glyph, so unloading after each pass was fine for a stray
+/// character and ruinous for a screen of them: text a font covers all but a
+/// little of goes through it cell by cell, and a frame of letters with
+/// combining marks took 3960 loads.
+const FRUITLESS_FALLBACK_LINGER: Duration = Duration::from_secs(10);
 
 /// How many characters each font remembers lacking: more than the CJK text
 /// of a page, and the set starts over once it is full.
@@ -91,11 +102,17 @@ pub struct HarfbuzzShaper {
     /// A run made only of them goes straight on to the next font. Without
     /// this, every run of CJK text in a UI font loaded each fallback ahead
     /// of the CJK font again -- face, size, cell metrics -- since a fallback
-    /// that shapes nothing is unloaded after each pass (see `do_shape`).
+    /// that shapes nothing does not stay loaded for long (see
+    /// `unload_fruitless_fallbacks`).
     missing: Vec<RefCell<HashSet<char>>>,
+    /// When `unload_fruitless_fallbacks` next looks.
+    next_unload: Cell<Instant>,
     /// How many times each font has been loaded.
     #[cfg(test)]
     loads: Vec<std::cell::Cell<usize>>,
+    /// The font and the range of each pass, in order.
+    #[cfg(test)]
+    passes: RefCell<Vec<(FallbackIdx, Range<usize>)>>,
     lib: ftwrap::Library,
     metrics: RefCell<HashMap<MetricsKey, FontMetrics>>,
     features: Vec<harfbuzz::hb_feature_t>,
@@ -120,6 +137,36 @@ fn make_question_string(s: &str) -> String {
     result
 }
 
+/// Put glyphs shaped from `question`, in place of `text` at `start` of its
+/// line, where the graphemes they stand for are and as wide as those are:
+/// the rest of the line is laid out from each glyph's cells.
+fn place_question_glyphs(
+    glyphs: &mut [GlyphInfo],
+    question: &str,
+    text: &str,
+    start: usize,
+    presentation_width: Option<&PresentationWidth>,
+) {
+    let mut next = start;
+    let graphemes: Vec<(usize, u8)> = Graphemes::new(text)
+        .map(|grapheme| {
+            let this = next;
+            next += grapheme.len();
+            let num_cells = match presentation_width {
+                Some(pw) => pw.num_cells(this..next),
+                None => unicode_column_width(grapheme, None) as u8,
+            };
+            (this, num_cells)
+        })
+        .collect();
+    let char_len = question.len() / graphemes.len().max(1);
+    for glyph in glyphs {
+        let (cluster, num_cells) = graphemes[glyph.cluster as usize / char_len];
+        glyph.cluster = cluster as u32;
+        glyph.num_cells = num_cells;
+    }
+}
+
 fn is_question_string(s: &str) -> bool {
     for c in s.chars() {
         if c != std::char::REPLACEMENT_CHARACTER {
@@ -127,6 +174,14 @@ fn is_question_string(s: &str) -> bool {
         }
     }
     true
+}
+
+fn presentation_of(handle: &ParsedFont) -> Presentation {
+    if handle.assume_emoji_presentation {
+        Presentation::Emoji
+    } else {
+        Presentation::Text
+    }
 }
 
 impl HarfbuzzShaper {
@@ -156,13 +211,41 @@ impl HarfbuzzShaper {
             fonts,
             handles,
             missing,
+            next_unload: Cell::new(Instant::now() + FRUITLESS_FALLBACK_LINGER),
             #[cfg(test)]
             loads,
+            #[cfg(test)]
+            passes: RefCell::new(vec![]),
             lib,
             metrics: RefCell::new(HashMap::new()),
             features,
             lang,
         })
+    }
+
+    /// Unload the fallbacks that have shaped nothing lately. They are
+    /// probably fonts from the system that are no use for what is on screen,
+    /// and not worth keeping around.
+    fn unload_fruitless_fallbacks(&self) {
+        let now = Instant::now();
+        if now < self.next_unload.get() {
+            return;
+        }
+        self.next_unload.set(now + FRUITLESS_FALLBACK_LINGER);
+        for (font_idx, opt_pair) in self.fonts.iter().enumerate() {
+            let mut opt_pair = opt_pair.borrow_mut();
+            let fruitless = opt_pair.as_ref().is_some_and(|pair| {
+                !pair.shaped_any
+                    && now.duration_since(pair.last_fruitless.get()) >= FRUITLESS_FALLBACK_LINGER
+            });
+            if fruitless {
+                log::trace!(
+                    "Shaper didn't resolve glyphs from {:?}, so unload it",
+                    self.handles[font_idx]
+                );
+                opt_pair.take();
+            }
+        }
     }
 
     /// Whether `font_idx` has been seen to have no glyph for any character
@@ -238,13 +321,10 @@ impl HarfbuzzShaper {
                         face,
                         font: RefCell::new(font),
                         shaped_any: false,
-                        presentation: if handle.assume_emoji_presentation {
-                            Presentation::Emoji
-                        } else {
-                            Presentation::Text
-                        },
+                        presentation: presentation_of(handle),
                         features,
                         last_size_and_dpi: RefCell::new(None),
+                        last_fruitless: Cell::new(Instant::now()),
                     });
                 }
 
@@ -267,6 +347,8 @@ impl HarfbuzzShaper {
         range: Range<usize>,
         presentation_width: Option<&PresentationWidth>,
     ) -> anyhow::Result<Vec<GlyphInfo>> {
+        #[cfg(test)]
+        self.passes.borrow_mut().push((font_idx, range.clone()));
         let mut buf = harfbuzz::Buffer::new()?;
         // We deliberately omit setting the script and leave it to harfbuzz
         // to infer from the buffer contents so that it can correctly
@@ -295,28 +377,27 @@ impl HarfbuzzShaper {
 
         loop {
             // A font already seen without any of these characters would only
-            // hand them all on to the next one. (`get`: the retry with a
-            // question string below keeps the range of the original text.)
-            if !no_more_fallbacks
-                && s.get(range.clone()).is_some_and(|text| self.lacks_all(font_idx, text))
-            {
+            // hand them all on to the next one.
+            if !no_more_fallbacks && self.lacks_all(font_idx, &s[range.clone()]) {
                 font_idx += 1;
                 continue;
             }
+            // Before loading it: a font only ever passed over would have
+            // nothing to show for being loaded, and go again.
+            if let (Some(p), Some(handle)) = (presentation, self.handles.get(font_idx)) {
+                let font_presentation = presentation_of(handle);
+                if font_presentation != p {
+                    log::trace!(
+                        "wanted presentation is {p:?} != font \
+                             presentation {font_presentation:?} so skip \
+                             font_idx={font_idx}"
+                    );
+                    font_idx += 1;
+                    continue;
+                }
+            }
             match self.load_fallback(font_idx, dpi).context("load_fallback")? {
                 Some(mut pair) => {
-                    if let Some(p) = presentation {
-                        if pair.presentation != p {
-                            log::trace!(
-                                "wanted presentation is {p:?} != font \
-                                     presentation {:?} so skip \
-                                     font_idx={font_idx}",
-                                pair.presentation
-                            );
-                            font_idx += 1;
-                            continue;
-                        }
-                    }
                     let point_size = font_size * self.handles[font_idx].scale.unwrap_or(1.);
 
                     // Tell harfbuzz to recompute important font metrics!
@@ -528,56 +609,93 @@ impl HarfbuzzShaper {
 
         let mut direct_clusters = 0;
 
+        // One or more entries of a cluster didn't have a corresponding glyph,
+        // so it needs a fallback. Neighbours that do go on together: the
+        // coalescing above only joins what got no glyph at all, which leaves
+        // letters with marks the font lacks one at a time, and a pass per
+        // cell made a screen of them take 70 ms. Only those of one script,
+        // though: a pass is shaped under the script guessed from its text,
+        // and a cell put under another's does not come out as it should.
+        let mut incomplete: Option<(Range<usize>, Option<harfbuzz::hb_script_t>)> = None;
+        let shape_incomplete = |run: Range<usize>,
+                                cluster: &mut Vec<GlyphInfo>,
+                                no_glyphs: &mut Vec<char>|
+         -> anyhow::Result<()> {
+            let mut shape = match self.do_shape(
+                font_idx + 1,
+                s,
+                font_size,
+                dpi,
+                no_glyphs,
+                presentation,
+                direction,
+                // NOT! substr; this is a coalesced sequence of incomplete clusters!
+                run.clone(),
+                presentation_width,
+            ) {
+                Ok(shape) => shape,
+                Err(e) => {
+                    let substr = &s[run.clone()];
+                    error!("{:?} for {:?}", e, substr);
+                    let question = make_question_string(substr);
+                    let mut shape = self.do_shape(
+                        0,
+                        &question,
+                        font_size,
+                        dpi,
+                        no_glyphs,
+                        presentation,
+                        direction,
+                        0..question.len(),
+                        // That one describes the line, not this.
+                        None,
+                    )?;
+                    place_question_glyphs(
+                        &mut shape,
+                        &question,
+                        substr,
+                        run.start,
+                        presentation_width,
+                    );
+                    shape
+                }
+            };
+            cluster.append(&mut shape);
+            Ok(())
+        };
+
         for infos in &info_clusters {
             let cluster_info = cluster_resolver
                 .get(infos[0].cluster)
                 .expect("assigned above");
-            let sub_range = cluster_info.start..cluster_info.start + cluster_info.byte_len;
-            let substr = &s[sub_range.clone()];
+            let substr = &s[cluster_info.start..cluster_info.start + cluster_info.byte_len];
 
             if cluster_info.incomplete {
-                // One or more entries didn't have a corresponding glyph,
-                // so try a fallback
-
-                /*
-                if font_idx == 0 {
-                    log::error!("incomplete cluster for text={:?} {:?}", s, info_clusters);
-                }
-                */
-
                 let first_info = &infos[0];
-
-                let mut shape = match self.do_shape(
-                    font_idx + 1,
-                    s,
-                    font_size,
-                    dpi,
-                    no_glyphs,
-                    presentation,
-                    direction,
-                    // NOT! substr; this is a coalesced sequence of incomplete clusters!
-                    first_info.cluster..first_info.cluster + first_info.len,
-                    presentation_width,
-                ) {
-                    Ok(shape) => Ok(shape),
-                    Err(e) => {
-                        error!("{:?} for {:?}", e, substr);
-                        self.do_shape(
-                            0,
-                            &make_question_string(substr),
-                            font_size,
-                            dpi,
-                            no_glyphs,
-                            presentation,
-                            direction,
-                            sub_range,
-                            presentation_width,
-                        )
+                let this = first_info.cluster..first_info.cluster + first_info.len;
+                // Coalescing can have joined this cluster's first glyphs to
+                // what came before and still left it glyphs of its own.
+                if incomplete
+                    .as_ref()
+                    .is_some_and(|(run, _)| run.start <= this.start && this.end <= run.end)
+                {
+                    continue;
+                }
+                let script = harfbuzz::guess_script(&s[this.clone()]);
+                match &mut incomplete {
+                    Some((run, run_script)) if run.end == this.start && *run_script == script => {
+                        run.end = this.end
                     }
-                }?;
-
-                cluster.append(&mut shape);
+                    run => {
+                        if let Some((run, _)) = run.replace((this, script)) {
+                            shape_incomplete(run, &mut cluster, no_glyphs)?;
+                        }
+                    }
+                }
                 continue;
+            }
+            if let Some((run, _)) = incomplete.take() {
+                shape_incomplete(run, &mut cluster, no_glyphs)?;
             }
 
             let total_width: f64 = infos.iter().map(|info| info.x_advance as f64).sum();
@@ -607,22 +725,22 @@ impl HarfbuzzShaper {
                 direct_clusters += 1;
             }
         }
+        if let Some((run, _)) = incomplete.take() {
+            shape_incomplete(run, &mut cluster, no_glyphs)?;
+        }
 
         if !shaped_any {
             if let Some(opt_pair) = self.fonts.get(font_idx) {
-                if direct_clusters == 0 {
-                    // If we've never shaped anything from this font, and we didn't
-                    // shape it just now, then we're probably a fallback font from
-                    // the system and unlikely to be useful to keep around, so we
-                    // unload it.
-                    log::trace!(
-                        "Shaper didn't resolve glyphs from {:?}, so unload it",
-                        self.handles[font_idx]
-                    );
-                    opt_pair.borrow_mut().take();
-                } else if let Some(pair) = &mut *opt_pair.borrow_mut() {
-                    // We shaped something: mark this pair up so that it sticks around
-                    pair.shaped_any = true;
+                if let Some(pair) = &mut *opt_pair.borrow_mut() {
+                    if direct_clusters == 0 {
+                        // We've never shaped anything from this font, and we
+                        // didn't shape anything just now: it goes if that
+                        // stays so (see `unload_fruitless_fallbacks`).
+                        pair.last_fruitless.set(Instant::now());
+                    } else {
+                        // We shaped something: mark this pair up so that it sticks around
+                        pair.shaped_any = true;
+                    }
                 }
             }
         }
@@ -644,6 +762,7 @@ impl FontShaper for HarfbuzzShaper {
         presentation_width: Option<&PresentationWidth>,
     ) -> anyhow::Result<Vec<GlyphInfo>> {
         let range = range.unwrap_or_else(|| 0..text.len());
+        self.unload_fruitless_fallbacks();
 
         log::trace!(
             "shape {range:?} `{}` with presentation={presentation:?}",
@@ -806,6 +925,7 @@ impl FontShaper for HarfbuzzShaper {
 #[derive(Debug)]
 struct ClusterInfo {
     start: usize,
+    cell_idx: Option<usize>,
     byte_len: usize,
     cell_width: u8,
     incomplete: bool,
@@ -813,9 +933,10 @@ struct ClusterInfo {
 
 #[derive(Default, Debug)]
 struct ClusterResolver<'a> {
-    map: HashMap<usize, ClusterInfo>,
+    /// In order of `cell_idx` and `start`: every line of text comes through
+    /// here for each font, so these are looked up, not hashed.
+    clusters: Vec<ClusterInfo>,
     presentation_width: Option<&'a PresentationWidth<'a>>,
-    start_by_cell_idx: HashMap<usize, usize>,
 }
 
 impl<'a> ClusterResolver<'a> {
@@ -826,30 +947,20 @@ impl<'a> ClusterResolver<'a> {
             start: usize,
         }
 
-        let mut map = HashMap::new();
-
-        for info in hb_infos.iter() {
-            let start = info.cluster as usize;
-
-            // Collect the cell index, which is the "true cluster"
-            // position from our perspective: the start of the grapheme
-            let cell_idx = match self.presentation_width {
-                Some(pw) => {
-                    let cell_idx = pw.byte_to_cell_idx(start);
-
-                    let entry = self.start_by_cell_idx.entry(cell_idx).or_insert(start);
-                    *entry = (*entry).min(start);
-
-                    Some(cell_idx)
+        // Collect the cell index, which is the "true cluster"
+        // position from our perspective: the start of the grapheme
+        let mut cluster_starts: Vec<Item> = hb_infos
+            .iter()
+            .map(|info| {
+                let start = info.cluster as usize;
+                Item {
+                    cell_idx: self.presentation_width.map(|pw| pw.byte_to_cell_idx(start)),
+                    start,
                 }
-                None => None,
-            };
-
-            map.entry(start).or_insert_with(|| Item { start, cell_idx });
-        }
-
-        let mut cluster_starts: Vec<Item> = map.into_values().collect();
-        cluster_starts.sort();
+            })
+            .collect();
+        cluster_starts.sort_unstable();
+        cluster_starts.dedup();
 
         // If we have multiple entries with the same starting cell index,
         // remove the duplicates.  Don't do this for `None` as that will
@@ -860,6 +971,7 @@ impl<'a> ClusterResolver<'a> {
             _ => false,
         });
 
+        self.clusters.reserve(cluster_starts.len());
         let mut iter = cluster_starts.iter().peekable();
         while let Some(item) = iter.next().copied() {
             let start = item.start;
@@ -869,8 +981,9 @@ impl<'a> ClusterResolver<'a> {
                 Some(p) => p.num_cells(start..next_start),
                 None => unicode_column_width(&s[start..next_start], None) as u8,
             };
-            self.map.entry(start).or_insert_with(|| ClusterInfo {
+            self.clusters.push(ClusterInfo {
                 start,
+                cell_idx: item.cell_idx,
                 byte_len,
                 cell_width,
                 incomplete: false,
@@ -878,26 +991,28 @@ impl<'a> ClusterResolver<'a> {
         }
     }
 
-    pub fn get_mut(&mut self, start: usize) -> Option<&mut ClusterInfo> {
+    fn position(&self, start: usize) -> Option<usize> {
         match self.presentation_width {
             Some(pw) => {
-                let cell_idx = pw.byte_to_cell_idx(start);
-                let actual_start = self.start_by_cell_idx.get(&cell_idx)?;
-                self.map.get_mut(&actual_start)
+                let cell_idx = Some(pw.byte_to_cell_idx(start));
+                self.clusters
+                    .binary_search_by_key(&cell_idx, |cluster| cluster.cell_idx)
+                    .ok()
             }
-            None => self.map.get_mut(&start),
+            None => self
+                .clusters
+                .binary_search_by_key(&start, |cluster| cluster.start)
+                .ok(),
         }
     }
 
+    pub fn get_mut(&mut self, start: usize) -> Option<&mut ClusterInfo> {
+        let position = self.position(start)?;
+        self.clusters.get_mut(position)
+    }
+
     pub fn get(&self, start: usize) -> Option<&ClusterInfo> {
-        match self.presentation_width {
-            Some(pw) => {
-                let cell_idx = pw.byte_to_cell_idx(start);
-                let actual_start = self.start_by_cell_idx.get(&cell_idx)?;
-                self.map.get(&actual_start)
-            }
-            None => self.map.get(&start),
-        }
+        self.clusters.get(self.position(start)?)
     }
 }
 
@@ -1408,6 +1523,217 @@ mod test {
                 "{}",
                 cluster.text
             );
+        }
+    }
+
+    /// A font with the letter and not its marks gets every cell of a line
+    /// wrong in turn. Sent on together they come out as they do one by one.
+    #[test]
+    fn neighbouring_incomplete_cells_shape_as_they_do_alone() {
+        let handles = emoji_last();
+        let config = config::configuration();
+        let cells = [
+            "a\u{300}\u{301}\u{302}",
+            "a\u{34f}\u{35c}\u{36f}",
+            "b",
+            "a\u{30a}\u{324}\u{336}",
+            "a\u{361}\u{362}\u{36e}",
+            "😀",
+            "a\u{34f}\u{301}",
+        ];
+        let shaper = HarfbuzzShaper::new(&config, &handles).unwrap();
+        let together: Vec<_> = shape_with(&shaper, &cells.concat(), None, None)
+            .0
+            .iter()
+            .map(|glyph| (glyph.font_idx, glyph.glyph_pos, glyph.num_cells))
+            .collect();
+        let alone: Vec<_> = cells
+            .iter()
+            .flat_map(|cell| {
+                let shaper = HarfbuzzShaper::new(&config, &handles).unwrap();
+                shape_with(&shaper, cell, None, None).0
+            })
+            .map(|glyph| (glyph.font_idx, glyph.glyph_pos, glyph.num_cells))
+            .collect();
+        assert_eq!(together, alone);
+    }
+
+    /// A run sent on to a fallback is shaped under one script, HarfBuzz's
+    /// guess from its first letter, and a cell of another script does not
+    /// shape right under that. So a run is made of cells that guess alike:
+    /// each gets what it would have got alone.
+    #[test]
+    fn a_run_sent_to_a_fallback_keeps_to_one_script() {
+        let config = config::configuration();
+        let shaper = HarfbuzzShaper::new(&config, &emoji_last()).unwrap();
+        let marks = "\u{34f}\u{35c}\u{36f}";
+        let latin = format!("a{marks}");
+        let cyrillic = format!("\u{434}{marks}");
+        let digit = format!("1{marks}");
+        let text = [&latin, &latin, &cyrillic, &cyrillic, &digit, &digit, &latin]
+            .map(String::as_str)
+            .concat();
+        shape_with(&shaper, &text, None, None);
+        let at = |cells: usize| latin.len() * cells + cells.saturating_sub(2).min(2);
+        let runs: Vec<_> = shaper
+            .passes
+            .borrow()
+            .iter()
+            .filter(|(font_idx, _)| *font_idx == 1)
+            .map(|(_, range)| range.clone())
+            .collect();
+        assert_eq!(
+            runs,
+            [at(0)..at(2), at(2)..at(4), at(4)..at(6), at(6)..at(7)],
+            "{text:?}"
+        );
+    }
+
+    /// A font with no glyph for a whole cell and only part of the next, which
+    /// it gives an invisible glyph for what follows, joins the two into the
+    /// first and then has the second on its own as well. Sent on, the run
+    /// already holds that second cell, and it must not go a second time: a
+    /// cell drawn twice pushes the rest of the line along.
+    #[test]
+    fn a_cell_a_run_already_holds_is_not_sent_again() {
+        let db = FontDatabase::with_built_in().unwrap();
+        let handles: Vec<_> = ["JetBrains Mono", "Noto Color Emoji", "Symbols Nerd Font Mono"]
+            .iter()
+            .map(|family| db.resolve(&FontAttributes::new(family), 14).unwrap().clone())
+            .collect();
+        let config = config::configuration();
+        let text = "o\u{361}a\u{34f}\u{35c}\u{36f}";
+        let line = Line::from_text(text, &CellAttributes::default(), SEQ_ZERO, None);
+        let clusters = line.cluster(None);
+        let width = PresentationWidth::with_cluster(&clusters[0]);
+        let shaper = HarfbuzzShaper::new(&config, &handles).unwrap();
+        let (glyphs, _) = shape_with(&shaper, &clusters[0].text, None, Some(&width));
+        let placed: Vec<_> = glyphs
+            .iter()
+            .map(|glyph| (glyph.cluster, glyph.num_cells))
+            .collect();
+        let cells: usize = glyphs.iter().map(|glyph| glyph.num_cells as usize).sum();
+        assert_eq!(cells, 2, "{placed:?}");
+    }
+
+    /// `guess_script` is only worth having if it says what HarfBuzz says.
+    #[test]
+    fn the_script_guessed_is_the_one_harfbuzz_guesses() {
+        use crate::hbwrap::hb_script_t::*;
+        for (text, script) in [
+            ("a\u{301}", Some(HB_SCRIPT_LATIN)),
+            ("1\u{301}a", Some(HB_SCRIPT_LATIN)),
+            ("\u{434}a", Some(HB_SCRIPT_CYRILLIC)),
+            ("\u{e01}\u{e48}", Some(HB_SCRIPT_THAI)),
+            ("\u{915}\u{93f}", Some(HB_SCRIPT_DEVANAGARI)),
+            ("1\u{301}", None),
+            ("\u{301}", None),
+            ("", None),
+        ] {
+            let mut buf = harfbuzz::Buffer::new().unwrap();
+            buf.add_str(text, 0..text.len());
+            buf.guess_segment_properties();
+            assert_eq!(harfbuzz::guess_script(text), script, "{text:?}");
+            assert_eq!(buf.script(), script, "{text:?}");
+        }
+    }
+
+    /// Loading a font to find it is the wrong sort of font cost the load,
+    /// and a fallback that way never shapes anything to be kept for.
+    #[test]
+    fn a_font_of_the_wrong_presentation_is_not_loaded() {
+        let config = config::configuration();
+        let shaper = HarfbuzzShaper::new(&config, &emoji_last()).unwrap();
+        shape_with(&shaper, "\u{1f600}", Some(Presentation::Emoji), None);
+        let loads: Vec<_> = shaper.loads.iter().map(std::cell::Cell::get).collect();
+        assert_eq!(loads, [0, 0, 0, 1]);
+    }
+
+    /// A fallback that will not load leaves what it was for showing as
+    /// replacement characters, in the place of what they replace.
+    #[test]
+    fn text_a_broken_fallback_was_for_stays_where_it_was() {
+        let mut handles = emoji_last();
+        handles[1].handle.source =
+            crate::locator::FontDataSource::OnDisk("/no/such/font.ttf".into());
+        let config = config::configuration();
+        let shaper = HarfbuzzShaper::new(&config, &handles).unwrap();
+        let text = "ab\u{1100}\u{1161}\u{1100}\u{1161}cd";
+        let clusters: Vec<_> = shape_with(&shaper, text, None, None)
+            .0
+            .iter()
+            .map(|glyph| glyph.cluster)
+            .collect();
+        assert_eq!(clusters, [0, 1, 2, 8, 14, 15], "{text:?}");
+    }
+
+    /// The window lays a line out by each glyph's cells, so one that takes up
+    /// less than what it replaces drags the rest of the line with it.
+    #[test]
+    fn text_a_broken_fallback_was_for_keeps_its_width() {
+        let mut handles = emoji_last();
+        handles[1].handle.source =
+            crate::locator::FontDataSource::OnDisk("/no/such/font.ttf".into());
+        let config = config::configuration();
+        let shaper = HarfbuzzShaper::new(&config, &handles).unwrap();
+        let line = Line::from_text(
+            "x\u{4e2d}\u{6587}y",
+            &CellAttributes::default(),
+            SEQ_ZERO,
+            None,
+        );
+        let clusters = line.cluster(None);
+        assert_eq!(clusters.len(), 1, "one run of text");
+        let width = PresentationWidth::with_cluster(&clusters[0]);
+        let placed: Vec<_> = shape_with(&shaper, &clusters[0].text, None, Some(&width))
+            .0
+            .iter()
+            .map(|glyph| (glyph.cluster, glyph.num_cells))
+            .collect();
+        assert_eq!(placed, [(0, 1), (1, 2), (4, 2), (7, 1)]);
+
+        let placed: Vec<_> = shape_with(&shaper, "\u{4e2d}y", None, None)
+            .0
+            .iter()
+            .map(|glyph| (glyph.cluster, glyph.num_cells))
+            .collect();
+        assert_eq!(placed, [(0, 2), (3, 1)], "with nothing to say how wide");
+    }
+
+    /// Text that combines is tried in every font each time, so a fallback
+    /// unloaded after each pass was loaded again for each. One that has shaped
+    /// nothing goes only once it has been left alone for a while.
+    #[test]
+    fn a_fallback_that_shapes_nothing_goes_after_a_while() {
+        let config = config::configuration();
+        let shaper = HarfbuzzShaper::new(&config, &emoji_last()).unwrap();
+        let loads = |shaper: &HarfbuzzShaper| {
+            shaper
+                .loads
+                .iter()
+                .map(std::cell::Cell::get)
+                .collect::<Vec<_>>()
+        };
+        // Conjoining jamo, which none of these fonts has.
+        let text = "\u{1100}\u{1161}";
+        shape_with(&shaper, text, None, None);
+        let first = loads(&shaper);
+        assert!(first[1..].iter().all(|&loads| loads == 1), "{first:?}");
+        shape_with(&shaper, text, None, None);
+        assert_eq!(loads(&shaper), first, "still loaded");
+
+        let long_ago = Instant::now() - FRUITLESS_FALLBACK_LINGER * 2;
+        for opt_pair in &shaper.fonts {
+            if let Some(pair) = &*opt_pair.borrow() {
+                pair.last_fruitless.set(long_ago);
+            }
+        }
+        shaper.next_unload.set(long_ago);
+        // Only Roboto is left, having shaped this; the rest were never any use.
+        shape_with(&shaper, "x", None, None);
+        assert!(shaper.fonts[0].borrow().is_some(), "it shapes what it can");
+        for font_idx in 1..4 {
+            assert!(shaper.fonts[font_idx].borrow().is_none(), "font {font_idx}");
         }
     }
 

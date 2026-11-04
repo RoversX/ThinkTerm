@@ -1,7 +1,7 @@
 use crate::domain::DomainId;
 use crate::pane::{
-    CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, PaneSummary,
-    Pattern, SearchResult, WithPaneLines,
+    BatchRead, CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId,
+    PaneSummary, Pattern, SearchResult, WithPaneLines,
 };
 use crate::renderable::*;
 use crate::tmux::{TmuxDomain, TmuxDomainState};
@@ -401,6 +401,9 @@ pub struct LocalPane {
     /// The progress the terminal last reported, for `get_progress` while
     /// the parser holds the terminal.
     last_progress: Mutex<Progress>,
+    /// Waiting for the batch of output being applied to end; see
+    /// `Pane::read_after_batch`.
+    batch_reads: Mutex<Vec<BatchRead>>,
     /// What the shell last reported about its commands, for `run_state`
     /// while the parser holds the terminal.
     last_shell_commands: Mutex<wezterm_term::ShellCommands>,
@@ -457,6 +460,11 @@ impl Pane for LocalPane {
         // The parser thread holds this for the whole of a batch of output;
         // a probe that fails is the batch still being applied.
         self.terminal.try_lock().is_none()
+    }
+
+    fn read_after_batch(&self, read: BatchRead) -> Result<(), BatchRead> {
+        self.batch_reads.lock().push(read);
+        Ok(())
     }
 
     fn hold_render_state_for_the_test(&self, hold: Duration) {
@@ -786,13 +794,19 @@ impl Pane for LocalPane {
         term.perform_actions_in_place(actions);
         self.apply_pending_and_store(&mut term);
         drop(term);
+        // This thread is the one that would take the terminal next, so
+        // these find it free without having to be lucky.
+        let reads = std::mem::take(&mut *self.batch_reads.lock());
+        for read in reads {
+            read(self);
+        }
         // A resize that arrived after that last look, while the terminal
-        // was still held here, found both of its own probes failing and
-        // left its note; nothing else would read it until the next batch,
-        // which a quiet program may never write. Looked at again with the
-        // terminal free, for as long as notes keep arriving: one left
-        // after the last look is applied by the resize's own second
-        // probe, which finds the terminal free.
+        // was still held here or read just now, found both of its own
+        // probes failing and left its note; nothing else would read it
+        // until the next batch, which a quiet program may never write.
+        // Looked at again with the terminal free, for as long as notes
+        // keep arriving: one left after the last look is applied by the
+        // resize's own second probe, which finds the terminal free.
         while self.anything_pending() {
             let mut term = self.terminal.lock();
             self.apply_pending_and_store(&mut term);
@@ -1916,6 +1930,7 @@ impl LocalPane {
             pending_seen: Mutex::new(false),
             shell_idle: Mutex::new(None),
             last_progress: Mutex::new(Progress::default()),
+            batch_reads: Mutex::new(Vec::new()),
             last_shell_commands,
             exit: Mutex::new(None),
         }
@@ -3327,6 +3342,70 @@ mod summary_tests {
         paused.keep();
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(title(&pane), "second", "a kept pause never resumes");
+    }
+
+    /// What a busy pane's parser is asked to read runs when the batch it is
+    /// on ends, once, on the thread that applied the batch, with the batch
+    /// in it and the terminal there for the taking.
+    #[test]
+    fn a_read_left_for_the_parser_runs_after_its_batch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (pane, _sizes, _exit) = pane();
+        let batch = |text: &str| {
+            let mut parser = termwiz::escape::parser::Parser::new();
+            let mut actions = vec![];
+            parser.parse(text.as_bytes(), |action| actions.push(action));
+            pane.perform_actions(actions);
+        };
+        let parser_thread = std::thread::current().id();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&runs);
+        pane.read_after_batch(Box::new(move |pane| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(std::thread::current().id(), parser_thread);
+            assert!(!pane.render_state_is_contended(), "the terminal is free");
+            let (_, lines) = pane.get_lines(0..1);
+            assert!(lines[0].as_str().starts_with("first"), "the batch is in it");
+        }))
+        .ok()
+        .expect("a local pane has a parser to ask");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "no batch yet");
+
+        batch("first");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "after the batch");
+        batch(" second");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "and only once");
+    }
+
+    /// A resize that lands while a read has the terminal finds both of its
+    /// probes failing and leaves its note, and with no output to follow
+    /// nothing would come back for it.
+    #[test]
+    fn a_note_left_during_a_read_is_not_left_behind() {
+        let (pane, _sizes, _exit) = pane();
+        pane.read_after_batch(Box::new(|pane| {
+            let pane = pane.downcast_ref::<LocalPane>().unwrap();
+            *pane.pending_focus.lock() = Some(true);
+        }))
+        .ok()
+        .expect("a local pane has a parser to ask");
+
+        pane.perform_actions(vec![]);
+        assert!(!pane.anything_pending(), "the batch saw to it");
+    }
+
+    /// A pane keeps these, so one that held its pane would never be freed.
+    #[test]
+    fn a_read_that_never_runs_goes_with_its_pane() {
+        let (pane, _sizes, _exit) = pane();
+        let held = Arc::new(());
+        let kept = Arc::clone(&held);
+        pane.read_after_batch(Box::new(move |_| drop(kept)))
+            .ok()
+            .expect("a local pane has a parser to ask");
+        assert_eq!(Arc::strong_count(&held), 2, "waiting for a batch");
+        drop(pane);
+        assert_eq!(Arc::strong_count(&held), 1, "gone with the pane");
     }
 
     #[cfg(unix)]

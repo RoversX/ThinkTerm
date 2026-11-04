@@ -1100,6 +1100,29 @@ impl Buffer {
             hb_buffer_guess_segment_properties(self.buf);
         }
     }
+
+    #[cfg(test)]
+    pub fn script(&self) -> Option<hb_script_t> {
+        let mut props = unsafe { mem::zeroed() };
+        unsafe { hb_buffer_get_segment_properties(self.buf, &mut props) };
+        (props.script != hb_script_t::HB_SCRIPT_INVALID).then_some(props.script)
+    }
+}
+
+/// The script `Buffer::guess_segment_properties` settles on for `text`: that
+/// of its first character with a script of its own, if it has one.
+pub fn guess_script(text: &str) -> Option<hb_script_t> {
+    let funcs = unsafe { hb_unicode_funcs_get_default() };
+    text.chars()
+        .map(|c| unsafe { hb_unicode_script(funcs, c as hb_codepoint_t) })
+        .find(|script| {
+            !matches!(
+                script,
+                hb_script_t::HB_SCRIPT_COMMON
+                    | hb_script_t::HB_SCRIPT_INHERITED
+                    | hb_script_t::HB_SCRIPT_UNKNOWN
+            )
+        })
 }
 
 pub struct FontFuncs {

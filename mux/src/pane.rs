@@ -28,6 +28,10 @@ pub use thinkterm_proto::{PaneId, Pattern, SearchResult};
 /// Dropping the last subscription releases the upstream subscription and cache.
 pub trait KittyFrameSubscription: std::fmt::Debug + Send + Sync {}
 
+/// See `Pane::read_after_batch`. Passed the pane rather than holding it, as
+/// a pane keeps these and must not end up owning itself.
+pub type BatchRead = Box<dyn FnOnce(&dyn Pane) + Send>;
+
 pub type KittyImageFuture = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<thinkterm_proto::image::GetImageCellResponse>> + Send>>;
 
 pub fn alloc_pane_id() -> PaneId {
@@ -434,6 +438,19 @@ pub trait Pane: Downcast + Send + Sync {
     /// no.
     fn render_state_is_contended(&self) -> bool {
         false
+    }
+
+    /// Have the thread applying this pane's output run `read` once the
+    /// batch it is on is done, for a reader `render_state_is_contended`
+    /// turned away. Between two batches that thread is the only one that
+    /// will not miss: a probe from anywhere else has to land in a gap of
+    /// about 0.1 ms, and under a flood can go on missing it for a second.
+    /// The read never happens if no batch follows, so the caller keeps
+    /// another way of finding out. Whatever it does comes off the pane's
+    /// throughput, so nothing that looks at the pane's processes belongs
+    /// here. Handed back by a pane with no such thread.
+    fn read_after_batch(&self, read: BatchRead) -> Result<(), BatchRead> {
+        Err(read)
     }
 
     /// Take whatever `render_state_is_contended` reports on and hold it

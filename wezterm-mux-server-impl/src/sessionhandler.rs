@@ -16,6 +16,7 @@ use mux::{
 };
 use promise::spawn::spawn_into_main_thread;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use termwiz::surface::SequenceNo;
@@ -115,6 +116,17 @@ pub(crate) struct PerPane {
     frame_subscription: Option<Box<dyn mux::pane::KittyFrameSubscription>>,
     /// A push task exists for this pane and has not yet read the pane.
     push_scheduled: bool,
+    /// Something asked for a push since the reading on its way was asked
+    /// for, and may not be in it: see `finish_push`.
+    push_wanted: bool,
+    /// Output landed on a push on its way; see `FLOOD_FRAMES_PER_PUSH`.
+    output_landed: bool,
+    /// Moves whenever what a reading is held against changes, so a reading
+    /// made away from the main thread can tell it was overtaken.
+    reading_generation: u64,
+    /// When this connection last had output sent, or a reading made by the
+    /// parser; see `push_pause`.
+    last_push: Option<Instant>,
     /// Terminal input from this connection for this pane, in the order it
     /// was sent, waiting for the pane to be free. See `drain_pane_inputs`.
     inputs: VecDeque<QueuedInput>,
@@ -206,6 +218,7 @@ impl PerPane {
         self.frame_revision = None;
         self.scene_seqno = 0;
         self.frame_epoch += 1;
+        self.reading_generation += 1;
         if !subscribe {
             self.frame_subscription = None;
         }
@@ -215,13 +228,69 @@ impl PerPane {
     /// Claim the one push slot; false when a push is already on its way,
     /// which will carry whatever the caller wanted sent.
     fn claim_push(&mut self) -> bool {
+        self.push_wanted = self.push_scheduled;
         !std::mem::replace(&mut self.push_scheduled, true)
+    }
+
+    /// `claim_push` for what the pane's output sets off, the only thing
+    /// that tells a flood from a keystroke landing on a push.
+    fn claim_push_for_output(&mut self) -> bool {
+        let claimed = self.claim_push();
+        self.output_landed = !claimed;
+        claimed
     }
 
     /// Give the slot back. Done just before the pane is read, so output
     /// that lands during the read schedules the next push.
     fn release_push(&mut self) {
         self.push_scheduled = false;
+        self.push_wanted = false;
+        self.output_landed = false;
+    }
+
+    /// End a push whose reading was made before now, by the pane's parser:
+    /// what asked for a push since then may not be in it, and the slot was
+    /// taken. True when that happened and the caller keeps the slot and
+    /// goes round again; false and the slot is free otherwise. Decided
+    /// under the one lock, so that nothing lands between the two.
+    fn finish_push(&mut self) -> bool {
+        // Found or not: it came off the output's throughput, and a flood that
+        // shows nothing would pay for one after every batch.
+        self.last_push = Some(Instant::now());
+        self.output_landed = false;
+        if std::mem::take(&mut self.push_wanted) {
+            return true;
+        }
+        self.push_scheduled = false;
+        false
+    }
+
+    /// What a reading of the pane needs from here.
+    fn push_inputs(&self) -> PushInputs {
+        PushInputs {
+            last: self.last_sent(),
+            frame_control: self.frame_control,
+            frame_revision: self.frame_revision,
+            scene_seqno: self.scene_seqno,
+            viewer: self.viewer,
+            generation: self.reading_generation,
+        }
+    }
+
+    /// How long before this connection's next push of the pane is due, a
+    /// `frame` after the last one that counts. A push of a free pane that
+    /// found nothing does not: one sets out as soon as a key is written, and
+    /// holding the output that key sets off behind it would be what a
+    /// flood's frame costs, on every keystroke.
+    fn push_pause(&self, frame: Duration, now: Instant) -> Duration {
+        let interval = if self.output_landed {
+            frame * FLOOD_FRAMES_PER_PUSH
+        } else {
+            frame
+        };
+        self.last_push.map_or(Duration::ZERO, |last| {
+            interval.saturating_sub(now.saturating_duration_since(last))
+        })
     }
 
     /// Queue `item`; Ok(true) when the caller has to start the drain.
@@ -249,14 +318,13 @@ impl PerPane {
 
     fn record_application_palette(&mut self, palette: Option<ColorPalette>) {
         self.last_sent_application_palette = Some(palette);
+        self.reading_generation += 1;
     }
 
     /// The pane as this connection last described it.
     fn last_sent(&self) -> LastSent {
         LastSent {
             cursor_position: self.cursor_position,
-            title: self.title.clone(),
-            working_dir: self.working_dir.clone(),
             dimensions: self.dimensions,
             mouse_grabbed: self.mouse_grabbed,
             alt_screen: self.alt_screen,
@@ -266,11 +334,34 @@ impl PerPane {
         }
     }
 
+    /// Whether `labels` have anything this connection has not been told.
+    fn labels_are_news(&self, labels: &PaneLabels) -> bool {
+        self.title != labels.title || self.working_dir != labels.working_dir
+    }
+
+    /// A reading of the pane as this connection last described it, for
+    /// labels that are all there is to say.
+    fn reading_of_nothing_new(&self) -> PaneReading {
+        PaneReading {
+            mouse_grabbed: self.mouse_grabbed,
+            alt_screen: self.alt_screen,
+            keyboard_encoding: self.keyboard_encoding,
+            bracketed_paste: self.bracketed_paste,
+            dimensions: self.dimensions,
+            cursor_position: self.cursor_position,
+            seqno: self.seqno,
+            dirty_lines: Default::default(),
+            bonus_lines: Vec::new(),
+            input_serial: None,
+        }
+    }
+
     /// Record what `read_pane_changes` found, and build the push for it.
     fn commit_changes(
         &mut self,
         pane_id: PaneId,
         reading: PaneReading,
+        labels: PaneLabels,
     ) -> GetPaneRenderChangesResponse {
         let PaneReading {
             mouse_grabbed,
@@ -279,13 +370,12 @@ impl PerPane {
             bracketed_paste,
             dimensions,
             cursor_position,
-            title,
-            working_dir,
             seqno,
             dirty_lines,
             bonus_lines,
             input_serial,
         } = reading;
+        let PaneLabels { title, working_dir } = labels;
         self.cursor_position = cursor_position;
         self.title = title.clone();
         self.working_dir = working_dir.clone();
@@ -295,6 +385,12 @@ impl PerPane {
         self.keyboard_encoding = keyboard_encoding;
         self.bracketed_paste = bracketed_paste;
         self.seqno = seqno;
+        self.reading_generation += 1;
+        // The push for a key goes out with the key, whatever it found. The
+        // output the key sets off comes next, and that is not to wait for it.
+        if input_serial.is_none() {
+            self.last_push = Some(Instant::now());
+        }
 
         self.sent_images.remember(&bonus_lines);
         let bonus_lines = bonus_lines.into();
@@ -327,8 +423,6 @@ impl PerPane {
 #[derive(Clone)]
 struct LastSent {
     cursor_position: StableCursorPosition,
-    title: String,
-    working_dir: Option<Url>,
     dimensions: RenderableDimensions,
     mouse_grabbed: bool,
     alt_screen: bool,
@@ -345,12 +439,87 @@ struct PaneReading {
     bracketed_paste: bool,
     dimensions: RenderableDimensions,
     cursor_position: StableCursorPosition,
-    title: String,
-    working_dir: Option<Url>,
     seqno: SequenceNo,
     dirty_lines: rangeset::RangeSet<StableRowIndex>,
     bonus_lines: Vec<(StableRowIndex, wezterm_term::Line)>,
     input_serial: Option<InputSerial>,
+}
+
+/// The viewport's rows and the cursor's, as a reading copied them.
+struct RowsRead {
+    first: StableRowIndex,
+    viewport: Vec<wezterm_term::Line>,
+    cursor: Option<(StableRowIndex, wezterm_term::Line)>,
+}
+
+/// A `PaneReading` whose rows have not been gone through yet.
+struct RawReading {
+    reading: PaneReading,
+    rows: Option<RowsRead>,
+}
+
+impl RawReading {
+    /// Pick the rows to send. Compressing them is most of the cost of a push
+    /// of text with anything in it but ASCII, so it is done here, apart from
+    /// the reading: a reading can be made by the pane's parser, whose time
+    /// goes straight off the output's throughput.
+    fn select_rows(self) -> PaneReading {
+        let Self { mut reading, rows } = self;
+        if let Some(RowsRead {
+            first,
+            viewport,
+            cursor,
+        }) = rows
+        {
+            reading.bonus_lines = select_dirty_lines(first, viewport, &mut reading.dirty_lines);
+            // Always send the cursor's row with ordinary changes, as that
+            // tends to be the busiest row.
+            if let Some((row, mut line)) = cursor {
+                line.compress_for_scrollback();
+                reading.bonus_lines.push((row, line));
+            }
+        }
+        reading
+    }
+}
+
+/// A pane's title and directory. Either can take a look at the pane's
+/// processes, which is not for its parser to do, so these are read on the
+/// main thread, and after the rest of a reading, not before: a title's alert
+/// goes out with the push, and the window redraws its title from what the
+/// push said. A reading can be asked for in the middle of the batch that set
+/// the title, which only the end of that batch makes readable from here.
+struct PaneLabels {
+    title: String,
+    working_dir: Option<Url>,
+}
+
+impl PaneLabels {
+    fn read(pane: &Arc<dyn Pane>) -> Self {
+        Self {
+            title: pane.title_without_waiting(),
+            working_dir: pane.working_dir_without_waiting(CachePolicy::AllowStale),
+        }
+    }
+}
+
+/// What a reading of the pane needs from `PerPane`, copied out for the same
+/// reason `LastSent` is, and so that it can be read off the main thread.
+struct PushInputs {
+    last: LastSent,
+    frame_control: bool,
+    frame_revision: Option<u64>,
+    scene_seqno: u64,
+    viewer: bool,
+    generation: u64,
+}
+
+/// Everything one push sends, read from the pane by `read_for_push`.
+struct PushReading {
+    application_palette: Option<ColorPalette>,
+    frames: Option<(u64, u64, Vec<wezterm_term::KittyFrameSelection>)>,
+    scene_seqno: u64,
+    changes: Option<RawReading>,
 }
 
 /// Select from owned rows after the pane's terminal lock has been released.
@@ -390,12 +559,12 @@ fn select_dirty_lines(
 /// with the screen they are on: the bounds read here before them may be
 /// of the other screen by then.
 fn read_pane_changes(
-    pane: &Arc<dyn Pane>,
+    pane: &dyn Pane,
     last: &LastSent,
     force_with_input_serial: Option<InputSerial>,
     scene_seqno: u64,
     viewer: bool,
-) -> Option<PaneReading> {
+) -> Option<RawReading> {
     let mut changed = false;
     let mouse_grabbed = pane.is_mouse_grabbed();
     if mouse_grabbed != last.mouse_grabbed {
@@ -427,18 +596,8 @@ fn read_pane_changes(
         changed = true;
     }
 
-    let title = pane.get_title();
-    if title != last.title {
-        changed = true;
-    }
-
-    let working_dir = pane.get_current_working_dir(CachePolicy::AllowStale);
-    if working_dir != last.working_dir {
-        changed = true;
-    }
-
     let seqno = pane.get_current_seqno();
-    let mut all_dirty_lines = pane.get_changed_since(
+    let all_dirty_lines = pane.get_changed_since(
         0..dims.physical_top + dims.viewport_rows as StableRowIndex,
         last.seqno,
     );
@@ -449,10 +608,10 @@ fn read_pane_changes(
     let sequence_only = !changed && force_with_input_serial.is_none();
     if sequence_only && !((last.seqno as u64) < scene_seqno && seqno as u64 >= scene_seqno) { return None; }
 
-    let bonus_lines = if sequence_only {
+    let rows = if sequence_only {
         // A relative placement can move without touching text or the cursor.
         // Acknowledge its terminal sequence without copying unchanged rows.
-        Vec::new()
+        None
     } else {
         let read = |lines| {
             if viewer {
@@ -463,33 +622,29 @@ fn read_pane_changes(
         };
         let viewport_range =
             dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex;
-        let (first_line, lines) = read(viewport_range);
-        let mut bonus_lines = select_dirty_lines(first_line, lines, &mut all_dirty_lines);
-
-        // Always send the cursor's row with ordinary changes, as that tends
-        // to be the busiest row. A viewer's may have left the screen.
-        let (cursor_line_idx, lines) = read(cursor_position.y..cursor_position.y + 1);
-        if let Some(mut cursor_line) = lines.into_iter().next() {
-            cursor_line.compress_for_scrollback();
-            bonus_lines.push((cursor_line_idx, cursor_line));
-        }
-        bonus_lines
+        let (first, viewport) = read(viewport_range);
+        // A viewer's cursor row may have left the screen.
+        let (row, lines) = read(cursor_position.y..cursor_position.y + 1);
+        Some(RowsRead {
+            first,
+            viewport,
+            cursor: lines.into_iter().next().map(|line| (row, line)),
+        })
     };
 
-    Some(PaneReading {
+    let reading = PaneReading {
         bracketed_paste,
         mouse_grabbed,
         alt_screen,
         keyboard_encoding,
         dimensions: dims,
         cursor_position,
-        title,
-        working_dir,
         seqno,
         dirty_lines: all_dirty_lines,
-        bonus_lines,
+        bonus_lines: Vec::new(),
         input_serial: force_with_input_serial,
-    })
+    };
+    Some(RawReading { reading, rows })
 }
 
 /// How long a push waits for a busy pane before looking again: short at
@@ -501,6 +656,26 @@ fn read_pane_changes(
 const PUSH_RETRY_MIN: Duration = Duration::from_millis(2);
 const PUSH_RETRY_MAX: Duration = Duration::from_millis(50);
 const PUSH_DEFERRAL_LIMIT: Duration = Duration::from_secs(30);
+
+/// The least time between two pushes of a pane to one connection: a frame
+/// at `max_fps`, the fastest a window draws. A flood gives a push for every
+/// batch, up to a thousand a second, and a client has to take in every one
+/// of them to draw at most every eighth: a window behind on rows of
+/// many-codepoint cells stopped drawing for seconds. A push waiting here
+/// holds the pane's slot, so output landing meanwhile is in what it reads
+/// when its time comes, the last of it included. Output after a pause is not
+/// held back, and neither is what a key sends: `drain_pane_inputs` pushes
+/// that itself.
+fn push_interval() -> Duration {
+    Duration::from_millis(1000 / config::configuration().max_fps.clamp(1, 1000))
+}
+
+/// How many of those a push waits while output goes on landing during the
+/// wait: a flood, not a program drawing frames. Half the window's frame rate
+/// is all anyone can follow of one, and the other half came straight off the
+/// throughput: a frame drawn costs the mux a reading and the machine the
+/// drawing of it, for Unicode text 5% of what `kitten __benchmark__` measures.
+const FLOOD_FRAMES_PER_PUSH: u32 = 2;
 
 /// The one push slot of a pane, given back however the push ends: a task
 /// dropped without running, a bail, a panic -- a slot left taken would
@@ -519,6 +694,13 @@ impl PushSlot {
             }
         }
     }
+
+    /// `PerPane::finish_push`: true when the slot is still held.
+    fn finish(&mut self) -> bool {
+        let held = self.per_pane.lock().unwrap().finish_push();
+        self.released = !held;
+        held
+    }
 }
 
 impl Drop for PushSlot {
@@ -527,18 +709,78 @@ impl Drop for PushSlot {
     }
 }
 
-/// Push `pane_id`'s changes to this connection once its render state can
-/// be read without waiting.
+/// A reading asked of a busy pane's parser, and how the two sides agree on
+/// which of them makes it.
+struct ReadAfterBatch {
+    /// Set by whichever side reads: the parser after its batch, or this
+    /// side, if it finds the pane free first.
+    taken: Arc<AtomicBool>,
+    reading: smol::channel::Receiver<PushReading>,
+    generation: u64,
+}
+
+/// Ask `pane`'s parser to read for this connection after its batch. None for
+/// a pane without a parser to ask, and for a connection that reads nothing
+/// of the pane.
+fn ask_parser_to_read(
+    pane: &Arc<dyn Pane>,
+    per_pane: &Arc<Mutex<PerPane>>,
+) -> Option<ReadAfterBatch> {
+    let inputs = {
+        let mut per_pane = per_pane.lock().unwrap();
+        if per_pane.events_only {
+            return None;
+        }
+        // What asked for a push until now will be in this reading.
+        per_pane.push_wanted = false;
+        per_pane.push_inputs()
+    };
+    let generation = inputs.generation;
+    let (found, reading) = smol::channel::bounded(1);
+    let taken = Arc::new(AtomicBool::new(false));
+    let claim = Arc::clone(&taken);
+    pane.read_after_batch(Box::new(move |pane| {
+        if found.is_closed() || claim.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        found.try_send(read_for_push(pane, &inputs, None)).ok();
+    }))
+    .ok()?;
+    Some(ReadAfterBatch {
+        taken,
+        reading,
+        generation,
+    })
+}
+
+/// The pane, unless it or the connection has gone while waiting for it.
+fn pane_still_wanted(pane_id: PaneId, sender: &PduSender) -> anyhow::Result<Arc<dyn Pane>> {
+    if sender.is_closed() {
+        anyhow::bail!("connection closed while pane {pane_id} was busy");
+    }
+    Mux::get()
+        .get_pane(pane_id)
+        .ok_or_else(|| anyhow!("no such pane {pane_id}"))
+}
+
+/// Push `pane_id`'s changes to this connection, reading the pane without
+/// the main thread ever waiting for it.
 ///
 /// Pushes run on the main thread with the rest of the mux's work, while
 /// each pane's parser holds the pane's terminal lock for as long as a
 /// batch of output takes to apply. Reading here while a pane was busy
 /// with, say, a very large image stalled every other pane's pushes and
 /// every request that needs the main thread until that batch was done --
-/// with a runaway pane, for good. So the lock is probed first, and a busy
-/// pane's push is put off: that pane's own output is what waits, nobody
-/// else's. The probe is a moment's glance, not a reservation; a pane that
-/// takes the lock back right after it still has to be waited for, once.
+/// with a runaway pane, for good. So the lock is probed first. The probe
+/// is a moment's glance, not a reservation; a pane that takes the lock
+/// back right after it still has to be waited for, once.
+///
+/// A probe alone is not enough for a pane that is merely busy. Under a
+/// flood the lock is free for a tenth of a millisecond between batches of
+/// a millisecond, and a retry on a timer lands in that gap by luck: output
+/// went a second at a time without reaching the screen. So the first probe
+/// to fail leaves the reading with the pane's parser, which makes it right
+/// after its batch. The timer stays, for the batch that was the last.
 async fn push_pane_changes_when_free(
     pane_id: PaneId,
     sender: PduSender,
@@ -548,29 +790,98 @@ async fn push_pane_changes_when_free(
         per_pane: Arc::clone(&per_pane),
         released: false,
     };
-    let Some(pane) =
-        pane_when_free(pane_id, &sender, "this push", Some(PUSH_DEFERRAL_LIMIT)).await?
-    else {
-        // Its next output will try again.
-        return Ok(());
-    };
-    // Released before the read, so output that lands during it
-    // schedules the next push rather than being carried by nobody.
-    slot.release();
-    let pushed_at = Instant::now();
-    let pushed = maybe_push_pane_changes(&pane, sender, per_pane, None);
-    metrics::histogram!("mux_server.push.latency").record(pushed_at.elapsed());
-    pushed
+    let mut delay = PUSH_RETRY_MIN;
+    let mut started = Instant::now();
+    let mut asked: Option<ReadAfterBatch> = None;
+    loop {
+        let pane = pane_still_wanted(pane_id, &sender)?;
+        if asked.is_none() {
+            let pause = per_pane
+                .lock()
+                .unwrap()
+                .push_pause(push_interval(), Instant::now());
+            if !pause.is_zero() {
+                smol::Timer::after(pause).await;
+                continue;
+            }
+        }
+        if !pane.render_state_is_contended() {
+            // Unless the parser has this reading in hand already.
+            if !asked
+                .as_ref()
+                .is_some_and(|asked| asked.taken.swap(true, Ordering::AcqRel))
+            {
+                // Released before the read, so output that lands during it
+                // schedules the next push rather than being carried by
+                // nobody.
+                slot.release();
+                let pushed_at = Instant::now();
+                let pushed = maybe_push_pane_changes(&pane, sender, per_pane, None);
+                metrics::histogram!("mux_server.push.latency").record(pushed_at.elapsed());
+                return pushed;
+            }
+        } else {
+            if started.elapsed() > PUSH_DEFERRAL_LIMIT {
+                log::warn!(
+                    "pane {pane_id} has been busy for {:?}; giving up on this push",
+                    started.elapsed()
+                );
+                // Its next output will try again.
+                return Ok(());
+            }
+            if asked.is_none() {
+                asked = ask_parser_to_read(&pane, &per_pane);
+            }
+        }
+        metrics::counter!("mux_server.push.deferred").increment(1);
+        let waited = match &asked {
+            Some(asked) => {
+                smol::future::or(async { Some(asked.reading.recv().await) }, async {
+                    smol::Timer::after(delay).await;
+                    None
+                })
+                .await
+            }
+            None => {
+                smol::Timer::after(delay).await;
+                None
+            }
+        };
+        delay = (delay * 2).min(PUSH_RETRY_MAX);
+        let (Some(waited), Some(asked_for)) = (waited, &asked) else {
+            continue;
+        };
+        let generation = asked_for.generation;
+        asked = None;
+        // An error is the reading dropped unmade, with its pane: the next
+        // look round finds out.
+        let Ok(reading) = waited else {
+            continue;
+        };
+        delay = PUSH_RETRY_MIN;
+        started = Instant::now();
+        metrics::counter!("mux_server.push.after_batch").increment(1);
+        // A push made here since overtook this one, which would put an older
+        // screen on top of it. The next look round reads afresh.
+        if per_pane.lock().unwrap().reading_generation != generation {
+            continue;
+        }
+        let labels = PaneLabels::read(&pane);
+        send_push_reading(pane_id, reading, labels, &sender, &per_pane)?;
+        if !slot.finish() {
+            return Ok(());
+        }
+    }
 }
 
 /// The pane, once its render state can be read without waiting on its
 /// parser. With a `limit`, None after that long of nothing but
 /// contention, with a warning naming `what` gave up; without one the wait
 /// is for as long as it takes, and the warning says so once. Every read
-/// of a pane on the main thread goes through here, so a pane wedged in
-/// its parser costs its own readers a wait and nobody else anything. The
-/// probe is a moment's glance, not a reservation; a pane that takes the
-/// lock back right after it still has to be waited for, once.
+/// of a pane on the main thread but a push's goes through here, so a pane
+/// wedged in its parser costs its own readers a wait and nobody else
+/// anything. The probe is a moment's glance, not a reservation; a pane that
+/// takes the lock back right after it still has to be waited for, once.
 async fn pane_when_free(
     pane_id: PaneId,
     sender: &PduSender,
@@ -581,12 +892,7 @@ async fn pane_when_free(
     let started = Instant::now();
     let mut warned = false;
     loop {
-        if sender.is_closed() {
-            anyhow::bail!("connection closed while pane {pane_id} was busy");
-        }
-        let Some(pane) = Mux::get().get_pane(pane_id) else {
-            anyhow::bail!("no such pane {pane_id}");
-        };
+        let pane = pane_still_wanted(pane_id, sender)?;
         if !pane.render_state_is_contended() {
             return Ok(Some(pane));
         }
@@ -858,44 +1164,66 @@ fn relative_scene_seqno(selections: &[wezterm_term::KittyFrameSelection]) -> u64
         .map(|placement| placement.source_seqno).max().unwrap_or(0)
 }
 
-/// Read `pane` and push what changed. Nothing of the pane is read while
-/// `per_pane` is locked (see `LastSent`); this runs on the main thread,
-/// where every writer of a `PerPane`'s state runs, so what is read out of
-/// it and what is written back stay consistent.
-fn maybe_push_pane_changes(
-    pane: &Arc<dyn Pane>,
-    sender: PduSender,
-    per_pane: Arc<Mutex<PerPane>>,
+/// Read `pane` against `inputs`, on whichever thread: nothing here touches
+/// `PerPane` (see `LastSent`).
+fn read_for_push(
+    pane: &dyn Pane,
+    inputs: &PushInputs,
     force_with_input_serial: Option<InputSerial>,
-) -> anyhow::Result<()> {
-    {
-        // A connection subscribed to events gets the pane's alerts and
-        // none of what it shows.
-        let mut per_pane = per_pane.lock().unwrap();
-        if per_pane.events_only {
-            return send_pane_alerts(pane.pane_id(), &sender, &mut per_pane);
-        }
-    }
+) -> PushReading {
     // Application palette provenance must arrive even when the state is
     // `None`: that explicit reset prevents a server's configured/advisory
-    // palette from taking over client rendering. Send it before line changes
-    // so a real application override is installed before those lines paint.
+    // palette from taking over client rendering.
     let application_palette = pane.palette_override();
-    let (needs_palette, last, frame_control, frame_revision, mut scene_seqno, viewer) = {
-        let per_pane = per_pane.lock().unwrap();
-        (
-            per_pane.needs_application_palette(&application_palette),
-            per_pane.last_sent(),
-            per_pane.frame_control,
-            per_pane.frame_revision,
-            per_pane.scene_seqno,
-            per_pane.viewer,
-        )
-    };
+    let frames = inputs
+        .frame_control
+        .then(|| pane.kitty_frame_selections(inputs.frame_revision))
+        .flatten();
+    let scene_seqno = frames
+        .as_ref()
+        .map_or(inputs.scene_seqno, |(_, _, selections)| {
+            relative_scene_seqno(selections)
+        });
+    let changes = read_pane_changes(
+        pane,
+        &inputs.last,
+        force_with_input_serial,
+        scene_seqno,
+        inputs.viewer,
+    );
+    PushReading {
+        application_palette,
+        frames,
+        scene_seqno,
+        changes,
+    }
+}
+
+/// Send what `read_for_push` found, and `labels`, read since then. This runs
+/// on the main thread, where every writer of a `PerPane`'s state runs. The
+/// palette goes before the line changes, so a real application override is
+/// installed before those lines paint.
+fn send_push_reading(
+    pane_id: PaneId,
+    reading: PushReading,
+    labels: PaneLabels,
+    sender: &PduSender,
+    per_pane: &Arc<Mutex<PerPane>>,
+) -> anyhow::Result<()> {
+    let PushReading {
+        application_palette,
+        frames,
+        scene_seqno,
+        changes,
+    } = reading;
+    let needs_palette = per_pane
+        .lock()
+        .unwrap()
+        .needs_application_palette(&application_palette);
     if needs_palette {
         sender.send(DecodedPdu {
             pdu: Pdu::SetApplicationPalette(SetApplicationPalette {
-                pane_id: pane.pane_id(),
+                pane_id,
                 palette: application_palette.clone(),
             }),
             serial: 0,
@@ -906,31 +1234,58 @@ fn maybe_push_pane_changes(
             .record_application_palette(application_palette);
     }
 
-    if frame_control {
-        if let Some((revision, image_epoch, selections)) = pane.kitty_frame_selections(frame_revision) {
-            scene_seqno = relative_scene_seqno(&selections);
-            sender.send(DecodedPdu {
-                pdu: Pdu::KittyFrameSelections(KittyFrameSelections {
-                    pane_id: pane.pane_id(), image_epoch, now_ms: wezterm_term::kitty_animation::monotonic_ms(), revision, selections,
-                }.fitted()),
-                serial: 0,
-            })?;
-            let mut per_pane = per_pane.lock().unwrap();
-            per_pane.frame_revision = Some(revision);
-            per_pane.scene_seqno = scene_seqno;
-        }
+    if let Some((revision, image_epoch, selections)) = frames {
+        sender.send(DecodedPdu {
+            pdu: Pdu::KittyFrameSelections(KittyFrameSelections {
+                pane_id, image_epoch, now_ms: wezterm_term::kitty_animation::monotonic_ms(), revision, selections,
+            }.fitted()),
+            serial: 0,
+        })?;
+        let mut per_pane = per_pane.lock().unwrap();
+        per_pane.frame_revision = Some(revision);
+        per_pane.scene_seqno = scene_seqno;
+        per_pane.reading_generation += 1;
     }
-    let reading = read_pane_changes(pane, &last, force_with_input_serial, scene_seqno, viewer);
+    let changes = changes.map(RawReading::select_rows);
     let mut per_pane = per_pane.lock().unwrap();
-    if let Some(reading) = reading {
-        let resp = per_pane.commit_changes(pane.pane_id(), reading);
+    let changes = changes.or_else(|| {
+        per_pane
+            .labels_are_news(&labels)
+            .then(|| per_pane.reading_of_nothing_new())
+    });
+    if let Some(changes) = changes {
+        let resp = per_pane.commit_changes(pane_id, changes, labels);
         sender.send(DecodedPdu {
             pdu: Pdu::GetPaneRenderChangesResponse(resp),
             serial: 0,
         })?;
     }
 
-    send_pane_alerts(pane.pane_id(), &sender, &mut per_pane)
+    send_pane_alerts(pane_id, sender, &mut per_pane)
+}
+
+/// Read `pane` and push what changed. Nothing of the pane is read while
+/// `per_pane` is locked (see `LastSent`); this runs on the main thread,
+/// where every writer of a `PerPane`'s state runs, so what is read out of
+/// it and what is written back stay consistent.
+fn maybe_push_pane_changes(
+    pane: &Arc<dyn Pane>,
+    sender: PduSender,
+    per_pane: Arc<Mutex<PerPane>>,
+    force_with_input_serial: Option<InputSerial>,
+) -> anyhow::Result<()> {
+    let inputs = {
+        // A connection subscribed to events gets the pane's alerts and
+        // none of what it shows.
+        let mut per_pane = per_pane.lock().unwrap();
+        if per_pane.events_only {
+            return send_pane_alerts(pane.pane_id(), &sender, &mut per_pane);
+        }
+        per_pane.push_inputs()
+    };
+    let reading = read_for_push(pane.as_ref(), &inputs, force_with_input_serial);
+    let labels = PaneLabels::read(pane);
+    send_push_reading(pane.pane_id(), reading, labels, &sender, &per_pane)
 }
 
 fn send_pane_alerts(
@@ -1508,7 +1863,9 @@ impl SessionHandler {
     fn subscribe_events(&mut self) {
         self.events_subscribed = true;
         for per_pane in self.per_pane.values() {
-            per_pane.lock().unwrap().events_only = true;
+            let mut per_pane = per_pane.lock().unwrap();
+            per_pane.events_only = true;
+            per_pane.reading_generation += 1;
         }
     }
 
@@ -1561,7 +1918,7 @@ impl SessionHandler {
         // One push on its way per pane. A burst of output notifications
         // used to queue a task each, and all but the first found nothing
         // new to send.
-        if !per_pane.lock().unwrap().claim_push() {
+        if !per_pane.lock().unwrap().claim_push_for_output() {
             return;
         }
         spawn_into_main_thread(push_pane_changes_when_free(pane_id, sender, per_pane)).detach();
@@ -2759,6 +3116,7 @@ impl SessionHandler {
                         }
                         state.frame_revision = Some(snapshot.0);
                         state.scene_seqno = relative_scene_seqno(&snapshot.2);
+                        state.reading_generation += 1;
                         (snapshot.0, snapshot.1, snapshot.2, state.scene_seqno != 0)
                     };
                     send_response(Ok(Pdu::KittyFrameSelections(KittyFrameSelections { pane_id, image_epoch, now_ms: wezterm_term::kitty_animation::monotonic_ms(), revision, selections }.fitted())));
@@ -3897,13 +4255,17 @@ mod web_server_address_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_viewport_for_pane, requires_existing_frontend_access, workspace_for_moved_pane,
-        InputDrain, PaneInput, PerPane, QueuedInput,
+        claim_viewport_for_pane, requires_existing_frontend_access, send_push_reading,
+        workspace_for_moved_pane, InputDrain, PaneInput, PaneLabels, PaneReading, PduSender,
+        PerPane, PushReading, QueuedInput,
     };
-    use codec::{EnsureThinkTermThread, Pdu};
+    use codec::{EnsureThinkTermThread, Pdu, WireKeyboardEncoding};
     use mux::client::ClientId;
+    use mux::renderable::{RenderableDimensions, StableCursorPosition};
     use mux::Mux;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use termwiz::surface::SequenceNo;
     use wezterm_term::color::ColorPalette;
     use wezterm_term::TerminalSize;
 
@@ -4407,6 +4769,244 @@ mod tests {
         assert!(
             state.claim_push(),
             "released: the next notification schedules again"
+        );
+    }
+
+    #[test]
+    fn a_reading_made_by_the_parser_is_followed_by_what_landed_after_it() {
+        let mut state = PerPane::default();
+        assert!(state.claim_push());
+        assert!(
+            !state.finish_push(),
+            "nothing landed: the push is over and the slot free"
+        );
+
+        assert!(state.claim_push(), "the slot was free");
+        assert!(!state.claim_push(), "output lands on a push on its way");
+        assert!(
+            state.finish_push(),
+            "it may not be in the reading, and nothing else will carry it"
+        );
+        assert!(
+            !state.claim_push(),
+            "going round keeps the slot, so there is one push at a time"
+        );
+        state.release_push();
+        assert!(
+            !state.finish_push(),
+            "a release reads past what landed before it"
+        );
+    }
+
+    fn no_labels() -> PaneLabels {
+        PaneLabels {
+            title: String::new(),
+            working_dir: None,
+        }
+    }
+
+    #[test]
+    fn a_reading_overtaken_on_its_way_back_can_tell() {
+        let mut state = PerPane::default();
+        let asked = state.push_inputs();
+        assert_eq!(state.reading_generation, asked.generation);
+
+        state.set_frame_control(true);
+        assert_ne!(
+            state.reading_generation, asked.generation,
+            "what the reading was held against has moved"
+        );
+
+        let asked = state.push_inputs();
+        state.commit_changes(1, reading_at(7), no_labels());
+        assert_ne!(
+            state.reading_generation, asked.generation,
+            "a push made here since would be covered up by an older screen"
+        );
+
+        let asked = state.push_inputs();
+        state.record_application_palette(Some(ColorPalette::default()));
+        assert_ne!(
+            state.reading_generation, asked.generation,
+            "an older reading would put the palette back"
+        );
+    }
+
+    #[test]
+    fn a_reading_overtaken_by_a_subscription_to_events_can_tell() {
+        use super::SessionHandler;
+        let mut handler = SessionHandler::new(PduSender::new(|_| Ok(())));
+        let per_pane = handler.per_pane(1);
+        let asked = per_pane.lock().unwrap().push_inputs();
+        handler.subscribe_events();
+        let generation = per_pane.lock().unwrap().reading_generation;
+        assert_ne!(
+            generation, asked.generation,
+            "the connection no longer wants what the reading found"
+        );
+    }
+
+    /// What a key sets off is the next thing to go out, however soon: the
+    /// push the key itself made holds nothing back, and neither does one
+    /// that set out when the key was written and found nothing yet.
+    #[test]
+    fn a_push_holds_back_the_next_only_if_it_sent_output() {
+        // Far longer than this could ever take, so only the rule is tested.
+        let frame = Duration::from_secs(3600);
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        let sender = PduSender::new(|_| Ok(()));
+        let due_now = || {
+            per_pane
+                .lock()
+                .unwrap()
+                .push_pause(frame, Instant::now())
+                .is_zero()
+        };
+
+        let nothing = PushReading {
+            application_palette: None,
+            frames: None,
+            scene_seqno: 0,
+            changes: None,
+        };
+        per_pane.lock().unwrap().claim_push();
+        send_push_reading(1, nothing, no_labels(), &sender, &per_pane).unwrap();
+        per_pane.lock().unwrap().release_push();
+        assert!(due_now(), "nothing went out");
+
+        let mut key = reading_at(1);
+        key.input_serial = Some(codec::InputSerial::now());
+        per_pane.lock().unwrap().commit_changes(1, key, no_labels());
+        assert!(due_now(), "that answered a key");
+
+        per_pane
+            .lock()
+            .unwrap()
+            .commit_changes(1, reading_at(2), no_labels());
+        assert!(!due_now(), "a frame went out");
+    }
+
+    /// The window redraws its title on the alert, from what the last push
+    /// said, and nothing tells it to look again: the alert has to come after
+    /// the title it is about, whatever else there was to say.
+    #[test]
+    fn a_title_goes_out_ahead_of_its_alert() {
+        use codec::DecodedPdu;
+        use wezterm_term::Alert;
+
+        let sent: Arc<Mutex<Vec<DecodedPdu>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&sent);
+        let sender = PduSender::new(move |pdu| {
+            sink.lock().unwrap().push(pdu);
+            Ok(())
+        });
+        let per_pane = Arc::new(Mutex::new(PerPane::default()));
+        per_pane
+            .lock()
+            .unwrap()
+            .notifications
+            .push(Alert::WindowTitleChanged("vim".to_string()));
+        let nothing = PushReading {
+            application_palette: Some(ColorPalette::default()),
+            frames: None,
+            scene_seqno: 0,
+            changes: None,
+        };
+        let labels = PaneLabels {
+            title: "vim".to_string(),
+            working_dir: None,
+        };
+        send_push_reading(1, nothing, labels, &sender, &per_pane).unwrap();
+
+        let sent = sent.lock().unwrap();
+        let names: Vec<&str> = sent.iter().map(|pdu| pdu.pdu.pdu_name()).collect();
+        assert_eq!(
+            names,
+            [
+                "SetApplicationPalette",
+                "GetPaneRenderChangesResponse",
+                "NotifyAlert"
+            ]
+        );
+        let Pdu::GetPaneRenderChangesResponse(push) = &sent[1].pdu else {
+            unreachable!()
+        };
+        assert_eq!(push.title, "vim");
+    }
+
+    /// Output that changes nothing on the screen is no less of a flood, and
+    /// what the parser reads for it comes off the output's throughput.
+    #[test]
+    fn a_reading_the_parser_made_counts_whatever_it_found() {
+        let frame = Duration::from_secs(3600);
+        let mut state = PerPane::default();
+        assert!(state.claim_push());
+        assert!(!state.finish_push());
+        assert!(!state.push_pause(frame, Instant::now()).is_zero());
+    }
+
+    fn reading_at(seqno: SequenceNo) -> PaneReading {
+        PaneReading {
+            mouse_grabbed: false,
+            alt_screen: false,
+            keyboard_encoding: WireKeyboardEncoding::default(),
+            bracketed_paste: false,
+            dimensions: RenderableDimensions::default(),
+            cursor_position: StableCursorPosition::default(),
+            seqno,
+            dirty_lines: Default::default(),
+            bonus_lines: Vec::new(),
+            input_serial: None,
+        }
+    }
+
+    #[test]
+    fn pushes_of_a_pane_are_at_least_a_frame_apart() {
+        let frame = Duration::from_millis(8);
+        let now = Instant::now();
+        let mut state = PerPane::default();
+        assert!(
+            state.push_pause(frame, now).is_zero(),
+            "the first goes at once"
+        );
+
+        state.last_push = Some(now);
+        assert_eq!(state.push_pause(frame, now), frame, "the next waits");
+        assert_eq!(
+            state.push_pause(frame, now + frame / 2),
+            frame / 2,
+            "for what is left of the frame"
+        );
+        assert!(
+            state.push_pause(frame, now + frame).is_zero(),
+            "output after a pause is not held back"
+        );
+    }
+
+    /// Output landing on a push on its way is a flood's mark: a program
+    /// drawing frames gives none while the frame's push waits. Nothing else
+    /// that asks for a push is.
+    #[test]
+    fn a_flood_of_output_is_pushed_half_as_often() {
+        let frame = Duration::from_millis(8);
+        let now = Instant::now();
+        let mut state = PerPane {
+            last_push: Some(now),
+            ..PerPane::default()
+        };
+
+        assert!(state.claim_push_for_output());
+        assert!(!state.claim_push());
+        assert_eq!(state.push_pause(frame, now), frame, "a key is no flood");
+
+        assert!(!state.claim_push_for_output());
+        assert_eq!(state.push_pause(frame, now), 2 * frame);
+
+        assert!(state.finish_push(), "the output landed since the reading");
+        assert_eq!(
+            state.push_pause(frame, now),
+            frame,
+            "and each wait is judged alone"
         );
     }
 
