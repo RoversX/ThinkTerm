@@ -20,14 +20,16 @@ use wezterm_font::LoadedFont;
 const MENU_MIN_WIDTH: usize = 240;
 const MENU_MAX_WIDTH: usize = 1000;
 const MENU_WINDOW_MARGIN: usize = 24;
-const MENU_PADDING_X: usize = 20;
-const MENU_PADDING_Y: usize = 10;
+const MENU_PADDING_X: usize = 22;
+const MENU_PADDING_Y: usize = 12;
 const MENU_LABEL_GAP: usize = 14;
 const MENU_ICON_SIZE: usize = 28;
 const MENU_ICON_SLOT: usize = 40;
 const MENU_CHECK_SLOT: usize = 36;
 const MENU_ARROW_SLOT: usize = 40;
-const MENU_ROW_EXTRA_HEIGHT: usize = 16;
+const MENU_ROW_EXTRA_HEIGHT: usize = 24;
+/// The rows of a menu too tall for its window at the height above.
+const MENU_ROW_COMPACT_EXTRA_HEIGHT: usize = 16;
 /// How far a submenu overlaps the row that opened it.
 const MENU_SUBMENU_OVERLAP: usize = 4;
 /// The menu's text against the sidebar's, whose size it follows: 15 points
@@ -797,6 +799,9 @@ impl crate::TermWindow {
         let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
         let row_height = (ui_metrics.cell_size.height as usize + self.ui_px(MENU_ROW_EXTRA_HEIGHT))
             .max(self.ui_px(40));
+        let compact_row_height = (ui_metrics.cell_size.height as usize
+            + self.ui_px(MENU_ROW_COMPACT_EXTRA_HEIGHT))
+        .max(self.ui_px(40));
         let mut palette = context_menu_palette(self.chrome());
         // Last word to the user: the menu tuning above overwrites slots the
         // chrome already resolved, `ui_colors` among them.
@@ -839,13 +844,24 @@ impl crate::TermWindow {
                 continue;
             }
 
-            let metrics = compute_menu_metrics(
+            let mut metrics = compute_menu_metrics(
                 self,
                 &ui_font,
                 row_height,
                 &rows,
                 self.dimensions.pixel_width,
             )?;
+            // A menu cannot scroll, so one the window cannot hold gives up
+            // the room between its rows rather than its last rows.
+            if metrics.height > self.dimensions.pixel_height {
+                metrics = compute_menu_metrics(
+                    self,
+                    &ui_font,
+                    compact_row_height,
+                    &rows,
+                    self.dimensions.pixel_width,
+                )?;
+            }
             let origin = if menu_path.is_empty() {
                 clamp_menu_origin(
                     anchor.x,
