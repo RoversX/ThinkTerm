@@ -1828,6 +1828,16 @@ macro_rules! parse {
 
 impl<'a> CSIParser<'a> {
     fn parse_next(&mut self, params: &'a [CsiParam]) -> Result<CSI, ()> {
+        // Everything in the special cases of `parse_special` is marked by
+        // what the parameters start or end with, and an SGR with several
+        // attributes comes through here for each of them.
+        match (self.orig_params.first(), self.orig_params.last()) {
+            (Some(CsiParam::P(_)), _) | (_, Some(CsiParam::P(_))) => self.parse_special(params),
+            _ => self.parse_ordinary(params),
+        }
+    }
+
+    fn parse_special(&mut self, params: &'a [CsiParam]) -> Result<CSI, ()> {
         match (self.control, self.orig_params) {
             ('k', [.., CsiParam::P(b' ')]) => self.select_character_path(params),
             ('q', [.., CsiParam::P(b' ')]) => self.cursor_style(params),
@@ -1936,62 +1946,66 @@ impl<'a> CSIParser<'a> {
             )),
             ('u', [CsiParam::P(b'<')]) => Ok(CSI::Keyboard(Keyboard::PopKittyState(1))),
 
-            _ => match self.control {
-                'c' => self
-                    .req_primary_device_attributes(params)
-                    .map(|dev| CSI::Device(Box::new(dev))),
+            _ => self.parse_ordinary(params),
+        }
+    }
 
-                '@' => parse!(Edit, InsertCharacter, params),
-                '`' => parse!(Cursor, CharacterPositionAbsolute, params),
-                'A' => parse!(Cursor, Up, params),
-                'B' => parse!(Cursor, Down, params),
-                'C' => parse!(Cursor, Right, params),
-                'D' => parse!(Cursor, Left, params),
-                'E' => parse!(Cursor, NextLine, params),
-                'F' => parse!(Cursor, PrecedingLine, params),
-                'G' => parse!(Cursor, CharacterAbsolute, params),
-                'H' => parse!(Cursor, Position, line, col, params),
-                'I' => parse!(Cursor, ForwardTabulation, params),
-                'J' => parse!(Edit, EraseInDisplay, params),
-                'K' => parse!(Edit, EraseInLine, params),
-                'L' => parse!(Edit, InsertLine, params),
-                'M' => parse!(Edit, DeleteLine, params),
-                'P' => parse!(Edit, DeleteCharacter, params),
-                'R' => parse!(Cursor, ActivePositionReport, line, col, params),
-                'S' => parse!(Edit, ScrollUp, params),
-                'T' => parse!(Edit, ScrollDown, params),
-                'W' => parse!(Cursor, TabulationControl, params),
-                'X' => parse!(Edit, EraseCharacter, params),
-                'Y' => parse!(Cursor, LineTabulation, params),
-                'Z' => parse!(Cursor, BackwardTabulation, params),
+    fn parse_ordinary(&mut self, params: &'a [CsiParam]) -> Result<CSI, ()> {
+        match self.control {
+            'c' => self
+                .req_primary_device_attributes(params)
+                .map(|dev| CSI::Device(Box::new(dev))),
 
-                'a' => parse!(Cursor, CharacterPositionForward, params),
-                'b' => parse!(Edit, Repeat, params),
-                'd' => parse!(Cursor, LinePositionAbsolute, params),
-                'e' => parse!(Cursor, LinePositionForward, params),
-                'f' => parse!(Cursor, CharacterAndLinePosition, line, col, params),
-                'g' => parse!(Cursor, TabulationClear, params),
-                'h' => self
-                    .terminal_mode(params)
-                    .map(|mode| CSI::Mode(Mode::SetMode(mode))),
-                'j' => parse!(Cursor, CharacterPositionBackward, params),
-                'k' => parse!(Cursor, LinePositionBackward, params),
-                'l' => self
-                    .terminal_mode(params)
-                    .map(|mode| CSI::Mode(Mode::ResetMode(mode))),
+            '@' => parse!(Edit, InsertCharacter, params),
+            '`' => parse!(Cursor, CharacterPositionAbsolute, params),
+            'A' => parse!(Cursor, Up, params),
+            'B' => parse!(Cursor, Down, params),
+            'C' => parse!(Cursor, Right, params),
+            'D' => parse!(Cursor, Left, params),
+            'E' => parse!(Cursor, NextLine, params),
+            'F' => parse!(Cursor, PrecedingLine, params),
+            'G' => parse!(Cursor, CharacterAbsolute, params),
+            'H' => parse!(Cursor, Position, line, col, params),
+            'I' => parse!(Cursor, ForwardTabulation, params),
+            'J' => parse!(Edit, EraseInDisplay, params),
+            'K' => parse!(Edit, EraseInLine, params),
+            'L' => parse!(Edit, InsertLine, params),
+            'M' => parse!(Edit, DeleteLine, params),
+            'P' => parse!(Edit, DeleteCharacter, params),
+            'R' => parse!(Cursor, ActivePositionReport, line, col, params),
+            'S' => parse!(Edit, ScrollUp, params),
+            'T' => parse!(Edit, ScrollDown, params),
+            'W' => parse!(Cursor, TabulationControl, params),
+            'X' => parse!(Edit, EraseCharacter, params),
+            'Y' => parse!(Cursor, LineTabulation, params),
+            'Z' => parse!(Cursor, BackwardTabulation, params),
 
-                'm' => self.sgr(params).map(CSI::Sgr),
-                'n' => self.dsr(params),
-                'r' => self.decstbm(params),
-                's' => self.decslrm(params),
-                't' => self.window(params).map(|p| CSI::Window(Box::new(p))),
-                'u' => noparams!(Cursor, RestoreCursor, params),
-                'x' => self
-                    .req_terminal_parameters(params)
-                    .map(|dev| CSI::Device(Box::new(dev))),
+            'a' => parse!(Cursor, CharacterPositionForward, params),
+            'b' => parse!(Edit, Repeat, params),
+            'd' => parse!(Cursor, LinePositionAbsolute, params),
+            'e' => parse!(Cursor, LinePositionForward, params),
+            'f' => parse!(Cursor, CharacterAndLinePosition, line, col, params),
+            'g' => parse!(Cursor, TabulationClear, params),
+            'h' => self
+                .terminal_mode(params)
+                .map(|mode| CSI::Mode(Mode::SetMode(mode))),
+            'j' => parse!(Cursor, CharacterPositionBackward, params),
+            'k' => parse!(Cursor, LinePositionBackward, params),
+            'l' => self
+                .terminal_mode(params)
+                .map(|mode| CSI::Mode(Mode::ResetMode(mode))),
 
-                _ => Err(()),
-            },
+            'm' => self.sgr(params).map(CSI::Sgr),
+            'n' => self.dsr(params),
+            'r' => self.decstbm(params),
+            's' => self.decslrm(params),
+            't' => self.window(params).map(|p| CSI::Window(Box::new(p))),
+            'u' => noparams!(Cursor, RestoreCursor, params),
+            'x' => self
+                .req_terminal_parameters(params)
+                .map(|dev| CSI::Device(Box::new(dev))),
+
+            _ => Err(()),
         }
     }
 
