@@ -106,6 +106,7 @@ impl ConnectionOps for Connection {
                     // trigger `drop` handlers during shutdown and that
                     // can have bad interactions
                     self.windows.borrow_mut().clear();
+                    super::window::finish_clipboard_requests();
                     return Ok(());
                 }
 

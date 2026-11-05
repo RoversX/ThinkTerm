@@ -12,7 +12,7 @@ use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use config::{ConfigHandle, ImePreeditRendering, SystemBackdrop, Win32BackdropTrial};
 use lazy_static::lazy_static;
-use promise::Future;
+use promise::{Future, Promise};
 use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
     RawWindowHandle, Win32WindowHandle, WindowHandle, WindowsDisplayHandle,
@@ -29,7 +29,10 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 use wezterm_color_types::LinearRgba;
 use wezterm_font::FontConfiguration;
 use wezterm_input_types::KeyboardLedStatus;
@@ -1227,6 +1230,252 @@ impl HasWindowHandle for Window {
     }
 }
 
+/// How long the GUI thread gives the clipboard thread before going on without
+/// it. Long enough for the usual operation to be over by the time the event
+/// that asked for it returns, as if it had run on the GUI thread: the key after
+/// a paste still lands after the paste, and a copy outlives the quit behind it.
+const CLIPBOARD_GUI_WAIT: Duration = Duration::from_millis(100);
+/// How long a read stays wanted. Past this the person has moved on, and the
+/// text would land in whatever they are doing by then: a password prompt, say.
+const CLIPBOARD_READ_LIMIT: Duration = Duration::from_secs(3);
+/// How long the process waits, on its way out, for what is still queued.
+const CLIPBOARD_EXIT_WAIT: Duration = Duration::from_secs(1);
+const CLIPBOARD_OPEN_RETRIES: usize = 20;
+const CLIPBOARD_OPEN_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+/// Requests handed to the clipboard thread and not finished yet.
+static CLIPBOARD_PENDING: Mutex<usize> = Mutex::new(0);
+static CLIPBOARD_SETTLED: Condvar = Condvar::new();
+static CLIPBOARD_LATEST_READ: AtomicU64 = AtomicU64::new(0);
+
+lazy_static! {
+    /// The clipboard API waits on whichever program owns the clipboard: up to
+    /// 30 seconds for data it promised and has not rendered, and 5 to take
+    /// the clipboard from it. On the GUI thread that wait stops the window.
+    /// So the GUI thread never calls it: every operation comes here, one at a
+    /// time and in order, so a paste right after a copy reads the copy.
+    static ref CLIPBOARD_THREAD: Option<Sender<ClipboardRequest>> = spawn_clipboard_thread();
+}
+
+/// One operation for [`CLIPBOARD_THREAD`].
+enum ClipboardRequest {
+    ReadText(Promise<String>, ClipboardRead),
+    ReadContents(Promise<ClipboardContents>, ClipboardRead),
+    WriteText(String),
+}
+
+impl ClipboardRequest {
+    fn run(self) {
+        match self {
+            Self::ReadText(mut promise, read) => {
+                promise.result(read.run(|_| read_clipboard_text()));
+            }
+            Self::ReadContents(mut promise, read) => {
+                promise.result(read.run(read_clipboard_contents));
+            }
+            Self::WriteText(text) => {
+                if let Err(err) = contain_clipboard_panic(|| write_clipboard_text(&text)) {
+                    log::warn!("{err:#}");
+                }
+            }
+        }
+    }
+
+    /// There is no thread to run this on.
+    fn abandon(self) {
+        let error = || anyhow!("the clipboard thread is not running");
+        match self {
+            Self::ReadText(mut promise, _) => {
+                promise.err(error());
+            }
+            Self::ReadContents(mut promise, _) => {
+                promise.err(error());
+            }
+            Self::WriteText(_) => log::error!("{:#}", error()),
+        }
+    }
+}
+
+/// What keeps a read wanted. A stalled owner holds up everything behind the
+/// read it stalled, so what was asked for meanwhile must not all land at once
+/// when it recovers: a newer read replaces an older one, as on X11.
+struct ClipboardRead {
+    generation: u64,
+    deadline: Instant,
+}
+
+impl ClipboardRead {
+    fn new() -> Self {
+        Self {
+            generation: CLIPBOARD_LATEST_READ.fetch_add(1, Ordering::SeqCst) + 1,
+            deadline: Instant::now() + CLIPBOARD_READ_LIMIT,
+        }
+    }
+
+    /// Fails once nothing should use what this read finds.
+    fn check(&self) -> anyhow::Result<()> {
+        if self.generation != CLIPBOARD_LATEST_READ.load(Ordering::SeqCst) {
+            bail!("a newer clipboard read replaced this one");
+        }
+        if Instant::now() > self.deadline {
+            log::warn!("giving up on a clipboard read: its owner took too long");
+            bail!("the clipboard took too long to answer");
+        }
+        Ok(())
+    }
+
+    fn run<T>(&self, read: impl FnOnce(&Self) -> anyhow::Result<T>) -> anyhow::Result<T> {
+        self.check()?;
+        let result = contain_clipboard_panic(|| read(self));
+        self.check()?;
+        result
+    }
+}
+
+/// A panic would otherwise end the thread, and the clipboard with it.
+fn contain_clipboard_panic<T>(work: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+        .unwrap_or_else(|_| Err(anyhow!("a clipboard operation panicked")))
+}
+
+fn spawn_clipboard_thread() -> Option<Sender<ClipboardRequest>> {
+    let (sender, receiver) = mpsc::channel::<ClipboardRequest>();
+    let spawned = std::thread::Builder::new()
+        .name("clipboard".to_string())
+        .spawn(move || {
+            for request in receiver {
+                request.run();
+                clipboard_request_finished();
+            }
+        });
+    match spawned {
+        Ok(_) => Some(sender),
+        Err(err) => {
+            log::error!("failed to start the clipboard thread: {err:#}");
+            None
+        }
+    }
+}
+
+fn submit_clipboard_request(request: ClipboardRequest) {
+    let queue_was_empty = {
+        let mut pending = CLIPBOARD_PENDING.lock().unwrap();
+        *pending += 1;
+        *pending == 1
+    };
+    let undelivered = match CLIPBOARD_THREAD.as_ref() {
+        Some(sender) => sender.send(request).err().map(|err| err.0),
+        None => Some(request),
+    };
+    if let Some(request) = undelivered {
+        request.abandon();
+        clipboard_request_finished();
+    } else if queue_was_empty {
+        // Behind a stall there is nothing to wait for, and held keys would
+        // spend the window's time waiting for it.
+        wait_for_clipboard(CLIPBOARD_GUI_WAIT);
+    }
+}
+
+fn clipboard_request_finished() {
+    let mut pending = CLIPBOARD_PENDING.lock().unwrap();
+    *pending -= 1;
+    if *pending == 0 {
+        CLIPBOARD_SETTLED.notify_all();
+    }
+}
+
+/// A plain wait, not a message loop: nothing can re-enter `wnd_proc` during it.
+fn wait_for_clipboard(limit: Duration) {
+    let pending = CLIPBOARD_PENDING.lock().unwrap();
+    let _ = CLIPBOARD_SETTLED
+        .wait_timeout_while(pending, limit, |pending| *pending > 0)
+        .unwrap();
+}
+
+/// Let what is still queued finish, a copy above all, before the process goes.
+pub(crate) fn finish_clipboard_requests() {
+    wait_for_clipboard(CLIPBOARD_EXIT_WAIT);
+}
+
+/// Clipboard listeners open the clipboard right after each change, so it is
+/// often taken for a moment. This thread, unlike the GUI's, can wait for it.
+fn open_clipboard() -> anyhow::Result<clipboard_win::Clipboard> {
+    let mut retries = CLIPBOARD_OPEN_RETRIES;
+    loop {
+        match clipboard_win::Clipboard::new_attempts(10) {
+            Ok(clipboard) => return Ok(clipboard),
+            Err(_) if retries > 0 => {
+                retries -= 1;
+                std::thread::sleep(CLIPBOARD_OPEN_RETRY_DELAY);
+            }
+            Err(err) => return Err(anyhow!("Error opening clipboard: {err}")),
+        }
+    }
+}
+
+fn write_clipboard_text(text: &str) -> anyhow::Result<()> {
+    let _clipboard = open_clipboard()?;
+    clipboard_win::set(clipboard_win::formats::Unicode, text)
+        .map_err(|err| anyhow!("Error setting clipboard: {err}"))
+}
+
+fn read_clipboard_text() -> anyhow::Result<String> {
+    let _clipboard = open_clipboard()?;
+    clipboard_win::get::<String, _>(clipboard_win::formats::Unicode)
+        .map(|s| s.replace("\r\n", "\n"))
+        .map_err(|e| anyhow!("Error getting clipboard: {e}"))
+}
+
+/// Files > text > image: files often travel with a text rendition and are the
+/// intent; spreadsheets offer text plus a bitmap of the cells and the text is
+/// the intent; screenshots are image-only.
+///
+/// A format whose owner never rendered it fails just as one never offered
+/// does, so `read` is asked between probes: past its limit the answer is not
+/// wanted, and the next format could wait as long again.
+fn read_clipboard_contents(read: &ClipboardRead) -> anyhow::Result<ClipboardContents> {
+    use clipboard_win::Getter;
+
+    // Hold the clipboard open across format negotiation so its owner
+    // cannot change between the files, text, and bitmap probes.
+    let _clipboard = open_clipboard()?;
+
+    let mut files = Vec::<String>::new();
+    if clipboard_win::formats::FileList
+        .read_clipboard(&mut files)
+        .is_ok()
+        && !files.is_empty()
+    {
+        return Ok(ClipboardContents::FilePaths(
+            files.into_iter().map(PathBuf::from).collect(),
+        ));
+    }
+    read.check()?;
+
+    let mut text = String::new();
+    if clipboard_win::formats::Unicode
+        .read_clipboard(&mut text)
+        .is_ok()
+    {
+        return Ok(ClipboardContents::Text(text.replace("\r\n", "\n")));
+    }
+    read.check()?;
+
+    let mut bytes = Vec::new();
+    if clipboard_win::formats::Bitmap
+        .read_clipboard(&mut bytes)
+        .is_ok()
+    {
+        return Ok(ClipboardContents::Image {
+            format: crate::ClipboardImageFormat::Bmp,
+            bytes,
+        });
+    }
+
+    Err(anyhow!("Clipboard has no supported files, text, or bitmap"))
+}
+
 #[async_trait(?Send)]
 impl WindowOps for Window {
     async fn enable_opengl(&self) -> anyhow::Result<Rc<glium::backend::Context>> {
@@ -1517,62 +1766,24 @@ impl WindowOps for Window {
     }
 
     fn get_clipboard(&self, _clipboard: Clipboard) -> Future<String> {
-        Future::result(
-            clipboard_win::get_clipboard_string()
-                .map(|s| s.replace("\r\n", "\n"))
-                .map_err(|e| anyhow!("Error getting clipboard: {e}")),
-        )
+        let mut promise = Promise::new();
+        let future = promise.get_future().unwrap();
+        submit_clipboard_request(ClipboardRequest::ReadText(promise, ClipboardRead::new()));
+        future
     }
 
     fn get_clipboard_contents(&self, _clipboard: Clipboard) -> Future<ClipboardContents> {
-        // Files > text > image: files often travel with a text rendition
-        // and are the intent; spreadsheets offer text plus a bitmap of the
-        // cells and the text is the intent; screenshots are image-only.
-        fn read_contents() -> anyhow::Result<ClipboardContents> {
-            use clipboard_win::Getter;
-
-            // Hold the clipboard open across format negotiation so its owner
-            // cannot change between the files, text, and bitmap probes.
-            let _clipboard = clipboard_win::Clipboard::new_attempts(10)
-                .map_err(|err| anyhow!("Error opening clipboard: {err}"))?;
-
-            let mut files = Vec::<String>::new();
-            if clipboard_win::formats::FileList
-                .read_clipboard(&mut files)
-                .is_ok()
-                && !files.is_empty()
-            {
-                return Ok(ClipboardContents::FilePaths(
-                    files.into_iter().map(PathBuf::from).collect(),
-                ));
-            }
-
-            let mut text = String::new();
-            if clipboard_win::formats::Unicode
-                .read_clipboard(&mut text)
-                .is_ok()
-            {
-                return Ok(ClipboardContents::Text(text.replace("\r\n", "\n")));
-            }
-
-            let mut bytes = Vec::new();
-            if clipboard_win::formats::Bitmap
-                .read_clipboard(&mut bytes)
-                .is_ok()
-            {
-                return Ok(ClipboardContents::Image {
-                    format: crate::ClipboardImageFormat::Bmp,
-                    bytes,
-                });
-            }
-
-            Err(anyhow!("Clipboard has no supported files, text, or bitmap"))
-        }
-        Future::result(read_contents())
+        let mut promise = Promise::new();
+        let future = promise.get_future().unwrap();
+        submit_clipboard_request(ClipboardRequest::ReadContents(
+            promise,
+            ClipboardRead::new(),
+        ));
+        future
     }
 
     fn set_clipboard(&self, _clipboard: Clipboard, text: String) {
-        clipboard_win::set_clipboard_string(&text).ok();
+        submit_clipboard_request(ClipboardRequest::WriteText(text));
     }
 
     fn set_window_drag_position(&self, coords: ScreenPoint) {
@@ -3917,6 +4128,7 @@ unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> 
             if let Some(conn) = Connection::get() {
                 conn.dispatch_app_event(ApplicationEvent::WillTerminate);
             }
+            finish_clipboard_requests();
             Some(0)
         }
         WM_CLOSE => {
@@ -3966,6 +4178,59 @@ unsafe extern "system" fn wnd_proc(
             log::error!("caught {:?}", e);
             std::process::exit(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod clipboard_read_tests {
+    use super::{contain_clipboard_panic, ClipboardRead};
+    use std::sync::{Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
+
+    /// Every read counts against the same latest read, so tests of them take
+    /// turns.
+    fn one_at_a_time() -> MutexGuard<'static, ()> {
+        static TURN: Mutex<()> = Mutex::new(());
+        TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn a_newer_read_replaces_an_older_one() {
+        let _turn = one_at_a_time();
+        let older = ClipboardRead::new();
+        assert!(older.check().is_ok());
+        let newer = ClipboardRead::new();
+        assert!(older.check().is_err());
+        assert!(newer.check().is_ok());
+        assert!(older.run(|_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn a_read_past_its_limit_is_not_used() {
+        let _turn = one_at_a_time();
+        let mut read = ClipboardRead::new();
+        assert!(read.run(|_| Ok(())).is_ok());
+        read.deadline = Instant::now() - Duration::from_millis(1);
+        assert!(read.run(|_| Ok(())).is_err());
+    }
+
+    /// What a read finds is thrown away, however good, if it stopped being
+    /// wanted while the read waited on the owner.
+    #[test]
+    fn a_read_replaced_while_it_waited_is_not_used() {
+        let _turn = one_at_a_time();
+        let read = ClipboardRead::new();
+        let result = read.run(|_| {
+            ClipboardRead::new();
+            Ok("found")
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_panic_comes_back_as_an_error() {
+        let result: anyhow::Result<()> = contain_clipboard_panic(|| panic!("in a test"));
+        assert!(result.is_err());
     }
 }
 
