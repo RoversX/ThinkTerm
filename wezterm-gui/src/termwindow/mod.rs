@@ -1960,10 +1960,13 @@ struct InlineTabRename {
     input: TextInputState,
     /// The text the editor opened with.
     initial: String,
+    /// Tells this edit from every other, of the same target too.
+    edit: u64,
 }
 
 impl InlineTabRename {
     fn new(target: InlineTabRenameTarget, text: String) -> Self {
+        static LAST_EDIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let mut input = TextInputState::new();
         input.set_text_end(text.clone());
         input.caret_select_all();
@@ -1971,6 +1974,7 @@ impl InlineTabRename {
             target,
             input,
             initial: text,
+            edit: LAST_EDIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -9466,12 +9470,16 @@ impl TermWindow {
             ClipboardPasteSource::Clipboard => ::window::Clipboard::Clipboard,
             ClipboardPasteSource::PrimarySelection => ::window::Clipboard::PrimarySelection,
         };
+        let target = self.active_content_view().map(|view| view.paste_target());
         let future = window.get_clipboard(clipboard);
         promise::spawn::spawn(async move {
             if let Ok(clip) = future.await {
                 window.notify(TermWindowNotif::Apply(Box::new(move |myself| {
+                    // Only where this paste was started: a clipboard can
+                    // answer after the focus has moved on.
                     let resp = myself
                         .content_view_mut_by_id(view_id)
+                        .filter(|v| Some(v.paste_target()) == target)
                         .map(|v| v.on_paste(&clip));
                     if let Some(resp) = resp {
                         myself.handle_content_response_for(view_id, resp);

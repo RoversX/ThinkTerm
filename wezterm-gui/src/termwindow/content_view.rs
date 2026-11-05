@@ -847,6 +847,13 @@ pub(crate) trait ContentView {
         ContentViewResponse::Redraw
     }
 
+    /// Tells where a paste would land now from anywhere else it could: which
+    /// form, and which field of it. A paste that comes back to a different
+    /// answer is dropped.
+    fn paste_target(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
     /// Handle the synthetic tab close button / Escape-style close request.
     fn on_close_requested(&mut self) -> ContentViewResponse {
         ContentViewResponse::Close

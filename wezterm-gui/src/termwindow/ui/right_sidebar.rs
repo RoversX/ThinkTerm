@@ -322,6 +322,19 @@ const FILE_PREVIEW_HEADER_HEIGHT: usize = 64;
 /// running transfers are never dropped, however many there are.
 const REMOTE_TRANSFER_STRIP_MAX: usize = 3;
 
+#[derive(Clone, PartialEq)]
+struct RightSidebarPasteTarget {
+    mode: RightSidebarMode,
+    keys_held: bool,
+    /// The Markdown preview in the way, by its instance.
+    preview: Option<u64>,
+    /// Otherwise the Note's document, by its session.
+    note_session: Option<usize>,
+    file_focus: Option<RightSidebarFileField>,
+    snippet_view: RightSidebarSnippetView,
+    snippet_focus: Option<RightSidebarSnippetField>,
+}
+
 #[derive(Clone)]
 pub(crate) struct TerminalPasteTarget {
     pane_id: PaneId,
@@ -6432,17 +6445,54 @@ impl crate::TermWindow {
             ClipboardPasteSource::Clipboard => Clipboard::Clipboard,
             ClipboardPasteSource::PrimarySelection => Clipboard::PrimarySelection,
         };
+        let target = self.right_sidebar_paste_target();
         let future = window.get_clipboard(clipboard);
         promise::spawn::spawn(async move {
             if let Ok(text) = future.await {
                 window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                    if term_window.push_right_sidebar_text(&text) {
+                    // Only the surface this paste was started in: a clipboard
+                    // can answer after the panel has moved on, and the Note
+                    // saves what lands in it.
+                    if term_window.right_sidebar_paste_target() == target
+                        && term_window.push_right_sidebar_text(&text)
+                    {
                         term_window.invalidate_window();
                     }
                 })));
             }
         })
         .detach();
+    }
+
+    /// What decides where `push_right_sidebar_text` puts its text. A paste
+    /// can start with the preview installed as the note surface and land
+    /// with it put away again, so the preview is named by its instance rather
+    /// than by which surface is installed.
+    fn right_sidebar_paste_target(&self) -> RightSidebarPasteTarget {
+        let preview = if self.note_surface_installed == NoteSurface::FilePreview {
+            Some(self.note_surface_instance)
+        } else if self.right_sidebar_markdown_preview_focused() {
+            self.right_sidebar_markdown_preview
+                .as_ref()
+                .map(|preview| preview.instance)
+        } else {
+            None
+        };
+        let note_session = self
+            .right_sidebar_note
+            .session
+            .as_ref()
+            .filter(|_| preview.is_none())
+            .map(|session| Arc::as_ptr(session) as *const () as usize);
+        RightSidebarPasteTarget {
+            mode: self.right_sidebar_mode,
+            keys_held: self.plugin_panel_keys_held,
+            preview,
+            note_session,
+            file_focus: self.right_sidebar_file_focus,
+            snippet_view: self.right_sidebar_snippet_view.clone(),
+            snippet_focus: self.right_sidebar_snippet_focus,
+        }
     }
 
     pub(crate) fn clear_right_sidebar_focused_input_selection(&mut self) {

@@ -477,6 +477,9 @@ pub(crate) struct SshHostsView {
     selected: usize,
     focus: Focus,
     form: Option<HostForm>,
+    /// Bumped by every form opened or closed: another host's form has the
+    /// same fields, and a paste started in one must not land in the other.
+    form_generation: usize,
     filtered: Vec<SshHostEntry>,
     system_host_count: usize,
     system_hosts_collapsed: bool,
@@ -552,6 +555,7 @@ impl SshHostsView {
             selected: 0,
             focus: Focus::Search,
             form: None,
+            form_generation: 0,
             filtered: Vec::new(),
             system_host_count: 0,
             system_hosts_collapsed: true,
@@ -681,6 +685,7 @@ impl SshHostsView {
         // choice starts on plain ssh.
         form.multiplexing = true;
         self.form = Some(form);
+        self.form_generation += 1;
         self.focus = Focus::Field(FIELD_HOST);
         self.reset_form_scroll();
     }
@@ -766,6 +771,7 @@ impl SshHostsView {
             .map(|(key, value)| (text_input_with(key), text_input_with(value)))
             .collect::<Vec<_>>();
         let advanced_open = !options.is_empty();
+        self.form_generation += 1;
         self.form = Some(HostForm {
             editing: Some(project_id.to_string()),
             original: Some(spec),
@@ -787,6 +793,7 @@ impl SshHostsView {
 
     fn close_form(&mut self) {
         self.form = None;
+        self.form_generation += 1;
         self.focus = Focus::Search;
         // Revealing a password is a decision about one host, not a mode.
         self.password_visible = false;
@@ -6233,6 +6240,18 @@ impl ContentView for SshHostsView {
         self.on_paste_impl(text)
     }
 
+    fn paste_target(&self) -> (usize, usize) {
+        // Each kind of field in its own residue, its row in the rest.
+        let field = match self.focus {
+            Focus::Search => 0,
+            Focus::Field(row) => 1 + row * 4,
+            Focus::OptionKey(row) => 2 + row * 4,
+            Focus::OptionValue(row) => 3 + row * 4,
+            Focus::Tailnet(row) => 4 + row * 4,
+        };
+        (self.form_generation, field)
+    }
+
     fn begin_new_remote_host(&mut self) {
         // Same reset the `+` button performs; the list refreshes on paint.
         self.open_new_form();
@@ -6311,6 +6330,19 @@ mod tests {
             momentum_phase: None,
             precise_wheel_lines: None,
         }
+    }
+
+    /// Two hosts' forms have the same fields and open on the same one: a
+    /// paste started in the first must not land in the second.
+    #[test]
+    fn another_hosts_form_is_another_place_to_paste_into() {
+        use super::ContentView;
+        let mut view = SshHostsView::new();
+        view.open_form_for("one", spec("prod-1", "192.0.2.7"));
+        let first = view.paste_target();
+        assert_eq!(view.paste_target(), first);
+        view.open_form_for("two", spec("prod-2", "192.0.2.8"));
+        assert_ne!(view.paste_target(), first);
     }
 
     #[test]

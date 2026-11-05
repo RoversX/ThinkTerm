@@ -249,8 +249,14 @@ mod content_view_key_routing_tests {
 }
 
 impl super::TermWindow {
-    fn paste_text_into_inline_tab_rename(&mut self, text: &str) {
-        if let Some(rename) = self.inline_tab_rename.as_mut() {
+    /// Only the edit this paste was started in: a clipboard can answer after
+    /// that one has ended and another begun, of the same name too.
+    fn paste_text_into_inline_tab_rename(&mut self, edit: u64, text: &str) {
+        if let Some(rename) = self
+            .inline_tab_rename
+            .as_mut()
+            .filter(|rename| rename.edit == edit)
+        {
             rename.input.caret_insert(text, false);
             self.update_title_impl();
             if let Some(window) = self.window.as_ref() {
@@ -312,13 +318,14 @@ impl super::TermWindow {
                     return true;
                 }
                 KeyCode::Char('v') | KeyCode::Char('V') => {
-                    if let Some(window) = self.window.as_ref().cloned() {
+                    let edit = self.inline_tab_rename.as_ref().map(|rename| rename.edit);
+                    if let (Some(window), Some(edit)) = (self.window.as_ref().cloned(), edit) {
                         let future = window.get_clipboard(Clipboard::Clipboard);
                         promise::spawn::spawn(async move {
                             if let Ok(text) = future.await {
                                 window.notify(crate::termwindow::TermWindowNotif::Apply(Box::new(
                                     move |term_window| {
-                                        term_window.paste_text_into_inline_tab_rename(&text);
+                                        term_window.paste_text_into_inline_tab_rename(edit, &text);
                                     },
                                 )));
                             }

@@ -130,6 +130,8 @@ impl TermWindow {
         let cursor = pane.get_cursor_position();
         if pane.send_paste(text).is_ok() {
             self.light_up_terminal_paste(pane, text, cursor);
+            // A slow clipboard can answer after the person has scrolled away.
+            self.maybe_scroll_to_bottom_for_input(pane);
         }
     }
 
