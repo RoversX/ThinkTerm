@@ -28,6 +28,8 @@ const MENU_ICON_SLOT: usize = 40;
 const MENU_CHECK_SLOT: usize = 36;
 const MENU_ARROW_SLOT: usize = 40;
 const MENU_ROW_EXTRA_HEIGHT: usize = 16;
+/// How far a submenu overlaps the row that opened it.
+const MENU_SUBMENU_OVERLAP: usize = 4;
 /// The menu's text against the sidebar's, whose size it follows: 15 points
 /// there (the macOS default) is 13 here, as the system's own menus have it.
 const MENU_FONT_SCALE: f64 = 13.0 / 15.0;
@@ -55,12 +57,25 @@ pub(crate) struct ContextMenuState {
     items: Vec<ContextMenuItem>,
     active_path: Option<Vec<usize>>,
     layout: Vec<ContextMenuLayoutItem>,
+    /// The cards of the menus on screen, each under the path of the row that
+    /// opened it, the topmost last.
+    panels: Vec<ContextMenuLayoutItem>,
 }
 
 #[derive(Clone, Debug)]
 struct ContextMenuLayoutItem {
     path: Vec<usize>,
     rect: MenuRect,
+}
+
+/// What a left press does at a point of an open menu.
+enum MenuPress {
+    /// Light this row, or open its submenu; nothing runs.
+    Light(Vec<usize>),
+    Run(ContextMenuAction),
+    /// On the menu but on no row: a caption, the padding, a separator.
+    Nothing,
+    Dismiss,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -110,6 +125,7 @@ impl ContextMenuState {
             items,
             active_path: None,
             layout: Vec::new(),
+            panels: Vec::new(),
         }
     }
 
@@ -127,12 +143,65 @@ impl ContextMenuState {
         true
     }
 
+    fn panel_at(&self, coords: window::Point) -> Option<&ContextMenuLayoutItem> {
+        self.panels
+            .iter()
+            .rev()
+            .find(|panel| panel.rect.hit_test(coords.x, coords.y))
+    }
+
+    /// The row under `coords`, of the menu on top there: a submenu covers
+    /// the rows of the menu it overlaps.
     fn hit_path(&self, coords: window::Point) -> Option<Vec<usize>> {
+        let panel = self.panel_at(coords)?;
         self.layout
             .iter()
             .rev()
+            .filter(|item| {
+                item.path.len() == panel.path.len() + 1 && item.path.starts_with(&panel.path)
+            })
             .find(|item| item.rect.hit_test(coords.x, coords.y))
             .map(|item| item.path.clone())
+    }
+
+    /// What stays open with the pointer on no row at `coords`: inside a
+    /// menu, that menu and any submenu it has open, with no row of its own
+    /// lit. A submenu's caption and the space around its rows lie on the way
+    /// to them, and closing it there left them out of reach.
+    fn path_kept_at(&self, coords: window::Point) -> Option<Vec<usize>> {
+        let mut kept = self.panel_at(coords)?.path.clone();
+        if let Some(active) = self.active_path.as_ref().filter(|active| active.starts_with(&kept)) {
+            for next in &active[kept.len()..] {
+                kept.push(*next);
+                if !self.path_has_submenu(&kept) {
+                    kept.pop();
+                    break;
+                }
+            }
+        }
+        (!kept.is_empty()).then_some(kept)
+    }
+
+    fn left_press(&self, coords: window::Point) -> MenuPress {
+        let Some(path) = self.hit_path(coords) else {
+            return if self.panel_at(coords).is_some() {
+                MenuPress::Nothing
+            } else {
+                MenuPress::Dismiss
+            };
+        };
+        // A submenu overlaps the row that opened it, so it can open under a
+        // pointer that then never moves, with a choice there that was never
+        // lit. Some of those choices cannot be undone: a click meant for the
+        // row beneath must not run one.
+        let unlit_choice = path.len() > 1 && self.active_path.as_deref() != Some(path.as_slice());
+        if unlit_choice || self.path_has_submenu(&path) {
+            return MenuPress::Light(path);
+        }
+        match self.action_for_path(&path) {
+            Some(action) => MenuPress::Run(action),
+            None => MenuPress::Light(path),
+        }
     }
 
     fn item_at_path(&self, path: &[usize]) -> Option<&ContextMenuItem> {
@@ -601,6 +670,7 @@ impl crate::TermWindow {
                     .map(|_| MouseCursor::Hand)
                     .unwrap_or(MouseCursor::Arrow);
                 context.set_cursor(Some(cursor));
+                let path = path.or_else(|| menu.path_kept_at(event.coords));
                 if menu.set_active_path(path) {
                     context.invalidate();
                 }
@@ -608,16 +678,13 @@ impl crate::TermWindow {
             }
             MouseEventKind::Press(MousePress::Left) => {
                 self.context_menu_suppressed_release = Some(MousePress::Left);
-                let path = menu.hit_path(event.coords);
-                if let Some(path) = path {
-                    if menu.path_has_submenu(&path) {
+                match menu.left_press(event.coords) {
+                    MenuPress::Light(path) => {
                         if menu.set_active_path(Some(path)) {
                             context.invalidate();
                         }
-                        return true;
                     }
-
-                    if let Some(action) = menu.action_for_path(&path) {
+                    MenuPress::Run(action) => {
                         self.close_fallback_context_menu();
                         context.invalidate();
                         match action {
@@ -630,21 +697,17 @@ impl crate::TermWindow {
                                 self.perform_context_menu_application_action(action_id);
                             }
                         }
-                        return true;
                     }
-
-                    if menu.set_active_path(Some(path)) {
+                    MenuPress::Nothing => {}
+                    MenuPress::Dismiss => {
+                        self.dismiss_fallback_context_menu();
                         context.invalidate();
                     }
-                    return true;
                 }
-
-                self.dismiss_fallback_context_menu();
-                context.invalidate();
                 true
             }
             MouseEventKind::Press(MousePress::Right) => {
-                if menu.hit_path(event.coords).is_some() {
+                if menu.panel_at(event.coords).is_some() {
                     return true;
                 }
                 self.dismiss_fallback_context_menu();
@@ -752,6 +815,7 @@ impl crate::TermWindow {
         });
 
         let mut layout: Vec<ContextMenuLayoutItem> = Vec::new();
+        let mut panels: Vec<ContextMenuLayoutItem> = Vec::new();
         let mut menu_paths = vec![Vec::new()];
         if let Some(active_path) = active_path.as_ref() {
             let mut prefix = Vec::new();
@@ -803,11 +867,26 @@ impl crate::TermWindow {
                     parent_rect,
                     metrics.width,
                     metrics.height,
+                    first_item_offset(
+                        &rows,
+                        self.ui_px(MENU_PADDING_Y),
+                        metrics.row_height,
+                        self.ui_px(MENU_SEPARATOR_HEIGHT),
+                    ),
                     self.dimensions.pixel_width,
                     self.dimensions.pixel_height,
                 )
             };
 
+            panels.push(ContextMenuLayoutItem {
+                path: menu_path.clone(),
+                rect: MenuRect {
+                    x: origin.0,
+                    y: origin.1,
+                    width: metrics.width,
+                    height: metrics.height,
+                },
+            });
             paint_menu_panel(self, &mut layers, palette, ui_metrics, origin, metrics)?;
             paint_menu_rows(
                 self,
@@ -827,6 +906,7 @@ impl crate::TermWindow {
         drop(layers);
         if let Some(menu) = self.context_menu.as_mut() {
             menu.layout = layout;
+            menu.panels = panels;
         }
 
         Ok(())
@@ -1005,21 +1085,60 @@ fn clamp_menu_origin(
     )
 }
 
+/// How far below a menu's top edge its first row the mouse can land on sits,
+/// past the padding and any caption above it.
+fn first_item_offset(
+    rows: &[MenuRow<'_>],
+    padding: usize,
+    row_height: usize,
+    separator_height: usize,
+) -> usize {
+    rows.iter()
+        .take_while(|row| !matches!(row, MenuRow::Item { .. }))
+        .fold(padding, |offset, row| {
+            offset
+                + match row {
+                    MenuRow::Separator => separator_height,
+                    _ => row_height,
+                }
+        })
+}
+
+/// Where a submenu of `width` by `height` goes: beside the row that opened
+/// it, `first_item_offset` up, so its first choice is level with that row
+/// and the pointer reaches it going straight across.
 fn submenu_origin(
     parent: MenuRect,
     width: usize,
     height: usize,
+    first_item_offset: usize,
     window_width: usize,
     window_height: usize,
 ) -> (usize, usize) {
-    let right_x = parent.x.saturating_add(parent.width).saturating_sub(4);
-    let left_x = parent.x.saturating_sub(width.saturating_sub(4));
+    let parent_right = parent.x.saturating_add(parent.width);
+    let right_x = parent_right.saturating_sub(MENU_SUBMENU_OVERLAP);
+    let left_x = parent.x.saturating_sub(width.saturating_sub(MENU_SUBMENU_OVERLAP));
     let x = if right_x.saturating_add(width) <= window_width {
         right_x
     } else {
         left_x
     };
-    let y = parent.y.min(window_height.saturating_sub(height)).max(0);
+    // A window too narrow for either side puts the submenu over the row that
+    // opened it, where lifting it would leave its first choice under the
+    // pointer that opened it.
+    let overlap = x
+        .saturating_add(width)
+        .min(parent_right)
+        .saturating_sub(x.max(parent.x));
+    let lift = if overlap > MENU_SUBMENU_OVERLAP {
+        0
+    } else {
+        first_item_offset
+    };
+    let y = parent
+        .y
+        .saturating_sub(lift)
+        .min(window_height.saturating_sub(height));
     (x, y)
 }
 
@@ -1367,9 +1486,12 @@ fn menu_icon(icon: &ContextMenuIcon) -> Option<SvgIcon> {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_rows, ContextMenuState, MenuRow};
+    use super::{
+        first_item_offset, render_rows, submenu_origin, ContextMenuLayoutItem, ContextMenuState,
+        MenuPress, MenuRect, MenuRow,
+    };
     use config::keyassignment::KeyAssignment;
-    use window::ContextMenuItem;
+    use window::{ContextMenuItem, Point};
 
     fn item(label: &str) -> ContextMenuItem {
         ContextMenuItem::item(label, KeyAssignment::Nop)
@@ -1383,6 +1505,261 @@ mod tests {
                 MenuRow::Separator => "separator",
             })
             .collect()
+    }
+
+    const BORDER: usize = 1;
+
+    /// A row of `panel`, inset by its border as `paint_menu_rows` lays it out.
+    fn row_of(panel: MenuRect, y: usize) -> MenuRect {
+        MenuRect {
+            x: panel.x + BORDER,
+            y,
+            width: panel.width - BORDER * 2,
+            height: 40,
+        }
+    }
+
+    fn laid_out(path: &[usize], rect: MenuRect) -> ContextMenuLayoutItem {
+        ContextMenuLayoutItem {
+            path: path.to_vec(),
+            rect,
+        }
+    }
+
+    /// The delete menus as `paint_context_menu` lays them out with
+    /// `active_path` lit: a row opening a submenu that explains itself above
+    /// the one choice in it, placed by `submenu_origin`, and there only while
+    /// the path goes through that row.
+    fn open_confirmation(active_path: &[usize]) -> ContextMenuState {
+        let mut menu = ContextMenuState::new(
+            Point::new(0, 0),
+            vec![
+                item("Edit"),
+                ContextMenuItem::submenu(
+                    "Delete",
+                    vec![
+                        ContextMenuItem::section_header("This cannot be undone."),
+                        item("Delete Permanently"),
+                    ],
+                ),
+            ],
+        );
+        let root = MenuRect {
+            x: 100,
+            y: 100,
+            width: 200,
+            height: 100,
+        };
+        let opener = row_of(root, 150);
+        menu.panels = vec![laid_out(&[], root)];
+        menu.layout = vec![laid_out(&[0], row_of(root, 110)), laid_out(&[1], opener)];
+        if active_path.first() == Some(&1) {
+            let (x, y) = submenu_origin(opener, 200, 100, 50, 1000, 1000);
+            let submenu = MenuRect {
+                x,
+                y,
+                width: 200,
+                height: 100,
+            };
+            menu.panels.push(laid_out(&[1], submenu));
+            menu.layout
+                .push(laid_out(&[1, 1], row_of(submenu, y + 50)));
+        }
+        menu.active_path = Some(active_path.to_vec());
+        menu
+    }
+
+    #[test]
+    fn a_submenu_stays_open_over_its_caption() {
+        let menu = open_confirmation(&[1]);
+        let caption = Point::new(400, 120);
+        assert_eq!(menu.hit_path(caption), None);
+        assert_eq!(menu.path_kept_at(caption), Some(vec![1]));
+    }
+
+    /// Back over the caption the choice is no longer lit, though its submenu
+    /// is still there.
+    #[test]
+    fn leaving_a_submenu_row_for_its_caption_lets_go_of_the_row() {
+        let menu = open_confirmation(&[1, 1]);
+        assert_eq!(menu.path_kept_at(Point::new(400, 120)), Some(vec![1]));
+    }
+
+    #[test]
+    fn a_submenu_stays_open_over_the_space_around_its_parent_row() {
+        let menu = open_confirmation(&[1, 1]);
+        assert_eq!(menu.path_kept_at(Point::new(200, 195)), Some(vec![1]));
+    }
+
+    #[test]
+    fn a_row_without_a_submenu_lets_go_off_the_rows() {
+        let menu = open_confirmation(&[0]);
+        assert_eq!(menu.path_kept_at(Point::new(200, 195)), None);
+    }
+
+    #[test]
+    fn leaving_every_menu_closes_the_submenu() {
+        let menu = open_confirmation(&[1]);
+        assert_eq!(menu.path_kept_at(Point::new(900, 900)), None);
+    }
+
+    #[test]
+    fn a_kept_path_reaches_every_open_level() {
+        let mut menu = ContextMenuState::new(
+            Point::new(0, 0),
+            vec![ContextMenuItem::submenu(
+                "Outer",
+                vec![ContextMenuItem::submenu("Inner", vec![item("Choice")])],
+            )],
+        );
+        let panel = |x| MenuRect {
+            x,
+            y: 0,
+            width: 100,
+            height: 60,
+        };
+        menu.panels = vec![
+            laid_out(&[], panel(0)),
+            laid_out(&[0], panel(96)),
+            laid_out(&[0, 0], panel(192)),
+        ];
+        menu.active_path = Some(vec![0, 0, 0]);
+        assert_eq!(menu.path_kept_at(Point::new(40, 55)), Some(vec![0, 0]));
+    }
+
+    #[test]
+    fn a_submenu_covers_the_rows_it_overlaps() {
+        let menu = open_confirmation(&[1]);
+        assert_eq!(menu.hit_path(Point::new(200, 160)), Some(vec![1]));
+        assert_eq!(menu.hit_path(Point::new(400, 160)), Some(vec![1, 1]));
+        // The far end of the row that opened it, under the submenu's choice
+        // and under its border.
+        assert_eq!(menu.hit_path(Point::new(297, 160)), Some(vec![1, 1]));
+        assert_eq!(menu.hit_path(Point::new(295, 160)), None);
+    }
+
+    /// A press on the far end of the opener, the instant the submenu opened
+    /// over it, lands on a choice nobody has seen lit.
+    #[test]
+    fn a_press_on_a_choice_that_was_not_lit_only_lights_it() {
+        let menu = open_confirmation(&[1]);
+        assert!(matches!(
+            menu.left_press(Point::new(297, 160)),
+            MenuPress::Light(path) if path == [1, 1]
+        ));
+    }
+
+    #[test]
+    fn a_press_on_the_lit_choice_runs_it() {
+        let menu = open_confirmation(&[1, 1]);
+        assert!(matches!(
+            menu.left_press(Point::new(400, 160)),
+            MenuPress::Run(_)
+        ));
+    }
+
+    #[test]
+    fn a_press_on_a_row_opening_a_submenu_never_runs_it() {
+        let menu = open_confirmation(&[1]);
+        assert!(matches!(
+            menu.left_press(Point::new(200, 160)),
+            MenuPress::Light(path) if path == [1]
+        ));
+    }
+
+    /// A menu opens under the pointer that opened it, so its own rows need no
+    /// hover first.
+    #[test]
+    fn a_press_on_a_top_level_row_runs_it_unlit() {
+        let menu = open_confirmation(&[]);
+        assert!(matches!(
+            menu.left_press(Point::new(200, 120)),
+            MenuPress::Run(_)
+        ));
+    }
+
+    #[test]
+    fn a_press_on_a_menu_but_no_row_leaves_it_open() {
+        let menu = open_confirmation(&[1]);
+        assert!(matches!(
+            menu.left_press(Point::new(400, 120)),
+            MenuPress::Nothing
+        ));
+        assert!(matches!(
+            menu.left_press(Point::new(200, 195)),
+            MenuPress::Nothing
+        ));
+    }
+
+    #[test]
+    fn a_press_outside_every_menu_dismisses_them() {
+        let menu = open_confirmation(&[1]);
+        assert!(matches!(
+            menu.left_press(Point::new(900, 900)),
+            MenuPress::Dismiss
+        ));
+    }
+
+    #[test]
+    fn a_submenu_lines_its_first_choice_up_with_the_row_that_opened_it() {
+        let parent = MenuRect {
+            x: 10,
+            y: 300,
+            width: 200,
+            height: 40,
+        };
+        let header = "This cannot be undone.".to_string();
+        let choice = item("Delete Permanently");
+        let rows = [
+            MenuRow::SectionHeader { label: &header },
+            MenuRow::Item {
+                index: 1,
+                item: &choice,
+            },
+        ];
+        let offset = first_item_offset(&rows, 10, 40, 14);
+        assert_eq!(offset, 50);
+
+        let (_, y) = submenu_origin(parent, 200, 100, offset, 1000, 1000);
+        assert_eq!(y + offset, parent.y);
+    }
+
+    #[test]
+    fn a_submenu_stays_in_the_window() {
+        let parent = MenuRect {
+            x: 10,
+            y: 20,
+            width: 200,
+            height: 40,
+        };
+        assert_eq!(submenu_origin(parent, 200, 100, 50, 1000, 1000).1, 0);
+
+        let parent = MenuRect { y: 980, ..parent };
+        assert_eq!(submenu_origin(parent, 200, 100, 50, 1000, 1000).1, 900);
+    }
+
+    /// Too narrow a window for either side puts the submenu over the row that
+    /// opened it. Its first choice must not then rise to the pointer.
+    #[test]
+    fn a_submenu_forced_over_its_row_keeps_its_first_choice_from_the_pointer() {
+        let parent = MenuRect {
+            x: 300,
+            y: 300,
+            width: 200,
+            height: 40,
+        };
+        assert_eq!(submenu_origin(parent, 500, 100, 50, 900, 1000), (0, 300));
+    }
+
+    #[test]
+    fn a_submenu_flipped_to_the_left_still_lines_up_with_its_row() {
+        let parent = MenuRect {
+            x: 600,
+            y: 300,
+            width: 200,
+            height: 40,
+        };
+        assert_eq!(submenu_origin(parent, 300, 100, 50, 1000, 1000), (304, 250));
     }
 
     /// A header captions the rows beneath it, so one with nothing beneath is
