@@ -104,20 +104,20 @@ On Linux, compared with kitty on Ubuntu 20.04 (i9-12900K), at 180×50 with `TERM
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/performance-linux-dark.svg">
-    <img src="assets/performance-linux-light.svg" alt="ThinkTerm throughput compared with kitty on Linux in five kitten benchmark workloads: ThinkTerm is faster in all five, from 1.1× to 2.2×" width="100%">
+    <img src="assets/performance-linux-light.svg" alt="ThinkTerm throughput compared with kitty on Linux in five kitten benchmark workloads: ThinkTerm is faster in all five, from 1.6× to 3.4×" width="100%">
   </picture>
 </p>
 
 <details>
 <summary>Table data</summary>
 
-| Workload | ThinkTerm 143b60a2<br>2026-10-02 | kitty 0.47.4<br>2026-10-02 | Ratio |
+| Workload | ThinkTerm 0.4.2<br>2026-11-05 | kitty 0.47.4<br>2026-11-05 | Ratio |
 | --- | ---: | ---: | ---: |
-| Only ASCII chars | **147.4** | 79.4 | 1.9× |
-| Unicode chars | **85.6** | 78.7 | 1.1× |
-| CSI codes with few chars | **50.0** | 44.0 | 1.1× |
-| Long escape codes | **533.5** | 238.1 | 2.2× |
-| Images | **391.8** | 181.0 | 2.2× |
+| Only ASCII chars | **224.1** | 80.0 | 2.8× |
+| Unicode chars | **186.8** | 79.0 | 2.4× |
+| CSI codes with few chars | **71.1** | 43.2 | 1.6× |
+| Long escape codes | **624.6** | 241.2 | 2.6× |
+| Images | **663.3** | 196.3 | 3.4× |
 
 </details>
 
@@ -141,6 +141,28 @@ Progress across versions on the same Mac. Ratio compares 0.4.2 with the early bu
 | CSI codes with few chars | 25.7 | 49.5 | 53.5 | **90.9** | 3.5× |
 | Long escape codes | 219.4 | 213.8 | 257.3 | **219.3** | 1.00× |
 | Images | 218.0 | 257.2 | 271.0 | **216.4** | 0.99× |
+
+</details>
+
+Progress across versions on the same Linux setup. Ratio compares 0.4.2 with 143b60a2.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-linux-progress-dark.svg">
+    <img src="assets/performance-linux-progress-light.svg" alt="ThinkTerm throughput across versions on Linux in five kitten benchmark workloads, from 143b60a2 through 0.4.1 to 0.4.2: 0.4.2 is ahead of 143b60a2 in all five, from 1.2× to 2.2×" width="100%">
+  </picture>
+</p>
+
+<details>
+<summary>Table data</summary>
+
+| Workload | ThinkTerm 143b60a2<br>2026-10-02 | ThinkTerm 0.4.1<br>2026-11-05 | ThinkTerm 0.4.2<br>2026-11-05 | Ratio |
+| --- | ---: | ---: | ---: | ---: |
+| Only ASCII chars | 147.4 | 156.2 | **224.1** | 1.5× |
+| Unicode chars | 85.6 | 96.8 | **186.8** | 2.2× |
+| CSI codes with few chars | 50.0 | 52.2 | **71.1** | 1.4× |
+| Long escape codes | 533.5 | 649.9 | **624.6** | 1.2× |
+| Images | 391.8 | 346.0 | **663.3** | 1.7× |
 
 </details>
 

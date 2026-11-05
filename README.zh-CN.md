@@ -102,20 +102,20 @@ Linux 上与 kitty 对比：Ubuntu 20.04（i9-12900K），180×50，`TERM=xterm-
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/performance-linux-zh-CN-dark.svg">
-    <img src="assets/performance-linux-zh-CN-light.svg" alt="Linux 上 ThinkTerm 与 kitty 在 5 项 kitten 跑分中的吞吐对比：ThinkTerm 全部更快（1.1× 到 2.2×）" width="100%">
+    <img src="assets/performance-linux-zh-CN-light.svg" alt="Linux 上 ThinkTerm 与 kitty 在 5 项 kitten 跑分中的吞吐对比：ThinkTerm 全部更快（1.6× 到 3.4×）" width="100%">
   </picture>
 </p>
 
 <details>
 <summary>表格数据</summary>
 
-| 测试项 | ThinkTerm 143b60a2<br>2026-10-02 | kitty 0.47.4<br>2026-10-02 | 倍数 |
+| 测试项 | ThinkTerm 0.4.2<br>2026-11-05 | kitty 0.47.4<br>2026-11-05 | 倍数 |
 | --- | ---: | ---: | ---: |
-| 纯 ASCII 字符 | **147.4** | 79.4 | 1.9× |
-| Unicode 字符 | **85.6** | 78.7 | 1.1× |
-| CSI 序列夹少量字符 | **50.0** | 44.0 | 1.1× |
-| 长转义序列 | **533.5** | 238.1 | 2.2× |
-| 图片 | **391.8** | 181.0 | 2.2× |
+| 纯 ASCII 字符 | **224.1** | 80.0 | 2.8× |
+| Unicode 字符 | **186.8** | 79.0 | 2.4× |
+| CSI 序列夹少量字符 | **71.1** | 43.2 | 1.6× |
+| 长转义序列 | **624.6** | 241.2 | 2.6× |
+| 图片 | **663.3** | 196.3 | 3.4× |
 
 </details>
 
@@ -139,6 +139,28 @@ Linux 上与 kitty 对比：Ubuntu 20.04（i9-12900K），180×50，`TERM=xterm-
 | CSI 序列夹少量字符 | 25.7 | 49.5 | 53.5 | **90.9** | 3.5× |
 | 长转义序列 | 219.4 | 213.8 | 257.3 | **219.3** | 1.00× |
 | 图片 | 218.0 | 257.2 | 271.0 | **216.4** | 0.99× |
+
+</details>
+
+同一套 Linux 环境上的版本进步。倍数是 0.4.2 相对 143b60a2。
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-linux-progress-zh-CN-dark.svg">
+    <img src="assets/performance-linux-progress-zh-CN-light.svg" alt="ThinkTerm 各版本在 Linux 上 5 项 kitten 跑分中的吞吐：从 143b60a2 到 0.4.1 再到 0.4.2，0.4.2 全部领先 143b60a2（1.2× 到 2.2×）" width="100%">
+  </picture>
+</p>
+
+<details>
+<summary>表格数据</summary>
+
+| 测试项 | ThinkTerm 143b60a2<br>2026-10-02 | ThinkTerm 0.4.1<br>2026-11-05 | ThinkTerm 0.4.2<br>2026-11-05 | 倍数 |
+| --- | ---: | ---: | ---: | ---: |
+| 纯 ASCII 字符 | 147.4 | 156.2 | **224.1** | 1.5× |
+| Unicode 字符 | 85.6 | 96.8 | **186.8** | 2.2× |
+| CSI 序列夹少量字符 | 50.0 | 52.2 | **71.1** | 1.4× |
+| 长转义序列 | 533.5 | 649.9 | **624.6** | 1.2× |
+| 图片 | 391.8 | 346.0 | **663.3** | 1.7× |
 
 </details>
 

@@ -32,16 +32,16 @@ CHARTS = [
     dict(
         prefix="performance-linux",
         rival="kitty",
-        legend=("ThinkTerm 143b60a2 · 2026-10-02", "kitty 0.47.4 · 2026-10-02"),
+        legend=("ThinkTerm 0.4.2 · 2026-11-05", "kitty 0.47.4 · 2026-11-05"),
         machine="Ubuntu 20.04 · i9-12900K",
         caption="linux",
-        scale_max=600,
+        scale_max=720,
         results={
-            "ascii": (147.4, 79.4),
-            "unicode": (85.6, 78.7),
-            "csi": (50.0, 44.0),
-            "long": (533.5, 238.1),
-            "images": (391.8, 181.0),
+            "ascii": (224.1, 80.0),
+            "unicode": (186.8, 79.0),
+            "csi": (71.1, 43.2),
+            "long": (624.6, 241.2),
+            "images": (663.3, 196.3),
         },
     ),
     dict(
@@ -55,7 +55,6 @@ CHARTS = [
         machine="Mac · M1 Pro",
         caption="progress",
         scale_max=300,
-        row_height=106,
         # workload: one MB/s per entry in legend, oldest first
         results={
             "ascii": (45.3, 133.0, 134.0, 206.1),
@@ -64,6 +63,24 @@ CHARTS = [
             "csi": (25.7, 49.5, 53.5, 90.9),
             "long": (219.4, 213.8, 257.3, 219.3),
             "images": (218.0, 257.2, 271.0, 216.4),
+        },
+    ),
+    dict(
+        prefix="performance-linux-progress",
+        legend=(
+            "143b60a2 · 2026-10-02",
+            "0.4.1 · 2026-11-05",
+            "0.4.2 · 2026-11-05",
+        ),
+        machine="Ubuntu 20.04 · i9-12900K",
+        caption="progress",
+        scale_max=720,
+        results={
+            "ascii": (147.4, 156.2, 224.1),
+            "unicode": (85.6, 96.8, 186.8),
+            "csi": (50.0, 52.2, 71.1),
+            "long": (533.5, 649.9, 624.6),
+            "images": (391.8, 346.0, 663.3),
         },
     ),
 ]
@@ -192,6 +209,8 @@ BAR_H = 16
 GAP = 5
 PILL_CX = 912
 LEGEND_X = 372
+LEGEND_END = 880  # legend lines stop short of the ratio heading
+LEGEND_LINE = 24
 
 
 def label_width(s):
@@ -199,12 +218,32 @@ def label_width(s):
     return sum(15.0 if ord(ch) >= 0x2E80 else 7.6 for ch in s)
 
 
+def blend(a, b, t):
+    """The colour a fraction t of the way from a to b, both #rrggbb."""
+    pairs = ((int(a[i:i + 2], 16), int(b[i:i + 2], 16)) for i in (1, 3, 5))
+    return "#" + "".join(f"{round(x + (y - x) * t):02x}" for x, y in pairs)
+
+
 def build(chart, lang, t):
     L = LANGS[lang]
     c = THEMES[t]
     # Newest first in a comparison, oldest first along a version history.
     progress = chart["caption"] == "progress"
-    row_h = chart.get("row_height", ROW_H)
+    versions = len(chart["legend"])
+    row_h = BAR_H * versions + GAP * (versions - 1) + 27 if progress else ROW_H
+
+    # Legend entries fill a line and wrap, so the bars start below the last one.
+    legend = []
+    legend_x0 = 72 if progress else LEGEND_X
+    lx, line = legend_x0, 0
+    for name in chart["legend"]:
+        width = 30 + round(len(name) * 7.0)
+        if lx + width > LEGEND_END and lx > legend_x0:
+            lx, line = legend_x0, line + 1
+        legend.append((name, lx, line))
+        lx += width + 30
+    top = TOP + LEGEND_LINE * line
+
     rows = [(L["labels"][k], v) for k, v in chart["results"].items()]
     scale_max = chart["scale_max"]
     x0 = max(MIN_X0, round(max(label_width(n) for n, _ in rows)) + 70)
@@ -226,7 +265,7 @@ def build(chart, lang, t):
         """The two values the ratio compares: newer, then older."""
         return (values[-1], values[0]) if progress else values
 
-    h = TOP + row_h * len(rows) + (56 if progress else 96)
+    h = top + row_h * len(rows) + (56 if progress else 96)
     o = []
     o.append(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {h}" width="{W}" height="{h}" role="img" aria-labelledby="t d">')
     o.append(f'<title id="t">{title}</title>')
@@ -257,9 +296,10 @@ def build(chart, lang, t):
     o.append('.ours-bar { fill: url(#ours); filter: url(#glow); }')
     o.append(f'.theirs {{ fill: {c["theirs"]}; }}')
     # Between the oldest and the newest, each version a step nearer the newest.
-    mids = c["mids"][-(len(chart["legend"]) - 2):] if progress else ()
-    for i, colour in enumerate(mids):
-        o.append(f'.mid{i} {{ fill: {colour}; }}')
+    mids = versions - 2 if progress else 0
+    for i in range(mids):
+        step = i / (mids - 1) if mids > 1 else 1
+        o.append(f'.mid{i} {{ fill: {blend(*c["mids"], step)}; }}')
     o.append(f'.win {{ fill: {c["win_fill"]}; stroke: {c["win_edge"]}; }}')
     o.append(f'.win-t {{ font-size: 14px; font-weight: 700; fill: {c["win_ink"]}; }}')
     o.append(f'.even {{ fill: {c["even_fill"]}; stroke: {c["even_edge"]}; }}')
@@ -272,20 +312,18 @@ def build(chart, lang, t):
     # legend
     ly = 132
     if progress:
-        bars = ("theirs", *(f"mid{i}" for i in range(len(mids))), "ours")
-        lx = 72
+        bars = ("theirs", *(f"mid{i}" for i in range(mids)), "ours")
     else:
         bars = ("ours", "theirs")
-        lx = LEGEND_X
-    for name, cls in zip(chart["legend"], bars):
-        o.append(f'<rect x="{lx}" y="{ly - 10}" width="22" height="12" rx="6" class="{cls}"/>')
-        o.append(f'<text x="{lx + 30}" y="{ly}" class="legend">{name}</text>')
-        lx += 30 + round(len(name) * 7.0) + 30
+    for (name, lx, line), cls in zip(legend, bars):
+        y = ly + LEGEND_LINE * line
+        o.append(f'<rect x="{lx}" y="{y - 10}" width="22" height="12" rx="6" class="{cls}"/>')
+        o.append(f'<text x="{lx + 30}" y="{y}" class="legend">{name}</text>')
     o.append(f'<text x="{PILL_CX}" y="{ly}" class="legend" text-anchor="middle">{escape(L["ratio"])}</text>')
 
     # grid, six steps whatever the scale
-    gy0 = TOP - 14
-    gy1 = TOP + row_h * len(rows) - 10
+    gy0 = top - 14
+    gy1 = top + row_h * len(rows) - 10
     step = scale_max // 6
     for v in range(step, scale_max + 1, step):
         x = x_of(v)
@@ -296,7 +334,7 @@ def build(chart, lang, t):
 
     r = BAR_H / 2
     for i, (name, values) in enumerate(rows):
-        y = TOP + i * row_h
+        y = top + i * row_h
         mid = y + (BAR_H * len(values) + GAP * (len(values) - 1)) / 2
         o.append(f'<text x="{x0 - 22}" y="{mid + 5:.1f}" class="label" text-anchor="end">{escape(name)}</text>')
         for j, (v, cls) in enumerate(zip(values, bars)):

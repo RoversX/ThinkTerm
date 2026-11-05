@@ -102,20 +102,20 @@ Unter Linux im Vergleich zu kitty auf Ubuntu 20.04 (i9-12900K), bei 180×50 mit 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/performance-linux-de-DE-dark.svg">
-    <img src="assets/performance-linux-de-DE-light.svg" alt="Durchsatz von ThinkTerm im Vergleich zu kitty unter Linux in fünf kitten-Benchmarks: ThinkTerm ist in allen fünf schneller (1,1× bis 2,2×)" width="100%">
+    <img src="assets/performance-linux-de-DE-light.svg" alt="Durchsatz von ThinkTerm im Vergleich zu kitty unter Linux in fünf kitten-Benchmarks: ThinkTerm ist in allen fünf schneller (1,6× bis 3,4×)" width="100%">
   </picture>
 </p>
 
 <details>
 <summary>Daten als Tabelle</summary>
 
-| Test | ThinkTerm 143b60a2<br>2026-10-02 | kitty 0.47.4<br>2026-10-02 | Faktor |
+| Test | ThinkTerm 0.4.2<br>2026-11-05 | kitty 0.47.4<br>2026-11-05 | Faktor |
 | --- | ---: | ---: | ---: |
-| Nur ASCII-Zeichen | **147,4** | 79,4 | 1,9× |
-| Unicode-Zeichen | **85,6** | 78,7 | 1,1× |
-| CSI-Sequenzen mit wenigen Zeichen | **50,0** | 44,0 | 1,1× |
-| Lange Escape-Sequenzen | **533,5** | 238,1 | 2,2× |
-| Bilder | **391,8** | 181,0 | 2,2× |
+| Nur ASCII-Zeichen | **224,1** | 80,0 | 2,8× |
+| Unicode-Zeichen | **186,8** | 79,0 | 2,4× |
+| CSI-Sequenzen mit wenigen Zeichen | **71,1** | 43,2 | 1,6× |
+| Lange Escape-Sequenzen | **624,6** | 241,2 | 2,6× |
+| Bilder | **663,3** | 196,3 | 3,4× |
 
 </details>
 
@@ -139,6 +139,28 @@ Fortschritt über die Versionen auf demselben Mac. Der Faktor vergleicht 0.4.2 m
 | CSI-Sequenzen mit wenigen Zeichen | 25,7 | 49,5 | 53,5 | **90,9** | 3,5× |
 | Lange Escape-Sequenzen | 219,4 | 213,8 | 257,3 | **219,3** | 1,00× |
 | Bilder | 218,0 | 257,2 | 271,0 | **216,4** | 0,99× |
+
+</details>
+
+Fortschritt über die Versionen in derselben Linux-Umgebung. Der Faktor vergleicht 0.4.2 mit 143b60a2.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-linux-progress-de-DE-dark.svg">
+    <img src="assets/performance-linux-progress-de-DE-light.svg" alt="Durchsatz von ThinkTerm über die Versionen unter Linux in fünf kitten-Benchmarks, von 143b60a2 über 0.4.1 bis 0.4.2: 0.4.2 liegt in allen fünf vor 143b60a2, um 1,2× bis 2,2×" width="100%">
+  </picture>
+</p>
+
+<details>
+<summary>Daten als Tabelle</summary>
+
+| Test | ThinkTerm 143b60a2<br>2026-10-02 | ThinkTerm 0.4.1<br>2026-11-05 | ThinkTerm 0.4.2<br>2026-11-05 | Faktor |
+| --- | ---: | ---: | ---: | ---: |
+| Nur ASCII-Zeichen | 147,4 | 156,2 | **224,1** | 1,5× |
+| Unicode-Zeichen | 85,6 | 96,8 | **186,8** | 2,2× |
+| CSI-Sequenzen mit wenigen Zeichen | 50,0 | 52,2 | **71,1** | 1,4× |
+| Lange Escape-Sequenzen | 533,5 | 649,9 | **624,6** | 1,2× |
+| Bilder | 391,8 | 346,0 | **663,3** | 1,7× |
 
 </details>
 

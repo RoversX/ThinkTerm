@@ -102,20 +102,20 @@ Linux では kitty と比較しました。Ubuntu 20.04（i9-12900K）、180×50
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/performance-linux-ja-JP-dark.svg">
-    <img src="assets/performance-linux-ja-JP-light.svg" alt="Linux での kitten ベンチマーク 5 項目における ThinkTerm と kitty のスループット比較：ThinkTerm は全項目で高速（1.1×〜2.2×）" width="100%">
+    <img src="assets/performance-linux-ja-JP-light.svg" alt="Linux での kitten ベンチマーク 5 項目における ThinkTerm と kitty のスループット比較：ThinkTerm は全項目で高速（1.6×〜3.4×）" width="100%">
   </picture>
 </p>
 
 <details>
 <summary>表形式のデータ</summary>
 
-| 項目 | ThinkTerm 143b60a2<br>2026-10-02 | kitty 0.47.4<br>2026-10-02 | 倍率 |
+| 項目 | ThinkTerm 0.4.2<br>2026-11-05 | kitty 0.47.4<br>2026-11-05 | 倍率 |
 | --- | ---: | ---: | ---: |
-| ASCII 文字のみ | **147.4** | 79.4 | 1.9× |
-| Unicode 文字 | **85.6** | 78.7 | 1.1× |
-| 文字の少ない CSI シーケンス | **50.0** | 44.0 | 1.1× |
-| 長いエスケープシーケンス | **533.5** | 238.1 | 2.2× |
-| 画像 | **391.8** | 181.0 | 2.2× |
+| ASCII 文字のみ | **224.1** | 80.0 | 2.8× |
+| Unicode 文字 | **186.8** | 79.0 | 2.4× |
+| 文字の少ない CSI シーケンス | **71.1** | 43.2 | 1.6× |
+| 長いエスケープシーケンス | **624.6** | 241.2 | 2.6× |
+| 画像 | **663.3** | 196.3 | 3.4× |
 
 </details>
 
@@ -139,6 +139,28 @@ Linux では kitty と比較しました。Ubuntu 20.04（i9-12900K）、180×50
 | 文字の少ない CSI シーケンス | 25.7 | 49.5 | 53.5 | **90.9** | 3.5× |
 | 長いエスケープシーケンス | 219.4 | 213.8 | 257.3 | **219.3** | 1.00× |
 | 画像 | 218.0 | 257.2 | 271.0 | **216.4** | 0.99× |
+
+</details>
+
+同じ Linux 環境でのバージョンごとの推移です。倍率は 0.4.2 と 143b60a2 の比較です。
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-linux-progress-ja-JP-dark.svg">
+    <img src="assets/performance-linux-progress-ja-JP-light.svg" alt="Linux での kitten ベンチマーク 5 項目における ThinkTerm のバージョンごとのスループット：143b60a2 から 0.4.1、0.4.2 まで。0.4.2 は全項目で 143b60a2 を上回る（1.2×〜2.2×）" width="100%">
+  </picture>
+</p>
+
+<details>
+<summary>表形式のデータ</summary>
+
+| 項目 | ThinkTerm 143b60a2<br>2026-10-02 | ThinkTerm 0.4.1<br>2026-11-05 | ThinkTerm 0.4.2<br>2026-11-05 | 倍率 |
+| --- | ---: | ---: | ---: | ---: |
+| ASCII 文字のみ | 147.4 | 156.2 | **224.1** | 1.5× |
+| Unicode 文字 | 85.6 | 96.8 | **186.8** | 2.2× |
+| 文字の少ない CSI シーケンス | 50.0 | 52.2 | **71.1** | 1.4× |
+| 長いエスケープシーケンス | 533.5 | 649.9 | **624.6** | 1.2× |
+| 画像 | 391.8 | 346.0 | **663.3** | 1.7× |
 
 </details>
 

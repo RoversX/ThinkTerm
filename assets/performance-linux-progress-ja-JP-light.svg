@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 659" width="1000" height="659" role="img" aria-labelledby="t d">
+<title id="t">バージョンごとの ThinkTerm</title>
+<desc id="d">kitten __benchmark__ · Ubuntu 20.04 · i9-12900K · MB/s、大きいほど高速. ASCII 文字のみ: 143b60a2 147.4, 0.4.1 156.2, 0.4.2 224.1 (1.5×); Unicode 文字: 143b60a2 85.6, 0.4.1 96.8, 0.4.2 186.8 (2.2×); 文字の少ない CSI シーケンス: 143b60a2 50.0, 0.4.1 52.2, 0.4.2 71.1 (1.4×); 長いエスケープシーケンス: 143b60a2 533.5, 0.4.1 649.9, 0.4.2 624.6 (1.2×); 画像: 143b60a2 391.8, 0.4.1 346.0, 0.4.2 663.3 (1.7×).</desc>
+<defs>
+<linearGradient id="ours" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#0071e3"/><stop offset="1" stop-color="#2b8cff"/></linearGradient>
+<filter id="glow" x="-10%" y="-80%" width="120%" height="300%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#0071e3" flood-opacity="0.28"/></filter>
+</defs>
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Yu Gothic', 'Meiryo', 'Noto Sans CJK JP', sans-serif; fill: #1d1d1f; }
+.headline { font-size: 32px; font-weight: 700; letter-spacing: -0.6px; }
+.subhead { font-size: 16px; fill: #6e6e73; }
+.label { font-size: 15px; font-weight: 600; letter-spacing: -0.1px; }
+.legend { font-size: 13.5px; font-weight: 500; fill: #6e6e73; }
+.val-ours { font-size: 13px; font-weight: 700; }
+.val-theirs { font-size: 12.5px; font-weight: 500; fill: #6e6e73; }
+.tick { font-size: 11.5px; fill: #86868b; }
+.caption { font-size: 13px; font-weight: 500; fill: #86868b; }
+.grid { stroke: #ececf0; stroke-width: 1; }
+.axis { stroke: #d2d2d7; stroke-width: 1.2; }
+.ours { fill: url(#ours); }
+.ours-bar { fill: url(#ours); filter: url(#glow); }
+.theirs { fill: #c7c7cc; }
+.mid0 { fill: #8fbff6; }
+.win { fill: #e8f1ff; stroke: #c4d7f6; }
+.win-t { font-size: 14px; font-weight: 700; fill: #0071e3; }
+.even { fill: #f5f5f7; stroke: #e3e3e8; }
+.even-t { font-size: 14px; font-weight: 700; fill: #6e6e73; }
+</style>
+<rect x="0.5" y="0.5" width="999" height="658" rx="28" fill="#ffffff" stroke="#d2d2d7"/>
+<text x="500" y="62" class="headline" text-anchor="middle">バージョンごとの ThinkTerm</text>
+<text x="500" y="92" class="subhead" text-anchor="middle">kitten __benchmark__ · Ubuntu 20.04 · i9-12900K · MB/s、大きいほど高速</text>
+<rect x="72" y="122" width="22" height="12" rx="6" class="theirs"/>
+<text x="102" y="132" class="legend">143b60a2 · 2026-10-02</text>
+<rect x="279" y="122" width="22" height="12" rx="6" class="mid0"/>
+<text x="309" y="132" class="legend">0.4.1 · 2026-11-05</text>
+<rect x="465" y="122" width="22" height="12" rx="6" class="ours"/>
+<text x="495" y="132" class="legend">0.4.2 · 2026-11-05</text>
+<text x="912" y="132" class="legend" text-anchor="middle">倍率</text>
+<line x1="450.3" y1="164" x2="450.3" y2="593" class="grid"/>
+<text x="450.3" y="613" class="tick" text-anchor="middle">120</text>
+<line x1="528.7" y1="164" x2="528.7" y2="593" class="grid"/>
+<text x="528.7" y="613" class="tick" text-anchor="middle">240</text>
+<line x1="607.0" y1="164" x2="607.0" y2="593" class="grid"/>
+<text x="607.0" y="613" class="tick" text-anchor="middle">360</text>
+<line x1="685.3" y1="164" x2="685.3" y2="593" class="grid"/>
+<text x="685.3" y="613" class="tick" text-anchor="middle">480</text>
+<line x1="763.7" y1="164" x2="763.7" y2="593" class="grid"/>
+<text x="763.7" y="613" class="tick" text-anchor="middle">600</text>
+<line x1="842.0" y1="164" x2="842.0" y2="593" class="grid"/>
+<text x="842.0" y="613" class="tick" text-anchor="middle">720</text>
+<line x1="372" y1="164" x2="372" y2="593" class="axis"/>
+<text x="372" y="613" class="tick" text-anchor="middle">0</text>
+<text x="350" y="212.0" class="label" text-anchor="end">ASCII 文字のみ</text>
+<rect x="372" y="178" width="96.2" height="16" rx="8.0" class="theirs"/>
+<text x="476.2" y="190.5" class="val-theirs">147.4</text>
+<rect x="372" y="199" width="102.0" height="16" rx="8.0" class="mid0"/>
+<text x="482.0" y="211.5" class="val-theirs">156.2</text>
+<rect x="372" y="220" width="146.3" height="16" rx="8.0" class="ours-bar"/>
+<text x="526.3" y="232.5" class="val-ours">224.1</text>
+<rect x="878" y="193.0" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="212.0" class="win-t" text-anchor="middle">1.5×</text>
+<text x="350" y="297.0" class="label" text-anchor="end">Unicode 文字</text>
+<rect x="372" y="263" width="55.9" height="16" rx="8.0" class="theirs"/>
+<text x="435.9" y="275.5" class="val-theirs">85.6</text>
+<rect x="372" y="284" width="63.2" height="16" rx="8.0" class="mid0"/>
+<text x="443.2" y="296.5" class="val-theirs">96.8</text>
+<rect x="372" y="305" width="121.9" height="16" rx="8.0" class="ours-bar"/>
+<text x="501.9" y="317.5" class="val-ours">186.8</text>
+<rect x="878" y="278.0" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="297.0" class="win-t" text-anchor="middle">2.2×</text>
+<text x="350" y="382.0" class="label" text-anchor="end">文字の少ない CSI シーケンス</text>
+<rect x="372" y="348" width="32.6" height="16" rx="8.0" class="theirs"/>
+<text x="412.6" y="360.5" class="val-theirs">50.0</text>
+<rect x="372" y="369" width="34.1" height="16" rx="8.0" class="mid0"/>
+<text x="414.1" y="381.5" class="val-theirs">52.2</text>
+<rect x="372" y="390" width="46.4" height="16" rx="8.0" class="ours-bar"/>
+<text x="426.4" y="402.5" class="val-ours">71.1</text>
+<rect x="878" y="363.0" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="382.0" class="win-t" text-anchor="middle">1.4×</text>
+<text x="350" y="467.0" class="label" text-anchor="end">長いエスケープシーケンス</text>
+<rect x="372" y="433" width="348.3" height="16" rx="8.0" class="theirs"/>
+<text x="728.3" y="445.5" class="val-theirs">533.5</text>
+<rect x="372" y="454" width="424.2" height="16" rx="8.0" class="mid0"/>
+<text x="804.2" y="466.5" class="val-theirs">649.9</text>
+<rect x="372" y="475" width="407.7" height="16" rx="8.0" class="ours-bar"/>
+<text x="787.7" y="487.5" class="val-ours">624.6</text>
+<rect x="878" y="448.0" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="467.0" class="win-t" text-anchor="middle">1.2×</text>
+<text x="350" y="552.0" class="label" text-anchor="end">画像</text>
+<rect x="372" y="518" width="255.8" height="16" rx="8.0" class="theirs"/>
+<text x="635.8" y="530.5" class="val-theirs">391.8</text>
+<rect x="372" y="539" width="225.9" height="16" rx="8.0" class="mid0"/>
+<text x="605.9" y="551.5" class="val-theirs">346.0</text>
+<rect x="372" y="560" width="433.0" height="16" rx="8.0" class="ours-bar"/>
+<text x="813.0" y="572.5" class="val-ours">663.3</text>
+<rect x="878" y="533.0" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="552.0" class="win-t" text-anchor="middle">1.7×</text>
+</svg>
