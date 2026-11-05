@@ -1112,6 +1112,115 @@ impl UnicodeVersion {
     }
 }
 
+/// The width of each character of the Basic Multilingual Plane that needs no
+/// segmenting. Two of these characters side by side are always two graphemes,
+/// each as wide as this says, which is all the work a line of CJK text or
+/// similar has to do: finding graphemes and looking up their widths the
+/// general way was 40% of the time it took to print one.
+///
+/// Filled in as characters turn up, so that a process that prints a few of
+/// them pays for a few. Threads that meet a new one at once work out the same
+/// answer.
+#[cfg(feature = "std")]
+pub struct PlainWidths {
+    version: u8,
+    ambiguous_are_wide: bool,
+    /// `UNKNOWN`, `NOT_PLAIN`, or one more than the character's width.
+    widths: Box<[core::sync::atomic::AtomicU8]>,
+}
+
+#[cfg(feature = "std")]
+impl PlainWidths {
+    const UNKNOWN: u8 = 0;
+    const NOT_PLAIN: u8 = 1;
+
+    fn new(version: &UnicodeVersion) -> Self {
+        Self {
+            version: version.version,
+            ambiguous_are_wide: version.ambiguous_are_wide,
+            widths: (0..0x10000)
+                .map(|_| core::sync::atomic::AtomicU8::new(Self::UNKNOWN))
+                .collect(),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn look_up(&self, code: usize) -> u8 {
+        // Anything but Hangul breaks from a letter or it does not break at
+        // all, and a Hangul syllable joins the rest of the jamo that can
+        // join a syllable.
+        const NEIGHBOURS: [char; 2] = ['a', '\u{ac00}'];
+        let splits = |a: char, b: char| {
+            let mut pair = [0; 8];
+            let first = a.encode_utf8(&mut pair).len();
+            let second = b.encode_utf8(&mut pair[first..]).len();
+            let pair = core::str::from_utf8(&pair[..first + second]).unwrap_or_default();
+            Graphemes::new(pair).count() == 2
+        };
+        let version = UnicodeVersion {
+            version: self.version,
+            ambiguous_are_wide: self.ambiguous_are_wide,
+            cell_widths: None,
+        };
+        let entry = match char::from_u32(code as u32) {
+            Some(c)
+                if !c.is_control() && NEIGHBOURS.iter().all(|&n| splits(n, c) && splits(c, n)) =>
+            {
+                let mut text = [0; 4];
+                match grapheme_column_width(c.encode_utf8(&mut text), Some(&version)) {
+                    0 => Self::NOT_PLAIN,
+                    width => width as u8 + 1,
+                }
+            }
+            _ => Self::NOT_PLAIN,
+        };
+        self.widths[code].store(entry, core::sync::atomic::Ordering::Relaxed);
+        entry
+    }
+
+    /// The length in bytes and width of the character at the start of
+    /// `bytes`, which is valid UTF-8 from there on, or None if it is not one
+    /// of these.
+    #[inline(always)]
+    pub fn first(&self, bytes: &[u8]) -> Option<(usize, usize)> {
+        let (len, code) = match *bytes {
+            [a @ 0..=0x7f, ..] => (1, a as usize),
+            [a @ 0xc0..=0xdf, b, ..] => (2, (a as usize & 0x1f) << 6 | (b as usize & 0x3f)),
+            [a @ 0xe0..=0xef, b, c, ..] => (
+                3,
+                (a as usize & 0xf) << 12 | (b as usize & 0x3f) << 6 | (c as usize & 0x3f),
+            ),
+            _ => return None,
+        };
+        let mut entry = self.widths[code].load(core::sync::atomic::Ordering::Relaxed);
+        if entry == Self::UNKNOWN {
+            entry = self.look_up(code);
+        }
+        match entry {
+            Self::NOT_PLAIN => None,
+            entry => Some((len, entry as usize - 1)),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl UnicodeVersion {
+    /// The table for this version, unless the configuration sets widths of
+    /// its own.
+    pub fn plain_widths(&self) -> Option<&'static PlainWidths> {
+        static TABLES: [std::sync::OnceLock<PlainWidths>; 8] =
+            [const { std::sync::OnceLock::new() }; 8];
+        if self.cell_widths.is_some() {
+            return None;
+        }
+        let table = usize::from(self.version >= 14) << 2
+            | usize::from(self.version >= 9) << 1
+            | usize::from(self.ambiguous_are_wide);
+        Some(TABLES[table].get_or_init(|| PlainWidths::new(self)))
+    }
+}
+
 pub const LATEST_UNICODE_VERSION: UnicodeVersion = UnicodeVersion {
     version: 14,
     ambiguous_are_wide: false,
@@ -1216,12 +1325,20 @@ fn is_ascii_with_combining_diacritics(bytes: &[u8]) -> bool {
     let Some((base, marks)) = bytes.split_first() else {
         return false;
     };
-    (b' '..=b'~').contains(base)
-        && !marks.is_empty()
-        && marks.len() % 2 == 0
-        && marks
-            .chunks_exact(2)
-            .all(|mark| matches!(mark, [0xcc, 0x80..=0xbf] | [0xcd, 0x80..=0xaf]))
+    (b' '..=b'~').contains(base) && !marks.is_empty() && diacritics_len(marks) == marks.len()
+}
+
+/// How many of the bytes at the start of `bytes` are combining diacritical
+/// marks, U+0300..=U+036F. Every one of them joins what is before it.
+#[inline]
+pub fn diacritics_len(bytes: &[u8]) -> usize {
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .take_while(|mark| matches!(mark, [0xcc, 0x80..=0xbf] | [0xcd, 0x80..=0xaf]))
+        .count()
+        * 2
 }
 
 fn general_column_width(s: &str, version: &UnicodeVersion) -> usize {
@@ -1283,6 +1400,94 @@ mod test {
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
+    }
+
+    /// Every character the table calls plain has to break from every other,
+    /// and be as wide as the general path says. The neighbours stand for all
+    /// the classes of character that can be plain.
+    #[cfg(feature = "std")]
+    #[test]
+    fn plain_text_needs_no_segmenting() {
+        let neighbours = [
+            'a', ' ', '\u{a9}', '\u{4e2d}', '\u{ac00}', '\u{ac01}', '\u{2764}',
+        ];
+        let split = |a: char, b: char| {
+            let pair: alloc::string::String = [a, b].iter().collect();
+            assert_eq!(
+                Graphemes::new(&pair).count(),
+                2,
+                "{:x} {:x}",
+                a as u32,
+                b as u32
+            );
+        };
+        for version in [8, 9, 14] {
+            for ambiguous_are_wide in [false, true] {
+                let mut version = UnicodeVersion::new(version);
+                version.ambiguous_are_wide = ambiguous_are_wide;
+                let plain = version.plain_widths().unwrap();
+                let mut plain_chars = 0;
+                for code in 0..0x10000 {
+                    let Some(c) = char::from_u32(code) else {
+                        continue;
+                    };
+                    let mut text = [0; 4];
+                    let text = c.encode_utf8(&mut text);
+                    match plain.first(text.as_bytes()) {
+                        None => {}
+                        Some((len, width)) => {
+                            plain_chars += 1;
+                            assert_eq!(len, text.len());
+                            assert_eq!(width, grapheme_column_width(text, Some(&version)));
+                            assert!(width > 0, "{code:x}");
+                            for &n in &neighbours {
+                                split(c, n);
+                                split(n, c);
+                            }
+                        }
+                    }
+                }
+                assert!(plain_chars > 50_000, "{plain_chars}");
+            }
+        }
+        // Diacritics stay with the letter, and end before what follows them.
+        for mark in 0x300..=0x36f {
+            let mark = char::from_u32(mark).unwrap();
+            for base in ' '..='~' {
+                for next in neighbours {
+                    let text: alloc::string::String = [base, mark, mark, next].iter().collect();
+                    let mut graphemes = Graphemes::new(&text);
+                    assert_eq!(
+                        graphemes.next().map(str::len),
+                        Some(1 + 2 * mark.len_utf8())
+                    );
+                    assert_eq!(graphemes.count(), 1, "{text:?}");
+                    assert_eq!(diacritics_len(&text.as_bytes()[1..]), 4);
+                }
+            }
+        }
+        for c in [
+            '\u{301}', '\u{200d}', '\u{fe0f}', '\u{1100}', '\u{1161}', '\u{11a8}', '\u{600}',
+        ] {
+            let version = UnicodeVersion::new(9);
+            let mut text = [0; 4];
+            let text = c.encode_utf8(&mut text);
+            assert!(version
+                .plain_widths()
+                .unwrap()
+                .first(text.as_bytes())
+                .is_none());
+        }
+        // Characters beyond the plane are never plain, and neither is the
+        // start of one.
+        let plain = UnicodeVersion::new(9).plain_widths().unwrap();
+        assert!(plain.first("\u{20000}".as_bytes()).is_none());
+        assert!(plain.first(b"").is_none());
+        assert!(plain.first(b"\n").is_none());
+
+        let mut custom = UnicodeVersion::new(9);
+        custom.cell_widths = Some(Arc::new(std::collections::HashMap::new()));
+        assert!(custom.plain_widths().is_none(), "the configuration decides");
     }
 
     #[test]
