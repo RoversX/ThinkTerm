@@ -4088,8 +4088,57 @@ unsafe fn drop_files(hwnd: HWND, _msg: UINT, wparam: WPARAM, _lparam: LPARAM) ->
     Some(0)
 }
 
-unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+/// Whether a handler further up this stack has the window. Handlers hold it
+/// across the application's code, and any wait in there on another thread's
+/// window takes in the messages sent to this one. Each of those would borrow
+/// the window again, and a panic in `wnd_proc` ends the process.
+fn window_is_held(hwnd: HWND) -> bool {
+    rc_from_hwnd(hwnd).is_some_and(|inner| inner.try_borrow_mut().is_err())
+}
+
+/// A message put off by `message_while_held`, in wparam, to handle once the
+/// window is free. It cannot simply be posted again: Windows refuses to post
+/// the ones that carry a pointer, and `DefWindowProcW` reads through that
+/// pointer, so they must not reach it again with none.
+const WM_HELD_MESSAGE: UINT = WM_APP + 1;
+
+/// A message that cannot have the window now.
+unsafe fn message_while_held(hwnd: HWND, msg: UINT) -> Option<LRESULT> {
     match msg {
+        // Left invalid, so it comes round again once the holder is done.
+        WM_PAINT => Some(0),
+        // Left to `DefWindowProcW` this would destroy the window.
+        WM_CLOSE => {
+            PostMessageW(hwnd, WM_HELD_MESSAGE, msg as WPARAM, 0);
+            Some(0)
+        }
+        // None of their handlers read wparam or lparam.
+        WM_SETFOCUS
+        | WM_KILLFOCUS
+        | WM_WINDOWPOSCHANGED
+        | WM_SETTINGCHANGE
+        | WM_DWMCOMPOSITIONCHANGED => {
+            PostMessageW(hwnd, WM_HELD_MESSAGE, msg as WPARAM, 0);
+            None
+        }
+        _ => None,
+    }
+}
+
+unsafe fn do_wnd_proc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    // These manage without the window, or with what `try_borrow` gives them.
+    let needs_window = !matches!(
+        msg,
+        WM_NCCREATE | WM_NCDESTROY | WM_NCCALCSIZE | WM_NCHITTEST | WM_ERASEBKGND | WM_ENDSESSION
+    );
+    if needs_window && window_is_held(hwnd) {
+        return message_while_held(hwnd, msg);
+    }
+    match msg {
+        WM_HELD_MESSAGE => {
+            do_wnd_proc(hwnd, wparam as UINT, 0, 0);
+            Some(0)
+        }
         WM_NCCREATE => wm_nccreate(hwnd, msg, wparam, lparam),
         WM_NCDESTROY => wm_ncdestroy(hwnd, msg, wparam, lparam),
         WM_NCCALCSIZE => wm_nccalcsize(hwnd, msg, wparam, lparam),
