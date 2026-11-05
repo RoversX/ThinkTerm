@@ -1026,6 +1026,7 @@ mod test {
 
     #[test]
     fn ligatures() {
+        let _turn = crate::harfbuzz_turn();
         let _ = env_logger::Builder::new()
             .is_test(true)
             .filter_level(log::LevelFilter::Trace)
@@ -1466,6 +1467,7 @@ mod test {
     /// every font is tried.
     #[test]
     fn fallbacks_known_to_lack_a_run_are_passed_over() {
+        let _turn = crate::harfbuzz_turn();
         let handles = emoji_last();
         let config = config::configuration();
         let texts = ["x", "😀", "a😀b", "😀😀", "\u{f120}", "中", "a中"];
@@ -1530,6 +1532,7 @@ mod test {
     /// wrong in turn. Sent on together they come out as they do one by one.
     #[test]
     fn neighbouring_incomplete_cells_shape_as_they_do_alone() {
+        let _turn = crate::harfbuzz_turn();
         let handles = emoji_last();
         let config = config::configuration();
         let cells = [
@@ -1564,6 +1567,7 @@ mod test {
     /// each gets what it would have got alone.
     #[test]
     fn a_run_sent_to_a_fallback_keeps_to_one_script() {
+        let _turn = crate::harfbuzz_turn();
         let config = config::configuration();
         let shaper = HarfbuzzShaper::new(&config, &emoji_last()).unwrap();
         let marks = "\u{34f}\u{35c}\u{36f}";
@@ -1596,6 +1600,7 @@ mod test {
     /// cell drawn twice pushes the rest of the line along.
     #[test]
     fn a_cell_a_run_already_holds_is_not_sent_again() {
+        let _turn = crate::harfbuzz_turn();
         let db = FontDatabase::with_built_in().unwrap();
         let handles: Vec<_> = ["JetBrains Mono", "Noto Color Emoji", "Symbols Nerd Font Mono"]
             .iter()
@@ -1619,6 +1624,7 @@ mod test {
     /// `guess_script` is only worth having if it says what HarfBuzz says.
     #[test]
     fn the_script_guessed_is_the_one_harfbuzz_guesses() {
+        let _turn = crate::harfbuzz_turn();
         use crate::hbwrap::hb_script_t::*;
         for (text, script) in [
             ("a\u{301}", Some(HB_SCRIPT_LATIN)),
@@ -1642,6 +1648,7 @@ mod test {
     /// and a fallback that way never shapes anything to be kept for.
     #[test]
     fn a_font_of_the_wrong_presentation_is_not_loaded() {
+        let _turn = crate::harfbuzz_turn();
         let config = config::configuration();
         let shaper = HarfbuzzShaper::new(&config, &emoji_last()).unwrap();
         shape_with(&shaper, "\u{1f600}", Some(Presentation::Emoji), None);
@@ -1653,6 +1660,7 @@ mod test {
     /// replacement characters, in the place of what they replace.
     #[test]
     fn text_a_broken_fallback_was_for_stays_where_it_was() {
+        let _turn = crate::harfbuzz_turn();
         let mut handles = emoji_last();
         handles[1].handle.source =
             crate::locator::FontDataSource::OnDisk("/no/such/font.ttf".into());
@@ -1671,6 +1679,7 @@ mod test {
     /// less than what it replaces drags the rest of the line with it.
     #[test]
     fn text_a_broken_fallback_was_for_keeps_its_width() {
+        let _turn = crate::harfbuzz_turn();
         let mut handles = emoji_last();
         handles[1].handle.source =
             crate::locator::FontDataSource::OnDisk("/no/such/font.ttf".into());
@@ -1705,6 +1714,7 @@ mod test {
     /// nothing goes only once it has been left alone for a while.
     #[test]
     fn a_fallback_that_shapes_nothing_goes_after_a_while() {
+        let _turn = crate::harfbuzz_turn();
         let config = config::configuration();
         let shaper = HarfbuzzShaper::new(&config, &emoji_last()).unwrap();
         let loads = |shaper: &HarfbuzzShaper| {
@@ -1741,6 +1751,7 @@ mod test {
     /// the font lacks each alone; an empty run lacks nothing.
     #[test]
     fn only_runs_of_single_character_graphemes_are_passed_over() {
+        let _turn = crate::harfbuzz_turn();
         let config = config::configuration();
         let shaper = HarfbuzzShaper::new(&config, &emoji_last()).unwrap();
         // Conjoining jamo: a font can have the syllable they make and
@@ -1757,6 +1768,7 @@ mod test {
     /// it does not hold yet.
     #[test]
     fn a_full_set_starts_over_only_for_a_new_character() {
+        let _turn = crate::harfbuzz_turn();
         let config = config::configuration();
         let shaper = HarfbuzzShaper::new(&config, &emoji_last()).unwrap();
         let chars: Vec<char> = ('\u{4e00}'..).take(MISSING_CHARS_LIMIT + 1).collect();

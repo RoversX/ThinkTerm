@@ -1464,12 +1464,22 @@ impl FontConfiguration {
     }
 }
 
+/// HarfBuzz is built without thread safety, which suits the one thread that
+/// shapes text in the program. The test harness has many: tests that use it
+/// take turns, or they crash each other now and then.
+#[cfg(test)]
+pub(crate) fn harfbuzz_turn() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
     #[test]
     fn dpi_change_invalidates_sized_entity_font_cache() -> anyhow::Result<()> {
+        let _turn = crate::harfbuzz_turn();
         let fonts = FontConfiguration::new(Some(ConfigHandle::default_config()), 144)?;
 
         let retina = fonts.title_font_with_size(15.0)?;
