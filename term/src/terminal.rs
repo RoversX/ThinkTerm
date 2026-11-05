@@ -171,9 +171,11 @@ impl Terminal {
         // writing to the writer sends data to input of the pty
         writer: Box<dyn std::io::Write + Send>,
     ) -> Terminal {
+        let mut parser = Parser::new();
+        parser.set_text_keeps_line_controls(true);
         Terminal {
             state: TerminalState::new(size, config, term_program, term_version, writer),
-            parser: Parser::new(),
+            parser,
         }
     }
 
@@ -192,7 +194,7 @@ impl Terminal {
             self.parser
                 .parse_with_borrowed_text(bytes, |event| match event {
                     ParsedAction::Action(action) => performer.perform(action),
-                    ParsedAction::Print(text) => performer.print_text(text),
+                    ParsedAction::Print(text) => performer.print_run(text),
                 });
         }
         self.state.kitty_scene_refresh();

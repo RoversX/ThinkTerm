@@ -817,6 +817,7 @@ fn parse_buffered_data(
     // the reader's count whenever nothing is left waiting to be sent.
     let mut unapplied = 0usize;
     let mut parser = termwiz::escape::parser::Parser::new();
+    parser.set_text_keeps_line_controls(true);
     let mut actions = vec![];
     let mut hold = false;
     let mut action_size = 0;

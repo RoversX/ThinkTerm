@@ -72,6 +72,21 @@ pub struct ScreenSnapshot {
     pub saved_cursor: Option<SavedCursor>,
 }
 
+#[cfg(test)]
+impl TerminalSnapshot {
+    /// This snapshot with every row in cells, for comparing what two
+    /// terminals hold however each came to store it: a row of ASCII written
+    /// over in place stays compact, and written a cell at a time does not.
+    pub(crate) fn with_rows_as_cells(mut self) -> Self {
+        for screen in [&mut self.screen, &mut self.alt_screen] {
+            for line in &mut screen.lines {
+                line.cells_mut();
+            }
+        }
+        self
+    }
+}
+
 /// A picture's place in a cell, with the picture itself replaced by its
 /// hash. Keeps the kitty image and placement ids, which the wire format's
 /// image cell drops: a delete-by-id after the restore has to find them.

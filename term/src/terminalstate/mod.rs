@@ -2621,20 +2621,25 @@ impl TerminalState {
                     let line_idx = screen.phys_row(y);
                     let line = screen.line_mut(line_idx);
 
-                    match line.cells_mut().get(to_copy).cloned() {
-                        None => Cell::blank(),
-                        Some(candidate) => {
-                            if candidate.str() == " " && to_copy > 0 {
-                                // It's a blank.  It may be the second part of
-                                // a double-wide pair; look ahead of it.
-                                let prior = &line.cells_mut()[to_copy - 1];
-                                if prior.width() > 1 {
-                                    prior.clone()
+                    // A row of ASCII can give the cell up as it is.
+                    if let Some(cell) = line.ascii_cell(to_copy) {
+                        cell
+                    } else {
+                        match line.cells_mut().get(to_copy).cloned() {
+                            None => Cell::blank(),
+                            Some(candidate) => {
+                                if candidate.str() == " " && to_copy > 0 {
+                                    // It's a blank.  It may be the second part of
+                                    // a double-wide pair; look ahead of it.
+                                    let prior = &line.cells_mut()[to_copy - 1];
+                                    if prior.width() > 1 {
+                                        prior.clone()
+                                    } else {
+                                        candidate
+                                    }
                                 } else {
                                     candidate
                                 }
-                            } else {
-                                candidate
                             }
                         }
                     }

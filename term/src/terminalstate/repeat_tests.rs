@@ -133,8 +133,8 @@ fn batched_repeat_matches_scalar_screen_cursor_and_scrollback() {
                 let mut actual = make();
                 actual.perform_csi_edit(Edit::Repeat(n));
                 assert_eq!(
-                    actual.snapshot(),
-                    expected.snapshot(),
+                    actual.snapshot().with_rows_as_cells(),
+                    expected.snapshot().with_rows_as_cells(),
                     "rows={rows}, cols={cols}, scrollback={scrollback}, setup={setup:?}, n={n}"
                 );
             }

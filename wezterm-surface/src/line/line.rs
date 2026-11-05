@@ -1,7 +1,7 @@
 use crate::cellcluster::CellCluster;
 use crate::hyperlink::Rule;
 use crate::line::cellref::CellRef;
-use crate::line::clusterline::ClusteredLine;
+use crate::line::clusterline::{runs_into, ClusteredLine};
 use crate::line::linebits::LineBits;
 use crate::line::storage::{CellStorage, VisibleCellIter};
 use crate::line::vecstorage::{VecStorage, VecStorageIter};
@@ -106,6 +106,14 @@ impl Clone for Line {
             #[cfg(feature = "appdata")]
             appdata: Mutex::new(self.appdata.lock().unwrap().clone()),
         }
+    }
+}
+
+/// The character of a cell of one printable ASCII character.
+fn printable_ascii(cell: &Cell) -> Option<char> {
+    match *cell.str().as_bytes() {
+        [byte @ b' '..=b'~'] => Some(byte as char),
+        _ => None,
     }
 }
 
@@ -715,7 +723,7 @@ impl Line {
                 }
                 Cow::Owned(s)
             }
-            CellStorage::C(cl) => Cow::Borrowed(&cl.text),
+            CellStorage::C(cl) => Cow::Borrowed(cl.text()),
         }
     }
 
@@ -843,12 +851,26 @@ impl Line {
         attr: CellAttributes,
         seqno: SequenceNo,
     ) {
+        self.set_cell_grapheme_after(idx, text, width, attr, false, seqno);
+    }
+
+    /// `set_cell_grapheme`, where `follows` says that `text` is known to be
+    /// separate from what is before it.
+    pub fn set_cell_grapheme_after(
+        &mut self,
+        idx: usize,
+        text: &str,
+        width: usize,
+        attr: CellAttributes,
+        follows: bool,
+        seqno: SequenceNo,
+    ) {
         if attr.hyperlink().is_some() {
             self.bits |= LineBits::HAS_HYPERLINK;
         }
 
         if let CellStorage::C(cl) = &mut self.cells {
-            if idx == cl.len() {
+            if idx == cl.len() && (follows || !cl.joins(text)) {
                 cl.append_grapheme(text, width, attr);
                 self.invalidate_implicit_hyperlinks(seqno);
                 self.invalidate_zones();
@@ -860,12 +882,14 @@ impl Line {
     }
 
     /// Whether `append_grapheme_run` can take graphemes starting at `idx`:
-    /// the end of clustered storage without implicit hyperlinks, which the
-    /// first write would otherwise expand to cells.
+    /// the end of clustered storage, or where only blanks are left of it,
+    /// without implicit hyperlinks, which the first write would otherwise
+    /// expand to cells.
     pub fn can_append_grapheme_run(&self, idx: usize) -> bool {
         match &self.cells {
             CellStorage::C(cl) => {
-                idx == cl.len() && (self.bits & LineBits::HAS_IMPLICIT_HYPERLINKS) == LineBits::NONE
+                (idx == cl.len() || cl.is_blank_from(idx))
+                    && (self.bits & LineBits::HAS_IMPLICIT_HYPERLINKS) == LineBits::NONE
             }
             _ => false,
         }
@@ -873,7 +897,8 @@ impl Line {
 
     /// `set_cell_grapheme` for each grapheme of a run written one after
     /// another from `idx`, all with `attr`; see `ClusteredLine::append_run`
-    /// for the arguments. Returns false, changing nothing, unless
+    /// for the arguments. `follows` says that `text` is known to be separate
+    /// from what is before it. Returns false, changing nothing, unless
     /// `can_append_grapheme_run(idx)` and `append_run` takes the run; the
     /// caller then writes the graphemes one at a time.
     pub fn append_grapheme_run(
@@ -885,6 +910,7 @@ impl Line {
         wide: &[u16],
         last_width: u8,
         attr: &CellAttributes,
+        follows: bool,
         seqno: SequenceNo,
     ) -> bool {
         if !self.can_append_grapheme_run(idx) {
@@ -893,7 +919,20 @@ impl Line {
         let CellStorage::C(cl) = &mut self.cells else {
             return false;
         };
-        if !cl.append_run(text, max_len, cells, wide, last_width, attr) {
+        if !follows && cl.joins_at(idx, text) {
+            return false;
+        }
+        // Blanks make way for the run, and those it does not reach stay.
+        let len = cl.len();
+        if idx < len && runs_into(text.as_bytes(), " ") {
+            return false;
+        }
+        cl.truncate_blanks(idx);
+        let appended = cl.append_run(text, max_len, cells, wide, last_width, attr);
+        if cl.len() < len {
+            cl.append_ascii_repeated(' ', len - cl.len(), &CellAttributes::blank());
+        }
+        if !appended {
             return false;
         }
         // What each set_cell_grapheme would do; repeating it changes nothing.
@@ -925,7 +964,7 @@ impl Line {
                 }
                 Self::pad_clustered_line(cl, idx);
             }
-            if idx == cl.len() {
+            if idx == cl.len() && !cl.joins(text) {
                 cl.append_grapheme(text, width, attr);
                 self.invalidate_implicit_hyperlinks(seqno);
                 self.invalidate_zones();
@@ -940,35 +979,67 @@ impl Line {
     // Keep gap filling off the overwrite path, which never needs padding.
     #[inline(never)]
     fn pad_clustered_line(cl: &mut ClusteredLine, idx: usize) {
-        // Tabs, cursor movement and LF without CR leave gaps. Their
-        // padding has one attribute run, so append it in chunks instead
-        // of repeating grapheme/attribute bookkeeping for every space.
-        const SPACES: &str = concat!(
-            "                                                                ",
-            "                                                                "
-        );
-        let blank = CellAttributes::blank();
-        while cl.len() < idx {
-            let count = (idx - cl.len()).min(SPACES.len());
-            cl.append_ascii(&SPACES[..count], &blank);
+        // Tabs, cursor movement and LF without CR leave gaps.
+        let count = idx.saturating_sub(cl.len());
+        cl.append_ascii_repeated(' ', count, &CellAttributes::blank());
+    }
+
+    /// Write ASCII over `range` of the cells without expanding compact storage;
+    /// see `ClusteredLine::overwrite_ascii`. What each write of a cell would
+    /// do to the rest of the line is done here if that went ahead.
+    fn overwrite_ascii(
+        &mut self,
+        range: Range<usize>,
+        attr: &CellAttributes,
+        seqno: SequenceNo,
+        write: impl FnOnce(&mut [u8]),
+    ) -> bool {
+        if (self.bits & LineBits::HAS_IMPLICIT_HYPERLINKS) != LineBits::NONE {
+            return false;
         }
+        let CellStorage::C(cl) = &mut self.cells else {
+            return false;
+        };
+        if !cl.overwrite_ascii(range, attr, write) {
+            return false;
+        }
+        if attr.hyperlink().is_some() {
+            self.bits |= LineBits::HAS_HYPERLINK;
+        }
+        self.invalidate_implicit_hyperlinks(seqno);
+        self.invalidate_zones();
+        self.update_last_change_seqno(seqno);
+        true
     }
 
     /// Write a run of printable ASCII with the same semantics as individual
-    /// `set_cell_grapheme` calls. Invalid input returns false without mutation.
-    /// Appending keeps compact storage; overwriting preserves image placements.
-    pub fn set_ascii_cells(
+    /// `set_cell_grapheme` calls. Appending keeps compact storage; overwriting
+    /// preserves image placements.
+    pub fn set_printable_ascii_cells(
         &mut self,
         idx: usize,
         text: &str,
         attr: &CellAttributes,
         seqno: SequenceNo,
-    ) -> bool {
-        if !text.bytes().all(|b| (b' '..=b'~').contains(&b)) {
-            return false;
-        }
+    ) {
+        debug_assert!(text.bytes().all(|b| (b' '..=b'~').contains(&b)));
         if text.is_empty() {
-            return true;
+            return;
+        }
+        // Over cells of the same sort, a row can stay as it is.
+        let over = text.len().min(self.len().saturating_sub(idx));
+        if over > 0
+            && self.overwrite_ascii(idx..idx + over, attr, seqno, |cells| {
+                cells.copy_from_slice(&text.as_bytes()[..over])
+            })
+        {
+            if over == text.len() {
+                return;
+            }
+            if let CellStorage::C(cl) = &mut self.cells {
+                cl.append_ascii(&text[over..], attr);
+            }
+            return;
         }
         // An append cannot overlap a wide cell. Write the whole run without
         // allocating attributes for a scalar first cell, unless hyperlink
@@ -980,14 +1051,14 @@ impl Line {
                 == LineBits::NONE
         {
             if let CellStorage::C(cl) = &mut self.cells {
-                if idx == cl.len() {
+                if idx == cl.len() && !cl.joins(text) {
                     cl.append_ascii(text, attr);
                     if attr.hyperlink().is_some() {
                         self.bits |= LineBits::HAS_HYPERLINK;
                     }
                     self.invalidate_zones();
                     self.update_last_change_seqno(seqno);
-                    return true;
+                    return;
                 }
             }
         }
@@ -1025,7 +1096,6 @@ impl Line {
                 }
             }
         }
-        true
     }
 
     pub fn set_cell_clearing_image_placements(
@@ -1069,7 +1139,7 @@ impl Line {
                 // their intended cell content
                 cl.append_grapheme(" ", 1, CellAttributes::blank());
             }
-            if idx == cl.len() {
+            if idx == cl.len() && !cl.joins(cell.str()) {
                 cl.append(cell);
                 return;
             }
@@ -1238,6 +1308,28 @@ impl Line {
             // them all away again before we return; NOP
             return;
         }
+        if cols.start == 0
+            && cols.end >= self.len()
+            && cols.end <= u16::MAX as usize
+            && matches!(&self.cells, CellStorage::C(_))
+            && (self.bits & LineBits::HAS_IMPLICIT_HYPERLINKS) == LineBits::NONE
+            && *cell == Cell::blank()
+        {
+            // The whole row: no cell of it survives to need looking at, and
+            // blanks need no more than a run of spaces. A row of cells stays
+            // one, or a row that has to be would go back and forth. Taking
+            // links back out of a row turns it into cells, so not one of those.
+            self.invalidate_implicit_hyperlinks(seqno);
+            self.invalidate_zones();
+            self.update_last_change_seqno(seqno);
+            if let CellStorage::C(cl) = &mut self.cells {
+                if !cl.clear_for_scrolling(cols.end.max(80).saturating_mul(2)) {
+                    *cl = ClusteredLine::new();
+                }
+                cl.append_ascii_repeated(' ', cols.end, cell.attrs());
+            }
+            return;
+        }
         if !cols.is_empty()
             && cols.start < self.len()
             && cols.end >= self.len()
@@ -1268,7 +1360,15 @@ impl Line {
             // Preserve that behavior, including styled wide-cell padding.
             cols.start += 1;
         }
+        // Compact storage only keeps a row of blanks it was overwriting: one
+        // that got this far by appending blanks has always lost them again.
+        let overwriting = cols.start < self.len() && !cols.is_empty();
         self.set_cell_range_impl(cols, cell, true, seqno);
+        if let CellStorage::C(cl) = &self.cells {
+            if overwriting && *cell == Cell::blank() && cl.is_all_blank() {
+                return;
+            }
+        }
         self.prune_trailing_blanks(seqno);
     }
 
@@ -1286,6 +1386,26 @@ impl Line {
         clear_image_placements: bool,
         seqno: SequenceNo,
     ) {
+        if cols.is_empty() {
+            return;
+        }
+        if let Some(c) = printable_ascii(cell) {
+            let over = cols.end.min(self.len());
+            if cols.start < over
+                && self.overwrite_ascii(cols.start..over, cell.attrs(), seqno, |cells| {
+                    cells.fill(c as u8)
+                })
+            {
+                cols.start = over;
+                if cols.is_empty() {
+                    return;
+                }
+                if let CellStorage::C(cl) = &mut self.cells {
+                    cl.append_ascii_repeated(c, cols.len(), cell.attrs());
+                    return;
+                }
+            }
+        }
         let Some(first) = cols.next() else {
             return;
         };
@@ -1309,6 +1429,12 @@ impl Line {
                     }
                 }
                 return;
+            }
+            if let (CellStorage::C(cl), Some(c)) = (&mut self.cells, printable_ascii(cell)) {
+                if cols.start == cl.len() {
+                    cl.append_ascii_repeated(c, cols.len(), cell.attrs());
+                    return;
+                }
             }
         }
 
@@ -1386,6 +1512,15 @@ impl Line {
             .find(|cell| cell.cell_index() == cell_index)
     }
 
+    /// The cell at `cell_index` of a row of nothing but one-byte cells in
+    /// compact storage, where it can be had without expanding the row.
+    pub fn ascii_cell(&self, cell_index: usize) -> Option<Cell> {
+        match &self.cells {
+            CellStorage::C(cl) => cl.get_byte_cell(cell_index).map(|cell| cell.as_cell()),
+            CellStorage::V(_) => None,
+        }
+    }
+
     pub fn cluster(&self, bidi_hint: Option<ParagraphDirectionHint>) -> Vec<CellCluster> {
         CellCluster::make_cluster(self.len(), self.visible_cells(), bidi_hint)
     }
@@ -1417,7 +1552,21 @@ impl Line {
             CellStorage::V(v) => ClusteredLine::from_cell_vec(v.len(), self.visible_cells()),
             CellStorage::C(_) => return,
         };
-        self.cells = CellStorage::C(cv);
+        if cv.reads_back_as(self.visible_cells()) {
+            self.cells = CellStorage::C(cv);
+        }
+    }
+
+    /// Make a compact line as long as `len` cells, where blanks written
+    /// beyond its end have been left implicit. They matter once what follows
+    /// on the next row is to be read as following them.
+    pub fn keep_blanks_to(&mut self, len: usize) {
+        if let CellStorage::C(cl) = &mut self.cells {
+            if cl.len() < len {
+                Self::pad_clustered_line(cl, len);
+                self.invalidate_zones();
+            }
+        }
     }
 
     pub fn cells_mut(&mut self) -> &mut [Cell] {

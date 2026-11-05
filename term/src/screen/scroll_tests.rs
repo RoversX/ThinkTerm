@@ -182,7 +182,7 @@ fn recycled_scrolling_matches_original_rows_and_stable_indices() {
                         3,
                     );
                     if row % 4 == 3 {
-                        line.set_ascii_cells(
+                        line.set_printable_ascii_cells(
                             0,
                             &"x".repeat(size.cols),
                             &CellAttributes::default(),

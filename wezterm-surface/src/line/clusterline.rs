@@ -9,6 +9,7 @@ use wezterm_cell::{Cell, CellAttributes};
 
 extern crate alloc;
 use alloc::boxed::Box;
+#[cfg(any(feature = "use_serde", test))]
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -24,9 +25,14 @@ struct Cluster {
 /// clusters of attribute data describing attributed ranges
 /// within the line
 #[cfg_attr(feature = "use_serde", derive(Serialize))]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(crate) struct ClusteredLine {
-    pub text: String,
+    /// Always valid UTF-8: only text goes in, and only ASCII over ASCII. It
+    /// is held as bytes for that second part, which a program moving around
+    /// the screen does for every character, and checked by `text()` when it
+    /// is read, which is rarer and goes through the whole line anyway.
+    #[cfg_attr(feature = "use_serde", serde(serialize_with = "serialize_text"))]
+    pub text: Vec<u8>,
     #[cfg_attr(
         feature = "use_serde",
         serde(
@@ -38,6 +44,107 @@ pub(crate) struct ClusteredLine {
     /// Length, measured in cells
     len: u32,
     last_cell_width: Option<NonZeroU8>,
+}
+
+/// Whether `after`, written right behind `before`, would become part of its
+/// last grapheme. A clustered line has nothing but its text to say where the
+/// cells are, so two cells that read back as one grapheme are one cell: text
+/// that comes apart like this has to be kept as cells.
+#[inline]
+pub(crate) fn runs_into(before: &[u8], after: &str) -> bool {
+    match (before.last(), after.as_bytes().first()) {
+        (Some(last), Some(first)) => {
+            !(ends_simply(before, *last) && starts_simply(*first))
+                && !plain_meets_plain(before, after)
+                && chars_join(before, after)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a character with this first byte can only be ASCII, a Han
+/// ideograph (U+4000..=U+9FFF) or a private use one (U+E000..=U+EFFF, which
+/// is where icons in prompts are), which is what nearly all text comes down
+/// to, and which join nothing on either side of them unless the other asks.
+#[inline]
+fn starts_simply(first: u8) -> bool {
+    first.is_ascii() || matches!(first, 0xe4..=0xe9 | 0xee)
+}
+
+/// `starts_simply` of the character at the end of `before`.
+#[inline]
+fn ends_simply(before: &[u8], last: u8) -> bool {
+    last.is_ascii() || matches!(*before, [.., 0xe4..=0xe9 | 0xee, 0x80..=0xbf, 0x80..=0xbf])
+}
+
+/// Characters that are the same to segmenting whichever version of Unicode
+/// their widths come from.
+#[cfg(feature = "std")]
+fn plain_chars() -> Option<&'static wezterm_cell::PlainWidths> {
+    wezterm_cell::UnicodeVersion::new(9).plain_widths()
+}
+
+/// Whether the characters that meet are ones that never join.
+#[cfg(feature = "std")]
+fn plain_meets_plain(before: &[u8], after: &str) -> bool {
+    let earliest = before.len().saturating_sub(3);
+    let start = (earliest..before.len())
+        .rfind(|&index| before[index] & 0xc0 != 0x80)
+        .unwrap_or(earliest);
+    plain_chars().is_some_and(|plain| {
+        plain.first(&before[start..]).is_some() && plain.first(after.as_bytes()).is_some()
+    })
+}
+
+#[cfg(not(feature = "std"))]
+fn plain_meets_plain(_before: &[u8], _after: &str) -> bool {
+    false
+}
+
+#[inline(never)]
+fn chars_join(before: &[u8], after: &str) -> bool {
+    // What joins can depend on the characters before the last one, though
+    // not on many of them.
+    const CONTEXT: usize = 16;
+    let Some(first) = after.chars().next() else {
+        return false;
+    };
+    // Except that regional indicators pair off from the first of them.
+    if ('\u{1f1e6}'..='\u{1f1ff}').contains(&first) {
+        let (_, indicators) = before.as_rchunks::<4>();
+        return indicators
+            .iter()
+            .rev()
+            .take_while(|c| matches!(c, [0xf0, 0x9f, 0x87, 0xa6..=0xbf]))
+            .count()
+            % 2
+            == 1;
+    }
+    let earliest = before.len().saturating_sub(CONTEXT);
+    let start = (earliest..before.len())
+        .find(|&index| before[index] & 0xc0 != 0x80)
+        .unwrap_or(before.len());
+    let context = &before[start..];
+    let mut joined = [0; CONTEXT + 4];
+    joined[..context.len()].copy_from_slice(context);
+    let end = context.len() + first.encode_utf8(&mut joined[context.len()..]).len();
+    core::str::from_utf8(&joined[..end]).is_ok_and(|text| {
+        Graphemes::new(text)
+            .last()
+            .is_some_and(|g| g.len() > first.len_utf8())
+    })
+}
+
+impl core::fmt::Debug for ClusteredLine {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ClusteredLine")
+            .field("text", &self.text())
+            .field("is_double_wide", &self.is_double_wide)
+            .field("clusters", &self.clusters)
+            .field("len", &self.len)
+            .field("last_cell_width", &self.last_cell_width)
+            .finish()
+    }
 }
 
 #[cfg(feature = "use_serde")]
@@ -68,10 +175,21 @@ impl<'de> Deserialize<'de> for ClusteredLine {
             None
         };
         Ok(Self {
-            text: wire.text, is_double_wide, clusters: wire.clusters,
+            text: wire.text.into_bytes(), is_double_wide, clusters: wire.clusters,
             len: wire.len, last_cell_width: wire.last_cell_width,
         })
     }
+}
+
+/// As the string it is on the wire.
+#[cfg(feature = "use_serde")]
+fn serialize_text<S>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    core::str::from_utf8(value)
+        .map_err(serde::ser::Error::custom)?
+        .serialize(serializer)
 }
 
 /// Serialize the bitset as a vector of the indices of just the 1 bits;
@@ -93,6 +211,10 @@ where
 }
 
 impl ClusteredLine {
+    /// How many clusters a line can have for one in the middle to be worth
+    /// changing in place.
+    const MAX_CLUSTERS: usize = 16;
+
     /// Reuse only small buffers when a discarded screen row becomes blank.
     /// Drop all attributes and wide-cell metadata, including image/link refs.
     pub(crate) fn clear_for_scrolling(&mut self, max_text_capacity: usize) -> bool {
@@ -112,7 +234,7 @@ impl ClusteredLine {
 
     pub fn new() -> Self {
         Self {
-            text: String::with_capacity(Self::NEW_TEXT_CAPACITY),
+            text: Vec::with_capacity(Self::NEW_TEXT_CAPACITY),
             is_double_wide: None,
             clusters: vec![],
             len: 0,
@@ -144,6 +266,12 @@ impl ClusteredLine {
             }
         }
 
+        // Cells can only read back short of `len()` from a line that was not
+        // written here; there is no use in believing all of what that claims.
+        let len = self.len().min(cells.len() + 256);
+        if cells.len() < len {
+            cells.resize_with(len, Cell::blank);
+        }
         cells.shrink_to_fit();
         cells
     }
@@ -155,7 +283,7 @@ impl ClusteredLine {
         // of growing one realloc at a time and allocating a bitset that the
         // typical all-narrow line immediately throws away.
         let mut is_double_wide: Option<Box<FixedBitSet>> = None;
-        let mut text = String::with_capacity(hint);
+        let mut text = Vec::with_capacity(hint);
         let mut clusters = vec![];
         let mut len = 0;
         let mut last_cell_width = None;
@@ -170,7 +298,7 @@ impl ClusteredLine {
                     .set(cell.cell_index(), true);
             }
 
-            text.push_str(cell.str());
+            text.extend_from_slice(cell.str().as_bytes());
 
             last_cluster = match last_cluster.take() {
                 None => Some(Cluster {
@@ -213,6 +341,46 @@ impl ClusteredLine {
         self.len as usize
     }
 
+    /// The line's text. It can only be anything but valid from a line off
+    /// the wire that lied about its cells, which is not worth a crash.
+    pub(crate) fn text(&self) -> &str {
+        core::str::from_utf8(&self.text).unwrap_or_default()
+    }
+
+    /// Whether `text` at the end of the line would run into what is there.
+    #[inline]
+    pub(crate) fn joins(&self, text: &str) -> bool {
+        runs_into(&self.text, text)
+    }
+
+    /// Whether the line's graphemes are `cells`, as they have to be for each
+    /// to be read back as the cell it was.
+    pub(crate) fn reads_back_as<'a>(&self, mut cells: impl Iterator<Item = CellRef<'a>>) -> bool {
+        self.text.is_ascii()
+            || self.is_plain()
+            || Graphemes::new(self.text())
+                .all(|g| matches!(cells.next(), Some(cell) if cell.str() == g))
+                && cells.next().is_none()
+    }
+
+    /// Whether the text is all characters that never join each other.
+    #[cfg(feature = "std")]
+    fn is_plain(&self) -> bool {
+        let Some(plain) = plain_chars() else {
+            return false;
+        };
+        let mut rest = &self.text[..];
+        while let Some((len, _)) = plain.first(rest) {
+            rest = &rest[len..];
+        }
+        rest.is_empty()
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn is_plain(&self) -> bool {
+        false
+    }
+
     fn is_double_wide(&self, cell_index: usize) -> bool {
         match &self.is_double_wide {
             Some(bitset) => bitset.contains(cell_index),
@@ -224,7 +392,7 @@ impl ClusteredLine {
         let mut clusters = self.clusters.iter();
         let cluster = clusters.next();
         ClusterLineCellIter {
-            graphemes: Graphemes::new(&self.text),
+            graphemes: Graphemes::new(self.text()),
             clusters,
             cluster,
             idx: 0,
@@ -255,9 +423,195 @@ impl ClusteredLine {
             });
             remaining -= count;
         }
-        self.text.push_str(text);
+        self.text.extend_from_slice(text.as_bytes());
         self.len += text.len() as u32;
         self.last_cell_width = NonZeroU8::new(1);
+    }
+
+    /// Whether each cell of the line is one byte of its text, which is what
+    /// lets a cell be found, and replaced, without going through the rest.
+    fn cells_are_bytes(&self) -> bool {
+        self.is_double_wide.is_none() && self.text.len() == self.len as usize
+    }
+
+    /// Whether the line is nothing but default blanks.
+    pub(crate) fn is_all_blank(&self) -> bool {
+        self.cells_are_bytes()
+            && self
+                .clusters
+                .iter()
+                .all(|c| c.attrs == CellAttributes::blank())
+            && self.text.iter().all(|&b| b == b' ')
+    }
+
+    /// Whether nothing but default blanks are left from cell `idx` on, which
+    /// a run can take the place of without looking at the cells. Not for a
+    /// line with a lot of clusters already: going through them all for each
+    /// new one is what cells are for.
+    pub(crate) fn is_blank_from(&self, idx: usize) -> bool {
+        let Some(count) = (self.len as usize).checked_sub(idx) else {
+            return false;
+        };
+        let Some(end) = self.text.len().checked_sub(count) else {
+            return false;
+        };
+        let (words, rest) = self.text[end..].as_chunks::<8>();
+        self.clusters.len() < Self::MAX_CLUSTERS
+            && matches!(self.clusters.last(), Some(cluster)
+                if cluster.cell_width as usize >= count && cluster.attrs == CellAttributes::blank())
+            && words.iter().all(|word| *word == [b' '; 8])
+            && rest.iter().all(|&b| b == b' ')
+            && self.no_wide_cells_from(idx.saturating_sub(1))
+            && !runs_into(&self.text[..end], " ")
+    }
+
+    /// Whether there are no wide cells from cell `idx` on. The bits stop at
+    /// the last wide cell unless the line was built all at once.
+    fn no_wide_cells_from(&self, idx: usize) -> bool {
+        self.is_double_wide
+            .as_ref()
+            .is_none_or(|bits| (idx..bits.len()).all(|cell| !bits.contains(cell)))
+    }
+
+    /// The cell at `cell_index`, if `cells_are_bytes` says it can be told
+    /// without going through the graphemes before it.
+    pub(crate) fn get_byte_cell(&self, cell_index: usize) -> Option<CellRef<'_>> {
+        if cell_index >= self.len as usize || !self.cells_are_bytes() {
+            return None;
+        }
+        let mut end = 0;
+        let cluster = self.clusters.iter().find(|cluster| {
+            end += cluster.cell_width as usize;
+            cell_index < end
+        })?;
+        Some(CellRef::ClusterRef {
+            cell_index,
+            text: core::str::from_utf8(self.text.get(cell_index..cell_index + 1)?).ok()?,
+            width: 1,
+            attrs: &cluster.attrs,
+        })
+    }
+
+    /// Replace `range` of the cells with ASCII written by `write`, all with
+    /// `attrs`, keeping the line compact. False, changing nothing, unless the
+    /// range is on a line `cells_are_bytes` is true of. The clusters are the
+    /// only part of it to go through, and a row that has many of them is
+    /// going to be cheaper as cells.
+    pub(crate) fn overwrite_ascii(
+        &mut self,
+        range: core::ops::Range<usize>,
+        attrs: &CellAttributes,
+        write: impl FnOnce(&mut [u8]),
+    ) -> bool {
+        if range.end > self.len as usize || range.is_empty() || !self.cells_are_bytes() {
+            return false;
+        }
+        // A cell's image placements outlive what is written over it. Clusters
+        // holding any are left for the cells to sort out.
+        #[cfg(feature = "use_image")]
+        if attrs.has_images() || self.clusters.iter().any(|c| c.attrs.has_images()) {
+            return false;
+        }
+        // The clusters `range` touches, and how far into them it starts and
+        // ends.
+        let mut pos = 0;
+        let mut first = None;
+        let mut last = None;
+        for (index, cluster) in self.clusters.iter().enumerate() {
+            let end = pos + cluster.cell_width as usize;
+            if first.is_none() && range.start < end {
+                first = Some((index, range.start - pos));
+            }
+            if range.end <= end {
+                last = Some((index, end - range.end));
+                break;
+            }
+            pos = end;
+        }
+        let (Some((first, before)), Some((last, after))) = (first, last) else {
+            return false;
+        };
+        let same = first == last && self.clusters[first].attrs == *attrs;
+        if !same {
+            if self.clusters.len() >= Self::MAX_CLUSTERS {
+                return false;
+            }
+            let cells = range.len();
+            if cells > u16::MAX as usize {
+                return false;
+            }
+            let mut pieces: [Option<Cluster>; 3] = [None, None, None];
+            if before > 0 {
+                pieces[0] = Some(Cluster {
+                    cell_width: before as u16,
+                    attrs: self.clusters[first].attrs.clone(),
+                });
+            }
+            pieces[1] = Some(Cluster {
+                cell_width: cells as u16,
+                attrs: attrs.clone(),
+            });
+            if after > 0 {
+                pieces[2] = Some(Cluster {
+                    cell_width: after as u16,
+                    attrs: self.clusters[last].attrs.clone(),
+                });
+            }
+            self.clusters
+                .splice(first..=last, IntoIterator::into_iter(pieces).flatten());
+        }
+        write(&mut self.text[range.clone()]);
+        debug_assert!(self.text[range].is_ascii());
+        true
+    }
+
+    /// `append_ascii` of `count` copies of the printable ASCII character `c`.
+    pub fn append_ascii_repeated(&mut self, c: char, count: usize, attrs: &CellAttributes) {
+        assert!((' '..='~').contains(&c));
+        let extend = matches!(self.clusters.last(), Some(cluster) if cluster.attrs == *attrs);
+        let mut remaining = count;
+        if extend {
+            if let Some(cluster) = self.clusters.last_mut() {
+                let more = remaining.min((u16::MAX - cluster.cell_width) as usize);
+                cluster.cell_width += more as u16;
+                remaining -= more;
+            }
+        }
+        while remaining > 0 {
+            let more = remaining.min(u16::MAX as usize);
+            self.clusters.push(Cluster {
+                attrs: attrs.clone(),
+                cell_width: more as u16,
+            });
+            remaining -= more;
+        }
+        self.text.resize(self.text.len() + count, c as u8);
+        self.len += count as u32;
+        self.last_cell_width = NonZeroU8::new(1);
+    }
+
+    /// Whether `text` at cell `idx`, which is the end of the line or where
+    /// only blanks are left of it, would run into what is before it.
+    pub(crate) fn joins_at(&self, idx: usize, text: &str) -> bool {
+        let end = self.text.len() - (self.len as usize - idx);
+        runs_into(&self.text[..end], text)
+    }
+
+    /// Take away the blanks from cell `idx` on (see `is_blank_from`).
+    pub(crate) fn truncate_blanks(&mut self, idx: usize) {
+        let blanks = self.len as usize - idx;
+        if blanks == 0 {
+            return;
+        }
+        self.text.truncate(self.text.len() - blanks);
+        self.len = idx as u32;
+        self.last_cell_width = None;
+        if let Some(cluster) = self.clusters.last_mut() {
+            cluster.cell_width -= blanks as u16;
+            if cluster.cell_width == 0 {
+                self.clusters.pop();
+            }
+        }
     }
 
     pub fn append_grapheme(&mut self, text: &str, cell_width: usize, attrs: CellAttributes) {
@@ -281,7 +635,7 @@ impl ClusteredLine {
         } else if let Some(cluster) = self.clusters.last_mut() {
             cluster.cell_width += cell_width;
         }
-        self.text.push_str(text);
+        self.text.extend_from_slice(text.as_bytes());
 
         if cell_width > 1 {
             let bitset = match self.is_double_wide.take() {
@@ -344,7 +698,7 @@ impl ClusteredLine {
             }),
         }
         self.text.reserve_exact(capacity - self.text.len());
-        self.text.push_str(text);
+        self.text.extend_from_slice(text.as_bytes());
         if let (Some(&first), Some(&last)) = (wide.first(), wide.last()) {
             let base = self.len as usize;
             let bitset = self.is_double_wide.get_or_insert_with(|| {
@@ -395,7 +749,7 @@ impl ClusteredLine {
         } else if let Some(cluster) = self.clusters.last_mut() {
             cluster.cell_width += cell_width;
         }
-        self.text.push_str(cell.str());
+        self.text.extend_from_slice(cell.str().as_bytes());
 
         if cell_width > 1 {
             let bitset = match self.is_double_wide.take() {
@@ -417,7 +771,7 @@ impl ClusteredLine {
     }
 
     pub fn prune_trailing_blanks(&mut self) -> bool {
-        let num_spaces = self.text.chars().rev().take_while(|&c| c == ' ').count();
+        let num_spaces = self.text.iter().rev().take_while(|&&b| b == b' ').count();
         if num_spaces == 0 {
             return false;
         }
@@ -517,10 +871,10 @@ impl<'a> Iterator for ClusterLineCellIter<'a> {
     }
 }
 
-/// The capacity a String of `capacity` ends with when graphemes of at most
+/// The capacity text of `capacity` ends with when graphemes of at most
 /// `max_len` bytes are pushed one at a time until it holds `len` bytes, or
-/// None where that would depend on each one's length. A String grows to
-/// twice its capacity, or to what it needs if more, and to at least 8 bytes.
+/// None where that would depend on each one's length. Text grows to twice
+/// its capacity, or to what it needs if more, and to at least 8 bytes.
 fn grown_capacity(capacity: usize, len: usize, max_len: usize) -> Option<usize> {
     if len <= capacity {
         return Some(capacity);

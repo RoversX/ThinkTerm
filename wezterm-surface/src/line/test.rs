@@ -82,7 +82,7 @@ fn compact_gap_padding_matches_individual_blank_cells() {
 #[test]
 fn scroll_reset_discards_oversized_storage() {
     let mut line = Line::new(1);
-    line.set_ascii_cells(0, &"x".repeat(8192), &CellAttributes::default(), 2);
+    line.set_printable_ascii_cells(0, &"x".repeat(8192), &CellAttributes::default(), 2);
     line.reset_for_scrolling(3, 116);
     assert_eq!(line, Line::new(3));
     match &line.cells {
@@ -167,6 +167,208 @@ fn recycled_rows_match_new_rows_and_release_links_and_cached_data() {
     }
 }
 
+/// Two rows are the same row whichever storage each happens to be in: writing
+/// ASCII over a compact row leaves it compact, where a cell at a time expands it.
+#[track_caller]
+fn assert_same_row(actual: &Line, expected: &Line, what: impl core::fmt::Debug) {
+    let cells = |line: &Line| {
+        line.visible_cells()
+            .map(|cell| {
+                (
+                    cell.cell_index(),
+                    cell.str().to_string(),
+                    cell.width(),
+                    cell.attrs().clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(cells(actual), cells(expected), "{what:?}");
+    assert_eq!(actual.len(), expected.len(), "{what:?}");
+    assert_eq!(actual.current_seqno(), expected.current_seqno(), "{what:?}");
+    assert_eq!(
+        actual.compute_shape_hash(),
+        expected.compute_shape_hash(),
+        "{what:?}"
+    );
+}
+
+/// Drawing a row looks for links in it, and leaves it clustered with them.
+#[test]
+fn erasing_a_row_scanned_for_links_erases_it() {
+    let rules = [Rule::new(r"\b\w+://\S+", "$0").unwrap()];
+    let mut line: Line = "see https://example.com/x".into();
+    line.compress_for_scrollback();
+    Line::apply_hyperlink_rules(&rules, &mut [&mut line]);
+    assert!(line.has_hyperlink());
+    assert!(matches!(&line.cells, super::storage::CellStorage::C(_)));
+
+    let len = line.len();
+    line.fill_range(0..len, &Cell::blank(), 2);
+    assert_eq!(line.as_str().trim_end(), "");
+    assert!(!line.has_hyperlink());
+}
+
+/// A clustered row has only its text to say where its cells are, so cells
+/// written one by one that would read back as one grapheme can't be kept in it.
+#[test]
+fn cells_that_would_read_back_as_one_stay_cells() {
+    let plain = CellAttributes::default();
+    let cells = |line: &Line| {
+        line.visible_cells()
+            .map(|cell| (cell.cell_index(), cell.str().to_string()))
+            .collect::<Vec<_>>()
+    };
+    for (first, second) in [
+        ("\u{e01}", "\u{e33}"),
+        ("🇺", "🇸"),
+        ("👍", "🏻"),
+        ("\u{1100}", "\u{1161}"),
+    ] {
+        let first_cell = Cell::new_grapheme(first, plain.clone(), None);
+        let second_cell = Cell::new_grapheme(second, plain.clone(), None);
+        let (first_width, second_width) = (first_cell.width(), second_cell.width());
+        let (next, last) = (1 + first_width, 1 + first_width + second_width);
+        let expected = vec![
+            (0, "a".to_string()),
+            (1, first.to_string()),
+            (next, second.to_string()),
+            (last, "z".to_string()),
+        ];
+        let mut one_by_one = Line::new(1);
+        one_by_one.set_cell_grapheme(0, "a", 1, plain.clone(), 2);
+        one_by_one.set_cell_grapheme(1, first, first_width, plain.clone(), 2);
+        one_by_one.set_cell_grapheme(next, second, second_width, plain.clone(), 2);
+        one_by_one.set_cell_grapheme(last, "z", 1, plain.clone(), 2);
+        assert_eq!(cells(&one_by_one), expected);
+
+        let mut as_cells = Line::new(1);
+        as_cells.set_cell(0, Cell::new('a', plain.clone()), 2);
+        as_cells.set_cell(1, first_cell, 2);
+        as_cells.set_cell(next, second_cell, 2);
+        as_cells.set_cell(last, Cell::new('z', plain.clone()), 2);
+        as_cells.compress_for_scrollback();
+        assert_eq!(cells(&as_cells), expected);
+
+        // A run is refused, for the caller to write it a cell at a time.
+        let mut run = Line::new(1);
+        run.set_cell_grapheme(0, first, first_width, plain.clone(), 2);
+        let wide: &[u16] = if second_width == 2 { &[0] } else { &[] };
+        let last_width = second_width as u8;
+        assert!(!run.append_grapheme_run(
+            first_width,
+            second,
+            4,
+            second_width,
+            wide,
+            last_width,
+            &plain,
+            false,
+            2
+        ));
+    }
+    // Text that was written together is one grapheme, as it always was.
+    let mut together = Line::new(1);
+    together.set_cell_grapheme(0, "\u{e01}\u{e33}", 1, plain.clone(), 2);
+    together.set_cell_grapheme(1, "z", 1, plain, 2);
+    assert_eq!(
+        cells(&together),
+        vec![(0, "\u{e01}\u{e33}".to_string()), (1, "z".to_string())]
+    );
+}
+
+/// Nothing assumes a row's cells add up to its length: rows can come off the
+/// wire from a build that merged them.
+#[test]
+fn cells_read_back_short_of_the_length_are_made_up_with_blanks() {
+    let mut cl = ClusteredLine::new();
+    cl.append_grapheme("\u{e01}", 1, CellAttributes::default());
+    cl.append_grapheme("\u{e33}", 1, CellAttributes::default());
+    cl.append_grapheme("z", 1, CellAttributes::default());
+    assert_eq!(cl.len(), 3);
+    assert_eq!(cl.to_cell_vec().len(), 3);
+}
+
+#[test]
+fn blanks_up_to_a_wrap_are_kept() {
+    let mut line = Line::new(1);
+    line.set_cell_grapheme(0, "a", 1, CellAttributes::default(), 2);
+    line.keep_blanks_to(5);
+    assert_eq!(line.len(), 5);
+    assert_eq!(line.as_str(), "a    ");
+    line.keep_blanks_to(3);
+    assert_eq!(line.len(), 5);
+}
+
+/// A run over a tail of blanks has to come out as writing each of its
+/// graphemes over them does, and leave the row as long as it was.
+#[test]
+fn runs_over_blanks_match_scalar_writes() {
+    let plain = CellAttributes::default();
+    let mut bold = CellAttributes::default();
+    bold.set_intensity(wezterm_cell::Intensity::Bold);
+    let row: &[(&str, usize)] = &[("x", 1), ("中", 2), ("y", 1)];
+    let run: &[(&str, usize)] = &[("a", 1), ("中", 2), ("😀", 2), ("b", 1)];
+    let text: alloc::string::String = run.iter().map(|(g, _)| *g).collect();
+    let cells: usize = run.iter().map(|(_, w)| w).sum();
+    for prefix in 0..=row.len() {
+        for blanks in [1, 3, 6, 7, 40] {
+            let mut base = Line::new(1);
+            let mut x = 0;
+            for (g, w) in &row[..prefix] {
+                base.set_cell_grapheme(x, g, *w, plain.clone(), 2);
+                x += w;
+            }
+            base.set_cell_range(x..x + blanks, &Cell::blank(), 3);
+            // Blanks past the end of a compact row are left out of it.
+            let start = x;
+            if base.len() != x + blanks {
+                base.keep_blanks_to(x + blanks);
+            }
+            for attrs in [&plain, &bold] {
+                let mut expected = base.clone();
+                expected.cells_mut();
+                let mut at = start;
+                for (g, w) in run {
+                    expected.set_cell_grapheme(at, g, *w, attrs.clone(), 4);
+                    at += w;
+                }
+                let mut actual = base.clone();
+                if let crate::line::storage::CellStorage::C(cl) = &mut actual.cells {
+                    cl.text.reserve_exact(80);
+                }
+                assert!(
+                    actual.can_append_grapheme_run(start),
+                    "{} {}",
+                    prefix,
+                    blanks
+                );
+                assert!(actual.append_grapheme_run(
+                    start,
+                    &text,
+                    4,
+                    cells,
+                    &[1, 3],
+                    1,
+                    attrs,
+                    false,
+                    4
+                ));
+                assert!(actual.is_compressed_for_scrollback());
+                assert_same_row(&actual, &expected, (prefix, blanks));
+            }
+        }
+    }
+    // Anything but a default blank in the way has to be written cell by cell.
+    let mut base = Line::new(1);
+    base.set_cell_grapheme(0, "a", 1, plain.clone(), 2);
+    base.set_cell_grapheme(1, " ", 1, bold.clone(), 2);
+    base.set_cell_grapheme(2, " ", 1, plain.clone(), 2);
+    assert!(!base.can_append_grapheme_run(1));
+    assert!(base.can_append_grapheme_run(2));
+    assert!(!base.can_append_grapheme_run(4));
+}
+
 // Keep a scalar reference so the fast path is checked against the old behavior,
 // including less visible state such as hyperlinks, sequence numbers and zones.
 fn scalar_range(line: &mut Line, range: core::ops::Range<usize>, cell: &Cell, clear: bool) {
@@ -199,10 +401,7 @@ fn check_range_against_scalar(
     } else {
         actual.set_cell_range(range.clone(), cell, 42);
     }
-    assert_eq!(
-        actual, expected,
-        "range={range:?}, cell={cell:?}, clear={clear}"
-    );
+    assert_same_row(&actual, &expected, (&range, cell, clear));
     assert_eq!(
         actual.semantic_zone_ranges(),
         expected.semantic_zone_ranges()
@@ -942,8 +1141,8 @@ fn check_ascii_against_scalar(base: &Line, start: usize, text: &str, attrs: &Cel
         );
     }
     let mut actual = base.clone();
-    assert!(actual.set_ascii_cells(start, text, attrs, 42));
-    assert_eq!(actual, expected, "start={start}, text={text:?}");
+    actual.set_printable_ascii_cells(start, text, attrs, 42);
+    assert_same_row(&actual, &expected, (start, text));
     assert_eq!(
         actual.semantic_zone_ranges(),
         expected.semantic_zone_ranges()
@@ -1023,18 +1222,8 @@ fn ascii_append_keeps_compact_storage_and_splits_full_attribute_clusters() {
     for len in [65534, 65535, 65536, 131073] {
         let text = "x".repeat(len);
         check_ascii_against_scalar(&base, base.len(), &text, &attrs);
-        assert!(base.set_ascii_cells(base.len(), &text, &attrs, 42));
+        base.set_printable_ascii_cells(base.len(), &text, &attrs, 42);
         assert!(base.is_compressed_for_scrollback());
-    }
-}
-
-#[test]
-fn invalid_ascii_input_is_rejected_without_mutating_the_line() {
-    for text in ["a\nb", "a\0b", "a\x7fb", "a界", "e\u{301}"] {
-        let mut line: Line = "original".into();
-        let original = line.clone();
-        assert!(!line.set_ascii_cells(3, text, &CellAttributes::default(), 42));
-        assert_eq!(line, original);
     }
 }
 
@@ -1091,7 +1280,7 @@ fn blank_fill_to_the_end_matches_scalar_writes_then_prune() {
                         expected.set_cell(x, Cell::blank(), 7);
                     }
                     expected.prune_trailing_blanks(7);
-                    assert_eq!(actual, expected, "text={text:?} {start}..{end}");
+                    assert_same_row(&actual, &expected, (text, start, end));
                 }
             }
         }
@@ -1215,7 +1404,7 @@ fn grapheme_runs_match_one_grapheme_at_a_time() {
                                 };
                                 let can = actual.can_append_grapheme_run(idx);
                                 let appended = actual.append_grapheme_run(
-                                    idx, &text, max_len, cells, &wide, last, attrs, 5,
+                                    idx, &text, max_len, cells, &wide, last, attrs, false, 5,
                                 );
                                 // Refused where the text's growth would depend
                                 // on each grapheme's length: one longer than the
