@@ -8,6 +8,8 @@ const MAX_CAPACITY: usize = 1024 * 1024;
 const IDLE_RELEASE: Duration = Duration::from_millis(100);
 /// One PTY read. A parser that keeps the queue this short is keeping up.
 const KEPT_CAPACITY: usize = 64 * 1024;
+/// How long the parser leaves a flood of output before looking at it again.
+const FLOOD_WAIT: Duration = Duration::from_micros(200);
 
 struct State {
     bytes: VecDeque<u8>,
@@ -15,6 +17,9 @@ struct State {
     last_backlog: Instant,
     writer_open: bool,
     reader_open: bool,
+    /// The parser is following a flood of output, and comes back for it
+    /// without being told: see `OutputSender::write_all_flooding`.
+    flooding: bool,
 }
 
 impl State {
@@ -50,6 +55,7 @@ fn channel_with_capacity(capacity: usize) -> (OutputSender, OutputReceiver) {
             last_backlog: Instant::now(),
             writer_open: true,
             reader_open: true,
+            flooding: false,
         }),
         readable: Condvar::new(),
         writable: Condvar::new(),
@@ -58,8 +64,20 @@ fn channel_with_capacity(capacity: usize) -> (OutputSender, OutputReceiver) {
     (OutputSender(Arc::clone(&shared)), OutputReceiver(shared))
 }
 
-impl Write for OutputSender {
-    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+impl OutputSender {
+    /// `write_all` of output with more behind it. The parser is told once,
+    /// and comes back on its own until the flood runs dry: waking it costs
+    /// the reader more than reading does, and a reader that is keeping up
+    /// would have to wake it again for every little it reads.
+    pub(crate) fn write_all_flooding(&mut self, mut data: &[u8]) -> io::Result<()> {
+        while !data.is_empty() {
+            let written = self.queue(data, true)?;
+            data = &data[written..];
+        }
+        Ok(())
+    }
+
+    fn queue(&mut self, data: &[u8], flooding: bool) -> io::Result<usize> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -83,13 +101,20 @@ impl Write for OutputSender {
             let additional = capacity - state.bytes.len();
             state.bytes.reserve_exact(additional);
         }
-        let was_empty = state.bytes.is_empty();
+        let wake = state.bytes.is_empty() && !(flooding && state.flooding);
+        state.flooding |= flooding;
         state.bytes.extend(data[..len].iter().copied());
         drop(state);
-        if was_empty {
+        if wake {
             shared.readable.notify_one();
         }
         Ok(len)
+    }
+}
+
+impl Write for OutputSender {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.queue(data, false)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -134,6 +159,11 @@ impl OutputReceiver {
         let shared = &self.0;
         let mut state = shared.state.lock();
         while state.bytes.is_empty() && state.writer_open {
+            if state.flooding {
+                let timed_out = shared.readable.wait_for(&mut state, FLOOD_WAIT).timed_out();
+                state.flooding = !timed_out || !state.bytes.is_empty();
+                continue;
+            }
             if shared
                 .readable
                 .wait_for(&mut state, IDLE_RELEASE)
@@ -176,8 +206,16 @@ impl OutputReceiver {
         let deadline = Instant::now() + timeout;
         let mut state = self.0.state.lock();
         while state.bytes.is_empty() && state.writer_open {
-            if self.0.readable.wait_until(&mut state, deadline).timed_out() {
-                break;
+            let look = if state.flooding {
+                deadline.min(Instant::now() + FLOOD_WAIT)
+            } else {
+                deadline
+            };
+            if self.0.readable.wait_until(&mut state, look).timed_out() {
+                if look == deadline {
+                    break;
+                }
+                state.flooding = !state.bytes.is_empty();
             }
         }
         !state.bytes.is_empty() || !state.writer_open
@@ -203,6 +241,70 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::thread;
+
+    /// Each write of a flood has to reach a parser that finished the one
+    /// before and went back to waiting, with only the first of them told.
+    #[test]
+    fn a_flood_reaches_the_parser_without_it_being_told() {
+        let (mut tx, mut rx) = channel();
+        let (done, finished) = mpsc::channel();
+        let parser = thread::spawn(move || {
+            let mut data = [0; 8];
+            for _ in 0..3 {
+                let size = rx.read(&mut data).unwrap();
+                done.send(data[..size].to_vec()).unwrap();
+            }
+        });
+        // A parser settled in its long wait, then a flood with too little
+        // time between writes for the idle timeout to find any of it.
+        thread::sleep(Duration::from_millis(20));
+        for text in [b"one", b"two"] {
+            tx.write_all_flooding(text).unwrap();
+            assert_eq!(
+                finished.recv_timeout(Duration::from_millis(50)).unwrap(),
+                text
+            );
+        }
+        // The flood over, the parser goes back to being told.
+        thread::sleep(Duration::from_millis(20));
+        tx.write_all(b"typed").unwrap();
+        assert_eq!(
+            finished.recv_timeout(Duration::from_millis(50)).unwrap(),
+            b"typed"
+        );
+        parser.join().unwrap();
+    }
+
+    #[test]
+    fn a_wait_for_more_output_follows_a_flood() {
+        let (mut tx, mut rx) = channel();
+        tx.write_all_flooding(b"x").unwrap();
+        rx.read(&mut [0; 8]).unwrap();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            tx.write_all_flooding(b"y").unwrap();
+            tx
+        });
+        let started = Instant::now();
+        assert!(rx.wait_readable(Duration::from_secs(5)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(writer.join().unwrap());
+    }
+
+    #[test]
+    fn a_flood_gets_through_a_full_queue() {
+        let (mut tx, mut rx) = channel_with_capacity(4);
+        let writer = thread::spawn(move || {
+            tx.write_all_flooding(b"abcdefgh").unwrap();
+        });
+        let mut data = [0; 8];
+        let mut read = 0;
+        while read < 8 {
+            read += rx.read(&mut data[read..]).unwrap();
+        }
+        assert_eq!(&data, b"abcdefgh");
+        writer.join().unwrap();
+    }
 
     #[test]
     fn output_keeps_order_across_wrap_partial_reads_and_eof() {

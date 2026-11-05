@@ -677,6 +677,10 @@ impl Drop for TabGeometryTransaction<'_> {
 /// a large parser batch, which would pin excess memory per pane.
 const PTY_READ_BUFSIZE: usize = 64 * 1024;
 
+/// What a read of a pty with more waiting comes to: as much as macOS gives at
+/// a time, and less than Linux does.
+const FULL_PTY_READ: usize = 1024;
+
 /// Bytes of external kitty payloads one flush may read into memory. A
 /// parser that fell behind a frame stream finds hundreds of frame escapes
 /// in a single read; reading every file they name held gigabytes for
@@ -1221,6 +1225,10 @@ fn read_from_pane_pty(
         tx.write_all(banner.as_bytes()).ok();
     }
 
+    // What comes from elsewhere is not read in pty-sized pieces, and a parser
+    // left to come back on its own needs finer timers than Windows has.
+    let can_flood = cfg!(unix) && pty_fd.is_some();
+
     while !dead.load(Ordering::Relaxed) {
         #[cfg(windows)]
         if let Some(control) = &control {
@@ -1306,7 +1314,14 @@ fn read_from_pane_pty(
                 if let Some(control) = &control {
                     control.pending_bytes.fetch_add(size, Ordering::SeqCst);
                 }
-                if let Err(err) = tx.write_all(&buf[..size]) {
+                // A full read says more is coming, and the wake is the most
+                // expensive part of a read. Anything less goes straight on.
+                let written = if can_flood && size >= FULL_PTY_READ {
+                    tx.write_all_flooding(&buf[..size])
+                } else {
+                    tx.write_all(&buf[..size])
+                };
+                if let Err(err) = written {
                     if let Some(control) = &control {
                         control.pending_bytes.fetch_sub(size, Ordering::SeqCst);
                     }
