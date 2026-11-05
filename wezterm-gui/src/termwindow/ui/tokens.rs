@@ -132,6 +132,10 @@ pub const PANE_NAV_INSET: usize = 10;
 pub const PANE_NAV_ICON_GAP: usize = 8;
 pub const PANE_NAV_BUTTON_GAP: usize = 4;
 pub const PANE_NAV_TAB_GAP: usize = 18;
+/// Corner radius of a terminal whose program paints its own background.
+/// The grid is inset from the window by `window_padding`, so this can round
+/// the painted surface without touching the outer window frame.
+pub const TERMINAL_GRID_CORNER_RADIUS: f32 = 16.0;
 pub const PANE_NAV_TAB_RADIUS: f32 = 999.0;
 /// Icon in the nav bar's trailing action buttons. Kept apart from
 /// `TAB_ICON_SIZE`: these are buttons, not tabs, and want their own weight.
