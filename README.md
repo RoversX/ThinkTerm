@@ -81,21 +81,21 @@ ThinkTerm was measured with its local mux: the shell runs in the mux server, and
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/performance-dark.svg">
-    <img src="assets/performance-light.svg" alt="ThinkTerm throughput compared with WezTerm in six kitten benchmark workloads: ThinkTerm is faster in five, from 1.3× to 5.7×, and level on images (1.0×)" width="100%">
+    <img src="assets/performance-light.svg" alt="ThinkTerm throughput compared with WezTerm in six kitten benchmark workloads: ThinkTerm is faster in five, from 1.1× to 8.7×, and slower on images (0.80×)" width="100%">
   </picture>
 </p>
 
 <details>
 <summary>Table data</summary>
 
-| Workload | ThinkTerm 0.4.1<br>2026-11-04 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | Ratio |
+| Workload | ThinkTerm 0.4.2<br>2026-11-05 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | Ratio |
 | --- | ---: | ---: | ---: |
-| Only ASCII chars | **134.0** | 23.6 | 5.7× |
-| Unicode chars | **109.2** | 46.7 | 2.3× |
-| Unique multi-codepoint Unicode cells | **234.4** | 49.3 | 4.8× |
-| CSI codes with few chars | **53.5** | 15.6 | 3.4× |
-| Long escape codes | **257.3** | 194.9 | 1.3× |
-| Images | **271.0** | 270.5 | 1.0× |
+| Only ASCII chars | **206.1** | 23.6 | 8.7× |
+| Unicode chars | **192.4** | 46.7 | 4.1× |
+| Unique multi-codepoint Unicode cells | **200.9** | 49.3 | 4.1× |
+| CSI codes with few chars | **90.9** | 15.6 | 5.8× |
+| Long escape codes | **219.3** | 194.9 | 1.1× |
+| Images | 216.4 | **270.5** | 0.80× |
 
 </details>
 
@@ -121,26 +121,26 @@ On Linux, compared with kitty on Ubuntu 20.04 (i9-12900K), at 180×50 with `TERM
 
 </details>
 
-Progress across versions on the same Mac. Ratio compares 0.4.1 with the early build.
+Progress across versions on the same Mac. Ratio compares 0.4.2 with the early build.
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/performance-progress-dark.svg">
-    <img src="assets/performance-progress-light.svg" alt="ThinkTerm throughput across versions in six kitten benchmark workloads, from an early build through 0.3.0 to 0.4.1: 0.4.1 is ahead of the early build in all six, from 1.2× to 3.5×" width="100%">
+    <img src="assets/performance-progress-light.svg" alt="ThinkTerm throughput across versions in six kitten benchmark workloads, from an early build through 0.3.0 and 0.4.1 to 0.4.2: 0.4.2 is ahead of the early build in four, from 3.0× to 4.5×, and level on long escape codes and images" width="100%">
   </picture>
 </p>
 
 <details>
 <summary>Table data</summary>
 
-| Workload | ThinkTerm early<br>2026-09 | ThinkTerm 0.3.0<br>2026-10-21 | ThinkTerm 0.4.1<br>2026-11-04 | Ratio |
-| --- | ---: | ---: | ---: | ---: |
-| Only ASCII chars | 45.3 | 133.0 | **134.0** | 3.0× |
-| Unicode chars | 52.2 | 104.5 | **109.2** | 2.1× |
-| Unique multi-codepoint Unicode cells | 67.8 | 197.5 | **234.4** | 3.5× |
-| CSI codes with few chars | 25.7 | 49.5 | **53.5** | 2.1× |
-| Long escape codes | 219.4 | 213.8 | **257.3** | 1.2× |
-| Images | 218.0 | 257.2 | **271.0** | 1.2× |
+| Workload | ThinkTerm early<br>2026-09 | ThinkTerm 0.3.0<br>2026-10-21 | ThinkTerm 0.4.1<br>2026-11-04 | ThinkTerm 0.4.2<br>2026-11-05 | Ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Only ASCII chars | 45.3 | 133.0 | 134.0 | **206.1** | 4.5× |
+| Unicode chars | 52.2 | 104.5 | 109.2 | **192.4** | 3.7× |
+| Unique multi-codepoint Unicode cells | 67.8 | 197.5 | 234.4 | **200.9** | 3.0× |
+| CSI codes with few chars | 25.7 | 49.5 | 53.5 | **90.9** | 3.5× |
+| Long escape codes | 219.4 | 213.8 | 257.3 | **219.3** | 1.00× |
+| Images | 218.0 | 257.2 | 271.0 | **216.4** | 0.99× |
 
 </details>
 

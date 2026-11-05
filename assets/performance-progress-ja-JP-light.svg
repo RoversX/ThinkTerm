@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 738" width="1000" height="738" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 870" width="1000" height="870" role="img" aria-labelledby="t d">
 <title id="t">バージョンごとの ThinkTerm</title>
-<desc id="d">kitten __benchmark__ · Mac · M1 Pro · MB/s、大きいほど高速. ASCII 文字のみ: ThinkTerm early 45.3, ThinkTerm 0.3.0 133.0, ThinkTerm 0.4.1 134.0 (3.0×); Unicode 文字: ThinkTerm early 52.2, ThinkTerm 0.3.0 104.5, ThinkTerm 0.4.1 109.2 (2.1×); 複数コードポイントの Unicode セル: ThinkTerm early 67.8, ThinkTerm 0.3.0 197.5, ThinkTerm 0.4.1 234.4 (3.5×); 文字の少ない CSI シーケンス: ThinkTerm early 25.7, ThinkTerm 0.3.0 49.5, ThinkTerm 0.4.1 53.5 (2.1×); 長いエスケープシーケンス: ThinkTerm early 219.4, ThinkTerm 0.3.0 213.8, ThinkTerm 0.4.1 257.3 (1.2×); 画像: ThinkTerm early 218.0, ThinkTerm 0.3.0 257.2, ThinkTerm 0.4.1 271.0 (1.2×).</desc>
+<desc id="d">kitten __benchmark__ · Mac · M1 Pro · MB/s、大きいほど高速. ASCII 文字のみ: early 45.3, 0.3.0 133.0, 0.4.1 134.0, 0.4.2 206.1 (4.5×); Unicode 文字: early 52.2, 0.3.0 104.5, 0.4.1 109.2, 0.4.2 192.4 (3.7×); 複数コードポイントの Unicode セル: early 67.8, 0.3.0 197.5, 0.4.1 234.4, 0.4.2 200.9 (3.0×); 文字の少ない CSI シーケンス: early 25.7, 0.3.0 49.5, 0.4.1 53.5, 0.4.2 90.9 (3.5×); 長いエスケープシーケンス: early 219.4, 0.3.0 213.8, 0.4.1 257.3, 0.4.2 219.3 (1.00×); 画像: early 218.0, 0.3.0 257.2, 0.4.1 271.0, 0.4.2 216.4 (0.99×).</desc>
 <defs>
 <linearGradient id="ours" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#0071e3"/><stop offset="1" stop-color="#2b8cff"/></linearGradient>
 <filter id="glow" x="-10%" y="-80%" width="120%" height="300%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#0071e3" flood-opacity="0.28"/></filter>
@@ -20,88 +20,103 @@ text { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro
 .ours { fill: url(#ours); }
 .ours-bar { fill: url(#ours); filter: url(#glow); }
 .theirs { fill: #c7c7cc; }
-.mid { fill: #9cc6f7; }
+.mid0 { fill: #c9e0fb; }
+.mid1 { fill: #8fbff6; }
 .win { fill: #e8f1ff; stroke: #c4d7f6; }
 .win-t { font-size: 14px; font-weight: 700; fill: #0071e3; }
 .even { fill: #f5f5f7; stroke: #e3e3e8; }
 .even-t { font-size: 14px; font-weight: 700; fill: #6e6e73; }
 </style>
-<rect x="0.5" y="0.5" width="999" height="737" rx="28" fill="#ffffff" stroke="#d2d2d7"/>
+<rect x="0.5" y="0.5" width="999" height="869" rx="28" fill="#ffffff" stroke="#d2d2d7"/>
 <text x="500" y="62" class="headline" text-anchor="middle">バージョンごとの ThinkTerm</text>
 <text x="500" y="92" class="subhead" text-anchor="middle">kitten __benchmark__ · Mac · M1 Pro · MB/s、大きいほど高速</text>
 <rect x="72" y="122" width="22" height="12" rx="6" class="theirs"/>
-<text x="102" y="132" class="legend">ThinkTerm early · 2026-09</text>
-<rect x="307" y="122" width="22" height="12" rx="6" class="mid"/>
-<text x="337" y="132" class="legend">ThinkTerm 0.3.0 · 2026-10-21</text>
-<rect x="563" y="122" width="22" height="12" rx="6" class="ours"/>
-<text x="593" y="132" class="legend">ThinkTerm 0.4.1 · 2026-11-04</text>
+<text x="102" y="132" class="legend">early · 2026-09</text>
+<rect x="237" y="122" width="22" height="12" rx="6" class="mid0"/>
+<text x="267" y="132" class="legend">0.3.0 · 2026-10-21</text>
+<rect x="423" y="122" width="22" height="12" rx="6" class="mid1"/>
+<text x="453" y="132" class="legend">0.4.1 · 2026-11-04</text>
+<rect x="609" y="122" width="22" height="12" rx="6" class="ours"/>
+<text x="639" y="132" class="legend">0.4.2 · 2026-11-05</text>
 <text x="912" y="132" class="legend" text-anchor="middle">倍率</text>
-<line x1="450.3" y1="164" x2="450.3" y2="672" class="grid"/>
-<text x="450.3" y="692" class="tick" text-anchor="middle">50</text>
-<line x1="528.7" y1="164" x2="528.7" y2="672" class="grid"/>
-<text x="528.7" y="692" class="tick" text-anchor="middle">100</text>
-<line x1="607.0" y1="164" x2="607.0" y2="672" class="grid"/>
-<text x="607.0" y="692" class="tick" text-anchor="middle">150</text>
-<line x1="685.3" y1="164" x2="685.3" y2="672" class="grid"/>
-<text x="685.3" y="692" class="tick" text-anchor="middle">200</text>
-<line x1="763.7" y1="164" x2="763.7" y2="672" class="grid"/>
-<text x="763.7" y="692" class="tick" text-anchor="middle">250</text>
-<line x1="842.0" y1="164" x2="842.0" y2="672" class="grid"/>
-<text x="842.0" y="692" class="tick" text-anchor="middle">300</text>
-<line x1="372" y1="164" x2="372" y2="672" class="axis"/>
-<text x="372" y="692" class="tick" text-anchor="middle">0</text>
-<text x="350" y="212.0" class="label" text-anchor="end">ASCII 文字のみ</text>
+<line x1="450.3" y1="164" x2="450.3" y2="804" class="grid"/>
+<text x="450.3" y="824" class="tick" text-anchor="middle">50</text>
+<line x1="528.7" y1="164" x2="528.7" y2="804" class="grid"/>
+<text x="528.7" y="824" class="tick" text-anchor="middle">100</text>
+<line x1="607.0" y1="164" x2="607.0" y2="804" class="grid"/>
+<text x="607.0" y="824" class="tick" text-anchor="middle">150</text>
+<line x1="685.3" y1="164" x2="685.3" y2="804" class="grid"/>
+<text x="685.3" y="824" class="tick" text-anchor="middle">200</text>
+<line x1="763.7" y1="164" x2="763.7" y2="804" class="grid"/>
+<text x="763.7" y="824" class="tick" text-anchor="middle">250</text>
+<line x1="842.0" y1="164" x2="842.0" y2="804" class="grid"/>
+<text x="842.0" y="824" class="tick" text-anchor="middle">300</text>
+<line x1="372" y1="164" x2="372" y2="804" class="axis"/>
+<text x="372" y="824" class="tick" text-anchor="middle">0</text>
+<text x="350" y="222.5" class="label" text-anchor="end">ASCII 文字のみ</text>
 <rect x="372" y="178" width="71.0" height="16" rx="8.0" class="theirs"/>
 <text x="451.0" y="190.5" class="val-theirs">45.3</text>
-<rect x="372" y="199" width="208.4" height="16" rx="8.0" class="mid"/>
+<rect x="372" y="199" width="208.4" height="16" rx="8.0" class="mid0"/>
 <text x="588.4" y="211.5" class="val-theirs">133.0</text>
-<rect x="372" y="220" width="209.9" height="16" rx="8.0" class="ours-bar"/>
-<text x="589.9" y="232.5" class="val-ours">134.0</text>
-<rect x="878" y="193.0" width="68" height="28" rx="14" class="win"/>
-<text x="912" y="212.0" class="win-t" text-anchor="middle">3.0×</text>
-<text x="350" y="296.0" class="label" text-anchor="end">Unicode 文字</text>
-<rect x="372" y="262" width="81.8" height="16" rx="8.0" class="theirs"/>
-<text x="461.8" y="274.5" class="val-theirs">52.2</text>
-<rect x="372" y="283" width="163.7" height="16" rx="8.0" class="mid"/>
-<text x="543.7" y="295.5" class="val-theirs">104.5</text>
-<rect x="372" y="304" width="171.1" height="16" rx="8.0" class="ours-bar"/>
-<text x="551.1" y="316.5" class="val-ours">109.2</text>
-<rect x="878" y="277.0" width="68" height="28" rx="14" class="win"/>
-<text x="912" y="296.0" class="win-t" text-anchor="middle">2.1×</text>
-<text x="350" y="380.0" class="label" text-anchor="end">複数コードポイントの Unicode セル</text>
-<rect x="372" y="346" width="106.2" height="16" rx="8.0" class="theirs"/>
-<text x="486.2" y="358.5" class="val-theirs">67.8</text>
-<rect x="372" y="367" width="309.4" height="16" rx="8.0" class="mid"/>
-<text x="689.4" y="379.5" class="val-theirs">197.5</text>
-<rect x="372" y="388" width="367.2" height="16" rx="8.0" class="ours-bar"/>
-<text x="747.2" y="400.5" class="val-ours">234.4</text>
-<rect x="878" y="361.0" width="68" height="28" rx="14" class="win"/>
-<text x="912" y="380.0" class="win-t" text-anchor="middle">3.5×</text>
-<text x="350" y="464.0" class="label" text-anchor="end">文字の少ない CSI シーケンス</text>
-<rect x="372" y="430" width="40.3" height="16" rx="8.0" class="theirs"/>
-<text x="420.3" y="442.5" class="val-theirs">25.7</text>
-<rect x="372" y="451" width="77.6" height="16" rx="8.0" class="mid"/>
-<text x="457.6" y="463.5" class="val-theirs">49.5</text>
-<rect x="372" y="472" width="83.8" height="16" rx="8.0" class="ours-bar"/>
-<text x="463.8" y="484.5" class="val-ours">53.5</text>
-<rect x="878" y="445.0" width="68" height="28" rx="14" class="win"/>
-<text x="912" y="464.0" class="win-t" text-anchor="middle">2.1×</text>
-<text x="350" y="548.0" class="label" text-anchor="end">長いエスケープシーケンス</text>
-<rect x="372" y="514" width="343.7" height="16" rx="8.0" class="theirs"/>
-<text x="723.7" y="526.5" class="val-theirs">219.4</text>
-<rect x="372" y="535" width="335.0" height="16" rx="8.0" class="mid"/>
-<text x="715.0" y="547.5" class="val-theirs">213.8</text>
-<rect x="372" y="556" width="403.1" height="16" rx="8.0" class="ours-bar"/>
-<text x="783.1" y="568.5" class="val-ours">257.3</text>
-<rect x="878" y="529.0" width="68" height="28" rx="14" class="win"/>
-<text x="912" y="548.0" class="win-t" text-anchor="middle">1.2×</text>
-<text x="350" y="632.0" class="label" text-anchor="end">画像</text>
-<rect x="372" y="598" width="341.5" height="16" rx="8.0" class="theirs"/>
-<text x="721.5" y="610.5" class="val-theirs">218.0</text>
-<rect x="372" y="619" width="402.9" height="16" rx="8.0" class="mid"/>
-<text x="782.9" y="631.5" class="val-theirs">257.2</text>
-<rect x="372" y="640" width="424.6" height="16" rx="8.0" class="ours-bar"/>
-<text x="804.6" y="652.5" class="val-ours">271.0</text>
-<rect x="878" y="613.0" width="68" height="28" rx="14" class="win"/>
-<text x="912" y="632.0" class="win-t" text-anchor="middle">1.2×</text>
+<rect x="372" y="220" width="209.9" height="16" rx="8.0" class="mid1"/>
+<text x="589.9" y="232.5" class="val-theirs">134.0</text>
+<rect x="372" y="241" width="322.9" height="16" rx="8.0" class="ours-bar"/>
+<text x="702.9" y="253.5" class="val-ours">206.1</text>
+<rect x="878" y="203.5" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="222.5" class="win-t" text-anchor="middle">4.5×</text>
+<text x="350" y="328.5" class="label" text-anchor="end">Unicode 文字</text>
+<rect x="372" y="284" width="81.8" height="16" rx="8.0" class="theirs"/>
+<text x="461.8" y="296.5" class="val-theirs">52.2</text>
+<rect x="372" y="305" width="163.7" height="16" rx="8.0" class="mid0"/>
+<text x="543.7" y="317.5" class="val-theirs">104.5</text>
+<rect x="372" y="326" width="171.1" height="16" rx="8.0" class="mid1"/>
+<text x="551.1" y="338.5" class="val-theirs">109.2</text>
+<rect x="372" y="347" width="301.4" height="16" rx="8.0" class="ours-bar"/>
+<text x="681.4" y="359.5" class="val-ours">192.4</text>
+<rect x="878" y="309.5" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="328.5" class="win-t" text-anchor="middle">3.7×</text>
+<text x="350" y="434.5" class="label" text-anchor="end">複数コードポイントの Unicode セル</text>
+<rect x="372" y="390" width="106.2" height="16" rx="8.0" class="theirs"/>
+<text x="486.2" y="402.5" class="val-theirs">67.8</text>
+<rect x="372" y="411" width="309.4" height="16" rx="8.0" class="mid0"/>
+<text x="689.4" y="423.5" class="val-theirs">197.5</text>
+<rect x="372" y="432" width="367.2" height="16" rx="8.0" class="mid1"/>
+<text x="747.2" y="444.5" class="val-theirs">234.4</text>
+<rect x="372" y="453" width="314.7" height="16" rx="8.0" class="ours-bar"/>
+<text x="694.7" y="465.5" class="val-ours">200.9</text>
+<rect x="878" y="415.5" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="434.5" class="win-t" text-anchor="middle">3.0×</text>
+<text x="350" y="540.5" class="label" text-anchor="end">文字の少ない CSI シーケンス</text>
+<rect x="372" y="496" width="40.3" height="16" rx="8.0" class="theirs"/>
+<text x="420.3" y="508.5" class="val-theirs">25.7</text>
+<rect x="372" y="517" width="77.6" height="16" rx="8.0" class="mid0"/>
+<text x="457.6" y="529.5" class="val-theirs">49.5</text>
+<rect x="372" y="538" width="83.8" height="16" rx="8.0" class="mid1"/>
+<text x="463.8" y="550.5" class="val-theirs">53.5</text>
+<rect x="372" y="559" width="142.4" height="16" rx="8.0" class="ours-bar"/>
+<text x="522.4" y="571.5" class="val-ours">90.9</text>
+<rect x="878" y="521.5" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="540.5" class="win-t" text-anchor="middle">3.5×</text>
+<text x="350" y="646.5" class="label" text-anchor="end">長いエスケープシーケンス</text>
+<rect x="372" y="602" width="343.7" height="16" rx="8.0" class="theirs"/>
+<text x="723.7" y="614.5" class="val-theirs">219.4</text>
+<rect x="372" y="623" width="335.0" height="16" rx="8.0" class="mid0"/>
+<text x="715.0" y="635.5" class="val-theirs">213.8</text>
+<rect x="372" y="644" width="403.1" height="16" rx="8.0" class="mid1"/>
+<text x="783.1" y="656.5" class="val-theirs">257.3</text>
+<rect x="372" y="665" width="343.6" height="16" rx="8.0" class="ours-bar"/>
+<text x="723.6" y="677.5" class="val-ours">219.3</text>
+<rect x="878" y="627.5" width="68" height="28" rx="14" class="even"/>
+<text x="912" y="646.5" class="even-t" text-anchor="middle">1.00×</text>
+<text x="350" y="752.5" class="label" text-anchor="end">画像</text>
+<rect x="372" y="708" width="341.5" height="16" rx="8.0" class="theirs"/>
+<text x="721.5" y="720.5" class="val-theirs">218.0</text>
+<rect x="372" y="729" width="402.9" height="16" rx="8.0" class="mid0"/>
+<text x="782.9" y="741.5" class="val-theirs">257.2</text>
+<rect x="372" y="750" width="424.6" height="16" rx="8.0" class="mid1"/>
+<text x="804.6" y="762.5" class="val-theirs">271.0</text>
+<rect x="372" y="771" width="339.0" height="16" rx="8.0" class="ours-bar"/>
+<text x="719.0" y="783.5" class="val-ours">216.4</text>
+<rect x="878" y="733.5" width="68" height="28" rx="14" class="even"/>
+<text x="912" y="752.5" class="even-t" text-anchor="middle">0.99×</text>
 </svg>

@@ -15,18 +15,18 @@ CHARTS = [
     dict(
         prefix="performance",
         rival="WezTerm",
-        legend=("ThinkTerm 0.4.1 · 2026-11-04", "WezTerm 20260117 · 2026-09-23"),
+        legend=("ThinkTerm 0.4.2 · 2026-11-05", "WezTerm 20260117 · 2026-09-23"),
         machine="Mac · M1 Pro",
         caption="mac",
         scale_max=300,
         # workload: (ThinkTerm MB/s, rival MB/s)
         results={
-            "ascii": (134.0, 23.6),
-            "unicode": (109.2, 46.7),
-            "multi": (234.4, 49.3),
-            "csi": (53.5, 15.6),
-            "long": (257.3, 194.9),
-            "images": (271.0, 270.5),
+            "ascii": (206.1, 23.6),
+            "unicode": (192.4, 46.7),
+            "multi": (200.9, 49.3),
+            "csi": (90.9, 15.6),
+            "long": (219.3, 194.9),
+            "images": (216.4, 270.5),
         },
     ),
     dict(
@@ -47,22 +47,23 @@ CHARTS = [
     dict(
         prefix="performance-progress",
         legend=(
-            "ThinkTerm early · 2026-09",
-            "ThinkTerm 0.3.0 · 2026-10-21",
-            "ThinkTerm 0.4.1 · 2026-11-04",
+            "early · 2026-09",
+            "0.3.0 · 2026-10-21",
+            "0.4.1 · 2026-11-04",
+            "0.4.2 · 2026-11-05",
         ),
         machine="Mac · M1 Pro",
         caption="progress",
         scale_max=300,
-        row_height=84,
-        # workload: (early MB/s, earlier MB/s, latest MB/s)
+        row_height=106,
+        # workload: one MB/s per entry in legend, oldest first
         results={
-            "ascii": (45.3, 133.0, 134.0),
-            "unicode": (52.2, 104.5, 109.2),
-            "multi": (67.8, 197.5, 234.4),
-            "csi": (25.7, 49.5, 53.5),
-            "long": (219.4, 213.8, 257.3),
-            "images": (218.0, 257.2, 271.0),
+            "ascii": (45.3, 133.0, 134.0, 206.1),
+            "unicode": (52.2, 104.5, 109.2, 192.4),
+            "multi": (67.8, 197.5, 234.4, 200.9),
+            "csi": (25.7, 49.5, 53.5, 90.9),
+            "long": (219.4, 213.8, 257.3, 219.3),
+            "images": (218.0, 257.2, 271.0, 216.4),
         },
     ),
 ]
@@ -170,13 +171,13 @@ LANGS = {
 THEMES = {
     "light": dict(
         card="#ffffff", card_edge="#d2d2d7", ink="#1d1d1f", sub="#6e6e73", faint="#86868b",
-        grid="#ececf0", axis="#d2d2d7", ours_a="#2b8cff", ours_b="#0071e3", theirs="#c7c7cc", mid="#9cc6f7",
+        grid="#ececf0", axis="#d2d2d7", ours_a="#2b8cff", ours_b="#0071e3", theirs="#c7c7cc", mids=("#c9e0fb", "#8fbff6"),
         win_fill="#e8f1ff", win_edge="#c4d7f6", win_ink="#0071e3",
         even_fill="#f5f5f7", even_edge="#e3e3e8", even_ink="#6e6e73", glow=0.28,
     ),
     "dark": dict(
         card="#000000", card_edge="#2c2c2e", ink="#f5f5f7", sub="#a1a1a6", faint="#8e8e93",
-        grid="#1c1c1e", axis="#3a3a3c", ours_a="#5fb0ff", ours_b="#2f8cff", theirs="#48484a", mid="#2c5f9e",
+        grid="#1c1c1e", axis="#3a3a3c", ours_a="#5fb0ff", ours_b="#2f8cff", theirs="#48484a", mids=("#1d3f6b", "#2f6bb3"),
         win_fill="#0b1f3d", win_edge="#1f4a85", win_ink="#4da3ff",
         even_fill="#1c1c1e", even_edge="#3a3a3c", even_ink="#a1a1a6", glow=0.5,
     ),
@@ -255,8 +256,10 @@ def build(chart, lang, t):
     o.append('.ours { fill: url(#ours); }')
     o.append('.ours-bar { fill: url(#ours); filter: url(#glow); }')
     o.append(f'.theirs {{ fill: {c["theirs"]}; }}')
-    if progress:
-        o.append(f'.mid {{ fill: {c["mid"]}; }}')
+    # Between the oldest and the newest, each version a step nearer the newest.
+    mids = c["mids"][-(len(chart["legend"]) - 2):] if progress else ()
+    for i, colour in enumerate(mids):
+        o.append(f'.mid{i} {{ fill: {colour}; }}')
     o.append(f'.win {{ fill: {c["win_fill"]}; stroke: {c["win_edge"]}; }}')
     o.append(f'.win-t {{ font-size: 14px; font-weight: 700; fill: {c["win_ink"]}; }}')
     o.append(f'.even {{ fill: {c["even_fill"]}; stroke: {c["even_edge"]}; }}')
@@ -269,7 +272,7 @@ def build(chart, lang, t):
     # legend
     ly = 132
     if progress:
-        bars = ("theirs", "mid", "ours")
+        bars = ("theirs", *(f"mid{i}" for i in range(len(mids))), "ours")
         lx = 72
     else:
         bars = ("ours", "theirs")
