@@ -1,6 +1,6 @@
 # ThinkTerm
 
-[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · **Français** · [Deutsch](README.de-DE.md)
+[English](../README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · **Français** · [Deutsch](README.de-DE.md)
 
 ## 📥 Téléchargement
 
@@ -26,21 +26,21 @@ ThinkTerm est un **terminal open source avec multiplexeur intégré, écrit en R
 <table>
   <tr>
     <td width="50%" align="center">
-      <img src="assets/screenshots/workspace.jpeg" alt="Terminaux divisés, aperçu du code et arborescence du projet" width="100%">
+      <img src="../assets/screenshots/workspace.jpeg" alt="Terminaux divisés, aperçu du code et arborescence du projet" width="100%">
       <br><strong>Espace de travail du projet</strong>
     </td>
     <td width="50%" align="center">
-      <img src="assets/screenshots/agents.jpeg" alt="État des agents à côté du terminal distant et des espaces de travail" width="100%">
+      <img src="../assets/screenshots/agents.jpeg" alt="État des agents à côté du terminal distant et des espaces de travail" width="100%">
       <br><strong>Agents sur plusieurs machines</strong>
     </td>
   </tr>
   <tr>
     <td width="50%" align="center">
-      <img src="assets/screenshots/overview.jpeg" alt="Aperçus des terminaux en direct regroupés par Space" width="100%">
+      <img src="../assets/screenshots/overview.jpeg" alt="Aperçus des terminaux en direct regroupés par Space" width="100%">
       <br><strong>Vue d’ensemble des sessions</strong>
     </td>
     <td width="50%" align="center">
-      <img src="assets/screenshots/spaces.jpeg" alt="Sélecteur de Space à côté des Threads du projet" width="100%">
+      <img src="../assets/screenshots/spaces.jpeg" alt="Sélecteur de Space à côté des Threads du projet" width="100%">
       <br><strong>Espaces</strong>
     </td>
   </tr>
@@ -50,8 +50,8 @@ ThinkTerm est un **terminal open source avec multiplexeur intégré, écrit en R
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg">
-    <img src="assets/architecture-light.svg" alt="Architecture simplifiée de ThinkTerm : l’application de bureau, la TUI et la CLI, le navigateur et les applications mobiles se connectent au serveur mux de chaque machine ; les machines peuvent se joindre entre elles, et l’application de bureau rejoint aussi des hôtes SSH et Mosh classiques" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="../assets/architecture-dark.svg">
+    <img src="../assets/architecture-light.svg" alt="Architecture simplifiée de ThinkTerm : l’application de bureau, la TUI et la CLI, le navigateur et les applications mobiles se connectent au serveur mux de chaque machine ; les machines peuvent se joindre entre elles, et l’application de bureau rejoint aussi des hôtes SSH et Mosh classiques" width="100%">
   </picture>
 </p>
 
@@ -78,8 +78,8 @@ ThinkTerm a été mesuré avec son mux local : le shell tourne dans le serveur m
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-fr-FR-dark.svg">
-    <img src="assets/performance-fr-FR-light.svg" alt="Débit de ThinkTerm comparé à WezTerm sur six tests kitten : ThinkTerm est plus rapide sur cinq (de 1,1× à 8,7×) et plus lent sur les images (0,80×)" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="../assets/performance-fr-FR-dark.svg">
+    <img src="../assets/performance-fr-FR-light.svg" alt="Débit de ThinkTerm comparé à WezTerm sur six tests kitten : ThinkTerm est plus rapide sur cinq (de 1,1× à 8,7×) et plus lent sur les images (0,80×)" width="100%">
   </picture>
 </p>
 
@@ -101,8 +101,8 @@ Sous Linux, comparé à kitty sur Ubuntu 20.04 (i9-12900K), en 180×50 avec `TER
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-linux-fr-FR-dark.svg">
-    <img src="assets/performance-linux-fr-FR-light.svg" alt="Débit de ThinkTerm comparé à kitty sous Linux sur cinq tests kitten : ThinkTerm est plus rapide sur les cinq (de 1,6× à 3,4×)" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="../assets/performance-linux-fr-FR-dark.svg">
+    <img src="../assets/performance-linux-fr-FR-light.svg" alt="Débit de ThinkTerm comparé à kitty sous Linux sur cinq tests kitten : ThinkTerm est plus rapide sur les cinq (de 1,6× à 3,4×)" width="100%">
   </picture>
 </p>
 
@@ -123,8 +123,8 @@ Progression au fil des versions sur le même Mac. Le rapport compare 0.4.2 à la
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-progress-fr-FR-dark.svg">
-    <img src="assets/performance-progress-fr-FR-light.svg" alt="Débit de ThinkTerm au fil des versions sur six tests kitten, d’une première version à 0.4.2 en passant par 0.3.0 et 0.4.1 : 0.4.2 devance la première version sur quatre, de 3,0× à 4,5×, et fait jeu égal sur les longues séquences d’échappement et les images" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="../assets/performance-progress-fr-FR-dark.svg">
+    <img src="../assets/performance-progress-fr-FR-light.svg" alt="Débit de ThinkTerm au fil des versions sur six tests kitten, d’une première version à 0.4.2 en passant par 0.3.0 et 0.4.1 : 0.4.2 devance la première version sur quatre, de 3,0× à 4,5×, et fait jeu égal sur les longues séquences d’échappement et les images" width="100%">
   </picture>
 </p>
 
@@ -146,8 +146,8 @@ Progression au fil des versions sur le même environnement Linux. Le rapport com
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-linux-progress-fr-FR-dark.svg">
-    <img src="assets/performance-linux-progress-fr-FR-light.svg" alt="Débit de ThinkTerm au fil des versions sous Linux sur cinq tests kitten, de 143b60a2 à 0.4.2 en passant par 0.4.1 : 0.4.2 devance 143b60a2 sur les cinq, de 1,2× à 2,2×" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="../assets/performance-linux-progress-fr-FR-dark.svg">
+    <img src="../assets/performance-linux-progress-fr-FR-light.svg" alt="Débit de ThinkTerm au fil des versions sous Linux sur cinq tests kitten, de 143b60a2 à 0.4.2 en passant par 0.4.1 : 0.4.2 devance 143b60a2 sur les cinq, de 1,2× à 2,2×" width="100%">
   </picture>
 </p>
 
@@ -182,12 +182,12 @@ Les espaces locaux et distants partagent la même barre latérale. L'état des T
 - **Tailscale intégré.** Rejoignez votre tailnet depuis ThinkTerm et atteignez ses machines sans l'application Tailscale ; elles apparaissent dans les hôtes distants à côté de vos serveurs enregistrés. Disponible sur macOS et Linux.
 - **Les fichiers à côté du terminal.** Parcourez les fichiers du projet, prévisualisez le code avec coloration syntaxique et ouvrez-le dans un éditeur externe. L'accès distant utilise SFTP, avec envoi, téléchargement et transfert par glisser-déposer.
 - **Notes.** Éditez du Markdown dans un Vault compatible avec Obsidian, avec tableaux, blocs de code et enregistrement automatique. Les fichiers restent de simples fichiers Markdown, dans le répertoire de votre choix.
-- **Extraits et plugins.** Snippets est intégré. Les plugins peuvent ajouter des panneaux à la barre latérale, sur le bureau et dans le navigateur. Le dépôt contient un [plugin Diff](plugins/diff) pour examiner les modifications Git du dépôt utilisé par le terminal voisin. Créez vos propres plugins en Rust avec le [ThinkTerm SDK](docs/thinkterm/plugins.md#rust-sdk). Trouvez les plugins partagés par d'autres sous le sujet GitHub [`thinkterm-plugin`](https://github.com/topics/thinkterm-plugin). Consultez le [guide des plugins](docs/thinkterm/plugins.md) pour l'installation et le développement.
+- **Extraits et plugins.** Snippets est intégré. Les plugins peuvent ajouter des panneaux à la barre latérale, sur le bureau et dans le navigateur. Le dépôt contient un [plugin Diff](../plugins/diff) pour examiner les modifications Git du dépôt utilisé par le terminal voisin. Créez vos propres plugins en Rust avec le [ThinkTerm SDK](../docs/thinkterm/plugins.md#rust-sdk). Trouvez les plugins partagés par d'autres sous le sujet GitHub [`thinkterm-plugin`](https://github.com/topics/thinkterm-plugin). Consultez le [guide des plugins](../docs/thinkterm/plugins.md) pour l'installation et le développement.
 - **Un cœur de terminal complet.** Ligatures, emoji en couleur, couleurs 24 bits, hyperliens, images intégrées, mode copie et intégration au shell proviennent de WezTerm. Pour découvrir d’autres fonctions du terminal, consultez la [documentation des fonctionnalités de WezTerm](https://wezterm.org/features.html).
 - **Paramètres de bureau natifs.** Réglez les thèmes, la taille du texte de l'interface, les options du terminal et le moteur de rendu. La fenêtre principale et celle des paramètres prennent en charge WebGPU et OpenGL, avec repli vers OpenGL si l'initialisation de WebGPU échoue.
 - **Cinq langues d'interface.** English, 简体中文, 日本語, Français et Deutsch.
 
-La CLI permet aussi d'automatiser les volets : `thinkterm cli send-text` envoie des entrées, `send-key` appuie sur des touches, `get-text` lit la sortie du terminal, et `wait` et `events` signalent la fin d'une commande ou ce qui se passe dans un volet. Nommez un volet avec `set-pane-label` pour le désigner par son nom. Les agents peuvent utiliser ces commandes pour interagir par leurs terminaux. Les [notes sur la collaboration](docs/thinkterm/agent-collaboration.md) décrivent le scénario démontré et les limites de l'entrée terminal comme mécanisme de messagerie.
+La CLI permet aussi d'automatiser les volets : `thinkterm cli send-text` envoie des entrées, `send-key` appuie sur des touches, `get-text` lit la sortie du terminal, et `wait` et `events` signalent la fin d'une commande ou ce qui se passe dans un volet. Nommez un volet avec `set-pane-label` pour le désigner par son nom. Les agents peuvent utiliser ces commandes pour interagir par leurs terminaux. Les [notes sur la collaboration](../docs/thinkterm/agent-collaboration.md) décrivent le scénario démontré et les limites de l'entrée terminal comme mécanisme de messagerie.
 
 ## Choisir son mode de connexion
 
@@ -213,11 +213,11 @@ La TUI prend en charge la navigation dans les espaces, les onglets, les volets d
 
 Activez un point d'écoute dans **Settings → Web**, puis créez un jeton d'accès pour le navigateur. Le serveur mux fournit le client et ses ressources. Par défaut, les connexions hors de l'interface de bouclage nécessitent HTTPS ; le navigateur doit également disposer d'un contexte sécurisé pour proposer WebGPU.
 
-Le guide [Accès par navigateur](docs/thinkterm/web-access.md) détaille les points d'écoute, les jetons, la redirection SSH et la gestion des certificats.
+Le guide [Accès par navigateur](../docs/thinkterm/web-access.md) détaille les points d'écoute, les jetons, la redirection SSH et la gestion des certificats.
 
 ### Développement mobile
 
-Les applications [iOS](ios) et [Android](android) utilisent des interfaces natives et un [cœur mobile partagé](thinkterm-mobile). Elles se connectent par SSH aux sessions d'une autre machine. Leur développement est actif ; elles ne sont pas présentées ici comme des produits mobiles déjà publiés.
+Les applications [iOS](../ios) et [Android](../android) utilisent des interfaces natives et un [cœur mobile partagé](../thinkterm-mobile). Elles se connectent par SSH aux sessions d'une autre machine. Leur développement est actif ; elles ne sont pas présentées ici comme des produits mobiles déjà publiés.
 
 ## Premiers pas
 
@@ -230,7 +230,7 @@ cd ThinkTerm
 cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p thinkterm-plugin-server -p thinkterm-tailnet-node
 ```
 
-Les exécutables sont créés dans `target/release`. Consultez le [guide de contribution](CONTRIBUTING.md) pour l'organisation du code et le processus de développement. Le [script de compilation web](ci/build-web.sh) produit les ressources Web séparément ; les points d'entrée mobiles sont [ios/build.sh](ios/build.sh) et [android/build.sh](android/build.sh).
+Les exécutables sont créés dans `target/release`. Consultez le [guide de contribution](../CONTRIBUTING.md) pour l'organisation du code et le processus de développement. Le [script de compilation web](../ci/build-web.sh) produit les ressources Web séparément ; les points d'entrée mobiles sont [ios/build.sh](../ios/build.sh) et [android/build.sh](../android/build.sh).
 
 Une fois les exécutables ajoutés à votre `PATH` :
 
@@ -253,9 +253,9 @@ npx skills add RoversX/ThinkTerm --skill thinkterm -g
 
 ## Documentation et développement
 
-- [Accès par navigateur](docs/thinkterm/web-access.md)
-- [Plugins](docs/thinkterm/plugins.md)
-- [Contribuer](CONTRIBUTING.md)
+- [Accès par navigateur](../docs/thinkterm/web-access.md)
+- [Plugins](../docs/thinkterm/plugins.md)
+- [Contribuer](../CONTRIBUTING.md)
 
 ## Configuration et confidentialité
 
@@ -267,7 +267,7 @@ La recherche de mises à jour peut être désactivée avec `check_for_updates = 
 
 Le carnet d'hôtes SSH de l'application de bureau chiffre les mots de passe avec une clé conservée localement. Toute personne possédant à la fois cette clé et les données chiffrées, y compris dans une sauvegarde, peut déchiffrer les mots de passe. Les jetons d'accès du navigateur donnent accès aux sessions terminal du serveur et doivent être traités comme des identifiants d'accès.
 
-Consultez [PRIVACY.md](PRIVACY.md) pour la politique de confidentialité et le traitement des données du navigateur.
+Consultez [PRIVACY.md](../PRIVACY.md) pour la politique de confidentialité et le traitement des données du navigateur.
 
 ## Remerciements
 
@@ -276,13 +276,13 @@ Consultez [PRIVACY.md](PRIVACY.md) pour la politique de confidentialité et le t
 - Merci à **Lucide, Simple Icons, Lobe Icons et material-icon-theme** pour leurs icônes.
 - Merci à toutes les personnes qui contribuent au code, aux traductions, aux tests, aux signalements de bugs et aux retours d’expérience de **ThinkTerm**.
 
-Les contributions sont les bienvenues. Lisez [CONTRIBUTING.md](CONTRIBUTING.md) avant d’ouvrir une pull request.
+Les contributions sont les bienvenues. Lisez [CONTRIBUTING.md](../CONTRIBUTING.md) avant d’ouvrir une pull request.
 
 ## Licence
 
-ThinkTerm est distribué sous **GPL-3.0-only** — voir [LICENSE.md](LICENSE.md). Le code provenant de WezTerm conserve sa licence MIT d’origine dans [LICENSE-MIT](LICENSE-MIT). Les manifestes de détection des agents provenant de herdr sont sous licence **Apache-2.0**.
+ThinkTerm est distribué sous **GPL-3.0-only** — voir [LICENSE.md](../LICENSE.md). Le code provenant de WezTerm conserve sa licence MIT d’origine dans [LICENSE-MIT](../LICENSE-MIT). Les manifestes de détection des agents provenant de herdr sont sous licence **Apache-2.0**.
 
-Consultez [NOTICE](NOTICE) et [licenses/README.md](licenses/README.md) pour les attributions complètes et les licences des composants tiers et des ressources incluses.
+Consultez [NOTICE](../NOTICE) et [licenses/README.md](../licenses/README.md) pour les attributions complètes et les licences des composants tiers et des ressources incluses.
 
 
 

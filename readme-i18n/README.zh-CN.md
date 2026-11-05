@@ -1,6 +1,6 @@
 # ThinkTerm
 
-[English](README.md) · **简体中文** · [日本語](README.ja-JP.md) · [Français](README.fr-FR.md) · [Deutsch](README.de-DE.md)
+[English](../README.md) · **简体中文** · [日本語](README.ja-JP.md) · [Français](README.fr-FR.md) · [Deutsch](README.de-DE.md)
 
 ## 📥 下载
 
@@ -26,21 +26,21 @@ ThinkTerm 是一款**使用 Rust 编写、内置终端复用器的开源终端**
 <table>
   <tr>
     <td width="50%" align="center">
-      <img src="assets/screenshots/workspace.jpeg" alt="终端分屏、源码预览和项目文件树" width="100%">
+      <img src="../assets/screenshots/workspace.jpeg" alt="终端分屏、源码预览和项目文件树" width="100%">
       <br><strong>项目工作空间</strong>
     </td>
     <td width="50%" align="center">
-      <img src="assets/screenshots/agents.jpeg" alt="远程终端旁的 Agent 状态与工作空间侧边栏" width="100%">
+      <img src="../assets/screenshots/agents.jpeg" alt="远程终端旁的 Agent 状态与工作空间侧边栏" width="100%">
       <br><strong>跨机器的 Agent</strong>
     </td>
   </tr>
   <tr>
     <td width="50%" align="center">
-      <img src="assets/screenshots/overview.jpeg" alt="按 Space 分组的终端实时预览" width="100%">
+      <img src="../assets/screenshots/overview.jpeg" alt="按 Space 分组的终端实时预览" width="100%">
       <br><strong>会话总览</strong>
     </td>
     <td width="50%" align="center">
-      <img src="assets/screenshots/spaces.jpeg" alt="项目 Thread 旁的 Space 选择器" width="100%">
+      <img src="../assets/screenshots/spaces.jpeg" alt="项目 Thread 旁的 Space 选择器" width="100%">
       <br><strong>空间切换</strong>
     </td>
   </tr>
@@ -50,8 +50,8 @@ ThinkTerm 是一款**使用 Rust 编写、内置终端复用器的开源终端**
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg">
-    <img src="assets/architecture-light.svg" alt="ThinkTerm 简化架构：桌面应用、TUI 和 CLI、浏览器以及手机应用连接到每台机器上的 mux 服务端；机器之间可以互相连接，桌面应用还能连接普通 SSH 和 Mosh 主机" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="../assets/architecture-dark.svg">
+    <img src="../assets/architecture-light.svg" alt="ThinkTerm 简化架构：桌面应用、TUI 和 CLI、浏览器以及手机应用连接到每台机器上的 mux 服务端；机器之间可以互相连接，桌面应用还能连接普通 SSH 和 Mosh 主机" width="100%">
   </picture>
 </p>
 
@@ -78,8 +78,8 @@ ThinkTerm 测试时开着本地 mux：shell 跑在 mux 服务端里，输出要�
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-zh-CN-dark.svg">
-    <img src="assets/performance-zh-CN-light.svg" alt="ThinkTerm 与 WezTerm 在 6 项 kitten 跑分中的吞吐对比：ThinkTerm 有 5 项更快（1.1× 到 8.7×），图片一项较慢（0.80×）" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="../assets/performance-zh-CN-dark.svg">
+    <img src="../assets/performance-zh-CN-light.svg" alt="ThinkTerm 与 WezTerm 在 6 项 kitten 跑分中的吞吐对比：ThinkTerm 有 5 项更快（1.1× 到 8.7×），图片一项较慢（0.80×）" width="100%">
   </picture>
 </p>
 
@@ -101,8 +101,8 @@ Linux 上与 kitty 对比：Ubuntu 20.04（i9-12900K），180×50，`TERM=xterm-
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-linux-zh-CN-dark.svg">
-    <img src="assets/performance-linux-zh-CN-light.svg" alt="Linux 上 ThinkTerm 与 kitty 在 5 项 kitten 跑分中的吞吐对比：ThinkTerm 全部更快（1.6× 到 3.4×）" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="../assets/performance-linux-zh-CN-dark.svg">
+    <img src="../assets/performance-linux-zh-CN-light.svg" alt="Linux 上 ThinkTerm 与 kitty 在 5 项 kitten 跑分中的吞吐对比：ThinkTerm 全部更快（1.6× 到 3.4×）" width="100%">
   </picture>
 </p>
 
@@ -123,8 +123,8 @@ Linux 上与 kitty 对比：Ubuntu 20.04（i9-12900K），180×50，`TERM=xterm-
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-progress-zh-CN-dark.svg">
-    <img src="assets/performance-progress-zh-CN-light.svg" alt="ThinkTerm 各版本在 6 项 kitten 跑分中的吞吐：从早期版本到 0.3.0、0.4.1 再到 0.4.2，0.4.2 有 4 项领先早期版本（3.0× 到 4.5×），长转义序列和图片持平" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="../assets/performance-progress-zh-CN-dark.svg">
+    <img src="../assets/performance-progress-zh-CN-light.svg" alt="ThinkTerm 各版本在 6 项 kitten 跑分中的吞吐：从早期版本到 0.3.0、0.4.1 再到 0.4.2，0.4.2 有 4 项领先早期版本（3.0× 到 4.5×），长转义序列和图片持平" width="100%">
   </picture>
 </p>
 
@@ -146,8 +146,8 @@ Linux 上与 kitty 对比：Ubuntu 20.04（i9-12900K），180×50，`TERM=xterm-
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/performance-linux-progress-zh-CN-dark.svg">
-    <img src="assets/performance-linux-progress-zh-CN-light.svg" alt="ThinkTerm 各版本在 Linux 上 5 项 kitten 跑分中的吞吐：从 143b60a2 到 0.4.1 再到 0.4.2，0.4.2 全部领先 143b60a2（1.2× 到 2.2×）" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="../assets/performance-linux-progress-zh-CN-dark.svg">
+    <img src="../assets/performance-linux-progress-zh-CN-light.svg" alt="ThinkTerm 各版本在 Linux 上 5 项 kitten 跑分中的吞吐：从 143b60a2 到 0.4.1 再到 0.4.2，0.4.2 全部领先 143b60a2（1.2× 到 2.2×）" width="100%">
   </picture>
 </p>
 
@@ -182,12 +182,12 @@ Linux 上与 kitty 对比：Ubuntu 20.04（i9-12900K），180×50，`TERM=xterm-
 - **内置 Tailscale。** 无需安装 Tailscale 客户端，就能在 ThinkTerm 中加入 tailnet 并连接其中的机器；它们会和已保存的服务器一起列在远程主机页中。支持 macOS 和 Linux。
 - **终端旁的文件。** 浏览项目文件，预览带语法高亮的源码，并用外部编辑器打开。远程文件通过 SFTP 访问，支持上传、下载和拖放传输。
 - **笔记。** 在兼容 Obsidian 的 Vault 中编辑 Markdown，支持表格、代码块和自动保存。文件仍是普通 Markdown，存放在你选择的目录中。
-- **片段与插件。** 内置 Snippets。插件可向桌面端和浏览器端添加侧边栏面板；仓库中包含 [Diff 插件](plugins/diff)，用于查看旁边终端所在 Git 仓库的改动。你也可以使用 [ThinkTerm SDK](docs/thinkterm/plugins.md#rust-sdk)，用 Rust 开发自己的插件。别人分享的插件可以在 GitHub 话题 [`thinkterm-plugin`](https://github.com/topics/thinkterm-plugin) 下找到。安装和开发方式见[插件指南](docs/thinkterm/plugins.md)。
+- **片段与插件。** 内置 Snippets。插件可向桌面端和浏览器端添加侧边栏面板；仓库中包含 [Diff 插件](../plugins/diff)，用于查看旁边终端所在 Git 仓库的改动。你也可以使用 [ThinkTerm SDK](../docs/thinkterm/plugins.md#rust-sdk)，用 Rust 开发自己的插件。别人分享的插件可以在 GitHub 话题 [`thinkterm-plugin`](https://github.com/topics/thinkterm-plugin) 下找到。安装和开发方式见[插件指南](../docs/thinkterm/plugins.md)。
 - **完整的终端核心。** 字体连字、彩色 Emoji、真彩色、超链接、内嵌图片、复制模式和 Shell 集成均继承自 WezTerm。 更多终端特性可参考 [WezTerm 功能文档](https://wezterm.org/features.html)。
 - **原生桌面设置。** 调整主题、界面字号、终端选项和渲染后端。主窗口与设置窗口均支持 WebGPU 和 OpenGL；WebGPU 初始化失败时会回退到 OpenGL。
 - **五种界面语言。** English、简体中文、日本語、Français 和 Deutsch。
 
-CLI 也支持自动化操作窗格：`thinkterm cli send-text` 发送输入，`send-key` 发送按键，`get-text` 读取终端输出，`wait` 和 `events` 会在命令结束或窗格发生变化时告知。用 `set-pane-label` 给窗格命名后，就可以按名字指定窗格。Agent 可以借助这些命令通过终端交互。[协作说明](docs/thinkterm/agent-collaboration.md) 记录了已演示的工作流程，以及将终端输入用作消息机制的局限。
+CLI 也支持自动化操作窗格：`thinkterm cli send-text` 发送输入，`send-key` 发送按键，`get-text` 读取终端输出，`wait` 和 `events` 会在命令结束或窗格发生变化时告知。用 `set-pane-label` 给窗格命名后，就可以按名字指定窗格。Agent 可以借助这些命令通过终端交互。[协作说明](../docs/thinkterm/agent-collaboration.md) 记录了已演示的工作流程，以及将终端输入用作消息机制的局限。
 
 ## 选择连接方式
 
@@ -213,11 +213,11 @@ TUI 支持工作空间导航、标签页、分屏、调整大小、复制模式�
 
 在 **Settings → Web（设置 → Web）** 中启用监听，然后为浏览器创建访问令牌。mux 服务端提供客户端页面及其资源。默认情况下，非回环连接需要 HTTPS；浏览器也需要安全上下文才能使用 WebGPU。
 
-监听配置、令牌、SSH 转发和证书处理方式见[浏览器访问](docs/thinkterm/web-access.md)。
+监听配置、令牌、SSH 转发和证书处理方式见[浏览器访问](../docs/thinkterm/web-access.md)。
 
 ### 移动端开发
 
-[iOS](ios) 和 [Android](android) 应用采用原生界面，共享[移动端核心](thinkterm-mobile)，通过 SSH 连接另一台机器上的会话。它们仍在积极开发中，目前不作为已发布的移动产品介绍。
+[iOS](../ios) 和 [Android](../android) 应用采用原生界面，共享[移动端核心](../thinkterm-mobile)，通过 SSH 连接另一台机器上的会话。它们仍在积极开发中，目前不作为已发布的移动产品介绍。
 
 ## 开始使用
 
@@ -230,7 +230,7 @@ cd ThinkTerm
 cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p thinkterm-plugin-server -p thinkterm-tailnet-node
 ```
 
-生成的可执行文件位于 `target/release`。源码结构和开发流程见[贡献指南](CONTRIBUTING.md)。[浏览器构建脚本](ci/build-web.sh) 用于构建独立的 Web 资源；移动端构建入口为 [ios/build.sh](ios/build.sh) 和 [android/build.sh](android/build.sh)。
+生成的可执行文件位于 `target/release`。源码结构和开发流程见[贡献指南](../CONTRIBUTING.md)。[浏览器构建脚本](../ci/build-web.sh) 用于构建独立的 Web 资源；移动端构建入口为 [ios/build.sh](../ios/build.sh) 和 [android/build.sh](../android/build.sh)。
 
 将可执行文件加入 `PATH` 后：
 
@@ -253,9 +253,9 @@ npx skills add RoversX/ThinkTerm --skill thinkterm -g
 
 ## 文档与开发
 
-- [浏览器访问](docs/thinkterm/web-access.md)
-- [插件](docs/thinkterm/plugins.md)
-- [参与贡献](CONTRIBUTING.md)
+- [浏览器访问](../docs/thinkterm/web-access.md)
+- [插件](../docs/thinkterm/plugins.md)
+- [参与贡献](../CONTRIBUTING.md)
 
 ## 配置与隐私
 
@@ -267,7 +267,7 @@ ThinkTerm 使用 Lua 配置，默认读取自己的 ThinkTerm 路径，并支持
 
 桌面端 SSH 主机簿使用本地保存的密钥加密密码。任何同时持有密钥和加密主机数据的人都可以解密密码，包括从备份中获得两者的情况。浏览器访问令牌可用于访问服务端终端会话，应作为凭据保管。
 
-隐私政策和浏览器数据处理方式见 [PRIVACY.md](PRIVACY.md)。
+隐私政策和浏览器数据处理方式见 [PRIVACY.md](../PRIVACY.md)。
 
 ## 致谢
 
@@ -276,13 +276,13 @@ ThinkTerm 使用 Lua 配置，默认读取自己的 ThinkTerm 路径，并支持
 - 感谢 **Lucide、Simple Icons、Lobe Icons 和 material-icon-theme**，提供图标资源。
 - 感谢所有为 **ThinkTerm** 贡献代码、翻译、测试、问题报告和使用反馈的参与者。
 
-欢迎贡献。提交 Pull Request 前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
+欢迎贡献。提交 Pull Request 前请阅读 [CONTRIBUTING.md](../CONTRIBUTING.md)。
 
 ## 许可证
 
-ThinkTerm 采用 **GPL-3.0-only** 许可证，见 [LICENSE.md](LICENSE.md)。来自 WezTerm 的代码保留其原有 MIT 许可证，见 [LICENSE-MIT](LICENSE-MIT)。来自 herdr 的 Agent 检测清单采用 **Apache-2.0** 许可证。
+ThinkTerm 采用 **GPL-3.0-only** 许可证，见 [LICENSE.md](../LICENSE.md)。来自 WezTerm 的代码保留其原有 MIT 许可证，见 [LICENSE-MIT](../LICENSE-MIT)。来自 herdr 的 Agent 检测清单采用 **Apache-2.0** 许可证。
 
-第三方组件与附带资源的完整署名及许可证见 [NOTICE](NOTICE) 和 [licenses/README.md](licenses/README.md)。
+第三方组件与附带资源的完整署名及许可证见 [NOTICE](../NOTICE) 和 [licenses/README.md](../licenses/README.md)。
 
 
 

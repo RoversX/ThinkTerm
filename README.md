@@ -1,6 +1,6 @@
 # ThinkTerm
 
-**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Français](README.fr-FR.md) · [Deutsch](README.de-DE.md)
+**English** · [简体中文](readme-i18n/README.zh-CN.md) · [日本語](readme-i18n/README.ja-JP.md) · [Français](readme-i18n/README.fr-FR.md) · [Deutsch](readme-i18n/README.de-DE.md)
 
 ## 📥 Download
 
