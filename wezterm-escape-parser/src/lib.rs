@@ -37,12 +37,15 @@ pub use self::esc::{Esc, EscCode};
 pub use self::osc::OperatingSystemCommand;
 
 use vtparse::CsiParam;
+pub use vtparse::{c0_position, printable_ascii_len};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     /// Send a single printable character to the display
     Print(char),
-    /// Send a string of printable characters to the display.
+    /// Send a string of printable characters to the display. Tabs and line
+    /// ends can be among them if the parser was asked to leave them there
+    /// (see `Parser::set_text_keeps_line_controls`).
     PrintString(String),
     /// A C0 or C1 control code
     Control(ControlCode),

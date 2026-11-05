@@ -145,6 +145,13 @@ impl Parser {
         });
     }
 
+    /// Have printable runs keep the tabs and line ends among them: see
+    /// `VTParser::set_text_keeps_line_controls`. Only for a consumer that
+    /// knows to act on them, as the terminal does for `Action::PrintString`.
+    pub fn set_text_keeps_line_controls(&mut self, keep: bool) {
+        self.state_machine.set_text_keeps_line_controls(keep);
+    }
+
     /// Like `parse`, but emits contiguous printable text as `PrintString`.
     /// Run boundaries have no semantic meaning: consumers must still combine
     /// adjacent print actions before Unicode grapheme segmentation.

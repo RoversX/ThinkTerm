@@ -110,16 +110,20 @@ pub trait VTActor {
     /// character.
     fn print(&mut self, b: char);
 
-    /// Print a non-empty run of bytes in the range 0x20..=0x7e.
-    /// The default preserves the per-character callback for existing actors.
+    /// Print a non-empty run of bytes in the range 0x20..=0x7e, and tabs and
+    /// line ends among them for a parser told to keep them
+    /// (`VTParser::set_text_keeps_line_controls`), which an actor that says so
+    /// has to act on. The default preserves the per-character callback for
+    /// existing actors.
     fn print_ascii(&mut self, text: &str) {
         for byte in text.bytes() {
             self.print(byte as char);
         }
     }
 
-    /// Print a non-empty run of valid UTF-8 without C0, DEL or C1 controls.
-    /// Runs need not end at a grapheme boundary. The default retains the
+    /// Print a non-empty run of valid UTF-8 without C0, DEL or C1 controls,
+    /// other than the ones `print_ascii` can have. Runs need not end at a
+    /// grapheme boundary. The default retains the
     /// per-character callback for actors that do not support borrowed text.
     fn print_utf8(&mut self, text: &str) {
         for c in text.chars() {
@@ -424,6 +428,8 @@ impl OscState {
 /// The virtual terminal parser.  It works together with an implementation of `VTActor`.
 pub struct VTParser {
     state: State,
+    /// See `set_text_keeps_line_controls`.
+    text_keeps_line_controls: bool,
 
     intermediates: [u8; MAX_INTERMEDIATES],
     num_intermediates: usize,
@@ -523,6 +529,7 @@ impl VTParser {
 
         Self {
             state: State::Ground,
+            text_keeps_line_controls: false,
             utf8_return_state: State::Ground,
 
             intermediates: [0, 0],
@@ -555,6 +562,16 @@ impl VTParser {
     /// i.e. there is no pending state held by the state machine.
     pub fn is_ground(&self) -> bool {
         self.state == State::Ground
+    }
+
+    /// Leave tabs, line feeds and carriage returns inside a run of text
+    /// passed to `VTActor::print_ascii` or `print_utf8`, for an actor that
+    /// looks for them there itself, rather than ending the run to call
+    /// `execute_c0_or_c1`. Output is mostly short lines; these are the
+    /// controls between them, and going through an action apiece for each
+    /// and for the text around it was a fair part of printing them.
+    pub fn set_text_keeps_line_controls(&mut self, keep: bool) {
+        self.text_keeps_line_controls = keep;
     }
 
     fn as_integer_params(&self) -> [i64; MAX_PARAMS] {
@@ -598,28 +615,50 @@ impl VTParser {
         }
     }
 
+    /// `Action::ApcPut` for each of the printable ASCII bytes at the start of
+    /// `bytes`; returns how many there were.
+    fn apc_put_run(&mut self, bytes: &[u8]) -> usize {
+        let run = printable_ascii_len(bytes);
+        #[cfg(any(feature = "std", feature = "alloc"))]
+        if !self.apc_full {
+            let room = self.apc_limit.saturating_sub(self.apc_data.len());
+            if run > room {
+                self.apc_full = true;
+                self.apc_data = Vec::new();
+            } else {
+                self.apc_data.extend_from_slice(&bytes[..run]);
+            }
+        }
+        run
+    }
+
+    /// Done at the start of every escape sequence.
+    fn clear(&mut self) {
+        self.num_intermediates = 0;
+        self.ignored_excess_intermediates = false;
+        self.osc.num_params = 0;
+        self.osc.full = false;
+        self.num_params = 0;
+        self.params_full = false;
+        self.current_param = None;
+        #[cfg(any(feature = "std", feature = "alloc"))]
+        {
+            self.apc_full = false;
+            if self.apc_data.capacity() != 0 {
+                self.apc_data = Vec::new();
+            }
+            if self.osc.buffer.capacity() != 0 {
+                self.osc.buffer = Vec::new();
+            }
+        }
+    }
+
     fn action(&mut self, action: Action, param: u8, actor: &mut dyn VTActor) {
         match action {
             Action::None | Action::Ignore => {}
             Action::Print => actor.print(param as char),
             Action::Execute => actor.execute_c0_or_c1(param),
-            Action::Clear => {
-                self.num_intermediates = 0;
-                self.ignored_excess_intermediates = false;
-                self.osc.num_params = 0;
-                self.osc.full = false;
-                self.num_params = 0;
-                self.params_full = false;
-                self.current_param.take();
-                #[cfg(any(feature = "std", feature = "alloc"))]
-                {
-                    self.apc_data.clear();
-                    self.apc_data.shrink_to_fit();
-                    self.apc_full = false;
-                    self.osc.buffer.clear();
-                    self.osc.buffer.shrink_to_fit();
-                }
-            }
+            Action::Clear => self.clear(),
             Action::Collect => {
                 if self.num_intermediates < MAX_INTERMEDIATES {
                     self.intermediates[self.num_intermediates] = param;
@@ -856,16 +895,27 @@ impl VTParser {
     #[inline(never)]
     fn parse_plain_csi(&mut self, bytes: &[u8], actor: &mut dyn VTActor) -> Option<usize> {
         let params = bytes.strip_prefix(b"\x1b[")?;
+        // DECSET and its like: the `?` is collected in CsiEntry, and becomes
+        // the first parameter once the state machine promotes it.
+        let (private, params) = match params {
+            [b'?', rest @ ..] => (true, rest),
+            _ => (false, params),
+        };
         let len = params
             .iter()
             .position(|b| !matches!(b, b'0'..=b'9' | b':' | b';'))?;
         let final_byte = params[len];
         // A leading ':' moves CsiEntry to CsiIgnore rather than dispatching.
-        if !(0x40..=0x7e).contains(&final_byte) || params[0] == b':' {
+        if !(0x40..=0x7e).contains(&final_byte) || (!private && params[0] == b':') {
             return None;
         }
         // Entering Escape and then CsiEntry clears twice; once is the same.
-        self.action(Action::Clear, 0, actor);
+        self.clear();
+        if private {
+            self.intermediates[0] = b'?';
+            self.params[0] = CsiParam::P(b'?');
+            self.num_params = 1;
+        }
         // Action::Param for each byte; after a clear there are no
         // intermediates to promote.
         let mut current: Option<i64> = None;
@@ -896,12 +946,12 @@ impl VTParser {
         }
         self.current_param = current.map(CsiParam::Integer);
         self.action(Action::CsiDispatch, final_byte, actor);
-        self.utf8_return_state = if len > 0 {
+        self.utf8_return_state = if len > 0 || private {
             State::CsiParam
         } else {
             State::CsiEntry
         };
-        Some(2 + len + 1)
+        Some(2 + usize::from(private) + len + 1)
     }
 
     /// Parse a sequence of bytes.  The sequence need not be complete.
@@ -918,7 +968,7 @@ impl VTParser {
                 // returned to Ground. ASCII and control-only input retain
                 // their original path without additional run-detection work.
                 if self.is_ground() {
-                    let text = printable_utf8_prefix(bytes);
+                    let text = printable_utf8_prefix(bytes, self.text_keeps_line_controls);
                     if !text.is_empty() {
                         actor.print_utf8(text);
                         bytes = &bytes[text.len()..];
@@ -929,10 +979,12 @@ impl VTParser {
             // Only Ground can bypass the state machine. In particular, ASCII
             // following an incomplete UTF-8 sequence must reach next_utf8.
             if self.is_ground() && (b' '..=b'~').contains(&bytes[0]) {
-                let end = bytes
-                    .iter()
-                    .position(|b| !(b' '..=b'~').contains(b))
-                    .unwrap_or(bytes.len());
+                let mut end = printable_ascii_len(bytes);
+                if self.text_keeps_line_controls {
+                    while matches!(bytes.get(end), Some(b'\t' | b'\n' | b'\r')) {
+                        end += 1 + printable_ascii_len(&bytes[end + 1..]);
+                    }
+                }
                 actor.print_ascii(core::str::from_utf8(&bytes[..end]).unwrap());
                 bytes = &bytes[end..];
             } else if self.state == State::OscString && (0x20..=0x7f).contains(&bytes[0]) {
@@ -940,6 +992,9 @@ impl VTParser {
                 // bytes, including UTF-8 and terminators, take the byte path.
                 let consumed = self.osc.put_ascii_run(bytes);
                 bytes = &bytes[consumed..];
+            } else if self.state == State::ApcString && (b' '..=b'~').contains(&bytes[0]) {
+                // The same for an APC, which is how images arrive.
+                bytes = &bytes[self.apc_put_run(bytes)..];
             } else {
                 if bytes[0] == 0x1b && self.is_ground() {
                     if let Some(consumed) = self.parse_plain_csi(bytes, actor) {
@@ -951,10 +1006,7 @@ impl VTParser {
                 bytes = &bytes[1..];
                 if matches!(
                     self.state,
-                    State::ApcString
-                        | State::DcsPassthrough
-                        | State::DcsIgnore
-                        | State::SosPmString
+                    State::DcsPassthrough | State::DcsIgnore | State::SosPmString
                 ) {
                     // Other string payloads (notably images) need the byte
                     // parser, so avoid an extra run-detection branch on every
@@ -966,16 +1018,65 @@ impl VTParser {
                     }
                     return;
                 }
+                // What is not a run of an APC goes a byte at a time, without
+                // coming back around for each.
+                while self.state == State::ApcString
+                    && matches!(bytes.first(), Some(byte) if !(b' '..=b'~').contains(byte))
+                {
+                    self.parse_byte(bytes[0], actor);
+                    bytes = &bytes[1..];
+                }
             }
         }
     }
+}
+
+/// How many of the bytes at the start of `bytes` are printable ASCII,
+/// 0x20..=0x7e. A word at a time: this is most of what parsing plain output
+/// is, and a run of it is typically longer than a word.
+#[inline]
+pub fn printable_ascii_len(bytes: &[u8]) -> usize {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let (words, tail) = bytes.as_chunks::<8>();
+    for (index, word) in words.iter().enumerate() {
+        let word = u64::from_le_bytes(*word);
+        // The top bit of each byte that is below 0x20 or above 0x7e, or
+        // that is above one of those: the lowest one set is exact.
+        let outside = (word.wrapping_sub(ONES * 0x20) | word.wrapping_add(ONES) | word) & HIGH;
+        if outside != 0 {
+            return index * 8 + (outside.trailing_zeros() / 8) as usize;
+        }
+    }
+    bytes.len() - tail.len()
+        + tail
+            .iter()
+            .position(|b| !(b' '..=b'~').contains(b))
+            .unwrap_or(tail.len())
+}
+
+/// Where the first C0 control in `bytes` is, or the length of `bytes`.
+#[inline]
+pub fn c0_position(bytes: &[u8]) -> usize {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let (words, tail) = bytes.as_chunks::<8>();
+    for (index, word) in words.iter().enumerate() {
+        let word = u64::from_le_bytes(*word);
+        // The top bit of each byte below 0x20, or above one that is.
+        let below = word.wrapping_sub(ONES * 0x20) & !word & HIGH;
+        if below != 0 {
+            return index * 8 + (below.trailing_zeros() / 8) as usize;
+        }
+    }
+    bytes.len() - tail.len() + tail.iter().position(|&b| b < 0x20).unwrap_or(tail.len())
 }
 
 /// Stop before controls, incomplete codepoints or invalid encodings so that
 /// the existing state machine retains all recovery and C1 dispatch behavior.
 /// Inspect each byte at most once, including on malformed input.
 #[inline(never)]
-fn printable_utf8_prefix(bytes: &[u8]) -> &str {
+fn printable_utf8_prefix(bytes: &[u8], line_controls: bool) -> &str {
     let mut pos = 0;
     while pos < bytes.len() {
         let tail = &bytes[pos..];
@@ -1006,6 +1107,8 @@ fn printable_utf8_prefix(bytes: &[u8]) -> &str {
             {
                 4
             }
+            // Only among text: alone, one would read as a character to print.
+            [b'\t' | b'\n' | b'\r', ..] if line_controls && pos > 0 => 1,
             _ => break,
         };
         pos += len;
@@ -1032,6 +1135,101 @@ mod test {
     }
 
     #[test]
+    fn scanning_by_the_word_finds_what_scanning_by_the_byte_finds() {
+        for byte in 0..=255u8 {
+            for len in 0..20 {
+                for at in 0..len {
+                    let mut printable = [b'a'; 20];
+                    printable[at] = byte;
+                    let printable = &printable[..len];
+                    assert_eq!(
+                        printable_ascii_len(printable),
+                        printable
+                            .iter()
+                            .position(|b| !(b' '..=b'~').contains(b))
+                            .unwrap_or(len),
+                        "{byte:x} at {at} of {len}"
+                    );
+                    // A byte above the top of a word must not hide one below
+                    // it, which is the way carries go.
+                    let mut high = [0xff; 20];
+                    high[at] = byte;
+                    let high = &high[..len];
+                    assert_eq!(
+                        c0_position(high),
+                        high.iter().position(|&b| b < 0x20).unwrap_or(len),
+                        "{byte:x} at {at} of {len}"
+                    );
+                    let mut low = [0x20; 20];
+                    low[at] = byte;
+                    let low = &low[..len];
+                    assert_eq!(
+                        c0_position(low),
+                        low.iter().position(|&b| b < 0x20).unwrap_or(len),
+                        "{byte:x} at {at} of {len}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// With line controls left in the text, what comes out is the same text
+    /// and the same controls in the same order, only together.
+    #[test]
+    fn text_can_keep_line_controls() {
+        let input = "a\tb\r\nc\n\u{4e2d}\u{4e2d}\n\u{6587}\u{6587}\t\t\x08d\x1b[me\nf";
+        let plain = parse_as_vec(input.as_bytes());
+        let mut parser = VTParser::new();
+        parser.set_text_keeps_line_controls(true);
+        let mut actor = CollectingVTActor::default();
+        parser.parse(input.as_bytes(), &mut actor);
+        let kept = actor.into_vec();
+        let controls = |actions: &[VTAction]| {
+            actions
+                .iter()
+                .filter(|action| matches!(action, VTAction::ExecuteC0orC1(_)))
+                .count()
+        };
+        assert_eq!(controls(&plain), 9);
+        assert_eq!(controls(&kept), 1, "just the backspace");
+
+        // Spell both out as characters and controls to compare them.
+        fn flat(actions: &[VTAction]) -> Vec<VTAction> {
+            let mut out = vec![];
+            for action in actions {
+                match action {
+                    VTAction::Print(c @ ('\t' | '\n' | '\r')) => {
+                        out.push(VTAction::ExecuteC0orC1(*c as u8))
+                    }
+                    other => out.push(other.clone()),
+                }
+            }
+            out
+        }
+        assert_eq!(flat(&kept), flat(&plain));
+    }
+
+    /// Alone, a line control in a run of text would read as a character.
+    #[test]
+    fn text_does_not_start_with_a_line_control() {
+        for control in *b"\t\n\r" {
+            // What follows a C1 control is the one place text starts unasked.
+            let input = [0xc2, 0x85, control];
+            let mut parser = VTParser::new();
+            parser.set_text_keeps_line_controls(true);
+            let mut actor = CollectingVTActor::default();
+            parser.parse(&input, &mut actor);
+            assert_eq!(
+                actor.into_vec(),
+                vec![
+                    VTAction::ExecuteC0orC1(0x85),
+                    VTAction::ExecuteC0orC1(control)
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn printable_utf8_accepts_all_scalars_except_controls() {
         for code in 0..=0x10ffff {
             if let Some(c) = char::from_u32(code) {
@@ -1039,12 +1237,12 @@ mod test {
                 let text = c.encode_utf8(&mut buffer);
                 let expected = if c.is_control() { 0 } else { text.len() };
                 assert_eq!(
-                    printable_utf8_prefix(text.as_bytes()).len(),
+                    printable_utf8_prefix(text.as_bytes(), false).len(),
                     expected,
                     "{code:x}"
                 );
                 for end in 0..text.len() {
-                    assert!(printable_utf8_prefix(&text.as_bytes()[..end]).is_empty());
+                    assert!(printable_utf8_prefix(&text.as_bytes()[..end], false).is_empty());
                 }
             }
         }
@@ -1062,7 +1260,11 @@ mod test {
                 .char_indices()
                 .find(|(_, c)| c.is_control())
                 .map_or(valid.len(), |(index, _)| index);
-            assert_eq!(printable_utf8_prefix(bytes), &valid[..end], "{bytes:x?}");
+            assert_eq!(
+                printable_utf8_prefix(bytes, false),
+                &valid[..end],
+                "{bytes:x?}"
+            );
         }
         // All byte pairs cover short malformed encodings and every C1 control.
         for a in 0..=255u8 {
