@@ -768,7 +768,7 @@ impl Domain for LocalDomain {
         let mut terminal = wezterm_term::Terminal::new(
             size,
             std::sync::Arc::new(config::TermConfig::new()),
-            "ThinkTerm",
+            config::TERM_PROGRAM,
             config::wezterm_version(),
             Box::new(writer.clone()),
         );
