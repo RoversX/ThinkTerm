@@ -79,21 +79,21 @@ ThinkTerm wurde mit lokalem mux gemessen: Die Shell läuft im mux-Server, und ih
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="../assets/performance-de-DE-dark.svg">
-    <img src="../assets/performance-de-DE-light.svg" alt="Durchsatz von ThinkTerm im Vergleich zu WezTerm in sechs kitten-Benchmarks: ThinkTerm ist in fünf schneller (1,1× bis 8,7×) und bei Bildern langsamer (0,80×)" width="100%">
+    <img src="../assets/performance-de-DE-light.svg" alt="Durchsatz von ThinkTerm im Vergleich zu WezTerm in sechs kitten-Benchmarks: ThinkTerm ist in fünf schneller (1,4× bis 9,4×) und bei Bildern gleichauf (1,0×)" width="100%">
   </picture>
 </p>
 
 <details>
 <summary>Daten als Tabelle</summary>
 
-| Test | ThinkTerm 0.4.2<br>2026-11-05 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | Faktor |
+| Test | ThinkTerm 0.4.3<br>2026-11-06 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | Faktor |
 | --- | ---: | ---: | ---: |
-| Nur ASCII-Zeichen | **206,1** | 23,6 | 8,7× |
-| Unicode-Zeichen | **192,4** | 46,7 | 4,1× |
-| Unicode-Zellen aus mehreren Codepoints | **200,9** | 49,3 | 4,1× |
-| CSI-Sequenzen mit wenigen Zeichen | **90,9** | 15,6 | 5,8× |
-| Lange Escape-Sequenzen | **219,3** | 194,9 | 1,1× |
-| Bilder | 216,4 | **270,5** | 0,80× |
+| Nur ASCII-Zeichen | **221,4** | 23,6 | 9,4× |
+| Unicode-Zeichen | **193,2** | 46,7 | 4,1× |
+| Unicode-Zellen aus mehreren Codepoints | **285,3** | 49,3 | 5,8× |
+| CSI-Sequenzen mit wenigen Zeichen | **89,9** | 15,6 | 5,8× |
+| Lange Escape-Sequenzen | **278,6** | 194,9 | 1,4× |
+| Bilder | **278,4** | 270,5 | 1,0× |
 
 </details>
 
@@ -119,26 +119,26 @@ Unter Linux im Vergleich zu kitty auf Ubuntu 20.04 (i9-12900K), bei 180×50 mit 
 
 </details>
 
-Fortschritt über die Versionen auf demselben Mac. Der Faktor vergleicht 0.4.2 mit dem frühen Build.
+Fortschritt über die Versionen auf demselben Mac. Der Faktor vergleicht 0.4.3 mit dem frühen Build.
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="../assets/performance-progress-de-DE-dark.svg">
-    <img src="../assets/performance-progress-de-DE-light.svg" alt="Durchsatz von ThinkTerm über die Versionen in sechs kitten-Benchmarks, von einem frühen Build über 0.3.0 und 0.4.1 bis 0.4.2: 0.4.2 liegt in vier vor dem frühen Build, um 3,0× bis 4,5×, und ist bei langen Escape-Sequenzen und Bildern gleichauf" width="100%">
+    <img src="../assets/performance-progress-de-DE-light.svg" alt="Durchsatz von ThinkTerm über die Versionen in sechs kitten-Benchmarks, von einem frühen Build über 0.3.0, 0.4.1 und 0.4.2 bis 0.4.3: 0.4.3 liegt in allen sechs vor dem frühen Build, um 1,3× bis 4,9×" width="100%">
   </picture>
 </p>
 
 <details>
 <summary>Daten als Tabelle</summary>
 
-| Test | ThinkTerm früh<br>2026-09 | ThinkTerm 0.3.0<br>2026-10-21 | ThinkTerm 0.4.1<br>2026-11-04 | ThinkTerm 0.4.2<br>2026-11-05 | Faktor |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Nur ASCII-Zeichen | 45,3 | 133,0 | 134,0 | **206,1** | 4,5× |
-| Unicode-Zeichen | 52,2 | 104,5 | 109,2 | **192,4** | 3,7× |
-| Unicode-Zellen aus mehreren Codepoints | 67,8 | 197,5 | 234,4 | **200,9** | 3,0× |
-| CSI-Sequenzen mit wenigen Zeichen | 25,7 | 49,5 | 53,5 | **90,9** | 3,5× |
-| Lange Escape-Sequenzen | 219,4 | 213,8 | 257,3 | **219,3** | 1,00× |
-| Bilder | 218,0 | 257,2 | 271,0 | **216,4** | 0,99× |
+| Test | ThinkTerm früh<br>2026-09 | ThinkTerm 0.3.0<br>2026-10-21 | ThinkTerm 0.4.1<br>2026-11-04 | ThinkTerm 0.4.2<br>2026-11-05 | ThinkTerm 0.4.3<br>2026-11-06 | Faktor |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Nur ASCII-Zeichen | 45,3 | 133,0 | 134,0 | 206,1 | **221,4** | 4,9× |
+| Unicode-Zeichen | 52,2 | 104,5 | 109,2 | 192,4 | **193,2** | 3,7× |
+| Unicode-Zellen aus mehreren Codepoints | 67,8 | 197,5 | 234,4 | 200,9 | **285,3** | 4,2× |
+| CSI-Sequenzen mit wenigen Zeichen | 25,7 | 49,5 | 53,5 | 90,9 | **89,9** | 3,5× |
+| Lange Escape-Sequenzen | 219,4 | 213,8 | 257,3 | 219,3 | **278,6** | 1,3× |
+| Bilder | 218,0 | 257,2 | 271,0 | 216,4 | **278,4** | 1,3× |
 
 </details>
 

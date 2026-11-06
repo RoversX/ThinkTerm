@@ -79,21 +79,21 @@ ThinkTerm 测试时开着本地 mux：shell 跑在 mux 服务端里，输出要�
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="../assets/performance-zh-CN-dark.svg">
-    <img src="../assets/performance-zh-CN-light.svg" alt="ThinkTerm 与 WezTerm 在 6 项 kitten 跑分中的吞吐对比：ThinkTerm 有 5 项更快（1.1× 到 8.7×），图片一项较慢（0.80×）" width="100%">
+    <img src="../assets/performance-zh-CN-light.svg" alt="ThinkTerm 与 WezTerm 在 6 项 kitten 跑分中的吞吐对比：ThinkTerm 有 5 项更快（1.4× 到 9.4×），图片一项持平（1.0×）" width="100%">
   </picture>
 </p>
 
 <details>
 <summary>表格数据</summary>
 
-| 测试项 | ThinkTerm 0.4.2<br>2026-11-05 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | 倍数 |
+| 测试项 | ThinkTerm 0.4.3<br>2026-11-06 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | 倍数 |
 | --- | ---: | ---: | ---: |
-| 纯 ASCII 字符 | **206.1** | 23.6 | 8.7× |
-| Unicode 字符 | **192.4** | 46.7 | 4.1× |
-| 多码点 Unicode 字符 | **200.9** | 49.3 | 4.1× |
-| CSI 序列夹少量字符 | **90.9** | 15.6 | 5.8× |
-| 长转义序列 | **219.3** | 194.9 | 1.1× |
-| 图片 | 216.4 | **270.5** | 0.80× |
+| 纯 ASCII 字符 | **221.4** | 23.6 | 9.4× |
+| Unicode 字符 | **193.2** | 46.7 | 4.1× |
+| 多码点 Unicode 字符 | **285.3** | 49.3 | 5.8× |
+| CSI 序列夹少量字符 | **89.9** | 15.6 | 5.8× |
+| 长转义序列 | **278.6** | 194.9 | 1.4× |
+| 图片 | **278.4** | 270.5 | 1.0× |
 
 </details>
 
@@ -119,26 +119,26 @@ Linux 上与 kitty 对比：Ubuntu 20.04（i9-12900K），180×50，`TERM=xterm-
 
 </details>
 
-同一台 Mac 上的版本进步。倍数是 0.4.2 相对早期版本。
+同一台 Mac 上的版本进步。倍数是 0.4.3 相对早期版本。
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="../assets/performance-progress-zh-CN-dark.svg">
-    <img src="../assets/performance-progress-zh-CN-light.svg" alt="ThinkTerm 各版本在 6 项 kitten 跑分中的吞吐：从早期版本到 0.3.0、0.4.1 再到 0.4.2，0.4.2 有 4 项领先早期版本（3.0× 到 4.5×），长转义序列和图片持平" width="100%">
+    <img src="../assets/performance-progress-zh-CN-light.svg" alt="ThinkTerm 各版本在 6 项 kitten 跑分中的吞吐：从早期版本到 0.3.0、0.4.1、0.4.2 再到 0.4.3，0.4.3 全部领先早期版本（1.3× 到 4.9×）" width="100%">
   </picture>
 </p>
 
 <details>
 <summary>表格数据</summary>
 
-| 测试项 | ThinkTerm 早期<br>2026-09 | ThinkTerm 0.3.0<br>2026-10-21 | ThinkTerm 0.4.1<br>2026-11-04 | ThinkTerm 0.4.2<br>2026-11-05 | 倍数 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 纯 ASCII 字符 | 45.3 | 133.0 | 134.0 | **206.1** | 4.5× |
-| Unicode 字符 | 52.2 | 104.5 | 109.2 | **192.4** | 3.7× |
-| 多码点 Unicode 字符 | 67.8 | 197.5 | 234.4 | **200.9** | 3.0× |
-| CSI 序列夹少量字符 | 25.7 | 49.5 | 53.5 | **90.9** | 3.5× |
-| 长转义序列 | 219.4 | 213.8 | 257.3 | **219.3** | 1.00× |
-| 图片 | 218.0 | 257.2 | 271.0 | **216.4** | 0.99× |
+| 测试项 | ThinkTerm 早期<br>2026-09 | ThinkTerm 0.3.0<br>2026-10-21 | ThinkTerm 0.4.1<br>2026-11-04 | ThinkTerm 0.4.2<br>2026-11-05 | ThinkTerm 0.4.3<br>2026-11-06 | 倍数 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 纯 ASCII 字符 | 45.3 | 133.0 | 134.0 | 206.1 | **221.4** | 4.9× |
+| Unicode 字符 | 52.2 | 104.5 | 109.2 | 192.4 | **193.2** | 3.7× |
+| 多码点 Unicode 字符 | 67.8 | 197.5 | 234.4 | 200.9 | **285.3** | 4.2× |
+| CSI 序列夹少量字符 | 25.7 | 49.5 | 53.5 | 90.9 | **89.9** | 3.5× |
+| 长转义序列 | 219.4 | 213.8 | 257.3 | 219.3 | **278.6** | 1.3× |
+| 图片 | 218.0 | 257.2 | 271.0 | 216.4 | **278.4** | 1.3× |
 
 </details>
 

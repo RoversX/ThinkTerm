@@ -79,21 +79,21 @@ ThinkTerm a été mesuré avec son mux local : le shell tourne dans le serveur m
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="../assets/performance-fr-FR-dark.svg">
-    <img src="../assets/performance-fr-FR-light.svg" alt="Débit de ThinkTerm comparé à WezTerm sur six tests kitten : ThinkTerm est plus rapide sur cinq (de 1,1× à 8,7×) et plus lent sur les images (0,80×)" width="100%">
+    <img src="../assets/performance-fr-FR-light.svg" alt="Débit de ThinkTerm comparé à WezTerm sur six tests kitten : ThinkTerm est plus rapide sur cinq (de 1,4× à 9,4×) et à égalité sur les images (1,0×)" width="100%">
   </picture>
 </p>
 
 <details>
 <summary>Données en tableau</summary>
 
-| Test | ThinkTerm 0.4.2<br>2026-11-05 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | Rapport |
+| Test | ThinkTerm 0.4.3<br>2026-11-06 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | Rapport |
 | --- | ---: | ---: | ---: |
-| Caractères ASCII uniquement | **206,1** | 23,6 | 8,7× |
-| Caractères Unicode | **192,4** | 46,7 | 4,1× |
-| Cellules Unicode à plusieurs points de code | **200,9** | 49,3 | 4,1× |
-| Séquences CSI avec peu de caractères | **90,9** | 15,6 | 5,8× |
-| Longues séquences d’échappement | **219,3** | 194,9 | 1,1× |
-| Images | 216,4 | **270,5** | 0,80× |
+| Caractères ASCII uniquement | **221,4** | 23,6 | 9,4× |
+| Caractères Unicode | **193,2** | 46,7 | 4,1× |
+| Cellules Unicode à plusieurs points de code | **285,3** | 49,3 | 5,8× |
+| Séquences CSI avec peu de caractères | **89,9** | 15,6 | 5,8× |
+| Longues séquences d’échappement | **278,6** | 194,9 | 1,4× |
+| Images | **278,4** | 270,5 | 1,0× |
 
 </details>
 
@@ -119,26 +119,26 @@ Sous Linux, comparé à kitty sur Ubuntu 20.04 (i9-12900K), en 180×50 avec `TER
 
 </details>
 
-Progression au fil des versions sur le même Mac. Le rapport compare 0.4.2 à la première version.
+Progression au fil des versions sur le même Mac. Le rapport compare 0.4.3 à la première version.
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="../assets/performance-progress-fr-FR-dark.svg">
-    <img src="../assets/performance-progress-fr-FR-light.svg" alt="Débit de ThinkTerm au fil des versions sur six tests kitten, d’une première version à 0.4.2 en passant par 0.3.0 et 0.4.1 : 0.4.2 devance la première version sur quatre, de 3,0× à 4,5×, et fait jeu égal sur les longues séquences d’échappement et les images" width="100%">
+    <img src="../assets/performance-progress-fr-FR-light.svg" alt="Débit de ThinkTerm au fil des versions sur six tests kitten, d’une première version à 0.4.3 en passant par 0.3.0, 0.4.1 et 0.4.2 : 0.4.3 devance la première version sur les six, de 1,3× à 4,9×" width="100%">
   </picture>
 </p>
 
 <details>
 <summary>Données en tableau</summary>
 
-| Test | ThinkTerm première version<br>2026-09 | ThinkTerm 0.3.0<br>2026-10-21 | ThinkTerm 0.4.1<br>2026-11-04 | ThinkTerm 0.4.2<br>2026-11-05 | Rapport |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Caractères ASCII uniquement | 45,3 | 133,0 | 134,0 | **206,1** | 4,5× |
-| Caractères Unicode | 52,2 | 104,5 | 109,2 | **192,4** | 3,7× |
-| Cellules Unicode à plusieurs points de code | 67,8 | 197,5 | 234,4 | **200,9** | 3,0× |
-| Séquences CSI avec peu de caractères | 25,7 | 49,5 | 53,5 | **90,9** | 3,5× |
-| Longues séquences d’échappement | 219,4 | 213,8 | 257,3 | **219,3** | 1,00× |
-| Images | 218,0 | 257,2 | 271,0 | **216,4** | 0,99× |
+| Test | ThinkTerm première version<br>2026-09 | ThinkTerm 0.3.0<br>2026-10-21 | ThinkTerm 0.4.1<br>2026-11-04 | ThinkTerm 0.4.2<br>2026-11-05 | ThinkTerm 0.4.3<br>2026-11-06 | Rapport |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Caractères ASCII uniquement | 45,3 | 133,0 | 134,0 | 206,1 | **221,4** | 4,9× |
+| Caractères Unicode | 52,2 | 104,5 | 109,2 | 192,4 | **193,2** | 3,7× |
+| Cellules Unicode à plusieurs points de code | 67,8 | 197,5 | 234,4 | 200,9 | **285,3** | 4,2× |
+| Séquences CSI avec peu de caractères | 25,7 | 49,5 | 53,5 | 90,9 | **89,9** | 3,5× |
+| Longues séquences d’échappement | 219,4 | 213,8 | 257,3 | 219,3 | **278,6** | 1,3× |
+| Images | 218,0 | 257,2 | 271,0 | 216,4 | **278,4** | 1,3× |
 
 </details>
 
