@@ -3426,9 +3426,11 @@ impl super::TermWindow {
         draggable: bool,
         event: MouseEvent,
     ) {
+        self.sidebar_row_landing = None;
         self.sidebar_row_drag = Some(super::SidebarRowDragState {
             kind,
             title,
+            grip: super::DragGrip::of(&item, event.coords),
             start: event.coords,
             current: event.coords,
             active: false,
@@ -3538,8 +3540,9 @@ impl super::TermWindow {
 
     /// Recompute which gap the drag would drop into. The candidate rows are
     /// this frame's rendered rects: same-Space Project rows for a project
-    /// drag, the same project's (unpinned) thread rows for a thread drag —
-    /// the pinned section and other projects' threads are not targets.
+    /// drag, the same project's (unpinned) thread rows for a thread drag,
+    /// the same group's for a reference — the pinned section and other
+    /// projects' threads are not targets.
     fn update_sidebar_row_drag_target(&mut self, coords: ::window::Point) {
         let Some(kind) = self
             .sidebar_row_drag
@@ -3561,13 +3564,7 @@ impl super::TermWindow {
                 thread_id,
                 project_id,
             } => {
-                // A dragged reference row reorders within the Space's ref
-                // list, not within the origin project's threads.
-                let siblings = if self.sidebar_row_is_thread_ref(thread_id) {
-                    crate::workspace_threads::space_thread_refs(&self.active_space_id)
-                } else {
-                    crate::workspace_threads::unpinned_thread_ids(project_id)
-                };
+                let siblings = self.sidebar_thread_siblings(thread_id, project_id);
                 self.ui_items
                     .iter()
                     .filter_map(|candidate| match &candidate.item_type {
@@ -3584,9 +3581,10 @@ impl super::TermWindow {
         // A thread pointer that leaves its own list's vertical extent (plus
         // one row of slack) is not aiming at any of its gaps: dropping there
         // cancels instead of snapping to the nearest end, which is what
-        // keeps a thread dragged onto ANOTHER project a no-op. A project
-        // has no foreign list to stray into — the whole sidebar is its drop
-        // zone, so anywhere below the last block simply means "the end".
+        // keeps a thread dragged onto ANOTHER project, or a reference onto
+        // another group, a no-op. A project has no foreign list to stray
+        // into — the whole sidebar is its drop zone, so anywhere below the
+        // last block simply means "the end".
         let within_span = match &kind {
             super::SidebarRowKind::Project(_) | super::SidebarRowKind::RefGroup(_) => {
                 !rows.is_empty()
@@ -3599,7 +3597,7 @@ impl super::TermWindow {
             }
         };
         let target = if sidebar_x_ok && within_span {
-            sidebar_insert_position(&rows, coords.y).map(|(before, line_y)| {
+            sidebar_insert_position(&rows, coords.y).map(|before| {
                 // The rendered rows are only the VISIBLE ones: "after the
                 // last visible row" is the end of the viewport, not of the
                 // list. Anchor to the next logical sibling instead, so a
@@ -3612,26 +3610,33 @@ impl super::TermWindow {
                     super::SidebarRowKind::Thread {
                         thread_id,
                         project_id,
-                    } => {
-                        if self.sidebar_row_is_thread_ref(thread_id) {
-                            crate::workspace_threads::space_thread_refs(&self.active_space_id)
-                        } else {
-                            crate::workspace_threads::unpinned_thread_ids(project_id)
-                        }
-                    }
+                    } => self.sidebar_thread_siblings(thread_id, project_id),
                 };
                 let before = clamp_end_anchor_to_next_logical_sibling(
                     before,
                     rows.last().map(|(id, _, _)| id.as_str()),
                     &logical,
                 );
-                super::SidebarInsertTarget { before, line_y }
+                super::SidebarInsertTarget { before }
             })
         } else {
             None
         };
         if let Some(state) = self.sidebar_row_drag.as_mut() {
-            state.target = target;
+            if state.target != target {
+                state.target = target;
+                self.aim_sidebar_make_way();
+            }
+        }
+    }
+
+    /// What a dragged thread row moves among, in order. A dragged reference
+    /// reorders within its group, not within the origin project's threads.
+    fn sidebar_thread_siblings(&self, thread_id: &str, project_id: &str) -> Vec<String> {
+        if self.sidebar_row_is_thread_ref(thread_id) {
+            crate::workspace_threads::space_thread_refs_from(&self.active_space_id, project_id)
+        } else {
+            crate::workspace_threads::unpinned_thread_ids(project_id)
         }
     }
 
@@ -3640,10 +3645,25 @@ impl super::TermWindow {
         state: super::SidebarRowDragState,
         context: &dyn WindowOps,
     ) {
-        let Some(target) = state.target else {
-            return;
+        self.sidebar_row_landing = Some(super::DragLanding::new(
+            state.kind.clone(),
+            state.title.clone(),
+            state.grip,
+            state.current,
+            (self.dimensions.pixel_width, self.dimensions.pixel_height),
+            Instant::now(),
+        ));
+        let moved = self.move_sidebar_row(&state);
+        self.sidebar_make_way.finish(moved);
+        context.invalidate();
+    }
+
+    /// Reorder the list as the drag asks. Returns whether it changed.
+    fn move_sidebar_row(&mut self, state: &super::SidebarRowDragState) -> bool {
+        let Some(target) = state.target.as_ref() else {
+            return false;
         };
-        let changed = match &state.kind {
+        match &state.kind {
             super::SidebarRowKind::Project(project_id) => {
                 let space_id = self.active_space_id.clone();
                 // Local Spaces order projects and ref groups in one merged
@@ -3688,9 +3708,6 @@ impl super::TermWindow {
                     )
                 }
             }
-        };
-        if changed {
-            context.invalidate();
         }
     }
 
@@ -3716,9 +3733,11 @@ impl super::TermWindow {
             return;
         }
         let title = self.pane_nav_tab_title(pane_id, &pane.get_title());
+        self.pane_tab_landing = None;
         self.pane_tab_drag = Some(PaneTabDragState {
             pane_id,
             title,
+            grip: super::DragGrip::of(&item, event.coords),
             start: event.coords,
             current: event.coords,
             active: false,
@@ -3853,6 +3872,16 @@ impl super::TermWindow {
     }
 
     fn drop_pane_tab_drag(&mut self, state: PaneTabDragState) {
+        // Back to its place, or, once the move below goes through, on to
+        // the new one.
+        self.pane_tab_landing = Some(super::DragLanding::new(
+            state.pane_id,
+            state.title.clone(),
+            state.grip,
+            state.current,
+            (self.dimensions.pixel_width, self.dimensions.pixel_height),
+            Instant::now(),
+        ));
         let Some(target) = state.target else {
             return;
         };
@@ -10477,7 +10506,7 @@ fn kill_workspace_windows(workspaces: &[String], skip_workspace: Option<&str>) {
 
 /// A project's draggable extent is its whole BLOCK: the header row plus
 /// every thread row rendered under it (nothing when collapsed). Gaps then
-/// sit between whole workspaces, so "after X" paints below X's last thread
+/// sit between whole workspaces, so "after X" lands below X's last thread
 /// instead of between X's header and its threads. Relies on the sidebar
 /// pushing items in visual order: each Project row followed by its rows,
 /// with the cross-project pinned section preceding the first Project.
@@ -10534,20 +10563,20 @@ pub(crate) fn clamp_end_anchor_to_next_logical_sibling(
 }
 
 /// Which gap of a row list a pointer at `pointer_y` selects: insert before
-/// the returned id, or at the end when None. The second value is where the
-/// insert indicator line paints. Rows are (id, top, bottom) in render order;
-/// the upper half of a row aims before it, the lower half after it.
+/// the returned id, or at the end when None, and no gap at all without rows.
+/// Rows are (id, top, bottom) in render order; the upper half of a row aims
+/// before it, the lower half after it.
 pub(crate) fn sidebar_insert_position(
     rows: &[(String, isize, isize)],
     pointer_y: isize,
-) -> Option<(Option<String>, isize)> {
+) -> Option<Option<String>> {
     for (id, top, bottom) in rows {
         let mid = (top + bottom) / 2;
         if pointer_y < mid {
-            return Some((Some(id.clone()), *top));
+            return Some(Some(id.clone()));
         }
     }
-    rows.last().map(|(_, _, bottom)| (None, *bottom))
+    rows.last().map(|_| None)
 }
 
 #[cfg(test)]
@@ -10619,10 +10648,10 @@ mod sidebar_drag_tests {
                 ("beta".to_string(), 176, 196),
             ]
         );
-        // Below beta: the end, with the line under the last block.
+        // Below beta: the end.
         assert_eq!(
             sidebar_insert_position(&folder_block_extents(&items, "space-x"), 500),
-            Some((None, 196))
+            Some(None)
         );
     }
 
@@ -10660,20 +10689,20 @@ mod sidebar_drag_tests {
         // Above everything and in the first row's upper half: before "a".
         assert_eq!(
             sidebar_insert_position(&rows(), -10),
-            Some((Some("a".to_string()), 0))
+            Some(Some("a".to_string()))
         );
         assert_eq!(
             sidebar_insert_position(&rows(), 4),
-            Some((Some("a".to_string()), 0))
+            Some(Some("a".to_string()))
         );
         // Lower half of "a" aims after it = before "b".
         assert_eq!(
             sidebar_insert_position(&rows(), 15),
-            Some((Some("b".to_string()), 24))
+            Some(Some("b".to_string()))
         );
         // Lower half of the last row, and anywhere below: the end.
-        assert_eq!(sidebar_insert_position(&rows(), 60), Some((None, 68)));
-        assert_eq!(sidebar_insert_position(&rows(), 500), Some((None, 68)));
+        assert_eq!(sidebar_insert_position(&rows(), 60), Some(None));
+        assert_eq!(sidebar_insert_position(&rows(), 500), Some(None));
         // No rows: nowhere to drop.
         assert_eq!(sidebar_insert_position(&[], 10), None);
     }

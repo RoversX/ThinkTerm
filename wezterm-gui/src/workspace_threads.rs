@@ -1697,15 +1697,24 @@ fn lock_store_following_settings() -> parking_lot::MutexGuard<'static, Workspace
     store
 }
 
-/// The reference list of a Space, in display order.
-pub fn space_thread_refs(host_space_id: &str) -> Vec<String> {
-    THREAD_STORE
-        .lock()
+/// A Space's references to threads of one project, in display order: the
+/// group a dragged reference moves within. A server folder's own rows show
+/// in that group too but are no references, and stay below these.
+pub fn space_thread_refs_from(host_space_id: &str, project_id: &str) -> Vec<String> {
+    let store = THREAD_STORE.lock();
+    let refs = store
         .spaces
         .iter()
         .find(|space| space.id == host_space_id)
-        .map(|space| space.thread_refs.clone())
-        .unwrap_or_default()
+        .map(|space| space.thread_refs.as_slice())
+        .unwrap_or(&[]);
+    let Some(project) = store.projects.iter().find(|p| p.id == project_id) else {
+        return Vec::new();
+    };
+    refs.iter()
+        .filter(|id| project.threads.iter().any(|thread| &thread.id == *id))
+        .cloned()
+        .collect()
 }
 
 /// Remember which reference the user last opened from this Space, so the
@@ -6751,7 +6760,10 @@ impl WorkspaceThreadStore {
         space.thread_refs.len() != before
     }
 
-    /// Reorder a reference before another (or to the end with `None`).
+    /// Reorder a reference before another of its group, the references to
+    /// the same project (or to the end of them with `None`). They trade the
+    /// places they hold in the Space's list, so groups, which show in the
+    /// order they first appear there, stay as they are.
     /// Purely local: reference order never travels to any server.
     fn move_thread_ref_before(
         &mut self,
@@ -6759,6 +6771,13 @@ impl WorkspaceThreadStore {
         thread_id: &str,
         before: Option<&str>,
     ) -> bool {
+        let Some(project) = self
+            .projects
+            .iter()
+            .find(|project| project.threads.iter().any(|t| t.id == thread_id))
+        else {
+            return false;
+        };
         let Some(space) = self
             .spaces
             .iter_mut()
@@ -6766,30 +6785,44 @@ impl WorkspaceThreadStore {
         else {
             return false;
         };
-        let Some(from) = space.thread_refs.iter().position(|id| id == thread_id) else {
+        let places: Vec<usize> = (0..space.thread_refs.len())
+            .filter(|&place| {
+                let id = &space.thread_refs[place];
+                project.threads.iter().any(|thread| &thread.id == id)
+            })
+            .collect();
+        let mut group: Vec<String> = places
+            .iter()
+            .map(|&place| space.thread_refs[place].clone())
+            .collect();
+        let Some(from) = group.iter().position(|id| id == thread_id) else {
             return false;
         };
-        // Mirror move_thread_before's guards: a drop on the row itself or on
-        // an anchor that has meanwhile vanished cancels the drag instead of
-        // teleporting the reference to the end of the list.
+        // Mirror move_thread_before's guards: a drop on the row itself, on an
+        // anchor that has meanwhile vanished or on one in another group
+        // cancels the drag instead of teleporting the reference to the end
+        // of the list.
         let to = match before {
             Some(anchor) => {
                 if anchor == thread_id {
                     return false;
                 }
-                let Some(index) = space.thread_refs.iter().position(|id| id == anchor) else {
+                let Some(index) = group.iter().position(|id| id == anchor) else {
                     return false;
                 };
                 index
             }
-            None => space.thread_refs.len(),
+            None => group.len(),
         };
         if to == from || to == from + 1 {
             return false;
         }
-        let moved = space.thread_refs.remove(from);
+        let moved = group.remove(from);
         let to = if to > from { to - 1 } else { to };
-        space.thread_refs.insert(to, moved);
+        group.insert(to, moved);
+        for (place, id) in places.into_iter().zip(group) {
+            space.thread_refs[place] = id;
+        }
         true
     }
 
@@ -12038,6 +12071,45 @@ mod tests {
         assert!(!store.move_thread_ref_before(&coll, &t1, Some(&t2)));
         let space = store.spaces.iter().find(|s| s.id == coll).unwrap();
         assert_eq!(space.thread_refs, vec![t1, t2]);
+    }
+
+    #[test]
+    fn a_reference_moves_only_within_its_group() {
+        let (mut store, coll, t1, t2) = store_with_collection();
+        let mut other = default_project_for_space(DEFAULT_SPACE_ID);
+        other.id = "project-other".to_string();
+        let o1 = WorkspaceThread::new(other.id.clone(), "gamma".to_string(), None);
+        let o2 = WorkspaceThread::new(other.id.clone(), "delta".to_string(), None);
+        let (o1, o2) = {
+            let ids = (o1.id.clone(), o2.id.clone());
+            other.threads.extend([o1, o2]);
+            ids
+        };
+        store.projects.push(other);
+        for id in [&t1, &o1, &t2, &o2] {
+            assert!(store.add_thread_ref(&coll, id));
+        }
+        let refs = |store: &WorkspaceThreadStore| {
+            let space = store.spaces.iter().find(|s| s.id == coll).unwrap();
+            space.thread_refs.clone()
+        };
+
+        // Over another group, nothing happens.
+        assert!(!store.move_thread_ref_before(&coll, &o1, Some(&t1)));
+        assert!(!store.move_thread_ref_before(&coll, &t2, Some(&o2)));
+        assert_eq!(refs(&store), vec![t1.clone(), o1.clone(), t2.clone(), o2.clone()]);
+
+        // The end is the end of its group, and the first row of the group
+        // that goes there leaves the group where it first appears.
+        assert!(store.move_thread_ref_before(&coll, &t1, None));
+        assert_eq!(refs(&store), vec![t2.clone(), o1.clone(), t1.clone(), o2.clone()]);
+        assert!(store.move_thread_ref_before(&coll, &o1, None));
+        assert_eq!(refs(&store), vec![t2.clone(), o2.clone(), t1.clone(), o1.clone()]);
+        assert!(store.move_thread_ref_before(&coll, &o1, Some(&o2)));
+        assert_eq!(refs(&store), vec![t2.clone(), o1.clone(), t1.clone(), o2.clone()]);
+
+        // The last of its group stays there.
+        assert!(!store.move_thread_ref_before(&coll, &t1, None));
     }
 
     #[test]

@@ -3888,84 +3888,39 @@ impl crate::TermWindow {
         self.paint_drag_ghost_pill(&label, anchor)
     }
 
-    /// Reorder drag of a left-sidebar Project/thread row: a 2px accent
-    /// insert line at the gap releasing would drop into, plus the floating
-    /// ghost pill with the row's title.
+    /// Reorder drag of a left-sidebar Project/thread row: the rows moving
+    /// aside for it, which the sidebar paints where this leaves them, and
+    /// the row itself, following the pointer. Driven here and not from the
+    /// mouse handler for `paint_pane_tab_drag_overlay`'s reason, and past the
+    /// drag's end, while the rows and the row settle.
     fn paint_sidebar_row_drag_overlay(&mut self) -> anyhow::Result<()> {
-        let Some(state) = self.sidebar_row_drag.as_ref() else {
-            return Ok(());
-        };
-        if !state.active {
-            return Ok(());
+        let now = Instant::now();
+        if self.sidebar_make_way.step(now) {
+            self.update_next_frame_time(Some(now + Duration::from_millis(16)));
         }
-        let label = state.title.clone();
-        let anchor = state.current;
-        let line_y = state.target.as_ref().map(|target| target.line_y);
-
-        let sidebar_span = self
-            .ui_items
-            .iter()
-            .find(|item| {
-                item.item_type == crate::termwindow::UIItemType::WorkspaceSidebarBackground
-            })
-            .map(|bg| (bg.x as f32, bg.width as f32));
-
-        if let (Some(line_y), Some((bg_x, bg_width))) = (line_y, sidebar_span) {
-            // Same explicit accent blue as the pane drop preview: readable
-            // in both appearances regardless of the palette's selected_bg.
-            let accent = match crate::native_settings::effective_appearance() {
-                window::Appearance::Light | window::Appearance::LightHighContrast => {
-                    LinearRgba::with_srgba(0, 122, 255, 255)
-                }
-                window::Appearance::Dark | window::Appearance::DarkHighContrast => {
-                    LinearRgba::with_srgba(10, 132, 255, 255)
-                }
-            };
-            let inset = self.ui_px(crate::termwindow::ui::tokens::SIDEBAR_INSET) as f32;
-            let thickness = self.ui_f32(2.0).max(2.0);
-            let rect = euclid::rect(
-                bg_x + inset,
-                line_y as f32 - thickness / 2.0,
-                (bg_width - inset * 2.0).max(0.0),
-                thickness,
-            );
-            let gl_state = self.render_state.as_ref().unwrap();
-            let layer = gl_state
-                .layer_for_zindex(0)
-                .context("sidebar drag overlay layer")?;
-            let mut layers = layer.quad_allocator();
-            self.filled_rectangle(&mut layers, 0, rect, accent)
-                .context("sidebar drag insert line")?;
-        }
-
-        self.paint_drag_ghost_pill(&label, anchor)
+        self.paint_sidebar_row_ghost(now)
     }
 
     /// Translucent preview of where a dragged level-2 pane tab would land
     /// (its tab bar = move into its stack, full pane = swap with it, half
-    /// pane = split), plus the floating tab-title pill. Registers no UIItem
-    /// (hit-transparent).
+    /// pane = split), plus the tab itself, following the pointer. Registers
+    /// no UIItem (hit-transparent).
     fn paint_pane_tab_drag_overlay(&mut self) -> anyhow::Result<()> {
-        let Some(state) = self.pane_tab_drag.as_ref() else {
+        let now = Instant::now();
+        let Some(state) = self.pane_tab_drag.as_ref().filter(|state| state.active) else {
             // The drag ended (dropped or cancelled): the layout underneath
             // has already changed, so a lingering highlight would point at
-            // nothing. Drop the picture rather than fade it.
+            // nothing. Drop the picture rather than fade it. The tab has
+            // still to get back to a place.
             self.pane_drop_preview = None;
-            return Ok(());
+            return self.paint_pane_tab_ghost(now);
         };
-        if !state.active {
-            self.pane_drop_preview = None;
-            return Ok(());
-        }
-        let label = state.title.clone();
-        let anchor = state.current;
         let target_rect = state.target.as_ref().map(|target| target.rect);
 
         // Ease the drawn highlight toward the hit-tested target. Driven here
         // and not from the mouse handler because paint_impl clears
         // has_animation on entry, so only a deadline registered during paint
         // survives to schedule the next frame.
-        let now = Instant::now();
         let shown = match (self.pane_drop_preview.as_mut(), target_rect) {
             (None, None) => None,
             (None, Some(rect)) => {
@@ -4075,7 +4030,62 @@ impl crate::TermWindow {
             }
         }
 
-        self.paint_drag_ghost_pill(&label, anchor)
+        self.paint_pane_tab_ghost(now)
+    }
+
+    /// Set what a drag carries at `(x, y)`, on a surface of its own with a
+    /// shadow under it, lifted off its list; `lifted` thins the shadow as it
+    /// comes back down. `content` is recorded with the thing's corner at the
+    /// origin: the painters take unsigned pixels, and tabs lay themselves
+    /// out from x = 0. Registers no UIItem (hit-transparent).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_drag_ghost(
+        &self,
+        content: &HeapQuadAllocator,
+        (x, y): (f32, f32),
+        grip: crate::termwindow::DragGrip,
+        surface: LinearRgba,
+        border: LinearRgba,
+        lifted: f32,
+        radius: f32,
+    ) -> anyhow::Result<()> {
+        let window = (self.dimensions.pixel_width, self.dimensions.pixel_height);
+        let gl_state = self.render_state.as_ref().unwrap();
+        let layer = gl_state
+            .layer_for_zindex(crate::termwindow::DRAG_GHOST_ZINDEX)
+            .context("drag ghost layer")?;
+        let mut layers = layer.quad_allocator();
+
+        // The surface first, and in place: the shadow is cut to the window
+        // as it is drawn, which it could not be from around the origin.
+        let ctx = DrawContext::new(gl_state, self.dimensions, &self.render_metrics);
+        let shadow = LinearRgba::with_components(
+            0.0,
+            0.0,
+            0.0,
+            lifted * if self.chrome().is_dark() { 0.5 } else { 0.22 },
+        );
+        ctx.draw_elevated_surface(
+            &mut layers,
+            0,
+            euclid::rect(x, y, grip.width as f32, grip.height as f32),
+            surface,
+            border,
+            shadow,
+            radius,
+        )
+        .context("drag ghost surface")?;
+
+        let clip = QuadClipRect::from_top_left_pixels(
+            0.0,
+            0.0,
+            window.0 as f32,
+            window.1 as f32,
+            &self.dimensions,
+        );
+        content
+            .apply_to_clipped_at(&mut layers, x, y, clip, 1.0)
+            .context("drag ghost content")
     }
 
     /// Floating label that follows the cursor during a drag. Painted after
@@ -5894,10 +5904,70 @@ impl crate::TermWindow {
     }
 }
 
+/// `top` as it looks on `ground`, solid: a ghost goes over anything, and a
+/// see-through window would show that through a surface as its bar paints it.
+pub(crate) fn drag_ghost_surface(top: LinearRgba, ground: LinearRgba) -> LinearRgba {
+    crate::termwindow::ui::sidebar::over(
+        top,
+        LinearRgba::with_components(ground.0, ground.1, ground.2, 1.0),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::quad::TripleLayerQuadAllocatorTrait;
+
+    #[test]
+    fn what_was_let_go_of_goes_from_there_to_its_place() {
+        let now = Instant::now();
+        let landing = crate::termwindow::DragLanding::new(
+            (),
+            String::new(),
+            grip_of_a_row(),
+            ::window::Point::new(340, 406),
+            (1000, 800),
+            now,
+        );
+        let rest = (10.0, 100.0);
+        assert_eq!(landing.place(rest, now), (310.0, 400.0));
+        let later = now + Duration::from_millis(50);
+        let (x, y) = landing.place(rest, later);
+        assert!(x > 10.0 && x < 310.0 && y > 100.0 && y < 400.0);
+        // Faster at first than at the end.
+        assert!(landing.progress(later) > 0.5);
+        assert_eq!(landing.place(rest, now + Duration::from_secs(1)), rest);
+    }
+
+    fn grip_of_a_row() -> crate::termwindow::DragGrip {
+        // Pressed 30px in and 6px down a row at (10, 100), 200 by 28.
+        crate::termwindow::DragGrip::of(
+            &UIItem {
+                x: 10,
+                y: 100,
+                width: 200,
+                height: 28,
+                item_type: UIItemType::WorkspaceSidebarBackground,
+            },
+            ::window::Point::new(40, 106),
+        )
+    }
+
+    #[test]
+    fn a_dragged_row_stays_held_where_it_was_pressed() {
+        let grip = grip_of_a_row();
+        let window = (1000, 800);
+        assert_eq!(grip.origin(::window::Point::new(40, 106), window), (10.0, 100.0));
+        assert_eq!(grip.origin(::window::Point::new(340, 406), window), (310.0, 400.0));
+    }
+
+    #[test]
+    fn a_dragged_row_stays_whole_inside_the_window() {
+        let grip = grip_of_a_row();
+        let window = (1000, 800);
+        assert_eq!(grip.origin(::window::Point::new(0, 0), window), (0.0, 0.0));
+        assert_eq!(grip.origin(::window::Point::new(2000, 2000), window), (800.0, 772.0));
+    }
 
     #[test]
     fn right_sidebar_hover_keeps_tab_bar_buttons_clickable() {

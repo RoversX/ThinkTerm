@@ -1498,6 +1498,22 @@ impl crate::TermWindow {
 
             let tab_left = pane_x + place.x;
             let tab_right = tab_left + tab_width as f32;
+            // A tab pressed half out of the strip was hit where the strip
+            // stops; what the drag carries is all of it.
+            let carried = match self
+                .pane_tab_drag
+                .as_mut()
+                .filter(|drag| drag.pane_id == tab.pane_id)
+            {
+                Some(drag) => {
+                    drag.grip.width = tab_width;
+                    drag.active
+                }
+                None => false,
+            } || self
+                .pane_tab_landing
+                .as_ref()
+                .is_some_and(|landing| landing.what == tab.pane_id);
             if tab_right <= tab_start as f32 || tab_left >= max_tab_right as f32 {
                 continue;
             }
@@ -1561,6 +1577,12 @@ impl crate::TermWindow {
                         action: PaneNavAction::Activate(tab.pane_id),
                     },
                 });
+            }
+            // A tab a drag has is painted where the pointer is, then on its
+            // way into place, so it is not left here as well. Its place in
+            // the strip stays.
+            if carried {
+                continue;
             }
 
             // Reborrow: the surrounding loop cannot move the caller's `&mut`.
@@ -1824,6 +1846,104 @@ impl crate::TermWindow {
             y + press_inset + ((visual_size.saturating_sub(icon_size)) / 2),
             icon_size,
             if hovered { hover_color } else { color },
+        )
+    }
+
+    /// The tab a drag carries, laid out as the strip lays it out and
+    /// selected, as pressing it left it. Its close button stays behind:
+    /// nothing on it can be pressed while it is carried. Let go of, it goes
+    /// on to its place, taking on the width it finds there.
+    pub(crate) fn paint_pane_tab_ghost(&mut self, now: Instant) -> anyhow::Result<()> {
+        let window = (self.dimensions.pixel_width, self.dimensions.pixel_height);
+        let drag = self.pane_tab_drag.as_ref().filter(|drag| drag.active);
+        let (pane_id, raw_title, origin, grip) = if let Some(state) = drag {
+            let origin = state.grip.origin(state.current, window);
+            (state.pane_id, state.title.clone(), origin, state.grip)
+        } else if let Some(landing) = self.pane_tab_landing.clone() {
+            let rest = self.ui_items.iter().find(|item| {
+                matches!(
+                    &item.item_type,
+                    UIItemType::PaneNav { action: PaneNavAction::Activate(id), .. }
+                        if *id == landing.what
+                )
+            });
+            let Some(rest) = rest else {
+                self.pane_tab_landing = None;
+                return Ok(());
+            };
+            let origin = landing.place((rest.x as f32, rest.y as f32), now);
+            let landed = landing.progress(now);
+            let from = landing.grip.width as f32;
+            let width = (from + (rest.width as f32 - from) * landed).round() as usize;
+            // Its last frame here is the tab's first frame back, or there
+            // would be one with neither.
+            if landed >= 1.0 {
+                self.pane_tab_landing = None;
+            }
+            self.update_next_frame_time(Some(now + std::time::Duration::from_millis(16)));
+            let grip = crate::termwindow::DragGrip {
+                width,
+                ..landing.grip
+            };
+            (landing.what, landing.title, origin, grip)
+        } else {
+            return Ok(());
+        };
+        let (width, height) = (grip.width, grip.height);
+        let (title, running) = match split_leading_legacy_progress_marker(&raw_title) {
+            Some("") => ("Terminal", true),
+            Some(title) => (title, true),
+            None => (raw_title.as_str(), false),
+        };
+        let chrome = self.chrome();
+        let surface = crate::termwindow::render::paint::drag_ghost_surface(
+            chrome.active_tab_surface(),
+            self.tab_bar_surface(chrome.header_bg),
+        );
+        let ui_font = self
+            .fonts
+            .title_font_with_size(crate::native_settings::pane_header_font_size(
+                &crate::native_settings::load_shared(),
+            ))
+            .context("pane tab ghost font")?;
+        let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
+
+        let mut content = HeapQuadAllocator::default();
+        let mut layers = TripleLayerQuadAllocator::Heap(&mut content);
+        let icon_size = self.ui_px(TAB_ICON_SIZE).min(height);
+        let icon_right = self.paint_pane_tab_icon(
+            &mut layers,
+            pane_id,
+            0,
+            height,
+            icon_size,
+            running,
+            chrome.text,
+            surface,
+            self.focused.is_some(),
+        )?;
+        let text_x = icon_right + self.ui_px(PANE_NAV_ICON_GAP);
+        let text_right = self.tab_close_button_x(width, height, icon_size);
+        self.paint_pane_nav_text(
+            &mut layers,
+            &ui_font,
+            ui_metrics,
+            title,
+            text_x,
+            height.saturating_sub(ui_metrics.cell_size.height as usize) / 2,
+            text_right.saturating_sub(text_x + self.ui_px(PANE_NAV_ICON_GAP)),
+            chrome.text,
+        )?;
+        drop(layers);
+
+        self.paint_drag_ghost(
+            &content,
+            origin,
+            grip,
+            surface,
+            chrome.control_border,
+            1.0,
+            self.ui_f32(PANE_NAV_TAB_RADIUS),
         )
     }
 

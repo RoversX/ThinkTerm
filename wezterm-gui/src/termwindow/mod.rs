@@ -168,6 +168,7 @@ pub mod resize;
 pub(crate) mod share;
 mod selection;
 mod sidebar_hover;
+mod sidebar_make_way;
 mod sidebar_slide;
 mod space_swipe;
 pub(crate) mod thread_numbers;
@@ -546,6 +547,10 @@ pub(crate) const COMMAND_PALETTE_ZINDEX: i8 = 11;
 /// z-index are a global order rather than per-surface depth, so a view sharing
 /// them with the terminal would have the terminal's text drawn through it.
 pub(crate) const CONTENT_VIEW_FADE_ZINDEX: i8 = 8;
+
+/// What a drag carries is solid, and goes over the panes and every panel a
+/// drag can cross. Within one z-index their text would be drawn through it.
+pub(crate) const DRAG_GHOST_ZINDEX: i8 = 13;
 
 lazy_static::lazy_static! {
     static ref WINDOW_CLASS: Mutex<String> = Mutex::new(wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS.to_owned());
@@ -1382,6 +1387,89 @@ struct FileDragState {
     active: bool,
 }
 
+/// How a drag took hold of what it carries: the pointer's distance from the
+/// thing's top-left corner, and the thing's size. What follows the pointer
+/// is the thing itself, still held where it was pressed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DragGrip {
+    pub x: f32,
+    pub y: f32,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl DragGrip {
+    pub fn of(item: &UIItem, pointer: ::window::Point) -> Self {
+        Self {
+            x: pointer.x as f32 - item.x as f32,
+            y: pointer.y as f32 - item.y as f32,
+            width: item.width,
+            height: item.height,
+        }
+    }
+
+    /// Where the thing's top-left corner goes with the pointer at `pointer`,
+    /// whole inside a window of `window` pixels.
+    pub fn origin(&self, pointer: ::window::Point, window: (usize, usize)) -> (f32, f32) {
+        let place = |at: f32, size: usize, room: usize| at.min(room as f32 - size as f32).max(0.0);
+        (
+            place(pointer.x as f32 - self.x, self.width, window.0),
+            place(pointer.y as f32 - self.y, self.height, window.1),
+        )
+    }
+}
+
+/// What a drag carried, going into its place once let go of, wherever that
+/// has turned out to be. The row or tab stays hidden until then, so there
+/// is never one of it too many or too few.
+#[derive(Clone, Debug)]
+pub(crate) struct DragLanding<T> {
+    pub what: T,
+    pub title: String,
+    pub grip: DragGrip,
+    /// Where it was let go of.
+    from: (f32, f32),
+    started: Instant,
+}
+
+impl<T> DragLanding<T> {
+    const TIME: Duration = Duration::from_millis(170);
+
+    pub fn new(
+        what: T,
+        title: String,
+        grip: DragGrip,
+        pointer: ::window::Point,
+        window: (usize, usize),
+        now: Instant,
+    ) -> Self {
+        Self {
+            what,
+            title,
+            grip,
+            from: grip.origin(pointer, window),
+            started: now,
+        }
+    }
+
+    /// How far it has come, 0 to 1, slowing as it arrives.
+    pub fn progress(&self, now: Instant) -> f32 {
+        let t = now.saturating_duration_since(self.started).as_secs_f32()
+            / Self::TIME.as_secs_f32();
+        1.0 - (1.0 - t.min(1.0)).powi(3)
+    }
+
+    /// Where it is on its way to `rest`. Asked every frame, since `rest` can
+    /// move: a tab goes on to the stack a drop has only just taken it to.
+    pub fn place(&self, rest: (f32, f32), now: Instant) -> (f32, f32) {
+        let along = self.progress(now);
+        (
+            self.from.0 + (rest.0 - self.from.0) * along,
+            self.from.1 + (rest.1 - self.from.1) * along,
+        )
+    }
+}
+
 /// A left-sidebar Project or thread row being dragged to a new position in
 /// its list. Armed on press; the pending click fires on release when the
 /// drag never crossed the movement threshold.
@@ -1389,6 +1477,7 @@ pub(crate) struct SidebarRowDragState {
     pub kind: SidebarRowKind,
     /// The row's display name, for the floating ghost under the cursor.
     pub title: String,
+    pub grip: DragGrip,
     pub start: ::window::Point,
     pub current: ::window::Point,
     pub active: bool,
@@ -1415,12 +1504,10 @@ pub(crate) enum SidebarRowKind {
 }
 
 /// Where releasing the drag would insert the row: directly before `before`,
-/// or last in the list when None. `line_y` is where the insert indicator
-/// paints.
+/// or last in the list when None.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SidebarInsertTarget {
     pub before: Option<String>,
-    pub line_y: isize,
 }
 
 /// What a Files-panel drag will paste once it lands on the terminal.
@@ -1592,6 +1679,7 @@ impl PaneDropPreviewAnim {
 pub(crate) struct PaneTabDragState {
     pub pane_id: PaneId,
     pub title: String,
+    pub grip: DragGrip,
     pub start: ::window::Point,
     pub current: ::window::Point,
     pub active: bool,
@@ -3226,10 +3314,13 @@ pub struct TermWindow {
     right_sidebar_file_drag: Option<FileDragState>,
     /// In-flight drag of a level-2 pane tab toward a move/split drop.
     pane_tab_drag: Option<PaneTabDragState>,
+    pane_tab_landing: Option<DragLanding<PaneId>>,
     /// Eased picture of `pane_tab_drag`'s drop target; see PaneDropPreviewAnim.
     pane_drop_preview: Option<PaneDropPreviewAnim>,
     /// In-flight reorder drag of a left-sidebar Project or thread row.
     sidebar_row_drag: Option<SidebarRowDragState>,
+    sidebar_row_landing: Option<DragLanding<SidebarRowKind>>,
+    sidebar_make_way: sidebar_make_way::SidebarMakeWay,
     /// Content views (e.g. SSH hosts) shown as synthetic tabs.
     content_views: Vec<ContentViewTab>,
     active_content_view_id: Option<ContentViewId>,
@@ -4702,7 +4793,10 @@ impl TermWindow {
             self.finish_inline_tab_rename(true);
             self.right_sidebar_file_drag = None;
             self.pane_tab_drag = None;
+            self.pane_tab_landing = None;
             self.sidebar_row_drag = None;
+            self.sidebar_row_landing = None;
+            self.sidebar_make_way.finish(false);
             let lost_split_drag = self
                 .dragging
                 .as_ref()
@@ -5200,6 +5294,9 @@ impl TermWindow {
             pane_tab_drag: None,
             pane_drop_preview: None,
             sidebar_row_drag: None,
+            sidebar_row_landing: None,
+            sidebar_make_way: Default::default(),
+            pane_tab_landing: None,
             content_views: vec![],
             active_content_view_id: None,
             content_view_response_tab_id: None,
