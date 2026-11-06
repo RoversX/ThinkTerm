@@ -366,7 +366,7 @@ pub trait Pane: Downcast + Send + Sync {
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>>;
     /// The pty behind `reader`, when there is one: the reader thread waits
     /// for it with poll, which is what lets it be parked (see
-    /// `crate::pause_pane_reader`).
+    /// `crate::pause_pane_reader`), and can read a flood from it directly.
     #[cfg(unix)]
     fn pty_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
         None

@@ -681,6 +681,13 @@ const PTY_READ_BUFSIZE: usize = 64 * 1024;
 /// a time, and less than Linux does.
 const FULL_PTY_READ: usize = 1024;
 
+/// How many times a reader following a flood tries again when the pty runs
+/// dry. The program fills it again within microseconds, which is much less
+/// than waiting to be told takes, and a read that finds nothing is cheap.
+/// More catch no more of a flood, and cost a program that writes in bursts.
+#[cfg(unix)]
+const FLOOD_RETRIES: usize = 8;
+
 /// Bytes of external kitty payloads one flush may read into memory. A
 /// parser that fell behind a frame stream finds hundreds of frame escapes
 /// in a single read; reading every file they name held gigabytes for
@@ -1113,6 +1120,52 @@ lazy_static::lazy_static! {
         parking_lot::Mutex::new(HashMap::new());
 }
 
+/// Reads a flood of output without waiting to be told of each piece. macOS
+/// hands out a pty's output a KiB at a time, and finding out that there is
+/// more takes longer than reading it, which made that the limit on how fast a
+/// pane could take in output. Only for output with more behind it: anything
+/// less than a full read goes back to waiting, so typing never comes here.
+#[cfg(unix)]
+struct FloodReader {
+    /// A duplicate of the pty that, unlike the pane's reader, says when there
+    /// is nothing to read. Non-blocking is a mode of the pty and not of this
+    /// duplicate: the pane's reader and writer see it too, and allow for it.
+    pty: FileDescriptor,
+    following: bool,
+}
+
+#[cfg(unix)]
+impl FloodReader {
+    fn new(pty_fd: i32) -> Option<Self> {
+        Some(Self {
+            pty: FileDescriptor::dup(&pty_fd).ok()?,
+            following: false,
+        })
+    }
+
+    /// Whether what was just read has more behind it.
+    fn follow(&mut self, more: bool) {
+        self.following = more && (self.following || self.pty.set_non_blocking(true).is_ok());
+    }
+
+    /// Read what is there, or return None for the reader to go back to
+    /// waiting, which is also where the pty's end and any error are met.
+    fn read(&mut self, buf: &mut [u8]) -> Option<usize> {
+        if !self.following {
+            return None;
+        }
+        for _ in 0..FLOOD_RETRIES {
+            match self.pty.read(buf) {
+                Ok(size) if size > 0 => return Some(size),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => std::hint::spin_loop(),
+                _ => break,
+            }
+        }
+        self.following = false;
+        None
+    }
+}
+
 /// A pane reader that is parked. Dropping it lets the reader run again;
 /// `keep` does not, for the pty that now belongs to another process.
 pub struct PausedReader {
@@ -1155,11 +1208,11 @@ pub fn pause_pane_reader(pane_id: PaneId, timeout: Duration) -> anyhow::Result<P
     })
 }
 
-/// This function is run in a separate thread; its purpose is to perform
-/// blocking reads from the pty (non-blocking reads are not portable to
-/// all platforms) and to feed the bytes to the parser thread through a
-/// bounded byte buffer. With a pty file descriptor to poll, the reader can also be
-/// parked; see [`pause_pane_reader`].
+/// This function is run in a separate thread; its purpose is to read from
+/// the pty, blocking except through a flood on macOS (see `FloodReader`), and
+/// to feed the bytes to the parser thread through a bounded byte buffer. With
+/// a pty file descriptor to poll, the reader can also be parked; see
+/// [`pause_pane_reader`].
 fn read_from_pane_pty(
     pane: Weak<dyn Pane>,
     banner: Option<String>,
@@ -1170,10 +1223,10 @@ fn read_from_pane_pty(
 
     let dead = Arc::new(AtomicBool::new(false));
 
-    let (pane_id, exit_behavior) = match pane.upgrade() {
-        Some(pane) => (pane.pane_id(), pane.exit_behavior()),
-        None => return,
+    let Some(held) = pane.upgrade() else {
+        return;
     };
+    let (pane_id, exit_behavior) = (held.pane_id(), held.exit_behavior());
 
     let (mut tx, rx) = output_buffer::channel();
 
@@ -1196,6 +1249,15 @@ fn read_from_pane_pty(
         }
         None => (None, None, None),
     };
+    // Only while the pane is held: once it has gone, the number of its pty can
+    // be another pane's, and this would read that pane's output.
+    #[cfg(unix)]
+    let mut flood = if cfg!(target_os = "macos") {
+        poll_fd.and_then(FloodReader::new)
+    } else {
+        None
+    };
+    drop(held);
     // Every reader can be paused here: a cancel ends the read it blocks in.
     #[cfg(windows)]
     let control = {
@@ -1237,8 +1299,23 @@ fn read_from_pane_pty(
                 continue;
             }
         }
+        // What is read here needs no waiting. A pause goes the usual way, and
+        // whatever happens to the pty meanwhile, the flood starts again after.
         #[cfg(unix)]
-        if let (Some(control), Some(wake_read), Some(fd)) = (&control, &mut wake_read, poll_fd) {
+        let flood_read = match (&control, &mut flood) {
+            (Some(control), Some(flood)) if control.paused.load(Ordering::SeqCst) => {
+                flood.follow(false);
+                None
+            }
+            (_, Some(flood)) => flood.read(&mut buf),
+            _ => None,
+        };
+        #[cfg(not(unix))]
+        let flood_read: Option<usize> = None;
+        #[cfg(unix)]
+        if let (None, Some(control), Some(wake_read), Some(fd)) =
+            (flood_read, &control, &mut wake_read, poll_fd)
+        {
             let mut pfd = [
                 pollfd {
                     fd: fd as _,
@@ -1286,7 +1363,10 @@ fn read_from_pane_pty(
         if let Some(control) = &control {
             *control.in_read.lock() = true;
         }
-        let read = reader.read(&mut buf);
+        let read = match flood_read {
+            Some(size) => Ok(size),
+            None => reader.read(&mut buf),
+        };
         #[cfg(windows)]
         if let Some(control) = &control {
             *control.in_read.lock() = false;
@@ -1316,7 +1396,12 @@ fn read_from_pane_pty(
                 }
                 // A full read says more is coming, and the wake is the most
                 // expensive part of a read. Anything less goes straight on.
-                let written = if can_flood && size >= FULL_PTY_READ {
+                let flooding = can_flood && size >= FULL_PTY_READ;
+                #[cfg(unix)]
+                if let Some(flood) = &mut flood {
+                    flood.follow(flooding);
+                }
+                let written = if flooding {
                     tx.write_all_flooding(&buf[..size])
                 } else {
                     tx.write_all(&buf[..size])
@@ -5679,5 +5764,60 @@ mod tests {
             true
         });
         mux.notify(MuxNotification::PaneRemoved(999_998));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod flood_reader_tests {
+    use super::*;
+    use portable_pty::{native_pty_system, PtySize};
+
+    /// Typing into the pty echoes it back as output. A child printing it
+    /// instead could not exit until that output had been read.
+    fn echo(typing: &mut Box<dyn Write + Send>, fd: i32, text: &str) {
+        typing.write_all(text.as_bytes()).unwrap();
+        let mut output = [pollfd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        }];
+        assert_eq!(poll(&mut output, Some(Duration::from_secs(10))).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_flood_is_read_until_it_stops_and_the_pane_reader_carries_on() {
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+        let fd = pair.master.as_raw_fd().unwrap();
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let mut typing = pair.master.take_writer().unwrap();
+        let mut flood = FloodReader::new(fd).unwrap();
+        let mut buf = [0; 64];
+
+        // Only a full read starts it, or a quiet pane would never be waited on.
+        echo(&mut typing, fd, "first");
+        assert_eq!(flood.read(&mut buf), None);
+        let size = reader.read(&mut buf).unwrap();
+        assert_eq!(&buf[..size], b"first");
+
+        echo(&mut typing, fd, "second");
+        flood.follow(true);
+        let size = flood.read(&mut buf).unwrap();
+        assert_eq!(&buf[..size], b"second");
+
+        // Dry, it gives up rather than waiting for what may never come.
+        flood.follow(true);
+        assert_eq!(flood.read(&mut buf), None);
+        assert_eq!(flood.read(&mut buf), None);
+
+        // The pty stays non-blocking, so the pane's reader has to wait for the
+        // next output itself rather than take the empty pty for an error.
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            typing.write_all(b"third").unwrap();
+            typing
+        });
+        let size = reader.read(&mut buf).unwrap();
+        assert_eq!(&buf[..size], b"third");
+        drop(late.join().unwrap());
     }
 }

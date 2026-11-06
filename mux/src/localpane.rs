@@ -3287,17 +3287,20 @@ mod summary_tests {
         }
     }
 
-    /// While a reader is paused, what the program writes stays in the pty;
-    /// resuming applies it, and a kept pause never does.
+    /// A pane with its reader running, and the end of the pipe it reads from.
     #[cfg(unix)]
-    #[test]
-    fn a_paused_reader_leaves_the_pty_output_where_it_is() {
+    fn pane_on_a_pipe(
+        id: PaneId,
+    ) -> (
+        Arc<dyn Pane>,
+        filedescriptor::FileDescriptor,
+        std::sync::mpsc::Sender<()>,
+    ) {
         use std::os::unix::io::AsRawFd;
         ensure_scheduler();
         let pipe = filedescriptor::Pipe::new().unwrap();
-        let mut program = pipe.write;
         let raw = pipe.read.as_raw_fd();
-        let (_exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
         let terminal = Terminal::new(
             size(80, 24),
             Arc::new(config::TermConfig::new()),
@@ -3306,7 +3309,7 @@ mod summary_tests {
             Box::new(Vec::new()),
         );
         let pane: Arc<dyn Pane> = Arc::new(LocalPane::new(
-            4242,
+            id,
             terminal,
             Box::new(SleepingChild(exit_rx)),
             Box::new(PipePty { read: pipe.read }),
@@ -3317,25 +3320,68 @@ mod summary_tests {
         let reader = pane.reader().unwrap().unwrap();
         let weak = Arc::downgrade(&pane);
         std::thread::spawn(move || crate::read_from_pane_pty(weak, None, reader, Some(raw)));
+        (pane, pipe.write, exit_tx)
+    }
 
-        let title = |pane: &Arc<dyn Pane>| pane.summary_without_waiting().title;
-        let wait_for = |pane: &Arc<dyn Pane>, want: &str| {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while title(pane) != want && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(5));
+    #[cfg(unix)]
+    fn wait_for_title(pane: &Arc<dyn Pane>, want: &str) {
+        let title = || pane.summary_without_waiting().title;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while title() != want && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(title(), want);
+    }
+
+    /// A reader going through a flood has no wait to be woken from, and stops
+    /// for a pause all the same.
+    #[cfg(unix)]
+    #[test]
+    fn a_reader_in_a_flood_stops_for_a_pause() {
+        let (pane, mut program, _exit_tx) = pane_on_a_pipe(4244);
+        program.write_all(b"\x1b]0;started\x07").unwrap();
+        wait_for_title(&pane, "started");
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flood = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    program.write_all(&[b' '; 4096]).unwrap();
+                }
+                program
             }
-            assert_eq!(title(pane), want);
-        };
+        });
+        std::thread::sleep(Duration::from_millis(20));
+
+        let paused = crate::pause_pane_reader(4244, Duration::from_secs(2)).expect("pause");
+        // The program stops only once the reader has gone on and made room.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(20));
+        drop(paused);
+        let mut program = flood.join().unwrap();
+
+        program.write_all(b"\x1b]0;after\x07").unwrap();
+        wait_for_title(&pane, "after");
+    }
+
+    /// While a reader is paused, what the program writes stays in the pty;
+    /// resuming applies it, and a kept pause never does.
+    #[cfg(unix)]
+    #[test]
+    fn a_paused_reader_leaves_the_pty_output_where_it_is() {
+        let (pane, mut program, _exit_tx) = pane_on_a_pipe(4242);
+        let title = |pane: &Arc<dyn Pane>| pane.summary_without_waiting().title;
 
         program.write_all(b"\x1b]0;first\x07").unwrap();
-        wait_for(&pane, "first");
+        wait_for_title(&pane, "first");
 
         let paused = crate::pause_pane_reader(4242, Duration::from_secs(2)).expect("pause");
         program.write_all(b"\x1b]0;second\x07").unwrap();
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(title(&pane), "first", "nothing is read while paused");
         drop(paused);
-        wait_for(&pane, "second");
+        wait_for_title(&pane, "second");
 
         let paused = crate::pause_pane_reader(4242, Duration::from_secs(2)).expect("pause again");
         program.write_all(b"\x1b]0;third\x07").unwrap();
