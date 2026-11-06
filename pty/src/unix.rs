@@ -121,7 +121,8 @@ fn wait_pty(fd: &FileDescriptor, events: i16) -> io::Result<()> {
     loop {
         match filedescriptor::poll(&mut fds, None) {
             Ok(_) => return Ok(()),
-            Err(filedescriptor::Error::Poll(error))
+            // Io is what select reports it as, which is what poll is on macOS.
+            Err(filedescriptor::Error::Poll(error) | filedescriptor::Error::Io(error))
                 if error.kind() == io::ErrorKind::Interrupted =>
             {
                 ()
