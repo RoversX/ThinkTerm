@@ -931,23 +931,25 @@ fn capture(pid_file: bool) -> anyhow::Result<Capture> {
 
     for pane in mux.iter_panes() {
         let pane_id = pane.pane_id();
-        let parts = match pane.downcast_ref::<LocalPane>() {
-            Some(local) if pane.domain_id() == local_domain => {
-                local.quiesce_connect_input()?;
-                travelling_parts(local)
-                    .with_context(|| format!("pane {pane_id} cannot be handed over"))?
-            }
-            _ => None,
+        let local = pane
+            .downcast_ref::<LocalPane>()
+            .filter(|_| pane.domain_id() == local_domain);
+        let Some(local) = local else {
+            left_behind.push(pane_id);
+            continue;
         };
+        let parts = travelling_parts(local)
+            .with_context(|| format!("pane {pane_id} cannot be handed over"))?;
         let Some(parts) = parts else {
+            local.quiesce_connect_input()?;
             left_behind.push(pane_id);
             continue;
         };
         let guard = mux::pause_pane_reader(pane_id, PAUSE_TIMEOUT)
             .with_context(|| format!("pausing pane {pane_id}"))?;
-        let local = pane
-            .downcast_ref::<LocalPane>()
-            .expect("checked above");
+        // Only now: this makes the pty blocking again, and a reader going
+        // through a flood would block in its read, where no pause reaches it.
+        local.quiesce_connect_input()?;
         let (snapshot, graphics, shell) = local.snapshot_terminal();
         paused.push(guard);
         panes.push((
@@ -1346,7 +1348,8 @@ fn start_listener(listener: OwnedFd, socket_path: &Path) -> anyhow::Result<()> {
 }
 
 /// A session imported from another program keeps that program's O_NONBLOCK
-/// until the next handoff. Ordinary panes read and write blocking.
+/// until the next handoff, and a flood can leave a pane's pty the same way.
+/// A pane starts out here blocking, and what needs otherwise asks again.
 #[cfg(unix)]
 fn ensure_blocking(fd: &OwnedFd) -> anyhow::Result<()> {
     let flags = rustix::fs::fcntl_getfl(fd)?;
