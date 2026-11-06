@@ -628,6 +628,7 @@ const MENU_TITLES: &[(&str, &str)] = &[
     ("Rotate Pane", "menu-bar-rotate-pane"),
     ("Select Pane", "menu-bar-select-pane"),
     ("Select Tab", "menu-bar-select-tab"),
+    ("Select Thread", "menu-bar-select-thread"),
     ("Select Window", "menu-bar-select-window"),
     ("Workspace", "menu-bar-workspace"),
 ];
@@ -1545,7 +1546,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         ActivateTab(-1) => CommandDef {
             brief: tr("command-activate-right-most-tab").into(),
             doc: "Activates the tab on the far right".into(),
-            keys: vec![(Modifiers::SUPER, "9".into())],
+            keys: vec![(Modifiers::CTRL, "9".into())],
             args: &[ArgType::ActiveWindow],
             menubar: &["Window", "Select Tab"],
             icon: None,
@@ -1554,7 +1555,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             let n = *n;
             let ordinal = english_ordinal(n + 1);
             let keys = if n >= 0 && n <= 7 {
-                vec![(Modifiers::SUPER, (n + 1).to_string())]
+                vec![(Modifiers::CTRL, (n + 1).to_string())]
             } else {
                 vec![]
             };
@@ -2599,6 +2600,25 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: Some("oct_terminal"),
         },
+        ActivateWorkspaceThreadByIndex(n) => {
+            let n = *n;
+            let ordinal = english_ordinal(n as isize + 1);
+            // The same digits as the numbers the sidebar shows while these
+            // keys are held: see `termwindow::thread_numbers`.
+            let keys = if n < crate::termwindow::thread_numbers::MOST_NUMBERS {
+                vec![(Modifiers::SUPER, (n + 1).to_string())]
+            } else {
+                vec![]
+            };
+            CommandDef {
+                brief: counted("command-activate-thread", n as i64 + 1, Some(&ordinal)).into(),
+                doc: format!("Opens the {ordinal} thread in the sidebar").into(),
+                keys,
+                args: &[ArgType::ActiveWindow],
+                menubar: &["Window", "Select Thread"],
+                icon: None,
+            }
+        }
     })
 }
 
@@ -2701,6 +2721,15 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         }),
         RotatePanes(RotationDirection::Clockwise),
         RotatePanes(RotationDirection::CounterClockwise),
+        ActivateWorkspaceThreadByIndex(0),
+        ActivateWorkspaceThreadByIndex(1),
+        ActivateWorkspaceThreadByIndex(2),
+        ActivateWorkspaceThreadByIndex(3),
+        ActivateWorkspaceThreadByIndex(4),
+        ActivateWorkspaceThreadByIndex(5),
+        ActivateWorkspaceThreadByIndex(6),
+        ActivateWorkspaceThreadByIndex(7),
+        ActivateWorkspaceThreadByIndex(8),
         ActivateTab(0),
         ActivateTab(1),
         ActivateTab(2),
@@ -2752,6 +2781,26 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn number_keys_reach_threads_and_ctrl_reaches_tabs() {
+        use super::KeyAssignment::{ActivateTab, ActivateWorkspaceThreadByIndex};
+        use crate::inputmap::default_chords;
+        use window::{KeyCode, Modifiers};
+
+        let chord = |c, mods| vec![(KeyCode::Char(c), mods)];
+        assert_eq!(
+            default_chords(&ActivateWorkspaceThreadByIndex(0)),
+            chord('1', Modifiers::SUPER)
+        );
+        assert_eq!(
+            default_chords(&ActivateWorkspaceThreadByIndex(8)),
+            chord('9', Modifiers::SUPER)
+        );
+        assert!(default_chords(&ActivateWorkspaceThreadByIndex(9)).is_empty());
+        assert_eq!(default_chords(&ActivateTab(0)), chord('1', Modifiers::CTRL));
+        assert_eq!(default_chords(&ActivateTab(-1)), chord('9', Modifiers::CTRL));
+    }
+
     #[test]
     fn every_menu_title_has_an_english_text() {
         for (_, id) in super::MENU_TITLES {

@@ -109,6 +109,7 @@ pub enum SvgIcon {
     Terminal,
     Trash2,
     Unlink2,
+    Command,
     ALargeSmall,
     AppWindow,
     Bold,
@@ -403,6 +404,7 @@ impl SvgIcon {
             }
             Self::Terminal => include_bytes!("../../../../third_party/lucide/icons/terminal.svg"),
             Self::Trash2 => include_bytes!("../../../../third_party/lucide/icons/trash-2.svg"),
+            Self::Command => include_bytes!("../../../../third_party/lucide/icons/command.svg"),
             Self::ALargeSmall => {
                 include_bytes!("../../../../third_party/lucide/icons/a-large-small.svg")
             }
@@ -965,6 +967,7 @@ mod tests {
             SvgIcon::SplitVertical,
             SvgIcon::Terminal,
             SvgIcon::Trash2,
+            SvgIcon::Command,
             SvgIcon::X,
             // Remote Hosts' Tailscale group: the tailnet and its machines.
             SvgIcon::Apple,

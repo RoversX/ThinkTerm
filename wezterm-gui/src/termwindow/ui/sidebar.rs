@@ -10,7 +10,7 @@ use crate::termwindow::ui::status_icon::UiStatusKind;
 use crate::termwindow::ui::tokens::{
     CAPSULE_BORDER_WIDTH, SIDEBAR_ICON_GAP, SIDEBAR_INSET, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
     SIDEBAR_RESIZE_HANDLE_WIDTH, SIDEBAR_ROW_GAP, SIDEBAR_ROW_HIGHLIGHT_RADIUS,
-    SIDEBAR_ROW_RADIUS, SIDEBAR_WIDTH_CELLS,
+    SIDEBAR_ROW_RADIUS, SIDEBAR_TITLE_FADE_GAP, SIDEBAR_WIDTH_CELLS,
     WINDOW_TAB_FULLSCREEN_NEW_SESSION_EXTRA_HEIGHT, WINDOW_TAB_FULLSCREEN_NEW_SESSION_Y_OFFSET,
     WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET,
     WINDOW_TAB_TOP_SPACER,
@@ -945,8 +945,9 @@ impl crate::TermWindow {
     /// `end_x`. With `show_end` false the row's buttons have the end, and
     /// neither the mark nor trailing icons are drawn. A `dimmed` row -- a
     /// ref whose machine is away -- has no mark: it cannot say what the
-    /// thread is doing. Returns
-    /// where the name starts and the right edge it must keep clear of.
+    /// thread is doing. `icons_at_end` is how present icons kept at the row's
+    /// end are. Returns where the name starts and the right edge it must keep
+    /// clear of.
     #[allow(clippy::too_many_arguments)]
     fn paint_sidebar_thread_marks(
         &self,
@@ -961,6 +962,7 @@ impl crate::TermWindow {
         show_end: bool,
         dimmed: bool,
         current: bool,
+        icons_at_end: f32,
         chrome: &UiPalette,
         foreground: LinearRgba,
     ) -> anyhow::Result<(usize, usize)> {
@@ -994,6 +996,11 @@ impl crate::TermWindow {
             count_font: &marks.count_font,
             count_metrics: &marks.count_metrics,
             count_color: chrome.secondary_text,
+            opacity: if marks.layout == NativeThreadIcons::Trailing {
+                icons_at_end
+            } else {
+                1.0
+            },
         };
         if marks.layout == NativeThreadIcons::Trailing {
             if show_end {
@@ -1285,7 +1292,7 @@ impl crate::TermWindow {
     /// The rows of the Space the sidebar is painted for. Painted for one
     /// this window is not in -- a card in the Library, a Space swiped to --
     /// nothing of the window's own workspace goes into them.
-    fn workspace_sidebar_view(
+    pub(crate) fn workspace_sidebar_view(
         &self,
         active_workspace: &str,
         workspaces: &[String],
@@ -2125,6 +2132,13 @@ impl crate::TermWindow {
                 .first()
                 .cloned()
         };
+        // A card in the Library and a Space swiped to are not the list the
+        // numbers count down.
+        let numbers = if card || self.workspace_sidebar_preview_space_id.is_some() {
+            None
+        } else {
+            self.thread_number_rows(&view)?
+        };
         // Everything from here until the end of the project loop scrolls with
         // `virtual_y`. A space-swipe slides exactly this stretch and leaves the
         // chrome painted before and after it standing.
@@ -2251,9 +2265,13 @@ impl crate::TermWindow {
                     let pin_x = delete_x.saturating_sub(action_size + 4);
                     let action_y = y + ((session_row_height.saturating_sub(action_size)) / 2);
                     let row_hovered = is_hovered && !is_renaming_session;
+                    let number = numbers.as_ref().and_then(|numbers| numbers.of(&session.id));
                     // In a Library card a row takes its click whole
                     // (`push_library_card_items`): no buttons on it there.
-                    let shows_actions = row_hovered && self.library_card_rect().is_none();
+                    // Nor under a number, where a click would find them
+                    // unseen.
+                    let shows_actions =
+                        row_hovered && self.library_card_rect().is_none() && number.is_none();
                     let surface = if is_selected {
                         over(selected_bg, sidebar_bg)
                     } else if row_hovered {
@@ -2261,26 +2279,28 @@ impl crate::TermWindow {
                     } else {
                         sidebar_bg
                     };
+                    let row_end = pinned_x
+                        .saturating_add(pinned_width)
+                        .saturating_sub(self.ui_px(SIDEBAR_INSET));
                     let (pinned_text_x, marks_right) = self.paint_sidebar_thread_marks(
                         layers,
                         &row_marks,
                         session,
                         pinned_status_x,
-                        pinned_x
-                            .saturating_add(pinned_width)
-                            .saturating_sub(self.ui_px(SIDEBAR_INSET)),
+                        row_end,
                         y,
                         session_row_height,
                         surface,
                         !shows_actions,
                         false,
                         is_selected,
+                        number.map_or(1.0, |number| number.icons_left()),
                         &chrome,
                         foreground,
                     )?;
                     let text_right = if shows_actions { pin_x } else { marks_right };
                     let title = self.sidebar_thread_title(&session.id, &session.name);
-                    self.paint_sidebar_text(
+                    self.paint_thread_row_name(
                         layers,
                         &ui_font,
                         ui_metrics,
@@ -2289,6 +2309,12 @@ impl crate::TermWindow {
                         text_y,
                         text_right.saturating_sub(pinned_text_x + self.ui_px(SIDEBAR_INSET)),
                         if is_selected { active_fg } else { foreground },
+                        number,
+                        row_end,
+                        y,
+                        session_row_height,
+                        is_selected,
+                        &chrome,
                     )?;
 
                     if shows_actions {
@@ -2461,7 +2487,7 @@ impl crate::TermWindow {
                             muted_fg,
                         )?;
                         let project_title = self.sidebar_project_title(&project.id, &project.name);
-                        self.paint_sidebar_text(
+                        self.paint_sidebar_name(
                             layers,
                             &ui_font,
                             ui_metrics,
@@ -2544,7 +2570,7 @@ impl crate::TermWindow {
                         )?;
                     }
                     let project_title = self.sidebar_project_title(&project.id, &project.name);
-                    self.paint_sidebar_text(
+                    self.paint_sidebar_name(
                         layers,
                         &ui_font,
                         ui_metrics,
@@ -2704,9 +2730,13 @@ impl crate::TermWindow {
                                 .context("sidebar hovered thread")?;
                             }
                             let row_hovered = is_hovered && !is_renaming_session;
+                            let number =
+                                numbers.as_ref().and_then(|numbers| numbers.of(&session.id));
                             // As for a pinned thread: no buttons on a row in a
-                            // Library card.
-                            let shows_actions = row_hovered && self.library_card_rect().is_none();
+                            // Library card, or under a number.
+                            let shows_actions = row_hovered
+                                && self.library_card_rect().is_none()
+                                && number.is_none();
                             let surface = if is_selected {
                                 over(selected_bg, sidebar_bg)
                             } else if row_hovered {
@@ -2714,30 +2744,31 @@ impl crate::TermWindow {
                             } else {
                                 sidebar_bg
                             };
-                            let (session_text_x, marks_right) = self
-                                .paint_sidebar_thread_marks(
-                                    layers,
-                                    &row_marks,
-                                    session,
-                                    session_status_x,
-                                    session_x
-                                        .saturating_add(session_width)
-                                        .saturating_sub(self.ui_px(SIDEBAR_INSET)),
-                                    y,
-                                    session_row_height,
-                                    surface,
-                                    !shows_actions,
-                                    false,
-                                    is_selected,
-                                    &chrome,
-                                    foreground,
-                                )?;
+                            let row_end = session_x
+                                .saturating_add(session_width)
+                                .saturating_sub(self.ui_px(SIDEBAR_INSET));
+                            let (session_text_x, marks_right) = self.paint_sidebar_thread_marks(
+                                layers,
+                                &row_marks,
+                                session,
+                                session_status_x,
+                                row_end,
+                                y,
+                                session_row_height,
+                                surface,
+                                !shows_actions,
+                                false,
+                                is_selected,
+                                number.map_or(1.0, |number| number.icons_left()),
+                                &chrome,
+                                foreground,
+                            )?;
                             let text_right = if shows_actions { pin_x } else { marks_right };
                             let text_width = text_right
                                 .saturating_sub(session_text_x + self.ui_px(SIDEBAR_INSET));
                             let session_title =
                                 self.sidebar_thread_title(&session.id, &session.name);
-                            self.paint_sidebar_text(
+                            self.paint_thread_row_name(
                                 layers,
                                 &ui_font,
                                 ui_metrics,
@@ -2746,6 +2777,12 @@ impl crate::TermWindow {
                                 text_y,
                                 text_width,
                                 if is_selected { active_fg } else { foreground },
+                                number,
+                                row_end,
+                                y,
+                                session_row_height,
+                                is_selected,
+                                &chrome,
                             )?;
                             if shows_actions {
                                 let pin_icon = if session.is_pinned {
@@ -2929,7 +2966,7 @@ impl crate::TermWindow {
                     };
                     let text_avail =
                         group_action_x.saturating_sub(group_text_x + self.ui_px(SIDEBAR_INSET));
-                    self.paint_sidebar_text(
+                    self.paint_sidebar_name(
                         layers,
                         &ui_font,
                         ui_metrics,
@@ -3117,29 +3154,34 @@ impl crate::TermWindow {
                         } else {
                             sidebar_bg
                         };
+                        let number = numbers.as_ref().and_then(|numbers| numbers.of(&session.id));
                         // A ref whose machine is away says nothing of what
                         // it is doing: it keeps its icons, not its mark.
+                        let row_end = session_x
+                            .saturating_add(session_width)
+                            .saturating_sub(self.ui_px(SIDEBAR_INSET));
                         let (session_text_x, marks_right) = self.paint_sidebar_thread_marks(
                             layers,
                             &row_marks,
                             session,
                             session_status_x,
-                            session_x
-                                .saturating_add(session_width)
-                                .saturating_sub(self.ui_px(SIDEBAR_INSET)),
+                            row_end,
                             y,
                             session_row_height,
                             surface,
-                            !is_hovered,
+                            !is_hovered || number.is_some(),
                             dimmed,
                             is_selected,
+                            number.map_or(1.0, |number| number.icons_left()),
                             &chrome,
                             foreground,
                         )?;
                         // Only a reference can be taken out: a row a server
                         // folder shows, with none of its own, stays as long
-                        // as the folder does.
+                        // as the folder does. Nor is it to be hit unseen
+                        // under a number.
                         let removable = is_hovered
+                            && number.is_none()
                             && (!reference.server_folder
                                 || workspace_threads::thread_ref_is_explicit(
                                     self.workspace_sidebar_space_id(),
@@ -3153,7 +3195,7 @@ impl crate::TermWindow {
                         } else {
                             foreground
                         };
-                        self.paint_sidebar_text(
+                        self.paint_thread_row_name(
                             layers,
                             &ui_font,
                             ui_metrics,
@@ -3162,6 +3204,12 @@ impl crate::TermWindow {
                             text_y,
                             text_right.saturating_sub(session_text_x + self.ui_px(SIDEBAR_INSET)),
                             text_fg,
+                            number,
+                            row_end,
+                            y,
+                            session_row_height,
+                            is_selected,
+                            &chrome,
                         )?;
 
                         if removable {
@@ -4349,6 +4397,33 @@ impl crate::TermWindow {
             ),
             fill,
             (radius - border_width).max(0.0),
+        )
+    }
+
+    /// A folder's name: as a thread row's, it goes out when it is too long.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_sidebar_name(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        font: &Rc<LoadedFont>,
+        metrics: RenderMetrics,
+        name: &str,
+        x: usize,
+        y: usize,
+        width: usize,
+        foreground: LinearRgba,
+    ) -> anyhow::Result<()> {
+        self.paint_title_fading_with(
+            layers,
+            font,
+            &metrics,
+            name,
+            x,
+            y,
+            width,
+            foreground,
+            SIDEBAR_TITLE_FADE_GAP,
+            |fade| fade,
         )
     }
 

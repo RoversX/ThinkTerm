@@ -676,6 +676,9 @@ pub enum KeyAssignment {
         space_id: String,
         thread_id: String,
     },
+    /// Open the thread on the sidebar's row of this number, from 0, counting
+    /// only the rows with a thread on them.
+    ActivateWorkspaceThreadByIndex(usize),
     ActivateWindow(usize),
     ActivateWindowRelative(isize),
     ActivateWindowRelativeNoWrap(isize),

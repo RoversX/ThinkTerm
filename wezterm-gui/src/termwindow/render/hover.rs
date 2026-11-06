@@ -25,7 +25,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wezterm_font::LoadedFont;
 use window::color::LinearRgba;
-use window::{Modifiers, UIKeyCapRendering};
+use window::Modifiers;
 
 const TAG_RADIUS: f32 = 16.0;
 const CARD_RADIUS: f32 = 24.0;
@@ -144,14 +144,26 @@ impl TermWindow {
             .cloned()
     }
 
-    /// The shortcut a tag shows after its label: the first chord bound to
-    /// the item's action, the platform's own modifier first, as the
-    /// keyboard settings label it.
+    /// The shortcut a tag shows after its label: `native_chord` of the
+    /// item's action, as the keyboard settings label it.
     pub(crate) fn hover_shortcut(&self, item_type: &UIItemType) -> Option<String> {
         let action = crate::termwindow::tooltip_action_for(item_type)?;
+        let (key, mods) = self.native_chord(&action)?;
+        Some(crate::inputmap::tight_chord_label(
+            &key,
+            mods,
+            self.config.ui_key_cap_rendering,
+        ))
+    }
+
+    /// The first chord bound to `action`, the platform's own modifier first.
+    pub(crate) fn native_chord(
+        &self,
+        action: &config::keyassignment::KeyAssignment,
+    ) -> Option<(window::KeyCode, Modifiers)> {
         let mut chords = self
             .input_map
-            .locate_app_wide_key_assignment(&action)
+            .locate_app_wide_key_assignment(action)
             .into_iter()
             .map(|(key, mods)| crate::inputmap::canonical_chord(&key, mods))
             .collect::<Vec<_>>();
@@ -163,15 +175,7 @@ impl TermWindow {
                 .then(a_mods.bits().cmp(&b_mods.bits()))
                 .then(a_key.cmp(b_key))
         });
-        let (key, mods) = chords.into_iter().next()?;
-        let rendering = self.config.ui_key_cap_rendering;
-        let label = crate::inputmap::chord_label(&key, mods, rendering);
-        // Set tight, as the Mac's menus write it: ⌘P, not ⌘ P.
-        Some(if rendering == UIKeyCapRendering::AppleSymbols {
-            label.replace(' ', "")
-        } else {
-            label
-        })
+        chords.into_iter().next()
     }
 
     fn hover_style(&self) -> anyhow::Result<HoverStyle> {

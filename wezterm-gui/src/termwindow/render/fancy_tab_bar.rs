@@ -7,15 +7,16 @@ use crate::tabbar::{TabBarItem, TabEntry};
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::platform_chrome::uses_integrated_window_buttons;
 use crate::termwindow::ui::tokens::{
-    ICON_BUTTON_BORDER_WIDTH, SIDEBAR_INSET, TAB_CLOSE_HOVER_INSET,
-    TAB_CLOSE_HOVER_RADIUS, TAB_CONTENT_INSET, TAB_ICON_SIZE, TAB_ROW_START_PADDING,
-    TAB_VERTICAL_PADDING,
-    WINDOW_TAB_ADD_BUTTON_RADIUS, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET, WINDOW_TAB_GAP,
+    ICON_BUTTON_BORDER_WIDTH, SIDEBAR_INSET, TAB_CLOSE_HOVER_INSET, TAB_CLOSE_HOVER_RADIUS,
+    TAB_CONTENT_INSET, TAB_ICON_SIZE, TAB_ROW_START_PADDING, TAB_TITLE_FADE_GAP,
+    TAB_VERTICAL_PADDING, TITLE_FADE, WINDOW_TAB_ADD_BUTTON_RADIUS,
+    WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET, WINDOW_TAB_GAP,
     WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
     WINDOW_TAB_LEADING_ACTION_ICON_SIZE, WINDOW_TAB_RADIUS, WINDOW_TAB_TOP_SPACER,
 };
 use crate::termwindow::window_tab_reveal::PaneBarWindowChrome;
 use crate::termwindow::{TermWindowNotif, UIItem, UIItemType, UiShapeCacheLookup};
+use crate::ui::draw::TextFade;
 use crate::ui::UiPalette;
 use crate::utilsprites::RenderMetrics;
 use anyhow::{anyhow, Context};
@@ -1543,8 +1544,87 @@ impl crate::TermWindow {
             }
             text.push_str(value);
         }
-        let text = self.ellipsize_ui_text(font, &text, width)?;
-        self.paint_ui_title_text(layers, font, &metrics, &text, x, y, width, foreground)
+        self.paint_fading_title(layers, font, &metrics, &text, x, y, width, foreground)
+    }
+
+    /// A tab's `title` in `width`. One too long goes out towards the end of
+    /// the space it has, rather than stopping at "...".
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_fading_title(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        title: &str,
+        x: usize,
+        y: usize,
+        width: usize,
+        foreground: LinearRgba,
+    ) -> anyhow::Result<()> {
+        self.paint_title_fading_with(
+            layers,
+            font,
+            metrics,
+            title,
+            x,
+            y,
+            width,
+            foreground,
+            TAB_TITLE_FADE_GAP,
+            |fade| fade,
+        )
+    }
+
+    /// `paint_fading_title`, ending `gap` short of `width`, with `fade_for`
+    /// having the last word on the fade it is given, which is `None` for a
+    /// title that fits.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_title_fading_with(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        title: &str,
+        x: usize,
+        y: usize,
+        width: usize,
+        foreground: LinearRgba,
+        gap: f32,
+        fade_for: impl FnOnce(Option<TextFade>) -> Option<TextFade>,
+    ) -> anyhow::Result<()> {
+        if width == 0 {
+            return Ok(());
+        }
+        let (shaped, _) = self.cached_ui_shape(font, metrics, title)?;
+        let advance: f32 = shaped
+            .iter()
+            .map(|info| info.glyph.x_advance.get() as f32)
+            .sum();
+        let right = (x + width) as f32;
+        let fade = fade_for((advance > width as f32).then(|| {
+            let to = right - self.ui_f32(gap).min(width as f32 / 4.0);
+            TextFade {
+                from: to - self.ui_f32(TITLE_FADE).min(width as f32 / 2.0),
+                to,
+                amount: 1.0,
+            }
+        }));
+        // The glyph the end falls on is drawn too, for the fade to run out
+        // across; those after it would not show.
+        let slack = metrics.cell_size.width as f32 * 2.0;
+        let clip_right = fade.map_or(right, |fade| right.max(fade.to + slack));
+        self.paint_cached_ui_shape_fading(
+            layers,
+            metrics,
+            &shaped,
+            x as f32,
+            y as f32,
+            x as f32,
+            clip_right,
+            fade,
+            |_| foreground,
+        )?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1768,6 +1848,28 @@ impl crate::TermWindow {
         y: f32,
         clip_left: f32,
         clip_right: f32,
+        color_for: F,
+    ) -> anyhow::Result<f32>
+    where
+        F: FnMut(&ShapedInfo) -> LinearRgba,
+    {
+        self.paint_cached_ui_shape_fading(
+            layers, metrics, shaped, start_x, y, clip_left, clip_right, None, color_for,
+        )
+    }
+
+    /// `paint_cached_ui_shape_clipped`, going out along `fade` if there is one.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_cached_ui_shape_fading<F>(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        metrics: &RenderMetrics,
+        shaped: &[ShapedInfo],
+        start_x: f32,
+        y: f32,
+        clip_left: f32,
+        clip_right: f32,
+        fade: Option<TextFade>,
         mut color_for: F,
     ) -> anyhow::Result<f32>
     where
@@ -1808,8 +1910,7 @@ impl crate::TermWindow {
                     y + top_offset + metrics.cell_size.height as f32,
                 );
                 quad.set_texture(sprite.texture_coords());
-                quad.set_fg_color(color);
-                quad.set_alt_color_and_mix_value(color, 0.0);
+                set_glyph_color(&mut quad, color, x_pos, x_pos + advance, fade);
                 quad.set_hsv(None);
                 x_pos += advance;
                 continue;
@@ -1835,8 +1936,7 @@ impl crate::TermWindow {
                     glyph_y + top_offset + glyph_height,
                 );
                 quad.set_texture(texture.texture_coords());
-                quad.set_fg_color(color);
-                quad.set_alt_color_and_mix_value(color, 0.0);
+                set_glyph_color(&mut quad, color, glyph_x, glyph_x + glyph_width, fade);
                 quad.set_has_color(glyph.has_color);
                 quad.set_hsv(None);
             }
@@ -2028,6 +2128,25 @@ struct HorizontalTextureClip {
     position_right: f32,
     texture_left: f32,
     texture_right: f32,
+}
+
+/// `color` on a glyph's quad, `fade` running across the span it covers.
+fn set_glyph_color(
+    quad: &mut impl QuadTrait,
+    color: LinearRgba,
+    left: f32,
+    right: f32,
+    fade: Option<TextFade>,
+) {
+    match fade {
+        Some(fade) => {
+            let left = color.mul_alpha(fade.alpha_at(left));
+            let right = color.mul_alpha(fade.alpha_at(right));
+            quad.set_corner_gradient(left, right, left, right);
+        }
+        None => quad.set_fg_color(color),
+    }
+    quad.set_alt_color_and_mix_value(color, 0.0);
 }
 
 fn horizontal_texture_clip(

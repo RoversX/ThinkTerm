@@ -807,6 +807,20 @@ pub(crate) fn chord_label(
     label
 }
 
+/// `chord_label`, set tight as the Mac's menus write it: ⌘P, not ⌘ P.
+pub(crate) fn tight_chord_label(
+    key: &KeyCode,
+    mods: Modifiers,
+    ui_key_cap_rendering: UIKeyCapRendering,
+) -> String {
+    let label = chord_label(key, mods, ui_key_cap_rendering);
+    if ui_key_cap_rendering == UIKeyCapRendering::AppleSymbols {
+        label.replace(' ', "")
+    } else {
+        label
+    }
+}
+
 /// `key` as the configuration file spells it: parsing the result gives
 /// `key` back. Settings → Keymap writes its shortcuts with it.
 pub(crate) fn config_key_name(key: &KeyCode) -> String {

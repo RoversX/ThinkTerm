@@ -4931,6 +4931,7 @@ impl crate::TermWindow {
         self.advance_workspace_sidebar_hover(frame_now);
         self.advance_right_sidebar_hover(frame_now);
         self.advance_window_tab_reveal(frame_now);
+        self.advance_thread_numbers(frame_now);
         self.advance_content_view_fade(frame_now);
         self.advance_sidebar_slides(frame_now);
         self.advance_library(frame_now);

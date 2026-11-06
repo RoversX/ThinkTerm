@@ -10312,6 +10312,7 @@ impl SettingsWindow {
             count_font: &count_font,
             count_metrics: &count_metrics,
             count_color: self.palette().secondary_text,
+            opacity: 1.0,
         };
         let pad = (height * 0.22).round();
         let bar_height = (height * 0.09).round().max(2.0);

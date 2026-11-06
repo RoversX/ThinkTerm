@@ -169,6 +169,9 @@ void main() {
   } else if (o_has_color == 1.0) {
     // the texture is full color info (eg: color emoji glyph)
     color = texture(atlas_nearest_sampler, o_tex);
+    // The vertex alpha still applies, as the WebGPU shader has it, so that
+    // an emoji goes with the text fading around it.
+    color.a *= fg_color.a;
     // this is the alpha
     colorMask = color.aaaa;
   } else if (o_has_color == 4.0) {

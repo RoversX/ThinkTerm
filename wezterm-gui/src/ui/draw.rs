@@ -22,6 +22,7 @@ use crate::termwindow::render::corners::{
     TOP_RIGHT_ROUNDED_CORNER_MASK, TOP_RIGHT_ROUNDED_CORNER_OUTLINE,
 };
 use crate::termwindow::ui::icons::{BrandIcon, SvgIcon};
+use crate::ui::anim::Easing;
 use crate::ui::{UiPalette, UiTokens};
 use crate::utilsprites::RenderMetrics;
 use std::collections::HashMap;
@@ -1179,6 +1180,34 @@ pub(crate) fn rasterize_disc(key: DiscKey) -> Image {
     image
 }
 
+/// Text going out towards its right end: whole up to `from`, and down by
+/// `amount` at `to` and past it. It is held in the glyphs' own colour, not
+/// painted over them, so it reads the same over any ground, a see-through
+/// one too.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TextFade {
+    pub(crate) from: f32,
+    pub(crate) to: f32,
+    pub(crate) amount: f32,
+}
+
+impl TextFade {
+    pub(crate) fn alpha_at(&self, x: f32) -> f32 {
+        let through = (x - self.from) / (self.to - self.from).max(1.0);
+        1.0 - self.amount * Easing::Smooth.apply(through)
+    }
+
+    /// This fade `t` of the way over to where `other` runs.
+    pub(crate) fn towards(self, other: Self, t: f32) -> Self {
+        let mix = |here: f32, there: f32| here + (there - here) * t;
+        Self {
+            from: mix(self.from, other.from),
+            to: mix(self.to, other.to),
+            amount: self.amount,
+        }
+    }
+}
+
 /// Whether a glyph that starts at `pos_x` and moves the pen by `advance`
 /// fits text that ends at `right_edge`.
 ///
@@ -1435,8 +1464,83 @@ impl RoundedFramePainter for DrawContext<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_ellipsized, glyph_fits, pixel_snap_rounded_rect, rasterize_disc, DiscKey};
+    use super::{
+        fit_ellipsized, glyph_fits, pixel_snap_rounded_rect, rasterize_disc, DiscKey, TextFade,
+    };
     use window::bitmaps::BitmapImage;
+
+    #[test]
+    fn a_text_fade_leaves_the_start_whole_and_takes_out_the_end() {
+        let fade = TextFade {
+            from: 100.0,
+            to: 140.0,
+            amount: 1.0,
+        };
+        assert_eq!(fade.alpha_at(20.0), 1.0);
+        assert_eq!(fade.alpha_at(100.0), 1.0);
+        assert_eq!(fade.alpha_at(120.0), 0.5);
+        assert_eq!(fade.alpha_at(140.0), 0.0);
+        assert_eq!(fade.alpha_at(300.0), 0.0);
+        let mut last = 1.0;
+        for x in 100..=140 {
+            let alpha = fade.alpha_at(x as f32);
+            assert!(alpha <= last, "brighter again at {x}");
+            last = alpha;
+        }
+    }
+
+    #[test]
+    fn a_text_fade_on_its_way_takes_only_its_share() {
+        let fade = |amount| TextFade {
+            from: 100.0,
+            to: 140.0,
+            amount,
+        };
+        assert_eq!(fade(0.0).alpha_at(300.0), 1.0);
+        assert_eq!(fade(0.25).alpha_at(300.0), 0.75);
+        assert_eq!(fade(0.25).alpha_at(20.0), 1.0);
+    }
+
+    #[test]
+    fn a_text_fade_moves_over_to_another() {
+        let here = TextFade {
+            from: 100.0,
+            to: 140.0,
+            amount: 1.0,
+        };
+        let there = TextFade {
+            from: 60.0,
+            to: 100.0,
+            amount: 0.5,
+        };
+        assert_eq!(here.towards(there, 0.0), here);
+        assert_eq!(
+            here.towards(there, 0.5),
+            TextFade {
+                from: 80.0,
+                to: 120.0,
+                amount: 1.0,
+            }
+        );
+        assert_eq!(
+            here.towards(there, 1.0),
+            TextFade {
+                amount: 1.0,
+                ..there
+            }
+        );
+    }
+
+    #[test]
+    fn a_text_fade_with_no_width_is_still_a_number() {
+        let fade = TextFade {
+            from: 100.0,
+            to: 100.0,
+            amount: 1.0,
+        };
+        assert_eq!(fade.alpha_at(100.0), 1.0);
+        assert_eq!(fade.alpha_at(101.0), 0.0);
+    }
 
     #[test]
     fn a_disc_is_round_and_its_offset_moves_it() {

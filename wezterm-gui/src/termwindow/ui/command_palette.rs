@@ -841,6 +841,7 @@ fn thread_icon_style<'a>(
         count_font: &marks.count_font,
         count_metrics: &marks.count_metrics,
         count_color,
+        opacity: 1.0,
     }
 }
 

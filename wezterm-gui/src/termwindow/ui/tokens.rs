@@ -87,6 +87,12 @@ pub const WINDOW_TAB_GAP: usize = 18;
 /// Matches `ssh_hosts_view`'s list fades, which solve the same problem
 /// vertically.
 pub const TAB_ROW_FADE_WIDTH: usize = 32;
+/// How far a title too long for its place takes to go out...
+pub const TITLE_FADE: f32 = 56.0;
+/// ...and the room it leaves before a tab's close button...
+pub const TAB_TITLE_FADE_GAP: f32 = 6.0;
+/// ...and before a sidebar row's mark, which a name runs right up to.
+pub const SIDEBAR_TITLE_FADE_GAP: f32 = 16.0;
 /// Pill: `snapped_rounded_corner_radius` clamps this to half the surface's
 /// short side, so the tab keeps semicircular ends at every row height.
 pub const WINDOW_TAB_RADIUS: f32 = 999.0;

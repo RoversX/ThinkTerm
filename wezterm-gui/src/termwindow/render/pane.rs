@@ -1847,8 +1847,7 @@ impl crate::TermWindow {
             return Ok(());
         }
 
-        let text = self.ellipsize_ui_text(font, text, width)?;
-        self.paint_ui_title_text(layers, font, &metrics, &text, x, y, width, foreground)
+        self.paint_fading_title(layers, font, &metrics, text, x, y, width, foreground)
     }
 
     /// The icon heading a pane tab: the card dressing what the pane runs,

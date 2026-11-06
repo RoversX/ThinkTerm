@@ -386,6 +386,44 @@ impl WorkspaceThreadsView {
                 .any(|reference| reference.thread.is_active)
         })
     }
+
+    /// The first `most` threads on the sidebar's rows, top to bottom: what a
+    /// number reaches. Only rows that are there to click count, so a folded
+    /// folder takes no numbers and a dangling reference, with nothing to
+    /// open, takes none.
+    pub fn first_threads(&self, most: usize) -> Vec<&WorkspaceThreadView> {
+        let mut threads: Vec<&WorkspaceThreadView> = self.pinned_threads.iter().collect();
+        for folder in &self.display_order {
+            if threads.len() >= most {
+                break;
+            }
+            match *folder {
+                SidebarFolder::Project(index) => {
+                    if let Some(project) = self
+                        .projects
+                        .get(index)
+                        .filter(|project| !project.threads_collapsed)
+                    {
+                        threads.extend(project.threads.iter());
+                    }
+                }
+                SidebarFolder::RefGroup(index) => {
+                    if let Some(group) = self.ref_groups.get(index).filter(|group| !group.collapsed)
+                    {
+                        threads.extend(
+                            group
+                                .threads
+                                .iter()
+                                .filter(|reference| !reference.dangling)
+                                .map(|reference| &reference.thread),
+                        );
+                    }
+                }
+            }
+        }
+        threads.truncate(most);
+        threads
+    }
 }
 
 /// One folder-style group of thread references sharing an origin Space.
@@ -13938,6 +13976,90 @@ mod tests {
         assert_eq!(store.pending_work_notification_count(), 1);
         // Running state is runtime truth and must survive acknowledgement.
         assert!(store.projects[0].threads[2].work_is_running);
+    }
+
+    #[test]
+    fn numbers_count_the_rows_a_click_can_reach() {
+        let ids = |threads: Vec<&WorkspaceThreadView>| {
+            threads
+                .into_iter()
+                .map(|thread| thread.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let thread = |name: &str| WorkspaceThreadView {
+            id: name.to_string(),
+            name: name.to_string(),
+            is_active: false,
+            is_materialized: true,
+            is_pinned: false,
+            is_unread: false,
+            work_status: WorkspaceThreadWorkStatus::Idle,
+        };
+        let project = |id: &str, collapsed: bool, names: &[&str]| ProjectView {
+            id: id.to_string(),
+            name: id.to_string(),
+            is_active: false,
+            threads_collapsed: collapsed,
+            threads: names.iter().map(|name| thread(*name)).collect(),
+            is_remote: false,
+            distro: None,
+            is_archived: false,
+            archived_at: None,
+        };
+        let reference = |name: &str, dangling: bool| ThreadRefView {
+            thread: thread(name),
+            origin_space_id: String::new(),
+            origin_space_name: String::new(),
+            origin_project_id: String::new(),
+            origin_project_name: String::new(),
+            machine_label: String::new(),
+            machine_is_local: true,
+            origin_domain_attached: true,
+            workspace_name: String::new(),
+            dangling,
+            server_folder: false,
+        };
+        let group = |key: &str, collapsed: bool, threads: Vec<ThreadRefView>| ThreadRefGroupView {
+            key: key.to_string(),
+            label: key.to_string(),
+            machine_label: String::new(),
+            machine_is_local: true,
+            origin_space_name: String::new(),
+            attached: true,
+            server_folder: false,
+            collapsed,
+            threads,
+        };
+        let view = WorkspaceThreadsView {
+            pinned_threads: vec![thread("pinned")],
+            projects: vec![
+                project("first", false, &["a", "b"]),
+                project("folded", true, &["unseen"]),
+                project("last", false, &["c"]),
+            ],
+            ref_groups: vec![
+                group(
+                    "refs",
+                    false,
+                    vec![reference("gone", true), reference("kept", false)],
+                ),
+                group("folded-refs", true, vec![reference("unseen-ref", false)]),
+            ],
+            // The sidebar's own order, not the Vecs': references go between
+            // the folders.
+            display_order: vec![
+                SidebarFolder::Project(0),
+                SidebarFolder::RefGroup(0),
+                SidebarFolder::RefGroup(1),
+                SidebarFolder::Project(1),
+                SidebarFolder::Project(2),
+            ],
+        };
+        assert_eq!(
+            ids(view.first_threads(9)),
+            vec!["pinned", "a", "b", "kept", "c"]
+        );
+        assert_eq!(ids(view.first_threads(2)), vec!["pinned", "a"]);
     }
 
     #[test]

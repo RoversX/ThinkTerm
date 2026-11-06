@@ -833,6 +833,13 @@ impl super::TermWindow {
         if key.key_is_down && !key.key.is_modifier() && self.dismiss_hover_tooltip() {
             context.invalidate();
         }
+        // On Windows a modifier's own key event names it physically.
+        if key.key_is_down
+            && !key.key.is_modifier()
+            && !key.phys_code.is_some_and(|code| code.is_modifier())
+        {
+            self.note_key_for_thread_numbers(&key);
+        }
         let mut input_trace =
             crate::input_diagnostics::KeyEventTrace::begin(key.key_is_down, key.key.is_modifier());
         // The leader key is a kind of modal modifier key.
@@ -863,6 +870,11 @@ impl super::TermWindow {
         if self.current_modifier_and_leds != modifier_and_leds {
             self.current_modifier_and_leds = modifier_and_leds;
             self.schedule_next_status_update();
+            // Everywhere else the window has an event for modifiers alone,
+            // and a key's state can run behind it.
+            if cfg!(windows) {
+                self.note_thread_number_modifiers(key.modifiers);
+            }
         }
 
         // While the command palette is open no physical-key binding may fire

@@ -35,25 +35,34 @@ in a form that you can copy and paste into your own configuration.
 | `CTRL+SHIFT`     | `t`      | `SpawnTab="CurrentPaneDomain"` |
 | `SUPER+SHIFT` | `T`    | `SpawnTab="DefaultDomain"` |
 | `SUPER`     | `w`      | `CloseCurrentTab{confirm=true}` |
-| `SUPER`     | `1`      | `ActivateTab=0` |
-| `SUPER`     | `2`      | `ActivateTab=1` |
-| `SUPER`     | `3`      | `ActivateTab=2` |
-| `SUPER`     | `4`      | `ActivateTab=3` |
-| `SUPER`     | `5`      | `ActivateTab=4` |
-| `SUPER`     | `6`      | `ActivateTab=5` |
-| `SUPER`     | `7`      | `ActivateTab=6` |
-| `SUPER`     | `8`      | `ActivateTab=7` |
-| `SUPER`     | `9`      | `ActivateTab=-1` |
+| `SUPER`     | `1`      | `ActivateWorkspaceThreadByIndex=0` |
+| `SUPER`     | `2`      | `ActivateWorkspaceThreadByIndex=1` |
+| `SUPER`     | `3`      | `ActivateWorkspaceThreadByIndex=2` |
+| `SUPER`     | `4`      | `ActivateWorkspaceThreadByIndex=3` |
+| `SUPER`     | `5`      | `ActivateWorkspaceThreadByIndex=4` |
+| `SUPER`     | `6`      | `ActivateWorkspaceThreadByIndex=5` |
+| `SUPER`     | `7`      | `ActivateWorkspaceThreadByIndex=6` |
+| `SUPER`     | `8`      | `ActivateWorkspaceThreadByIndex=7` |
+| `SUPER`     | `9`      | `ActivateWorkspaceThreadByIndex=8` |
 | `CTRL+SHIFT`     | `w`      | `CloseCurrentTab{confirm=true}` |
-| `CTRL+SHIFT`     | `1`      | `ActivateTab=0` |
-| `CTRL+SHIFT`     | `2`      | `ActivateTab=1` |
-| `CTRL+SHIFT`     | `3`      | `ActivateTab=2` |
-| `CTRL+SHIFT`     | `4`      | `ActivateTab=3` |
-| `CTRL+SHIFT`     | `5`      | `ActivateTab=4` |
-| `CTRL+SHIFT`     | `6`      | `ActivateTab=5` |
-| `CTRL+SHIFT`     | `7`      | `ActivateTab=6` |
-| `CTRL+SHIFT`     | `8`      | `ActivateTab=7` |
-| `CTRL+SHIFT`     | `9`      | `ActivateTab=-1` |
+| `CTRL+SHIFT`     | `1`      | `ActivateWorkspaceThreadByIndex=0` |
+| `CTRL+SHIFT`     | `2`      | `ActivateWorkspaceThreadByIndex=1` |
+| `CTRL+SHIFT`     | `3`      | `ActivateWorkspaceThreadByIndex=2` |
+| `CTRL+SHIFT`     | `4`      | `ActivateWorkspaceThreadByIndex=3` |
+| `CTRL+SHIFT`     | `5`      | `ActivateWorkspaceThreadByIndex=4` |
+| `CTRL+SHIFT`     | `6`      | `ActivateWorkspaceThreadByIndex=5` |
+| `CTRL+SHIFT`     | `7`      | `ActivateWorkspaceThreadByIndex=6` |
+| `CTRL+SHIFT`     | `8`      | `ActivateWorkspaceThreadByIndex=7` |
+| `CTRL+SHIFT`     | `9`      | `ActivateWorkspaceThreadByIndex=8` |
+| `CTRL`     | `1`      | `ActivateTab=0` |
+| `CTRL`     | `2`      | `ActivateTab=1` |
+| `CTRL`     | `3`      | `ActivateTab=2` |
+| `CTRL`     | `4`      | `ActivateTab=3` |
+| `CTRL`     | `5`      | `ActivateTab=4` |
+| `CTRL`     | `6`      | `ActivateTab=5` |
+| `CTRL`     | `7`      | `ActivateTab=6` |
+| `CTRL`     | `8`      | `ActivateTab=7` |
+| `CTRL`     | `9`      | `ActivateTab=-1` |
 | `SUPER+SHIFT` | `[` | `ActivateTabRelative=-1` |
 | `CTRL+SHIFT`     | `Tab` | `ActivateTabRelative=-1` |
 | `CTRL`           | `PageUp` | `ActivateTabRelative=-1` |
@@ -87,6 +96,8 @@ in a form that you can copy and paste into your own configuration.
 | `CTRL+SHIFT` | `UpArrow`    | `ActivatePaneDirection="Up"` |
 | `CTRL+SHIFT` | `DownArrow`    | `ActivatePaneDirection="Down"` |
 | `CTRL+SHIFT` | `Z`    | `TogglePaneZoomState` |
+
+`CTRL` with a digit goes to `ActivateTab`, so those keys do not reach the program in the terminal: Ctrl-6 in vim, say, or Ctrl-7 as undo in Emacs and readline. Bind one to [DisableDefaultAssignment](lua/keyassignment/DisableDefaultAssignment.md) to hand it back.
 
 If you don't want the default assignments to be registered, you can
 disable all of them with this configuration; if you chose to do this,

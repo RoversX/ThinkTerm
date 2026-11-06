@@ -170,6 +170,7 @@ mod selection;
 mod sidebar_hover;
 mod sidebar_slide;
 mod space_swipe;
+pub(crate) mod thread_numbers;
 mod window_tab_reveal;
 pub mod spawn;
 pub mod ssh_hosts_view;
@@ -3335,6 +3336,8 @@ pub struct TermWindow {
     /// The window tab row hidden or brought down from the top edge, as
     /// Settings asks; see `window_tab_reveal`.
     window_tab_reveal: window_tab_reveal::WindowTabReveal,
+    /// The numbers on the sidebar's threads while their keys are held.
+    thread_numbers: thread_numbers::ThreadNumbers,
     /// Hover-reveal of the collapsed right sidebar: the same machine as the
     /// left one's, mirrored onto the right edge.
     right_sidebar_hover: sidebar_hover::SidebarHoverReveal,
@@ -4667,6 +4670,7 @@ impl TermWindow {
             self.workspace_sidebar_hover.cancel_immediately();
             self.right_sidebar_hover.cancel_immediately();
             self.window_tab_reveal.cancel();
+            self.cancel_thread_numbers();
             self.clear_workspace_space_swipe_frame_transition();
             self.right_sidebar_note.native_text_input_snapshot_key = None;
             window.set_native_text_input_snapshot(None);
@@ -5243,6 +5247,7 @@ impl TermWindow {
             library: Default::default(),
             workspace_sidebar_hover: sidebar_hover::SidebarHoverReveal::default(),
             window_tab_reveal,
+            thread_numbers: Default::default(),
             right_sidebar_hover: sidebar_hover::SidebarHoverReveal::default(),
             right_sidebar_hover_was_presented: false,
             titlebar_sidebar_button_hovered: false,
@@ -5845,6 +5850,7 @@ impl TermWindow {
             }
             WindowEvent::AdviseModifiersLedStatus(modifiers, leds) => {
                 self.current_modifier_and_leds = (modifiers, leds);
+                self.note_thread_number_modifiers(modifiers);
                 self.update_title();
                 window.invalidate();
                 Ok(true)
@@ -11460,6 +11466,8 @@ impl TermWindow {
     ) -> anyhow::Result<PerformAssignmentResult> {
         use KeyAssignment::*;
 
+        self.interrupt_thread_numbers(matches!(assignment, ActivateWorkspaceThreadByIndex(_)));
+
         if let Some(modal) = self.get_modal() {
             if modal.perform_assignment(assignment, self) {
                 return Ok(PerformAssignmentResult::Handled);
@@ -12443,6 +12451,11 @@ impl TermWindow {
             } => {
                 if let Some(window) = self.window.as_ref().cloned() {
                     self.switch_space_to_thread(space_id.clone(), Some(thread_id.clone()), &window);
+                }
+            }
+            ActivateWorkspaceThreadByIndex(index) => {
+                if let Some(window) = self.window.as_ref().cloned() {
+                    self.activate_numbered_thread(*index, &window);
                 }
             }
             PromptInputLine(args) => self.show_prompt_input_line(args),

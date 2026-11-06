@@ -156,6 +156,8 @@ pub(crate) struct IconStyle<'a> {
     pub count_metrics: &'a crate::utilsprites::RenderMetrics,
     /// "+N" after trailing icons.
     pub count_color: LinearRgba,
+    /// How present the icons are, 1 for all the way.
+    pub opacity: f32,
 }
 
 /// Draw `icons` in the slot at `x` (see [`slot_width`]) centred on `cy`;
@@ -254,7 +256,8 @@ pub(crate) fn draw_trailing(
     }
     if let Some(text) = more {
         let x = left + d + step * (shown - 1) as f32 + d * 0.15;
-        draw_count_text(ctx, layers, &text, x, cy, style.count_color, style)?;
+        let color = style.count_color.mul_alpha(style.opacity);
+        draw_count_text(ctx, layers, &text, x, cy, color, style)?;
     }
     Ok(left)
 }
@@ -274,7 +277,8 @@ fn draw_icon(
     ring: f32,
 ) -> Result<()> {
     if ring > 0.0 {
-        ctx.draw_disc(layers, LAYER, x + d / 2.0, y + d / 2.0, d + ring * 2.0, style.surface)?;
+        let surface = style.surface.mul_alpha(style.opacity);
+        ctx.draw_disc(layers, LAYER, x + d / 2.0, y + d / 2.0, d + ring * 2.0, surface)?;
     }
     crate::ui::tile::draw_tile(
         ctx,
@@ -284,7 +288,7 @@ fn draw_icon(
         y,
         d,
         d / 2.0,
-        icon.circle.linear(),
+        icon.circle.linear().mul_alpha(style.opacity),
         style.dark,
         &tab_icons::PLATE,
     )?;
@@ -298,7 +302,7 @@ fn draw_icon(
             x + (d - size) / 2.0,
             y + (d - size) / 2.0,
             size,
-            icon.glyph_color.linear(),
+            icon.glyph_color.linear().mul_alpha(style.opacity),
         )?;
     }
     Ok(())

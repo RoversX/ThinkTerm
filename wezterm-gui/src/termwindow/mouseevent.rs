@@ -2170,6 +2170,9 @@ impl super::TermWindow {
 
     pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         log::trace!("{:?}", event);
+        if matches!(event.kind, WMEK::Press(_)) {
+            self.interrupt_thread_numbers(false);
+        }
         // A move that does not reach the terminal -- the tab bar, a sidebar
         // -- leaves no cell behind: coming back is coming into a pane.
         let pointer_cell_before = if matches!(event.kind, WMEK::Move) {
