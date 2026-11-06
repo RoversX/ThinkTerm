@@ -3,7 +3,7 @@ tags:
   - font
   - command_palette
 ---
-# `command_palette_font_size = 14.0`
+# `command_palette_font_size = 13.0`
 
 {{since('20230320-124340-559cb7b0')}}
 

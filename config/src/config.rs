@@ -1888,7 +1888,7 @@ fn default_char_select_bg_color() -> RgbaColor {
 }
 
 fn default_command_palette_font_size() -> f64 {
-    14.0
+    13.0
 }
 
 fn default_command_palette_fg_color() -> RgbaColor {
