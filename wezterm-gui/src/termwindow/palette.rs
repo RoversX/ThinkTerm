@@ -3,6 +3,7 @@
 //! `termwindow/ui/command_palette.rs`.
 
 use crate::commands::{CommandDef, ExpandedCommand};
+use crate::inputmap::InputMap;
 use crate::termwindow::GuiWin;
 use config::keyassignment::KeyAssignment;
 use config::ConfigHandle;
@@ -96,12 +97,37 @@ pub struct UserPaletteEntry {
 }
 impl_lua_conversion_dynamic!(UserPaletteEntry);
 
+/// Whether `action` only means something inside the copy overlay, on its own
+/// or as part of a chain such as "copy, then close". A chain that opens the
+/// overlay itself works from anywhere.
+fn is_copy_mode_action(action: &KeyAssignment) -> bool {
+    fn opens_overlay(action: &KeyAssignment) -> bool {
+        match action {
+            KeyAssignment::ActivateCopyMode | KeyAssignment::Search(_) => true,
+            KeyAssignment::Multiple(actions) => actions.iter().any(opens_overlay),
+            _ => false,
+        }
+    }
+    match action {
+        KeyAssignment::CopyMode(_) => true,
+        KeyAssignment::Multiple(actions) => {
+            actions.iter().any(is_copy_mode_action) && !opens_overlay(action)
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn build_commands(
     gui_window: GuiWin,
     pane: Option<MuxPane>,
     filter_copy_mode: bool,
 ) -> Vec<ExpandedCommand> {
     let mut commands = CommandDef::actions_for_palette_and_menubar(&config::configuration());
+    // In the palette only groups carry an icon, and an entry from
+    // `augment-command-palette` that names its own.
+    for command in &mut commands {
+        command.icon = None;
+    }
 
     match config::run_immediate_with_lua_config(|lua| {
         let mut entries: Vec<UserPaletteEntry> = vec![];
@@ -142,11 +168,7 @@ pub(crate) fn build_commands(
     }
 
     commands.retain(|cmd| {
-        if filter_copy_mode {
-            !matches!(cmd.action, KeyAssignment::CopyMode(_))
-        } else {
-            true
-        }
+        !filter_copy_mode || !is_copy_mode_action(&cmd.action)
     });
 
     let scores = frecency_scores();
@@ -173,15 +195,27 @@ pub(crate) fn build_commands(
     commands
 }
 
-/// The human-readable shortcut column for a command: its chords sorted to
-/// prefer the platform-native modifier (⌘ on macOS), rendered with the
-/// configured key-cap style (`⌘⇧P` under AppleSymbols), deduped, truncated to
-/// `palette_max_key_assigments_for_action` and joined with ", ".
-/// `None` when the command has no bindings.
-pub(crate) fn format_key_label(command: &ExpandedCommand, config: &ConfigHandle) -> Option<String> {
-    if command.keys.is_empty() {
-        return None;
+/// Give `commands` the chords they are bound to now. What `CommandDef` carries
+/// is the defaults, which Settings → Keymap and the configuration file change.
+pub(crate) fn apply_bound_chords(commands: &mut [ExpandedCommand], input_map: &InputMap) {
+    for command in commands {
+        command.keys = input_map
+            .keys
+            .default
+            .iter()
+            .filter(|(_, entry)| entry.action == command.action)
+            .map(|((key, mods), _)| (*mods, key.clone()))
+            .collect();
     }
+}
+
+/// The chords shown for a command: sorted to prefer the platform-native
+/// modifier (⌘ on macOS), deduped by how they read, truncated to
+/// `palette_max_key_assigments_for_action`.
+pub(crate) fn shown_chords(
+    command: &ExpandedCommand,
+    config: &ConfigHandle,
+) -> Vec<(Modifiers, window::KeyCode)> {
     let mut keys = command.keys.clone();
 
     keys.sort_by(|(a_mods, a_key), (b_mods, b_key)| {
@@ -208,19 +242,100 @@ pub(crate) fn format_key_label(command: &ExpandedCommand, config: &ConfigHandle)
         a_key.cmp(&b_key)
     });
 
-    let mut keys = keys
+    let rendering = config.ui_key_cap_rendering;
+    keys.dedup_by_key(|(mods, key)| crate::inputmap::tight_chord_label(key, *mods, rendering));
+    keys.truncate(config.palette_max_key_assigments_for_action);
+    keys
+}
+
+/// The human-readable shortcut column for a command, rendered with the
+/// configured key-cap style (`⌘⇧P` under AppleSymbols) and joined with ", ".
+/// `None` when the command has no bindings.
+pub(crate) fn format_key_label(command: &ExpandedCommand, config: &ConfigHandle) -> Option<String> {
+    let keys = shown_chords(command, config)
         .into_iter()
         .map(|(mods, keycode)| {
-            crate::inputmap::chord_label(&keycode, mods, config.ui_key_cap_rendering)
+            crate::inputmap::tight_chord_label(&keycode, mods, config.ui_key_cap_rendering)
         })
         .collect::<Vec<_>>();
-
-    keys.dedup();
-    keys.truncate(config.palette_max_key_assigments_for_action);
 
     if keys.is_empty() {
         None
     } else {
         Some(keys.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod palette_tests {
+    use super::{apply_bound_chords, is_copy_mode_action};
+    use crate::commands::ExpandedCommand;
+    use crate::inputmap::InputMap;
+    use crate::native_settings::KeymapEntry;
+    use config::keyassignment::{CopyModeAssignment, KeyAssignment, Pattern};
+    use window::{KeyCode, Modifiers};
+
+    #[test]
+    fn a_command_shows_the_chords_it_is_bound_to_now() {
+        let action = KeyAssignment::SpawnWindow;
+        let mut commands = vec![ExpandedCommand {
+            brief: "New Window".into(),
+            doc: "".into(),
+            keys: vec![(Modifiers::SUPER, KeyCode::Char('n'))],
+            action: action.clone(),
+            menubar: &[],
+            icon: None,
+            accessory: None,
+            english_brief: None,
+        }];
+        let config = config::ConfigHandle::default_config();
+        let map = InputMap::with_keymap(
+            &config,
+            &[
+                KeymapEntry {
+                    key: KeyCode::Char('y'),
+                    mods: Modifiers::SUPER,
+                    action,
+                },
+                KeymapEntry {
+                    key: KeyCode::Char('n'),
+                    mods: Modifiers::SUPER,
+                    action: KeyAssignment::Nop,
+                },
+            ],
+        );
+
+        apply_bound_chords(&mut commands, &map);
+
+        let keys = &commands[0].keys;
+        assert!(keys.contains(&(Modifiers::SUPER, KeyCode::Char('y'))));
+        assert!(!keys.contains(&(Modifiers::SUPER, KeyCode::Char('n'))));
+    }
+
+    #[test]
+    fn a_chain_that_opens_the_overlay_is_not_copy_mode_only() {
+        let move_up = KeyAssignment::CopyMode(CopyModeAssignment::MoveToScrollbackTop);
+        assert!(!is_copy_mode_action(&KeyAssignment::Multiple(vec![
+            KeyAssignment::ActivateCopyMode,
+            move_up.clone(),
+        ])));
+        assert!(!is_copy_mode_action(&KeyAssignment::Multiple(vec![
+            KeyAssignment::Search(Pattern::CurrentSelectionOrEmptyString),
+            KeyAssignment::CopyMode(CopyModeAssignment::ClearPattern),
+        ])));
+    }
+
+    #[test]
+    fn a_chain_ending_the_copy_overlay_counts_as_copy_mode() {
+        let close = KeyAssignment::CopyMode(CopyModeAssignment::Close);
+        let chain = KeyAssignment::Multiple(vec![KeyAssignment::ScrollToBottom, close.clone()]);
+        let nested = KeyAssignment::Multiple(vec![KeyAssignment::SpawnWindow, chain.clone()]);
+
+        assert!(is_copy_mode_action(&close));
+        assert!(is_copy_mode_action(&chain));
+        assert!(is_copy_mode_action(&nested));
+        assert!(!is_copy_mode_action(&KeyAssignment::Multiple(vec![
+            KeyAssignment::ScrollToBottom,
+        ])));
     }
 }
