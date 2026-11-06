@@ -22,6 +22,11 @@ pub enum SvgIcon {
     Check,
     ChevronDown,
     ChevronRight,
+    ChevronUp,
+    CornerDownLeft,
+    ArrowBigUp,
+    ArrowRightToLine,
+    Option,
     ChevronsUpDown,
     Cloud,
     CodeXml,
@@ -248,6 +253,19 @@ impl SvgIcon {
             Self::ChevronRight => {
                 include_bytes!("../../../../third_party/lucide/icons/chevron-right.svg")
             }
+            Self::ChevronUp => {
+                include_bytes!("../../../../third_party/lucide/icons/chevron-up.svg")
+            }
+            Self::CornerDownLeft => {
+                include_bytes!("../../../../third_party/lucide/icons/corner-down-left.svg")
+            }
+            Self::ArrowBigUp => {
+                include_bytes!("../../../../third_party/lucide/icons/arrow-big-up.svg")
+            }
+            Self::ArrowRightToLine => {
+                include_bytes!("../../../../third_party/lucide/icons/arrow-right-to-line.svg")
+            }
+            Self::Option => include_bytes!("../../../../third_party/lucide/icons/option.svg"),
             Self::ChevronsUpDown => {
                 include_bytes!("../../../../third_party/lucide/icons/chevrons-up-down.svg")
             }
@@ -918,6 +936,11 @@ mod tests {
             SvgIcon::ExternalLink,
             SvgIcon::ChevronDown,
             SvgIcon::ChevronRight,
+            SvgIcon::ChevronUp,
+            SvgIcon::CornerDownLeft,
+            SvgIcon::ArrowBigUp,
+            SvgIcon::ArrowRightToLine,
+            SvgIcon::Option,
             SvgIcon::ChevronsUpDown,
             SvgIcon::Cloud,
             SvgIcon::CodeXml,
