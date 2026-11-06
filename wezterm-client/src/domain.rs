@@ -6347,16 +6347,23 @@ impl ClientDomain {
                 // client's build whenever the two differ, codec mismatch or
                 // not: the running one hands its panes over and exits. A
                 // failed takeover leaves a compatible server serving and
-                // an incompatible one refused as before.
+                // an incompatible one refused as before. A newer release
+                // is not brought back: compatible it serves, incompatible
+                // it is refused without trying.
                 if let (ClientDomainConfig::Unix(unix), true) =
                     (&config, config.is_local_session_host())
                 {
                     let needs_takeover = match &verified {
-                        Ok(info) => info.version_string != config::wezterm_version(),
+                        Ok(info) => {
+                            info.version_string != config::wezterm_version()
+                                && !crate::local_update::server_is_newer(&info.version_string)
+                        }
                         Err(err)
                             if err
                                 .downcast_ref::<crate::client::IncompatibleVersionError>()
-                                .is_some() =>
+                                .is_some_and(|mismatch| {
+                                    !crate::local_update::server_is_newer(&mismatch.version)
+                                }) =>
                         {
                             true
                         }

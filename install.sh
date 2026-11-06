@@ -397,6 +397,23 @@ if [ -f "$manifest" ]; then
   case "$prev_app" in */ThinkTerm.app) ;; *) prev_app="" ;; esac
 fi
 
+# A desktop app this prefix does not own: a distro package, or an install
+# under another prefix. The server variant never touches it, and it is worth
+# saying so, because the two then go separate ways: its launcher finds
+# `thinkterm` through PATH, where ~/.local/bin usually comes first, and this
+# install cannot start a GUI. Not on macOS, where an app runs its own binaries
+# and updates itself.
+other_gui=""
+if [ "$os" = linux ]; then
+  if other_gui=$(command -v thinkterm-gui 2>/dev/null) && [ ! "$other_gui" -ef "$bindir/thinkterm-gui" ]; then
+    :
+  elif [ -f /usr/share/applications/com.roversx.thinkterm.desktop ]; then
+    other_gui=/usr/share/applications/com.roversx.thinkterm.desktop
+  else
+    other_gui=""
+  fi
+fi
+
 # Never guessed from the machine: a headless box may want the TUI, and a
 # desktop may be somebody's SSH target. Ask when there is someone to ask.
 # Under `curl | sh` stdin is the script itself, so the question goes through
@@ -406,6 +423,9 @@ if [ -z "$variant" ]; then
   if [ -t 2 ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
     if [ -n "$prev_variant" ]; then
       note "ThinkTerm $prev_variant${prev_version:+ $prev_version} is installed under $(pretty "$prefix")." > /dev/tty
+    fi
+    if [ -n "$other_gui" ]; then
+      note "The desktop app is also at $(pretty "$other_gui"); the server variant leaves it at its own version." > /dev/tty
     fi
     printf '  %sWhich ThinkTerm do you want on this machine?%s\n' "$ui_bold" "$ui_reset" > /dev/tty
     printf '    %s1%s  desktop  %sGUI + CLI + TUI + mux server%s\n' "$ui_accent" "$ui_reset" "$ui_dim" "$ui_reset" > /dev/tty
@@ -1396,6 +1416,18 @@ esac
 
 if system=$(command -v thinkterm 2>/dev/null) && [ "$system" != "$bindir/thinkterm" ]; then
   next ! "another thinkterm comes first on PATH: $(pretty "$system")"
+fi
+
+if [ -n "$other_gui" ] && [ "$variant" = server ]; then
+  next ! "this install has no GUI, and the desktop app at $(pretty "$other_gui") stays at its own version."
+  note "Its launcher may find this install first and stop working."
+  # Only where it would work: the launcher looks in ~/.local/share, not under
+  # another prefix, and the GUI needs a newer glibc than the server.
+  if [ "$prefix" = "$HOME/.local" ] && { [ -z "$glibc" ] || [ "$(printf '%s\n%s\n' "$min_glibc_desktop" "$glibc" \
+      | sort -V 2>/dev/null | head -n1)" = "$min_glibc_desktop" ]; }; then
+    note "To keep them together, run:"
+    cmd "curl -fsSL https://raw.githubusercontent.com/$repo/main/install.sh | sh -s -- --desktop"
+  fi
 fi
 
 if [ -n "$missing_libs" ]; then

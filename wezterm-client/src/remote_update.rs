@@ -16,6 +16,8 @@
 //! - pick "the latest release". The server has to match *this* client, which
 //!   may not be the latest; a development build has no release to match at
 //!   all and is told so.
+//! - take a host backwards. A newer server stays, and this client is the one
+//!   told to update.
 //! - end sessions to get the new version running, when it can help it. A
 //!   server that can hand over (`thinkterm-mux-server --takeover`) is asked
 //!   to; only when it cannot, or the person turned that off, does the old
@@ -92,6 +94,17 @@ pub fn offer_remote_update(
         err.codec_vers,
         codec::CODEC_VERSION
     ));
+    // Another client brought that server forward, and it would not hand its
+    // sessions to this release anyway: all an install could do is leave an
+    // older build beside it and a question about ending them.
+    if thinkterm_update::is_older_release(&local, &err.version) {
+        ui.output_str(&format!(
+            "That server is newer than this client, so nothing changes on {host}. \
+             Update ThinkTerm here to {} to connect.\n",
+            err.version
+        ));
+        return Ok(RemoteUpdateOutcome::Declined);
+    }
     let answer = ui.input(&format!(
         "Look up ThinkTerm {local} on GitHub to install on {host}? [y/N] "
     ));
@@ -120,8 +133,9 @@ pub fn offer_remote_update(
 
     // The ssh session comes first: the host has to be asked what is
     // installed there before the question can say what will change. A
-    // workstation with the desktop variant keeps its GUI; --server would
-    // have removed it.
+    // workstation with the desktop variant keeps its GUI, whoever installed
+    // it: --server would have removed the script's, and left a package's
+    // launcher starting a CLI that has no GUI to start.
     let ssh_config = mux::ssh::ssh_domain_to_ssh_config(ssh_dom)?;
     let mut ui_for_auth = ui.clone();
     let session = mux::ssh::ssh_connect_with_ui_and_password(
@@ -130,16 +144,30 @@ pub fn offer_remote_update(
         ssh_dom.stored_password.clone(),
     )
     .with_context(|| format!("opening an ssh session to {host} for the update"))?;
-    let variant = remote_variant(&session);
+    let manifest = run_capture(&session, VARIANT_READ).unwrap_or_default();
+    let host_probe = run_capture(&session, HOST_PROBE).unwrap_or_default();
+    let gui_probe = run_capture(&session, GUI_PROBE).unwrap_or_default();
+    let (variant, package_gui) = remote_variant(&manifest, &host_probe, &gui_probe);
     // A host the release binaries cannot run on gets the answer straight
     // away, rather than an installer run that fails at its first check.
-    if let Some(reason) = host_cannot_take_a_release(&session, variant) {
+    if let Some(reason) = release_refusal(&host_probe, variant) {
         ui.output_str(&format!(
             "{reason}, so the release build of {local} cannot be installed on {host}.\n{}\n",
             thinkterm_update::build_from_source_instructions(&local)
         ));
         return Ok(RemoteUpdateOutcome::Declined);
     }
+    let package_note = match package_gui {
+        PackageGui::Absent => String::new(),
+        PackageGui::Updated => format!(
+            "{host} has the ThinkTerm desktop app, so this installs the app too, keeping the \
+             app and the server on one version. Its launcher moves to the new install.\n"
+        ),
+        PackageGui::LeftBehind(reason) => format!(
+            "{reason}, so the ThinkTerm desktop app on {host} cannot come along: only the server \
+             is updated, the app stays at its own version, and its launcher may stop working.\n"
+        ),
+    };
 
     let command = thinkterm_update::install_command(variant, &local);
     // Uncommitted changes can include a newer protocol than the release
@@ -158,7 +186,7 @@ pub fn offer_remote_update(
         "ThinkTerm can install {local} there now ({variant} variant, as the ssh user, \
          under ~/.local, with no root). A verified online installer (or bundled fallback) \
          and trusted release information will be sent over SSH; the host downloads the archive.\n\
-         {caveat}Install it? [y/N] ",
+         {package_note}{caveat}Install it? [y/N] ",
     ));
     let answer = match answer {
         Ok(answer) => answer,
@@ -389,6 +417,12 @@ const HOST_PROBE: &str =
 const VARIANT_READ: &str =
     "sed -n 's/^variant=//p' \"$HOME/.local/share/thinkterm/install-manifest\" 2>/dev/null";
 
+/// Prints `gui` where a desktop app is installed that may not be the
+/// script's: a package writes no manifest for `VARIANT_READ` to find.
+const GUI_PROBE: &str = "if command -v thinkterm-gui >/dev/null 2>&1 \
+     || [ -f /usr/share/applications/com.roversx.thinkterm.desktop ]; \
+     then echo gui; fi";
+
 /// Why the host cannot run a release binary of `variant`, if it cannot: the
 /// same two checks `install.sh` makes first, made here so the answer comes
 /// before the question. An unreadable answer is not a refusal; the script
@@ -427,13 +461,35 @@ fn release_refusal(probe: &str, variant: &str) -> Option<String> {
     None
 }
 
-/// Which variant the script installed on the host, read from its manifest.
-/// Falls back to the server variant, which is the only one that makes sense
-/// on a host with no install to preserve.
-fn remote_variant(session: &Session) -> &'static str {
-    match run_capture(session, VARIANT_READ).as_deref().map(str::trim) {
-        Ok("desktop") => "desktop",
-        _ => "server",
+/// What an update does about a desktop app the script did not install.
+#[derive(Debug, PartialEq, Eq)]
+enum PackageGui {
+    Absent,
+    /// The desktop variant goes in beside it, and its launcher takes over.
+    Updated,
+    /// The desktop variant cannot run on the host, for this reason.
+    LeftBehind(String),
+}
+
+/// The variant to install, from what `VARIANT_READ`, `HOST_PROBE` and
+/// `GUI_PROBE` printed on the host. The script's desktop variant stays what
+/// it is. So does a distro package's app, on Linux, and a server install
+/// that has already gone in beside one moves to the desktop variant with it:
+/// the package's launcher may go through PATH, where a server under ~/.local
+/// takes the name from it, and the package cannot update itself to keep up
+/// with that server. A macOS bundle has neither problem, so it is not
+/// replaced from here. The server variant is what is left.
+fn remote_variant(manifest: &str, host_probe: &str, gui_probe: &str) -> (&'static str, PackageGui) {
+    if manifest.trim() == "desktop" {
+        return ("desktop", PackageGui::Absent);
+    }
+    let linux = host_probe.lines().next().map(str::trim) == Some("Linux");
+    if !linux || gui_probe.trim() != "gui" {
+        return ("server", PackageGui::Absent);
+    }
+    match release_refusal(host_probe, "desktop") {
+        None => ("desktop", PackageGui::Updated),
+        Some(reason) => ("server", PackageGui::LeftBehind(reason)),
     }
 }
 
@@ -576,7 +632,7 @@ fn run_and_relay_status(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_yes, release_refusal, without_input};
+    use super::{is_yes, release_refusal, remote_variant, without_input, PackageGui};
 
     #[test]
     fn only_an_explicit_yes_counts() {
@@ -607,12 +663,98 @@ mod tests {
         assert_eq!(release_refusal("Darwin\narm64\n\n", "desktop"), None);
     }
 
+    #[test]
+    fn a_host_keeps_the_desktop_app_it_has() {
+        let ubuntu = "Linux\nx86_64\nglibc 2.35\n";
+        // Nothing to preserve.
+        assert_eq!(
+            remote_variant("", ubuntu, ""),
+            ("server", PackageGui::Absent)
+        );
+        assert_eq!(
+            remote_variant("server\n", ubuntu, ""),
+            ("server", PackageGui::Absent)
+        );
+        // The script's own.
+        assert_eq!(
+            remote_variant("desktop\n", ubuntu, "gui\n"),
+            ("desktop", PackageGui::Absent)
+        );
+        // A package's, which writes no manifest, and one that a server
+        // install has already gone in beside.
+        assert_eq!(
+            remote_variant("", ubuntu, "gui\n"),
+            ("desktop", PackageGui::Updated)
+        );
+        assert_eq!(
+            remote_variant("server\n", ubuntu, "gui\n"),
+            ("desktop", PackageGui::Updated)
+        );
+        // Unreadable answers change nothing.
+        assert_eq!(
+            remote_variant("", "", "gui\n"),
+            ("server", PackageGui::Absent)
+        );
+    }
+
+    #[test]
+    fn a_package_gui_the_release_cannot_replace_is_named_and_left_behind() {
+        let (variant, gui) = remote_variant("", "Linux\nx86_64\nglibc 2.31\n", "gui\n");
+        assert_eq!(variant, "server");
+        match gui {
+            PackageGui::LeftBehind(reason) => assert!(reason.contains("glibc 2.31"), "{}", reason),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_mac_app_is_not_replaced_from_here() {
+        assert_eq!(
+            remote_variant("", "Darwin\narm64\n\n", "gui\n"),
+            ("server", PackageGui::Absent)
+        );
+        assert_eq!(
+            remote_variant("desktop", "Darwin\narm64\n\n", "gui\n"),
+            ("desktop", PackageGui::Absent)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_gui_probe_answers_from_the_path() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("thinkterm-gui-probe-{}", std::process::id()));
+        let empty = dir.join("empty");
+        let with_gui = dir.join("with-gui");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&with_gui).unwrap();
+        let gui = with_gui.join("thinkterm-gui");
+        std::fs::write(&gui, "#!/bin/sh\n").unwrap();
+        let mut mode = std::fs::metadata(&gui).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+        std::fs::set_permissions(&gui, mode).unwrap();
+        let answer = |path: &std::path::Path| {
+            let out = Command::new("/bin/sh")
+                .args(["-c", &without_input(super::GUI_PROBE)])
+                .env("PATH", path)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert_eq!(answer(&with_gui), "gui\n");
+        if !std::path::Path::new("/usr/share/applications/com.roversx.thinkterm.desktop").exists() {
+            assert_eq!(answer(&empty), "");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn every_remote_command_still_parses_once_its_input_is_cut() {
         for command in [
             super::HOST_PROBE.to_string(),
             super::VARIANT_READ.to_string(),
+            super::GUI_PROBE.to_string(),
             super::STOP_COMMAND.to_string(),
             thinkterm_update::install_command("server", "9.9.9"),
             thinkterm_update::takeover_command(),

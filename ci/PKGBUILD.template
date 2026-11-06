@@ -68,6 +68,11 @@ package() {
                  "${pkgdir}/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png"
   install -Dm644 squashfs-root/usr/share/applications/com.roversx.thinkterm.desktop \
                  "${pkgdir}/usr/share/applications/com.roversx.thinkterm.desktop"
+  # By bare name it goes through PATH, where an install under ~/.local would
+  # decide what it starts.
+  sed -i -e 's|^TryExec=thinkterm$|TryExec=/usr/bin/thinkterm|' \
+         -e 's|^Exec=thinkterm |Exec=/usr/bin/thinkterm |' \
+         "${pkgdir}/usr/share/applications/com.roversx.thinkterm.desktop"
   install -Dm644 squashfs-root/usr/share/nautilus-python/extensions/wezterm-nautilus.py \
                  "${pkgdir}/usr/share/nautilus-python/extensions/wezterm-nautilus.py"
 }

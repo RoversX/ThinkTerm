@@ -15,9 +15,11 @@
 //! domain the host is.
 
 use config::{ConfigHandle, UnixDomain};
+use fluent_bundle::FluentArgs;
 use mux::domain::Domain;
 use mux::Mux;
 use std::sync::{Arc, Mutex, OnceLock};
+use wezterm_client::client::IncompatibleVersionError;
 use wezterm_client::domain::{ClientDomain, ClientDomainConfig};
 use window::WindowOps as _;
 
@@ -300,6 +302,20 @@ pub(crate) fn fall_back_to_in_process(mux: &Mux, why: &anyhow::Error) {
             "local sessions: could not attach the session server {host} ({why:#}) and \
              there is no in-process domain to fall back to"
         ),
+    }
+    if let Some(server) = why
+        .downcast_ref::<IncompatibleVersionError>()
+        .filter(|mismatch| wezterm_client::local_update::server_is_newer(&mismatch.version))
+    {
+        // The person's terminals are in that server, out of sight of this
+        // launch, and nothing else on screen would say where they went.
+        let mut args = FluentArgs::new();
+        args.set("version", config::wezterm_version());
+        args.set("server", server.version.clone());
+        wezterm_toast_notification::persistent_toast_notification(
+            "ThinkTerm",
+            &crate::i18n::tr_args("session-server-newer", &args),
+        );
     }
 }
 

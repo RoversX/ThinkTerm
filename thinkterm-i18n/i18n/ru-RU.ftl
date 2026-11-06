@@ -407,6 +407,7 @@ menu-space-server-group-offline = { $name } (отключено)
 menu-space-server-group-connecting = { $name } (подключение…)
 menu-space-server-group-reconnecting = { $name } (повторное подключение…)
 remote-tree-mutation-offline = { $name } отключён. Подключитесь и повторите попытку.
+session-server-newer = Этот ThinkTerm ({ $version }) старее сервера сеансов на этом компьютере ({ $server }), поэтому это окно запускает собственные терминалы. Ваши терминалы продолжают работать на сервере: обновите ThinkTerm, чтобы вернуться к ним. Чтобы остаться на этой версии, остановите сервер сеансов в настройках — эти терминалы завершатся.
 menu-new-space-here = Новое пространство здесь
 menu-new-space-on-server = Новое пространство на сервере
 menu-add-remote-host = Добавить удалённый узел…

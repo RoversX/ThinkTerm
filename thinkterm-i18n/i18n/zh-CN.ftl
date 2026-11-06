@@ -409,6 +409,7 @@ menu-space-server-group-offline = { $name }（已断开）
 menu-space-server-group-connecting = { $name }（连接中…）
 menu-space-server-group-reconnecting = { $name }（重连中…）
 remote-tree-mutation-offline = { $name } 已断开。请重新连接后再试。
+session-server-newer = 这个 ThinkTerm({ $version })比这台电脑上的会话服务器({ $server })旧,所以这个窗口单独运行终端。你原来的终端还在服务器里:更新 ThinkTerm 就能回到它们;想留在这个版本,可以在设置里停止会话服务器,那些终端会随之结束。
 menu-new-space-here = 在此服务器新建空间
 menu-new-space-on-server = 在服务器上新建空间
 menu-add-remote-host = 添加远程主机…

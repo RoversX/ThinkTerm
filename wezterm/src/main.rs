@@ -1301,10 +1301,24 @@ fn delegate_to_gui(saver: UmaskSaver) -> anyhow::Result<()> {
         "thinkterm-gui"
     };
 
-    let exe = std::env::current_exe()?
+    let exe = std::env::current_exe()?;
+    // On macOS this can be the link install.sh leaves in ~/.local/bin, and
+    // the GUI is beside what that points at. Not on Windows, where the
+    // canonical form is a verbatim path and there are no such links.
+    #[cfg(unix)]
+    let exe = exe.canonicalize().unwrap_or(exe);
+    let exe = exe
         .parent()
         .ok_or_else(|| anyhow!("exe has no parent dir!?"))?
         .join(exe_name);
+
+    if !exe.exists() {
+        anyhow::bail!(
+            "this ThinkTerm has no GUI to start: {} is not installed. `thinkterm tui` runs in \
+             this terminal; the desktop install of ThinkTerm adds the GUI",
+            exe.display()
+        );
+    }
 
     let mut cmd = Command::new(exe);
     if cfg!(windows) {

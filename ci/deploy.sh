@@ -48,6 +48,14 @@ TAG_NAME=${TAG_NAME:-$(git -c "core.abbrev=8" show -s "--format=%cd-%h" "--date=
 
 HERE=$(pwd)
 
+# The launcher in a package that installs to /usr/bin names that binary. By
+# bare name it goes through PATH, and an install under ~/.local, which usually
+# comes first, then decides what it starts: possibly a server with no GUI.
+# assets/wezterm.desktop itself stays as it is: an AppImage takes the name of
+# what it runs from it, Flatpak has no /usr/bin of its own to point at, and
+# install.sh rewrites the bare name for its own prefix.
+PIN_DESKTOP_EXEC="sed -i -e 's|^TryExec=thinkterm\$|TryExec=/usr/bin/thinkterm|' -e 's|^Exec=thinkterm |Exec=/usr/bin/thinkterm |'"
+
 if test -z "${SUDO+x}" && hash sudo 2>/dev/null; then
   SUDO="sudo"
 fi
@@ -519,6 +527,7 @@ ln -s thinkterm %{buildroot}/etc/bash_completion.d/wezterm
 ln -s thinkterm.fish %{buildroot}/usr/share/fish/vendor_completions.d/wezterm.fish
 install -Dm644 assets/icon/terminal.png %{buildroot}/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
 install -Dm644 assets/wezterm.desktop %{buildroot}/usr/share/applications/com.roversx.thinkterm.desktop
+$PIN_DESKTOP_EXEC %{buildroot}/usr/share/applications/com.roversx.thinkterm.desktop
 install -Dm644 assets/wezterm.appdata.xml %{buildroot}/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
 install -Dm644 assets/wezterm-nautilus.py %{buildroot}/usr/share/nautilus-python/extensions/wezterm-nautilus.py
 install -Dm644 NOTICE %{buildroot}/usr/share/licenses/thinkterm/NOTICE
@@ -691,6 +700,7 @@ EOF
             install -Dm755 -t $root/usr/bin assets/open-thinkterm-here assets/open-wezterm-here
             install -Dm644 assets/icon/terminal.png $root/usr/share/icons/hicolor/128x128/apps/com.roversx.thinkterm.png
             install -Dm644 assets/wezterm.desktop $root/usr/share/applications/com.roversx.thinkterm.desktop
+            eval "$PIN_DESKTOP_EXEC $root/usr/share/applications/com.roversx.thinkterm.desktop"
             install -Dm644 assets/wezterm.appdata.xml $root/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
             install -Dm644 assets/wezterm-nautilus.py $root/usr/share/nautilus-python/extensions/wezterm-nautilus.py
           fi
@@ -874,6 +884,7 @@ package() {
   install -Dm755 -t "\$pkgdir"/usr/bin "\$srcdir"/thinkterm-tailnet
 
   install -Dm644 "\$srcdir"/wezterm.desktop "\$pkgdir"/usr/share/applications/com.roversx.thinkterm.desktop
+  $PIN_DESKTOP_EXEC "\$pkgdir"/usr/share/applications/com.roversx.thinkterm.desktop
   install -Dm644 "\$srcdir"/wezterm.appdata.xml "\$pkgdir"/usr/share/metainfo/com.roversx.thinkterm.appdata.xml
   install -Dm644 "\$srcdir"/terminal.png "\$pkgdir"/usr/share/pixmaps/com.roversx.thinkterm.png
   install -Dm644 "\$srcdir"/wezterm-icon.svg "\$pkgdir"/usr/share/pixmaps/com.roversx.thinkterm.svg

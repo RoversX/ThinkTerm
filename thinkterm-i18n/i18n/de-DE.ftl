@@ -424,6 +424,7 @@ menu-space-server-group-offline = { $name } (getrennt)
 menu-space-server-group-connecting = { $name } (verbindet…)
 menu-space-server-group-reconnecting = { $name } (verbindet erneut…)
 remote-tree-mutation-offline = { $name } ist getrennt. Verbinden Sie sich erneut und versuchen Sie es noch einmal.
+session-server-newer = Dieses ThinkTerm ({ $version }) ist älter als der Sitzungsserver auf diesem Computer ({ $server }), daher führt dieses Fenster eigene Terminals aus. Ihre bisherigen Terminals laufen im Server weiter: Aktualisieren Sie ThinkTerm, um zu ihnen zurückzukehren. Um bei dieser Version zu bleiben, stoppen Sie den Sitzungsserver in den Einstellungen; dabei werden die Terminals beendet.
 menu-new-space-here = Neuer Space hier
 menu-new-space-on-server = Neuer Space auf Server
 menu-add-remote-host = Remote-Host hinzufügen…

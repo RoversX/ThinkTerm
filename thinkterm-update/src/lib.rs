@@ -995,6 +995,19 @@ pub fn is_newer_release(latest: &str, current: &str) -> bool {
     }
 }
 
+/// Is `version` a release older than the release `than`? Development builds
+/// are left out on purpose, unlike in `is_newer_release`: their stamps order
+/// by commit date, and a build of an older commit is not thereby behind. A
+/// release built with local changes counts as that release, where semver
+/// would read `-dirty` as coming before it.
+pub fn is_older_release(version: &str, than: &str) -> bool {
+    let release = |version: &str| parse_release(version.trim_end_matches("-dirty"));
+    matches!(
+        (release(version), release(than)),
+        (Some(version), Some(than)) if version < than
+    )
+}
+
 /// Is `latest` -- a release made from a commit committed at
 /// `latest_commit_time` -- something the running build, `current` committed
 /// at `current_commit_time`, should be told about?
@@ -1398,6 +1411,23 @@ mod tests {
         assert!(is_newer_release("20260904-120000-abcdef12", "20260903-120000-abcdef12"));
         assert!(!is_newer_release("0.2.0", "20260903-120000-abcdef12"));
         assert!(!is_newer_release("20260903-120000-abcdef12", "0.2.0"));
+    }
+
+    #[test]
+    fn only_two_releases_can_be_older_than_each_other() {
+        assert!(is_older_release("0.3.9", "0.4.0"));
+        assert!(is_older_release("v0.3.9", "0.4.0"));
+        assert!(!is_older_release("0.4.0", "0.4.0"));
+        assert!(!is_older_release("0.4.1", "0.4.0"));
+        assert!(!is_older_release("0.4.0-dirty", "0.4.0"));
+        assert!(!is_older_release("0.4.0", "0.4.0-dirty"));
+        assert!(is_older_release("0.3.9-dirty", "0.4.0"));
+        assert!(!is_older_release(
+            "20260903-120000-abcdef12",
+            "20260904-120000-abcdef12"
+        ));
+        assert!(!is_older_release("20260903-120000-abcdef12", "0.4.0"));
+        assert!(!is_older_release("0.4.0", "20260903-120000-abcdef12"));
     }
 
     #[test]

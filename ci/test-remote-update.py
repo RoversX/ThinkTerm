@@ -331,6 +331,53 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual((installed / "pam" / policy.name).read_bytes(), policy.read_bytes())
         self.assertFalse((prefix / "etc/pam.d/thinkterm-connect-auth").exists())
 
+    def test_server_says_when_it_leaves_a_desktop_app_behind(self):
+        self.tool("thinkterm-gui", "#!/bin/sh\nexit 0\n")
+        output = self.run_install()
+        self.assertIn("this install has no GUI", output)
+        self.assertIn(str(self.bin / "thinkterm-gui"), output)
+        self.assertIn("sh -s -- --desktop\n", output)
+
+    def test_server_offers_no_way_out_under_another_prefix(self):
+        self.tool("thinkterm-gui", "#!/bin/sh\nexit 0\n")
+        output = self.run_install("--prefix", str(self.root / "elsewhere"))
+        self.assertIn("this install has no GUI", output)
+        self.assertNotIn("--desktop", output)
+
+    def test_server_offers_no_way_out_the_host_cannot_take(self):
+        self.package(GZIP.replace(".tar.gz", "-glibc2.31.tar.gz"))
+        self.write_api()
+        self.env["TEST_GLIBC"] = "2.31"
+        self.tool("thinkterm-gui", "#!/bin/sh\nexit 0\n")
+        output = self.run_install()
+        self.assertIn("this install has no GUI", output)
+        self.assertNotIn("--desktop", output)
+
+    @unittest.skipIf(Path("/usr/share/applications/com.roversx.thinkterm.desktop").exists(),
+                     "this machine has a packaged ThinkTerm")
+    def test_server_with_no_other_desktop_app_says_nothing_of_one(self):
+        self.assertNotIn("this install has no GUI", self.run_install())
+
+    @unittest.skipIf(Path("/usr/share/applications/com.roversx.thinkterm.desktop").exists(),
+                     "this machine has a packaged ThinkTerm")
+    def test_server_replacing_its_own_desktop_says_nothing_of_it(self):
+        bindir = self.home / ".local/bin"
+        bindir.mkdir(parents=True)
+        (bindir / "thinkterm-gui").write_text("#!/bin/sh\nexit 0\n")
+        (bindir / "thinkterm-gui").chmod(0o755)
+        self.env["PATH"] = f"{bindir}:{self.env['PATH']}"
+        # Spelled differently from the PATH entry that finds it.
+        output = self.run_install("--prefix", f"{self.home}/.local/")
+        self.assertNotIn("this install has no GUI", output)
+        self.assertFalse((bindir / "thinkterm-gui").exists())
+
+    def test_desktop_beside_another_desktop_app_says_nothing_of_it(self):
+        archive = self.desktop_package()
+        self.tool("thinkterm-gui", "#!/bin/sh\nexit 0\n")
+        output = self.run_install("--desktop", "--from", str(archive),
+                                  "--sha256", hashlib.sha256(archive.read_bytes()).hexdigest())
+        self.assertNotIn("this install has no GUI", output)
+
     def test_linux_desktop_without_authentication_assets_still_installs(self):
         archive = self.desktop_package(authentication=False)
         self.run_install("--desktop", "--from", str(archive),

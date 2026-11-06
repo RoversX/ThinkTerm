@@ -187,20 +187,28 @@ pub fn handoff_socket_path(socket_path: &Path) -> PathBuf {
 
 // ---------------------------------------------------------------- framing
 
-fn write_message(stream: &mut UnixStream, message: &HandoffMessage) -> anyhow::Result<()> {
+fn encode_message(message: &HandoffMessage) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut encode = varbincode::Serializer::new(&mut bytes);
     message
         .serialize(&mut encode)
         .context("encoding a handoff message")?;
+    Ok(bytes)
+}
+
+fn write_frame(stream: &mut UnixStream, bytes: &[u8]) -> anyhow::Result<()> {
     let len = u32::try_from(bytes.len()).context("a handoff message is too large")?;
     stream.write_all(&len.to_le_bytes())?;
-    stream.write_all(&bytes)?;
+    stream.write_all(bytes)?;
     stream.flush()?;
     Ok(())
 }
 
-fn read_message(stream: &mut UnixStream) -> anyhow::Result<HandoffMessage> {
+fn write_message(stream: &mut UnixStream, message: &HandoffMessage) -> anyhow::Result<()> {
+    write_frame(stream, &encode_message(message)?)
+}
+
+fn read_frame(stream: &mut UnixStream) -> anyhow::Result<Vec<u8>> {
     let mut len = [0u8; 4];
     stream
         .read_exact(&mut len)
@@ -211,9 +219,70 @@ fn read_message(stream: &mut UnixStream) -> anyhow::Result<HandoffMessage> {
     }
     let mut bytes = vec![0u8; len];
     stream.read_exact(&mut bytes)?;
-    let mut reader = &bytes[..];
-    let mut decode = varbincode::Deserializer::new(&mut reader);
+    Ok(bytes)
+}
+
+fn decode_message(reader: &mut &[u8]) -> anyhow::Result<HandoffMessage> {
+    let mut decode = varbincode::Deserializer::new(reader);
     HandoffMessage::deserialize(&mut decode).context("decoding a handoff message")
+}
+
+fn read_message(stream: &mut UnixStream) -> anyhow::Result<HandoffMessage> {
+    let bytes = read_frame(stream)?;
+    decode_message(&mut &bytes[..])
+}
+
+/// `Ready`, then the build saying it, in the same frame but outside the
+/// message: a running server from before successors said their build
+/// decodes `Ready` and never looks past it, so this is not a change of
+/// shape and `HANDOFF_VERSION` stays, and updating from one still works.
+fn write_ready(stream: &mut UnixStream) -> anyhow::Result<()> {
+    let mut bytes = encode_message(&HandoffMessage::Ready {
+        version: HANDOFF_VERSION,
+    })?;
+    bytes.extend_from_slice(config::wezterm_version().as_bytes());
+    write_frame(stream, &bytes)
+}
+
+/// The handoff version and the build from `write_ready`. A successor from
+/// before it says no build.
+fn read_ready(stream: &mut UnixStream) -> anyhow::Result<(u32, Option<String>)> {
+    let bytes = read_frame(stream)?;
+    let mut rest = &bytes[..];
+    match decode_message(&mut rest)? {
+        HandoffMessage::Ready { version } => Ok((
+            version,
+            (!rest.is_empty()).then(|| String::from_utf8_lossy(rest).into_owned()),
+        )),
+        HandoffMessage::Refused(why) => bail!("the other side refused: {why}"),
+        message => bail!("expected Ready, got {message:?}"),
+    }
+}
+
+/// Why a server of release `own` keeps its panes from a successor of build
+/// `successor`, if it does. An app left behind by an update of the server
+/// (a distro package beside a newer install under ~/.local) starts its own
+/// server at every launch, and handing over to it would put the older build
+/// in charge of the panes and shut out the clients that updated the server
+/// in the first place. A successor that says no build predates this rule,
+/// and so this server. Development builds are not held to it, nor is one
+/// that says no build on Windows: there is only one install there, so that
+/// is a rollback on purpose, and an app from before this rule stops a server
+/// that refuses it, terminals and all.
+fn refusal_of_older_successor(own: &str, successor: Option<&str>) -> Option<String> {
+    if !thinkterm_update::is_release_version(own) {
+        return None;
+    }
+    match successor {
+        None if cfg!(windows) => None,
+        None => Some(format!(
+            "this server is {own}, which an older build does not take over"
+        )),
+        Some(successor) if thinkterm_update::is_older_release(successor, own) => Some(format!(
+            "this server is {own}, which the older build {successor} does not take over"
+        )),
+        Some(_) => None,
+    }
 }
 
 fn expect(stream: &mut UnixStream, what: &str) -> anyhow::Result<HandoffMessage> {
@@ -233,7 +302,6 @@ fn placeholder(what: &str) -> HandoffMessage {
     match what {
         "Ack" => HandoffMessage::Ack,
         "Owned" => HandoffMessage::Owned,
-        "Ready" => HandoffMessage::Ready { version: 0 },
         other => panic!("no placeholder for {}", other),
     }
 }
@@ -778,11 +846,14 @@ struct Capture {
 }
 
 fn serve_inner(stream: &mut UnixStream, socket_path: &Path) -> anyhow::Result<()> {
-    let HandoffMessage::Ready { version } = expect(stream, "Ready")? else {
-        unreachable!()
-    };
+    let (version, successor_build) = read_ready(stream)?;
     if version != HANDOFF_VERSION {
         bail!("the successor speaks handoff version {version}, this server speaks {HANDOFF_VERSION}");
+    }
+    if let Some(why) =
+        refusal_of_older_successor(config::wezterm_version(), successor_build.as_deref())
+    {
+        bail!("{why}");
     }
     #[cfg(windows)]
     let successor = Successor::of(stream)?;
@@ -1130,12 +1201,7 @@ pub fn begin(socket_path: &Path) -> anyhow::Result<Takeover> {
     })?;
     stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
     stream.set_write_timeout(Some(STEP_TIMEOUT))?;
-    write_message(
-        &mut stream,
-        &HandoffMessage::Ready {
-            version: HANDOFF_VERSION,
-        },
-    )?;
+    write_ready(&mut stream)?;
     let hello = match read_message(&mut stream)? {
         HandoffMessage::Hello(hello) => hello,
         HandoffMessage::Refused(why) => {
@@ -1705,6 +1771,50 @@ mod tests {
             prune_tree(PaneNode::Leaf(entry(4)), &keep),
             PaneNode::Empty
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_build_of_a_successor_passes_servers_that_do_not_look_for_it() {
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        // What a server from before builds were said reads.
+        write_ready(&mut a).unwrap();
+        match read_message(&mut b).unwrap() {
+            HandoffMessage::Ready { version } => assert_eq!(version, HANDOFF_VERSION),
+            other => panic!("{:?}", other),
+        }
+
+        write_ready(&mut a).unwrap();
+        let (version, build) = read_ready(&mut b).unwrap();
+        assert_eq!(version, HANDOFF_VERSION);
+        assert_eq!(build.as_deref(), Some(config::wezterm_version()));
+
+        // What a successor from before builds were said sends.
+        write_message(
+            &mut a,
+            &HandoffMessage::Ready {
+                version: HANDOFF_VERSION,
+            },
+        )
+        .unwrap();
+        assert_eq!(read_ready(&mut b).unwrap(), (HANDOFF_VERSION, None));
+
+        write_message(&mut a, &HandoffMessage::Refused("no".to_string())).unwrap();
+        assert!(read_ready(&mut b).is_err());
+    }
+
+    #[test]
+    fn panes_go_only_to_a_successor_that_is_not_older() {
+        let refused = |own, successor| refusal_of_older_successor(own, successor).is_some();
+        assert!(refused("0.4.3", Some("0.4.2")));
+        // Says no build: from before successors did, so older than this.
+        assert_eq!(refused("0.4.3", None), !cfg!(windows));
+        assert!(!refused("0.4.3", Some("0.4.3")));
+        assert!(!refused("0.4.3", Some("0.4.4")));
+        // A development build on either side is free to.
+        assert!(!refused("0.4.3", Some("20261106-120000-abcdef12")));
+        assert!(!refused("20261106-120000-abcdef12", Some("0.4.2")));
+        assert!(!refused("20261106-120000-abcdef12", None));
     }
 
     #[cfg(unix)]

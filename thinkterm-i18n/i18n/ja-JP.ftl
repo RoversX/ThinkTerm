@@ -409,6 +409,7 @@ menu-space-server-group-offline = { $name }（切断）
 menu-space-server-group-connecting = { $name }（接続中…）
 menu-space-server-group-reconnecting = { $name }（再接続中…）
 remote-tree-mutation-offline = { $name } は切断されています。再接続してからもう一度お試しください。
+session-server-newer = この ThinkTerm({ $version })は、このコンピュータのセッションサーバー({ $server })より古いため、このウィンドウは独自のターミナルを実行します。これまでのターミナルはサーバーで動き続けています。ThinkTerm を更新すると戻れます。このバージョンを使い続ける場合は、設定でセッションサーバーを停止できますが、それらのターミナルは終了します。
 menu-new-space-here = このサーバーに新しいスペース
 menu-new-space-on-server = サーバーに新しいスペース
 menu-add-remote-host = リモートホストを追加…

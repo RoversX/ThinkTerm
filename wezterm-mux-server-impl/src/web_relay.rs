@@ -2088,6 +2088,14 @@ fn plan(
             });
         }
     }
+    // Its sessions would not come to an older release, so the most this
+    // could do is ask to end them.
+    if let Some(theirs) = remote.filter(|theirs| thinkterm_update::is_older_release(ours, theirs))
+    {
+        return Plan::Cannot(format!(
+            "ThinkTerm there ({theirs}) is newer than this server ({ours}); update this server"
+        ));
+    }
     if let Some(why) = blocked {
         return Plan::Cannot(why.to_string());
     }
@@ -2096,8 +2104,8 @@ fn plan(
     }
     let newer = match met {
         Met::Other { newer, .. } => *newer,
-        // Older by its own word is ours to update. Newer, or a version
-        // that does not compare with this one, is the person's to decide.
+        // Older by its own word is ours to update. A version that does not
+        // compare with this one is the person's to decide.
         Met::Mute {
             version: Some(theirs),
             ..
@@ -3225,6 +3233,23 @@ mod tests {
         assert!(matches!(
             plan(&ours, &other(true), OURS, None, consent),
             Plan::Ask(AskKind::Replace, _)
+        ));
+        // A newer release there: left alone, whatever was agreed to.
+        let newer = Met::Other {
+            newer: true,
+            version: "0.4.4".into(),
+        };
+        let agreed = Consent {
+            install: true,
+            replace: true,
+        };
+        assert!(matches!(
+            plan(&ours, &newer, "0.4.3", None, consent),
+            Plan::Cannot(why) if why.contains("0.4.4") && why.contains("0.4.3")
+        ));
+        assert!(matches!(
+            plan(&ours, &newer, "0.4.3", None, agreed),
+            Plan::Cannot(_)
         ));
         // Nothing there: asked once, then installed.
         let empty = Probe {

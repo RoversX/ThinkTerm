@@ -44,7 +44,8 @@ string.
 ## Additional Resources
 
 * `assets/shell-integration`, `assets/shell-completion`: should be deployed along with the `wezterm` executable
-* `assets/wezterm.desktop`, `assets/wezterm.appdata.xml`, `assets/wezterm-nautilus.py`: should be deployed along with `wezterm-gui`
+* `assets/wezterm.desktop`, `assets/wezterm.appdata.xml`, `assets/wezterm-nautilus.py`: should be deployed along with `wezterm-gui`.
+  Point `Exec=` and `TryExec=` in the `.desktop` file at your package's `thinkterm` by absolute path, as `ci/deploy.sh` does: by bare name it goes through `PATH`, where a `thinkterm` under `~/.local/bin` may come first and have no GUI to start.
 
 ## Building wezterm
 

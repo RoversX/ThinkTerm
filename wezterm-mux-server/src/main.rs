@@ -50,7 +50,8 @@ struct Opt {
 
     /// Take over from the mux server already running on this socket:
     /// its panes, windows and clients continue under this binary, and
-    /// the running server exits. The running server must support it.
+    /// the running server exits. The running server must support it, and
+    /// does not hand over to an older release.
     #[arg(long = "takeover")]
     takeover: bool,
 

@@ -65,6 +65,14 @@ pub fn local_session_host_started_by_us() -> bool {
     STARTED_LOCAL_SESSION_HOST.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Whether the server running here, of `version`, is a newer release than
+/// this client: an app left behind by an update of the server. That server
+/// stays, sessions and all. A takeover would at best be refused, and the
+/// stop that follows one on Windows would end its terminals.
+pub fn server_is_newer(version: &str) -> bool {
+    thinkterm_update::is_older_release(config::wezterm_version(), version)
+}
+
 /// Run the server this client ships with as a successor of the one
 /// listening on `unix`'s socket. `Ok(true)` when that one no longer serves
 /// -- this build's successor does, or another client's that took it over

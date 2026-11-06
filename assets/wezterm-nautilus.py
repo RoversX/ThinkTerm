@@ -35,7 +35,9 @@ class OpenInWezTermAction(GObject.GObject, Nautilus.MenuProvider):
                     "org.freedesktop.systemd1.Manager", None)
 
     def _open_terminal(self, path):
-        cmd = ['thinkterm', 'start', '--cwd', path]
+        # The GUI by its own name: the first `thinkterm` on PATH may be an
+        # install that has none.
+        cmd = ['thinkterm-gui', 'start', '--cwd', path]
         child = Gio.Subprocess.new(cmd, Gio.SubprocessFlags.NONE)
         if self._systemd:
             # Move new terminal into a dedicated systemd scope to make systemd

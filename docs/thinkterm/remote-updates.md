@@ -29,6 +29,19 @@ The v1 script must preserve `--release-info`, `--version`, `--server`,
 are `#!/bin/sh` and `# thinkterm-installer-v1`. Breaking that contract requires
 a new channel and namespace; old clients continue using v1 or their fallback.
 
+The variant follows what the host has. The script's desktop variant stays. On
+Linux, a desktop app from a distro package, which writes no manifest, gets the
+desktop variant under `~/.local`, even where a server install already sits
+beside it: a server there can take the name `thinkterm` from the package's
+launcher and leaves the app on its old version, and a package cannot update
+itself. A host whose glibc is too old for the desktop variant gets the server,
+and the question says what happens to the app. A macOS bundle is left alone: it
+runs its own binaries and updates itself.
+
+A client never takes a host backwards. A server of a newer release than the
+client is left as it is and the client is told to update, because that server
+would not hand its sessions to the older build.
+
 The client first asks the GitHub releases API for its exact release version.
 If that fails, it tries `thinkterm-release.txt` and its detached `.sig` file,
 using the configured download sources. A pinned Ed25519 public key verifies

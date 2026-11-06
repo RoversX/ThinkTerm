@@ -424,6 +424,7 @@ menu-space-server-group-offline = { $name } (déconnecté)
 menu-space-server-group-connecting = { $name } (connexion…)
 menu-space-server-group-reconnecting = { $name } (reconnexion…)
 remote-tree-mutation-offline = { $name } est déconnecté. Reconnectez-vous et réessayez.
+session-server-newer = Ce ThinkTerm ({ $version }) est plus ancien que le serveur de session de cet ordinateur ({ $server }) : cette fenêtre exécute donc ses propres terminaux. Les vôtres continuent dans le serveur : mettez ThinkTerm à jour pour les retrouver. Pour rester sur cette version, arrêtez le serveur de session dans les réglages, ce qui y mettra fin.
 menu-new-space-here = Nouvel espace ici
 menu-new-space-on-server = Nouvel espace sur un serveur
 menu-add-remote-host = Ajouter un hôte distant…
