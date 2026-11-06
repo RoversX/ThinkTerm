@@ -1894,6 +1894,13 @@ impl SettingsWindow {
         }
     }
 
+    /// Show the Keymap page, searching for `search`.
+    pub(super) fn show_keymap_search(&mut self, search: &str) {
+        self.enter_section(SettingsSection::Keymap);
+        self.ui.keymap.search.set_text_end(search.to_string());
+        self.set_focused_input(Some(SettingsAction::KeymapSearchInput));
+    }
+
     /// A key pressed while a shortcut is being recorded. Always handled:
     /// nothing else may act on it.
     pub(super) fn keymap_record_key(&mut self, event: &KeyEvent) -> bool {

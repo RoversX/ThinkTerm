@@ -299,6 +299,8 @@ thread_local! {
     /// The Import page's source to choose and start on, with PENDING_SECTION
     /// set to Import: first-run setup's Import buttons open Settings there.
     static PENDING_IMPORT: Cell<Option<ImportSource>> = const { Cell::new(None) };
+    /// What the Keymap page should search for, with PENDING_SECTION.
+    static PENDING_KEYMAP_SEARCH: Cell<Option<String>> = const { Cell::new(None) };
     /// The window Settings was opened from. The colour-scheme row hands the
     /// choosing back to that window's command palette, and a preview belongs
     /// in the terminal the user was looking at rather than in whichever
@@ -3839,12 +3841,40 @@ pub fn show_import_from(mux_window_id: MuxWindowId, space_id: &str, source: Opti
     show();
 }
 
+/// Open Settings on the Keymap page, searching for `search` (nothing, when it
+/// is empty), asked from a terminal window: the command palette's way to a
+/// command's shortcuts.
+pub fn show_keymap_from(mux_window_id: MuxWindowId, space_id: &str, search: &str) {
+    remember_origin(mux_window_id, space_id);
+    let switched = SETTINGS_WINDOW.with(|slot| {
+        let slot = slot.borrow();
+        let SettingsWindowSlot::Open { settings, .. } = &*slot else {
+            return false;
+        };
+        let mut settings = settings.borrow_mut();
+        if settings.window.is_none() {
+            return false;
+        }
+        settings.show_keymap_search(search);
+        if let Some(window) = settings.window.as_ref() {
+            window.invalidate();
+        }
+        true
+    });
+    if !switched {
+        PENDING_SECTION.with(|pending| pending.set(Some(SettingsSection::Keymap)));
+        PENDING_KEYMAP_SEARCH.with(|pending| pending.set(Some(search.to_string())));
+    }
+    show();
+}
+
 /// A window that failed to open takes the page it was asked for with it.
 /// Left set, the request would be acted on by the next, unrelated, opening:
 /// straight to that page, and an import started that nobody asked for.
 fn forget_pending_pages() {
     PENDING_SECTION.with(|pending| pending.take());
     PENDING_IMPORT.with(|pending| pending.take());
+    PENDING_KEYMAP_SEARCH.with(|pending| pending.take());
 }
 
 /// Whether a WezTerm configuration is there for the Import page to read.
@@ -4295,7 +4325,8 @@ impl SettingsWindow {
         // now and then send the next, unrelated, opening to that page.
         let late_section = PENDING_SECTION.with(|pending| pending.take());
         let pending_import = PENDING_IMPORT.with(|pending| pending.take());
-        if late_section.is_some() || pending_import.is_some() {
+        let pending_keymap_search = PENDING_KEYMAP_SEARCH.with(|pending| pending.take());
+        if late_section.is_some() || pending_import.is_some() || pending_keymap_search.is_some() {
             if let Some(settings) = settings_window_for_instance(instance_id) {
                 let mut settings = settings.borrow_mut();
                 if let Some(section) = late_section {
@@ -4304,6 +4335,9 @@ impl SettingsWindow {
                 if let Some(source) = pending_import {
                     settings.enter_section(SettingsSection::Import);
                     settings.start_import(source, &window);
+                }
+                if let Some(search) = pending_keymap_search {
+                    settings.show_keymap_search(&search);
                 }
             }
         }
