@@ -1238,6 +1238,8 @@ impl LiveOverviewView {
                                         hold_scale: self.live_resizing,
                                         opacity: 0.0,
                                         prebuild: true,
+                                        corner_radius: 0.0,
+                                        background: None,
                                     });
                                 }
                             } else {
@@ -1258,6 +1260,8 @@ impl LiveOverviewView {
                                             hold_scale: self.live_resizing,
                                             opacity: 1.0 - arrived,
                                             prebuild: false,
+                                            corner_radius: 0.0,
+                                            background: None,
                                         });
                                     }
                                 }
@@ -1270,6 +1274,8 @@ impl LiveOverviewView {
                                         hold_scale: self.live_resizing,
                                         opacity: arrived,
                                         prebuild: false,
+                                        corner_radius: 0.0,
+                                        background: None,
                                     });
                                     self.visible_panes
                                         .extend(snapshot.panes.iter().map(|pane| pane.pane_id));
@@ -2917,7 +2923,7 @@ fn palette_identity(palette: &wezterm_term::color::ColorPalette) -> u64 {
     hasher.finish()
 }
 
-fn capture_terminal_snapshot(tab_id: TabId) -> Option<TerminalPreviewSnapshot> {
+pub(crate) fn capture_terminal_snapshot(tab_id: TabId) -> Option<TerminalPreviewSnapshot> {
     let tab = Mux::get().get_tab(tab_id)?;
     let tab_size = tab.get_size();
     if tab_size.cols == 0 || tab_size.rows == 0 {

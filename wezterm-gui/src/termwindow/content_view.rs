@@ -548,6 +548,11 @@ pub(crate) struct TerminalPreviewRequest {
     /// into, which has to be ready when the terminal lands on it and must not
     /// show before then.
     pub prebuild: bool,
+    /// The radius of the picture's corners, in pixels.
+    pub corner_radius: f32,
+    /// What to fill the picture with in place of the backgrounds its panes
+    /// report, which a pane not on screen may not have heard of yet.
+    pub background: Option<::window::color::LinearRgba>,
 }
 
 /// Progress of an SSH connection that a content view kicked off, pushed by the

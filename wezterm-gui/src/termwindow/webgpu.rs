@@ -51,6 +51,7 @@ struct AtlasBindGroups {
 }
 
 pub struct WebGpuState {
+    instance: wgpu::Instance,
     pub adapter_info: wgpu::AdapterInfo,
     pub downlevel_caps: wgpu::DownlevelCapabilities,
     pub surface: wgpu::Surface<'static>,
@@ -102,6 +103,10 @@ impl RawHandlePair {
             window: window.window_handle().expect("window handle").as_raw(),
             display: window.display_handle().expect("display handle").as_raw(),
         }
+    }
+
+    fn surface_on(&self, instance: &wgpu::Instance) -> anyhow::Result<wgpu::Surface<'static>> {
+        Ok(unsafe { instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_window(self)?)? })
     }
 }
 
@@ -255,6 +260,20 @@ pub struct CardRenderTexture {
 
 impl CardRenderTexture {
     pub fn new(width: u32, height: u32, state: &WebGpuState) -> anyhow::Result<Self> {
+        Self::with_copies(width, height, state, crate::framedump::enabled())
+    }
+
+    /// One that can be copied onto a surface rather than only drawn.
+    pub fn copyable(width: u32, height: u32, state: &WebGpuState) -> anyhow::Result<Self> {
+        Self::with_copies(width, height, state, true)
+    }
+
+    fn with_copies(
+        width: u32,
+        height: u32,
+        state: &WebGpuState,
+        copies: bool,
+    ) -> anyhow::Result<Self> {
         let limit = state.device.limits().max_texture_dimension_2d;
         if width > limit || height > limit {
             anyhow::bail!(
@@ -275,7 +294,7 @@ impl CardRenderTexture {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: if crate::framedump::enabled() {
+            usage: if copies {
                 wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::TEXTURE_BINDING
                     | wgpu::TextureUsages::COPY_SRC
@@ -491,9 +510,7 @@ impl WebGpuState {
             backends,
             ..Default::default()
         });
-        let surface = unsafe {
-            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::from_window(&handle)?)?
-        };
+        let surface = handle.surface_on(&instance)?;
 
         let mut adapter: Option<wgpu::Adapter> = None;
 
@@ -675,6 +692,7 @@ impl WebGpuState {
         let pipeline = Pipeline::new(&device, config.format);
 
         Ok(Self {
+            instance,
             adapter_info,
             downlevel_caps,
             surface,
@@ -696,6 +714,25 @@ impl WebGpuState {
                 MAX_FRAMES_IN_FLIGHT + 1,
             )),
         })
+    }
+
+    /// A surface on this device for another window of ours, which can then
+    /// show what this one has rendered without a device of its own. The
+    /// handle goes with the surface.
+    pub fn surface_for(
+        &self,
+        window: &Window,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<(wgpu::Surface<'static>, RawHandlePair)> {
+        let handle = RawHandlePair::new(window);
+        let surface = handle.surface_on(&self.instance)?;
+        let mut config = self.config.borrow().clone();
+        config.width = width;
+        config.height = height;
+        config.usage |= wgpu::TextureUsages::COPY_DST;
+        surface.configure(&self.device, &config);
+        Ok((surface, handle))
     }
 
     /// Present a frame and tell the window, which wgpu does not: on Wayland

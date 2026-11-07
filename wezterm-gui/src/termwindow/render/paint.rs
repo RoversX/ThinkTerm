@@ -212,6 +212,8 @@ pub(crate) struct PreviewGeometryKey {
     /// start and end, and each flip re-keyed all cards at once -- a full
     /// same-frame rebuild of the overview to draw the identical picture.
     scale_bits: u64,
+    corner_radius: u32,
+    background: Option<[u32; 4]>,
     pixel_width: usize,
     pixel_height: usize,
     dpi: usize,
@@ -319,6 +321,8 @@ pub(crate) struct PendingCardRender {
     pub quad_count: usize,
     /// The rect (top-left window pixels) the verts were recorded against.
     pub area: RectF,
+    /// The radius the texture's corners are cut to.
+    pub corner_radius: f32,
 }
 
 /// One textured quad standing in for a card's thousands of glyph quads,
@@ -475,6 +479,10 @@ fn preview_quad_key(
             area_width: preview.area.size.width.to_bits(),
             area_height: preview.area.size.height.to_bits(),
             scale_bits: scale.to_bits(),
+            corner_radius: preview.corner_radius.to_bits(),
+            background: preview
+                .background
+                .map(|fill| [fill.0, fill.1, fill.2, fill.3].map(f32::to_bits)),
             // Quad positions are relative to the centre of the window.
             pixel_width: dimensions.pixel_width,
             pixel_height: dimensions.pixel_height,
@@ -2636,7 +2644,7 @@ impl crate::TermWindow {
     /// Render live, read-only terminal thumbnails requested by a ContentView.
     /// This reuses the normal screen-line renderer at a smaller font scale;
     /// panes are never resized and no input or focus is sent to them.
-    fn paint_terminal_previews(
+    pub(crate) fn paint_terminal_previews(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
         previews: &[TerminalPreviewRequest],
@@ -2757,7 +2765,22 @@ impl crate::TermWindow {
     /// Whether `tab_id`'s card has a finished picture of what its terminal
     /// shows now: a cached recording with something in it, and no rebuild of
     /// it still under way across frames.
-    fn preview_thumbnail_recorded(&self, tab_id: TabId) -> bool {
+    /// The finished picture of `tab_id`'s card, as a texture.
+    pub(crate) fn preview_picture(
+        &self,
+        tab_id: TabId,
+    ) -> Option<Rc<crate::termwindow::webgpu::CardRenderTexture>> {
+        if !self.preview_thumbnail_recorded(tab_id) {
+            return None;
+        }
+        self.preview_quad_cache
+            .borrow()
+            .get(&tab_id)?
+            .texture
+            .clone()
+    }
+
+    pub(crate) fn preview_thumbnail_recorded(&self, tab_id: TabId) -> bool {
         self.preview_quad_cache
             .borrow()
             .get(&tab_id)
@@ -3008,6 +3031,7 @@ impl crate::TermWindow {
                             first_vertex,
                             quad_count,
                             area: preview.area,
+                            corner_radius: preview.corner_radius,
                         });
                     if shown {
                         self.card_composites.borrow_mut().push(CardComposite {
@@ -3059,7 +3083,7 @@ impl crate::TermWindow {
         self.webgpu.is_some()
     }
 
-    fn create_card_texture(
+    pub(crate) fn create_card_texture(
         &self,
         area: RectF,
     ) -> anyhow::Result<Rc<crate::termwindow::webgpu::CardRenderTexture>> {
@@ -3116,6 +3140,7 @@ impl crate::TermWindow {
                     first_vertex,
                     quad_count,
                     area: recorded_area,
+                    corner_radius: preview.corner_radius,
                 });
         }
         let Some(texture) = self
@@ -3290,7 +3315,8 @@ impl crate::TermWindow {
             .map(|pane| pane.palette.resolve_bg(ColorAttribute::Default).to_linear())
             .expect("checked that the tab has panes");
         if *resume_pane == 0 && *resume_line == 0 {
-            self.filled_rectangle(layers, 0, preview.area, preview_background)?;
+            let fill = preview.background.unwrap_or(preview_background);
+            self.filled_rectangle(layers, 0, preview.area, fill)?;
         }
 
         // Quantization bounds the number of cached FontConfigurations even
@@ -3434,7 +3460,9 @@ impl crate::TermWindow {
                     layers,
                     0,
                     pane_bounds,
-                    palette.resolve_bg(ColorAttribute::Default).to_linear(),
+                    preview
+                        .background
+                        .unwrap_or_else(|| palette.resolve_bg(ColorAttribute::Default).to_linear()),
                 )?;
             }
 
@@ -6058,6 +6086,26 @@ mod tests {
         assert_eq!(under(&items, 500), Some(UIItemType::WindowTabsTravelling));
     }
 
+    #[test]
+    fn a_preview_with_rounder_corners_is_another_picture() {
+        let area = euclid::rect(0.0, 0.0, 100.0, 100.0);
+        let dimensions = Dimensions {
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let geometry = |preview: &TerminalPreviewRequest| {
+            preview_quad_key(preview, &dimensions, 0, 1.0).geometry
+        };
+        let plain = test_preview(area);
+        let rounded = TerminalPreviewRequest {
+            corner_radius: 8.0,
+            ..test_preview(area)
+        };
+        assert!(geometry(&plain) == geometry(&test_preview(area)));
+        assert!(geometry(&plain) != geometry(&rounded));
+    }
+
     fn test_preview(area: RectF) -> TerminalPreviewRequest {
         TerminalPreviewRequest {
             tab_id: 1,
@@ -6071,6 +6119,8 @@ mod tests {
             hold_scale: false,
             opacity: 1.0,
             prebuild: false,
+            corner_radius: 0.0,
+            background: None,
         }
     }
 

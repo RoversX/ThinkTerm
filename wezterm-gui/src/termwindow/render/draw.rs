@@ -141,6 +141,115 @@ fn composite_quad_verts(
     ])
 }
 
+/// Show `card`, rendered on this device already, on the `surface` of a window
+/// with nothing else in it, and `thumbnail` over it. The card goes on as it
+/// is rather than through the blend, which would count the alpha already in
+/// its edges a second time and darken them.
+pub(crate) fn show_card_on_surface(
+    webgpu: &WebGpuState,
+    surface: &wgpu::Surface<'static>,
+    dimensions: Dimensions,
+    card: &crate::termwindow::webgpu::CardRenderTexture,
+    thumbnail: Option<&crate::termwindow::render::paint::CardComposite>,
+) -> anyhow::Result<()> {
+    use crate::quad::{V_BOT_LEFT, V_BOT_RIGHT, V_TOP_LEFT, V_TOP_RIGHT};
+    use wgpu::util::DeviceExt;
+
+    let output = surface.get_current_texture()?;
+    let mut encoder = webgpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Card Window Encoder"),
+        });
+    encoder.copy_texture_to_texture(
+        card.texture.as_image_copy(),
+        output.texture.as_image_copy(),
+        wgpu::Extent3d {
+            width: card.width.min(output.texture.width()),
+            height: card.height.min(output.texture.height()),
+            depth_or_array_layers: 1,
+        },
+    );
+    let thumbnail =
+        thumbnail.and_then(|picture| Some((picture, composite_quad_verts(picture, &dimensions)?)));
+    let drawing = thumbnail.map(|(picture, verts)| {
+        let vertices = webgpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Card Window Vertices"),
+                usage: wgpu::BufferUsages::VERTEX,
+                contents: bytemuck::cast_slice(&verts),
+            });
+        let indices = [
+            V_TOP_LEFT,
+            V_TOP_RIGHT,
+            V_BOT_LEFT,
+            V_TOP_RIGHT,
+            V_BOT_LEFT,
+            V_BOT_RIGHT,
+        ]
+        .map(|corner| corner as u32);
+        let index = webgpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Card Window Indices"),
+                usage: wgpu::BufferUsages::INDEX,
+                contents: bytemuck::cast_slice(&indices),
+            });
+        (picture, vertices, index)
+    });
+    if let Some((picture, vertices, index)) = &drawing {
+        let projection = euclid::Transform3D::<f32, f32, f32>::ortho(
+            -(dimensions.pixel_width as f32) / 2.0,
+            dimensions.pixel_width as f32 / 2.0,
+            dimensions.pixel_height as f32 / 2.0,
+            -(dimensions.pixel_height as f32) / 2.0,
+            -1.0,
+            1.0,
+        )
+        .to_arrays_transposed();
+        let uniforms = webgpu.card_uniform(0, ShaderUniform {
+            foreground_text_hsb: [1.0; 3],
+            milliseconds: 0,
+            viewport_and_corner: [
+                dimensions.pixel_width as f32,
+                dimensions.pixel_height as f32,
+                0.0,
+                0.0,
+            ],
+            window_border: [0.0; 4],
+            projection,
+        });
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Card Window Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&webgpu.render_pipeline);
+        pass.set_bind_group(0, &uniforms, &[]);
+        pass.set_bind_group(1, &picture.texture.bind_group, &[]);
+        pass.set_bind_group(2, &picture.texture.bind_group, &[]);
+        pass.set_vertex_buffer(0, vertices.slice(..));
+        pass.set_index_buffer(index.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..6, 0, 0..1);
+    }
+    webgpu.queue.submit(std::iter::once(encoder.finish()));
+    output.present();
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct WindowBorder {
     pub width: f32,
@@ -342,7 +451,7 @@ pub(crate) fn draw_webgpu_layers(
                 viewport_and_corner: [
                     pending.texture.width as f32,
                     pending.texture.height as f32,
-                    0.0,
+                    pending.corner_radius,
                     0.0,
                 ],
                 window_border: [0.0; 4],
