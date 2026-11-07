@@ -78,6 +78,7 @@ pub enum SvgIcon {
     PanelRightOpen,
     Package,
     Pencil,
+    PersonStanding,
     Pin,
     PinOff,
     Pipette,
@@ -358,6 +359,9 @@ impl SvgIcon {
                 include_bytes!("../../../../third_party/lucide/icons/panel-right-open.svg")
             }
             Self::Pencil => include_bytes!("../../../../third_party/lucide/icons/pencil.svg"),
+            Self::PersonStanding => {
+                include_bytes!("../../../../third_party/lucide/icons/person-standing.svg")
+            }
             Self::Package => include_bytes!("../../../../third_party/lucide/icons/package.svg"),
             Self::Pin => include_bytes!("../../../../third_party/lucide/icons/pin.svg"),
             Self::PinOff => include_bytes!("../../../../third_party/lucide/icons/pin-off.svg"),
@@ -962,6 +966,7 @@ mod tests {
             SvgIcon::Minimize2,
             SvgIcon::NotebookTabs,
             SvgIcon::Palette,
+            SvgIcon::PersonStanding,
             SvgIcon::PanelLeft,
             SvgIcon::PanelLeftClose,
             SvgIcon::PanelLeftOpen,

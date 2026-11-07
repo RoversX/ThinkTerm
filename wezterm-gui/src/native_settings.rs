@@ -2132,6 +2132,15 @@ pub(crate) use thinkterm_tab_icons::{
     TabIconCard as NativeTabIconCard, TabIconSettings as NativeTabIconSettings,
 };
 
+/// Settings › Accessibility.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct NativeAccessibilitySettings {
+    /// The sidebar's add buttons keep their circle when the pointer is not
+    /// over them.
+    pub(crate) show_button_shapes: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct ThinkTermNativeSettings {
@@ -2151,6 +2160,7 @@ pub(crate) struct ThinkTermNativeSettings {
     pub(crate) tab_icons: NativeTabIconSettings,
     pub(crate) sharing: NativeSharingSettings,
     pub(crate) agents: NativeAgentsSettings,
+    pub(crate) accessibility: NativeAccessibilitySettings,
 }
 
 impl Default for ThinkTermNativeSettings {
@@ -2172,6 +2182,7 @@ impl Default for ThinkTermNativeSettings {
             tab_icons: NativeTabIconSettings::default(),
             sharing: NativeSharingSettings::default(),
             agents: NativeAgentsSettings::default(),
+            accessibility: NativeAccessibilitySettings::default(),
         }
     }
 }
@@ -3211,6 +3222,10 @@ pub(crate) fn right_sidebar_note_pane_expanded() -> bool {
 
 pub(crate) fn right_sidebar_open_with_app() -> Option<NativeOpenWithApp> {
     load().chrome.right_sidebar_open_with_app
+}
+
+pub(crate) fn show_button_shapes() -> bool {
+    load_shared().accessibility.show_button_shapes
 }
 
 pub(crate) fn sidebar_thread_icons() -> NativeThreadIcons {

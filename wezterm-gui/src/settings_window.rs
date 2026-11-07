@@ -932,6 +932,7 @@ enum SettingsSection {
     Keymap,
     CommandPalette,
     Import,
+    Accessibility,
     Developer,
     UiKit,
     Memory,
@@ -955,6 +956,7 @@ const BASE_SECTIONS: &[SettingsSection] = &[
     SettingsSection::Keymap,
     SettingsSection::CommandPalette,
     SettingsSection::Import,
+    SettingsSection::Accessibility,
     SettingsSection::Developer,
     SettingsSection::Backup,
     SettingsSection::Update,
@@ -1021,6 +1023,7 @@ fn initial_section() -> SettingsSection {
     let section = match name.as_str() {
         "general" => SettingsSection::General,
         "appearance" => SettingsSection::Appearance,
+        "accessibility" => SettingsSection::Accessibility,
         "tabicons" | "tab-icons" | "tab_icons" => SettingsSection::TabIcons,
         "sidebar" => SettingsSection::Sidebar,
         "terminal" => SettingsSection::Terminal,
@@ -1059,6 +1062,7 @@ impl SettingsSection {
         match self {
             Self::General => crate::i18n::tr("settings-section-general"),
             Self::Appearance => crate::i18n::tr("settings-section-appearance"),
+            Self::Accessibility => crate::i18n::tr("settings-section-accessibility"),
             Self::TabIcons => crate::i18n::tr("settings-section-tab-icons"),
             Self::Sidebar => crate::i18n::tr("settings-section-sidebar"),
             Self::Terminal => crate::i18n::tr("settings-section-terminal"),
@@ -1085,6 +1089,7 @@ impl SettingsSection {
         match self {
             Self::General => SettingsIcon::General,
             Self::Appearance => SettingsIcon::Appearance,
+            Self::Accessibility => SettingsIcon::Accessibility,
             Self::TabIcons => SettingsIcon::TabIcons,
             Self::Sidebar => SettingsIcon::Sidebar,
             Self::Terminal => SettingsIcon::Terminal,
@@ -1113,6 +1118,7 @@ impl SettingsSection {
         match self {
             Self::General => TileColor::Gray,
             Self::Appearance => TileColor::Purple,
+            Self::Accessibility => TileColor::Blue,
             Self::TabIcons => TileColor::Pink,
             Self::Sidebar => TileColor::Blue,
             Self::Terminal => TileColor::Slate,
@@ -1201,6 +1207,7 @@ impl SettingsSection {
                 "Logo",
                 "Agent",
             ],
+            Self::Accessibility => &["Accessibility", "Button Shapes", "Buttons", "Hover"],
             Self::Appearance => &[
                 "Theme Mode",
                 "Tab Bar",
@@ -1429,6 +1436,10 @@ impl SettingsSection {
                 && ["settings-language", "settings-restore-pane-output"]
                     .iter()
                     .any(|key| crate::i18n::tr(key).to_lowercase().contains(query)))
+            || (self == Self::Accessibility
+                && crate::i18n::tr("settings-button-shapes")
+                    .to_lowercase()
+                    .contains(query))
             || (self == Self::Privacy
                 && [
                     "settings-privacy-heading",
@@ -2371,6 +2382,7 @@ enum SettingsAction {
     SetCursorBlink(crate::native_settings::NativeCursorBlink),
     SetCursorShape(crate::native_settings::NativeCursorShape),
     ToggleOverlayScrollbar,
+    ToggleButtonShapes,
     ToggleSplitAnimation,
     SetBottomQuoteMode(NativeBottomQuoteMode),
     DecreaseBottomQuoteFontSize,
@@ -7040,6 +7052,30 @@ impl SettingsWindow {
                 };
                 self.save_and_apply_bottom_quote_settings(status);
             }
+            SettingsAction::ToggleButtonShapes => {
+                self.ui.open_dropdown = None;
+                let shapes = !self.native_settings.accessibility.show_button_shapes;
+                self.native_settings.accessibility.show_button_shapes = shapes;
+                let setting = crate::i18n::tr("settings-button-shapes");
+                match crate::native_settings::save(&self.native_settings) {
+                    Ok(()) => {
+                        if let Some(front_end) = crate::frontend::try_front_end() {
+                            front_end.invalidate_all_windows();
+                        }
+                        let value = if shapes { "common-on" } else { "common-off" };
+                        self.status = settings_tr(
+                            "settings-status-value-now",
+                            &[("setting", setting), ("value", crate::i18n::tr(value))],
+                        );
+                    }
+                    Err(err) => {
+                        self.status = settings_tr(
+                            "settings-status-save-error",
+                            &[("setting", setting), ("error", format!("{err:#}"))],
+                        );
+                    }
+                }
+            }
             SettingsAction::ToggleOverlayScrollbar => {
                 self.ui.open_dropdown = None;
                 self.native_settings.terminal.overlay_scrollbar =
@@ -8863,6 +8899,7 @@ impl SettingsWindow {
             SettingsSection::Web => self.paint_web(layers, x, max_width)?,
             SettingsSection::ShareSync => self.paint_share_sync(layers, x, max_width)?,
             SettingsSection::Privacy => self.paint_privacy(layers, x, max_width)?,
+            SettingsSection::Accessibility => self.paint_accessibility(layers, x, max_width)?,
             // Never selected: picking it opens Remote Hosts instead.
             SettingsSection::Tailscale => {}
             SettingsSection::Archived => self.paint_archived(layers, x, max_width)?,
@@ -14117,6 +14154,60 @@ impl SettingsWindow {
                 .detach();
             }),
         );
+    }
+
+    fn paint_accessibility(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        x: f32,
+        max_width: f32,
+    ) -> anyhow::Result<()> {
+        let palette = self.palette();
+        let body_font = Rc::clone(&self.body_font);
+        let scroll = self.ui.content_scroll.offset;
+        let section_y = self.ui_px(CONTENT_SECTION_Y) - scroll;
+        let card_padding = self.ui_px(36.0);
+        let row_x = x + card_padding;
+        let row_width = max_width - card_padding * 2.0;
+
+        self.draw_text(
+            layers,
+            &body_font,
+            x,
+            section_y,
+            &crate::i18n::tr("settings-accessibility-heading"),
+            palette.muted_text,
+            max_width,
+        )?;
+        let (card_y, _) = self.settings_card_geometry(section_y, 0);
+        let bottom = self.paint_card(layers, x, card_y, max_width, |this, layers, top| {
+            let mut rows = RowCursor::new(top, this);
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::CirclePlus,
+                TileColor::Blue,
+            )?;
+            rows.add(this.paint_toggle_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-button-shapes"),
+                &crate::i18n::tr("settings-button-shapes-description"),
+                this.native_settings.accessibility.show_button_shapes,
+                SettingsAction::ToggleButtonShapes,
+                rows.rule(),
+            )?);
+            Ok(rows.bottom)
+        })?;
+        self.ui.content_scroll.set_extents(
+            self.content_viewport_extent(),
+            self.settings_content_extent(bottom + scroll),
+        );
+        Ok(())
     }
 
     fn paint_terminal(

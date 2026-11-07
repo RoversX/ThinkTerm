@@ -2434,7 +2434,7 @@ impl crate::TermWindow {
                     button_x.saturating_sub(item_x + self.ui_px(SIDEBAR_INSET) * 2),
                     muted_fg,
                 )?;
-                self.paint_sidebar_action_button(
+                self.paint_sidebar_icon_button(
                     layers,
                     1,
                     euclid::rect(
@@ -2608,7 +2608,7 @@ impl crate::TermWindow {
                             project_action_size,
                             project_action_size,
                         );
-                    self.paint_sidebar_action_button(
+                    self.paint_sidebar_icon_button(
                         layers,
                         1,
                         euclid::rect(
@@ -3020,7 +3020,7 @@ impl crate::TermWindow {
                             group_action_size,
                             group_action_size,
                         );
-                    self.paint_sidebar_action_button(
+                    self.paint_sidebar_icon_button(
                         layers,
                         1,
                         euclid::rect(
@@ -4256,6 +4256,24 @@ impl crate::TermWindow {
             radius,
             CAPSULE_BORDER_WIDTH,
         )
+    }
+
+    /// One of the sidebar's add buttons: an action button whose circle shows
+    /// only under the pointer, unless Settings › Accessibility keeps button
+    /// shapes.
+    fn paint_sidebar_icon_button(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        layer_num: usize,
+        rect: RectF,
+        chrome: UiPalette,
+        hovered: bool,
+        dimmed: bool,
+    ) -> anyhow::Result<()> {
+        if !hovered && !crate::native_settings::show_button_shapes() {
+            return Ok(());
+        }
+        self.paint_sidebar_action_button(layers, layer_num, rect, chrome, hovered, dimmed)
     }
 
     pub(crate) fn fill_rounded_rectangle(
