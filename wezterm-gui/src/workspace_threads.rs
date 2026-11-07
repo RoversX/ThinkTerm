@@ -73,6 +73,10 @@ pub struct WorkspaceThreadStore {
     /// is turned down -- leaves no folder behind.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub invented_server_domains: std::collections::BTreeSet<String>,
+    /// Threads this device has open in a window of their own: they go back
+    /// to one when it starts. Per-device, like the fields above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub own_windows: Vec<OwnThreadWindow>,
     /// The Appearance choice to show servers as folders in this device's
     /// Spaces (see `NativeServerPlacement`), mirrored so store methods can
     /// follow it without reading settings under the store's lock. Entry
@@ -80,6 +84,15 @@ pub struct WorkspaceThreadStore {
     /// `lock_store_following_settings`.
     #[serde(skip)]
     pub servers_as_folders: bool,
+}
+
+/// A thread open in a window of its own. `frame_slot` is which remembered
+/// window frame it uses: the lowest free one, so that however many threads
+/// come and go, the frames kept are as many as were ever open at once.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnThreadWindow {
+    pub thread_id: WorkspaceThreadId,
+    pub frame_slot: u32,
 }
 
 /// One session the Import page brought in, and the Space it became.
@@ -2817,7 +2830,39 @@ pub fn thread_to_recover_after_window_death(space_id: &str) -> Option<WorkspaceT
     if let Some(thread_id) = other_thread_after_window_death(&store, space_id) {
         return Some(thread_id);
     }
+    new_thread_for_space(&mut store, space_id)
+}
 
+/// The thread a new window of the Space starts on when the active one is in
+/// a window of its own: the most recently used thread that is not, or a new
+/// one. Not in a remote Space, whose threads only its server can make.
+pub fn thread_beside_own_windows(space_id: &str) -> Option<WorkspaceThreadId> {
+    let mut store = THREAD_STORE.lock();
+    store.normalize_after_load();
+    if !store.has_space(space_id) {
+        return None;
+    }
+    let free = thread_free_of_own_windows(&store, space_id);
+    if free.is_some() || store.is_client_domain_space(space_id) {
+        return free;
+    }
+    new_thread_for_space(&mut store, space_id)
+}
+
+fn thread_free_of_own_windows(
+    store: &WorkspaceThreadStore,
+    space_id: &str,
+) -> Option<WorkspaceThreadId> {
+    latest_thread_in_space(store, space_id, |id| {
+        store.own_windows.iter().any(|own| own.thread_id == id)
+    })
+}
+
+/// A new thread in the Space's active project, or its first.
+fn new_thread_for_space(
+    store: &mut WorkspaceThreadStore,
+    space_id: &str,
+) -> Option<WorkspaceThreadId> {
     let active_project_id = store.active_project_id_for_space(space_id);
     let project_id = active_project_id
         .filter(|project_id| {
@@ -2834,7 +2879,7 @@ pub fn thread_to_recover_after_window_death(space_id: &str) -> Option<WorkspaceT
                 .map(|p| p.id.clone())
         })?;
     let thread_id = store.create_thread(&project_id, None);
-    persist_locked(&store);
+    persist_locked(store);
     Some(thread_id)
 }
 
@@ -2874,7 +2919,17 @@ fn other_thread_after_window_death(
         .as_ref()
         .and_then(|project_id| store.projects.iter().find(|p| &p.id == project_id))
         .and_then(|project| project.active_thread_id.clone());
+    latest_thread_in_space(store, space_id, |id| {
+        dead_thread_id.as_deref() == Some(id)
+    })
+}
 
+/// The Space's most recently used thread that `skip` lets through.
+fn latest_thread_in_space(
+    store: &WorkspaceThreadStore,
+    space_id: &str,
+    skip: impl Fn(&str) -> bool,
+) -> Option<WorkspaceThreadId> {
     let mut best: Option<(i64, WorkspaceThreadId)> = None;
     // A dying window must never resurrect an archived project.
     for project in store
@@ -2883,7 +2938,7 @@ fn other_thread_after_window_death(
         .filter(|p| p.space_id == space_id && !p.is_archived())
     {
         for thread in &project.threads {
-            if dead_thread_id.as_deref() == Some(thread.id.as_str()) {
+            if skip(&thread.id) {
                 continue;
             }
             if best
@@ -3833,6 +3888,64 @@ pub fn snapshot_active_space_thread_layout_with_font_scales<F>(
 ) where
     F: Fn(PaneId) -> Option<f64>,
 {
+    snapshot_window_thread_layout(space_id, workspace, window_id, pane_font_scale, true);
+}
+
+/// The same for a thread in a window of its own, which is seldom the one
+/// its Space has active: that is what the main window went on to.
+pub fn snapshot_own_window_thread_layout<F>(
+    space_id: &str,
+    workspace: &str,
+    window_id: MuxWindowId,
+    pane_font_scale: F,
+) where
+    F: Fn(PaneId) -> Option<f64>,
+{
+    snapshot_window_thread_layout(space_id, workspace, window_id, pane_font_scale, false);
+}
+
+/// `thread_id` is in a window of its own from now on. Returns the window's
+/// frame slot.
+pub fn note_thread_in_own_window(thread_id: &str) -> u32 {
+    let mut store = THREAD_STORE.lock();
+    let frame_slot = store.own_window_frame_slot(thread_id);
+    schedule_workspace_thread_store_persist();
+    frame_slot
+}
+
+/// `thread_id` left its own window: closed by hand, or ended. A window that
+/// goes with the app is not this, and opens again at the next start.
+pub fn note_thread_left_own_window(thread_id: &str) {
+    let mut store = THREAD_STORE.lock();
+    store
+        .own_windows
+        .retain(|window| window.thread_id != thread_id);
+    schedule_workspace_thread_store_persist();
+}
+
+/// The threads to open in their own windows as the app starts. A thread no
+/// longer there is forgotten.
+pub fn threads_to_reopen_in_own_windows() -> Vec<WorkspaceThreadId> {
+    let mut store = THREAD_STORE.lock();
+    if store.forget_own_windows_of_gone_threads() {
+        schedule_workspace_thread_store_persist();
+    }
+    store
+        .own_windows
+        .iter()
+        .map(|window| window.thread_id.clone())
+        .collect()
+}
+
+fn snapshot_window_thread_layout<F>(
+    space_id: &str,
+    workspace: &str,
+    window_id: MuxWindowId,
+    pane_font_scale: F,
+    only_the_active_thread: bool,
+) where
+    F: Fn(PaneId) -> Option<f64>,
+{
     if is_materializing_thread_layout(workspace) {
         return;
     }
@@ -3906,7 +4019,12 @@ pub fn snapshot_active_space_thread_layout_with_font_scales<F>(
     }
 
     let mut store = THREAD_STORE.lock();
-    if store.snapshot_active_space_thread_layout(space_id, workspace, snapshot) {
+    let snapshotted = if only_the_active_thread {
+        store.snapshot_active_space_thread_layout(space_id, workspace, snapshot)
+    } else {
+        store.snapshot_thread_layout(space_id, workspace, snapshot)
+    };
+    if snapshotted {
         // Debounced rather than written through. A Space switch calls this,
         // `switch_window_space` and `activate_thread_record` back to back, and
         // each one used to fsync the whole store: three ~88ms stalls on the
@@ -7443,6 +7561,7 @@ impl WorkspaceThreadStore {
         // be made up for it.
         if is_share_view_workspace(active_workspace)
             || is_connection_page_workspace(active_workspace)
+            || is_thread_page_workspace(active_workspace)
         {
             return changed;
         }
@@ -7994,6 +8113,76 @@ impl WorkspaceThreadStore {
         session.materialized_workspace_name = Some(workspace.to_string());
         session.layout = Some(snapshot);
         session.last_active_at = now_ts();
+        true
+    }
+
+    fn forget_own_windows_of_gone_threads(&mut self) -> bool {
+        let known: std::collections::HashSet<WorkspaceThreadId> = self
+            .projects
+            .iter()
+            .flat_map(|project| project.threads.iter().map(|thread| thread.id.clone()))
+            .collect();
+        let before = self.own_windows.len();
+        self.own_windows
+            .retain(|window| known.contains(&window.thread_id));
+        self.own_windows.len() != before
+    }
+
+    fn own_window_frame_slot(&mut self, thread_id: &str) -> u32 {
+        if let Some(window) = self
+            .own_windows
+            .iter()
+            .find(|window| window.thread_id == thread_id)
+        {
+            return window.frame_slot;
+        }
+        let frame_slot = (0..)
+            .find(|slot| !self.own_windows.iter().any(|window| window.frame_slot == *slot))
+            .unwrap_or_default();
+        self.own_windows.push(OwnThreadWindow {
+            thread_id: thread_id.to_string(),
+            frame_slot,
+        });
+        frame_slot
+    }
+
+    /// Record the layout of whichever of the Space's threads runs in
+    /// `workspace`, active or not. Local threads only, for the reasons above.
+    fn snapshot_thread_layout(
+        &mut self,
+        space_id: &str,
+        workspace: &str,
+        snapshot: WorkspaceThreadLayoutSnapshot,
+    ) -> bool {
+        if self.is_client_domain_space(space_id) {
+            return false;
+        }
+        let thread = self
+            .projects
+            .iter_mut()
+            .filter(|project| {
+                project.space_id == space_id && !is_mux_domain_project_id(&project.id)
+            })
+            .flat_map(|project| {
+                let project_id = project.id.clone();
+                project
+                    .threads
+                    .iter_mut()
+                    .map(move |thread| (project_id.clone(), thread))
+            })
+            .find(|(project_id, thread)| {
+                thread
+                    .materialized_workspace_name
+                    .clone()
+                    .unwrap_or_else(|| workspace_name_for_thread(project_id, &thread.id))
+                    == workspace
+            });
+        let Some((_, thread)) = thread else {
+            return false;
+        };
+        thread.materialized_workspace_name = Some(workspace.to_string());
+        thread.layout = Some(snapshot);
+        thread.last_active_at = now_ts();
         true
     }
 
@@ -11104,6 +11293,15 @@ pub const CONNECTION_PAGE_WORKSPACE_PREFIX: &str = "thinkterm-connecting:";
 
 pub fn is_connection_page_workspace(workspace: &str) -> bool {
     workspace.starts_with(CONNECTION_PAGE_WORKSPACE_PREFIX)
+}
+
+/// The workspaces of the page a window shows for a thread open in a window
+/// of its own, one per window (see `termwindow::thread_window`). As with a
+/// connection page, no thread owns one and none may be bound to one.
+pub const THREAD_PAGE_WORKSPACE_PREFIX: &str = "thinkterm-open-elsewhere:";
+
+pub fn is_thread_page_workspace(workspace: &str) -> bool {
+    workspace.starts_with(THREAD_PAGE_WORKSPACE_PREFIX)
 }
 
 /// Whether `workspace` is the mux workspace this thread runs in: its
@@ -14423,6 +14621,131 @@ mod tests {
             thread.materialized_workspace_name.as_deref() != Some(watching.as_str())
         })));
         assert_eq!(store.projects.len(), 1, "no project is made up for it");
+    }
+
+    #[test]
+    fn a_thread_page_on_screen_leaves_the_threads_alone() {
+        let space = default_space_id();
+        let page = format!("{THREAD_PAGE_WORKSPACE_PREFIX}1");
+        let mut store = test_store();
+        let thread = WorkspaceThread::new(
+            "project-default".to_string(),
+            "main".to_string(),
+            Some("workspace-default".to_string()),
+        );
+        let thread_id = thread.id.clone();
+        let mut project = test_project_in_space(
+            &space,
+            "project-default",
+            "Default",
+            PathBuf::from("/tmp/default"),
+            vec![thread],
+        );
+        project.active_thread_id = Some(thread_id.clone());
+        store.projects.push(project);
+        store.set_active_project_for_space(&space, "project-default".to_string());
+
+        store.sync_current_project(&space, &page);
+
+        assert_eq!(store.projects.len(), 1, "no project is made up for it");
+        assert_eq!(
+            store.projects[0].active_thread_id.as_deref(),
+            Some(thread_id.as_str())
+        );
+        assert_eq!(store.workspace_space_id(&page), None);
+    }
+
+    fn two_thread_store() -> (WorkspaceThreadStore, String, String) {
+        let space = default_space_id();
+        let mut store = test_store();
+        let shown = WorkspaceThread::new("project-1".to_string(), "main".to_string(), None);
+        let away = WorkspaceThread::new("project-1".to_string(), "Thread 2".to_string(), None);
+        let (shown_id, away_id) = (shown.id.clone(), away.id.clone());
+        let mut project = test_project(
+            "project-1",
+            "thinkterm",
+            PathBuf::from("/tmp/thinkterm"),
+            vec![shown, away],
+        );
+        project.active_thread_id = Some(shown_id.clone());
+        store.projects.push(project);
+        store.set_active_project_for_space(&space, "project-1".to_string());
+        (store, shown_id, away_id)
+    }
+
+    #[test]
+    fn a_thread_in_its_own_window_keeps_its_layout_while_another_is_active() {
+        let space = default_space_id();
+        let (mut store, _, away_id) = two_thread_store();
+        let workspace = workspace_name_for_thread("project-1", &away_id);
+        let layout = WorkspaceThreadLayoutSnapshot {
+            active_tab: 1,
+            tabs: Vec::new(),
+            terminal_specs: Vec::new(),
+            strict_cwd_spawns: true,
+        };
+
+        assert!(
+            !store.snapshot_active_space_thread_layout(&space, &workspace, layout.clone()),
+            "only the active thread goes by the main window's snapshot"
+        );
+        assert!(store.snapshot_thread_layout(&space, &workspace, layout.clone()));
+        let saved = store.projects[0]
+            .threads
+            .iter()
+            .find(|thread| thread.id == away_id)
+            .and_then(|thread| thread.layout.as_ref());
+        assert_eq!(saved, Some(&layout));
+        assert!(
+            !store.snapshot_thread_layout(&space, "no-such-workspace", layout),
+            "a workspace no thread runs in is nobody's layout"
+        );
+    }
+
+    #[test]
+    fn own_windows_take_the_lowest_free_frame_slot() {
+        let mut store = test_store();
+        assert_eq!(store.own_window_frame_slot("a"), 0);
+        assert_eq!(store.own_window_frame_slot("b"), 1);
+        assert_eq!(store.own_window_frame_slot("a"), 0, "asked again, the same");
+        store.own_windows.retain(|window| window.thread_id != "a");
+        assert_eq!(store.own_window_frame_slot("c"), 0, "a free one is taken");
+        assert_eq!(store.own_window_frame_slot("d"), 2);
+    }
+
+    #[test]
+    fn a_new_window_passes_over_threads_in_their_own_windows() {
+        let (mut store, shown_id, other_id) = two_thread_store();
+        let space_id = store
+            .projects
+            .iter()
+            .find(|project| project.threads.iter().any(|thread| thread.id == shown_id))
+            .map(|project| project.space_id.clone())
+            .unwrap();
+        store.own_window_frame_slot(&shown_id);
+        assert_eq!(
+            thread_free_of_own_windows(&store, &space_id),
+            Some(other_id.clone())
+        );
+        store.own_window_frame_slot(&other_id);
+        assert_eq!(thread_free_of_own_windows(&store, &space_id), None);
+    }
+
+    #[test]
+    fn own_windows_of_threads_no_longer_there_are_forgotten() {
+        let (mut store, shown_id, _) = two_thread_store();
+        store.own_window_frame_slot(&shown_id);
+        store.own_window_frame_slot("thread-gone");
+
+        assert!(store.forget_own_windows_of_gone_threads());
+
+        let kept: Vec<&str> = store
+            .own_windows
+            .iter()
+            .map(|window| window.thread_id.as_str())
+            .collect();
+        assert_eq!(kept, [shown_id.as_str()]);
+        assert!(!store.forget_own_windows_of_gone_threads());
     }
 
     #[test]
