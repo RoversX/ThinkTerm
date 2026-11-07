@@ -371,6 +371,7 @@ sidebar-settings = 设置
 tooltip-sidebar-settings = 设置
 tooltip-sidebar-view-options = 视图选项
 tooltip-sidebar-thread-search = 查找线程
+tooltip-sidebar-new-project = 添加工作区
 tooltip-sidebar-ssh-hosts = 远程主机
 tooltip-sidebar-live-overview = 实时总览
 tooltip-sidebar-notifications = 通知

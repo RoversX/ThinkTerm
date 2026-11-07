@@ -374,6 +374,7 @@ sidebar-settings = Settings
 tooltip-sidebar-settings = Settings
 tooltip-sidebar-view-options = View Options
 tooltip-sidebar-thread-search = Find Thread
+tooltip-sidebar-new-project = Add workspace
 tooltip-sidebar-ssh-hosts = Remote Hosts
 tooltip-sidebar-live-overview = Live Overview
 tooltip-sidebar-notifications = Notifications

@@ -57,6 +57,9 @@ const WORKSPACE_SECTION_LABEL_GAP: usize = 12;
 /// `workspace_sidebar_hidden_statuses` cannot be cleared from the UI.
 const SHOW_SIDEBAR_VIEW_OPTIONS: bool = false;
 
+/// Room between New Thread's row and the list under it.
+const TOP_ACTION_BOTTOM_GAP: usize = 16;
+
 /// Diameter for every round sidebar action button, and the height of the
 /// New Thread pill beside them. Also their corner radius, since they are all
 /// fully rounded.
@@ -1265,7 +1268,8 @@ impl crate::TermWindow {
         if reconnect_row_height > 0 {
             y += reconnect_row_height + self.ui_px(SIDEBAR_INSET);
         }
-        let list_top = y + top_action_y_offset + top_action_height + self.ui_px(SIDEBAR_INSET);
+        let list_top =
+            y + top_action_y_offset + top_action_height + self.ui_px(TOP_ACTION_BOTTOM_GAP);
 
         WorkspaceSidebarLayout {
             panel_x,
@@ -2072,7 +2076,7 @@ impl crate::TermWindow {
         };
         self.paint_sidebar_icon(
             layers,
-            SvgIcon::CirclePlus,
+            SvgIcon::SquarePen,
             top_action_icon_x,
             top_action_icon_y,
             top_action_icon_size,
@@ -2461,7 +2465,7 @@ impl crate::TermWindow {
                 );
                 self.paint_sidebar_icon(
                     layers,
-                    SvgIcon::FolderPlus,
+                    SvgIcon::ProjectAdd,
                     button_x + ((section_button_size.saturating_sub(section_icon_size)) / 2),
                     button_y + ((section_button_size.saturating_sub(section_icon_size)) / 2),
                     section_icon_size,
@@ -2639,7 +2643,7 @@ impl crate::TermWindow {
                     );
                     self.paint_sidebar_icon(
                         layers,
-                        SvgIcon::Plus,
+                        SvgIcon::CirclePlus,
                         project_action_x
                             + ((project_action_size.saturating_sub(action_icon_size)) / 2),
                         project_action_y
@@ -3049,7 +3053,7 @@ impl crate::TermWindow {
                     );
                     self.paint_sidebar_icon(
                         layers,
-                        SvgIcon::Plus,
+                        SvgIcon::CirclePlus,
                         group_action_x + ((group_action_size.saturating_sub(action_icon_size)) / 2),
                         group_action_y + ((group_action_size.saturating_sub(action_icon_size)) / 2),
                         action_icon_size,
@@ -3673,7 +3677,7 @@ impl crate::TermWindow {
             };
             self.paint_sidebar_icon(
                 layers,
-                SvgIcon::CirclePlus,
+                SvgIcon::SquarePen,
                 top_action_icon_x,
                 top_action_icon_y,
                 top_action_icon_size,

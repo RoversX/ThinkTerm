@@ -371,6 +371,7 @@ sidebar-settings = 設定
 tooltip-sidebar-settings = 設定
 tooltip-sidebar-view-options = 表示オプション
 tooltip-sidebar-thread-search = スレッドを検索
+tooltip-sidebar-new-project = ワークスペースを追加
 tooltip-sidebar-ssh-hosts = リモートホスト
 tooltip-sidebar-live-overview = ライブ概要
 tooltip-sidebar-notifications = 通知

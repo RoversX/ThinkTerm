@@ -1767,11 +1767,14 @@ mod tooltip_tests {
 
     #[test]
     fn every_icon_only_sidebar_button_has_a_name() {
-        // These five carry no text of their own, so the hover tag is the only
+        // These carry no text of their own, so the hover tag is the only
         // place their name appears.
         for item_type in [
             UIItemType::WorkspaceSidebarSettings,
             UIItemType::WorkspaceSidebarThreadSearch,
+            UIItemType::ProjectNew,
+            UIItemType::WorkspaceThreadNew(String::new()),
+            UIItemType::ThreadRefGroupNewThread(String::new()),
             UIItemType::WorkspaceSidebarViewOptions,
             UIItemType::WorkspaceSidebarSshHosts,
             UIItemType::WorkspaceSidebarLiveOverview,
@@ -2301,6 +2304,10 @@ pub fn tooltip_label_for(item_type: &UIItemType) -> Option<String> {
     let key = match item_type {
         UIItemType::WorkspaceSidebarSettings => "tooltip-sidebar-settings",
         UIItemType::WorkspaceSidebarThreadSearch => "tooltip-sidebar-thread-search",
+        UIItemType::ProjectNew => "tooltip-sidebar-new-project",
+        UIItemType::WorkspaceThreadNew(_) | UIItemType::ThreadRefGroupNewThread(_) => {
+            "sidebar-new-thread"
+        }
         UIItemType::WorkspaceSidebarViewOptions => "tooltip-sidebar-view-options",
         UIItemType::WorkspaceSidebarSshHosts => "tooltip-sidebar-ssh-hosts",
         UIItemType::WorkspaceSidebarLiveOverview => "tooltip-sidebar-live-overview",

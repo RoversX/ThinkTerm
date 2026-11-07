@@ -374,6 +374,7 @@ sidebar-settings = Réglages
 tooltip-sidebar-settings = Réglages
 tooltip-sidebar-view-options = Options d'affichage
 tooltip-sidebar-thread-search = Trouver un fil
+tooltip-sidebar-new-project = Ajouter un espace de travail
 tooltip-sidebar-ssh-hosts = Hôtes distants
 tooltip-sidebar-live-overview = Aperçu en direct
 tooltip-sidebar-notifications = Notifications

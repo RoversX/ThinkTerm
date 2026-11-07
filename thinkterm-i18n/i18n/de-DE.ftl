@@ -374,6 +374,7 @@ sidebar-settings = Einstellungen
 tooltip-sidebar-settings = Einstellungen
 tooltip-sidebar-view-options = Ansichtsoptionen
 tooltip-sidebar-thread-search = Thread finden
+tooltip-sidebar-new-project = Workspace hinzufügen
 tooltip-sidebar-ssh-hosts = Remote-Hosts
 tooltip-sidebar-live-overview = Live-Übersicht
 tooltip-sidebar-notifications = Mitteilungen

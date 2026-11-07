@@ -105,6 +105,7 @@ pub enum SvgIcon {
     CircleX,
     CirclePlus,
     SquarePlus,
+    SquarePen,
     Square,
     SquareRoundCorner,
     SquareStack,
@@ -147,6 +148,9 @@ pub enum SvgIcon {
     /// The mux server of the README's architecture diagram: a host whose
     /// sessions live on it, which is what ThinkTerm Connect means.
     MuxServer,
+    /// A folder with its plus in a gap at the top right: the sidebar's new
+    /// project button.
+    ProjectAdd,
     /// Apple's mark, tinted like the rest rather than painted in its own
     /// black: drawn white, it vanishes on a light theme.
     Apple,
@@ -409,6 +413,7 @@ impl SvgIcon {
             Self::SquarePlus => {
                 include_bytes!("../../../../third_party/lucide/icons/square-plus.svg")
             }
+            Self::SquarePen => include_bytes!("../../../../third_party/lucide/icons/square-pen.svg"),
             Self::SquareStack => {
                 include_bytes!("../../../../third_party/lucide/icons/square-stack.svg")
             }
@@ -468,6 +473,7 @@ impl SvgIcon {
                 include_bytes!("../../../../third_party/lucide/icons/hard-drive.svg")
             }
             Self::MuxServer => include_bytes!("../../../../assets/ui/mux-server.svg"),
+            Self::ProjectAdd => include_bytes!("../../../../assets/ui/project-add.svg"),
             Self::QrCode => include_bytes!("../../../../third_party/lucide/icons/qr-code.svg"),
             Self::Smartphone => {
                 include_bytes!("../../../../third_party/lucide/icons/smartphone.svg")
@@ -953,6 +959,7 @@ mod tests {
             SvgIcon::Folder,
             SvgIcon::FolderOpen,
             SvgIcon::FolderPlus,
+            SvgIcon::ProjectAdd,
             SvgIcon::FolderTree,
             SvgIcon::Globe,
             SvgIcon::Info,

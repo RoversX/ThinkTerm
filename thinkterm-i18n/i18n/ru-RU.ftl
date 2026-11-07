@@ -369,6 +369,7 @@ sidebar-settings = Настройки
 tooltip-sidebar-settings = Настройки
 tooltip-sidebar-view-options = Параметры вида
 tooltip-sidebar-thread-search = Найти ветку
+tooltip-sidebar-new-project = Добавить рабочую область
 tooltip-sidebar-ssh-hosts = Удалённые узлы
 tooltip-sidebar-live-overview = Обзор в реальном времени
 tooltip-sidebar-notifications = Уведомления
