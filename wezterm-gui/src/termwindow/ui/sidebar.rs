@@ -2750,20 +2750,30 @@ impl crate::TermWindow {
                         project_action_size
                             .saturating_sub(self.ui_px(SIDEBAR_SECTION_ACTION_ICON_INSET)),
                     );
-                    self.paint_sidebar_icon(
-                        layers,
-                        SvgIcon::CirclePlus,
-                        project_action_x
-                            + ((project_action_size.saturating_sub(action_icon_size)) / 2),
-                        project_action_y
-                            + ((project_action_size.saturating_sub(action_icon_size)) / 2),
-                        action_icon_size,
-                        if project.is_active || project_action_hovered {
-                            foreground
-                        } else {
-                            muted_fg
-                        },
-                    )?;
+                    // With the chevron, under the pointer only, unless
+                    // Settings › Accessibility keeps the buttons showing.
+                    let action_shown = if crate::native_settings::show_button_shapes() {
+                        1.0
+                    } else {
+                        chevron_shown
+                    };
+                    if action_shown > 0.0 {
+                        self.paint_sidebar_icon(
+                            layers,
+                            SvgIcon::CirclePlus,
+                            project_action_x
+                                + ((project_action_size.saturating_sub(action_icon_size)) / 2),
+                            project_action_y
+                                + ((project_action_size.saturating_sub(action_icon_size)) / 2),
+                            action_icon_size,
+                            if project.is_active || project_action_hovered {
+                                foreground
+                            } else {
+                                muted_fg
+                            }
+                            .mul_alpha(action_shown),
+                        )?;
+                    }
                 }
 
                 virtual_y += session_row_height + row_gap;
@@ -3209,20 +3219,31 @@ impl crate::TermWindow {
                         group_action_size
                             .saturating_sub(self.ui_px(SIDEBAR_SECTION_ACTION_ICON_INSET)),
                     );
-                    self.paint_sidebar_icon(
-                        layers,
-                        SvgIcon::CirclePlus,
-                        group_action_x + ((group_action_size.saturating_sub(action_icon_size)) / 2),
-                        group_action_y + ((group_action_size.saturating_sub(action_icon_size)) / 2),
-                        action_icon_size,
-                        if group_action_hovered {
-                            foreground
-                        } else if group.attached {
-                            muted_fg
-                        } else {
-                            muted_fg.mul_alpha(0.5)
-                        },
-                    )?;
+                    // As a project's.
+                    let action_shown = if crate::native_settings::show_button_shapes() {
+                        1.0
+                    } else {
+                        chevron_shown
+                    };
+                    if action_shown > 0.0 {
+                        self.paint_sidebar_icon(
+                            layers,
+                            SvgIcon::CirclePlus,
+                            group_action_x
+                                + ((group_action_size.saturating_sub(action_icon_size)) / 2),
+                            group_action_y
+                                + ((group_action_size.saturating_sub(action_icon_size)) / 2),
+                            action_icon_size,
+                            if group_action_hovered {
+                                foreground
+                            } else if group.attached {
+                                muted_fg
+                            } else {
+                                muted_fg.mul_alpha(0.5)
+                            }
+                            .mul_alpha(action_shown),
+                        )?;
+                    }
                 }
                 virtual_y += session_row_height + row_gap;
 
