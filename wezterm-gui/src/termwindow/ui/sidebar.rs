@@ -1,6 +1,8 @@
 use crate::quad::{
-    HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator, TripleLayerQuadAllocatorTrait,
+    HeapQuadAllocator, QuadClipRect, QuadTrait, TripleLayerQuadAllocator,
+    TripleLayerQuadAllocatorTrait,
 };
+use crate::termwindow::sidebar_disclosure::{FolderChevrons, FolderKind};
 use crate::termwindow::render::corners::{
     BOTTOM_LEFT_ROUNDED_CORNER, BOTTOM_RIGHT_ROUNDED_CORNER, TOP_LEFT_ROUNDED_CORNER,
     TOP_RIGHT_ROUNDED_CORNER,
@@ -57,6 +59,20 @@ const WORKSPACE_SECTION_LABEL_GAP: usize = 12;
 /// `workspace_sidebar_hidden_statuses` cannot be cleared from the UI.
 const SHOW_SIDEBAR_VIEW_OPTIONS: bool = false;
 
+/// The largest recording of a folder's rows kept for the next frame.
+const FOLDER_ROWS_KEEP_BYTES: usize = 1 << 20;
+/// The Workspaces heading, as the rows that glide know it.
+const WORKSPACES_LABEL_KEY: &str = "section:workspaces";
+/// The Pinned heading likewise, which never moves but can appear.
+const PINNED_LABEL_KEY: &str = "section:pinned";
+
+/// How far open a folder is drawn: where its animation has got to, or
+/// settled where it is.
+fn folder_open(chevrons: &FolderChevrons, kind: FolderKind, id: &str, collapsed: bool) -> f32 {
+    chevrons
+        .open_of(kind, id)
+        .unwrap_or(if collapsed { 0.0 } else { 1.0 })
+}
 /// Room between New Thread's row and the list under it.
 const TOP_ACTION_BOTTOM_GAP: usize = 16;
 
@@ -70,7 +86,6 @@ const TOP_ACTION_BOTTOM_GAP: usize = 16;
 /// `SESSION_ROW_MIN_HEIGHT` too.
 const TOP_ACTION_MAX_HEIGHT: usize = 58;
 const SESSION_ROW_MIN_HEIGHT: usize = 66;
-const SESSION_ROW_SIDE_PADDING: usize = 10;
 const SESSION_ACTION_MIN_SIZE: usize = 48;
 const SESSION_ACTION_MAX_SIZE: usize = 52;
 const SESSION_ACTION_ICON_INSET: usize = 12;
@@ -461,6 +476,7 @@ impl crate::TermWindow {
     /// gap on any display whose ui scale is not exactly 1 (e.g. Linux 96dpi
     /// at 0.5), inflating max_scroll past the painted content.
     fn workspace_sidebar_list_height(
+        chevrons: &FolderChevrons,
         view: &workspace_threads::WorkspaceThreadsView,
         shared_rows: usize,
         row_height: usize,
@@ -497,20 +513,32 @@ impl crate::TermWindow {
             match folder {
                 workspace_threads::SidebarFolder::Project(index) => {
                     if let Some(project) = view.projects.get(*index) {
-                        if !project.threads_collapsed {
-                            height = height.saturating_add(
-                                project.threads.len().saturating_mul(row_height + row_gap),
-                            );
-                        }
+                        let open = folder_open(
+                            chevrons,
+                            FolderKind::Project,
+                            &project.id,
+                            project.threads_collapsed,
+                        );
+                        height = height.saturating_add(
+                            (project.threads.len().saturating_mul(row_height + row_gap) as f32
+                                * open)
+                                .round() as usize,
+                        );
                     }
                 }
                 workspace_threads::SidebarFolder::RefGroup(index) => {
                     if let Some(group) = view.ref_groups.get(*index) {
-                        if !group.collapsed {
-                            height = height.saturating_add(
-                                group.threads.len().saturating_mul(row_height + row_gap),
-                            );
-                        }
+                        let open = folder_open(
+                            chevrons,
+                            FolderKind::RefGroup,
+                            &group.key,
+                            group.collapsed,
+                        );
+                        height = height.saturating_add(
+                            (group.threads.len().saturating_mul(row_height + row_gap) as f32
+                                * open)
+                                .round() as usize,
+                        );
                     }
                 }
             }
@@ -526,7 +554,9 @@ impl crate::TermWindow {
         height.saturating_sub(row_gap)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn workspace_sidebar_scroll_height(
+        chevrons: &FolderChevrons,
         view: &workspace_threads::WorkspaceThreadsView,
         shared_rows: usize,
         row_height: usize,
@@ -536,6 +566,7 @@ impl crate::TermWindow {
         viewport_height: usize,
     ) -> usize {
         let height = Self::workspace_sidebar_list_height(
+            chevrons,
             view,
             shared_rows,
             row_height,
@@ -1354,6 +1385,7 @@ impl crate::TermWindow {
         let view = self.workspace_sidebar_view(&active_workspace, &workspaces);
         let row_gap = self.ui_px(SIDEBAR_ROW_GAP);
         let total_height = Self::workspace_sidebar_scroll_height(
+            &self.folder_chevrons,
             &view,
             self.shared_with_us_rows(),
             layout.row_height,
@@ -1410,6 +1442,7 @@ impl crate::TermWindow {
         let view = self.workspace_sidebar_view(&active_workspace, &workspaces);
         let row_gap = self.ui_px(SIDEBAR_ROW_GAP);
         let total_height = Self::workspace_sidebar_scroll_height(
+            &self.folder_chevrons,
             &view,
             self.shared_with_us_rows(),
             layout.row_height,
@@ -2127,9 +2160,18 @@ impl crate::TermWindow {
         }
         let list_top = layout.list_top;
         let row_gap = self.ui_px(SIDEBAR_ROW_GAP);
+        // The live list only: a Library card or a Space swiped to is not the
+        // list a row was taken out of, and shows its folders as they are.
+        let rows_tracked = !card && self.workspace_sidebar_preview_space_id.is_none();
+        let still_folders = FolderChevrons::default();
         let max_scroll = {
             let viewport_height = content_bottom.saturating_sub(list_top);
             let total_height = Self::workspace_sidebar_scroll_height(
+                if rows_tracked {
+                    &self.folder_chevrons
+                } else {
+                    &still_folders
+                },
                 &view,
                 self.shared_with_us_rows(),
                 session_row_height,
@@ -2165,6 +2207,15 @@ impl crate::TermWindow {
             top + session_row_height as f32 > list_top_f && top < content_bottom_f
         };
         let mut virtual_y = 0usize;
+        // Nothing glides while rows are moving for another reason.
+        let rows_glide = rows_tracked
+            && carried.is_none()
+            && self.sidebar_make_way.is_idle()
+            && !self.folder_chevrons.folding();
+        if rows_tracked {
+            let space = self.workspace_sidebar_space_id().to_string();
+            self.sidebar_row_places.begin(&space, scroll_offset);
+        }
         // The row of the thread this window shows, wherever it is, for the
         // pill that brings it back into sight.
         let mut current_row: Option<CurrentRow> = None;
@@ -2187,6 +2238,15 @@ impl crate::TermWindow {
         let list_quads_start = layers.heap_mark();
 
         if !view.pinned_threads.is_empty() {
+            self.note_sidebar_row(
+                PINNED_LABEL_KEY,
+                "",
+                virtual_y,
+                virtual_y,
+                0.0,
+                rows_tracked,
+                rows_glide,
+            );
             let label_top = list_top_f + virtual_y as f32 - scroll_offset;
             let label_bottom = label_top + session_row_height as f32;
             let label_is_visible = label_bottom > list_top_f && label_top < content_bottom_f;
@@ -2225,10 +2285,21 @@ impl crate::TermWindow {
             let pinned_width = item_width.saturating_sub(self.ui_px(SIDEBAR_INSET) * 2);
             let pinned_status_x = pinned_x + self.ui_px(SIDEBAR_INSET);
             for session in &view.pinned_threads {
+                self.note_sidebar_row(
+                    &session.id,
+                    "",
+                    virtual_y,
+                    virtual_y,
+                    0.0,
+                    rows_tracked,
+                    rows_glide,
+                );
                 let row_top = list_top_f + virtual_y as f32 - scroll_offset;
                 let row_bottom = row_top + session_row_height as f32;
                 let row_is_visible = row_bottom > list_top_f && row_top < content_bottom_f;
-                let y = row_top.floor().max(0.0) as usize;
+                let y = (row_top + self.sidebar_make_way.shift_of(&session.id))
+                    .floor()
+                    .max(0.0) as usize;
                 let hit_y = row_top.max(list_top_f).floor().max(0.0) as usize;
                 let hit_bottom = row_bottom.min(content_bottom_f).ceil().max(hit_y as f32) as usize;
                 let hit_height = hit_bottom.saturating_sub(hit_y).max(1);
@@ -2411,11 +2482,22 @@ impl crate::TermWindow {
             if !view.pinned_threads.is_empty() {
                 virtual_y += self.ui_px(WORKSPACE_SECTION_LABEL_GAP);
             }
+            self.note_sidebar_row(
+                WORKSPACES_LABEL_KEY,
+                "",
+                virtual_y,
+                virtual_y,
+                0.0,
+                rows_tracked,
+                rows_glide,
+            );
             let label_top = list_top_f + virtual_y as f32 - scroll_offset;
             let label_bottom = label_top + session_row_height as f32;
             let label_is_visible = label_bottom > list_top_f && label_top < content_bottom_f;
             if label_is_visible {
-                let label_y = label_top.floor().max(0.0) as usize;
+                let label_y = (label_top + self.sidebar_make_way.shift_of(WORKSPACES_LABEL_KEY))
+                    .floor()
+                    .max(0.0) as usize;
                 let button_y =
                     label_y + ((session_row_height.saturating_sub(section_button_size)) / 2);
                 let button_x = item_x
@@ -2487,6 +2569,16 @@ impl crate::TermWindow {
                 let Some(project) = view.projects.get(*folder_project_index) else {
                     continue;
                 };
+                let folder_place = virtual_y;
+                let folder_glided = self.note_sidebar_row(
+                    &project.id,
+                    "",
+                    folder_place,
+                    folder_place,
+                    0.0,
+                    rows_tracked,
+                    rows_glide,
+                );
                 let row_top = list_top_f + virtual_y as f32 - scroll_offset;
                 let row_bottom = row_top + session_row_height as f32;
                 let row_is_visible = row_bottom > list_top_f && row_top < content_bottom_f;
@@ -2498,15 +2590,17 @@ impl crate::TermWindow {
                 let hit_height = hit_bottom.saturating_sub(hit_y).max(1);
 
                 let disclosure_size = icon_size.min(22);
-                let disclosure_x = item_x + self.ui_px(SIDEBAR_INSET);
-                let project_icon_x = disclosure_x + disclosure_size + 4;
+                let project_icon_x = item_x + self.ui_px(SIDEBAR_INSET);
                 let project_text_x = project_icon_x + icon_size + self.ui_px(SIDEBAR_ICON_GAP);
                 let project_action_size =
                     section_button_size.min(session_row_height.saturating_sub(8));
                 let project_action_x = item_x
                     .saturating_add(item_width)
                     .saturating_sub(project_action_size + self.ui_px(SIDEBAR_INSET));
-                let project_text_right = project_action_x;
+                // The chevron sits by the add button, there under the pointer.
+                let disclosure_x = project_action_x
+                    .saturating_sub(disclosure_size + self.ui_px(SIDEBAR_INSET) / 2);
+                let project_text_right = disclosure_x;
 
                 if project.is_archived {
                     // A revealed archived row: dimmed, inert, no chevron and
@@ -2547,6 +2641,19 @@ impl crate::TermWindow {
                     continue;
                 }
 
+                let row_hovered = !suppress_hover
+                    && carried.is_none()
+                    && self.is_pointer_over_ui_rect(item_x, hit_y, item_width, hit_height);
+                let (chevron_shown, project_open) = if rows_tracked {
+                    self.folder_chevrons.aim(
+                        FolderKind::Project,
+                        &project.id,
+                        row_hovered,
+                        !project.threads_collapsed,
+                    )
+                } else {
+                    (0.0, if project.threads_collapsed { 0.0 } else { 1.0 })
+                };
                 if row_is_visible {
                     self.ui_items.push(UIItem {
                         x: item_x,
@@ -2568,17 +2675,19 @@ impl crate::TermWindow {
                         height: disclosure_size,
                         item_type: UIItemType::ProjectToggleThreads(project.id.clone()),
                     });
-                    self.paint_sidebar_icon(
+                    let chevron_hovered = row_hovered
+                        && self.is_pointer_over_ui_rect(
+                            disclosure_x,
+                            disclosure_y,
+                            disclosure_size,
+                            disclosure_size,
+                        );
+                    self.paint_folder_chevron(
                         layers,
-                        if project.threads_collapsed {
-                            SvgIcon::ChevronRight
-                        } else {
-                            SvgIcon::ChevronDown
-                        },
-                        disclosure_x,
-                        disclosure_y,
-                        disclosure_size,
-                        muted_fg,
+                        (disclosure_x, disclosure_y, disclosure_size),
+                        chevron_shown,
+                        project_open,
+                        if chevron_hovered { foreground } else { muted_fg },
                     )?;
                     self.paint_sidebar_project_icon(
                         layers,
@@ -2659,16 +2768,31 @@ impl crate::TermWindow {
 
                 virtual_y += session_row_height + row_gap;
 
-                if !project.threads_collapsed {
-                    let session_x = item_x
-                        + self.ui_px(SIDEBAR_INSET) * 3
-                        + self.ui_px(SESSION_ROW_SIDE_PADDING);
-                    let session_width = item_width.saturating_sub(
-                        self.ui_px(SIDEBAR_INSET) * 3 + self.ui_px(SESSION_ROW_SIDE_PADDING) * 2,
-                    );
-                    let session_status_x = session_x + self.ui_px(SIDEBAR_INSET) + 2;
+                if project_open > 0.0 {
+                    // Opening or closing, the rows fade with the folder and
+                    // what follows moves by as much of them as is open.
+                    let rows_start = virtual_y;
+                    let into = &mut *layers;
+                    let mut rows = std::mem::take(&mut self.sidebar_folder_rows);
+                    rows.recycle();
+                    let layers = &mut TripleLayerQuadAllocator::Heap(&mut rows);
+                    // Lined up with the folder's icon, as pinned rows are.
+                    let session_x = item_x + self.ui_px(SIDEBAR_INSET);
+                    let session_width = item_width.saturating_sub(self.ui_px(SIDEBAR_INSET) * 2);
+                    let session_status_x = session_x + self.ui_px(SIDEBAR_INSET);
 
                     for session in &project.threads {
+                        // Within its folder: a folder moved as a whole moves
+                        // its rows by its own shift.
+                        self.note_sidebar_row(
+                            &session.id,
+                            &project.id,
+                            virtual_y - folder_place,
+                            virtual_y,
+                            folder_glided,
+                            rows_tracked,
+                            rows_glide,
+                        );
                         let row_top = list_top_f + virtual_y as f32 - scroll_offset;
                         let row_bottom = row_top + session_row_height as f32;
                         let row_is_visible = row_bottom > list_top_f && row_top < content_bottom_f;
@@ -2868,7 +2992,20 @@ impl crate::TermWindow {
 
                         virtual_y += session_row_height + row_gap;
                     }
-                } else if current_row.is_none() {
+                    self.show_folder_rows(
+                        into,
+                        &rows,
+                        project_open,
+                        &mut virtual_y,
+                        rows_start,
+                        list_top_f + rows_start as f32 - scroll_offset + folder_shift,
+                        (list_top_f, content_bottom_f),
+                    )?;
+                    if rows.resident_bytes() <= FOLDER_ROWS_KEEP_BYTES {
+                        self.sidebar_folder_rows = rows;
+                    }
+                }
+                if project.threads_collapsed && current_row.is_none() {
                     // Folded away: where it would be once its folder opens.
                     if let Some((index, session)) =
                         project.threads.iter().enumerate().find(|(_, session)| {
@@ -2895,6 +3032,16 @@ impl crate::TermWindow {
                 let Some(group) = view.ref_groups.get(*folder_group_index) else {
                     continue;
                 };
+                let folder_place = virtual_y;
+                let folder_glided = self.note_sidebar_row(
+                    &group.key,
+                    "",
+                    folder_place,
+                    folder_place,
+                    0.0,
+                    rows_tracked,
+                    rows_glide,
+                );
                 let row_top = list_top_f + virtual_y as f32 - scroll_offset;
                 let row_bottom = row_top + session_row_height as f32;
                 let row_is_visible = row_bottom > list_top_f && row_top < content_bottom_f;
@@ -2909,8 +3056,7 @@ impl crate::TermWindow {
                 let hit_height = hit_bottom.saturating_sub(hit_y).max(1);
 
                 let disclosure_size = icon_size.min(22);
-                let disclosure_x = item_x + self.ui_px(SIDEBAR_INSET);
-                let group_icon_x = disclosure_x + disclosure_size + 4;
+                let group_icon_x = item_x + self.ui_px(SIDEBAR_INSET);
                 let group_text_x = group_icon_x + icon_size + self.ui_px(SIDEBAR_ICON_GAP);
                 let icon_y = y + ((session_row_height.saturating_sub(icon_size)) / 2);
                 let disclosure_y = y + ((session_row_height.saturating_sub(disclosure_size)) / 2);
@@ -2920,6 +3066,21 @@ impl crate::TermWindow {
                 let group_action_x = item_x
                     .saturating_add(item_width)
                     .saturating_sub(group_action_size + self.ui_px(SIDEBAR_INSET));
+                let disclosure_x = group_action_x
+                    .saturating_sub(disclosure_size + self.ui_px(SIDEBAR_INSET) / 2);
+                let row_hovered = !suppress_hover
+                    && carried.is_none()
+                    && self.is_pointer_over_ui_rect(item_x, hit_y, item_width, hit_height);
+                let (chevron_shown, group_open) = if rows_tracked {
+                    self.folder_chevrons.aim(
+                        FolderKind::RefGroup,
+                        &group.key,
+                        row_hovered,
+                        !group.collapsed,
+                    )
+                } else {
+                    (0.0, if group.collapsed { 0.0 } else { 1.0 })
+                };
                 if row_is_visible {
                     let group_key = format!("{group_space_id}::{}", group.key);
                     // The hover tag carries the provenance the project-name
@@ -2957,16 +3118,13 @@ impl crate::TermWindow {
                     });
                 }
                 if row_paints {
-                    self.paint_sidebar_icon(
+                    // The whole row opens and closes the group, so the
+                    // chevron only says which way it will go.
+                    self.paint_folder_chevron(
                         layers,
-                        if group.collapsed {
-                            SvgIcon::ChevronRight
-                        } else {
-                            SvgIcon::ChevronDown
-                        },
-                        disclosure_x,
-                        disclosure_y,
-                        disclosure_size,
+                        (disclosure_x, disclosure_y, disclosure_size),
+                        chevron_shown,
+                        group_open,
                         muted_fg,
                     )?;
                     // A server folder is the server itself, not a link to
@@ -2998,7 +3156,7 @@ impl crate::TermWindow {
                         muted_fg.mul_alpha(0.6)
                     };
                     let text_avail =
-                        group_action_x.saturating_sub(group_text_x + self.ui_px(SIDEBAR_INSET));
+                        disclosure_x.saturating_sub(group_text_x + self.ui_px(SIDEBAR_INSET));
                     self.paint_sidebar_name(
                         layers,
                         &ui_font,
@@ -3068,33 +3226,46 @@ impl crate::TermWindow {
                 }
                 virtual_y += session_row_height + row_gap;
 
-                if group.collapsed {
-                    if current_row.is_none() {
-                        if let Some((index, reference)) =
-                            group.threads.iter().enumerate().find(|(_, reference)| {
-                                self.is_workspace_sidebar_thread_selected(&reference.thread, false)
-                            })
-                        {
-                            current_row = Some(CurrentRow::new(
-                                virtual_y + index * (session_row_height + row_gap),
-                                Some((
-                                    Fold::RefGroup(format!("{group_space_id}::{}", group.key)),
-                                    virtual_y.saturating_sub(session_row_height + row_gap),
-                                )),
-                                thread_icon(&reference.thread),
-                            ));
-                        }
+                if group.collapsed && current_row.is_none() {
+                    if let Some((index, reference)) =
+                        group.threads.iter().enumerate().find(|(_, reference)| {
+                            self.is_workspace_sidebar_thread_selected(&reference.thread, false)
+                        })
+                    {
+                        current_row = Some(CurrentRow::new(
+                            virtual_y + index * (session_row_height + row_gap),
+                            Some((
+                                Fold::RefGroup(format!("{group_space_id}::{}", group.key)),
+                                virtual_y.saturating_sub(session_row_height + row_gap),
+                            )),
+                            thread_icon(&reference.thread),
+                        ));
                     }
+                }
+                if group_open <= 0.0 {
                     continue;
                 }
-                let session_x =
-                    item_x + self.ui_px(SIDEBAR_INSET) * 3 + self.ui_px(SESSION_ROW_SIDE_PADDING);
-                let session_width = item_width.saturating_sub(
-                    self.ui_px(SIDEBAR_INSET) * 3 + self.ui_px(SESSION_ROW_SIDE_PADDING) * 2,
-                );
-                let session_status_x = session_x + self.ui_px(SIDEBAR_INSET) + 2;
+                // As with a project's rows: faded and folded as it opens
+                // and closes.
+                let rows_start = virtual_y;
+                let into = &mut *layers;
+                let mut rows = std::mem::take(&mut self.sidebar_folder_rows);
+                rows.recycle();
+                let layers = &mut TripleLayerQuadAllocator::Heap(&mut rows);
+                let session_x = item_x + self.ui_px(SIDEBAR_INSET);
+                let session_width = item_width.saturating_sub(self.ui_px(SIDEBAR_INSET) * 2);
+                let session_status_x = session_x + self.ui_px(SIDEBAR_INSET);
                 for reference in &group.threads {
                     let session = &reference.thread;
+                    self.note_sidebar_row(
+                        &session.id,
+                        &group.key,
+                        virtual_y - folder_place,
+                        virtual_y,
+                        folder_glided,
+                        rows_tracked,
+                        rows_glide,
+                    );
                     let row_top = list_top_f + virtual_y as f32 - scroll_offset;
                     let row_bottom = row_top + session_row_height as f32;
                     let row_is_visible = row_bottom > list_top_f && row_top < content_bottom_f;
@@ -3286,6 +3457,18 @@ impl crate::TermWindow {
                     }
 
                     virtual_y += session_row_height + row_gap;
+                }
+                self.show_folder_rows(
+                    into,
+                    &rows,
+                    group_open,
+                    &mut virtual_y,
+                    rows_start,
+                    list_top_f + rows_start as f32 - scroll_offset + folder_shift,
+                    (list_top_f, content_bottom_f),
+                )?;
+                if rows.resident_bytes() <= FOLDER_ROWS_KEEP_BYTES {
+                    self.sidebar_folder_rows = rows;
                 }
             }
         }
@@ -4714,25 +4897,12 @@ impl crate::TermWindow {
         let mut rests_selected = false;
         let mut content = HeapQuadAllocator::default();
         let mut layers = TripleLayerQuadAllocator::Heap(&mut content);
-        // A folder header's chevron and name; says where its icon goes.
+        // A folder header's name; says where its icon goes. Its chevron
+        // shows only under the pointer, which a carried row is not under.
         let folder_row = |layers: &mut TripleLayerQuadAllocator,
-                          collapsed: bool,
                           fg: LinearRgba|
          -> anyhow::Result<(usize, usize)> {
-            let disclosure_size = icon_size.min(22);
-            self.paint_sidebar_icon(
-                layers,
-                if collapsed {
-                    SvgIcon::ChevronRight
-                } else {
-                    SvgIcon::ChevronDown
-                },
-                inset,
-                height.saturating_sub(disclosure_size) / 2,
-                disclosure_size,
-                chrome.secondary_text,
-            )?;
-            let icon_x = inset + disclosure_size + 4;
+            let icon_x = inset;
             let text_x = icon_x + icon_size + self.ui_px(SIDEBAR_ICON_GAP);
             self.paint_sidebar_name(
                 layers,
@@ -4790,7 +4960,7 @@ impl crate::TermWindow {
                     return Ok(());
                 };
                 let fg = chrome.secondary_text;
-                let (x, y) = folder_row(&mut layers, project.threads_collapsed, fg)?;
+                let (x, y) = folder_row(&mut layers, fg)?;
                 self.paint_sidebar_project_icon(&mut layers, project, x, y, icon_size, fg)?;
             }
             SidebarRowKind::RefGroup(key) => {
@@ -4802,7 +4972,7 @@ impl crate::TermWindow {
                 } else {
                     chrome.secondary_text.mul_alpha(0.6)
                 };
-                let (x, y) = folder_row(&mut layers, group.collapsed, fg)?;
+                let (x, y) = folder_row(&mut layers, fg)?;
                 let icon = if group.server_folder {
                     SvgIcon::Server
                 } else {
@@ -4948,6 +5118,121 @@ impl crate::TermWindow {
         // (`RenderMetrics::with_font_metrics(&ui_font.metrics())`).
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
         self.cached_ui_text_advance(font, &metrics, text)
+    }
+
+    /// `id` is laid out at `place` in the live list, counted from the top of
+    /// `within` (a folder's id, or "" for the list itself), and at `in_list`
+    /// from the top of the list. Moved there by the list since the frame
+    /// before, it glides from where it was; `carried` is how far its folder
+    /// was just sent gliding. Returns how far it was sent itself.
+    #[allow(clippy::too_many_arguments)]
+    fn note_sidebar_row(
+        &mut self,
+        id: &str,
+        within: &str,
+        place: usize,
+        in_list: usize,
+        carried: f32,
+        tracked: bool,
+        glide: bool,
+    ) -> f32 {
+        if !tracked {
+            return 0.0;
+        }
+        let moved = self.sidebar_row_places.note(
+            id,
+            within,
+            place as f32,
+            in_list as f32,
+            carried,
+        );
+        match moved {
+            Some(by) if glide => {
+                self.sidebar_make_way.glide(id, by);
+                by
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// A folder's rows, recorded apart: replayed as faded as the folder is
+    /// closed, and the list after them pulled up by as much of them as is.
+    ///
+    /// Cut to as much of them as is open, from `top` on screen and within
+    /// `list` (its top and bottom), so that the list coming up after them
+    /// never runs over what is still fading.
+    #[allow(clippy::too_many_arguments)]
+    fn show_folder_rows(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        rows: &HeapQuadAllocator,
+        open: f32,
+        virtual_y: &mut usize,
+        rows_start: usize,
+        top: f32,
+        list: (f32, f32),
+    ) -> anyhow::Result<()> {
+        if open >= 1.0 {
+            return rows.apply_to(layers);
+        }
+        let height = (virtual_y.saturating_sub(rows_start) as f32 * open).round();
+        *virtual_y = rows_start + height as usize;
+        let clip_top = top.max(list.0);
+        let clip_bottom = (top + height).min(list.1);
+        if clip_bottom <= clip_top {
+            return Ok(());
+        }
+        let clip = QuadClipRect::from_top_left_pixels(
+            0.0,
+            clip_top,
+            self.dimensions.pixel_width as f32,
+            clip_bottom,
+            &self.dimensions,
+        );
+        rows.apply_to_clipped(layers, clip, open)
+    }
+
+    /// A folder's chevron by its add button: faded in as far as the pointer
+    /// has brought it, turned as far as the folder has opened.
+    fn paint_folder_chevron(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        (x, y, size): (usize, usize, usize),
+        shown: f32,
+        turned: f32,
+        color: LinearRgba,
+    ) -> anyhow::Result<()> {
+        use crate::termwindow::sidebar_disclosure::{chevron_frame, CHEVRON_FRAMES};
+        if shown <= 0.0 {
+            return Ok(());
+        }
+        let left_offset = self.dimensions.pixel_width as f32 / 2.0;
+        let top_offset = self.dimensions.pixel_height as f32 / 2.0;
+        let gl_state = self.render_state.as_ref().unwrap();
+        let sprite = gl_state
+            .glyph_cache
+            .borrow_mut()
+            .cached_rotated_svg_icon(
+                SvgIcon::ChevronRight,
+                size,
+                chevron_frame(turned),
+                CHEVRON_FRAMES,
+            )?
+            .texture_coords();
+        let color = color.mul_alpha(shown);
+        let mut quad = layers.allocate(2)?;
+        quad.set_position(
+            x as f32 - left_offset,
+            y as f32 - top_offset,
+            x as f32 + size as f32 - left_offset,
+            y as f32 + size as f32 - top_offset,
+        );
+        quad.set_texture(sprite);
+        quad.set_fg_color(color);
+        quad.set_alt_color_and_mix_value(color, 0.0);
+        quad.set_hsv(None);
+        quad.set_grayscale();
+        Ok(())
     }
 
     pub(crate) fn paint_sidebar_icon(

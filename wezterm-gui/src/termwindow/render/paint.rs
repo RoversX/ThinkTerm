@@ -5954,6 +5954,12 @@ impl crate::TermWindow {
             .context("paint_pane_tab_drag_overlay")?;
         self.paint_sidebar_row_drag_overlay()
             .context("paint_sidebar_row_drag_overlay")?;
+        // Once a frame, after every sidebar this frame painted.
+        let now = Instant::now();
+        if self.folder_chevrons.step(now) {
+            self.update_next_frame_time(Some(now + Duration::from_millis(16)));
+        }
+        self.sidebar_row_places.end_frame();
         self.paint_file_drag_ghost()
             .context("paint_file_drag_ghost")?;
         // Last, so the tag sits above every chrome surface it might overhang.

@@ -168,6 +168,7 @@ pub mod resize;
 pub(crate) mod share;
 mod selection;
 mod sidebar_hover;
+mod sidebar_disclosure;
 mod sidebar_make_way;
 mod sidebar_slide;
 mod space_swipe;
@@ -3336,6 +3337,12 @@ pub struct TermWindow {
     sidebar_row_drag: Option<SidebarRowDragState>,
     sidebar_row_landing: Option<DragLanding<SidebarRowKind>>,
     sidebar_make_way: sidebar_make_way::SidebarMakeWay,
+    folder_chevrons: sidebar_disclosure::FolderChevrons,
+    sidebar_row_places: sidebar_make_way::RowPlaces,
+    /// A folder's rows as they are recorded, to be replayed faded while it
+    /// opens and closes; kept unless it grew large, so that a frame records
+    /// into the last one's buffers.
+    sidebar_folder_rows: crate::quad::HeapQuadAllocator,
     /// Content views (e.g. SSH hosts) shown as synthetic tabs.
     content_views: Vec<ContentViewTab>,
     active_content_view_id: Option<ContentViewId>,
@@ -5361,6 +5368,9 @@ impl TermWindow {
             sidebar_row_drag: None,
             sidebar_row_landing: None,
             sidebar_make_way: Default::default(),
+            folder_chevrons: Default::default(),
+            sidebar_row_places: Default::default(),
+            sidebar_folder_rows: Default::default(),
             pane_tab_landing: None,
             content_views: vec![],
             active_content_view_id: None,

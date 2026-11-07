@@ -72,6 +72,23 @@ impl SidebarMakeWay {
         }
     }
 
+    /// Rows the list itself has just moved by `by`, a row taken away or
+    /// added above them: drawn where they were, going on from there.
+    pub fn glide(&mut self, id: &str, by: f32) {
+        self.shifts
+            .entry(id.to_string())
+            .or_insert(Shift {
+                drawn: 0.0,
+                going: 0.0,
+            })
+            .drawn += by;
+    }
+
+    /// Nothing is moving aside or settling.
+    pub fn is_idle(&self) -> bool {
+        self.shifts.is_empty()
+    }
+
     /// The drag is over. With `moved`, the list has just changed to what the
     /// rows were heading for, so each is now at home in a new place, still
     /// drawn where it was: it goes on from there rather than jumping. Without
@@ -96,6 +113,8 @@ impl SidebarMakeWay {
         let mut moving = false;
         for shift in self.shifts.values_mut() {
             if (shift.going - shift.drawn).abs() <= NEAR {
+                // Landing counts: the frame that shows it landed is owed.
+                moving |= shift.drawn != shift.going;
                 shift.drawn = shift.going;
             } else {
                 shift.drawn += (shift.going - shift.drawn) * k;
@@ -109,9 +128,291 @@ impl SidebarMakeWay {
     }
 }
 
+/// Where the list laid out each of its rows in the paint before, so that a
+/// row the list itself moves -- one taken away or added above it, or the row
+/// itself pinned or put back -- can be drawn going there rather than
+/// jumping. Holds the rows of one Space as last painted, updated in place, so
+/// it is no bigger than the list and a frame allocates only for rows it has
+/// not seen.
+#[derive(Debug, Default)]
+pub(crate) struct RowPlaces {
+    space: String,
+    places: HashMap<String, Place>,
+    /// Counts the paints.
+    paint: u64,
+    /// Whether the list was painted in the frame under way.
+    painted: bool,
+    /// Whether this paint has nothing before it to compare with.
+    fresh: bool,
+    /// Where the list was scrolled to in the last paint.
+    scroll: f32,
+    /// Whether this paint's list is scrolled as the last one's was.
+    steady: bool,
+    /// Whether a row has appeared in this paint, above the rows still to
+    /// be noted.
+    grown: bool,
+}
+
+#[derive(Debug, Clone)]
+struct Place {
+    /// The part of the list `was` and `is` are counted in.
+    within: String,
+    was: f32,
+    is: f32,
+    /// The same two counted from the top of the list.
+    was_in_list: f32,
+    is_in_list: f32,
+    paint: u64,
+}
+
+impl RowPlaces {
+    /// A paint of `space`'s list, scrolled to `scroll`, starts. Rows the
+    /// last paint did not lay out are let go of. Nothing is compared in a
+    /// paint scrolled from where the last one was: a list that shrank under
+    /// its scrolled end is pulled down by as much as its rows go up, so on
+    /// screen they have not moved.
+    pub fn begin(&mut self, space: &str, scroll: f32) {
+        self.fresh = self.space != space || self.places.is_empty();
+        if self.space != space {
+            self.space.clear();
+            self.space.push_str(space);
+            self.places.clear();
+        }
+        let last = self.paint;
+        self.places.retain(|_, place| place.paint == last);
+        self.paint += 1;
+        self.painted = true;
+        self.steady = (scroll - self.scroll).abs() < NEAR;
+        self.scroll = scroll;
+        self.grown = false;
+    }
+
+    /// A frame is done. One that did not paint the list (the sidebar away,
+    /// say) lets go of every row: the list may move while nobody watches.
+    pub fn end_frame(&mut self) {
+        if !std::mem::take(&mut self.painted) {
+            self.places.clear();
+        }
+    }
+
+    /// `id` is laid out at `place` in this paint, counted from the top of
+    /// `within` (a folder, say), and at `in_list` from the top of the list.
+    /// Returns how far up it is to be drawn from there, as far up as the
+    /// list has moved it since the paint before. `carried` is how far its
+    /// part of the list was just sent the same way, which a row staying in
+    /// it shares and a row new to it does not.
+    ///
+    /// After a row new to the list, the rows going down to make room for it
+    /// would slide over it, so they and the rest are put in place at once:
+    /// all but one come from another part of the list, which is going far.
+    pub fn note(
+        &mut self,
+        id: &str,
+        within: &str,
+        place: f32,
+        in_list: f32,
+        carried: f32,
+    ) -> Option<f32> {
+        let paint = self.paint;
+        let Some(known) = self.places.get_mut(id) else {
+            self.places.insert(
+                id.to_string(),
+                Place {
+                    within: within.to_string(),
+                    was: place,
+                    is: place,
+                    was_in_list: in_list,
+                    is_in_list: in_list,
+                    paint,
+                },
+            );
+            self.grown |= !self.fresh;
+            return None;
+        };
+        if known.paint != paint {
+            known.was = known.is;
+            known.was_in_list = known.is_in_list;
+            known.paint = paint;
+        }
+        known.is = place;
+        known.is_in_list = in_list;
+        let crossed = known.within != within;
+        let by = if crossed {
+            known.within.clear();
+            known.within.push_str(within);
+            known.was_in_list - in_list - carried
+        } else {
+            known.was - place
+        };
+        let crowded = self.grown && !crossed;
+        (self.steady && !crowded && by.abs() >= NEAR).then_some(by)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One frame painting the list once, noting `rows` as (id, within,
+    /// place, place in the list, carried).
+    fn paint(
+        places: &mut RowPlaces,
+        scroll: f32,
+        rows: &[(&str, &str, f32, f32, f32)],
+    ) -> Vec<Option<f32>> {
+        places.begin("s", scroll);
+        let moved = rows
+            .iter()
+            .map(|(id, within, place, in_list, carried)| {
+                places.note(id, within, *place, *in_list, *carried)
+            })
+            .collect();
+        places.end_frame();
+        moved
+    }
+
+    #[test]
+    fn a_row_the_list_moves_is_reported_once() {
+        let mut places = RowPlaces::default();
+        assert_eq!(
+            paint(&mut places, 0.0, &[("b", "", 40.0, 40.0, 0.0)]),
+            [None]
+        );
+        assert_eq!(
+            paint(&mut places, 0.0, &[("b", "", 20.0, 20.0, 0.0)]),
+            [Some(20.0)]
+        );
+        assert_eq!(
+            paint(&mut places, 0.0, &[("b", "", 20.0, 20.0, 0.0)]),
+            [None]
+        );
+        assert_eq!(
+            paint(&mut places, 0.0, &[("b", "", 60.0, 60.0, 0.0)]),
+            [Some(-40.0)]
+        );
+    }
+
+    #[test]
+    fn a_row_painted_twice_in_a_paint_is_reported_both_times() {
+        let mut places = RowPlaces::default();
+        paint(&mut places, 0.0, &[("b", "", 40.0, 40.0, 0.0)]);
+        let row = ("b", "", 20.0, 20.0, 0.0);
+        assert_eq!(
+            paint(&mut places, 0.0, &[row, row]),
+            [Some(20.0), Some(20.0)]
+        );
+    }
+
+    #[test]
+    fn rows_of_another_space_are_not_compared() {
+        let mut places = RowPlaces::default();
+        paint(&mut places, 0.0, &[("b", "", 40.0, 40.0, 0.0)]);
+        places.begin("t", 0.0);
+        assert_eq!(places.note("b", "", 20.0, 20.0, 0.0), None);
+    }
+
+    #[test]
+    fn a_frame_without_the_list_lets_go_of_its_rows() {
+        let mut places = RowPlaces::default();
+        paint(&mut places, 0.0, &[("b", "", 40.0, 40.0, 0.0)]);
+        places.end_frame();
+        assert_eq!(
+            paint(&mut places, 0.0, &[("b", "", 20.0, 20.0, 0.0)]),
+            [None]
+        );
+    }
+
+    #[test]
+    fn a_row_pinned_goes_from_where_it_was_in_the_list() {
+        let mut places = RowPlaces::default();
+        paint(&mut places, 0.0, &[("b", "folder", 20.0, 100.0, 0.0)]);
+        assert_eq!(
+            paint(&mut places, 0.0, &[("b", "", 20.0, 20.0, 0.0)]),
+            [Some(80.0)]
+        );
+        // Put back into a folder sent 10 up itself: the row's own share is
+        // the rest of the way.
+        assert_eq!(
+            paint(&mut places, 0.0, &[("b", "folder", 20.0, 110.0, 10.0)]),
+            [Some(-100.0)]
+        );
+    }
+
+    #[test]
+    fn a_list_scrolled_since_the_paint_before_reports_no_move() {
+        let mut places = RowPlaces::default();
+        paint(&mut places, 40.0, &[("b", "", 60.0, 60.0, 0.0)]);
+        assert_eq!(
+            paint(&mut places, 20.0, &[("b", "", 40.0, 40.0, 0.0)]),
+            [None]
+        );
+        assert_eq!(
+            paint(&mut places, 20.0, &[("b", "", 40.0, 40.0, 0.0)]),
+            [None]
+        );
+    }
+
+    #[test]
+    fn rows_after_a_new_row_are_not_pushed_down_over_it() {
+        let mut places = RowPlaces::default();
+        paint(
+            &mut places,
+            0.0,
+            &[("a", "", 0.0, 0.0, 0.0), ("c", "", 20.0, 20.0, 0.0)],
+        );
+        assert_eq!(
+            paint(
+                &mut places,
+                0.0,
+                &[
+                    ("a", "", 0.0, 0.0, 0.0),
+                    ("b", "", 20.0, 20.0, 0.0),
+                    ("c", "", 40.0, 40.0, 0.0)
+                ],
+            ),
+            [None, None, None]
+        );
+    }
+
+    #[test]
+    fn the_first_pin_sends_the_pinned_row_alone() {
+        let mut places = RowPlaces::default();
+        paint(
+            &mut places,
+            0.0,
+            &[
+                ("label", "", 0.0, 0.0, 0.0),
+                ("folder", "", 20.0, 20.0, 0.0),
+                ("c", "folder", 20.0, 40.0, 0.0),
+                ("d", "folder", 40.0, 60.0, 0.0),
+            ],
+        );
+        // The Pinned heading appears and c goes under it: the rest is put
+        // where it goes, and c alone comes up from its folder.
+        assert_eq!(
+            paint(
+                &mut places,
+                0.0,
+                &[
+                    ("pinned", "", 0.0, 0.0, 0.0),
+                    ("c", "", 20.0, 20.0, 0.0),
+                    ("label", "", 40.0, 40.0, 0.0),
+                    ("folder", "", 60.0, 60.0, 0.0),
+                    ("d", "folder", 20.0, 80.0, 0.0),
+                ],
+            ),
+            [None, Some(20.0), None, None, None]
+        );
+    }
+
+    #[test]
+    fn a_glided_row_settles_home() {
+        let mut way = SidebarMakeWay::default();
+        way.glide("b", 20.0);
+        assert_eq!(way.shift_of("b"), 20.0);
+        settle(&mut way);
+        assert!(way.is_idle());
+    }
 
     const LIST: [&str; 4] = ["a", "b", "c", "d"];
 

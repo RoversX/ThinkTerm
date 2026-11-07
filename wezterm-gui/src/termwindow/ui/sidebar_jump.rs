@@ -178,6 +178,12 @@ impl crate::TermWindow {
         }
         jump.pressed_at = Some(Instant::now());
         jump.reveal = true;
+        if jump.fold.is_some() {
+            // The row is to be scrolled to in the next frame, in the list as
+            // it is with its folder open, so the folder does not unfold.
+            self.folder_chevrons.land();
+        }
+        let jump = &mut self.sidebar_jump;
         match jump.fold.take() {
             Some(Fold::Project(project_id)) => {
                 crate::workspace_threads::expand_project_threads(&project_id);
