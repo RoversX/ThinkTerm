@@ -638,6 +638,13 @@ pub(crate) trait ContentView {
         Ok(())
     }
 
+    /// Whether the window paints this view's ground, as see-through as the
+    /// terminal's, and cuts the view to its area. Only for a view in the
+    /// terminal's place: a full-window view is left to itself.
+    fn host_paints_ground(&self) -> bool {
+        true
+    }
+
     /// Select a native chrome font role rather than inventing view-local font
     /// sizes.  Overview uses the same sidebar, pane-header and settings roles
     /// as the rest of ThinkTerm.

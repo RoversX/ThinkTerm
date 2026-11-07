@@ -2195,6 +2195,10 @@ fn language_preference_for(settings: &ThinkTermNativeSettings) -> &'static str {
 }
 
 impl ContentView for OnboardingView {
+    fn host_paints_ground(&self) -> bool {
+        false
+    }
+
     fn title(&self) -> String {
         crate::i18n::tr("onboarding-window-title")
     }

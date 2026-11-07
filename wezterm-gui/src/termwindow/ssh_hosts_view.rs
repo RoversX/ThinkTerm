@@ -6124,6 +6124,10 @@ fn open_thread_response(project_id: String) -> ContentViewResponse {
 }
 
 impl ContentView for SshHostsView {
+    fn host_paints_ground(&self) -> bool {
+        false
+    }
+
     fn title(&self) -> String {
         crate::i18n::tr("ssh-hosts-title")
     }

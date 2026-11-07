@@ -2,7 +2,9 @@ use crate::quad::{
     translated_clipped_vertices, HeapQuadAllocator, HeapQuadMark, QuadClipRect, QuadTrait,
     TripleLayerQuadAllocator, Vertex,
 };
-use crate::termwindow::content_view::{ContentViewTypography, TerminalPreviewRequest};
+use crate::termwindow::content_view::{
+    ContentViewPresentation, ContentViewTypography, TerminalPreviewRequest,
+};
 use crate::termwindow::render::{LineToEleShapeCacheKey, RenderScreenLineParams};
 use crate::termwindow::{PaintOutcome, RenderFrame, TermWindowNotif, UIItem, UIItemType};
 use crate::ui::DrawContext;
@@ -2557,6 +2559,8 @@ impl crate::TermWindow {
         // Occupy the terminal content area between the workspace and right
         // sidebars, below the top tab bar and above a bottom tab bar.
         let area = self.content_view_area();
+        let page_ground = self.content_view_ground();
+        let page_clip = self.clip_of(area);
         let surface = euclid::rect(
             0.0,
             0.0,
@@ -2605,17 +2609,48 @@ impl crate::TermWindow {
                 view.set_defer_preview_captures(defer_preview_captures);
                 view.set_host_preview_aspect(host_preview_aspect);
                 view.paint_surface_background(&ctx, layers, surface, palette)?;
-                view.paint(
-                    &ctx,
-                    layers,
-                    area,
-                    palette,
-                    &ui_font,
-                    &title_font,
-                    &section_font,
-                    &caption_font,
-                    cursor_on,
-                )?;
+                if view.presentation() == ContentViewPresentation::ContentArea
+                    && view.host_paints_ground()
+                {
+                    // Cut to the area: there is no solid ground above it to
+                    // hide a page that has scrolled past its top.
+                    ctx.draw_rect(
+                        layers,
+                        0,
+                        area.origin.x,
+                        area.origin.y,
+                        area.size.width,
+                        area.size.height,
+                        page_ground,
+                    )?;
+                    let mut page_palette = palette;
+                    page_palette.window_bg = page_ground;
+                    let mut page = HeapQuadAllocator::default();
+                    view.paint(
+                        &ctx,
+                        &mut TripleLayerQuadAllocator::Heap(&mut page),
+                        area,
+                        page_palette,
+                        &ui_font,
+                        &title_font,
+                        &section_font,
+                        &caption_font,
+                        cursor_on,
+                    )?;
+                    page.apply_to_clipped(layers, page_clip, 1.0)?;
+                } else {
+                    view.paint(
+                        &ctx,
+                        layers,
+                        area,
+                        palette,
+                        &ui_font,
+                        &title_font,
+                        &section_font,
+                        &caption_font,
+                        cursor_on,
+                    )?;
+                }
                 (view.next_frame_time(), view.terminal_previews())
             } else {
                 (None, Vec::new())

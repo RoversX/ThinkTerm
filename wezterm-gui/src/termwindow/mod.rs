@@ -9985,6 +9985,14 @@ impl TermWindow {
         }
     }
 
+    /// The ground of a page in the terminal's place: as see-through as the
+    /// terminal's, so that going between them changes nothing behind.
+    pub(crate) fn content_view_ground(&self) -> LinearRgba {
+        self.terminal_shade
+            .unwrap_or(self.chrome().window_bg)
+            .mul_alpha(self.terminal_ground_opacity(self.config.window_background_opacity))
+    }
+
     fn dark_interface(&self) -> bool {
         matches!(
             self.chrome_appearance,
