@@ -1019,17 +1019,36 @@ impl TermWindow {
                             zindex: crate::termwindow::DRAG_GHOST_ZINDEX,
                         }),
                         // OpenGL keeps it as quads, to play back where the
-                        // card is now.
-                        None => self.paint_terminal_previews(
-                            &mut layers,
-                            &[TerminalPreviewRequest {
-                                area: dest,
-                                clip: dest,
-                                prebuild: false,
-                                opacity,
-                                ..request
-                            }],
-                        )?,
+                        // card is now. Nothing cuts their corners, so the
+                        // card paints back over them.
+                        None => {
+                            self.paint_terminal_previews(
+                                &mut layers,
+                                &[TerminalPreviewRequest {
+                                    area: dest,
+                                    clip: dest,
+                                    prebuild: false,
+                                    opacity,
+                                    ..request
+                                }],
+                            )?;
+                            let surface = self.tear_off_surface().mul_alpha(opacity);
+                            let radius = self.ui_f32(TEAR_OFF_THUMBNAIL_RADIUS);
+                            let gl_state = self
+                                .render_state
+                                .as_ref()
+                                .context("tear-off card without a render state")?;
+                            DrawContext::new(gl_state, self.dimensions, &self.render_metrics)
+                                .draw_rounded_preview_chrome(
+                                    &mut layers,
+                                    2,
+                                    dest,
+                                    dest,
+                                    surface,
+                                    None,
+                                    radius,
+                                )?;
+                        }
                     }
                 }
             }

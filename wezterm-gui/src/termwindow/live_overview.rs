@@ -2513,7 +2513,7 @@ impl ContentView for LiveOverviewView {
                 chrome.preview,
                 chrome.clip,
                 chrome.fill,
-                chrome.border,
+                Some(chrome.border),
                 ctx.px(PREVIEW_RADIUS),
             )?;
         }

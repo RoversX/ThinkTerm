@@ -298,9 +298,10 @@ impl<'a> DrawContext<'a> {
     }
 
     /// Cover the four wedges outside a rounded preview after the terminal has
-    /// been painted, then redraw its thin outline. The complete chrome is
-    /// emitted into a heap buffer and clipped as quads, so a corner crossing a
-    /// scroll boundary remains rounded instead of disappearing all at once.
+    /// been painted, then redraw its thin outline if it has one. The complete
+    /// chrome is emitted into a heap buffer and clipped as quads, so a corner
+    /// crossing a scroll boundary remains rounded instead of disappearing all
+    /// at once.
     pub(crate) fn draw_rounded_preview_chrome(
         &self,
         layers: &mut TripleLayerQuadAllocator<'_>,
@@ -308,7 +309,7 @@ impl<'a> DrawContext<'a> {
         rect: RectF,
         clip: RectF,
         mask: LinearRgba,
-        border: LinearRgba,
+        border: Option<LinearRgba>,
         radius: f32,
     ) -> anyhow::Result<()> {
         let radius = radius
@@ -352,54 +353,58 @@ impl<'a> DrawContext<'a> {
             let mut clipped_layers = TripleLayerQuadAllocator::Heap(&mut heap);
             for (x, y, mask_poly, outline_poly) in corners {
                 self.draw_corner(&mut clipped_layers, layer_num, x, y, mask_poly, size, mask)?;
-                self.draw_corner(
-                    &mut clipped_layers,
-                    layer_num,
-                    x,
-                    y,
-                    outline_poly,
-                    size,
-                    border,
-                )?;
+                if let Some(border) = border {
+                    self.draw_corner(
+                        &mut clipped_layers,
+                        layer_num,
+                        x,
+                        y,
+                        outline_poly,
+                        size,
+                        border,
+                    )?;
+                }
             }
 
-            let stroke = self.px(1.0).max(1.0);
-            let edges: [RectF; 4] = [
-                euclid::rect(
-                    rect.min_x() + radius,
-                    rect.min_y(),
-                    rect.size.width - radius * 2.0,
-                    stroke,
-                ),
-                euclid::rect(
-                    rect.min_x() + radius,
-                    rect.max_y() - stroke,
-                    rect.size.width - radius * 2.0,
-                    stroke,
-                ),
-                euclid::rect(
-                    rect.min_x(),
-                    rect.min_y() + radius,
-                    stroke,
-                    rect.size.height - radius * 2.0,
-                ),
-                euclid::rect(
-                    rect.max_x() - stroke,
-                    rect.min_y() + radius,
-                    stroke,
-                    rect.size.height - radius * 2.0,
-                ),
-            ];
-            for edge in edges {
-                self.draw_rect(
-                    &mut clipped_layers,
-                    layer_num,
-                    edge.origin.x,
-                    edge.origin.y,
-                    edge.size.width,
-                    edge.size.height,
-                    border,
-                )?;
+            if let Some(border) = border {
+                let stroke = self.px(1.0).max(1.0);
+                let edges: [RectF; 4] = [
+                    euclid::rect(
+                        rect.min_x() + radius,
+                        rect.min_y(),
+                        rect.size.width - radius * 2.0,
+                        stroke,
+                    ),
+                    euclid::rect(
+                        rect.min_x() + radius,
+                        rect.max_y() - stroke,
+                        rect.size.width - radius * 2.0,
+                        stroke,
+                    ),
+                    euclid::rect(
+                        rect.min_x(),
+                        rect.min_y() + radius,
+                        stroke,
+                        rect.size.height - radius * 2.0,
+                    ),
+                    euclid::rect(
+                        rect.max_x() - stroke,
+                        rect.min_y() + radius,
+                        stroke,
+                        rect.size.height - radius * 2.0,
+                    ),
+                ];
+                for edge in edges {
+                    self.draw_rect(
+                        &mut clipped_layers,
+                        layer_num,
+                        edge.origin.x,
+                        edge.origin.y,
+                        edge.size.width,
+                        edge.size.height,
+                        border,
+                    )?;
+                }
             }
         }
         let clip = QuadClipRect::from_top_left_pixels(
