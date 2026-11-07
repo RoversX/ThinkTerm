@@ -202,16 +202,6 @@ impl ProjectRootView {
         self.last_ui_scale = ctx.scale();
         // The glide a notched wheel was given lives in the scroll state.
         self.scroll_animating = self.scroll.advance_animation(Instant::now());
-        ctx.draw_rect(
-            layers,
-            0,
-            area.origin.x,
-            area.origin.y,
-            area.size.width,
-            area.size.height,
-            palette.window_bg,
-        )?;
-
         let pad = ctx.px(PAD);
         let shell_w = (area.size.width - pad * 2.0)
             .min(ctx.px(CONTENT_MAX_W))
@@ -476,19 +466,6 @@ impl ProjectRootView {
             bx += w + button_gap;
         }
 
-        // Nothing here clips, so scrolled-away content would bleed into the
-        // window chrome above.
-        if self.scroll.offset > 0.0 && area.origin.y > 0.0 {
-            ctx.draw_rect(
-                layers,
-                2,
-                area.origin.x,
-                0.0,
-                area.size.width,
-                area.origin.y,
-                palette.sidebar_bg,
-            )?;
-        }
         if self.scroll.has_overflow() {
             draw_scrollbar(
                 ctx,
@@ -1051,6 +1028,11 @@ mod tests {
             detail: "denied".to_string(),
             via_session_server: false,
         }
+    }
+
+    #[test]
+    fn a_page_leaves_its_ground_to_the_window() {
+        assert!(view().host_paints_ground());
     }
 
     fn view() -> ProjectRootView {

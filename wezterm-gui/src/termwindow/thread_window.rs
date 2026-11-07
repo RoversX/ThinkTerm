@@ -1495,15 +1495,6 @@ impl ContentView for ThreadElsewhereView {
         _cursor_on: bool,
     ) -> anyhow::Result<()> {
         self.widgets.clear();
-        ctx.draw_rect(
-            layers,
-            0,
-            area.origin.x,
-            area.origin.y,
-            area.size.width,
-            area.size.height,
-            palette.window_bg,
-        )?;
 
         let center_x = area.origin.x + area.size.width / 2.0;
         let max_width = (area.size.width - ctx.px(PAD) * 2.0).max(0.0);

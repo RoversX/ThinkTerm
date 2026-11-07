@@ -125,16 +125,6 @@ impl RemoteThreadView {
         self.last_ui_scale = ctx.scale();
         // The glide a notched wheel was given lives in the scroll state.
         self.scroll_animating = self.scroll.advance_animation(Instant::now());
-        ctx.draw_rect(
-            layers,
-            0,
-            area.origin.x,
-            area.origin.y,
-            area.size.width,
-            area.size.height,
-            palette.window_bg,
-        )?;
-
         let pad = ctx.px(PAD);
         let shell_w = (area.size.width - pad * 2.0)
             .min(ctx.px(CONTENT_MAX_W))
@@ -233,21 +223,6 @@ impl RemoteThreadView {
 
         self.paint_phase_buttons(ctx, layers, font, palette, x, y, button_h)?;
 
-        // Nothing here can clip, so scrolled-away content would bleed into the
-        // window chrome above. Repaint that strip in the chrome colour; the
-        // tab bar / window buttons are drawn after content views and land on
-        // top of it again.
-        if self.scroll.offset > 0.0 && area.origin.y > 0.0 {
-            ctx.draw_rect(
-                layers,
-                2,
-                area.origin.x,
-                0.0,
-                area.size.width,
-                area.origin.y,
-                palette.sidebar_bg,
-            )?;
-        }
         if self.scroll.has_overflow() {
             draw_scrollbar(
                 ctx,
