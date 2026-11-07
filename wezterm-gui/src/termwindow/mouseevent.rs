@@ -6,7 +6,7 @@ use crate::termwindow::space_swipe::{SidebarSpaceSwipeFinish, SidebarSpaceSwipeU
 use crate::termwindow::ui::platform_chrome::WindowTabChromeParams;
 use crate::termwindow::ui::sidebar::SpaceConnectionState;
 use crate::termwindow::ui::tokens::{
-    PANE_NAV_INSET, PANE_NAV_TAB_GAP, TAB_MIN_WIDTH,
+    MACOS_THREAD_WINDOW_TAB_START, PANE_NAV_INSET, PANE_NAV_TAB_GAP, TAB_MIN_WIDTH,
     TAB_ROW_START_PADDING, TAB_TARGET_WIDTH, TAB_VERTICAL_PADDING,
     WINDOW_TAB_ACTION_RESERVED_WIDTH, WINDOW_TAB_GAP, WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE,
     WINDOW_TAB_LEADING_ACTION_GAP, WINDOW_TAB_TOP_SPACER,
@@ -676,9 +676,10 @@ impl super::TermWindow {
     pub(super) fn pane_nav_tab_left_inset(&self, pos: &PositionedPane) -> usize {
         // A window tab row out of the layout leaves the traffic lights and
         // the sidebar button beside them over the top-left pane's bar, whose
-        // tabs then start where the row's do. Brought down, the row takes
-        // them back and pushes the bar below them: its tabs go back to the
-        // edge as the row comes. Off macOS the bar holds the sidebar button
+        // tabs then start where the row's do, or nearer the lights in a
+        // thread's own window, which has no button. Brought down, the row
+        // takes them back and pushes the bar below them: its tabs go back to
+        // the edge as the row comes. Off macOS the bar holds the sidebar button
         // itself (see `pane_bar_sidebar_toggle_share`), and makes way for it
         // the same way.
         let edge = self.ui_px(PANE_NAV_INSET) as f32;
@@ -689,8 +690,12 @@ impl super::TermWindow {
             && self.workspace_sidebar_width() == 0
             && !self.window_tab_reveal.in_layout()
         {
-            let clear = self.window_tab_left_padding_pixels().ceil()
-                + self.ui_px(TAB_ROW_START_PADDING) as f32;
+            let clear = if self.dedicated_thread.is_some() {
+                self.ui_px(MACOS_THREAD_WINDOW_TAB_START) as f32
+            } else {
+                self.window_tab_left_padding_pixels().ceil()
+                    + self.ui_px(TAB_ROW_START_PADDING) as f32
+            };
             let away = 1.0 - self.window_tab_reveal.shown();
             return (edge + (clear - edge).max(0.0) * away).round() as usize;
         }

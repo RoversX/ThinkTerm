@@ -53,6 +53,9 @@ pub const WINDOW_TAB_REVEAL_EDGE_OVER_CONTROLS_HEIGHT: usize = 8;
 pub const WINDOW_RESIZE_EDGE_HEIGHT: usize = 12;
 pub const MACOS_TITLEBAR_CONTENT_TOP_INSET: usize = 52;
 pub const MACOS_TRAFFIC_LIGHT_CLEARANCE_WIDTH: usize = 164;
+/// Where a thread's own window starts its tabs on macOS, nearer the traffic
+/// lights than a window tab row: nothing else shares the bar with them.
+pub const MACOS_THREAD_WINDOW_TAB_START: usize = 160;
 pub const MACOS_WINDOW_TAB_RESERVED_ACTION_SLOTS: usize = 1;
 
 /// A tab row's height, from its title font's line height.
