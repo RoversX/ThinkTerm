@@ -337,7 +337,7 @@ impl crate::TermWindow {
         let space = self.active_space_id.clone();
         if let Some(thread_id) = crate::workspace_threads::ensure_active_thread_for_space(&space) {
             if !self.open_remote_workspace_thread_without_connecting(&thread_id, &window) {
-                self.activate_workspace_thread(thread_id, &window);
+                self.show_thread_or_its_page(thread_id, &window);
             }
         } else {
             window.invalidate();
@@ -490,6 +490,14 @@ impl crate::TermWindow {
                     }
                 }
             }
+            crate::termwindow::ContextMenuApplicationAction::OpenThreadInOwnWindow(thread_id) => {
+                if let Some(window) = self.window.clone() {
+                    self.open_thread_in_own_window(thread_id, None, &window);
+                }
+            }
+            crate::termwindow::ContextMenuApplicationAction::GoToThreadWindow(thread_id) => {
+                self.focus_thread_window(&thread_id);
+            }
             crate::termwindow::ContextMenuApplicationAction::RemoveThreadFromCollection {
                 collection_space_id,
                 thread_id,
@@ -521,7 +529,7 @@ impl crate::TermWindow {
                                     if !self.open_remote_workspace_thread_without_connecting(
                                         &next, &window,
                                     ) {
-                                        self.activate_workspace_thread(next, &window);
+                                        self.show_thread_or_its_page(next, &window);
                                     }
                                 }
                                 None => self.leave_detached_ref_content(),

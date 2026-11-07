@@ -146,6 +146,17 @@ pub(crate) fn slot_width(layout: NativeThreadIcons, diameter: f32) -> f32 {
     }
 }
 
+/// How much of the slot `count` icons `diameter` across fill, for setting
+/// them apart from a row: centred on their own, say.
+pub(crate) fn drawn_width(layout: NativeThreadIcons, count: usize, diameter: f32) -> f32 {
+    match layout {
+        NativeThreadIcons::Badge | NativeThreadIcons::Trailing if count > 1 => diameter * 1.33,
+        NativeThreadIcons::Badge | NativeThreadIcons::Trailing => diameter,
+        NativeThreadIcons::Coins => diameter * (1.0 + 0.175 * (count.clamp(1, 3) - 1) as f32),
+        NativeThreadIcons::Cluster => diameter * 1.2,
+    }
+}
+
 /// How icons are drawn on a row: what sets one off from another, and what
 /// a count is written in.
 pub(crate) struct IconStyle<'a> {

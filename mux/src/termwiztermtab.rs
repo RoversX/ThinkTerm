@@ -524,6 +524,20 @@ pub fn allocate(
     (tw_term, pane)
 }
 
+/// A pane with nothing behind it, known to no tab and not to the mux. A
+/// window showing a page where its terminal would be hands it to the code
+/// that needs a pane to run a key binding against; nothing reads what it is
+/// sent.
+pub fn inert_pane(
+    size: TerminalSize,
+    config: Arc<dyn TerminalConfiguration + Send + Sync>,
+) -> anyhow::Result<Arc<dyn Pane>> {
+    let render_pipe = Pipe::new()?;
+    let (input_tx, _input_rx) = channel();
+    let pane = TermWizTerminalPane::new(0, size, input_tx, render_pipe.read, Some(config));
+    Ok(Arc::new(pane))
+}
+
 /// This function spawns a thread and constructs a GUI window with an
 /// associated termwiz Terminal object to execute the provided function.
 /// The function is expected to run in a loop to manage input and output

@@ -900,7 +900,7 @@ impl super::TermWindow {
             }
         }
         let stage = crate::input_diagnostics::StageTimer::begin("get_active_pane");
-        let pane = self.get_active_pane_or_overlay();
+        let pane = self.pane_for_key_bindings();
         stage.finish(pane.is_some());
         let pane = match pane {
             Some(pane) => pane,
@@ -1209,7 +1209,7 @@ impl super::TermWindow {
         );
 
         let stage = crate::input_diagnostics::StageTimer::begin("get_active_pane");
-        let pane = self.get_active_pane_or_overlay();
+        let pane = self.pane_for_key_bindings();
         stage.finish(pane.is_some());
         let pane = match pane {
             Some(pane) => pane,

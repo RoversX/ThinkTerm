@@ -13,6 +13,9 @@ use window::{
 #[derive(Debug, Clone, Copy)]
 pub struct WindowTabChromeParams {
     pub workspace_sidebar_width: usize,
+    /// False in a thread's own window, which has no sidebar to toggle and so
+    /// keeps no place for the button.
+    pub has_workspace_sidebar: bool,
     pub window_state: WindowState,
     pub window_decorations: WindowDecorations,
     pub integrated_title_button_alignment: IntegratedTitleButtonAlignment,
@@ -97,7 +100,7 @@ impl WindowTabChromeParams {
     }
 
     pub fn leading_action_slot_count(self) -> usize {
-        if self.workspace_sidebar_width > 0 {
+        if self.workspace_sidebar_width > 0 || !self.has_workspace_sidebar {
             return 0;
         }
 
@@ -117,7 +120,8 @@ impl WindowTabChromeParams {
     }
 
     pub fn shows_sidebar_toggle_action(self) -> bool {
-        self.workspace_sidebar_width == 0
+        self.has_workspace_sidebar
+            && self.workspace_sidebar_width == 0
             && (self.window_state.contains(WindowState::FULL_SCREEN) || !cfg!(target_os = "macos"))
     }
 
@@ -269,6 +273,7 @@ mod tests {
     ) -> WindowTabChromeParams {
         WindowTabChromeParams {
             workspace_sidebar_width,
+            has_workspace_sidebar: true,
             window_state,
             window_decorations: WindowDecorations::INTEGRATED_BUTTONS | WindowDecorations::RESIZE,
             integrated_title_button_alignment: IntegratedTitleButtonAlignment::Right,
@@ -277,6 +282,21 @@ mod tests {
             dpi: 96,
             top_fancy_row_height,
         }
+    }
+
+    #[test]
+    fn a_window_without_a_sidebar_keeps_no_place_for_its_toggle() {
+        let params = WindowTabChromeParams {
+            has_workspace_sidebar: false,
+            ..test_params(0, WindowState::default(), Some(38))
+        };
+        assert!(!params.shows_sidebar_toggle_action());
+        assert_eq!(params.leading_action_slot_count(), 0);
+        assert_eq!(params.leading_action_area_width_pixels(), 0.0);
+        assert!(
+            params.left_padding_pixels()
+                < test_params(0, WindowState::default(), Some(38)).left_padding_pixels()
+        );
     }
 
     #[test]

@@ -172,6 +172,7 @@ mod sidebar_make_way;
 mod sidebar_slide;
 mod space_swipe;
 pub(crate) mod thread_numbers;
+pub(crate) mod thread_window;
 mod window_tab_reveal;
 pub mod spawn;
 pub mod ssh_hosts_view;
@@ -693,6 +694,10 @@ pub(crate) enum ContextMenuApplicationAction {
         space_id: String,
         thread_id: String,
     },
+    /// Thread menu: give the thread a window of its own.
+    OpenThreadInOwnWindow(crate::workspace_threads::WorkspaceThreadId),
+    /// Thread menu: bring forward the window the thread is open in.
+    GoToThreadWindow(crate::workspace_threads::WorkspaceThreadId),
     /// Sidebar view-options: show/hide threads with this work status.
     ToggleWorkspaceStatusFilter(crate::workspace_threads::WorkspaceThreadWorkStatus),
     /// Sidebar view-options: transiently reveal archived projects.
@@ -3360,6 +3365,15 @@ pub struct TermWindow {
     /// windows spawned by the reconcile, e.g. reconnect/auth prompts): they
     /// close when their mux window dies instead of falling back to a thread.
     dies_with_mux_window: bool,
+    /// The thread this window exists to show: a window of its own, with no
+    /// sidebars, opened from the thread list (see `thread_window`).
+    dedicated_thread: Option<crate::workspace_threads::WorkspaceThreadId>,
+    /// The page standing in here for a thread open in its own window.
+    elsewhere_page: Option<thread_window::ThreadElsewherePage>,
+    /// A thread to give its own window as soon as it is on screen here.
+    thread_bound_for_own_window: Option<thread_window::ThreadBoundForOwnWindow>,
+    /// Thread windows the app was left with, still to open.
+    threads_to_reopen: std::collections::VecDeque<crate::workspace_threads::WorkspaceThreadId>,
     /// Opened for a server's connection (Connect, `thinkterm connect`) that
     /// has not got through yet: if it fails or is turned down, the window
     /// goes, as it came for nothing else.
@@ -4136,6 +4150,17 @@ impl TermWindow {
         }
         self.persist_workspace_layout_after_mutation("window close requested");
 
+        // A thread's own window is one view of a thread that goes on running
+        // in the thread list. As the last window it goes with the app, and
+        // comes back with it.
+        if let Some(thread_id) = &self.dedicated_thread {
+            if front_end().gui_windows().len() > 1 {
+                crate::workspace_threads::note_thread_left_own_window(thread_id);
+                self.close_gui_window_now(window, true);
+                return;
+            }
+        }
+
         let mux = Mux::get();
         let preserve_mux_window = self.should_preserve_mux_window_on_gui_close();
         match self.config.window_close_confirmation {
@@ -4747,7 +4772,8 @@ impl TermWindow {
             let mux = Mux::get();
             let ws = mux
                 .get_window(self.mux_window_id)
-                .map(|w| w.get_workspace().to_string());
+                .map(|w| w.get_workspace().to_string())
+                .filter(|ws| !crate::workspace_threads::is_thread_page_workspace(ws));
             if let Some(ws) = ws {
                 if mux.active_workspace() != ws {
                     mux.set_active_workspace(&ws);
@@ -4842,7 +4868,7 @@ impl TermWindow {
 
 impl TermWindow {
     pub async fn new_window(mux_window_id: MuxWindowId) -> anyhow::Result<()> {
-        Self::new_window_impl(mux_window_id, None, true, None).await
+        Self::new_window_impl(mux_window_id, None, true, None, None).await
     }
 
     /// For domain-owned mux windows (remote mux windows arriving via a
@@ -4850,7 +4876,7 @@ impl TermWindow {
     /// a saved workspace thread. Restoring would adopt this window onto a
     /// different mux window, orphaning/killing the one the domain created.
     pub async fn new_window_without_restore(mux_window_id: MuxWindowId) -> anyhow::Result<()> {
-        Self::new_window_impl(mux_window_id, None, false, None).await
+        Self::new_window_impl(mux_window_id, None, false, None, None).await
     }
 
     pub async fn new_window_with_claimed_space(
@@ -4864,6 +4890,26 @@ impl TermWindow {
             Some((space_owner_id, active_space_id)),
             false,
             remote_open_domain,
+            None,
+        )
+        .await
+    }
+
+    /// A window of its own for `thread_id`, showing its running mux window.
+    /// It sits in the thread's Space without holding it: the window with the
+    /// sidebar goes on holding that, and never hears of this one.
+    pub(crate) async fn new_thread_window(
+        mux_window_id: MuxWindowId,
+        space_id: String,
+        request: thread_window::OwnWindowRequest,
+    ) -> anyhow::Result<()> {
+        let space_owner_id = crate::workspace_threads::next_space_owner_id();
+        Self::new_window_impl(
+            mux_window_id,
+            Some((space_owner_id, space_id)),
+            false,
+            None,
+            Some(request),
         )
         .await
     }
@@ -4873,6 +4919,7 @@ impl TermWindow {
         claimed_space: Option<(u64, String)>,
         restore_saved_thread: bool,
         remote_open_domain: Option<DomainId>,
+        own_window: Option<thread_window::OwnWindowRequest>,
     ) -> anyhow::Result<()> {
         let config = configuration();
         let native_settings = crate::native_settings::load();
@@ -4960,7 +5007,12 @@ impl TermWindow {
         // A window tab row that hides gives its height to the terminal: the
         // window opens without it, and the shell starts at the size it asked
         // for rather than being resized as the window appears.
-        let window_tab_reveal = window_tab_reveal::WindowTabReveal::new();
+        let in_own_window = own_window.is_some();
+        let window_tab_reveal = if in_own_window {
+            window_tab_reveal::WindowTabReveal::always_hiding()
+        } else {
+            window_tab_reveal::WindowTabReveal::new()
+        };
         let window_tab_row_height = if window_tab_reveal.in_layout() {
             Self::tab_bar_pixel_height_impl(&fontconfig)? as usize
         } else {
@@ -5008,9 +5060,9 @@ impl TermWindow {
         // A right sidebar that starts open, as it was left, takes its width
         // beside the terminal rather than out of it: the shell starts at the
         // size asked for instead of being resized as the window opens.
-        let right_sidebar_shown =
-            crate::native_settings::right_sidebar_starts_shown(&native_settings.chrome)
-                && RightSidebarMode::any_panel_enabled();
+        let right_sidebar_shown = !in_own_window
+            && crate::native_settings::right_sidebar_starts_shown(&native_settings.chrome)
+            && RightSidebarMode::any_panel_enabled();
         let right_sidebar_width = if right_sidebar_shown {
             ui::right_sidebar_width_for_metrics(&render_metrics, dpi as usize)
         } else {
@@ -5027,7 +5079,7 @@ impl TermWindow {
 
         let mut dimensions = Dimensions {
             pixel_width: (terminal_size.pixel_width
-                + workspace_sidebar_width
+                + if in_own_window { 0 } else { workspace_sidebar_width }
                 + right_sidebar_width
                 + padding_left
                 + padding_right) as usize,
@@ -5055,7 +5107,8 @@ impl TermWindow {
         let render_state = None;
 
         let connection_name = Connection::get().unwrap().name();
-        let dies_with_mux_window = claimed_space.is_none() && !restore_saved_thread;
+        let dies_with_mux_window =
+            in_own_window || (claimed_space.is_none() && !restore_saved_thread);
         let (space_owner_id, active_space_id) = claimed_space.unwrap_or_else(|| {
             let space_owner_id = crate::workspace_threads::next_space_owner_id();
             // Windows created without a saved-thread restore are incidental
@@ -5318,13 +5371,18 @@ impl TermWindow {
             space_owner_id,
             active_space_id,
             dies_with_mux_window,
+            dedicated_thread: own_window.as_ref().map(|request| request.thread_id.clone()),
+            elsewhere_page: None,
+            thread_bound_for_own_window: None,
+            threads_to_reopen: std::collections::VecDeque::new(),
             opened_to_connect: remote_open_domain.is_some(),
             space_reconnects_in_flight: HashSet::new(),
             watched_space_connection_state: None,
             workspace_layout_structure_fingerprint,
             workspace_sidebar_width,
             workspace_sidebar_pending_thread_selection: None,
-            workspace_sidebar_collapsed: !native_settings.onboarding.show_left_sidebar_by_default,
+            workspace_sidebar_collapsed: in_own_window
+                || !native_settings.onboarding.show_left_sidebar_by_default,
             workspace_sidebar_scroll_offset: 0.0,
             workspace_sidebar_scroll_offsets: HashMap::new(),
             workspace_sidebar_swipe: space_swipe::SidebarSpaceSwipeState::default(),
@@ -5530,7 +5588,8 @@ impl TermWindow {
         //
         // macOS is untouched by any of this and keeps using AppKit's frame
         // autosave below; `frame_to_restore` yields nothing there.
-        let restored_frame = if crate::main_window_placement::claim_main_window(mux_window_id)
+        let restored_frame = if !in_own_window
+            && crate::main_window_placement::claim_main_window(mux_window_id)
             && native_settings.window.restore_main_window_frame
             && x.is_none()
             && y.is_none()
@@ -5548,7 +5607,10 @@ impl TermWindow {
             macos_frame_autosave_name: if cfg!(target_os = "macos")
                 && native_settings.window.restore_main_window_frame
             {
-                Some("ThinkTerm.MainWindow".to_string())
+                Some(match &own_window {
+                    Some(request) => format!("ThinkTerm.ThreadWindow.{}", request.frame_slot),
+                    None => "ThinkTerm.MainWindow".to_string(),
+                })
             } else {
                 None
             },
@@ -5571,7 +5633,13 @@ impl TermWindow {
             },
         )
         .await?;
-        window.set_titlebar_sidebar_button_visible(true);
+        window.set_titlebar_sidebar_button_visible(!in_own_window);
+        // Its one bar is where the system keeps the title bar: what is on the
+        // bar has to stay put under the pointer, and only its blank moves
+        // the window (`pane_bar_blank_is_title_bar`).
+        if in_own_window {
+            window.set_moved_on_request_only();
+        }
         {
             let mut tw = tw.borrow_mut();
             tw.window.replace(window.clone());
@@ -5699,7 +5767,12 @@ impl TermWindow {
             } else {
                 myself.sync_current_workspace_thread();
             }
-            myself.maybe_show_onboarding();
+            if myself.dedicated_thread.is_none() {
+                myself.maybe_show_onboarding();
+            }
+            if restore_saved_thread && front_end().take_reopening_thread_windows() {
+                myself.begin_reopening_thread_windows();
+            }
             // The mux window can predate this native window, so no
             // TabAddedToWindow notification is guaranteed after the GUI has
             // subscribed. Converge the already-active tab before the first
@@ -5707,6 +5780,9 @@ impl TermWindow {
             // takeover epoch here rather than exposing its saved/TUI grid.
             if !myself.content_view_foreground() {
                 myself.resize_mux_tabs_to_current_terminal_size();
+            }
+            if let Some(position) = own_window.as_ref().and_then(|request| request.position) {
+                window.set_window_position(position);
             }
             window.show();
             // Maximizing after the window is shown, rather than asking for a
@@ -5738,6 +5814,9 @@ impl TermWindow {
             )
         };
         front_end().record_known_window(window.clone(), adopted_mux_window_id, recovery_slot);
+        if let Some(request) = &own_window {
+            front_end().thread_window_opened(&request.thread_id, &window);
+        }
 
         // A Project directory refused before this window existed has been
         // waiting for somewhere to be shown; this is the first moment there is
@@ -5788,7 +5867,9 @@ impl TermWindow {
         }
         match event {
             WindowEvent::Destroyed => {
-                crate::main_window_placement::window_closed(self.mux_window_id);
+                if self.dedicated_thread.is_none() {
+                    crate::main_window_placement::window_closed(self.mux_window_id);
+                }
                 self.flush_right_sidebar_note_blocking();
                 self.save_right_sidebar_markdown_preview_before_destroy();
                 self.clear_gui_recovery_intent();
@@ -5805,7 +5886,9 @@ impl TermWindow {
                 // Get the placement on disk before anything that might quit
                 // the process gets going. The claim is kept: the close may
                 // still be called off by a confirmation prompt.
-                crate::main_window_placement::close_requested(self.mux_window_id);
+                if self.dedicated_thread.is_none() {
+                    crate::main_window_placement::close_requested(self.mux_window_id);
+                }
                 self.close_requested(window);
                 Ok(true)
             }
@@ -5813,7 +5896,9 @@ impl TermWindow {
                 // While a restored frame is still being asserted the window is
                 // passing through geometry nobody chose; recording it would
                 // save the startup wobble rather than where the window lives.
-                if !self.settle_restored_frame(frame, maximized, window) {
+                if self.dedicated_thread.is_none()
+                    && !self.settle_restored_frame(frame, maximized, window)
+                {
                     crate::main_window_placement::record(self.mux_window_id, frame, maximized);
                 }
                 Ok(true)
@@ -5858,7 +5943,7 @@ impl TermWindow {
                 // A native context menu delivers its selection this way;
                 // whichever way the menu ended, it is over now.
                 self.native_context_menu_open = false;
-                if let Some(pane) = self.get_active_pane_or_overlay() {
+                if let Some(pane) = self.pane_for_key_bindings() {
                     self.perform_key_assignment(&pane, &action)?;
                     window.invalidate();
                 }
@@ -6783,6 +6868,7 @@ impl TermWindow {
         // leaving a live window that never hears PaneOutput again, painting
         // only on input events and the 1s render watchdog.
         self.subscribe_to_pane_updates();
+        self.leave_thread_elsewhere_page(mux_window_id);
 
         // Keep the frontend's window<->mux mapping accurate so that the
         // additive reconcile does not try to spawn a duplicate window for the
@@ -6823,6 +6909,7 @@ impl TermWindow {
         // be up).
         self.resize_mux_tabs_to_current_terminal_size();
         self.sync_current_workspace_thread();
+        self.send_on_thread_bound_for_own_window(mux_window_id);
 
         // A Space/thread switch can replace the active pane without changing
         // the native window's focus state, so no FocusChanged event follows
@@ -6901,7 +6988,7 @@ impl TermWindow {
             if let Some(thread_id) =
                 crate::workspace_threads::ensure_active_thread_for_space(&self.active_space_id)
             {
-                self.activate_workspace_thread(thread_id, &window);
+                self.show_thread_or_its_page(thread_id, &window);
                 return;
             }
         }
@@ -6929,6 +7016,21 @@ impl TermWindow {
                 .is_some_and(|plan| !plan.needs_materialize)
                 {
                     self.activate_workspace_thread(thread_id, &window);
+                    return;
+                }
+            }
+        }
+        // A mirror rebuilt on reconnecting gets a new window for the same
+        // thread.
+        if let Some(workspace) = self
+            .dedicated_thread
+            .as_deref()
+            .and_then(crate::workspace_threads::thread_workspace_name)
+        {
+            if let Some(target) = crate::workspace_threads::window_to_show_in_workspace(&workspace)
+            {
+                if !front_end().has_mux_window(target) {
+                    self.switch_to_mux_window(target);
                     return;
                 }
             }
@@ -6968,6 +7070,9 @@ impl TermWindow {
             crate::workspace_threads::thread_to_recover_after_window_death(&self.active_space_id)
         };
         let Some(thread_id) = recovery_thread else {
+            if let Some(thread_id) = &self.dedicated_thread {
+                crate::workspace_threads::note_thread_left_own_window(thread_id);
+            }
             window.close();
             front_end().forget_known_window(&window);
             return;
@@ -6977,7 +7082,7 @@ impl TermWindow {
         // subscription id still names the dead mux window, so a queued
         // WindowRemoved would match and kill a subscription made now.
         // switch_to_mux_window re-subscribes after updating the id.
-        self.activate_workspace_thread(thread_id, &window);
+        self.show_thread_or_its_page(thread_id, &window);
     }
 
     /// Put the connection page of `domain_name`'s Space on screen: a mux
@@ -7838,6 +7943,10 @@ impl TermWindow {
     }
 
     fn sync_current_workspace_thread(&mut self) {
+        // Which thread the Space is on is for the window with its sidebar.
+        if self.dedicated_thread.is_some() {
+            return;
+        }
         let Some(workspace) = self.current_mux_workspace() else {
             return;
         };
@@ -7936,6 +8045,9 @@ impl TermWindow {
         preferred_thread: Option<String>,
         window: &Window,
     ) -> bool {
+        if self.dedicated_thread.is_some() {
+            return false;
+        }
         // Navigating elsewhere cancels the earlier window-opening intent.
         self.remote_open_intent = None;
         if self.workspace_sidebar_swipe.pending_switch_target() != Some(space_id.as_str()) {
@@ -7978,7 +8090,7 @@ impl TermWindow {
         let target_thread = preferred_thread
             .or_else(|| crate::workspace_threads::ensure_active_thread_for_space(&space_id));
         if let Some(thread_id) = target_thread {
-            self.activate_workspace_thread(thread_id, window);
+            self.show_thread_or_its_page(thread_id, window);
         } else {
             // Nothing to adopt; settle the reflow immediately.
             self.consume_pending_sidebar_reflow();
@@ -11568,6 +11680,29 @@ impl TermWindow {
         if let Some(modal) = self.get_modal() {
             if modal.perform_assignment(assignment, self) {
                 return Ok(PerformAssignmentResult::Handled);
+            }
+        }
+
+        if self.elsewhere_page.is_some() {
+            // Whether to quit is asked in a terminal, and there is none here.
+            if matches!(assignment, QuitApplication | QuitAndStopSessionServer) {
+                self.hand_to_thread_on_page(assignment.clone());
+                return Ok(PerformAssignmentResult::Handled);
+            }
+            if thread_window::needs_a_terminal(assignment) {
+                return Ok(PerformAssignmentResult::Handled);
+            }
+        }
+        if self.dedicated_thread.is_some() {
+            match thread_window::own_window_assignment(assignment) {
+                thread_window::OwnWindowAssignment::Perform => {}
+                thread_window::OwnWindowAssignment::HandOn => {
+                    self.hand_on_assignment(assignment.clone());
+                    return Ok(PerformAssignmentResult::Handled);
+                }
+                thread_window::OwnWindowAssignment::Ignore => {
+                    return Ok(PerformAssignmentResult::Handled);
+                }
             }
         }
 

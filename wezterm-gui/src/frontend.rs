@@ -1,6 +1,7 @@
 use crate::scripting::guiwin::GuiWin;
 use crate::spawn::SpawnWhere;
 use crate::termwindow::TermWindowNotif;
+use crate::workspace_threads::WorkspaceThreadId;
 use crate::TermWindow;
 use ::window::*;
 use anyhow::{anyhow, Context, Error};
@@ -13,7 +14,7 @@ use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
 use promise::{Future, Promise};
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use wezterm_client::domain::{ClientDomain, FrontendRecoverySlot, ThinkTermFrontendRecoveryTarget};
@@ -185,6 +186,13 @@ pub struct GuiFrontEnd {
     switching_workspaces: RefCell<usize>,
     spawned_mux_window: RefCell<HashSet<MuxWindowId>>,
     known_windows: RefCell<BTreeMap<Window, MuxWindowId>>,
+    /// Threads in a window of their own (see `termwindow::thread_window`).
+    /// `None` while the window is on its way. An entry goes with its window
+    /// in `forget_known_window`, or in `thread_window_not_opened`.
+    thread_windows: RefCell<HashMap<WorkspaceThreadId, Option<Window>>>,
+    /// The first window has set about opening the thread windows the app
+    /// was left with.
+    thread_windows_reopening: Cell<bool>,
     /// Whether this process has shown a GUI window yet. AppKit asks a
     /// freshly launched app with no windows to "open an untitled file";
     /// before the first window exists that request is the launch itself,
@@ -242,6 +250,8 @@ impl GuiFrontEnd {
             switching_workspaces: RefCell::new(0),
             spawned_mux_window: RefCell::new(HashSet::new()),
             known_windows: RefCell::new(BTreeMap::new()),
+            thread_windows: RefCell::new(HashMap::new()),
+            thread_windows_reopening: Cell::new(false),
             any_window_recorded: Cell::new(false),
             startup_settled: Cell::new(false),
             new_window_request_held: Cell::new(false),
@@ -926,8 +936,13 @@ impl GuiFrontEnd {
         // for may be live in it still.
         crate::local_sessions::attach_host_if_detached().await;
         let mux = Mux::get();
-        let thread_id = crate::workspace_threads::ensure_active_thread_for_space(space_id)
+        let mut thread_id = crate::workspace_threads::ensure_active_thread_for_space(space_id)
             .ok_or_else(|| anyhow!("failed to ensure active thread for Space {space_id}"))?;
+        // Its own window has it: two windows cannot share a thread.
+        if front_end().thread_is_in_own_window(&thread_id) {
+            thread_id = crate::workspace_threads::thread_beside_own_windows(space_id)
+                .ok_or_else(|| anyhow!("no thread free for a new window of Space {space_id}"))?;
+        }
         let live_workspaces = mux.iter_workspaces();
         let plan =
             crate::workspace_threads::activate_thread_record(&thread_id, &live_workspaces, true)
@@ -1097,7 +1112,89 @@ impl GuiFrontEnd {
         }
     }
 
+    /// Note that `thread_id` is getting a window of its own. False when it
+    /// has one, or one is on its way.
+    pub(crate) fn begin_thread_window(&self, thread_id: &str) -> bool {
+        let mut windows = self.thread_windows.borrow_mut();
+        if windows.contains_key(thread_id) {
+            return false;
+        }
+        windows.insert(thread_id.to_string(), None);
+        true
+    }
+
+    /// True once, for the window that sets about reopening thread windows.
+    pub(crate) fn take_reopening_thread_windows(&self) -> bool {
+        !self.thread_windows_reopening.replace(true)
+    }
+
+    pub(crate) fn thread_window_opened(&self, thread_id: &str, window: &Window) {
+        self.thread_windows
+            .borrow_mut()
+            .insert(thread_id.to_string(), Some(window.clone()));
+    }
+
+    pub(crate) fn thread_window_not_opened(&self, thread_id: &str) {
+        self.thread_windows.borrow_mut().remove(thread_id);
+        self.tell_windows_thread_window_closed(thread_id.to_string());
+    }
+
+    /// The window of its own `thread_id` is open in.
+    pub(crate) fn thread_window(&self, thread_id: &str) -> Option<Window> {
+        self.thread_windows.borrow().get(thread_id)?.clone()
+    }
+
+    pub(crate) fn thread_is_in_own_window(&self, thread_id: &str) -> bool {
+        self.thread_windows.borrow().contains_key(thread_id)
+    }
+
+    /// `window` is a thread's own, which shows that thread and no other.
+    pub(crate) fn is_thread_window(&self, window: &Window) -> bool {
+        self.thread_windows
+            .borrow()
+            .values()
+            .any(|candidate| candidate.as_ref() == Some(window))
+    }
+
+    /// A window that shows whichever thread it is asked to, for what a
+    /// thread's own window hands on: the one on the thread's Space if there
+    /// is one.
+    pub(crate) fn window_for_any_thread(&self, space_id: &str) -> Option<GuiWin> {
+        crate::workspace_threads::window_owner_for_space(space_id)
+            .and_then(|owner| {
+                self.gui_window_for_recovery_slot(FrontendRecoverySlot::Window(owner))
+            })
+            .filter(|candidate| !self.is_thread_window(&candidate.window))
+            .or_else(|| {
+                self.gui_windows()
+                    .into_iter()
+                    .find(|candidate| !self.is_thread_window(&candidate.window))
+            })
+    }
+
+    fn tell_windows_thread_window_closed(&self, thread_id: String) {
+        for candidate in self.gui_windows() {
+            let thread_id = thread_id.clone();
+            candidate
+                .window
+                .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                    term_window.thread_window_closed(&thread_id);
+                })));
+        }
+    }
+
     pub fn forget_known_window(&self, window: &Window) {
+        let closed_thread = {
+            let mut thread_windows = self.thread_windows.borrow_mut();
+            let closed_thread = thread_windows
+                .iter()
+                .find(|(_, candidate)| candidate.as_ref() == Some(window))
+                .map(|(thread_id, _)| thread_id.clone());
+            if let Some(thread_id) = &closed_thread {
+                thread_windows.remove(thread_id);
+            }
+            closed_thread
+        };
         self.recovery_windows
             .borrow_mut()
             .retain(|_, candidate| candidate != window);
@@ -1122,6 +1219,9 @@ impl GuiFrontEnd {
             // escapes the sweep above; remember to finish the job when its
             // windows materialize (see the WindowCreated handler).
             self.detach_when_windowless.set(true);
+        }
+        if let Some(thread_id) = closed_thread {
+            self.tell_windows_thread_window_closed(thread_id);
         }
         if !self.is_switching_workspace() {
             self.reconcile_workspace();

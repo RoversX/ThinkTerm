@@ -154,9 +154,14 @@ fn last_used(windows: &[GuiWin]) -> Option<&GuiWin> {
         .active_identity()
         .and_then(|client| mux.resolve_focused_pane(&client))
         .map(|(_domain, window_id, _tab_id, _pane_id)| window_id);
+    // A thread's own window goes nowhere else, so it cannot be the start.
+    let front_end = crate::frontend::front_end();
+    let free = |gui: &&GuiWin| !front_end.is_thread_window(&gui.window);
     windows
         .iter()
+        .filter(free)
         .find(|gui| Some(gui.mux_window_id) == focused)
+        .or_else(|| windows.iter().find(free))
         .or_else(|| windows.first())
 }
 

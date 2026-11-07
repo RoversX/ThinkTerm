@@ -2320,7 +2320,7 @@ impl crate::TermWindow {
     /// terminal reclaims the space through the same zero-width path collapse
     /// already uses, so nothing downstream needs its own special case.
     pub(crate) fn right_sidebar_has_panels(&self) -> bool {
-        RightSidebarMode::any_panel_enabled()
+        self.dedicated_thread.is_none() && RightSidebarMode::any_panel_enabled()
     }
 
     /// The width the TERMINAL is laid out against. Zero whenever the sidebar
@@ -2597,7 +2597,8 @@ impl crate::TermWindow {
             || self.context_menu.is_some()
             || self.native_context_menu_open
             || self.inline_tab_rename.is_some();
-        let eligible = self.right_sidebar_collapsed
+        let eligible = self.dedicated_thread.is_none()
+            && self.right_sidebar_collapsed
             && self.right_sidebar_has_panels()
             && !self.content_view_foreground()
             && !self.content_view_transition_running()

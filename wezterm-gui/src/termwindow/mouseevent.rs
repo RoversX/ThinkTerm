@@ -579,6 +579,7 @@ impl super::TermWindow {
     pub(crate) fn window_tab_chrome_params(&self) -> WindowTabChromeParams {
         WindowTabChromeParams {
             workspace_sidebar_width: self.workspace_sidebar_width(),
+            has_workspace_sidebar: self.dedicated_thread.is_none(),
             window_state: self.window_state,
             window_decorations: self.config.window_decorations,
             integrated_title_button_alignment: self.config.integrated_title_button_alignment,
@@ -1078,6 +1079,7 @@ impl super::TermWindow {
         // out; one open while it is away keeps it from revealing.
         let overlay_open = self.menu_or_overlay_open();
         let eligible = crate::native_settings::workspace_sidebar_hover_reveal_enabled()
+            && self.dedicated_thread.is_none()
             && self.workspace_sidebar_collapsed
             && !self.content_view_foreground()
             && !self.content_view_transition_running()
@@ -2607,11 +2609,7 @@ impl super::TermWindow {
                                         }
                                     }
                                     super::SidebarRowKind::Thread { thread_id, .. } => {
-                                        if !self.open_remote_workspace_thread_without_connecting(
-                                            &thread_id, context,
-                                        ) {
-                                            self.activate_workspace_thread(thread_id, context);
-                                        }
+                                        self.pick_sidebar_thread(thread_id, context);
                                     }
                                 }
                             }
@@ -6950,6 +6948,25 @@ impl super::TermWindow {
             crate::workspace_threads::thread_connection_state(&thread_id, &live_workspaces);
         let mut items = vec![];
 
+        let in_own_window = front_end().thread_is_in_own_window(&thread_id);
+        items.push(self.context_menu_application_item_with_icon(
+            crate::i18n::tr(if in_own_window {
+                "thread-window-go-to"
+            } else {
+                "menu-open-thread-in-window"
+            }),
+            ContextMenuIcon::Window,
+            if in_own_window {
+                crate::termwindow::ContextMenuApplicationAction::GoToThreadWindow(thread_id.clone())
+            } else {
+                crate::termwindow::ContextMenuApplicationAction::OpenThreadInOwnWindow(
+                    thread_id.clone(),
+                )
+            },
+            true,
+        ));
+        items.push(ContextMenuItem::Separator);
+
         if let Some(connection) = connection.as_ref() {
             let remote_host_exists = connection.is_remote
                 && crate::ssh_hosts::host_spec(
@@ -7684,6 +7701,16 @@ impl super::TermWindow {
         orphan_candidate_window_id: Option<MuxWindowId>,
         workspaces_to_kill_after_adopt: Vec<String>,
     ) {
+        if self.dedicated_thread.is_some() {
+            if self.dedicated_thread.as_deref() != Some(thread_id.as_str()) {
+                self.hand_on_assignment(KeyAssignment::ActivateWorkspaceThread {
+                    space_id: self.active_space_id.clone(),
+                    thread_id,
+                });
+            }
+            return;
+        }
+        self.forget_thread_bound_for_own_window_unless(&thread_id);
         let thread_home_space = crate::workspace_threads::thread_space_id(&thread_id);
         let in_this_space = thread_home_space.as_deref() == Some(self.active_space_id.as_str());
         // A window may activate any thread its Space references: the
@@ -7754,6 +7781,18 @@ impl super::TermWindow {
                         if let Some(other) =
                             crate::frontend::front_end().gui_window_for_mux_window(target)
                         {
+                            // What this window showed is being ended, and
+                            // the thread it was to go on to is in a window of
+                            // its own.
+                            if !workspaces_to_kill_after_adopt.is_empty()
+                                && front_end().thread_is_in_own_window(&plan.thread_id)
+                            {
+                                self.show_thread_elsewhere_page(plan.thread_id.clone());
+                            }
+                            kill_workspace_windows(
+                                &workspaces_to_kill_after_adopt,
+                                Some(&plan.workspace_name),
+                            );
                             let workspace = plan.workspace_name.clone();
                             let project_path = plan.project_path.clone();
                             let project_id = plan.project_id.clone();
@@ -8189,6 +8228,7 @@ impl super::TermWindow {
 
         if let Err(err) = result {
             log::error!("failed to materialize ThinkTerm thread: {err:#}");
+            self.thread_bound_for_own_window_failed(&thread_id);
             // Nothing landed, so there is nothing for the first-open claim
             // to take; leaving it armed would claim the next tab shown.
             self.remote_open_intent = None;

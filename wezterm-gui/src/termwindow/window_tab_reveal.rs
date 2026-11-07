@@ -31,6 +31,9 @@ use window::{MouseEvent, WindowDecorations, WindowOps, WindowState};
 pub(crate) struct WindowTabReveal {
     mode: NativeWindowTabs,
     pinned: bool,
+    /// A thread's own window: the row hides whatever Settings say, so the
+    /// pane bar shares the traffic lights' row.
+    always_hiding: bool,
     hover: SidebarHoverReveal,
     /// How far out the row is, 0 to 1, as of the last step: what geometry
     /// reads between steps, so a frame and the clicks on it agree.
@@ -53,6 +56,15 @@ impl WindowTabReveal {
         }
     }
 
+    pub(crate) fn always_hiding() -> Self {
+        Self {
+            mode: NativeWindowTabs::AutoHide,
+            pinned: false,
+            always_hiding: true,
+            ..Default::default()
+        }
+    }
+
     /// The row keeps its place in the layout.
     pub(crate) fn in_layout(&self) -> bool {
         row_in_layout(self.mode, self.pinned)
@@ -60,7 +72,7 @@ impl WindowTabReveal {
 
     /// The row carries its pin: it auto-hides, pinned or not.
     pub(crate) fn shows_pin(&self) -> bool {
-        self.mode == NativeWindowTabs::AutoHide
+        self.mode == NativeWindowTabs::AutoHide && !self.always_hiding
     }
 
     pub(crate) fn pinned(&self) -> bool {
@@ -334,7 +346,7 @@ impl TermWindow {
         else {
             return false;
         };
-        self.pane_bars_stand_in()
+        (self.pane_bars_stand_in() || self.window_tab_reveal.always_hiding)
             && !self.config.window_decorations.contains(WindowDecorations::TITLE)
             && !self
                 .window_state
@@ -369,6 +381,12 @@ impl TermWindow {
     fn window_tab_hover_input(&self) -> HoverInput {
         let overlay_open = self.menu_or_overlay_open();
         let presented = self.window_tab_reveal.hover.is_presented();
+        // A thread's own window with one tab has nothing to bring down, and
+        // the top of it is what moves the window.
+        let lone_tab = self.window_tab_reveal.always_hiding
+            && Mux::get()
+                .get_window(self.mux_window_id)
+                .is_some_and(|window| window.len() < 2);
         // A row out for a rename goes back the usual way once it is done,
         // whatever the mode. Unlike the sidebars, a terminal that is
         // connecting or offline does not hold the row back: it is the way
@@ -376,6 +394,7 @@ impl TermWindow {
         let eligible = (!self.window_tab_reveal.in_layout()
             || self.renaming_window_tab()
             || presented)
+            && !lone_tab
             && self.tab_bar_pixel_height().unwrap_or(0.0) > 0.0
             && !self.content_view_is_full_window()
             && (!overlay_open || presented);
@@ -475,6 +494,9 @@ impl TermWindow {
     /// Take a new mode or pin from Settings: the terminal gets the row's
     /// height back, or gives it up, once.
     pub(crate) fn refresh_window_tabs(&mut self) {
+        if self.window_tab_reveal.always_hiding {
+            return;
+        }
         let before = self.window_tab_reveal.in_layout();
         let (mode, pinned) = crate::native_settings::window_tabs_choice();
         self.window_tab_reveal.mode = mode;

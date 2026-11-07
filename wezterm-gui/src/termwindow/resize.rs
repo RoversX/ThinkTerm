@@ -2168,12 +2168,26 @@ impl super::TermWindow {
             return;
         };
         let space_id = self.space_id_for_layout_snapshot(window.get_workspace());
-        crate::workspace_threads::snapshot_active_space_thread_layout_with_font_scales(
-            &space_id,
-            window.get_workspace(),
-            self.mux_window_id,
-            |pane_id| self.persisted_font_scale_for_pane(pane_id),
-        );
+        self.snapshot_layout_under(&space_id, window.get_workspace());
+    }
+
+    fn snapshot_layout_under(&self, space_id: &str, workspace: &str) {
+        let pane_font_scale = |pane_id| self.persisted_font_scale_for_pane(pane_id);
+        if self.dedicated_thread.is_some() {
+            crate::workspace_threads::snapshot_own_window_thread_layout(
+                space_id,
+                workspace,
+                self.mux_window_id,
+                pane_font_scale,
+            );
+        } else {
+            crate::workspace_threads::snapshot_active_space_thread_layout_with_font_scales(
+                space_id,
+                workspace,
+                self.mux_window_id,
+                pane_font_scale,
+            );
+        }
     }
 
     /// The Space a layout snapshot should be recorded under. A window
@@ -2192,12 +2206,7 @@ impl super::TermWindow {
             return;
         };
         let space_id = self.space_id_for_layout_snapshot(window.get_workspace());
-        crate::workspace_threads::snapshot_active_space_thread_layout_with_font_scales(
-            &space_id,
-            window.get_workspace(),
-            self.mux_window_id,
-            |pane_id| self.persisted_font_scale_for_pane(pane_id),
-        );
+        self.snapshot_layout_under(&space_id, window.get_workspace());
     }
 
     fn apply_font_scales_to_mux_window_panes(

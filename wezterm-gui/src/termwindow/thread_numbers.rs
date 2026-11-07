@@ -529,9 +529,7 @@ impl TermWindow {
         let Some(thread_id) = threads.get(index).map(|thread| thread.id.clone()) else {
             return;
         };
-        if !self.open_remote_workspace_thread_without_connecting(&thread_id, window) {
-            self.activate_workspace_thread(thread_id, window);
-        }
+        self.pick_sidebar_thread(thread_id, window);
         window.invalidate();
     }
 }
