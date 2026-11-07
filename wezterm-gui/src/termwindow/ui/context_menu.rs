@@ -9,9 +9,7 @@ use ::window::{
     MousePress, WindowOps,
 };
 use anyhow::Context;
-use mux::pane::Pane;
 use std::rc::Rc;
-use std::sync::Arc;
 use wezterm_font::LoadedFont;
 
 // Design pixels (2x macOS backing), scaled via ui_px/ui_f32 like the rest
@@ -664,7 +662,6 @@ impl crate::TermWindow {
     pub(crate) fn mouse_event_context_menu(
         &mut self,
         event: &MouseEvent,
-        pane: &Arc<dyn Pane>,
         context: &dyn WindowOps,
     ) -> bool {
         let Some(menu) = self.context_menu.as_mut() else {
@@ -699,8 +696,12 @@ impl crate::TermWindow {
                         context.invalidate();
                         match action {
                             ContextMenuAction::KeyAssignment(action) => {
-                                if let Err(err) = self.perform_key_assignment(pane, &action) {
-                                    log::error!("context menu action failed: {err:#}");
+                                if let Some(pane) = self.pane_for_key_bindings() {
+                                    if let Err(err) = self.perform_key_assignment(&pane, &action) {
+                                        log::error!("context menu action failed: {err:#}");
+                                    }
+                                } else {
+                                    log::warn!("context menu action with no pane: {action:?}");
                                 }
                             }
                             ContextMenuAction::ApplicationAction(action_id) => {
@@ -723,10 +724,11 @@ impl crate::TermWindow {
                 self.dismiss_fallback_context_menu();
                 context.invalidate();
                 // A right click goes on to open the menu of whatever it is on
-                // -- a tab, a sidebar row, or a terminal set to show its menu --
-                // where it is. One on a terminal that would paste or copy
-                // only closes this one.
-                let on_terminal = self.resolve_ui_item(event).is_none();
+                // -- a tab, a sidebar row, a page, or a terminal set to show
+                // its menu -- where it is. One on a terminal that would paste
+                // or copy only closes this one.
+                let on_terminal =
+                    !self.content_view_foreground() && self.resolve_ui_item(event).is_none();
                 if !on_terminal
                     || crate::termwindow::mouseevent::right_click_mode(event.modifiers)
                         == crate::native_settings::NativeRightClick::Menu

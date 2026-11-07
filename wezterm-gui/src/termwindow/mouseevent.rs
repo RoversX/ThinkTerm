@@ -2335,9 +2335,7 @@ impl super::TermWindow {
             return;
         }
 
-        // The command palette owns all pointer traffic while open. Dispatched
-        // before the pane-dependent context-menu branch so it also works when
-        // there is no active pane (content view foreground).
+        // The command palette owns all pointer traffic while open.
         if self.mouse_event_command_palette(&event, context) {
             self.release_pointer_ownership(&event);
             return;
@@ -2348,15 +2346,17 @@ impl super::TermWindow {
             return;
         }
 
-        if let Some(pane) = pane.as_ref() {
-            if self.mouse_event_context_menu(&event, pane, context) {
-                self.release_pointer_ownership(&event);
-                return;
-            }
-        } else if matches!(
-            self.current_mouse_capture,
-            Some(MouseCapture::TerminalPane(_))
-        ) {
+        // Not only over a terminal: a menu also opens over a page with none.
+        if self.mouse_event_context_menu(&event, context) {
+            self.release_pointer_ownership(&event);
+            return;
+        }
+        if pane.is_none()
+            && matches!(
+                self.current_mouse_capture,
+                Some(MouseCapture::TerminalPane(_))
+            )
+        {
             self.current_mouse_capture = None;
         }
 
