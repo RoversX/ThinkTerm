@@ -1494,6 +1494,9 @@ pub(crate) struct SidebarRowDragState {
     /// single while the pointer parks in an edge hot zone.
     pub autoscroll_scheduled: bool,
     pub target: Option<SidebarInsertTarget>,
+    /// A thread row out of the sidebar: let go of there, it gets a window
+    /// of its own.
+    pub tear_off: Option<thread_window::ThreadTearOff>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3368,6 +3371,8 @@ pub struct TermWindow {
     /// The thread this window exists to show: a window of its own, with no
     /// sidebars, opened from the thread list (see `thread_window`).
     dedicated_thread: Option<crate::workspace_threads::WorkspaceThreadId>,
+    /// A tear-off card let go of, up until the thread's window takes over.
+    thread_card_landing: Option<thread_window::ThreadCardWindow>,
     /// The page standing in here for a thread open in its own window.
     elsewhere_page: Option<thread_window::ThreadElsewherePage>,
     /// A thread to give its own window as soon as it is on screen here.
@@ -5372,6 +5377,7 @@ impl TermWindow {
             active_space_id,
             dies_with_mux_window,
             dedicated_thread: own_window.as_ref().map(|request| request.thread_id.clone()),
+            thread_card_landing: None,
             elsewhere_page: None,
             thread_bound_for_own_window: None,
             threads_to_reopen: std::collections::VecDeque::new(),

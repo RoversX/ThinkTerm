@@ -1802,7 +1802,7 @@ fn localized_shade_label(shade: crate::native_settings::NativeShade) -> String {
 }
 
 /// Whether this macOS has Liquid Glass to offer.
-fn liquid_glass_available() -> bool {
+pub(crate) fn liquid_glass_available() -> bool {
     #[cfg(target_os = "macos")]
     {
         ::window::os::macos::liquid_glass_available()

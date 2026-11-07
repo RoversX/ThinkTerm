@@ -2589,7 +2589,9 @@ impl super::TermWindow {
                             self.update_sidebar_row_drag_target(event.coords);
                         }
                         if let Some(state) = self.sidebar_row_drag.take() {
-                            if state.active {
+                            if state.tear_off.as_ref().is_some_and(|off| off.is_out()) {
+                                self.drop_thread_out_of_sidebar(state, event.screen_coords);
+                            } else if state.active {
                                 self.drop_sidebar_row_drag(state, context);
                             } else {
                                 // Never crossed the drag threshold: this was
@@ -3435,6 +3437,7 @@ impl super::TermWindow {
             draggable,
             autoscroll_scheduled: false,
             target: None,
+            tear_off: None,
         });
         self.dragging.replace((item, event));
     }
@@ -3447,8 +3450,12 @@ impl super::TermWindow {
         context: &dyn WindowOps,
     ) {
         let mut dragging_active = false;
+        // A pinned row has no place to move to, but comes out like any other.
+        let out_of_sidebar = !self.pointer_over_workspace_sidebar(event.coords);
         if let Some(state) = self.sidebar_row_drag.as_mut() {
-            if state.draggable && !state.active {
+            let tears_off =
+                out_of_sidebar && matches!(state.kind, super::SidebarRowKind::Thread { .. });
+            if (state.draggable || tears_off) && !state.active {
                 let dx = event.coords.x - state.start.x;
                 let dy = event.coords.y - state.start.y;
                 // ~5px of travel turns the pending click into a drag
@@ -3460,7 +3467,14 @@ impl super::TermWindow {
             dragging_active = state.active;
         }
         if dragging_active {
-            self.autoscroll_sidebar_for_row_drag(event.coords.y);
+            let torn_off = self
+                .sidebar_row_drag
+                .as_ref()
+                .and_then(|state| state.tear_off.as_ref())
+                .is_some_and(|tear_off| tear_off.is_out());
+            if !torn_off {
+                self.autoscroll_sidebar_for_row_drag(event.coords.y);
+            }
             self.update_sidebar_row_drag_target(event.coords);
             context.set_cursor(Some(MouseCursor::Hand));
             context.invalidate();
@@ -3549,11 +3563,11 @@ impl super::TermWindow {
         else {
             return;
         };
-        let sidebar_x_ok = self
-            .ui_items
-            .iter()
-            .find(|candidate| candidate.item_type == UIItemType::WorkspaceSidebarBackground)
-            .is_some_and(|bg| coords.x >= bg.x as isize && coords.x < (bg.x + bg.width) as isize);
+        let sidebar_x_ok = self.pointer_over_workspace_sidebar(coords);
+        if let super::SidebarRowKind::Thread { thread_id, .. } = &kind {
+            self.aim_thread_tear_off(thread_id, !sidebar_x_ok);
+            self.move_thread_card_window();
+        }
         let rows: Vec<(String, isize, isize)> = match &kind {
             super::SidebarRowKind::Project(_) | super::SidebarRowKind::RefGroup(_) => {
                 folder_block_extents(&self.ui_items, &self.active_space_id)
@@ -3594,7 +3608,11 @@ impl super::TermWindow {
                 })
             }
         };
-        let target = if sidebar_x_ok && within_span {
+        let can_move = self
+            .sidebar_row_drag
+            .as_ref()
+            .is_some_and(|state| state.draggable);
+        let target = if sidebar_x_ok && within_span && can_move {
             sidebar_insert_position(&rows, coords.y).map(|before| {
                 // The rendered rows are only the VISIBLE ones: "after the
                 // last visible row" is the end of the viewport, not of the
@@ -3626,6 +3644,13 @@ impl super::TermWindow {
                 self.aim_sidebar_make_way();
             }
         }
+    }
+
+    fn pointer_over_workspace_sidebar(&self, coords: ::window::Point) -> bool {
+        self.ui_items
+            .iter()
+            .find(|candidate| candidate.item_type == UIItemType::WorkspaceSidebarBackground)
+            .is_some_and(|bg| coords.x >= bg.x as isize && coords.x < (bg.x + bg.width) as isize)
     }
 
     /// What a dragged thread row moves among, in order. A dragged reference

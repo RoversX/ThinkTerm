@@ -12,29 +12,50 @@
 //! window kept for the page alone. No thread owns that window and nothing
 //! snapshots it (`is_thread_page_workspace`). Without a tab it has no pane to
 //! run key bindings against, so the page brings an inert one.
+//!
+//! A row dragged out of the sidebar becomes a card, and goes back to being
+//! the row if it comes back. No window draws past its own edges, so the card
+//! is a little window of its own from the moment it sets out, following the
+//! pointer wherever on the screen it goes. That window is Liquid Glass where
+//! the system has it, with a surface on this window's GPU device showing the
+//! whole card as rendered here. Growing is the window opening up over a
+//! picture that stays where it is. It must never take the focus: a window
+//! that loses it drops the drag.
 
 use crate::frontend::front_end;
 use crate::termwindow::content_view::{
-    ContentView, ContentViewId, ContentViewResponse,
+    ContentView, ContentViewId, ContentViewResponse, TerminalPreviewRequest,
+    TerminalPreviewSnapshot,
 };
-use crate::quad::TripleLayerQuadAllocator;
-use crate::termwindow::{domain_is_attached, TermWindow, TermWindowNotif};
+use crate::quad::{HeapQuadAllocator, QuadClipRect, TripleLayerQuadAllocator};
+use crate::termwindow::render::draw::show_card_on_surface;
+use crate::termwindow::render::paint::{CardComposite, PendingCardRender};
+use crate::termwindow::webgpu::{CardRenderTexture, RawHandlePair};
+use crate::termwindow::{domain_is_attached, get_window_class, TermWindow, TermWindowNotif};
 use crate::ui::{
     rect, ControlState, DrawContext, InteractionState, UiContext, UiPalette,
     WidgetKind,
 };
 use crate::workspace_threads::{self, WorkspaceThreadId};
+use anyhow::Context as _;
 use config::keyassignment::KeyAssignment;
-use config::TermConfig;
+use config::window::WindowLevel;
+use config::{Dimension, MacosWindowGlass, TermConfig};
 use mux::pane::Pane;
+use mux::tab::TabId;
 use mux::window::WindowId as MuxWindowId;
 use mux::Mux;
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use wezterm_font::LoadedFont;
 use wezterm_term::{KeyCode, KeyModifiers};
-use window::{MouseEventKind as WMEK, MousePress, RectF, ScreenPoint, Window, WindowOps};
+use window::{
+    Dimensions, FloatingCard, MouseEventKind as WMEK, MousePress, RectF, RequestedWindowGeometry, ScreenPoint,
+    Window, WindowDecorations, WindowOps, WindowState,
+};
 
 /// Keeps the page's mux window alive with no tab in it, whichever view is in
 /// front of the page at the moment.
@@ -46,6 +67,18 @@ const HERO_ICON_SIZE: f32 = 76.0;
 const BUTTON_MARGIN: f32 = 6.0;
 const BUTTON_PADDING: f32 = 16.0;
 const PAD: f32 = 32.0;
+
+/// The card a thread row becomes as it leaves the sidebar.
+const TEAR_OFF_CARD_WIDTH: f32 = 424.0;
+const TEAR_OFF_CARD_RADIUS: f32 = 20.0;
+const TEAR_OFF_CARD_PADDING: f32 = 8.0;
+/// Round the same centres as the card's corners, whatever those are.
+const TEAR_OFF_THUMBNAIL_RADIUS: f32 = TEAR_OFF_CARD_RADIUS - TEAR_OFF_CARD_PADDING;
+const TEAR_OFF_GROW: Duration = Duration::from_millis(220);
+/// How long the card this window draws takes to give way to its own window.
+const TEAR_OFF_HANDOVER: Duration = Duration::from_millis(100);
+/// Room around the card in its own window for the shadow to fall in.
+const TEAR_OFF_CARD_MARGIN: f32 = 56.0;
 
 /// A page standing in for a thread that is open in a window of its own.
 pub(crate) struct ThreadElsewherePage {
@@ -63,6 +96,118 @@ pub(crate) struct ThreadBoundForOwnWindow {
     /// What this window was showing before it opened the thread to get it
     /// running, to go back to.
     return_to: Option<WorkspaceThreadId>,
+}
+
+/// A thread row dragged out of the sidebar.
+pub(crate) struct ThreadTearOff {
+    started: Instant,
+    /// The thread's terminal as it stood, for a thread that is running.
+    preview: Option<(TabId, Arc<TerminalPreviewSnapshot>)>,
+    /// Bound for the card, or back for the row.
+    out: bool,
+    /// When it set off that way, and how far out it was then.
+    turned: Instant,
+    turned_from: f32,
+    place: TearOffPlace,
+}
+
+impl ThreadTearOff {
+    fn new(preview: Option<(TabId, Arc<TerminalPreviewSnapshot>)>, now: Instant) -> Self {
+        Self {
+            started: now,
+            preview,
+            out: true,
+            turned: now,
+            turned_from: 0.0,
+            place: TearOffPlace::Growing,
+        }
+    }
+
+    pub(crate) fn is_out(&self) -> bool {
+        self.out
+    }
+
+    fn aim(&mut self, out: bool, now: Instant) {
+        if out != self.out {
+            self.turned_from = self.grown(now);
+            self.turned = now;
+            self.out = out;
+        }
+    }
+
+    fn travelled(&self, now: Instant) -> f32 {
+        let elapsed = now.saturating_duration_since(self.turned);
+        (elapsed.as_secs_f32() / TEAR_OFF_GROW.as_secs_f32()).min(1.0)
+    }
+
+    fn settled(&self, now: Instant) -> bool {
+        self.travelled(now) >= 1.0
+    }
+
+    /// How far from the row it is, 0 to 1.
+    fn grown(&self, now: Instant) -> f32 {
+        let target = if self.out { 1.0 } else { 0.0 };
+        let eased = crate::ui::anim::Easing::OutCubic.apply(self.travelled(now));
+        self.turned_from + (target - self.turned_from) * eased
+    }
+
+    fn into_card_window(self) -> Option<ThreadCardWindow> {
+        match self.place {
+            TearOffPlace::Out { card, .. } => Some(card),
+            _ => None,
+        }
+    }
+}
+
+/// Where a card is being drawn.
+enum TearOffPlace {
+    /// Here, with its own window not asked for yet.
+    Growing,
+    /// Here for good.
+    Here,
+    /// Here, with its own window on the way.
+    Leaving {
+        chrome: Rc<CardRenderTexture>,
+        dimensions: Dimensions,
+    },
+    /// In its own window, since `since`.
+    Out {
+        card: ThreadCardWindow,
+        since: Instant,
+    },
+}
+
+/// The little window a card moves into, gone when this is.
+pub(crate) struct ThreadCardWindow {
+    window: Window,
+    surface: wgpu::Surface<'static>,
+    _handle: RawHandlePair,
+    /// The card's surface and title, as much of it as the window shows.
+    chrome: Rc<CardRenderTexture>,
+    /// The whole card's size, which the surface keeps as the window grows.
+    dimensions: Dimensions,
+    /// The size the window was last given.
+    size: Cell<(usize, usize)>,
+    has_thumbnail: bool,
+}
+
+impl Drop for ThreadCardWindow {
+    fn drop(&mut self) {
+        self.window.close();
+    }
+}
+
+/// Where the card goes `grown` of the way (0 to 1) from the row it comes
+/// from: over the pointer, held about its title.
+fn tear_off_card_rect(row: RectF, pointer: (f32, f32), size: (f32, f32), grown: f32) -> RectF {
+    let width = row.size.width + (size.0 - row.size.width) * grown;
+    let height = row.size.height + (size.1 - row.size.height) * grown;
+    let held_x = (pointer.0 - row.origin.x) / row.size.width.max(1.0);
+    let held_y = (pointer.1 - row.origin.y) / row.size.height.max(1.0);
+    let title_at = row.size.height / 2.0 / height.max(1.0);
+    let x = pointer.0 - width * held_x;
+    let y = pointer.1 - height * (held_y + (title_at - held_y) * grown);
+    rect(x, y, width, height)
 }
 
 /// What a thread's own window is opened with.
@@ -226,6 +371,7 @@ impl TermWindow {
             thread_id: thread_id.clone(),
             position,
         };
+        let home = window.clone();
         promise::spawn::spawn(async move {
             match TermWindow::new_thread_window(mux_window_id, space_id, request).await {
                 Ok(()) => {
@@ -239,6 +385,9 @@ impl TermWindow {
                     front_end().thread_window_not_opened(&thread_id);
                 }
             }
+            home.notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                term_window.thread_card_landing = None;
+            })));
         })
         .detach();
     }
@@ -286,6 +435,624 @@ impl TermWindow {
             .is_some_and(|state| !state.is_remote)
             && workspace_threads::client_domain_for_space(&self.active_space_id).is_none();
         here && local
+    }
+
+    /// A dragged thread row has left the sidebar, or come back.
+    pub(crate) fn aim_thread_tear_off(&mut self, thread_id: &str, out: bool) {
+        let Some(state) = self.sidebar_row_drag.as_mut() else {
+            return;
+        };
+        if !state.active {
+            return;
+        }
+        let now = Instant::now();
+        match state.tear_off.as_mut() {
+            Some(tear_off) => tear_off.aim(out, now),
+            None if out => {
+                state.tear_off = Some(ThreadTearOff::new(thread_preview(thread_id), now));
+            }
+            None => {}
+        }
+    }
+
+    /// Fit the card's window to how far out it is and where the pointer is.
+    pub(crate) fn move_thread_card_window(&self) {
+        let Some(state) = self.sidebar_row_drag.as_ref() else {
+            return;
+        };
+        let Some(tear_off) = state.tear_off.as_ref() else {
+            return;
+        };
+        if let TearOffPlace::Out { card, .. } = &tear_off.place {
+            let rect =
+                self.thread_tear_off_card(&state.grip, state.current, tear_off.grown(Instant::now()));
+            self.place_thread_card_window(&card.window, &card.size, rect, state.current);
+        }
+    }
+
+    fn place_thread_card_window(
+        &self,
+        window: &Window,
+        size: &Cell<(usize, usize)>,
+        rect: RectF,
+        pointer: ::window::Point,
+    ) {
+        let wanted = (
+            rect.size.width.round() as usize,
+            rect.size.height.round() as usize,
+        );
+        if size.replace(wanted) != wanted {
+            window.resize_floating(wanted.0 as f32, wanted.1 as f32);
+        }
+        if let Some((event, home)) = self.current_mouse_event.as_ref().zip(self.window.as_ref()) {
+            let margin = self.ui_f32(TEAR_OFF_CARD_MARGIN);
+            let to_screen = home.screen_units_per_pixel();
+            window.set_window_position(ScreenPoint::new(
+                event.screen_coords.x
+                    - ((pointer.x as f32 - rect.origin.x + margin) * to_screen).round() as isize,
+                event.screen_coords.y
+                    - ((pointer.y as f32 - rect.origin.y + margin) * to_screen).round() as isize,
+            ));
+        }
+    }
+
+    /// Windows and Linux stop at this window's edge until this has been
+    /// tried on them. Wayland lets no program place a window, and the whole
+    /// screen is this window when it is full screen.
+    fn thread_card_can_leave_window(&self) -> bool {
+        cfg!(target_os = "macos")
+            && self.webgpu.is_some()
+            && !self.window_state.contains(WindowState::FULL_SCREEN)
+    }
+
+    /// Render the whole card for a window of its own, and have that made.
+    fn send_thread_card_out(&mut self) -> anyhow::Result<TearOffPlace> {
+        let state = self
+            .sidebar_row_drag
+            .as_ref()
+            .context("a tear-off card with no drag")?;
+        let title = state.title.clone();
+        let row_height = state.grip.height as usize;
+        let crate::termwindow::SidebarRowKind::Thread { thread_id, .. } = &state.kind else {
+            anyhow::bail!("a tear-off card with no thread");
+        };
+        let thread_id = thread_id.clone();
+        let glass = crate::settings_window::liquid_glass_available();
+        let card = self.thread_tear_off_card(&state.grip, state.current, 1.0);
+        let started = state
+            .tear_off
+            .as_ref()
+            .context("a tear-off card with no tear-off")?
+            .started;
+
+        let mut heap = HeapQuadAllocator::default();
+        self.paint_tear_off_chrome(
+            &mut TripleLayerQuadAllocator::Heap(&mut heap),
+            card,
+            &thread_id,
+            &title,
+            row_height,
+            0.0,
+            !glass,
+            1.0,
+        )?;
+        let webgpu = self.webgpu.as_ref().context("no webgpu state")?;
+        let texture = Rc::new(CardRenderTexture::copyable(
+            (card.size.width.ceil() as u32).max(1),
+            (card.size.height.ceil() as u32).max(1),
+            webgpu,
+        )?);
+        let (first_vertex, quad_count) = {
+            let mut frame_verts = self.card_frame_verts.borrow_mut();
+            let base = frame_verts.len();
+            heap.extract_vertices(&mut frame_verts);
+            (base, (frame_verts.len() - base) / 4)
+        };
+        self.pending_card_renders
+            .borrow_mut()
+            .push(PendingCardRender {
+                texture: Rc::clone(&texture),
+                first_vertex,
+                quad_count,
+                area: card,
+                corner_radius: 0.0,
+            });
+
+        let dimensions = Dimensions {
+            pixel_width: texture.width as usize,
+            pixel_height: texture.height as usize,
+            dpi: self.dimensions.dpi,
+        };
+        let window = self
+            .window
+            .clone()
+            .context("a tear-off card with no window")?;
+        let config = self.config.adjusted(|config| {
+            config.window_background_opacity = 0.0;
+            config.macos_window_background_blur = 0;
+            // The shadow is the card's own: the system's comes with a line
+            // round the window.
+            config.window_decorations =
+                WindowDecorations::NONE | WindowDecorations::MACOS_FORCE_DISABLE_SHADOW;
+            config.macos_window_glass = if glass {
+                MacosWindowGlass::Clear
+            } else {
+                MacosWindowGlass::Blur
+            };
+        });
+        let fonts = Rc::clone(&self.fonts);
+        let geometry = RequestedWindowGeometry {
+            width: Dimension::Pixels(dimensions.pixel_width as f32),
+            height: Dimension::Pixels(dimensions.pixel_height as f32),
+            ..Default::default()
+        };
+        promise::spawn::spawn(async move {
+            let opened = Window::new_window(
+                &get_window_class(),
+                "",
+                geometry,
+                Some(&config),
+                fonts,
+                |_, _| {},
+            )
+            .await;
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                match opened {
+                    Ok(card) => term_window.thread_card_window_opened(started, card),
+                    Err(err) => {
+                        log::warn!("no window for the tear-off card: {err:#}");
+                        term_window.keep_thread_card_here(started);
+                    }
+                }
+            })));
+        })
+        .detach();
+
+        Ok(TearOffPlace::Leaving {
+            chrome: texture,
+            dimensions,
+        })
+    }
+
+    fn keep_thread_card_here(&mut self, started: Instant) {
+        if let Some(tear_off) = self.thread_tear_off_mut(started) {
+            tear_off.place = TearOffPlace::Here;
+        }
+        self.invalidate_window();
+    }
+
+    fn thread_tear_off_mut(&mut self, started: Instant) -> Option<&mut ThreadTearOff> {
+        self.sidebar_row_drag
+            .as_mut()
+            .and_then(|state| state.tear_off.as_mut())
+            .filter(|tear_off| tear_off.started == started)
+    }
+
+    fn thread_card_window_opened(&mut self, started: Instant, window: Window) {
+        let leaving = self
+            .thread_tear_off_mut(started)
+            .map(|tear_off| std::mem::replace(&mut tear_off.place, TearOffPlace::Here));
+        let Some(TearOffPlace::Leaving { chrome, dimensions }) = leaving else {
+            // The drag ended while it was being made.
+            window.close();
+            return;
+        };
+        match self.show_thread_card_window(&window, chrome, dimensions) {
+            Ok(card) => {
+                if let Some(tear_off) = self.thread_tear_off_mut(started) {
+                    tear_off.place = TearOffPlace::Out {
+                        card,
+                        since: Instant::now(),
+                    };
+                }
+            }
+            Err(err) => {
+                log::warn!("the tear-off card stays in its window: {err:#}");
+                window.close();
+            }
+        }
+        self.invalidate_window();
+    }
+
+    fn show_thread_card_window(
+        &self,
+        window: &Window,
+        chrome: Rc<CardRenderTexture>,
+        dimensions: Dimensions,
+    ) -> anyhow::Result<ThreadCardWindow> {
+        let webgpu = self.webgpu.as_ref().context("no webgpu state")?;
+        let (surface, handle) = webgpu.surface_for(
+            window,
+            dimensions.pixel_width as u32,
+            dimensions.pixel_height as u32,
+        )?;
+        window.set_window_level(WindowLevel::AlwaysOnTop);
+        let state = self
+            .sidebar_row_drag
+            .as_ref()
+            .context("a tear-off card with no drag")?;
+        let grown = state
+            .tear_off
+            .as_ref()
+            .map_or(0.0, |tear_off| tear_off.grown(Instant::now()));
+        let rect = self.thread_tear_off_card(&state.grip, state.current, grown);
+        let width = rect.size.width.round();
+        let height = rect.size.height.round();
+        let scale = self
+            .window
+            .as_ref()
+            .map_or(1.0, |home| home.pixels_per_point());
+        window.show_floating(FloatingCard {
+            fade_in: TEAR_OFF_HANDOVER,
+            scale,
+            width,
+            height,
+            full_width: dimensions.pixel_width as f32,
+            full_height: dimensions.pixel_height as f32,
+            margin: self.ui_f32(TEAR_OFF_CARD_MARGIN),
+            corner_radius: self.ui_f32(TEAR_OFF_CARD_RADIUS),
+            title_height: state.grip.height as f32,
+            thumbnail_inset: self.ui_f32(TEAR_OFF_CARD_PADDING),
+            thumbnail_radius: self.ui_f32(TEAR_OFF_THUMBNAIL_RADIUS),
+        });
+        let size = Cell::new((width as usize, height as usize));
+        self.place_thread_card_window(window, &size, rect, state.current);
+        show_card_on_surface(webgpu, &surface, dimensions, &chrome, None)?;
+        Ok(ThreadCardWindow {
+            window: window.clone(),
+            surface,
+            _handle: handle,
+            chrome,
+            dimensions,
+            size,
+            has_thumbnail: false,
+        })
+    }
+
+    /// The picture is ready, in a frame already submitted: put it on the card.
+    fn show_thumbnail_on_thread_card(&mut self) {
+        let Some(webgpu) = self.webgpu.clone() else {
+            return;
+        };
+        let padding = self.ui_f32(TEAR_OFF_CARD_PADDING);
+        let picture = self.sidebar_row_drag.as_ref().and_then(|state| {
+            let (tab_id, _) = state.tear_off.as_ref()?.preview.as_ref()?;
+            Some((self.preview_picture(*tab_id)?, state.grip.height as f32))
+        });
+        let Some((texture, title_height)) = picture else {
+            return;
+        };
+        let Some(state) = self.sidebar_row_drag.as_mut() else {
+            return;
+        };
+        let Some(TearOffPlace::Out { card, .. }) =
+            state.tear_off.as_mut().map(|tear_off| &mut tear_off.place)
+        else {
+            return;
+        };
+        let dest = rect(
+            padding,
+            title_height,
+            texture.width as f32,
+            texture.height as f32,
+        );
+        let thumbnail = CardComposite {
+            texture,
+            dest,
+            clip: dest,
+            opacity: 1.0,
+            zindex: 0,
+        };
+        let shown = show_card_on_surface(
+            &webgpu,
+            &card.surface,
+            card.dimensions,
+            &card.chrome,
+            Some(&thumbnail),
+        );
+        match shown {
+            Ok(()) => card.has_thumbnail = true,
+            Err(err) => log::warn!("no thumbnail on the tear-off card: {err:#}"),
+        }
+    }
+
+    pub(crate) fn drop_thread_out_of_sidebar(
+        &mut self,
+        mut state: crate::termwindow::SidebarRowDragState,
+        pointer_on_screen: ScreenPoint,
+    ) {
+        self.sidebar_make_way.finish(false);
+        // Stays up until there is a window to take its place.
+        let card_window = state
+            .tear_off
+            .take()
+            .and_then(ThreadTearOff::into_card_window);
+        let crate::termwindow::SidebarRowKind::Thread { thread_id, .. } = state.kind else {
+            return;
+        };
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let card = self.thread_tear_off_card(&state.grip, state.current, 1.0);
+        let to_screen = window.screen_units_per_pixel();
+        let position = ScreenPoint::new(
+            pointer_on_screen.x
+                - ((state.current.x as f32 - card.origin.x) * to_screen) as isize,
+            pointer_on_screen.y
+                - ((state.current.y as f32 - card.origin.y) * to_screen) as isize,
+        );
+        let had_window = front_end().thread_is_in_own_window(&thread_id);
+        self.open_thread_in_own_window(thread_id.clone(), Some(position), &window);
+        // Only a window on its way takes over from the card, and says when.
+        if !had_window && front_end().thread_is_in_own_window(&thread_id) {
+            self.thread_card_landing = card_window;
+        }
+    }
+
+    fn thread_tear_off_card(
+        &self,
+        grip: &crate::termwindow::DragGrip,
+        pointer: ::window::Point,
+        grown: f32,
+    ) -> RectF {
+        let row = rect(
+            pointer.x as f32 - grip.x,
+            pointer.y as f32 - grip.y,
+            grip.width as f32,
+            grip.height as f32,
+        );
+        let width = self.ui_f32(TEAR_OFF_CARD_WIDTH);
+        let terminal = self.terminal_content_rect();
+        let aspect = terminal.size.height / terminal.size.width.max(1.0);
+        tear_off_card_rect(
+            row,
+            (pointer.x as f32, pointer.y as f32),
+            (width, width * aspect),
+            grown,
+        )
+    }
+
+    /// The card under the pointer while a thread row is out of the sidebar.
+    /// False when no row is.
+    fn tear_off_surface(&self) -> window::color::LinearRgba {
+        let chrome = self.chrome();
+        crate::termwindow::render::paint::drag_ghost_surface(
+            chrome.sidebar_row_active_bg,
+            self.sidebar_surface(chrome.workspace_sidebar_bg),
+        )
+    }
+
+    /// The card's surface and the row it came from, for this window or for
+    /// its own.
+    fn paint_tear_off_chrome(
+        &self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        card: RectF,
+        thread_id: &str,
+        title: &str,
+        row_height: usize,
+        grown: f32,
+        solid: bool,
+        opacity: f32,
+    ) -> anyhow::Result<()> {
+        let chrome = self.chrome();
+        let surface = self.tear_off_surface();
+        if solid {
+            let radius = self.ui_f32(TEAR_OFF_CARD_RADIUS);
+            let gl_state = self
+                .render_state
+                .as_ref()
+                .context("tear-off card without a render state")?;
+            let ctx = DrawContext::new(gl_state, self.dimensions, &self.render_metrics);
+            let shadow = window::color::LinearRgba::with_components(
+                0.0,
+                0.0,
+                0.0,
+                opacity * grown * if chrome.is_dark() { 0.5 } else { 0.22 },
+            );
+            ctx.draw_elevated_surface(
+                layers,
+                0,
+                card,
+                surface.mul_alpha(opacity),
+                chrome.sidebar_row_active_border.mul_alpha(opacity),
+                shadow,
+                radius,
+            )?;
+        }
+        let mut row = HeapQuadAllocator::default();
+        self.paint_thread_row_title(
+            &mut TripleLayerQuadAllocator::Heap(&mut row),
+            thread_id,
+            title,
+            card.size.width as usize,
+            row_height,
+            surface,
+        )?;
+        let clip = QuadClipRect::from_top_left_pixels(
+            card.min_x(),
+            card.min_y(),
+            card.max_x(),
+            card.max_y(),
+            &self.dimensions,
+        );
+        row.apply_to_clipped_at(layers, card.origin.x, card.origin.y, clip, opacity)
+    }
+
+    pub(crate) fn paint_thread_tear_off(&mut self, now: Instant) -> anyhow::Result<bool> {
+        let Some(state) = self
+            .sidebar_row_drag
+            .as_ref()
+            .filter(|state| state.active && state.tear_off.is_some())
+        else {
+            return Ok(false);
+        };
+        let Some(tear_off) = state.tear_off.as_ref() else {
+            return Ok(false);
+        };
+        // Back at its row, it is the row again.
+        if !tear_off.out && tear_off.settled(now) {
+            if let Some(state) = self.sidebar_row_drag.as_mut() {
+                state.tear_off = None;
+            }
+            return Ok(false);
+        }
+        let grown = tear_off.grown(now);
+        let travelling = !tear_off.settled(now);
+        // Going, under the window that is taking over from it.
+        let mut opacity = 1.0;
+        let mut needs_thumbnail = true;
+        let mut in_own_window = false;
+        if let TearOffPlace::Out { card, since } = &tear_off.place {
+            let gone = now.saturating_duration_since(*since).as_secs_f32()
+                / TEAR_OFF_HANDOVER.as_secs_f32();
+            opacity = (1.0 - gone).max(0.0);
+            needs_thumbnail = !card.has_thumbnail;
+            in_own_window = true;
+        }
+        let growing = matches!(tear_off.place, TearOffPlace::Growing);
+        let preview = tear_off.preview.clone();
+        let title = state.title.clone();
+        let row_height = state.grip.height as usize;
+        let thread_id = match &state.kind {
+            crate::termwindow::SidebarRowKind::Thread { thread_id, .. } => thread_id.clone(),
+            _ => return Ok(false),
+        };
+        let full_size = self
+            .thread_tear_off_card(&state.grip, state.current, 1.0)
+            .size;
+        let mut card = self.thread_tear_off_card(&state.grip, state.current, grown);
+        // Whole inside the window, while this window is the one drawing it.
+        let room = (
+            (self.dimensions.pixel_width as f32 - card.size.width).max(0.0),
+            (self.dimensions.pixel_height as f32 - card.size.height).max(0.0),
+        );
+        card.origin.x = card.origin.x.clamp(0.0, room.0);
+        card.origin.y = card.origin.y.clamp(0.0, room.1);
+        if travelling {
+            self.move_thread_card_window();
+        }
+        if travelling || (in_own_window && opacity > 0.0) {
+            self.update_next_frame_time(Some(now + Duration::from_millis(16)));
+        }
+        if opacity <= 0.0 && !needs_thumbnail {
+            return Ok(true);
+        }
+
+        let padding = self.ui_f32(TEAR_OFF_CARD_PADDING);
+        let layer = {
+            let gl_state = self
+                .render_state
+                .as_ref()
+                .context("tear-off card without a render state")?;
+            gl_state.layer_for_zindex(crate::termwindow::DRAG_GHOST_ZINDEX)?
+        };
+        let mut layers = layer.quad_allocator();
+        if opacity > 0.0 {
+            self.paint_tear_off_chrome(
+                &mut layers,
+                card,
+                &thread_id,
+                &title,
+                row_height,
+                grown,
+                true,
+                opacity,
+            )?;
+        }
+        // On glass the card's window cuts the corners, as the system does.
+        let corner_radius = if crate::settings_window::liquid_glass_available() {
+            0.0
+        } else {
+            self.ui_f32(TEAR_OFF_THUMBNAIL_RADIUS)
+        };
+        let background = Some(self.palette().background.to_linear());
+        let mut thumbnail_ready = false;
+        if let Some((tab_id, snapshot)) = preview {
+            let title_height = row_height as f32;
+            let width = full_size.width - padding * 2.0;
+            let height = (full_size.height - title_height - padding).max(0.0);
+            if height > 0.0 {
+                // Under way from the moment the row comes away, so as to be
+                // there when the card has grown to take it. A big terminal
+                // takes more than a frame, and is put together in place: it
+                // has to be built where it stays put, not on a moving card.
+                let area = rect(0.0, 0.0, width, height);
+                let request = TerminalPreviewRequest {
+                    tab_id,
+                    snapshot,
+                    area,
+                    clip: area,
+                    hold_scale: false,
+                    opacity: 1.0,
+                    prebuild: true,
+                    corner_radius,
+                    background,
+                };
+                self.paint_terminal_previews(&mut layers, std::slice::from_ref(&request))?;
+                let recorded = self.preview_thumbnail_recorded(tab_id);
+                let picture = self.preview_picture(tab_id);
+                thumbnail_ready = picture.is_some();
+                if !recorded {
+                    self.update_next_frame_time(Some(now + Duration::from_millis(16)));
+                } else if grown >= 1.0 && opacity > 0.0 {
+                    let dest = rect(
+                        card.origin.x + padding,
+                        card.origin.y + title_height,
+                        width,
+                        height,
+                    );
+                    match picture {
+                        // Over this card, not under it with the terminal behind.
+                        Some(texture) => self.card_composites.borrow_mut().push(CardComposite {
+                            texture,
+                            dest,
+                            clip: dest,
+                            opacity,
+                            zindex: crate::termwindow::DRAG_GHOST_ZINDEX,
+                        }),
+                        // OpenGL keeps it as quads, to play back where the
+                        // card is now.
+                        None => self.paint_terminal_previews(
+                            &mut layers,
+                            &[TerminalPreviewRequest {
+                                area: dest,
+                                clip: dest,
+                                prebuild: false,
+                                opacity,
+                                ..request
+                            }],
+                        )?,
+                    }
+                }
+            }
+        }
+        drop(layers);
+        if in_own_window && needs_thumbnail && thumbnail_ready {
+            if let Some(window) = self.window.as_ref() {
+                window.notify(TermWindowNotif::Apply(Box::new(|term_window| {
+                    term_window.show_thumbnail_on_thread_card();
+                })));
+            }
+        }
+        if growing {
+            let place = if self.thread_card_can_leave_window() {
+                self.send_thread_card_out().unwrap_or_else(|err| {
+                    log::warn!("the tear-off card stays in its window: {err:#}");
+                    TearOffPlace::Here
+                })
+            } else {
+                TearOffPlace::Here
+            };
+            if let Some(tear_off) = self
+                .sidebar_row_drag
+                .as_mut()
+                .and_then(|state| state.tear_off.as_mut())
+            {
+                tear_off.place = place;
+            }
+        }
+        Ok(true)
     }
 
     pub(crate) fn focus_thread_window(&self, thread_id: &str) {
@@ -606,6 +1373,17 @@ impl TermWindow {
     }
 }
 
+/// The running thread's terminal, to show on the card.
+fn thread_preview(thread_id: &str) -> Option<(TabId, Arc<TerminalPreviewSnapshot>)> {
+    let workspace = workspace_threads::thread_workspace_name(thread_id)?;
+    let mux_window_id = workspace_threads::window_to_show_in_workspace(&workspace)?;
+    let tab_id = Mux::get()
+        .get_active_tab_for_window(mux_window_id)?
+        .tab_id();
+    let snapshot = crate::termwindow::live_overview::capture_terminal_snapshot(tab_id)?;
+    Some((tab_id, Arc::new(snapshot)))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThreadPageAction {
     GoToWindow,
@@ -880,6 +1658,52 @@ mod tests {
             own_window_assignment(&KeyAssignment::SpawnTab(SpawnTabDomain::CurrentPaneDomain)),
             OwnWindowAssignment::Perform
         );
+    }
+
+    #[test]
+    fn a_card_leaving_a_row_starts_as_the_row_and_keeps_it_under_the_pointer() {
+        let row = rect(10.0, 40.0, 200.0, 30.0);
+        let pointer = (60.0, 55.0);
+        let card = tear_off_card_rect(row, pointer, (300.0, 200.0), 0.0);
+        assert_eq!((card.origin.x, card.origin.y), (10.0, 40.0));
+        assert_eq!((card.size.width, card.size.height), (200.0, 30.0));
+        for grown in [0.0, 0.25, 0.5, 1.0] {
+            let card = tear_off_card_rect(row, pointer, (300.0, 200.0), grown);
+            assert!(
+                card.origin.x <= pointer.0 && pointer.0 <= card.max_x(),
+                "at {}",
+                grown
+            );
+            assert!(
+                card.origin.y <= pointer.1 && pointer.1 <= card.max_y(),
+                "at {}",
+                grown
+            );
+        }
+    }
+
+    #[test]
+    fn a_card_turning_back_carries_on_from_where_it_had_got_to() {
+        let start = Instant::now();
+        let mut tear_off = ThreadTearOff::new(None, start);
+        assert_eq!(tear_off.grown(start), 0.0);
+        assert_eq!(tear_off.grown(start + TEAR_OFF_GROW), 1.0);
+
+        let halfway = start + TEAR_OFF_GROW / 2;
+        let reached = tear_off.grown(halfway);
+        tear_off.aim(false, halfway);
+        assert_eq!(tear_off.grown(halfway), reached);
+        assert!(!tear_off.settled(halfway));
+        assert_eq!(tear_off.grown(halfway + TEAR_OFF_GROW), 0.0);
+        assert!(tear_off.settled(halfway + TEAR_OFF_GROW));
+    }
+
+    #[test]
+    fn a_grown_card_is_held_by_its_title() {
+        let row = rect(10.0, 40.0, 200.0, 30.0);
+        let card = tear_off_card_rect(row, (60.0, 55.0), (300.0, 200.0), 1.0);
+        assert_eq!((card.size.width, card.size.height), (300.0, 200.0));
+        assert_eq!(55.0 - card.origin.y, 15.0);
     }
 
     #[test]

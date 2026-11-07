@@ -4558,12 +4558,80 @@ impl crate::TermWindow {
             .map(|item| (item.x as f32, item.y as f32))
     }
 
+    /// A thread's icon and name, for a row `height` tall with its top left
+    /// at the origin: what a card torn off the row keeps of it.
+    pub(crate) fn paint_thread_row_title(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        thread_id: &str,
+        title: &str,
+        width: usize,
+        height: usize,
+        surface: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let chrome = self.chrome();
+        let ui_font = self
+            .fonts
+            .title_font_with_size(crate::native_settings::sidebar_font_size(
+                &crate::native_settings::load_shared(),
+            ))
+            .context("thread row title font")?;
+        let ui_metrics = RenderMetrics::with_font_metrics(&ui_font.metrics());
+        let inset = self.ui_px(SIDEBAR_INSET);
+        let text_y = height.saturating_sub(ui_metrics.cell_size.height as usize) / 2;
+        let mux = Mux::get();
+        let active_workspace = self
+            .current_mux_workspace()
+            .unwrap_or_else(|| mux.active_workspace());
+        let view = self.workspace_sidebar_view(&active_workspace, &mux.iter_workspaces());
+        let suppress_own_active = self.sidebar_own_active_is_stale(&view, &active_workspace);
+        let Some((thread, dimmed, suppress_active)) =
+            thread_row_in_view(&view, thread_id, suppress_own_active)
+        else {
+            return Ok(());
+        };
+        let marks = self.sidebar_thread_row_marks()?;
+        let (text_x, marks_right) = self.paint_sidebar_thread_marks(
+            layers,
+            &marks,
+            thread,
+            inset + 2,
+            width.saturating_sub(inset),
+            0,
+            height,
+            surface,
+            false,
+            dimmed,
+            self.is_workspace_sidebar_thread_selected(thread, suppress_active),
+            1.0,
+            &chrome,
+            chrome.text,
+        )?;
+        self.paint_sidebar_name(
+            layers,
+            &ui_font,
+            ui_metrics,
+            title,
+            text_x,
+            text_y,
+            marks_right.saturating_sub(text_x + inset),
+            if dimmed {
+                chrome.secondary_text.mul_alpha(0.7)
+            } else {
+                chrome.text
+            },
+        )
+    }
+
     /// The row a reorder carries, laid out as the list lays it out, on a
     /// surface of its own: at rest most rows have none to lift. Its buttons
     /// stay behind: nothing on it can be pressed while it is carried. Let
     /// go of, it goes on to its place, and such a surface fades as it gets
     /// there, so that the row it becomes is no different.
     pub(crate) fn paint_sidebar_row_ghost(&mut self, now: Instant) -> anyhow::Result<()> {
+        if self.paint_thread_tear_off(now)? {
+            return Ok(());
+        }
         let drag = self.sidebar_row_drag.as_ref().filter(|drag| drag.active);
         let (kind, title, grip, origin, landed) = if let Some(state) = drag {
             let window = (self.dimensions.pixel_width, self.dimensions.pixel_height);
@@ -4658,22 +4726,7 @@ impl crate::TermWindow {
         };
         match &kind {
             SidebarRowKind::Thread { thread_id, .. } => {
-                let own = view
-                    .pinned_threads
-                    .iter()
-                    .chain(view.projects.iter().flat_map(|project| &project.threads))
-                    .find(|thread| thread.id == *thread_id)
-                    .map(|thread| (thread, false, suppress_own_active));
-                let row = own.or_else(|| {
-                    view.ref_groups
-                        .iter()
-                        .flat_map(|group| &group.threads)
-                        .find(|reference| reference.thread.id == *thread_id)
-                        .map(|reference| {
-                            let dimmed = reference.dangling || !reference.origin_domain_attached;
-                            (&reference.thread, dimmed, false)
-                        })
-                });
+                let row = thread_row_in_view(&view, thread_id, suppress_own_active);
                 let Some((thread, dimmed, suppress_active)) = row else {
                     return Ok(());
                 };
@@ -5051,6 +5104,31 @@ fn notification_badge_pulse_phase(elapsed: Duration) -> Option<f32> {
     }
     let total_progress = elapsed.as_secs_f32() / NOTIFICATION_BADGE_PULSE_DURATION.as_secs_f32();
     Some((total_progress * NOTIFICATION_BADGE_PULSE_COUNT).fract())
+}
+
+/// A thread's row in `view`: the thread, whether it is dimmed, and whether its
+/// selection is suppressed.
+fn thread_row_in_view<'a>(
+    view: &'a workspace_threads::WorkspaceThreadsView,
+    thread_id: &str,
+    suppress_own_active: bool,
+) -> Option<(&'a workspace_threads::WorkspaceThreadView, bool, bool)> {
+    let own = view
+        .pinned_threads
+        .iter()
+        .chain(view.projects.iter().flat_map(|project| &project.threads))
+        .find(|thread| thread.id == thread_id)
+        .map(|thread| (thread, false, suppress_own_active));
+    own.or_else(|| {
+        view.ref_groups
+            .iter()
+            .flat_map(|group| &group.threads)
+            .find(|reference| reference.thread.id == thread_id)
+            .map(|reference| {
+                let dimmed = reference.dangling || !reference.origin_domain_attached;
+                (&reference.thread, dimmed, false)
+            })
+    })
 }
 
 /// The `shown` state a sidebar toggle should move to.
