@@ -809,6 +809,26 @@ pub trait WindowOps {
     /// Show a hidden window
     fn show(&self);
 
+    /// Bring the window up as `card`, fading in, without taking the focus
+    /// from the one that has it.
+    fn show_floating(&self, _card: FloatingCard) {
+        self.show();
+    }
+
+    /// Give a window shown as a card this much of the card, in pixels.
+    fn resize_floating(&self, _width: f32, _height: f32) {}
+
+    /// How many of this window's pixels make one point.
+    fn pixels_per_point(&self) -> f32 {
+        1.0
+    }
+
+    /// What one of this window's pixels comes to in the units of a
+    /// [`ScreenPoint`], for working out a position from the pointer's.
+    fn screen_units_per_pixel(&self) -> f32 {
+        1.0
+    }
+
     fn notify<T: Any + Send + Sync>(&self, t: T)
     where
         Self: Sized;
@@ -886,6 +906,11 @@ pub trait WindowOps {
     /// This is only implemented on backends that handle
     /// window movement on the server side (Wayland).
     fn request_drag_move(&self) {}
+
+    /// Move only for `request_drag_move`: a press on what the system takes
+    /// for its title bar leaves the window where it is, whatever is drawn
+    /// there.
+    fn set_moved_on_request_only(&self) {}
 
     /// Signal to the windowing system that the mouse is over
     /// a window dragging area.
@@ -1002,6 +1027,29 @@ pub trait WindowOps {
     ) -> anyhow::Result<Option<os::parameters::Parameters>> {
         Ok(None)
     }
+}
+
+/// A window that is a card floating over everything else: the card, with a
+/// shadow of the window's own in `margin` around it. All in pixels.
+#[derive(Debug, Clone, Copy)]
+pub struct FloatingCard {
+    pub fade_in: std::time::Duration,
+    /// The pixels of the window the card comes from, per point.
+    pub scale: f32,
+    /// How much of the card to show to begin with.
+    pub width: f32,
+    pub height: f32,
+    /// The whole card, as the window's picture has it.
+    pub full_width: f32,
+    pub full_height: f32,
+    pub margin: f32,
+    pub corner_radius: f32,
+    /// On glass, the picture shows through the title's band across the top
+    /// and a rectangle under it, this far in from the card's other sides,
+    /// with the system's corners.
+    pub title_height: f32,
+    pub thumbnail_inset: f32,
+    pub thumbnail_radius: f32,
 }
 
 #[derive(Debug, Clone, Default)]
