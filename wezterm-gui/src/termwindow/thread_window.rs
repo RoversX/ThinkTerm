@@ -318,7 +318,10 @@ impl TermWindow {
             let return_to = if self.elsewhere_page.is_some() {
                 None
             } else {
+                // Recorded as soon as it was picked, it may be this very
+                // thread, on its way here.
                 workspace_threads::recorded_active_thread_for_space(&self.active_space_id)
+                    .filter(|active| *active != thread_id)
             };
             self.thread_bound_for_own_window = Some(ThreadBoundForOwnWindow {
                 thread_id: thread_id.clone(),
@@ -359,9 +362,13 @@ impl TermWindow {
                 workspace_threads::activation_plan_for_thread(thread_id, &live_workspaces)
                     .is_some_and(|plan| !plan.needs_materialize)
             });
-            match return_to {
-                Some(return_to) => self.activate_workspace_thread(return_to, window),
-                None => self.show_thread_elsewhere_page(thread_id.clone()),
+            if let Some(return_to) = return_to {
+                self.activate_workspace_thread(return_to, window);
+            }
+            // Another window may have that thread by now, and two cannot
+            // share this one.
+            if self.mux_window_id == mux_window_id {
+                self.show_thread_elsewhere_page(thread_id.clone());
             }
         }
         // The reconcile must leave this one to us: it has a window coming.
@@ -1061,6 +1068,17 @@ impl TermWindow {
         }
     }
 
+    /// What a page's button does: to the thread's own window or, with that
+    /// gone, to the window that took the thread back. Activating comes to
+    /// that window, or opens the thread here if none did.
+    fn go_to_thread_on_page(&mut self, thread_id: WorkspaceThreadId) {
+        if front_end().thread_is_in_own_window(&thread_id) {
+            self.focus_thread_window(&thread_id);
+        } else if let Some(window) = self.window.clone() {
+            self.activate_workspace_thread(thread_id, &window);
+        }
+    }
+
     /// Hand `assignment` to a window that shows the thread list, from one
     /// that does not.
     pub(crate) fn hand_on_assignment(&self, assignment: KeyAssignment) {
@@ -1265,7 +1283,13 @@ impl TermWindow {
             workspace_threads::activation_plan_for_thread(thread_id, &live_workspaces)
                 .is_some_and(|plan| !plan.needs_materialize);
         if still_running {
-            self.activate_workspace_thread(thread_id.to_string(), &window);
+            // Another page got there first. This one stays, and its button
+            // goes to that window.
+            let taken = workspace_threads::thread_workspace_name(thread_id)
+                .is_some_and(|workspace| self.workspace_shown_elsewhere(&workspace));
+            if !taken {
+                self.activate_workspace_thread(thread_id.to_string(), &window);
+            }
             return;
         }
         // It ended in its window: on to another, as when a window's own
@@ -1410,7 +1434,7 @@ impl ThreadElsewhereView {
     fn go_to_window(&self) -> ContentViewResponse {
         let thread_id = self.thread_id.clone();
         ContentViewResponse::Run(Box::new(move |term_window| {
-            term_window.focus_thread_window(&thread_id);
+            term_window.go_to_thread_on_page(thread_id);
         }))
     }
 

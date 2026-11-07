@@ -881,6 +881,11 @@ impl GuiFrontEnd {
     }
 
     pub(crate) fn spawn_space_window(&self) {
+        self.spawn_space_window_then(|| {});
+    }
+
+    /// As `spawn_space_window`, with `opened` to run once the window is up.
+    pub(crate) fn spawn_space_window_then(&self, opened: impl FnOnce() + 'static) {
         // Each Dock "New Window" gets its own Space and its own GUI window, and
         // must work regardless of whatever else is in flight. We claim a
         // distinct (unoccupied) Space synchronously so rapid repeated clicks
@@ -916,6 +921,7 @@ impl GuiFrontEnd {
             }
             .await;
 
+            let is_open = result.is_ok();
             match result {
                 Ok(()) => front_end().opening_succeeded(),
                 Err(err) => {
@@ -925,6 +931,9 @@ impl GuiFrontEnd {
                 }
             }
             front_end().set_switching_workspaces(false);
+            if is_open {
+                opened();
+            }
         })
         .detach();
     }

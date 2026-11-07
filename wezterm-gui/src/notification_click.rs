@@ -63,7 +63,7 @@ fn this_run() -> &'static str {
 pub fn install() {
     wezterm_toast_notification::set_click_handler(|click| {
         // The system reports the click on a thread of its own.
-        promise::spawn::spawn_into_main_thread(async move { reveal(click) }).detach();
+        promise::spawn::spawn_into_main_thread(async move { reveal(click, true) }).detach();
     });
     // The click handler is otherwise set up with this run's first
     // notification, and a click on one still listed from before is lost.
@@ -75,7 +75,8 @@ pub fn install() {
     }
 }
 
-fn reveal(click: NotificationClick) {
+/// `may_open` says a window that can go to the target may be opened for it.
+fn reveal(click: NotificationClick, may_open: bool) {
     let Some(target) = NotificationTarget::decode(&click.target, this_run()) else {
         return;
     };
@@ -85,6 +86,7 @@ fn reveal(click: NotificationClick) {
     };
     let mux = Mux::get();
     let windows = front_end.gui_windows();
+    let retry = click.clone();
     let token = click.activation_token;
     match target {
         NotificationTarget::Pane(pane_id) => {
@@ -115,6 +117,8 @@ fn reveal(click: NotificationClick) {
                             window.focus_with_activation_token(token.as_deref());
                         }
                     })));
+            } else if may_open && !windows.is_empty() {
+                reveal_from_new_window(retry);
             }
         }
         NotificationTarget::Thread(workspace) => {
@@ -141,9 +145,17 @@ fn reveal(click: NotificationClick) {
                             window.focus_with_activation_token(token.as_deref());
                         }
                     })));
+            } else if may_open && !windows.is_empty() {
+                reveal_from_new_window(retry);
             }
         }
     }
+}
+
+/// Only threads' own windows are up, and those go nowhere else: the click
+/// comes back to a window that can.
+fn reveal_from_new_window(click: NotificationClick) {
+    crate::frontend::front_end().spawn_space_window_then(move || reveal(click, false));
 }
 
 /// The window last in use, which the paths to other threads and Spaces
@@ -162,7 +174,6 @@ fn last_used(windows: &[GuiWin]) -> Option<&GuiWin> {
         .filter(free)
         .find(|gui| Some(gui.mux_window_id) == focused)
         .or_else(|| windows.iter().find(free))
-        .or_else(|| windows.first())
 }
 
 #[cfg(test)]

@@ -1786,7 +1786,7 @@ impl TermWindow {
 
     /// Whether activating `workspace`'s thread here would hand it to another
     /// window already showing it: the check `activate_workspace_thread` makes.
-    fn workspace_shown_elsewhere(&self, workspace: &str) -> bool {
+    pub(crate) fn workspace_shown_elsewhere(&self, workspace: &str) -> bool {
         crate::workspace_threads::window_to_show_in_workspace(workspace).is_some_and(|target| {
             target != self.mux_window_id
                 && crate::frontend::front_end()
