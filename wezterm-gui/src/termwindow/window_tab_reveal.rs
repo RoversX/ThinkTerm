@@ -25,7 +25,7 @@ use crate::termwindow::{
 use mux::tab::PositionedPane;
 use mux::Mux;
 use std::time::Instant;
-use window::{MouseEvent, WindowDecorations, WindowOps, WindowState};
+use window::{IntegratedTitleButtonStyle, MouseEvent, WindowDecorations, WindowOps, WindowState};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WindowTabReveal {
@@ -170,6 +170,25 @@ fn row_in_layout(mode: NativeWindowTabs, pinned: bool) -> bool {
         NativeWindowTabs::Show => true,
         NativeWindowTabs::AutoHide => pinned,
     }
+}
+
+/// Whether the window has a title bar of the system's above what it draws.
+/// macOS mostly keeps its bar over the content, `TITLE` or not, and what
+/// lies under it there is for the window to say.
+#[cfg(target_os = "macos")]
+fn title_bar_above_content(
+    decorations: WindowDecorations,
+    button_style: IntegratedTitleButtonStyle,
+) -> bool {
+    !::window::os::macos::content_under_title_bar(decorations, button_style)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn title_bar_above_content(
+    decorations: WindowDecorations,
+    _button_style: IntegratedTitleButtonStyle,
+) -> bool {
+    decorations.contains(WindowDecorations::TITLE)
 }
 
 impl TermWindow {
@@ -347,7 +366,10 @@ impl TermWindow {
             return false;
         };
         (self.pane_bars_stand_in() || self.window_tab_reveal.always_hiding)
-            && !self.config.window_decorations.contains(WindowDecorations::TITLE)
+            && !title_bar_above_content(
+                self.config.window_decorations,
+                self.config.integrated_title_button_style,
+            )
             && !self
                 .window_state
                 .intersects(WindowState::FULL_SCREEN | WindowState::SERVER_DECORATED)
@@ -571,6 +593,24 @@ mod tests {
         assert!(!held.covers(700, 30));
         assert!(!held.covers(-1, 10));
         assert!(!PaneBarsHeld::default().covers(700, 10));
+    }
+
+    #[test]
+    fn a_window_left_to_its_defaults_has_no_title_bar_above_its_pane_bars() {
+        assert!(!title_bar_above_content(
+            WindowDecorations::default(),
+            IntegratedTitleButtonStyle::default()
+        ));
+    }
+
+    #[test]
+    fn a_title_bar_is_above_the_pane_bars_only_where_the_window_keeps_it_there() {
+        let style = IntegratedTitleButtonStyle::default();
+        assert!(title_bar_above_content(WindowDecorations::TITLE, style));
+        assert_eq!(
+            title_bar_above_content(WindowDecorations::TITLE | WindowDecorations::RESIZE, style),
+            !cfg!(target_os = "macos")
+        );
     }
 
     #[test]

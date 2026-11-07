@@ -2938,6 +2938,16 @@ fn thinkterm_titlebar_sidebar_button(titlebar_view_container: &StrongPtr) -> Opt
     }
 }
 
+/// Whether a window with these decorations has its content run on under the
+/// title bar, rather than starting below it.
+pub fn content_under_title_bar(
+    decorations: WindowDecorations,
+    integrated_title_button_style: IntegratedTitleButtonStyle,
+) -> bool {
+    decoration_to_mask(decorations, integrated_title_button_style)
+        .contains(NSWindowStyleMask::NSFullSizeContentViewWindowMask)
+}
+
 fn decoration_to_mask(
     decorations: WindowDecorations,
     integrated_title_button_style: IntegratedTitleButtonStyle,
