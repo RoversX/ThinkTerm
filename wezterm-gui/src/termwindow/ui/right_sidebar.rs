@@ -13977,13 +13977,13 @@ impl crate::TermWindow {
         content_width: usize,
         content_bottom: usize,
     ) -> anyhow::Result<()> {
-        let refresh_size = (ui_metrics.cell_size.height as usize + self.ui_px(12))
-            .clamp(self.ui_px(28), self.ui_px(38));
+        // Round buttons as tall as the filter box, spaced as the left
+        // sidebar's New Thread and notifications buttons are.
+        let refresh_size = self.ui_px(FILE_FILTER_HEIGHT);
         let refresh_x = content_x + content_width.saturating_sub(refresh_size);
-        let refresh_y =
-            content_top + self.ui_px(FILE_FILTER_HEIGHT).saturating_sub(refresh_size) / 2;
+        let refresh_y = content_top;
         let upload_size = refresh_size;
-        let upload_gap = self.ui_px(SIDEBAR_INSET);
+        let upload_gap = self.ui_px(SIDEBAR_ICON_GAP) + 4;
         let upload_x = refresh_x.saturating_sub(upload_size + upload_gap);
         // The same filter box as a local project; the project's name heads
         // the tree below it. Leave room for both header buttons.
@@ -14010,7 +14010,7 @@ impl crate::TermWindow {
             UIItemType::RightSidebarFileFilter,
             false,
         )?;
-        self.paint_files_preview_header_icon_button(
+        self.paint_files_header_action_button(
             layers,
             chrome,
             foreground,
@@ -14021,7 +14021,7 @@ impl crate::TermWindow {
             SvgIcon::Upload,
             UIItemType::RightSidebarRemoteFileUpload,
         )?;
-        self.paint_files_preview_header_icon_button(
+        self.paint_files_header_action_button(
             layers,
             chrome,
             foreground,
@@ -14175,7 +14175,7 @@ impl crate::TermWindow {
                 UIItemType::RightSidebarFileFilter,
                 false,
             )?;
-            self.paint_files_preview_header_icon_button(
+            self.paint_files_header_action_button(
                 layers,
                 chrome,
                 foreground,
@@ -14186,7 +14186,7 @@ impl crate::TermWindow {
                 SvgIcon::Upload,
                 UIItemType::RightSidebarRemoteFileUpload,
             )?;
-            self.paint_files_preview_header_icon_button(
+            self.paint_files_header_action_button(
                 layers,
                 chrome,
                 foreground,
@@ -15701,9 +15701,9 @@ impl crate::TermWindow {
         }
     }
 
-    /// The header's Upload button. macOS can put files and folders in one
-    /// native panel; the other platforms get a two-item menu because their
-    /// native dialogs cannot offer both at once.
+    /// The header's Upload button. macOS puts files and folders in one native
+    /// panel and opens it straight away; the other platforms get a two-item
+    /// menu first because their native dialogs cannot offer both at once.
     pub(crate) fn begin_remote_upload_picker(&mut self, anchor: Point) {
         let Some(directory) = self.right_sidebar_remote_upload_directory() else {
             self.right_sidebar_remote_files.error_message =
@@ -15721,26 +15721,15 @@ impl crate::TermWindow {
             return;
         };
 
-        // Ask where first. The selected folder is the default, but showing it
-        // in the menu makes the destination explicit and lets the user cancel
-        // and pick another row in the tree before choosing files.
-        let path = directory.as_str().to_string();
-        let mut items = Vec::new();
+        // Files go into the folder selected in the tree, or the one holding
+        // the selected file, as a drop onto that row would.
         if window.supports_combined_path_picker() {
-            items.push(self.context_menu_application_item_with_icon(
-                right_sidebar_arg("right-upload-to", "path", path),
-                ContextMenuIcon::Folder,
-                crate::termwindow::ContextMenuApplicationAction::UploadFromPicker {
-                    allow_files: true,
-                    allow_directories: true,
-                    directory,
-                    origin,
-                    anchor,
-                },
-                true,
-            ));
-        } else {
-            items.push(self.context_menu_application_item_with_icon(
+            self.pick_remote_upload_paths(true, true, directory, origin, anchor);
+            return;
+        }
+        let path = directory.as_str().to_string();
+        let items = vec![
+            self.context_menu_application_item_with_icon(
                 right_sidebar_arg("right-upload-files-to", "path", path.clone()),
                 ContextMenuIcon::File,
                 crate::termwindow::ContextMenuApplicationAction::UploadFromPicker {
@@ -15751,8 +15740,8 @@ impl crate::TermWindow {
                     anchor,
                 },
                 true,
-            ));
-            items.push(self.context_menu_application_item_with_icon(
+            ),
+            self.context_menu_application_item_with_icon(
                 right_sidebar_arg("right-upload-folder-to", "path", path),
                 ContextMenuIcon::Folder,
                 crate::termwindow::ContextMenuApplicationAction::UploadFromPicker {
@@ -15763,8 +15752,8 @@ impl crate::TermWindow {
                     anchor,
                 },
                 true,
-            ));
-        }
+            ),
+        ];
         self.show_term_context_menu(&window, anchor, items);
     }
 
@@ -18585,15 +18574,13 @@ impl crate::TermWindow {
         content_bottom: usize,
         icon_size: usize,
     ) -> anyhow::Result<()> {
-        // Reserve room on the right for an icon-only Refresh button so it never
-        // eats into the filename/search width.
-        let refresh_size = (ui_metrics.cell_size.height as usize + self.ui_px(12))
-            .clamp(self.ui_px(28), self.ui_px(38));
-        let refresh_gap = self.ui_px(SIDEBAR_INSET);
+        // Reserve room on the right for a round Refresh button, as tall as the
+        // filter box, so it never eats into the filename/search width.
+        let refresh_size = self.ui_px(FILE_FILTER_HEIGHT);
+        let refresh_gap = self.ui_px(SIDEBAR_ICON_GAP) + 4;
         let filter_width = content_width.saturating_sub(refresh_size + refresh_gap);
         let refresh_x = content_x + content_width - refresh_size;
-        let refresh_y =
-            content_top + self.ui_px(FILE_FILTER_HEIGHT).saturating_sub(refresh_size) / 2;
+        let refresh_y = content_top;
         let filter_label = crate::i18n::tr("right-filter-files");
 
         let filter_input = self.right_sidebar_file_filter.clone();
@@ -18615,7 +18602,7 @@ impl crate::TermWindow {
             UIItemType::RightSidebarFileFilter,
             false,
         )?;
-        self.paint_files_preview_header_icon_button(
+        self.paint_files_header_action_button(
             layers,
             chrome,
             foreground,
@@ -18902,7 +18889,7 @@ impl crate::TermWindow {
                 UIItemType::RightSidebarFileFilter,
                 false,
             )?;
-            self.paint_files_preview_header_icon_button(
+            self.paint_files_header_action_button(
                 layers,
                 chrome,
                 foreground,
@@ -19779,6 +19766,50 @@ impl crate::TermWindow {
             item_type,
         });
         let icon_size = (size * 58 / 100).max(self.ui_px(16));
+        self.paint_sidebar_icon(
+            layers,
+            icon,
+            x + (size.saturating_sub(icon_size)) / 2,
+            y + (size.saturating_sub(icon_size)) / 2,
+            icon_size,
+            if hovered { foreground } else { muted_fg },
+        )
+    }
+
+    /// A button beside the Files filter, Upload or Refresh: round, and made
+    /// like the left sidebar's New Thread and notifications buttons, so the
+    /// two sidebars' actions look alike.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_files_header_action_button(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        chrome: UiPalette,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+        x: usize,
+        y: usize,
+        size: usize,
+        icon: SvgIcon,
+        item_type: UIItemType,
+    ) -> anyhow::Result<()> {
+        let hovered = self.is_pointer_over_ui_rect(x, y, size, size);
+        self.paint_sidebar_action_button(
+            layers,
+            1,
+            euclid::rect(x as f32, y as f32, size as f32, size as f32),
+            chrome,
+            hovered,
+            false,
+        )
+        .context("right sidebar files header button")?;
+        self.ui_items.push(UIItem {
+            x,
+            y,
+            width: size,
+            height: size,
+            item_type,
+        });
+        let icon_size = (size * 44 / 100).max(self.ui_px(14));
         self.paint_sidebar_icon(
             layers,
             icon,
