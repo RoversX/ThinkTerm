@@ -10160,7 +10160,6 @@ impl crate::TermWindow {
             visible_height,
             row_metrics.row_height,
         );
-        let see_through = self.chrome_see_through();
         self.paint_right_sidebar_contents(layers, |this, layers| {
             let selected = this
                 .right_sidebar_note
@@ -10171,13 +10170,9 @@ impl crate::TermWindow {
                 let row = &rows[index];
                 let y = tree_top as f32 + (index * row_metrics.row_height) as f32
                     - this.right_sidebar_note_tree_scroll_offset;
-                // Opaque, a row scrolled part-way out stays whole at the top,
-                // under the fade. See-through has no fade, so the row keeps its
-                // place and what is above the list is cut away after the loop.
-                let y = y
-                    .floor()
-                    .max(if see_through { 0.0 } else { tree_top as f32 })
-                    as usize;
+                // A row scrolled part-way out keeps its place: what is above
+                // the list is cut away after the loop.
+                let y = y.floor().max(0.0) as usize;
                 let height = row_metrics.row_height.min(tree_bottom.saturating_sub(y));
                 // What is hovered and clicked: the part inside the list.
                 let hit_y = y.max(tree_top);
@@ -10269,16 +10264,14 @@ impl crate::TermWindow {
                     if active { foreground } else { muted_fg },
                 )?;
             }
-            if see_through {
-                this.paint_right_sidebar_file_mask(
-                    layers,
-                    chrome,
-                    content_x,
-                    content_top,
-                    content_width,
-                    tree_top.saturating_sub(content_top),
-                )?;
-            }
+            this.paint_right_sidebar_file_mask(
+                layers,
+                chrome,
+                content_x,
+                content_top,
+                content_width,
+                tree_top.saturating_sub(content_top),
+            )?;
             Ok(())
         })?;
 
@@ -18705,7 +18698,7 @@ impl crate::TermWindow {
         width: usize,
         height: usize,
     ) -> anyhow::Result<()> {
-        if width == 0 || height == 0 || self.chrome_see_through() {
+        if width == 0 || height == 0 {
             return Ok(());
         }
         let opaque_height = self.ui_px(12).min(height);
@@ -18756,19 +18749,16 @@ impl crate::TermWindow {
     }
 
     /// Paints `contents` -- what a panel holds, over the ground it has
-    /// already painted -- into `layers`. See-through, they are recorded on
-    /// their own first, so that the scroll masks painted among them cut what
-    /// they cover out of what `contents` painted before them: painting the
-    /// ground over it again, as an opaque window does, would show as a darker
-    /// band. Nested, the inner block's masks cut only the inner block.
+    /// already painted -- into `layers`. They are recorded on their own
+    /// first, so that the scroll masks and fades painted among them cut and
+    /// fade what `contents` painted before them: painting the ground over it
+    /// again would show as a darker band over a see-through ground. Nested,
+    /// the inner block's masks cut only the inner block.
     pub(crate) fn paint_right_sidebar_contents(
         &mut self,
         layers: &mut TripleLayerQuadAllocator,
         contents: impl FnOnce(&mut Self, &mut TripleLayerQuadAllocator) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
-        if !self.chrome_see_through() {
-            return contents(self, layers);
-        }
         let mut recorded = self
             .right_sidebar_contents_scratch
             .pop()
@@ -18794,9 +18784,25 @@ impl crate::TermWindow {
         width: usize,
         height: usize,
     ) -> anyhow::Result<()> {
-        // See-through, the list is cut where the mask begins instead: a fade
-        // of the ground over it would darken the ground.
-        if width == 0 || height == 0 || self.chrome_see_through() {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        // In what is being recorded, the list fades in its own alpha.
+        if self.right_sidebar_recording_contents {
+            if let TripleLayerQuadAllocator::Heap(contents) = layers {
+                contents.fade_in_across(QuadClipRect::from_top_left_pixels(
+                    x as f32,
+                    y as f32,
+                    (x + width) as f32,
+                    (y + height) as f32,
+                    &self.dimensions,
+                ));
+                return Ok(());
+            }
+        }
+        // Otherwise a fade of the ground over a see-through one would
+        // darken it: the list is left cut where the mask begins.
+        if self.chrome_see_through() {
             return Ok(());
         }
 

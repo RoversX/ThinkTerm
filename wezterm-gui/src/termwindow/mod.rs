@@ -3443,9 +3443,13 @@ pub struct TermWindow {
     /// entry and sets it around the row loop, so it describes that paint and
     /// no other; a paint that bailed out before the list leaves it `None`.
     workspace_sidebar_list_quads: Option<(HeapQuadMark, HeapQuadMark)>,
-    /// The see-through left sidebar's recording buffer, kept from frame to
-    /// frame: no larger than `WORKSPACE_SIDEBAR_SCRATCH_KEEP_BYTES`, let go
-    /// when the sidebar collapses.
+    /// A tab row's recording buffer, kept from frame to frame and from one
+    /// row to the next: no larger than `TAB_ROW_SCRATCH_KEEP_BYTES`, and
+    /// let go while the window is hidden.
+    tab_row_scratch: HeapQuadAllocator,
+    /// The left sidebar's recording buffer, kept from frame to frame: no
+    /// larger than `WORKSPACE_SIDEBAR_SCRATCH_KEEP_BYTES`, let go when the
+    /// sidebar collapses.
     workspace_sidebar_scratch: HeapQuadAllocator,
     workspace_sidebar_scrollbar_visible_until: Option<Instant>,
     /// The pill at the list's edge while the window's thread is out of
@@ -4716,8 +4720,10 @@ impl TermWindow {
             render_state.dedicated_images.borrow_mut().clear();
         }
         self.line_quad_cache.borrow_mut().clear();
-        // Likewise the scratch recorder: a hidden window records no lines.
+        // Likewise the scratch recorders: a hidden window records no lines,
+        // nor tab rows.
         *self.line_quad_scratch.borrow_mut() = HeapQuadAllocator::default();
+        self.tab_row_scratch = HeapQuadAllocator::default();
         // Nor renders cards.
         self.release_card_frame_buffers();
         // And the panes last painted, which would keep one closed since
@@ -5415,6 +5421,7 @@ impl TermWindow {
             workspace_space_swipe_target_frame: None,
             workspace_space_swipe_tracked: false,
             workspace_sidebar_list_quads: None,
+            tab_row_scratch: HeapQuadAllocator::default(),
             workspace_sidebar_scratch: HeapQuadAllocator::default(),
             workspace_space_swipe_push_active: false,
             workspace_space_swipe_direction: 0.0,

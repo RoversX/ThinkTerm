@@ -55,8 +55,7 @@ const MAX_PREVIEW_FILL: f32 = 1.5;
 /// Height of the pane layer divider the tab bar draws below itself, in the same
 /// device pixels the divider quad uses. Kept in step with `fancy_tab_bar`.
 const TAB_BAR_SEAM_HEIGHT: f32 = 1.0;
-/// The largest recording buffer the see-through left sidebar keeps for the
-/// next frame.
+/// The largest recording buffer the left sidebar keeps for the next frame.
 const WORKSPACE_SIDEBAR_SCRATCH_KEEP_BYTES: usize = 8 << 20;
 
 /// How many cards may rebuild their recorded quads in one frame.
@@ -5690,20 +5689,13 @@ impl crate::TermWindow {
                     }
                 }
             } else if capture_space_source {
-                // See-through, the sidebar's list is cut to its viewport, which
-                // takes a recording: record, then draw what was recorded.
-                if self.chrome_see_through() {
-                    let mut sidebar_layers = TripleLayerQuadAllocator::Heap(&mut sidebar_frame);
-                    self.paint_workspace_sidebar(&mut sidebar_layers)
-                        .context("capture source workspace sidebar")?;
-                    drop(sidebar_layers);
-                    sidebar_frame.apply_to(&mut layer.quad_allocator())?;
-                } else {
-                    let mut sidebar_layers = layer.tee_quad_allocator(&mut sidebar_frame);
-                    self.paint_workspace_sidebar(&mut sidebar_layers)
-                        .context("capture source workspace sidebar")?;
-                    drop(sidebar_layers);
-                }
+                // The sidebar's list is cut and faded at its ends, which takes
+                // a recording: record, then draw what was recorded.
+                let mut sidebar_layers = TripleLayerQuadAllocator::Heap(&mut sidebar_frame);
+                self.paint_workspace_sidebar(&mut sidebar_layers)
+                    .context("capture source workspace sidebar")?;
+                drop(sidebar_layers);
+                sidebar_frame.apply_to(&mut layer.quad_allocator())?;
 
                 self.workspace_space_swipe_source_frame =
                     Some(crate::termwindow::CapturedSidebar {
@@ -5739,9 +5731,9 @@ impl crate::TermWindow {
                     self.replay_pane(&recorded, &mut layer.quad_allocator(), sliver)
                         .context("replay sliding workspace sidebar's edge")?;
                 }
-            } else if self.chrome_see_through() {
-                // As above: the list is cut in a recording, one whose buffer
-                // is kept from frame to frame.
+            } else {
+                // As above: the list is cut and faded in a recording, one
+                // whose buffer is kept from frame to frame.
                 let mut recorded = std::mem::take(&mut self.workspace_sidebar_scratch);
                 recorded.recycle();
                 let mut sidebar_layers = TripleLayerQuadAllocator::Heap(&mut recorded);
@@ -5756,11 +5748,6 @@ impl crate::TermWindow {
                     self.workspace_sidebar_scratch = recorded;
                 }
                 applied?;
-            } else {
-                let mut sidebar_layers = layer.quad_allocator();
-                self.paint_workspace_sidebar(&mut sidebar_layers)
-                    .context("paint_workspace_sidebar")?;
-                drop(sidebar_layers);
             }
 
             let mut chrome_layers = layer.quad_allocator();

@@ -888,6 +888,14 @@ impl crate::TermWindow {
         let tab_height = button_size;
         let tab_y = button_y;
         let tab_fg = if pos.is_active { foreground } else { muted_fg };
+        // The tabs are recorded, so that where the strip runs on past its
+        // viewport it can fade out in their own alpha: over a see-through
+        // bar a fade of its ground would show as a band.
+        let into = &mut *layers;
+        let mut row = std::mem::take(&mut self.tab_row_scratch);
+        row.recycle();
+        let row_start = row.mark();
+        let layers = &mut TripleLayerQuadAllocator::Heap(&mut row);
         for (idx, tab) in tabs.into_iter().enumerate() {
             if tab_width <= icon_size + self.ui_px(PANE_NAV_ICON_GAP) + button_size
                 || viewport_width == 0
@@ -1121,11 +1129,10 @@ impl crate::TermWindow {
         // Dissolve the strip into the bar wherever it runs on past its
         // viewport, so a clipped tab reads as continuing rather than as one
         // sliced in half.
-        self.paint_tab_row_fades(
-            layers,
-            self.collapsed_bar_surface(),
-            tab_y,
-            tab_height,
+        self.apply_tab_row(
+            row,
+            &row_start,
+            into,
             tab_start,
             max_tab_right,
             scroll_offset > 0.5,
@@ -1473,6 +1480,14 @@ impl crate::TermWindow {
                 .collect(),
             None => vec![],
         };
+        // The tabs are recorded, so that where the strip runs on past its
+        // viewport it can fade out in their own alpha: over a see-through
+        // bar a fade of its ground would show as a band.
+        let into = &mut *layers;
+        let mut row = std::mem::take(&mut self.tab_row_scratch);
+        row.recycle();
+        let row_start = row.mark();
+        let layers = &mut TripleLayerQuadAllocator::Heap(&mut row);
         for place in places {
             if tab_width <= icon_size + self.ui_px(PANE_NAV_ICON_GAP) + button_size
                 || viewport_width == 0
@@ -1766,11 +1781,10 @@ impl crate::TermWindow {
         // Dissolve the strip into the bar wherever it runs on past its
         // viewport, so a clipped tab reads as continuing rather than as one
         // sliced in half.
-        self.paint_tab_row_fades(
-            layers,
-            background,
-            pane_y.max(0.0) as usize,
-            nav_height,
+        self.apply_tab_row(
+            row,
+            &row_start,
+            into,
             tab_start,
             max_tab_right,
             scroll_offset > 0.5,

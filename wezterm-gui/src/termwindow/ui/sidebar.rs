@@ -3677,14 +3677,28 @@ impl crate::TermWindow {
             }
         }
 
-        // See-through, a row scrolled under the header or the footer is cut
-        // off there: the covers painted over it opaque would show as darker
-        // bands. Only a recording can be cut, so the see-through callers
-        // record; anything else keeps the covers. So does a Library card,
-        // whose covers would square its corners.
-        let list_cut = match (see_through || card, list_quads_start, &mut *layers) {
-            (true, Some(start), TripleLayerQuadAllocator::Heap(heap)) => {
-                heap.clip_after(
+        // A row scrolled under the header or the footer is cut off there,
+        // and the list fades out towards the end it goes on past -- in the
+        // rows' own alpha, so that it reads the same over a see-through
+        // ground. Only a recording can be cut, so the callers record;
+        // anything else gets covers painted over the ends instead.
+        let list_height = content_bottom.saturating_sub(list_top);
+        let list_fade = crate::quad::QuadEdgeFade {
+            top: if scroll_offset > 0.0 {
+                self.ui_px(SIDEBAR_TOP_FADE_HEIGHT).min(list_height / 2) as f32
+            } else {
+                0.0
+            },
+            bottom: if settings_footer_height > 0 && scroll_offset < max_scroll {
+                self.ui_px(SIDEBAR_SETTINGS_FADE_HEIGHT).min(list_height / 2) as f32
+            } else {
+                0.0
+            },
+            ..Default::default()
+        };
+        let list_cut = match (list_quads_start, &mut *layers) {
+            (Some(start), TripleLayerQuadAllocator::Heap(heap)) => {
+                heap.cut_after(
                     &start,
                     crate::quad::QuadClipRect::from_top_left_pixels(
                         panel_x as f32,
@@ -3693,16 +3707,13 @@ impl crate::TermWindow {
                         content_bottom_f,
                         &self.dimensions,
                     ),
+                    list_fade,
                 );
                 true
             }
             _ => false,
         };
         self.workspace_sidebar_list_quads = list_quads_start.zip(layers.heap_mark());
-
-        // The fades over the ends of the list, wherever they read as fades:
-        // not over a see-through ground, where they would be bands.
-        let list_fades = !list_cut || (card && !see_through);
 
         let header_mask_height = list_top.saturating_sub(panel_y);
         // Covers what the list left under the header, then paints the header
@@ -3927,28 +3938,6 @@ impl crate::TermWindow {
             }
         }
 
-        if max_scroll > 0.0 && scroll_offset > 0.0 && list_fades {
-            let fade_height = self
-                .ui_px(SIDEBAR_TOP_FADE_HEIGHT)
-                .min(content_bottom.saturating_sub(list_top));
-            for step in 0..fade_height {
-                let progress = step as f32 / fade_height as f32;
-                let alpha = 1.0 - progress * progress * (3.0 - 2.0 * progress);
-                self.filled_rectangle(
-                    layers,
-                    2,
-                    euclid::rect(
-                        panel_x as f32,
-                        (list_top + step) as f32,
-                        panel_width as f32,
-                        1.0,
-                    ),
-                    sidebar_bg.mul_alpha(alpha),
-                )
-                .context("sidebar top scroll fade")?;
-            }
-        }
-
         let bottom_mask_height = panel_y
             .saturating_add(panel_height)
             .saturating_sub(content_bottom);
@@ -3968,27 +3957,6 @@ impl crate::TermWindow {
         }
 
         if settings_footer_height > 0 {
-            let fade_height = self
-                .ui_px(SIDEBAR_SETTINGS_FADE_HEIGHT)
-                .min(settings_footer_y.saturating_sub(panel_y))
-                .min(content_bottom.saturating_sub(panel_y));
-            if max_scroll > 0.0 && fade_height > 0 && list_fades {
-                for step in 0..fade_height {
-                    let progress = (step + 1) as f32 / fade_height as f32;
-                    self.filled_rectangle(
-                        layers,
-                        2,
-                        euclid::rect(
-                            panel_x as f32,
-                            (settings_footer_y.saturating_sub(fade_height) + step) as f32,
-                            panel_width as f32,
-                            1.0,
-                        ),
-                        sidebar_bg.mul_alpha(progress * progress * (3.0 - 2.0 * progress)),
-                    )
-                    .context("sidebar settings fade")?;
-                }
-            }
             // A Library card has no footer: what follows is set apart, for
             // the sidebar on its way into its card to let go of.
             if card {

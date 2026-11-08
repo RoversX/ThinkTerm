@@ -584,6 +584,108 @@ impl BoxedQuad {
         }
         Some(clipped)
     }
+
+    /// This quad, already cut to `clip`, faded towards its edges as `fade`
+    /// says: handed to `out` whole where it is clear of the fades, and in
+    /// strips across them otherwise, each with its corners' alpha taken
+    /// down as far as the fade has got there.
+    fn faded(self, clip: QuadClipRect, fade: QuadEdgeFade, out: &mut impl FnMut(Self)) {
+        if !fade.along(FadeAxis::Horizontal) {
+            return self.faded_along(clip, fade, FadeAxis::Vertical, out);
+        }
+        self.faded_along(clip, fade, FadeAxis::Vertical, &mut |strip: Self| {
+            strip.faded_along(clip, fade, FadeAxis::Horizontal, out)
+        });
+    }
+
+    /// `faded`, for the fades along one axis.
+    fn faded_along(
+        self,
+        clip: QuadClipRect,
+        fade: QuadEdgeFade,
+        axis: FadeAxis,
+        out: &mut impl FnMut(Self),
+    ) {
+        if !fade.along(axis) {
+            return out(self);
+        }
+        let (left, top, right, bottom) = self.position;
+        let (start, end) = match axis {
+            FadeAxis::Vertical => (top, bottom),
+            FadeAxis::Horizontal => (left, right),
+        };
+        // Where the fades' steps fall across this quad.
+        let mut cuts = [0.0f32; 2 * QuadEdgeFade::STEPS];
+        let mut count = 0;
+        for (edge, run) in fade.ends(clip, axis) {
+            if run == 0.0 {
+                continue;
+            }
+            for step in 1..=QuadEdgeFade::STEPS {
+                let at = edge + run * step as f32 / QuadEdgeFade::STEPS as f32;
+                if at > start && at < end {
+                    cuts[count] = at;
+                    count += 1;
+                }
+            }
+        }
+        let cuts = &mut cuts[..count];
+        cuts.sort_by(f32::total_cmp);
+        let shown = |at| fade.shown_at(clip, axis, at);
+        if cuts.is_empty() {
+            // No step falls across it: the one strip is the quad itself.
+            let (shown_start, shown_end) = (shown(start), shown(end));
+            return self.faded_strip(axis, shown_start, shown_end, out);
+        }
+
+        let mut strip_start = start;
+        for strip_end in cuts.iter().copied().chain(std::iter::once(end)) {
+            let band = match axis {
+                FadeAxis::Vertical => clip.with_vertical(strip_start, strip_end),
+                FadeAxis::Horizontal => clip.with_horizontal(strip_start, strip_end),
+            };
+            if let Some(strip) = self.positioned_clipped(left, top, right, bottom, band) {
+                strip.faded_strip(axis, shown(strip_start), shown(strip_end), out);
+            }
+            strip_start = strip_end;
+        }
+    }
+
+    /// One strip of `faded_along`, shown `shown_start` at its start along
+    /// `axis` and `shown_end` at its end: handed to `out` with its corners'
+    /// alpha taken down that far, or not at all where it is gone.
+    fn faded_strip(
+        mut self,
+        axis: FadeAxis,
+        shown_start: f32,
+        shown_end: f32,
+        out: &mut impl FnMut(Self),
+    ) {
+        if shown_start <= 0.0 && shown_end <= 0.0 {
+            return;
+        }
+        if shown_start < 1.0 || shown_end < 1.0 {
+            let mut corners = self
+                .fg_color_corners
+                .as_deref()
+                .copied()
+                .unwrap_or([self.fg_color; VERTICES_PER_CELL]);
+            let (starts, ends) = match axis {
+                FadeAxis::Vertical => ([V_TOP_LEFT, V_TOP_RIGHT], [V_BOT_LEFT, V_BOT_RIGHT]),
+                FadeAxis::Horizontal => ([V_TOP_LEFT, V_BOT_LEFT], [V_TOP_RIGHT, V_BOT_RIGHT]),
+            };
+            for corner in starts {
+                corners[corner][3] *= shown_start;
+            }
+            for corner in ends {
+                corners[corner][3] *= shown_end;
+            }
+            self.fg_color = corners[V_TOP_LEFT];
+            self.fg_color_corners = Some(Box::new(corners));
+            self.alt_color[3] *= (shown_start + shown_end) / 2.0;
+        }
+        out(self);
+    }
 }
 
 fn lerp(start: f32, end: f32, amount: f32) -> f32 {
@@ -704,6 +806,64 @@ impl QuadClipRect {
             right,
             ..*self
         }
+    }
+}
+
+/// How a recording cut to a rect fades out towards the edges it is cut at:
+/// whole from `top` pixels below the top edge, `bottom` above the bottom
+/// one and so on, gone at the edge itself, eased between. Held in the
+/// quads' own alpha, not painted over them, so it reads the same over any
+/// ground, a see-through one too. Zero is a plain cut.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct QuadEdgeFade {
+    pub top: f32,
+    pub bottom: f32,
+    pub left: f32,
+    pub right: f32,
+}
+
+/// Down or across.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FadeAxis {
+    Vertical,
+    Horizontal,
+}
+
+impl QuadEdgeFade {
+    /// The steps each fade is cut into: the ease runs straight between them.
+    const STEPS: usize = 8;
+
+    fn is_none(&self) -> bool {
+        !self.along(FadeAxis::Vertical) && !self.along(FadeAxis::Horizontal)
+    }
+
+    fn along(&self, axis: FadeAxis) -> bool {
+        match axis {
+            FadeAxis::Vertical => self.top > 0.0 || self.bottom > 0.0,
+            FadeAxis::Horizontal => self.left > 0.0 || self.right > 0.0,
+        }
+    }
+
+    /// The fades at the start and the end of `axis` inside `clip`: where
+    /// each edge is, and how far in from it the fade runs.
+    fn ends(&self, clip: QuadClipRect, axis: FadeAxis) -> [(f32, f32); 2] {
+        match axis {
+            FadeAxis::Vertical => [(clip.top, self.top), (clip.bottom, -self.bottom)],
+            FadeAxis::Horizontal => [(clip.left, self.left), (clip.right, -self.right)],
+        }
+    }
+
+    /// How much of what is at `at` along `axis` shows, inside `clip`.
+    fn shown_at(&self, clip: QuadClipRect, axis: FadeAxis, at: f32) -> f32 {
+        let eased = |through: f32| {
+            let t = through.clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        self.ends(clip, axis)
+            .into_iter()
+            .filter(|(_, run)| *run != 0.0)
+            .map(|(edge, run)| eased((at - edge) / run))
+            .product()
     }
 }
 
@@ -1001,6 +1161,82 @@ impl HeapQuadAllocator {
                 }
             }
             layer.truncate(kept);
+        }
+    }
+
+    /// Fade what has been recorded so far in across `band`, from gone at
+    /// its top to whole at its bottom, as a ground-coloured fade painted
+    /// over it would seem to -- in the quads' own alpha, so that it reads
+    /// the same over a see-through ground. Quads above the band, below it,
+    /// or centred beside it are left as they are, and so is any part of one
+    /// above the band.
+    pub fn fade_in_across(&mut self, band: QuadClipRect) {
+        if band.bottom <= band.top {
+            return;
+        }
+        let touches = |quad: &BoxedQuad| {
+            let (left, top, right, bottom) = quad.position;
+            let middle = (left + right) / 2.0;
+            top < band.bottom && bottom > band.top && middle >= band.left && middle < band.right
+        };
+        let fade = QuadEdgeFade {
+            top: band.bottom - band.top,
+            ..Default::default()
+        };
+        for layer in [&mut self.layer0, &mut self.layer1, &mut self.layer2] {
+            // Everything before the first quad the band touches stays where
+            // it is; what follows is taken off and put back in its order.
+            let Some(begin) = layer.iter().position(&touches) else {
+                continue;
+            };
+            for quad in layer.split_off(begin) {
+                if !touches(&quad) {
+                    layer.push(quad);
+                    continue;
+                }
+                let (left, top, right, bottom) = quad.position;
+                let over = |top, bottom| QuadClipRect {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                };
+                let above = quad.positioned_clipped(left, top, right, bottom, over(top, band.top));
+                let within =
+                    quad.positioned_clipped(left, top, right, bottom, over(band.top, bottom));
+                if let Some(above) = above {
+                    layer.push(above);
+                }
+                if let Some(within) = within {
+                    within.faded(over(band.top, f32::MAX), fade, &mut |strip| {
+                        layer.push(strip)
+                    });
+                }
+            }
+        }
+    }
+
+    /// `clip_after`, faded out towards the edges it cuts at as `fade` says.
+    pub fn cut_after(&mut self, mark: &HeapQuadMark, clip: QuadClipRect, fade: QuadEdgeFade) {
+        if fade.is_none() {
+            return self.clip_after(mark, clip);
+        }
+        for (layer_num, layer) in [
+            (0, &mut self.layer0),
+            (1, &mut self.layer1),
+            (2, &mut self.layer2),
+        ] {
+            // What is faded goes on after the rest in its order, and the
+            // quads it came from are dropped after: the layer keeps its
+            // buffer.
+            let begin = Self::layer_bounds(mark, layer_num).min(layer.len());
+            let end = layer.len();
+            for index in begin..end {
+                if let Some(clipped) = layer[index].translated_clipped(0.0, 0.0, clip) {
+                    clipped.faded(clip, fade, &mut |strip| layer.push(strip));
+                }
+            }
+            layer.drain(begin..end);
         }
     }
 
@@ -1868,5 +2104,148 @@ mod recording_occlusion_tests {
         // The ground is untouched, the row above is cut at the top, the row
         // below is gone.
         assert_eq!(tops, vec![(0.0, 100.0), (0.0, 10.0), (40.0, 70.0)]);
+    }
+
+    #[test]
+    fn a_cut_faded_at_its_top_takes_alpha_down_towards_the_edge() {
+        let mut heap = HeapQuadAllocator::default();
+        let mark = heap.mark();
+        {
+            let mut quad = heap.allocate(0).unwrap();
+            quad.set_position(0.0, -20.0, 100.0, 40.0);
+            quad.set_fg_color(LinearRgba(1.0, 1.0, 1.0, 1.0));
+        }
+        heap.cut_after(
+            &mark,
+            rect(0.0, 0.0, 100.0, 100.0),
+            QuadEdgeFade {
+                top: 16.0,
+                ..Default::default()
+            },
+        );
+        let strips: Vec<(f32, f32, f32, f32)> = heap
+            .layer0
+            .iter()
+            .map(|q| {
+                let corners = q.fg_color_corners.as_deref().copied();
+                let alpha = |corner: usize| corners.map_or(q.fg_color[3], |c| c[corner][3]);
+                (
+                    q.position.1,
+                    q.position.3,
+                    alpha(V_TOP_LEFT),
+                    alpha(V_BOT_LEFT),
+                )
+            })
+            .collect();
+        // Cut at the edge, then strips across the fade getting more solid
+        // downwards, then the rest whole.
+        assert_eq!(strips.first().map(|s| (s.0, s.2)), Some((0.0, 0.0)));
+        assert_eq!(strips.last().copied(), Some((16.0, 40.0, 1.0, 1.0)));
+        assert_eq!(strips.len(), QuadEdgeFade::STEPS + 1);
+        for pair in strips.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "the strips meet");
+            assert_eq!(pair[0].3, pair[1].2, "the alpha runs on across them");
+            assert!(pair[0].2 <= pair[0].3);
+        }
+    }
+
+    #[test]
+    fn a_cut_with_no_fade_is_a_plain_clip() {
+        let mut heap = HeapQuadAllocator::default();
+        let mark = heap.mark();
+        for top in [-20.0, 40.0, 120.0] {
+            heap.allocate(0)
+                .unwrap()
+                .set_position(0.0, top, 100.0, top + 30.0);
+        }
+        heap.cut_after(&mark, rect(0.0, 0.0, 100.0, 100.0), QuadEdgeFade::default());
+        let tops: Vec<(f32, f32)> = heap
+            .layer0
+            .iter()
+            .map(|q| (q.position.1, q.position.3))
+            .collect();
+        assert_eq!(tops, vec![(0.0, 10.0), (40.0, 70.0)]);
+    }
+
+    #[test]
+    fn a_quad_clear_of_the_fades_is_kept_as_it_was() {
+        let mut heap = HeapQuadAllocator::default();
+        let mark = heap.mark();
+        heap.allocate(1)
+            .unwrap()
+            .set_position(0.0, 40.0, 100.0, 60.0);
+        heap.cut_after(
+            &mark,
+            rect(0.0, 0.0, 100.0, 100.0),
+            QuadEdgeFade {
+                top: 16.0,
+                bottom: 16.0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(heap.layer1.len(), 1);
+        assert_eq!(heap.layer1[0].position, (0.0, 40.0, 100.0, 60.0));
+        assert!(heap.layer1[0].fg_color_corners.is_none());
+    }
+
+    #[test]
+    fn a_band_faded_in_leaves_what_is_above_and_beside_it() {
+        let mut heap = HeapQuadAllocator::default();
+        for (left, top) in [(0.0, -30.0), (0.0, 5.0), (200.0, 5.0), (0.0, 60.0)] {
+            heap.allocate(0)
+                .unwrap()
+                .set_position(left, top, left + 100.0, top + 20.0);
+        }
+        heap.fade_in_across(rect(0.0, 0.0, 100.0, 40.0));
+        let quads: Vec<((f32, f32, f32, f32), bool)> = heap
+            .layer0
+            .iter()
+            .map(|q| (q.position, q.fg_color_corners.is_some()))
+            .collect();
+        // Above: whole. In the band: strips, faded. Beside it and below it:
+        // whole, and still in their order after the strips.
+        assert_eq!(quads.first(), Some(&((0.0, -30.0, 100.0, -10.0), false)));
+        assert!(quads[1..quads.len() - 2].iter().all(|(_, faded)| *faded));
+        assert_eq!(quads[quads.len() - 2], ((200.0, 5.0, 300.0, 25.0), false));
+        assert_eq!(quads[quads.len() - 1], ((0.0, 60.0, 100.0, 80.0), false));
+    }
+
+    #[test]
+    fn a_cut_faded_at_its_right_takes_alpha_down_towards_that_edge() {
+        let mut heap = HeapQuadAllocator::default();
+        let mark = heap.mark();
+        {
+            let mut quad = heap.allocate(0).unwrap();
+            quad.set_position(60.0, 0.0, 140.0, 20.0);
+            quad.set_fg_color(LinearRgba(1.0, 1.0, 1.0, 1.0));
+        }
+        heap.cut_after(
+            &mark,
+            rect(0.0, 0.0, 100.0, 100.0),
+            QuadEdgeFade {
+                right: 16.0,
+                ..Default::default()
+            },
+        );
+        let strips: Vec<(f32, f32, f32, f32)> = heap
+            .layer0
+            .iter()
+            .map(|q| {
+                let corners = q.fg_color_corners.as_deref().copied();
+                let alpha = |corner: usize| corners.map_or(q.fg_color[3], |c| c[corner][3]);
+                (
+                    q.position.0,
+                    q.position.2,
+                    alpha(V_TOP_LEFT),
+                    alpha(V_TOP_RIGHT),
+                )
+            })
+            .collect();
+        assert_eq!(strips.first().copied(), Some((60.0, 84.0, 1.0, 1.0)));
+        assert_eq!(strips.last().map(|s| (s.1, s.3)), Some((100.0, 0.0)));
+        for pair in strips.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "the strips meet");
+            assert_eq!(pair[0].3, pair[1].2, "the alpha runs on across them");
+        }
     }
 }

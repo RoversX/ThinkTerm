@@ -1,5 +1,5 @@
 use crate::quad::{
-    HeapQuadAllocator, QuadClipRect, QuadTrait, TripleLayerQuadAllocator,
+    HeapQuadAllocator, QuadClipRect, QuadEdgeFade, QuadTrait, TripleLayerQuadAllocator,
     TripleLayerQuadAllocatorTrait,
 };
 use crate::shapecache::{BorrowedShapeCacheKey, ShapedInfo};
@@ -8,7 +8,7 @@ use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::ui::platform_chrome::uses_integrated_window_buttons;
 use crate::termwindow::ui::tokens::{
     ICON_BUTTON_BORDER_WIDTH, SIDEBAR_INSET, TAB_CLOSE_HOVER_INSET, TAB_CLOSE_HOVER_RADIUS,
-    TAB_CONTENT_INSET, TAB_ICON_SIZE, TAB_ROW_START_PADDING, TAB_TITLE_FADE_GAP,
+    TAB_CONTENT_INSET, TAB_ICON_SIZE, TAB_ROW_FADE_WIDTH, TAB_ROW_START_PADDING, TAB_TITLE_FADE_GAP,
     TAB_VERTICAL_PADDING, TITLE_FADE, WINDOW_TAB_ADD_BUTTON_RADIUS,
     WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET, WINDOW_TAB_GAP,
     WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
@@ -33,6 +33,8 @@ const WINDOW_TAB_INSET: usize = 8;
 const WINDOW_TAB_ICON_GAP: usize = 8;
 const WINDOW_TAB_MIN_TEXT_COLS: usize = 3;
 const UI_SHAPE_CACHE_FONT_IDENTITY_BIT: u64 = 1u64 << 63;
+/// The largest recording of a tab row kept for the next frame.
+pub(crate) const TAB_ROW_SCRATCH_KEEP_BYTES: usize = 1 << 20;
 
 
 impl crate::TermWindow {
@@ -153,6 +155,15 @@ impl crate::TermWindow {
         let cv_active = self.active_content_view_shown_in_tab_bar();
         let show_mux_tabs = !self.active_content_view_is_remote_thread();
 
+        // The tabs are recorded, so that where the row runs on past its
+        // viewport it can fade out in their own alpha: over a see-through
+        // bar a fade of its ground would show as a band.
+        let into = &mut *layers;
+        let mut row = std::mem::take(&mut self.tab_row_scratch);
+        row.recycle();
+        let row_start = row.mark();
+        let layers = &mut TripleLayerQuadAllocator::Heap(&mut row);
+
         let tab_step = tab_width + self.ui_px(WINDOW_TAB_GAP);
         let mut tab_sequence_idx = 0usize;
         if show_mux_tabs {
@@ -247,13 +258,12 @@ impl crate::TermWindow {
 
         // Dissolve the row into the bar wherever it runs on past the viewport,
         // so a clipped tab reads as continuing rather than as one sliced in
-        // half. Goes down after the tabs and before the trailing actions, which
-        // own the space beyond the boundary.
-        self.paint_tab_row_fades(
-            layers,
-            background,
-            content_row_y,
-            content_row_height,
+        // half. What follows paints straight into the bar again.
+        let layers = into;
+        self.apply_tab_row(
+            row,
+            &row_start,
+            &mut *layers,
             viewport_left,
             viewport_right,
             scroll_offset > 0.5,
@@ -283,6 +293,45 @@ impl crate::TermWindow {
         }
 
         Ok(ui_items)
+    }
+
+    /// Replay a tab `row` recorded from `start` into `layers`, cut at its
+    /// viewport and fading out at the ends that run on past it; then keep
+    /// its buffer for the next row, unless it grew large.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_tab_row(
+        &mut self,
+        mut row: HeapQuadAllocator,
+        start: &crate::quad::HeapQuadMark,
+        layers: &mut TripleLayerQuadAllocator,
+        viewport_left: usize,
+        viewport_right: usize,
+        fade_at_left: bool,
+        fade_at_right: bool,
+    ) -> anyhow::Result<()> {
+        let width = self
+            .ui_px(TAB_ROW_FADE_WIDTH)
+            .min(viewport_right.saturating_sub(viewport_left) / 2) as f32;
+        row.cut_after(
+            start,
+            QuadClipRect::from_top_left_pixels(
+                viewport_left as f32,
+                0.0,
+                viewport_right as f32,
+                self.dimensions.pixel_height as f32,
+                &self.dimensions,
+            ),
+            QuadEdgeFade {
+                left: if fade_at_left { width } else { 0.0 },
+                right: if fade_at_right { width } else { 0.0 },
+                ..Default::default()
+            },
+        );
+        let applied = row.apply_to(layers);
+        if row.resident_bytes() <= TAB_ROW_SCRATCH_KEEP_BYTES {
+            self.tab_row_scratch = row;
+        }
+        applied
     }
 
     pub(crate) fn paint_window_tab_trailing_actions(
