@@ -14,7 +14,7 @@ use crate::termwindow::ui::tokens::{
     WINDOW_TAB_LEADING_ACTION_BUTTON_SIZE, WINDOW_TAB_LEADING_ACTION_GAP,
     WINDOW_TAB_LEADING_ACTION_ICON_SIZE, WINDOW_TAB_RADIUS, WINDOW_TAB_TOP_SPACER,
 };
-use crate::termwindow::window_tab_reveal::PaneBarWindowChrome;
+use crate::termwindow::window_tab_reveal::{PaneBarWindowChrome, ToggleSlot};
 use crate::termwindow::{TermWindowNotif, UIItem, UIItemType, UiShapeCacheLookup};
 use crate::ui::draw::TextFade;
 use crate::ui::UiPalette;
@@ -335,7 +335,7 @@ impl crate::TermWindow {
     }
 
     pub(crate) fn paint_window_tab_trailing_actions(
-        &self,
+        &mut self,
         layers: &mut TripleLayerQuadAllocator,
     ) -> anyhow::Result<Vec<UIItem>> {
         let row_height = self.tab_bar_pixel_height()?.ceil() as usize;
@@ -439,7 +439,7 @@ impl crate::TermWindow {
                     UIItemType::TabBar(TabBarItem::NewTabButton),
                     false,
                 )?;
-                self.paint_window_tab_right_sidebar_toggle_button(
+                self.paint_window_tab_row_right_sidebar_toggle(
                     layers,
                     &mut ui_items,
                     right_sidebar_toggle_x,
@@ -479,7 +479,7 @@ impl crate::TermWindow {
                 UIItemType::TabBar(TabBarItem::NewTabButton),
                 false,
             )?;
-            self.paint_window_tab_right_sidebar_toggle_button(
+            self.paint_window_tab_row_right_sidebar_toggle(
                 layers,
                 &mut ui_items,
                 right_sidebar_toggle_x,
@@ -576,7 +576,9 @@ impl crate::TermWindow {
     /// right sidebar's toggle before them and a rule between them and the
     /// pane's buttons, while the pane bars stand in for a row that is away
     /// (see `pane_bar_window_chrome`). Returns where the pane's buttons go on
-    /// from; `pane_bar_window_chrome_width` is the width this takes.
+    /// from, and where the toggle stands -- left empty while it travels
+    /// (see `pane_bar_toggle_travels`); `pane_bar_window_chrome_width` is
+    /// the width this takes.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn paint_pane_bar_window_chrome(
         &self,
@@ -588,7 +590,7 @@ impl crate::TermWindow {
         bar_height: usize,
         button_size: usize,
         icon_size: usize,
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<(usize, usize)> {
         let chrome = self.chrome();
         let mut x = bar_right.saturating_sub(self.ui_px(WINDOW_TAB_INSET) + 2);
         if parts.window_buttons {
@@ -609,19 +611,23 @@ impl crate::TermWindow {
                 )?
             };
         }
+        let mut toggle_x = x;
         if parts.right_sidebar_toggle {
             x = x.saturating_sub(button_size);
-            self.paint_window_tab_right_sidebar_toggle_button(
-                layers,
-                ui_items,
-                x,
-                bar_y,
-                bar_height,
-                button_size,
-                icon_size,
-                chrome.text,
-                chrome.secondary_text,
-            )?;
+            toggle_x = x;
+            if !self.pane_bar_toggle_travels(parts) {
+                self.paint_window_tab_right_sidebar_toggle_button(
+                    layers,
+                    ui_items,
+                    x,
+                    bar_y,
+                    bar_height,
+                    button_size,
+                    icon_size,
+                    chrome.text,
+                    chrome.secondary_text,
+                )?;
+            }
         }
         x = x.saturating_sub(self.ui_px(WINDOW_TAB_LEADING_ACTION_GAP));
         let rule_height = button_size * 3 / 5;
@@ -641,7 +647,7 @@ impl crate::TermWindow {
             bar_right.saturating_sub(x),
             self.pane_bar_window_chrome_width(parts, button_size)
         );
-        Ok(x)
+        Ok((x, toggle_x))
     }
 
     /// What `paint_pane_bar_window_chrome` takes from the bar's right end.
@@ -1487,8 +1493,48 @@ impl crate::TermWindow {
         )
     }
 
+    /// The row's own right sidebar toggle -- unless the row is on its way
+    /// and the one the top-right pane bar holds is going up into its place
+    /// (see `pane_bar_toggle_travels`): then only where it lands is noted.
     #[allow(clippy::too_many_arguments)]
-    fn paint_window_tab_right_sidebar_toggle_button(
+    fn paint_window_tab_row_right_sidebar_toggle(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator,
+        ui_items: &mut Vec<UIItem>,
+        button_x: usize,
+        row_y: usize,
+        row_height: usize,
+        button_size: usize,
+        icon_size: usize,
+        foreground: LinearRgba,
+        muted_fg: LinearRgba,
+    ) -> anyhow::Result<()> {
+        if !self.window_tab_row_in_place() {
+            let slot = ToggleSlot {
+                x: button_x as f32,
+                y: (row_y + row_height.saturating_sub(button_size) / 2) as f32,
+                size: button_size as f32,
+                icon: icon_size as f32,
+            };
+            if self.window_tab_reveal.note_toggle_in_row(slot) {
+                return Ok(());
+            }
+        }
+        self.paint_window_tab_right_sidebar_toggle_button(
+            layers,
+            ui_items,
+            button_x,
+            row_y,
+            row_height,
+            button_size,
+            icon_size,
+            foreground,
+            muted_fg,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_window_tab_right_sidebar_toggle_button(
         &self,
         layers: &mut TripleLayerQuadAllocator,
         ui_items: &mut Vec<UIItem>,

@@ -8,9 +8,10 @@
 //! workspace sidebar's machine (`SidebarHoverReveal`): the same dwell, grace
 //! and travel, fed a strip along the top instead of the left edge.
 //!
-//! macOS keeps its traffic lights while the row is away. Elsewhere the row
-//! holds the window's own buttons and the sidebars' toggles, so the pane
-//! bars along the top hold them instead, and their blank moves the window.
+//! macOS keeps its traffic lights while the row is away, and the pane bar at
+//! the top right holds the right sidebar's toggle. Elsewhere the row holds
+//! the window's own buttons and the sidebars' toggles, so the pane bars
+//! along the top hold them instead, and their blank moves the window.
 
 use crate::native_settings::NativeWindowTabs;
 use crate::quad::{HeapQuadAllocator, QuadClipRect, TripleLayerQuadAllocator};
@@ -44,6 +45,35 @@ pub(crate) struct WindowTabReveal {
     /// last frame, and so far in this one.
     held: PaneBarsHeld,
     holding: PaneBarsHeld,
+    /// While the row travels, this frame: where the top-right pane bar
+    /// would hold the right sidebar's toggle, and where the row holds it
+    /// once in place. The one toggle goes from the one up to the other as
+    /// the row comes, and back down as it goes.
+    toggle_in_bar: Option<ToggleSlot>,
+    toggle_in_row: Option<ToggleSlot>,
+}
+
+/// Where a toggle button stands, in window pixels: its top left corner,
+/// its size and its icon's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ToggleSlot {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) size: f32,
+    pub(crate) icon: f32,
+}
+
+impl ToggleSlot {
+    /// `along` of the way from `self` to `to`.
+    fn towards(self, to: Self, along: f32) -> Self {
+        let lerp = |a: f32, b: f32| a + (b - a) * along;
+        Self {
+            x: lerp(self.x, to.x),
+            y: lerp(self.y, to.y),
+            size: lerp(self.size, to.size),
+            icon: lerp(self.icon, to.icon),
+        }
+    }
 }
 
 impl WindowTabReveal {
@@ -106,6 +136,8 @@ impl WindowTabReveal {
     /// the pointer goes by the last one's until it is done.
     pub(crate) fn begin_paint(&mut self) {
         self.holding = PaneBarsHeld::default();
+        self.toggle_in_bar = None;
+        self.toggle_in_row = None;
     }
 
     /// A paint pass is done: the pointer goes by what its pane bars held.
@@ -123,6 +155,23 @@ impl WindowTabReveal {
     /// to `bottom`.
     pub(crate) fn note_sidebar_toggle(&mut self, right: usize, bottom: usize) {
         self.holding.sidebar_toggle = Some((right, bottom));
+    }
+
+    /// The top-right pane bar would hold the right sidebar's toggle at
+    /// `slot`, and leaves it to go up into the travelling row.
+    pub(crate) fn note_toggle_in_bar(&mut self, slot: ToggleSlot) {
+        self.toggle_in_bar = Some(slot);
+    }
+
+    /// The travelling row has the right sidebar's toggle at `slot` once in
+    /// place, and leaves it to the one coming up from the pane bar. False
+    /// when none is: the row draws its own.
+    pub(crate) fn note_toggle_in_row(&mut self, slot: ToggleSlot) -> bool {
+        if self.toggle_in_bar.is_none() {
+            return false;
+        }
+        self.toggle_in_row = Some(slot);
+        true
     }
 }
 
@@ -262,6 +311,7 @@ impl TermWindow {
             &self.dimensions,
         );
         recorded.apply_to_clipped_at(layers, 0.0, shift, clip, 1.0)?;
+        self.paint_travelling_right_sidebar_toggle(layers, shift)?;
         let left = self.tab_bar_left_edge();
         Ok(vec![UIItem {
             x: left,
@@ -272,16 +322,14 @@ impl TermWindow {
         }])
     }
 
-    /// Off macOS, while the row auto-hides, the pane bars along the window's
-    /// top keep room for what it holds that has nowhere else to be -- the
-    /// window's buttons and the sidebars' toggles -- as macOS keeps its
-    /// traffic lights: all of it while the row is away, none once it is
-    /// down, in step as it comes. 0 where they keep none.
+    /// While the row auto-hides, the pane bars along the window's top keep
+    /// room for what it holds that has nowhere else to be -- off macOS the
+    /// window's buttons and the sidebars' toggles, on macOS, which keeps its
+    /// traffic lights, the right sidebar's toggle: all of it while the row
+    /// is away, none once it is down, in step as it comes. 0 where they keep
+    /// none.
     pub(crate) fn pane_bars_stand_in_share(&self) -> f32 {
-        if cfg!(target_os = "macos")
-            || self.window_tab_reveal.in_layout()
-            || self.tab_bar_pixel_height().unwrap_or(0.0) <= 0.0
-        {
+        if self.window_tab_reveal.in_layout() || self.tab_bar_pixel_height().unwrap_or(0.0) <= 0.0 {
             return 0.0;
         }
         1.0 - self.window_tab_reveal.shown
@@ -295,10 +343,12 @@ impl TermWindow {
 
     /// As `pane_bars_stand_in_share`, for `pos`'s bar starting with the
     /// workspace sidebar's toggle: the one at the top left, wherever the row
-    /// would draw one.
+    /// would draw one. Not on macOS, where that bar leaves the room to the
+    /// traffic lights instead (see `pane_nav_tab_left_inset`).
     pub(crate) fn pane_bar_sidebar_toggle_share(&self, pos: &PositionedPane) -> f32 {
         let share = self.pane_bars_stand_in_share();
         if share > 0.0
+            && !cfg!(target_os = "macos")
             && pos.left == 0
             && pos.top == 0
             && self.window_tab_shows_sidebar_toggle_action()
@@ -312,15 +362,20 @@ impl TermWindow {
     /// What `pos`'s bar ends with, as the bar at the top right standing in
     /// for the row: the right sidebar's toggle, and the window's own
     /// buttons unless an open sidebar holds them. A bar too narrow for them
-    /// all holds none, and the row has to come down for them.
+    /// all holds none, and the row has to come down for them. On macOS the
+    /// window's buttons are the traffic lights, which stay, and an open
+    /// right sidebar has its own toggle at its top, as the row leaves it.
     pub(crate) fn pane_bar_window_chrome(&self, pos: &PositionedPane) -> PaneBarWindowChrome {
         let top_right = pos.top == 0 && pos.left + pos.width >= self.terminal_size.cols;
         if !top_right || self.pane_bars_stand_in_share() <= 0.0 {
             return PaneBarWindowChrome::default();
         }
+        let macos = cfg!(target_os = "macos");
         let parts = PaneBarWindowChrome {
-            right_sidebar_toggle: self.right_sidebar_has_panels(),
-            window_buttons: self.fancy_tab_bar_shows_window_buttons()
+            right_sidebar_toggle: self.right_sidebar_has_panels()
+                && !(macos && self.right_sidebar_width() > 0),
+            window_buttons: !macos
+                && self.fancy_tab_bar_shows_window_buttons()
                 && self.right_sidebar_width() == 0,
         };
         let fits = self
@@ -331,6 +386,50 @@ impl TermWindow {
         } else {
             PaneBarWindowChrome::default()
         }
+    }
+
+    /// The right sidebar's toggle, which the top-right bar holds with
+    /// nothing else, goes up into the row as it comes down and back as it
+    /// goes, rather than out past the bar's end with the window's buttons:
+    /// the row is on its way.
+    pub(crate) fn pane_bar_toggle_travels(&self, parts: PaneBarWindowChrome) -> bool {
+        let share = self.pane_bars_stand_in_share();
+        parts.right_sidebar_toggle && !parts.window_buttons && share > 0.0 && share < 1.0
+    }
+
+    /// The right sidebar's toggle on its way between the top-right pane bar
+    /// and the travelling row, painted over both: the row having been
+    /// drawn `shift` pixels above its place, `shown` of the way along.
+    fn paint_travelling_right_sidebar_toggle(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        shift: f32,
+    ) -> anyhow::Result<()> {
+        let (Some(bar), Some(row)) = (
+            self.window_tab_reveal.toggle_in_bar,
+            self.window_tab_reveal.toggle_in_row,
+        ) else {
+            return Ok(());
+        };
+        let row = ToggleSlot {
+            y: row.y + shift,
+            ..row
+        };
+        let at = bar.towards(row, self.window_tab_reveal.shown);
+        let size = at.size.round().max(1.0) as usize;
+        let chrome = self.chrome();
+        // Nothing on the way takes a click: see `paint_window_tab_row_travelling`.
+        self.paint_window_tab_right_sidebar_toggle_button(
+            layers,
+            &mut Vec::new(),
+            at.x.round().max(0.0) as usize,
+            at.y.round().max(0.0) as usize,
+            size,
+            size,
+            at.icon.round().max(1.0) as usize,
+            chrome.text,
+            chrome.secondary_text,
+        )
     }
 
     /// How far down from the window's top its chrome reaches at the right:
@@ -355,7 +454,9 @@ impl TermWindow {
     /// `item` is the blank of a pane bar along the window's top, and stands
     /// in for the row's as the title bar: not where the system draws one,
     /// nor in full screen, where there is no window to move, nor on the
-    /// strip of a collapsed stack, which runs the window's height.
+    /// strip of a collapsed stack, which runs the window's height. On macOS,
+    /// where the bars stand in for the right sidebar's toggle alone, only in
+    /// a thread's own window.
     pub(crate) fn pane_bar_blank_is_title_bar(&self, item: &UIItem) -> bool {
         let UIItemType::PaneNav {
             pane_id,
@@ -365,7 +466,8 @@ impl TermWindow {
         else {
             return false;
         };
-        (self.pane_bars_stand_in() || self.window_tab_reveal.always_hiding)
+        ((self.pane_bars_stand_in() && !cfg!(target_os = "macos"))
+            || self.window_tab_reveal.always_hiding)
             && !title_bar_above_content(
                 self.config.window_decorations,
                 self.config.integrated_title_button_style,

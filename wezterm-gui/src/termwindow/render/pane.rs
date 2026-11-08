@@ -32,7 +32,7 @@ use config::VisualBellTarget;
 use mux::pane::{PaneId, WithPaneLines};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use crate::termwindow::render::split_slide::TabPlace;
-use crate::termwindow::window_tab_reveal::PaneBarWindowChrome;
+use crate::termwindow::window_tab_reveal::{PaneBarWindowChrome, ToggleSlot};
 use mux::tab::{CollapsedPaneLayout, PaneStackTab, PositionedPane, SplitDirection};
 use mux::Mux;
 use ordered_float::NotNan;
@@ -1265,6 +1265,8 @@ impl crate::TermWindow {
         // the sidebar's toggle starts the top-left one. They slide in from
         // the bar's ends and fade up as the row goes, and back out as it
         // comes, which carries its own; only all the way in do they work.
+        // The right sidebar's toggle on its own goes up into the row instead
+        // (see `pane_bar_toggle_travels`).
         let mut window_items = Vec::new();
         let bar_clip = QuadClipRect::from_top_left_pixels(
             pane_x,
@@ -1278,7 +1280,7 @@ impl crate::TermWindow {
         if window_chrome.any() {
             let mut held = HeapQuadAllocator::default();
             let mut held_layers = TripleLayerQuadAllocator::Heap(&mut held);
-            let left = self.paint_pane_bar_window_chrome(
+            let (left, toggle_x) = self.paint_pane_bar_window_chrome(
                 &mut held_layers,
                 &mut window_items,
                 window_chrome,
@@ -1289,6 +1291,14 @@ impl crate::TermWindow {
                 icon_size,
             )?;
             drop(held_layers);
+            if self.pane_bar_toggle_travels(window_chrome) {
+                self.window_tab_reveal.note_toggle_in_bar(ToggleSlot {
+                    x: toggle_x as f32,
+                    y: (pane_y as usize + nav_height.saturating_sub(button_size) / 2) as f32,
+                    size: button_size as f32,
+                    icon: icon_size as f32,
+                });
+            }
             let out = button_x.saturating_sub(left).saturating_sub(room) as f32;
             held.apply_to_clipped_at(layers, out, 0.0, bar_clip, self.pane_bars_stand_in_share())
                 .context("pane bar window buttons")?;
