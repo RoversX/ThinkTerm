@@ -958,6 +958,11 @@ pub enum UIItemType {
     /// The card's own surface: swallows clicks that miss a button so they do
     /// not fall through to the file tree or terminal underneath.
     TransferCardBackground,
+    /// Go to the pane a dynamic status card is about; `true` when it is in
+    /// this window.
+    DynamicStatusReveal(PaneId, bool),
+    /// The pill on top of the open dynamic status: opens the Status panel.
+    DynamicStatusShowAll,
     /// The area a plugin's panel draws in: the pointer and the wheel over it
     /// go to the panel's player.
     RightSidebarPluginPanel,
@@ -2352,6 +2357,12 @@ pub fn tooltip_label_for(item_type: &UIItemType) -> Option<String> {
         }
         UIItemType::RightSidebarRemoteFileUpload => "tooltip-upload-files",
         UIItemType::TransferCardDismiss(_) => "right-dismiss",
+        UIItemType::TransferCardCancel(_) => "right-cancel",
+        UIItemType::TransferCardRetry(_) => "right-retry",
+        UIItemType::TransferCardOpen(_) => "right-open",
+        UIItemType::TransferCardOpenDownloads(_) => "command-reveal-in-folder",
+        UIItemType::TransferCardCopyPath(_) => "right-copy-path",
+        UIItemType::DynamicStatusReveal(..) => "dynamic-status-go-to",
         UIItemType::RightSidebarAgent(crate::agent_status::AgentPanelAction::ViewOptions) => {
             "tooltip-sidebar-view-options"
         }
@@ -3753,6 +3764,7 @@ pub struct TermWindow {
     /// Downloads that have stopped, held for the floating card after the
     /// transfer row may already have been trimmed out of the strip.
     transfer_toasts: Vec<render::transfer_card::TransferToast>,
+    dynamic_status: render::dynamic_status::DynamicStatus,
     /// The directory a file drag is currently hovering over, so the row can be
     /// highlighted and the drop knows where it would land.
     right_sidebar_remote_drop_target: Option<remote_files::RemotePath>,
@@ -4509,6 +4521,7 @@ impl TermWindow {
             || !self.edge_lights.is_empty()
             || self.pending_paste.is_some()
             || self.update_capsule.owes_frames()
+            || self.dynamic_status.owes_frames()
     }
 
     /// An overlay scrollbar that is still up has a fade to finish; the
@@ -5594,6 +5607,7 @@ impl TermWindow {
             right_sidebar_remote_transfers: Vec::new(),
             right_sidebar_remote_transfer_next_id: 0,
             transfer_toasts: Vec::new(),
+            dynamic_status: Default::default(),
             right_sidebar_remote_drop_target: None,
             right_sidebar_local_drop_target: None,
             pending_local_copy: None,
@@ -6577,11 +6591,20 @@ impl TermWindow {
                     self.update_title();
                 }
                 MuxNotification::Alert {
+                    alert: Alert::Progress(progress),
+                    pane_id,
+                } => {
+                    self.refresh_thread_work_for_pane(pane_id);
+                    self.update_title();
+                    // A pane in another tab or thread reporting its
+                    // progress shows on the dynamic status.
+                    self.dynamic_status_progress_changed(pane_id, &progress);
+                }
+                MuxNotification::Alert {
                     alert:
                         Alert::WindowTitleChanged(_)
                         | Alert::TabTitleChanged(_)
-                        | Alert::IconTitleChanged(_)
-                        | Alert::Progress(_),
+                        | Alert::IconTitleChanged(_),
                     pane_id,
                 } => {
                     self.refresh_thread_work_for_pane(pane_id);
@@ -6717,8 +6740,12 @@ impl TermWindow {
                     crate::workspace_threads::schedule_dock_badge_refresh();
                     // Waiting -> error leaves the aggregate NeedsAttention
                     // unchanged, but changes its icon. Decide from what this
-                    // window displays, not from the aggregate's changed bit.
-                    self.invalidate_window_if(self.agent_status_change_is_visible(pane_id));
+                    // window displays, not from the aggregate's changed bit
+                    // -- the dynamic status included.
+                    let on_dynamic_status = self.dynamic_status_agent_changed(pane_id);
+                    self.invalidate_window_if(
+                        on_dynamic_status || self.agent_status_change_is_visible(pane_id),
+                    );
                 }
                 MuxNotification::ForegroundProgramChanged(pane_id) => {
                     // The pane's tab, or its thread's row in the sidebar.
@@ -6795,7 +6822,8 @@ impl TermWindow {
                 }
                 // Filtered out before it gets here; for event subscribers.
                 MuxNotification::PaneExited { .. } => {}
-                MuxNotification::PaneRemoved(_) => {
+                MuxNotification::PaneRemoved(pane_id) => {
+                    self.dynamic_status_pane_removed(pane_id);
                     self.refresh_all_thread_work();
                     self.persist_workspace_layout_after_mutation("pane removed");
                     // A pane leaving a mirror tab (its process exited, a peer

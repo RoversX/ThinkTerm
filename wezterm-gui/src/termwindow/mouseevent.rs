@@ -1901,6 +1901,8 @@ impl super::TermWindow {
             | UIItemType::TransferCardOpenDownloads(_)
             | UIItemType::TransferCardCopyPath(_)
             | UIItemType::TransferCardBackground
+            | UIItemType::DynamicStatusReveal(..)
+            | UIItemType::DynamicStatusShowAll
             | UIItemType::ContextMenuBackdrop
             | UIItemType::SharePanel
             | UIItemType::ContextMenuItem(_)
@@ -2091,6 +2093,8 @@ impl super::TermWindow {
             | UIItemType::TransferCardOpenDownloads(_)
             | UIItemType::TransferCardCopyPath(_)
             | UIItemType::TransferCardBackground
+            | UIItemType::DynamicStatusReveal(..)
+            | UIItemType::DynamicStatusShowAll
             | UIItemType::ContextMenuBackdrop
             | UIItemType::SharePanel
             | UIItemType::ContextMenuItem(_)
@@ -4467,7 +4471,9 @@ impl super::TermWindow {
             | UIItemType::TransferCardOpen(_)
             | UIItemType::TransferCardOpenDownloads(_)
             | UIItemType::TransferCardCopyPath(_)
-            | UIItemType::TransferCardBackground => {
+            | UIItemType::TransferCardBackground
+            | UIItemType::DynamicStatusReveal(..)
+            | UIItemType::DynamicStatusShowAll => {
                 self.mouse_event_transfer_card(item.clone(), event, context);
             }
             UIItemType::UpdateCapsule => self.mouse_event_update_capsule(false, event, context),
@@ -4953,7 +4959,9 @@ impl super::TermWindow {
             | UIItemType::TransferCardOpen(_)
             | UIItemType::TransferCardOpenDownloads(_)
             | UIItemType::TransferCardCopyPath(_)
-            | UIItemType::TransferCardBackground => {
+            | UIItemType::TransferCardBackground
+            | UIItemType::DynamicStatusReveal(..)
+            | UIItemType::DynamicStatusShowAll => {
                 self.mouse_event_transfer_card(item.clone(), event, context);
             }
             UIItemType::UpdateCapsule => self.mouse_event_update_capsule(false, event, context),
@@ -5707,32 +5715,43 @@ impl super::TermWindow {
     ) {
         context.set_cursor(Some(MouseCursor::Hand));
         if event.kind == WMEK::Press(MousePress::Left) {
-            let previous_width = self.right_sidebar_width();
-            let previous_mode = self.right_sidebar_mode;
-            if previous_mode == super::RightSidebarMode::Tasks
-                && mode != super::RightSidebarMode::Tasks
-            {
-                self.clear_right_sidebar_text_focus();
-            }
-            self.right_sidebar_mode = mode;
-            if self.right_sidebar_mode == super::RightSidebarMode::Tasks {
-                self.right_sidebar_note_memory_release_token =
-                    self.right_sidebar_note_memory_release_token.wrapping_add(1);
-            } else if previous_mode == super::RightSidebarMode::Tasks {
-                self.schedule_right_sidebar_note_memory_release();
-            }
-            // Leaving the file view (e.g. switching to Snippets/Tasks) makes the
-            // file index idle; schedule it for release. Entering it refreshes +
-            // (re)starts the periodic re-scan.
-            if self.right_sidebar_file_view_active() {
-                self.kick_right_sidebar_file_rescan_cycle();
-                self.request_right_sidebar_remote_files_connect(false);
-            } else {
-                self.schedule_right_sidebar_file_memory_release();
-                self.release_right_sidebar_remote_files_if_hidden();
-            }
-            self.invalidate_or_reflow_right_sidebar(previous_width, context);
+            self.set_right_sidebar_mode(mode, context);
         }
+    }
+
+    /// Show `mode` in the right sidebar: the text it had focus in let go,
+    /// the memory of the one left released and of the one shown kept, and
+    /// the terminal laid out again if the panel's width changed.
+    pub(crate) fn set_right_sidebar_mode(
+        &mut self,
+        mode: super::RightSidebarMode,
+        context: &dyn WindowOps,
+    ) {
+        let previous_width = self.right_sidebar_width();
+        let previous_mode = self.right_sidebar_mode;
+        if previous_mode == super::RightSidebarMode::Tasks
+            && mode != super::RightSidebarMode::Tasks
+        {
+            self.clear_right_sidebar_text_focus();
+        }
+        self.right_sidebar_mode = mode;
+        if self.right_sidebar_mode == super::RightSidebarMode::Tasks {
+            self.right_sidebar_note_memory_release_token =
+                self.right_sidebar_note_memory_release_token.wrapping_add(1);
+        } else if previous_mode == super::RightSidebarMode::Tasks {
+            self.schedule_right_sidebar_note_memory_release();
+        }
+        // Leaving the file view (e.g. switching to Snippets/Tasks) makes the
+        // file index idle; schedule it for release. Entering it refreshes +
+        // (re)starts the periodic re-scan.
+        if self.right_sidebar_file_view_active() {
+            self.kick_right_sidebar_file_rescan_cycle();
+            self.request_right_sidebar_remote_files_connect(false);
+        } else {
+            self.schedule_right_sidebar_file_memory_release();
+            self.release_right_sidebar_remote_files_if_hidden();
+        }
+        self.invalidate_or_reflow_right_sidebar(previous_width, context);
     }
 
     pub fn mouse_event_right_sidebar_snippet(
@@ -6056,6 +6075,11 @@ impl super::TermWindow {
                 self.open_download_toast_folder(id)
             }
             UIItemType::TransferCardCopyPath(id) => self.copy_transfer_path(id),
+            UIItemType::DynamicStatusReveal(pane_id, true) => self.reveal_pane(pane_id),
+            UIItemType::DynamicStatusReveal(pane_id, false) => {
+                self.reveal_pane_elsewhere(pane_id, context, None);
+            }
+            UIItemType::DynamicStatusShowAll => self.show_status_from_dynamic_status(context),
             _ => return,
         }
         context.invalidate();

@@ -1309,32 +1309,52 @@ impl TermWindow {
         size: usize,
         mono: LinearRgba,
     ) -> anyhow::Result<()> {
+        self.paint_agent_mark_faded(layers, agent, x, y, size, mono, 1.0)
+    }
+
+    /// `paint_agent_mark`, `alpha` of the way there, for a mark fading in
+    /// or out with what it stands beside. `mono` carries its own alpha.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint_agent_mark_faded(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        agent: &agent_status::AgentPaneStatus,
+        x: usize,
+        y: usize,
+        size: usize,
+        mono: LinearRgba,
+        alpha: f32,
+    ) -> anyhow::Result<()> {
         match brand_of(agent) {
             Some(AgentIcon::Color(brand)) => {
-                self.paint_sidebar_brand_icon(layers, brand, x, y, size)
+                self.paint_sidebar_brand_icon_faded(layers, brand, x, y, size, alpha)
             }
             Some(AgentIcon::Mono(icon)) => self.paint_sidebar_icon(layers, icon, x, y, size, mono),
-            None => self.paint_pane_card(layers, agent.pane_id, x, y, size),
+            None => self.paint_pane_card_faded(layers, agent.pane_id, x, y, size, alpha),
         }
     }
 
-    /// The card `pane_id`'s tab shows, `size` pixels square: the terminal's
-    /// when the pane is not in this process.
-    fn paint_pane_card(
+    /// The card `pane_id`'s tab shows, `size` pixels square, `alpha` of the
+    /// way there: the terminal's when the pane is not in this process.
+    pub(crate) fn paint_pane_card_faded(
         &self,
         layers: &mut TripleLayerQuadAllocator,
         pane_id: PaneId,
         x: usize,
         y: usize,
         size: usize,
+        alpha: f32,
     ) -> anyhow::Result<()> {
+        if alpha <= 0.001 {
+            return Ok(());
+        }
         let icon = Mux::get()
             .get_pane(pane_id)
             .map(|pane| crate::tab_icons::resolve(pane.as_ref()))
             .unwrap_or_else(|| crate::tab_icons::catalog().terminal_card().resolved());
         let gl_state = self.render_state.as_ref().unwrap();
         let ctx = crate::ui::draw::DrawContext::new(gl_state, self.dimensions, &self.render_metrics);
-        crate::tab_icons::draw_plate(
+        crate::tab_icons::draw_plate_faded(
             &ctx,
             layers,
             1,
@@ -1343,6 +1363,7 @@ impl TermWindow {
             size as f32,
             icon.circle,
             self.chrome().is_dark(),
+            alpha,
         )
         .context("program card")?;
         let glyph = ((size as f32 * TAB_ICON_GLYPH_RATIO).round() as usize).clamp(1, size.max(1));
@@ -1354,7 +1375,7 @@ impl TermWindow {
             (x + (size - glyph) / 2) as f32,
             (y + (size - glyph) / 2) as f32,
             glyph as f32,
-            icon.glyph_color.linear(),
+            icon.glyph_color.linear().mul_alpha(alpha),
         )
         .context("program card glyph")
     }

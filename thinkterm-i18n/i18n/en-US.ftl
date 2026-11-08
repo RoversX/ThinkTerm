@@ -1734,6 +1734,9 @@ remote-files-listing-too-large = The remote file listing is too large
 download-completed = Download completed
 download-completed-body = Downloaded { $path }
 transfer-card-preparing = Preparing…
+dynamic-status-go-to = Go to
+dynamic-status-show-all = Show all in Status
+dynamic-status-more = { $count } more
 transfer-card-canceling = Canceling…
 download-card-failed = Download failed
 download-card-saved-to = Saved to { $path }
@@ -1741,9 +1744,7 @@ transfer-card-items = { $count ->
         [one] { $count } item
        *[other] { $count } items
     }
-download-open-file = Open File
 download-open-folder = Open Folder
-download-open-downloads = Open Download Folder
 upload-card-uploading = Uploading
 upload-completed = Upload completed
 upload-card-failed = Upload failed

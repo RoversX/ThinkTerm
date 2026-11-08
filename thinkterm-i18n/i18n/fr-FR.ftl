@@ -1728,6 +1728,9 @@ remote-files-listing-too-large = La liste des fichiers distants est trop grande
 download-completed = Téléchargement terminé
 download-completed-body = Téléchargé dans { $path }
 transfer-card-preparing = Préparation…
+dynamic-status-go-to = Afficher
+dynamic-status-show-all = Tout voir dans État
+dynamic-status-more = { $count } de plus
 transfer-card-canceling = Annulation…
 download-card-failed = Échec du téléchargement
 download-card-saved-to = Enregistré dans { $path }
@@ -1735,9 +1738,7 @@ transfer-card-items = { $count ->
         [one] { $count } élément
        *[other] { $count } éléments
     }
-download-open-file = Ouvrir le fichier
 download-open-folder = Ouvrir le dossier
-download-open-downloads = Ouvrir le dossier de téléchargement
 upload-card-uploading = Envoi en cours
 upload-completed = Envoi terminé
 upload-card-failed = Échec de l’envoi

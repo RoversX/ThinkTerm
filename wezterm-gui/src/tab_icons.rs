@@ -288,6 +288,22 @@ pub(crate) fn draw_plate(
     circle: Rgb,
     dark: bool,
 ) -> Result<()> {
+    draw_plate_faded(ctx, layers, layer, x, y, diameter, circle, dark, 1.0)
+}
+
+/// `draw_plate`, `alpha` of the way there.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_plate_faded(
+    ctx: &DrawContext,
+    layers: &mut TripleLayerQuadAllocator,
+    layer: usize,
+    x: f32,
+    y: f32,
+    diameter: f32,
+    circle: Rgb,
+    dark: bool,
+    alpha: f32,
+) -> Result<()> {
     draw_tile(
         ctx,
         layers,
@@ -296,7 +312,7 @@ pub(crate) fn draw_plate(
         y,
         diameter,
         diameter / 2.0,
-        circle.linear(),
+        circle.linear().mul_alpha(alpha),
         dark,
         &PLATE,
     )

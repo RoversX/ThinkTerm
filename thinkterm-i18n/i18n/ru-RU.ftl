@@ -1655,6 +1655,9 @@ remote-files-listing-too-large = Список удалённых файлов с
 download-completed = Загрузка завершена
 download-completed-body = Скачано: { $path }
 transfer-card-preparing = Подготовка…
+dynamic-status-go-to = Перейти
+dynamic-status-show-all = Показать всё в «Состоянии»
+dynamic-status-more = ещё { $count }
 transfer-card-canceling = Отмена…
 download-card-failed = Не удалось скачать
 download-card-saved-to = Сохранено в { $path }
@@ -1663,9 +1666,7 @@ transfer-card-items = { $count ->
         [few] { $count } элемента
        *[other] { $count } элементов
     }
-download-open-file = Открыть файл
 download-open-folder = Открыть папку
-download-open-downloads = Открыть папку загрузок
 upload-card-uploading = Отправка
 upload-completed = Отправка завершена
 upload-card-failed = Не удалось отправить

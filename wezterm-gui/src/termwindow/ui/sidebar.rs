@@ -5251,6 +5251,19 @@ impl crate::TermWindow {
         y: usize,
         size: usize,
     ) -> anyhow::Result<()> {
+        self.paint_sidebar_brand_icon_faded(layers, icon, x, y, size, 1.0)
+    }
+
+    /// `paint_sidebar_brand_icon`, `alpha` of the way there.
+    pub(crate) fn paint_sidebar_brand_icon_faded(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        icon: BrandIcon,
+        x: usize,
+        y: usize,
+        size: usize,
+        alpha: f32,
+    ) -> anyhow::Result<()> {
         let left_offset = self.dimensions.pixel_width as f32 / 2.0;
         let top_offset = self.dimensions.pixel_height as f32 / 2.0;
         let gl_state = self.render_state.as_ref().unwrap();
@@ -5270,7 +5283,7 @@ impl crate::TermWindow {
         quad.set_texture(sprite);
         quad.set_hsv(None);
         quad.set_has_color(true);
-        quad.set_fg_color(LinearRgba::with_components(1.0, 1.0, 1.0, 1.0));
+        quad.set_fg_color(LinearRgba::with_components(1.0, 1.0, 1.0, alpha));
 
         Ok(())
     }

@@ -1734,6 +1734,9 @@ remote-files-listing-too-large = Die entfernte Dateiliste ist zu groß
 download-completed = Download abgeschlossen
 download-completed-body = Geladen nach { $path }
 transfer-card-preparing = Wird vorbereitet…
+dynamic-status-go-to = Anzeigen
+dynamic-status-show-all = Alles in Status anzeigen
+dynamic-status-more = { $count } weitere
 transfer-card-canceling = Wird abgebrochen…
 download-card-failed = Download fehlgeschlagen
 download-card-saved-to = Gespeichert in { $path }
@@ -1741,9 +1744,7 @@ transfer-card-items = { $count ->
         [one] { $count } Element
        *[other] { $count } Elemente
     }
-download-open-file = Datei öffnen
 download-open-folder = Ordner öffnen
-download-open-downloads = Download-Ordner öffnen
 upload-card-uploading = Wird hochgeladen
 upload-completed = Upload abgeschlossen
 upload-card-failed = Upload fehlgeschlagen
