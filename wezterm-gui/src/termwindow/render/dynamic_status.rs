@@ -374,6 +374,11 @@ pub(crate) struct DynamicStatus {
 }
 
 impl DynamicStatus {
+    fn expire_agent_news(&mut self, now: Instant) {
+        self.agent_news
+            .retain(|_, at| now.duration_since(*at) < NEWS_FOR);
+    }
+
     fn grow(&self, now: Instant) -> f32 {
         self.grow.as_ref().map_or(0.0, |timeline| timeline.value(now))
     }
@@ -868,6 +873,16 @@ impl crate::TermWindow {
     /// can share the corner without guessing at each other's height.
     pub(crate) fn paint_dynamic_status(&mut self) -> anyhow::Result<()> {
         let now = Instant::now();
+        self.dynamic_status.expire_agent_news(now);
+        if let Some(deadline) = self
+            .dynamic_status
+            .agent_news
+            .values()
+            .map(|at| *at + NEWS_FOR)
+            .min()
+        {
+            self.update_next_frame_time(Some(deadline));
+        }
         // This window's own focus: someone looking at this one, not at any
         // window of the app.
         let focused = self.focused.is_some();
@@ -949,9 +964,6 @@ impl crate::TermWindow {
             let keys: HashSet<StatusKey> = items.iter().map(StatusItem::key).collect();
             dynamic.first_seen.retain(|key, _| keys.contains(key));
             dynamic.phases.retain(|key, _| keys.contains(key));
-            dynamic
-                .agent_news
-                .retain(|_, at| now.duration_since(*at) <= NEWS_FOR);
             let mut arrived = None;
             for item in &items {
                 let key = item.key();
@@ -2365,6 +2377,8 @@ impl crate::TermWindow {
         if !crate::agent_status::enabled() {
             return false;
         }
+        let now = Instant::now();
+        self.dynamic_status.expire_agent_news(now);
         let shown = self.dynamic_status.agent_marks.get(&pane_id).copied();
         let status = Mux::get().get_pane(pane_id).and_then(|pane| {
             let status = pane.agent_status().filter(|status| !status.ended)?;
@@ -2376,7 +2390,7 @@ impl crate::TermWindow {
             .as_ref()
             .is_some_and(|(_, status)| matches!(status.state, AgentState::Blocked | AgentState::Error))
         {
-            self.dynamic_status.agent_news.insert(pane_id, Instant::now());
+            self.dynamic_status.agent_news.insert(pane_id, now);
         }
         let agents_listed = self.right_sidebar_width() > 0
             && self.right_sidebar_mode == crate::termwindow::RightSidebarMode::Agents;
@@ -2411,6 +2425,9 @@ impl crate::TermWindow {
     /// of date, and if it was on the dynamic status, it goes now rather than at the
     /// next repaint.
     pub(crate) fn dynamic_status_pane_removed(&mut self, pane_id: PaneId) {
+        self.dynamic_status.agent_news.remove(&pane_id);
+        self.dynamic_status.agent_marks.remove(&pane_id);
+        self.dynamic_status.agent_since.remove(&pane_id);
         self.dynamic_status.agents = None;
         self.dynamic_status.panes = None;
         if self
@@ -2707,6 +2724,21 @@ fn status_mark(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_news_expires_even_after_an_empty_or_hidden_status() {
+        let now = Instant::now();
+        let mut dynamic = DynamicStatus::default();
+        dynamic.agent_news.insert(1, now);
+        dynamic.agent_news.insert(2, now + Duration::from_secs(1));
+        dynamic.clear();
+        dynamic.hide(now);
+        dynamic.expire_agent_news(now + NEWS_FOR);
+        assert!(!dynamic.agent_news.contains_key(&1));
+        assert!(dynamic.agent_news.contains_key(&2));
+        dynamic.expire_agent_news(now + NEWS_FOR + Duration::from_secs(1));
+        assert!(dynamic.agent_news.is_empty());
+    }
 
     fn rect(x: f32, y: f32, w: f32, h: f32) -> RectF {
         euclid::rect(x, y, w, h)
