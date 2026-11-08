@@ -51,6 +51,34 @@ impl crate::TermWindow {
         active: bool,
     ) -> anyhow::Result<()> {
         let rect = euclid::rect(0.0, y as f32, width as f32, height as f32);
+        // Over a see-through window a tab, as a sidebar row, lets some of
+        // what is behind it through: no shadow under it to darken that, and
+        // its edge a ring round the fill rather than a coat under it.
+        if self.chrome_see_through() {
+            use crate::termwindow::ui::tokens::{
+                SEE_THROUGH_BORDER_BOOST, SEE_THROUGH_SURFACE_ALPHA,
+            };
+            let Some(gl_state) = self.render_state.as_ref() else {
+                return Ok(());
+            };
+            let border = if active {
+                border.mul_alpha(SEE_THROUGH_BORDER_BOOST.min(1.0 / border.3.max(f32::EPSILON)))
+            } else {
+                border
+            };
+            return crate::ui::draw::DrawContext::new(gl_state, self.dimensions, &self.render_metrics)
+                .draw_rounded_frame(
+                    layers,
+                    layer_num,
+                    rect.min_x(),
+                    rect.min_y(),
+                    rect.width(),
+                    rect.height(),
+                    fill.mul_alpha(SEE_THROUGH_SURFACE_ALPHA),
+                    border,
+                    radius,
+                );
+        }
         if active {
             self.paint_active_surface_shadow(layers, layer_num, rect, radius)?;
         }
