@@ -81,21 +81,21 @@ ThinkTerm was measured with its local mux: the shell runs in the mux server, and
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/performance-dark.svg">
-    <img src="assets/performance-light.svg" alt="ThinkTerm throughput compared with WezTerm in six kitten benchmark workloads: ThinkTerm is faster in five, from 1.4× to 9.4×, and level on images (1.0×)" width="100%">
+    <img src="assets/performance-light.svg" alt="ThinkTerm throughput compared with WezTerm in six kitten benchmark workloads: ThinkTerm is faster in all six, from 1.1× to 9.8×" width="100%">
   </picture>
 </p>
 
 <details>
 <summary>Table data</summary>
 
-| Workload | ThinkTerm 0.4.3<br>2026-11-06 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | Ratio |
+| Workload | ThinkTerm 0.4.7<br>2026-11-08 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | Ratio |
 | --- | ---: | ---: | ---: |
-| Only ASCII chars | **221.4** | 23.6 | 9.4× |
-| Unicode chars | **193.2** | 46.7 | 4.1× |
-| Unique multi-codepoint Unicode cells | **285.3** | 49.3 | 5.8× |
-| CSI codes with few chars | **89.9** | 15.6 | 5.8× |
-| Long escape codes | **278.6** | 194.9 | 1.4× |
-| Images | **278.4** | 270.5 | 1.0× |
+| Only ASCII chars | **231.2** | 23.6 | 9.8× |
+| Unicode chars | **207.5** | 46.7 | 4.4× |
+| Unique multi-codepoint Unicode cells | **307.2** | 49.3 | 6.2× |
+| CSI codes with few chars | **89.6** | 15.6 | 5.7× |
+| Long escape codes | **317.9** | 194.9 | 1.6× |
+| Images | **305.8** | 270.5 | 1.1× |
 
 </details>
 

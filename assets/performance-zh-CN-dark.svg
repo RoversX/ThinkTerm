@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 670" width="1000" height="670" role="img" aria-labelledby="t d">
 <title id="t">ThinkTerm vs WezTerm</title>
-<desc id="d">kitten __benchmark__ · Mac · M1 Pro · MB/s，越大越好. 纯 ASCII 字符: ThinkTerm 221.4, WezTerm 23.6 (9.4×); Unicode 字符: ThinkTerm 193.2, WezTerm 46.7 (4.1×); 多码点 Unicode 字符: ThinkTerm 285.3, WezTerm 49.3 (5.8×); CSI 序列夹少量字符: ThinkTerm 89.9, WezTerm 15.6 (5.8×); 长转义序列: ThinkTerm 278.6, WezTerm 194.9 (1.4×); 图片: ThinkTerm 278.4, WezTerm 270.5 (1.0×).</desc>
+<desc id="d">kitten __benchmark__ · Mac · M1 Pro · MB/s，越大越好. 纯 ASCII 字符: ThinkTerm 231.2, WezTerm 23.6 (9.8×); Unicode 字符: ThinkTerm 207.5, WezTerm 46.7 (4.4×); 多码点 Unicode 字符: ThinkTerm 307.2, WezTerm 49.3 (6.2×); CSI 序列夹少量字符: ThinkTerm 89.6, WezTerm 15.6 (5.7×); 长转义序列: ThinkTerm 317.9, WezTerm 194.9 (1.6×); 图片: ThinkTerm 305.8, WezTerm 270.5 (1.1×).</desc>
 <defs>
 <linearGradient id="ours" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#2f8cff"/><stop offset="1" stop-color="#5fb0ff"/></linearGradient>
 <filter id="glow" x="-10%" y="-80%" width="120%" height="300%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#2f8cff" flood-opacity="0.5"/></filter>
@@ -29,65 +29,65 @@ text { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro
 <text x="500" y="62" class="headline" text-anchor="middle">ThinkTerm vs WezTerm</text>
 <text x="500" y="92" class="subhead" text-anchor="middle">kitten __benchmark__ · Mac · M1 Pro · MB/s，越大越好</text>
 <rect x="372" y="122" width="22" height="12" rx="6" class="ours"/>
-<text x="402" y="132" class="legend">ThinkTerm 0.4.3 · 2026-11-06</text>
+<text x="402" y="132" class="legend">ThinkTerm 0.4.7 · 2026-11-08</text>
 <rect x="628" y="122" width="22" height="12" rx="6" class="theirs"/>
 <text x="658" y="132" class="legend">WezTerm 20260117 · 2026-09-23</text>
 <text x="912" y="132" class="legend" text-anchor="middle">倍数</text>
 <line x1="450.3" y1="164" x2="450.3" y2="564" class="grid"/>
-<text x="450.3" y="584" class="tick" text-anchor="middle">50</text>
+<text x="450.3" y="584" class="tick" text-anchor="middle">60</text>
 <line x1="528.7" y1="164" x2="528.7" y2="564" class="grid"/>
-<text x="528.7" y="584" class="tick" text-anchor="middle">100</text>
+<text x="528.7" y="584" class="tick" text-anchor="middle">120</text>
 <line x1="607.0" y1="164" x2="607.0" y2="564" class="grid"/>
-<text x="607.0" y="584" class="tick" text-anchor="middle">150</text>
+<text x="607.0" y="584" class="tick" text-anchor="middle">180</text>
 <line x1="685.3" y1="164" x2="685.3" y2="564" class="grid"/>
-<text x="685.3" y="584" class="tick" text-anchor="middle">200</text>
+<text x="685.3" y="584" class="tick" text-anchor="middle">240</text>
 <line x1="763.7" y1="164" x2="763.7" y2="564" class="grid"/>
-<text x="763.7" y="584" class="tick" text-anchor="middle">250</text>
+<text x="763.7" y="584" class="tick" text-anchor="middle">300</text>
 <line x1="842.0" y1="164" x2="842.0" y2="564" class="grid"/>
-<text x="842.0" y="584" class="tick" text-anchor="middle">300</text>
+<text x="842.0" y="584" class="tick" text-anchor="middle">360</text>
 <line x1="372" y1="164" x2="372" y2="564" class="axis"/>
 <text x="372" y="584" class="tick" text-anchor="middle">0</text>
 <text x="350" y="201.5" class="label" text-anchor="end">纯 ASCII 字符</text>
-<rect x="372" y="178" width="346.9" height="16" rx="8.0" class="ours-bar"/>
-<text x="726.9" y="190.5" class="val-ours">221.4</text>
-<rect x="372" y="199" width="37.0" height="16" rx="8.0" class="theirs"/>
-<text x="417.0" y="211.5" class="val-theirs">23.6</text>
+<rect x="372" y="178" width="301.8" height="16" rx="8.0" class="ours-bar"/>
+<text x="681.8" y="190.5" class="val-ours">231.2</text>
+<rect x="372" y="199" width="30.8" height="16" rx="8.0" class="theirs"/>
+<text x="410.8" y="211.5" class="val-theirs">23.6</text>
 <rect x="878" y="182.5" width="68" height="28" rx="14" class="win"/>
-<text x="912" y="201.5" class="win-t" text-anchor="middle">9.4×</text>
+<text x="912" y="201.5" class="win-t" text-anchor="middle">9.8×</text>
 <text x="350" y="267.5" class="label" text-anchor="end">Unicode 字符</text>
-<rect x="372" y="244" width="302.7" height="16" rx="8.0" class="ours-bar"/>
-<text x="682.7" y="256.5" class="val-ours">193.2</text>
-<rect x="372" y="265" width="73.2" height="16" rx="8.0" class="theirs"/>
-<text x="453.2" y="277.5" class="val-theirs">46.7</text>
+<rect x="372" y="244" width="270.9" height="16" rx="8.0" class="ours-bar"/>
+<text x="650.9" y="256.5" class="val-ours">207.5</text>
+<rect x="372" y="265" width="61.0" height="16" rx="8.0" class="theirs"/>
+<text x="441.0" y="277.5" class="val-theirs">46.7</text>
 <rect x="878" y="248.5" width="68" height="28" rx="14" class="win"/>
-<text x="912" y="267.5" class="win-t" text-anchor="middle">4.1×</text>
+<text x="912" y="267.5" class="win-t" text-anchor="middle">4.4×</text>
 <text x="350" y="333.5" class="label" text-anchor="end">多码点 Unicode 字符</text>
-<rect x="372" y="310" width="447.0" height="16" rx="8.0" class="ours-bar"/>
-<text x="827.0" y="322.5" class="val-ours">285.3</text>
-<rect x="372" y="331" width="77.2" height="16" rx="8.0" class="theirs"/>
-<text x="457.2" y="343.5" class="val-theirs">49.3</text>
+<rect x="372" y="310" width="401.1" height="16" rx="8.0" class="ours-bar"/>
+<text x="781.1" y="322.5" class="val-ours">307.2</text>
+<rect x="372" y="331" width="64.4" height="16" rx="8.0" class="theirs"/>
+<text x="444.4" y="343.5" class="val-theirs">49.3</text>
 <rect x="878" y="314.5" width="68" height="28" rx="14" class="win"/>
-<text x="912" y="333.5" class="win-t" text-anchor="middle">5.8×</text>
+<text x="912" y="333.5" class="win-t" text-anchor="middle">6.2×</text>
 <text x="350" y="399.5" class="label" text-anchor="end">CSI 序列夹少量字符</text>
-<rect x="372" y="376" width="140.8" height="16" rx="8.0" class="ours-bar"/>
-<text x="520.8" y="388.5" class="val-ours">89.9</text>
-<rect x="372" y="397" width="24.4" height="16" rx="8.0" class="theirs"/>
-<text x="404.4" y="409.5" class="val-theirs">15.6</text>
+<rect x="372" y="376" width="117.0" height="16" rx="8.0" class="ours-bar"/>
+<text x="497.0" y="388.5" class="val-ours">89.6</text>
+<rect x="372" y="397" width="20.4" height="16" rx="8.0" class="theirs"/>
+<text x="400.4" y="409.5" class="val-theirs">15.6</text>
 <rect x="878" y="380.5" width="68" height="28" rx="14" class="win"/>
-<text x="912" y="399.5" class="win-t" text-anchor="middle">5.8×</text>
+<text x="912" y="399.5" class="win-t" text-anchor="middle">5.7×</text>
 <text x="350" y="465.5" class="label" text-anchor="end">长转义序列</text>
-<rect x="372" y="442" width="436.5" height="16" rx="8.0" class="ours-bar"/>
-<text x="816.5" y="454.5" class="val-ours">278.6</text>
-<rect x="372" y="463" width="305.3" height="16" rx="8.0" class="theirs"/>
-<text x="685.3" y="475.5" class="val-theirs">194.9</text>
+<rect x="372" y="442" width="415.0" height="16" rx="8.0" class="ours-bar"/>
+<text x="795.0" y="454.5" class="val-ours">317.9</text>
+<rect x="372" y="463" width="254.5" height="16" rx="8.0" class="theirs"/>
+<text x="634.5" y="475.5" class="val-theirs">194.9</text>
 <rect x="878" y="446.5" width="68" height="28" rx="14" class="win"/>
-<text x="912" y="465.5" class="win-t" text-anchor="middle">1.4×</text>
+<text x="912" y="465.5" class="win-t" text-anchor="middle">1.6×</text>
 <text x="350" y="531.5" class="label" text-anchor="end">图片</text>
-<rect x="372" y="508" width="436.2" height="16" rx="8.0" class="ours-bar"/>
-<text x="816.2" y="520.5" class="val-ours">278.4</text>
-<rect x="372" y="529" width="423.8" height="16" rx="8.0" class="theirs"/>
-<text x="803.8" y="541.5" class="val-theirs">270.5</text>
-<rect x="878" y="512.5" width="68" height="28" rx="14" class="even"/>
-<text x="912" y="531.5" class="even-t" text-anchor="middle">1.0×</text>
+<rect x="372" y="508" width="399.2" height="16" rx="8.0" class="ours-bar"/>
+<text x="779.2" y="520.5" class="val-ours">305.8</text>
+<rect x="372" y="529" width="353.2" height="16" rx="8.0" class="theirs"/>
+<text x="733.2" y="541.5" class="val-theirs">270.5</text>
+<rect x="878" y="512.5" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="531.5" class="win-t" text-anchor="middle">1.1×</text>
 <text x="500" y="636" class="caption" text-anchor="middle">ThinkTerm 测试时开着本地 mux：shell 跑在 mux 服务端里，输出要先经过 mux 再到窗口。</text>
 </svg>

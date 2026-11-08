@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 670" width="1000" height="670" role="img" aria-labelledby="t d">
 <title id="t">ThinkTerm vs WezTerm</title>
-<desc id="d">kitten __benchmark__ · Mac · M1 Pro · Mo/s, plus c’est élevé, mieux c’est. Caractères ASCII uniquement: ThinkTerm 221,4, WezTerm 23,6 (9,4×); Caractères Unicode: ThinkTerm 193,2, WezTerm 46,7 (4,1×); Cellules Unicode à plusieurs points de code: ThinkTerm 285,3, WezTerm 49,3 (5,8×); Séquences CSI avec peu de caractères: ThinkTerm 89,9, WezTerm 15,6 (5,8×); Longues séquences d’échappement: ThinkTerm 278,6, WezTerm 194,9 (1,4×); Images: ThinkTerm 278,4, WezTerm 270,5 (1,0×).</desc>
+<desc id="d">kitten __benchmark__ · Mac · M1 Pro · Mo/s, plus c’est élevé, mieux c’est. Caractères ASCII uniquement: ThinkTerm 231,2, WezTerm 23,6 (9,8×); Caractères Unicode: ThinkTerm 207,5, WezTerm 46,7 (4,4×); Cellules Unicode à plusieurs points de code: ThinkTerm 307,2, WezTerm 49,3 (6,2×); Séquences CSI avec peu de caractères: ThinkTerm 89,6, WezTerm 15,6 (5,7×); Longues séquences d’échappement: ThinkTerm 317,9, WezTerm 194,9 (1,6×); Images: ThinkTerm 305,8, WezTerm 270,5 (1,1×).</desc>
 <defs>
 <linearGradient id="ours" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#2f8cff"/><stop offset="1" stop-color="#5fb0ff"/></linearGradient>
 <filter id="glow" x="-10%" y="-80%" width="120%" height="300%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#2f8cff" flood-opacity="0.5"/></filter>
@@ -29,65 +29,65 @@ text { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro
 <text x="500" y="62" class="headline" text-anchor="middle">ThinkTerm vs WezTerm</text>
 <text x="500" y="92" class="subhead" text-anchor="middle">kitten __benchmark__ · Mac · M1 Pro · Mo/s, plus c’est élevé, mieux c’est</text>
 <rect x="372" y="122" width="22" height="12" rx="6" class="ours"/>
-<text x="402" y="132" class="legend">ThinkTerm 0.4.3 · 2026-11-06</text>
+<text x="402" y="132" class="legend">ThinkTerm 0.4.7 · 2026-11-08</text>
 <rect x="628" y="122" width="22" height="12" rx="6" class="theirs"/>
 <text x="658" y="132" class="legend">WezTerm 20260117 · 2026-09-23</text>
 <text x="912" y="132" class="legend" text-anchor="middle">Rapport</text>
 <line x1="471.2" y1="164" x2="471.2" y2="564" class="grid"/>
-<text x="471.2" y="584" class="tick" text-anchor="middle">50</text>
+<text x="471.2" y="584" class="tick" text-anchor="middle">60</text>
 <line x1="545.3" y1="164" x2="545.3" y2="564" class="grid"/>
-<text x="545.3" y="584" class="tick" text-anchor="middle">100</text>
+<text x="545.3" y="584" class="tick" text-anchor="middle">120</text>
 <line x1="619.5" y1="164" x2="619.5" y2="564" class="grid"/>
-<text x="619.5" y="584" class="tick" text-anchor="middle">150</text>
+<text x="619.5" y="584" class="tick" text-anchor="middle">180</text>
 <line x1="693.7" y1="164" x2="693.7" y2="564" class="grid"/>
-<text x="693.7" y="584" class="tick" text-anchor="middle">200</text>
+<text x="693.7" y="584" class="tick" text-anchor="middle">240</text>
 <line x1="767.8" y1="164" x2="767.8" y2="564" class="grid"/>
-<text x="767.8" y="584" class="tick" text-anchor="middle">250</text>
+<text x="767.8" y="584" class="tick" text-anchor="middle">300</text>
 <line x1="842.0" y1="164" x2="842.0" y2="564" class="grid"/>
-<text x="842.0" y="584" class="tick" text-anchor="middle">300</text>
+<text x="842.0" y="584" class="tick" text-anchor="middle">360</text>
 <line x1="397" y1="164" x2="397" y2="564" class="axis"/>
 <text x="397" y="584" class="tick" text-anchor="middle">0</text>
 <text x="375" y="201.5" class="label" text-anchor="end">Caractères ASCII uniquement</text>
-<rect x="397" y="178" width="328.4" height="16" rx="8.0" class="ours-bar"/>
-<text x="733.4" y="190.5" class="val-ours">221,4</text>
-<rect x="397" y="199" width="35.0" height="16" rx="8.0" class="theirs"/>
-<text x="440.0" y="211.5" class="val-theirs">23,6</text>
+<rect x="397" y="178" width="285.8" height="16" rx="8.0" class="ours-bar"/>
+<text x="690.8" y="190.5" class="val-ours">231,2</text>
+<rect x="397" y="199" width="29.2" height="16" rx="8.0" class="theirs"/>
+<text x="434.2" y="211.5" class="val-theirs">23,6</text>
 <rect x="878" y="182.5" width="68" height="28" rx="14" class="win"/>
-<text x="912" y="201.5" class="win-t" text-anchor="middle">9,4×</text>
+<text x="912" y="201.5" class="win-t" text-anchor="middle">9,8×</text>
 <text x="375" y="267.5" class="label" text-anchor="end">Caractères Unicode</text>
-<rect x="397" y="244" width="286.6" height="16" rx="8.0" class="ours-bar"/>
-<text x="691.6" y="256.5" class="val-ours">193,2</text>
-<rect x="397" y="265" width="69.3" height="16" rx="8.0" class="theirs"/>
-<text x="474.3" y="277.5" class="val-theirs">46,7</text>
+<rect x="397" y="244" width="256.5" height="16" rx="8.0" class="ours-bar"/>
+<text x="661.5" y="256.5" class="val-ours">207,5</text>
+<rect x="397" y="265" width="57.7" height="16" rx="8.0" class="theirs"/>
+<text x="462.7" y="277.5" class="val-theirs">46,7</text>
 <rect x="878" y="248.5" width="68" height="28" rx="14" class="win"/>
-<text x="912" y="267.5" class="win-t" text-anchor="middle">4,1×</text>
+<text x="912" y="267.5" class="win-t" text-anchor="middle">4,4×</text>
 <text x="375" y="333.5" class="label" text-anchor="end">Cellules Unicode à plusieurs points de code</text>
-<rect x="397" y="310" width="423.2" height="16" rx="8.0" class="ours-bar"/>
-<text x="828.2" y="322.5" class="val-ours">285,3</text>
-<rect x="397" y="331" width="73.1" height="16" rx="8.0" class="theirs"/>
-<text x="478.1" y="343.5" class="val-theirs">49,3</text>
+<rect x="397" y="310" width="379.7" height="16" rx="8.0" class="ours-bar"/>
+<text x="784.7" y="322.5" class="val-ours">307,2</text>
+<rect x="397" y="331" width="60.9" height="16" rx="8.0" class="theirs"/>
+<text x="465.9" y="343.5" class="val-theirs">49,3</text>
 <rect x="878" y="314.5" width="68" height="28" rx="14" class="win"/>
-<text x="912" y="333.5" class="win-t" text-anchor="middle">5,8×</text>
+<text x="912" y="333.5" class="win-t" text-anchor="middle">6,2×</text>
 <text x="375" y="399.5" class="label" text-anchor="end">Séquences CSI avec peu de caractères</text>
-<rect x="397" y="376" width="133.4" height="16" rx="8.0" class="ours-bar"/>
-<text x="538.4" y="388.5" class="val-ours">89,9</text>
-<rect x="397" y="397" width="23.1" height="16" rx="8.0" class="theirs"/>
-<text x="428.1" y="409.5" class="val-theirs">15,6</text>
+<rect x="397" y="376" width="110.8" height="16" rx="8.0" class="ours-bar"/>
+<text x="515.8" y="388.5" class="val-ours">89,6</text>
+<rect x="397" y="397" width="19.3" height="16" rx="8.0" class="theirs"/>
+<text x="424.3" y="409.5" class="val-theirs">15,6</text>
 <rect x="878" y="380.5" width="68" height="28" rx="14" class="win"/>
-<text x="912" y="399.5" class="win-t" text-anchor="middle">5,8×</text>
+<text x="912" y="399.5" class="win-t" text-anchor="middle">5,7×</text>
 <text x="375" y="465.5" class="label" text-anchor="end">Longues séquences d’échappement</text>
-<rect x="397" y="442" width="413.3" height="16" rx="8.0" class="ours-bar"/>
-<text x="818.3" y="454.5" class="val-ours">278,6</text>
-<rect x="397" y="463" width="289.1" height="16" rx="8.0" class="theirs"/>
-<text x="694.1" y="475.5" class="val-theirs">194,9</text>
+<rect x="397" y="442" width="393.0" height="16" rx="8.0" class="ours-bar"/>
+<text x="798.0" y="454.5" class="val-ours">317,9</text>
+<rect x="397" y="463" width="240.9" height="16" rx="8.0" class="theirs"/>
+<text x="645.9" y="475.5" class="val-theirs">194,9</text>
 <rect x="878" y="446.5" width="68" height="28" rx="14" class="win"/>
-<text x="912" y="465.5" class="win-t" text-anchor="middle">1,4×</text>
+<text x="912" y="465.5" class="win-t" text-anchor="middle">1,6×</text>
 <text x="375" y="531.5" class="label" text-anchor="end">Images</text>
-<rect x="397" y="508" width="413.0" height="16" rx="8.0" class="ours-bar"/>
-<text x="818.0" y="520.5" class="val-ours">278,4</text>
-<rect x="397" y="529" width="401.2" height="16" rx="8.0" class="theirs"/>
-<text x="806.2" y="541.5" class="val-theirs">270,5</text>
-<rect x="878" y="512.5" width="68" height="28" rx="14" class="even"/>
-<text x="912" y="531.5" class="even-t" text-anchor="middle">1,0×</text>
+<rect x="397" y="508" width="378.0" height="16" rx="8.0" class="ours-bar"/>
+<text x="783.0" y="520.5" class="val-ours">305,8</text>
+<rect x="397" y="529" width="334.4" height="16" rx="8.0" class="theirs"/>
+<text x="739.4" y="541.5" class="val-theirs">270,5</text>
+<rect x="878" y="512.5" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="531.5" class="win-t" text-anchor="middle">1,1×</text>
 <text x="500" y="636" class="caption" text-anchor="middle">ThinkTerm mesuré avec son mux local : le shell tourne dans le serveur mux, et sa sortie passe par le mux avant la fenêtre.</text>
 </svg>

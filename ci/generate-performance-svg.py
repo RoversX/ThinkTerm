@@ -15,18 +15,18 @@ CHARTS = [
     dict(
         prefix="performance",
         rival="WezTerm",
-        legend=("ThinkTerm 0.4.3 · 2026-11-06", "WezTerm 20260117 · 2026-09-23"),
+        legend=("ThinkTerm 0.4.7 · 2026-11-08", "WezTerm 20260117 · 2026-09-23"),
         machine="Mac · M1 Pro",
         caption="mac",
-        scale_max=300,
+        scale_max=360,
         # workload: (ThinkTerm MB/s, rival MB/s)
         results={
-            "ascii": (221.4, 23.6),
-            "unicode": (193.2, 46.7),
-            "multi": (285.3, 49.3),
-            "csi": (89.9, 15.6),
-            "long": (278.6, 194.9),
-            "images": (278.4, 270.5),
+            "ascii": (231.2, 23.6),
+            "unicode": (207.5, 46.7),
+            "multi": (307.2, 49.3),
+            "csi": (89.6, 15.6),
+            "long": (317.9, 194.9),
+            "images": (305.8, 270.5),
         },
     ),
     dict(

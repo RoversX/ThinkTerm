@@ -79,21 +79,21 @@ ThinkTerm はローカル mux を有効にした状態で計測しています�
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="../assets/performance-ja-JP-dark.svg">
-    <img src="../assets/performance-ja-JP-light.svg" alt="kitten ベンチマーク 6 項目での ThinkTerm と WezTerm のスループット比較：ThinkTerm は 5 項目で高速（1.4×〜9.4×）、画像はほぼ同等（1.0×）" width="100%">
+    <img src="../assets/performance-ja-JP-light.svg" alt="kitten ベンチマーク 6 項目での ThinkTerm と WezTerm のスループット比較：ThinkTerm は 6 項目すべてで高速（1.1×〜9.8×）" width="100%">
   </picture>
 </p>
 
 <details>
 <summary>表形式のデータ</summary>
 
-| 項目 | ThinkTerm 0.4.3<br>2026-11-06 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | 倍率 |
+| 項目 | ThinkTerm 0.4.7<br>2026-11-08 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | 倍率 |
 | --- | ---: | ---: | ---: |
-| ASCII 文字のみ | **221.4** | 23.6 | 9.4× |
-| Unicode 文字 | **193.2** | 46.7 | 4.1× |
-| 複数コードポイントの Unicode セル | **285.3** | 49.3 | 5.8× |
-| 文字の少ない CSI シーケンス | **89.9** | 15.6 | 5.8× |
-| 長いエスケープシーケンス | **278.6** | 194.9 | 1.4× |
-| 画像 | **278.4** | 270.5 | 1.0× |
+| ASCII 文字のみ | **231.2** | 23.6 | 9.8× |
+| Unicode 文字 | **207.5** | 46.7 | 4.4× |
+| 複数コードポイントの Unicode セル | **307.2** | 49.3 | 6.2× |
+| 文字の少ない CSI シーケンス | **89.6** | 15.6 | 5.7× |
+| 長いエスケープシーケンス | **317.9** | 194.9 | 1.6× |
+| 画像 | **305.8** | 270.5 | 1.1× |
 
 </details>
 

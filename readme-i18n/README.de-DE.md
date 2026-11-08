@@ -79,21 +79,21 @@ ThinkTerm wurde mit lokalem mux gemessen: Die Shell läuft im mux-Server, und ih
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="../assets/performance-de-DE-dark.svg">
-    <img src="../assets/performance-de-DE-light.svg" alt="Durchsatz von ThinkTerm im Vergleich zu WezTerm in sechs kitten-Benchmarks: ThinkTerm ist in fünf schneller (1,4× bis 9,4×) und bei Bildern gleichauf (1,0×)" width="100%">
+    <img src="../assets/performance-de-DE-light.svg" alt="Durchsatz von ThinkTerm im Vergleich zu WezTerm in sechs kitten-Benchmarks: ThinkTerm ist in allen sechs schneller (1,1× bis 9,8×)" width="100%">
   </picture>
 </p>
 
 <details>
 <summary>Daten als Tabelle</summary>
 
-| Test | ThinkTerm 0.4.3<br>2026-11-06 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | Faktor |
+| Test | ThinkTerm 0.4.7<br>2026-11-08 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | Faktor |
 | --- | ---: | ---: | ---: |
-| Nur ASCII-Zeichen | **221,4** | 23,6 | 9,4× |
-| Unicode-Zeichen | **193,2** | 46,7 | 4,1× |
-| Unicode-Zellen aus mehreren Codepoints | **285,3** | 49,3 | 5,8× |
-| CSI-Sequenzen mit wenigen Zeichen | **89,9** | 15,6 | 5,8× |
-| Lange Escape-Sequenzen | **278,6** | 194,9 | 1,4× |
-| Bilder | **278,4** | 270,5 | 1,0× |
+| Nur ASCII-Zeichen | **231,2** | 23,6 | 9,8× |
+| Unicode-Zeichen | **207,5** | 46,7 | 4,4× |
+| Unicode-Zellen aus mehreren Codepoints | **307,2** | 49,3 | 6,2× |
+| CSI-Sequenzen mit wenigen Zeichen | **89,6** | 15,6 | 5,7× |
+| Lange Escape-Sequenzen | **317,9** | 194,9 | 1,6× |
+| Bilder | **305,8** | 270,5 | 1,1× |
 
 </details>
 

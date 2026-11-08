@@ -79,21 +79,21 @@ ThinkTerm 测试时开着本地 mux：shell 跑在 mux 服务端里，输出要�
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="../assets/performance-zh-CN-dark.svg">
-    <img src="../assets/performance-zh-CN-light.svg" alt="ThinkTerm 与 WezTerm 在 6 项 kitten 跑分中的吞吐对比：ThinkTerm 有 5 项更快（1.4× 到 9.4×），图片一项持平（1.0×）" width="100%">
+    <img src="../assets/performance-zh-CN-light.svg" alt="ThinkTerm 与 WezTerm 在 6 项 kitten 跑分中的吞吐对比：ThinkTerm 6 项全部更快（1.1× 到 9.8×）" width="100%">
   </picture>
 </p>
 
 <details>
 <summary>表格数据</summary>
 
-| 测试项 | ThinkTerm 0.4.3<br>2026-11-06 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | 倍数 |
+| 测试项 | ThinkTerm 0.4.7<br>2026-11-08 | WezTerm 20260117-154428-05343b38<br>2026-09-23 | 倍数 |
 | --- | ---: | ---: | ---: |
-| 纯 ASCII 字符 | **221.4** | 23.6 | 9.4× |
-| Unicode 字符 | **193.2** | 46.7 | 4.1× |
-| 多码点 Unicode 字符 | **285.3** | 49.3 | 5.8× |
-| CSI 序列夹少量字符 | **89.9** | 15.6 | 5.8× |
-| 长转义序列 | **278.6** | 194.9 | 1.4× |
-| 图片 | **278.4** | 270.5 | 1.0× |
+| 纯 ASCII 字符 | **231.2** | 23.6 | 9.8× |
+| Unicode 字符 | **207.5** | 46.7 | 4.4× |
+| 多码点 Unicode 字符 | **307.2** | 49.3 | 6.2× |
+| CSI 序列夹少量字符 | **89.6** | 15.6 | 5.7× |
+| 长转义序列 | **317.9** | 194.9 | 1.6× |
+| 图片 | **305.8** | 270.5 | 1.1× |
 
 </details>
 
