@@ -5,12 +5,12 @@ pub const SIDEBAR_INSET: usize = 10;
 pub const SIDEBAR_ICON_GAP: usize = 10;
 pub const SIDEBAR_ROW_GAP: usize = 10;
 pub const SIDEBAR_ROW_RADIUS: f32 = 10.0;
-/// Corner of the highlight behind a selected or hovered sidebar row. Scaled as
-/// a whole, unlike the `ui_f32(SIDEBAR_ROW_RADIUS) + 2.0` it replaces, where
-/// the added 2 stayed in raw pixels and so grew relative to the design on any
-/// display below the 2x grid the chrome is drawn for.
-pub const SIDEBAR_ROW_HIGHLIGHT_RADIUS: f32 = 20.0;
 pub const SIDEBAR_RESIZE_HANDLE_WIDTH: usize = 8;
+/// How much of a selected or hovered surface -- a sidebar row, a tab -- is
+/// kept over a see-through window, so that some of what is behind it shows.
+pub const SEE_THROUGH_SURFACE_ALPHA: f32 = 0.7;
+/// How much more of a selected surface's border is drawn there, for its edge.
+pub const SEE_THROUGH_BORDER_BOOST: f32 = 1.8;
 /// Left-edge strip that arms a hover reveal of the collapsed sidebar.
 ///
 /// Scaled through `ui_px`, not a raw pixel count: cell width scales with DPI

@@ -93,15 +93,15 @@ const SWITCH_KNOB_INSET: f32 = 4.0;
 const WORK_MOMENT_CHIP_HEIGHT: f32 = 44.0;
 const WORK_MOMENT_CHIP_GAP: f32 = 14.0;
 const WORK_MOMENT_CHECK_SIDE: f32 = 24.0;
-// Matches termwindow::ui::tokens::SIDEBAR_ROW_HIGHLIGHT_RADIUS: the two
-// sidebars draw the same shape.
-const NAV_ROW_RADIUS: f32 = 20.0;
 // Row geometry lifted from the main window's sidebar -- SESSION_ROW_MIN_HEIGHT,
 // SIDEBAR_INSET and SIDEBAR_ROW_GAP in termwindow::ui. Both sidebars grow a row
 // from their own font's cell height against a shared floor rather than pinning
 // a constant, so a Settings row and a thread row are the same size even though
 // the two use different font sizes.
-const NAV_ROW_MIN_HEIGHT: f32 = 66.0;
+const NAV_ROW_MIN_HEIGHT: f32 = 72.0;
+// The corner of a row's highlight. The main window's sidebar draws its rows
+// as pills; Settings keeps its rounded rectangles.
+const NAV_ROW_RADIUS: f32 = 20.0;
 const NAV_ROW_INSET: f32 = 10.0;
 const NAV_ROW_GAP: f32 = 10.0;
 const HEADER_HEIGHT: f32 = 132.0;

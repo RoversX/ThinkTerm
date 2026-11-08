@@ -12,9 +12,9 @@ use crate::termwindow::ui::platform_chrome;
 use crate::termwindow::ui::sidebar_jump::{CurrentRow, Fold, JumpList};
 use crate::termwindow::ui::status_icon::UiStatusKind;
 use crate::termwindow::ui::tokens::{
-    CAPSULE_BORDER_WIDTH, SIDEBAR_ICON_GAP, SIDEBAR_INSET, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
-    SIDEBAR_RESIZE_HANDLE_WIDTH, SIDEBAR_ROW_GAP, SIDEBAR_ROW_HIGHLIGHT_RADIUS,
-    SIDEBAR_ROW_RADIUS, SIDEBAR_TITLE_FADE_GAP, SIDEBAR_WIDTH_CELLS,
+    CAPSULE_BORDER_WIDTH, SEE_THROUGH_BORDER_BOOST, SEE_THROUGH_SURFACE_ALPHA, SIDEBAR_ICON_GAP,
+    SIDEBAR_INSET, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_RESIZE_HANDLE_WIDTH,
+    SIDEBAR_ROW_GAP, SIDEBAR_ROW_RADIUS, SIDEBAR_TITLE_FADE_GAP, SIDEBAR_WIDTH_CELLS,
     WINDOW_TAB_FULLSCREEN_NEW_SESSION_EXTRA_HEIGHT, WINDOW_TAB_FULLSCREEN_NEW_SESSION_Y_OFFSET,
     WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_X, WINDOW_TAB_FULLSCREEN_SIDEBAR_BUTTON_Y_OFFSET,
     WINDOW_TAB_TOP_SPACER,
@@ -85,7 +85,10 @@ const TOP_ACTION_BOTTOM_GAP: usize = 16;
 /// notification button. Raising it past 58 means raising
 /// `SESSION_ROW_MIN_HEIGHT` too.
 const TOP_ACTION_MAX_HEIGHT: usize = 58;
-const SESSION_ROW_MIN_HEIGHT: usize = 66;
+const SESSION_ROW_MIN_HEIGHT: usize = 72;
+/// How much further in from a row's end its status mark sits than its icons
+/// from the start.
+const SESSION_STATUS_END_CLEARANCE: usize = 6;
 const SESSION_ACTION_MIN_SIZE: usize = 48;
 const SESSION_ACTION_MAX_SIZE: usize = 52;
 const SESSION_ACTION_ICON_INSET: usize = 12;
@@ -1015,10 +1018,14 @@ impl crate::TermWindow {
         chrome: &UiPalette,
         foreground: LinearRgba,
     ) -> anyhow::Result<(usize, usize)> {
-        // As far in from the row's end as the icons sit from its start,
-        // centre for centre, rather than against the edge.
-        let mark_x = end_x
-            .saturating_sub(self.ui_px(SESSION_STATUS_ICON_SIZE) + self.ui_px(SIDEBAR_INSET));
+        // In from the row's end rather than against the edge, and a little
+        // further than the icons sit from its start, clear of the round end
+        // of the highlight.
+        let mark_x = end_x.saturating_sub(
+            self.ui_px(SESSION_STATUS_ICON_SIZE)
+                + self.ui_px(SIDEBAR_INSET)
+                + self.ui_px(SESSION_STATUS_END_CLEARANCE),
+        );
         let mut text_right = end_x;
         if show_end && !dimmed {
             self.paint_sidebar_thread_mark(
@@ -1603,7 +1610,7 @@ impl crate::TermWindow {
             None => return Ok(()),
         };
 
-        let chrome = self.chrome();
+        let chrome = self.sidebar_chrome();
         let foreground = chrome.text;
         let sidebar_bg = self.sidebar_surface(chrome.workspace_sidebar_bg);
         let see_through = self.chrome_see_through();
@@ -2334,23 +2341,8 @@ impl crate::TermWindow {
                             pinned_width as f32,
                             session_row_height as f32,
                         );
-                        self.paint_active_surface_shadow(
-                            layers,
-                            0,
-                            row_rect,
-                            self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
-                        )
-                        .context("sidebar selected pinned thread shadow")?;
-                        self.fill_rounded_rectangle_with_border(
-                            layers,
-                            0,
-                            row_rect,
-                            selected_bg,
-                            selected_border,
-                            self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
-                            CAPSULE_BORDER_WIDTH,
-                        )
-                        .context("sidebar selected pinned thread")?;
+                        self.paint_sidebar_selected_row(layers, row_rect, selected_bg, selected_border)
+                            .context("sidebar selected pinned thread")?;
                     } else if is_hovered && !is_renaming_session {
                         self.fill_rounded_rectangle(
                             layers,
@@ -2362,7 +2354,7 @@ impl crate::TermWindow {
                                 session_row_height as f32,
                             ),
                             chrome.sidebar_row_hover_bg,
-                            self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
+                            session_row_height as f32 / 2.0,
                         )
                         .context("sidebar hovered pinned thread")?;
                     }
@@ -2829,23 +2821,8 @@ impl crate::TermWindow {
                                 session_width as f32,
                                 session_row_height as f32,
                             );
-                            self.paint_active_surface_shadow(
-                                layers,
-                                0,
-                                row_rect,
-                                self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
-                            )
-                            .context("sidebar selected thread shadow")?;
-                            self.fill_rounded_rectangle_with_border(
-                                layers,
-                                0,
-                                row_rect,
-                                selected_bg,
-                                selected_border,
-                                self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
-                                CAPSULE_BORDER_WIDTH,
-                            )
-                            .context("sidebar selected thread")?;
+                            self.paint_sidebar_selected_row(layers, row_rect, selected_bg, selected_border)
+                                .context("sidebar selected thread")?;
                         }
 
                         let text_y = y + ((session_row_height.saturating_sub(ui_cell_height)) / 2);
@@ -2888,7 +2865,7 @@ impl crate::TermWindow {
                                         session_row_height as f32,
                                     ),
                                     chrome.sidebar_row_hover_bg,
-                                    self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
+                                    session_row_height as f32 / 2.0,
                                 )
                                 .context("sidebar hovered thread")?;
                             }
@@ -3336,23 +3313,8 @@ impl crate::TermWindow {
                                 session_width as f32,
                                 session_row_height as f32,
                             );
-                            self.paint_active_surface_shadow(
-                                layers,
-                                0,
-                                row_rect,
-                                self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
-                            )
-                            .context("sidebar selected thread ref shadow")?;
-                            self.fill_rounded_rectangle_with_border(
-                                layers,
-                                0,
-                                row_rect,
-                                selected_bg,
-                                selected_border,
-                                self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
-                                CAPSULE_BORDER_WIDTH,
-                            )
-                            .context("sidebar selected thread ref")?;
+                            self.paint_sidebar_selected_row(layers, row_rect, selected_bg, selected_border)
+                                .context("sidebar selected thread ref")?;
                         } else if is_hovered {
                             self.fill_rounded_rectangle(
                                 layers,
@@ -3364,7 +3326,7 @@ impl crate::TermWindow {
                                     session_row_height as f32,
                                 ),
                                 chrome.sidebar_row_hover_bg,
-                                self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
+                                session_row_height as f32 / 2.0,
                             )
                             .context("sidebar hovered thread ref")?;
                         }
@@ -3567,30 +3529,15 @@ impl crate::TermWindow {
                         session_row_height as f32,
                     );
                     if shown {
-                        self.paint_active_surface_shadow(
-                            layers,
-                            0,
-                            row_rect,
-                            self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
-                        )
-                        .context("sidebar watched shared pane shadow")?;
-                        self.fill_rounded_rectangle_with_border(
-                            layers,
-                            0,
-                            row_rect,
-                            selected_bg,
-                            selected_border,
-                            self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
-                            CAPSULE_BORDER_WIDTH,
-                        )
-                        .context("sidebar watched shared pane")?;
+                        self.paint_sidebar_selected_row(layers, row_rect, selected_bg, selected_border)
+                            .context("sidebar watched shared pane")?;
                     } else if hovered {
                         self.fill_rounded_rectangle(
                             layers,
                             0,
                             row_rect,
                             chrome.sidebar_row_hover_bg,
-                            self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
+                            session_row_height as f32 / 2.0,
                         )
                         .context("sidebar hovered shared pane")?;
                     }
@@ -4434,6 +4381,65 @@ impl crate::TermWindow {
         )
     }
 
+    /// The chrome the sidebar's list paints with. Over a see-through window
+    /// its rows' highlights let some of what is behind it through, rather
+    /// than standing over it as solid blocks.
+    fn sidebar_chrome(&self) -> UiPalette {
+        let mut chrome = self.chrome();
+        if self.chrome_see_through() {
+            for color in [
+                &mut chrome.sidebar_row_hover_bg,
+                &mut chrome.sidebar_row_pressed_bg,
+                &mut chrome.sidebar_row_active_bg,
+            ] {
+                *color = color.mul_alpha(SEE_THROUGH_SURFACE_ALPHA);
+            }
+        }
+        chrome
+    }
+
+    /// The highlight of a selected sidebar row, a pill. Over a see-through
+    /// window there is no shadow under it to darken what shows through, and
+    /// its edge is a ring, the clearer for it, drawn round the fill rather
+    /// than under it.
+    fn paint_sidebar_selected_row(
+        &self,
+        layers: &mut TripleLayerQuadAllocator,
+        rect: RectF,
+        fill: LinearRgba,
+        border: LinearRgba,
+    ) -> anyhow::Result<()> {
+        let radius = rect.height() / 2.0;
+        if self.chrome_see_through() {
+            let Some(gl_state) = self.render_state.as_ref() else {
+                return Ok(());
+            };
+            let boost = SEE_THROUGH_BORDER_BOOST.min(1.0 / border.3.max(f32::EPSILON));
+            return DrawContext::new(gl_state, self.dimensions, &self.render_metrics)
+                .draw_rounded_frame(
+                    layers,
+                    0,
+                    rect.min_x(),
+                    rect.min_y(),
+                    rect.width(),
+                    rect.height(),
+                    fill,
+                    border.mul_alpha(boost),
+                    radius,
+                );
+        }
+        self.paint_active_surface_shadow(layers, 0, rect, radius)?;
+        self.fill_rounded_rectangle_with_border(
+            layers,
+            0,
+            rect,
+            fill,
+            border,
+            radius,
+            CAPSULE_BORDER_WIDTH,
+        )
+    }
+
     /// One of the sidebar's add buttons: an action button whose circle shows
     /// only under the pointer, unless Settings › Accessibility keeps button
     /// shapes.
@@ -4980,7 +4986,7 @@ impl crate::TermWindow {
             surface.mul_alpha(lifted),
             chrome.sidebar_row_active_border.mul_alpha(lifted),
             lifted,
-            self.ui_f32(SIDEBAR_ROW_HIGHLIGHT_RADIUS),
+            height as f32 / 2.0,
         )
     }
 
