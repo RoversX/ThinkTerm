@@ -185,6 +185,101 @@ fn first_file_uri_to_path(
         .map_err(|()| anyhow::anyhow!("portal uri is not a file path: {uri:?}"))
 }
 
+fn file_uris_to_paths(
+    results: &HashMap<String, OwnedValue>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let Some(uris) = results.get("uris") else {
+        return Ok(Vec::new());
+    };
+    let uris = Vec::<String>::try_from(
+        uris.try_clone()
+            .context("clone portal returned uris value")?,
+    )
+    .map_err(|err| anyhow::anyhow!("portal returned invalid uris: {err:#?}"))?;
+    let mut paths = Vec::new();
+    for uri in uris {
+        let url = Url::parse(&uri).with_context(|| format!("parsing portal uri {uri:?}"))?;
+        if let Ok(path) = url.to_file_path() {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+pub async fn pick_paths(
+    options: crate::PathPickerOptions,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let connection = zbus::ConnectionBuilder::session()?.build().await?;
+    let proxy = PortalFileChooserProxy::new(&connection)
+        .await
+        .context("make file chooser proxy")?;
+
+    let mut portal_options = HashMap::new();
+    portal_options.insert("modal", Value::from(true));
+    portal_options.insert("multiple", Value::from(options.multiple));
+    // The portal's OpenFile has one mode: files or folders. A caller that
+    // needs both uses the platform menu instead of asking for both here.
+    portal_options.insert(
+        "directory",
+        Value::from(options.allow_directories && !options.allow_files),
+    );
+    portal_options.insert("accept_label", Value::from(options.prompt.as_str()));
+
+    let handle = proxy
+        .OpenFile("", &options.title, portal_options)
+        .or(async {
+            async_io::Timer::after(std::time::Duration::from_secs(1)).await;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Timed out opening xdg-desktop-portal path picker",
+            )
+            .into())
+        })
+        .await
+        .context("Opening xdg-desktop-portal path picker")?;
+
+    let request = PortalRequestProxy::builder(&connection)
+        .path(handle)?
+        .build()
+        .await
+        .context("make portal request proxy")?;
+    let mut stream = request
+        .receive_Response()
+        .await
+        .context("subscribe to portal request response")?;
+    let signal = stream
+        .next()
+        .or(async {
+            async_io::Timer::after(std::time::Duration::from_secs(60)).await;
+            None
+        })
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Timed out waiting for path picker response"))?;
+    let args = signal.args().context("decode path picker response")?;
+    if args.response != 0 {
+        return Ok(Vec::new());
+    }
+
+    file_uris_to_paths(&args.results)
+}
+
+pub fn pick_paths_async(
+    options: crate::PathPickerOptions,
+    callback: Box<dyn FnOnce(Vec<PathBuf>) + 'static>,
+) {
+    promise::spawn::spawn(async move {
+        let paths = match pick_paths(options).await {
+            Ok(paths) => paths,
+            Err(err) => {
+                log::warn!("failed to show xdg-desktop-portal path picker: {err:#}");
+                Vec::new()
+            }
+        };
+        callback(paths);
+    })
+    .detach();
+}
+
 pub async fn pick_folder(options: crate::FolderPickerOptions) -> anyhow::Result<Option<PathBuf>> {
     let connection = zbus::ConnectionBuilder::session()?.build().await?;
     let proxy = PortalFileChooserProxy::new(&connection)

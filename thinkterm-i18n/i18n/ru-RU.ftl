@@ -382,6 +382,8 @@ library-title = Библиотека ThinkTerm
 library-spaces = Пространства
 library-count = Компьютеров: { $machines } · пространств: { $spaces }
 library-disconnected = отключено
+tooltip-refresh-files = Обновить сведения о папке
+tooltip-upload-files = Отправить файлы/папки
 menu-rename-project = Переименовать проект…
 menu-grant-folder-access = Разрешить доступ к папке…
 menu-new-thread = Новая ветка
@@ -581,6 +583,11 @@ right-script-required = Скрипт *
 right-script-placeholder = Введите команду или скрипт
 right-run = Запустить
 right-download = Скачать
+right-upload-to = Отправить в { $path }…
+right-upload-files-to = Отправить файлы в { $path }…
+right-upload-folder-to = Отправить папку в { $path }…
+right-upload-picker-title = Отправить файлы/папки
+right-upload-picker-prompt = Отправить
 right-new-folder = Новая папка
 right-delete = Удалить…
 right-copy-all = Копировать всё
@@ -1647,6 +1654,22 @@ remote-files-listing-refused = Удалённый узел не смог пок�
 remote-files-listing-too-large = Список удалённых файлов слишком большой
 download-completed = Загрузка завершена
 download-completed-body = Скачано: { $path }
+transfer-card-preparing = Подготовка…
+transfer-card-canceling = Отмена…
+download-card-failed = Не удалось скачать
+download-card-saved-to = Сохранено в { $path }
+transfer-card-items = { $count ->
+        [one] { $count } элемент
+        [few] { $count } элемента
+       *[other] { $count } элементов
+    }
+download-open-file = Открыть файл
+download-open-folder = Открыть папку
+download-open-downloads = Открыть папку загрузок
+upload-card-uploading = Отправка
+upload-completed = Отправка завершена
+upload-card-failed = Не удалось отправить
+upload-card-uploaded-to = Отправлено в { $path }
 plugin-answer-no-terminal = рядом с панелью нет терминала
 plugin-answer-local-terminal = терминал рядом с панелью работает на этом компьютере
 plugin-answer-moved = терминал рядом с панелью теперь на другом компьютере
