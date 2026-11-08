@@ -167,13 +167,12 @@ impl crate::TermWindow {
             return self.paint_update_capsule_flight(now);
         }
         let status = crate::settings_window::update_capsule_status();
-        // Out of the way while a menu, the palette or a dialog is up, and
-        // while the right sidebar is slid out over the corner.
+        // Out of the way while a menu, the palette or a dialog is up. A right
+        // sidebar coming out over the corner moves it along instead.
         let hidden = dismissed()
             || self.context_menu.is_some()
             || self.command_palette.is_some()
-            || self.get_modal().is_some()
-            || (self.right_sidebar_collapsed && self.right_sidebar_presented());
+            || self.get_modal().is_some();
         let Some(status) = status.filter(|_| !hidden) else {
             let capsule = &mut self.update_capsule;
             if status_gone(&capsule.kind, hidden) {
@@ -352,9 +351,10 @@ impl crate::TermWindow {
 
         let height = px(HEIGHT);
         let width = base_width + px(CLOSE + GAP) * close_open;
+        // Left of the right sidebar, moving with its edge while it slides.
         let right = self.dimensions.pixel_width as f32
             - border.right.get() as f32
-            - self.right_sidebar_width() as f32
+            - self.right_sidebar_on_screen_width(now)
             - px(MARGIN);
         let bottom = floor - px(MARGIN);
 
@@ -909,7 +909,7 @@ fn paint_sweep(
 /// from twelve o'clock, then the surface's colour inside to cut the ring's
 /// inner edge clean. Without a fraction, a quarter of it at `turn` (0 to 1).
 #[allow(clippy::too_many_arguments)]
-fn paint_ring(
+pub(crate) fn paint_ring(
     ctx: &DrawContext,
     layers: &mut crate::quad::TripleLayerQuadAllocator,
     (cx, cy): (f32, f32),

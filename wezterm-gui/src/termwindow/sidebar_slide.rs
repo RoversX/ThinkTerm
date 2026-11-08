@@ -512,6 +512,24 @@ impl crate::TermWindow {
         }
     }
 
+    /// How wide the right sidebar is on screen at `now`: as much of it as
+    /// is out while it slides, or while the pointer has it out over the
+    /// terminal, otherwise the width the terminal leaves it. What sits in
+    /// the terminal's bottom-right corner moves with its edge rather than
+    /// be covered by it.
+    pub(crate) fn right_sidebar_on_screen_width(&self, now: Instant) -> f32 {
+        let docked = self.right_sidebar_docked_width() as f32;
+        if let Some(out) = self.sidebar_slides.out(Side::Right, now) {
+            return (out.panel * docked).round().max(0.0);
+        }
+        if self.right_sidebar_collapsed {
+            if let Some(revealed) = self.right_sidebar_hover.progress(now) {
+                return (revealed * docked).round();
+            }
+        }
+        self.right_sidebar_width() as f32
+    }
+
     /// How this frame draws the sidebars on their way.
     pub(crate) fn sidebar_slide_frame(&self, now: Instant) -> Option<SidebarSlideFrame> {
         let left_out = self.sidebar_slides.out(Side::Left, now);
