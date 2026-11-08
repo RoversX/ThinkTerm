@@ -15691,14 +15691,10 @@ impl crate::TermWindow {
     /// Where the header's Upload button puts files: the selected directory,
     /// the parent of a selected file, or the tree root.
     fn right_sidebar_remote_upload_directory(&self) -> Option<RemotePath> {
-        let root = self.right_sidebar_remote_files.root.clone()?;
-        let Some(selected) = self.right_sidebar_remote_files.selected.as_ref() else {
-            return Some(root);
-        };
-        match self.right_sidebar_remote_files.kind_for_path(selected) {
-            Some(RemoteFileKind::Directory) => Some(selected.clone()),
-            _ => selected.parent().or(Some(root)),
-        }
+        remote_upload_directory(
+            &self.right_sidebar_remote_files,
+            &self.right_sidebar_remote_file_search,
+        )
     }
 
     /// The header's Upload button. macOS puts files and folders in one native
@@ -16128,25 +16124,15 @@ impl crate::TermWindow {
             destination: None,
             remote_destination,
         });
-        self.trim_remote_transfers();
         if let Some(toast) = toast {
             self.push_transfer_toast(toast);
         }
+        self.trim_remote_transfers();
     }
 
-    /// Keep the strip from growing without bound: finished entries are the
-    /// only ones ever dropped, and the oldest go first.
-    fn trim_remote_transfers(&mut self) {
-        while self.right_sidebar_remote_transfers.len() > REMOTE_TRANSFER_STRIP_MAX {
-            let Some(index) = self
-                .right_sidebar_remote_transfers
-                .iter()
-                .position(|transfer| !transfer.is_running())
-            else {
-                break;
-            };
-            self.right_sidebar_remote_transfers.remove(index);
-        }
+    /// Retry cards pin at most three finished records until they are dismissed.
+    pub(crate) fn trim_remote_transfers(&mut self) {
+        trim_remote_transfer_records(&mut self.right_sidebar_remote_transfers, &self.transfer_toasts);
     }
 
     fn start_remote_upload(
@@ -17031,7 +17017,7 @@ impl crate::TermWindow {
                     Ok(destination) => {
                         let mut detail = format!("Saved to {}", destination.display());
                         if let Some(note) = &note {
-                            detail.push_str(&format!(" ({note})"));
+                            detail = format!("{note} · {detail}");
                         }
                         RemoteTransferStatus::Done(detail)
                     }
@@ -17894,135 +17880,14 @@ impl crate::TermWindow {
 
     fn finish_remote_transfer(&mut self, id: u64, status: RemoteTransferStatus) {
         let now = Instant::now();
-        let toast = if let Some(transfer) = self
+        let toast = self
             .right_sidebar_remote_transfers
             .iter_mut()
             .find(|transfer| transfer.id == id)
-        {
-            transfer.status = status;
-            let canceled = match &transfer.status {
-                RemoteTransferStatus::Failed(message) => {
-                    message.starts_with(REMOTE_TRANSFER_CANCELED)
-                }
-                RemoteTransferStatus::FailedWithLeftover { message, .. } => {
-                    message.starts_with(REMOTE_TRANSFER_CANCELED)
-                }
-                _ => false,
-            };
-            if canceled {
-                None
-            } else {
-                let item_count = transfer.progress.items().map(|(done, _)| done);
-                let size = if item_count.is_none() {
-                    transfer.progress.total()
-                } else {
-                    None
-                };
-                let retryable = transfer.can_retry();
-                let remote_path = transfer
-                    .remote_destination
-                    .as_ref()
-                    .map(|path| path.as_str().to_string());
-                let remote_dir = transfer
-                    .remote_destination
-                    .as_ref()
-                    .and_then(|path| path.parent())
-                    .map(|path| path.as_str().to_string());
-                match transfer.kind {
-                    RemoteTransferKind::Download => {
-                        let is_folder = matches!(
-                            &transfer.source,
-                            Some(RemoteTransferSource::DownloadFolder { .. })
-                        );
-                        match &transfer.status {
-                            RemoteTransferStatus::Done(_) => {
-                                transfer.destination.clone().map(|path| {
-                                    TransferToast::download_done(
-                                        id,
-                                        transfer.name.clone(),
-                                        path,
-                                        is_folder,
-                                        size,
-                                        item_count,
-                                        now,
-                                    )
-                                })
-                            }
-                            RemoteTransferStatus::Failed(message) => {
-                                Some(TransferToast::download_failed(
-                                    id,
-                                    transfer.name.clone(),
-                                    transfer.destination.clone(),
-                                    is_folder,
-                                    message.clone(),
-                                    retryable,
-                                    now,
-                                ))
-                            }
-                            RemoteTransferStatus::FailedWithLeftover { message, .. } => {
-                                Some(TransferToast::download_failed(
-                                    id,
-                                    transfer.name.clone(),
-                                    transfer.destination.clone(),
-                                    is_folder,
-                                    message.clone(),
-                                    retryable,
-                                    now,
-                                ))
-                            }
-                            RemoteTransferStatus::Running => None,
-                        }
-                    }
-                    RemoteTransferKind::Upload => {
-                        let is_folder = item_count.is_some()
-                            || matches!(
-                                &transfer.source,
-                                Some(RemoteTransferSource::Upload { local, .. }) if local.is_dir()
-                            );
-                        match &transfer.status {
-                            RemoteTransferStatus::Done(_) => Some(TransferToast::upload_done(
-                                id,
-                                transfer.name.clone(),
-                                remote_path,
-                                remote_dir,
-                                is_folder,
-                                size,
-                                item_count,
-                                now,
-                            )),
-                            RemoteTransferStatus::Failed(message) => {
-                                Some(TransferToast::upload_failed(
-                                    id,
-                                    transfer.name.clone(),
-                                    remote_path,
-                                    remote_dir,
-                                    is_folder,
-                                    message.clone(),
-                                    retryable,
-                                    now,
-                                ))
-                            }
-                            RemoteTransferStatus::FailedWithLeftover { message, .. } => {
-                                Some(TransferToast::upload_failed(
-                                    id,
-                                    transfer.name.clone(),
-                                    remote_path,
-                                    remote_dir,
-                                    is_folder,
-                                    message.clone(),
-                                    retryable,
-                                    now,
-                                ))
-                            }
-                            RemoteTransferStatus::Running => None,
-                        }
-                    }
-                    _ => None,
-                }
-            }
-        } else {
-            None
-        };
+            .and_then(|transfer| {
+                transfer.status = status;
+                TransferToast::from_transfer(transfer, now)
+            });
         if let Some(toast) = toast {
             self.push_transfer_toast(toast);
         }
@@ -18079,6 +17944,9 @@ impl crate::TermWindow {
             .or_else(|| self.right_sidebar_remote_file_search.kind_for_path(&path));
         match kind {
             Some(RemoteFileKind::Directory) => {
+                if !self.leave_right_sidebar_file_preview() {
+                    return;
+                }
                 // Selecting a folder is also how the Upload button learns
                 // where the next files should go; expanding it is unchanged.
                 self.right_sidebar_remote_files.selected = Some(path.clone());
@@ -22438,6 +22306,38 @@ fn file_row_placement(
         FileRowPlacement::Below
     } else {
         FileRowPlacement::Visible(row_top)
+    }
+}
+
+fn remote_upload_directory(
+    files: &crate::termwindow::remote_files::RemoteFilesState,
+    search: &RemoteFileSearchState,
+) -> Option<RemotePath> {
+    let root = files.root.clone()?;
+    let Some(selected) = files.selected.as_ref() else {
+        return Some(root);
+    };
+    match files
+        .kind_for_path(selected)
+        .or_else(|| search.kind_for_path(selected))
+    {
+        Some(RemoteFileKind::Directory) => Some(selected.clone()),
+        Some(_) => selected.parent().or(Some(root)),
+        None => None,
+    }
+}
+
+fn trim_remote_transfer_records(transfers: &mut Vec<RemoteTransfer>, toasts: &[TransferToast]) {
+    while transfers.len() > REMOTE_TRANSFER_STRIP_MAX {
+        let Some(index) = transfers.iter().position(|transfer| {
+            !transfer.is_running()
+                && !toasts
+                    .iter()
+                    .any(|toast| toast.id == transfer.id && toast.retryable)
+        }) else {
+            break;
+        };
+        transfers.remove(index);
     }
 }
 
@@ -27503,5 +27403,107 @@ mod wiki_link_name_tests {
         } else {
             assert_eq!(refused, None, "an ordinary note name here");
         }
+    }
+}
+
+#[cfg(test)]
+mod transfer_review_tests {
+    use super::*;
+    use crate::termwindow::remote_files::{RemoteFilesState, RemotePreviewStatus};
+
+    #[test]
+    fn upload_uses_an_unloaded_search_folder_and_rejects_unknown_kinds() {
+        let root = RemotePath::from_server_absolute("/srv/project").unwrap();
+        let folder = root
+            .join_name("unloaded")
+            .unwrap()
+            .join_name("folder")
+            .unwrap();
+        let mut files = RemoteFilesState::default();
+        files.root = Some(root.clone());
+        files.selected = Some(folder.clone());
+        let search = RemoteFileSearchState {
+            rows: Arc::new(vec![RemoteFileRow {
+                entry: RemoteFileEntry {
+                    path: folder.clone(),
+                    name: "folder".into(),
+                    kind: RemoteFileKind::Directory,
+                    size: None,
+                },
+                depth: 0,
+                expanded: false,
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(files.kind_for_path(&folder), None);
+        assert_eq!(
+            remote_upload_directory(&files, &search),
+            Some(folder.clone())
+        );
+        assert_eq!(
+            remote_upload_directory(&files, &RemoteFileSearchState::default()),
+            None
+        );
+        files.selected = None;
+        assert_eq!(remote_upload_directory(&files, &search), Some(root));
+    }
+
+    #[test]
+    fn closing_a_preview_before_selecting_a_folder_rejects_its_late_result() {
+        let file = RemotePath::from_server_absolute("/srv/project/a.txt").unwrap();
+        let folder = RemotePath::from_server_absolute("/srv/project/folder").unwrap();
+        for ready in [false, true] {
+            let mut files = RemoteFilesState::default();
+            files.transition(RemoteFilesEvent::SelectFile(file.clone()));
+            if ready {
+                files.transition(RemoteFilesEvent::PreviewFinished {
+                    generation: files.generation,
+                    path: file.clone(),
+                    error: None,
+                });
+            }
+            files.clear_selection();
+            files.selected = Some(folder.clone());
+            files.transition(RemoteFilesEvent::PreviewFinished {
+                generation: files.generation,
+                path: file.clone(),
+                error: None,
+            });
+            assert_eq!(files.selected.as_ref(), Some(&folder));
+            assert_eq!(files.preview, RemotePreviewStatus::None);
+        }
+    }
+
+    #[test]
+    fn retry_card_pins_the_only_finished_record_until_dismissal() {
+        let mut transfers: Vec<_> = (1..=4)
+            .map(|id| RemoteTransfer {
+                id,
+                kind: RemoteTransferKind::Download,
+                name: "file.txt".into(),
+                progress: RemoteTransferProgress::default(),
+                status: RemoteTransferStatus::Running,
+                source: Some(RemoteTransferSource::Download {
+                    remote: RemotePath::from_server_absolute("/srv/file.txt").unwrap(),
+                }),
+                origin: Some(RemoteOperationOrigin::new(
+                    "server-a".into(),
+                    "server-a".into(),
+                )),
+                destination: Some(PathBuf::from("/tmp/file.txt")),
+                remote_destination: None,
+            })
+            .collect();
+        transfers[3].status = RemoteTransferStatus::Failed("connection lost".into());
+        let toast = TransferToast::from_transfer(&transfers[3], Instant::now()).unwrap();
+        assert!(toast.retryable);
+        trim_remote_transfer_records(&mut transfers, &[toast.clone()]);
+        assert_eq!(transfers.len(), 4);
+        assert!(transfers
+            .iter()
+            .any(|transfer| transfer.id == toast.id && transfer.can_retry()));
+        trim_remote_transfer_records(&mut transfers, &[]);
+        assert_eq!(transfers.len(), REMOTE_TRANSFER_STRIP_MAX);
+        assert!(transfers.iter().all(|transfer| transfer.id != toast.id));
     }
 }

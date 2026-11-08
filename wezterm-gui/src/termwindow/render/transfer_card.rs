@@ -12,7 +12,8 @@
 
 use super::dynamic_status::{CardContent, Mark, Tone};
 use crate::termwindow::remote_files::{
-    RemoteTransferKind, RemoteTransferProgress, RemoteTransferStatus,
+    RemoteTransfer, RemoteTransferKind, RemoteTransferProgress, RemoteTransferSource,
+    RemoteTransferStatus, REMOTE_TRANSFER_CANCELED,
 };
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::UIItemType;
@@ -27,8 +28,8 @@ const DONE_TTL: Duration = Duration::from_secs(5);
 
 /// A transfer that has stopped, kept long enough to be read. It carries a
 /// snapshot of what the card needs because the strip may trim the row it came
-/// from before this card is done; the id only ties it to the transfer that
-/// produced it.
+/// from before this card is done. Retry cards keep their source row alive
+/// until they are dismissed or evicted.
 #[derive(Clone, Debug)]
 pub(crate) struct TransferToast {
     pub kind: RemoteTransferKind,
@@ -48,6 +49,8 @@ pub(crate) struct TransferToast {
     /// row kept its source and host. Successes never offer Retry.
     pub retryable: bool,
     pub outcome: TransferToastOutcome,
+    pub completion_detail: Option<String>,
+    pub leftover: Option<String>,
     pub shown_at: Instant,
     pub paused_at: Option<Instant>,
     pub closing_at: Option<Instant>,
@@ -81,6 +84,8 @@ impl TransferToast {
             item_count,
             retryable: false,
             outcome: TransferToastOutcome::Done,
+            completion_detail: None,
+            leftover: None,
             shown_at: now,
             paused_at: None,
             closing_at: None,
@@ -109,6 +114,8 @@ impl TransferToast {
             item_count,
             retryable: false,
             outcome: TransferToastOutcome::Done,
+            completion_detail: None,
+            leftover: None,
             shown_at: now,
             paused_at: None,
             closing_at: None,
@@ -136,6 +143,8 @@ impl TransferToast {
             item_count: None,
             retryable,
             outcome: TransferToastOutcome::Failed(message),
+            completion_detail: None,
+            leftover: None,
             shown_at: now,
             paused_at: None,
             closing_at: None,
@@ -164,10 +173,97 @@ impl TransferToast {
             item_count: None,
             retryable,
             outcome: TransferToastOutcome::Failed(message),
+            completion_detail: None,
+            leftover: None,
             shown_at: now,
             paused_at: None,
             closing_at: None,
         }
+    }
+
+    pub(crate) fn from_transfer(transfer: &RemoteTransfer, now: Instant) -> Option<Self> {
+        let (message, leftover) = match &transfer.status {
+            RemoteTransferStatus::Running => return None,
+            RemoteTransferStatus::Failed(message)
+                if message.starts_with(REMOTE_TRANSFER_CANCELED) =>
+            {
+                return None;
+            }
+            RemoteTransferStatus::Failed(message) => (Some(message.clone()), None),
+            RemoteTransferStatus::FailedWithLeftover { message, leftover } => {
+                (Some(message.clone()), Some(leftover.clone()))
+            }
+            RemoteTransferStatus::Done(_) => (None, None),
+        };
+        let item_count = transfer.progress.items().map(|(done, _)| done);
+        let size = if item_count.is_none() {
+            transfer.progress.total()
+        } else {
+            None
+        };
+        let remote_path = transfer
+            .remote_destination
+            .as_ref()
+            .map(|path| path.as_str().to_string());
+        let remote_dir = transfer
+            .remote_destination
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(|path| path.as_str().to_string());
+        let is_folder = item_count.is_some()
+            || matches!(
+                &transfer.source,
+                Some(RemoteTransferSource::DownloadFolder { .. })
+            )
+            || matches!(&transfer.source, Some(RemoteTransferSource::Upload { local, .. }) if local.is_dir());
+        let mut toast = match (transfer.kind, message) {
+            (RemoteTransferKind::Download, Some(message)) => Self::download_failed(
+                transfer.id,
+                transfer.name.clone(),
+                transfer.destination.clone(),
+                is_folder,
+                message,
+                transfer.can_retry(),
+                now,
+            ),
+            (RemoteTransferKind::Upload, Some(message)) => Self::upload_failed(
+                transfer.id,
+                transfer.name.clone(),
+                remote_path,
+                remote_dir,
+                is_folder,
+                message,
+                transfer.can_retry(),
+                now,
+            ),
+            (RemoteTransferKind::Download, None) => Self::download_done(
+                transfer.id,
+                transfer.name.clone(),
+                transfer.destination.clone()?,
+                is_folder,
+                size,
+                item_count,
+                now,
+            ),
+            (RemoteTransferKind::Upload, None) => Self::upload_done(
+                transfer.id,
+                transfer.name.clone(),
+                remote_path,
+                remote_dir,
+                is_folder,
+                size,
+                item_count,
+                now,
+            ),
+            _ => return None,
+        };
+        if let RemoteTransferStatus::Done(detail) = &transfer.status {
+            if is_folder {
+                toast.completion_detail = Some(detail.clone());
+            }
+        }
+        toast.leftover = leftover;
+        Some(toast)
     }
 
     /// Success notices make way for the next transfer. A failure stays until
@@ -215,11 +311,13 @@ impl crate::TermWindow {
         while self.transfer_toasts.len() > MAX_CARDS {
             self.transfer_toasts.remove(0);
         }
+        self.trim_remote_transfers();
         self.invalidate_window();
     }
 
     pub(crate) fn dismiss_transfer_toast(&mut self, id: u64) {
         self.transfer_toasts.retain(|toast| toast.id != id);
+        self.trim_remote_transfers();
         self.invalidate_window();
     }
 
@@ -423,9 +521,14 @@ impl crate::TermWindow {
     }
 
     /// Drop the notices whose time is up.
-    pub(super) fn drop_closed_transfer_toasts(&mut self, _now: Instant) {
-        self.transfer_toasts
-            .retain(|toast| toast.closing_at.is_none());
+    pub(super) fn drop_closed_transfer_toasts(&mut self, now: Instant) {
+        let before = self.transfer_toasts.len();
+        self.transfer_toasts.retain(|toast| toast.closing_at.is_none());
+        if self.transfer_toasts.len() != before {
+            self.trim_remote_transfers();
+            // This frame already painted the expired snapshot.
+            self.update_next_frame_time(Some(now));
+        }
     }
 }
 
@@ -485,11 +588,15 @@ pub(crate) fn card_content(view: &CardView) -> CardContent<'static> {
                         });
                     }
                     actions.push(close);
+                    let detail = match &toast.leftover {
+                        Some(leftover) => format!("{title} · {leftover} was left behind — {message}"),
+                        None => format!("{title} · {message}"),
+                    };
                     CardContent {
                         mark: Mark::Icon(SvgIcon::CircleAlert),
                         tone: Tone::Failed,
                         name: toast.name.clone(),
-                        detail: format!("{title} · {message}"),
+                        detail,
                         short: crate::i18n::tr("right-agents-state-error"),
                         bar: None,
                         actions,
@@ -547,6 +654,9 @@ pub(crate) fn card_content(view: &CardView) -> CardContent<'static> {
 
 fn download_done_detail(toast: &TransferToast) -> String {
     let mut parts = Vec::new();
+    if let Some(detail) = &toast.completion_detail {
+        parts.push(detail.clone());
+    }
     if let Some(size) = toast.size {
         parts.push(format_size(size));
     }
@@ -555,7 +665,11 @@ fn download_done_detail(toast: &TransferToast) -> String {
         args.set("count", count as i64);
         parts.push(crate::i18n::tr_args("transfer-card-items", &args));
     }
-    if let Some(path) = &toast.path {
+    if let Some(path) = toast
+        .path
+        .as_ref()
+        .filter(|_| toast.completion_detail.is_none())
+    {
         let folder = path.parent().unwrap_or(path);
         let mut args = fluent_bundle::FluentArgs::new();
         args.set("path", display_folder(folder));
@@ -566,6 +680,9 @@ fn download_done_detail(toast: &TransferToast) -> String {
 
 fn upload_done_detail(toast: &TransferToast) -> String {
     let mut parts = Vec::new();
+    if let Some(detail) = &toast.completion_detail {
+        parts.push(detail.clone());
+    }
     if let Some(size) = toast.size {
         parts.push(format_size(size));
     }
@@ -661,6 +778,71 @@ fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn folder_transfer(kind: RemoteTransferKind, status: RemoteTransferStatus) -> RemoteTransfer {
+        let progress = RemoteTransferProgress::default();
+        progress.set_item_total(12);
+        let remote =
+            crate::termwindow::remote_files::RemotePath::from_server_absolute("/srv/tree").unwrap();
+        let source = match kind {
+            RemoteTransferKind::Upload => RemoteTransferSource::Upload {
+                local: PathBuf::from("/tmp/tree"),
+                remote: remote.clone(),
+                directory: remote.parent().unwrap(),
+            },
+            _ => RemoteTransferSource::DownloadFolder { remote },
+        };
+        RemoteTransfer {
+            id: 1,
+            kind,
+            name: "tree".into(),
+            progress,
+            status,
+            source: Some(source),
+            origin: Some(crate::termwindow::remote_files::RemoteOperationOrigin::new(
+                "server-a".into(),
+                "server-a".into(),
+            )),
+            destination: Some(PathBuf::from("/tmp/tree")),
+            remote_destination: None,
+        }
+    }
+
+    #[test]
+    fn canceled_or_failed_transfers_keep_their_leftover_notice() {
+        for kind in [RemoteTransferKind::Download, RemoteTransferKind::Upload] {
+            for message in [REMOTE_TRANSFER_CANCELED, "connection lost"] {
+                let transfer = folder_transfer(
+                    kind,
+                    RemoteTransferStatus::FailedWithLeftover {
+                        message: message.into(),
+                        leftover: "/tmp/partial-tree".into(),
+                    },
+                );
+                let toast = TransferToast::from_transfer(&transfer, Instant::now()).unwrap();
+                assert_eq!(toast.deadline(), None);
+                let content = card_content(&CardView::Toast(toast));
+                assert!(content.detail.contains("/tmp/partial-tree"));
+                assert!(content.detail.contains(message));
+            }
+        }
+        let canceled = folder_transfer(
+            RemoteTransferKind::Download,
+            RemoteTransferStatus::Failed(REMOTE_TRANSFER_CANCELED.into()),
+        );
+        assert!(TransferToast::from_transfer(&canceled, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn folder_completion_keeps_omissions_in_the_card() {
+        for kind in [RemoteTransferKind::Download, RemoteTransferKind::Upload] {
+            let detail = "2 symlink(s) skipped, 1 unreadable item(s)";
+            let transfer = folder_transfer(kind, RemoteTransferStatus::Done(detail.into()));
+            let toast = TransferToast::from_transfer(&transfer, Instant::now()).unwrap();
+            let content = card_content(&CardView::Toast(toast));
+            assert!(content.detail.contains(detail));
+        }
+    }
 
     #[test]
     fn sizes_keep_a_small_file_out_of_megabytes() {
