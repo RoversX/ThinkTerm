@@ -1769,9 +1769,9 @@ fn localized_mac_glass_label(glass: crate::native_settings::NativeMacGlass) -> S
     use crate::native_settings::NativeMacGlass;
     crate::i18n::tr(match glass {
         NativeMacGlass::Blur => "settings-mac-glass-blur",
+        NativeMacGlass::Frosted => "settings-mac-glass-frosted",
         NativeMacGlass::Regular => "settings-mac-glass-regular",
         NativeMacGlass::Clear => "settings-mac-glass-clear",
-        NativeMacGlass::ClearOverBlur => "settings-mac-glass-clear-over-blur",
     })
 }
 
@@ -9474,7 +9474,7 @@ impl SettingsWindow {
                 TileColor::Blue,
             )?;
             rows.add(this.paint_window_opacity_row(layers, tx, rows.y, tw, rows.rule())?);
-            if cfg!(target_os = "macos") && liquid_glass_available() {
+            if cfg!(target_os = "macos") {
                 let (tx, tw) = this.paint_row_tile(
                     layers,
                     row_x,
@@ -20332,6 +20332,7 @@ impl SettingsWindow {
         let current = self.native_settings.appearance.mac_glass;
         crate::native_settings::NativeMacGlass::ALL
             .iter()
+            .filter(|glass| !glass.is_liquid_glass() || liquid_glass_available())
             .map(|glass| {
                 (
                     localized_mac_glass_label(*glass),

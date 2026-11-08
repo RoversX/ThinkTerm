@@ -313,16 +313,15 @@ pub enum Win32BackdropTrial {
 }
 
 /// What a see-through window on macOS shows behind it: the blur of
-/// `macos_window_background_blur`, or Liquid Glass (macOS 26 and later) in
-/// its regular or clear style, the clear one alone or over a blur of its
-/// own.
+/// `macos_window_background_blur`, the system's frosted material, or Liquid
+/// Glass (macOS 26 and later) in its regular or clear style.
 #[derive(Debug, Copy, Clone, FromDynamic, ToDynamic, PartialEq, Eq, Default)]
 pub enum MacosWindowGlass {
     #[default]
     Blur,
+    Frosted,
     Regular,
     Clear,
-    ClearOverBlur,
 }
 
 pub fn default_win32_acrylic_accent_color() -> RgbaColor {

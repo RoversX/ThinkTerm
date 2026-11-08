@@ -606,28 +606,37 @@ impl NativeThreadStatus {
     pub(crate) const ALL: [Self; 4] = [Self::Ring, Self::Pulse, Self::Pixels, Self::Dots];
 }
 
-/// What a see-through window shows behind it on macOS: the plain blur, or
-/// Liquid Glass (see `config::MacosWindowGlass`).
+/// What a see-through window shows behind it on macOS: the plain blur, the
+/// system's frosted material, or Liquid Glass (see
+/// `config::MacosWindowGlass`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NativeMacGlass {
     #[default]
     Blur,
+    /// Clear glass over the material was offered once; the material is
+    /// what is left of it.
+    #[serde(alias = "clear_over_blur")]
+    Frosted,
     Regular,
     Clear,
-    ClearOverBlur,
 }
 
 impl NativeMacGlass {
     /// Every look, in the order the settings window offers them.
-    pub(crate) const ALL: [Self; 4] = [Self::Blur, Self::Regular, Self::Clear, Self::ClearOverBlur];
+    pub(crate) const ALL: [Self; 4] = [Self::Frosted, Self::Regular, Self::Clear, Self::Blur];
+
+    /// Whether it is Liquid Glass, which only macOS 26 and later have.
+    pub(crate) fn is_liquid_glass(self) -> bool {
+        matches!(self, Self::Regular | Self::Clear)
+    }
 
     fn glass(self) -> config::MacosWindowGlass {
         match self {
             Self::Blur => config::MacosWindowGlass::Blur,
+            Self::Frosted => config::MacosWindowGlass::Frosted,
             Self::Regular => config::MacosWindowGlass::Regular,
             Self::Clear => config::MacosWindowGlass::Clear,
-            Self::ClearOverBlur => config::MacosWindowGlass::ClearOverBlur,
         }
     }
 }
@@ -3734,12 +3743,12 @@ mod tests {
     fn the_mac_glass_is_asked_for_on_macos_and_read_whatever_was_written() {
         use wezterm_dynamic::ToDynamic;
         let mut settings = ThinkTermNativeSettings::default();
-        settings.appearance.mac_glass = NativeMacGlass::ClearOverBlur;
+        settings.appearance.mac_glass = NativeMacGlass::Frosted;
         let [.., glass] = window_opacity_overrides(&settings);
         assert_eq!(
             glass.1,
             cfg!(target_os = "macos")
-                .then(|| config::MacosWindowGlass::ClearOverBlur.to_dynamic())
+                .then(|| config::MacosWindowGlass::Frosted.to_dynamic())
         );
         let read = |written: &str| {
             let text = format!(r#"{{"appearance":{{"mac_glass":{written}}}}}"#);
@@ -3748,7 +3757,9 @@ mod tests {
                 .appearance
                 .mac_glass
         };
-        assert_eq!(read(r#""clear_over_blur""#), NativeMacGlass::ClearOverBlur);
+        assert_eq!(read(r#""frosted""#), NativeMacGlass::Frosted);
+        // Clear glass over the blur became the blur on its own.
+        assert_eq!(read(r#""clear_over_blur""#), NativeMacGlass::Frosted);
         // A look tried and dropped reads as the blur.
         assert_eq!(read(r#""regular_over_blur""#), NativeMacGlass::Blur);
         assert_eq!(read(r#""something_new""#), NativeMacGlass::Blur);
