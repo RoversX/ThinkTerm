@@ -80,11 +80,11 @@ const TOP_ACTION_BOTTOM_GAP: usize = 16;
 /// New Thread pill beside them. Also their corner radius, since they are all
 /// fully rounded.
 ///
-/// 58 is the ceiling: the per-section buttons are additionally clamped to
-/// `session_row_height - 8`, so anything larger makes them stop matching the
-/// notification button. Raising it past 58 means raising
-/// `SESSION_ROW_MIN_HEIGHT` too.
-const TOP_ACTION_MAX_HEIGHT: usize = 58;
+/// As tall as a thread row (`SESSION_ROW_MIN_HEIGHT`), so New Thread lines
+/// up with the rows under it. The per-section buttons are additionally
+/// clamped to `session_row_height - 8`, and so come out a little smaller
+/// than the notification button.
+const TOP_ACTION_MAX_HEIGHT: usize = 72;
 const SESSION_ROW_MIN_HEIGHT: usize = 72;
 /// How much further in from a row's end its status mark sits than its icons
 /// from the start.
