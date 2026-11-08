@@ -203,7 +203,8 @@ impl crate::TermWindow {
 
     /// The trailing action buttons alone.
     fn pane_nav_actions_width(&self, pos: &PositionedPane, button_size: usize) -> usize {
-        let action_count = 4
+        let action_count = 3
+            + usize::from(self.pane_bar_shows_zoom(pos))
             + usize::from(self.can_collapse_pane_stack(pos))
             + usize::from(
                 self.pane_can_share(&pos.pane)
@@ -1172,6 +1173,24 @@ impl crate::TermWindow {
         tabs
     }
 
+    /// Whether `pos`'s bar has the zoom button: zoomed, to come back out, or
+    /// beside another pane. One alone in its tab fills it already, and the
+    /// button did nothing there. A closed pane on its way out had another.
+    fn pane_bar_shows_zoom(&self, pos: &PositionedPane) -> bool {
+        let pane_id = pos.pane.pane_id();
+        if pos.is_zoomed
+            || self
+                .closed_pane_nav
+                .as_ref()
+                .is_some_and(|nav| nav.pane(pane_id).is_some())
+        {
+            return true;
+        }
+        Mux::get()
+            .get_active_tab_for_window(self.mux_window_id)
+            .is_some_and(|tab| tab.pane_split_direction_by_index(pos.index).is_some())
+    }
+
     pub(crate) fn can_collapse_pane_stack(&self, pos: &PositionedPane) -> bool {
         if let Some(nav) = self
             .closed_pane_nav
@@ -1345,14 +1364,16 @@ impl crate::TermWindow {
         if self.can_collapse_pane_stack(pos) {
             actions.push((SvgIcon::Shrink, PaneNavAction::ToggleCollapse));
         }
-        actions.push((
-            if pos.is_zoomed {
-                SvgIcon::Minimize2
-            } else {
-                SvgIcon::Maximize2
-            },
-            PaneNavAction::ToggleZoom,
-        ));
+        if self.pane_bar_shows_zoom(pos) {
+            actions.push((
+                if pos.is_zoomed {
+                    SvgIcon::Minimize2
+                } else {
+                    SvgIcon::Maximize2
+                },
+                PaneNavAction::ToggleZoom,
+            ));
+        }
         // A shared pane's button wears the accent while the share lasts,
         // and a dot while someone asks to type; a pane watching another
         // account's share has its pill in the button's place.
