@@ -105,37 +105,12 @@ pub fn offer_remote_update(
         ));
         return Ok(RemoteUpdateOutcome::Declined);
     }
-    let answer = ui.input(&format!(
-        "Look up ThinkTerm {local} on GitHub to install on {host}? [y/N] "
-    ));
-    let answer = match answer {
-        Ok(answer) => answer,
-        Err(err) => {
-            log::info!("remote update not offered: {err:#}");
-            return Ok(RemoteUpdateOutcome::Declined);
-        }
-    };
-    if !is_yes(&answer) {
-        ui.output_str(&format!(
-            "Not looking it up. To update {host} yourself, install ThinkTerm {local} \
-             there, or build a matching thinkterm-mux-server from the same source.\n"
-        ));
-        return Ok(RemoteUpdateOutcome::Declined);
-    }
-    ui.output_str(&format!("Looking up release information for {local}...\n"));
-    let release = match thinkterm_update::remote::get_release(&local) {
-        Ok(release) => release,
-        Err(lookup) => {
-            ui.output_str(&format!("Could not resolve release {local}: {lookup:#}\n"));
-            return Ok(RemoteUpdateOutcome::Declined);
-        }
-    };
 
-    // The ssh session comes first: the host has to be asked what is
-    // installed there before the question can say what will change. A
-    // workstation with the desktop variant keeps its GUI, whoever installed
-    // it: --server would have removed the script's, and left a package's
-    // launcher starting a CLI that has no GUI to start.
+    // The host is asked what is installed there first, so that the one
+    // question can say what will change. A workstation with the desktop
+    // variant keeps its GUI, whoever installed it: --server would have
+    // removed the script's, and left a package's launcher starting a CLI
+    // that has no GUI to start.
     let ssh_config = mux::ssh::ssh_domain_to_ssh_config(ssh_dom)?;
     let mut ui_for_auth = ui.clone();
     let session = mux::ssh::ssh_connect_with_ui_and_password(
@@ -182,6 +157,7 @@ pub fn offer_remote_update(
         String::new()
     };
 
+    // Asked once: the release is looked up and installed on the one answer.
     let answer = ui.input(&format!(
         "ThinkTerm can install {local} there now ({variant} variant, as the ssh user, \
          under ~/.local, with no root). A verified online installer (or bundled fallback) \
@@ -201,6 +177,15 @@ pub fn offer_remote_update(
         ));
         return Ok(RemoteUpdateOutcome::Declined);
     }
+
+    ui.output_str(&format!("Looking up release information for {local}...\n"));
+    let release = match thinkterm_update::remote::get_release(&local) {
+        Ok(release) => release,
+        Err(lookup) => {
+            ui.output_str(&format!("Could not resolve release {local}: {lookup:#}\n"));
+            return Ok(RemoteUpdateOutcome::Declined);
+        }
+    };
 
     ui.output_str(&format!("\nInstalling ThinkTerm {local} on {host}...\n"));
     let status = run_remote_installer(&session, ui, variant, &release)?;
