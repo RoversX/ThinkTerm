@@ -1541,13 +1541,12 @@ impl crate::TermWindow {
                 if hovered { look.text } else { look.muted },
             )?;
         }
-        // The update capsule, dismissed, flies to the dot on the shoulder of
+        // The update notice, dismissed, lives on as a dot on the shoulder of
         // settings.
         let dot = self.ui_f32(14.0);
         let (icon_x, icon_y) = icon_at(settings);
         let dot_x = icon_x + icon_size as f32 - dot * 0.75;
         let dot_y = icon_y - dot * 0.25;
-        self.update_capsule.gear_dot_slot = Some((dot_x + dot / 2.0, dot_y + dot / 2.0, dot));
         if let Some(failed) = crate::termwindow::render::update_capsule::gear_dot() {
             self.fill_rounded_rectangle(
                 layers,
@@ -2015,7 +2014,6 @@ impl crate::TermWindow {
             .replace(space.to_string());
         let collapsed = std::mem::replace(&mut self.workspace_sidebar_collapsed, false);
         let scrollbar = self.workspace_sidebar_scrollbar_visible_until.take();
-        let gear_dot = self.update_capsule.gear_dot_slot;
         let mouse = self.current_mouse_event.clone();
         self.current_mouse_event = pointer.and_then(|(x, y)| {
             mouse.clone().map(|mut event| {
@@ -2038,7 +2036,6 @@ impl crate::TermWindow {
         self.update_next_frame_time(animation);
         self.update_next_frame_time(due);
         self.current_mouse_event = mouse;
-        self.update_capsule.gear_dot_slot = gear_dot;
         self.workspace_sidebar_scrollbar_visible_until = scrollbar;
         self.workspace_sidebar_collapsed = collapsed;
         self.workspace_sidebar_preview_space_id = preview;

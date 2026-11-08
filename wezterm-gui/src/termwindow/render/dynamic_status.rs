@@ -15,7 +15,8 @@
 
 use super::transfer_card::{card_content, CardAction, CardView, TransferToastOutcome};
 use crate::agent_status::{AgentPaneStatus, AgentState, ProgramReport, ShownState};
-use crate::termwindow::render::update_capsule::paint_ring;
+use crate::settings_window::UpdateCapsuleStatus;
+use crate::termwindow::render::update_capsule::{self, paint_ring};
 use crate::termwindow::ui::icons::SvgIcon;
 use crate::termwindow::{UIItem, UIItemType};
 use crate::ui::anim::{Easing, Timeline};
@@ -40,11 +41,9 @@ type RectF = euclid::Rect<f32, window::PixelUnit>;
 /// other's text through their backgrounds.
 const ZINDEX: i8 = 6;
 
-/// Points: the update capsule's unit, as the two share the corner.
+/// Points: the unit everything here is measured in.
 const POINT: f32 = 2.0;
 const MARGIN: f32 = 10.0;
-/// Room left above the update capsule when it is in the same corner.
-const CAPSULE_LIFT: f32 = 42.0;
 
 /// The folded pill.
 const PILL_HEIGHT: f32 = 36.0;
@@ -152,6 +151,8 @@ const AGENTS_STALE: Duration = Duration::from_secs(2);
 pub(crate) enum StatusKey {
     Pane(PaneId),
     Transfer(u64),
+    /// The update notice: one at a time, whatever state it is in.
+    Update,
 }
 
 /// A pane that reported its progress itself (OSC 9;4).
@@ -178,6 +179,8 @@ pub(crate) enum StatusItem {
         here: bool,
     },
     Pane(PaneProgress),
+    /// A newer release, followed through its install to the restart.
+    Update(UpdateCapsuleStatus),
 }
 
 impl StatusItem {
@@ -186,6 +189,7 @@ impl StatusItem {
             Self::Transfer(view) => StatusKey::Transfer(view.id()),
             Self::Agent { agents, index, .. } => StatusKey::Pane(agents[*index].pane_id),
             Self::Pane(pane) => StatusKey::Pane(pane.pane_id),
+            Self::Update(_) => StatusKey::Update,
         }
     }
 
@@ -208,6 +212,7 @@ impl StatusItem {
                 TransferToastOutcome::Done => 2,
             },
             Self::Transfer(CardView::Running { .. }) => 3,
+            Self::Update(status) => update_capsule::rank(status),
         }
     }
 
@@ -247,6 +252,7 @@ impl StatusItem {
                 TransferToastOutcome::Done => 6,
                 TransferToastOutcome::Failed(_) => 7,
             },
+            Self::Update(status) => update_capsule::phase(status),
         }
     }
 
@@ -267,6 +273,7 @@ impl StatusItem {
             Self::Transfer(CardView::Toast(toast)) => now.duration_since(toast.shown_at) <= NEWS_FOR,
             Self::Transfer(CardView::Running { .. }) => true,
             Self::Pane(_) => false,
+            Self::Update(status) => update_capsule::is_news(status),
         }
     }
 
@@ -279,7 +286,7 @@ impl StatusItem {
                 here,
             } => Some(UIItemType::DynamicStatusReveal(agents[*index].pane_id, *here)),
             Self::Pane(pane) => Some(UIItemType::DynamicStatusReveal(pane.pane_id, pane.here)),
-            Self::Transfer(_) => None,
+            Self::Transfer(_) | Self::Update(_) => None,
         }
     }
 }
@@ -869,8 +876,7 @@ pub(crate) struct CardContent<'a> {
 }
 
 impl crate::TermWindow {
-    /// Paint the dynamic status. Called after the update capsule, so the two
-    /// can share the corner without guessing at each other's height.
+    /// Paint the dynamic status, in the terminal area's bottom-right corner.
     pub(crate) fn paint_dynamic_status(&mut self) -> anyhow::Result<()> {
         let now = Instant::now();
         self.dynamic_status.expire_agent_news(now);
@@ -1095,18 +1101,14 @@ impl crate::TermWindow {
         } else {
             content_bottom
         };
-        // The terminal area's own corner, left of an open right sidebar, as
-        // the update capsule sits; above the capsule when it is there. With
-        // the sidebar sliding in or out, as much of it as is out this frame:
-        // the dynamic status moves with its edge.
+        // The terminal area's own corner, left of an open right sidebar.
+        // With the sidebar sliding in or out, as much of it as is out this
+        // frame: the dynamic status moves with its edge.
         let right = self.dimensions.pixel_width as f32
             - border.right.get() as f32
             - self.right_sidebar_on_screen_width(now)
             - px(MARGIN);
-        let mut bottom = floor - px(MARGIN);
-        if self.update_capsule_visible() {
-            bottom -= px(CAPSULE_LIFT);
-        }
+        let bottom = floor - px(MARGIN);
         let top_limit = border.top.get() as f32 + top_tab_height + px(20.0);
         // No wider than the terminal area left of it, as far as there is one.
         let left = border.left.get() as f32 + self.workspace_sidebar_width() as f32 + px(MARGIN);
@@ -1498,7 +1500,7 @@ impl crate::TermWindow {
                 .iter()
                 .filter_map(|key| match key {
                     StatusKey::Transfer(id) => Some(*id),
-                    StatusKey::Pane(_) => None,
+                    StatusKey::Pane(_) | StatusKey::Update => None,
                 })
                 .collect();
             // Nor while the window is out of sight -- minimised, covered,
@@ -2168,6 +2170,12 @@ impl crate::TermWindow {
     /// costs no allocation. The panes on screen are only listed once there
     /// is something to filter.
     fn dynamic_status_items(&mut self, now: Instant) -> Vec<StatusItem> {
+        let update = if update_capsule::dismissed() {
+            None
+        } else {
+            crate::settings_window::update_capsule_status()
+        };
+        self.update_capsule.note(now, update.as_ref());
         let has_transfers = self.has_transfer_cards();
         let agents_listed = self.right_sidebar_width() > 0
             && self.right_sidebar_mode == crate::termwindow::RightSidebarMode::Agents;
@@ -2185,7 +2193,7 @@ impl crate::TermWindow {
             .panes
             .as_ref()
             .is_some_and(|(_, panes)| !panes.is_empty());
-        if !has_transfers && !any_agent && !any_pane {
+        if !has_transfers && !any_agent && !any_pane && update.is_none() {
             self.dynamic_status.agent_marks.clear();
             return Vec::new();
         }
@@ -2198,6 +2206,7 @@ impl crate::TermWindow {
         } else {
             Vec::new()
         };
+        items.extend(update.map(StatusItem::Update));
         let on_screen: HashSet<PaneId> = if any_agent || any_pane {
             self.get_panes_to_render()
                 .iter()
@@ -2470,6 +2479,7 @@ fn status_content(item: &StatusItem) -> CardContent<'_> {
     };
     match item {
         StatusItem::Transfer(view) => card_content(view),
+        StatusItem::Update(status) => update_capsule::content(status),
         StatusItem::Agent {
             agents,
             index,

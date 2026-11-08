@@ -2356,7 +2356,8 @@ pub fn tooltip_label_for(item_type: &UIItemType) -> Option<String> {
             "tooltip-refresh-files"
         }
         UIItemType::RightSidebarRemoteFileUpload => "tooltip-upload-files",
-        UIItemType::TransferCardDismiss(_) => "right-dismiss",
+        UIItemType::TransferCardDismiss(_) | UIItemType::UpdateCapsuleDismiss => "right-dismiss",
+        UIItemType::UpdateCapsule => render::update_capsule::action_tooltip(),
         UIItemType::TransferCardCancel(_) => "right-cancel",
         UIItemType::TransferCardRetry(_) => "right-retry",
         UIItemType::TransferCardOpen(_) => "right-open",
@@ -4453,8 +4454,7 @@ impl TermWindow {
 
     /// What has to keep going even where nobody can see it, because its end
     /// changes more than this window's picture: a transition whose last
-    /// frame tidies up after it, the update notice's dismissal (every
-    /// window hides it then), a takeover or recovery waiting for this
+    /// frame tidies up after it, a takeover or recovery waiting for this
     /// window to confirm its geometry (the whole connection waits with it),
     /// and a remote thread being opened (claimed on a frame).
     ///
@@ -4462,7 +4462,7 @@ impl TermWindow {
     /// terminal shown; one owed to a tab switched away from or closed, or
     /// held up behind a page, would keep the window drawing for good.
     fn owes_frames_while_hidden(&self) -> bool {
-        if self.content_view_fade.is_some() || self.update_capsule.owes_frames_while_hidden() {
+        if self.content_view_fade.is_some() {
             return true;
         }
         if self.content_view_foreground() {
@@ -4520,7 +4520,6 @@ impl TermWindow {
             // usual way, and a light left frozen on screen would stay.
             || !self.edge_lights.is_empty()
             || self.pending_paste.is_some()
-            || self.update_capsule.owes_frames()
             || self.dynamic_status.owes_frames()
             // A finished transfer's notice runs out in a window seen but
             // not in front too.

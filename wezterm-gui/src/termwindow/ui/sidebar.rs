@@ -4149,16 +4149,13 @@ impl crate::TermWindow {
                 settings_icon_size,
                 foreground,
             )?;
-            // The update capsule, once dismissed, lives on as a dot on the
+            // The update notice, once dismissed, lives on as a dot on the
             // shoulder of the button that leads to settings, ringed in the
             // sidebar background so it reads on the icon rather than in it;
             // red when the install failed.
-            // Where the dot goes is recorded either way: the capsule flies
-            // there when it is dismissed.
             let dot = (settings_icon_size / 3).max(self.ui_px(5)) as f32;
             let dot_x = (settings_icon_x + settings_icon_size) as f32 - dot * 0.75;
             let dot_y = settings_icon_y as f32 - dot * 0.25;
-            self.update_capsule.gear_dot_slot = Some((dot_x + dot / 2.0, dot_y + dot / 2.0, dot));
             if let Some(failed) = crate::termwindow::render::update_capsule::gear_dot() {
                 let ring = dot + 2.0 * self.ui_f32(1.5);
                 self.fill_rounded_rectangle(

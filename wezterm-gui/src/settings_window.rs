@@ -492,7 +492,7 @@ fn start_update_install_with(
 
     // The installer downloads and replaces files: off the UI thread, with
     // its progress and outcome posted back to whichever Settings window is
-    // open by then and to the windows' update capsules.
+    // open by then and to the windows' update notices.
     let spawned = std::thread::Builder::new()
         .name("thinkterm-update-install".into())
         .spawn(move || {
@@ -601,7 +601,7 @@ fn start_update_install_with(
     }
 }
 
-/// What the update capsule shows of an install's progress: the whole
+/// What the update notice shows of an install's progress: the whole
 /// percentage while it downloads, none once the installer runs.
 fn capsule_percent(progress: &Option<thinkterm_update::InstallProgress>) -> Option<u64> {
     match progress {
@@ -630,7 +630,7 @@ pub(crate) fn installs_updates_itself() -> bool {
     cfg!(windows) || thinkterm_update::InstallMethod::detect().self_updatable()
 }
 
-/// Where an update stands, as the update capsule shows it.
+/// Where an update stands, as the update notice shows it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum UpdateCapsuleStatus {
     /// `new_build`: the release has the running build's own version, made
@@ -668,7 +668,7 @@ pub(crate) fn update_capsule_status() -> Option<UpdateCapsuleStatus> {
 }
 
 /// `restart_ends_terminals`, asked again at most once a second: the update
-/// capsule asks on every paint of every window, and the answer only moves
+/// notice asks on every paint of every window, and the answer only moves
 /// as panes come and go.
 fn restart_ends_terminals_lately() -> bool {
     thread_local! {
@@ -684,7 +684,7 @@ fn restart_ends_terminals_lately() -> bool {
     })
 }
 
-/// Restart into the installed update, from the update capsule. False when
+/// Restart into the installed update, from the update notice. False when
 /// it did not: an install still runs, or restarting now would end
 /// terminals after all.
 pub(crate) fn restart_into_update() -> bool {
@@ -21015,7 +21015,7 @@ impl SettingsWindow {
             let inset_x = self.ui_px(DROPDOWN_HOVER_INSET_X);
             let inset_y = self.ui_px(DROPDOWN_HOVER_INSET_Y);
             // Opaque, a step of the card towards its text as the eye sees
-            // it, as the update capsule's button: the card's own hover grey
+            // it, as the dynamic status's buttons: the card's own hover grey
             // is a translucent white, which blends in linear light and so
             // comes out several times brighter than it reads in sRGB.
             let step = if pressed { 0.14 } else { 0.08 };

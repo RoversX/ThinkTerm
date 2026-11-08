@@ -52,7 +52,7 @@ const TAB_WHEEL_DIRECTION_LOCK_MS: u64 = 140;
 /// submenu of their own.
 const NEW_TAB_MENU_HOSTS_INLINE: usize = 6;
 
-/// The update capsule floats over the terminal's corner: a wheel turned over
+/// The update notice's buttons float over the terminal's corner: a wheel turned over
 /// it scrolls the terminal underneath.
 fn update_capsule_wheel_passthrough(event: &MouseEvent, item: &UIItem) -> bool {
     matches!(event.kind, WMEK::VertWheel(_) | WMEK::HorzWheel(_))
@@ -6113,7 +6113,7 @@ impl super::TermWindow {
     ) {
         context.set_cursor(Some(MouseCursor::Hand));
         if event.kind == WMEK::Press(MousePress::Left) {
-            // The gear carries the dismissed update capsule's dot: the click
+            // The gear carries the dismissed update notice's dot: the click
             // goes where the capsule would have led.
             if crate::termwindow::render::update_capsule::gear_dot().is_some() {
                 crate::settings_window::show_update_page_from(

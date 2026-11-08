@@ -33,7 +33,7 @@ pub fn update_available() -> bool {
 
 lazy_static::lazy_static! {
     /// The release `UPDATE_AVAILABLE` is about, kept in memory with the
-    /// flag: the update capsule names it on every paint and installs it when
+    /// flag: the update notice names it on every paint and installs it when
     /// clicked, whether or not the check could be saved to disk.
     static ref AVAILABLE_RELEASE: Mutex<Option<Release>> = Mutex::new(None);
 }
@@ -68,7 +68,7 @@ pub fn available_version() -> Option<String> {
 }
 
 /// Record the flag and the release it is about; when either changes, ask
-/// every window to repaint so the update capsule appears, goes away or
+/// every window to repaint so the update notice appears, goes away or
 /// names the new release. Only the checker thread and a check asked for
 /// from Settings call this: both run once the GUI is up, and spawning onto
 /// the main thread needs its scheduler.

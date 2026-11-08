@@ -78,7 +78,7 @@ const WATCH_VAR: &str = "thinkterm_share";
 /// Above the tooltips and the command palette, under the recording
 /// overlay: the panel is opened over the others and closes when one of
 /// them takes the window (see `paint_share_panel`). A z-index of its own,
-/// for the reason the update capsule's gives.
+/// for the reason the dynamic status's gives.
 const PANEL_ZINDEX: i8 = 12;
 
 // Geometry in design pixels (the 2x macOS grid), converted with `ctx.px`
