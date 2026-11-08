@@ -493,8 +493,14 @@ impl crate::TermWindow {
         let (_, pane_y) = self.pane_content_origin(pos)?;
         let (pane_x, pane_width) = self.pane_chrome_span(pos)?;
         let mut height = (pos.height as f32 * self.render_metrics.cell_size.height as f32).max(1.0);
-        if self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id) && pos.top > 0 {
-            height = height.max(self.pane_nav_bar_height() as f32);
+        if self.collapsed_pane_layouts.contains_key(&pos.pane_stack_id) {
+            if pos.top > 0 {
+                height = height.max(self.pane_nav_bar_height() as f32);
+            }
+        } else {
+            // Along the tree's bottom edge, the room under it its rows go on
+            // into.
+            height += self.pane_bottom_slack(pos, self.terminal_size.rows) as f32;
         }
         // The frame starts at the nav bar, lifted for panes along the top.
         let lift = self.pane_nav_lift(pos);

@@ -67,6 +67,10 @@ pub struct FrontendCellMetrics {
     pub cell_height: usize,
     /// Vertical chrome drawn inside the pane's rect (the pane nav bar), px.
     pub chrome_height: usize,
+    /// Room under the tree the frontend lets a pane along its bottom edge
+    /// run its terminal on into, px: what is left of the window under the
+    /// tree's last row. The tree knows which panes those are.
+    pub extra_height: usize,
     pub dpi: u32,
 }
 
@@ -93,9 +97,14 @@ pub fn frontend_cell_metrics(pane_id: PaneId) -> Option<FrontendCellMetrics> {
 
 /// Convert a split-tree pixel rect into the size the registered frontend
 /// would compute for it. Mirrors the GUI's `terminal_size_for_positioned_pane`
-/// exactly: chrome is clamped so one terminal row always survives, and the
-/// pixel size is re-derived from whole cells.
-pub fn apply_frontend_cell_metrics(pane_id: PaneId, size: TerminalSize) -> TerminalSize {
+/// exactly: chrome is clamped so one terminal row always survives, the room
+/// under the tree is added for a pane `along_bottom` of it, and the pixel
+/// size is re-derived from whole cells.
+pub fn apply_frontend_cell_metrics(
+    pane_id: PaneId,
+    size: TerminalSize,
+    along_bottom: bool,
+) -> TerminalSize {
     let Some(m) = frontend_cell_metrics(pane_id) else {
         return size;
     };
@@ -105,7 +114,10 @@ pub fn apply_frontend_cell_metrics(pane_id: PaneId, size: TerminalSize) -> Termi
         .chrome_height
         .min(size.pixel_height.saturating_sub(cell_height));
     let pixel_width = size.pixel_width.max(cell_width);
-    let pixel_height = size.pixel_height.saturating_sub(chrome).max(cell_height);
+    let room_below = if along_bottom { m.extra_height } else { 0 };
+    let pixel_height = (size.pixel_height + room_below)
+        .saturating_sub(chrome)
+        .max(cell_height);
     let cols = (pixel_width / cell_width).max(1);
     let rows = (pixel_height / cell_height).max(1);
     TerminalSize {
@@ -1446,5 +1458,38 @@ mod test {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn the_room_under_a_pane_adds_up_with_its_own_remainder_to_another_row() {
+        let pane_id = PaneId::MAX - 7;
+        let metrics = FrontendCellMetrics {
+            cell_width: 10,
+            cell_height: 32,
+            chrome_height: 78,
+            extra_height: 0,
+            dpi: 96,
+        };
+        let rect = TerminalSize {
+            rows: 39,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 39 * 32,
+            dpi: 96,
+        };
+        set_frontend_cell_metrics(pane_id, Some(metrics));
+        // The nav bar takes 78 of the rect's 1248: 36 rows and 18 over.
+        assert_eq!(apply_frontend_cell_metrics(pane_id, rect, true).rows, 36);
+        set_frontend_cell_metrics(
+            pane_id,
+            Some(FrontendCellMetrics {
+                extra_height: 16,
+                ..metrics
+            }),
+        );
+        // With the 16 under the tree, 37 -- for a pane along its bottom.
+        assert_eq!(apply_frontend_cell_metrics(pane_id, rect, true).rows, 37);
+        assert_eq!(apply_frontend_cell_metrics(pane_id, rect, false).rows, 36);
+        set_frontend_cell_metrics(pane_id, None);
     }
 }

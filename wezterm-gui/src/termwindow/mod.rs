@@ -6652,6 +6652,7 @@ impl TermWindow {
                             {
                                 self.set_window_size(size, window)?;
                             } else if tab_size != self.terminal_size {
+                                self.refresh_pane_tree_slack(&tab);
                                 tab.resize(self.terminal_size);
                             }
                             self.stage_workspace_thread_font_scales();

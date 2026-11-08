@@ -152,7 +152,9 @@ impl PaneStack {
         self.active = self.panes.len().saturating_sub(1);
     }
 
-    fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
+    /// `along_bottom`: whether the stack runs along the tree's bottom edge,
+    /// where a frontend may let its panes take the room under the tree.
+    fn resize(&self, size: TerminalSize, along_bottom: bool) -> anyhow::Result<()> {
         for pane in &self.panes {
             // Remote mirror panes are sized by the GUI layer, which
             // subtracts per-pane chrome (the pane nav bar) from the cell
@@ -165,7 +167,7 @@ impl PaneStack {
             // registered cell metrics: convert the tree's pixel rect with
             // the pane's own font scale and chrome so this write agrees
             // with the GUI's, instead of fighting it (no entry = raw size).
-            let size = crate::pane::apply_frontend_cell_metrics(pane.pane_id(), size);
+            let size = crate::pane::apply_frontend_cell_metrics(pane.pane_id(), size, along_bottom);
             log::debug!(
                 target: "sizetrace",
                 "stack resize pane {} -> {}x{} ({}x{}px)",
@@ -619,38 +621,43 @@ fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &Termina
                         }
                         return;
                     }
+                    // The lower side first, a row each in turn: its panes run on
+                    // into the window's room under the tree, which a row given
+                    // or taken anywhere else would take from or give to them,
+                    // so that they would lose a row as the window grew and get
+                    // one back as it went on.
                     SplitDirection::Vertical if y_adjust > 0 => {
-                        adjust_y_size(&mut *left, 1, cell_dimensions);
-                        data.first.rows += 1;
-                        data.first.pixel_height =
-                            data.first.rows.saturating_mul(cell_dimensions.pixel_height);
+                        adjust_y_size(&mut *right, 1, cell_dimensions);
+                        data.second.rows += 1;
+                        data.second.pixel_height = data
+                            .second
+                            .rows
+                            .saturating_mul(cell_dimensions.pixel_height);
                         y_adjust -= 1;
                         if y_adjust > 0 {
-                            adjust_y_size(&mut *right, 1, cell_dimensions);
-                            data.second.rows += 1;
-                            data.second.pixel_height = data
-                                .second
-                                .rows
-                                .saturating_mul(cell_dimensions.pixel_height);
+                            adjust_y_size(&mut *left, 1, cell_dimensions);
+                            data.first.rows += 1;
+                            data.first.pixel_height =
+                                data.first.rows.saturating_mul(cell_dimensions.pixel_height);
                             y_adjust -= 1;
                         }
                     }
                     SplitDirection::Vertical => {
                         // y_adjust is negative
-                        if data.first.rows > 1 {
-                            adjust_y_size(&mut *left, -1, cell_dimensions);
-                            data.first.rows -= 1;
-                            data.first.pixel_height =
-                                data.first.rows.saturating_mul(cell_dimensions.pixel_height);
-                            y_adjust += 1;
-                        }
-                        if y_adjust < 0 && data.second.rows > 1 {
+                        if data.second.rows > 1 {
                             adjust_y_size(&mut *right, -1, cell_dimensions);
                             data.second.rows -= 1;
                             data.second.pixel_height = data
                                 .second
                                 .rows
                                 .saturating_mul(cell_dimensions.pixel_height);
+                            y_adjust += 1;
+                        }
+                        if y_adjust < 0 && data.first.rows > 1 {
+                            adjust_y_size(&mut *left, -1, cell_dimensions);
+                            data.first.rows -= 1;
+                            data.first.pixel_height =
+                                data.first.rows.saturating_mul(cell_dimensions.pixel_height);
                             y_adjust += 1;
                         }
                     }
@@ -663,7 +670,12 @@ fn adjust_y_size(tree: &mut Tree, mut y_adjust: isize, cell_dimensions: &Termina
     }
 }
 
-fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) -> anyhow::Result<()> {
+/// `along_bottom`: whether `tree` runs along the bottom edge of the whole.
+fn apply_sizes_from_splits(
+    tree: &Tree,
+    size: &TerminalSize,
+    along_bottom: bool,
+) -> anyhow::Result<()> {
     match tree {
         Tree::Empty => return Ok(()),
         Tree::Node { data: None, .. } => return Ok(()),
@@ -672,14 +684,25 @@ fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) -> anyhow::Result<(
             right,
             data: Some(data),
         } => {
-            apply_sizes_from_splits(&*left, &data.first)?;
-            apply_sizes_from_splits(&*right, &data.second)?;
+            // Of two sides stacked one over the other, the upper stops short.
+            let stacked = data.direction == SplitDirection::Vertical;
+            apply_sizes_from_splits(&*left, &data.first, along_bottom && !stacked)?;
+            apply_sizes_from_splits(&*right, &data.second, along_bottom)?;
         }
         Tree::Leaf(stack) => {
-            stack.resize(*size)?;
+            stack.resize(*size, along_bottom)?;
         }
     }
     Ok(())
+}
+
+/// Whether the leaf `cursor` is at runs along the tree's bottom edge: below
+/// the divider of every split above it that stacks its two sides.
+fn runs_along_bottom(cursor: &Cursor) -> bool {
+    cursor.path_to_root().all(|(branch, split)| match split {
+        Some(split) if split.direction == SplitDirection::Vertical => branch == PathBranch::IsRight,
+        _ => true,
+    })
 }
 
 /// If `old` and `new` share the same split topology (node/leaf shape and
@@ -1172,9 +1195,10 @@ impl Tab {
     /// Apply the new size of the tab to the panes contained within.
     /// The delta between the current and the new size is computed,
     /// and is distributed between the splits.  For small resizes
-    /// this algorithm biases towards adjusting the left/top nodes
-    /// first.  For large resizes this tends to proportionally adjust
-    /// the relative sizes of the elements in a split.
+    /// this algorithm biases towards adjusting the left nodes first,
+    /// and the lower ones of a vertical split (see `adjust_y_size`).
+    /// For large resizes this tends to proportionally adjust the
+    /// relative sizes of the elements in a split.
     pub fn resize(&self, size: TerminalSize) -> bool {
         self.inner.lock().resize(size)
     }
@@ -1660,7 +1684,7 @@ impl TabInner {
             // split sizes down to them and say so, the way a real resize
             // would, so the GUI adopts and publishes the new frames.
             if let Some(root) = self.pane.as_ref() {
-                if let Err(err) = apply_sizes_from_splits(root, &self.size) {
+                if let Err(err) = apply_sizes_from_splits(root, &self.size, true) {
                     log::error!("failed to resize panes after topology change: {err:#}");
                 }
             }
@@ -2015,7 +2039,9 @@ impl TabInner {
                 Err(c) => {
                     self.pane.replace(c.tree());
                     let size = self.size;
-                    if let Err(err) = apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size) {
+                    if let Err(err) =
+                        apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size, true)
+                    {
                         log::error!("failed to resize panes after rotation: {err:#}");
                     }
                     break;
@@ -2045,7 +2071,9 @@ impl TabInner {
                 Err(c) => {
                     self.pane.replace(c.tree());
                     let size = self.size;
-                    if let Err(err) = apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size) {
+                    if let Err(err) =
+                        apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size, true)
+                    {
                         log::error!("failed to resize panes after rotation: {err:#}");
                     }
                     break;
@@ -2205,6 +2233,12 @@ impl TabInner {
     }
 
     fn resize(&mut self, size: TerminalSize) -> bool {
+        self.resize_tree(size, true)
+    }
+
+    /// `resize`, for a tree that runs along the bottom edge of the whole
+    /// only if `along_bottom`: one about to have a pane put under it.
+    fn resize_tree(&mut self, size: TerminalSize, along_bottom: bool) -> bool {
         if size.rows == 0 || size.cols == 0 {
             // Ignore "impossible" resize requests
             return false;
@@ -2287,7 +2321,9 @@ impl TabInner {
             self.size = size;
 
             // And then resize the individual panes to match
-            if let Err(err) = apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size) {
+            if let Err(err) =
+                apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size, along_bottom)
+            {
                 log::error!("failed to resize panes after split adjustment: {err:#}");
             }
         }
@@ -2806,8 +2842,9 @@ impl TabInner {
 
             if cursor.is_leaf() {
                 // Apply our size to the tty
+                let along_bottom = runs_along_bottom(&cursor);
                 if let Some(stack) = cursor.leaf_mut() {
-                    if let Err(err) = stack.resize(pane_size) {
+                    if let Err(err) = stack.resize(pane_size, along_bottom) {
                         log::error!("failed to resize pane stack: {err:#}");
                     }
                 }
@@ -3127,8 +3164,9 @@ impl TabInner {
                             dpi: cell_dims.dpi,
                         };
 
+                        let along_bottom = runs_along_bottom(&cursor);
                         if let Some(stack) = cursor.leaf_mut() {
-                            if let Err(err) = stack.resize(size) {
+                            if let Err(err) = stack.resize(size, along_bottom) {
                                 log::error!("failed to resize pane stack after removal: {err:#}");
                             }
                         } else {
@@ -3136,8 +3174,9 @@ impl TabInner {
                         }
                     } else if !dead_panes.is_empty() {
                         // Apply our revised size to the tty
+                        let along_bottom = runs_along_bottom(&cursor);
                         if let Some(stack) = cursor.leaf_mut() {
-                            if let Err(err) = stack.resize(pane_size) {
+                            if let Err(err) = stack.resize(pane_size, along_bottom) {
                                 log::error!("failed to resize pane stack after removal: {err:#}");
                             }
                         }
@@ -3787,7 +3826,7 @@ impl TabInner {
 
             // Advise the panes of their new sizes
             let size = self.size;
-            if let Err(err) = apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size) {
+            if let Err(err) = apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size, true) {
                 log::error!("failed to resize panes after moving active pane: {err:#}");
             }
         }
@@ -3935,14 +3974,20 @@ impl TabInner {
                 false
             };
 
+            // A split that puts the new pane under the rest takes the rest
+            // off the tree's bottom edge, before they are resized to make
+            // room for it.
+            let goes_below =
+                request.direction == SplitDirection::Vertical && request.target_is_second;
+
             if needs_resize {
                 // Pre-emptively resize the tab contents down to
                 // match the target size; it's easier to reuse
                 // existing resize logic that way
                 if request.target_is_second {
-                    self.resize(split_info.first.clone());
+                    self.resize_tree(split_info.first.clone(), !goes_below);
                 } else {
-                    self.resize(split_info.second.clone());
+                    self.resize_tree(split_info.second.clone(), true);
                 }
             }
 
@@ -3985,6 +4030,11 @@ impl TabInner {
                 }
             };
 
+            // The pane split, and so both halves when they stand side by
+            // side; stacked, only the lower.
+            let along_bottom = runs_along_bottom(&cursor);
+            let first_along_bottom =
+                along_bottom && split_info.direction != SplitDirection::Vertical;
             let existing_stack = cursor.leaf_mut().unwrap().clone();
             let new_stack = PaneStack::new(pane);
 
@@ -3994,8 +4044,8 @@ impl TabInner {
                 (new_stack, existing_stack)
             };
 
-            stack1.resize(split_info.first)?;
-            stack2.resize(split_info.second)?;
+            stack1.resize(split_info.first, first_along_bottom)?;
+            stack2.resize(split_info.second, along_bottom)?;
 
             *cursor.leaf_mut().unwrap() = stack1;
 

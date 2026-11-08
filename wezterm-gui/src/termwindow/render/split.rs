@@ -29,6 +29,13 @@ impl crate::TermWindow {
             let width = self.render_metrics.underline_height as f32;
             let mut top = pos_y - (cell_height / 2.0);
             let mut bottom = top + (1. + split.size as f32) * cell_height;
+            // Along the tree's bottom edge the panes' rows go on into the
+            // room under it (`pane_tree_slack`), past the half cell the line
+            // reaches: it goes as far as they do.
+            if split.top + split.size >= self.terminal_size.rows {
+                let tree_bottom = pos_y + split.size as f32 * cell_height;
+                bottom = bottom.max(tree_bottom + self.pane_tree_slack() as f32);
+            }
             // Between the top panes the line reaches up beside their lifted
             // nav bars (see `pane_nav_lift`), straight through the terminal
             // bar under them; along the bottom it stops short of the bar.
