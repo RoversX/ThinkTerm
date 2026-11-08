@@ -129,6 +129,10 @@ const FINISHED_MAX: usize = 3;
 /// Work shorter than this is not news when it ends -- a one-line answer --
 /// as the finished sound has it.
 const FINISHED_AFTER: Duration = Duration::from_secs(5);
+/// How long an agent has to stay stopped to have finished: its state can
+/// flicker to idle for a moment mid-task, as a thread's running does
+/// (the sidebar holds it through 800 ms for the same reason).
+const FINISHED_SETTLE: Duration = Duration::from_millis(800);
 /// How long something new shows as its card before the dynamic status folds again.
 const BANNER: Duration = Duration::from_millis(3000);
 /// The waiting dot breathes for a while after the wait begins, then rests:
@@ -215,47 +219,78 @@ pub(crate) struct FinishedAgent {
 #[derive(Default)]
 pub(crate) struct FinishedAgents {
     working: HashMap<PaneId, Instant>,
+    /// Stopped, and since when: finished once that has held for
+    /// [`FINISHED_SETTLE`].
+    stopping: HashMap<PaneId, Instant>,
     shown: Vec<FinishedAgent>,
 }
 
 impl FinishedAgents {
-    /// An agent's state, as it changes. Working long enough and then
-    /// stopping puts it on; anything else it does takes it off again.
-    /// True when it went on.
-    fn note(&mut self, now: Instant, pane_id: PaneId, state: Option<AgentState>, listed: bool) -> bool {
-        self.shown.retain(|agent| agent.pane_id != pane_id);
+    /// An agent's state, as it changes. Stopping after work starts the wait
+    /// for it to stay stopped; working again, waiting, failing or ending
+    /// takes it off, or out of the wait. More news of it still idle -- a new
+    /// title, its result seen elsewhere -- leaves it as it is. True when it
+    /// started to wait, and so wants a frame to see it through.
+    fn note(&mut self, now: Instant, pane_id: PaneId, state: Option<AgentState>) -> bool {
         match state {
             Some(AgentState::Working) => {
+                self.shown.retain(|agent| agent.pane_id != pane_id);
+                // A flicker of idle: the same run, still counted from its start.
+                self.stopping.remove(&pane_id);
                 self.working.entry(pane_id).or_insert(now);
                 false
             }
             Some(AgentState::Idle) => {
-                let worked = self
-                    .working
-                    .remove(&pane_id)
-                    .is_some_and(|since| now.duration_since(since) >= FINISHED_AFTER);
-                if !worked || listed {
+                if !self.working.contains_key(&pane_id) || self.stopping.contains_key(&pane_id) {
                     return false;
                 }
-                self.shown.push(FinishedAgent {
-                    pane_id,
-                    shown_at: now,
-                    paused_at: None,
-                });
-                let excess = self.shown.len().saturating_sub(FINISHED_MAX);
-                self.shown.drain(..excess);
+                self.stopping.insert(pane_id, now);
                 true
             }
             // Waiting, failed, ended or unknown: not a finish.
             _ => {
-                self.working.remove(&pane_id);
+                self.forget(pane_id);
                 false
             }
         }
     }
 
+    /// Put on those that have stayed stopped long enough after working
+    /// long enough -- unless the Status panel lists them. True when one went
+    /// on.
+    fn settle(&mut self, now: Instant, listed: bool) -> bool {
+        let settled: Vec<(PaneId, Instant)> = self
+            .stopping
+            .iter()
+            .filter(|(_, stopped)| now.duration_since(**stopped) >= FINISHED_SETTLE)
+            .map(|(pane_id, stopped)| (*pane_id, *stopped))
+            .collect();
+        let mut on = false;
+        for (pane_id, stopped) in settled {
+            self.stopping.remove(&pane_id);
+            let worked = self
+                .working
+                .remove(&pane_id)
+                .is_some_and(|since| stopped.duration_since(since) >= FINISHED_AFTER);
+            if !worked || listed {
+                continue;
+            }
+            self.shown.retain(|agent| agent.pane_id != pane_id);
+            self.shown.push(FinishedAgent {
+                pane_id,
+                shown_at: now,
+                paused_at: None,
+            });
+            on = true;
+        }
+        let excess = self.shown.len().saturating_sub(FINISHED_MAX);
+        self.shown.drain(..excess);
+        on
+    }
+
     fn forget(&mut self, pane_id: PaneId) {
         self.working.remove(&pane_id);
+        self.stopping.remove(&pane_id);
         self.shown.retain(|agent| agent.pane_id != pane_id);
     }
 
@@ -282,12 +317,15 @@ impl FinishedAgents {
         }
     }
 
-    /// When the next one is due to go, while one's clock runs.
+    /// When the next one is due to go on or off: one stopped long enough,
+    /// or one whose clock runs out.
     pub(crate) fn deadline(&self) -> Option<Instant> {
+        let settling = self.stopping.values().map(|stopped| *stopped + FINISHED_SETTLE);
         self.shown
             .iter()
             .filter(|agent| agent.paused_at.is_none())
             .map(|agent| agent.shown_at + FINISHED_FOR)
+            .chain(settling)
             .min()
     }
 }
@@ -1049,7 +1087,9 @@ impl crate::TermWindow {
             items = std::mem::take(&mut dynamic.last);
         }
 
-        let mut held = false;
+        // The pointer anywhere over it, resting or not: what holds a
+        // notice's clock, as `held` (below) is what opens it.
+        let mut over = false;
         let mut opening = false;
         let front_open;
         if going {
@@ -1069,11 +1109,11 @@ impl crate::TermWindow {
             if self.dynamic_status.still_pointer.is_some() && self.dynamic_status.still_pointer != pointer {
                 self.dynamic_status.still_pointer = None;
             }
-            held = self.dynamic_status.still_pointer.is_none()
-                && self
-                    .dynamic_status
-                    .bounds
-                    .is_some_and(|rect| pointer_over(self, rect));
+            over = self
+                .dynamic_status
+                .bounds
+                .is_some_and(|rect| pointer_over(self, rect));
+            let held = self.dynamic_status.still_pointer.is_none() && over;
             let dynamic = &mut self.dynamic_status;
             if held {
                 dynamic.away_since = None;
@@ -1627,8 +1667,11 @@ impl crate::TermWindow {
                 .collect();
             // Nor while the window is out of sight -- minimised, covered,
             // on another desktop: a notice must not run out before anyone
-            // could have looked. A window seen but not in front counts.
-            self.advance_transfer_toasts(now, &visible, held || self.occluded.is_some());
+            // could have looked. A window seen but not in front counts. A
+            // pointer it came up under holds it too: that is someone
+            // reading it, even before they move.
+            let hold = over || self.occluded.is_some();
+            self.advance_transfer_toasts(now, &visible, hold);
             if let Some(deadline) = self.next_transfer_toast_deadline() {
                 self.update_next_frame_time(Some(deadline));
             }
@@ -1639,7 +1682,6 @@ impl crate::TermWindow {
                     _ => None,
                 })
                 .collect();
-            let hold = held || self.occluded.is_some();
             if self.dynamic_status.finished.advance(now, &finished, hold) {
                 // This frame already painted the one that went.
                 self.update_next_frame_time(Some(now));
@@ -2315,10 +2357,14 @@ impl crate::TermWindow {
         };
         self.update_capsule.note(now, update.as_ref());
         // The Status panel lists them: none of its own then.
-        if self.right_sidebar_width() > 0
-            && self.right_sidebar_mode == crate::termwindow::RightSidebarMode::Agents
-        {
+        let listed = self.right_sidebar_width() > 0
+            && self.right_sidebar_mode == crate::termwindow::RightSidebarMode::Agents;
+        if listed {
             self.dynamic_status.finished.shown.clear();
+        }
+        self.dynamic_status.finished.settle(now, listed);
+        if let Some(due) = self.dynamic_status.finished.deadline() {
+            self.update_next_frame_time(Some(due));
         }
         let any_finished = !self.dynamic_status.finished.shown.is_empty();
         let has_transfers = self.has_transfer_cards();
@@ -2571,9 +2617,11 @@ impl crate::TermWindow {
         let agents_listed = self.right_sidebar_width() > 0
             && self.right_sidebar_mode == crate::termwindow::RightSidebarMode::Agents;
         let finished = &mut self.dynamic_status.finished;
-        let was_finished = finished.shown.iter().any(|agent| agent.pane_id == pane_id);
+        let is_finished =
+            |finished: &FinishedAgents| finished.shown.iter().any(|agent| agent.pane_id == pane_id);
+        let was_finished = is_finished(finished);
         let state = status.as_ref().map(|(_, status)| status.state);
-        if finished.note(now, pane_id, state, agents_listed) || was_finished {
+        if finished.note(now, pane_id, state) || was_finished != is_finished(finished) {
             // Just finished, or no longer: on or off the dynamic status now,
             // with a snapshot that knows the agent as it stands.
             self.dynamic_status.agents = None;
@@ -2942,22 +2990,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_agent_that_worked_a_while_and_stopped_is_finished() {
+    fn an_agent_that_worked_a_while_and_stayed_stopped_is_finished() {
         let now = Instant::now();
+        let at = |secs: f32| now + Duration::from_secs_f32(secs);
         let mut finished = FinishedAgents::default();
-        assert!(!finished.note(now, 1, Some(AgentState::Working), false));
+        assert!(!finished.note(at(0.0), 1, Some(AgentState::Working)));
         // A quick answer is not news.
-        assert!(!finished.note(now + Duration::from_secs(2), 1, Some(AgentState::Idle), false));
-        assert!(!finished.note(now, 1, Some(AgentState::Working), false));
-        assert!(finished.note(now + Duration::from_secs(6), 1, Some(AgentState::Idle), false));
+        assert!(finished.note(at(2.0), 1, Some(AgentState::Idle)));
+        assert!(!finished.settle(at(3.0), false));
+        assert!(!finished.note(at(10.0), 1, Some(AgentState::Working)));
+        // Flickering to idle mid-task: the same run, nothing shown.
+        assert!(finished.note(at(12.0), 1, Some(AgentState::Idle)));
+        assert!(!finished.settle(at(12.5), false));
+        assert!(!finished.note(at(12.6), 1, Some(AgentState::Working)));
+        assert!(!finished.settle(at(14.0), false));
+        assert!(finished.shown.is_empty());
+        // Stopping for good, counted from the start of the run.
+        assert!(finished.note(at(16.0), 1, Some(AgentState::Idle)));
+        assert_eq!(finished.deadline(), Some(at(16.0) + FINISHED_SETTLE));
+        assert!(!finished.settle(at(16.5), false));
+        assert!(finished.settle(at(16.9), false));
+        assert_eq!(finished.shown.len(), 1);
+        // More news of it, still idle, leaves it on.
+        assert!(!finished.note(at(17.0), 1, Some(AgentState::Idle)));
         assert_eq!(finished.shown.len(), 1);
         // At work again, it is not finished any more.
-        assert!(!finished.note(now + Duration::from_secs(7), 1, Some(AgentState::Working), false));
+        assert!(!finished.note(at(18.0), 1, Some(AgentState::Working)));
         assert!(finished.shown.is_empty());
-        // Nor is one that stopped to wait, and the Status panel lists its own.
-        assert!(!finished.note(now + Duration::from_secs(20), 1, Some(AgentState::Blocked), false));
-        assert!(!finished.note(now + Duration::from_secs(21), 1, Some(AgentState::Working), false));
-        assert!(!finished.note(now + Duration::from_secs(30), 1, Some(AgentState::Idle), true));
+        // Nor is one that stopped to wait.
+        assert!(!finished.note(at(30.0), 1, Some(AgentState::Blocked)));
+        assert!(finished.stopping.is_empty() && finished.working.is_empty());
+        // And while the Status panel lists them, none of its own.
+        assert!(!finished.note(at(31.0), 1, Some(AgentState::Working)));
+        assert!(finished.note(at(40.0), 1, Some(AgentState::Idle)));
+        assert!(!finished.settle(at(41.0), true));
         assert!(finished.shown.is_empty());
     }
 
@@ -2966,8 +3032,9 @@ mod tests {
         let now = Instant::now();
         let mut finished = FinishedAgents::default();
         finished.working.insert(1, now);
-        assert!(finished.note(now + FINISHED_AFTER, 1, Some(AgentState::Idle), false));
-        let start = now + FINISHED_AFTER;
+        assert!(finished.note(now + FINISHED_AFTER, 1, Some(AgentState::Idle)));
+        let start = now + FINISHED_AFTER + FINISHED_SETTLE;
+        assert!(finished.settle(start, false));
         let seen: HashSet<PaneId> = [1].iter().copied().collect();
         assert!(!finished.advance(start + Duration::from_secs(4), &seen, false));
         assert_eq!(finished.deadline(), Some(start + FINISHED_FOR));
