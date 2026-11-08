@@ -85,6 +85,8 @@ const TOP_ACTION_BOTTOM_GAP: usize = 16;
 /// clamped to `session_row_height - 8`, and so come out a little smaller
 /// than the notification button.
 const TOP_ACTION_MAX_HEIGHT: usize = 72;
+/// The Space menu's row: this, plus a little.
+const SPACE_MENU_BASE_HEIGHT: usize = 58;
 const SESSION_ROW_MIN_HEIGHT: usize = 72;
 /// How much further in from a row's end its status mark sits than its icons
 /// from the start.
@@ -1283,7 +1285,10 @@ impl crate::TermWindow {
             0
         };
         let space_menu_y = y;
-        let space_menu_height = top_action_height + self.ui_px(6);
+        // Kept to the height it had beside the shorter New Thread: grown with
+        // it, the menu's hover ground reads as a slab over the list.
+        let space_menu_height = top_action_height.min(self.ui_px(SPACE_MENU_BASE_HEIGHT))
+            + self.ui_px(6);
         y += space_menu_height + self.ui_px(SIDEBAR_INSET);
         // Connecting keeps the row (as a spinner) so the whole retry
         // sequence paints one stable row instead of flickering between
@@ -1907,7 +1912,8 @@ impl crate::TermWindow {
                     space_menu_height as f32,
                 ),
                 chrome.sidebar_button_hover_bg,
-                self.ui_f32(SIDEBAR_ROW_RADIUS + 4.0),
+                // A pill, as the rows under it.
+                space_menu_height as f32 / 2.0,
             )
             .context("sidebar space menu button")?;
         }
@@ -1921,15 +1927,10 @@ impl crate::TermWindow {
         let space_icon_size = header_icon_size.min(space_menu_height.saturating_sub(14));
         let space_icon_x = space_menu_x + self.ui_px(SIDEBAR_INSET);
         let space_icon_y = space_menu_y + ((space_menu_height.saturating_sub(space_icon_size)) / 2);
-        let space_action_icon_size = space_icon_size.min(22);
-        let space_action_icon_x = space_menu_x
-            .saturating_add(space_menu_width)
-            .saturating_sub(self.ui_px(SIDEBAR_INSET) + space_action_icon_size);
-        let space_action_icon_y =
-            space_menu_y + ((space_menu_height.saturating_sub(space_action_icon_size)) / 2);
+        // The whole row opens the menu, so its name runs to the end.
         let space_text_right = space_menu_x
             .saturating_add(space_menu_width)
-            .saturating_sub(self.ui_px(SIDEBAR_INSET) + space_action_icon_size + top_action_gap);
+            .saturating_sub(self.ui_px(SIDEBAR_INSET));
         let space_text_x = space_icon_x + space_icon_size + top_action_gap;
         let space_name =
             crate::workspace_threads::active_space_name(self.workspace_sidebar_space_id())
@@ -1994,18 +1995,6 @@ impl crate::TermWindow {
             space_menu_y + ((space_menu_height.saturating_sub(ui_cell_height)) / 2),
             space_text_right.saturating_sub(space_text_x),
             foreground,
-        )?;
-        self.paint_sidebar_icon(
-            layers,
-            SvgIcon::Ellipsis,
-            space_action_icon_x,
-            space_action_icon_y,
-            space_action_icon_size,
-            if space_menu_hovered {
-                foreground
-            } else {
-                muted_fg
-            },
         )?;
         let mut y = space_menu_y + space_menu_height + self.ui_px(SIDEBAR_INSET);
         if layout.reconnect_row_height > 0 {
@@ -3729,7 +3718,7 @@ impl crate::TermWindow {
                         space_menu_height as f32,
                     ),
                     chrome.sidebar_button_hover_bg,
-                    self.ui_f32(SIDEBAR_ROW_RADIUS + 4.0),
+                    space_menu_height as f32 / 2.0,
                 )
                 .context("sidebar space menu button repaint")?;
             }
@@ -3762,18 +3751,6 @@ impl crate::TermWindow {
                 space_menu_y + ((space_menu_height.saturating_sub(ui_cell_height)) / 2),
                 space_text_right.saturating_sub(space_text_x),
                 foreground,
-            )?;
-            self.paint_sidebar_icon(
-                layers,
-                SvgIcon::Ellipsis,
-                space_action_icon_x,
-                space_action_icon_y,
-                space_action_icon_size,
-                if space_menu_hovered {
-                    foreground
-                } else {
-                    muted_fg
-                },
             )?;
             if layout.reconnect_row_height > 0 {
                 self.paint_space_reconnect_row(
