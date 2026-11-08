@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 604" width="1000" height="604" role="img" aria-labelledby="t d">
+<title id="t">ThinkTerm vs kitty</title>
+<desc id="d">kitten __benchmark__ · Ubuntu 20.04 · i9-12900K · МБ/с, больше — лучше. Только символы ASCII: ThinkTerm 224,1, kitty 80,0 (2,8×); Символы Unicode: ThinkTerm 186,8, kitty 79,0 (2,4×); CSI-последовательности с малым числом символов: ThinkTerm 71,1, kitty 43,2 (1,6×); Длинные escape-последовательности: ThinkTerm 624,6, kitty 241,2 (2,6×); Изображения: ThinkTerm 663,3, kitty 196,3 (3,4×).</desc>
+<defs>
+<linearGradient id="ours" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#0071e3"/><stop offset="1" stop-color="#2b8cff"/></linearGradient>
+<filter id="glow" x="-10%" y="-80%" width="120%" height="300%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#0071e3" flood-opacity="0.28"/></filter>
+</defs>
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #1d1d1f; }
+.headline { font-size: 32px; font-weight: 700; letter-spacing: -0.6px; }
+.subhead { font-size: 16px; fill: #6e6e73; }
+.label { font-size: 15px; font-weight: 600; letter-spacing: -0.1px; }
+.legend { font-size: 13.5px; font-weight: 500; fill: #6e6e73; }
+.val-ours { font-size: 13px; font-weight: 700; }
+.val-theirs { font-size: 12.5px; font-weight: 500; fill: #6e6e73; }
+.tick { font-size: 11.5px; fill: #86868b; }
+.caption { font-size: 13px; font-weight: 500; fill: #86868b; }
+.grid { stroke: #ececf0; stroke-width: 1; }
+.axis { stroke: #d2d2d7; stroke-width: 1.2; }
+.ours { fill: url(#ours); }
+.ours-bar { fill: url(#ours); filter: url(#glow); }
+.theirs { fill: #c7c7cc; }
+.win { fill: #e8f1ff; stroke: #c4d7f6; }
+.win-t { font-size: 14px; font-weight: 700; fill: #0071e3; }
+.even { fill: #f5f5f7; stroke: #e3e3e8; }
+.even-t { font-size: 14px; font-weight: 700; fill: #6e6e73; }
+</style>
+<rect x="0.5" y="0.5" width="999" height="603" rx="28" fill="#ffffff" stroke="#d2d2d7"/>
+<text x="500" y="62" class="headline" text-anchor="middle">ThinkTerm vs kitty</text>
+<text x="500" y="92" class="subhead" text-anchor="middle">kitten __benchmark__ · Ubuntu 20.04 · i9-12900K · МБ/с, больше — лучше</text>
+<rect x="372" y="122" width="22" height="12" rx="6" class="ours"/>
+<text x="402" y="132" class="legend">ThinkTerm 0.4.2 · 2026-11-05</text>
+<rect x="628" y="122" width="22" height="12" rx="6" class="theirs"/>
+<text x="658" y="132" class="legend">kitty 0.47.4 · 2026-11-05</text>
+<text x="912" y="132" class="legend" text-anchor="middle">Разница</text>
+<line x1="490.3" y1="164" x2="490.3" y2="498" class="grid"/>
+<text x="490.3" y="518" class="tick" text-anchor="middle">120</text>
+<line x1="560.7" y1="164" x2="560.7" y2="498" class="grid"/>
+<text x="560.7" y="518" class="tick" text-anchor="middle">240</text>
+<line x1="631.0" y1="164" x2="631.0" y2="498" class="grid"/>
+<text x="631.0" y="518" class="tick" text-anchor="middle">360</text>
+<line x1="701.3" y1="164" x2="701.3" y2="498" class="grid"/>
+<text x="701.3" y="518" class="tick" text-anchor="middle">480</text>
+<line x1="771.7" y1="164" x2="771.7" y2="498" class="grid"/>
+<text x="771.7" y="518" class="tick" text-anchor="middle">600</text>
+<line x1="842.0" y1="164" x2="842.0" y2="498" class="grid"/>
+<text x="842.0" y="518" class="tick" text-anchor="middle">720</text>
+<line x1="420" y1="164" x2="420" y2="498" class="axis"/>
+<text x="420" y="518" class="tick" text-anchor="middle">0</text>
+<text x="398" y="201.5" class="label" text-anchor="end">Только символы ASCII</text>
+<rect x="420" y="178" width="131.3" height="16" rx="8.0" class="ours-bar"/>
+<text x="559.3" y="190.5" class="val-ours">224,1</text>
+<rect x="420" y="199" width="46.9" height="16" rx="8.0" class="theirs"/>
+<text x="474.9" y="211.5" class="val-theirs">80,0</text>
+<rect x="878" y="182.5" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="201.5" class="win-t" text-anchor="middle">2,8×</text>
+<text x="398" y="267.5" class="label" text-anchor="end">Символы Unicode</text>
+<rect x="420" y="244" width="109.5" height="16" rx="8.0" class="ours-bar"/>
+<text x="537.5" y="256.5" class="val-ours">186,8</text>
+<rect x="420" y="265" width="46.3" height="16" rx="8.0" class="theirs"/>
+<text x="474.3" y="277.5" class="val-theirs">79,0</text>
+<rect x="878" y="248.5" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="267.5" class="win-t" text-anchor="middle">2,4×</text>
+<text x="398" y="333.5" class="label" text-anchor="end">CSI-последовательности с малым числом символов</text>
+<rect x="420" y="310" width="41.7" height="16" rx="8.0" class="ours-bar"/>
+<text x="469.7" y="322.5" class="val-ours">71,1</text>
+<rect x="420" y="331" width="25.3" height="16" rx="8.0" class="theirs"/>
+<text x="453.3" y="343.5" class="val-theirs">43,2</text>
+<rect x="878" y="314.5" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="333.5" class="win-t" text-anchor="middle">1,6×</text>
+<text x="398" y="399.5" class="label" text-anchor="end">Длинные escape-последовательности</text>
+<rect x="420" y="376" width="366.1" height="16" rx="8.0" class="ours-bar"/>
+<text x="794.1" y="388.5" class="val-ours">624,6</text>
+<rect x="420" y="397" width="141.4" height="16" rx="8.0" class="theirs"/>
+<text x="569.4" y="409.5" class="val-theirs">241,2</text>
+<rect x="878" y="380.5" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="399.5" class="win-t" text-anchor="middle">2,6×</text>
+<text x="398" y="465.5" class="label" text-anchor="end">Изображения</text>
+<rect x="420" y="442" width="388.8" height="16" rx="8.0" class="ours-bar"/>
+<text x="816.8" y="454.5" class="val-ours">663,3</text>
+<rect x="420" y="463" width="115.1" height="16" rx="8.0" class="theirs"/>
+<text x="543.1" y="475.5" class="val-theirs">196,3</text>
+<rect x="878" y="446.5" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="465.5" class="win-t" text-anchor="middle">3,4×</text>
+<text x="500" y="570" class="caption" text-anchor="middle">ThinkTerm измерялся через локальный mux · 180×50 · Xvfb с программной отрисовкой на CPU</text>
+</svg>

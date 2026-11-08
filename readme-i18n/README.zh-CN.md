@@ -1,6 +1,6 @@
 # ThinkTerm
 
-[English](../README.md) · **简体中文** · [日本語](README.ja-JP.md) · [Français](README.fr-FR.md) · [Deutsch](README.de-DE.md)
+[English](../README.md) · **简体中文** · [日本語](README.ja-JP.md) · [Français](README.fr-FR.md) · [Deutsch](README.de-DE.md) · [Русский](README.ru-RU.md)
 
 ## 📥 下载
 
@@ -45,30 +45,6 @@ ThinkTerm 是一款**使用 Rust 编写、内置终端复用器的开源终端**
     </td>
   </tr>
 </table>
-
-## 以终端复用器为核心
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="../assets/architecture-dark.svg">
-    <img src="../assets/architecture-light.svg" alt="ThinkTerm 简化架构：桌面应用、TUI 和 CLI、浏览器以及手机应用连接到每台机器上的 mux 服务端；机器之间可以互相连接，桌面应用还能连接普通 SSH 和 Mosh 主机" width="100%">
-  </picture>
-</p>
-
-终端复用器负责管理多个终端会话，并允许客户端接入。在 ThinkTerm 中，**会话、标签页和分屏由 mux 服务端持有**，客户端负责显示内容和传递输入。
-
-- **断开后继续工作。** 客户端断开连接时，服务端持有的会话仍然运行。稍后重新连接，就能继续同一个 Shell、构建或 Agent 任务；主动关闭窗格是另一项操作。
-- **从不同客户端访问同一批会话。** 桌面端、`thinkterm tui` 和浏览器端都可以连接服务端，也可以同时接入多个客户端，以各自的界面操作共享会话。
-- **跨机器组织工作。** 每台主机运行自己的 mux 服务端。ThinkTerm Connect 将远程工作空间与本地工作放在同一个桌面界面中，通过侧边栏就能切换机器。进程始终在原来的主机上运行。
-- **更新时会话不中断。** 桌面端为服务器更新 ThinkTerm 时，正在运行的 mux 服务端会把会话交接给新版本，Shell、构建和 Agent 都会继续运行。
-
-会话持续运行的前提是 mux 服务端及其主机保持可用；这不意味着服务端或主机重启后能恢复原先运行的进程。
-
-## 为什么做 ThinkTerm
-
-同时在多个项目中运行 Agent 时，标签栏很快就会让人分不清：哪个还在工作，哪个需要输入，刚才的构建又在哪里结束了？ThinkTerm 把项目结构和工作状态放在终端旁边，让本地与远程工作一目了然。
-
-Rust 支撑着 ThinkTerm 的终端核心、mux 服务端、桌面客户端和 TUI。桌面端通过 GPU 渲染，不依赖 Electron 或内嵌 WebView。Zed 的 UI 框架 GPUI 无法满足 ThinkTerm 在终端渲染上的性能要求。在 WezTerm 的原生基础之上，ThinkTerm 提供工作空间组织、持久远程会话和辅助 Agent 工作的工具。
 
 ## 性能
 
@@ -164,6 +140,30 @@ Linux 上与 kitty 对比：Ubuntu 20.04（i9-12900K），180×50，`TERM=xterm-
 
 </details>
 
+## 为什么做 ThinkTerm
+
+同时在多个项目中运行 Agent 时，标签栏很快就会让人分不清：哪个还在工作，哪个需要输入，刚才的构建又在哪里结束了？ThinkTerm 把项目结构和工作状态放在终端旁边，让本地与远程工作一目了然。
+
+Rust 支撑着 ThinkTerm 的终端核心、mux 服务端、桌面客户端和 TUI。桌面端通过 GPU 渲染，不依赖 Electron 或内嵌 WebView。Zed 的 UI 框架 GPUI 无法满足 ThinkTerm 在终端渲染上的性能要求。在 WezTerm 的原生基础之上，ThinkTerm 提供工作空间组织、持久远程会话和辅助 Agent 工作的工具。
+
+## 以终端复用器为核心
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="../assets/architecture-dark.svg">
+    <img src="../assets/architecture-light.svg" alt="ThinkTerm 简化架构：桌面应用、TUI 和 CLI、浏览器以及手机应用连接到每台机器上的 mux 服务端；机器之间可以互相连接，桌面应用还能连接普通 SSH 和 Mosh 主机" width="100%">
+  </picture>
+</p>
+
+终端复用器负责管理多个终端会话，并允许客户端接入。在 ThinkTerm 中，**会话、标签页和分屏由 mux 服务端持有**，客户端负责显示内容和传递输入。
+
+- **断开后继续工作。** 客户端断开连接时，服务端持有的会话仍然运行。稍后重新连接，就能继续同一个 Shell、构建或 Agent 任务；主动关闭窗格是另一项操作。
+- **从不同客户端访问同一批会话。** 桌面端、`thinkterm tui` 和浏览器端都可以连接服务端，也可以同时接入多个客户端，以各自的界面操作共享会话。
+- **跨机器组织工作。** 每台主机运行自己的 mux 服务端。ThinkTerm Connect 将远程工作空间与本地工作放在同一个桌面界面中，通过侧边栏就能切换机器。进程始终在原来的主机上运行。
+- **更新时会话不中断。** 桌面端为服务器更新 ThinkTerm 时，正在运行的 mux 服务端会把会话交接给新版本，Shell、构建和 Agent 都会继续运行。
+
+会话持续运行的前提是 mux 服务端及其主机保持可用；这不意味着服务端或主机重启后能恢复原先运行的进程。
+
 ## 围绕工作组织会话
 
 | 层级 | 用途 |
@@ -185,7 +185,7 @@ Linux 上与 kitty 对比：Ubuntu 20.04（i9-12900K），180×50，`TERM=xterm-
 - **片段与插件。** 内置 Snippets。插件可向桌面端和浏览器端添加侧边栏面板；仓库中包含 [Diff 插件](../plugins/diff)，用于查看旁边终端所在 Git 仓库的改动。你也可以使用 [ThinkTerm SDK](../docs/thinkterm/plugins.md#rust-sdk)，用 Rust 开发自己的插件。别人分享的插件可以在 GitHub 话题 [`thinkterm-plugin`](https://github.com/topics/thinkterm-plugin) 下找到。安装和开发方式见[插件指南](../docs/thinkterm/plugins.md)。
 - **完整的终端核心。** 字体连字、彩色 Emoji、真彩色、超链接、内嵌图片、复制模式和 Shell 集成均继承自 WezTerm。 更多终端特性可参考 [WezTerm 功能文档](https://wezterm.org/features.html)。
 - **原生桌面设置。** 调整主题、界面字号、终端选项和渲染后端。主窗口与设置窗口均支持 WebGPU 和 OpenGL；WebGPU 初始化失败时会回退到 OpenGL。
-- **五种界面语言。** English、简体中文、日本語、Français 和 Deutsch。
+- **六种界面语言。** English、简体中文、日本語、Français、Deutsch 和 Русский。
 
 CLI 也支持自动化操作窗格：`thinkterm cli send-text` 发送输入，`send-key` 发送按键，`get-text` 读取终端输出，`wait` 和 `events` 会在命令结束或窗格发生变化时告知。用 `set-pane-label` 给窗格命名后，就可以按名字指定窗格。Agent 可以借助这些命令通过终端交互。[协作说明](../docs/thinkterm/agent-collaboration.md) 记录了已演示的工作流程，以及将终端输入用作消息机制的局限。
 

@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 1020" width="1000" height="1020" role="img" aria-labelledby="t d">
+<title id="t">ThinkTerm от версии к версии</title>
+<desc id="d">kitten __benchmark__ · Mac · M1 Pro · МБ/с, больше — лучше. Только символы ASCII: early 45,3, 0.3.0 133,0, 0.4.1 134,0, 0.4.2 206,1, 0.4.3 221,4 (4,9×); Символы Unicode: early 52,2, 0.3.0 104,5, 0.4.1 109,2, 0.4.2 192,4, 0.4.3 193,2 (3,7×); Ячейки Unicode из нескольких кодовых точек: early 67,8, 0.3.0 197,5, 0.4.1 234,4, 0.4.2 200,9, 0.4.3 285,3 (4,2×); CSI-последовательности с малым числом символов: early 25,7, 0.3.0 49,5, 0.4.1 53,5, 0.4.2 90,9, 0.4.3 89,9 (3,5×); Длинные escape-последовательности: early 219,4, 0.3.0 213,8, 0.4.1 257,3, 0.4.2 219,3, 0.4.3 278,6 (1,3×); Изображения: early 218,0, 0.3.0 257,2, 0.4.1 271,0, 0.4.2 216,4, 0.4.3 278,4 (1,3×).</desc>
+<defs>
+<linearGradient id="ours" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#2f8cff"/><stop offset="1" stop-color="#5fb0ff"/></linearGradient>
+<filter id="glow" x="-10%" y="-80%" width="120%" height="300%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#2f8cff" flood-opacity="0.5"/></filter>
+</defs>
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #f5f5f7; }
+.headline { font-size: 32px; font-weight: 700; letter-spacing: -0.6px; }
+.subhead { font-size: 16px; fill: #a1a1a6; }
+.label { font-size: 15px; font-weight: 600; letter-spacing: -0.1px; }
+.legend { font-size: 13.5px; font-weight: 500; fill: #a1a1a6; }
+.val-ours { font-size: 13px; font-weight: 700; }
+.val-theirs { font-size: 12.5px; font-weight: 500; fill: #a1a1a6; }
+.tick { font-size: 11.5px; fill: #8e8e93; }
+.caption { font-size: 13px; font-weight: 500; fill: #8e8e93; }
+.grid { stroke: #1c1c1e; stroke-width: 1; }
+.axis { stroke: #3a3a3c; stroke-width: 1.2; }
+.ours { fill: url(#ours); }
+.ours-bar { fill: url(#ours); filter: url(#glow); }
+.theirs { fill: #48484a; }
+.mid0 { fill: #1d3f6b; }
+.mid1 { fill: #26558f; }
+.mid2 { fill: #2f6bb3; }
+.win { fill: #0b1f3d; stroke: #1f4a85; }
+.win-t { font-size: 14px; font-weight: 700; fill: #4da3ff; }
+.even { fill: #1c1c1e; stroke: #3a3a3c; }
+.even-t { font-size: 14px; font-weight: 700; fill: #a1a1a6; }
+</style>
+<rect x="0.5" y="0.5" width="999" height="1019" rx="28" fill="#000000" stroke="#2c2c2e"/>
+<text x="500" y="62" class="headline" text-anchor="middle">ThinkTerm от версии к версии</text>
+<text x="500" y="92" class="subhead" text-anchor="middle">kitten __benchmark__ · Mac · M1 Pro · МБ/с, больше — лучше</text>
+<rect x="72" y="122" width="22" height="12" rx="6" class="theirs"/>
+<text x="102" y="132" class="legend">early · 2026-09</text>
+<rect x="237" y="122" width="22" height="12" rx="6" class="mid0"/>
+<text x="267" y="132" class="legend">0.3.0 · 2026-10-21</text>
+<rect x="423" y="122" width="22" height="12" rx="6" class="mid1"/>
+<text x="453" y="132" class="legend">0.4.1 · 2026-11-04</text>
+<rect x="609" y="122" width="22" height="12" rx="6" class="mid2"/>
+<text x="639" y="132" class="legend">0.4.2 · 2026-11-05</text>
+<rect x="72" y="146" width="22" height="12" rx="6" class="ours"/>
+<text x="102" y="156" class="legend">0.4.3 · 2026-11-06</text>
+<text x="912" y="132" class="legend" text-anchor="middle">Разница</text>
+<line x1="490.3" y1="188" x2="490.3" y2="954" class="grid"/>
+<text x="490.3" y="974" class="tick" text-anchor="middle">50</text>
+<line x1="560.7" y1="188" x2="560.7" y2="954" class="grid"/>
+<text x="560.7" y="974" class="tick" text-anchor="middle">100</text>
+<line x1="631.0" y1="188" x2="631.0" y2="954" class="grid"/>
+<text x="631.0" y="974" class="tick" text-anchor="middle">150</text>
+<line x1="701.3" y1="188" x2="701.3" y2="954" class="grid"/>
+<text x="701.3" y="974" class="tick" text-anchor="middle">200</text>
+<line x1="771.7" y1="188" x2="771.7" y2="954" class="grid"/>
+<text x="771.7" y="974" class="tick" text-anchor="middle">250</text>
+<line x1="842.0" y1="188" x2="842.0" y2="954" class="grid"/>
+<text x="842.0" y="974" class="tick" text-anchor="middle">300</text>
+<line x1="420" y1="188" x2="420" y2="954" class="axis"/>
+<text x="420" y="974" class="tick" text-anchor="middle">0</text>
+<text x="398" y="257.0" class="label" text-anchor="end">Только символы ASCII</text>
+<rect x="420" y="202" width="63.7" height="16" rx="8.0" class="theirs"/>
+<text x="491.7" y="214.5" class="val-theirs">45,3</text>
+<rect x="420" y="223" width="187.1" height="16" rx="8.0" class="mid0"/>
+<text x="615.1" y="235.5" class="val-theirs">133,0</text>
+<rect x="420" y="244" width="188.5" height="16" rx="8.0" class="mid1"/>
+<text x="616.5" y="256.5" class="val-theirs">134,0</text>
+<rect x="420" y="265" width="289.9" height="16" rx="8.0" class="mid2"/>
+<text x="717.9" y="277.5" class="val-theirs">206,1</text>
+<rect x="420" y="286" width="311.4" height="16" rx="8.0" class="ours-bar"/>
+<text x="739.4" y="298.5" class="val-ours">221,4</text>
+<rect x="878" y="238.0" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="257.0" class="win-t" text-anchor="middle">4,9×</text>
+<text x="398" y="384.0" class="label" text-anchor="end">Символы Unicode</text>
+<rect x="420" y="329" width="73.4" height="16" rx="8.0" class="theirs"/>
+<text x="501.4" y="341.5" class="val-theirs">52,2</text>
+<rect x="420" y="350" width="147.0" height="16" rx="8.0" class="mid0"/>
+<text x="575.0" y="362.5" class="val-theirs">104,5</text>
+<rect x="420" y="371" width="153.6" height="16" rx="8.0" class="mid1"/>
+<text x="581.6" y="383.5" class="val-theirs">109,2</text>
+<rect x="420" y="392" width="270.6" height="16" rx="8.0" class="mid2"/>
+<text x="698.6" y="404.5" class="val-theirs">192,4</text>
+<rect x="420" y="413" width="271.8" height="16" rx="8.0" class="ours-bar"/>
+<text x="699.8" y="425.5" class="val-ours">193,2</text>
+<rect x="878" y="365.0" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="384.0" class="win-t" text-anchor="middle">3,7×</text>
+<text x="398" y="511.0" class="label" text-anchor="end">Ячейки Unicode из нескольких кодовых точек</text>
+<rect x="420" y="456" width="95.4" height="16" rx="8.0" class="theirs"/>
+<text x="523.4" y="468.5" class="val-theirs">67,8</text>
+<rect x="420" y="477" width="277.8" height="16" rx="8.0" class="mid0"/>
+<text x="705.8" y="489.5" class="val-theirs">197,5</text>
+<rect x="420" y="498" width="329.7" height="16" rx="8.0" class="mid1"/>
+<text x="757.7" y="510.5" class="val-theirs">234,4</text>
+<rect x="420" y="519" width="282.6" height="16" rx="8.0" class="mid2"/>
+<text x="710.6" y="531.5" class="val-theirs">200,9</text>
+<rect x="420" y="540" width="401.3" height="16" rx="8.0" class="ours-bar"/>
+<text x="829.3" y="552.5" class="val-ours">285,3</text>
+<rect x="878" y="492.0" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="511.0" class="win-t" text-anchor="middle">4,2×</text>
+<text x="398" y="638.0" class="label" text-anchor="end">CSI-последовательности с малым числом символов</text>
+<rect x="420" y="583" width="36.2" height="16" rx="8.0" class="theirs"/>
+<text x="464.2" y="595.5" class="val-theirs">25,7</text>
+<rect x="420" y="604" width="69.6" height="16" rx="8.0" class="mid0"/>
+<text x="497.6" y="616.5" class="val-theirs">49,5</text>
+<rect x="420" y="625" width="75.3" height="16" rx="8.0" class="mid1"/>
+<text x="503.3" y="637.5" class="val-theirs">53,5</text>
+<rect x="420" y="646" width="127.9" height="16" rx="8.0" class="mid2"/>
+<text x="555.9" y="658.5" class="val-theirs">90,9</text>
+<rect x="420" y="667" width="126.5" height="16" rx="8.0" class="ours-bar"/>
+<text x="554.5" y="679.5" class="val-ours">89,9</text>
+<rect x="878" y="619.0" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="638.0" class="win-t" text-anchor="middle">3,5×</text>
+<text x="398" y="765.0" class="label" text-anchor="end">Длинные escape-последовательности</text>
+<rect x="420" y="710" width="308.6" height="16" rx="8.0" class="theirs"/>
+<text x="736.6" y="722.5" class="val-theirs">219,4</text>
+<rect x="420" y="731" width="300.7" height="16" rx="8.0" class="mid0"/>
+<text x="728.7" y="743.5" class="val-theirs">213,8</text>
+<rect x="420" y="752" width="361.9" height="16" rx="8.0" class="mid1"/>
+<text x="789.9" y="764.5" class="val-theirs">257,3</text>
+<rect x="420" y="773" width="308.5" height="16" rx="8.0" class="mid2"/>
+<text x="736.5" y="785.5" class="val-theirs">219,3</text>
+<rect x="420" y="794" width="391.9" height="16" rx="8.0" class="ours-bar"/>
+<text x="819.9" y="806.5" class="val-ours">278,6</text>
+<rect x="878" y="746.0" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="765.0" class="win-t" text-anchor="middle">1,3×</text>
+<text x="398" y="892.0" class="label" text-anchor="end">Изображения</text>
+<rect x="420" y="837" width="306.7" height="16" rx="8.0" class="theirs"/>
+<text x="734.7" y="849.5" class="val-theirs">218,0</text>
+<rect x="420" y="858" width="361.8" height="16" rx="8.0" class="mid0"/>
+<text x="789.8" y="870.5" class="val-theirs">257,2</text>
+<rect x="420" y="879" width="381.2" height="16" rx="8.0" class="mid1"/>
+<text x="809.2" y="891.5" class="val-theirs">271,0</text>
+<rect x="420" y="900" width="304.4" height="16" rx="8.0" class="mid2"/>
+<text x="732.4" y="912.5" class="val-theirs">216,4</text>
+<rect x="420" y="921" width="391.6" height="16" rx="8.0" class="ours-bar"/>
+<text x="819.6" y="933.5" class="val-ours">278,4</text>
+<rect x="878" y="873.0" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="892.0" class="win-t" text-anchor="middle">1,3×</text>
+</svg>

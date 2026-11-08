@@ -1,6 +1,6 @@
 # ThinkTerm
 
-[English](../README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Français](README.fr-FR.md) · **Deutsch**
+[English](../README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Français](README.fr-FR.md) · **Deutsch** · [Русский](README.ru-RU.md)
 
 ## 📥 Download
 
@@ -45,30 +45,6 @@ ThinkTerm ist ein **in Rust geschriebenes Open-Source-Terminal mit integriertem 
     </td>
   </tr>
 </table>
-
-## Der Multiplexer als Kern
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="../assets/architecture-dark.svg">
-    <img src="../assets/architecture-light.svg" alt="Vereinfachte Architektur von ThinkTerm: Desktop-App, TUI und CLI, Browser und Smartphone-Apps verbinden sich mit dem mux-Server auf jedem Rechner; die Rechner können einander erreichen, und die Desktop-App erreicht auch normale SSH- und Mosh-Hosts" width="100%">
-  </picture>
-</p>
-
-Ein Terminal-Multiplexer verwaltet mehrere Terminalsitzungen, mit denen sich Clients verbinden können. In ThinkTerm **hält der mux-Server die Sitzungen, Tabs und geteilten Terminalbereiche**. Der Client zeigt sie an und überträgt deine Eingaben.
-
-- **Trennen und zurückkehren.** Wenn du einen Client trennst, laufen die Sitzungen auf dem Server weiter. Verbinde dich später erneut, um dieselbe Shell, denselben Build oder dieselbe Agentenaufgabe fortzusetzen. Einen Terminalbereich ausdrücklich zu schließen ist eine separate Aktion.
-- **Dieselben Sitzungen über verschiedene Clients nutzen.** Verbinde dich per Desktop, `thinkterm tui` oder Browser mit dem Server. Mehrere Clients können gleichzeitig verbunden sein und über ihre jeweilige Oberfläche auf die gemeinsamen Sitzungen zugreifen.
-- **Auf mehreren Rechnern arbeiten.** Jeder Host betreibt seinen eigenen mux-Server. ThinkTerm Connect zeigt entfernte Arbeitsbereiche neben der lokalen Arbeit in der Desktop-Anwendung an, sodass du über die Seitenleiste zwischen Rechnern wechselst. Die Prozesse laufen weiterhin auf ihrem ursprünglichen Host.
-- **Aktualisieren, ohne Sitzungen zu verlieren.** Wenn der Desktop ThinkTerm auf einem Server aktualisiert, übergibt der laufende mux-Server seine Sitzungen an die neue Version – Shells, Builds und Agenten laufen weiter.
-
-Die Sitzungen bleiben nur bestehen, solange mux-Server und Host verfügbar sind. Laufende Prozesse werden nach einem Server- oder Rechnerneustart nicht wiederhergestellt.
-
-## Warum ThinkTerm
-
-Wenn mehrere Agenten in unterschiedlichen Projekten laufen, wird die Tab-Leiste schnell unübersichtlich: Welche Sitzung arbeitet noch, welche wartet auf eine Eingabe, und wo ist gerade der Build fertig geworden? ThinkTerm zeigt die Projektstruktur und den Arbeitsstatus direkt neben dem Terminal und bringt lokale und entfernte Arbeit zusammen.
-
-Rust bildet die Grundlage für den Terminalkern, den mux-Server, den Desktop-Client und die TUI von ThinkTerm. Die Desktop-Anwendung rendert über die GPU, ohne Electron oder eingebettete WebView. GPUI, das UI-Framework von Zed, erfüllt die Leistungsanforderungen von ThinkTerm an das Terminal-Rendering nicht. Auf der nativen Basis von WezTerm ergänzt ThinkTerm Arbeitsbereiche, dauerhafte Remote-Sitzungen und Werkzeuge für die Arbeit mit Agenten.
 
 ## Leistung
 
@@ -164,6 +140,30 @@ Fortschritt über die Versionen in derselben Linux-Umgebung. Der Faktor vergleic
 
 </details>
 
+## Warum ThinkTerm
+
+Wenn mehrere Agenten in unterschiedlichen Projekten laufen, wird die Tab-Leiste schnell unübersichtlich: Welche Sitzung arbeitet noch, welche wartet auf eine Eingabe, und wo ist gerade der Build fertig geworden? ThinkTerm zeigt die Projektstruktur und den Arbeitsstatus direkt neben dem Terminal und bringt lokale und entfernte Arbeit zusammen.
+
+Rust bildet die Grundlage für den Terminalkern, den mux-Server, den Desktop-Client und die TUI von ThinkTerm. Die Desktop-Anwendung rendert über die GPU, ohne Electron oder eingebettete WebView. GPUI, das UI-Framework von Zed, erfüllt die Leistungsanforderungen von ThinkTerm an das Terminal-Rendering nicht. Auf der nativen Basis von WezTerm ergänzt ThinkTerm Arbeitsbereiche, dauerhafte Remote-Sitzungen und Werkzeuge für die Arbeit mit Agenten.
+
+## Der Multiplexer als Kern
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="../assets/architecture-dark.svg">
+    <img src="../assets/architecture-light.svg" alt="Vereinfachte Architektur von ThinkTerm: Desktop-App, TUI und CLI, Browser und Smartphone-Apps verbinden sich mit dem mux-Server auf jedem Rechner; die Rechner können einander erreichen, und die Desktop-App erreicht auch normale SSH- und Mosh-Hosts" width="100%">
+  </picture>
+</p>
+
+Ein Terminal-Multiplexer verwaltet mehrere Terminalsitzungen, mit denen sich Clients verbinden können. In ThinkTerm **hält der mux-Server die Sitzungen, Tabs und geteilten Terminalbereiche**. Der Client zeigt sie an und überträgt deine Eingaben.
+
+- **Trennen und zurückkehren.** Wenn du einen Client trennst, laufen die Sitzungen auf dem Server weiter. Verbinde dich später erneut, um dieselbe Shell, denselben Build oder dieselbe Agentenaufgabe fortzusetzen. Einen Terminalbereich ausdrücklich zu schließen ist eine separate Aktion.
+- **Dieselben Sitzungen über verschiedene Clients nutzen.** Verbinde dich per Desktop, `thinkterm tui` oder Browser mit dem Server. Mehrere Clients können gleichzeitig verbunden sein und über ihre jeweilige Oberfläche auf die gemeinsamen Sitzungen zugreifen.
+- **Auf mehreren Rechnern arbeiten.** Jeder Host betreibt seinen eigenen mux-Server. ThinkTerm Connect zeigt entfernte Arbeitsbereiche neben der lokalen Arbeit in der Desktop-Anwendung an, sodass du über die Seitenleiste zwischen Rechnern wechselst. Die Prozesse laufen weiterhin auf ihrem ursprünglichen Host.
+- **Aktualisieren, ohne Sitzungen zu verlieren.** Wenn der Desktop ThinkTerm auf einem Server aktualisiert, übergibt der laufende mux-Server seine Sitzungen an die neue Version – Shells, Builds und Agenten laufen weiter.
+
+Die Sitzungen bleiben nur bestehen, solange mux-Server und Host verfügbar sind. Laufende Prozesse werden nach einem Server- oder Rechnerneustart nicht wiederhergestellt.
+
 ## Arbeitsbereiche passend zu deiner Arbeit
 
 | Ebene | Zweck |
@@ -185,7 +185,7 @@ Lokale und entfernte Arbeitsbereiche teilen sich eine Seitenleiste. Der Thread-S
 - **Snippets und Plugins.** Snippets ist integriert. Plugins können der Seitenleiste auf dem Desktop und im Browser weitere Panels hinzufügen. Das Repository enthält ein [Diff-Plugin](../plugins/diff), das Git-Änderungen im Repository des benachbarten Terminals anzeigt. Mit dem [ThinkTerm SDK](../docs/thinkterm/plugins.md#rust-sdk) kannst du eigene Plugins in Rust entwickeln. Plugins anderer findest du unter dem GitHub-Topic [`thinkterm-plugin`](https://github.com/topics/thinkterm-plugin). Einrichtung und Entwicklung beschreibt die [Plugin-Anleitung](../docs/thinkterm/plugins.md).
 - **Ein leistungsfähiger Terminalkern.** Ligaturen, farbige Emojis, Echtfarben, Hyperlinks, eingebettete Bilder, Kopiermodus und Shell-Integration stammen aus WezTerm. Weitere Terminalfunktionen findest du in der [Funktionsübersicht von WezTerm](https://wezterm.org/features.html).
 - **Native Desktop-Einstellungen.** Passe Themes, Schriftgrößen der Oberfläche, Terminaloptionen und das Rendering-Backend an. Haupt- und Einstellungsfenster unterstützen WebGPU und OpenGL; schlägt die Initialisierung von WebGPU fehl, wird auf OpenGL zurückgegriffen.
-- **Fünf Oberflächensprachen.** English, 简体中文, 日本語, Français und Deutsch.
+- **Sechs Oberflächensprachen.** English, 简体中文, 日本語, Français, Deutsch und Русский.
 
 Über die CLI lassen sich Terminalbereiche auch automatisieren: `thinkterm cli send-text` sendet Eingaben, `send-key` drückt Tasten, `get-text` liest Terminalausgaben, und `wait` und `events` melden, wenn ein Befehl endet oder in einem Terminalbereich etwas passiert. Mit `set-pane-label` benannte Terminalbereiche lassen sich über ihren Namen ansprechen. Agenten können diese Befehle nutzen, um über ihre Terminals zusammenzuarbeiten. Die [Notizen zur Zusammenarbeit](../docs/thinkterm/agent-collaboration.md) beschreiben den demonstrierten Ablauf und die Grenzen von Terminaleingaben als Nachrichtenmechanismus.
 

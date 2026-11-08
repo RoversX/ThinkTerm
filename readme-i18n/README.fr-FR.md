@@ -1,6 +1,6 @@
 # ThinkTerm
 
-[English](../README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · **Français** · [Deutsch](README.de-DE.md)
+[English](../README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · **Français** · [Deutsch](README.de-DE.md) · [Русский](README.ru-RU.md)
 
 ## 📥 Téléchargement
 
@@ -45,30 +45,6 @@ ThinkTerm est un **terminal open source avec multiplexeur intégré, écrit en R
     </td>
   </tr>
 </table>
-
-## Le multiplexeur au cœur de ThinkTerm
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="../assets/architecture-dark.svg">
-    <img src="../assets/architecture-light.svg" alt="Architecture simplifiée de ThinkTerm : l’application de bureau, la TUI et la CLI, le navigateur et les applications mobiles se connectent au serveur mux de chaque machine ; les machines peuvent se joindre entre elles, et l’application de bureau rejoint aussi des hôtes SSH et Mosh classiques" width="100%">
-  </picture>
-</p>
-
-Un multiplexeur de terminaux gère plusieurs sessions et permet aux clients de s’y connecter. Dans ThinkTerm, **le serveur mux conserve les sessions, les onglets et les volets divisés**. Le client les affiche et transmet vos entrées.
-
-- **Se détacher, puis revenir.** Déconnecter un client laisse les sessions du serveur actives. Reconnectez-vous plus tard pour retrouver le même shell, la même compilation ou la même tâche d’agent. Fermer explicitement un volet est une action distincte.
-- **Accéder aux mêmes sessions depuis plusieurs clients.** Utilisez le bureau, `thinkterm tui` ou le navigateur pour vous connecter au serveur. Plusieurs clients peuvent être connectés simultanément, chacun offrant sa propre interface aux sessions partagées.
-- **Travailler sur plusieurs machines.** Chaque hôte exécute son propre serveur mux. ThinkTerm Connect affiche les espaces distants à côté du travail local dans l’application de bureau, pour passer d’une machine à l’autre depuis la barre latérale. Les processus continuent de s’exécuter sur leur hôte d’origine.
-- **Mettre à jour sans couper les sessions.** Quand le bureau met à jour ThinkTerm sur un serveur, le serveur mux en cours transmet ses sessions à la nouvelle version : shells, compilations et agents continuent de tourner.
-
-La persistance des sessions dépend de la disponibilité du serveur mux et de son hôte ; elle ne restaure pas les processus après un redémarrage du serveur ou de la machine.
-
-## Pourquoi ThinkTerm
-
-Lorsque plusieurs agents travaillent sur différents projets, la barre d'onglets ne suffit plus : quelle session travaille encore, laquelle attend une réponse et où la compilation vient-elle de se terminer ? ThinkTerm place la structure des projets et leur état à côté du terminal, pour suivre le travail local et distant au même endroit.
-
-Rust est au cœur du terminal, du serveur mux, du client de bureau et de la TUI de ThinkTerm. L’application de bureau utilise le GPU pour le rendu, sans Electron ni WebView intégrée. GPUI, le framework d’interface de Zed, ne répond pas aux exigences de performance de ThinkTerm pour le rendu du terminal. Sur les fondations natives de WezTerm, ThinkTerm ajoute l’organisation en espaces de travail, les sessions distantes persistantes et des outils pour travailler avec des agents.
 
 ## Performances
 
@@ -164,6 +140,30 @@ Progression au fil des versions sur le même environnement Linux. Le rapport com
 
 </details>
 
+## Pourquoi ThinkTerm
+
+Lorsque plusieurs agents travaillent sur différents projets, la barre d'onglets ne suffit plus : quelle session travaille encore, laquelle attend une réponse et où la compilation vient-elle de se terminer ? ThinkTerm place la structure des projets et leur état à côté du terminal, pour suivre le travail local et distant au même endroit.
+
+Rust est au cœur du terminal, du serveur mux, du client de bureau et de la TUI de ThinkTerm. L’application de bureau utilise le GPU pour le rendu, sans Electron ni WebView intégrée. GPUI, le framework d’interface de Zed, ne répond pas aux exigences de performance de ThinkTerm pour le rendu du terminal. Sur les fondations natives de WezTerm, ThinkTerm ajoute l’organisation en espaces de travail, les sessions distantes persistantes et des outils pour travailler avec des agents.
+
+## Le multiplexeur au cœur de ThinkTerm
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="../assets/architecture-dark.svg">
+    <img src="../assets/architecture-light.svg" alt="Architecture simplifiée de ThinkTerm : l’application de bureau, la TUI et la CLI, le navigateur et les applications mobiles se connectent au serveur mux de chaque machine ; les machines peuvent se joindre entre elles, et l’application de bureau rejoint aussi des hôtes SSH et Mosh classiques" width="100%">
+  </picture>
+</p>
+
+Un multiplexeur de terminaux gère plusieurs sessions et permet aux clients de s’y connecter. Dans ThinkTerm, **le serveur mux conserve les sessions, les onglets et les volets divisés**. Le client les affiche et transmet vos entrées.
+
+- **Se détacher, puis revenir.** Déconnecter un client laisse les sessions du serveur actives. Reconnectez-vous plus tard pour retrouver le même shell, la même compilation ou la même tâche d’agent. Fermer explicitement un volet est une action distincte.
+- **Accéder aux mêmes sessions depuis plusieurs clients.** Utilisez le bureau, `thinkterm tui` ou le navigateur pour vous connecter au serveur. Plusieurs clients peuvent être connectés simultanément, chacun offrant sa propre interface aux sessions partagées.
+- **Travailler sur plusieurs machines.** Chaque hôte exécute son propre serveur mux. ThinkTerm Connect affiche les espaces distants à côté du travail local dans l’application de bureau, pour passer d’une machine à l’autre depuis la barre latérale. Les processus continuent de s’exécuter sur leur hôte d’origine.
+- **Mettre à jour sans couper les sessions.** Quand le bureau met à jour ThinkTerm sur un serveur, le serveur mux en cours transmet ses sessions à la nouvelle version : shells, compilations et agents continuent de tourner.
+
+La persistance des sessions dépend de la disponibilité du serveur mux et de son hôte ; elle ne restaure pas les processus après un redémarrage du serveur ou de la machine.
+
 ## Des espaces adaptés à votre travail
 
 | Niveau | Rôle |
@@ -185,7 +185,7 @@ Les espaces locaux et distants partagent la même barre latérale. L'état des T
 - **Extraits et plugins.** Snippets est intégré. Les plugins peuvent ajouter des panneaux à la barre latérale, sur le bureau et dans le navigateur. Le dépôt contient un [plugin Diff](../plugins/diff) pour examiner les modifications Git du dépôt utilisé par le terminal voisin. Créez vos propres plugins en Rust avec le [ThinkTerm SDK](../docs/thinkterm/plugins.md#rust-sdk). Trouvez les plugins partagés par d'autres sous le sujet GitHub [`thinkterm-plugin`](https://github.com/topics/thinkterm-plugin). Consultez le [guide des plugins](../docs/thinkterm/plugins.md) pour l'installation et le développement.
 - **Un cœur de terminal complet.** Ligatures, emoji en couleur, couleurs 24 bits, hyperliens, images intégrées, mode copie et intégration au shell proviennent de WezTerm. Pour découvrir d’autres fonctions du terminal, consultez la [documentation des fonctionnalités de WezTerm](https://wezterm.org/features.html).
 - **Paramètres de bureau natifs.** Réglez les thèmes, la taille du texte de l'interface, les options du terminal et le moteur de rendu. La fenêtre principale et celle des paramètres prennent en charge WebGPU et OpenGL, avec repli vers OpenGL si l'initialisation de WebGPU échoue.
-- **Cinq langues d'interface.** English, 简体中文, 日本語, Français et Deutsch.
+- **Six langues d'interface.** English, 简体中文, 日本語, Français, Deutsch et Русский.
 
 La CLI permet aussi d'automatiser les volets : `thinkterm cli send-text` envoie des entrées, `send-key` appuie sur des touches, `get-text` lit la sortie du terminal, et `wait` et `events` signalent la fin d'une commande ou ce qui se passe dans un volet. Nommez un volet avec `set-pane-label` pour le désigner par son nom. Les agents peuvent utiliser ces commandes pour interagir par leurs terminaux. Les [notes sur la collaboration](../docs/thinkterm/agent-collaboration.md) décrivent le scénario démontré et les limites de l'entrée terminal comme mécanisme de messagerie.
 

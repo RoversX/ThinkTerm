@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 670" width="1000" height="670" role="img" aria-labelledby="t d">
+<title id="t">ThinkTerm vs WezTerm</title>
+<desc id="d">kitten __benchmark__ · Mac · M1 Pro · МБ/с, больше — лучше. Только символы ASCII: ThinkTerm 231,2, WezTerm 23,6 (9,8×); Символы Unicode: ThinkTerm 207,5, WezTerm 46,7 (4,4×); Ячейки Unicode из нескольких кодовых точек: ThinkTerm 307,2, WezTerm 49,3 (6,2×); CSI-последовательности с малым числом символов: ThinkTerm 89,6, WezTerm 15,6 (5,7×); Длинные escape-последовательности: ThinkTerm 317,9, WezTerm 194,9 (1,6×); Изображения: ThinkTerm 305,8, WezTerm 270,5 (1,1×).</desc>
+<defs>
+<linearGradient id="ours" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#2f8cff"/><stop offset="1" stop-color="#5fb0ff"/></linearGradient>
+<filter id="glow" x="-10%" y="-80%" width="120%" height="300%"><feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#2f8cff" flood-opacity="0.5"/></filter>
+</defs>
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #f5f5f7; }
+.headline { font-size: 32px; font-weight: 700; letter-spacing: -0.6px; }
+.subhead { font-size: 16px; fill: #a1a1a6; }
+.label { font-size: 15px; font-weight: 600; letter-spacing: -0.1px; }
+.legend { font-size: 13.5px; font-weight: 500; fill: #a1a1a6; }
+.val-ours { font-size: 13px; font-weight: 700; }
+.val-theirs { font-size: 12.5px; font-weight: 500; fill: #a1a1a6; }
+.tick { font-size: 11.5px; fill: #8e8e93; }
+.caption { font-size: 13px; font-weight: 500; fill: #8e8e93; }
+.grid { stroke: #1c1c1e; stroke-width: 1; }
+.axis { stroke: #3a3a3c; stroke-width: 1.2; }
+.ours { fill: url(#ours); }
+.ours-bar { fill: url(#ours); filter: url(#glow); }
+.theirs { fill: #48484a; }
+.win { fill: #0b1f3d; stroke: #1f4a85; }
+.win-t { font-size: 14px; font-weight: 700; fill: #4da3ff; }
+.even { fill: #1c1c1e; stroke: #3a3a3c; }
+.even-t { font-size: 14px; font-weight: 700; fill: #a1a1a6; }
+</style>
+<rect x="0.5" y="0.5" width="999" height="669" rx="28" fill="#000000" stroke="#2c2c2e"/>
+<text x="500" y="62" class="headline" text-anchor="middle">ThinkTerm vs WezTerm</text>
+<text x="500" y="92" class="subhead" text-anchor="middle">kitten __benchmark__ · Mac · M1 Pro · МБ/с, больше — лучше</text>
+<rect x="372" y="122" width="22" height="12" rx="6" class="ours"/>
+<text x="402" y="132" class="legend">ThinkTerm 0.4.7 · 2026-11-08</text>
+<rect x="628" y="122" width="22" height="12" rx="6" class="theirs"/>
+<text x="658" y="132" class="legend">WezTerm 20260117 · 2026-09-23</text>
+<text x="912" y="132" class="legend" text-anchor="middle">Разница</text>
+<line x1="490.3" y1="164" x2="490.3" y2="564" class="grid"/>
+<text x="490.3" y="584" class="tick" text-anchor="middle">60</text>
+<line x1="560.7" y1="164" x2="560.7" y2="564" class="grid"/>
+<text x="560.7" y="584" class="tick" text-anchor="middle">120</text>
+<line x1="631.0" y1="164" x2="631.0" y2="564" class="grid"/>
+<text x="631.0" y="584" class="tick" text-anchor="middle">180</text>
+<line x1="701.3" y1="164" x2="701.3" y2="564" class="grid"/>
+<text x="701.3" y="584" class="tick" text-anchor="middle">240</text>
+<line x1="771.7" y1="164" x2="771.7" y2="564" class="grid"/>
+<text x="771.7" y="584" class="tick" text-anchor="middle">300</text>
+<line x1="842.0" y1="164" x2="842.0" y2="564" class="grid"/>
+<text x="842.0" y="584" class="tick" text-anchor="middle">360</text>
+<line x1="420" y1="164" x2="420" y2="564" class="axis"/>
+<text x="420" y="584" class="tick" text-anchor="middle">0</text>
+<text x="398" y="201.5" class="label" text-anchor="end">Только символы ASCII</text>
+<rect x="420" y="178" width="271.0" height="16" rx="8.0" class="ours-bar"/>
+<text x="699.0" y="190.5" class="val-ours">231,2</text>
+<rect x="420" y="199" width="27.7" height="16" rx="8.0" class="theirs"/>
+<text x="455.7" y="211.5" class="val-theirs">23,6</text>
+<rect x="878" y="182.5" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="201.5" class="win-t" text-anchor="middle">9,8×</text>
+<text x="398" y="267.5" class="label" text-anchor="end">Символы Unicode</text>
+<rect x="420" y="244" width="243.2" height="16" rx="8.0" class="ours-bar"/>
+<text x="671.2" y="256.5" class="val-ours">207,5</text>
+<rect x="420" y="265" width="54.7" height="16" rx="8.0" class="theirs"/>
+<text x="482.7" y="277.5" class="val-theirs">46,7</text>
+<rect x="878" y="248.5" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="267.5" class="win-t" text-anchor="middle">4,4×</text>
+<text x="398" y="333.5" class="label" text-anchor="end">Ячейки Unicode из нескольких кодовых точек</text>
+<rect x="420" y="310" width="360.1" height="16" rx="8.0" class="ours-bar"/>
+<text x="788.1" y="322.5" class="val-ours">307,2</text>
+<rect x="420" y="331" width="57.8" height="16" rx="8.0" class="theirs"/>
+<text x="485.8" y="343.5" class="val-theirs">49,3</text>
+<rect x="878" y="314.5" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="333.5" class="win-t" text-anchor="middle">6,2×</text>
+<text x="398" y="399.5" class="label" text-anchor="end">CSI-последовательности с малым числом символов</text>
+<rect x="420" y="376" width="105.0" height="16" rx="8.0" class="ours-bar"/>
+<text x="533.0" y="388.5" class="val-ours">89,6</text>
+<rect x="420" y="397" width="18.3" height="16" rx="8.0" class="theirs"/>
+<text x="446.3" y="409.5" class="val-theirs">15,6</text>
+<rect x="878" y="380.5" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="399.5" class="win-t" text-anchor="middle">5,7×</text>
+<text x="398" y="465.5" class="label" text-anchor="end">Длинные escape-последовательности</text>
+<rect x="420" y="442" width="372.6" height="16" rx="8.0" class="ours-bar"/>
+<text x="800.6" y="454.5" class="val-ours">317,9</text>
+<rect x="420" y="463" width="228.5" height="16" rx="8.0" class="theirs"/>
+<text x="656.5" y="475.5" class="val-theirs">194,9</text>
+<rect x="878" y="446.5" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="465.5" class="win-t" text-anchor="middle">1,6×</text>
+<text x="398" y="531.5" class="label" text-anchor="end">Изображения</text>
+<rect x="420" y="508" width="358.5" height="16" rx="8.0" class="ours-bar"/>
+<text x="786.5" y="520.5" class="val-ours">305,8</text>
+<rect x="420" y="529" width="317.1" height="16" rx="8.0" class="theirs"/>
+<text x="745.1" y="541.5" class="val-theirs">270,5</text>
+<rect x="878" y="512.5" width="68" height="28" rx="14" class="win"/>
+<text x="912" y="531.5" class="win-t" text-anchor="middle">1,1×</text>
+<text x="500" y="636" class="caption" text-anchor="middle">ThinkTerm измерялся с локальным mux: оболочка работает в mux-сервере, и её вывод проходит через mux, прежде чем попасть в окно.</text>
+</svg>

@@ -184,6 +184,25 @@ LANGS = {
             linux="ThinkTerm mesuré via son mux local · 180×50 · Xvfb avec rendu logiciel sur CPU",
         ),
     ),
+    "ru-RU": dict(
+        progress_title="ThinkTerm от версии к версии",
+        fonts=LATIN_FONTS,
+        decimal=",",
+        subhead="kitten __benchmark__ · {machine} · МБ/с, больше — лучше",
+        ratio="Разница",
+        labels=dict(
+            ascii="Только символы ASCII",
+            unicode="Символы Unicode",
+            multi="Ячейки Unicode из нескольких кодовых точек",
+            csi="CSI-последовательности с малым числом символов",
+            long="Длинные escape-последовательности",
+            images="Изображения",
+        ),
+        captions=dict(
+            mac="ThinkTerm измерялся с локальным mux: оболочка работает в mux-сервере, и её вывод проходит через mux, прежде чем попасть в окно.",
+            linux="ThinkTerm измерялся через локальный mux · 180×50 · Xvfb с программной отрисовкой на CPU",
+        ),
+    ),
 }
 
 THEMES = {
