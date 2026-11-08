@@ -4522,6 +4522,9 @@ impl TermWindow {
             || self.pending_paste.is_some()
             || self.update_capsule.owes_frames()
             || self.dynamic_status.owes_frames()
+            // A finished transfer's notice runs out in a window seen but
+            // not in front too.
+            || self.next_transfer_toast_deadline().is_some()
     }
 
     /// An overlay scrollbar that is still up has a fade to finish; the
@@ -4618,6 +4621,9 @@ impl TermWindow {
             self.split_slides.release();
             // Nor a sidebar left on its way, still holding what it shows.
             self.finish_sidebar_slides();
+            // Nor a finished transfer's notice left to run out unseen; the
+            // first frame back starts its clock again.
+            self.pause_transfer_toasts(Instant::now());
         }
     }
 

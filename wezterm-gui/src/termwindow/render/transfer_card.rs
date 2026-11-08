@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 /// Finished transfer notices kept at once.
 const MAX_CARDS: usize = 3;
-const DONE_TTL: Duration = Duration::from_secs(12);
+const DONE_TTL: Duration = Duration::from_secs(5);
 
 /// A transfer that has stopped, kept long enough to be read. It carries a
 /// snapshot of what the card needs because the strip may trim the row it came
@@ -393,7 +393,7 @@ impl crate::TermWindow {
                 continue;
             }
             // Held under the pointer, and held while the dynamic status has no room
-            // for it: a notice should not burn its twelve seconds where
+            // for it: a notice should not burn its five seconds where
             // nobody can see it.
             if held || !visible.contains(&toast.id) {
                 if toast.paused_at.is_none() {
@@ -414,7 +414,7 @@ impl crate::TermWindow {
 
     /// When the next finished notice is due to go, so a frame is there to
     /// see it off.
-    pub(super) fn next_transfer_toast_deadline(&self) -> Option<Instant> {
+    pub(crate) fn next_transfer_toast_deadline(&self) -> Option<Instant> {
         self.transfer_toasts
             .iter()
             .filter(|toast| toast.closing_at.is_none() && toast.paused_at.is_none())

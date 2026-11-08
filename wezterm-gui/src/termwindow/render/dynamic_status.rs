@@ -1489,9 +1489,10 @@ impl crate::TermWindow {
                     StatusKey::Pane(_) => None,
                 })
                 .collect();
-            // Nor while the window is in the background: a notice must not
-            // run out before anyone has looked.
-            self.advance_transfer_toasts(now, &visible, held || !focused);
+            // Nor while the window is out of sight -- minimised, covered,
+            // on another desktop: a notice must not run out before anyone
+            // could have looked. A window seen but not in front counts.
+            self.advance_transfer_toasts(now, &visible, held || self.occluded.is_some());
             if let Some(deadline) = self.next_transfer_toast_deadline() {
                 self.update_next_frame_time(Some(deadline));
             }
@@ -1510,7 +1511,7 @@ impl crate::TermWindow {
 
     /// Hold every finished notice's clock while the dynamic status is not there to
     /// show it.
-    fn pause_transfer_toasts(&mut self, now: Instant) {
+    pub(crate) fn pause_transfer_toasts(&mut self, now: Instant) {
         for toast in &mut self.transfer_toasts {
             if toast.closing_at.is_none() && toast.paused_at.is_none() {
                 toast.paused_at = Some(now);
