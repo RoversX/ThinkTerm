@@ -940,6 +940,13 @@ rank_sources() {
   cat "$tmp"/rate-* | sort -nr | awk '{print $2}' > "$tmp/ranked-sources"
 }
 
+# The archive is all there and is the one GitHub recorded.
+archive_complete() {
+  [ -s "$archive" ] \
+    && { [ -z "$size" ] || [ "$(wc -c < "$archive")" -eq "$size" ]; } \
+    && [ "$(sha256 "$archive")" = "$digest" ]
+}
+
 verified_download() {
   source=$1
   transfer_mode=${2:-}
@@ -947,10 +954,21 @@ verified_download() {
   if [ "$source" != github ]; then
     source_url="https://$source/$url"; source_via=$source; source_auth=""
   fi
-  rm -f "$archive" "$tmp/slow-$source"
+  rm -f "$tmp/slow-$source"
+  # What a source before this one brought is kept: they all serve the same
+  # bytes, so this one goes on from there, and the whole is checked at the
+  # end. One that will not go on from there starts it again.
+  carried=0
+  if [ -s "$archive" ]; then
+    archive_complete && return 0
+    carried=$(wc -c < "$archive")
+    note "going on from $(mb "$carried") MB with $source"
+  fi
   attempt=0
   while [ "$attempt" -lt 3 ]; do
     attempt=$((attempt + 1))
+    had=0
+    [ ! -f "$archive" ] || had=$(wc -c < "$archive")
     # If every measured link is slow, keep the fastest rather than refuse all
     # of them. If it stalls or breaks, the next source still gets a chance.
     transfer_rate=1; transfer_window=15
@@ -965,9 +983,17 @@ verified_download() {
     if download "$archive" "$source_via" "$source_auth" --connect-timeout 4 \
         --speed-limit "$transfer_rate" --speed-time "$transfer_window" --retry 0 \
         -C - -o "$archive" "$source_url"; then
-      if [ "$(sha256 "$archive")" = "$digest" ] \
-          && { [ -z "$size" ] || [ "$(wc -c < "$archive")" -eq "$size" ]; }; then
+      if archive_complete; then
         return 0
+      fi
+      # Bytes from another source may be what is wrong: this one gets to
+      # bring the whole before it is the one blamed.
+      if [ "$carried" -gt 0 ]; then
+        warn "checksum or size mismatch going on with $source; starting again"
+        rm -f "$archive"
+        carried=0
+        attempt=0
+        continue
       fi
       warn "checksum or size mismatch from $source; discarded"
       rm -f "$archive"
@@ -981,13 +1007,14 @@ verified_download() {
         22|63) break ;;
         28)
           if [ "$transfer_rate" -gt 1 ]; then
-            if [ "$mirror" = auto ] && [ -s "$archive" ]; then
+            if [ "$mirror" = auto ] && [ -f "$archive" ] \
+                && [ "$(wc -c < "$archive")" -gt "$had" ]; then
               : > "$tmp/slow-$source"
             fi
             break
           fi
           ;;
-        33|36) rm -f "$archive" ;;
+        33|36) rm -f "$archive"; carried=0 ;;
       esac
       [ "$attempt" -ge 3 ] || note "retrying $source (resuming when supported)"
     fi

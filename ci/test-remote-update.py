@@ -31,9 +31,12 @@ host = urlparse(url).hostname
 name = url.rsplit("/", 1)[-1]
 dest = Path(args[args.index("-o") + 1])
 speed_limit = int(args[args.index("--speed-limit") + 1]) if "--speed-limit" in args else 0
+offset = dest.stat().st_size if "-C" in args and dest.exists() else 0
+# Which source wrote the archive last, so a resume can tell its own bytes.
+writer = root / "last-writer"
 with (root / "requests" / f"{time.time_ns()}-{os.getpid()}").open("w") as log:
     log.write(json.dumps({"host": host, "name": name, "probe": "--range" in args,
-                          "resume": "-C" in args, "speed_limit": speed_limit,
+                          "resume": "-C" in args, "speed_limit": speed_limit, "offset": offset,
                           "auth": any("Authorization:" in x for x in args)}) + "\n")
 if host == "api.github.com":
     if config.get("api_failure", False):
@@ -64,22 +67,28 @@ attempt = int(counter.read_text()) if counter.exists() else 0
 counter.write_text(str(attempt + 1))
 if speed_limit > config.get("transfer_rates", {}).get(host, speed_limit):
     dest.write_bytes(data[:20])
+    writer.write_text(host)
     sys.exit(28)
 if config.get("resume") and attempt == 0:
     dest.write_bytes(data[:20])
+    writer.write_text(host)
     sys.exit(18)
 if config.get("no_range") and attempt == 1 and dest.exists() and dest.stat().st_size:
     sys.exit(33)
 if config.get("slow"):
     dest.write_bytes(data[:20])
+    writer.write_text(host)
     time.sleep(2.4)
 if "-C" in args and dest.exists():
-    offset = dest.stat().st_size
-    assert dest.read_bytes() == data[:offset], "resume prefix corrupted"
+    # As curl does: what is there is taken as this source's first bytes.
+    # Bytes this same source wrote must be its own.
+    if writer.exists() and writer.read_text() == host:
+        assert dest.read_bytes() == data[:offset], "resume prefix corrupted"
     with dest.open("ab") as output:
-        output.write(data[offset:])
+        output.write(data[dest.stat().st_size:])
 else:
     dest.write_bytes(data)
+writer.write_text(host)
 '''
 
 
@@ -229,8 +238,21 @@ class InstallerTests(unittest.TestCase):
         output = self.run_install()
         self.assertIn("mismatch", output)
         downloads = [r for r in self.requests() if r["name"] == GZIP and not r["probe"]]
-        self.assertEqual([r["host"] for r in downloads], mirrors + ["github.com", *mirrors[:2]])
-        self.assertEqual([r["speed_limit"] for r in downloads[-2:]], [1, 1])
+        # The corrupt mirror goes on from another's bytes first, then has
+        # to bring the whole of its own before it is passed over.
+        self.assertEqual([r["host"] for r in downloads],
+                         mirrors + ["github.com", mirrors[0], mirrors[0], mirrors[1]])
+        self.assertEqual([r["speed_limit"] for r in downloads[-3:]], [1, 1, 1])
+
+    def test_next_mirror_goes_on_from_a_slow_ones_bytes(self):
+        self.network.update(rates={"ghfast.top": 900000, "gh-proxy.org": 800000},
+                            transfer_rates={"ghfast.top": 131072})
+        output = self.run_install()
+        downloads = [r for r in self.requests() if r["name"] == GZIP and not r["probe"]]
+        self.assertEqual([r["host"] for r in downloads], ["ghfast.top", "gh-proxy.org"])
+        self.assertEqual(downloads[1]["offset"], 20)
+        self.assertIn("going on from", output)
+        self.assertIn("verified SHA-256", output)
 
     def test_http_failures_do_not_get_slow_download_retry(self):
         mirrors = self.slow_mirrors()
