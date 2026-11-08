@@ -121,6 +121,14 @@ const POP_OVERSHOOT: f32 = 0.12;
 const PACE: Duration = Duration::from_millis(34);
 /// How recently something must have happened to be shown as news.
 const NEWS_FOR: Duration = Duration::from_secs(5);
+/// How long an agent that has just finished stays on, as a finished
+/// transfer does: counted only while it can be seen.
+const FINISHED_FOR: Duration = Duration::from_secs(5);
+/// Agents that have just finished kept on at once.
+const FINISHED_MAX: usize = 3;
+/// Work shorter than this is not news when it ends -- a one-line answer --
+/// as the finished sound has it.
+const FINISHED_AFTER: Duration = Duration::from_secs(5);
 /// How long something new shows as its card before the dynamic status folds again.
 const BANNER: Duration = Duration::from_millis(3000);
 /// The waiting dot breathes for a while after the wait begins, then rests:
@@ -151,6 +159,9 @@ const AGENTS_STALE: Duration = Duration::from_secs(2);
 pub(crate) enum StatusKey {
     Pane(PaneId),
     Transfer(u64),
+    /// An agent that has just finished, by its pane: apart from the same
+    /// agent's own card, which it never shows beside.
+    Finished(PaneId),
     /// The update notice: one at a time, whatever state it is in.
     Update,
 }
@@ -181,6 +192,104 @@ pub(crate) enum StatusItem {
     Pane(PaneProgress),
     /// A newer release, followed through its install to the restart.
     Update(UpdateCapsuleStatus),
+    /// An agent that has just finished: an entry of the shared status
+    /// snapshot, as `Agent` is, and since when it has been on.
+    Finished {
+        agent: FinishedAgent,
+        agents: Arc<Vec<AgentPaneStatus>>,
+        index: usize,
+        here: bool,
+    },
+}
+
+/// An agent that has just finished, as one window shows it.
+#[derive(Clone, Copy)]
+pub(crate) struct FinishedAgent {
+    pane_id: PaneId,
+    shown_at: Instant,
+    paused_at: Option<Instant>,
+}
+
+/// What one window knows of agents finishing: since when each one at work
+/// has been, and those that have just finished.
+#[derive(Default)]
+pub(crate) struct FinishedAgents {
+    working: HashMap<PaneId, Instant>,
+    shown: Vec<FinishedAgent>,
+}
+
+impl FinishedAgents {
+    /// An agent's state, as it changes. Working long enough and then
+    /// stopping puts it on; anything else it does takes it off again.
+    /// True when it went on.
+    fn note(&mut self, now: Instant, pane_id: PaneId, state: Option<AgentState>, listed: bool) -> bool {
+        self.shown.retain(|agent| agent.pane_id != pane_id);
+        match state {
+            Some(AgentState::Working) => {
+                self.working.entry(pane_id).or_insert(now);
+                false
+            }
+            Some(AgentState::Idle) => {
+                let worked = self
+                    .working
+                    .remove(&pane_id)
+                    .is_some_and(|since| now.duration_since(since) >= FINISHED_AFTER);
+                if !worked || listed {
+                    return false;
+                }
+                self.shown.push(FinishedAgent {
+                    pane_id,
+                    shown_at: now,
+                    paused_at: None,
+                });
+                let excess = self.shown.len().saturating_sub(FINISHED_MAX);
+                self.shown.drain(..excess);
+                true
+            }
+            // Waiting, failed, ended or unknown: not a finish.
+            _ => {
+                self.working.remove(&pane_id);
+                false
+            }
+        }
+    }
+
+    fn forget(&mut self, pane_id: PaneId) {
+        self.working.remove(&pane_id);
+        self.shown.retain(|agent| agent.pane_id != pane_id);
+    }
+
+    /// Run each one's clock while it is in `visible` and nothing holds it;
+    /// drop those whose time is up. True when one went.
+    fn advance(&mut self, now: Instant, visible: &HashSet<PaneId>, held: bool) -> bool {
+        let before = self.shown.len();
+        self.shown.retain_mut(|agent| {
+            if held || !visible.contains(&agent.pane_id) {
+                agent.paused_at.get_or_insert(now);
+                return true;
+            }
+            if let Some(paused) = agent.paused_at.take() {
+                agent.shown_at += now.duration_since(paused);
+            }
+            now < agent.shown_at + FINISHED_FOR
+        });
+        self.shown.len() != before
+    }
+
+    fn pause(&mut self, now: Instant) {
+        for agent in &mut self.shown {
+            agent.paused_at.get_or_insert(now);
+        }
+    }
+
+    /// When the next one is due to go, while one's clock runs.
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.shown
+            .iter()
+            .filter(|agent| agent.paused_at.is_none())
+            .map(|agent| agent.shown_at + FINISHED_FOR)
+            .min()
+    }
 }
 
 impl StatusItem {
@@ -190,6 +299,7 @@ impl StatusItem {
             Self::Agent { agents, index, .. } => StatusKey::Pane(agents[*index].pane_id),
             Self::Pane(pane) => StatusKey::Pane(pane.pane_id),
             Self::Update(_) => StatusKey::Update,
+            Self::Finished { agent, .. } => StatusKey::Finished(agent.pane_id),
         }
     }
 
@@ -213,6 +323,8 @@ impl StatusItem {
             },
             Self::Transfer(CardView::Running { .. }) => 3,
             Self::Update(status) => update_capsule::rank(status),
+            // With what has just finished.
+            Self::Finished { .. } => 2,
         }
     }
 
@@ -230,6 +342,7 @@ impl StatusItem {
                 .get(&agents[*index].pane_id)
                 .map_or(now, |(_, at)| *at),
             Self::Transfer(CardView::Toast(toast)) => toast.shown_at,
+            Self::Finished { agent, .. } => agent.shown_at,
             _ => first_seen.get(&self.key()).copied().unwrap_or(now),
         }
     }
@@ -253,6 +366,7 @@ impl StatusItem {
                 TransferToastOutcome::Failed(_) => 7,
             },
             Self::Update(status) => update_capsule::phase(status),
+            Self::Finished { .. } => 13,
         }
     }
 
@@ -274,6 +388,7 @@ impl StatusItem {
             Self::Transfer(CardView::Running { .. }) => true,
             Self::Pane(_) => false,
             Self::Update(status) => update_capsule::is_news(status),
+            Self::Finished { .. } => true,
         }
     }
 
@@ -286,6 +401,9 @@ impl StatusItem {
                 here,
             } => Some(UIItemType::DynamicStatusReveal(agents[*index].pane_id, *here)),
             Self::Pane(pane) => Some(UIItemType::DynamicStatusReveal(pane.pane_id, pane.here)),
+            Self::Finished { agent, here, .. } => {
+                Some(UIItemType::DynamicStatusReveal(agent.pane_id, *here))
+            }
             Self::Transfer(_) | Self::Update(_) => None,
         }
     }
@@ -374,6 +492,8 @@ pub(crate) struct DynamicStatus {
     /// once from the host's whole seconds: worked out every frame it would
     /// jitter by a second, and the order with it.
     agent_since: HashMap<PaneId, (u64, Instant)>,
+    /// Agents that have just finished, each on for a moment.
+    pub(crate) finished: FinishedAgents,
     /// Where the pointer was when a banner came up under it. Until it
     /// moves, it is resting there, not hovering: the banner folds when its
     /// time is up rather than opening into the whole stack.
@@ -702,6 +822,7 @@ impl DynamicStatus {
             phases: std::mem::take(&mut self.phases),
             agent_news: std::mem::take(&mut self.agent_news),
             agent_since: std::mem::take(&mut self.agent_since),
+            finished: std::mem::take(&mut self.finished),
             pill_key: self.pill_key,
             card_key: self.card_key,
             discs: self
@@ -721,6 +842,7 @@ impl DynamicStatus {
             panes: self.panes.take(),
             agents: self.agents.take(),
             agent_news: std::mem::take(&mut self.agent_news),
+            finished: std::mem::take(&mut self.finished),
             ..Self::default()
         };
     }
@@ -902,7 +1024,7 @@ impl crate::TermWindow {
                 .and_then(|view| view.tab_key())
                 .is_some_and(|key| key.starts_with("onboarding:"));
         if hidden {
-            self.pause_transfer_toasts(now);
+            self.pause_status_notices(now);
             self.dynamic_status.hide(now);
             return Ok(());
         }
@@ -914,7 +1036,7 @@ impl crate::TermWindow {
         self.dynamic_status.set_present(now, present);
         let going = !present;
         if going {
-            self.pause_transfer_toasts(now);
+            self.pause_status_notices(now);
             let dynamic = &mut self.dynamic_status;
             let still_going = dynamic
                 .presence
@@ -1500,7 +1622,7 @@ impl crate::TermWindow {
                 .iter()
                 .filter_map(|key| match key {
                     StatusKey::Transfer(id) => Some(*id),
-                    StatusKey::Pane(_) | StatusKey::Update => None,
+                    StatusKey::Pane(_) | StatusKey::Update | StatusKey::Finished(_) => None,
                 })
                 .collect();
             // Nor while the window is out of sight -- minimised, covered,
@@ -1508,6 +1630,21 @@ impl crate::TermWindow {
             // could have looked. A window seen but not in front counts.
             self.advance_transfer_toasts(now, &visible, held || self.occluded.is_some());
             if let Some(deadline) = self.next_transfer_toast_deadline() {
+                self.update_next_frame_time(Some(deadline));
+            }
+            let finished: HashSet<PaneId> = shown_keys
+                .iter()
+                .filter_map(|key| match key {
+                    StatusKey::Finished(pane_id) => Some(*pane_id),
+                    _ => None,
+                })
+                .collect();
+            let hold = held || self.occluded.is_some();
+            if self.dynamic_status.finished.advance(now, &finished, hold) {
+                // This frame already painted the one that went.
+                self.update_next_frame_time(Some(now));
+            }
+            if let Some(deadline) = self.dynamic_status.finished.deadline() {
                 self.update_next_frame_time(Some(deadline));
             }
             if turning {
@@ -1523,14 +1660,15 @@ impl crate::TermWindow {
         Ok(())
     }
 
-    /// Hold every finished notice's clock while the dynamic status is not there to
-    /// show it.
-    pub(crate) fn pause_transfer_toasts(&mut self, now: Instant) {
+    /// Hold every finished notice's clock -- a transfer's, a thread's --
+    /// while the dynamic status is not there to show it.
+    pub(crate) fn pause_status_notices(&mut self, now: Instant) {
         for toast in &mut self.transfer_toasts {
             if toast.closing_at.is_none() && toast.paused_at.is_none() {
                 toast.paused_at = Some(now);
             }
         }
+        self.dynamic_status.finished.pause(now);
     }
 
     /// The folded pill's width for `content`.
@@ -2176,6 +2314,13 @@ impl crate::TermWindow {
             crate::settings_window::update_capsule_status()
         };
         self.update_capsule.note(now, update.as_ref());
+        // The Status panel lists them: none of its own then.
+        if self.right_sidebar_width() > 0
+            && self.right_sidebar_mode == crate::termwindow::RightSidebarMode::Agents
+        {
+            self.dynamic_status.finished.shown.clear();
+        }
+        let any_finished = !self.dynamic_status.finished.shown.is_empty();
         let has_transfers = self.has_transfer_cards();
         let agents_listed = self.right_sidebar_width() > 0
             && self.right_sidebar_mode == crate::termwindow::RightSidebarMode::Agents;
@@ -2193,7 +2338,7 @@ impl crate::TermWindow {
             .panes
             .as_ref()
             .is_some_and(|(_, panes)| !panes.is_empty());
-        if !has_transfers && !any_agent && !any_pane && update.is_none() {
+        if !has_transfers && !any_agent && !any_pane && update.is_none() && !any_finished {
             self.dynamic_status.agent_marks.clear();
             return Vec::new();
         }
@@ -2207,7 +2352,7 @@ impl crate::TermWindow {
             Vec::new()
         };
         items.extend(update.map(StatusItem::Update));
-        let on_screen: HashSet<PaneId> = if any_agent || any_pane {
+        let on_screen: HashSet<PaneId> = if any_agent || any_pane || any_finished {
             self.get_panes_to_render()
                 .iter()
                 .map(|positioned| positioned.pane.pane_id())
@@ -2248,6 +2393,28 @@ impl crate::TermWindow {
                         .cloned()
                         .map(StatusItem::Pane),
                 );
+            }
+        }
+        if any_finished {
+            // One in sight has been seen, and one no longer in the snapshot
+            // has gone with its pane: either is done with.
+            self.dynamic_status.finished.shown.retain(|agent| {
+                !on_screen.contains(&agent.pane_id)
+                    && all_agents.iter().any(|status| status.pane_id == agent.pane_id)
+            });
+            for agent in &self.dynamic_status.finished.shown {
+                let Some(index) = all_agents
+                    .iter()
+                    .position(|status| status.pane_id == agent.pane_id)
+                else {
+                    continue;
+                };
+                items.push(StatusItem::Finished {
+                    agent: *agent,
+                    agents: Arc::clone(&all_agents),
+                    index,
+                    here: all_agents[index].window_id == Some(self.mux_window_id),
+                });
             }
         }
         // An agent's state began at a whole second on its host's clock:
@@ -2403,6 +2570,15 @@ impl crate::TermWindow {
         }
         let agents_listed = self.right_sidebar_width() > 0
             && self.right_sidebar_mode == crate::termwindow::RightSidebarMode::Agents;
+        let finished = &mut self.dynamic_status.finished;
+        let was_finished = finished.shown.iter().any(|agent| agent.pane_id == pane_id);
+        let state = status.as_ref().map(|(_, status)| status.state);
+        if finished.note(now, pane_id, state, agents_listed) || was_finished {
+            // Just finished, or no longer: on or off the dynamic status now,
+            // with a snapshot that knows the agent as it stands.
+            self.dynamic_status.agents = None;
+            return true;
+        }
         let show = crate::native_settings::agent_status_display();
         let mark = status.filter(|_| !agents_listed).and_then(|(pane, status)| {
             if !status_wants(status.state, status.report.as_ref(), show) {
@@ -2434,6 +2610,7 @@ impl crate::TermWindow {
     /// of date, and if it was on the dynamic status, it goes now rather than at the
     /// next repaint.
     pub(crate) fn dynamic_status_pane_removed(&mut self, pane_id: PaneId) {
+        self.dynamic_status.finished.forget(pane_id);
         self.dynamic_status.agent_news.remove(&pane_id);
         self.dynamic_status.agent_marks.remove(&pane_id);
         self.dynamic_status.agent_since.remove(&pane_id);
@@ -2480,6 +2657,35 @@ fn status_content(item: &StatusItem) -> CardContent<'_> {
     match item {
         StatusItem::Transfer(view) => card_content(view),
         StatusItem::Update(status) => update_capsule::content(status),
+        StatusItem::Finished {
+            agents,
+            index,
+            here,
+            ..
+        } => {
+            let agent = &agents[*index];
+            let done = crate::i18n::tr("right-agents-state-done");
+            let name = crate::agent_status::display_name(&agent.agent_id);
+            // Named as its agent card was -- by what it worked on -- with
+            // the thread said under it when that is another window's.
+            let mut detail = vec![name.clone(), done.clone()];
+            if !*here && !agent.place.is_empty() {
+                detail.push(agent.place.clone());
+            }
+            CardContent {
+                mark: Mark::Agent(agent),
+                tone: Tone::Done,
+                name: if agent.title.is_empty() {
+                    name
+                } else {
+                    agent.title.clone()
+                },
+                detail: detail.join(" · "),
+                short: done,
+                bar: None,
+                actions: vec![go_to(agent.pane_id, *here, true)],
+            }
+        }
         StatusItem::Agent {
             agents,
             index,
@@ -2734,6 +2940,60 @@ fn status_mark(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_that_worked_a_while_and_stopped_is_finished() {
+        let now = Instant::now();
+        let mut finished = FinishedAgents::default();
+        assert!(!finished.note(now, 1, Some(AgentState::Working), false));
+        // A quick answer is not news.
+        assert!(!finished.note(now + Duration::from_secs(2), 1, Some(AgentState::Idle), false));
+        assert!(!finished.note(now, 1, Some(AgentState::Working), false));
+        assert!(finished.note(now + Duration::from_secs(6), 1, Some(AgentState::Idle), false));
+        assert_eq!(finished.shown.len(), 1);
+        // At work again, it is not finished any more.
+        assert!(!finished.note(now + Duration::from_secs(7), 1, Some(AgentState::Working), false));
+        assert!(finished.shown.is_empty());
+        // Nor is one that stopped to wait, and the Status panel lists its own.
+        assert!(!finished.note(now + Duration::from_secs(20), 1, Some(AgentState::Blocked), false));
+        assert!(!finished.note(now + Duration::from_secs(21), 1, Some(AgentState::Working), false));
+        assert!(!finished.note(now + Duration::from_secs(30), 1, Some(AgentState::Idle), true));
+        assert!(finished.shown.is_empty());
+    }
+
+    #[test]
+    fn a_finished_agent_goes_after_its_time_on_screen() {
+        let now = Instant::now();
+        let mut finished = FinishedAgents::default();
+        finished.working.insert(1, now);
+        assert!(finished.note(now + FINISHED_AFTER, 1, Some(AgentState::Idle), false));
+        let start = now + FINISHED_AFTER;
+        let seen: HashSet<PaneId> = [1].iter().copied().collect();
+        assert!(!finished.advance(start + Duration::from_secs(4), &seen, false));
+        assert_eq!(finished.deadline(), Some(start + FINISHED_FOR));
+        assert!(finished.advance(start + FINISHED_FOR, &seen, false));
+        assert!(finished.shown.is_empty());
+    }
+
+    #[test]
+    fn a_finished_agent_waits_while_held_or_unseen() {
+        let now = Instant::now();
+        let mut finished = FinishedAgents::default();
+        finished.shown.push(FinishedAgent {
+            pane_id: 1,
+            shown_at: now,
+            paused_at: None,
+        });
+        let seen: HashSet<PaneId> = [1].iter().copied().collect();
+        // Under the pointer for ten seconds, then left alone.
+        assert!(!finished.advance(now + Duration::from_secs(1), &seen, true));
+        assert_eq!(finished.deadline(), None);
+        assert!(!finished.advance(now + Duration::from_secs(11), &seen, false));
+        assert!(!finished.advance(now + Duration::from_secs(14), &seen, false));
+        // Not on the status at all -- folded into "+N" -- holds it too.
+        assert!(!finished.advance(now + Duration::from_secs(30), &HashSet::new(), false));
+        assert_eq!(finished.shown.len(), 1);
+    }
 
     #[test]
     fn agent_news_expires_even_after_an_empty_or_hidden_status() {
