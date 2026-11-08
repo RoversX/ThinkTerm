@@ -57,14 +57,42 @@ impl ShadowKey {
 /// corners, in the alpha channel; the colour channels are left black, as
 /// the grayscale quad path only reads alpha.
 pub(crate) fn rasterize_shadow(key: ShadowKey) -> Image {
+    let side = key.layout().side;
+    let coverage = silhouette(key);
+
+    // A Gaussian blur, as three box blurs one after another: the same
+    // shadow to the eye, at a cost that does not grow with the blur. The
+    // direct kernel took a tenth of a second for a card-sized shadow in a
+    // build without optimisation -- a stalled frame for every new radius an
+    // animation reached. The boxes' reach stays inside the sprite's margin.
+    let blurred = if key.sigma == 0 {
+        coverage
+    } else {
+        let mut blurred = coverage;
+        for width in gaussian_boxes(key.sigma as f32) {
+            blurred = box_blur(&blurred, side, width, true);
+            blurred = box_blur(&blurred, side, width, false);
+        }
+        blurred
+    };
+
+    let mut image = Image::new(side, side);
+    let pixels = image.pixel_data_slice_mut();
+    for (i, alpha) in blurred.iter().enumerate() {
+        pixels[i * 4 + 3] = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+    image
+}
+
+/// Coverage of the key's rounded rectangle at each pixel centre of its
+/// sprite, anti-aliased by the signed distance to its edge: the shadow
+/// before it is blurred.
+fn silhouette(key: ShadowKey) -> Vec<f32> {
     let layout = key.layout();
     let side = layout.side;
     let extent = layout.extent as f32;
     let radius = key.radius as f32;
     let inner = (side - 2 * layout.extent) as f32;
-
-    // Coverage of the rounded rectangle at each pixel centre, anti-aliased
-    // by the signed distance to its edge.
     let half = inner / 2.0;
     let centre = extent + half;
     let mut coverage = vec![0f32; side * side];
@@ -78,50 +106,59 @@ pub(crate) fn rasterize_shadow(key: ShadowKey) -> Image {
             coverage[y * side + x] = (0.5 - distance).clamp(0.0, 1.0);
         }
     }
+    coverage
+}
 
-    // Separable Gaussian blur, kernel out to three sigma either side.
-    let sigma = key.sigma.max(1) as f32;
-    let reach = layout.extent;
-    let kernel: Vec<f32> = (0..=2 * reach)
-        .map(|i| {
-            let d = i as f32 - reach as f32;
-            (-(d * d) / (2.0 * sigma * sigma)).exp()
-        })
-        .collect();
-    let norm: f32 = kernel.iter().sum();
-    let blur_axis = |src: &[f32], horizontal: bool| -> Vec<f32> {
-        let mut out = vec![0f32; side * side];
-        for y in 0..side {
-            for x in 0..side {
-                let mut acc = 0.0;
-                for (i, weight) in kernel.iter().enumerate() {
-                    let offset = i as isize - reach as isize;
-                    let (sx, sy) = if horizontal {
-                        (x as isize + offset, y as isize)
-                    } else {
-                        (x as isize, y as isize + offset)
-                    };
-                    if sx >= 0 && sy >= 0 && (sx as usize) < side && (sy as usize) < side {
-                        acc += weight * src[sy as usize * side + sx as usize];
-                    }
-                }
-                out[y * side + x] = acc / norm;
-            }
-        }
-        out
-    };
-    let blurred = if key.sigma == 0 {
-        coverage
-    } else {
-        blur_axis(&blur_axis(&coverage, true), false)
-    };
-
-    let mut image = Image::new(side, side);
-    let pixels = image.pixel_data_slice_mut();
-    for (i, alpha) in blurred.iter().enumerate() {
-        pixels[i * 4 + 3] = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+/// The widths of three box blurs that together come closest to a Gaussian
+/// of `sigma`: odd, and as near equal as the variance allows.
+fn gaussian_boxes(sigma: f32) -> [usize; 3] {
+    const PASSES: f32 = 3.0;
+    let ideal = (12.0 * sigma * sigma / PASSES + 1.0).sqrt();
+    let mut lower = ideal.floor() as i32;
+    if lower % 2 == 0 {
+        lower -= 1;
     }
-    image
+    let lower = lower.max(1);
+    let upper = lower + 2;
+    let lower_f = lower as f32;
+    let narrow = ((12.0 * sigma * sigma
+        - PASSES * lower_f * lower_f
+        - 4.0 * PASSES * lower_f
+        - 3.0 * PASSES)
+        / (-4.0 * lower_f - 4.0))
+        .round()
+        .clamp(0.0, PASSES) as usize;
+    let mut widths = [upper as usize; 3];
+    for width in widths.iter_mut().take(narrow) {
+        *width = lower as usize;
+    }
+    widths
+}
+
+/// One box blur of an odd `width` along rows (or, `horizontal` false,
+/// columns) of a `side` x `side` image, with nothing beyond its edges.
+fn box_blur(src: &[f32], side: usize, width: usize, horizontal: bool) -> Vec<f32> {
+    let reach = width / 2;
+    let mut out = vec![0f32; side * side];
+    let mut running = vec![0f32; side + 1];
+    for line in 0..side {
+        let at = |i: usize| {
+            if horizontal {
+                line * side + i
+            } else {
+                i * side + line
+            }
+        };
+        for i in 0..side {
+            running[i + 1] = running[i] + src[at(i)];
+        }
+        for i in 0..side {
+            let start = i.saturating_sub(reach);
+            let end = (i + reach + 1).min(side);
+            out[at(i)] = (running[end] - running[start]) / width as f32;
+        }
+    }
+    out
 }
 
 /// One slice of a nine-slice shadow: where it lands on screen, and which
@@ -222,6 +259,63 @@ mod tests {
         assert!(edge > 60 && edge < 200, "edge alpha {edge}");
     }
 
+    /// The blur as the kernel had it, kept to hold the boxes to.
+    fn direct_gaussian(src: &[f32], side: usize, sigma: f32, reach: usize) -> Vec<f32> {
+        let kernel: Vec<f32> = (0..=2 * reach)
+            .map(|i| {
+                let d = i as f32 - reach as f32;
+                (-(d * d) / (2.0 * sigma * sigma)).exp()
+            })
+            .collect();
+        let norm: f32 = kernel.iter().sum();
+        let axis = |src: &[f32], horizontal: bool| -> Vec<f32> {
+            let mut out = vec![0f32; side * side];
+            for y in 0..side {
+                for x in 0..side {
+                    let mut acc = 0.0;
+                    for (i, weight) in kernel.iter().enumerate() {
+                        let offset = i as isize - reach as isize;
+                        let (sx, sy) = if horizontal {
+                            (x as isize + offset, y as isize)
+                        } else {
+                            (x as isize, y as isize + offset)
+                        };
+                        if sx >= 0 && sy >= 0 && (sx as usize) < side && (sy as usize) < side {
+                            acc += weight * src[sy as usize * side + sx as usize];
+                        }
+                    }
+                    out[y * side + x] = acc / norm;
+                }
+            }
+            out
+        };
+        axis(&axis(src, true), false)
+    }
+
+    #[test]
+    fn three_boxes_cast_the_shadow_the_kernel_did() {
+        for (radius, sigma) in [(8u16, 4u16), (18, 9), (30, 18)] {
+            let key = ShadowKey { radius, sigma };
+            let layout = key.layout();
+            let reference =
+                direct_gaussian(&silhouette(key), layout.side, sigma as f32, layout.extent);
+            let image = rasterize_shadow(key);
+            let worst = image
+                .pixel_data_slice()
+                .chunks(4)
+                .zip(reference.iter())
+                .map(|(px, want)| (px[3] as f32 - want.clamp(0.0, 1.0) * 255.0).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst <= 6.0,
+                "radius {} sigma {}: off by {} of 255",
+                radius,
+                sigma,
+                worst
+            );
+        }
+    }
+
     #[test]
     fn nine_slices_tile_the_shadow_without_gaps_or_overlap() {
         let layout = ShadowKey {
@@ -261,3 +355,5 @@ mod tests {
         assert!(slices.len() < 9);
     }
 }
+
+
