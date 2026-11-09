@@ -73,6 +73,11 @@ const CARD_MARK: f32 = 36.0;
 const CARD_GAP: f32 = 11.0;
 const CARD_RING: f32 = 34.0;
 const CARD_RING_STROKE: f32 = 3.0;
+/// A finished thing's tick: white on a green disc this big -- on the pill,
+/// and on the card -- this far after any word before it.
+const DONE_PILL_BADGE: f32 = 22.0;
+const DONE_CARD_BADGE: f32 = 34.0;
+const DONE_GAP: f32 = 6.0;
 const BUTTON: f32 = 36.0;
 const BUTTON_GLYPH: f32 = 15.0;
 const BUTTON_GAP: f32 = 7.0;
@@ -1917,11 +1922,12 @@ impl crate::TermWindow {
         // The pill opening into its own card -- not into another thing's
         // (a banner), and not while either gives way to new content.
         let travel = front_open == 0 && pill_from.is_none() && card_from.is_none();
-        // Its ring goes with it when the card has one where the pill does:
-        // a card with buttons in its place has none.
+        // Its ring -- or a finished one's tick -- goes with it when the card
+        // has one where the pill does: a card with buttons in its place has
+        // none.
         let travel_ring = travel
-            && content(0).bar.is_some()
             && content(0).tone != Tone::Waiting
+            && (content(0).bar.is_some() || content(0).tone == Tone::Done)
             && content(0).actions.is_empty();
         let open_alpha = smoothstep((open_amount - 0.45) / 0.45) * content_in;
         if folded_alpha > 0.001 {
@@ -2119,7 +2125,7 @@ impl crate::TermWindow {
         Ok(px(PILL_PAD_LEFT + PILL_MARK + PILL_GAP)
             + name
             + self.pill_trail_width(fonts, content, px)?
-            + px(PILL_PAD_RIGHT))
+            + pill_pad_right(content, px))
     }
 
     /// The width of what follows the name on the pill, with its gap.
@@ -2139,13 +2145,32 @@ impl crate::TermWindow {
                 end -= percent_width + px(1.0) + number_width + px(BUTTON_GAP);
             }
         }
+        if let Some(width) = self.card_done_width(fonts, content, px)? {
+            end -= width + px(BUTTON_GAP);
+        }
         Ok(end)
+    }
+
+    /// How wide a finished card's tick at its end is, with any word before
+    /// it, when it has one: finished, with no buttons and no ring there
+    /// instead.
+    fn card_done_width(&self, fonts: &Fonts, content: &CardContent, px: &impl Fn(f32) -> f32) -> anyhow::Result<Option<f32>> {
+        if content.tone != Tone::Done || !content.actions.is_empty() || content.bar.is_some() {
+            return Ok(None);
+        }
+        let text = if content.short.is_empty() {
+            0.0
+        } else {
+            self.sidebar_text_width(&fonts.body, &content.short)?.ceil() + px(DONE_GAP)
+        };
+        Ok(Some(text + px(DONE_CARD_BADGE)))
     }
 
     /// The mark and name of the thing the pill opens into, travelling from
     /// where the pill has them to where its card does as it opens (`t`, 0 to
     /// 1): one name moving, rather than one fading as another comes. The
     /// pill's square mark gives way to the card's round one on the way.
+    /// With `ring`, its ring or tick at the end goes along too.
     #[allow(clippy::too_many_arguments)]
     fn paint_status_head(
         &self,
@@ -2170,6 +2195,18 @@ impl crate::TermWindow {
         let open = card_head(fonts, rect, self.card_text_end(fonts, rect, content, px)?, px);
         let place = folded.lerp(open, t);
         // The ring too: from the pill's end, small, to the card's, large.
+        // A finished one's tick the same.
+        if ring && content.bar.is_none() && content.tone == Tone::Done {
+            let pill_cx = rect.max_x() - pill_pad_right(content, px) - px(DONE_PILL_BADGE) / 2.0;
+            let card_cx = rect.max_x() - px(CARD_PAD_RIGHT) - px(DONE_CARD_BADGE) / 2.0;
+            paint_done_badge(
+                ctx,
+                layers,
+                (mix(pill_cx, card_cx), mid),
+                mix(px(DONE_PILL_BADGE), px(DONE_CARD_BADGE)),
+                alpha,
+            )?;
+        }
         if let (true, Some(fraction)) = (ring, content.bar) {
             let pill_cx = folded.name_x + folded.name_width + px(PILL_GAP) + px(PILL_RING) / 2.0;
             let card_cx = rect.max_x() - px(CARD_PAD_RIGHT) - px(CARD_RING) / 2.0;
@@ -2218,7 +2255,7 @@ impl crate::TermWindow {
         let lead = match (content.tone, content.bar) {
             (Tone::Waiting, _) => px(WAIT_DOT),
             (_, Some(_)) => px(PILL_RING),
-            (Tone::Done, None) => px(14.0),
+            (Tone::Done, None) => px(DONE_PILL_BADGE),
             _ => 0.0,
         };
         let width = if lead > 0.0 && text > 0.0 {
@@ -2300,7 +2337,7 @@ impl crate::TermWindow {
             mark: px(PILL_MARK),
             name_x,
             name_y: mid - fonts.title_line / 2.0,
-            name_width: (rect.max_x() - px(PILL_PAD_RIGHT) - trail - name_x).max(0.0),
+            name_width: (rect.max_x() - pill_pad_right(content, px) - trail - name_x).max(0.0),
         })
     }
 
@@ -2384,11 +2421,6 @@ impl crate::TermWindow {
                 }
                 x += px(PILL_RING + 6.0);
             }
-            (Tone::Done, None) => {
-                ctx.draw_svg_icon(layers, SvgIcon::Check, x, mid - px(7.0), px(14.0), color.mul_alpha(alpha))
-                    .context("dynamic status check")?;
-                x += px(14.0);
-            }
             _ => {}
         }
         if !content.short.is_empty() && content.bar.is_none() {
@@ -2407,6 +2439,13 @@ impl crate::TermWindow {
                 width as usize,
                 text_color.mul_alpha(alpha),
             )?;
+            x += width;
+        }
+        // Finished: its tick, after any word.
+        if ring && content.tone == Tone::Done && content.bar.is_none() {
+            let size = px(DONE_PILL_BADGE);
+            let gap = if content.short.is_empty() { 0.0 } else { px(DONE_GAP) };
+            paint_done_badge(ctx, layers, (x + gap + size / 2.0, mid), size, alpha)?;
         }
         Ok(())
     }
@@ -2522,6 +2561,26 @@ impl crate::TermWindow {
             }
         }
 
+        if let Some(width) = self.card_done_width(fonts, content, px)? {
+            let badge = px(DONE_CARD_BADGE);
+            if ring {
+                paint_done_badge(ctx, layers, (end - badge / 2.0, mid), badge, alpha)?;
+            }
+            if !content.short.is_empty() {
+                let text = width - badge - px(DONE_GAP);
+                self.paint_status_line(
+                    layers,
+                    &fonts.body,
+                    fonts.body_metrics,
+                    &content.short,
+                    (end - width).max(0.0) as usize,
+                    (mid - fonts.body_line / 2.0).max(0.0) as usize,
+                    text as usize,
+                    ink.muted.mul_alpha(alpha),
+                )?;
+            }
+            end -= width + px(BUTTON_GAP);
+        }
         let place = card_head(fonts, rect, end, px);
         if head {
             self.paint_status_disc_mark(layers, ctx, ink, content, place.mark_x, mid, place.mark, alpha)?;
@@ -3297,11 +3356,11 @@ fn status_content(item: &StatusItem) -> CardContent {
             ..
         } => {
             let agent = &agents[*index];
-            let done = crate::i18n::tr("right-agents-state-done");
             let name = crate::agent_status::display_name(&agent.agent_id);
             // Named as its agent card was -- by what it worked on -- with
-            // the thread said under it when that is another window's.
-            let mut detail = vec![name.clone(), done.clone()];
+            // the thread said under it when that is another window's. The
+            // tick at the card's end says it is done.
+            let mut detail = vec![name.clone()];
             if !*here && !agent.place.is_empty() {
                 detail.push(agent.place.clone());
             }
@@ -3314,9 +3373,10 @@ fn status_content(item: &StatusItem) -> CardContent {
                     agent.title.clone()
                 },
                 detail: detail.join(" · "),
-                short: done,
+                short: String::new(),
                 bar: None,
-                actions: vec![go_to(agent.pane_id, *here, true)],
+                // Nothing to do but look: the card itself goes to it.
+                actions: Vec::new(),
             }
         }
         StatusItem::Command {
@@ -3325,12 +3385,14 @@ fn status_content(item: &StatusItem) -> CardContent {
             here,
         } => {
             let failed = command.failed();
-            let state = crate::i18n::tr(if failed {
-                "right-agents-state-error"
+            let state = if failed {
+                crate::i18n::tr("right-agents-state-error")
             } else {
-                "right-agents-state-done"
-            });
-            let mut detail = vec![state.clone()];
+                String::new()
+            };
+            // A finish has its tick at the card's end; a failure says so
+            // here, with how.
+            let mut detail = if failed { vec![state.clone()] } else { Vec::new() };
             if let Some(code) = command.exit.filter(|_| failed) {
                 let mut args = fluent_bundle::FluentArgs::new();
                 args.set("code", code);
@@ -3347,7 +3409,11 @@ fn status_content(item: &StatusItem) -> CardContent {
                 detail: detail.join(" · "),
                 short: state,
                 bar: None,
-                actions: vec![go_to(notice.pane_id, *here, true)],
+                actions: if failed {
+                    vec![go_to(notice.pane_id, *here, true)]
+                } else {
+                    Vec::new()
+                },
             }
         }
         StatusItem::Task {
@@ -3494,6 +3560,41 @@ fn reading_says_anything(reading: &TaskReading) -> bool {
         || reading.percent.is_some()
         || reading.count.is_some()
         || reading.detail.is_some()
+}
+
+/// The pill's room after what ends it: a finished one's badge sits as far
+/// in from the end as from the top and bottom.
+fn pill_pad_right(content: &CardContent, px: &impl Fn(f32) -> f32) -> f32 {
+    if content.tone == Tone::Done && content.bar.is_none() {
+        px((PILL_HEIGHT - DONE_PILL_BADGE) / 2.0)
+    } else {
+        px(PILL_PAD_RIGHT)
+    }
+}
+
+/// A finished thing's badge: a white tick on a green disc, `size` across,
+/// centred on `center`.
+fn paint_done_badge(
+    ctx: &DrawContext,
+    layers: &mut crate::quad::TripleLayerQuadAllocator,
+    center: (f32, f32),
+    size: f32,
+    alpha: f32,
+) -> anyhow::Result<()> {
+    let (cx, cy) = center;
+    // A deeper green than the finished marks', for the white to read on.
+    let green = LinearRgba::with_srgba(0, 188, 0, 255);
+    ctx.draw_disc(layers, 1, cx, cy, size, green.mul_alpha(alpha))?;
+    let tick = size * 0.6;
+    ctx.draw_svg_icon(
+        layers,
+        SvgIcon::Check,
+        cx - tick / 2.0,
+        cy - tick / 2.0,
+        tick,
+        LinearRgba::with_srgba(255, 255, 255, 255).mul_alpha(alpha),
+    )
+    .context("dynamic status done badge")
 }
 
 /// Where a card in `rect` has its mark and name, its text reaching to `end`.
