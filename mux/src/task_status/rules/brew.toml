@@ -1,0 +1,45 @@
+# Homebrew. Written for ThinkTerm from brew's own output, which is English
+# only. `brew` is a shell script that hands over to Ruby, so the program
+# shows up under either name.
+
+id = "brew"
+programs = ["brew", "brew.rb", "brew.sh"]
+
+# "Error: node: no bottle available!"
+[[rules]]
+id = "error"
+state = "error"
+priority = 200
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^Error: ']
+
+# curl's bar while a bottle downloads: "#########            36.4%".
+[[rules]]
+id = "download_progress"
+priority = 120
+region = "bottom_non_empty_lines(1)"
+line_regex = ['^[#O=\-\s]*#[#O=\-\s]*\s(?P<percent>\d{1,3})(?:\.\d+)?%\s*$']
+
+# "==> Pouring node--21.0.0.arm64_sonoma.bottle.tar.gz"
+[[rules]]
+id = "pouring"
+priority = 110
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^==> Pouring (?P<name>.+?)--']
+detail = "Installing {name}"
+
+# "==> Downloading https://ghcr.io/v2/homebrew/core/node/blobs/sha256:…"
+[[rules]]
+id = "downloading"
+priority = 105
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^==> Downloading \S+/(?P<name>[^/\s]+)/(?:blobs|manifests)/']
+detail = "Downloading {name}"
+
+# "==> Upgrading node", "==> Installing node", "==> Fetching node"
+[[rules]]
+id = "step"
+priority = 100
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^==> (?P<verb>Upgrading|Installing|Fetching) (?P<name>[A-Za-z][\w@+.-]*)\s*$']
+detail = "{verb} {name}"

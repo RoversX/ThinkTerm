@@ -64,6 +64,7 @@ mod tests {
         ForegroundProgram {
             executable: executable.to_string(),
             runs: None,
+            task: None,
         }
     }
 

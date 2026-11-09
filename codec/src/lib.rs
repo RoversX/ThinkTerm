@@ -897,7 +897,9 @@ macro_rules! pdu {
 ///     (GetPaneRenderChangesResponse::bracketed_paste).
 /// 85: The machine a pane of another one is on (ListPanesResponse::
 ///     pane_machines), as a window gives the panes it is connected to.
-pub const CODEC_VERSION: usize = 86;
+/// 87: A foreground program carries what its task rules read off its
+///     screen (ForegroundProgram::task), for a tool such as apt or brew.
+pub const CODEC_VERSION: usize = 87;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -3598,7 +3600,7 @@ mod test {
         // tripwire: whoever bumps the codec must come here, confirm the
         // round-trips still cover the new version, and advance it
         // deliberately.
-        assert_eq!(CODEC_VERSION, 86);
+        assert_eq!(CODEC_VERSION, 87);
         use thinkterm_proto::{
             AgentEvidence, AgentState, AgentStatus, ProgramBlockedKind, ProgramReport,
             ProgramReportChild, ProgramReportState,
@@ -3668,7 +3670,7 @@ mod test {
     #[test]
     fn foreground_program_protocol_round_trip_at_version_74() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 86);
+        assert_eq!(CODEC_VERSION, 87);
         use thinkterm_proto::ForegroundProgram;
 
         fn round_trip(pdu: &Pdu) -> Pdu {
@@ -3682,6 +3684,7 @@ mod test {
         let program = ForegroundProgram {
             executable: "node".to_string(),
             runs: Some("npm".to_string()),
+            task: None,
         };
         for pdu in [
             Pdu::ForegroundProgramChanged(ForegroundProgramChanged {
@@ -3708,6 +3711,7 @@ mod test {
         let smuggled = ForegroundProgram {
             executable: "node".to_string(),
             runs: Some("../../etc/passwd".to_string()),
+            task: None,
         };
         assert_eq!(
             round_trip(&Pdu::ForegroundProgramChanged(ForegroundProgramChanged {
@@ -3740,6 +3744,7 @@ mod test {
                     program: ForegroundProgram {
                         executable: "node".to_string(),
                         runs: Some("npm".to_string()),
+                        task: None,
                     },
                 }],
             })
@@ -3769,7 +3774,7 @@ mod test {
     #[test]
     fn run_state_protocol_round_trip_at_version_80() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 86);
+        assert_eq!(CODEC_VERSION, 87);
         use thinkterm_proto::{PaneExit, PaneRunState, ProgramState, ShellCommands};
 
         let exit = PaneExit {
@@ -3875,7 +3880,7 @@ mod test {
     fn frame_control_extension_round_trips_without_changing_legacy_version() {
         // The extension is asked for, so it needed no bump of its own; 74
         // is the foreground program's, which a server sends unasked.
-        assert_eq!(CODEC_VERSION, 86);
+        assert_eq!(CODEC_VERSION, 87);
         for pdu in [
             Pdu::GetKittyImage(GetKittyImage { pane_id: 3, image_id: 7, data_hash: [9; 32], have_frames: 2, image_epoch: Some(4) }),
             Pdu::GetKittyFrameSelections(GetKittyFrameSelections { pane_id: 3, subscribe: true }),

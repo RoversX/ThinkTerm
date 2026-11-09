@@ -56,6 +56,9 @@ const REMOTE_SESSION_CLIENTS: &[&str] = &["ssh", "autossh", "mosh", "mosh-client
 /// The user var shell integration sets to the command line it is about to
 /// run, and empties at the prompt (`assets/shell-integration/wezterm.sh`).
 const REPORTED_PROGRAM_VAR: &str = "WEZTERM_PROG";
+/// A tool with task rules (`crate::task_status`) has its screen read no
+/// more often than this; a reading that has not changed goes nowhere.
+const TASK_READ_EVERY: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 struct Record {
@@ -68,6 +71,8 @@ struct Record {
     candidate: Option<(Option<ForegroundProgram>, Instant)>,
     /// When the pane was last looked at, for the floor.
     probed_at: Option<Instant>,
+    /// When a tool's screen was last read, for its own floor.
+    read_at: Option<Instant>,
 }
 
 lazy_static::lazy_static! {
@@ -268,6 +273,9 @@ fn drain() {
             }
             continue;
         }
+        if read_task(pane.as_ref(), pane_id, now) {
+            publish_change(pane_id);
+        }
         let (known, confirming, since_probe) = match REGISTRY.read().get(&pane_id) {
             Some(record) => (
                 true,
@@ -307,6 +315,12 @@ fn drain() {
         };
         if changed {
             publish_change(pane_id);
+            // A tool that has just taken the foreground is read at once: it
+            // may have drawn its screen and gone quiet already, a question
+            // waiting for an answer, with no more output to bring it here.
+            if read_task(pane.as_ref(), pane_id, now) {
+                publish_change(pane_id);
+            }
         }
         // Activity owes a look after it; a candidate waits for its
         // confirmation. Neither is new activity.
@@ -319,18 +333,75 @@ fn drain() {
     }
 }
 
+/// Read the screen of a tool that has task rules into its published
+/// program, when a reading is due. Returns whether the reading changed. A
+/// reading not yet due is owed a look once it is: the screen the tool left
+/// when it went quiet -- a question waiting for an answer -- must be read.
+fn read_task(pane: &dyn Pane, pane_id: PaneId, now: Instant) -> bool {
+    let rules = {
+        let registry = REGISTRY.read();
+        let Some(record) = registry.get(&pane_id) else {
+            return false;
+        };
+        let Some(program) = record.published.as_ref() else {
+            return false;
+        };
+        let rules = program
+            .runs
+            .as_deref()
+            .and_then(crate::task_status::rules_for)
+            .or_else(|| crate::task_status::rules_for(&program.executable));
+        let Some(rules) = rules else {
+            return false;
+        };
+        let due = record
+            .read_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= TASK_READ_EVERY);
+        if !due {
+            drop(registry);
+            requeue(pane_id, false);
+            return false;
+        }
+        rules
+    };
+    let reading = rules.read(&crate::task_status::screen_tail(pane));
+    let mut registry = REGISTRY.write();
+    let Some(record) = registry.get_mut(&pane_id) else {
+        return false;
+    };
+    record.read_at = Some(now);
+    let Some(program) = record.published.as_mut() else {
+        return false;
+    };
+    if program.task.as_ref() == Some(&reading) {
+        return false;
+    }
+    program.task = Some(reading);
+    true
+}
+
+/// The same program, whatever its task reading says.
+fn same_program(a: &Option<ForegroundProgram>, b: &Option<ForegroundProgram>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.executable == b.executable && a.runs == b.runs,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 /// Fold one look into the pane's record. Returns whether the published
-/// program changed.
+/// program changed. A look sees the program, not what it is doing: the
+/// published task reading stays until the program changes.
 fn observe(record: &mut Record, observed: Option<ForegroundProgram>, now: Instant) -> bool {
     record.probed_at = Some(now);
     if !record.announced {
         record.announced = true;
         record.candidate = None;
-        let changed = record.published != observed;
+        let changed = !same_program(&record.published, &observed);
         record.published = observed;
         return changed;
     }
-    if observed == record.published {
+    if same_program(&observed, &record.published) {
         record.candidate = None;
         return false;
     }
@@ -394,7 +465,11 @@ fn command_line_program(command: &str) -> Option<ForegroundProgram> {
     } else {
         None
     };
-    let program = ForegroundProgram { executable, runs };
+    let program = ForegroundProgram {
+        executable,
+        runs,
+        task: None,
+    };
     program.within_budget().then_some(program)
 }
 
@@ -424,7 +499,11 @@ fn process_program(pane: &dyn Pane, policy: CachePolicy) -> Option<ForegroundPro
     } else {
         None
     };
-    let program = ForegroundProgram { executable, runs };
+    let program = ForegroundProgram {
+        executable,
+        runs,
+        task: None,
+    };
     program.within_budget().then_some(program)
 }
 
@@ -1045,6 +1124,7 @@ mod tests {
         Some(ForegroundProgram {
             executable: executable.to_string(),
             runs: None,
+            task: None,
         })
     }
 
@@ -1087,6 +1167,7 @@ mod tests {
         let sudo_ssh = Some(ForegroundProgram {
             executable: "sudo".to_string(),
             runs: Some("ssh".to_string()),
+            task: None,
         });
         assert_eq!(choose(sudo_ssh, reported), program("vim"));
         // At the remote prompt the client itself shows.

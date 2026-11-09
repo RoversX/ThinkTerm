@@ -33,7 +33,7 @@ pub use command::{CommandSpec, EnvVar};
 pub use keyassignment::{PaneDirection, ScrollbackEraseMode, SpawnTabDomain};
 pub use layout::{PaneEntry, PaneNode, PaneStackEntry, SerdeUrl};
 pub use pane::{Pattern, SearchResult};
-pub use program::ForegroundProgram;
+pub use program::{ForegroundProgram, TaskReading, TaskState};
 pub use renderable::{RenderableDimensions, StableCursorPosition};
 pub use run_state::{PaneExit, PaneRunState, ProgramState, ShellCommands};
 pub use split::{SplitDirection, SplitDirectionAndSize, SplitRequest, SplitSize};

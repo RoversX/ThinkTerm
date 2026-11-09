@@ -53,6 +53,7 @@ pub mod shell_integration;
 pub mod ssh;
 pub mod ssh_agent;
 pub mod tab;
+pub mod task_status;
 pub mod termwiztermtab;
 pub mod tmux;
 pub mod tmux_commands;

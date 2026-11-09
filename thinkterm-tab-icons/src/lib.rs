@@ -1080,6 +1080,7 @@ mod tests {
         ForegroundProgram {
             executable: executable.to_string(),
             runs: runs.map(str::to_string),
+            task: None,
         }
     }
 

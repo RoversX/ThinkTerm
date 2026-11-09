@@ -1,0 +1,62 @@
+# Debian and Ubuntu's package tool, `apt` and the scripts' `apt-get`.
+# Written for ThinkTerm from apt's own output. Its words are translated with
+# the system's language; where a rule can, it keys on what is not -- the
+# `[Y/n]` choices, the `E:` prefix, the shape of a progress line.
+
+id = "apt"
+programs = ["apt", "apt-get"]
+
+# "Do you want to continue? [Y/n] " -- the last line, waiting for an answer.
+[[rules]]
+id = "confirm"
+state = "waiting"
+priority = 300
+region = "bottom_non_empty_lines(1)"
+line_regex = ['\[Y/n\]\s*$', '\[y/N\]\s*$']
+
+# "E: Unable to locate package …"
+[[rules]]
+id = "error"
+state = "error"
+priority = 200
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^E: ']
+
+# apt's own bar while dpkg installs: "Progress: [ 62%] [#####......]".
+# apt-get draws none.
+[[rules]]
+id = "install_progress"
+priority = 130
+region = "bottom_non_empty_lines(1)"
+line_regex = ['\[\s*(?P<percent>\d{1,3})%\]\s*\[[#.]*\]?\s*$']
+
+# The download line, rewritten in place: "45% [3 libssl3 1,234 kB/1,903 kB 65%]".
+[[rules]]
+id = "download_progress"
+priority = 120
+region = "bottom_non_empty_lines(1)"
+line_regex = ['^(?P<percent>\d{1,3})% \[']
+
+# "Setting up libssl3:amd64 (3.0.2-0ubuntu1.15) ..."
+[[rules]]
+id = "installing"
+priority = 110
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^(?P<verb>Setting up|Unpacking|Removing) (?P<name>\S+) \(']
+detail = "{verb} {name}"
+
+# The same in another language: a package, its version, and "...".
+[[rules]]
+id = "installing_any_language"
+priority = 105
+region = "bottom_non_empty_lines(6)"
+line_regex = ['(?P<name>[a-z0-9][a-z0-9+.:-]*) \([^)]*\)(?: \S+ \([^)]*\))? \.\.\.$']
+detail = "{name}"
+
+# "Get:3 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libssl3 amd64 3.0.2 [1,903 kB]"
+[[rules]]
+id = "downloading"
+priority = 100
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^[^\s:]+:\d+ \S+://\S+ \S+ \S+ (?P<name>\S+) ']
+detail = "Downloading {name}"

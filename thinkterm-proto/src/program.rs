@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// lets exceed 255 bytes.
 pub const MAX_PROGRAM_NAME_BYTES: usize = 255;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ForegroundProgram {
     /// File name of the executable leading the terminal's foreground
     /// process group: `vim`, `node`, `python3.12`, `zsh`.
@@ -24,12 +24,80 @@ pub struct ForegroundProgram {
     /// command (`vim` for `sudo vim`). `None` when it runs nothing of the
     /// kind, as an interactive shell does.
     pub runs: Option<String>,
+    /// What it is doing, read off its screen by task rules where the pane
+    /// lives, when it is a tool that has some (a package manager, say).
+    pub task: Option<TaskReading>,
+}
+
+/// Longest `TaskReading::name`: a tool's name.
+pub const MAX_TASK_NAME_BYTES: usize = 64;
+/// Longest `TaskReading::detail`, in characters: a few words.
+pub const MAX_TASK_DETAIL_CHARS: usize = 80;
+
+/// What a tool is doing, as far as its screen says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum TaskState {
+    #[default]
+    Running,
+    /// Stopped to ask the user something.
+    Waiting,
+    /// Said it failed.
+    Error,
+}
+
+/// One reading of a tool's screen.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TaskReading {
+    /// What to call the tool: `apt`, `brew`.
+    pub name: String,
+    pub state: TaskState,
+    /// 0 to 100.
+    pub percent: Option<u8>,
+    /// How many of how many.
+    pub count: Option<(u32, u32)>,
+    /// What it is doing now, in a few words.
+    pub detail: Option<String>,
+}
+
+/// A character that should not be in a task reading's words: a control
+/// character, or one that is not seen but changes what is -- the direction
+/// text runs in, or what joins to what. The words come off a screen, which
+/// any program can print to.
+pub fn is_hidden_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
+impl TaskReading {
+    fn within_budget(&self) -> bool {
+        !self.name.is_empty()
+            && !self.name.chars().any(is_hidden_char)
+            && self.detail.as_deref().is_none_or(|detail| !detail.chars().any(is_hidden_char))
+            && self.name.len() <= MAX_TASK_NAME_BYTES
+            && self.percent.is_none_or(|percent| percent <= 100)
+            && self.count.is_none_or(|(done, total)| total > 0 && done <= total)
+            && self
+                .detail
+                .as_deref()
+                .is_none_or(|detail| detail.chars().count() <= MAX_TASK_DETAIL_CHARS)
+    }
 }
 
 impl ForegroundProgram {
-    /// Both names are plain, non-empty file names within the budget.
+    /// Both names are plain, non-empty file names within the budget, and
+    /// a task reading, if any, within its own.
     pub fn within_budget(&self) -> bool {
-        is_program_name(&self.executable) && self.runs.as_deref().is_none_or(is_program_name)
+        is_program_name(&self.executable)
+            && self.runs.as_deref().is_none_or(is_program_name)
+            && self.task.as_ref().is_none_or(TaskReading::within_budget)
     }
 }
 
@@ -46,8 +114,21 @@ mod tests {
         let program = |executable: &str, runs: Option<&str>| ForegroundProgram {
             executable: executable.to_string(),
             runs: runs.map(str::to_string),
+            task: None,
         };
         assert!(program("node", Some("npm")).within_budget());
+        let reading = |detail: &str| ForegroundProgram {
+            task: Some(TaskReading {
+                name: "apt".to_string(),
+                detail: Some(detail.to_string()),
+                ..TaskReading::default()
+            }),
+            ..program("apt", None)
+        };
+        assert!(reading("Setting up libfoo").within_budget());
+        // Text that reads one way and runs another is turned away.
+        assert!(!reading("Setting up \u{202E}oof").within_budget());
+        assert!(!reading("line\nbreak").within_budget());
         assert!(program("zsh", None).within_budget());
         assert!(!program("", None).within_budget());
         assert!(!program("node", Some("")).within_budget());
