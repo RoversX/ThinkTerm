@@ -831,6 +831,9 @@ pub(crate) struct DynamicStatus {
     /// moves, it is resting there, not hovering: the banner folds when its
     /// time is up rather than opening into the whole stack.
     still_pointer: Option<(isize, isize)>,
+    /// Where the pointer was when typing hid it. Until it moves, it is out
+    /// of sight and over nothing: a notice under it runs down as any other.
+    hidden_pointer: Option<(isize, isize)>,
 }
 
 impl DynamicStatus {
@@ -1431,10 +1434,14 @@ impl crate::TermWindow {
             if self.dynamic_status.still_pointer.is_some() && self.dynamic_status.still_pointer != pointer {
                 self.dynamic_status.still_pointer = None;
             }
-            over = self
-                .dynamic_status
-                .bounds
-                .is_some_and(|rect| pointer_over(self, rect));
+            if self.dynamic_status.hidden_pointer.is_some() && self.dynamic_status.hidden_pointer != pointer {
+                self.dynamic_status.hidden_pointer = None;
+            }
+            over = self.dynamic_status.hidden_pointer.is_none()
+                && self
+                    .dynamic_status
+                    .bounds
+                    .is_some_and(|rect| pointer_over(self, rect));
             let held = self.dynamic_status.still_pointer.is_none() && over;
             let dynamic = &mut self.dynamic_status;
             if held {
@@ -2067,6 +2074,14 @@ impl crate::TermWindow {
         // Kept for next frame: what a thing that goes had been.
         self.dynamic_status.last = items;
         Ok(())
+    }
+
+    /// Typing hid the pointer: until it moves, it is over nothing here.
+    pub(crate) fn dynamic_status_pointer_hidden(&mut self) {
+        self.dynamic_status.hidden_pointer = self
+            .current_mouse_event
+            .as_ref()
+            .map(|event| (event.coords.x, event.coords.y));
     }
 
     /// Hold every finished notice's clock -- a transfer's, a thread's --

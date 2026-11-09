@@ -810,6 +810,7 @@ impl super::TermWindow {
                             let stage =
                                 crate::input_diagnostics::StageTimer::begin("set_cursor_none");
                             context.set_cursor(None);
+                            self.dynamic_status_pointer_hidden();
                             stage.finish(true);
                         }
                         if !keycode.is_modifier() {
@@ -1399,6 +1400,7 @@ impl super::TermWindow {
                     {
                         let stage = crate::input_diagnostics::StageTimer::begin("set_cursor_none");
                         context.set_cursor(None);
+                        self.dynamic_status_pointer_hidden();
                         stage.finish(true);
                     }
                     if !key.is_modifier() {
