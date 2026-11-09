@@ -11,7 +11,9 @@ manifests in [agent-status.md](../agent-status.md).
 ThinkTerm ships rules for **apt** (including `apt-get`) and **Homebrew**.
 
 Task rules only feed Dynamic Status. They do not change a thread's status in
-the sidebar or what the Status panel lists.
+the sidebar or what the Status panel lists. A tool that has rules and also
+reports its own progress is shown once: by what its rules read, when they
+read anything, and by its own report otherwise.
 
 ## When a tool is read
 
@@ -76,12 +78,23 @@ Each rule has:
 | `state` | Optional: `running`, `waiting` (stopped to ask the user) or `error`. |
 | `priority` | Higher is weighed first. Defaults to 0. |
 | `detail` | Optional text saying what the tool is doing. `{name}` puts in what the group `name` matched. |
+| `sum` | Optional, `true` for a tool that draws a line for each of several things at once (parallel downloads). Every line of the region that matches counts, not only the bottom one: see below. |
+| `after_regex` | Optional regular expressions for a heading the tool prints before each step. The rule looks no higher than the bottom-most line one of them matches, so what an earlier or interrupted step left on screen is not counted. |
 
 Named groups take values out of the match:
 
 - `percent` — 0 to 100 (a decimal part is dropped).
+- `done_size` and `total_size` — how much of how much, as sizes such as
+  `10.0MB`, `512 B` or `1.2GiB`; the percent, when there is no `percent`.
 - `done` and `total` — how many of how many; used when there is no percent.
 - `detail` — used as the detail when the rule has no `detail` text.
+
+With `sum = true`, the sizes (`done_size`, `total_size`) and counts
+(`done`, `total`) of every matching line that has both are added up, and
+the detail can say `{lines}` (how many lines matched) and `{lines_done}`
+(how many have got to their total). Other groups come from the bottom
+line. Once every line has got to its total the rule no longer matches, so
+whatever the tool goes on to do is read instead.
 
 The reading is put together from every rule that matches: the state from
 the highest-priority one that sets a state (otherwise `running`), and the

@@ -6,8 +6,13 @@
 //! A tool's file names the programs it is about and lists rules. Each rule
 //! looks at a region of the screen's bottom with line regexes; the first
 //! line (from the bottom) one of them matches makes the rule match. Named
-//! groups take the numbers out: `percent`, `done` and `total`, and any other
-//! group can be put into the rule's `detail` text as `{name}`. Rules are
+//! groups take the numbers out: `percent` (or `done_size` and `total_size`,
+//! sizes such as "10.0MB", for it), `done` and `total`, and any other
+//! group can be put into the rule's `detail` text as `{name}`. A rule with
+//! `sum` counts every line it matches rather than the bottom one: their
+//! sizes and counts add up, for as long as any of them is under way. A rule
+//! with `after_regex` looks no higher than the last line that matches it --
+//! the heading of what the tool is doing now. Rules are
 //! weighed by priority: the state comes from the highest matching rule
 //! that sets one, and each of percent, count and detail from the highest
 //! matching rule that has it. See `docs/thinkterm/task-status.md`.
@@ -37,7 +42,9 @@ struct Rule {
     priority: i32,
     region: Region,
     line_regex: Vec<Regex>,
+    after_regex: Vec<Regex>,
     detail: Option<String>,
+    sum: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -69,7 +76,11 @@ struct RuleFile {
     region: String,
     line_regex: Vec<String>,
     #[serde(default)]
+    after_regex: Vec<String>,
+    #[serde(default)]
     detail: Option<String>,
+    #[serde(default)]
+    sum: bool,
 }
 
 /// The tools ThinkTerm knows out of the box.
@@ -157,22 +168,29 @@ fn compile(text: &str, origin: &str) -> Option<TaskRules> {
             log::error!("task rules {origin}: unknown region {:?}", rule.region);
             return None;
         };
-        let mut line_regex = Vec::new();
-        for pattern in &rule.line_regex {
-            match Regex::new(pattern) {
-                Ok(regex) => line_regex.push(regex),
-                Err(err) => {
-                    log::error!("task rules {origin}: bad regex {pattern:?}: {err}");
-                    return None;
+        let compile_all = |patterns: &[String]| -> Option<Vec<Regex>> {
+            let mut compiled = Vec::new();
+            for pattern in patterns {
+                match Regex::new(pattern) {
+                    Ok(regex) => compiled.push(regex),
+                    Err(err) => {
+                        log::error!("task rules {origin}: bad regex {pattern:?}: {err}");
+                        return None;
+                    }
                 }
             }
-        }
+            Some(compiled)
+        };
+        let line_regex = compile_all(&rule.line_regex)?;
+        let after_regex = compile_all(&rule.after_regex)?;
         rules.push(Rule {
             state,
             priority: rule.priority,
             region,
             line_regex,
+            after_regex,
             detail: rule.detail,
+            sum: rule.sum,
         });
     }
     rules.sort_by_key(|rule| std::cmp::Reverse(rule.priority));
@@ -224,7 +242,12 @@ impl TaskRules {
                 reading.percent = captures
                     .get("percent")
                     .and_then(|text| text.split('.').next()?.parse::<u8>().ok())
-                    .map(|percent| percent.min(100));
+                    .map(|percent| percent.min(100))
+                    .or_else(|| {
+                        let done = parse_size(captures.get("done_size")?)?;
+                        let total = parse_size(captures.get("total_size")?)?;
+                        (total > 0.0).then(|| (done / total * 100.0).floor().clamp(0.0, 100.0) as u8)
+                    });
             }
             if reading.count.is_none() {
                 let number = |name| captures.get(name).and_then(|text| text.parse::<u32>().ok());
@@ -258,34 +281,123 @@ impl TaskRules {
 }
 
 impl Rule {
-    /// The named groups of the first line from the bottom of the region
-    /// that one of the rule's regexes matches.
+    /// What the rule takes from `screen`: the named groups of the first
+    /// line from the bottom of the region that one of its regexes matches
+    /// -- or, with `sum`, of all of them added up.
     fn find(&self, screen: &[String]) -> Option<HashMap<String, String>> {
+        if self.sum {
+            self.find_sum(screen)
+        } else {
+            self.matches(screen).next()
+        }
+    }
+
+    /// The named groups of each line of the region, from the bottom up,
+    /// that one of the rule's regexes matches -- up to the first line an
+    /// `after_regex` matches, which starts what the tool is doing now.
+    fn matches<'a>(&'a self, screen: &'a [String]) -> impl Iterator<Item = HashMap<String, String>> + 'a {
         let Region::BottomNonEmptyLines(count) = self.region;
-        let lines = screen
+        screen
             .iter()
             .rev()
             .map(|line| line.trim_end())
             .filter(|line| !line.trim().is_empty())
-            .take(count);
-        for line in lines {
-            for regex in &self.line_regex {
-                let Some(found) = regex.captures(line) else {
-                    continue;
-                };
-                return Some(
-                    regex
-                        .capture_names()
-                        .flatten()
-                        .filter_map(|name| {
-                            Some((name.to_string(), found.name(name)?.as_str().to_string()))
-                        })
-                        .collect(),
-                );
-            }
-        }
-        None
+            .take(count)
+            .take_while(move |line| !self.after_regex.iter().any(|regex| regex.is_match(line)))
+            .filter_map(move |line| {
+                self.line_regex.iter().find_map(|regex| {
+                    let found = regex.captures(line)?;
+                    Some(
+                        regex
+                            .capture_names()
+                            .flatten()
+                            .filter_map(|name| {
+                                Some((name.to_string(), found.name(name)?.as_str().to_string()))
+                            })
+                            .collect(),
+                    )
+                })
+            })
     }
+
+    /// Every line the rule matches, while any is still under way: the
+    /// bottom one's groups, with `done_size` and `total_size` (and `done`
+    /// and `total`) added up over the lines that have both, `lines` how
+    /// many there are and `lines_done` how many have got to their total.
+    fn find_sum(&self, screen: &[String]) -> Option<HashMap<String, String>> {
+        let mut bottom = None;
+        let (mut lines, mut lines_done) = (0u64, 0u64);
+        let mut sizes: Option<(f64, f64)> = None;
+        let mut counts: Option<(u64, u64)> = None;
+        for groups in self.matches(screen) {
+            let size = |name| groups.get(name).and_then(|text| parse_size(text));
+            let count = |name| groups.get(name).and_then(|text| text.parse::<u64>().ok());
+            let size = size("done_size").zip(size("total_size"));
+            let count = count("done").zip(count("total"));
+            lines += 1;
+            let complete = match (size, count) {
+                (Some((done, total)), _) => done >= total,
+                (None, Some((done, total))) => done >= total,
+                (None, None) => false,
+            };
+            if complete {
+                lines_done += 1;
+            }
+            if let Some((done, total)) = size {
+                let sum = sizes.get_or_insert((0.0, 0.0));
+                sum.0 += done;
+                sum.1 += total;
+            }
+            if let Some((done, total)) = count {
+                let sum = counts.get_or_insert((0, 0));
+                sum.0 = sum.0.saturating_add(done);
+                sum.1 = sum.1.saturating_add(total);
+            }
+            bottom.get_or_insert(groups);
+        }
+        // Nothing, or all of it done: the tool has moved on.
+        if lines == lines_done {
+            return None;
+        }
+        let mut groups: HashMap<String, String> = bottom?;
+        for name in ["done_size", "total_size", "done", "total"] {
+            groups.remove(name);
+        }
+        if let Some((done, total)) = sizes {
+            groups.insert("done_size".into(), format!("{done}"));
+            groups.insert("total_size".into(), format!("{total}"));
+        }
+        if let Some((done, total)) = counts {
+            groups.insert("done".into(), done.to_string());
+            groups.insert("total".into(), total.to_string());
+        }
+        groups.insert("lines".into(), lines.to_string());
+        groups.insert("lines_done".into(), lines_done.to_string());
+        Some(groups)
+    }
+}
+
+/// A size as tools print it -- "10.0MB", "512 B", "1.2 GiB" -- in bytes.
+fn parse_size(text: &str) -> Option<f64> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let number: f64 = number.parse().ok()?;
+    let scale = match unit.trim() {
+        "" | "B" => 1.0,
+        "kB" | "KB" => 1e3,
+        "MB" => 1e6,
+        "GB" => 1e9,
+        "TB" => 1e12,
+        "KiB" => 1024.0,
+        "MiB" => 1024.0 * 1024.0,
+        "GiB" => 1024.0 * 1024.0 * 1024.0,
+        "TiB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some(number * scale)
 }
 
 /// `template` with each `{name}` replaced by what that group took.
@@ -343,6 +455,14 @@ mod tests {
         assert_eq!(reading.percent, Some(45));
         assert_eq!(reading.detail.as_deref(), Some("Downloading libssl3"));
 
+        // An index has no package name, only its size where one would be.
+        let reading = apt.read(&screen(
+            "Get:2 http://archive.example/ubuntu jammy-updates InRelease [128 kB]\n\
+             12% [Waiting for headers]",
+        ));
+        assert_eq!(reading.percent, Some(12));
+        assert_eq!(reading.detail, None);
+
         let reading = apt.read(&screen(
             "Unpacking libssl3:amd64 (3.0.2-0ubuntu1.15) over (3.0.2-0ubuntu1.14) ...\n\
              Setting up libssl3:amd64 (3.0.2-0ubuntu1.15) ...\n\
@@ -365,8 +485,46 @@ mod tests {
         // do not.
         let reading = apt.read(&screen("您希望继续执行吗？ [Y/n] "));
         assert_eq!(reading.state, TaskState::Waiting);
+        // Some languages translate the choices too.
+        for question in ["Möchten Sie fortfahren? [J/n] ", "Хотите продолжить? [Д/н] ", "Continuer ? [o/N] "] {
+            assert_eq!(apt.read(&screen(question)).state, TaskState::Waiting, "{}", question);
+        }
         let reading = apt.read(&screen("E: Unable to locate package nosuchthing"));
         assert_eq!(reading.state, TaskState::Error);
+    }
+
+    #[test]
+    fn a_password_or_a_changed_config_file_waits_for_the_user() {
+        let apt = bundled("apt");
+        for prompt in [
+            "[sudo] password for user: ",
+            "[sudo: authenticate] Password: ",
+            "[sudo] user 的密码：",
+            "Password:",
+        ] {
+            assert_eq!(apt.read(&screen(prompt)).state, TaskState::Waiting, "{}", prompt);
+        }
+        let reading = apt.read(&screen(
+            "Configuration file '/etc/ssh/sshd_config'\n\
+             \x20==> Modified (by you or by a script) since installation.\n\
+             \x20==> Package distributor has shipped an updated version.\n\
+             \x20The default action is to keep your current version.\n\
+             *** sshd_config (Y/I/N/O/D/Z) [default=N] ? ",
+        ));
+        assert_eq!(reading.state, TaskState::Waiting);
+        // Once answered, it goes on.
+        let reading = apt.read(&screen(
+            "*** sshd_config (Y/I/N/O/D/Z) [default=N] ? N\n\
+             Setting up openssh-server (1:9.6p1-3ubuntu13.5) ...",
+        ));
+        assert_eq!(reading.state, TaskState::Running);
+
+        let brew = bundled("brew");
+        let reading = brew.read(&screen(
+            "==> Running installer for example with `sudo` (which may request your password)...\n\
+             Password:",
+        ));
+        assert_eq!(reading.state, TaskState::Waiting);
     }
 
     #[test]
@@ -390,6 +548,86 @@ mod tests {
 
         let reading = brew.read(&screen("Error: node: no bottle available!"));
         assert_eq!(reading.state, TaskState::Error);
+    }
+
+    #[test]
+    fn brew_downloading_in_parallel_says_how_far_the_whole_lot_is() {
+        let brew = bundled("brew");
+        // A line each, redrawn in place: 10.0 + 2.1 of 25.0 + 2.1 MB, and
+        // one whose size is not known yet.
+        let reading = brew.read(&screen(
+            "==> Fetching downloads for: node, ripgrep and python@3.13\n\
+             \u{2714}\u{FE0E} Bottle Manifest node (21.0.0)                 Downloaded   12.3KB/ 12.3KB\n\
+             \u{280B} Bottle node (21.0.0)          ##########       Downloading  10.0MB/ 25.0MB\n\
+             \u{2714}\u{FE0E} Bottle ripgrep (14.1.1)                       Downloaded    2.1MB/  2.1MB\n\
+             \u{2819} Bottle python@3.13 (3.13.1)                    Downloading   1.2MB/-------",
+        ));
+        assert_eq!(reading.state, TaskState::Running);
+        assert_eq!(reading.percent, Some(44));
+        assert_eq!(reading.detail.as_deref(), Some("1 of 3 downloaded"));
+
+        // A cask, and a pane too narrow for the version: counted all the same.
+        let reading = brew.read(&screen(
+            "==> Fetching downloads for: firefox\n\
+             \u{280B} Cask firefox (130.0)     ########       Downloading  40.0MB/ 80.0MB\n\
+             \u{280B} Bottle pyth ####  Downloading  20.0MB/ 20.0MB",
+        ));
+        assert_eq!(reading.percent, Some(60));
+        assert_eq!(reading.detail.as_deref(), Some("1 of 2 downloaded"));
+
+        // Lines an interrupted run left above this run's heading are not
+        // this run's.
+        let reading = brew.read(&screen(
+            "==> Fetching downloads for: foo\n\
+             \u{280B} Bottle foo (1.0)      ####         Downloading  10.0MB/ 25.0MB\n\
+             ^C\n\
+             $ brew install foo\n\
+             ==> Fetching downloads for: foo\n\
+             \u{2714}\u{FE0E} Bottle foo (1.0)                    Downloaded   25.0MB/ 25.0MB\n\
+             ==> Pouring foo--1.0.arm64_sonoma.bottle.tar.gz",
+        ));
+        assert_eq!(reading.percent, None);
+        assert_eq!(reading.detail.as_deref(), Some("Installing foo"));
+
+        // All of it down, and on to the next step: that step is what it says.
+        let reading = brew.read(&screen(
+            "\u{2714}\u{FE0E} Bottle node (21.0.0)                          Downloaded   25.0MB/ 25.0MB\n\
+             \u{2714}\u{FE0E} Bottle ripgrep (14.1.1)                       Downloaded    2.1MB/  2.1MB\n\
+             ==> Pouring node--21.0.0.arm64_sonoma.bottle.tar.gz",
+        ));
+        assert_eq!(reading.percent, None);
+        assert_eq!(reading.detail.as_deref(), Some("Installing node"));
+    }
+
+    #[test]
+    fn a_summing_rule_adds_up_counts_too() {
+        let rules = compile(
+            r#"
+            id = "demo"
+            programs = ["demo"]
+            [[rules]]
+            id = "jobs"
+            sum = true
+            region = "bottom_non_empty_lines(5)"
+            line_regex = ['^job \S+ (?P<done>\d+)/(?P<total>\d+)$']
+            detail = "{lines_done} of {lines} jobs"
+            "#,
+            "test",
+        )
+        .unwrap();
+        let reading = rules.read(&screen("job a 3/3\njob b 1/4\njob c 0/5"));
+        assert_eq!(reading.count, Some((4, 12)));
+        assert_eq!(reading.detail.as_deref(), Some("1 of 3 jobs"));
+        assert_eq!(rules.read(&screen("job a 3/3\njob b 4/4")).detail, None);
+    }
+
+    #[test]
+    fn sizes_read_in_their_units() {
+        assert_eq!(parse_size(" 10.0MB"), Some(10e6));
+        assert_eq!(parse_size("512.0 B"), Some(512.0));
+        assert_eq!(parse_size("2KiB"), Some(2048.0));
+        assert_eq!(parse_size("-------"), None);
+        assert_eq!(parse_size("3 parsecs"), None);
     }
 
     #[test]

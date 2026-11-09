@@ -7,12 +7,32 @@ id = "apt"
 programs = ["apt", "apt-get"]
 
 # "Do you want to continue? [Y/n] " -- the last line, waiting for an answer.
+# Some languages translate the choices too: "[J/n]", "[O/n]", "[Д/н]".
 [[rules]]
 id = "confirm"
 state = "waiting"
 priority = 300
 region = "bottom_non_empty_lines(1)"
-line_regex = ['\[Y/n\]\s*$', '\[y/N\]\s*$']
+line_regex = ['\[\p{Lu}/\p{Ll}\]\s*$', '\[\p{Ll}/\p{Lu}\]\s*$']
+
+# sudo asking for the password first: "[sudo] password for user: ", or
+# sudo-rs's "[sudo: authenticate] Password: "; "Password: " where the prompt
+# is left to the system.
+[[rules]]
+id = "password"
+state = "waiting"
+priority = 300
+region = "bottom_non_empty_lines(1)"
+line_regex = ['^\[sudo[^\]]*\] .*[:：]\s*$', '^Password:\s*$']
+
+# dpkg asking what to do about a configuration file you changed, partway
+# through an upgrade: "*** sshd_config (Y/I/N/O/D/Z) [default=N] ? ".
+[[rules]]
+id = "config_file"
+state = "waiting"
+priority = 300
+region = "bottom_non_empty_lines(1)"
+line_regex = ['^\*\*\* .+ \(Y/I/N/O/D/Z\) .*\?\s*$']
 
 # "E: Unable to locate package …"
 [[rules]]
@@ -54,9 +74,10 @@ line_regex = ['(?P<name>[a-z0-9][a-z0-9+.:-]*) \([^)]*\)(?: \S+ \([^)]*\))? \.\.
 detail = "{name}"
 
 # "Get:3 http://archive.ubuntu.com/ubuntu jammy-updates/main amd64 libssl3 amd64 3.0.2 [1,903 kB]"
+# An index ("… jammy-updates InRelease [128 kB]") has its size there instead.
 [[rules]]
 id = "downloading"
 priority = 100
 region = "bottom_non_empty_lines(6)"
-line_regex = ['^[^\s:]+:\d+ \S+://\S+ \S+ \S+ (?P<name>\S+) ']
+line_regex = ['^[^\s:]+:\d+ \S+://\S+ \S+ \S+ (?P<name>[^\s\[]\S*) ']
 detail = "Downloading {name}"
