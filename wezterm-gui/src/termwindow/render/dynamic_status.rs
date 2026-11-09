@@ -2892,14 +2892,24 @@ impl crate::TermWindow {
         }
         if any_pane {
             // A pane an agent runs in is the agent's to show, whatever it
-            // says on the dynamic status or not.
+            // says on the dynamic status or not. So is one a tool with task
+            // rules runs in, once its rules read anything, whatever progress
+            // it reports too: one thing, said once.
             let agent_panes: HashSet<PaneId> = all_agents.iter().map(|agent| agent.pane_id).collect();
+            let runs = &self.dynamic_status.finished.runs;
+            let task_pane = |pane_id: &PaneId| {
+                runs.get(pane_id)
+                    .and_then(|run| run.reading.as_ref())
+                    .is_some_and(reading_says_anything)
+            };
             if let Some((_, panes)) = &self.dynamic_status.panes {
                 items.extend(
                     panes
                         .iter()
                         .filter(|pane| {
-                            !agent_panes.contains(&pane.pane_id) && !on_screen.contains(&pane.pane_id)
+                            !agent_panes.contains(&pane.pane_id)
+                                && !task_pane(&pane.pane_id)
+                                && !on_screen.contains(&pane.pane_id)
                         })
                         .cloned()
                         .map(StatusItem::Pane),
@@ -2945,13 +2955,19 @@ impl crate::TermWindow {
         }
         if any_task {
             // A tool out of sight, as its task rules last read it; one on
-            // screen tells the user itself.
+            // screen tells the user itself. Rules that have read nothing
+            // give way to the progress the tool reports, if it does.
             let mux = Mux::get();
             for (pane_id, run) in &self.dynamic_status.finished.runs {
                 let Some(reading) = &run.reading else {
                     continue;
                 };
                 if on_screen.contains(pane_id) {
+                    continue;
+                }
+                if !reading_says_anything(reading)
+                    && items.iter().any(|item| matches!(item, StatusItem::Pane(pane) if pane.pane_id == *pane_id))
+                {
                     continue;
                 }
                 let here = mux
@@ -3443,6 +3459,15 @@ fn status_content(item: &StatusItem) -> CardContent {
     }
 }
 
+/// Whether a tool's rules have read anything off its screen: a state, a
+/// number or what it is doing, rather than only that it is running.
+fn reading_says_anything(reading: &TaskReading) -> bool {
+    reading.state != TaskState::Running
+        || reading.percent.is_some()
+        || reading.count.is_some()
+        || reading.detail.is_some()
+}
+
 /// Where a card in `rect` has its mark and name, its text reaching to `end`.
 fn card_head(fonts: &Fonts, rect: RectF, end: f32, px: &impl Fn(f32) -> f32) -> Head {
     let mid = rect.min_y() + rect.size.height / 2.0;
@@ -3646,6 +3671,22 @@ fn status_mark(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rules_that_read_nothing_leave_a_tool_to_its_own_progress() {
+        let mut reading = TaskReading {
+            name: "apt".into(),
+            ..TaskReading::default()
+        };
+        assert!(!reading_says_anything(&reading));
+        reading.detail = Some("Setting up libssl3".into());
+        assert!(reading_says_anything(&reading));
+        let waiting = TaskReading {
+            state: TaskState::Waiting,
+            ..TaskReading::default()
+        };
+        assert!(reading_says_anything(&waiting));
+    }
 
     #[test]
     fn an_agent_that_worked_a_while_and_stayed_stopped_is_finished() {
