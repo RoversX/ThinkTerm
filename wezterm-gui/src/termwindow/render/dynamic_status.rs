@@ -108,6 +108,10 @@ const VANISH: Duration = Duration::from_millis(480);
 const SWAP: Duration = Duration::from_millis(420);
 /// The pill easing to the width of a new name.
 const PILL_RESIZE: Duration = Duration::from_millis(480);
+/// How often a turning ring on the pill or a disc is drawn: smooth enough
+/// to read as turning, rather than the sidebar spinners' dozen steps a
+/// second. A card's, twice the size, takes every frame the display gives.
+const RING_FRAME: Duration = Duration::from_millis(33);
 /// A progress ring easing to a new reading: readings come a second or two
 /// apart, and the ring would otherwise jump from one to the next.
 const BAR_EASE: Duration = Duration::from_millis(600);
@@ -1769,6 +1773,7 @@ impl crate::TermWindow {
 
         let mut drawn: Vec<RectF> = vec![front_rect];
         let mut turning = false;
+        let mut turning_open = false;
         let mut hits: Vec<UIItem> = Vec::new();
         let mut shown_keys = Vec::new();
         let interactive = !going && content_in > 0.9;
@@ -1807,7 +1812,7 @@ impl crate::TermWindow {
             self.paint_status_surface(&mut layers, &ctx, &ink, rect, surface)?;
             drawn.push(rect);
             shown_keys.push(item.key());
-            turning |= content(*item_index).bar == Some(None);
+            turning_open |= content(*item_index).bar == Some(None);
             let mut buttons = Vec::new();
             self.paint_status_card(
                 &mut layers,
@@ -1949,7 +1954,7 @@ impl crate::TermWindow {
         let mut front_buttons = Vec::new();
         if open_alpha > 0.001 {
             shown_keys.push(items[front_open].key());
-            turning |= content(front_open).bar == Some(None);
+            turning_open |= content(front_open).bar == Some(None);
             let (was, is) = swap_mix(card_from.as_ref().map(|(_, at)| *at));
             if let Some((from, _)) = card_from.as_ref() {
                 self.paint_status_card(&mut layers, &ctx, &fonts, &ink, front_rect, from, open_alpha * was, &mut Vec::new(), true, true, &px)?;
@@ -1988,8 +1993,9 @@ impl crate::TermWindow {
         drop(layers);
 
         // Only what is on screen and moves on its own asks for frames. A
-        // ring with no fraction turns, folded or open, on the spinners'
-        // shared clock. A transfer's numbers are read a few times a second.
+        // ring with no fraction turns some thirty frames a second folded,
+        // and every frame on an open card. A transfer's numbers are read a
+        // few times a second.
         // A program's own progress is announced when it changes, and paints
         // then.
         let counting = items.iter().any(|item| {
@@ -2063,8 +2069,12 @@ impl crate::TermWindow {
             if let Some(deadline) = self.dynamic_status.finished.deadline() {
                 self.update_next_frame_time(Some(deadline));
             }
-            if turning {
-                self.request_spinner_frame();
+            if turning_open {
+                // The next frame the display gives: a deadline goes through
+                // a timer, and comes a frame late.
+                self.update_next_frame_time(Some(now));
+            } else if turning {
+                self.update_next_frame_time(Some(now + RING_FRAME));
             }
             if counting {
                 self.update_next_frame_time(Some(now + COUNT_EVERY));
@@ -2695,13 +2705,16 @@ impl crate::TermWindow {
         color: LinearRgba,
         alpha: f32,
     ) -> anyhow::Result<()> {
-        // A turning ring runs on the spinners' clock, which every spinner in
-        // the window shares.
+        // A turning ring goes round smoothly, by the wall clock, so every
+        // ring in every window is at the same angle.
         let turn = match fraction {
             Some(_) => 0.0,
             None => {
-                let frames = crate::termwindow::ui::status_icon::spinner_frames();
-                (frames % SPIN_STEPS) as f32 / SPIN_STEPS as f32
+                let millis = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                (millis % RING_TURN_MS) as f32 / RING_TURN_MS as f32
             }
         };
         paint_ring(
@@ -3595,8 +3608,8 @@ fn ui_item(rect: RectF, item_type: UIItemType) -> UIItem {
     }
 }
 
-/// Steps of the spinners' clock to one turn of an indeterminate ring.
-const SPIN_STEPS: u128 = 12;
+/// One turn of an indeterminate ring, in milliseconds.
+const RING_TURN_MS: u128 = 1000;
 
 /// Whether the dynamic status shows an agent in `state`: waiting on the user,
 /// stopped on an error, or saying how far it has got. From the parts a pane
