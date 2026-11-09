@@ -24,6 +24,7 @@ use crate::ui::draw::DrawContext;
 use crate::utilsprites::RenderMetrics;
 use anyhow::Context;
 use mux::pane::PaneId;
+use mux::task_status::{TaskReading, TaskState};
 use mux::Mux;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -53,6 +54,7 @@ const PILL_MARK: f32 = 20.0;
 const PILL_GAP: f32 = 9.0;
 const PILL_NAME_MAX: f32 = 190.0;
 const PILL_RING: f32 = 16.0;
+const PILL_RING_STROKE: f32 = 2.4;
 const WAIT_DOT: f32 = 8.0;
 /// The disc the second thing splits off into, and the count of the rest.
 const SATELLITE_GAP: f32 = 6.0;
@@ -70,6 +72,7 @@ const CARD_PAD_RIGHT: f32 = 12.0;
 const CARD_MARK: f32 = 36.0;
 const CARD_GAP: f32 = 11.0;
 const CARD_RING: f32 = 34.0;
+const CARD_RING_STROKE: f32 = 3.0;
 const BUTTON: f32 = 36.0;
 const BUTTON_GLYPH: f32 = 15.0;
 const BUTTON_GAP: f32 = 7.0;
@@ -105,6 +108,12 @@ const VANISH: Duration = Duration::from_millis(480);
 const SWAP: Duration = Duration::from_millis(420);
 /// The pill easing to the width of a new name.
 const PILL_RESIZE: Duration = Duration::from_millis(480);
+/// A progress ring easing to a new reading: readings come a second or two
+/// apart, and the ring would otherwise jump from one to the next.
+const BAR_EASE: Duration = Duration::from_millis(600);
+/// A reading that falls back by more than this -- a download done, the
+/// install starting from nothing -- is jumped to, not wound back.
+const BAR_FALLBACK: f32 = 0.05;
 const RESIZE_OVERSHOOT: f32 = 0.05;
 /// A disc beside the pill popping up in its place, and shrinking away.
 const SATELLITE_IN: Duration = Duration::from_millis(600);
@@ -129,6 +138,16 @@ const FINISHED_MAX: usize = 3;
 /// Work shorter than this is not news when it ends -- a one-line answer --
 /// as the finished sound has it.
 const FINISHED_AFTER: Duration = Duration::from_secs(5);
+/// A command that ran shorter than this is not news when it ends.
+const COMMAND_AFTER: Duration = Duration::from_secs(10);
+/// How long before the shell is seen back its last output may be, to be
+/// taken as the prompt that ended the command: a pane out of sight is looked
+/// at again some six seconds late at worst (a five-second floor, a batch and
+/// a confirmation), while a window of a mux client hears of such a pane's
+/// output only now and then -- an older print is not the end.
+const END_LOOKBACK: Duration = Duration::from_secs(8);
+/// How late an exit report may update a notice after the shell was observed.
+const EXIT_MATCH: Duration = Duration::from_secs(3);
 /// How long an agent has to stay stopped to have finished: its state can
 /// flicker to idle for a moment mid-task, as a thread's running does
 /// (the sidebar holds it through 800 ms for the same reason).
@@ -163,6 +182,8 @@ const AGENTS_STALE: Duration = Duration::from_secs(2);
 pub(crate) enum StatusKey {
     Pane(PaneId),
     Transfer(u64),
+    /// A tool running in a pane, as its task rules read its screen.
+    Task(PaneId),
     /// An agent that has just finished, by its pane: apart from the same
     /// agent's own card, which it never shows beside.
     Finished(PaneId),
@@ -204,14 +225,75 @@ pub(crate) enum StatusItem {
         index: usize,
         here: bool,
     },
+    /// A long command that has just ended in a pane out of sight.
+    Command {
+        notice: FinishedAgent,
+        command: FinishedCommand,
+        here: bool,
+    },
+    /// A tool at work in a pane out of sight -- a package manager, say --
+    /// as its task rules read its screen.
+    Task {
+        pane_id: PaneId,
+        name: String,
+        reading: TaskReading,
+        /// When it came to be in its state, as this window heard it.
+        since: Instant,
+        here: bool,
+    },
 }
 
-/// An agent that has just finished, as one window shows it.
-#[derive(Clone, Copy)]
+/// A command that ran a while and ended: what it was, for how long, how
+/// it ended when the shell said, and the thread it ran in.
+#[derive(Clone)]
+pub(crate) struct FinishedCommand {
+    label: String,
+    took: Duration,
+    exit: Option<i32>,
+    /// Its task rules last read an error off its screen.
+    saw_error: bool,
+    place: String,
+}
+
+impl FinishedCommand {
+    /// It said it failed: a non-zero status, or, without the shell's word,
+    /// an error its screen showed last. Otherwise it is taken to have
+    /// finished.
+    fn failed(&self) -> bool {
+        match self.exit {
+            Some(code) => code != 0,
+            None => self.saw_error,
+        }
+    }
+}
+
+/// A command running in a pane, as its foreground program shows it.
+struct Run {
+    label: String,
+    since: Instant,
+    /// When the pane last printed while it ran: the shell's prompt coming
+    /// back is when it ended, which a pane out of sight is only looked at
+    /// again some seconds after.
+    printed: Option<Instant>,
+    /// An agent ran in it: the agent's own card says when it is done.
+    agent: bool,
+    /// What it is doing, when it is a tool with task rules: read off its
+    /// screen where the pane lives (`mux::task_status`) and pushed with its
+    /// foreground program; and when it came to be in that state.
+    reading: Option<TaskReading>,
+    state_since: Instant,
+    /// The shell's exit report, retained until this run is removed.
+    exit: Option<i32>,
+}
+
+/// An agent that has just finished, or a command, as one window shows it.
+#[derive(Clone)]
 pub(crate) struct FinishedAgent {
     pane_id: PaneId,
     shown_at: Instant,
     paused_at: Option<Instant>,
+    /// What ended, when it was a command rather than an agent.
+    command: Option<FinishedCommand>,
 }
 
 /// What one window knows of agents finishing: since when each one at work
@@ -223,18 +305,67 @@ pub(crate) struct FinishedAgents {
     /// [`FINISHED_SETTLE`].
     stopping: HashMap<PaneId, Instant>,
     shown: Vec<FinishedAgent>,
+    /// Commands running in panes, and how the last one in each ended, as
+    /// the shell said, while the pane has yet to show its prompt again.
+    runs: HashMap<PaneId, Run>,
+    seeded: bool,
 }
 
 impl FinishedAgents {
+    /// Read existing panes once; unchanged mux readings need not be republished.
+    fn seed(
+        &mut self,
+        now: Instant,
+        panes: impl IntoIterator<Item = (PaneId, Option<thinkterm_proto::ForegroundProgram>)>,
+    ) {
+        for (pane_id, program) in panes {
+            if !self.runs.contains_key(&pane_id) {
+                self.observe_program(now, pane_id, program.as_ref(), true, String::new);
+            }
+        }
+        self.seeded = true;
+    }
+
+    fn observe_program(
+        &mut self,
+        now: Instant,
+        pane_id: PaneId,
+        program: Option<&thinkterm_proto::ForegroundProgram>,
+        in_sight: bool,
+        place: impl FnOnce() -> String,
+    ) -> bool {
+        // An SSH-domain prompt has no local leader and clears its reported
+        // program. With no previous run, an unknown pane is simply a no-op.
+        self.program(
+            now,
+            pane_id,
+            program.and_then(running_command),
+            program.and_then(|program| program.task.clone()),
+            in_sight,
+            place,
+        )
+    }
+
     /// An agent's state, as it changes. Stopping after work starts the wait
     /// for it to stay stopped; working again, waiting, failing or ending
     /// takes it off, or out of the wait. More news of it still idle -- a new
     /// title, its result seen elsewhere -- leaves it as it is. True when it
     /// started to wait, and so wants a frame to see it through.
     fn note(&mut self, now: Instant, pane_id: PaneId, state: Option<AgentState>) -> bool {
+        // An agent at work in the pane: whatever ran there was the agent.
+        // Every pane hears of its agent status, an idle or unknown one in
+        // a plain shell too, so only work says an agent was there.
+        if matches!(
+            state,
+            Some(AgentState::Working | AgentState::Blocked | AgentState::Error)
+        ) {
+            if let Some(run) = self.runs.get_mut(&pane_id) {
+                run.agent = true;
+            }
+        }
         match state {
             Some(AgentState::Working) => {
-                self.shown.retain(|agent| agent.pane_id != pane_id);
+                self.drop_agent(pane_id);
                 // A flicker of idle: the same run, still counted from its start.
                 self.stopping.remove(&pane_id);
                 self.working.entry(pane_id).or_insert(now);
@@ -247,9 +378,13 @@ impl FinishedAgents {
                 self.stopping.insert(pane_id, now);
                 true
             }
-            // Waiting, failed, ended or unknown: not a finish.
+            // Waiting, failed, ended or unknown -- or no agent at all, as
+            // in a shell: not an agent's finish. A command's notice is the
+            // command's own.
             _ => {
-                self.forget(pane_id);
+                self.working.remove(&pane_id);
+                self.stopping.remove(&pane_id);
+                self.drop_agent(pane_id);
                 false
             }
         }
@@ -259,6 +394,9 @@ impl FinishedAgents {
     /// long enough -- unless the Status panel lists them. True when one went
     /// on.
     fn settle(&mut self, now: Instant, listed: bool) -> bool {
+        if listed {
+            self.shown.retain(|notice| notice.command.is_some());
+        }
         let settled: Vec<(PaneId, Instant)> = self
             .stopping
             .iter()
@@ -275,11 +413,12 @@ impl FinishedAgents {
             if !worked || listed {
                 continue;
             }
-            self.shown.retain(|agent| agent.pane_id != pane_id);
+            self.drop_agent(pane_id);
             self.shown.push(FinishedAgent {
                 pane_id,
                 shown_at: now,
                 paused_at: None,
+                command: None,
             });
             on = true;
         }
@@ -288,10 +427,127 @@ impl FinishedAgents {
         on
     }
 
+    /// Take an agent's notice off; a command's in the same pane stays.
+    fn drop_agent(&mut self, pane_id: PaneId) {
+        self.shown
+            .retain(|notice| notice.pane_id != pane_id || notice.command.is_some());
+    }
+
     fn forget(&mut self, pane_id: PaneId) {
+        self.runs.remove(&pane_id);
         self.working.remove(&pane_id);
         self.stopping.remove(&pane_id);
         self.shown.retain(|agent| agent.pane_id != pane_id);
+    }
+
+    /// A pane's foreground program, as it changes: `running` names the
+    /// command when one runs, `None` is the shell at its prompt. A command
+    /// that ran long enough and ends out of sight puts its notice on, with
+    /// how it ended if the shell said. True when it went on.
+    fn program(
+        &mut self,
+        now: Instant,
+        pane_id: PaneId,
+        running: Option<String>,
+        task: Option<TaskReading>,
+        in_sight: bool,
+        place: impl FnOnce() -> String,
+    ) -> bool {
+        let Some(label) = running else {
+            let Some(run) = self.runs.remove(&pane_id) else {
+                return false;
+            };
+            let exit = run.exit;
+            let ended = run
+                .printed
+                .filter(|printed| *printed > run.since && now.duration_since(*printed) <= END_LOOKBACK)
+                .unwrap_or(now);
+            let took = ended.duration_since(run.since);
+            if run.agent || in_sight || took < COMMAND_AFTER {
+                return !in_sight && run.reading.is_some();
+            }
+            let saw_error = run
+                .reading
+                .as_ref()
+                .is_some_and(|reading| reading.state == TaskState::Error);
+            self.shown.retain(|notice| notice.pane_id != pane_id);
+            self.shown.push(FinishedAgent {
+                pane_id,
+                shown_at: now,
+                paused_at: None,
+                command: Some(FinishedCommand {
+                    label: run.reading.map_or(run.label, |reading| reading.name),
+                    took,
+                    exit,
+                    saw_error,
+                    place: place(),
+                }),
+            });
+            let excess = self.shown.len().saturating_sub(FINISHED_MAX);
+            self.shown.drain(..excess);
+            return true;
+        };
+        if let Some(run) = self.runs.get_mut(&pane_id) {
+            // What the tool is doing now; a handover to another program of
+            // the same tool -- `brew` to Ruby running `brew.rb` -- is the
+            // same run. A new reading of one out of sight wants a paint.
+            if run.reading == task {
+                return false;
+            }
+            let state = |reading: &Option<TaskReading>| reading.as_ref().map(|reading| reading.state);
+            if state(&run.reading) != state(&task) {
+                run.state_since = now;
+            }
+            run.reading = task;
+            return !in_sight;
+        } else {
+            // Another command: what the last one left behind is over.
+            self.shown
+                .retain(|notice| notice.pane_id != pane_id || notice.command.is_none());
+            self.runs.insert(
+                pane_id,
+                Run {
+                    label,
+                    since: now,
+                    printed: None,
+                    agent: false,
+                    reading: task,
+                    state_since: now,
+                    exit: None,
+                },
+            );
+        }
+        false
+    }
+
+    /// A pane printed. Only a pane running a command is noted; nothing is
+    /// looked up for the rest, however much they print.
+    fn printed(&mut self, now: Instant, pane_id: PaneId) {
+        if self.runs.is_empty() {
+            return;
+        }
+        if let Some(run) = self.runs.get_mut(&pane_id) {
+            run.printed = Some(now);
+        }
+    }
+
+    /// The shell said how a command ended (OSC 133). Usually before it takes
+    /// the foreground back, so kept for that; just after, it goes on the
+    /// notice already up. True when a notice changed.
+    fn exit(&mut self, now: Instant, pane_id: PaneId, code: Option<i32>) -> bool {
+        if let Some(command) = self
+            .shown
+            .iter_mut()
+            .filter(|notice| notice.pane_id == pane_id && now.duration_since(notice.shown_at) <= EXIT_MATCH)
+            .find_map(|notice| notice.command.as_mut())
+        {
+            command.exit = code;
+            return true;
+        }
+        if let Some(run) = self.runs.get_mut(&pane_id) {
+            run.exit = code;
+        }
+        false
     }
 
     /// Run each one's clock while it is in `visible` and nothing holds it;
@@ -338,6 +594,8 @@ impl StatusItem {
             Self::Pane(pane) => StatusKey::Pane(pane.pane_id),
             Self::Update(_) => StatusKey::Update,
             Self::Finished { agent, .. } => StatusKey::Finished(agent.pane_id),
+            Self::Command { notice, .. } => StatusKey::Finished(notice.pane_id),
+            Self::Task { pane_id, .. } => StatusKey::Task(*pane_id),
         }
     }
 
@@ -363,6 +621,18 @@ impl StatusItem {
             Self::Update(status) => update_capsule::rank(status),
             // With what has just finished.
             Self::Finished { .. } => 2,
+            Self::Command { command, .. } => {
+                if command.failed() {
+                    1
+                } else {
+                    2
+                }
+            }
+            Self::Task { reading, .. } => match reading.state {
+                TaskState::Waiting => 0,
+                TaskState::Error => 1,
+                TaskState::Running => 3,
+            },
         }
     }
 
@@ -381,6 +651,7 @@ impl StatusItem {
                 .map_or(now, |(_, at)| *at),
             Self::Transfer(CardView::Toast(toast)) => toast.shown_at,
             Self::Finished { agent, .. } => agent.shown_at,
+            Self::Command { notice, .. } => notice.shown_at,
             _ => first_seen.get(&self.key()).copied().unwrap_or(now),
         }
     }
@@ -405,6 +676,18 @@ impl StatusItem {
             },
             Self::Update(status) => update_capsule::phase(status),
             Self::Finished { .. } => 13,
+            Self::Command { command, .. } => {
+                if command.failed() {
+                    15
+                } else {
+                    14
+                }
+            }
+            Self::Task { reading, .. } => match reading.state {
+                TaskState::Running => 16,
+                TaskState::Waiting => 17,
+                TaskState::Error => 18,
+            },
         }
     }
 
@@ -426,7 +709,13 @@ impl StatusItem {
             Self::Transfer(CardView::Running { .. }) => true,
             Self::Pane(_) => false,
             Self::Update(status) => update_capsule::is_news(status),
-            Self::Finished { .. } => true,
+            Self::Finished { .. } | Self::Command { .. } => true,
+            // A tool that has just stopped to ask, or just failed, is news;
+            // working is not, and nor is one that only came into view
+            // because its tab was switched away from.
+            Self::Task { reading, since, .. } => {
+                reading.state != TaskState::Running && now.duration_since(*since) <= NEWS_FOR
+            }
         }
     }
 
@@ -442,6 +731,10 @@ impl StatusItem {
             Self::Finished { agent, here, .. } => {
                 Some(UIItemType::DynamicStatusReveal(agent.pane_id, *here))
             }
+            Self::Command { notice, here, .. } => {
+                Some(UIItemType::DynamicStatusReveal(notice.pane_id, *here))
+            }
+            Self::Task { pane_id, here, .. } => Some(UIItemType::DynamicStatusReveal(*pane_id, *here)),
             Self::Transfer(_) | Self::Update(_) => None,
         }
     }
@@ -520,6 +813,8 @@ pub(crate) struct DynamicStatus {
     more: Option<(Timeline, Timeline)>,
     /// Cards gone from the stack, still going.
     leaving: Vec<Leaving>,
+    /// Each progress ring's fraction, easing from one reading to the next.
+    bars: HashMap<StatusKey, Timeline>,
     /// Each thing's state as the dynamic status last saw it (see
     /// [`StatusItem::phase`]).
     phases: HashMap<StatusKey, u8>,
@@ -918,6 +1213,7 @@ impl DynamicStatus {
                 .more
                 .as_ref()
                 .is_some_and(|(slot, here)| slot.is_running() || here.is_running())
+            || self.bars.values().any(Timeline::is_running)
     }
 
     /// Step every clock; let go of what has finished going. Says whether
@@ -953,6 +1249,7 @@ impl DynamicStatus {
             step(slot);
             step(here);
         }
+        self.bars.values_mut().for_each(&mut step);
         for gone in self.leaving.iter_mut().chain(self.leaving_discs.iter_mut()) {
             step(&mut gone.here);
         }
@@ -1006,6 +1303,30 @@ struct Fonts {
     small_line: f32,
 }
 
+/// Where a thing's mark and name sit, on the pill or on its card: the
+/// mark's centre and size, and the name's top left and room.
+#[derive(Clone, Copy)]
+struct Head {
+    mark_x: f32,
+    mark: f32,
+    name_x: f32,
+    name_y: f32,
+    name_width: f32,
+}
+
+impl Head {
+    fn lerp(self, to: Head, t: f32) -> Head {
+        let mix = |a: f32, b: f32| a + (b - a) * t;
+        Head {
+            mark_x: mix(self.mark_x, to.mark_x),
+            mark: mix(self.mark, to.mark),
+            name_x: mix(self.name_x, to.name_x),
+            name_y: mix(self.name_y, to.name_y),
+            name_width: mix(self.name_width, to.name_width),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tone {
     Progress,
@@ -1016,15 +1337,16 @@ pub(crate) enum Tone {
 }
 
 /// What stands for a thing: a transfer's icon, or a program's own mark.
-pub(crate) enum Mark<'a> {
+pub(crate) enum Mark {
     Icon(SvgIcon),
-    Agent(&'a AgentPaneStatus),
+    /// The pane's tab icon, as its tab and its thread's row in the sidebar
+    /// show it -- for an agent too, so one pane looks the same everywhere.
     Pane(PaneId),
 }
 
 /// What a card says and offers, whatever its state.
-pub(crate) struct CardContent<'a> {
-    pub mark: Mark<'a>,
+pub(crate) struct CardContent {
+    pub mark: Mark,
     pub tone: Tone,
     pub name: String,
     pub detail: String,
@@ -1295,11 +1617,33 @@ impl crate::TermWindow {
             .chain(above.iter().copied())
             .filter(|index| *index < items.len())
             .collect();
-        let contents: Vec<Option<CardContent>> = items
+        let mut contents: Vec<Option<CardContent>> = items
             .iter()
             .enumerate()
             .map(|(index, item)| drawn_items.contains(&index).then(|| status_content(item)))
             .collect();
+        // A ring eases to each new reading rather than jumping to it.
+        let bars = &mut self.dynamic_status.bars;
+        bars.retain(|key, _| items.iter().any(|item| item.key() == *key));
+        for (item, content) in items.iter().zip(contents.iter_mut()) {
+            let Some(content) = content else {
+                continue;
+            };
+            let key = item.key();
+            let Some(Some(reading)) = content.bar else {
+                bars.remove(&key);
+                continue;
+            };
+            let bar = bars
+                .entry(key)
+                .or_insert_with(|| Timeline::settled(now, reading));
+            if reading < bar.value(now) - BAR_FALLBACK {
+                *bar = Timeline::settled(now, reading);
+            } else if (bar.target() - reading).abs() > f32::EPSILON {
+                bar.retarget(now, reading, BAR_EASE, Easing::OutCubic);
+            }
+            content.bar = Some(Some(bar.value(now).clamp(0.0, 1.0)));
+        }
         let content = |index: usize| {
             contents[index]
                 .as_ref()
@@ -1432,7 +1776,7 @@ impl crate::TermWindow {
             let surface = smoothstep(rise * 2.5) * smoothstep(here * 1.6) * content_in;
             let shown = smoothstep((rise - 0.55) / 0.45) * smoothstep((here - 0.35) / 0.65) * content_in;
             self.paint_status_surface(&mut layers, &ctx, &ink, rect, surface)?;
-            self.paint_status_card(&mut layers, &ctx, &fonts, &ink, rect, content, shown, &mut Vec::new(), &px)?;
+            self.paint_status_card(&mut layers, &ctx, &fonts, &ink, rect, content, shown, &mut Vec::new(), true, true, &px)?;
         }
 
         // The cards above the front one, rising out of it, each in its place.
@@ -1467,6 +1811,8 @@ impl crate::TermWindow {
                 content(*item_index),
                 shown,
                 &mut buttons,
+                true,
+                true,
                 &px,
             )?;
             if interactive && rise > 0.9 && here > 0.9 {
@@ -1546,6 +1892,7 @@ impl crate::TermWindow {
                 self.paint_status_satellite(
                     &mut layers, &ctx, &fonts, &ink, rect, content(index), rest, fade, fade, &px,
                 )?;
+                turning |= content(index).bar == Some(None);
                 shown_keys.push(item.key());
                 drawn.push(rect);
             }
@@ -1555,10 +1902,20 @@ impl crate::TermWindow {
         // giving way to the other's, and either one's old content to its new.
         self.paint_status_surface(&mut layers, &ctx, &ink, front_rect, surface_in)?;
         let folded_alpha = (1.0 - smoothstep(open_amount / 0.4)) * content_in;
+        // The pill opening into its own card -- not into another thing's
+        // (a banner), and not while either gives way to new content.
+        let travel = front_open == 0 && pill_from.is_none() && card_from.is_none();
+        // Its ring goes with it when the card has one where the pill does:
+        // a card with buttons in its place has none.
+        let travel_ring = travel
+            && content(0).bar.is_some()
+            && content(0).tone != Tone::Waiting
+            && content(0).actions.is_empty();
         let open_alpha = smoothstep((open_amount - 0.45) / 0.45) * content_in;
         if folded_alpha > 0.001 {
             let first_seen = dynamic.first_seen.get(&items[0].key()).copied();
             shown_keys.push(items[0].key());
+            turning |= content(0).bar == Some(None);
             if content(0).tone == Tone::Waiting
                 && first_seen.is_some_and(|at| now.duration_since(at) < PULSE_FOR)
             {
@@ -1566,7 +1923,7 @@ impl crate::TermWindow {
             }
             let (was, is) = swap_mix(pill_from.as_ref().map(|(_, at)| *at));
             if let Some((from, _)) = pill_from.as_ref() {
-                self.paint_status_pill(&mut layers, &ctx, &fonts, &ink, front_rect, from, folded_alpha * was, None, &px)?;
+                self.paint_status_pill(&mut layers, &ctx, &fonts, &ink, front_rect, from, folded_alpha * was, None, true, true, &px)?;
             }
             self.paint_status_pill(
                 &mut layers,
@@ -1577,6 +1934,8 @@ impl crate::TermWindow {
                 content(0),
                 folded_alpha * is,
                 first_seen.map(|at| now.duration_since(at)),
+                !travel,
+                !travel_ring,
                 &px,
             )?;
         }
@@ -1586,7 +1945,7 @@ impl crate::TermWindow {
             turning |= content(front_open).bar == Some(None);
             let (was, is) = swap_mix(card_from.as_ref().map(|(_, at)| *at));
             if let Some((from, _)) = card_from.as_ref() {
-                self.paint_status_card(&mut layers, &ctx, &fonts, &ink, front_rect, from, open_alpha * was, &mut Vec::new(), &px)?;
+                self.paint_status_card(&mut layers, &ctx, &fonts, &ink, front_rect, from, open_alpha * was, &mut Vec::new(), true, true, &px)?;
             }
             self.paint_status_card(
                 &mut layers,
@@ -1597,8 +1956,15 @@ impl crate::TermWindow {
                 content(front_open),
                 open_alpha * is,
                 &mut front_buttons,
+                !travel,
+                !travel_ring,
                 &px,
             )?;
+        }
+        // The same thing folded and open: its mark and name go from the one
+        // to the other themselves.
+        if travel {
+            self.paint_status_head(&mut layers, &ctx, &fonts, &ink, front_rect, content(0), open_amount, content_in, travel_ring, &px)?;
         }
         if interactive && grow > 0.9 {
             hits.push(ui_item(
@@ -1615,10 +1981,8 @@ impl crate::TermWindow {
         drop(layers);
 
         // Only what is on screen and moves on its own asks for frames. A
-        // ring with no fraction turns only on an open card, on the spinners'
-        // shared clock: folded it keeps still, as a window redrawn a dozen
-        // times a second for minutes on end, for a ring in its corner, is
-        // not worth it. A transfer's numbers are read a few times a second.
+        // ring with no fraction turns, folded or open, on the spinners'
+        // shared clock. A transfer's numbers are read a few times a second.
         // A program's own progress is announced when it changes, and paints
         // then.
         let counting = items.iter().any(|item| {
@@ -1662,7 +2026,10 @@ impl crate::TermWindow {
                 .iter()
                 .filter_map(|key| match key {
                     StatusKey::Transfer(id) => Some(*id),
-                    StatusKey::Pane(_) | StatusKey::Update | StatusKey::Finished(_) => None,
+                    StatusKey::Pane(_)
+                    | StatusKey::Update
+                    | StatusKey::Finished(_)
+                    | StatusKey::Task(_) => None,
                 })
                 .collect();
             // Nor while the window is out of sight -- minimised, covered,
@@ -1731,6 +2098,86 @@ impl crate::TermWindow {
     }
 
     /// The width of what follows the name on the pill, with its gap.
+    /// How far right a card's text may reach in `rect`: left of its
+    /// buttons, or of its ring and number. As `paint_status_card` lays it out.
+    fn card_text_end(&self, fonts: &Fonts, rect: RectF, content: &CardContent, px: &impl Fn(f32) -> f32) -> anyhow::Result<f32> {
+        let mut end = rect.max_x() - px(CARD_PAD_RIGHT);
+        end -= content.actions.len() as f32 * px(BUTTON + BUTTON_GAP);
+        if let Some(fraction) = content.bar {
+            if content.actions.is_empty() {
+                end -= px(CARD_RING) + px(BUTTON_GAP);
+            }
+            if let Some(fraction) = fraction {
+                let number = format!("{}", (fraction * 100.0).floor() as u32);
+                let percent_width = self.sidebar_text_width(&fonts.body, "%")?.ceil();
+                let number_width = self.sidebar_text_width(&fonts.big, &number)?.ceil();
+                end -= percent_width + px(1.0) + number_width + px(BUTTON_GAP);
+            }
+        }
+        Ok(end)
+    }
+
+    /// The mark and name of the thing the pill opens into, travelling from
+    /// where the pill has them to where its card does as it opens (`t`, 0 to
+    /// 1): one name moving, rather than one fading as another comes. The
+    /// pill's square mark gives way to the card's round one on the way.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_status_head(
+        &self,
+        layers: &mut crate::quad::TripleLayerQuadAllocator,
+        ctx: &DrawContext,
+        fonts: &Fonts,
+        ink: &Ink,
+        rect: RectF,
+        content: &CardContent,
+        t: f32,
+        alpha: f32,
+        ring: bool,
+        px: &impl Fn(f32) -> f32,
+    ) -> anyhow::Result<()> {
+        if alpha <= 0.001 {
+            return Ok(());
+        }
+        let t = t.clamp(0.0, 1.0);
+        let mix = |a: f32, b: f32| a + (b - a) * t;
+        let mid = rect.min_y() + rect.size.height / 2.0;
+        let folded = self.pill_head(fonts, rect, content, px)?;
+        let open = card_head(fonts, rect, self.card_text_end(fonts, rect, content, px)?, px);
+        let place = folded.lerp(open, t);
+        // The ring too: from the pill's end, small, to the card's, large.
+        if let (true, Some(fraction)) = (ring, content.bar) {
+            let pill_cx = folded.name_x + folded.name_width + px(PILL_GAP) + px(PILL_RING) / 2.0;
+            let card_cx = rect.max_x() - px(CARD_PAD_RIGHT) - px(CARD_RING) / 2.0;
+            self.paint_status_ring(
+                layers,
+                ctx,
+                ink,
+                (mix(pill_cx, card_cx), mid),
+                mix(px(PILL_RING), px(CARD_RING)),
+                mix(px(PILL_RING_STROKE), px(CARD_RING_STROKE)),
+                fraction,
+                ink.accent,
+                alpha,
+            )?;
+        }
+        if t < 0.999 {
+            self.paint_status_tile(layers, ctx, ink, content, place.mark_x - place.mark / 2.0, mid, place.mark, alpha * (1.0 - t))?;
+        }
+        if t > 0.001 {
+            self.paint_status_disc_mark(layers, ctx, ink, content, place.mark_x, mid, place.mark, alpha * t)?;
+        }
+        self.paint_status_line(
+            layers,
+            &fonts.title,
+            fonts.title_metrics,
+            &content.name,
+            place.name_x.max(0.0) as usize,
+            place.name_y.max(0.0) as usize,
+            place.name_width as usize,
+            ink.text.mul_alpha(alpha),
+        )
+    }
+
     fn pill_trail_width(
         &self,
         fonts: &Fonts,
@@ -1817,7 +2264,24 @@ impl crate::TermWindow {
         .context("dynamic status surface")
     }
 
-    /// The folded pill's content: the mark, the name, and its state.
+    /// Where the pill has its mark and name, in `rect`.
+    fn pill_head(&self, fonts: &Fonts, rect: RectF, content: &CardContent, px: &impl Fn(f32) -> f32) -> anyhow::Result<Head> {
+        let mid = rect.min_y() + rect.size.height / 2.0;
+        let x = rect.min_x() + px(PILL_PAD_LEFT);
+        let name_x = x + px(PILL_MARK + PILL_GAP);
+        let trail = self.pill_trail_width(fonts, content, px)?;
+        Ok(Head {
+            mark_x: x + px(PILL_MARK) / 2.0,
+            mark: px(PILL_MARK),
+            name_x,
+            name_y: mid - fonts.title_line / 2.0,
+            name_width: (rect.max_x() - px(PILL_PAD_RIGHT) - trail - name_x).max(0.0),
+        })
+    }
+
+    /// The folded pill's content: the mark, the name, and its state. Without
+    /// `head`, the mark and name are left to be drawn on their way to the
+    /// card (`paint_status_head`).
     #[allow(clippy::too_many_arguments)]
     fn paint_status_pill(
         &self,
@@ -1829,25 +2293,28 @@ impl crate::TermWindow {
         content: &CardContent,
         alpha: f32,
         waited: Option<Duration>,
+        head: bool,
+        ring: bool,
         px: &impl Fn(f32) -> f32,
     ) -> anyhow::Result<()> {
         let mid = rect.min_y() + rect.size.height / 2.0;
-        let x = rect.min_x() + px(PILL_PAD_LEFT);
-        self.paint_status_tile(layers, ctx, ink, content, x, mid, px(PILL_MARK), alpha)?;
-
-        let name_x = x + px(PILL_MARK + PILL_GAP);
+        let place = self.pill_head(fonts, rect, content, px)?;
+        if head {
+            self.paint_status_tile(layers, ctx, ink, content, place.mark_x - place.mark / 2.0, mid, place.mark, alpha)?;
+            self.paint_status_line(
+                layers,
+                &fonts.title,
+                fonts.title_metrics,
+                &content.name,
+                place.name_x.max(0.0) as usize,
+                place.name_y.max(0.0) as usize,
+                place.name_width as usize,
+                ink.text.mul_alpha(alpha),
+            )?;
+        }
+        let name_x = place.name_x;
+        let name_width = place.name_width;
         let trail = self.pill_trail_width(fonts, content, px)?;
-        let name_width = (rect.max_x() - px(PILL_PAD_RIGHT) - trail - name_x).max(0.0);
-        self.paint_status_line(
-            layers,
-            &fonts.title,
-            fonts.title_metrics,
-            &content.name,
-            name_x.max(0.0) as usize,
-            (mid - fonts.title_line / 2.0).max(0.0) as usize,
-            name_width as usize,
-            ink.text.mul_alpha(alpha),
-        )?;
         if trail <= 0.0 {
             return Ok(());
         }
@@ -1877,18 +2344,19 @@ impl crate::TermWindow {
                 x += px(WAIT_DOT + 6.0);
             }
             (_, Some(fraction)) => {
-                self.paint_status_ring(
-                    layers,
-                    ctx,
-                    ink,
-                    (x + px(PILL_RING) / 2.0, mid),
-                    px(PILL_RING),
-                    px(2.4),
-                    fraction,
-                    false,
-                    ink.accent,
-                    alpha,
-                )?;
+                if ring {
+                    self.paint_status_ring(
+                        layers,
+                        ctx,
+                        ink,
+                        (x + px(PILL_RING) / 2.0, mid),
+                        px(PILL_RING),
+                        px(PILL_RING_STROKE),
+                        fraction,
+                        ink.accent,
+                        alpha,
+                    )?;
+                }
                 x += px(PILL_RING + 6.0);
             }
             (Tone::Done, None) => {
@@ -1931,6 +2399,8 @@ impl crate::TermWindow {
         content: &CardContent,
         alpha: f32,
         buttons: &mut Vec<UIItem>,
+        head: bool,
+        ring: bool,
         px: &impl Fn(f32) -> f32,
     ) -> anyhow::Result<()> {
         if alpha <= 0.001 {
@@ -1982,18 +2452,19 @@ impl crate::TermWindow {
         if let Some(fraction) = content.bar {
             if content.actions.is_empty() {
                 let size = px(CARD_RING);
-                self.paint_status_ring(
-                    layers,
-                    ctx,
-                    ink,
-                    (end - size / 2.0, mid),
-                    size,
-                    px(3.0),
-                    fraction,
-                    true,
-                    ink.accent,
-                    alpha,
-                )?;
+                if ring {
+                    self.paint_status_ring(
+                        layers,
+                        ctx,
+                        ink,
+                        (end - size / 2.0, mid),
+                        size,
+                        px(CARD_RING_STROKE),
+                        fraction,
+                        ink.accent,
+                        alpha,
+                    )?;
+                }
                 end -= size + px(BUTTON_GAP);
             }
             if let Some(fraction) = fraction {
@@ -2026,23 +2497,23 @@ impl crate::TermWindow {
             }
         }
 
-        let mark_x = rect.min_x() + px(CARD_PAD_LEFT);
-        self.paint_status_disc_mark(layers, ctx, ink, content, mark_x + px(CARD_MARK) / 2.0, mid, px(CARD_MARK), alpha)?;
-
-        let text_x = mark_x + px(CARD_MARK + CARD_GAP);
-        let text_width = (end - px(CARD_GAP) + px(BUTTON_GAP) - text_x).max(0.0);
-        let block = fonts.title_line + px(2.0) + fonts.body_line;
-        let name_y = mid - block / 2.0;
-        self.paint_status_line(
-            layers,
-            &fonts.title,
-            fonts.title_metrics,
-            &content.name,
-            text_x.max(0.0) as usize,
-            name_y.max(0.0) as usize,
-            text_width as usize,
-            ink.text.mul_alpha(alpha),
-        )?;
+        let place = card_head(fonts, rect, end, px);
+        if head {
+            self.paint_status_disc_mark(layers, ctx, ink, content, place.mark_x, mid, place.mark, alpha)?;
+            self.paint_status_line(
+                layers,
+                &fonts.title,
+                fonts.title_metrics,
+                &content.name,
+                place.name_x.max(0.0) as usize,
+                place.name_y.max(0.0) as usize,
+                place.name_width as usize,
+                ink.text.mul_alpha(alpha),
+            )?;
+        }
+        let text_x = place.name_x;
+        let text_width = place.name_width;
+        let name_y = place.name_y;
         let detail_color = match content.tone {
             Tone::Waiting | Tone::Failed => tone_color(content.tone, ink),
             Tone::Progress | Tone::Done => ink.muted,
@@ -2098,7 +2569,6 @@ impl crate::TermWindow {
                     px(SATELLITE_RING),
                     px(2.4),
                     fraction,
-                    false,
                     tone_color(content.tone, ink),
                     alpha,
                 )?;
@@ -2195,9 +2665,8 @@ impl crate::TermWindow {
     }
 
     /// A progress ring centred on `center`, `size` across: as far as it has
-    /// got, or, when there is no telling, a quarter of it -- turning if
-    /// `turning`, else still and centred on the top, where no fraction of a
-    /// determinate ring would sit.
+    /// got, or, when there is no telling, a quarter of it turning -- on the
+    /// pill and its discs as on the cards.
     #[allow(clippy::too_many_arguments)]
     fn paint_status_ring(
         &self,
@@ -2208,7 +2677,6 @@ impl crate::TermWindow {
         size: f32,
         stroke: f32,
         fraction: Option<f32>,
-        turning: bool,
         color: LinearRgba,
         alpha: f32,
     ) -> anyhow::Result<()> {
@@ -2216,11 +2684,10 @@ impl crate::TermWindow {
         // the window shares.
         let turn = match fraction {
             Some(_) => 0.0,
-            None if turning => {
+            None => {
                 let frames = crate::termwindow::ui::status_icon::spinner_frames();
                 (frames % SPIN_STEPS) as f32 / SPIN_STEPS as f32
             }
-            None => -0.125,
         };
         paint_ring(
             ctx,
@@ -2285,14 +2752,9 @@ impl crate::TermWindow {
         let color = tone_color(content.tone, ink);
         let (disc, mark) = match content.mark {
             Mark::Icon(_) => (color.mul_alpha(0.13), 0.5),
-            // A pane's tab card is a disc already, and so is an agent's mark
-            // when it has no brand of its own and falls back to that card:
-            // drawn at the full size, with nothing behind to show as a rim.
+            // A pane's tab card is a disc already: drawn at the full size,
+            // with nothing behind to show as a rim.
             Mark::Pane(_) => return self.paint_status_mark(layers, ctx, content, cx, cy, size, color.mul_alpha(alpha)),
-            Mark::Agent(agent) if crate::termwindow::ui::agent_panel::brand_of(agent).is_none() => {
-                return self.paint_status_mark(layers, ctx, content, cx, cy, size, color.mul_alpha(alpha));
-            }
-            Mark::Agent(_) => (LinearRgba::with_srgba(44, 44, 46, 255), 0.56),
         };
         ctx.draw_disc(layers, 1, cx, cy, size, disc.mul_alpha(alpha))?;
         self.paint_status_mark(layers, ctx, content, cx, cy, size * mark, color.mul_alpha(alpha))
@@ -2318,15 +2780,6 @@ impl crate::TermWindow {
                 .context("dynamic status icon"),
             // Program marks fade with what they stand beside, as content
             // giving way to other content does.
-            Mark::Agent(agent) => self.paint_agent_mark_faded(
-                layers,
-                agent,
-                x as usize,
-                y as usize,
-                size.round() as usize,
-                color,
-                color.3,
-            ),
             Mark::Pane(pane_id) => {
                 self.paint_pane_card_faded(
                     layers,
@@ -2359,14 +2812,26 @@ impl crate::TermWindow {
         // The Status panel lists them: none of its own then.
         let listed = self.right_sidebar_width() > 0
             && self.right_sidebar_mode == crate::termwindow::RightSidebarMode::Agents;
-        if listed {
-            self.dynamic_status.finished.shown.clear();
+        if !self.dynamic_status.finished.seeded {
+            let mux = Mux::get();
+            self.dynamic_status.finished.seed(
+                now,
+                mux.iter_panes()
+                    .into_iter()
+                    .map(|pane| (pane.pane_id(), pane.foreground_program())),
+            );
         }
         self.dynamic_status.finished.settle(now, listed);
         if let Some(due) = self.dynamic_status.finished.deadline() {
             self.update_next_frame_time(Some(due));
         }
         let any_finished = !self.dynamic_status.finished.shown.is_empty();
+        let any_task = self
+            .dynamic_status
+            .finished
+            .runs
+            .values()
+            .any(|run| run.reading.is_some());
         let has_transfers = self.has_transfer_cards();
         let agents_listed = self.right_sidebar_width() > 0
             && self.right_sidebar_mode == crate::termwindow::RightSidebarMode::Agents;
@@ -2384,7 +2849,7 @@ impl crate::TermWindow {
             .panes
             .as_ref()
             .is_some_and(|(_, panes)| !panes.is_empty());
-        if !has_transfers && !any_agent && !any_pane && update.is_none() && !any_finished {
+        if !has_transfers && !any_agent && !any_pane && update.is_none() && !any_finished && !any_task {
             self.dynamic_status.agent_marks.clear();
             return Vec::new();
         }
@@ -2398,7 +2863,7 @@ impl crate::TermWindow {
             Vec::new()
         };
         items.extend(update.map(StatusItem::Update));
-        let on_screen: HashSet<PaneId> = if any_agent || any_pane || any_finished {
+        let on_screen: HashSet<PaneId> = if any_agent || any_pane || any_finished || any_task {
             self.get_panes_to_render()
                 .iter()
                 .map(|positioned| positioned.pane.pane_id())
@@ -2444,11 +2909,26 @@ impl crate::TermWindow {
         if any_finished {
             // One in sight has been seen, and one no longer in the snapshot
             // has gone with its pane: either is done with.
-            self.dynamic_status.finished.shown.retain(|agent| {
-                !on_screen.contains(&agent.pane_id)
-                    && all_agents.iter().any(|status| status.pane_id == agent.pane_id)
+            let mux = Mux::get();
+            self.dynamic_status.finished.shown.retain(|notice| {
+                !on_screen.contains(&notice.pane_id)
+                    && match notice.command {
+                        Some(_) => mux.get_pane(notice.pane_id).is_some(),
+                        None => all_agents.iter().any(|status| status.pane_id == notice.pane_id),
+                    }
             });
             for agent in &self.dynamic_status.finished.shown {
+                if let Some(command) = &agent.command {
+                    let here = mux
+                        .resolve_pane_id(agent.pane_id)
+                        .is_some_and(|(_, window_id, _)| window_id == self.mux_window_id);
+                    items.push(StatusItem::Command {
+                        notice: agent.clone(),
+                        command: command.clone(),
+                        here,
+                    });
+                    continue;
+                }
                 let Some(index) = all_agents
                     .iter()
                     .position(|status| status.pane_id == agent.pane_id)
@@ -2456,10 +2936,33 @@ impl crate::TermWindow {
                     continue;
                 };
                 items.push(StatusItem::Finished {
-                    agent: *agent,
+                    agent: agent.clone(),
                     agents: Arc::clone(&all_agents),
                     index,
                     here: all_agents[index].window_id == Some(self.mux_window_id),
+                });
+            }
+        }
+        if any_task {
+            // A tool out of sight, as its task rules last read it; one on
+            // screen tells the user itself.
+            let mux = Mux::get();
+            for (pane_id, run) in &self.dynamic_status.finished.runs {
+                let Some(reading) = &run.reading else {
+                    continue;
+                };
+                if on_screen.contains(pane_id) {
+                    continue;
+                }
+                let here = mux
+                    .resolve_pane_id(*pane_id)
+                    .is_some_and(|(_, window_id, _)| window_id == self.mux_window_id);
+                items.push(StatusItem::Task {
+                    pane_id: *pane_id,
+                    name: reading.name.clone(),
+                    reading: reading.clone(),
+                    since: run.state_since,
+                    here,
                 });
             }
         }
@@ -2654,6 +3157,44 @@ impl crate::TermWindow {
                 .any(|positioned| positioned.pane.pane_id() == pane_id)
     }
 
+    /// A pane's foreground program changed: a command started, or ended and
+    /// gave the shell back. True when the window should paint.
+    pub(crate) fn dynamic_status_program_changed(&mut self, pane_id: PaneId) -> bool {
+        let mux = Mux::get();
+        let Some(pane) = mux.get_pane(pane_id) else {
+            return false;
+        };
+        let program = pane.foreground_program();
+        let in_sight = self
+            .get_panes_to_render()
+            .iter()
+            .any(|positioned| positioned.pane.pane_id() == pane_id);
+        let place = || {
+            mux.resolve_pane_id(pane_id)
+                .and_then(|(_, window_id, _)| {
+                    let workspace = mux.get_window(window_id)?.get_workspace().to_string();
+                    crate::workspace_threads::thread_place_and_machine_for_workspace(&workspace)
+                })
+                .map(|(place, _)| place)
+                .unwrap_or_default()
+        };
+        self.dynamic_status
+            .finished
+            .observe_program(Instant::now(), pane_id, program.as_ref(), in_sight, place)
+    }
+
+    /// A pane printed: the last output of a command running there marks
+    /// when it ended.
+    pub(crate) fn dynamic_status_pane_printed(&mut self, pane_id: PaneId) {
+        self.dynamic_status.finished.printed(Instant::now(), pane_id);
+    }
+
+    /// The shell said how a command ended (OSC 133). True when the window
+    /// should paint.
+    pub(crate) fn dynamic_status_command_exit(&mut self, pane_id: PaneId, code: Option<i32>) -> bool {
+        self.dynamic_status.finished.exit(Instant::now(), pane_id, code)
+    }
+
     /// A pane went away: what the dynamic status read about panes and agents is out
     /// of date, and if it was on the dynamic status, it goes now rather than at the
     /// next repaint.
@@ -2696,7 +3237,7 @@ fn tone_color(tone: Tone, ink: &Ink) -> LinearRgba {
     }
 }
 
-fn status_content(item: &StatusItem) -> CardContent<'_> {
+fn status_content(item: &StatusItem) -> CardContent {
     let go_to = |pane_id: PaneId, here: bool, primary: bool| CardAction {
         icon: SvgIcon::ArrowRight,
         primary,
@@ -2721,7 +3262,7 @@ fn status_content(item: &StatusItem) -> CardContent<'_> {
                 detail.push(agent.place.clone());
             }
             CardContent {
-                mark: Mark::Agent(agent),
+                mark: Mark::Pane(agent.pane_id),
                 tone: Tone::Done,
                 name: if agent.title.is_empty() {
                     name
@@ -2732,6 +3273,74 @@ fn status_content(item: &StatusItem) -> CardContent<'_> {
                 short: done,
                 bar: None,
                 actions: vec![go_to(agent.pane_id, *here, true)],
+            }
+        }
+        StatusItem::Command {
+            notice,
+            command,
+            here,
+        } => {
+            let failed = command.failed();
+            let state = crate::i18n::tr(if failed {
+                "right-agents-state-error"
+            } else {
+                "right-agents-state-done"
+            });
+            let mut detail = vec![state.clone()];
+            if let Some(code) = command.exit.filter(|_| failed) {
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("code", code);
+                detail.push(crate::i18n::tr_args("dynamic-status-exit", &args));
+            }
+            detail.push(took_label(command.took));
+            if !*here && !command.place.is_empty() {
+                detail.push(command.place.clone());
+            }
+            CardContent {
+                mark: Mark::Pane(notice.pane_id),
+                tone: if failed { Tone::Failed } else { Tone::Done },
+                name: command.label.clone(),
+                detail: detail.join(" · "),
+                short: state,
+                bar: None,
+                actions: vec![go_to(notice.pane_id, *here, true)],
+            }
+        }
+        StatusItem::Task {
+            pane_id,
+            name,
+            reading,
+            here,
+            ..
+        } => {
+            let (tone, state) = match reading.state {
+                TaskState::Running => (Tone::Progress, "right-agents-state-working"),
+                TaskState::Waiting => (Tone::Waiting, "right-agents-state-blocked"),
+                TaskState::Error => (Tone::Failed, "right-agents-state-error"),
+            };
+            let state = crate::i18n::tr(state);
+            let fraction = reading
+                .percent
+                .map(|percent| f32::from(percent) / 100.0)
+                .or(reading.count.map(|(done, total)| done as f32 / total as f32));
+            let short = match (reading.percent, reading.count) {
+                _ if tone != Tone::Progress => state.clone(),
+                (Some(percent), _) => format!("{percent}%"),
+                (None, Some((done, total))) => format!("{done}/{total}"),
+                (None, None) => state.clone(),
+            };
+            CardContent {
+                mark: Mark::Pane(*pane_id),
+                tone,
+                name: name.clone(),
+                detail: reading.detail.clone().unwrap_or_else(|| state.clone()),
+                short,
+                bar: (tone == Tone::Progress).then_some(fraction),
+                actions: if tone == Tone::Progress {
+                    Vec::new()
+                } else {
+                    vec![go_to(*pane_id, *here, true)]
+                },
             }
         }
         StatusItem::Agent {
@@ -2766,7 +3375,7 @@ fn status_content(item: &StatusItem) -> CardContent<'_> {
                 None => detail.push(state.clone()),
             }
             CardContent {
-                mark: Mark::Agent(agent),
+                mark: Mark::Pane(agent.pane_id),
                 tone,
                 name: if agent.title.is_empty() {
                     crate::agent_status::display_name(&agent.agent_id)
@@ -2831,6 +3440,21 @@ fn status_content(item: &StatusItem) -> CardContent<'_> {
                 },
             }
         }
+    }
+}
+
+/// Where a card in `rect` has its mark and name, its text reaching to `end`.
+fn card_head(fonts: &Fonts, rect: RectF, end: f32, px: &impl Fn(f32) -> f32) -> Head {
+    let mid = rect.min_y() + rect.size.height / 2.0;
+    let mark_left = rect.min_x() + px(CARD_PAD_LEFT);
+    let name_x = mark_left + px(CARD_MARK + CARD_GAP);
+    let block = fonts.title_line + px(2.0) + fonts.body_line;
+    Head {
+        mark_x: mark_left + px(CARD_MARK) / 2.0,
+        mark: px(CARD_MARK),
+        name_x,
+        name_y: mid - block / 2.0,
+        name_width: (end - px(CARD_GAP) + px(BUTTON_GAP) - name_x).max(0.0),
     }
 }
 
@@ -2956,6 +3580,40 @@ fn status_wants(
 /// the name is left out while it works -- it changes with every step of the
 /// work, and the dynamic status is not where that is followed. Worked out alike from
 /// the snapshot, when painting, and from the pane, when it reports a change.
+/// How long a command took, to the second under an hour.
+fn took_label(took: Duration) -> String {
+    let seconds = took.as_secs();
+    let mut args = fluent_bundle::FluentArgs::new();
+    let key = if seconds < 60 {
+        args.set("seconds", seconds);
+        "dynamic-status-took-seconds"
+    } else if seconds < 3600 {
+        args.set("minutes", seconds / 60);
+        args.set("seconds", seconds % 60);
+        "dynamic-status-took-minutes"
+    } else {
+        args.set("hours", seconds / 3600);
+        args.set("minutes", seconds % 3600 / 60);
+        "dynamic-status-took-hours"
+    };
+    crate::i18n::tr_args(key, &args)
+}
+
+/// What a pane's foreground program says runs in it: the command, or
+/// `None` for a shell at its prompt -- a shell running nothing of its own.
+fn running_command(program: &thinkterm_proto::ForegroundProgram) -> Option<String> {
+    let shell = matches!(
+        program.executable.as_str(),
+        "sh" | "bash" | "zsh" | "fish" | "dash" | "ash" | "busybox" | "ksh" | "mksh" | "tcsh"
+            | "csh" | "nu" | "elvish" | "xonsh" | "pwsh" | "-zsh" | "-bash" | "-sh" | "-fish"
+    );
+    match (&program.runs, shell) {
+        (None, true) => None,
+        (Some(runs), _) => Some(runs.clone()),
+        (None, false) => Some(program.executable.clone()),
+    }
+}
+
 fn status_mark(
     state: AgentState,
     report: Option<&ProgramReport>,
@@ -3028,6 +3686,208 @@ mod tests {
     }
 
     #[test]
+    fn a_long_command_that_ends_out_of_sight_is_finished() {
+        let now = Instant::now();
+        let at = |secs: u64| now + Duration::from_secs(secs);
+        let place = || "acme · Launch".to_string();
+        let mut finished = FinishedAgents::default();
+        // A quick one is not news.
+        assert!(!finished.program(at(0), 1, Some("ls".into()), None, false, place));
+        // (A plain shell's agent status says nothing about what runs.)
+        assert!(!finished.note(at(1), 1, Some(AgentState::Unknown)));
+        assert!(!finished.program(at(2), 1, None, None, false, place));
+        // Nor is one that ends in front of the user.
+        assert!(!finished.program(at(10), 1, Some("cargo".into()), None, false, place));
+        assert!(!finished.program(at(40), 1, None, None, true, place));
+        // Out of sight, with the shell's word on how it went first...
+        assert!(!finished.program(at(50), 1, Some("cargo".into()), None, false, place));
+        // ...the program it hands over to does not restart the clock, and
+        // its last output -- the prompt -- is when it ended, however late
+        // the shell is seen back.
+        assert!(!finished.program(at(55), 1, Some("rustc".into()), None, false, place));
+        finished.printed(at(79), 1);
+        assert!(!finished.exit(at(80), 1, Some(101)));
+        assert!(finished.program(at(81), 1, None, None, false, place));
+        let command = finished.shown[0].command.clone().unwrap();
+        assert_eq!(command.label, "cargo");
+        assert_eq!(command.took, Duration::from_secs(29));
+        assert!(command.failed());
+        // ...or just after.
+        assert!(!finished.program(at(90), 2, Some("npm".into()), None, false, place));
+        // A print from long before the end is not the prompt that ended it.
+        finished.printed(at(91), 2);
+        assert!(finished.program(at(120), 2, None, None, false, place));
+        assert!(finished.exit(at(121), 2, Some(0)));
+        assert!(!finished.shown[1].command.as_ref().unwrap().failed());
+        // News that no agent runs there leaves a command's notice alone.
+        assert!(!finished.note(at(122), 2, None));
+        assert!(!finished.note(at(122), 2, Some(AgentState::Unknown)));
+        assert_eq!(finished.shown.len(), 2);
+        // The next command in that pane takes its notice off.
+        assert!(!finished.program(at(130), 2, Some("npm".into()), None, false, place));
+        assert_eq!(finished.shown.len(), 1);
+    }
+
+    #[test]
+    fn an_exit_survives_a_delayed_background_probe_and_stays_with_its_run() {
+        let now = Instant::now();
+        let mut finished = FinishedAgents::default();
+        finished.program(now, 1, Some("cargo".into()), None, false, String::new);
+        finished.exit(now + Duration::from_secs(30), 1, Some(101));
+        assert!(finished.program(now + Duration::from_secs(36), 1, None, None, false, String::new));
+        let command = finished.shown[0].command.as_ref().unwrap();
+        assert_eq!(command.exit, Some(101));
+        assert!(command.failed());
+        finished.program(now + Duration::from_secs(40), 1, Some("cargo".into()), None, false, String::new);
+        finished.program(now + Duration::from_secs(60), 1, None, None, false, String::new);
+        assert_eq!(finished.shown[0].command.as_ref().unwrap().exit, None);
+    }
+
+    fn waiting_program() -> thinkterm_proto::ForegroundProgram {
+        thinkterm_proto::ForegroundProgram {
+            executable: "apt".into(),
+            runs: None,
+            task: Some(TaskReading {
+                name: "apt".into(),
+                state: TaskState::Waiting,
+                ..TaskReading::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn an_ssh_prompt_clears_the_task_and_the_next_run_starts_fresh() {
+        let now = Instant::now();
+        let mut finished = FinishedAgents::default();
+        let program = waiting_program();
+        finished.observe_program(now, 1, Some(&program), false, String::new);
+        // Even a short run must repaint to remove its waiting card.
+        assert!(finished.observe_program(now + Duration::from_secs(2), 1, None, false, String::new));
+        assert!(finished.runs.is_empty());
+        assert!(finished.shown.is_empty());
+        let later = now + Duration::from_secs(3);
+        finished.observe_program(later, 1, Some(&program), false, String::new);
+        assert_eq!(finished.runs[&1].since, later);
+        assert!(finished.observe_program(now + Duration::from_secs(30), 1, None, false, String::new));
+        assert!(finished.runs.is_empty());
+        assert_eq!(finished.shown.len(), 1);
+    }
+
+    #[test]
+    fn a_new_window_seeds_existing_tasks_without_restarting_known_runs() {
+        let now = Instant::now();
+        let mut finished = FinishedAgents::default();
+        let program = waiting_program();
+        finished.observe_program(now, 1, Some(&program), false, String::new);
+        let later = now + Duration::from_secs(5);
+        finished.seed(later, [(1, Some(program.clone())), (2, Some(program.clone())), (3, None)]);
+        assert!(finished.seeded);
+        assert_eq!(finished.runs.len(), 2);
+        assert_eq!(finished.runs[&1].since, now);
+        assert_eq!(finished.runs[&2].reading, program.task);
+        assert_eq!(finished.runs[&2].state_since, later);
+        assert!(finished.shown.is_empty());
+    }
+
+    #[test]
+    fn the_status_sidebar_preserves_command_notices() {
+        let now = Instant::now();
+        let mut finished = FinishedAgents::default();
+        finished.program(now, 1, Some("cargo".into()), None, false, String::new);
+        finished.note(now, 2, Some(AgentState::Working));
+        let later = now + Duration::from_secs(30);
+        finished.program(later, 1, None, None, false, String::new);
+        finished.note(later, 2, Some(AgentState::Idle));
+        assert!(finished.settle(later + FINISHED_SETTLE, false));
+        assert_eq!(finished.shown.len(), 2);
+        finished.settle(later + FINISHED_SETTLE, true);
+        assert_eq!(finished.shown.len(), 1);
+        assert!(finished.shown[0].command.is_some());
+        assert_eq!(finished.shown[0].pane_id, 1);
+    }
+
+    #[test]
+    fn a_tool_that_ends_goes_by_its_rules_name_and_its_last_error() {
+        let now = Instant::now();
+        let mut finished = FinishedAgents::default();
+        finished.program(now, 1, Some("brew".into()), None, false, String::new);
+        // Handed over to Ruby running `brew.rb`, read by brew's rules: a
+        // new reading out of sight wants a paint.
+        let failing = TaskReading {
+            name: "brew".to_string(),
+            state: TaskState::Error,
+            ..TaskReading::default()
+        };
+        assert!(finished.program(
+            now + Duration::from_secs(1),
+            1,
+            Some("brew.rb".into()),
+            Some(failing),
+            false,
+            String::new
+        ));
+        assert!(finished.program(now + Duration::from_secs(60), 1, None, None, false, String::new));
+        let command = finished.shown[0].command.clone().unwrap();
+        assert_eq!(command.label, "brew");
+        assert!(command.failed());
+    }
+
+    #[test]
+    fn a_tool_waiting_is_news_only_just_after_it_began_to() {
+        let now = Instant::now();
+        let task = |state: TaskState, since: Instant| StatusItem::Task {
+            pane_id: 1,
+            name: "apt".to_string(),
+            reading: TaskReading {
+                name: "apt".to_string(),
+                state,
+                ..TaskReading::default()
+            },
+            since,
+            here: true,
+        };
+        let news = HashMap::new();
+        assert!(task(TaskState::Waiting, now).is_news(now, &news));
+        // Waiting a while, and only now in view: not news.
+        let earlier = now - Duration::from_secs(60);
+        assert!(!task(TaskState::Waiting, earlier).is_news(now, &news));
+        assert!(!task(TaskState::Running, now).is_news(now, &news));
+    }
+
+    #[test]
+    fn an_agent_run_is_not_a_command_finishing() {
+        let now = Instant::now();
+        let mut finished = FinishedAgents::default();
+        finished.program(now, 1, Some("claude".into()), None, false, String::new);
+        finished.note(now + Duration::from_secs(1), 1, Some(AgentState::Working));
+        let later = now + Duration::from_secs(600);
+        assert!(!finished.program(later, 1, None, None, false, String::new));
+        assert!(finished.shown.iter().all(|notice| notice.command.is_none()));
+    }
+
+    #[test]
+    fn a_shell_at_its_prompt_runs_nothing() {
+        let program = |executable: &str, runs: Option<&str>| thinkterm_proto::ForegroundProgram {
+            executable: executable.to_string(),
+            runs: runs.map(str::to_string),
+            task: None,
+        };
+        assert_eq!(running_command(&program("zsh", None)), None);
+        assert_eq!(running_command(&program("bash", Some("deploy.sh"))).as_deref(), Some("deploy.sh"));
+        assert_eq!(running_command(&program("node", Some("npm"))).as_deref(), Some("npm"));
+        assert_eq!(running_command(&program("cargo", None)).as_deref(), Some("cargo"));
+    }
+
+    #[test]
+    fn a_command_took_reads_in_its_largest_units() {
+        assert!(took_label(Duration::from_secs(42)).contains("42"));
+        let minutes = took_label(Duration::from_secs(192));
+        assert!(minutes.contains('3') && minutes.contains("12"));
+        let hours = took_label(Duration::from_secs(3 * 3600 + 5 * 60));
+        assert!(hours.contains('3') && hours.contains('5'));
+    }
+
+    #[test]
     fn a_finished_agent_goes_after_its_time_on_screen() {
         let now = Instant::now();
         let mut finished = FinishedAgents::default();
@@ -3050,6 +3910,7 @@ mod tests {
             pane_id: 1,
             shown_at: now,
             paused_at: None,
+            command: None,
         });
         let seen: HashSet<PaneId> = [1].iter().copied().collect();
         // Under the pointer for ten seconds, then left alone.

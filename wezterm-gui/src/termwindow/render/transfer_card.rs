@@ -539,7 +539,7 @@ pub(crate) struct CardAction {
     pub item: UIItemType,
 }
 
-pub(crate) fn card_content(view: &CardView) -> CardContent<'static> {
+pub(crate) fn card_content(view: &CardView) -> CardContent {
     match view {
         CardView::Running {
             kind,

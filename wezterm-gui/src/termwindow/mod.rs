@@ -6616,11 +6616,14 @@ impl TermWindow {
                     self.refresh_thread_work_for_pane(pane_id);
                     self.update_title();
                 }
-                // Filtered out before it gets here; for event subscribers.
+                // How a command ended, for the dynamic status's notice of it.
                 MuxNotification::Alert {
-                    alert: Alert::CommandFinished { .. },
-                    pane_id: _,
-                } => {}
+                    alert: Alert::CommandFinished { exit_code },
+                    pane_id,
+                } => {
+                    let changed = self.dynamic_status_command_exit(pane_id, exit_code);
+                    self.invalidate_window_if(changed);
+                }
                 MuxNotification::Alert {
                     alert: Alert::PaletteChanged,
                     pane_id: _,
@@ -6723,6 +6726,7 @@ impl TermWindow {
                     self.persist_workspace_layout_after_mutation("tab added");
                 }
                 MuxNotification::PaneOutput(pane_id) => {
+                    self.dynamic_status_pane_printed(pane_id);
                     self.mux_pane_output_event(pane_id);
                 }
                 MuxNotification::AgentStatusChanged(pane_id) => {
@@ -6754,8 +6758,10 @@ impl TermWindow {
                     );
                 }
                 MuxNotification::ForegroundProgramChanged(pane_id) => {
-                    // The pane's tab, or its thread's row in the sidebar.
-                    self.invalidate_window_if(self.agent_status_change_is_visible(pane_id));
+                    // The pane's tab, or its thread's row in the sidebar, or
+                    // a long command ending on the dynamic status.
+                    let ended = self.dynamic_status_program_changed(pane_id);
+                    self.invalidate_window_if(ended || self.agent_status_change_is_visible(pane_id));
                 }
                 MuxNotification::WindowInvalidated(_) => {
                     window.invalidate();
@@ -7884,6 +7890,7 @@ impl TermWindow {
                     | Alert::IconTitleChanged(_)
                     | Alert::Progress(_)
                     | Alert::SetUserVar { .. }
+                    | Alert::CommandFinished { .. }
                     | Alert::Bell,
             }
             | MuxNotification::PaneFocused(pane_id)
@@ -7961,7 +7968,7 @@ impl TermWindow {
                 // contents with (or remove) the opaque handoff surface.
             }
             MuxNotification::Alert {
-                alert: Alert::ToastNotification { .. } | Alert::CommandFinished { .. },
+                alert: Alert::ToastNotification { .. },
                 ..
             }
             | MuxNotification::PaneExited { .. }

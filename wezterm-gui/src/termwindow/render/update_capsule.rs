@@ -113,7 +113,7 @@ pub(crate) fn is_news(status: &UpdateCapsuleStatus) -> bool {
 }
 
 /// What the notice says and offers in `status`.
-pub(crate) fn content(status: &UpdateCapsuleStatus) -> CardContent<'static> {
+pub(crate) fn content(status: &UpdateCapsuleStatus) -> CardContent {
     let act = |icon: SvgIcon| CardAction {
         icon,
         primary: true,
