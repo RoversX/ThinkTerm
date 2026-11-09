@@ -73,6 +73,31 @@ struct Record {
     probed_at: Option<Instant>,
     /// When a tool's screen was last read, for its own floor.
     read_at: Option<Instant>,
+    /// Whether the tool has printed since its screen was last read: a
+    /// screen that has not changed is not read again.
+    read_owed: bool,
+}
+
+/// Whether a tool's screen is to be read now, once it is due, or not at
+/// all because nothing has changed it since the last read.
+#[derive(Debug, PartialEq, Eq)]
+enum ReadDue {
+    Now,
+    Later,
+    Never,
+}
+
+/// Note whether the tool has `printed`, and say when its screen is to be
+/// read.
+fn read_due(record: &mut Record, printed: bool, now: Instant) -> ReadDue {
+    record.read_owed |= printed;
+    if !record.read_owed {
+        return ReadDue::Never;
+    }
+    match record.read_at {
+        Some(at) if now.saturating_duration_since(at) < TASK_READ_EVERY => ReadDue::Later,
+        _ => ReadDue::Now,
+    }
 }
 
 lazy_static::lazy_static! {
@@ -273,7 +298,7 @@ fn drain() {
             }
             continue;
         }
-        if read_task(pane.as_ref(), pane_id, now) {
+        if read_task(pane.as_ref(), pane_id, now, activity) {
             publish_change(pane_id);
         }
         let (known, confirming, since_probe) = match REGISTRY.read().get(&pane_id) {
@@ -318,7 +343,7 @@ fn drain() {
             // A tool that has just taken the foreground is read at once: it
             // may have drawn its screen and gone quiet already, a question
             // waiting for an answer, with no more output to bring it here.
-            if read_task(pane.as_ref(), pane_id, now) {
+            if read_task(pane.as_ref(), pane_id, now, true) {
                 publish_change(pane_id);
             }
         }
@@ -337,10 +362,12 @@ fn drain() {
 /// program, when a reading is due. Returns whether the reading changed. A
 /// reading not yet due is owed a look once it is: the screen the tool left
 /// when it went quiet -- a question waiting for an answer -- must be read.
-fn read_task(pane: &dyn Pane, pane_id: PaneId, now: Instant) -> bool {
+/// Once read, that screen is not read again until the tool has `printed`:
+/// a tool waiting out of sight for an answer costs nothing while it waits.
+fn read_task(pane: &dyn Pane, pane_id: PaneId, now: Instant, printed: bool) -> bool {
     let rules = {
-        let registry = REGISTRY.read();
-        let Some(record) = registry.get(&pane_id) else {
+        let mut registry = REGISTRY.write();
+        let Some(record) = registry.get_mut(&pane_id) else {
             return false;
         };
         let Some(program) = record.published.as_ref() else {
@@ -354,15 +381,15 @@ fn read_task(pane: &dyn Pane, pane_id: PaneId, now: Instant) -> bool {
         let Some(rules) = rules else {
             return false;
         };
-        let due = record
-            .read_at
-            .is_none_or(|at| now.saturating_duration_since(at) >= TASK_READ_EVERY);
-        if !due {
-            drop(registry);
-            requeue(pane_id, false);
-            return false;
+        match read_due(record, printed, now) {
+            ReadDue::Now => rules,
+            ReadDue::Later => {
+                drop(registry);
+                requeue(pane_id, false);
+                return false;
+            }
+            ReadDue::Never => return false,
         }
-        rules
     };
     let reading = rules.read(&crate::task_status::screen_tail(pane));
     let mut registry = REGISTRY.write();
@@ -370,6 +397,7 @@ fn read_task(pane: &dyn Pane, pane_id: PaneId, now: Instant) -> bool {
         return false;
     };
     record.read_at = Some(now);
+    record.read_owed = false;
     let Some(program) = record.published.as_mut() else {
         return false;
     };
@@ -1225,6 +1253,24 @@ mod tests {
         ));
         assert_eq!(record.published, program("zsh"));
         assert!(record.candidate.is_none());
+    }
+
+    #[test]
+    fn a_quiet_tool_has_its_screen_read_once() {
+        let start = Instant::now();
+        let mut record = Record::default();
+        // Printed: read at once, then not again until it prints.
+        assert_eq!(read_due(&mut record, true, start), ReadDue::Now);
+        record.read_at = Some(start);
+        record.read_owed = false;
+        assert_eq!(read_due(&mut record, false, start + Duration::from_secs(3)), ReadDue::Never);
+        // Printing again within the floor waits for it, and is not lost.
+        let printed = start + Duration::from_millis(500);
+        assert_eq!(read_due(&mut record, true, printed), ReadDue::Later);
+        assert_eq!(
+            read_due(&mut record, false, start + Duration::from_secs(2)),
+            ReadDue::Now
+        );
     }
 
     #[test]
