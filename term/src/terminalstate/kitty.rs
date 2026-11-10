@@ -1398,9 +1398,32 @@ impl TerminalState {
             let matches = |image: &wezterm_cell::image::ImageCell| {
                 image.image_id().is_some_and(|id| selected.contains(&PlacementKey { image_id: id, placement_id: image.placement_tag() }))
             };
+            // Rows above that are scrollback. A picture that has scrolled
+            // out of the screen is history: deleting its placement or its
+            // data must not reach back and erase it. The cells keep their
+            // pixels so the history still paints, and a client can fetch
+            // them by cell even after the image id is gone.
+            let first_visible = [false, true]
+                .map(|alternate| self.screen_for_alt(alternate).phys_row(0));
             for alternate in [false, true] {
-                self.screen.screen_for_alt_mut(alternate).for_each_phys_line_mut(|_, line| {
+                let history_rows = first_visible[usize::from(alternate)];
+                self.screen.screen_for_alt_mut(alternate).for_each_phys_line_mut(|row, line| {
                     if !line.has_images() {
+                        return;
+                    }
+                    if row < history_rows {
+                        for cell in line.cells_mut_for_attr_changes_only() {
+                            cell.attrs_mut().demote_images_to_history(matches);
+                        }
+                        // Images this deletion did not name keep their
+                        // program-facing placement, as they always have.
+                        for cell in line.visible_cells() {
+                            for image in cell.attrs().image_attachments() {
+                                if let Some(id) = image.image_id() {
+                                    remaining.insert(PlacementKey { image_id: id, placement_id: image.placement_tag() });
+                                }
+                            }
+                        }
                         return;
                     }
                     if line.visible_cells().any(|cell| cell.attrs().image_attachments().any(matches)) {

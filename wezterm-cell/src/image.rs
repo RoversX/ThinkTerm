@@ -152,6 +152,19 @@ impl ImageCell {
         }
     }
 
+    /// The same pixels and the same cell slice, with no kitty identity.
+    /// When a program deletes an image, rows that have already scrolled
+    /// into the scrollback keep it as history: nothing can address it by
+    /// image id again, but the cells still paint it and a client can fetch
+    /// the pixels by cell.
+    pub fn as_history(&self) -> Self {
+        let mut cell = self.clone();
+        cell.image_id = None;
+        cell.placement_id = None;
+        cell.placement_tag = 0;
+        cell
+    }
+
     pub fn matches_placement(&self, image_id: u32, placement_id: Option<u32>) -> bool {
         self.image_id == Some(image_id) && self.placement_id == placement_id
     }
