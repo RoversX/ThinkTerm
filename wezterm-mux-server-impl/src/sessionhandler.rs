@@ -586,27 +586,31 @@ fn read_pane_changes(
         changed = true;
     }
 
-    let dims = pane.get_dimensions();
-    if dims != last.dimensions {
+    let dims_before = pane.get_dimensions();
+    if dims_before != last.dimensions {
         changed = true;
     }
 
-    let cursor_position = pane.get_cursor_position();
-    if cursor_position != last.cursor_position {
+    let cursor_before = pane.get_cursor_position();
+    if cursor_before != last.cursor_position {
         changed = true;
     }
 
-    let seqno = pane.get_current_seqno();
-    let all_dirty_lines = pane.get_changed_since(
-        0..dims.physical_top + dims.viewport_rows as StableRowIndex,
+    let seqno_before = pane.get_current_seqno();
+    let dirty_before = pane.get_changed_since(
+        0..dims_before.physical_top + dims_before.viewport_rows as StableRowIndex,
         last.seqno,
     );
-    if !all_dirty_lines.is_empty() {
+    if !dirty_before.is_empty() {
         changed = true;
     }
 
     let sequence_only = !changed && force_with_input_serial.is_none();
-    if sequence_only && !((last.seqno as u64) < scene_seqno && seqno as u64 >= scene_seqno) { return None; }
+    if sequence_only
+        && !((last.seqno as u64) < scene_seqno && seqno_before as u64 >= scene_seqno)
+    {
+        return None;
+    }
 
     let rows = if sequence_only {
         // A relative placement can move without touching text or the cursor.
@@ -620,17 +624,32 @@ fn read_pane_changes(
                 pane.get_lines(lines)
             }
         };
-        let viewport_range =
-            dims.physical_top..dims.physical_top + dims.viewport_rows as StableRowIndex;
+        let viewport_range = dims_before.physical_top
+            ..dims_before.physical_top + dims_before.viewport_rows as StableRowIndex;
         let (first, viewport) = read(viewport_range);
         // A viewer's cursor row may have left the screen.
-        let (row, lines) = read(cursor_position.y..cursor_position.y + 1);
+        let (row, lines) = read(cursor_before.y..cursor_before.y + 1);
         Some(RowsRead {
             first,
             viewport,
             cursor: lines.into_iter().next().map(|line| (row, line)),
         })
     };
+
+    // The parser can run between any two of the calls above: a batch of
+    // output may have scrolled the screen after `dims_before` was taken.
+    // Report the state that follows the rows we just copied, not the one
+    // that preceded them. Otherwise the rows read from the old viewport are
+    // labelled as the live screen, and a client scrolled back can show an
+    // old row at a stable index that now holds a different line: the
+    // top/bottom tear seen when a fast program scrolls under a reader.
+    let dims = pane.get_dimensions();
+    let cursor_position = pane.get_cursor_position();
+    let seqno = pane.get_current_seqno();
+    let all_dirty_lines = pane.get_changed_since(
+        0..dims.physical_top + dims.viewport_rows as StableRowIndex,
+        last.seqno,
+    );
 
     let reading = PaneReading {
         bracketed_paste,
