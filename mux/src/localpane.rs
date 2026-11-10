@@ -619,6 +619,45 @@ impl Pane for LocalPane {
         })
     }
 
+    fn read_remote_file(
+        &self,
+        request: thinkterm_proto::file::ReadRemoteFile,
+    ) -> crate::pane::ReadRemoteFileFuture {
+        // Chunks are bounded by the caller, but never trust the wire: a
+        // single request may not ask the server for an unbounded buffer.
+        const MAX_CHUNK: u32 = 8 * 1024 * 1024;
+        let length = request.length.min(MAX_CHUNK);
+        let pane_id = request.pane_id;
+        let path = request.path;
+        let offset = request.offset;
+        Box::pin(async move {
+            smol::unblock(move || {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut file =
+                    std::fs::File::open(&path).map_err(|err| anyhow::anyhow!("opening {path}: {err}"))?;
+                let metadata = file
+                    .metadata()
+                    .map_err(|err| anyhow::anyhow!("reading {path} metadata: {err}"))?;
+                anyhow::ensure!(metadata.is_file(), "{path} is not a regular file");
+                let total = metadata.len();
+                anyhow::ensure!(offset <= total, "offset {offset} is past the end of {path}");
+                file.seek(SeekFrom::Start(offset))
+                    .map_err(|err| anyhow::anyhow!("seeking {path}: {err}"))?;
+                let mut data = vec![0u8; length as usize];
+                let n = file
+                    .read(&mut data)
+                    .map_err(|err| anyhow::anyhow!("reading {path}: {err}"))?;
+                data.truncate(n);
+                Ok(thinkterm_proto::file::ReadRemoteFileResponse {
+                    pane_id,
+                    data,
+                    eof: offset + n as u64 >= total,
+                })
+            })
+            .await
+        })
+    }
+
     fn is_dead(&self) -> bool {
         let mut proc = self.process.lock();
 

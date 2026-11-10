@@ -72,6 +72,7 @@ fn subject(pdu: &Pdu) -> Vec<(Subject, Use)> {
         Pdu::GetPaneRunState(req) => vec![(Pane(req.pane_id), Read)],
         Pdu::GetPaneDirection(req) => vec![(Pane(req.pane_id), Read)],
         Pdu::GetKittyImage(req) => vec![(Pane(req.pane_id), Read)],
+        Pdu::ReadRemoteFile(req) => vec![(Pane(req.pane_id), Read)],
         Pdu::GetKittyFrameSelections(req) => vec![(Pane(req.pane_id), Read)],
         Pdu::GetImageCell(req) => vec![(Pane(req.pane_id), Read)],
         Pdu::WriteToPane(req) => vec![(Pane(req.pane_id), Act)],

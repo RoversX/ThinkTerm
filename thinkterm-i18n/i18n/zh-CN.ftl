@@ -1778,6 +1778,7 @@ settings-status-sharing-error = 没能保存分享设置：{ $error }
 
 ## Asking before something a terminal program printed is acted on.
 link-open-other-app = 用其他应用打开
+link-open-remote-app = 下载到本机并用其他应用打开
 link-open-cancel = 取消
 link-refused-unsafe = 没有打开：链接不安全
 paste-confirm-header = 这段内容带换行，一粘贴就可能直接执行命令

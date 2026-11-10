@@ -794,8 +794,12 @@ pub(crate) enum ContextMenuApplicationAction {
     /// Answer to "these files already exist" for a queued local copy.
     ResolveLocalCopyConflict(transfer_walk::ConflictChoice),
     /// Answer to "open this terminal link in another app?": the link to
-    /// open, or `None` to leave it.
-    ResolveTerminalLink(Option<String>),
+    /// open and the pane it came from, or `None` to leave it. The pane
+    /// tells us whether its path is on this machine or the host behind it.
+    ResolveTerminalLink {
+        link: Option<String>,
+        pane_id: Option<PaneId>,
+    },
     /// Answer to "this paste could run commands, paste anyway?": the pane
     /// and the text to paste into it, or `None` to leave it.
     ResolvePaste(Option<(PaneId, String)>),
@@ -12941,7 +12945,7 @@ impl TermWindow {
                         wezterm_open_url::open_url(&link);
                     } else {
                         term_window.notify(TermWindowNotif::Apply(Box::new(move |myself| {
-                            myself.open_terminal_link(link, anchor);
+                            myself.open_terminal_link(link, anchor, pane.0);
                         })));
                     }
                 }

@@ -619,10 +619,10 @@ impl crate::TermWindow {
             crate::termwindow::ContextMenuApplicationAction::ResolveRemoteConfirm(proceed) => {
                 self.resolve_pending_remote_confirm(proceed);
             }
-            crate::termwindow::ContextMenuApplicationAction::ResolveTerminalLink(link) => {
+            crate::termwindow::ContextMenuApplicationAction::ResolveTerminalLink { link, pane_id } => {
                 if let Some(link) = link {
                     log::info!("opening terminal link");
-                    wezterm_open_url::open_url(&link);
+                    self.open_terminal_link_now(link, pane_id);
                 }
             }
             crate::termwindow::ContextMenuApplicationAction::ResolvePaste(paste) => {
