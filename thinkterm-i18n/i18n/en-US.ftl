@@ -1833,6 +1833,7 @@ settings-status-sharing-error = Could not save the sharing setting: { $error }
 
 ## Asking before something a terminal program printed is acted on.
 link-open-other-app = Open in Another App
+link-open-remote-app = Download and Open on This Machine
 link-open-cancel = Cancel
 link-refused-unsafe = Not Opened: the Link Is Unsafe
 paste-confirm-header = This text has line breaks and could run commands as soon as it is pasted

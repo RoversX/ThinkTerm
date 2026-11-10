@@ -3230,6 +3230,32 @@ impl SessionHandler {
                 }).detach();
             }
 
+            // A viewer sees the terminal, not the host's filesystem.
+            Pdu::ReadRemoteFile(_) if self.is_share_viewer() => {
+                send_response(Err(anyhow!("a shared pane cannot read files")))
+            }
+            Pdu::ReadRemoteFile(request) => {
+                let sender = self.to_write_tx.clone();
+                spawn_into_main_thread(async move {
+                    let result = match pane_when_free(
+                        request.pane_id,
+                        &sender,
+                        "a remote file read",
+                        Some(PUSH_DEFERRAL_LIMIT),
+                    )
+                    .await
+                    {
+                        Ok(Some(pane)) => {
+                            pane.read_remote_file(request).await.map(Pdu::ReadRemoteFileResponse)
+                        }
+                        Ok(None) => Err(anyhow!("pane is busy")),
+                        Err(err) => Err(err),
+                    };
+                    send_response(result);
+                })
+                .detach();
+            }
+
             Pdu::GetImageCell(GetImageCell {
                 pane_id,
                 line_idx,
@@ -3878,6 +3904,7 @@ impl SessionHandler {
             | Pdu::ShareStateChanged { .. }
             | Pdu::ShareDiscoverResponse { .. }
             | Pdu::ShareCandidatesResponse { .. }
+            | Pdu::ReadRemoteFileResponse { .. }
             | Pdu::ErrorResponse { .. } => {
                 send_response(Err(anyhow!("expected a request, got {:?}", decoded.pdu)))
             }

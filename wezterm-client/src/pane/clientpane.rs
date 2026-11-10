@@ -792,6 +792,39 @@ impl Pane for ClientPane {
         })
     }
 
+    fn read_remote_file(
+        &self,
+        request: codec::ReadRemoteFile,
+    ) -> mux::pane::ReadRemoteFileFuture {
+        let client = Arc::clone(&self.client);
+        let remote_pane = self.remote_pane_id;
+        let local_pane = self.local_pane_id;
+        Box::pin(async move {
+            let response = client
+                .client
+                .send_pdu(Pdu::ReadRemoteFile(codec::ReadRemoteFile {
+                    pane_id: remote_pane,
+                    ..request
+                }))
+                .await?;
+            match response {
+                Pdu::ReadRemoteFileResponse(mut response) => {
+                    anyhow::ensure!(
+                        response.pane_id == remote_pane,
+                        "remote file pane mismatch"
+                    );
+                    response.pane_id = local_pane;
+                    Ok(response)
+                }
+                Pdu::ErrorResponse(err) => anyhow::bail!("{}", err.reason),
+                Pdu::Invalid { .. } => {
+                    anyhow::bail!("the server does not support reading remote files")
+                }
+                _ => anyhow::bail!("unexpected remote file response"),
+            }
+        })
+    }
+
     fn pane_id(&self) -> PaneId {
         self.local_pane_id
     }

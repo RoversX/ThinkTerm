@@ -16,6 +16,7 @@ pub mod agent;
 pub mod image;
 pub mod client;
 pub mod command;
+pub mod file;
 pub mod keyassignment;
 pub mod layout;
 pub mod pane;

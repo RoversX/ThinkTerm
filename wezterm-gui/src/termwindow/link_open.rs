@@ -5,6 +5,10 @@
 //! not opened at all: what the user saw is not what would open.
 
 use crate::termwindow::ContextMenuApplicationAction;
+use mux::pane::{Pane, PaneId};
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use window::{ContextMenuIcon, ContextMenuItem};
 
 /// How long a link may be in the menu that asks about it, in characters.
@@ -86,11 +90,90 @@ fn shown_link(uri: &str) -> String {
     elided
 }
 
+/// A link that names a file on the host that owns the pane: an absolute
+/// path or a `file://` URL without a host. Anything with another scheme is
+/// either a web page or an application's own URL.
+fn link_file_path(uri: &str) -> Option<PathBuf> {
+    if let Ok(url) = url::Url::parse(uri) {
+        if url.scheme() == "file" {
+            return if url.host_str().is_some() {
+                None
+            } else {
+                url.to_file_path().ok()
+            };
+        }
+        if !url.scheme().is_empty() {
+            return None;
+        }
+    }
+    let path = PathBuf::from(uri);
+    path.is_absolute().then_some(path)
+}
+
+fn pane_is_local(pane_id: PaneId) -> bool {
+    mux::Mux::get()
+        .get_pane(pane_id)
+        .is_some_and(|pane| pane.downcast_ref::<mux::localpane::LocalPane>().is_some())
+}
+
+/// Fetch `path` from the host that owns `pane`, in chunks, so a picture
+/// produced there can be opened by an application here.
+async fn fetch_remote_file(pane: Arc<dyn Pane>, path: PathBuf) -> anyhow::Result<Vec<u8>> {
+    const CHUNK: u32 = 4 * 1024 * 1024;
+    const LIMIT: usize = 64 * 1024 * 1024;
+    let display = path.display().to_string();
+    let path = path.to_string_lossy().into_owned();
+    let mut data = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        let response = pane
+            .read_remote_file(codec::ReadRemoteFile {
+                pane_id: pane.pane_id(),
+                path: path.clone(),
+                offset,
+                length: CHUNK,
+            })
+            .await?;
+        anyhow::ensure!(response.data.len() <= CHUNK as usize, "oversized file chunk");
+        data.extend_from_slice(&response.data);
+        offset += response.data.len() as u64;
+        if response.eof {
+            return Ok(data);
+        }
+        anyhow::ensure!(!response.data.is_empty(), "{display} ended early");
+        anyhow::ensure!(
+            data.len() <= LIMIT,
+            "{display} is larger than the 64 MiB link limit"
+        );
+    }
+}
+
+/// Write the fetched bytes under the terminal cache so the local opener
+/// sees the extension it needs, and return the copy's path.
+fn write_link_copy(path: &Path, bytes: &[u8]) -> anyhow::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("link");
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    let directory = std::env::temp_dir().join("thinkterm-links");
+    std::fs::create_dir_all(&directory)?;
+    let local = directory.join(format!("{:016x}-{name}", hasher.finish()));
+    std::fs::write(&local, bytes)?;
+    Ok(local)
+}
+
 impl crate::TermWindow {
     /// Open `uri`, a terminal link the user clicked that the `open-uri`
     /// event left to us: a web page at once, anything else after asking in
     /// a menu at `anchor`, and a link hiding characters not at all.
-    pub(crate) fn open_terminal_link(&mut self, uri: String, anchor: ::window::Point) {
+    pub(crate) fn open_terminal_link(
+        &mut self,
+        uri: String,
+        anchor: ::window::Point,
+        pane_id: PaneId,
+    ) {
         let decision = classify(&uri);
         if decision == LinkOpen::Direct {
             wezterm_open_url::open_url(&uri);
@@ -102,32 +185,87 @@ impl crate::TermWindow {
         let header = ContextMenuItem::SectionHeader {
             label: shown_link(&uri),
         };
+        let remote_file = link_file_path(&uri).is_some() && !pane_is_local(pane_id);
         self.begin_context_menu_application_actions();
         let items = if decision == LinkOpen::Refuse {
             log::warn!("not opening an unsafe terminal link");
             let refused = self.context_menu_application_item_with_icon(
                 crate::i18n::tr("link-refused-unsafe"),
                 ContextMenuIcon::Warning,
-                ContextMenuApplicationAction::ResolveTerminalLink(None),
+                ContextMenuApplicationAction::ResolveTerminalLink {
+                    link: None,
+                    pane_id: None,
+                },
                 false,
             );
             vec![header, refused]
         } else {
             let open = self.context_menu_application_item_with_icon(
-                crate::i18n::tr("link-open-other-app"),
+                crate::i18n::tr(if remote_file {
+                    "link-open-remote-app"
+                } else {
+                    "link-open-other-app"
+                }),
                 ContextMenuIcon::ExternalLink,
-                ContextMenuApplicationAction::ResolveTerminalLink(Some(uri)),
+                ContextMenuApplicationAction::ResolveTerminalLink {
+                    link: Some(uri),
+                    pane_id: Some(pane_id),
+                },
                 true,
             );
             let cancel = self.context_menu_application_item_with_icon(
                 crate::i18n::tr("link-open-cancel"),
                 ContextMenuIcon::Close,
-                ContextMenuApplicationAction::ResolveTerminalLink(None),
+                ContextMenuApplicationAction::ResolveTerminalLink {
+                    link: None,
+                    pane_id: None,
+                },
                 true,
             );
             vec![header, open, cancel]
         };
         self.show_term_context_menu(&window, anchor, items);
+    }
+
+    /// Open a terminal link whose target lives on the pane's host: fetch a
+    /// copy for this machine and hand that to the local opener.
+    pub(crate) fn open_terminal_link_now(&self, link: String, pane_id: Option<PaneId>) {
+        let Some(pane_id) = pane_id else {
+            wezterm_open_url::open_url(&link);
+            return;
+        };
+        let Some(path) = link_file_path(&link) else {
+            wezterm_open_url::open_url(&link);
+            return;
+        };
+        if pane_is_local(pane_id) {
+            wezterm_open_url::open_url(&link);
+            return;
+        }
+        let Some(pane) = mux::Mux::get().get_pane(pane_id) else {
+            wezterm_open_url::open_url(&link);
+            return;
+        };
+        promise::spawn::spawn(async move {
+            let result = async {
+                let bytes = fetch_remote_file(pane, path.clone()).await?;
+                promise::spawn::spawn_into_new_thread(move || {
+                    let local = write_link_copy(&path, &bytes)?;
+                    wezterm_open_url::open_url(&local.to_string_lossy());
+                    Ok(())
+                })
+                .await
+            }
+            .await;
+            if let Err(err) = result {
+                log::error!("unable to open a remote terminal link: {err:#}");
+                wezterm_toast_notification::persistent_toast_notification(
+                    "ThinkTerm",
+                    &format!("Unable to open the linked file: {err}"),
+                );
+            }
+        })
+        .detach();
     }
 }
 
@@ -191,6 +329,29 @@ mod tests {
             classify("file:///home/user/my notes.txt"),
             LinkOpen::Confirm
         );
+    }
+
+    #[test]
+    fn file_links_are_paths_but_urls_are_not() {
+        assert_eq!(
+            link_file_path("/tmp/icon/preview.jpg"),
+            Some(PathBuf::from("/tmp/icon/preview.jpg"))
+        );
+        assert_eq!(
+            link_file_path("file:///tmp/icon/preview.jpg"),
+            Some(PathBuf::from("/tmp/icon/preview.jpg"))
+        );
+        // The host in a file URL is some other machine's, not the pane's.
+        assert_eq!(link_file_path("file://elsewhere/tmp/x.jpg"), None);
+        for link in [
+            "https://example.com/x.jpg",
+            "mailto:user@example.com",
+            "vscode://file/tmp/x.jpg",
+            "notes.txt",
+            "./notes.txt",
+        ] {
+            assert_eq!(link_file_path(link), None, "{link}");
+        }
     }
 
     #[test]

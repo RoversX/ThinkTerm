@@ -34,6 +34,8 @@ pub type BatchRead = Box<dyn FnOnce(&dyn Pane) + Send>;
 
 pub type KittyImageFuture = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<thinkterm_proto::image::GetImageCellResponse>> + Send>>;
 
+pub type ReadRemoteFileFuture = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<thinkterm_proto::file::ReadRemoteFileResponse>> + Send>>;
+
 pub fn alloc_pane_id() -> PaneId {
     PANE_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
 }
@@ -427,6 +429,14 @@ pub trait Pane: Downcast + Send + Sync {
     }
     fn get_kitty_image(&self, _request: thinkterm_proto::image::GetKittyImage) -> KittyImageFuture {
         Box::pin(async { anyhow::bail!("pane does not provide canonical Kitty images") })
+    }
+    /// Read a slice of a file on the host that owns this pane. Used to open
+    /// a terminal link naming a path that only exists over there.
+    fn read_remote_file(
+        &self,
+        _request: thinkterm_proto::file::ReadRemoteFile,
+    ) -> ReadRemoteFileFuture {
+        Box::pin(async { anyhow::bail!("pane does not provide remote file reads") })
     }
     fn subscribe_kitty_frames(&self) -> Option<Box<dyn KittyFrameSubscription>> {
         None
