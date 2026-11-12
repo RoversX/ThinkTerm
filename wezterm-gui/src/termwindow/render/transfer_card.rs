@@ -54,6 +54,9 @@ pub(crate) struct TransferToast {
     pub shown_at: Instant,
     pub paused_at: Option<Instant>,
     pub closing_at: Option<Instant>,
+    /// A success whose time as itself is up: it stays, folded to its tick,
+    /// until it is dismissed or a newer one takes its place.
+    pub quiet: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +92,7 @@ impl TransferToast {
             shown_at: now,
             paused_at: None,
             closing_at: None,
+            quiet: false,
         }
     }
 
@@ -119,6 +123,7 @@ impl TransferToast {
             shown_at: now,
             paused_at: None,
             closing_at: None,
+            quiet: false,
         }
     }
 
@@ -148,6 +153,7 @@ impl TransferToast {
             shown_at: now,
             paused_at: None,
             closing_at: None,
+            quiet: false,
         }
     }
 
@@ -178,6 +184,7 @@ impl TransferToast {
             shown_at: now,
             paused_at: None,
             closing_at: None,
+            quiet: false,
         }
     }
 
@@ -266,13 +273,13 @@ impl TransferToast {
         Some(toast)
     }
 
-    /// Success notices make way for the next transfer. A failure stays until
-    /// the user closes it or retries: it carries the only way back into a
+    /// When a success goes quiet; it stays after, as a failure does, until
+    /// the user closes it -- a failure carries the only way back into a
     /// transfer whose strip row is deliberately not shown.
     fn deadline(&self) -> Option<Instant> {
         match self.outcome {
-            TransferToastOutcome::Done => Some(self.shown_at + DONE_TTL),
-            TransferToastOutcome::Failed(_) => None,
+            TransferToastOutcome::Done if !self.quiet => Some(self.shown_at + DONE_TTL),
+            _ => None,
         }
     }
 }
@@ -485,7 +492,10 @@ impl crate::TermWindow {
         views
     }
 
-    pub(super) fn advance_transfer_toasts(&mut self, now: Instant, visible: &HashSet<u64>, held: bool) {
+    /// Run each success's clock while it can be seen; one whose time is up
+    /// goes quiet. True when one did.
+    pub(super) fn advance_transfer_toasts(&mut self, now: Instant, visible: &HashSet<u64>, held: bool) -> bool {
+        let mut changed = false;
         for toast in &mut self.transfer_toasts {
             if toast.closing_at.is_some() {
                 continue;
@@ -504,10 +514,12 @@ impl crate::TermWindow {
             }
             if let Some(deadline) = toast.deadline() {
                 if toast.paused_at.is_none() && now >= deadline {
-                    toast.closing_at = Some(now);
+                    toast.quiet = true;
+                    changed = true;
                 }
             }
         }
+        changed
     }
 
     /// When the next finished notice is due to go, so a frame is there to
@@ -548,6 +560,7 @@ pub(crate) fn card_content(view: &CardView) -> CardContent {
             progress,
             canceling,
         } => CardContent {
+            quiet: false,
             mark: Mark::Icon(match kind {
                 RemoteTransferKind::Upload => SvgIcon::Upload,
                 _ => SvgIcon::Download,
@@ -593,6 +606,7 @@ pub(crate) fn card_content(view: &CardView) -> CardContent {
                         None => format!("{title} · {message}"),
                     };
                     CardContent {
+                        quiet: false,
                         mark: Mark::Icon(SvgIcon::CircleAlert),
                         tone: Tone::Failed,
                         name: toast.name.clone(),
@@ -636,7 +650,18 @@ pub(crate) fn card_content(view: &CardView) -> CardContent {
                             ],
                         ),
                     };
+                    // Gone quiet, it can be put away.
+                    let mut actions = actions;
+                    let dismiss = UIItemType::TransferCardDismiss(toast.id);
+                    if toast.quiet && !actions.iter().any(|action| action.item == dismiss) {
+                        actions.push(CardAction {
+                            icon: SvgIcon::X,
+                            primary: false,
+                            item: dismiss,
+                        });
+                    }
                     CardContent {
+                        quiet: toast.quiet,
                         mark: Mark::Icon(SvgIcon::Check),
                         tone: Tone::Done,
                         name: toast.name.clone(),
@@ -831,6 +856,28 @@ mod tests {
             RemoteTransferStatus::Failed(REMOTE_TRANSFER_CANCELED.into()),
         );
         assert!(TransferToast::from_transfer(&canceled, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn a_finished_transfer_goes_quiet_and_can_be_put_away() {
+        let now = Instant::now();
+        let transfer = folder_transfer(RemoteTransferKind::Download, RemoteTransferStatus::Done(String::new()));
+        let mut toast = TransferToast::from_transfer(&transfer, now).unwrap();
+        assert_eq!(toast.deadline(), Some(now + DONE_TTL));
+        let content = card_content(&CardView::Toast(toast.clone()));
+        assert!(!content.quiet);
+        assert!(!content
+            .actions
+            .iter()
+            .any(|action| action.item == UIItemType::TransferCardDismiss(toast.id)));
+        toast.quiet = true;
+        assert_eq!(toast.deadline(), None);
+        let content = card_content(&CardView::Toast(toast.clone()));
+        assert!(content.quiet);
+        assert!(content
+            .actions
+            .iter()
+            .any(|action| action.item == UIItemType::TransferCardDismiss(toast.id)));
     }
 
     #[test]

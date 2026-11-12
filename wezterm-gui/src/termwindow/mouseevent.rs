@@ -1896,6 +1896,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarRemoteTransfer(_)
             | UIItemType::TransferCardCancel(_)
             | UIItemType::TransferCardDismiss(_)
+            | UIItemType::FinishedNoticeDismiss(_)
             | UIItemType::TransferCardRetry(_)
             | UIItemType::TransferCardOpen(_)
             | UIItemType::TransferCardOpenDownloads(_)
@@ -2088,6 +2089,7 @@ impl super::TermWindow {
             | UIItemType::RightSidebarRemoteTransfer(_)
             | UIItemType::TransferCardCancel(_)
             | UIItemType::TransferCardDismiss(_)
+            | UIItemType::FinishedNoticeDismiss(_)
             | UIItemType::TransferCardRetry(_)
             | UIItemType::TransferCardOpen(_)
             | UIItemType::TransferCardOpenDownloads(_)
@@ -4467,6 +4469,7 @@ impl super::TermWindow {
             }
             UIItemType::TransferCardCancel(_)
             | UIItemType::TransferCardDismiss(_)
+            | UIItemType::FinishedNoticeDismiss(_)
             | UIItemType::TransferCardRetry(_)
             | UIItemType::TransferCardOpen(_)
             | UIItemType::TransferCardOpenDownloads(_)
@@ -4955,6 +4958,7 @@ impl super::TermWindow {
             }
             UIItemType::TransferCardCancel(_)
             | UIItemType::TransferCardDismiss(_)
+            | UIItemType::FinishedNoticeDismiss(_)
             | UIItemType::TransferCardRetry(_)
             | UIItemType::TransferCardOpen(_)
             | UIItemType::TransferCardOpenDownloads(_)
@@ -6067,6 +6071,7 @@ impl super::TermWindow {
         match item.item_type {
             UIItemType::TransferCardCancel(id) => self.cancel_transfer(id),
             UIItemType::TransferCardDismiss(id) => self.dismiss_transfer_toast(id),
+            UIItemType::FinishedNoticeDismiss(pane_id) => self.dismiss_finished_notice(pane_id),
             UIItemType::TransferCardRetry(id) => {
                 self.retry_transfer_from_card(id, event.coords)
             }

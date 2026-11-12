@@ -129,6 +129,7 @@ pub(crate) fn content(status: &UpdateCapsuleStatus) -> CardContent {
     let product = PRODUCT.to_string();
     match status {
         UpdateCapsuleStatus::Available { version, new_build } => CardContent {
+            quiet: false,
             mark: Mark::Icon(SvgIcon::ArrowDown),
             tone: Tone::Progress,
             name: crate::i18n::tr(if *new_build {
@@ -142,6 +143,7 @@ pub(crate) fn content(status: &UpdateCapsuleStatus) -> CardContent {
             actions: vec![act(SvgIcon::ArrowDown), close],
         },
         UpdateCapsuleStatus::Installing { fraction } => CardContent {
+            quiet: false,
             mark: Mark::Icon(SvgIcon::ArrowDown),
             tone: Tone::Progress,
             name: crate::i18n::tr(if fraction.is_some() {
@@ -160,6 +162,7 @@ pub(crate) fn content(status: &UpdateCapsuleStatus) -> CardContent {
             actions: vec![close],
         },
         UpdateCapsuleStatus::Installed { restart: true } => CardContent {
+            quiet: false,
             mark: Mark::Icon(SvgIcon::RotateCw),
             tone: Tone::Done,
             name: crate::i18n::tr("update-capsule-restart"),
@@ -171,6 +174,7 @@ pub(crate) fn content(status: &UpdateCapsuleStatus) -> CardContent {
         // A restart here would end terminals: the Update page says what
         // to do instead.
         UpdateCapsuleStatus::Installed { restart: false } => CardContent {
+            quiet: false,
             mark: Mark::Icon(SvgIcon::Check),
             tone: Tone::Done,
             name: crate::i18n::tr("update-capsule-installed"),
@@ -180,6 +184,7 @@ pub(crate) fn content(status: &UpdateCapsuleStatus) -> CardContent {
             actions: vec![act(SvgIcon::ArrowRight), close],
         },
         UpdateCapsuleStatus::Failed => CardContent {
+            quiet: false,
             mark: Mark::Icon(SvgIcon::CircleAlert),
             tone: Tone::Failed,
             name: crate::i18n::tr("update-capsule-failed"),

@@ -951,6 +951,8 @@ pub enum UIItemType {
     /// path of what it uploaded.
     TransferCardCancel(u64),
     TransferCardDismiss(u64),
+    /// Put away a finished agent's or command's notice gone quiet, unseen.
+    FinishedNoticeDismiss(PaneId),
     TransferCardRetry(u64),
     TransferCardOpen(u64),
     TransferCardOpenDownloads(u64),
@@ -2356,7 +2358,9 @@ pub fn tooltip_label_for(item_type: &UIItemType) -> Option<String> {
             "tooltip-refresh-files"
         }
         UIItemType::RightSidebarRemoteFileUpload => "tooltip-upload-files",
-        UIItemType::TransferCardDismiss(_) | UIItemType::UpdateCapsuleDismiss => "right-dismiss",
+        UIItemType::TransferCardDismiss(_)
+        | UIItemType::FinishedNoticeDismiss(_)
+        | UIItemType::UpdateCapsuleDismiss => "right-dismiss",
         UIItemType::UpdateCapsule => render::update_capsule::action_tooltip(),
         UIItemType::TransferCardCancel(_) => "right-cancel",
         UIItemType::TransferCardRetry(_) => "right-retry",

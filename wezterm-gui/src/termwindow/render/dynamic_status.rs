@@ -139,11 +139,12 @@ const POP_OVERSHOOT: f32 = 0.12;
 const PACE: Duration = Duration::from_millis(34);
 /// How recently something must have happened to be shown as news.
 const NEWS_FOR: Duration = Duration::from_secs(5);
-/// How long an agent that has just finished stays on, as a finished
-/// transfer does: counted only while it can be seen.
+/// How long an agent that has just finished stays on as itself, as a
+/// finished transfer does: counted only while it can be seen. Then it goes
+/// quiet -- its tick alone -- until its pane is seen or it is dismissed.
 const FINISHED_FOR: Duration = Duration::from_secs(5);
-/// Agents that have just finished kept on at once.
-const FINISHED_MAX: usize = 3;
+/// Finished agents and commands kept at once; the oldest goes first.
+const FINISHED_MAX: usize = 6;
 /// Work shorter than this is not news when it ends -- a one-line answer --
 /// as the finished sound has it.
 const FINISHED_AFTER: Duration = Duration::from_secs(5);
@@ -303,6 +304,16 @@ pub(crate) struct FinishedAgent {
     paused_at: Option<Instant>,
     /// What ended, when it was a command rather than an agent.
     command: Option<FinishedCommand>,
+    /// Its time as itself is up: it waits, folded to its tick, to be seen.
+    quiet: bool,
+}
+
+impl FinishedAgent {
+    /// A command that failed: it stays as it is until seen, as a failed
+    /// transfer does, rather than going quiet.
+    fn failed(&self) -> bool {
+        self.command.as_ref().is_some_and(FinishedCommand::failed)
+    }
 }
 
 /// What one window knows of agents finishing: since when each one at work
@@ -428,6 +439,7 @@ impl FinishedAgents {
                 shown_at: now,
                 paused_at: None,
                 command: None,
+                quiet: false,
             });
             on = true;
         }
@@ -485,6 +497,7 @@ impl FinishedAgents {
                 pane_id,
                 shown_at: now,
                 paused_at: None,
+                quiet: false,
                 command: Some(FinishedCommand {
                     label: reading.map_or(run.label, |reading| reading.name),
                     took,
@@ -561,20 +574,27 @@ impl FinishedAgents {
     }
 
     /// Run each one's clock while it is in `visible` and nothing holds it;
-    /// drop those whose time is up. True when one went.
+    /// those whose time is up go quiet. A failure has no clock. True when
+    /// one went quiet.
     fn advance(&mut self, now: Instant, visible: &HashSet<PaneId>, held: bool) -> bool {
-        let before = self.shown.len();
-        self.shown.retain_mut(|agent| {
+        let mut changed = false;
+        for agent in &mut self.shown {
+            if agent.quiet || agent.failed() {
+                continue;
+            }
             if held || !visible.contains(&agent.pane_id) {
                 agent.paused_at.get_or_insert(now);
-                return true;
+                continue;
             }
             if let Some(paused) = agent.paused_at.take() {
                 agent.shown_at += now.duration_since(paused);
             }
-            now < agent.shown_at + FINISHED_FOR
-        });
-        self.shown.len() != before
+            if now >= agent.shown_at + FINISHED_FOR {
+                agent.quiet = true;
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn pause(&mut self, now: Instant) {
@@ -589,7 +609,7 @@ impl FinishedAgents {
         let settling = self.stopping.values().map(|stopped| *stopped + FINISHED_SETTLE);
         self.shown
             .iter()
-            .filter(|agent| agent.paused_at.is_none())
+            .filter(|agent| agent.paused_at.is_none() && !agent.quiet && !agent.failed())
             .map(|agent| agent.shown_at + FINISHED_FOR)
             .chain(settling)
             .min()
@@ -623,17 +643,27 @@ impl StatusItem {
                 Progress::Error(_) => 1,
                 _ => 3,
             },
+            // What finished a while ago gives way to everything.
             Self::Transfer(CardView::Toast(toast)) => match toast.outcome {
                 TransferToastOutcome::Failed(_) => 1,
+                TransferToastOutcome::Done if toast.quiet => 5,
                 TransferToastOutcome::Done => 2,
             },
             Self::Transfer(CardView::Running { .. }) => 3,
             Self::Update(status) => update_capsule::rank(status),
             // With what has just finished.
-            Self::Finished { .. } => 2,
-            Self::Command { command, .. } => {
+            Self::Finished { agent, .. } => {
+                if agent.quiet {
+                    5
+                } else {
+                    2
+                }
+            }
+            Self::Command { command, notice, .. } => {
                 if command.failed() {
                     1
+                } else if notice.quiet {
+                    5
                 } else {
                     2
                 }
@@ -1368,6 +1398,8 @@ pub(crate) struct CardContent {
     /// How far it has got: `Some(None)` when there is no telling.
     pub bar: Option<Option<f32>>,
     pub actions: Vec<CardAction>,
+    /// Finished a while ago and not yet seen: folded to its tick alone.
+    pub quiet: bool,
 }
 
 impl crate::TermWindow {
@@ -1922,7 +1954,7 @@ impl crate::TermWindow {
         let folded_alpha = (1.0 - smoothstep(open_amount / 0.4)) * content_in;
         // The pill opening into its own card -- not into another thing's
         // (a banner), and not while either gives way to new content.
-        let travel = front_open == 0 && pill_from.is_none() && card_from.is_none();
+        let travel = front_open == 0 && pill_from.is_none() && card_from.is_none() && !content(0).quiet;
         // Its ring -- or a finished one's tick -- goes with it when the card
         // has one where the pill does: a card with buttons in its place has
         // none.
@@ -2058,7 +2090,10 @@ impl crate::TermWindow {
             // pointer it came up under holds it too: that is someone
             // reading it, even before they move.
             let hold = over || self.occluded.is_some();
-            self.advance_transfer_toasts(now, &visible, hold);
+            if self.advance_transfer_toasts(now, &visible, hold) {
+                // One went quiet after this frame was painted.
+                self.update_next_frame_time(Some(now));
+            }
             if let Some(deadline) = self.next_transfer_toast_deadline() {
                 self.update_next_frame_time(Some(deadline));
             }
@@ -2070,7 +2105,7 @@ impl crate::TermWindow {
                 })
                 .collect();
             if self.dynamic_status.finished.advance(now, &finished, hold) {
-                // This frame already painted the one that went.
+                // One went quiet after this frame was painted.
                 self.update_next_frame_time(Some(now));
             }
             if let Some(deadline) = self.dynamic_status.finished.deadline() {
@@ -2091,6 +2126,15 @@ impl crate::TermWindow {
         // Kept for next frame: what a thing that goes had been.
         self.dynamic_status.last = items;
         Ok(())
+    }
+
+    /// A finished notice gone quiet, put away unseen.
+    pub(crate) fn dismiss_finished_notice(&mut self, pane_id: PaneId) {
+        self.dynamic_status
+            .finished
+            .shown
+            .retain(|notice| notice.pane_id != pane_id);
+        self.invalidate_window();
     }
 
     /// Typing hid the pointer: until it moves, it is over nothing here.
@@ -2119,6 +2163,10 @@ impl crate::TermWindow {
         content: &CardContent,
         px: &impl Fn(f32) -> f32,
     ) -> anyhow::Result<f32> {
+        // Gone quiet: a disc around its tick.
+        if content.quiet {
+            return Ok(px(PILL_HEIGHT));
+        }
         let name = self
             .sidebar_text_width(&fonts.title, &content.name)?
             .ceil()
@@ -2156,7 +2204,12 @@ impl crate::TermWindow {
     /// it, when it has one: finished, with no buttons and no ring there
     /// instead.
     fn card_done_width(&self, fonts: &Fonts, content: &CardContent, px: &impl Fn(f32) -> f32) -> anyhow::Result<Option<f32>> {
-        if content.tone != Tone::Done || !content.actions.is_empty() || content.bar.is_some() {
+        // Beside its buttons only when quiet: the dismiss button is all it
+        // has then.
+        if content.tone != Tone::Done
+            || (!content.actions.is_empty() && !content.quiet)
+            || content.bar.is_some()
+        {
             return Ok(None);
         }
         let text = if content.short.is_empty() {
@@ -2361,6 +2414,10 @@ impl crate::TermWindow {
         px: &impl Fn(f32) -> f32,
     ) -> anyhow::Result<()> {
         let mid = rect.min_y() + rect.size.height / 2.0;
+        if content.quiet {
+            let size = px(DONE_PILL_BADGE);
+            return paint_done_badge(ctx, layers, (rect.min_x() + rect.size.width / 2.0, mid), size, alpha);
+        }
         let place = self.pill_head(fonts, rect, content, px)?;
         if head {
             self.paint_status_tile(layers, ctx, ink, content, place.mark_x - place.mark / 2.0, mid, place.mark, alpha)?;
@@ -2658,6 +2715,9 @@ impl crate::TermWindow {
                     alpha,
                 )?;
                 self.paint_status_mark(layers, ctx, content, cx, cy, px(SATELLITE_MARK), tone_color(content.tone, ink).mul_alpha(alpha))?;
+            }
+            None if content.quiet => {
+                paint_done_badge(ctx, layers, (cx, cy), px(DONE_PILL_BADGE), alpha)?;
             }
             None => {
                 let size = px(PILL_MARK);
@@ -3361,10 +3421,10 @@ fn status_content(item: &StatusItem) -> CardContent {
         StatusItem::Transfer(view) => card_content(view),
         StatusItem::Update(status) => update_capsule::content(status),
         StatusItem::Finished {
+            agent: notice,
             agents,
             index,
             here,
-            ..
         } => {
             let agent = &agents[*index];
             let name = crate::agent_status::display_name(&agent.agent_id);
@@ -3386,8 +3446,14 @@ fn status_content(item: &StatusItem) -> CardContent {
                 detail: detail.join(" · "),
                 short: String::new(),
                 bar: None,
-                // Nothing to do but look: the card itself goes to it.
-                actions: Vec::new(),
+                // Nothing to do but look: the card itself goes to it. Gone
+                // quiet, it can also be put away unseen.
+                actions: if notice.quiet {
+                    vec![dismiss_finished(notice.pane_id)]
+                } else {
+                    Vec::new()
+                },
+                quiet: notice.quiet,
             }
         }
         StatusItem::Command {
@@ -3422,9 +3488,12 @@ fn status_content(item: &StatusItem) -> CardContent {
                 bar: None,
                 actions: if failed {
                     vec![go_to(notice.pane_id, *here, true)]
+                } else if notice.quiet {
+                    vec![dismiss_finished(notice.pane_id)]
                 } else {
                     Vec::new()
                 },
+                quiet: notice.quiet,
             }
         }
         StatusItem::Task {
@@ -3451,6 +3520,7 @@ fn status_content(item: &StatusItem) -> CardContent {
                 (None, None) => state.clone(),
             };
             CardContent {
+                quiet: false,
                 mark: Mark::Pane(*pane_id),
                 tone,
                 name: name.clone(),
@@ -3496,6 +3566,7 @@ fn status_content(item: &StatusItem) -> CardContent {
                 None => detail.push(state.clone()),
             }
             CardContent {
+                quiet: false,
                 mark: Mark::Pane(agent.pane_id),
                 tone,
                 name: if agent.title.is_empty() {
@@ -3549,6 +3620,7 @@ fn status_content(item: &StatusItem) -> CardContent {
                 }
             };
             CardContent {
+                quiet: false,
                 mark: Mark::Pane(pane.pane_id),
                 tone,
                 name,
@@ -3561,6 +3633,15 @@ fn status_content(item: &StatusItem) -> CardContent {
                 },
             }
         }
+    }
+}
+
+/// The button that puts away a finished notice gone quiet, unseen.
+fn dismiss_finished(pane_id: PaneId) -> CardAction {
+    CardAction {
+        icon: SvgIcon::X,
+        primary: false,
+        item: UIItemType::FinishedNoticeDismiss(pane_id),
     }
 }
 
@@ -4125,7 +4206,7 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_agent_goes_after_its_time_on_screen() {
+    fn a_finished_agent_goes_quiet_after_its_time_on_screen() {
         let now = Instant::now();
         let mut finished = FinishedAgents::default();
         finished.working.insert(1, now);
@@ -4136,7 +4217,38 @@ mod tests {
         assert!(!finished.advance(start + Duration::from_secs(4), &seen, false));
         assert_eq!(finished.deadline(), Some(start + FINISHED_FOR));
         assert!(finished.advance(start + FINISHED_FOR, &seen, false));
+        // Kept, folded to its tick, with no clock left to run.
+        assert_eq!(finished.shown.len(), 1);
+        assert!(finished.shown[0].quiet);
+        assert_eq!(finished.deadline(), None);
+        assert!(!finished.advance(start + Duration::from_secs(3600), &seen, false));
+        assert_eq!(finished.shown.len(), 1);
+        // Working again takes it off, as before.
+        finished.note(start + Duration::from_secs(3601), 1, Some(AgentState::Working));
         assert!(finished.shown.is_empty());
+    }
+
+    #[test]
+    fn a_failed_command_stays_as_it_is() {
+        let now = Instant::now();
+        let mut finished = FinishedAgents::default();
+        finished.shown.push(FinishedAgent {
+            pane_id: 2,
+            shown_at: now,
+            paused_at: None,
+            quiet: false,
+            command: Some(FinishedCommand {
+                label: "make".into(),
+                took: Duration::from_secs(30),
+                exit: Some(2),
+                saw_error: false,
+                place: String::new(),
+            }),
+        });
+        let seen: HashSet<PaneId> = [2].iter().copied().collect();
+        assert_eq!(finished.deadline(), None);
+        assert!(!finished.advance(now + Duration::from_secs(60), &seen, false));
+        assert!(!finished.shown[0].quiet);
     }
 
     #[test]
@@ -4148,6 +4260,7 @@ mod tests {
             shown_at: now,
             paused_at: None,
             command: None,
+            quiet: false,
         });
         let seen: HashSet<PaneId> = [1].iter().copied().collect();
         // Under the pointer for ten seconds, then left alone.
