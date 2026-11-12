@@ -1509,8 +1509,8 @@ impl TermWindow {
 
     /// The view menu: what to show (by state, and by machine once there is
     /// more than one), how to group and order it, and which parts of a
-    /// program's report to show -- the same four switches as Settings ›
-    /// Agents, ticked and without icons -- and reloading the detection rules.
+    /// program's report to show, ticked and without icons -- and reloading
+    /// the detection rules.
     fn agents_view_options_menu_items(&mut self) -> Vec<window::ContextMenuItem> {
         use crate::native_settings::{AgentStatusPart, AgentsGroupBy, AgentsSortBy};
         use crate::termwindow::ContextMenuApplicationAction as Action;

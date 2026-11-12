@@ -1415,7 +1415,7 @@ mod server_terminal_tests {
 
 /// What the server this process runs for the command line lets the programs
 /// that ask have of the servers' terminals the windows are connected to:
-/// as far as Settings › Agents says.
+/// as far as Settings › Agents & Status says.
 fn keep_servers_terminals() {
     use crate::native_settings::NativeServerTerminals;
     use wezterm_mux_server_impl::foreign_panes::{install, Policy, Reach};
@@ -1488,6 +1488,9 @@ fn setup_mux(
     mux::agent_status::set_process_preference(|| {
         crate::native_settings::agent_panel_enabled()
     });
+    // Likewise Dynamic Status and its tool switches govern which tools'
+    // screens this process reads; a server reads by its own.
+    mux::task_status::set_tool_preference(crate::native_settings::task_tool_enabled);
     // The user-facing shell choice reaches every local spawn from here.
     // A headless mux server installs nothing, so this preference can only
     // ever decide what *this* process spawns, never what a remote server

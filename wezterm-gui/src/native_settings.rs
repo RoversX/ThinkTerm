@@ -1268,6 +1268,13 @@ pub(crate) struct NativeChromeSettings {
     pub(crate) agent_panel_enabled: Option<bool>,
     /// What is shown of the state programs report about themselves.
     pub(crate) agent_status_display: NativeAgentStatusDisplay,
+    /// Dynamic Status, the corner of the terminal area that shows what is
+    /// out of sight. Absent means on. Off, it shows only ThinkTerm's own
+    /// news: an update, a transfer.
+    pub(crate) dynamic_status_enabled: Option<bool>,
+    /// Tools whose screens are not read for Dynamic Status, by the id of
+    /// their task rules (`mux::task_status`).
+    pub(crate) task_tools_off: Vec<String>,
     /// How the Agents panel's view menu filters, groups and orders it.
     pub(crate) agents_panel_view: NativeAgentsPanelView,
     /// The panels plugins add to the right sidebar, as the plugin host last
@@ -1388,7 +1395,7 @@ impl Default for NativeWindowSettings {
 
 /// What the sidebar's thread cards, the bell and the Agents panel show of
 /// the state programs report about themselves (OSC 7501). All of it, unless
-/// the user turned a part off in Settings › Agents.
+/// the user turned a part off in the Agents panel's view menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct NativeAgentStatusDisplay {
@@ -1413,8 +1420,7 @@ impl Default for NativeAgentStatusDisplay {
 }
 
 /// The parts of a program's own status report (OSC 7501) that can be
-/// switched on and off: in Settings › Agents and in the Agents panel's view
-/// menu, which flip the same settings.
+/// switched on and off, in the Agents panel's view menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentStatusPart {
     Description,
@@ -1424,7 +1430,7 @@ pub(crate) enum AgentStatusPart {
 }
 
 impl AgentStatusPart {
-    /// In the order the Status Display card numbers them.
+    /// In the order the Agents panel's view menu lists them.
     pub(crate) const ALL: [Self; 4] = [
         Self::Description,
         Self::Reason,
@@ -1438,15 +1444,6 @@ impl AgentStatusPart {
             Self::Reason => "settings-agent-status-reason",
             Self::Progress => "settings-agent-status-progress",
             Self::Subtasks => "settings-agent-status-subtasks",
-        }
-    }
-
-    pub(crate) fn description_key(self) -> &'static str {
-        match self {
-            Self::Description => "settings-agent-status-description-description",
-            Self::Reason => "settings-agent-status-reason-description",
-            Self::Progress => "settings-agent-status-progress-description",
-            Self::Subtasks => "settings-agent-status-subtasks-description",
         }
     }
 
@@ -1768,7 +1765,7 @@ impl Default for NativeWebSettings {
 
 /// How far the programs on this machine -- `thinkterm cli`, the agents it
 /// is run by, plugins -- may reach the terminals of the servers a window is
-/// connected to: Settings › Agents. Off until turned on: what they would
+/// connected to: Settings › Agents & Status. Off until turned on: what they would
 /// reach is a shell on another machine, logged in as the person at the
 /// window (`wezterm_mux_server_impl::foreign_panes`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
@@ -3383,6 +3380,25 @@ pub(crate) fn dock_badge_moments() -> Option<WorkMoments> {
 /// while painting.
 pub(crate) fn agent_status_display() -> NativeAgentStatusDisplay {
     load_shared().chrome.agent_status_display
+}
+
+/// Whether Dynamic Status shows what is out of sight, or only ThinkTerm's
+/// own news.
+pub(crate) fn dynamic_status_enabled() -> bool {
+    load_shared().chrome.dynamic_status_enabled.unwrap_or(true)
+}
+
+/// Whether the tool with task rules `id` has its screen read: Dynamic
+/// Status on, and the tool not switched off.
+pub(crate) fn task_tool_enabled(id: &str) -> bool {
+    load_shared().chrome.task_tool_enabled(id)
+}
+
+impl NativeChromeSettings {
+    pub(crate) fn task_tool_enabled(&self, id: &str) -> bool {
+        self.dynamic_status_enabled.unwrap_or(true)
+            && !self.task_tools_off.iter().any(|off| off == id)
+    }
 }
 
 /// Flip one part of the status display from outside Settings (the Agents

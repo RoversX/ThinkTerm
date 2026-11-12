@@ -710,8 +710,8 @@ pub(crate) enum ContextMenuApplicationAction {
     ToggleAgentsMachineFilter(String),
     SetAgentsGroupBy(crate::native_settings::AgentsGroupBy),
     SetAgentsSortBy(crate::native_settings::AgentsSortBy),
-    /// Agents panel view menu: one part of programs' status reports, the
-    /// same switch Settings › Agents flips.
+    /// Agents panel view menu: one part of programs' status reports, shown
+    /// or not.
     ToggleAgentStatusPart(crate::native_settings::AgentStatusPart),
     /// Agents panel view menu: re-read the agent detection rules.
     ReloadAgentRules,

@@ -1,7 +1,6 @@
 use crate::tab_icons::RgbExt as _;
 use crate::customglyph::{BlockKey, Poly};
 use crate::glyphcache::CachedGlyph;
-use crate::native_settings::AgentStatusPart;
 use crate::native_settings::{NativeWorkspaceSettings, WorkMoment, WorkMoments};
 use wezterm_mux_server_impl::privacy::PrivacyReport;
 use crate::quad::{
@@ -989,7 +988,8 @@ fn agent_detail_lines(agent_id: &str, kind: crate::agent_status::IntegrationKind
 }
 
 /// Debug affordance companion to `THINKTERM_SETTINGS_SECTION`: pre-expands
-/// one Integrations row (e.g. for unattended UI captures).
+/// one Integrations row (e.g. for unattended UI captures). The same name
+/// opens a tool's row on the Dynamic Status card.
 fn initial_expanded_agent() -> Option<&'static str> {
     let name = std::env::var("THINKTERM_SETTINGS_EXPAND").ok()?;
     crate::agent_status::SUPPORTED_AGENTS
@@ -1299,6 +1299,13 @@ impl SettingsSection {
                 "Servers",
                 "Remote",
                 "thinkterm cli",
+                "Status",
+                "Dynamic Status",
+                "Tools",
+                "Task Rules",
+                "Homebrew",
+                "brew",
+                "apt",
             ],
             Self::Archived => &[
                 "Archive",
@@ -1952,6 +1959,33 @@ fn plugin_key(id: &str) -> u64 {
     web_token_key(id)
 }
 
+/// The tab icon a tool's tab wears: its first program's.
+fn task_tool_icon(tool: &mux::task_status::Tool) -> crate::tab_icons::ResolvedIcon {
+    let program = thinkterm_proto::ForegroundProgram {
+        executable: tool.programs.first().cloned().unwrap_or_default(),
+        ..Default::default()
+    };
+    crate::tab_icons::catalog()
+        .card_for(None, Some(&program))
+        .resolved()
+}
+
+/// What Settings calls a tool: the name of the tab icon made for it
+/// ("Homebrew" for brew), else its rules' own name.
+fn task_tool_display_name(tool: &mux::task_status::Tool) -> String {
+    let catalog = crate::tab_icons::catalog();
+    let program = thinkterm_proto::ForegroundProgram {
+        executable: tool.programs.first().cloned().unwrap_or_default(),
+        ..Default::default()
+    };
+    let card = catalog.card_for(None, Some(&program));
+    if card.programs.iter().any(|name| *name == tool.id) {
+        card.name.clone()
+    } else {
+        tool.name.clone()
+    }
+}
+
 /// Every window lays its right sidebar out again. Not invalidate_all_windows:
 /// the sidebar's width can have gone to or from zero, and only a real
 /// relayout resizes the panes around that.
@@ -2247,7 +2281,15 @@ enum SettingsAction {
     /// into a permission's list.
     #[cfg(target_os = "macos")]
     RevealPrivacyHolder,
-    ToggleAgentStatusPart(AgentStatusPart),
+    /// Dynamic Status on, or down to ThinkTerm's own news.
+    ToggleDynamicStatus,
+    /// One tool's screen read or not. Carries `plugin_key(id)`, as
+    /// TogglePlugin does: the rules can be reloaded in between.
+    ToggleTaskTool(u64),
+    /// Open or close what a tool's rules read, keyed the same way.
+    ToggleTaskToolDetails(u64),
+    /// Show the folder the user's own task rules go in.
+    OpenTaskRulesFolder,
     ToggleRemoteUpdateKeepsSessions,
     ToggleLocalSessionsViaMux,
     ToggleRestorePaneOutput,
@@ -4049,6 +4091,9 @@ struct SettingsWindow {
     chrome_palette: UiPalette,
     selected: SettingsSection,
     agents_expanded: Option<&'static str>,
+    /// The tool on the Dynamic Status card whose row is open, by
+    /// `plugin_key(id)`.
+    task_tool_expanded: Option<u64>,
     reverse_access: connect_access::UiState,
     native_settings: ThinkTermNativeSettings,
     active_main_renderer: NativeRendererBackend,
@@ -4225,6 +4270,9 @@ impl SettingsWindow {
             ),
             selected: initial_section(),
             agents_expanded: initial_expanded_agent(),
+            task_tool_expanded: std::env::var("THINKTERM_SETTINGS_EXPAND")
+                .ok()
+                .map(|id| plugin_key(&id)),
             reverse_access: connect_access::UiState::default(),
             native_settings,
             active_main_renderer,
@@ -6694,24 +6742,49 @@ impl SettingsWindow {
                     Err(err) => log::warn!("finding the program permissions belong to: {err:#}"),
                 }
             }
-            SettingsAction::ToggleAgentStatusPart(part) => {
+            SettingsAction::ToggleDynamicStatus => {
                 self.ui.open_dropdown = None;
-                part.toggle(&mut self.native_settings.chrome.agent_status_display);
-                let setting = crate::i18n::tr(part.label_key());
-                self.status = match crate::native_settings::save(&self.native_settings) {
-                    Ok(()) => {
-                        // The sidebars, tabs and cards that show the part are
-                        // in the main windows.
-                        if let Some(front_end) = crate::frontend::try_front_end() {
-                            front_end.invalidate_all_windows();
+                let chrome = &mut self.native_settings.chrome;
+                chrome.dynamic_status_enabled = Some(!chrome.dynamic_status_enabled.unwrap_or(true));
+                self.save_dynamic_status(crate::i18n::tr("settings-dynamic-status-show"));
+            }
+            SettingsAction::ToggleTaskTool(key) => {
+                self.ui.open_dropdown = None;
+                // Greyed while Dynamic Status is off: what it would switch
+                // shows nowhere.
+                let tool = mux::task_status::tools()
+                    .into_iter()
+                    .find(|tool| plugin_key(&tool.id) == key);
+                if let Some(tool) = tool.filter(|_| {
+                    self.native_settings.chrome.dynamic_status_enabled.unwrap_or(true)
+                }) {
+                    let off = &mut self.native_settings.chrome.task_tools_off;
+                    match off.iter().position(|id| *id == tool.id) {
+                        Some(index) => {
+                            off.remove(index);
                         }
-                        settings_tr("settings-status-saved", &[("setting", setting)])
+                        None => off.push(tool.id.clone()),
                     }
-                    Err(err) => settings_tr(
-                        "settings-status-save-error",
-                        &[("setting", setting), ("error", format!("{err:#}"))],
-                    ),
+                    self.save_dynamic_status(task_tool_display_name(&tool));
+                }
+            }
+            SettingsAction::ToggleTaskToolDetails(key) => {
+                self.ui.open_dropdown = None;
+                self.task_tool_expanded = if self.task_tool_expanded == Some(key) {
+                    None
+                } else {
+                    Some(key)
                 };
+            }
+            SettingsAction::OpenTaskRulesFolder => {
+                self.ui.open_dropdown = None;
+                let dir = mux::task_status::rules_dir();
+                // Made so there is somewhere to put the first file.
+                if let Err(err) = std::fs::create_dir_all(&dir) {
+                    self.status = format!("Unable to create {}: {err:#}", dir.display());
+                } else {
+                    Self::open_path(dir);
+                }
             }
             SettingsAction::Hint(_) => {}
             SettingsAction::ToggleRemoteUpdateKeepsSessions => {
@@ -10857,10 +10930,7 @@ impl SettingsWindow {
         Ok(y + height)
     }
 
-    /// Settings › Agents › Status Display: a picture of where a program's
-    /// own report shows, numbered like the switches under it, then one
-    /// switch per part. Returns where the card ends.
-    /// Settings › Agents' card on how far the programs here may reach the
+    /// Settings › Agents & Status' card on how far the programs here may reach the
     /// terminals of the servers a window is connected to, under its own
     /// heading below `above`. Returns where it ends.
     fn paint_server_terminals_card(
@@ -10924,7 +10994,28 @@ impl SettingsWindow {
         })
     }
 
-    fn paint_agent_status_card(
+    /// Save a Dynamic Status switch, `setting` naming it, and have every
+    /// window show what it now allows.
+    fn save_dynamic_status(&mut self, setting: String) {
+        self.status = match crate::native_settings::save(&self.native_settings) {
+            Ok(()) => {
+                mux::foreground_program::refresh_task_readings();
+                if let Some(front_end) = crate::frontend::try_front_end() {
+                    front_end.invalidate_all_windows();
+                }
+                settings_tr("settings-status-saved", &[("setting", setting)])
+            }
+            Err(err) => settings_tr(
+                "settings-status-save-error",
+                &[("setting", setting), ("error", format!("{err:#}"))],
+            ),
+        };
+    }
+
+    /// Dynamic Status: what the corner of the terminal area shows, its
+    /// switch, and the tools whose screens are read for it, each with its
+    /// own; then where rules for other tools go. Returns where it ends.
+    fn paint_dynamic_status_card(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
         x: f32,
@@ -10934,84 +11025,228 @@ impl SettingsWindow {
         let card_padding = self.ui_px(36.0);
         let row_x = x + card_padding;
         let row_width = max_width - card_padding * 2.0;
-        self.paint_card(layers, x, card_y, max_width, |this, layers, top| {
-            let diagram_bottom = this.paint_agent_status_diagram(layers, row_x, top, row_width)?;
-            let slot = this.ui_px(ROW_TILE_SIDE);
-            let indent = slot + this.ui_px(ROW_TILE_GAP);
-            let badge = this.ui_px(ROW_BADGE_SIDE).round();
+        let tools = mux::task_status::tools();
+        // The switch's explanation says what stays when it is off.
+        let layout = CardLayout {
+            description_lines: 3,
+            ..self.card_layout()
+        };
+        self.paint_card_as(layers, x, card_y, max_width, layout, |this, layers, top| {
+            let diagram_bottom =
+                this.paint_dynamic_status_diagram(layers, row_x, top, row_width, &tools)?;
             let mut rows = RowCursor::new(diagram_bottom + this.ui_px(52.0), this);
             // The first rule closes off the picture, across the card.
             this.paint_separator(layers, row_x, rows.y - this.ui_px(28.0), row_width)?;
-            let display = this.native_settings.chrome.agent_status_display;
-            for (index, part) in AgentStatusPart::ALL.iter().copied().enumerate() {
-                let block_bottom = this.settings_row_description_y(rows.y)
-                    + this.metrics.cell_size.height as f32;
-                this.paint_number_badge(
-                    layers,
-                    row_x + ((slot - badge) / 2.0).round(),
-                    ((rows.y + block_bottom - badge) / 2.0).round(),
-                    badge,
-                    index + 1,
-                )?;
-                rows.add(this.paint_toggle_setting_row(
-                    layers,
-                    row_x + indent,
-                    rows.y,
-                    row_width - indent,
-                    &crate::i18n::tr(part.label_key()),
-                    &crate::i18n::tr(part.description_key()),
-                    part.shown(&display),
-                    SettingsAction::ToggleAgentStatusPart(part),
-                    rows.rule(),
-                )?);
+            let enabled = this.native_settings.chrome.dynamic_status_enabled.unwrap_or(true);
+            rows.add(this.paint_toggle_setting_row(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                &crate::i18n::tr("settings-dynamic-status-show"),
+                &crate::i18n::tr("settings-dynamic-status-show-description"),
+                enabled,
+                SettingsAction::ToggleDynamicStatus,
+                rows.rule(),
+            )?);
+            for tool in &tools {
+                let extra =
+                    this.paint_task_tool_row(layers, row_x, rows.y, row_width, tool, enabled, rows.rule())?;
+                rows.add(extra);
             }
+            let (tx, tw) = this.paint_row_tile(
+                layers,
+                row_x,
+                rows.y,
+                row_width,
+                SvgIcon::Plus,
+                TileColor::Gray,
+            )?;
+            rows.add(this.paint_action_setting_row(
+                layers,
+                tx,
+                rows.y,
+                tw,
+                &crate::i18n::tr("settings-task-tools-other"),
+                &settings_tr(
+                    "settings-task-tools-other-description",
+                    &[("folder", home_relative(&mux::task_status::rules_dir()))],
+                ),
+                &crate::i18n::tr("settings-plugins-open-folder"),
+                SettingsAction::OpenTaskRulesFolder,
+                rows.rule(),
+            )?);
             Ok(rows.bottom)
         })
     }
 
-    /// The main window drawn small with the parts of a program's own report
-    /// where they show: a thread's hover card beside the sidebar, and the
-    /// Agents panel on the right. Each part carries its switch's number; a
-    /// part switched off is left out, and the one whose switch is under the
-    /// pointer lights up. Returns where the picture ends.
-    fn paint_agent_status_diagram(
+    /// One tool's row on the Dynamic Status card: its tab icon, whether it
+    /// is installed here, and its switch; a click on its text opens what
+    /// its rules read and where they are. While Dynamic Status is off the
+    /// row is greyed and its switch does nothing. Returns what it took
+    /// beyond one line of description, as the setting rows do.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_task_tool_row(
+        &mut self,
+        layers: &mut TripleLayerQuadAllocator<'_>,
+        row_x: f32,
+        y: f32,
+        row_width: f32,
+        tool: &mux::task_status::Tool,
+        active: bool,
+        draw_top_rule: bool,
+    ) -> anyhow::Result<f32> {
+        let palette = self.palette();
+        let body_font = Rc::clone(&self.body_font);
+        let key = plugin_key(&tool.id);
+        let expanded = self.task_tool_expanded == Some(key);
+        let cell_height = self.metrics.cell_size.height as f32;
+        let side = self.ui_px(ROW_TILE_SIDE);
+        let block_bottom = self.settings_row_description_y(y) + cell_height;
+        // Its tab icon, as its tab wears it.
+        let icon = task_tool_icon(tool);
+        self.draw_tab_icon(
+            layers,
+            icon.circle,
+            &icon.glyph,
+            icon.glyph_color.linear(),
+            row_x,
+            ((y + block_bottom - side) / 2.0).round(),
+            side,
+        )?;
+        let indent = side + self.ui_px(ROW_TILE_GAP);
+        let text_x = row_x + indent;
+        let text_width = (row_width - indent).max(0.0);
+        let arrow = if expanded { "\u{25be}" } else { "\u{25b8}" };
+        let label = format!("{arrow}  {}", task_tool_display_name(tool));
+        let description = crate::i18n::tr(if crate::agent_status::tool_on_path(&tool.id) {
+            "settings-task-tool-found"
+        } else {
+            "settings-task-tool-missing"
+        });
+        let on = !self.native_settings.chrome.task_tools_off.iter().any(|id| *id == tool.id);
+        let extra = self.paint_toggle_setting_row(
+            layers,
+            text_x,
+            y,
+            text_width,
+            &label,
+            &description,
+            on,
+            SettingsAction::ToggleTaskTool(key),
+            draw_top_rule,
+        )?;
+        // The text opens the row; the switch keeps its own column.
+        let control_width = self.settings_control_width(text_width);
+        self.ui_context.push(
+            rect(
+                row_x,
+                y - self.ui_px(6.0),
+                (indent + text_width - control_width - self.ui_px(24.0)).max(0.0),
+                block_bottom + extra - y + self.ui_px(12.0),
+            ),
+            WidgetKind::Button,
+            SettingsAction::ToggleTaskToolDetails(key),
+        );
+        let mut taken = extra;
+        let mut end = block_bottom + extra;
+        if expanded {
+            let inset = self.ui_px(16.0);
+            let line_step = (cell_height + self.ui_px(8.0)).max(self.ui_px(24.0));
+            let bundled = tool.file.is_none();
+            let reads = crate::i18n::tr(match tool.id.as_str() {
+                "brew" if bundled => "settings-task-tool-reads-brew",
+                "apt" if bundled => "settings-task-tool-reads-apt",
+                _ => "settings-task-tool-reads-own",
+            });
+            // Rules are known by the id inside them, whatever their file
+            // is called.
+            let rules = match &tool.file {
+                Some(file) => settings_tr("settings-task-tool-rules-own", &[("file", home_relative(file))]),
+                None => settings_tr(
+                    "settings-task-tool-rules-bundled",
+                    &[
+                        ("folder", home_relative(&mux::task_status::rules_dir())),
+                        ("id", tool.id.clone()),
+                    ],
+                ),
+            };
+            let lines: Vec<String> = [reads, rules]
+                .iter()
+                .flat_map(|text| self.wrap_settings_text(&body_font, text, text_width - inset * 2.0))
+                .collect();
+            let block_y = end + self.ui_px(18.0);
+            let block_height = lines.len() as f32 * line_step + self.ui_px(22.0);
+            self.draw_rounded_frame(
+                layers,
+                0,
+                text_x,
+                block_y,
+                text_width,
+                block_height,
+                palette.control_bg,
+                palette.rule,
+                self.ui_px(10.0),
+            )?;
+            let mut line_y = block_y + self.ui_px(12.0);
+            for line in &lines {
+                self.draw_text(
+                    layers,
+                    &body_font,
+                    text_x + inset,
+                    line_y,
+                    line,
+                    palette.secondary_text,
+                    text_width - inset * 2.0,
+                )?;
+                line_y += line_step;
+            }
+            end = block_y + block_height;
+            // The next row's rule goes below the block.
+            taken = (end + self.ui_px(46.0) - y - self.settings_row_step()).max(extra);
+        }
+        if !active {
+            let top = y - self.ui_px(14.0);
+            self.draw_rounded_rect(
+                layers,
+                2,
+                row_x - self.ui_px(4.0),
+                top,
+                row_width + self.ui_px(8.0),
+                end + self.ui_px(14.0) - top,
+                palette.card_bg.mul_alpha(0.6),
+                0.0,
+            )?;
+        }
+        Ok(taken)
+    }
+
+    /// The terminal area drawn small with what Dynamic Status shows in its
+    /// bottom-right corner: a command that finished out of sight, with its
+    /// tick, and a tool's progress under it. What is switched off is left
+    /// out. Returns where the picture ends.
+    fn paint_dynamic_status_diagram(
         &mut self,
         layers: &mut TripleLayerQuadAllocator<'_>,
         x: f32,
         y: f32,
         width: f32,
+        tools: &[mux::task_status::Tool],
     ) -> anyhow::Result<f32> {
-        use crate::termwindow::ui::agent_panel::AGENT_BLOCKED_COLOR;
         let colors = self.chrome_palette;
         let ground = opaque(colors.window_bg);
         let sidebar_ground = opaque(colors.workspace_sidebar_bg);
-        let surface = opaque(colors.control_bg);
         let rule = colors.control_border;
         let line = self.ui_px(2.0).max(1.0).round();
-        let height = self.ui_px(330.0).round();
+        let height = self.ui_px(250.0).round();
         let radius = self.ui_px(16.0).round();
-        // Smaller than the font-size picture's: here four sit in one column.
-        let badge = self.ui_px(30.0).round();
         let bar = self.ui_px(10.0).round();
-        let pad = self.ui_px(18.0).round();
+        let pad = self.ui_px(26.0).round();
         let muted = colors.muted_text.mul_alpha(0.55);
-        let strong = colors.text.mul_alpha(0.8);
-        let brand = LinearRgba::with_srgba(0xD9, 0x77, 0x57, 0xFF);
-        let tint = colors.accent.mul_alpha(0.22);
-        let show = self.native_settings.chrome.agent_status_display;
-        let lit = self.hovered_agent_status_part();
         let sidebar_w = (width * 0.2).round();
-        let panel_w = (width * 0.34).round();
-        let middle_x = x + sidebar_w;
-        let panel_x = x + width - panel_w;
-        let middle_w = panel_x - middle_x;
-        let tabs_h = self.ui_px(54.0).round();
-
         let window = (x, y, width, height, radius);
         self.paint_window_shape(layers, window, sidebar_w, ground, sidebar_ground)?;
-        self.draw_rect(layers, 0, middle_x, y, line, height, rule)?;
-        self.draw_rect(layers, 0, panel_x, y, line, height, rule)?;
-        self.draw_rect(layers, 0, middle_x, y + tabs_h, middle_w, line, rule)?;
+        self.draw_rect(layers, 0, x + sidebar_w, y, line, height, rule)?;
         self.draw_rounded_frame(
             layers,
             0,
@@ -11023,304 +11258,140 @@ impl SettingsWindow {
             rule,
             radius,
         )?;
-
-        // A part's elements, lit when its switch is under the pointer.
-        let part = |this: &mut Self,
-                        layers: &mut TripleLayerQuadAllocator<'_>,
-                        which: AgentStatusPart,
-                        (px, py, pw, ph): (f32, f32, f32, f32),
-                        color: LinearRgba|
-         -> anyhow::Result<()> {
-            if lit == Some(which) {
-                let grow = this.ui_px(6.0);
-                this.draw_rounded_rect(
-                    layers,
-                    0,
-                    px - grow,
-                    py - grow,
-                    pw + grow * 2.0,
-                    ph + grow * 2.0,
-                    tint,
-                    (ph / 2.0 + grow).min(this.ui_px(12.0)),
-                )?;
-            }
-            this.draw_rounded_rect(layers, 0, px, py, pw, ph, color, ph / 2.0)
-        };
-        // The waiting reason's pill, in the panel's amber.
-        let pill = |this: &mut Self,
-                    layers: &mut TripleLayerQuadAllocator<'_>,
-                    px: f32,
-                    py: f32|
-         -> anyhow::Result<f32> {
-            let pw = this.ui_px(54.0).round();
-            let ph = bar * 1.8;
-            if lit == Some(AgentStatusPart::Reason) {
-                let grow = this.ui_px(6.0);
-                this.draw_rounded_rect(
-                    layers,
-                    0,
-                    px - grow,
-                    py - grow,
-                    pw + grow * 2.0,
-                    ph + grow * 2.0,
-                    tint,
-                    ph / 2.0 + grow,
-                )?;
-            }
-            this.draw_rounded_rect(
+        // A terminal's lines.
+        let text_x = x + sidebar_w + pad;
+        let area = width - sidebar_w;
+        for (index, share) in [0.44f32, 0.3, 0.52, 0.22].iter().enumerate() {
+            let line_y = y + pad + index as f32 * bar * 2.4;
+            self.draw_rounded_rect(layers, 0, text_x, line_y, area * share, bar, muted, bar / 2.0)?;
+        }
+        let chrome = &self.native_settings.chrome;
+        if !chrome.dynamic_status_enabled.unwrap_or(true) {
+            return Ok(y + height);
+        }
+        // A tool switched on, one installed here if there is one.
+        let on: Vec<&mux::task_status::Tool> = tools
+            .iter()
+            .filter(|tool| !chrome.task_tools_off.iter().any(|id| *id == tool.id))
+            .collect();
+        let tool = on
+            .iter()
+            .find(|tool| crate::agent_status::tool_on_path(&tool.id))
+            .or(on.first())
+            .map(|tool| (*tool).clone());
+        // Black in either appearance, as Dynamic Status is.
+        let surface = LinearRgba::with_srgba(5, 5, 5, 255);
+        let strong = LinearRgba::with_srgba(255, 255, 255, 215);
+        let faint = LinearRgba::with_srgba(235, 235, 245, 110);
+        let right = x + width - pad;
+        let mut above = y + height - pad;
+        if let Some(tool) = tool {
+            let pill_h = self.ui_px(44.0).round();
+            let pill_w = self.ui_px(150.0).round();
+            let pill_x = right - pill_w;
+            let pill_y = above - pill_h;
+            self.draw_rounded_rect(layers, 0, pill_x, pill_y, pill_w, pill_h, surface, pill_h / 2.0)?;
+            let mark = self.ui_px(28.0).round();
+            let icon = task_tool_icon(&tool);
+            self.draw_tab_icon(
                 layers,
-                0,
-                px,
-                py,
-                pw,
-                ph,
-                AGENT_BLOCKED_COLOR.mul_alpha(0.3),
-                ph / 2.0,
+                icon.circle,
+                &icon.glyph,
+                icon.glyph_color.linear(),
+                pill_x + ((pill_h - mark) / 2.0).round(),
+                pill_y + ((pill_h - mark) / 2.0).round(),
+                mark,
             )?;
-            Ok(px + pw + this.ui_px(10.0))
-        };
-
-        // The sidebar's threads, the third one under the pointer.
-        let row_step = self.ui_px(34.0).round();
-        let first_row = y + self.ui_px(52.0).round();
-        let hovered_row = first_row + row_step * 2.0;
-        for (index, share) in [0.75f32, 0.6, 0.7, 0.5, 0.65].iter().copied().enumerate() {
-            let row_y = first_row + row_step * index as f32;
-            if index == 2 {
-                self.draw_rounded_rect(
-                    layers,
-                    0,
-                    x + pad / 2.0,
-                    row_y - bar,
-                    sidebar_w - pad,
-                    bar * 3.0,
-                    surface,
-                    bar * 1.5,
-                )?;
-            }
-            let dot = if index == 2 { AGENT_BLOCKED_COLOR } else { muted };
-            self.draw_rounded_rect(layers, 0, x + pad, row_y, bar, bar, dot, bar / 2.0)?;
-            let bar_x = x + pad + bar * 2.0;
             self.draw_rounded_rect(
                 layers,
                 0,
-                bar_x,
-                row_y,
-                (x + sidebar_w - pad - bar_x) * share,
+                pill_x + pill_h,
+                pill_y + (pill_h - bar) / 2.0,
+                (pill_w * 0.32).round(),
                 bar,
                 strong,
                 bar / 2.0,
             )?;
-        }
-
-        // Two tabs: an agent's, with the dot that says it waits.
-        let tab_h = self.ui_px(32.0).round();
-        let tab_w = (middle_w * 0.26).round();
-        let tab_y = y + ((tabs_h - tab_h) / 2.0).round();
-        for index in 0..2 {
-            let tab_x = middle_x + pad + (tab_w + pad * 0.6) * index as f32;
-            self.draw_rounded_rect(layers, 0, tab_x, tab_y, tab_w, tab_h, surface, tab_h / 2.0)?;
-            let circle = tab_h - self.ui_px(8.0);
-            let circle_x = tab_x + self.ui_px(4.0);
-            let circle_y = tab_y + self.ui_px(4.0);
-            let fill = if index == 0 { brand } else { muted };
-            self.draw_rounded_rect(layers, 0, circle_x, circle_y, circle, circle, fill, circle / 2.0)?;
-            self.draw_rounded_rect(
+            let ring = self.ui_px(22.0);
+            let ctx = crate::ui::draw::DrawContext::new(
+                self.render_state.as_ref().unwrap(),
+                self.dimensions,
+                &self.metrics,
+            );
+            crate::termwindow::render::update_capsule::paint_ring(
+                &ctx,
                 layers,
-                0,
-                circle_x + circle + self.ui_px(8.0),
-                tab_y + (tab_h - bar) / 2.0,
-                tab_w * 0.45,
-                bar,
-                muted,
-                bar / 2.0,
+                (pill_x + pill_w - pill_h / 2.0, pill_y + pill_h / 2.0),
+                ring / 2.0 - self.ui_px(1.5),
+                self.ui_px(3.0),
+                Some(0.44),
+                0.0,
+                LinearRgba::with_srgba(255, 255, 255, 46),
+                colors.accent,
+                surface,
             )?;
-            if index == 0 {
-                let dot = self.ui_px(12.0).round();
-                self.draw_rounded_rect(
-                    layers,
-                    0,
-                    circle_x + circle - dot * 0.7,
-                    circle_y - dot * 0.25,
-                    dot,
-                    dot,
-                    AGENT_BLOCKED_COLOR,
-                    dot / 2.0,
-                )?;
-            }
+            above = pill_y - self.ui_px(12.0);
         }
-
-        // The hovered thread's card, beside the sidebar.
-        let card_x = middle_x + self.ui_px(12.0);
-        let card_w = (middle_w * 0.55).round();
-        let card_y = hovered_row - self.ui_px(22.0);
-        let card_h = pad * 2.0 + bar + self.ui_px(14.0) + bar * 1.8;
-        self.draw_rounded_frame(
+        let card_h = self.ui_px(64.0).round();
+        let card_w = (area * 0.58).min(self.ui_px(340.0)).round();
+        let card_x = right - card_w;
+        let card_y = above - card_h;
+        self.draw_rounded_rect(layers, 0, card_x, card_y, card_w, card_h, surface, card_h / 2.0)?;
+        let mark = self.ui_px(40.0).round();
+        let terminal = crate::tab_icons::catalog().terminal_card().resolved();
+        self.draw_tab_icon(
             layers,
-            0,
-            card_x,
-            card_y,
-            card_w,
-            card_h,
-            surface,
-            rule,
-            self.ui_px(10.0),
+            terminal.circle,
+            &terminal.glyph,
+            terminal.glyph_color.linear(),
+            card_x + ((card_h - mark) / 2.0).round(),
+            card_y + ((card_h - mark) / 2.0).round(),
+            mark,
         )?;
-        let heading_y = card_y + pad;
+        let text_x = card_x + card_h + self.ui_px(4.0);
         self.draw_rounded_rect(
             layers,
             0,
-            card_x + pad,
-            heading_y,
-            bar,
-            bar,
-            AGENT_BLOCKED_COLOR,
-            bar / 2.0,
-        )?;
-        self.draw_rounded_rect(
-            layers,
-            0,
-            card_x + pad + bar * 2.0,
-            heading_y,
-            card_w * 0.4,
+            text_x,
+            card_y + card_h * 0.3 - bar / 2.0,
+            (card_w * 0.34).round(),
             bar,
             strong,
             bar / 2.0,
         )?;
-        let said_y = heading_y + bar + self.ui_px(14.0);
-        let mut said_x = card_x + pad;
-        if show.reason {
-            said_x = pill(self, layers, said_x, said_y)?;
-        }
-        let card_said_end = card_x + card_w - pad;
-        if show.description {
-            part(
-                self,
-                layers,
-                AgentStatusPart::Description,
-                (said_x, said_y + bar * 0.4, (card_said_end - said_x).max(bar), bar),
-                muted,
-            )?;
-        }
-
-        // The Agents panel: one agent with everything it reported, a part
-        // to a line in the switches' order, each line's number in a gutter
-        // to the right where it sits on nothing.
-        let gutter = badge + self.ui_px(16.0);
-        let row_x = panel_x + pad / 2.0;
-        let row_w = panel_w - pad - gutter;
-        let text_x = row_x + pad + bar * 2.4;
-        let text_end = row_x + row_w - pad;
-        let line_step = (badge + self.ui_px(8.0)).round();
-        let progress_h = self.ui_px(8.0).round();
-        let row_y = y + self.ui_px(36.0).round();
-        let lines = 2
-            + usize::from(show.description)
-            + usize::from(show.reason)
-            + usize::from(show.progress)
-            + usize::from(show.subtasks);
-        let row_h = pad * 2.0 + line_step * (lines - 1) as f32 + bar;
-        self.draw_rounded_rect(layers, 0, row_x, row_y, row_w, row_h, surface, self.ui_px(12.0))?;
-        let mark = bar * 1.6;
-        let mut line_y = row_y + pad;
         self.draw_rounded_rect(
             layers,
             0,
-            row_x + pad,
-            line_y - bar * 0.3,
-            mark,
-            mark,
-            brand,
-            mark / 2.0,
+            text_x,
+            card_y + card_h * 0.66 - bar / 2.0,
+            (card_w * 0.2).round(),
+            bar,
+            faint,
+            bar / 2.0,
         )?;
-        self.draw_rounded_rect(layers, 0, text_x, line_y, (text_end - text_x) * 0.7, bar, strong, bar / 2.0)?;
-        line_y += line_step;
-        self.draw_rounded_rect(layers, 0, text_x, line_y, (text_end - text_x) * 0.45, bar, muted, bar / 2.0)?;
-        let badge_x = (row_x + row_w + (gutter - badge) / 2.0).round();
-        let mut badges = Vec::new();
-        if show.description {
-            line_y += line_step;
-            part(
-                self,
-                layers,
-                AgentStatusPart::Description,
-                (text_x, line_y, (text_end - text_x) * 0.85, bar),
-                muted,
-            )?;
-            badges.push((1, line_y + bar / 2.0));
-        }
-        if show.reason {
-            line_y += line_step;
-            pill(self, layers, text_x, line_y - bar * 0.4)?;
-            badges.push((2, line_y + bar / 2.0));
-        }
-        if show.progress {
-            line_y += line_step;
-            let track_y = line_y + (bar - progress_h) / 2.0;
-            let track_w = text_end - text_x;
-            part(
-                self,
-                layers,
-                AgentStatusPart::Progress,
-                (text_x, track_y, track_w, progress_h),
-                colors.separator,
-            )?;
-            self.draw_rounded_rect(
-                layers,
-                0,
-                text_x,
-                track_y,
-                (track_w * 0.6).round(),
-                progress_h,
-                colors.accent,
-                progress_h / 2.0,
-            )?;
-            badges.push((3, line_y + bar / 2.0));
-        }
-        if show.subtasks {
-            // Folded to the one line that counts them, as the panel shows
-            // them until that line is clicked.
-            line_y += line_step;
-            let chevron = (bar * 1.6).round();
-            self.draw_svg_icon(
-                layers,
-                SvgIcon::ChevronRight,
-                text_x - (chevron - bar) / 2.0,
-                line_y + (bar - chevron) / 2.0,
-                chevron,
-                colors.muted_text,
-            )?;
-            part(
-                self,
-                layers,
-                AgentStatusPart::Subtasks,
-                (
-                    text_x + bar * 2.0,
-                    line_y,
-                    (text_end - text_x - bar * 2.0) * 0.55,
-                    bar,
-                ),
-                muted,
-            )?;
-            badges.push((4, line_y + bar / 2.0));
-        }
-        for (number, center_y) in badges {
-            self.paint_number_badge(layers, badge_x, (center_y - badge / 2.0).round(), badge, number)?;
-        }
+        let tick = self.ui_px(36.0).round();
+        let tick_x = card_x + card_w - (card_h - tick) / 2.0 - tick;
+        let tick_y = card_y + ((card_h - tick) / 2.0).round();
+        self.draw_rounded_rect(
+            layers,
+            0,
+            tick_x,
+            tick_y,
+            tick,
+            tick,
+            LinearRgba::with_srgba(0, 188, 0, 255),
+            tick / 2.0,
+        )?;
+        let check = (tick * 0.6).round();
+        self.draw_svg_icon(
+            layers,
+            SvgIcon::Check,
+            tick_x + (tick - check) / 2.0,
+            tick_y + (tick - check) / 2.0,
+            check,
+            LinearRgba::with_srgba(255, 255, 255, 255),
+        )?;
         Ok(y + height)
-    }
-
-    /// The Status Display part whose switch the pointer is on, if any.
-    fn hovered_agent_status_part(&self) -> Option<AgentStatusPart> {
-        match self
-            .ui
-            .interaction
-            .pressed
-            .or(self.ui.interaction.hovered)?
-        {
-            SettingsAction::ToggleAgentStatusPart(part) => Some(part),
-            _ => None,
-        }
     }
 
     /// Tint one part of a window drawn by `paint_typography_diagram`: the
@@ -12707,19 +12778,20 @@ impl SettingsWindow {
                 (detail_block_rel_y + detail_block_height + self.ui_px(18.0) - row_step).max(0.0)
             })
             .unwrap_or(0.0);
-        // How much of a program's own report shows comes first; the
-        // integrations follow under their own heading.
+        // Dynamic Status comes first; how much of a program's own report
+        // shows is the Status panel's, in its view menu. The integrations
+        // follow under their own heading.
         self.draw_text(
             layers,
             &body_font,
             x,
             section_y,
-            &crate::i18n::tr("settings-agent-status-heading"),
+            &crate::i18n::tr("settings-dynamic-status-heading"),
             palette.muted_text,
             max_width,
         )?;
         let (status_card_y, _) = self.settings_card_geometry(section_y, 0);
-        let status_bottom = self.paint_agent_status_card(layers, x, status_card_y, max_width)?;
+        let status_bottom = self.paint_dynamic_status_card(layers, x, status_card_y, max_width)?;
         let status_bottom =
             self.paint_server_terminals_card(layers, x, status_bottom, max_width)?;
         let status_bottom = self.paint_reverse_access_card(layers, x, status_bottom, max_width)?;

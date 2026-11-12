@@ -72,7 +72,7 @@ pub async fn resolve_reaching_servers(
 
 /// How a pane on a server is named, said where a name names nothing here.
 const SERVER_PANES: &str = "a pane on a server is named MACHINE/NAME, as `thinkterm cli list` \
-     shows it, with ThinkTerm open and Settings › Agents letting programs here reach it";
+     shows it, with ThinkTerm open and Settings › Agents & Status letting programs here reach it";
 
 /// The pane `name` names on a machine, as `MACHINE/ID` or `MACHINE/NAME`;
 /// `None` when it starts with no machine's name.

@@ -21,8 +21,10 @@ read anything, and by its own report otherwise.
 - The screen is read where the pane lives — this machine for its own panes,
   the server for a remote one — and only what was read travels to the
   window, not the screen.
-- It is read at most once every two seconds, and only the bottom lines a
-  rule asks for are looked at. Panes running anything else are never read.
+- It is read at most once every two seconds, and only after it has printed
+  something new or a detection switch has changed; only the bottom lines
+  a rule asks for are looked at. Panes
+  running anything else are never read.
 - It shows only while the pane is out of sight: a tool on screen tells you
   itself.
 - It shows as soon as its pane goes out of sight. One that has just begun
@@ -31,13 +33,22 @@ read anything, and by its own report otherwise.
 - When it ends, the usual "finished" notice for a long command takes over,
   marked as failed if the rules last read an error and the shell did not
   report the exit status.
+- **Settings › Agents & Status** switches Dynamic Status off (only updates
+  and transfers still show there) or one tool at a time. A tool switched
+  off on this machine is not read here; a server reads its own panes, and
+  what it reads for a tool switched off here is retained but not shown.
+  Enabling detection queues a fresh reading of existing local panes, even
+  if the tool is quietly waiting for input. Remote readings become visible
+  again without waiting for another server update. Switches use the rules'
+  stable `id`, so changing `name` does not change which switch applies.
 
 ## Writing rules
 
 Put a file in `~/.config/thinkterm/task-detection/` on the machine the
 pane runs on. A file whose `id` matches a bundled one replaces it; any other
-is added. Rules are loaded when ThinkTerm (or, on a server, its mux server)
-starts.
+is added, whatever the file is called. Files added, changed or removed
+there are picked up within a few seconds, by ThinkTerm and by a server's
+mux server alike.
 
 ```toml
 id = "pacman"

@@ -145,11 +145,11 @@ fn allows(reach: Reach, what: Use, machine: &str) -> Result<(), String> {
         (Reach::Read, Use::Act) => Err(format!(
             "the terminals on {machine} can only be read from this machine: \
              let programs here type into them too in ThinkTerm's \
-             Settings › Agents"
+             Settings › Agents & Status"
         )),
         (Reach::Off, _) => Err(format!(
             "the terminals on {machine} are not reachable from this machine: \
-             let programs here reach them in ThinkTerm's Settings › Agents"
+             let programs here reach them in ThinkTerm's Settings › Agents & Status"
         )),
     }
 }

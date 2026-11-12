@@ -475,8 +475,9 @@ impl FinishedAgents {
             if run.agent || in_sight || took < COMMAND_AFTER {
                 return !in_sight && run.reading.is_some();
             }
-            let saw_error = run
-                .reading
+            // Only rules the user left on name the command or say it failed.
+            let reading = run.reading.filter(task_shown);
+            let saw_error = reading
                 .as_ref()
                 .is_some_and(|reading| reading.state == TaskState::Error);
             self.shown.retain(|notice| notice.pane_id != pane_id);
@@ -485,7 +486,7 @@ impl FinishedAgents {
                 shown_at: now,
                 paused_at: None,
                 command: Some(FinishedCommand {
-                    label: run.reading.map_or(run.label, |reading| reading.name),
+                    label: reading.map_or(run.label, |reading| reading.name),
                     took,
                     exit,
                     saw_error,
@@ -2912,30 +2913,40 @@ impl crate::TermWindow {
         if let Some(due) = self.dynamic_status.finished.deadline() {
             self.update_next_frame_time(Some(due));
         }
+        // Switched off, only ThinkTerm's own news shows: an update, a
+        // transfer. A notice switched off is done with, not kept for later.
+        let enabled = crate::native_settings::dynamic_status_enabled();
+        if !enabled {
+            self.dynamic_status.finished.shown.clear();
+        }
         let any_finished = !self.dynamic_status.finished.shown.is_empty();
-        let any_task = self
-            .dynamic_status
-            .finished
-            .runs
-            .values()
-            .any(|run| run.reading.is_some());
+        let any_task = enabled
+            && self
+                .dynamic_status
+                .finished
+                .runs
+                .values()
+                .any(|run| run.reading.as_ref().is_some_and(task_shown));
         let has_transfers = self.has_transfer_cards();
         let agents_listed = self.right_sidebar_width() > 0
             && self.right_sidebar_mode == crate::termwindow::RightSidebarMode::Agents;
         let show = crate::native_settings::agent_status_display();
-        let agents = (crate::agent_status::enabled() && !agents_listed)
+        let agents = (enabled && crate::agent_status::enabled() && !agents_listed)
             .then(|| self.status_agents(now));
         let any_agent = agents.as_ref().is_some_and(|agents| {
             agents
                 .iter()
                 .any(|agent| status_wants(agent.state, agent.report.as_ref(), show))
         });
-        self.refresh_status_panes(now);
-        let any_pane = self
-            .dynamic_status
-            .panes
-            .as_ref()
-            .is_some_and(|(_, panes)| !panes.is_empty());
+        if enabled {
+            self.refresh_status_panes(now);
+        }
+        let any_pane = enabled
+            && self
+                .dynamic_status
+                .panes
+                .as_ref()
+                .is_some_and(|(_, panes)| !panes.is_empty());
         if !has_transfers && !any_agent && !any_pane && update.is_none() && !any_finished && !any_task {
             self.dynamic_status.agent_marks.clear();
             return Vec::new();
@@ -2987,7 +2998,7 @@ impl crate::TermWindow {
             let task_pane = |pane_id: &PaneId| {
                 runs.get(pane_id)
                     .and_then(|run| run.reading.as_ref())
-                    .is_some_and(reading_says_anything)
+                    .is_some_and(|reading| task_shown(reading) && reading_says_anything(reading))
             };
             if let Some((_, panes)) = &self.dynamic_status.panes {
                 items.extend(
@@ -3046,7 +3057,7 @@ impl crate::TermWindow {
             // give way to the progress the tool reports, if it does.
             let mux = Mux::get();
             for (pane_id, run) in &self.dynamic_status.finished.runs {
-                let Some(reading) = &run.reading else {
+                let Some(reading) = run.reading.as_ref().filter(|reading| task_shown(reading)) else {
                     continue;
                 };
                 if on_screen.contains(pane_id) {
@@ -3553,6 +3564,12 @@ fn status_content(item: &StatusItem) -> CardContent {
     }
 }
 
+/// Whether a tool's reading is for showing: Dynamic Status on, and the
+/// tool not switched off in Settings.
+fn task_shown(reading: &TaskReading) -> bool {
+    crate::native_settings::task_tool_enabled(&reading.id)
+}
+
 /// Whether a tool's rules have read anything off its screen: a state, a
 /// number or what it is doing, rather than only that it is running.
 fn reading_says_anything(reading: &TaskReading) -> bool {
@@ -3958,6 +3975,55 @@ mod tests {
         assert_eq!(finished.runs[&2].reading, program.task);
         assert_eq!(finished.runs[&2].state_since, later);
         assert!(finished.shown.is_empty());
+    }
+
+    #[test]
+    fn hidden_remote_readings_survive_switches_and_updates() {
+        let now = Instant::now();
+        let mut settings = crate::native_settings::NativeChromeSettings::default();
+        settings.task_tools_off.push("apt".into());
+        let mut finished = FinishedAgents::default();
+        let mut program = waiting_program();
+        finished.seed(now, [(1, Some(program.clone()))]);
+        let visible = |finished: &FinishedAgents,
+                       settings: &crate::native_settings::NativeChromeSettings| {
+            finished.runs[&1]
+                .reading
+                .as_ref()
+                .filter(|reading| settings.task_tool_enabled(&reading.id))
+                .cloned()
+        };
+        assert_eq!(visible(&finished, &settings), None);
+        // An update received while hidden must also remain available.
+        program.task.as_mut().unwrap().detail = Some("Confirm installation".into());
+        finished.observe_program(now, 1, Some(&program), false, String::new);
+        settings.task_tools_off.clear();
+        assert_eq!(visible(&finished, &settings), program.task);
+        settings.dynamic_status_enabled = Some(false);
+        assert_eq!(visible(&finished, &settings), None);
+        settings.dynamic_status_enabled = Some(true);
+        assert_eq!(visible(&finished, &settings), program.task);
+        assert_eq!(finished.runs[&1].since, now);
+    }
+
+    #[test]
+    fn tool_switches_ignore_display_names() {
+        let mut settings = crate::native_settings::NativeChromeSettings::default();
+        settings.task_tools_off.push("brew".into());
+        // Bundled and overridden names obey the same switch; an unrelated
+        // tool sharing the name still obeys its own id.
+        for name in ["brew", "Homebrew", "Package manager"] {
+            let reading = TaskReading {
+                id: "brew".into(),
+                name: name.into(),
+                ..Default::default()
+            };
+            assert!(!settings.task_tool_enabled(&reading.id));
+            let other = TaskReading { id: "apt".into(), ..reading };
+            assert!(settings.task_tool_enabled(&other.id));
+        }
+        settings.task_tools_off.clear();
+        assert!(settings.task_tool_enabled("brew"));
     }
 
     #[test]

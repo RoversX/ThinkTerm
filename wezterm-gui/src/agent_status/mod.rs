@@ -532,6 +532,8 @@ pub(crate) const SUPPORTED_AGENTS: &[(&str, &[&str], IntegrationKind)] = &[
 ];
 
 static PATH_PROBE: Mutex<Option<HashMap<&'static str, bool>>> = Mutex::new(None);
+/// The same for the tools with task rules (`mux::task_status`), by id.
+static TOOL_PATH_PROBE: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
 
 /// Directories searched when probing for agent executables. A GUI process
 /// launched from Finder/Dock inherits launchd's minimal PATH (no
@@ -720,6 +722,15 @@ pub(crate) fn agent_on_path(agent_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `agent_on_path` for a tool with task rules, by its id.
+pub(crate) fn tool_on_path(tool_id: &str) -> bool {
+    TOOL_PATH_PROBE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().and_then(|map| map.get(tool_id).copied()))
+        .unwrap_or(false)
+}
+
 static PATH_PROBE_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Re-run the executable probe on a worker thread (the login-shell PATH
@@ -754,6 +765,22 @@ pub(crate) fn refresh_path_probe() {
         }
         if let Ok(mut guard) = PATH_PROBE.lock() {
             *guard = Some(map);
+        }
+        let tools: HashMap<String, bool> = mux::task_status::tools()
+            .into_iter()
+            .map(|tool| {
+                let found = dirs.iter().any(|dir| {
+                    tool.programs.iter().any(|name| {
+                        candidate_file_names(name)
+                            .iter()
+                            .any(|file| is_executable_file(&dir.join(file)))
+                    })
+                });
+                (tool.id, found)
+            })
+            .collect();
+        if let Ok(mut guard) = TOOL_PATH_PROBE.lock() {
+            *guard = Some(tools);
         }
         promise::spawn::spawn_into_main_thread(async {
             // The settings window is the surface that reads this result,
