@@ -1,11 +1,11 @@
-# Sourced from herdr (https://github.com/herdrdev/herdr) at commit d6dae88.
+# Sourced from herdr (https://github.com/herdrdev/herdr) at commit ee5bfb5.
 # Licensed under the Apache License 2.0; see NOTICE at the repository root.
 # Local changes: attribution header added.
 
 id = "copilot"
-version = "2026.07.07.1"
+version = "2026.08.29.1"
 min_engine_version = 1
-updated_at = "2026-07-07T14:15:00Z"
+updated_at = "2026-08-29T00:00:00Z"
 aliases = ["github-copilot", "ghcs"]
 
 [[rules]]
@@ -26,6 +26,14 @@ all = [
     { contains = ["enter accept"] },
   ] },
 ]
+
+[[rules]]
+id = "background_agents_working"
+state = "working"
+priority = 110
+region = "bottom_non_empty_lines(6)"
+visible_working = true
+line_regex = ['^\s*◎\s+Waiting for background agents(?:\s|·|$)']
 
 [[rules]]
 id = "working_cancel_hint"

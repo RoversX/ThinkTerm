@@ -1,11 +1,11 @@
-# Sourced from herdr (https://github.com/herdrdev/herdr) at commit d6dae88.
+# Sourced from herdr (https://github.com/herdrdev/herdr) at commit ee5bfb5.
 # Licensed under the Apache License 2.0; see NOTICE at the repository root.
 # Local changes: attribution header added.
 
 id = "codex"
-version = "2026.08.09.1"
+version = "2026.10.11.1"
 min_engine_version = 3
-updated_at = "2026-08-09T00:00:00Z"
+updated_at = "2026-10-11T00:00:00Z"
 
 [[rules]]
 id = "osc_title_blocked"
@@ -42,8 +42,40 @@ priority = 950
 region = "top_non_empty_lines(20)"
 visible_blocker = true
 all = [
-  { regex = ['\A> You are in [^\r\n]+(?:\r?\n|$)'] },
-  { regex = ['(?s)Do\s+you\s+trust\s+the\s+contents\s+of\s+this\s+directory\?'] },
+  { any = [
+    { regex = ['\A> You are in [^\r\n]+(?:\r?\n|$)'] },
+    { contains = ["Folder access"] },
+  ] },
+  { any = [
+    { regex = ['(?s)Do\s+you\s+trust\s+the\s+contents\s+of\s+this\s+directory\?'] },
+    { all = [
+      { contains = ["Trust this folder?", "Codex can read, edit, and run files here"] },
+      { any = [
+        { contains = ["Trust and continue"] },
+        { contains = ["enter continue"] },
+      ] },
+    ] },
+  ] },
+]
+
+[[rules]]
+id = "startup_update"
+state = "blocked"
+priority = 950
+region = "bottom_non_empty_lines(20)"
+visible_blocker = true
+# Keep the legacy dialog; the shared picker (0.159+) has a different heading
+# and footer. Choices can scroll out of a short viewport, but both gates must
+# remain visible. The passive update history notice has neither picker footer.
+any = [
+  { all = [
+    { contains = ["Update available!", "Update now"] },
+    { regex = ['Skip\s+until\s+next\s+version', 'Press enter to continue\s*\z'] },
+  ] },
+  { all = [
+    { regex = ['(?m)^\s*Update\s+available\s+·'] },
+    { regex = ['enter\s+continue\s+·\s+esc\s+skip\s*\z'] },
+  ] },
 ]
 
 [[rules]]
@@ -57,13 +89,16 @@ any = [
   { contains = ["enter to submit answer"] },
   { contains = ["enter to submit all"] },
   { contains = ["allow command?"] },
+  { contains = ["All Results", "Filesystem Only", "Plugins"] },
 ]
 
 [[rules]]
 id = "weak_blocker"
 state = "blocked"
 priority = 600
-region = "whole_recent"
+region = "whole_recent_without_current_prompt_marker"
+# Sparkles can replace the space after ›. A later response marker makes that prompt stale.
+not = [{ regex = ['(?m)^›[⠁⠂⠄⠈⠐⠠⡀⢀][^\n]*(?:\n(?:[^•■✗✓\n][^\n]*)?)*\z'] }]
 any = [
   { contains = ["[y/n]"] },
   { contains = ["yes (y)"] },
@@ -75,10 +110,15 @@ any = [
 id = "screen_working_fallback"
 state = "working"
 priority = 500
-region = "bottom_non_empty_lines(3)"
+region = "before_current_prompt_marker"
 visible_working = true
-line_regex = ['^[•◦]\s+Working \([^)]*esc to interrupt\)(?: · .*)?$']
-not = [{ contains = ["■ Conversation interrupted"] }]
+# Support animated and reduced-motion status, including dynamic activity labels.
+# The interrupt hint can be remapped, unbound, or hidden, and queued inputs can
+# sit below the status. Require the live timer suffix with no later response.
+any = [{ contains = [" to interrupt)"] }, { contains = ["s)"] }]
+regex = ['(?m)^(?:[•◦][ \t]+)?[^\s›•◦■✗✓─][^\r\n]* \((?:[0-9]+[hm] )*[0-9]+s(?: • [^\r\n]+? to interrupt)?\)(?: · [^\r\n]*)?(?:\r?\n(?:[^•◦›■✗✓─\r\n][^\r\n]*|•[ \t]+(?:Queued\s+follow-up\s+inputs|Messages\s+to\s+be\s+submitted\s+after\s+next\s+tool\s+call(?:\s+\(press\s+[^\r\n]+?\s+to\s+interrupt\s+and\s+send\s+immediately\))?|Messages\s+to\s+be\s+submitted\s+at\s+end\s+of\s+turn)|›[⠁⠂⠄⠈⠐⠠⡀⢀][^\r\n]*)?)*\s*\z']
+# A failed reconnect keeps its final elapsed timer but is no longer working.
+not = [{ line_regex = ['^(?:[•◦][ \t]+)?Reconnect failed — check the endpoint, then relaunch \([0-9hms ]+\)$'] }]
 
 [[rules]]
 id = "osc_title_idle"
