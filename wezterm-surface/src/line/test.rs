@@ -86,7 +86,7 @@ fn scroll_reset_discards_oversized_storage() {
     line.reset_for_scrolling(3, 116);
     assert_eq!(line, Line::new(3));
     match &line.cells {
-        super::storage::CellStorage::C(cl) => assert!(cl.text.capacity() <= 232),
+        super::storage::CellStorage::C(cl) => assert!(cl.text.capacity() <= 116 * 4),
         _ => panic!("reset row should use compact storage"),
     }
 }

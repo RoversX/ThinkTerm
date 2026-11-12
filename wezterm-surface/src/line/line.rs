@@ -169,7 +169,9 @@ impl Line {
     /// only bounded compact buffers. Never retain a vector of cells or a large
     /// historical allocation merely because the row has scrolled off screen.
     pub fn reset_for_scrolling(&mut self, seqno: SequenceNo, columns: usize) {
-        self.reset_for_scrolling_within(seqno, columns.max(80).saturating_mul(2));
+        // Room for a row of wide characters, three bytes to two cells, in a
+        // buffer that grew to hold it by doubling.
+        self.reset_for_scrolling_within(seqno, columns.max(80).saturating_mul(4));
     }
 
     /// `reset_for_scrolling`, keeping a text buffer no larger than a new
