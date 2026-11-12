@@ -947,6 +947,52 @@ impl Line {
         true
     }
 
+    /// `append_grapheme_run` for a run whose wide cells are given as a mask
+    /// (see `ClusteredLine::append_run_masked`).
+    pub fn append_wide_run(
+        &mut self,
+        idx: usize,
+        text: &str,
+        max_len: usize,
+        cells: usize,
+        wide: &[u64],
+        last_width: u8,
+        attr: &CellAttributes,
+        follows: bool,
+        seqno: SequenceNo,
+    ) -> bool {
+        if !self.can_append_grapheme_run(idx) {
+            return false;
+        }
+        let CellStorage::C(cl) = &mut self.cells else {
+            return false;
+        };
+        if !follows && cl.joins_at(idx, text) {
+            return false;
+        }
+        // Blanks make way for the run, and those it does not reach stay.
+        let len = cl.len();
+        if idx < len && runs_into(text.as_bytes(), " ") {
+            return false;
+        }
+        cl.truncate_blanks(idx);
+        let appended = cl.append_run_masked(text, max_len, cells, wide, last_width, attr);
+        if cl.len() < len {
+            cl.append_ascii_repeated(' ', len - cl.len(), &CellAttributes::blank());
+        }
+        if !appended {
+            return false;
+        }
+        // What each set_cell_grapheme would do; repeating it changes nothing.
+        if attr.hyperlink().is_some() {
+            self.bits |= LineBits::HAS_HYPERLINK;
+        }
+        self.invalidate_implicit_hyperlinks(seqno);
+        self.invalidate_zones();
+        self.update_last_change_seqno(seqno);
+        true
+    }
+
     // Keep padding and overwrites out of the common sequential append path.
     #[inline(never)]
     fn set_cell_grapheme_nonappend(

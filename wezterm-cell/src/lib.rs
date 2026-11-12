@@ -1202,6 +1202,32 @@ impl PlainWidths {
             entry => Some((len, entry as usize - 1)),
         }
     }
+
+    /// How many characters at the start of `bytes`, which is valid UTF-8,
+    /// are ones of these that take three bytes and two cells, up to `limit`
+    /// of them: what a line of CJK text is made of, counted without going
+    /// through `first` for each.
+    #[inline]
+    pub fn wide_run(&self, bytes: &[u8], limit: usize) -> usize {
+        const WIDE: u8 = 3;
+        let mut count = 0;
+        for bytes in bytes.chunks_exact(3).take(limit) {
+            let (a, b, c) = (bytes[0], bytes[1], bytes[2]);
+            if a & 0xf0 != 0xe0 {
+                break;
+            }
+            let code = (a as usize & 0xf) << 12 | (b as usize & 0x3f) << 6 | (c as usize & 0x3f);
+            let mut entry = self.widths[code].load(core::sync::atomic::Ordering::Relaxed);
+            if entry == Self::UNKNOWN {
+                entry = self.look_up(code);
+            }
+            if entry != WIDE {
+                break;
+            }
+            count += 1;
+        }
+        count
+    }
 }
 
 #[cfg(feature = "std")]
@@ -1488,6 +1514,51 @@ mod test {
         let mut custom = UnicodeVersion::new(9);
         custom.cell_widths = Some(Arc::new(std::collections::HashMap::new()));
         assert!(custom.plain_widths().is_none(), "the configuration decides");
+    }
+
+    #[test]
+    fn a_wide_run_is_what_first_gives_one_at_a_time() {
+        for version in [8, 9, 14] {
+            for ambiguous_are_wide in [false, true] {
+                let mut version = UnicodeVersion::new(version);
+                version.ambiguous_are_wide = ambiguous_are_wide;
+                let plain = version.plain_widths().unwrap();
+                // Each character of the plane on its own, and after a wide
+                // one: counted if and only if it is three bytes and two
+                // cells of plain text.
+                for code in 0..0x10000 {
+                    let Some(c) = char::from_u32(code) else {
+                        continue;
+                    };
+                    let mut text = [0; 4];
+                    let text = c.encode_utf8(&mut text);
+                    let wide = plain.first(text.as_bytes()) == Some((3, 2));
+                    assert_eq!(
+                        plain.wide_run(text.as_bytes(), 8),
+                        usize::from(wide),
+                        "{code:x}"
+                    );
+                    let after: alloc::string::String = ['\u{4e2d}', c].iter().collect();
+                    assert_eq!(
+                        plain.wide_run(after.as_bytes(), 8),
+                        1 + usize::from(wide),
+                        "{code:x}"
+                    );
+                }
+                // A run stops at the limit, at the end, at anything else, and
+                // at what is not the start of a character of three bytes.
+                let run = "\u{4e2d}\u{6587}\u{3001}\u{ff0c}\u{5b57}";
+                for limit in 0..=6 {
+                    assert_eq!(plain.wide_run(run.as_bytes(), limit), limit.min(5));
+                }
+                assert_eq!(plain.wide_run("\u{4e2d}a\u{6587}".as_bytes(), 8), 1);
+                assert_eq!(plain.wide_run("\u{4e2d}\u{e9}\u{6587}".as_bytes(), 8), 1);
+                assert_eq!(plain.wide_run("\u{4e2d}\u{1f600}".as_bytes(), 8), 1);
+                assert_eq!(plain.wide_run("\u{4e2d}\u{301}".as_bytes(), 8), 1);
+                assert_eq!(plain.wide_run(b"", 8), 0);
+                assert_eq!(plain.wide_run(b"abc", 8), 0);
+            }
+        }
     }
 
     #[test]
