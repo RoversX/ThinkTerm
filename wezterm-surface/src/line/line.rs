@@ -1064,6 +1064,35 @@ impl Line {
                 }
             }
         }
+        // Past the end of a compact row: a tab, a cursor movement or a line
+        // feed without a return left a gap, which is blanks, and the text
+        // goes after them in one piece. Default blanks that would lead it
+        // are part of the gap: past the end of a row they are not stored
+        // until something follows them.
+        if (self.bits & (LineBits::SCANNED_IMPLICIT_HYPERLINKS | LineBits::HAS_IMPLICIT_HYPERLINKS))
+            == LineBits::NONE
+        {
+            if let CellStorage::C(cl) = &mut self.cells {
+                if idx > cl.len() {
+                    let gap = if *attr == CellAttributes::blank() {
+                        text.bytes().take_while(|&b| b == b' ').count()
+                    } else {
+                        0
+                    };
+                    if gap == text.len() {
+                        return;
+                    }
+                    Self::pad_clustered_line(cl, idx + gap);
+                    cl.append_ascii(&text[gap..], attr);
+                    if attr.hyperlink().is_some() {
+                        self.bits |= LineBits::HAS_HYPERLINK;
+                    }
+                    self.invalidate_zones();
+                    self.update_last_change_seqno(seqno);
+                    return;
+                }
+            }
+        }
         // Establish the same wide-cell boundary and line metadata as a scalar
         // write before taking either storage-specific path.
         self.set_cell_grapheme(idx, &text[..1], 1, attr.clone(), seqno);
