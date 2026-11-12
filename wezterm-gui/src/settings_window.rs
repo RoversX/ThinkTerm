@@ -2507,6 +2507,9 @@ struct TabIconEditorLayout {
     shape_row: f32,
     /// Each colour's row.
     color_row: f32,
+    /// The colour rows: the circle's, and the glyph's unless the glyph
+    /// keeps its own colours.
+    color_rows: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4399,6 +4402,17 @@ impl SettingsWindow {
                 if let Some(search) = pending_keymap_search {
                     settings.show_keymap_search(&search);
                 }
+            }
+        }
+
+        // `tab-icon:<id>`: the Tab Icons page opens on that card's editor.
+        #[cfg(debug_assertions)]
+        if let Some(id) = std::env::var("THINKTERM_SETTINGS_EXPAND")
+            .ok()
+            .and_then(|value| value.strip_prefix("tab-icon:").map(str::to_string))
+        {
+            if let Some(settings) = settings_window_for_instance(instance_id) {
+                settings.borrow_mut().select_tab_icon(id);
             }
         }
 
@@ -13415,14 +13429,15 @@ impl SettingsWindow {
             + self.ui_px(TAB_ICON_EDITOR_SWATCH_GAP)
             + self.ui_px(TAB_ICON_EDITOR_SWATCH);
         let hairline = self.ui_px(1.0).max(1.0);
+        let color_rows = if card.glyph.is_full_color() { 1 } else { 2 };
         let height = self.ui_px(TAB_ICON_EDITOR_PAD) * 2.0
             + self.ui_px(TAB_ICON_EDITOR_HEAD)
             + self.ui_px(TAB_ICON_EDITOR_SECTION_GAP) * 2.0
             + programs_row
             + hairline
             + shape_row
-            + color_row * 2.0
-            + hairline;
+            + color_row * color_rows as f32
+            + hairline * (color_rows - 1) as f32;
 
         let chips = card
             .programs
@@ -13449,6 +13464,7 @@ impl SettingsWindow {
             shape_buttons,
             shape_row,
             color_row,
+            color_rows,
         }
     }
 
@@ -13730,7 +13746,8 @@ impl SettingsWindow {
             )?;
         }
 
-        // The second group: the two colours.
+        // The second group: the two colours -- the circle's alone for a
+        // glyph in its own colours, which takes no other.
         let group_y = group_y + group_height + self.ui_px(TAB_ICON_EDITOR_SECTION_GAP);
         self.draw_rounded_rect(
             layers,
@@ -13738,7 +13755,7 @@ impl SettingsWindow {
             inner_x,
             group_y,
             inner_width,
-            layout.color_row * 2.0 + hairline,
+            layout.color_row * layout.color_rows as f32 + hairline * (layout.color_rows - 1) as f32,
             group_fill,
             group_radius,
         )?;
@@ -13755,6 +13772,9 @@ impl SettingsWindow {
             crate::tab_icons::CIRCLE_PRESETS,
             SettingsAction::TabIconCirclePreset,
         )?;
+        if layout.color_rows < 2 {
+            return Ok(());
+        }
         let rule_y = group_y + layout.color_row;
         self.draw_rect(
             layers,

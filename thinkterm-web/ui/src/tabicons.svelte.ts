@@ -1,13 +1,23 @@
 // The icons heading the tabs (thinkterm-web/src/tab_icons.rs): the cards
 // this page's server sent over the relay, drawn here as one stylesheet --
-// each card's colours and its mark, as a mask cut out of its SVG -- and
+// each card's colours and its mark, as a mask cut out of its SVG or, for a
+// mark in its own colours, the SVG itself -- and
 // the class that picks a card by its id. Which card a tab gets is the
 // wasm's to say; every client is handed the same cards, other machines'
 // tabs included, as the desktop dresses them with its own.
 
 import { everyClient, type Client } from './client';
 
-type WireCard = { id: string; circle: string; glyph: string; svg: string };
+type WireCard = {
+  id: string;
+  circle: string;
+  glyph: string;
+  svg: string;
+  /** Drawn in its own colours, not as a shape filled with `glyph`. */
+  full_color?: boolean;
+  /** How big the mark is against the usual size. */
+  scale?: number;
+};
 
 export const icons = $state({
   /** Each card's class, by its id. */
@@ -40,6 +50,15 @@ export function setTabIcons(catalog: unknown) {
     if (typeof card?.id !== 'string' || typeof card.svg !== 'string' || !HEX.test(card.circle) || !HEX.test(card.glyph)) return;
     classes[card.id] = `k${i}`;
     rules.push(`.ticon.k${i} { --c: ${card.circle}; --g: ${card.glyph}; --m: ${mask(card.svg)}; }`);
+    // A mark in its own colours is the image, not a mask over a fill.
+    if (card.full_color === true) {
+      rules.push(`.ticon.k${i} > i { background: var(--m) center / contain no-repeat; -webkit-mask: none; mask: none; }`);
+    }
+    const scale = card.scale;
+    if (typeof scale === 'number' && Number.isFinite(scale) && scale !== 1 && scale >= 0.5 && scale <= 2) {
+      const side = `${(56 * scale).toFixed(1)}%`;
+      rules.push(`.ticon.k${i} > i { width: ${side}; height: ${side}; }`);
+    }
   });
   let style = document.getElementById('tab-icons');
   if (!(style instanceof HTMLStyleElement)) {

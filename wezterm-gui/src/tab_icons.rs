@@ -99,9 +99,11 @@ fn svg_path(id: &str) -> PathBuf {
     icon_dir().join(format!("{id}.svg"))
 }
 
-/// The glyph as a white mask `size` pixels square, for the painter to tint.
+/// The glyph as a white mask `size` pixels square, for the painter to tint
+/// -- or, one in its own colours, as it is.
 pub(crate) fn rasterize_glyph(key: &GlyphKey, size: usize) -> Result<Image> {
     match key {
+        GlyphKey::Builtin(glyph) if glyph.is_full_color() => rasterize(glyph.bytes(), size),
         GlyphKey::Builtin(glyph) => rasterize_mask(glyph.bytes(), size),
         GlyphKey::Svg(id) => {
             let path = svg_path(id);
@@ -128,6 +130,19 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>> {
 /// coverage (the atlas is premultiplied, so that is all four channels set to
 /// alpha), and the painter tints it.
 fn rasterize_mask(svg: &[u8], size: usize) -> Result<Image> {
+    let mut image = rasterize(svg, size)?;
+    for pixel in image.pixel_data_slice_mut().chunks_exact_mut(4) {
+        let alpha = pixel[3];
+        pixel[0] = alpha;
+        pixel[1] = alpha;
+        pixel[2] = alpha;
+    }
+    Ok(image)
+}
+
+/// The SVG drawn `size` pixels square, centred, in its own colours,
+/// premultiplied as the atlas keeps them.
+fn rasterize(svg: &[u8], size: usize) -> Result<Image> {
     let size = size.max(1);
     let mut options = resvg::usvg::Options::default();
     // An icon is a shape: nothing it names outside itself is ever fetched.
@@ -142,14 +157,7 @@ fn rasterize_mask(svg: &[u8], size: usize) -> Result<Image> {
     let mut pixmap = resvg::tiny_skia::Pixmap::new(size as u32, size as u32)
         .ok_or_else(|| anyhow!("allocating a {size}px glyph"))?;
     resvg::render(&tree, transform, &mut pixmap.as_mut());
-    let mut data = pixmap.take();
-    for pixel in data.chunks_exact_mut(4) {
-        let alpha = pixel[3];
-        pixel[0] = alpha;
-        pixel[1] = alpha;
-        pixel[2] = alpha;
-    }
-    Ok(Image::from_raw(size, size, data))
+    Ok(Image::from_raw(size, size, pixmap.take()))
 }
 
 fn covers_anything(mask: &Image) -> bool {
@@ -337,6 +345,19 @@ pub(crate) fn draw_glyph(
     if size < 1.0 {
         return Ok(());
     }
+    // A mark drawn bigger than the rest keeps their centre, on whole
+    // pixels as theirs are: its sprite is drawn at a whole size.
+    let scale = glyph.scale();
+    let (x, y, size) = if scale == 1.0 {
+        (x, y, size)
+    } else {
+        let grown = (size * scale).round();
+        (
+            (x - (grown - size) / 2.0).round(),
+            (y - (grown - size) / 2.0).round(),
+            grown,
+        )
+    };
     let sprite = ctx
         .render_state
         .glyph_cache
@@ -356,11 +377,19 @@ pub(crate) fn draw_glyph(
         y + size - top_offset,
     );
     quad.set_texture(sprite);
-    quad.set_fg_color(color);
-    quad.set_alt_color_and_mix_value(color, 0.0);
     quad.set_hsv(None);
-    quad.set_has_color(false);
-    quad.set_grayscale();
+    if glyph.is_full_color() {
+        // Its own colours, only as present as `color` says.
+        let white = LinearRgba::with_components(1.0, 1.0, 1.0, color.3);
+        quad.set_fg_color(white);
+        quad.set_alt_color_and_mix_value(white, 0.0);
+        quad.set_has_color(true);
+    } else {
+        quad.set_fg_color(color);
+        quad.set_alt_color_and_mix_value(color, 0.0);
+        quad.set_has_color(false);
+        quad.set_grayscale();
+    }
     Ok(())
 }
 
@@ -571,5 +600,21 @@ mod tests {
         }
         assert!(pixels.iter().any(|pixel| pixel[3] == 0xFF));
         assert!(pixels.iter().any(|pixel| pixel[3] == 0));
+    }
+
+    #[test]
+    fn a_mark_in_its_own_colours_keeps_them() {
+        let key = GlyphKey::Builtin(BuiltinGlyph::Homebrew);
+        let image = rasterize_glyph(&key, 64).unwrap();
+        // Homebrew's amber: red well above blue, where it is opaque.
+        assert!(image
+            .pixel_data_slice()
+            .chunks_exact(4)
+            .any(|pixel| pixel[3] == 0xFF && pixel[0] > 0xE0 && pixel[2] < 0x80));
+        let mask = rasterize_glyph(&GlyphKey::Builtin(BuiltinGlyph::Ruby), 64).unwrap();
+        assert!(mask
+            .pixel_data_slice()
+            .chunks_exact(4)
+            .all(|pixel| pixel[0] == pixel[3] && pixel[2] == pixel[3]));
     }
 }

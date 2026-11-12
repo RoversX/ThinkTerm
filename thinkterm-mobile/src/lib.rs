@@ -464,8 +464,15 @@ impl Core {
     pub fn tab_icon(&self, id: String, size: u32) -> Option<TabIcon> {
         let card = self.icons.card(&id)?;
         let size = size.clamp(1, icons::MAX_SIZE);
+        // The shell tints a shape: a mark in its own colours is drawn as
+        // its one-colour form, at the usual size.
+        let svg = if card.full_color {
+            thinkterm_tab_icons::builtin_shape(&card.id).unwrap_or(card.svg.as_str())
+        } else {
+            card.svg.as_str()
+        };
         Some(TabIcon {
-            mask: icons::mask(&card.svg, size).unwrap_or_default(),
+            mask: icons::mask(svg, size).unwrap_or_default(),
             circle: card.circle,
             glyph: card.glyph,
             size,

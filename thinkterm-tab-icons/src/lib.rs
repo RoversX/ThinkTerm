@@ -34,8 +34,24 @@ pub enum GlyphKey {
     Svg(Arc<str>),
 }
 
+impl GlyphKey {
+    /// See `BuiltinGlyph::is_full_color`; an imported SVG is a shape.
+    pub fn is_full_color(&self) -> bool {
+        matches!(self, Self::Builtin(glyph) if glyph.is_full_color())
+    }
+
+    /// See `BuiltinGlyph::scale`.
+    pub fn scale(&self) -> f32 {
+        match self {
+            Self::Builtin(glyph) => glyph.scale(),
+            Self::Svg(_) => 1.0,
+        }
+    }
+}
+
 /// The marks the built-in cards use. Brand marks come from simple-icons and
-/// lobe-icons, generic ones from lucide; all are single-colour shapes.
+/// lobe-icons, generic ones from lucide; all are single-colour shapes but
+/// Homebrew's, which keeps its own colours (`is_full_color`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuiltinGlyph {
     Activity,
@@ -56,6 +72,7 @@ pub enum BuiltinGlyph {
     GitHub,
     Go,
     Hammer,
+    Homebrew,
     Java,
     Kimi,
     Kubernetes,
@@ -86,6 +103,33 @@ pub enum BuiltinGlyph {
 }
 
 impl BuiltinGlyph {
+    /// Whether the mark is drawn in its own colours, rather than as a shape
+    /// the card's glyph colour fills.
+    pub fn is_full_color(self) -> bool {
+        matches!(self, Self::Homebrew)
+    }
+
+    /// The mark as a single-colour shape, for a painter that can only tint
+    /// one: a mark in its own colours has that form too.
+    pub fn shape_svg(self) -> &'static str {
+        match self {
+            Self::Homebrew => std::str::from_utf8(include_bytes!(
+                "../../third_party/simple-icons/icons/homebrew.svg"
+            ))
+            .unwrap_or_default(),
+            _ => self.svg(),
+        }
+    }
+
+    /// How big the mark is drawn against the others: a narrow one reads as
+    /// small at their size.
+    pub fn scale(self) -> f32 {
+        match self {
+            Self::Homebrew => 68.0 / 56.0,
+            _ => 1.0,
+        }
+    }
+
     /// The SVG, as the file in the tree has it.
     pub fn svg(self) -> &'static str {
         std::str::from_utf8(self.bytes()).unwrap_or_default()
@@ -130,6 +174,7 @@ impl BuiltinGlyph {
             Self::GitHub => simple!("github"),
             Self::Go => simple!("go"),
             Self::Hammer => lucide!("hammer"),
+            Self::Homebrew => include_bytes!("../glyphs/homebrew.svg"),
             Self::Java => simple!("openjdk"),
             Self::Kimi => lobe!("kimi"),
             Self::Kubernetes => simple!("kubernetes"),
@@ -542,6 +587,17 @@ pub const BUILTIN_CARDS: &[BuiltinCard] = &[
         agents: &[],
         programs: &["ansible", "ansible-playbook"],
     },
+    // brew is a Ruby script: it is found by its own name before Ruby's.
+    // Its mark brings its own amber, on a quiet grey.
+    BuiltinCard {
+        id: "homebrew",
+        name: "Homebrew",
+        glyph: BuiltinGlyph::Homebrew,
+        circle: Rgb(0x3A, 0x3A, 0x3C),
+        glyph_color: WHITE,
+        agents: &[],
+        programs: &["brew"],
+    },
     BuiltinCard {
         id: "ssh",
         name: "SSH",
@@ -870,6 +926,8 @@ impl Catalog {
                     GlyphKey::Builtin(glyph) => glyph.svg().to_string(),
                     GlyphKey::Svg(hash) => svg(hash).unwrap_or_default(),
                 },
+                full_color: card.glyph.is_full_color(),
+                scale: card.glyph.scale(),
                 programs: card.programs.clone(),
                 agents: card.agents.clone(),
             })
@@ -951,8 +1009,27 @@ pub struct WireCard {
     pub glyph: String,
     /// The glyph's shape, drawn in `glyph` over `circle`.
     pub svg: String,
+    /// Whether `svg` is drawn in its own colours instead.
+    #[serde(default)]
+    pub full_color: bool,
+    /// How big the glyph is drawn against the usual size.
+    #[serde(default = "usual_scale")]
+    pub scale: f32,
     pub programs: Vec<String>,
     pub agents: Vec<String>,
+}
+
+fn usual_scale() -> f32 {
+    1.0
+}
+
+/// A built-in card's mark as a single-colour shape, by the card's id: for a
+/// painter that tints shapes and is handed a card in its own colours.
+pub fn builtin_shape(card_id: &str) -> Option<&'static str> {
+    BUILTIN_CARDS
+        .iter()
+        .find(|card| card.id == card_id)
+        .map(|card| card.glyph.shape_svg())
 }
 
 /// Every card a page needs, and which one is the terminal's.
@@ -1110,6 +1187,33 @@ mod tests {
         );
         assert_eq!(card_id(&catalog, &program("sudo", Some("htop"))), "monitor");
         assert_eq!(card_id(&catalog, &program("ffmpeg", None)), TERMINAL_CARD);
+        assert_eq!(card_id(&catalog, &program("ruby", Some("brew.rb"))), "homebrew");
+        assert_eq!(card_id(&catalog, &program("ruby", Some("other.rb"))), "ruby");
+    }
+
+    #[test]
+    fn homebrews_mark_keeps_its_colours_and_is_drawn_bigger() {
+        let catalog = build(&TabIconSettings::default());
+        let homebrew = catalog.card("homebrew").unwrap();
+        assert!(homebrew.glyph.is_full_color());
+        assert!(homebrew.glyph.scale() > 1.0);
+        assert!(!catalog.card("ruby").unwrap().glyph.is_full_color());
+        let wire = catalog.wire(|_| None);
+        let card = wire.cards.iter().find(|card| card.id == "homebrew").unwrap();
+        assert!(card.full_color);
+        assert!(card.svg.contains("#fbb040"));
+        // A painter that only tints shapes gets the one-colour mark.
+        let shape = builtin_shape("homebrew").unwrap();
+        assert!(!shape.contains("#fbb040") && shape.contains("<path"));
+        assert_eq!(builtin_shape("ruby"), Some(BuiltinGlyph::Ruby.svg()));
+        // A page that sent neither, from before, reads as a shape at the
+        // usual size.
+        let old: WireCard = serde_json::from_str(
+            r##"{"id":"x","circle":"#000000","glyph":"#ffffff","svg":"","programs":[],"agents":[]}"##,
+        )
+        .unwrap();
+        assert!(!old.full_color);
+        assert_eq!(old.scale, 1.0);
     }
 
     #[test]
