@@ -78,6 +78,8 @@ const CARD_RING_STROKE: f32 = 3.0;
 const DONE_PILL_BADGE: f32 = 22.0;
 const DONE_CARD_BADGE: f32 = 34.0;
 const DONE_GAP: f32 = 6.0;
+/// The tick on the corner of a quiet notice's mark.
+const DONE_CORNER: f32 = 11.0;
 const BUTTON: f32 = 36.0;
 const BUTTON_GLYPH: f32 = 15.0;
 const BUTTON_GAP: f32 = 7.0;
@@ -306,6 +308,11 @@ pub(crate) struct FinishedAgent {
     command: Option<FinishedCommand>,
     /// Its time as itself is up: it waits, folded to its tick, to be seen.
     quiet: bool,
+    /// Opened under the pointer: read, so it goes once the pointer has been
+    /// away for [`FINISHED_FOR`], rather than waiting to be seen. Since when
+    /// it has been away.
+    looked: bool,
+    left_at: Option<Instant>,
 }
 
 impl FinishedAgent {
@@ -440,6 +447,8 @@ impl FinishedAgents {
                 paused_at: None,
                 command: None,
                 quiet: false,
+                looked: false,
+                left_at: None,
             });
             on = true;
         }
@@ -498,6 +507,8 @@ impl FinishedAgents {
                 shown_at: now,
                 paused_at: None,
                 quiet: false,
+                looked: false,
+                left_at: None,
                 command: Some(FinishedCommand {
                     label: reading.map_or(run.label, |reading| reading.name),
                     took,
@@ -574,17 +585,44 @@ impl FinishedAgents {
     }
 
     /// Run each one's clock while it is in `visible` and nothing holds it;
-    /// those whose time is up go quiet. A failure has no clock. True when
-    /// one went quiet.
-    fn advance(&mut self, now: Instant, visible: &HashSet<PaneId>, held: bool) -> bool {
+    /// those whose time is up go quiet. One `opened` under the pointer is
+    /// read: it goes once the pointer has been away its time. A failure has
+    /// no clock. True when one went quiet or went.
+    fn advance(
+        &mut self,
+        now: Instant,
+        visible: &HashSet<PaneId>,
+        opened: &HashSet<PaneId>,
+        held: bool,
+    ) -> bool {
         let mut changed = false;
-        for agent in &mut self.shown {
-            if agent.quiet || agent.failed() {
-                continue;
+        self.shown.retain_mut(|agent| {
+            if agent.failed() {
+                return true;
             }
-            if held || !visible.contains(&agent.pane_id) {
+            let out = held || !visible.contains(&agent.pane_id);
+            if !agent.looked && opened.contains(&agent.pane_id) {
+                agent.looked = true;
+                agent.paused_at = None;
+            }
+            if agent.looked {
+                if out {
+                    agent.left_at = None;
+                    return true;
+                }
+                let left = *agent.left_at.get_or_insert(now);
+                if now >= left + FINISHED_FOR {
+                    changed = true;
+                    return false;
+                }
+                return true;
+            }
+            if agent.quiet {
+                return true;
+            }
+            if out {
                 agent.paused_at.get_or_insert(now);
-                continue;
+                return true;
             }
             if let Some(paused) = agent.paused_at.take() {
                 agent.shown_at += now.duration_since(paused);
@@ -593,13 +631,18 @@ impl FinishedAgents {
                 agent.quiet = true;
                 changed = true;
             }
-        }
+            true
+        });
         changed
     }
 
     fn pause(&mut self, now: Instant) {
         for agent in &mut self.shown {
-            agent.paused_at.get_or_insert(now);
+            if agent.looked {
+                agent.left_at = None;
+            } else {
+                agent.paused_at.get_or_insert(now);
+            }
         }
     }
 
@@ -609,8 +652,16 @@ impl FinishedAgents {
         let settling = self.stopping.values().map(|stopped| *stopped + FINISHED_SETTLE);
         self.shown
             .iter()
-            .filter(|agent| agent.paused_at.is_none() && !agent.quiet && !agent.failed())
-            .map(|agent| agent.shown_at + FINISHED_FOR)
+            .filter(|agent| !agent.failed())
+            .filter_map(|agent| {
+                if agent.looked {
+                    agent.left_at.map(|left| left + FINISHED_FOR)
+                } else if agent.paused_at.is_none() && !agent.quiet {
+                    Some(agent.shown_at + FINISHED_FOR)
+                } else {
+                    None
+                }
+            })
             .chain(settling)
             .min()
     }
@@ -1738,11 +1789,13 @@ impl crate::TermWindow {
 
         // The pill, folded, and the front card, open; what is drawn is
         // between the two, anchored at the corner -- or, arriving or going,
-        // between that and a disc at the pill's end.
+        // between that and a disc at the pill's end. Its overshoot never
+        // takes it narrower than it is tall.
         let pill_width = dynamic
             .pill_width
             .as_ref()
-            .map_or(pill_target, |timeline| timeline.value(now));
+            .map_or(pill_target, |timeline| timeline.value(now))
+            .max(px(PILL_HEIGHT));
         let pill = euclid::rect(
             right - pill_width,
             bottom - px(PILL_HEIGHT),
@@ -1757,9 +1810,19 @@ impl crate::TermWindow {
         );
         let end = px(PILL_HEIGHT) * disc;
         let end_center = (right - px(PILL_HEIGHT) / 2.0, bottom - px(PILL_HEIGHT) / 2.0);
+        // Settling back past the pill takes as much off its width as off a
+        // card's: a short pill would be left a sliver, so it is never
+        // narrower than it is tall.
+        let folded = lerp_rect(pill, card, grow);
+        let folded = if folded.size.width < folded.size.height {
+            let side = folded.size.height;
+            euclid::rect(folded.max_x() - side, folded.min_y(), side, side)
+        } else {
+            folded
+        };
         let front_rect = lerp_rect(
             euclid::rect(end_center.0 - end / 2.0, end_center.1 - end / 2.0, end, end),
-            lerp_rect(pill, card, grow),
+            folded,
             stretch,
         );
 
@@ -1814,6 +1877,8 @@ impl crate::TermWindow {
         let mut turning_open = false;
         let mut hits: Vec<UIItem> = Vec::new();
         let mut shown_keys = Vec::new();
+        // The cards open all the way: read, when the pointer opened them.
+        let mut opened_keys = Vec::new();
         let interactive = !going && content_in > 0.9;
 
         // Cards that have left the stack, shrinking away where they were;
@@ -1850,6 +1915,9 @@ impl crate::TermWindow {
             self.paint_status_surface(&mut layers, &ctx, &ink, rect, surface)?;
             drawn.push(rect);
             shown_keys.push(item.key());
+            if rise > 0.9 && here > 0.9 {
+                opened_keys.push(item.key());
+            }
             turning_open |= content(*item_index).bar == Some(None);
             let mut buttons = Vec::new();
             self.paint_status_card(
@@ -1993,6 +2061,9 @@ impl crate::TermWindow {
         let mut front_buttons = Vec::new();
         if open_alpha > 0.001 {
             shown_keys.push(items[front_open].key());
+            if open_alpha > 0.9 {
+                opened_keys.push(items[front_open].key());
+            }
             turning_open |= content(front_open).bar == Some(None);
             let (was, is) = swap_mix(card_from.as_ref().map(|(_, at)| *at));
             if let Some((from, _)) = card_from.as_ref() {
@@ -2090,8 +2161,20 @@ impl crate::TermWindow {
             // pointer it came up under holds it too: that is someone
             // reading it, even before they move.
             let hold = over || self.occluded.is_some();
-            if self.advance_transfer_toasts(now, &visible, hold) {
-                // One went quiet after this frame was painted.
+            // Opened by the pointer resting on it, not by news: a banner
+            // is not read.
+            if !self.dynamic_status.full {
+                opened_keys.clear();
+            }
+            let opened_transfers: HashSet<u64> = opened_keys
+                .iter()
+                .filter_map(|key| match key {
+                    StatusKey::Transfer(id) => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            if self.advance_transfer_toasts(now, &visible, &opened_transfers, hold) {
+                // One went quiet, or went, after this frame was painted.
                 self.update_next_frame_time(Some(now));
             }
             if let Some(deadline) = self.next_transfer_toast_deadline() {
@@ -2104,8 +2187,19 @@ impl crate::TermWindow {
                     _ => None,
                 })
                 .collect();
-            if self.dynamic_status.finished.advance(now, &finished, hold) {
-                // One went quiet after this frame was painted.
+            let opened_finished: HashSet<PaneId> = opened_keys
+                .iter()
+                .filter_map(|key| match key {
+                    StatusKey::Finished(pane_id) => Some(*pane_id),
+                    _ => None,
+                })
+                .collect();
+            if self
+                .dynamic_status
+                .finished
+                .advance(now, &finished, &opened_finished, hold)
+            {
+                // One went quiet, or went, after this frame was painted.
                 self.update_next_frame_time(Some(now));
             }
             if let Some(deadline) = self.dynamic_status.finished.deadline() {
@@ -2149,7 +2243,9 @@ impl crate::TermWindow {
     /// while the dynamic status is not there to show it.
     pub(crate) fn pause_status_notices(&mut self, now: Instant) {
         for toast in &mut self.transfer_toasts {
-            if toast.closing_at.is_none() && toast.paused_at.is_none() {
+            if toast.looked {
+                toast.left_at = None;
+            } else if toast.closing_at.is_none() && toast.paused_at.is_none() {
                 toast.paused_at = Some(now);
             }
         }
@@ -2163,14 +2259,14 @@ impl crate::TermWindow {
         content: &CardContent,
         px: &impl Fn(f32) -> f32,
     ) -> anyhow::Result<f32> {
-        // Gone quiet: a disc around its tick.
-        if content.quiet {
-            return Ok(px(PILL_HEIGHT));
-        }
         let name = self
             .sidebar_text_width(&fonts.title, &content.name)?
             .ceil()
             .min(px(PILL_NAME_MAX));
+        // Gone quiet: its mark, ticked, and its name.
+        if content.quiet {
+            return Ok(px(PILL_PAD_LEFT + PILL_MARK + PILL_GAP) + name + px(PILL_PAD_RIGHT));
+        }
         Ok(px(PILL_PAD_LEFT + PILL_MARK + PILL_GAP)
             + name
             + self.pill_trail_width(fonts, content, px)?
@@ -2415,8 +2511,21 @@ impl crate::TermWindow {
     ) -> anyhow::Result<()> {
         let mid = rect.min_y() + rect.size.height / 2.0;
         if content.quiet {
-            let size = px(DONE_PILL_BADGE);
-            return paint_done_badge(ctx, layers, (rect.min_x() + rect.size.width / 2.0, mid), size, alpha);
+            let size = px(PILL_MARK);
+            let x = rect.min_x() + px(PILL_PAD_LEFT);
+            self.paint_status_tile(layers, ctx, ink, content, x, mid, size, alpha)?;
+            paint_done_corner(ctx, layers, ink, (x + size / 2.0, mid), size, px, alpha)?;
+            let name_x = x + size + px(PILL_GAP);
+            return self.paint_status_line(
+                layers,
+                &fonts.title,
+                fonts.title_metrics,
+                &content.name,
+                name_x.max(0.0) as usize,
+                (mid - fonts.title_line / 2.0).max(0.0) as usize,
+                (rect.max_x() - px(PILL_PAD_RIGHT) - name_x).max(0.0) as usize,
+                ink.text.mul_alpha(alpha),
+            );
         }
         let place = self.pill_head(fonts, rect, content, px)?;
         if head {
@@ -2717,7 +2826,9 @@ impl crate::TermWindow {
                 self.paint_status_mark(layers, ctx, content, cx, cy, px(SATELLITE_MARK), tone_color(content.tone, ink).mul_alpha(alpha))?;
             }
             None if content.quiet => {
-                paint_done_badge(ctx, layers, (cx, cy), px(DONE_PILL_BADGE), alpha)?;
+                let size = px(PILL_MARK);
+                self.paint_status_tile(layers, ctx, ink, content, cx - size / 2.0, cy, size, alpha)?;
+                paint_done_corner(ctx, layers, ink, (cx, cy), size, px, alpha)?;
             }
             None => {
                 let size = px(PILL_MARK);
@@ -3695,6 +3806,35 @@ fn paint_done_badge(
     .context("dynamic status done badge")
 }
 
+/// A quiet notice's tick: small, on the lower right of its mark (`size`
+/// across, centred on `center`), over the glyph and ringed in the surface.
+fn paint_done_corner(
+    ctx: &DrawContext,
+    layers: &mut crate::quad::TripleLayerQuadAllocator,
+    ink: &Ink,
+    center: (f32, f32),
+    size: f32,
+    px: &impl Fn(f32) -> f32,
+    alpha: f32,
+) -> anyhow::Result<()> {
+    let off = size * 0.38;
+    let (cx, cy) = (center.0 + off, center.1 + off);
+    let badge = px(DONE_CORNER);
+    ctx.draw_disc(layers, 2, cx, cy, badge + px(3.0), ink.fill.mul_alpha(alpha))?;
+    let green = LinearRgba::with_srgba(0, 188, 0, 255);
+    ctx.draw_disc(layers, 2, cx, cy, badge, green.mul_alpha(alpha))?;
+    let tick = badge * 0.62;
+    ctx.draw_svg_icon(
+        layers,
+        SvgIcon::Check,
+        cx - tick / 2.0,
+        cy - tick / 2.0,
+        tick,
+        LinearRgba::with_srgba(255, 255, 255, 255).mul_alpha(alpha),
+    )
+    .context("dynamic status done corner")
+}
+
 /// Where a card in `rect` has its mark and name, its text reaching to `end`.
 fn card_head(fonts: &Fonts, rect: RectF, end: f32, px: &impl Fn(f32) -> f32) -> Head {
     let mid = rect.min_y() + rect.size.height / 2.0;
@@ -4214,14 +4354,14 @@ mod tests {
         let start = now + FINISHED_AFTER + FINISHED_SETTLE;
         assert!(finished.settle(start, false));
         let seen: HashSet<PaneId> = [1].iter().copied().collect();
-        assert!(!finished.advance(start + Duration::from_secs(4), &seen, false));
+        assert!(!finished.advance(start + Duration::from_secs(4), &seen, &HashSet::new(), false));
         assert_eq!(finished.deadline(), Some(start + FINISHED_FOR));
-        assert!(finished.advance(start + FINISHED_FOR, &seen, false));
+        assert!(finished.advance(start + FINISHED_FOR, &seen, &HashSet::new(), false));
         // Kept, folded to its tick, with no clock left to run.
         assert_eq!(finished.shown.len(), 1);
         assert!(finished.shown[0].quiet);
         assert_eq!(finished.deadline(), None);
-        assert!(!finished.advance(start + Duration::from_secs(3600), &seen, false));
+        assert!(!finished.advance(start + Duration::from_secs(3600), &seen, &HashSet::new(), false));
         assert_eq!(finished.shown.len(), 1);
         // Working again takes it off, as before.
         finished.note(start + Duration::from_secs(3601), 1, Some(AgentState::Working));
@@ -4237,6 +4377,8 @@ mod tests {
             shown_at: now,
             paused_at: None,
             quiet: false,
+            looked: false,
+            left_at: None,
             command: Some(FinishedCommand {
                 label: "make".into(),
                 took: Duration::from_secs(30),
@@ -4247,7 +4389,7 @@ mod tests {
         });
         let seen: HashSet<PaneId> = [2].iter().copied().collect();
         assert_eq!(finished.deadline(), None);
-        assert!(!finished.advance(now + Duration::from_secs(60), &seen, false));
+        assert!(!finished.advance(now + Duration::from_secs(60), &seen, &HashSet::new(), false));
         assert!(!finished.shown[0].quiet);
     }
 
@@ -4261,16 +4403,47 @@ mod tests {
             paused_at: None,
             command: None,
             quiet: false,
+            looked: false,
+            left_at: None,
         });
         let seen: HashSet<PaneId> = [1].iter().copied().collect();
         // Under the pointer for ten seconds, then left alone.
-        assert!(!finished.advance(now + Duration::from_secs(1), &seen, true));
+        assert!(!finished.advance(now + Duration::from_secs(1), &seen, &HashSet::new(), true));
         assert_eq!(finished.deadline(), None);
-        assert!(!finished.advance(now + Duration::from_secs(11), &seen, false));
-        assert!(!finished.advance(now + Duration::from_secs(14), &seen, false));
+        assert!(!finished.advance(now + Duration::from_secs(11), &seen, &HashSet::new(), false));
+        assert!(!finished.advance(now + Duration::from_secs(14), &seen, &HashSet::new(), false));
         // Not on the status at all -- folded into "+N" -- holds it too.
-        assert!(!finished.advance(now + Duration::from_secs(30), &HashSet::new(), false));
+        assert!(!finished.advance(now + Duration::from_secs(30), &HashSet::new(), &HashSet::new(), false));
         assert_eq!(finished.shown.len(), 1);
+    }
+
+    #[test]
+    fn a_finished_notice_opened_under_the_pointer_goes_once_left() {
+        let now = Instant::now();
+        let mut finished = FinishedAgents::default();
+        finished.shown.push(FinishedAgent {
+            pane_id: 1,
+            shown_at: now,
+            paused_at: None,
+            command: None,
+            quiet: true,
+            looked: false,
+            left_at: None,
+        });
+        let seen: HashSet<PaneId> = [1].iter().copied().collect();
+        let none = HashSet::new();
+        // Opened under the pointer: read.
+        assert!(!finished.advance(now, &seen, &seen, true));
+        assert_eq!(finished.deadline(), None);
+        // The pointer leaves, and comes back before its time is up.
+        assert!(!finished.advance(now + Duration::from_secs(1), &seen, &none, false));
+        assert_eq!(finished.deadline(), Some(now + Duration::from_secs(1) + FINISHED_FOR));
+        assert!(!finished.advance(now + Duration::from_secs(4), &seen, &none, true));
+        // Away again: it goes its time after that.
+        assert!(!finished.advance(now + Duration::from_secs(5), &seen, &none, false));
+        assert!(!finished.advance(now + Duration::from_secs(9), &seen, &none, false));
+        assert!(finished.advance(now + Duration::from_secs(5) + FINISHED_FOR, &seen, &none, false));
+        assert!(finished.shown.is_empty());
     }
 
     #[test]

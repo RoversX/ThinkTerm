@@ -57,6 +57,10 @@ pub(crate) struct TransferToast {
     /// A success whose time as itself is up: it stays, folded to its tick,
     /// until it is dismissed or a newer one takes its place.
     pub quiet: bool,
+    /// A success opened under the pointer: read, so it goes once the
+    /// pointer has been away for [`DONE_TTL`]. Since when it has been away.
+    pub looked: bool,
+    pub left_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,6 +97,8 @@ impl TransferToast {
             paused_at: None,
             closing_at: None,
             quiet: false,
+            looked: false,
+            left_at: None,
         }
     }
 
@@ -124,6 +130,8 @@ impl TransferToast {
             paused_at: None,
             closing_at: None,
             quiet: false,
+            looked: false,
+            left_at: None,
         }
     }
 
@@ -154,6 +162,8 @@ impl TransferToast {
             paused_at: None,
             closing_at: None,
             quiet: false,
+            looked: false,
+            left_at: None,
         }
     }
 
@@ -185,6 +195,8 @@ impl TransferToast {
             paused_at: None,
             closing_at: None,
             quiet: false,
+            looked: false,
+            left_at: None,
         }
     }
 
@@ -277,6 +289,9 @@ impl TransferToast {
     /// the user closes it -- a failure carries the only way back into a
     /// transfer whose strip row is deliberately not shown.
     fn deadline(&self) -> Option<Instant> {
+        if self.looked {
+            return self.left_at.map(|left| left + DONE_TTL);
+        }
         match self.outcome {
             TransferToastOutcome::Done if !self.quiet => Some(self.shown_at + DONE_TTL),
             _ => None,
@@ -493,11 +508,35 @@ impl crate::TermWindow {
     }
 
     /// Run each success's clock while it can be seen; one whose time is up
-    /// goes quiet. True when one did.
-    pub(super) fn advance_transfer_toasts(&mut self, now: Instant, visible: &HashSet<u64>, held: bool) -> bool {
+    /// goes quiet. One `opened` under the pointer is read: it goes once the
+    /// pointer has been away its time. True when one went quiet or went.
+    pub(super) fn advance_transfer_toasts(
+        &mut self,
+        now: Instant,
+        visible: &HashSet<u64>,
+        opened: &HashSet<u64>,
+        held: bool,
+    ) -> bool {
         let mut changed = false;
         for toast in &mut self.transfer_toasts {
             if toast.closing_at.is_some() {
+                continue;
+            }
+            let done = matches!(toast.outcome, TransferToastOutcome::Done);
+            if done && !toast.looked && opened.contains(&toast.id) {
+                toast.looked = true;
+                toast.paused_at = None;
+            }
+            if toast.looked {
+                if held || !visible.contains(&toast.id) {
+                    toast.left_at = None;
+                    continue;
+                }
+                let left = *toast.left_at.get_or_insert(now);
+                if now >= left + DONE_TTL {
+                    toast.closing_at = Some(now);
+                    changed = true;
+                }
                 continue;
             }
             // Held under the pointer, and held while the dynamic status has no room
@@ -878,6 +917,11 @@ mod tests {
             .actions
             .iter()
             .any(|action| action.item == UIItemType::TransferCardDismiss(toast.id)));
+        // Opened under the pointer: its time runs from when the pointer left.
+        toast.looked = true;
+        assert_eq!(toast.deadline(), None);
+        toast.left_at = Some(now);
+        assert_eq!(toast.deadline(), Some(now + DONE_TTL));
     }
 
     #[test]
