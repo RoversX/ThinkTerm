@@ -3365,6 +3365,19 @@ mod summary_tests {
         wait_for_title(&pane, "after");
     }
 
+    /// A full read says that more is coming, and what it parses to waits to
+    /// go on with the rest of its batch. When nothing more comes, it goes
+    /// on all the same, before the reader waits for what may never come.
+    #[cfg(unix)]
+    #[test]
+    fn a_full_read_with_nothing_after_it_is_applied() {
+        let (pane, mut program, _exit_tx) = pane_on_a_pipe(4245);
+        let mut output = vec![b' '; 4096];
+        output.extend_from_slice(b"\x1b]0;whole\x07");
+        program.write_all(&output).unwrap();
+        wait_for_title(&pane, "whole");
+    }
+
     /// While a reader is paused, what the program writes stays in the pty;
     /// resuming applies it, and a kept pause never does.
     #[cfg(unix)]
