@@ -874,8 +874,118 @@ async fn push_pane_changes_when_free(
     }
 }
 
+/// How long a pane's output waits between two batches for the main thread
+/// to take the turn it asked for, and then again for it to be done with it.
+/// The main thread gets there in a fraction of this unless it is busy, and
+/// output kept waiting longer would be output held up for input.
+const TURN_LIMIT: Duration = Duration::from_millis(2);
+
+/// After a turn that nobody came for, how long a pane's output goes on
+/// without offering another: a main thread too busy to take one is not
+/// waited for again by everything else that asked, nor after every batch.
+const TURN_REST: Duration = Duration::from_millis(16);
+
+thread_local! {
+    /// When a turn offered by this thread, which applies a pane's output,
+    /// last went untaken.
+    static TURN_UNTAKEN: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// A pane found free, or given a turn by the thread that applies its
+/// output: with a turn that thread waits between two batches, the terminal
+/// free, until this is dropped or `TURN_LIMIT` has passed.
+struct FreePane {
+    pane: Arc<dyn Pane>,
+    _turn: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl FreePane {
+    fn without_a_turn(pane: Arc<dyn Pane>) -> Self {
+        Self { pane, _turn: None }
+    }
+}
+
+impl std::ops::Deref for FreePane {
+    type Target = Arc<dyn Pane>;
+
+    fn deref(&self) -> &Arc<dyn Pane> {
+        &self.pane
+    }
+}
+
+/// Ask `pane`'s parser for a turn at the terminal after its batch: what is
+/// received is the turn, kept for as long as the terminal is wanted. None
+/// for a pane without a parser to ask.
+///
+/// A flood leaves the terminal free for a moment between batches and no
+/// longer, and a probe on a timer finds that moment by luck, if at all:
+/// a key typed at a pane in a flood waited for it, sometimes for a second.
+///
+/// The turn is an offer until it is taken (see `take_turn`): one that the
+/// main thread comes to late has run out, and the terminal is no longer
+/// free behind it.
+fn ask_parser_for_a_turn(
+    pane: &Arc<dyn Pane>,
+) -> Option<smol::channel::Receiver<std::sync::mpsc::Sender<()>>> {
+    let (go, went) = smol::channel::bounded(1);
+    let asked_from = std::thread::current().id();
+    pane.read_after_batch(Box::new(move |_pane| offer_turn(&go, asked_from)))
+        .ok()?;
+    Some(went)
+}
+
+/// Between two batches, on the thread that applies a pane's output: offer
+/// the turn asked for from `asked_from`, and wait while it is used.
+fn offer_turn(
+    go: &smol::channel::Sender<std::sync::mpsc::Sender<()>>,
+    asked_from: std::thread::ThreadId,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+    // Whoever asked has stopped waiting, for this one at least.
+    if go.is_closed() {
+        return;
+    }
+    // A batch applied by the thread that asked, which has the terminal to
+    // itself once it is back at its tasks: nothing could take a turn while
+    // that thread waited here.
+    if std::thread::current().id() == asked_from {
+        return;
+    }
+    if TURN_UNTAKEN.with(|at| at.get().is_some_and(|at| at.elapsed() < TURN_REST)) {
+        return;
+    }
+    let (turn, heard) = std::sync::mpsc::channel::<()>();
+    if go.try_send(turn).is_err() {
+        return;
+    }
+    // The first thing heard is that the turn was taken, and the only thing
+    // after it is the turn being dropped.
+    let taken = match heard.recv_timeout(TURN_LIMIT) {
+        Ok(()) => true,
+        // Taken just as the time ran out counts.
+        Err(RecvTimeoutError::Timeout) => {
+            let taken = heard.try_recv().is_ok();
+            if !taken {
+                TURN_UNTAKEN.with(|at| at.set(Some(Instant::now())));
+            }
+            taken
+        }
+        Err(RecvTimeoutError::Disconnected) => false,
+    };
+    if taken {
+        let _ = heard.recv_timeout(TURN_LIMIT);
+    }
+}
+
+/// Take a turn that was offered: false if it ran out first, and the output
+/// has gone on to its next batch with the terminal.
+fn take_turn(turn: &std::sync::mpsc::Sender<()>) -> bool {
+    turn.send(()).is_ok()
+}
+
 /// The pane, once its render state can be read without waiting on its
-/// parser. With a `limit`, None after that long of nothing but
+/// parser: found free, or with a turn its parser gives between two batches
+/// (see `FreePane`). With a `limit`, None after that long of nothing but
 /// contention, with a warning naming `what` gave up; without one the wait
 /// is for as long as it takes, and the warning says so once. Every read
 /// of a pane on the main thread but a push's goes through here, so a pane
@@ -887,14 +997,29 @@ async fn pane_when_free(
     sender: &PduSender,
     what: &str,
     limit: Option<Duration>,
-) -> anyhow::Result<Option<Arc<dyn Pane>>> {
+) -> anyhow::Result<Option<FreePane>> {
     let mut delay = PUSH_RETRY_MIN;
     let started = Instant::now();
     let mut warned = false;
+    // The turn asked for and not yet offered: asked for once, however many
+    // times the timer comes round before the batch ends.
+    let mut asked: Option<smol::channel::Receiver<std::sync::mpsc::Sender<()>>> = None;
     loop {
         let pane = pane_still_wanted(pane_id, sender)?;
         if !pane.render_state_is_contended() {
-            return Ok(Some(pane));
+            // The terminal may be free because a turn was offered while
+            // this was not looking: it is taken then, rather than left for
+            // the output to wait out as one nobody came for.
+            if let Some(turn) = asked.as_ref().and_then(|went| went.try_recv().ok()) {
+                if take_turn(&turn) {
+                    metrics::counter!("mux_server.turn.given").increment(1);
+                    return Ok(Some(FreePane {
+                        pane,
+                        _turn: Some(turn),
+                    }));
+                }
+            }
+            return Ok(Some(FreePane::without_a_turn(pane)));
         }
         if started.elapsed() > limit.unwrap_or(PUSH_DEFERRAL_LIMIT) {
             if limit.is_some() {
@@ -913,8 +1038,45 @@ async fn pane_when_free(
             }
         }
         metrics::counter!("mux_server.push.deferred").increment(1);
-        smol::Timer::after(delay).await;
-        delay = (delay * 2).min(PUSH_RETRY_MAX);
+        // The timer stays, for the batch that was the last: a parser with
+        // nothing more to apply gives no turns.
+        if asked.is_none() {
+            asked = ask_parser_for_a_turn(&pane);
+        }
+        match &asked {
+            Some(went) => {
+                let offered = smol::future::or(async { Some(went.recv().await) }, async {
+                    smol::Timer::after(delay).await;
+                    None
+                })
+                .await;
+                match offered {
+                    Some(Ok(turn)) => {
+                        asked = None;
+                        if take_turn(&turn) {
+                            metrics::counter!("mux_server.turn.given").increment(1);
+                            return Ok(Some(FreePane {
+                                pane,
+                                _turn: Some(turn),
+                            }));
+                        }
+                        // It ran out before this got to it: look again.
+                        metrics::counter!("mux_server.turn.missed").increment(1);
+                    }
+                    // The batch ended without a turn to offer.
+                    Some(Err(_)) => {
+                        asked = None;
+                        smol::future::yield_now().await;
+                    }
+                    // The timer came round first: the next wait is longer.
+                    None => delay = (delay * 2).min(PUSH_RETRY_MAX),
+                }
+            }
+            None => {
+                smol::Timer::after(delay).await;
+                delay = (delay * 2).min(PUSH_RETRY_MAX);
+            }
+        }
     }
 }
 
@@ -961,6 +1123,7 @@ async fn drain_pane_inputs(
         } else {
             Mux::get()
                 .get_pane(pane_id)
+                .map(FreePane::without_a_turn)
                 .ok_or_else(|| anyhow!("no such pane {pane_id}"))
         };
         let pane = match pane {
@@ -972,6 +1135,9 @@ async fn drain_pane_inputs(
             }
         };
         let result = apply_pane_input(&pane, &sender, &per_pane, &source, item.input);
+        // The turn, if this had one, ends with the input applied: the
+        // output goes on while the rest of the main thread has its turn.
+        drop(pane);
         (item.respond)(result);
         // A burst typed while the pane was busy is applied a piece per
         // turn of the main thread, not all in one.
@@ -5057,6 +5223,73 @@ mod tests {
             config::keyassignment::ScrollbackEraseMode::ScrollbackOnly
         )
         .needs_the_terminal());
+    }
+
+    /// A turn is an offer: one that is taken keeps the output waiting until
+    /// it is dropped, and taking it says so.
+    #[test]
+    fn a_turn_that_is_taken_is_waited_on_until_it_is_dropped() {
+        use super::{offer_turn, take_turn};
+        let asked_from = std::thread::current().id();
+        let held = super::TURN_LIMIT / 4;
+        // A main thread that is late for one offer asks again, as here.
+        for _ in 0..50 {
+            let (go, went) = smol::channel::bounded(1);
+            let output = std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                offer_turn(&go, asked_from);
+                started.elapsed()
+            });
+            let turn = went.recv_blocking().expect("a turn is offered");
+            if !take_turn(&turn) {
+                output.join().unwrap();
+                continue;
+            }
+            // The output waits for as long as the turn is held, and no
+            // longer than its limit allows once it is dropped.
+            std::thread::sleep(held);
+            drop(turn);
+            let waited = output.join().unwrap();
+            assert!(waited >= held, "{:?}", waited);
+            assert!(waited < std::time::Duration::from_secs(1), "{:?}", waited);
+            return;
+        }
+        panic!("no turn could be taken in fifty tries");
+    }
+
+    /// A turn nobody takes runs out: taking it then says so, the terminal
+    /// being the output's again, and the same thread offers no other for a
+    /// while, so that a busy main thread is waited for once and not after
+    /// every batch, by everything that asked.
+    #[test]
+    fn a_turn_nobody_takes_runs_out_and_is_not_offered_again_at_once() {
+        use super::{offer_turn, take_turn};
+        let asked_from = std::thread::current().id();
+        let (go, went) = smol::channel::bounded(1);
+        let (go_again, went_again) = smol::channel::bounded(1);
+        let output = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            offer_turn(&go, asked_from);
+            let first = started.elapsed();
+            offer_turn(&go_again, asked_from);
+            first
+        });
+        let first = output.join().unwrap();
+        assert!(first >= super::TURN_LIMIT, "{:?}", first);
+        let turn = went.try_recv().expect("the first was offered");
+        assert!(!take_turn(&turn), "and had run out");
+        assert!(went_again.try_recv().is_err(), "the second was not offered");
+    }
+
+    /// The thread that asked may be the one that applies the batch, when it
+    /// applies something of its own: it cannot take a turn while it waits
+    /// for itself, and is not made to.
+    #[test]
+    fn the_thread_that_asked_is_not_kept_waiting_for_its_own_turn() {
+        use super::offer_turn;
+        let (go, went) = smol::channel::bounded(1);
+        offer_turn(&go, std::thread::current().id());
+        assert!(went.try_recv().is_err(), "nothing was offered");
     }
 
     /// Input for a pane waits in its queue in the order it was sent; a

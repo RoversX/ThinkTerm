@@ -725,6 +725,79 @@ impl ClusteredLine {
         true
     }
 
+    /// `append_run` for a run whose wide cells are given as a mask: bit n of
+    /// `wide`, lowest first, is the cell n places from the current end, set
+    /// where a grapheme two cells wide starts. A row of wide characters is
+    /// marked a word at a time, and its set of them sized once.
+    pub fn append_run_masked(
+        &mut self,
+        text: &str,
+        max_len: usize,
+        cells: usize,
+        wide: &[u64],
+        last_width: u8,
+        attrs: &CellAttributes,
+    ) -> bool {
+        let extend = matches!(self.clusters.last(), Some(cluster) if cluster.attrs == *attrs);
+        let prior = if extend {
+            self.clusters
+                .last()
+                .map_or(0, |cluster| cluster.cell_width as usize)
+        } else {
+            0
+        };
+        if prior + cells > u16::MAX as usize {
+            return false;
+        }
+        let Some(capacity) =
+            grown_capacity(self.text.capacity(), self.text.len() + text.len(), max_len)
+        else {
+            return false;
+        };
+        match self.clusters.last_mut() {
+            Some(cluster) if extend => cluster.cell_width = (prior + cells) as u16,
+            _ => self.clusters.push(Cluster {
+                attrs: attrs.clone(),
+                cell_width: cells as u16,
+            }),
+        }
+        self.text.reserve_exact(capacity - self.text.len());
+        self.text.extend_from_slice(text.as_bytes());
+        let last = wide
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, word)| **word != 0)
+            .map(|(index, word)| index * 64 + 63 - word.leading_zeros() as usize);
+        if let Some(last) = last {
+            let base = self.len as usize;
+            let bits = base + last + 1;
+            // Sized once for the run: a row of wide characters was otherwise
+            // a growth for every 32 cells of it.
+            let bitset = self
+                .is_double_wide
+                .get_or_insert_with(|| Box::new(FixedBitSet::with_capacity(bits)));
+            bitset.grow(bits);
+            // The set keeps its bits 32 to a block; a word of the
+            // mask lands on up to three of them.
+            let blocks = bitset.as_mut_slice();
+            for (index, &word) in wide.iter().enumerate() {
+                if word == 0 {
+                    continue;
+                }
+                let bit = base + index * 64;
+                let spread = (word as u128) << (bit % 32);
+                let parts = [spread as u32, (spread >> 32) as u32, (spread >> 64) as u32];
+                for (block, part) in blocks[bit / 32..].iter_mut().zip(parts) {
+                    *block |= part;
+                }
+            }
+        }
+        self.last_cell_width = NonZeroU8::new(last_width);
+        self.len += cells as u32;
+        true
+    }
+
     pub fn append(&mut self, cell: Cell) {
         let cell_width = cell.width() as u16;
         let new_cluster = match self.clusters.last() {

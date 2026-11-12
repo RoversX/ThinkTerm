@@ -169,7 +169,9 @@ impl Line {
     /// only bounded compact buffers. Never retain a vector of cells or a large
     /// historical allocation merely because the row has scrolled off screen.
     pub fn reset_for_scrolling(&mut self, seqno: SequenceNo, columns: usize) {
-        self.reset_for_scrolling_within(seqno, columns.max(80).saturating_mul(2));
+        // Room for a row of wide characters, three bytes to two cells, in a
+        // buffer that grew to hold it by doubling.
+        self.reset_for_scrolling_within(seqno, columns.max(80).saturating_mul(4));
     }
 
     /// `reset_for_scrolling`, keeping a text buffer no larger than a new
@@ -945,6 +947,52 @@ impl Line {
         true
     }
 
+    /// `append_grapheme_run` for a run whose wide cells are given as a mask
+    /// (see `ClusteredLine::append_run_masked`).
+    pub fn append_wide_run(
+        &mut self,
+        idx: usize,
+        text: &str,
+        max_len: usize,
+        cells: usize,
+        wide: &[u64],
+        last_width: u8,
+        attr: &CellAttributes,
+        follows: bool,
+        seqno: SequenceNo,
+    ) -> bool {
+        if !self.can_append_grapheme_run(idx) {
+            return false;
+        }
+        let CellStorage::C(cl) = &mut self.cells else {
+            return false;
+        };
+        if !follows && cl.joins_at(idx, text) {
+            return false;
+        }
+        // Blanks make way for the run, and those it does not reach stay.
+        let len = cl.len();
+        if idx < len && runs_into(text.as_bytes(), " ") {
+            return false;
+        }
+        cl.truncate_blanks(idx);
+        let appended = cl.append_run_masked(text, max_len, cells, wide, last_width, attr);
+        if cl.len() < len {
+            cl.append_ascii_repeated(' ', len - cl.len(), &CellAttributes::blank());
+        }
+        if !appended {
+            return false;
+        }
+        // What each set_cell_grapheme would do; repeating it changes nothing.
+        if attr.hyperlink().is_some() {
+            self.bits |= LineBits::HAS_HYPERLINK;
+        }
+        self.invalidate_implicit_hyperlinks(seqno);
+        self.invalidate_zones();
+        self.update_last_change_seqno(seqno);
+        true
+    }
+
     // Keep padding and overwrites out of the common sequential append path.
     #[inline(never)]
     fn set_cell_grapheme_nonappend(
@@ -1053,6 +1101,35 @@ impl Line {
             if let CellStorage::C(cl) = &mut self.cells {
                 if idx == cl.len() && !cl.joins(text) {
                     cl.append_ascii(text, attr);
+                    if attr.hyperlink().is_some() {
+                        self.bits |= LineBits::HAS_HYPERLINK;
+                    }
+                    self.invalidate_zones();
+                    self.update_last_change_seqno(seqno);
+                    return;
+                }
+            }
+        }
+        // Past the end of a compact row: a tab, a cursor movement or a line
+        // feed without a return left a gap, which is blanks, and the text
+        // goes after them in one piece. Default blanks that would lead it
+        // are part of the gap: past the end of a row they are not stored
+        // until something follows them.
+        if (self.bits & (LineBits::SCANNED_IMPLICIT_HYPERLINKS | LineBits::HAS_IMPLICIT_HYPERLINKS))
+            == LineBits::NONE
+        {
+            if let CellStorage::C(cl) = &mut self.cells {
+                if idx > cl.len() {
+                    let gap = if *attr == CellAttributes::blank() {
+                        text.bytes().take_while(|&b| b == b' ').count()
+                    } else {
+                        0
+                    };
+                    if gap == text.len() {
+                        return;
+                    }
+                    Self::pad_clustered_line(cl, idx + gap);
+                    cl.append_ascii(&text[gap..], attr);
                     if attr.hyperlink().is_some() {
                         self.bits |= LineBits::HAS_HYPERLINK;
                     }

@@ -86,7 +86,7 @@ fn scroll_reset_discards_oversized_storage() {
     line.reset_for_scrolling(3, 116);
     assert_eq!(line, Line::new(3));
     match &line.cells {
-        super::storage::CellStorage::C(cl) => assert!(cl.text.capacity() <= 232),
+        super::storage::CellStorage::C(cl) => assert!(cl.text.capacity() <= 116 * 4),
         _ => panic!("reset row should use compact storage"),
     }
 }
@@ -1182,6 +1182,33 @@ fn ascii_runs_match_scalar_storage_links_and_wide_boundaries() {
                 ] {
                     for attrs in [CellAttributes::default(), linked.clone()] {
                         check_ascii_against_scalar(&base, start, replacement, &attrs);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Text written past the end of a row, across a gap a tab or a cursor
+/// movement left, has to come out as writing it a cell at a time does: the
+/// gap filled with blanks, and default blanks that lead the text left out
+/// with it unless something follows them.
+#[test]
+fn ascii_past_a_gap_matches_scalar_writes() {
+    let mut bold = CellAttributes::default();
+    bold.set_intensity(wezterm_cell::Intensity::Bold);
+    let mut linked = CellAttributes::default();
+    linked.set_hyperlink(Some(Arc::new(Hyperlink::new("https://example.org"))));
+    let styles = [CellAttributes::default(), bold, linked];
+    for prefix in ["", "ab", "a\u{754c}", "e\u{301}", "ab   "] {
+        for initial in &styles {
+            let mut base = Line::from_text(prefix, initial, 7, None);
+            base.compress_for_scrollback();
+            base.semantic_zone_ranges();
+            for gap in [1, 2, 7, 60] {
+                for attrs in &styles {
+                    for text in ["x", " ", "   ", " x", "   lead", "ab  cd  ", "0123456789"] {
+                        check_ascii_against_scalar(&base, base.len() + gap, text, attrs);
                     }
                 }
             }

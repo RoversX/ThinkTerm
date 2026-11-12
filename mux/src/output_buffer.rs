@@ -4,7 +4,11 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const MAX_CAPACITY: usize = 1024 * 1024;
+/// The most output held between the reader and the parser: half of it in
+/// the ring the reader fills, and half in the ring the parser took last and
+/// is working through (see `OutputReceiver::read_buffered`).
+const MAX_HELD: usize = 1024 * 1024;
+const MAX_CAPACITY: usize = MAX_HELD / 2;
 const IDLE_RELEASE: Duration = Duration::from_millis(100);
 /// One PTY read. A parser that keeps the queue this short is keeping up.
 const KEPT_CAPACITY: usize = 64 * 1024;
@@ -23,14 +27,19 @@ struct State {
 }
 
 impl State {
-    /// Storage left by a burst the parser finished a while ago. Output that
-    /// never stops for `IDLE_RELEASE` would otherwise hold it indefinitely.
-    fn outlived_burst(&mut self) -> bool {
+    /// Storage left by a burst the parser finished a while ago, in this
+    /// ring or in the one the parser took, which has `elsewhere` bytes of
+    /// it. Output that never stops for `IDLE_RELEASE` would otherwise hold
+    /// it indefinitely. Only a ring grows past `KEPT_CAPACITY` for a
+    /// backlog and nothing else: the parser's own buffer, which grows by
+    /// doubling, says nothing of one.
+    fn outlived_burst(&mut self, elsewhere: usize) -> bool {
         if self.bytes.len() > KEPT_CAPACITY {
             self.last_backlog = Instant::now();
             return false;
         }
-        self.bytes.capacity() > KEPT_CAPACITY && self.last_backlog.elapsed() >= IDLE_RELEASE
+        self.bytes.capacity().max(elsewhere) > KEPT_CAPACITY
+            && self.last_backlog.elapsed() >= IDLE_RELEASE
     }
 }
 
@@ -42,7 +51,10 @@ struct Shared {
 }
 
 pub(crate) struct OutputSender(Arc<Shared>);
-pub(crate) struct OutputReceiver(Arc<Shared>);
+/// The parser's end, and the ring it took whole and hands the parser a
+/// batch at a time: storage like the reader's ring, with which it changes
+/// places, and released by the same rules.
+pub(crate) struct OutputReceiver(Arc<Shared>, VecDeque<u8>);
 
 pub(crate) fn channel() -> (OutputSender, OutputReceiver) {
     channel_with_capacity(MAX_CAPACITY)
@@ -61,7 +73,10 @@ fn channel_with_capacity(capacity: usize) -> (OutputSender, OutputReceiver) {
         writable: Condvar::new(),
         capacity: capacity.clamp(1, MAX_CAPACITY),
     });
-    (OutputSender(Arc::clone(&shared)), OutputReceiver(shared))
+    (
+        OutputSender(Arc::clone(&shared)),
+        OutputReceiver(shared, VecDeque::new()),
+    )
 }
 
 impl OutputSender {
@@ -95,8 +110,9 @@ impl OutputSender {
         let len = data.len().min(shared.capacity - state.bytes.len());
         let needed = state.bytes.len() + len;
         if needed > state.bytes.capacity() {
-            // Grow only for queued output. The one-MiB limit is independent
-            // of the parser batch size, as the socket buffer limit was.
+            // Grow only for queued output. The limit on what is held is
+            // independent of the parser batch size, as the socket buffer
+            // limit was.
             let capacity = needed.next_power_of_two().min(shared.capacity);
             let additional = capacity - state.bytes.len();
             state.bytes.reserve_exact(additional);
@@ -127,7 +143,13 @@ impl Read for OutputReceiver {
         if data.is_empty() {
             return Ok(0);
         }
-        let state = self.wait_for_data(|| {});
+        // What the parser took whole comes before what is still queued.
+        if !self.1.is_empty() {
+            let len = data.len().min(self.1.len());
+            Self::copy_taken(&mut self.1, &mut data[..len]);
+            return Ok(len);
+        }
+        let state = Self::wait_for_data(&self.0, || {});
         Ok(self.copy_bytes(state, data))
     }
 }
@@ -136,27 +158,57 @@ impl OutputReceiver {
     /// Allocate the parser's buffer only when output arrives. Release it
     /// with the byte ring after an idle wait, or once a burst is over and
     /// only sparse output follows; queued actions own their text.
+    ///
+    /// The parser takes the reader's ring whole, leaving in its place the
+    /// one it took before and has finished with, and works through what it
+    /// took a batch at a time without the lock. The reader would otherwise
+    /// wait out every copy the parser made from the ring, and the program
+    /// it reads from would wait with it; and the two threads would pass the
+    /// ring's bookkeeping back and forth for every batch.
     pub(crate) fn read_buffered(&mut self, data: &mut Vec<u8>, limit: usize) -> io::Result<usize> {
         if limit == 0 {
             return Ok(0);
         }
-        let mut state = self.wait_for_data(|| *data = Vec::new());
-        if state.bytes.is_empty() {
-            return Ok(0);
+        let Self(shared, taken) = self;
+        if taken.is_empty() {
+            let mut state = Self::wait_for_data(shared, || {
+                *data = Vec::new();
+                *taken = VecDeque::new();
+            });
+            if state.bytes.is_empty() {
+                return Ok(0);
+            }
+            if state.outlived_burst(taken.capacity()) {
+                state.bytes.shrink_to_fit();
+                *data = Vec::new();
+                *taken = VecDeque::new();
+            }
+            let was_full = state.bytes.len() == shared.capacity;
+            std::mem::swap(&mut state.bytes, taken);
+            drop(state);
+            if was_full {
+                shared.writable.notify_one();
+            }
         }
-        if state.outlived_burst() {
-            state.bytes.shrink_to_fit();
-            *data = Vec::new();
-        }
-        let len = limit.min(state.bytes.len());
+        let len = limit.min(taken.len());
         if data.len() < len {
             data.resize(len, 0);
         }
-        Ok(self.copy_bytes(state, &mut data[..len]))
+        Self::copy_taken(taken, &mut data[..len]);
+        Ok(len)
     }
 
-    fn wait_for_data(&self, mut release_buffer: impl FnMut()) -> MutexGuard<'_, State> {
-        let shared = &self.0;
+    /// The front of what the parser took, into `data`.
+    fn copy_taken(taken: &mut VecDeque<u8>, data: &mut [u8]) {
+        let len = data.len();
+        let (first, second) = taken.as_slices();
+        let first_len = len.min(first.len());
+        data[..first_len].copy_from_slice(&first[..first_len]);
+        data[first_len..].copy_from_slice(&second[..len - first_len]);
+        taken.drain(..len);
+    }
+
+    fn wait_for_data(shared: &Shared, mut release_buffer: impl FnMut()) -> MutexGuard<'_, State> {
         let mut state = shared.state.lock();
         while state.bytes.is_empty() && state.writer_open {
             if state.flooding {
@@ -198,11 +250,17 @@ impl OutputReceiver {
     }
 
     pub(crate) fn readable_now(&self) -> bool {
+        if !self.1.is_empty() {
+            return true;
+        }
         let state = self.0.state.lock();
         !state.bytes.is_empty() || !state.writer_open
     }
 
     pub(crate) fn wait_readable(&self, timeout: Duration) -> bool {
+        if !self.1.is_empty() {
+            return true;
+        }
         let deadline = Instant::now() + timeout;
         let mut state = self.0.state.lock();
         while state.bytes.is_empty() && state.writer_open {
@@ -394,10 +452,15 @@ mod tests {
         reader.join().unwrap();
     }
 
+    /// The reader's ring takes half of what may be held, allocated only as
+    /// it fills; the other half is the ring the parser took and is working
+    /// through, so with a parser that has taken one the reader queues as
+    /// much again before it waits.
     #[test]
-    fn production_write_credit_is_one_mib_and_allocated_only_as_needed() {
+    fn the_reader_and_the_parser_hold_one_mib_between_them() {
         let (mut tx, mut rx) = channel();
-        assert_eq!(tx.0.capacity, 1024 * 1024);
+        assert_eq!(MAX_HELD, 1024 * 1024);
+        assert_eq!(tx.0.capacity, MAX_HELD / 2);
         assert_eq!(tx.0.state.lock().bytes.capacity(), 0);
         tx.write_all(b"x").unwrap();
         assert!(tx.0.state.lock().bytes.capacity() <= 8);
@@ -407,24 +470,35 @@ mod tests {
         assert_eq!(tx.0.state.lock().bytes.capacity(), MAX_CAPACITY);
         let (started, ready) = mpsc::channel();
         let (done, result) = mpsc::channel();
+        let more = vec![b'z'; MAX_CAPACITY];
         let writer = thread::spawn(move || {
             started.send(()).unwrap();
-            done.send(tx.write_all(b"z")).unwrap();
+            done.send(tx.write_all(&more)).unwrap();
+            started.send(()).unwrap();
+            done.send(tx.write_all(b"!")).unwrap();
         });
         ready.recv().unwrap();
         assert!(result.recv_timeout(Duration::from_millis(20)).is_err());
-        let mut head = [0; 1];
-        assert_eq!(rx.read(&mut head).unwrap(), 1);
-        assert_eq!(&head, b"x");
+        // The parser takes the ring whole, and one byte of it: the reader
+        // has a ring's worth of room again, and no more than that.
+        let mut buffer = Vec::new();
+        assert_eq!(rx.read_buffered(&mut buffer, 1).unwrap(), 1);
+        assert_eq!(&buffer[..1], b"x");
         result
             .recv_timeout(Duration::from_secs(2))
             .unwrap()
             .unwrap();
-        writer.join().unwrap();
+        ready.recv().unwrap();
+        assert!(result.recv_timeout(Duration::from_millis(20)).is_err());
+        assert_eq!(rx.1.len() + rx.0.state.lock().bytes.len(), MAX_HELD - 1);
         let mut rest = Vec::new();
         rx.read_to_end(&mut rest).unwrap();
+        result.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        writer.join().unwrap();
+        assert_eq!(rest.len(), MAX_HELD);
         assert_eq!(&rest[..input.len()], input.as_slice());
-        assert_eq!(rest.last(), Some(&b'z'));
+        assert!(rest[input.len()..MAX_HELD - 1].iter().all(|&b| b == b'z'));
+        assert_eq!(rest.last(), Some(&b'!'));
     }
 
     #[test]
@@ -501,14 +575,16 @@ mod tests {
         while drained < MAX_CAPACITY {
             drained += rx.read_buffered(&mut buffer, BATCH).unwrap();
         }
-        assert_eq!(rx.0.state.lock().bytes.capacity(), MAX_CAPACITY);
+        // The storage is in the reader's ring or in the one the parser took.
+        let kept = |rx: &OutputReceiver| rx.0.state.lock().bytes.capacity().max(rx.1.capacity());
+        assert_eq!(kept(&rx), MAX_CAPACITY);
         assert!(buffer.capacity() >= BATCH);
 
         // Straight after the burst the pane still counts as busy.
         rx.0.state.lock().last_backlog = Instant::now() + Duration::from_secs(60);
         tx.write_all(b"tick").unwrap();
         assert_eq!(rx.read_buffered(&mut buffer, BATCH).unwrap(), 4);
-        assert_eq!(rx.0.state.lock().bytes.capacity(), MAX_CAPACITY);
+        assert_eq!(kept(&rx), MAX_CAPACITY);
         assert!(buffer.capacity() >= BATCH);
 
         // Output never stopped, so no idle wait ran, but the burst is over.
@@ -518,7 +594,7 @@ mod tests {
         assert_eq!(rx.read_buffered(&mut buffer, 2).unwrap(), 2);
         assert_eq!(&buffer[..2], b"to");
         assert!(buffer.capacity() <= 8);
-        assert_eq!(rx.0.state.lock().bytes.capacity(), 4);
+        assert!(kept(&rx) <= 8);
         assert_eq!(rx.read_buffered(&mut buffer, BATCH).unwrap(), 2);
         assert_eq!(&buffer[..2], b"ck");
     }
@@ -533,7 +609,8 @@ mod tests {
         let stale = Instant::now() - IDLE_RELEASE;
         rx.0.state.lock().last_backlog = stale;
         assert_eq!(rx.read_buffered(&mut buffer, 1).unwrap(), 1);
-        assert_eq!(rx.0.state.lock().bytes.capacity(), capacity);
+        // Kept, with the parser now, which took the ring whole.
+        assert_eq!(rx.1.capacity(), capacity);
         assert!(rx.0.state.lock().last_backlog > stale);
     }
 
@@ -569,12 +646,83 @@ mod tests {
             assert_eq!(buffer.capacity(), 0);
         });
         ready.recv().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while shared.state.lock().bytes.capacity() > 0 && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
-        }
+        // The ring the parser took left an empty one in its place, so the
+        // reader's ring says nothing of whether the idle wait has run:
+        // give it the time.
+        thread::sleep(IDLE_RELEASE * 5);
         assert_eq!(shared.state.lock().bytes.capacity(), 0);
         drop(tx);
         reader.join().unwrap();
+    }
+
+    /// The parser takes the reader's ring whole and works through it a
+    /// batch at a time; whatever the sizes of the batches and of the
+    /// writes, the output comes through whole and in order, and what the
+    /// parser took counts as readable until it has had all of it.
+    #[test]
+    fn a_ring_taken_whole_is_read_in_order_a_batch_at_a_time() {
+        let (mut tx, mut rx) = channel();
+        let expected: Vec<u8> = (0..700_000u32).map(|n| (n % 251) as u8).collect();
+        let input = expected.clone();
+        let writer = thread::spawn(move || {
+            for (nth, bytes) in input.chunks(1024).enumerate() {
+                if nth % 3 == 0 {
+                    tx.write_all_flooding(bytes).unwrap();
+                } else {
+                    tx.write_all(bytes).unwrap();
+                }
+                if nth % 7 == 0 {
+                    thread::yield_now();
+                }
+            }
+        });
+        let mut received = Vec::new();
+        let mut buffer = Vec::new();
+        let mut limit = 1;
+        loop {
+            let len = rx.read_buffered(&mut buffer, limit).unwrap();
+            if len == 0 {
+                break;
+            }
+            assert!(len <= limit);
+            if !rx.1.is_empty() {
+                assert!(rx.readable_now());
+                assert!(rx.wait_readable(Duration::ZERO));
+            }
+            assert!(rx.1.len() <= MAX_CAPACITY);
+            received.extend_from_slice(&buffer[..len]);
+            limit = (limit * 5) % 4099 + 1;
+        }
+        writer.join().unwrap();
+        assert_eq!(received.len(), expected.len());
+        assert!(received == expected);
+    }
+
+    /// The two rings change places and never hold more between them than
+    /// one ring did before, and the one the parser took goes with its
+    /// buffer when the pane falls idle.
+    #[test]
+    fn the_ring_the_parser_took_is_storage_like_the_readers() {
+        const BATCH: usize = 128 * 1024;
+        let (mut tx, mut rx) = channel();
+        let mut buffer = Vec::new();
+        for _ in 0..3 {
+            tx.write_all(&vec![b'x'; MAX_CAPACITY]).unwrap();
+            let mut drained = 0;
+            while drained < MAX_CAPACITY {
+                drained += rx.read_buffered(&mut buffer, BATCH).unwrap();
+                let ring = rx.0.state.lock().bytes.capacity();
+                assert!(ring + rx.1.capacity() <= MAX_HELD, "ring {ring} taken {}", rx.1.capacity());
+            }
+        }
+        let writer = thread::spawn(move || {
+            thread::sleep(IDLE_RELEASE * 5);
+            drop(tx);
+        });
+        assert_eq!(rx.read_buffered(&mut buffer, BATCH).unwrap(), 0);
+        assert_eq!(rx.1.capacity(), 0);
+        assert_eq!(rx.0.state.lock().bytes.capacity(), 0);
+        assert_eq!(buffer.capacity(), 0);
+        writer.join().unwrap();
     }
 }
