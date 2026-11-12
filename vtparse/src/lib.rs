@@ -1072,9 +1072,29 @@ pub fn c0_position(bytes: &[u8]) -> usize {
     bytes.len() - tail.len() + tail.iter().position(|&b| b < 0x20).unwrap_or(tail.len())
 }
 
+/// How many bytes at the start of `bytes` are whole characters of three
+/// bytes whose first is 0xE1..=0xEC or 0xEE..=0xEF: the ones that take any
+/// two continuation bytes, which is nearly all of CJK text. Kept out of
+/// line: the scan of every other kind of text is then as it was.
+#[inline(never)]
+fn three_byte_run(bytes: &[u8]) -> usize {
+    let mut len = 0;
+    for chunk in bytes.as_chunks::<3>().0 {
+        let lead = chunk[0];
+        let ordinary = lead.wrapping_sub(0xe1) <= 0x0b || lead.wrapping_sub(0xee) <= 0x01;
+        if !(ordinary && chunk[1] & 0xc0 == 0x80 && chunk[2] & 0xc0 == 0x80) {
+            break;
+        }
+        len += 3;
+    }
+    len
+}
+
 /// Stop before controls, incomplete codepoints or invalid encodings so that
 /// the existing state machine retains all recovery and C1 dispatch behavior.
-/// Inspect each byte at most once, including on malformed input.
+/// CJK text is taken a run at a time (`three_byte_run`), and the rest a
+/// character at a time: short runs, a letter and its marks, are no quicker
+/// as runs. A byte is looked at once, or twice where a run stopped at it.
 #[inline(never)]
 fn printable_utf8_prefix(bytes: &[u8], line_controls: bool) -> &str {
     let mut pos = 0;
@@ -1086,16 +1106,18 @@ fn printable_utf8_prefix(bytes: &[u8], line_controls: bool) -> &str {
             // U+0080..U+009F are encoded C1 controls, not printable text.
             [0xc2, 0xa0..=0xbf, ..] => 2,
             [0xc3..=0xdf, b, ..] if continuation(*b) => 2,
-            [a @ 0xe0..=0xef, b, c, ..]
-                if continuation(*c)
-                    && match a {
-                        0xe0 => (0xa0..=0xbf).contains(b),
-                        0xed => (0x80..=0x9f).contains(b),
-                        _ => continuation(*b),
-                    } =>
+            [0xe1..=0xec | 0xee..=0xef, b, c, rest @ ..]
+                if continuation(*b) && continuation(*c) =>
             {
-                3
+                // Only another like it makes a run: a letter with a tone
+                // mark, a dash or an arrow among other text is one character.
+                match rest.first() {
+                    Some(0xe1..=0xec | 0xee..=0xef) => 3 + three_byte_run(rest),
+                    _ => 3,
+                }
             }
+            [0xe0, 0xa0..=0xbf, c, ..] if continuation(*c) => 3,
+            [0xed, 0x80..=0x9f, c, ..] if continuation(*c) => 3,
             [a @ 0xf0..=0xf4, b, c, d, ..]
                 if continuation(*c)
                     && continuation(*d)
@@ -1243,6 +1265,49 @@ mod test {
                 );
                 for end in 0..text.len() {
                     assert!(printable_utf8_prefix(&text.as_bytes()[..end], false).is_empty());
+                }
+            }
+        }
+    }
+
+    /// Runs of three-byte characters are taken together: every lead byte
+    /// with every two bytes after it, inside a run and at the end of one,
+    /// has to stop where the standard validator stops.
+    #[test]
+    fn utf8_runs_stop_where_the_standard_validator_does() {
+        fn expected(bytes: &[u8]) -> usize {
+            let valid_len = match core::str::from_utf8(bytes) {
+                Ok(text) => text.len(),
+                Err(error) => error.valid_up_to(),
+            };
+            let valid = core::str::from_utf8(&bytes[..valid_len]).unwrap();
+            valid
+                .char_indices()
+                .find(|(_, c)| c.is_control())
+                .map_or(valid.len(), |(index, _)| index)
+        }
+        // After a character of two bytes the three under test are judged by
+        // the match; after one of three they are inside a run, and judged
+        // by the run.
+        for lead in ["\u{4e2d}\u{e9}", "\u{e9}\u{4e2d}"] {
+            let mut bytes = [0u8; 12];
+            bytes[..5].copy_from_slice(lead.as_bytes());
+            bytes[8..].copy_from_slice("\u{6587}x".as_bytes());
+            for a in 0x80..=0xffu8 {
+                for b in 0..=0xffu8 {
+                    for c in (0..=0xffu8).step_by(3).chain([0x7f, 0x80, 0xbf, 0xc0]) {
+                        bytes[5] = a;
+                        bytes[6] = b;
+                        bytes[7] = c;
+                        for end in [7, 8, 12] {
+                            assert_eq!(
+                                printable_utf8_prefix(&bytes[..end], false).len(),
+                                expected(&bytes[..end]),
+                                "{:x?}",
+                                &bytes[..end]
+                            );
+                        }
+                    }
                 }
             }
         }
