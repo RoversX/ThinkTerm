@@ -29,7 +29,7 @@ pub struct ForegroundProgram {
     pub task: Option<TaskReading>,
 }
 
-/// Longest `TaskReading::name`: a tool's name.
+/// Longest task-rules id or display name, in bytes.
 pub const MAX_TASK_NAME_BYTES: usize = 64;
 /// Longest `TaskReading::detail`, in characters: a few words.
 pub const MAX_TASK_DETAIL_CHARS: usize = 80;
@@ -48,6 +48,8 @@ pub enum TaskState {
 /// One reading of a tool's screen.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct TaskReading {
+    /// Stable task-rules id, independent of the tool's display name.
+    pub id: String,
     /// What to call the tool: `apt`, `brew`.
     pub name: String,
     pub state: TaskState,
@@ -78,7 +80,10 @@ pub fn is_hidden_char(c: char) -> bool {
 
 impl TaskReading {
     fn within_budget(&self) -> bool {
-        !self.name.is_empty()
+        !self.id.is_empty()
+            && self.id.len() <= MAX_TASK_NAME_BYTES
+            && !self.id.chars().any(is_hidden_char)
+            && !self.name.is_empty()
             && !self.name.chars().any(is_hidden_char)
             && self.detail.as_deref().is_none_or(|detail| !detail.chars().any(is_hidden_char))
             && self.name.len() <= MAX_TASK_NAME_BYTES
@@ -110,6 +115,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn task_ids_must_be_bounded_and_visible() {
+        let mut reading = TaskReading {
+            id: "brew".into(),
+            name: "Homebrew".into(),
+            ..Default::default()
+        };
+        assert!(reading.within_budget());
+        for id in [
+            String::new(),
+            "x".repeat(MAX_TASK_NAME_BYTES + 1),
+            "brew\n".into(),
+            "brew\u{202E}".into(),
+        ] {
+            reading.id = id;
+            assert!(!reading.within_budget());
+        }
+    }
+
+    #[test]
     fn budget_rejects_paths_and_oversized_names() {
         let program = |executable: &str, runs: Option<&str>| ForegroundProgram {
             executable: executable.to_string(),
@@ -119,6 +143,7 @@ mod tests {
         assert!(program("node", Some("npm")).within_budget());
         let reading = |detail: &str| ForegroundProgram {
             task: Some(TaskReading {
+                id: "apt".to_string(),
                 name: "apt".to_string(),
                 detail: Some(detail.to_string()),
                 ..TaskReading::default()

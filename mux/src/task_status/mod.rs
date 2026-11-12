@@ -20,11 +20,12 @@
 //! Only the reading is decided here. When to read, and what to show of it,
 //! is the frontend's business.
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 use thinkterm_proto::program::{is_hidden_char, MAX_TASK_DETAIL_CHARS, MAX_TASK_NAME_BYTES};
 pub use thinkterm_proto::{TaskReading, TaskState};
 
@@ -35,6 +36,9 @@ pub struct TaskRules {
     pub name: String,
     programs: Vec<String>,
     rules: Vec<Rule>,
+    /// The user's file the rules came from; `None` for those ThinkTerm
+    /// ships.
+    file: Option<std::path::PathBuf>,
 }
 
 struct Rule {
@@ -91,22 +95,125 @@ const MAX_REGION_LINES: usize = 40;
 
 static RULES: RwLock<Option<HashMap<String, Arc<TaskRules>>>> = RwLock::new(None);
 
+/// Which tools' screens may be read, by id; see `set_tool_preference`.
+type ToolPreference = Box<dyn Fn(&str) -> bool + Send + Sync>;
+static TOOL_PREFERENCE: RwLock<Option<ToolPreference>> = RwLock::new(None);
+
+/// One tool rules are loaded for, as a settings page lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tool {
+    pub id: String,
+    pub name: String,
+    pub programs: Vec<String>,
+    /// The user's file its rules came from; `None` for the ones ThinkTerm
+    /// ships.
+    pub file: Option<std::path::PathBuf>,
+}
+
+/// Install a process-local switch: which tools' screens are read, by id.
+/// A process without one -- a headless mux server -- reads every tool's.
+pub fn set_tool_preference(preference: impl Fn(&str) -> bool + Send + Sync + 'static) {
+    *TOOL_PREFERENCE.write() = Some(Box::new(preference));
+}
+
+fn tool_allowed(id: &str) -> bool {
+    TOOL_PREFERENCE
+        .read()
+        .as_ref()
+        .is_none_or(|preference| preference(id))
+}
+
 /// The rules for a program, by the name ThinkTerm sees it under (`apt`,
-/// `brew.rb`), if any tool claims it.
+/// `brew.rb`), if any tool claims it and it is not switched off.
 pub fn rules_for(program: &str) -> Option<Arc<TaskRules>> {
-    if RULES.read().is_none() {
-        reload();
-    }
-    RULES
+    keep_loaded();
+    let rules = RULES
         .read()
         .as_ref()?
         .values()
         .find(|rules| rules.programs.iter().any(|name| name == program))
-        .cloned()
+        .cloned()?;
+    tool_allowed(&rules.id).then_some(rules)
 }
 
-/// Load the bundled rules and the user's: a `<id>.toml` in the override
-/// directory replaces the bundled file with that id, and any other is added.
+/// Every tool rules are loaded for, by name.
+pub fn tools() -> Vec<Tool> {
+    keep_loaded();
+    let mut tools: Vec<Tool> = RULES
+        .read()
+        .as_ref()
+        .map(|rules| {
+            rules
+                .values()
+                .map(|rules| Tool {
+                    id: rules.id.clone(),
+                    name: rules.name.clone(),
+                    programs: rules.programs.clone(),
+                    file: rules.file.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    tools.sort_by_key(|tool| tool.name.to_lowercase());
+    tools
+}
+
+/// How often the rules folder is looked at for files added, changed or
+/// taken away, so new rules work without a restart -- of this process, or
+/// of a server, which reads its own folder.
+const FOLDER_CHECK_EVERY: Duration = Duration::from_secs(3);
+
+/// A `.toml` file in the rules folder, as far as noticing a change goes.
+type FolderEntry = (std::ffi::OsString, Option<SystemTime>, u64);
+
+/// When the rules folder was last looked at, and what was in it.
+static FOLDER: Mutex<Option<(Instant, Vec<FolderEntry>)>> = Mutex::new(None);
+
+/// Load the rules if they are not, and again if the folder changed since
+/// it was last looked at, at most every `FOLDER_CHECK_EVERY`.
+fn keep_loaded() {
+    let now = Instant::now();
+    let mut folder = FOLDER.lock();
+    let loaded = RULES.read().is_some();
+    if loaded
+        && folder
+            .as_ref()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) < FOLDER_CHECK_EVERY)
+    {
+        return;
+    }
+    let entries = folder_entries(&rules_dir());
+    let changed = folder.as_ref().is_none_or(|(_, seen)| *seen != entries);
+    *folder = Some((now, entries));
+    drop(folder);
+    if !loaded || changed {
+        reload();
+    }
+}
+
+fn folder_entries(dir: &std::path::Path) -> Vec<FolderEntry> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<FolderEntry> = read
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("toml"))
+        .map(|entry| {
+            let metadata = entry.metadata().ok();
+            (
+                entry.file_name(),
+                metadata.as_ref().and_then(|metadata| metadata.modified().ok()),
+                metadata.map_or(0, |metadata| metadata.len()),
+            )
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// Load the bundled rules and the user's: a file in the rules folder whose
+/// `id` is a bundled tool's replaces its rules, whatever the file is
+/// called, and any other adds a tool.
 pub fn reload() {
     let mut map = HashMap::new();
     for text in BUNDLED {
@@ -114,7 +221,7 @@ pub fn reload() {
             map.insert(rules.id.clone(), Arc::new(rules));
         }
     }
-    if let Ok(entries) = std::fs::read_dir(override_dir()) {
+    if let Ok(entries) = std::fs::read_dir(rules_dir()) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
@@ -131,7 +238,9 @@ pub fn reload() {
     *RULES.write() = Some(map);
 }
 
-fn override_dir() -> std::path::PathBuf {
+/// Where the user's own rules go: a file there whose `id` is a bundled
+/// tool's replaces its rules, and any other adds a tool.
+pub fn rules_dir() -> std::path::PathBuf {
     // As with agent rules, tests must not read the developer's own.
     #[cfg(test)]
     {
@@ -198,8 +307,10 @@ fn compile(text: &str, origin: &str) -> Option<TaskRules> {
         Some(name) => name,
         None => file.id.clone(),
     };
-    if name.is_empty() || name.len() > MAX_TASK_NAME_BYTES || name.chars().any(is_hidden_char) {
-        log::error!("task rules {origin}: the name must be 1 to {MAX_TASK_NAME_BYTES} bytes");
+    if [&file.id, &name].iter().any(|value| {
+        value.is_empty() || value.len() > MAX_TASK_NAME_BYTES || value.chars().any(is_hidden_char)
+    }) {
+        log::error!("task rules {origin}: id and name must be 1 to {MAX_TASK_NAME_BYTES} visible bytes");
         return None;
     }
     Some(TaskRules {
@@ -207,6 +318,7 @@ fn compile(text: &str, origin: &str) -> Option<TaskRules> {
         name,
         programs: file.programs,
         rules,
+        file: (origin != "bundled").then(|| std::path::PathBuf::from(origin)),
     })
 }
 
@@ -226,6 +338,7 @@ impl TaskRules {
     /// Read `screen`, its lines top to bottom.
     pub fn read(&self, screen: &[String]) -> TaskReading {
         let mut reading = TaskReading {
+            id: self.id.clone(),
             name: self.name.clone(),
             ..TaskReading::default()
         };
@@ -436,12 +549,53 @@ mod tests {
     }
 
     #[test]
+    fn a_rules_file_added_or_changed_is_noticed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(folder_entries(dir.path()).is_empty());
+        std::fs::write(dir.path().join("notes.txt"), "not rules").unwrap();
+        assert!(folder_entries(dir.path()).is_empty());
+        let rules = dir.path().join("pacman.toml");
+        std::fs::write(&rules, "id = \"pacman\"").unwrap();
+        let added = folder_entries(dir.path());
+        assert_eq!(added.len(), 1);
+        std::fs::write(&rules, "id = \"pacman\"\nprograms = [\"pacman\"]").unwrap();
+        assert_ne!(folder_entries(dir.path()), added);
+    }
+
+    #[test]
+    fn the_tools_are_listed_by_name() {
+        reload();
+        let tools = tools();
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(names, ["apt", "brew"]);
+        assert!(tools.iter().all(|tool| tool.file.is_none()));
+    }
+
+    #[test]
     fn the_bundled_rules_compile_and_claim_their_programs() {
         assert_eq!(bundled("apt").id, "apt");
         assert_eq!(bundled("apt-get").id, "apt");
         assert_eq!(bundled("brew").id, "brew");
         assert_eq!(bundled("brew.rb").name, "brew");
         assert!(rules_for("vim").is_none());
+    }
+
+    #[test]
+    fn readings_keep_the_rules_id_when_names_change_or_collide() {
+        let rules = |id: &str, name: &str| {
+            compile(
+                &format!("id = {id:?}\nname = {name:?}\nprograms = [\"example\"]\nrules = []"),
+                "test",
+            )
+            .unwrap()
+        };
+        for name in ["brew", "Homebrew", "Package manager"] {
+            let brew = rules("brew", name).read(&[]);
+            let apt = rules("apt", name).read(&[]);
+            assert_eq!(brew.id, "brew");
+            assert_eq!(apt.id, "apt");
+            assert_eq!(brew.name, apt.name);
+        }
     }
 
     #[test]

@@ -899,7 +899,9 @@ macro_rules! pdu {
 ///     pane_machines), as a window gives the panes it is connected to.
 /// 87: A foreground program carries what its task rules read off its
 ///     screen (ForegroundProgram::task), for a tool such as apt or brew.
-pub const CODEC_VERSION: usize = 87;
+/// 88: Task readings carry their stable rules id, so display-name overrides
+///     cannot bypass a client's per-tool switch.
+pub const CODEC_VERSION: usize = 88;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -3600,7 +3602,7 @@ mod test {
         // tripwire: whoever bumps the codec must come here, confirm the
         // round-trips still cover the new version, and advance it
         // deliberately.
-        assert_eq!(CODEC_VERSION, 87);
+        assert_eq!(CODEC_VERSION, 88);
         use thinkterm_proto::{
             AgentEvidence, AgentState, AgentStatus, ProgramBlockedKind, ProgramReport,
             ProgramReportChild, ProgramReportState,
@@ -3670,7 +3672,7 @@ mod test {
     #[test]
     fn foreground_program_protocol_round_trip_at_version_74() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 87);
+        assert_eq!(CODEC_VERSION, 88);
         use thinkterm_proto::ForegroundProgram;
 
         fn round_trip(pdu: &Pdu) -> Pdu {
@@ -3700,6 +3702,31 @@ mod test {
                 programs: vec![ForegroundProgramEntry {
                     pane_id: 7,
                     program: program.clone(),
+                }],
+            }),
+        ] {
+            assert_eq!(round_trip(&pdu), pdu);
+        }
+
+        let task_program = ForegroundProgram {
+            executable: "brew".into(),
+            task: Some(thinkterm_proto::TaskReading {
+                id: "brew".into(),
+                name: "Homebrew".into(),
+                state: thinkterm_proto::TaskState::Waiting,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for pdu in [
+            Pdu::ForegroundProgramChanged(ForegroundProgramChanged {
+                pane_id: 7,
+                program: Some(task_program.clone()),
+            }),
+            Pdu::GetForegroundProgramsResponse(GetForegroundProgramsResponse {
+                programs: vec![ForegroundProgramEntry {
+                    pane_id: 7,
+                    program: task_program,
                 }],
             }),
         ] {
@@ -3774,7 +3801,7 @@ mod test {
     #[test]
     fn run_state_protocol_round_trip_at_version_80() {
         // Same tripwire as the agent-status test above.
-        assert_eq!(CODEC_VERSION, 87);
+        assert_eq!(CODEC_VERSION, 88);
         use thinkterm_proto::{PaneExit, PaneRunState, ProgramState, ShellCommands};
 
         let exit = PaneExit {
@@ -3880,7 +3907,7 @@ mod test {
     fn frame_control_extension_round_trips_without_changing_legacy_version() {
         // The extension is asked for, so it needed no bump of its own; 74
         // is the foreground program's, which a server sends unasked.
-        assert_eq!(CODEC_VERSION, 87);
+        assert_eq!(CODEC_VERSION, 88);
         for pdu in [
             Pdu::GetKittyImage(GetKittyImage { pane_id: 3, image_id: 7, data_hash: [9; 32], have_frames: 2, image_epoch: Some(4) }),
             Pdu::GetKittyFrameSelections(GetKittyFrameSelections { pane_id: 3, subscribe: true }),

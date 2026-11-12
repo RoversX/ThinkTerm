@@ -3918,6 +3918,7 @@ mod tests {
             executable: "apt".into(),
             runs: None,
             task: Some(TaskReading {
+                id: "apt".into(),
                 name: "apt".into(),
                 state: TaskState::Waiting,
                 ..TaskReading::default()

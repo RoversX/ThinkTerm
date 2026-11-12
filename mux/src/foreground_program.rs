@@ -11,7 +11,8 @@
 //! what it runs. What a program looks like is the frontend's business.
 //!
 //! Nothing is polled. A pane is looked at when it prints or retitles, and
-//! once more after that burst settles; a pane doing nothing costs nothing.
+//! once more after that burst settles, or when detection settings change;
+//! a pane doing nothing costs nothing.
 //!
 //! A pane whose terminal is on another machine -- an ssh domain's channel,
 //! which has no local leader, or `ssh` run in a local pane -- runs whatever
@@ -145,6 +146,15 @@ pub fn refresh_enabled() {
         mark_all_panes();
     } else {
         schedule_drain();
+    }
+}
+
+/// Settings may enable task detection for a tool already waiting quietly
+/// for input. Queue a read even though its screen has not changed. The
+/// drain still applies the tool switches and skips remote mirrors.
+pub fn refresh_task_readings() {
+    if enabled() && INSTALLED.load(Ordering::Acquire) {
+        mark_all_panes();
     }
 }
 
