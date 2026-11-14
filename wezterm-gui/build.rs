@@ -1,15 +1,20 @@
-/// Where cargo puts this package's executable: the directory three levels
-/// above OUT_DIR (`<target>/[<triple>/]<profile dir>/build/<pkg>-<hash>/out`).
-/// The `PROFILE` variable cannot name it: a custom profile such as `dist`
-/// reports the profile it inherits from, and a `--target` build lands in a
-/// per-triple directory that `PROFILE` knows nothing about.
+/// Where cargo puts this package's executable: the directory that holds the
+/// `build` directory OUT_DIR is under
+/// (`<target>/[<triple>/]<profile dir>/build/...`). How far under `build`
+/// OUT_DIR lies is not counted: cargo had it at `<pkg>-<hash>/out`, and has
+/// it at `<pkg>/<hash>/out` since 1.100. The `PROFILE` variable cannot name
+/// the directory: a custom profile such as `dist` reports the profile it
+/// inherits from, and a `--target` build lands in a per-triple directory
+/// that `PROFILE` knows nothing about.
 #[cfg(any(windows, target_os = "macos"))]
 fn exe_output_dir(repo_dir: &std::path::Path) -> std::path::PathBuf {
     if let Some(out_dir) = std::env::var_os("OUT_DIR") {
-        if let Some(dir) = std::path::Path::new(&out_dir).ancestors().nth(3) {
-            if dir.is_dir() {
-                return dir.to_path_buf();
-            }
+        let dir = std::path::Path::new(&out_dir)
+            .ancestors()
+            .find(|dir| dir.file_name().is_some_and(|name| name == "build"))
+            .and_then(std::path::Path::parent);
+        if let Some(dir) = dir.filter(|dir| dir.is_dir()) {
+            return dir.to_path_buf();
         }
     }
     let profile = std::env::var("PROFILE").unwrap();
