@@ -145,6 +145,14 @@ fn tab_places(layout: &codec::ListPanesResponse, pane_id: PaneId) -> Option<Vec<
     (!entries.is_empty()).then(|| entries.iter().map(place).collect())
 }
 
+/// The tab that holds `pane_id`, and whether a pane of it is zoomed.
+fn tab_of(layout: &codec::ListPanesResponse, pane_id: PaneId) -> Option<(TabId, bool)> {
+    let tab = crate::layout::tab_containing(layout, pane_id)?;
+    let (_, tab_id) = tab.window_and_tab_ids()?;
+    let zoomed = crate::layout::leaves(tab).iter().any(|entry| entry.is_zoomed_pane);
+    Some((tab_id, zoomed))
+}
+
 /// A pane's whole screen, for a thumbnail with the terminal's shape: every
 /// row of its viewport at its own size, in its own colours. A run's
 /// background is `""` where it is the screen's own (`background`).
@@ -554,6 +562,11 @@ pub struct Inner<P: Platform, L: Link> {
     claimed_layout: Option<crate::layout::TabLayout>,
     /// When `claimed_layout` was claimed, on the platform's clock.
     claimed_at: f64,
+    /// A zoom asked of the server and drawn already (`zoom_ahead`): the
+    /// tab, the pane zoomed or none, and when. A listing that still says
+    /// otherwise is the server's word from before it heard, and is let
+    /// pass, until one agrees or `ZOOM_PATIENCE_MS` is up.
+    zoom_ahead: Option<(TabId, Option<PaneId>, f64)>,
     /// A divider claim on the wire, and the step that arrived meanwhile
     /// to send when it answers: one round trip at a time, the newest
     /// position wins.
@@ -904,6 +917,7 @@ impl<P: Platform, L: Link> App<P, L> {
             drag_layout: None,
             claimed_layout: None,
             claimed_at: 0.0,
+            zoom_ahead: None,
             divider_claim_busy: false,
             divider_claim_next: None,
             preview_epoch: 0,
@@ -4177,6 +4191,24 @@ impl<P: Platform, L: Link> App<P, L> {
             Self::set_status(&inner, &tr("web-toast-no-panes"));
             return;
         };
+        // A zoom drawn ahead of the server: a listing from before the server
+        // heard of it would put the tab back for a moment. It is let pass,
+        // and the server asked again; one that agrees, another tab, or the
+        // patience running out ends the wait.
+        {
+            let mut inner = self.inner.borrow_mut();
+            if let Some((tab, zoomed, at)) = inner.zoom_ahead {
+                let waiting = tab == layout.tab_id
+                    && tab == inner.tab_id
+                    && inner.platform.monotonic_ms() - at < Self::ZOOM_PATIENCE_MS;
+                if waiting && layout.zoomed != zoomed {
+                    drop(inner);
+                    self.refresh_layout_soon();
+                    return;
+                }
+                inner.zoom_ahead = None;
+            }
+        }
         let (link, tab_changed) = {
             let mut inner = self.inner.borrow_mut();
             if inner.switching || inner.disconnected.is_some() {
@@ -4254,20 +4286,7 @@ impl<P: Platform, L: Link> App<P, L> {
         };
         self.mark_focused_program_status_seen();
         self.sync_frame_control();
-        for pane_id in fresh {
-            let link = link.clone();
-            self.spawn(async move {
-                let _ = thinkterm_session::host::request(
-                    &link,
-                    Pdu::GetPaneRenderChanges(codec::GetPaneRenderChanges { pane_id }),
-                    |pdu| match pdu {
-                        Pdu::LivenessResponse(_) | Pdu::UnitResponse(_) => Ok(()),
-                        other => Err(other),
-                    },
-                )
-                .await;
-            });
-        }
+        self.ask_after(fresh);
         if tab_changed || first_layout {
             self.match_desktop_cell();
             self.resize();
@@ -4315,6 +4334,89 @@ impl<P: Platform, L: Link> App<P, L> {
         if claim {
             self.take_over_with(true);
         }
+    }
+
+    /// A pane's first push comes when something asks after it: one
+    /// liveness poll for each of `panes`, new to the page, and the answer
+    /// is not waited for.
+    fn ask_after(self: &Rc<Self>, panes: Vec<PaneId>) {
+        let link = self.inner.borrow().link.clone();
+        for pane_id in panes {
+            let link = link.clone();
+            self.spawn(async move {
+                let _ = thinkterm_session::host::request(
+                    &link,
+                    Pdu::GetPaneRenderChanges(codec::GetPaneRenderChanges { pane_id }),
+                    |pdu| match pdu {
+                        Pdu::LivenessResponse(_) | Pdu::UnitResponse(_) => Ok(()),
+                        other => Err(other),
+                    },
+                )
+                .await;
+            });
+        }
+    }
+
+    /// How long a zoom drawn ahead of the server waits for a listing that
+    /// agrees with it, before the page takes the server's word instead:
+    /// long enough for the request and the listing after it over a slow
+    /// connection, short enough that a zoom the server never made does not
+    /// stay on screen.
+    const ZOOM_PATIENCE_MS: f64 = 4_000.0;
+
+    /// Draw the tab as a zoom just asked for will leave it -- pane
+    /// `pane_id` alone at the tab's size, or the split it hid back --
+    /// without waiting for the server: the request is one trip there and
+    /// back, and the listing that shows what came of it another. Each
+    /// pane keeps its rows at the grid its new frame gives it
+    /// (`preview_panes`) until the server's own arrive. Returns the panes
+    /// new to the page; `None` when there is nothing to go by -- no
+    /// listing yet, a lone pane, a pane behind another in a stack -- and
+    /// the server's listing shows the zoom when it comes.
+    fn zoom_ahead(inner: &mut Inner<P, L>, pane_id: PaneId, zoom: bool) -> Option<Vec<PaneId>> {
+        let current = inner.tab_layout.as_ref()?;
+        let (tab_id, tab) = (current.tab_id, current.size);
+        if zoom && current.panes.len() < 2 {
+            return None;
+        }
+        let node = crate::layout::tab_containing(inner.layout.as_ref()?, pane_id)?;
+        if node.window_and_tab_ids().map(|(_, tab_id)| tab_id) != Some(tab_id) {
+            return None;
+        }
+        let nav_rows = Self::nav_rows_for(inner, crate::layout::leaves(node).len());
+        let mut ahead = crate::layout::with_zoom(node, tab, nav_rows, zoom.then_some(pane_id))?;
+        let panes = Self::native_panes(inner, &ahead);
+        for place in &mut ahead.panes {
+            if let Some(pane) = panes.iter().find(|pane| pane.pane_id == place.pane_id) {
+                place.content = (pane.size.cols, pane.size.rows);
+                place.size = pane.size;
+            }
+        }
+        // A grid claimed for the window gives way: the zoom is drawn.
+        inner.claimed_layout = None;
+        let fresh = Self::apply_layout(inner, ahead, pane_id);
+        // The panes that were on show keep their rows, at their new width.
+        let resized: Vec<(PaneId, TerminalSize)> = panes
+            .iter()
+            .filter(|pane| !fresh.contains(&pane.pane_id))
+            .filter(|pane| {
+                inner.panes.get(&pane.pane_id).is_some_and(|cell| {
+                    let dims = cell.session.dimensions();
+                    (dims.cols, dims.viewport_rows) != (pane.size.cols, pane.size.rows)
+                })
+            })
+            .map(|pane| (pane.pane_id, pane.size))
+            .collect();
+        Self::preview_panes(inner, &resized);
+        // What a keystroke would claim follows the drawn layout.
+        {
+            let mut lease = inner.link.lease_mut();
+            lease.native = panes;
+            lease.native_root = Some(tab);
+        }
+        inner.zoom_ahead = Some((tab_id, zoom.then_some(pane_id), inner.platform.monotonic_ms()));
+        Self::render_strip(inner);
+        Some(fresh)
     }
 
     /// Make `inner.panes` match `layout`, focusing `want` if it is drawn
@@ -6868,23 +6970,58 @@ impl<P: Platform, L: Link> App<P, L> {
         }
     }
 
-    /// Zoom the focused pane to the whole tab, or back.
+    /// Zoom the focused pane to the whole tab, or back. A pane named may
+    /// be another tab's -- a tab's menu names the one its tab shows: that
+    /// tab is zoomed and comes on show, as the desktop's menu has it, and
+    /// the one that was on show is left as it is.
     pub fn toggle_zoom(self: &Rc<Self>, pane: Option<PaneId>) {
         let pane_id = self.target_pane(pane);
-        let (tab_id, zoomed) = {
+        let (tab_id, zoomed, shown, link) = {
             let inner = self.inner.borrow();
-            let zoomed = inner.tab_layout.as_ref().is_some_and(|l| l.zoomed.is_some());
-            (inner.tab_id, zoomed)
+            let elsewhere = inner
+                .layout
+                .as_ref()
+                .and_then(|listed| tab_of(listed, pane_id))
+                .filter(|(tab_id, _)| *tab_id != inner.tab_id);
+            match elsewhere {
+                Some((tab_id, zoomed)) => (tab_id, zoomed, false, inner.link.clone()),
+                None => {
+                    let zoomed = inner.tab_layout.as_ref().is_some_and(|l| l.zoomed.is_some());
+                    (inner.tab_id, zoomed, true, inner.link.clone())
+                }
+            }
         };
-        self.act(
-            "web-act-zoom-pane",
-            Pdu::SetPaneZoomed(codec::SetPaneZoomed {
+        // On screen at once; the server hears of it meanwhile.
+        let fresh = match shown {
+            true => Self::zoom_ahead(&mut self.inner.borrow_mut(), pane_id, !zoomed),
+            false => None,
+        };
+        if let Some(fresh) = fresh {
+            self.sync_frame_control();
+            self.ask_after(fresh);
+            self.refresh_status();
+            self.request_frame();
+        }
+        let app = Rc::clone(self);
+        self.spawn(async move {
+            let pdu = Pdu::SetPaneZoomed(codec::SetPaneZoomed {
                 containing_tab_id: tab_id,
                 pane_id,
                 zoomed: !zoomed,
-            }),
-            |_, _| {},
-        );
+            });
+            if let Err(err) = thinkterm_session::host::request(&link, pdu, Ok).await {
+                log::warn!("web-act-zoom-pane: {err:#}");
+                let mut inner = app.inner.borrow_mut();
+                // Nothing came of it: the server's layout again.
+                inner.zoom_ahead = None;
+                Self::set_status(&inner, &failed("web-act-zoom-pane", &err));
+            } else if !shown && !app.inner.borrow().panes.contains_key(&pane_id) {
+                // Its tab, listed again as it is now.
+                return app.switch_to_pane(pane_id, false);
+            }
+            app.refresh_layout();
+            app.platform.focus_input();
+        });
     }
 
     /// Close the focused pane, ending its program.
@@ -8190,6 +8327,11 @@ mod tests {
         );
         assert_eq!(at(30), Some(vec![(31, 0, 0)]), "a zoomed pane alone");
         assert_eq!(at(99), None);
+        // The tab each is in, and whether that tab is zoomed: a stack's
+        // pane behind, and the pane a zoomed one hides, are in theirs too.
+        assert_eq!(super::tab_of(&layout, 22), Some((2, false)));
+        assert_eq!(super::tab_of(&layout, 30), Some((3, true)));
+        assert_eq!(super::tab_of(&layout, 99), None);
         // Each at the size the same listing has it.
         let place = tab_places(&layout, 21).unwrap()[1];
         assert_eq!((place.cols, place.rows), (40, 12));

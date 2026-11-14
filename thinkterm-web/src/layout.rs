@@ -372,6 +372,40 @@ pub fn layout(node: &PaneNode) -> Option<TabLayout> {
 /// have left it -- never the grid itself, since claiming a frame the
 /// size of the pane would shrink the pane by the bar's rows each time.
 pub fn layout_in(node: &PaneNode, tab_size: Option<TerminalSize>, nav_rows: usize) -> Option<TabLayout> {
+    lay(node, tab_size, nav_rows, None)
+}
+
+/// The tab as it will be once pane `zoom` is zoomed, or once no pane is:
+/// what the page draws the moment a zoom is asked for, before the server
+/// has said anything. `tab` is the tab's own grid, which a zoom leaves as
+/// it is; the split tree behind a zoomed pane is listed at the size the
+/// tab had when it was zoomed, and is scaled to `tab` when it comes back.
+/// The panes' own grids are still the listing's. `None` for a pane that
+/// is not drawn in the tab, and for a tree that does not fit `tab`.
+pub fn with_zoom(node: &PaneNode, tab: TerminalSize, nav_rows: usize, zoom: Option<PaneId>) -> Option<TabLayout> {
+    let layout = lay(node, Some(tab), nav_rows, Some(zoom))?;
+    if layout.zoomed != zoom {
+        return None;
+    }
+    if (layout.cols, layout.rows) == (tab.cols, tab.rows) {
+        Some(layout)
+    } else {
+        scaled(&layout, tab)
+    }
+}
+
+/// `layout_in`, with the server's word on which pane is zoomed replaced
+/// by `zoom` when there is one.
+fn lay(
+    node: &PaneNode,
+    tab_size: Option<TerminalSize>,
+    nav_rows: usize,
+    zoom: Option<Option<PaneId>>,
+) -> Option<TabLayout> {
+    let is_zoomed = |entry: &PaneEntry| match zoom {
+        Some(zoom) => zoom == Some(entry.pane_id),
+        None => entry.is_zoomed_pane,
+    };
     let listed = node.root_size()?;
     let framed = |grid: TerminalSize| {
         tab_size.unwrap_or_else(|| {
@@ -386,7 +420,7 @@ pub fn layout_in(node: &PaneNode, tab_size: Option<TerminalSize>, nav_rows: usiz
     // A zoomed pane's own size is the tab's: the split tree it hides is
     // not resized while it is zoomed, so the root the server lists is
     // wherever the tab stood at the zoom.
-    let zoomed_grid = leaves(node).into_iter().find(|e| e.is_zoomed_pane).map(|e| e.size);
+    let zoomed_grid = leaves(node).into_iter().find(|e| is_zoomed(e)).map(|e| e.size);
     let size = match (node, zoomed_grid) {
         (PaneNode::Split { .. }, None) => listed,
         (_, Some(grid)) => framed(grid),
@@ -407,6 +441,11 @@ pub fn layout_in(node: &PaneNode, tab_size: Option<TerminalSize>, nav_rows: usiz
     let mut dividers = Vec::new();
     let mut hidden = Vec::new();
     walk(node, root, &mut panes, &mut dividers, &mut hidden);
+    if let Some(zoom) = zoom {
+        for p in &mut panes {
+            p.is_zoomed = zoom == Some(p.pane_id);
+        }
+    }
     // A zoomed pane fills the tab; the rest are there but not drawn. Its
     // listed position is where it sat before the zoom.
     let zoomed = panes.iter().find(|p| p.is_zoomed).map(|p| p.pane_id);
@@ -666,6 +705,50 @@ mod tests {
         assert_eq!(l.panes[0].frame, Rect { left: 0, top: 0, cols: 80, rows: 24 });
         assert!(l.dividers.is_empty());
         assert_eq!(l.hidden, vec![1]);
+    }
+
+    /// What the page draws the moment a zoom is asked for: the pane alone
+    /// at the tab's size, and back, from a listing that has yet to say so.
+    #[test]
+    fn a_zoom_asked_for_is_laid_out_before_the_server_lists_it() {
+        let node = split(
+            SplitDirection::Horizontal,
+            size(40, 24),
+            size(39, 24),
+            PaneNode::Leaf(pane(1, 40, 24, 0, 0, false)),
+            PaneNode::Leaf(pane(2, 39, 24, 41, 0, true)),
+        );
+        let ahead = with_zoom(&node, size(80, 24), 0, Some(2)).unwrap();
+        assert_eq!(ahead.zoomed, Some(2));
+        assert_eq!((ahead.cols, ahead.rows), (80, 24));
+        assert_eq!(ahead.panes.len(), 1);
+        assert_eq!(ahead.panes[0].frame, Rect { left: 0, top: 0, cols: 80, rows: 24 });
+        assert!(ahead.panes[0].is_zoomed);
+        assert!(ahead.dividers.is_empty());
+        assert_eq!(ahead.hidden, vec![1]);
+        assert_eq!(with_zoom(&node, size(80, 24), 0, Some(9)), None, "not a pane of the tab");
+
+        // Back, from the listing of the zoomed tab: the tree it hid, which
+        // was 80 columns wide when it was zoomed, at the 160 the tab has now.
+        let mut zoomed = pane(2, 160, 24, 41, 0, true);
+        zoomed.is_zoomed_pane = true;
+        let node = split(
+            SplitDirection::Horizontal,
+            size(40, 24),
+            size(39, 24),
+            PaneNode::Leaf(pane(1, 40, 24, 0, 0, false)),
+            PaneNode::Leaf(zoomed),
+        );
+        let back = with_zoom(&node, size(160, 24), 0, None).unwrap();
+        assert_eq!(back.zoomed, None);
+        assert_eq!((back.cols, back.rows), (160, 24));
+        assert_eq!(back.panes.iter().map(|p| p.pane_id).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(back.panes.iter().all(|p| !p.is_zoomed));
+        assert_eq!(back.dividers.len(), 1);
+        let (first, second) = (back.panes[0].frame, back.panes[1].frame);
+        assert_eq!(first.cols + 1 + second.cols, 160, "the frames and the divider make up the tab");
+        assert_eq!(second.left, first.cols + 1);
+        assert!(back.hidden.is_empty());
     }
 
     /// The server's tree keeps the pre-zoom sizes while a pane is zoomed;
