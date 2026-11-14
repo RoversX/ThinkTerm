@@ -197,6 +197,19 @@ impl SshdConfig {
             .insert("StrictModes".to_string(), Self::yes_value(yes));
     }
 
+    /// Have the server ask a quiet client whether it is still there, and
+    /// drop one that leaves `count_max` such questions unanswered.
+    pub fn set_client_alive(&mut self, interval_secs: u32, count_max: u32) {
+        self.0.insert(
+            "ClientAliveInterval".to_string(),
+            vec![interval_secs.to_string()],
+        );
+        self.0.insert(
+            "ClientAliveCountMax".to_string(),
+            vec![count_max.to_string()],
+        );
+    }
+
     fn yes_value(yes: bool) -> Vec<String> {
         vec![Self::yes_string(yes)]
     }

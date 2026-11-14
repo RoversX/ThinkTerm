@@ -66,6 +66,33 @@ impl SessionWrap {
         }
     }
 
+    /// Have the backend take in what its socket holds and see that it can
+    /// be written to. Reading a channel does this on the way; this is for
+    /// when no channel is there to read. False once the connection is found
+    /// to have ended.
+    pub fn service_socket(&mut self) -> bool {
+        match self {
+            // The socket left ready with nobody to take it up was seen
+            // and measured with libssh alone.
+            #[cfg(feature = "ssh2")]
+            Self::Ssh2(_) => true,
+
+            #[cfg(feature = "libssh-rs")]
+            Self::LibSsh(sess) => {
+                // libssh handles its socket only within a call made on a
+                // channel. One that is never opened is nothing the far end
+                // hears of, and is freed as it is dropped. The call fails
+                // only when the session itself has.
+                match sess.sess.new_channel() {
+                    Ok(channel) => channel
+                        .poll_timeout(false, Some(std::time::Duration::ZERO))
+                        .is_ok(),
+                    Err(_) => true,
+                }
+            }
+        }
+    }
+
     pub fn as_socket_descriptor(&self) -> SocketDescriptor {
         match self {
             #[cfg(feature = "ssh2")]

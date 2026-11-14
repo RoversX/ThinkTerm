@@ -729,6 +729,25 @@ impl SessionInner {
             } else if idle_wakes < 3 {
                 idle_wakes += 1;
             } else {
+                // The session socket is ready and nothing took it up. Only
+                // a call on a channel has the backend deal with its socket,
+                // and here no channel is being read: a session kept for
+                // file transfers has none in `channels`, nor has one whose
+                // command has ended or that has run nothing yet. What the
+                // far end sent unasked, a write still marked as wanted, or
+                // the end of the connection then kept poll returning at
+                // once, two hundred times a second for as long as the
+                // session was held.
+                //
+                // A connection found ended has nothing more to give: with
+                // no channel left to wind down, the loop ends with it, and
+                // whoever still holds the session is told so on its next
+                // request rather than by a socket that stays ready.
+                if poll_array[1].revents != 0 && !sess.service_socket() && self.channels.is_empty()
+                {
+                    anyhow::bail!("the connection to the server has ended");
+                }
+
                 // Repeated immediate wakeups with no IO progress. The nap
                 // below caps this at a couple of hundred iterations a
                 // second, which keeps CPU usage negligible; don't kill the
