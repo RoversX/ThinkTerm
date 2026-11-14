@@ -1087,6 +1087,8 @@ mod tests {
         });
     }
 
+    // The client here is a socket of this platform's own kind.
+    #[cfg(unix)]
     #[test]
     fn a_peer_that_vanishes_does_not_stop_the_listener() {
         smol::block_on(async {
